@@ -12,7 +12,7 @@ import {
   isGitRepo,
   listRemotes,
   localBranchExists,
-  pickRemote,
+  selectRepoRemote,
   remoteDefaultBranch,
   type GitOptions,
 } from './git.js';
@@ -88,6 +88,8 @@ export interface PrepareRequest {
   checkoutPath: string;
   /** OWNER/NAME the clone's remote must point at. */
   repoFullName: string;
+  /** repositories.<repo>.remote: use exactly this remote (any host, OWNER/NAME must match). */
+  remote?: string | undefined;
   /** Configured base branch; defaults to the remote's default branch. */
   baseBranch?: string | undefined;
   branch: string;
@@ -125,12 +127,9 @@ export function prepareJobWorktree(req: PrepareRequest): Promise<PreparedWorktre
     const opts: GitOptions = { cwd: checkoutPath, git: req.git };
     if (!(await isGitRepo(opts))) throw new PrepareError(`checkoutPath ${checkoutPath} is not a git repository`);
 
-    const remotes = await listRemotes(opts);
-    const remote = pickRemote(remotes, repoFullName);
-    if (!remote) {
-      const seen = remotes.length ? remotes.map((r) => `${r.name} -> ${redactRemoteUrl(r.url)}`).join(', ') : 'none';
-      throw new PrepareError(`no remote of ${checkoutPath} points at ${repoFullName} (remotes: ${seen})`);
-    }
+    const selection = selectRepoRemote(await listRemotes(opts), repoFullName, req.remote);
+    if (!selection.ok) throw new PrepareError(`${checkoutPath}: ${selection.error}`);
+    const remote = selection.remote;
 
     const net: GitOptions = { ...opts, signal: req.signal };
     const baseBranch = req.baseBranch ?? (await remoteDefaultBranch(remote.name, net));

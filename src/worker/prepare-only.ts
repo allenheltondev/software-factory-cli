@@ -57,6 +57,7 @@ export class PrepareOnlyExecutor implements Executor {
         prepared = await prepareJobWorktree({
           checkoutPath: checkoutSource,
           repoFullName: found.fullName,
+          remote: found.repo.remote,
           baseBranch: found.repo.baseBranch,
           branch,
           worktreePath,

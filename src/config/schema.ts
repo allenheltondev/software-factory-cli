@@ -74,6 +74,15 @@ export const repositorySchema = z.strictObject({
    */
   checkoutPath: z.string().min(1).optional(),
   /**
+   * Remote of checkoutPath to fetch from. By default only a github.com remote whose path is
+   * OWNER/REPO qualifies (origin preferred). Naming a remote here allows any host, e.g. an SSH
+   * host alias (github-work:OWNER/REPO); its OWNER/REPO must still match.
+   */
+  remote: z
+    .string()
+    .regex(/^[^-\s][^\s]*$/, 'a git remote name, e.g. origin')
+    .optional(),
+  /**
    * New subscriptions start at the current event stream position. Set an ISO timestamp
    * to enqueue matching events created at or after it on the first poll instead.
    */

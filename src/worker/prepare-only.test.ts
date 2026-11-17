@@ -37,6 +37,8 @@ function setup(repoOver: Record<string, unknown> = {}, over: Partial<FactoryConf
         id: 42,
         // Relative to the config file's directory.
         checkoutPath: relative(paths.configDir, f.clone),
+        // The fixture's remote is a local path, so it has to be named explicitly.
+        remote: 'origin',
         workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
         ...repoOver,
       },

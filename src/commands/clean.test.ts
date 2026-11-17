@@ -52,6 +52,7 @@ describe('factory clean', { timeout: 60_000 }, () => {
         'octo/widgets': {
           id: 42,
           checkoutPath: f.clone,
+          remote: 'origin',
           workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
         },
       },

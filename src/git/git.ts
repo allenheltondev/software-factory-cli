@@ -66,21 +66,60 @@ async function tryGit(args: readonly string[], opts: GitOptions): Promise<GitOut
   }
 }
 
-/**
- * OWNER/NAME from a remote URL: https://host/o/r(.git), git@host:o/r.git, ssh://git@host/o/r.git,
- * or a local path ending in o/r(.git). The host is not checked (SSH host aliases are common);
- * `factory doctor` confirms the repository ID through the API.
- */
-export function parseRemoteRepo(url: string): { owner: string; name: string } | null {
-  const trimmed = url.trim().replace(/[\\/]+$/, '').replace(/\.git$/i, '');
-  const parts = trimmed.split(/[\\/:]+/).filter(Boolean);
-  if (parts.length < 2) return null;
-  return { owner: parts[parts.length - 2]!, name: parts[parts.length - 1]! };
+export interface ParsedRemote {
+  /** Lowercased host for URL and scp-style remotes; null for local paths and file:// URLs. */
+  host: string | null;
+  owner: string;
+  name: string;
+  /** True when the URL path is exactly OWNER/NAME(.git), with nothing before it. */
+  exactPath: boolean;
 }
 
-export function remoteMatchesRepo(url: string, fullName: string): boolean {
-  const r = parseRemoteRepo(url);
-  return r !== null && `${r.owner}/${r.name}`.toLowerCase() === fullName.toLowerCase();
+/**
+ * Split a remote URL into host and OWNER/NAME: https://host/o/r(.git), ssh://git@host[:port]/o/r.git,
+ * git@host:o/r.git (scp-style, including SSH host aliases), or a local path ending in o/r(.git).
+ */
+export function parseRemoteUrl(url: string): ParsedRemote | null {
+  const u = url.trim();
+  let host: string | null = null;
+  let path: string;
+  const withScheme = /^([a-z][a-z0-9+.-]*):\/\/(?:[^@/]*@)?([^/:]+)(?::\d+)?(\/.*)?$/i.exec(u);
+  if (/^file:\/\//i.test(u)) {
+    path = u.slice('file://'.length);
+  } else if (withScheme) {
+    host = withScheme[2]!.toLowerCase();
+    path = withScheme[3] ?? '';
+  } else {
+    const scp = /^(?:[^@/\\\s]+@)?([^/\\:\s]+):(.*)$/.exec(u);
+    // A single letter before ":" is a Windows drive (C:\...), not a host.
+    if (scp && !/^[a-z]$/i.test(scp[1]!)) {
+      host = scp[1]!.toLowerCase();
+      path = scp[2]!;
+    } else {
+      path = u;
+    }
+  }
+  const parts = path
+    .replace(/[\\/]+$/, '')
+    .replace(/\.git$/i, '')
+    .split(/[\\/]+/)
+    .filter(Boolean);
+  if (parts.length < 2) return null;
+  return { host, owner: parts[parts.length - 2]!, name: parts[parts.length - 1]!, exactPath: parts.length === 2 };
+}
+
+const sameRepo = (p: ParsedRemote, fullName: string) => `${p.owner}/${p.name}`.toLowerCase() === fullName.toLowerCase();
+
+/** A github.com URL (https, http, ssh:// or git@github.com:) whose path is exactly OWNER/NAME. */
+export function isGitHubRemoteFor(url: string, fullName: string): boolean {
+  const p = parseRemoteUrl(url);
+  return p !== null && p.host === 'github.com' && p.exactPath && sameRepo(p, fullName);
+}
+
+/** OWNER/NAME match on any host (used only for a remote the config names explicitly). */
+export function remoteOwnerNameMatches(url: string, fullName: string): boolean {
+  const p = parseRemoteUrl(url);
+  return p !== null && sameRepo(p, fullName);
 }
 
 /** Hide credentials embedded in a remote URL (https://user:token@host/...) before logging it. */
@@ -107,10 +146,48 @@ export async function listRemotes(opts: GitOptions): Promise<Remote[]> {
   return remotes;
 }
 
-/** The remote pointing at OWNER/NAME, preferring "origin" when several do. */
-export function pickRemote(remotes: readonly Remote[], fullName: string): Remote | null {
-  const matching = remotes.filter((r) => remoteMatchesRepo(r.url, fullName));
-  return matching.find((r) => r.name === 'origin') ?? matching[0] ?? null;
+export type RemoteSelection = { ok: true; remote: Remote; reason: string } | { ok: false; error: string };
+
+/**
+ * The one rule the worker and `factory doctor` use to decide which remote of a clone is the
+ * configured repository.
+ *
+ * - With `explicit` (repositories.<repo>.remote), use exactly that remote. Its OWNER/NAME must
+ *   match, but any host is allowed, for SSH host aliases such as github-work:owner/repo.
+ * - Otherwise only github.com remotes whose path is OWNER/NAME qualify, preferring "origin".
+ *   A same-named repo on another host never qualifies on its own.
+ */
+export function selectRepoRemote(remotes: readonly Remote[], fullName: string, explicit?: string): RemoteSelection {
+  const list = () => (remotes.length ? remotes.map((r) => `${r.name} -> ${redactRemoteUrl(r.url)}`).join(', ') : 'none');
+  const key = `repositories.${fullName}.remote`;
+  if (explicit !== undefined) {
+    const remote = remotes.find((r) => r.name === explicit);
+    if (!remote) return { ok: false, error: `remote "${explicit}" set in ${key} does not exist (remotes: ${list()})` };
+    if (!remoteOwnerNameMatches(remote.url, fullName)) {
+      return { ok: false, error: `remote "${explicit}" set in ${key} points at ${redactRemoteUrl(remote.url)}, not ${fullName}` };
+    }
+    return { ok: true, remote, reason: `set in ${key}` };
+  }
+  const github = remotes.filter((r) => isGitHubRemoteFor(r.url, fullName));
+  const remote = github.find((r) => r.name === 'origin') ?? github[0];
+  if (remote) {
+    const why = `github.com URL for ${fullName}`;
+    return {
+      ok: true,
+      remote,
+      reason: remote.name === 'origin' || !remotes.some((r) => r.name === 'origin') ? why : `${why}; origin is not one`,
+    };
+  }
+  const lookalike = remotes.find((r) => remoteOwnerNameMatches(r.url, fullName));
+  if (lookalike) {
+    return {
+      ok: false,
+      error:
+        `no github.com remote points at ${fullName} (remotes: ${list()}). If "${lookalike.name}" reaches GitHub ` +
+        `through an SSH host alias, set ${key}: ${lookalike.name}`,
+    };
+  }
+  return { ok: false, error: `no github.com remote points at ${fullName} (remotes: ${list()})` };
 }
 
 /** The remote's default branch: asks the remote, then falls back to the local refs/remotes/<remote>/HEAD. */

@@ -1,8 +1,9 @@
-// `factory doctor`: each repo's checkoutPath must be a clone of that repo. The remote's
-// OWNER/NAME is matched here; the repo check confirms the ID behind that name via the API.
+// `factory doctor`: each repo's checkoutPath must be a clone of that repo. The remote is
+// chosen with the same rule the worker uses (selectRepoRemote); the repo check confirms
+// the ID behind the configured name via the API.
 import { resolve } from 'node:path';
 import { repoNeedsCheckout, type FactoryConfig } from '../config/schema.js';
-import { pickRemote, redactRemoteUrl, type Remote } from '../git/git.js';
+import { redactRemoteUrl, selectRepoRemote, type Remote } from '../git/git.js';
 import type { FactoryPaths } from '../paths.js';
 import type { CheckResult, CheckStatus, DoctorProbes } from './doctor.js';
 
@@ -40,13 +41,13 @@ export async function checkRepoCheckouts(
       const url = await probes.run(git, ['-C', dir, 'remote', 'get-url', r]).catch(() => null);
       if (url?.code === 0) remotes.push({ name: r, url: url.stdout.trim() });
     }
-    const match = pickRemote(remotes, fullName);
-    if (!match) {
-      const seen = remotes.length ? remotes.map((r) => `${r.name} -> ${redactRemoteUrl(r.url)}`).join(', ') : 'none';
-      add(sev, `${dir}: no remote points at ${fullName} (remotes: ${seen})`);
+    const selection = selectRepoRemote(remotes, fullName, repo.remote);
+    if (!selection.ok) {
+      add(sev, `${dir}: ${selection.error}`);
       continue;
     }
-    add('ok', `${dir} (remote ${match.name} -> ${redactRemoteUrl(match.url)})`);
+    const { remote } = selection;
+    add('ok', `${dir}: using remote ${remote.name} (${redactRemoteUrl(remote.url)}); ${selection.reason}`);
   }
   return checks;
 }

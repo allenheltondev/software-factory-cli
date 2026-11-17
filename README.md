@@ -104,6 +104,7 @@ repositories:
 | `repositories.<OWNER/REPO>.id` | required | Stable GitHub repository ID (filled in by `configure` / `add`) |
 | `repositories.<OWNER/REPO>.baseBranch` | remote's default branch | Branch that per-job branches start from (fetched first) |
 | `repositories.<OWNER/REPO>.checkoutPath` | none | Local clone of the repo that per-job worktrees are created from, relative to the config file's directory. Required in `prepare-only` mode when a workflow's action has `output: local-branch` |
+| `repositories.<OWNER/REPO>.remote` | a github.com remote | Remote of `checkoutPath` to fetch from. Without it, only a remote whose URL is on `github.com` with path `OWNER/REPO` qualifies (`origin` preferred). Set it for an SSH host alias such as `git@github-work:OWNER/REPO`; any host is then accepted, but `OWNER/REPO` must still match |
 | `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
@@ -119,7 +120,9 @@ Config changes take effect when the worker restarts.
 In `prepare-only` mode, each job whose action has `output: local-branch` gets:
 
 - a fetch of the base branch (`baseBranch`, else the remote's default branch) from the
-  remote of `checkoutPath` that points at the repo (`origin` if several do);
+  repo's remote in `checkoutPath`: the one named by `remote`, else a remote whose URL is on
+  `github.com` with path `OWNER/REPO` (`origin` if several are). A same-named repo on another
+  host is never picked on its own;
 - a new branch `factory/issue-<n>-<jobId>` at the fetched commit. A retried job's later
   attempts add `-<attempt>`. An existing branch is never reused; the run fails instead;
 - a worktree at `<state dir>/worktrees/<repoId>/<jobId>[-<attempt>]`, recorded as the run's
@@ -127,8 +130,8 @@ In `prepare-only` mode, each job whose action has `output: local-branch` gets:
 
 Your clone's own checkout is not touched. Git operations on one clone are serialized, so
 concurrent jobs in one repo do not race. `factory doctor` checks that each `checkoutPath`
-exists, is a Git repository and has a remote for the configured repo; its repository check
-confirms the repo ID behind that name.
+exists and is a Git repository, and shows which remote it selected (by the same rule) and
+why; its repository check confirms the repo ID behind the configured name.
 
 Worktrees of failed and interrupted runs are kept for inspection. `factory clean` removes
 worktrees of succeeded runs, runs closed before they started (canceled), and runs whose agent

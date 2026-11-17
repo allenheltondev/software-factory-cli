@@ -42,6 +42,11 @@ describe('validateConfig', () => {
 
     cfg.repositories[repo].checkoutPath = '../clones/kids and dragons';
     expect(validateConfig(cfg).ok).toBe(true);
+    cfg.repositories[repo].remote = 'github-work';
+    expect(validateConfig(cfg).ok).toBe(true);
+    cfg.repositories[repo].remote = '--upload-pack=x';
+    expect(validateConfig(cfg).ok).toBe(false);
+    delete cfg.repositories[repo].remote;
 
     delete cfg.repositories[repo].checkoutPath;
     cfg.actions['implement-issue'].output = 'log';

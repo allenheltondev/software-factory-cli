@@ -38,6 +38,7 @@ repositories:
     # Local clone that per-job worktrees branch from (relative to this file); required in prepare-only mode.
     # checkoutPath: ../clones/kids-and-dragons
     # baseBranch: main # defaults to the remote's default branch
+    # remote: origin # only needed when the GitHub remote uses an SSH host alias (git@github-work:OWNER/REPO)
     workflows:
       - id: implement
         trigger:
