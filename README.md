@@ -13,7 +13,7 @@ also creates a branch and Git worktree per job (still without an agent). The **l
 runs the routed agent in that worktree; this release ships the Claude Code, Codex and Kiro
 adapters (see [Live mode with Claude Code](#live-mode-with-claude-code),
 [Live mode with Codex](#live-mode-with-codex) and [Live mode with Kiro](#live-mode-with-kiro)).
-PR creation comes next. See [docs/design.md](docs/design.md).
+See [docs/design.md](docs/design.md).
 
 Publication is opt-in per repository: with `publish: draft-pr` (or `pr`), a live run that
 succeeded and left commits gets its branch pushed and a PR opened as your `gh` account. See
@@ -546,7 +546,8 @@ that the active account has push access to every repository with `publish` set.
 - In live mode the agent runs as your user, in the job's worktree, with the worker's
   environment minus `GH_TOKEN`/`GITHUB_TOKEN`. That is not a sandbox: what the agent may do
   is up to the agent CLI's own permission settings. Claude Code runs in full-auto mode by
-  default (see [Live mode with Claude Code](#live-mode-with-claude-code)), and so does Kiro
+  default (see [Live mode with Claude Code](#live-mode-with-claude-code)), and so do Codex
+  (see [Live mode with Codex](#live-mode-with-codex)) and Kiro
   (see [Live mode with Kiro](#live-mode-with-kiro)); the allowlist of actors who can dispatch
   work is the guard on who can start such a run.
 - Agent credentials such as `KIRO_API_KEY` belong in the worker's environment, set by its
