@@ -212,6 +212,32 @@ describe('prepareJobWorktree', { timeout: 60_000 }, () => {
     expect(f.git(f.clone, 'branch', '--list', other.branch)).toBe('');
   });
 
+  it('reports a worktree that git created before failing, so the run can keep it', async () => {
+    const f = fixture();
+    f.failPostCheckout();
+    const req = request(f);
+    const seen: string[] = [];
+    await expect(prepareJobWorktree({ ...req, onCheckout: (p) => seen.push(p) })).rejects.toThrow(
+      /git worktree add .*failed.*was created and is kept for inspection/,
+    );
+    expect(seen).toEqual([req.worktreePath]);
+    expect(existsSync(req.worktreePath)).toBe(true);
+    expect(f.git(f.clone, 'branch', '--list', req.branch)).toContain(req.branch);
+  });
+
+  it('calls onCheckout once the worktree exists, and not when nothing was created', async () => {
+    const f = fixture();
+    const ok: string[] = [];
+    const req = request(f);
+    await prepareJobWorktree({ ...req, onCheckout: (p) => ok.push(p) });
+    expect(ok).toEqual([req.worktreePath]);
+
+    const none: string[] = [];
+    const again = request(f); // same branch: refused before anything is created
+    await expect(prepareJobWorktree({ ...again, onCheckout: (p) => none.push(p) })).rejects.toThrow(/already exists/);
+    expect(none).toEqual([]);
+  });
+
   it('rejects a missing checkout, a non-repo, and a clone of another repo', async () => {
     const f = fixture();
     await expect(prepareJobWorktree(request(f, { checkoutPath: join(f.root, 'nope') }))).rejects.toThrow(/does not exist/);

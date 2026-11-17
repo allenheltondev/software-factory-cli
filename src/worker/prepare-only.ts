@@ -39,6 +39,7 @@ export class PrepareOnlyExecutor implements Executor {
     const worktreePath = jobWorktreePath(ctx.paths, job, run.attempt);
 
     let prepared: PreparedWorktree | null = null;
+    let checkout: string | null = null;
     let error: string | null = null;
     let note: string;
     if (!action) {
@@ -63,12 +64,17 @@ export class PrepareOnlyExecutor implements Executor {
           worktreePath,
           git: this.opts.git,
           signal: ctx.signal,
+          onCheckout: (path) => {
+            checkout = path;
+            ctx.recordProcess({ checkoutPath: path });
+          },
         });
-        ctx.recordProcess({ checkoutPath: prepared.worktreePath });
         note = `checkout: ${prepared.worktreePath}`;
       } catch (err) {
         error = `could not prepare the worktree: ${message(err)}`;
-        note = 'checkout: none (preparation failed)';
+        note = checkout
+          ? `checkout: ${checkout} (left by the failed preparation; kept for inspection)`
+          : 'checkout: none (preparation failed)';
       }
     }
 

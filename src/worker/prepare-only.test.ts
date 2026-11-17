@@ -143,6 +143,24 @@ describe('PrepareOnlyExecutor', { timeout: 60_000 }, () => {
     expect(log).toMatch(/error: could not prepare the worktree: branch factory\/issue-5-job_\w+ already exists/);
   });
 
+  it('records a worktree left by a failed git worktree add, so the failed run keeps it', async () => {
+    const { f, paths, config, db } = setup();
+    f.failPostCheckout();
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 8 });
+    const c = claim(db, config, paths);
+    const { ctx, recorded } = context(db, config, paths, c.run.id);
+    const result = await new PrepareOnlyExecutor().execute(c, ctx);
+    const checkout = join(worktreesRoot(paths), '42', c.job.id);
+    expect(result.outcome).toBe('failed');
+    expect(result.error).toMatch(/kept for inspection/);
+    expect(recorded).toEqual([{ checkoutPath: checkout }]);
+    expect(db.prepare('SELECT checkout_path FROM runs WHERE id = ?').get(c.run.id)).toEqual({ checkout_path: checkout });
+    expect(existsSync(checkout)).toBe(true);
+    expect(readFileSync(c.run.logPath!, 'utf8')).toContain(
+      `checkout: ${checkout} (left by the failed preparation; kept for inspection)`,
+    );
+  });
+
   it('suffixes the branch and worktree of a later attempt', async () => {
     const { f, paths, config, db } = setup();
     insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 6 });

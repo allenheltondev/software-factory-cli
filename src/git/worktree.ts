@@ -2,10 +2,11 @@
 // the source: each job gets its own branch and a worktree under the per-user data dir.
 import { existsSync, realpathSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { FactoryPaths } from '../paths.js';
 import {
   addWorktree,
+  listWorktreePaths,
   redactRemoteUrl,
   assertValidBranchName,
   fetchBranch,
@@ -97,6 +98,11 @@ export interface PrepareRequest {
   git?: string;
   /** Aborts network operations (ls-remote, fetch). */
   signal?: AbortSignal;
+  /**
+   * Called as soon as the job's worktree exists, including when `git worktree add` created it
+   * and then failed (e.g. a post-checkout hook exited non-zero), so the run can record it.
+   */
+  onCheckout?: (worktreePath: string) => void;
 }
 
 export interface PreparedWorktree {
@@ -106,6 +112,32 @@ export interface PreparedWorktree {
   baseSha: string;
   branch: string;
   worktreePath: string;
+}
+
+/** Comparable form of a path: resolved, symlinks followed where possible, case-folded where the FS usually is. */
+function comparablePath(p: string): string {
+  let out = resolve(p);
+  try {
+    out = realpathSync.native(out);
+  } catch {
+    try {
+      out = join(realpathSync.native(dirname(out)), basename(out));
+    } catch {
+      // neither the path nor its parent exists; keep the lexical form
+    }
+  }
+  return process.platform === 'win32' || process.platform === 'darwin' ? out.toLowerCase() : out;
+}
+
+/** Did a failed `git worktree add` leave this attempt's worktree behind (on disk or registered)? */
+async function worktreeWasCreated(worktreePath: string, opts: GitOptions): Promise<boolean> {
+  if (existsSync(worktreePath)) return true;
+  try {
+    const want = comparablePath(worktreePath);
+    return (await listWorktreePaths(opts)).some((p) => comparablePath(p) === want);
+  } catch {
+    return false;
+  }
 }
 
 function isDirectory(p: string): boolean {
@@ -144,7 +176,19 @@ export function prepareJobWorktree(req: PrepareRequest): Promise<PreparedWorktre
       throw new PrepareError(`worktree path ${worktreePath} already exists; refusing to reuse it`);
     }
     await mkdir(dirname(worktreePath), { recursive: true });
-    await addWorktree(worktreePath, branch, baseSha, opts);
+    try {
+      await addWorktree(worktreePath, branch, baseSha, opts);
+    } catch (err) {
+      // Git can create the branch and worktree and still exit non-zero. Keep what it made
+      // (failed runs stay inspectable; factory clean leaves them alone) and say so.
+      if (await worktreeWasCreated(worktreePath, opts)) {
+        req.onCheckout?.(worktreePath);
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new PrepareError(`${detail} (the worktree at ${worktreePath} was created and is kept for inspection)`);
+      }
+      throw err;
+    }
+    req.onCheckout?.(worktreePath);
     return { remote: remote.name, remoteUrl: redactRemoteUrl(remote.url), baseBranch, baseSha, branch, worktreePath };
   });
 }

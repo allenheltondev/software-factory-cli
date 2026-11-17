@@ -224,6 +224,15 @@ export async function addWorktree(path: string, branch: string, startPoint: stri
   await runGit(['worktree', 'add', '--quiet', '-b', branch, path, startPoint], opts);
 }
 
+/** Paths of every worktree registered with the repository (`git worktree list --porcelain`). */
+export async function listWorktreePaths(opts: GitOptions): Promise<string[]> {
+  const out = (await runGit(['worktree', 'list', '--porcelain'], opts)).stdout;
+  return out
+    .split(/\r?\n/)
+    .filter((l) => l.startsWith('worktree '))
+    .map((l) => l.slice('worktree '.length));
+}
+
 /** The repository's shared .git directory, as an absolute path. Run with cwd inside any of its worktrees. */
 export async function gitCommonDir(opts: GitOptions): Promise<string> {
   const out = (await runGit(['rev-parse', '--git-common-dir'], opts)).stdout.trim();

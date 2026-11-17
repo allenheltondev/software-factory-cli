@@ -27,6 +27,8 @@ export interface GitFixture {
   git(cwd: string, ...args: string[]): string;
   /** Commit a file directly in the bare remote's branch (via a scratch clone) and return its SHA. */
   pushCommit(branch: string, file: string, content: string): string;
+  /** Point the clone's core.hooksPath at a directory whose post-checkout hook exits 1. */
+  failPostCheckout(): void;
   cleanup(): void;
 }
 
@@ -70,6 +72,13 @@ export function createGitFixture(fullName = 'octo/widgets', defaultBranch = 'mai
       git(scratch, 'commit', '--quiet', '-m', `update ${file}`);
       git(scratch, 'push', '--quiet', 'origin', branch);
       return git(scratch, 'rev-parse', 'HEAD');
+    },
+    failPostCheckout() {
+      const hooks = join(root, 'failing hooks');
+      mkdirSync(hooks, { recursive: true });
+      // Git for Windows runs hooks through its bundled sh, so a POSIX script works everywhere.
+      writeFileSync(join(hooks, 'post-checkout'), '#!/bin/sh\necho "post-checkout refused" >&2\nexit 1\n', { mode: 0o755 });
+      git(clone, 'config', 'core.hooksPath', hooks);
     },
     cleanup() {
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
