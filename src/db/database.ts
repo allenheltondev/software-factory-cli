@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { createRequire } from 'node:module';
-import type { EventEnvelope, Job, JobStatus, Run, RunOutcome } from '../types.js';
+import type { EventEnvelope, Job, JobStatus, Run, RunOutcome, RunSummary } from '../types.js';
 
 export type Db = DatabaseSyncType;
 
@@ -158,6 +158,8 @@ const MIGRATIONS: Record<number, Migration> = {
     -- still matches, so a pid the OS reused is never killed. Earlier runs have none and are
     -- never signalled.
     ALTER TABLE runs ADD COLUMN pid_start_time TEXT;
+    -- JSON RunSummary written after a live agent run: commits, changed files, last output.
+    ALTER TABLE runs ADD COLUMN summary TEXT;
   `,
 };
 
@@ -307,6 +309,16 @@ export interface RunRow {
   ended_at: string | null;
   outcome: RunOutcome | null;
   error: string | null;
+  summary: string | null;
+}
+
+function parseSummary(json: string | null): RunSummary | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as RunSummary;
+  } catch {
+    return null;
+  }
 }
 
 export function rowToRun(r: RunRow): Run {
@@ -328,5 +340,6 @@ export function rowToRun(r: RunRow): Run {
     endedAt: r.ended_at,
     outcome: r.outcome,
     error: r.error,
+    summary: parseSummary(r.summary),
   };
 }

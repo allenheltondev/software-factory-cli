@@ -12,6 +12,7 @@ const emptySnapshot = (): StatusSnapshot => ({
   agents: [],
   activeRuns: [],
   recentJobs: [],
+  recentAgentRuns: [],
   recentErrors: [],
   checkpoints: [],
 });

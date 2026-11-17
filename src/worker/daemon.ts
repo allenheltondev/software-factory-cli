@@ -12,6 +12,7 @@ import {
   markExecutionStarted,
   releaseClaim,
   setRunProcess,
+  setRunSummary,
   WorkerLockLostError,
   type Claim,
 } from '../db/queue.js';
@@ -195,6 +196,13 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         result = await executor.execute(claim, ctx);
       } catch (err) {
         result = { outcome: err instanceof StartFailedError ? 'start_failed' : 'failed', error: message(err) };
+      }
+      if (result.summary) {
+        try {
+          setRunSummary(db, run.id, result.summary);
+        } catch (err) {
+          runLog.error('could not record run summary', { error: message(err) });
+        }
       }
       try {
         finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });

@@ -98,7 +98,7 @@ describe('migration v4', () => {
 });
 
 describe('migration v5', () => {
-  it('adds an empty process start time to existing runs (reconcile never signals such a pid)', () => {
+  it('adds an empty process start time and summary to existing runs (reconcile never signals such a pid)', () => {
     const db = openDatabase(':memory:', { migrateTo: 4 });
     db.prepare(
       `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
@@ -110,6 +110,6 @@ describe('migration v5', () => {
     ).run();
     migrate(db);
     expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 5 });
-    expect(db.prepare('SELECT pid, pid_start_time FROM runs').get()).toEqual({ pid: 4242, pid_start_time: null });
+    expect(db.prepare('SELECT pid, pid_start_time, summary FROM runs').get()).toEqual({ pid: 4242, pid_start_time: null, summary: null });
   });
 });

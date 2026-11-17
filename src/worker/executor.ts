@@ -1,12 +1,12 @@
-// OWNER: queue/worker workstream. Execution seam: the daemon hands each claim to
-// an Executor. This release ships only the log-only executor; real adapters
-// (codex/claude/kiro subprocesses in per-job worktrees) implement the same interface.
+// OWNER: queue/worker workstream. Execution seam: the daemon hands each claim to an
+// Executor: log-only (here), prepare-only (prepare-only.ts) or live (live.ts), chosen by
+// execution.mode in createExecutor.
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { agentAdapter, type FactoryConfig } from '../config/schema.js';
+import { agentAdapter, type FactoryConfig, type RepositoryConfig } from '../config/schema.js';
 import { ownEntry, type Claim, type RunProcessInfo } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
-import type { IssueSnapshot, RunOutcome } from '../types.js';
+import type { IssueSnapshot, Job, RunOutcome, RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
 
 export interface ExecutionContext {
@@ -37,6 +37,8 @@ export interface ExecutionContext {
 export interface ExecutionResult {
   outcome: RunOutcome;
   error?: string | null;
+  /** What a live agent run left behind; stored for `factory status`. */
+  summary?: RunSummary | null;
 }
 
 /**
@@ -55,6 +57,18 @@ export class StartFailedError extends Error {
 export interface Executor {
   readonly name: string;
   execute(claim: Claim, ctx: ExecutionContext): Promise<ExecutionResult>;
+}
+
+/** The repo's config entry, matched by stable ID first, then by name. */
+export function findRepoConfig(
+  config: FactoryConfig,
+  job: Pick<Job, 'repoId' | 'repoFullName'>,
+): { fullName: string; repo: RepositoryConfig } | null {
+  for (const [fullName, repo] of Object.entries(config.repositories)) {
+    if (repo.id === job.repoId) return { fullName, repo };
+  }
+  const repo = ownEntry(config.repositories, job.repoFullName);
+  return repo ? { fullName: job.repoFullName, repo } : null;
 }
 
 /** Resolve an action's prompt file against the config file's directory. */

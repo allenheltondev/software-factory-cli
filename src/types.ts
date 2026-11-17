@@ -91,4 +91,26 @@ export interface Run {
   endedAt: string | null;
   outcome: RunOutcome | null;
   error: string | null;
+  /** What a live agent run left behind; null for log-only and prepare-only runs. */
+  summary: RunSummary | null;
+}
+
+/** Recorded after a live agent run, in run.log and the state DB (`factory status`). */
+export interface RunSummary {
+  branch: string;
+  baseSha: string;
+  worktree: string;
+  /** Commits on the job branch since the base commit, newest first ("<short sha> <subject>"), capped. */
+  commits: string[];
+  commitCount: number;
+  /** Tracked files that differ from the base commit, committed or not. */
+  filesChanged: number;
+  /** Last line of `git diff --stat <base>`, e.g. "3 files changed, 10 insertions(+), 2 deletions(-)". */
+  diffStat: string;
+  /** Files in the worktree that git does not track yet. */
+  untracked: number;
+  /** The agent's last output lines (stdout and stderr). */
+  lastOutput: string[];
+  /** Parts of the summary that could not be computed. */
+  notes: string[];
 }

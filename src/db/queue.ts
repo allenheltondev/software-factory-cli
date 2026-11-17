@@ -3,7 +3,7 @@
 import { join } from 'node:path';
 import type { FactoryConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
-import type { Job, JobStatus, Run, RunOutcome } from '../types.js';
+import type { Job, JobStatus, Run, RunOutcome, RunSummary } from '../types.js';
 import { newId, nowIso } from '../util/ids.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
 
@@ -203,6 +203,7 @@ export function claimNextJob(
         ended_at: null,
         outcome: null,
         error: null,
+        summary: null,
       };
       db.prepare(
         `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, hostname, pid, lease_expires_at, started_at)
@@ -255,6 +256,11 @@ export function setRunProcess(db: Db, runId: string, info: RunProcessInfo): void
   }
   if (info.checkoutPath !== undefined)
     db.prepare('UPDATE runs SET checkout_path = ? WHERE id = ?').run(info.checkoutPath, runId);
+}
+
+/** Store the post-run summary of a live agent run. */
+export function setRunSummary(db: Db, runId: string, summary: RunSummary): void {
+  db.prepare('UPDATE runs SET summary = ? WHERE id = ?').run(JSON.stringify(summary), runId);
 }
 
 /**
@@ -430,6 +436,8 @@ export interface StatusSnapshot {
   agents: AgentLoad[];
   activeRuns: Array<{ run: Run; job: Job }>;
   recentJobs: Job[];
+  /** Finished live agent runs (those with a summary), newest first. */
+  recentAgentRuns: Array<{ run: Run; job: Job }>;
   recentErrors: Array<{ at: string; scope: string; repoFullName: string | null; jobId: string | null; message: string }>;
   checkpoints: Array<{ repoId: number; fullName: string; lastEventId: number | null; updatedAt: string }>;
 }
@@ -477,6 +485,15 @@ export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => num
     db.prepare('SELECT * FROM jobs ORDER BY updated_at DESC, rowid DESC LIMIT 10').all() as unknown as JobRow[]
   ).map(rowToJob);
 
+  const recentAgentRuns = (
+    db
+      .prepare('SELECT * FROM runs WHERE ended_at IS NOT NULL AND summary IS NOT NULL ORDER BY ended_at DESC, rowid DESC LIMIT 5')
+      .all() as unknown as RunRow[]
+  ).map((row) => {
+    const run = rowToRun(row);
+    return { run, job: rowToJob(getJobRow(db, run.jobId)!) };
+  });
+
   const recentErrors = (
     db.prepare('SELECT at, scope, repo_full_name, job_id, message FROM errors ORDER BY id DESC LIMIT 10').all() as {
       at: string;
@@ -493,5 +510,5 @@ export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => num
       .all() as { repo_id: number; full_name: string; last_event_id: number | null; updated_at: string }[]
   ).map((c) => ({ repoId: c.repo_id, fullName: c.full_name, lastEventId: c.last_event_id, updatedAt: c.updated_at }));
 
-  return { worker, counts, agents, activeRuns, recentJobs, recentErrors, checkpoints };
+  return { worker, counts, agents, activeRuns, recentJobs, recentAgentRuns, recentErrors, checkpoints };
 }
