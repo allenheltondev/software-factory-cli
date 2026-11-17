@@ -3,6 +3,7 @@ import { dirname, isAbsolute, resolve } from 'node:path';
 import { parse, stringify } from 'yaml';
 import type { FactoryConfig, FactoryConfigInput } from './schema.js';
 import { formatIssues, validateConfig, type ConfigIssue } from './validate.js';
+import { updateYamlText } from './yaml-update.js';
 
 export class ConfigError extends Error {
   constructor(
@@ -45,14 +46,18 @@ export function loadConfig(path: string): LoadedConfig {
 
 /**
  * Validate, then atomically write the config. Refuses to write an invalid config.
- * Writes the *input* shape so defaults are not frozen into the file.
+ * Writes the *input* shape so defaults are not frozen into the file. When a file
+ * already exists, only the nodes that changed are edited, so hand-written
+ * comments, key order and formatting elsewhere are kept.
  */
 export function saveConfig(path: string, input: FactoryConfigInput): LoadedConfig {
   const result = validateConfig(input);
   if (!result.ok) throw new ConfigError('Refusing to save invalid config', result.errors);
+  const existing = existsSync(path) ? readFileSync(path, 'utf8') : null;
+  const text = (existing !== null && updateYamlText(existing, input)) || stringify(input, { lineWidth: 0 });
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, stringify(input, { lineWidth: 0 }), 'utf8');
+  writeFileSync(tmp, text, 'utf8');
   renameSync(tmp, path);
   return { config: result.config, path, warnings: result.warnings };
 }
