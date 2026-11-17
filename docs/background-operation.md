@@ -85,7 +85,7 @@ installed plist's `EnvironmentVariables` and reload it:
 
 ```sh
 plist="$HOME/Library/LaunchAgents/local.software-factory.plist"
-read -rs -p 'KIRO_API_KEY: ' key; echo
+printf 'KIRO_API_KEY: '; stty -echo; IFS= read -r key; stty echo; echo
 plutil -replace EnvironmentVariables.KIRO_API_KEY -string "$key" "$plist"; unset key
 chmod 600 "$plist"
 plutil -lint "$plist"
@@ -107,7 +107,7 @@ ignored. Create it readable only by you:
 envfile="${XDG_CONFIG_HOME:-$HOME/.config}/software-factory/worker.env"
 mkdir -p "$(dirname "$envfile")"
 install -m 600 /dev/null "$envfile"
-read -rs -p 'KIRO_API_KEY: ' key; echo
+printf 'KIRO_API_KEY: '; stty -echo; IFS= read -r key; stty echo; echo
 printf 'KIRO_API_KEY=%s\n' "$key" > "$envfile"; unset key
 # Once, with the options you installed with, if the unit predates its EnvironmentFile line:
 bash "$(npm root -g)/software-factory-cli/examples/launchers/linux/install-systemd-user.sh"
