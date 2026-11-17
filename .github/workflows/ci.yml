@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - name: Pack smoke test
+        run: node scripts/pack-smoke.mjs
+
+      # Launchers: render or register them against the built CLI with paths containing spaces.
+      - name: Launchers (Windows Task Scheduler)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in Get-ChildItem examples\launchers\windows\*.ps1) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.ToString() } }
+            Write-Host "parsed $($f.Name)"
+          }
+          $cfgDir = Join-Path $env:RUNNER_TEMP 'launcher cfg dir'
+          $home2 = Join-Path $env:RUNNER_TEMP 'launcher factory home'
+          New-Item -ItemType Directory -Force $cfgDir | Out-Null
+          Copy-Item examples\config.yaml (Join-Path $cfgDir 'config.yaml')
+          $task = "SoftwareFactory CI $env:GITHUB_RUN_ID-${{ matrix.node }}"
+          .\examples\launchers\windows\register-task.ps1 -TaskName $task -NoStart `
+            -ConfigPath (Join-Path $cfgDir 'config.yaml') -CliPath (Join-Path $PWD 'dist\cli.js') -FactoryHome $home2
+          try {
+            $xml = Export-ScheduledTask -TaskName $task
+            foreach ($expected in @(
+                '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>',
+                '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>',
+                '<RestartOnFailure>',
+                '<StartWhenAvailable>true</StartWhenAvailable>',
+                '<LogonTrigger>',
+                '<LogonType>InteractiveToken</LogonType>')) {
+              if (-not $xml.Contains($expected)) { throw "task XML is missing $expected`n$xml" }
+            }
+            Write-Host 'task definition ok'
+          } finally {
+            .\examples\launchers\windows\unregister-task.ps1 -TaskName $task -FactoryHome $home2
+          }
+
+      - name: Launchers (macOS LaunchAgent)
+        if: runner.os == 'macOS'
+        run: |
+          bash -n examples/launchers/macos/install-launchagent.sh
+          plutil -lint examples/launchers/macos/software-factory.plist.template
+          out="$RUNNER_TEMP/launcher out dir"
+          mkdir -p "$out"
+          bash examples/launchers/macos/install-launchagent.sh --print --label ci.software-factory \
+            --cli "$PWD/dist/cli.js" --config "$RUNNER_TEMP/launcher cfg dir/config.yaml" \
+            --factory-home "$RUNNER_TEMP/launcher factory home" > "$out/ci.plist"
+          plutil -lint "$out/ci.plist"
+          plutil -p "$out/ci.plist"
+
+      - name: Launchers (systemd user unit)
+        if: runner.os == 'Linux'
+        run: |
+          bash -n examples/launchers/linux/install-systemd-user.sh
+          cfg="$RUNNER_TEMP/launcher cfg dir"
+          mkdir -p "$cfg" "$RUNNER_TEMP/unit"
+          cp examples/config.yaml "$cfg/config.yaml"
+          bash examples/launchers/linux/install-systemd-user.sh --print \
+            --cli "$PWD/dist/cli.js" --config "$cfg/config.yaml" \
+            --factory-home "$RUNNER_TEMP/launcher factory home" > "$RUNNER_TEMP/unit/software-factory.service"
+          cat "$RUNNER_TEMP/unit/software-factory.service"
+          systemd-analyze verify "$RUNNER_TEMP/unit/software-factory.service"

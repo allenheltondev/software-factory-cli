@@ -1,0 +1,148 @@
+// OWNER: GitHub/poller workstream. Ingestion-side persistence: checkpoints,
+// deduplicated job inserts, and cancellation of queued jobs.
+import { rowToJob, transaction, type Db, type JobRow } from './database.js';
+import type { EventEnvelope, Job } from '../types.js';
+import { newId, nowIso } from '../util/ids.js';
+
+export interface Checkpoint {
+  repoId: number;
+  fullName: string;
+  lastEventId: number | null;
+  etag: string | null;
+  initializedAt: string;
+  updatedAt: string;
+}
+
+export interface NewJob {
+  repoId: number;
+  repoFullName: string;
+  workflowId: string;
+  eventId: string;
+  issueNumber: number;
+  action: string;
+  pool: string;
+  envelope: EventEnvelope;
+}
+
+interface CheckpointRow {
+  repo_id: number;
+  full_name: string;
+  last_event_id: number | null;
+  etag: string | null;
+  initialized_at: string;
+  updated_at: string;
+}
+
+export function getCheckpoint(db: Db, repoId: number): Checkpoint | null {
+  const r = db.prepare('SELECT * FROM repo_checkpoints WHERE repo_id = ?').get(repoId) as unknown as
+    | CheckpointRow
+    | undefined;
+  if (!r) return null;
+  return {
+    repoId: r.repo_id,
+    fullName: r.full_name,
+    lastEventId: r.last_event_id,
+    etag: r.etag,
+    initializedAt: r.initialized_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+/**
+ * In ONE transaction: insert jobs (ignoring duplicates on repo_id+workflow_id+event_id)
+ * and advance the repo checkpoint. Returns the jobs actually inserted, in batch order.
+ * The stored last_event_id never moves backwards.
+ */
+export function commitPollBatch(
+  db: Db,
+  batch: {
+    repoId: number;
+    fullName: string;
+    lastEventId: number | null;
+    etag: string | null;
+    jobs: NewJob[];
+    now?: () => number;
+  },
+): Job[] {
+  const at = nowIso(batch.now);
+  // Ignore only duplicates of the dedupe key. Plain INSERT OR IGNORE would also swallow
+  // NOT NULL / CHECK / primary-key violations and silently drop a job.
+  const insert = db.prepare(
+    `INSERT INTO jobs
+       (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope,
+        status, status_reason, attempts, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, 0, ?, ?)
+     ON CONFLICT (repo_id, workflow_id, event_id) DO NOTHING`,
+  );
+  const upsert = db.prepare(
+    `INSERT INTO repo_checkpoints (repo_id, full_name, last_event_id, etag, initialized_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT (repo_id) DO UPDATE SET
+       full_name     = excluded.full_name,
+       last_event_id = CASE
+                         WHEN repo_checkpoints.last_event_id IS NULL THEN excluded.last_event_id
+                         WHEN excluded.last_event_id IS NULL THEN repo_checkpoints.last_event_id
+                         ELSE MAX(repo_checkpoints.last_event_id, excluded.last_event_id)
+                       END,
+       etag          = excluded.etag,
+       updated_at    = excluded.updated_at`,
+  );
+
+  return transaction(db, () => {
+    const inserted: Job[] = [];
+    for (const j of batch.jobs) {
+      const id = newId('job');
+      const res = insert.run(
+        id,
+        j.repoId,
+        j.repoFullName,
+        j.workflowId,
+        j.eventId,
+        j.issueNumber,
+        j.action,
+        j.pool,
+        JSON.stringify(j.envelope),
+        at,
+        at,
+      );
+      if (Number(res.changes) > 0) {
+        inserted.push({
+          id,
+          repoId: j.repoId,
+          repoFullName: j.repoFullName,
+          workflowId: j.workflowId,
+          eventId: j.eventId,
+          issueNumber: j.issueNumber,
+          action: j.action,
+          pool: j.pool,
+          envelope: j.envelope,
+          status: 'queued',
+          statusReason: null,
+          attempts: 0,
+          createdAt: at,
+          updatedAt: at,
+        });
+      }
+    }
+    upsert.run(batch.repoId, batch.fullName, batch.lastEventId, batch.etag, at, at);
+    return inserted;
+  });
+}
+
+/** Queued jobs, oldest first (insertion order breaks created_at ties). */
+export function listQueuedJobs(db: Db): Job[] {
+  const rows = db
+    .prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, rowid")
+    .all() as unknown as JobRow[];
+  return rows.map(rowToJob);
+}
+
+/** Mark a job canceled only if it is still queued. Returns true if it changed. */
+export function cancelQueuedJob(db: Db, jobId: string, reason: string, now?: () => number): boolean {
+  const res = db
+    .prepare(
+      "UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
+    )
+    .run(reason, nowIso(now), jobId);
+  return Number(res.changes) > 0;
+}

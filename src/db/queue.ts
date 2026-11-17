@@ -1,0 +1,456 @@
+// OWNER: queue/worker workstream. Claim-side persistence: atomic claims, runs,
+// leases, retry, and status queries.
+import { join } from 'node:path';
+import type { FactoryConfig } from '../config/schema.js';
+import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
+import type { Job, JobStatus, Run, RunOutcome } from '../types.js';
+import { newId, nowIso } from '../util/ids.js';
+import { WORKER_STALE_MS } from '../worker/lock.js';
+
+export interface Claim {
+  job: Job;
+  run: Run;
+}
+
+/**
+ * How many consecutive start failures (adapter could not start) a job may have
+ * before it is marked failed instead of being requeued for another agent.
+ * The count resets when the user retries the job.
+ */
+export const MAX_START_FAILURES = 3;
+
+const JOB_STATUSES: readonly JobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'interrupted', 'canceled'];
+const RETRYABLE: readonly JobStatus[] = ['failed', 'interrupted', 'canceled'];
+
+/** Config maps are plain objects; never let a job's pool/agent name resolve to an Object.prototype member. */
+export function ownEntry<T>(map: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
+/** meta key holding the attempt count at the user's last `factory retry`; start failures before it don't count. */
+const retryFloorKey = (jobId: string) => `retry_floor:${jobId}`;
+
+function getJobRow(db: Db, jobId: string): JobRow | undefined {
+  return db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as JobRow | undefined;
+}
+
+function getRunRow(db: Db, runId: string): RunRow | undefined {
+  return db.prepare('SELECT * FROM runs WHERE id = ?').get(runId) as RunRow | undefined;
+}
+
+function runningByAgent(db: Db): Map<string, number> {
+  const rows = db.prepare('SELECT agent, count(*) AS n FROM runs WHERE ended_at IS NULL GROUP BY agent').all() as {
+    agent: string;
+    n: number;
+  }[];
+  return new Map(rows.map((r) => [r.agent, r.n]));
+}
+
+const issueKey = (repoId: number, issue: number) => `${repoId}#${issue}`;
+
+/**
+ * Agents that failed to start this job in the current streak of start failures
+ * (since the user's last retry), and how many such failures there were.
+ * Claims closed without an outcome (canceled/released before start) are ignored.
+ */
+function startFailureStreak(db: Db, jobId: string): { count: number; agents: Set<string> } {
+  const floorRow = db.prepare('SELECT value FROM meta WHERE key = ?').get(retryFloorKey(jobId)) as
+    | { value: string }
+    | undefined;
+  const floor = floorRow ? Number(floorRow.value) : 0;
+  const rows = db
+    .prepare('SELECT agent, outcome, ended_at FROM runs WHERE job_id = ? AND attempt > ? ORDER BY attempt DESC')
+    .all(jobId, floor) as { agent: string; outcome: RunOutcome | null; ended_at: string | null }[];
+  const agents = new Set<string>();
+  let count = 0;
+  for (const r of rows) {
+    if (r.outcome === 'start_failed') {
+      count++;
+      agents.add(r.agent);
+    } else if (r.outcome === null && r.ended_at !== null) {
+      continue;
+    } else {
+      break;
+    }
+  }
+  return { count, agents };
+}
+
+function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void {
+  const reason = `${problem}; fix the config, restart the worker and run "factory retry ${row.id}"`;
+  db.prepare("UPDATE jobs SET status = 'failed', status_reason = ?, updated_at = ? WHERE id = ?").run(reason, at, row.id);
+  recordError(db, { scope: 'queue', repoFullName: row.repo_full_name, jobId: row.id, message: reason, at });
+}
+
+/**
+ * Pick an agent for a job in `poolName` using the pool's persisted round-robin
+ * cursor: walk the pool from next_index and take the first enabled agent with
+ * capacity, preferring agents that have not just failed to start this job.
+ * Advances the cursor past the chosen agent. Returns null if none has capacity.
+ */
+function pickAgent(
+  db: Db,
+  config: FactoryConfig,
+  jobId: string,
+  poolName: string,
+  poolAgents: readonly string[],
+  load: Map<string, number>,
+): string | null {
+  const n = poolAgents.length;
+  if (n === 0) return null;
+  const cursorRow = db.prepare('SELECT next_index FROM pool_cursors WHERE pool = ?').get(poolName) as
+    | { next_index: number }
+    | undefined;
+  const start = (((cursorRow?.next_index ?? 0) % n) + n) % n;
+  const capable: { name: string; index: number }[] = [];
+  for (let k = 0; k < n; k++) {
+    const index = (start + k) % n;
+    const name = poolAgents[index]!;
+    const agent = ownEntry(config.agents, name);
+    if (agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) capable.push({ name, index });
+  }
+  if (capable.length === 0) return null;
+  const failed = startFailureStreak(db, jobId).agents;
+  const choice = capable.find((c) => !failed.has(c.name)) ?? capable[0]!;
+  db.prepare(
+    'INSERT INTO pool_cursors (pool, next_index) VALUES (?, ?) ON CONFLICT (pool) DO UPDATE SET next_index = excluded.next_index',
+  ).run(poolName, (choice.index + 1) % n);
+  return choice.name;
+}
+
+/**
+ * Atomically pick the oldest claimable queued job and start a run for it on an
+ * eligible agent with capacity, honoring the global limit, per-agent limits
+ * (across pools and repos), round-robin order per pool, and at most one running
+ * job per (repo, issue). Returns null when nothing can start now.
+ *
+ * A queued job whose pool or action is no longer in the config is marked
+ * `failed` with a reason and an error row (never silently dropped); the user can
+ * `factory retry` it after fixing the config. Jobs in `excludeJobIds` are skipped.
+ */
+export function claimNextJob(
+  db: Db,
+  config: FactoryConfig,
+  opts: {
+    workerId: string;
+    leaseSeconds: number;
+    runsDir: string;
+    now?: () => number;
+    excludeJobIds?: ReadonlySet<string>;
+  },
+): Claim | null {
+  const clock = opts.now ?? Date.now;
+  return transaction(db, () => {
+    const open = (db.prepare('SELECT count(*) AS n FROM runs WHERE ended_at IS NULL').get() as { n: number }).n;
+    if (open >= config.maxConcurrent) return null;
+
+    const load = runningByAgent(db);
+    const busyIssues = new Set(
+      (
+        db
+          .prepare(
+            `SELECT DISTINCT repo_id, issue_number FROM jobs
+             WHERE status = 'running' OR id IN (SELECT job_id FROM runs WHERE ended_at IS NULL)`,
+          )
+          .all() as { repo_id: number; issue_number: number }[]
+      ).map((r) => issueKey(r.repo_id, r.issue_number)),
+    );
+    const queued = db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, rowid").all() as unknown as JobRow[];
+    const nowMs = clock();
+    const at = new Date(nowMs).toISOString();
+
+    for (const row of queued) {
+      if (opts.excludeJobIds?.has(row.id)) continue;
+      if (busyIssues.has(issueKey(row.repo_id, row.issue_number))) continue;
+
+      const pool = ownEntry(config.pools, row.pool);
+      if (!pool) {
+        failUnroutable(db, row, `pool "${row.pool}" is no longer configured`, at);
+        continue;
+      }
+      if (!ownEntry(config.actions, row.action)) {
+        failUnroutable(db, row, `action "${row.action}" is no longer configured`, at);
+        continue;
+      }
+
+      const agent = pickAgent(db, config, row.id, row.pool, pool.agents, load);
+      if (!agent) continue; // this pool is saturated; later jobs in other pools may still start
+
+      const runId = newId('run');
+      const runRow: RunRow = {
+        id: runId,
+        job_id: row.id,
+        attempt: row.attempts + 1,
+        pool: row.pool,
+        agent,
+        checkout_path: null,
+        log_path: join(opts.runsDir, runId, 'run.log'),
+        worker_id: opts.workerId,
+        pid: null,
+        lease_expires_at: new Date(nowMs + opts.leaseSeconds * 1000).toISOString(),
+        started_at: at,
+        ended_at: null,
+        outcome: null,
+        error: null,
+      };
+      db.prepare(
+        `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, pid, lease_expires_at, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        runRow.id,
+        runRow.job_id,
+        runRow.attempt,
+        runRow.pool,
+        runRow.agent,
+        runRow.checkout_path,
+        runRow.log_path,
+        runRow.worker_id,
+        runRow.pid,
+        runRow.lease_expires_at,
+        runRow.started_at,
+      );
+      db.prepare(
+        "UPDATE jobs SET status = 'running', status_reason = NULL, attempts = attempts + 1, updated_at = ? WHERE id = ?",
+      ).run(at, row.id);
+      return { job: rowToJob(getJobRow(db, row.id)!), run: rowToRun(runRow) };
+    }
+    return null;
+  });
+}
+
+export function heartbeatRun(db: Db, runId: string, leaseSeconds: number, now?: () => number): void {
+  const clock = now ?? Date.now;
+  db.prepare('UPDATE runs SET lease_expires_at = ? WHERE id = ? AND ended_at IS NULL').run(
+    new Date(clock() + leaseSeconds * 1000).toISOString(),
+    runId,
+  );
+}
+
+/** Record the agent subprocess and/or checkout for a running run (used by live adapters and reconcile). */
+export function setRunProcess(db: Db, runId: string, info: { pid?: number | null; checkoutPath?: string | null }): void {
+  if (info.pid !== undefined) db.prepare('UPDATE runs SET pid = ? WHERE id = ?').run(info.pid, runId);
+  if (info.checkoutPath !== undefined)
+    db.prepare('UPDATE runs SET checkout_path = ? WHERE id = ?').run(info.checkoutPath, runId);
+}
+
+export function getRun(db: Db, runId: string): Run | null {
+  const row = getRunRow(db, runId);
+  return row ? rowToRun(row) : null;
+}
+
+export function getJob(db: Db, jobId: string): Job | null {
+  const row = getJobRow(db, jobId);
+  return row ? rowToJob(row) : null;
+}
+
+export function listOpenRuns(db: Db): Run[] {
+  return (db.prepare('SELECT * FROM runs WHERE ended_at IS NULL ORDER BY started_at').all() as unknown as RunRow[]).map(rowToRun);
+}
+
+/**
+ * Close a run and move its job to the matching terminal state (or back to queued for start_failed).
+ *
+ * - succeeded / failed / interrupted: job gets the same status (checkout and log are kept).
+ * - start_failed: the slot is released and the job requeued so another eligible agent is
+ *   tried; after MAX_START_FAILURES consecutive start failures the job is marked failed.
+ *
+ * Idempotent: closing an already-closed run is a no-op. Only a job still `running` is moved.
+ */
+export function finishRun(
+  db: Db,
+  runId: string,
+  result: { outcome: RunOutcome; error?: string | null; now?: () => number },
+): void {
+  const at = nowIso(result.now ?? Date.now);
+  transaction(db, () => {
+    const run = getRunRow(db, runId);
+    if (!run) throw new Error(`run ${runId} not found`);
+    if (run.ended_at !== null) return;
+    const error = result.error ?? null;
+    db.prepare('UPDATE runs SET ended_at = ?, outcome = ?, error = ? WHERE id = ?').run(at, result.outcome, error, runId);
+
+    const job = getJobRow(db, run.job_id);
+    if (!job || job.status !== 'running') return;
+
+    let status: JobStatus;
+    let reason: string | null;
+    switch (result.outcome) {
+      case 'succeeded':
+        status = 'succeeded';
+        reason = null;
+        break;
+      case 'failed':
+        status = 'failed';
+        reason = error ?? `run ${runId} on ${run.agent} failed`;
+        break;
+      case 'interrupted':
+        status = 'interrupted';
+        reason = error ?? `run ${runId} on ${run.agent} was interrupted`;
+        break;
+      case 'start_failed': {
+        const { count } = startFailureStreak(db, job.id);
+        const detail = error ?? 'unknown error';
+        if (count >= MAX_START_FAILURES) {
+          status = 'failed';
+          reason = `no agent could start after ${count} attempts; last error on ${run.agent}: ${detail}`;
+        } else {
+          status = 'queued';
+          reason = `${run.agent} could not start (${detail}); requeued for another agent`;
+        }
+        break;
+      }
+    }
+    db.prepare('UPDATE jobs SET status = ?, status_reason = ?, updated_at = ? WHERE id = ?').run(
+      status,
+      reason,
+      at,
+      job.id,
+    );
+    if (result.outcome !== 'succeeded') {
+      recordError(db, {
+        scope: 'worker',
+        repoFullName: job.repo_full_name,
+        jobId: job.id,
+        message: `run ${runId} (${run.agent}) ${result.outcome}: ${reason}`,
+        at,
+      });
+    }
+  });
+}
+
+function closeClaim(db: Db, runId: string, jobStatus: 'canceled' | 'queued', reason: string, now?: () => number): void {
+  const at = nowIso(now ?? Date.now);
+  transaction(db, () => {
+    const run = getRunRow(db, runId);
+    if (!run) throw new Error(`run ${runId} not found`);
+    if (run.ended_at !== null) return;
+    // outcome stays NULL: the agent never started, so this is not an agent failure.
+    db.prepare('UPDATE runs SET ended_at = ?, error = ? WHERE id = ?').run(
+      at,
+      `${jobStatus === 'canceled' ? 'canceled' : 'released'} before start: ${reason}`,
+      runId,
+    );
+    db.prepare("UPDATE jobs SET status = ?, status_reason = ?, updated_at = ? WHERE id = ? AND status = 'running'").run(
+      jobStatus,
+      reason,
+      at,
+      run.job_id,
+    );
+  });
+}
+
+/**
+ * The pre-start check rejected a claimed job (issue closed or dispatch label removed):
+ * cancel the job with the reason and close the run with no outcome (not an agent failure).
+ */
+export function cancelClaim(db: Db, runId: string, reason: string, now?: () => number): void {
+  closeClaim(db, runId, 'canceled', reason, now);
+}
+
+/**
+ * Give a claimed job back to the queue without starting it (e.g. the pre-start
+ * check could not reach GitHub, or the worker is stopping). The run closes with no outcome.
+ */
+export function releaseClaim(db: Db, runId: string, reason: string, now?: () => number): void {
+  closeClaim(db, runId, 'queued', reason, now);
+}
+
+/** Deliberately requeue a failed, interrupted or canceled job. Throws for other states. */
+export function retryJob(db: Db, jobId: string, now?: () => number): Job {
+  const at = nowIso(now ?? Date.now);
+  return transaction(db, () => {
+    const row = getJobRow(db, jobId);
+    if (!row) throw new Error(`job ${jobId} not found`);
+    if (!RETRYABLE.includes(row.status)) {
+      throw new Error(`job ${jobId} is ${row.status}; only failed, interrupted or canceled jobs can be retried`);
+    }
+    db.prepare("UPDATE jobs SET status = 'queued', status_reason = ?, updated_at = ? WHERE id = ?").run(
+      `retried by user (was ${row.status})`,
+      at,
+      jobId,
+    );
+    db.prepare(
+      'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
+    ).run(retryFloorKey(jobId), String(row.attempts));
+    return rowToJob(getJobRow(db, jobId)!);
+  });
+}
+
+export interface AgentLoad {
+  agent: string;
+  enabled: boolean;
+  running: number;
+  maxConcurrent: number;
+}
+
+export interface StatusSnapshot {
+  worker: { workerId: string; pid: number; hostname: string; startedAt: string; heartbeatAt: string; stale: boolean } | null;
+  counts: Record<JobStatus, number>;
+  agents: AgentLoad[];
+  activeRuns: Array<{ run: Run; job: Job }>;
+  recentJobs: Job[];
+  recentErrors: Array<{ at: string; scope: string; repoFullName: string | null; jobId: string | null; message: string }>;
+  checkpoints: Array<{ repoId: number; fullName: string; lastEventId: number | null; updatedAt: string }>;
+}
+
+export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => number): StatusSnapshot {
+  const nowMs = (now ?? Date.now)();
+
+  const lock = db.prepare('SELECT * FROM worker_lock WHERE id = 1').get() as
+    | { worker_id: string; pid: number; hostname: string; started_at: string; heartbeat_at: string }
+    | undefined;
+  const worker = lock
+    ? {
+        workerId: lock.worker_id,
+        pid: lock.pid,
+        hostname: lock.hostname,
+        startedAt: lock.started_at,
+        heartbeatAt: lock.heartbeat_at,
+        stale: nowMs - Date.parse(lock.heartbeat_at) > WORKER_STALE_MS,
+      }
+    : null;
+
+  const counts = Object.fromEntries(JOB_STATUSES.map((s) => [s, 0])) as Record<JobStatus, number>;
+  for (const r of db.prepare('SELECT status, count(*) AS n FROM jobs GROUP BY status').all() as {
+    status: JobStatus;
+    n: number;
+  }[]) {
+    counts[r.status] = r.n;
+  }
+
+  const load = runningByAgent(db);
+  const agents: AgentLoad[] = Object.entries(config.agents).map(([agent, cfg]) => ({
+    agent,
+    enabled: cfg.enabled,
+    running: load.get(agent) ?? 0,
+    maxConcurrent: cfg.maxConcurrent,
+  }));
+  // Runs still open on agents that were removed from the config stay visible.
+  for (const [agent, running] of load) {
+    if (!ownEntry(config.agents, agent)) agents.push({ agent, enabled: false, running, maxConcurrent: 0 });
+  }
+
+  const activeRuns = listOpenRuns(db).map((run) => ({ run, job: rowToJob(getJobRow(db, run.jobId)!) }));
+
+  const recentJobs = (
+    db.prepare('SELECT * FROM jobs ORDER BY updated_at DESC, rowid DESC LIMIT 10').all() as unknown as JobRow[]
+  ).map(rowToJob);
+
+  const recentErrors = (
+    db.prepare('SELECT at, scope, repo_full_name, job_id, message FROM errors ORDER BY id DESC LIMIT 10').all() as {
+      at: string;
+      scope: string;
+      repo_full_name: string | null;
+      job_id: string | null;
+      message: string;
+    }[]
+  ).map((e) => ({ at: e.at, scope: e.scope, repoFullName: e.repo_full_name, jobId: e.job_id, message: e.message }));
+
+  const checkpoints = (
+    db
+      .prepare('SELECT repo_id, full_name, last_event_id, updated_at FROM repo_checkpoints ORDER BY full_name')
+      .all() as { repo_id: number; full_name: string; last_event_id: number | null; updated_at: string }[]
+  ).map((c) => ({ repoId: c.repo_id, fullName: c.full_name, lastEventId: c.last_event_id, updatedAt: c.updated_at }));
+
+  return { worker, counts, agents, activeRuns, recentJobs, recentErrors, checkpoints };
+}

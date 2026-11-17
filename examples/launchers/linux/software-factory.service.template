@@ -1,0 +1,27 @@
+# systemd --user unit for `factory start`.
+#
+# install-systemd-user.sh fills the __PLACEHOLDERS__ (with systemd quoting and % escaping)
+# and writes ~/.config/systemd/user/<name>.service. To fill it by hand, use absolute paths,
+# keep the double quotes around paths with spaces, and write a literal % as %%.
+#
+# A user service runs while you are logged in. To keep it running before login and after
+# logout, enable lingering once:  loginctl enable-linger "$USER"
+
+[Unit]
+Description=software-factory worker (factory start)
+
+[Service]
+Type=simple
+# node runs the installed package's dist/cli.js directly; no npm shim or shell.
+ExecStart="__NODE__" "__CLI__" start --config "__CONFIG__"
+WorkingDirectory=__WORKDIR__
+Environment="PATH=__PATH__"
+#__EXTRA_ENV__
+Restart=on-failure
+RestartSec=30
+# SIGTERM to the worker so it can stop gracefully; anything left after the timeout is killed.
+KillMode=mixed
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
