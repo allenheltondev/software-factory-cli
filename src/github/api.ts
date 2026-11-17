@@ -65,6 +65,8 @@ export interface GitHubApi {
   /** One page of repository issue events. Page 1 is the newest page. */
   listIssueEvents(repo: RepoRef, opts: { page: number; perPage?: number; etag?: string | null }): Promise<IssueEventsPage>;
   getIssue(repo: RepoRef, issueNumber: number): Promise<GitHubIssue>;
+  /** Every event on one issue, oldest first (paginated internally). `issue` is null on these. */
+  listEventsForIssue(repo: RepoRef, issueNumber: number): Promise<GitHubIssueEvent[]>;
 }
 
 export class GitHubError extends Error {

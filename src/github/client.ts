@@ -343,5 +343,10 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       const res = await request<RawIssue>(`${repoPath(repo)}/issues/${issueNumber}`, { redirect: 'manual' });
       return mapIssue(res.data!);
     },
+
+    async listEventsForIssue(repo, issueNumber) {
+      const raw = await paginate<RawIssueEvent>(`${repoPath(repo)}/issues/${issueNumber}/events`);
+      return raw.map(mapEvent);
+    },
   };
 }

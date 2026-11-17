@@ -175,6 +175,19 @@ class FakeGitHub implements GitHubApi {
     const { gone: _gone, ...rest } = issue;
     return { ...rest, labels: [...rest.labels] };
   }
+
+  async listEventsForIssue(repo: RepoRef, issueNumber: number): Promise<GitHubIssueEvent[]> {
+    this.calls.push({ method: 'listEventsForIssue', repoId: repo.id, arg: issueNumber });
+    const r = this.repo(repo.id);
+    if (r.fail) throw r.fail;
+    const issue = r.issues.get(issueNumber);
+    if (!issue) throw new GitHubError(`issue ${issueNumber} not found`, 404);
+    if (issue.gone) throw new GitHubError(`issue ${issueNumber} gone`, issue.gone);
+    return r.events
+      .filter((e) => e.issue?.number === issueNumber)
+      .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id - b.id)
+      .map((e) => ({ ...e, issue: null }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -876,6 +889,55 @@ describe('checkJobDispatchable', () => {
     expect(await checkJobDispatchable({ api: gh, config }, job!)).toMatchObject({
       ok: false,
       reason: expect.stringMatching(/no longer configured/),
+    });
+  });
+
+  it('live: cancels a job whose label application was superseded by an actor outside the allowlist', async () => {
+    const { gh, db, deps } = setup(makeConfig({ execution: { mode: 'live' } }));
+    gh.createIssue(REPO, 1);
+    await init(deps);
+    gh.label(REPO, 1, READY);
+    await pollOnce(deps);
+    const [job] = listQueuedJobs(db);
+    expect(await checkJobDispatchable(deps, job!)).toMatchObject({ ok: true });
+
+    // Removed, then put back by a collaborator who may not dispatch. The issue carries the label
+    // again, but not on the authority of the application that queued the job.
+    gh.unlabel(REPO, 1, READY, 'mallory');
+    gh.label(REPO, 1, READY, 'mallory');
+    const superseded = {
+      ok: false,
+      reason: `the "${READY}" label application that queued this job is no longer the current one (the label was removed or reapplied since)`,
+    };
+    expect(await checkJobDispatchable(deps, job!)).toEqual(superseded);
+
+    const s = await pollOnce(deps);
+    expect(s.jobsCanceled).toBe(1);
+    expect(listQueuedJobs(db)).toEqual([]);
+    expect(allJobs(db).find((j) => j.id === job!.id)).toMatchObject({ status: 'canceled', status_reason: superseded.reason });
+  });
+
+  it('live: a reapplication by an allowed actor replaces the old job, and a narrowed allowlist cancels', async () => {
+    const config = makeConfig({ execution: { mode: 'live' }, dispatch: { allowedActors: ['allen', 'sam'] } });
+    const { gh, db, deps } = setup(config);
+    gh.createIssue(REPO, 1);
+    await init(deps);
+    gh.label(REPO, 1, READY);
+    await pollOnce(deps);
+    const [first] = listQueuedJobs(db);
+
+    gh.unlabel(REPO, 1, READY, 'sam');
+    gh.label(REPO, 1, READY, 'sam');
+    await pollOnce(deps);
+    const queued = listQueuedJobs(db);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]!.id).not.toBe(first!.id);
+    expect(await checkJobDispatchable(deps, queued[0]!)).toMatchObject({ ok: true });
+
+    const narrowed = makeConfig({ execution: { mode: 'live' }, dispatch: { allowedActors: ['allen'] } });
+    expect(await checkJobDispatchable({ api: gh, config: narrowed }, queued[0]!)).toEqual({
+      ok: false,
+      reason: `"${READY}" was applied by sam, who is not an allowed actor for this workflow`,
     });
   });
 

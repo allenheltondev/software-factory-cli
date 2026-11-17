@@ -133,6 +133,31 @@ describe('createGitHubApi', () => {
     expect(p1again).toEqual({ events: [], nextPage: null, etag: 'W/"abc"', notModified: true });
   });
 
+  it('lists one issue\'s events through every page, oldest first', async () => {
+    const ev = (id: number, event: string, actor: string) => ({
+      id,
+      event,
+      created_at: '2026-01-01T00:00:00Z',
+      actor: { login: actor },
+      label: { name: 'ready', color: 'fff' },
+    });
+    const { fn, calls } = fakeFetch((url) =>
+      url.searchParams.get('page') === '2'
+        ? json([ev(3, 'labeled', 'mallory')])
+        : json([ev(1, 'labeled', 'allen'), ev(2, 'unlabeled', 'mallory')], {
+            headers: { link: '<https://api.github.com/repositories/42/issues/7/events?per_page=100&page=2>; rel="next"' },
+          }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const events = await api.listEventsForIssue({ id: 42, fullName: 'o/r' }, 7);
+    expect(new URL(calls[0]!.url).pathname).toBe('/repositories/42/issues/7/events');
+    expect(events.map((e) => [e.id, e.event, e.actor, e.label, e.issue])).toEqual([
+      [1, 'labeled', 'allen', 'ready', null],
+      [2, 'unlabeled', 'mallory', 'ready', null],
+      [3, 'labeled', 'mallory', 'ready', null],
+    ]);
+  });
+
   it('maps rate limits to GitHubError with retryAfterSeconds', async () => {
     const reset = Math.floor(Date.now() / 1000) + 120;
     const { fn } = fakeFetch((url) => {
