@@ -4,7 +4,7 @@
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { agentAdapter, type FactoryConfig } from '../config/schema.js';
-import { ownEntry, type Claim } from '../db/queue.js';
+import { ownEntry, type Claim, type RunProcessInfo } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
 import type { RunOutcome } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -20,10 +20,11 @@ export interface ExecutionContext {
   signal: AbortSignal;
   now: () => number;
   /**
-   * Persist the agent subprocess pid and/or the job's checkout path as soon as they
-   * exist, so a later worker can reap the process and keep the checkout after a crash.
+   * Persist the agent subprocess pid (then its OS start time) and/or the job's checkout path
+   * as soon as they exist, so a later worker can reap the process and keep the checkout after
+   * a crash.
    */
-  recordProcess(info: { pid?: number | null; checkoutPath?: string | null }): void;
+  recordProcess(info: RunProcessInfo): void;
 }
 
 export interface ExecutionResult {

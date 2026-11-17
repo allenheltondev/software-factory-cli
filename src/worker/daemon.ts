@@ -33,7 +33,7 @@ import {
   heartbeatWorkerLock,
   releaseWorkerLock,
 } from './lock.js';
-import { defaultProcessControl, type ProcessControl } from './process.js';
+import { defaultProcessControl, terminateIfSameProcess, type ProcessControl } from './process.js';
 import { reconcileInterruptedRuns } from './reconcile.js';
 
 export { WorkerLockedError } from './lock.js';
@@ -297,14 +297,17 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     await settleWithin([...inFlight.values()].map((f) => f.done), interruptGraceMs);
 
     for (const [runId, f] of inFlight) {
+      // The executor did not stop its agent within the grace period. Same host by construction;
+      // still verify the start time so a pid the OS reused is never killed.
       const current = getRun(db, runId);
-      if (current?.pid != null && processControl.isAlive(current.pid)) {
-        await processControl.terminate(current.pid).catch(() => undefined);
+      let note = '';
+      if (current?.pid != null) {
+        note = (await terminateIfSameProcess(processControl, current.pid, current.pidStartTime).catch(() => ({ note: '' }))).note;
       }
       try {
         finishRun(db, runId, {
           outcome: 'interrupted',
-          error: 'worker stopped before the run finished',
+          error: `worker stopped before the run finished${note ? `; ${note}` : ''}`,
           now,
         });
       } catch (err) {

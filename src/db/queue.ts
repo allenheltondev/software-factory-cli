@@ -196,6 +196,7 @@ export function claimNextJob(
         worker_id: opts.workerId,
         hostname: opts.hostname,
         pid: null,
+        pid_start_time: null,
         lease_expires_at: new Date(nowMs + opts.leaseSeconds * 1000).toISOString(),
         started_at: at,
         execution_started_at: null,
@@ -237,9 +238,21 @@ export function heartbeatRun(db: Db, runId: string, leaseSeconds: number, now?: 
   );
 }
 
+export interface RunProcessInfo {
+  /** Agent pid. Setting it clears any start time recorded for an earlier pid. */
+  pid?: number | null;
+  /** OS start time of `pid` (see processStartTime); recorded once known, right after the pid. */
+  pidStartTime?: string | null;
+  checkoutPath?: string | null;
+}
+
 /** Record the agent subprocess and/or checkout for a running run (used by live adapters and reconcile). */
-export function setRunProcess(db: Db, runId: string, info: { pid?: number | null; checkoutPath?: string | null }): void {
-  if (info.pid !== undefined) db.prepare('UPDATE runs SET pid = ? WHERE id = ?').run(info.pid, runId);
+export function setRunProcess(db: Db, runId: string, info: RunProcessInfo): void {
+  if (info.pid !== undefined) {
+    db.prepare('UPDATE runs SET pid = ?, pid_start_time = ? WHERE id = ?').run(info.pid, info.pidStartTime ?? null, runId);
+  } else if (info.pidStartTime !== undefined) {
+    db.prepare('UPDATE runs SET pid_start_time = ? WHERE id = ?').run(info.pidStartTime, runId);
+  }
   if (info.checkoutPath !== undefined)
     db.prepare('UPDATE runs SET checkout_path = ? WHERE id = ?').run(info.checkoutPath, runId);
 }

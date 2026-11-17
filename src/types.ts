@@ -70,6 +70,11 @@ export interface Run {
   /** Host of the worker that claimed the run (null for runs from before it was recorded). */
   hostname: string | null;
   pid: number | null;
+  /**
+   * OS start time of `pid`, platform-tagged (see processStartTime). A pid is only signalled when
+   * this still matches, so a reused pid is never killed. Null for runs recorded before v5.
+   */
+  pidStartTime: string | null;
   leaseExpiresAt: string;
   /** When the job was claimed. */
   startedAt: string;

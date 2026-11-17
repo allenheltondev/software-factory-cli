@@ -4,7 +4,7 @@ import { finishRun, listOpenRuns, releaseClaim } from '../db/queue.js';
 import type { Run } from '../types.js';
 import { nowIso } from '../util/ids.js';
 import type { Logger } from '../util/log.js';
-import type { ProcessControl } from './process.js';
+import { terminateIfSameProcess, type ProcessControl } from './process.js';
 
 export interface ReconcileOptions {
   /** This worker's host. Only pids recorded by runs claimed on this host are signalled. */
@@ -32,8 +32,10 @@ export interface ReconcileResult {
  *   job is NOT requeued; the user decides with `factory retry`.
  *
  * A pid is only signalled when the run was claimed on this host (runs.hostname), whichever
- * earlier worker claimed it, so a pid recorded on another machine is never killed. Runs
- * with no recorded host are never signalled.
+ * earlier worker claimed it, and the process's OS start time still matches the one recorded
+ * at spawn (runs.pid_start_time), so a pid recorded on another machine, or one the OS has
+ * since given to another process, is never killed. Runs with no recorded host or start time
+ * are never signalled.
  */
 export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): Promise<ReconcileResult> {
   const now = opts.now ?? Date.now;
@@ -48,15 +50,12 @@ export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): 
     const sameHost = run.hostname !== null && run.hostname === opts.hostname;
     let note = '';
     if (run.pid !== null) {
-      if (sameHost && opts.processControl.isAlive(run.pid)) {
-        opts.log.warn('terminating agent process left by previous worker', { runId: run.id, pid: run.pid });
-        try {
-          await opts.processControl.terminate(run.pid);
-          note = `; terminated leftover agent process ${run.pid}`;
-        } catch (err) {
-          note = `; could not terminate agent process ${run.pid}: ${(err as Error).message}`;
-        }
-      } else if (!sameHost) {
+      if (sameHost) {
+        const r = await terminateIfSameProcess(opts.processControl, run.pid, run.pidStartTime);
+        if (r.terminated) opts.log.warn('terminated agent process left by previous worker', { runId: run.id, pid: run.pid });
+        else if (r.note) opts.log.warn('left a recorded agent pid alone', { runId: run.id, pid: run.pid, why: r.note });
+        if (r.note) note = `; ${r.note}`;
+      } else {
         note = `; agent pid ${run.pid} was not signalled (recorded on ${run.hostname ? `host ${run.hostname}` : 'an unknown host'})`;
       }
     }

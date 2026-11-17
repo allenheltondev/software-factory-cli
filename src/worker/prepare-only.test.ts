@@ -92,7 +92,7 @@ describe('PrepareOnlyExecutor', { timeout: 60_000 }, () => {
         }
       },
       checkDispatchable: async () => ({ ok: true }),
-      processControl: { isAlive: () => false, terminate: async () => {} },
+      processControl: { isAlive: () => false, startTime: async () => null, terminate: async () => {} },
       hostname: 'host-a',
       pid: 4242,
     });
