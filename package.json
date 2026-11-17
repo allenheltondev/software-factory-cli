@@ -1,0 +1,38 @@
+{
+  "name": "software-factory-cli",
+  "version": "0.1.0",
+  "description": "CLI that watches your GitHub repos and dispatches labeled issues to coding agents",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "factory": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "npm run build",
+    "smoke:pack": "node scripts/pack-smoke.mjs"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.0.0",
+    "commander": "^14.0.0",
+    "yaml": "^2.8.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}
