@@ -4,7 +4,7 @@ import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../co
 import { openDatabase, type Db } from '../db/database.js';
 import { getCheckpoint, listQueuedJobs } from '../db/ingest.js';
 import { silentLogger } from '../util/log.js';
-import { OVERLAP_MS, backoffSeconds, checkJobDispatchable, pollOnce, type PollerDeps } from './poller.js';
+import { EVENTS_PER_PAGE, OVERLAP_MS, backoffSeconds, checkJobDispatchable, pollOnce, type PollerDeps } from './poller.js';
 import {
   GitHubError,
   type GitHubApi,
@@ -678,7 +678,7 @@ describe('pollOnce: errors and paging', () => {
     expect(pages).toEqual([1, 2]);
   });
 
-  it('keeps scanning after a page-1 304 when the overlap extends past page 1', async () => {
+  it('fetches page 1 unconditionally when the overlap extends past page 1', async () => {
     const { gh, db, deps } = setup();
     gh.createIssue(REPO, 1);
     gh.createIssue(REPO, 2);
@@ -693,7 +693,39 @@ describe('pollOnce: errors and paging', () => {
     expect(listQueuedJobs(db).map((j) => j.eventId)).toEqual([String(late.id)]);
     const calls = gh.calls.filter((c) => c.method === 'listIssueEvents').slice(1);
     expect(calls.map((c) => (c.arg as { page: number }).page)).toEqual([1, 2]);
-    expect(calls[0]!.arg).toMatchObject({ etag: expect.any(String) }); // page 1 was conditional (304)
+    expect(calls[0]!.arg).toMatchObject({ etag: null }); // no 304 shortcut while the overlap spans pages
+  });
+
+  it('does not treat an exactly full single page as the whole stream', async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.createIssue(REPO, 2);
+    gh.noise(REPO, 1, EVENTS_PER_PAGE); // exactly one full page at initialization
+    await init(deps);
+    expect(getCheckpoint(db, REPO)!.page1CoversOverlap).toBe(false);
+    // A late label one second older than everything: it alone starts page 2, page 1 is unchanged.
+    const oldest = Date.parse(gh.repos.get(REPO)!.events[0]!.createdAt);
+    const late = gh.labelAt(REPO, 2, READY, oldest - 1000);
+    const s = await pollOnce(deps);
+    expect(s.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
+    expect(listQueuedJobs(db).map((j) => j.eventId)).toEqual([String(late.id)]);
+  });
+
+  it('does not revive a superseded label when the overlap spans pages', async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    await init(deps);
+    gh.label(REPO, 1, READY); // old application; ends up on page 2
+    gh.noise(REPO, 1, 120);
+    gh.unlabel(REPO, 1, READY); // removal and reapplication land on page 1
+    const reapplied = gh.label(REPO, 1, READY);
+    const first = await pollOnce(deps);
+    expect(first.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
+    expect(getCheckpoint(db, REPO)!.page1CoversOverlap).toBe(false);
+    // Nothing new. The next scan must still see page 1's removal next to page 2's old application.
+    const second = await pollOnce(deps);
+    expect(second.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 0 });
+    expect(allJobs(db).map((j) => j.event_id)).toEqual([String(reapplied.id)]);
   });
 
   it('ends the cycle on a page-1 304 when page 1 already covers the overlap', async () => {
