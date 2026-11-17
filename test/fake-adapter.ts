@@ -1,5 +1,5 @@
 // Test-only adapter that runs test/fake-agent.mjs. Registered from tests under a real adapter
-// name (the config schema only accepts known adapters); production registers none.
+// name (the config schema only accepts known adapters), replacing any built-in one until restored.
 import { fileURLToPath } from 'node:url';
 import type { AgentAdapter } from '../src/agents/adapters/registry.js';
 

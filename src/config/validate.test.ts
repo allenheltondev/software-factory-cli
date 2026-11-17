@@ -59,18 +59,37 @@ describe('validateConfig', () => {
     expect(validateConfig(cfg).ok).toBe(true);
   });
 
-  it('rejects live mode while an enabled agent has no implemented adapter (none ship yet)', () => {
+  it('rejects live mode while an enabled agent has no implemented adapter (only claude ships)', () => {
     const cfg = example();
     cfg.execution = { mode: 'live' };
+    cfg.repositories['allenheltondev/kids-and-dragons'].checkoutPath = '../clones/kids-and-dragons';
     const r = validateConfig(cfg);
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    for (const agent of ['codex', 'claude', 'kiro']) {
-      expect(r.errors).toContainEqual({
-        path: `agents.${agent}`,
-        message: expect.stringMatching(/live execution is not implemented for adapter ".+" in this release/),
-      });
-    }
+    expect(r.errors).toEqual([
+      { path: 'agents.codex', message: expect.stringMatching(/live execution is not implemented for adapter "codex" in this release/) },
+      { path: 'agents.kiro', message: expect.stringMatching(/live execution is not implemented for adapter "kiro" in this release/) },
+    ]);
+
+    cfg.agents.codex.enabled = false;
+    const kiroOnly = validateConfig(cfg);
+    expect(kiroOnly.ok).toBe(false);
+    if (!kiroOnly.ok) expect(kiroOnly.errors.map((e) => e.path)).toEqual(['agents.kiro']);
+  });
+
+  it('accepts live mode with the built-in Claude Code adapter when claude is the only enabled agent', () => {
+    const cfg = example();
+    cfg.execution = { mode: 'live' };
+    cfg.repositories['allenheltondev/kids-and-dragons'].checkoutPath = '../clones/kids-and-dragons';
+    cfg.agents.codex.enabled = false;
+    cfg.agents.kiro.enabled = false;
+    cfg.agents.claude.args = ['--permission-mode', 'acceptEdits', '--allowedTools', 'Bash(npm test *)'];
+    // The art pool only has codex, so art jobs wait; that's a warning, not an error.
+    expect(validateConfig(cfg)).toMatchObject({ ok: true, warnings: [{ path: 'pools.art', message: expect.stringMatching(/disabled/) }] });
+
+    // An agent with another name that uses the claude adapter counts too.
+    cfg.agents['claude-opus'] = { adapter: 'claude', args: ['--model', 'opus'] };
+    expect(validateConfig(cfg).ok).toBe(true);
   });
 
   it('accepts live mode once every enabled agent has an adapter, a checkout and a prompt', () => {

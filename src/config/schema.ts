@@ -4,7 +4,7 @@ export const CONFIG_VERSION = 1;
 
 /**
  * Agent adapters the CLI knows about. Whether an adapter can run agents in live mode is a separate
- * question: see src/agents/adapters/registry.ts (no production adapter is implemented yet).
+ * question: see src/agents/adapters/registry.ts (only claude is implemented so far).
  */
 export const KNOWN_ADAPTERS = ['codex', 'claude', 'kiro'] as const;
 export type AdapterName = (typeof KNOWN_ADAPTERS)[number];
