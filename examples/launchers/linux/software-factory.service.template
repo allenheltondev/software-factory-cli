@@ -17,6 +17,9 @@ ExecStart="__NODE__" "__CLI__" start --config "__CONFIG__"
 WorkingDirectory=__WORKDIR__
 Environment="PATH=__PATH__"
 #__EXTRA_ENV__
+# Optional KEY=value file (the leading - means a missing file is fine) for secrets the agent
+# CLIs need, such as KIRO_API_KEY. Keep it chmod 600 and out of config.yaml.
+EnvironmentFile=-__ENV_FILE__
 Restart=on-failure
 RestartSec=30
 # SIGTERM to the worker so it can stop gracefully; anything left after the timeout is killed.

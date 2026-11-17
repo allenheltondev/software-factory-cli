@@ -84,6 +84,17 @@ describe('validateConfig', () => {
     expect(r.ok).toBe(true);
   });
 
+  it('accepts live mode with the built-in Kiro adapter, alone or alongside claude', () => {
+    const cfg = example();
+    cfg.execution = { mode: 'live' };
+    cfg.repositories['allenheltondev/kids-and-dragons'].checkoutPath = '../clones/kids-and-dragons';
+    cfg.agents.codex.enabled = false;
+    cfg.agents.kiro.args = ['--trust-tools=read_file,grep_search'];
+    expect(validateConfig(cfg).ok).toBe(true);
+    cfg.agents.claude.enabled = false;
+    expect(validateConfig(cfg).ok).toBe(true);
+  });
+
   it('accepts live mode with the built-in Claude Code adapter when claude is the only enabled agent', () => {
     const cfg = example();
     cfg.execution = { mode: 'live' };
