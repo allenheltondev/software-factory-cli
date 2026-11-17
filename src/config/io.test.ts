@@ -129,6 +129,13 @@ describe('updateYamlText', () => {
     expect(out).toBe('l:\n  - b # second\n  - c\n');
   });
 
+  it('moves an entry to a new key by id only when the match is unambiguous', () => {
+    const src = 'm:\n  # note\n  old:\n    id: 1\n    x: a # keep\n';
+    expect(updateYamlText(src, { m: { new: { id: 1, x: 'a' } } })).toBe('m:\n  # note\n  new:\n    id: 1\n    x: a # keep\n');
+    const two = 'm:\n  a:\n    id: 1 # a\n  b:\n    id: 1 # b\n';
+    expect(updateYamlText(two, { m: { c: { id: 1 } } })).toBe('m:\n  c:\n    id: 1\n');
+  });
+
   it('gives up (returns null) when the edit would not round-trip, e.g. through an alias', () => {
     const src = 'base: &b {x: 1}\nother: *b\n';
     const out = updateYamlText(src, { base: { x: 2 }, other: { x: 1 } });

@@ -117,6 +117,18 @@ describe('factory add', () => {
     expect(validateConfig(cfg).ok).toBe(true);
   });
 
+  it('keeps comments inside a repo renamed on GitHub and renames its key in place', async () => {
+    const ctx = fakeContext({ api: fakeApi({ repos: [fakeRepo('new-owner/app', 1)], labels: { 'new-owner/app': ['factory:ready'] } }) });
+    mkdirSync(dirname(ctx.paths.configFile), { recursive: true });
+    writeFileSync(ctx.paths.configFile, COMMENTED_CONFIG);
+
+    expect(await addCommand(ctx, 'new-owner/app', {})).toBe(EXIT.OK);
+    expect(ctx.out.text).toContain('moved from o/app');
+    const text = readFileSync(ctx.paths.configFile, 'utf8');
+    expect(text).toBe(COMMENTED_CONFIG.replace('  # The main app\n  o/app:\n', '  # The main app\n  new-owner/app:\n'));
+    expect(validateConfig(parse(text)).ok).toBe(true);
+  });
+
   it('refuses to edit an invalid existing config', async () => {
     const ctx = fakeContext({ api: fakeApi({ repos: [fakeRepo('o/r', 1)] }) });
     await addCommand(ctx, 'o/r', {});

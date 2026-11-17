@@ -50,13 +50,44 @@ function update(doc: Document, node: unknown, value: Plain, isRoot = false): unk
   return doc.createNode(value);
 }
 
+const idOf = (v: unknown): unknown =>
+  isObject(v) && (typeof v.id === 'number' || typeof v.id === 'string') ? v.id : undefined;
+
+/**
+ * Pair up keys that disappear with keys that appear when both entries carry the
+ * same `id` (one candidate each way), so the entry can be moved instead of rebuilt.
+ */
+function findRenames(doc: Document, map: YAMLMap, keys: (string | undefined)[], value: Record<string, Plain>) {
+  const renames = new Map<YAMLMap['items'][number], string>();
+  const removed = map.items.filter(
+    (p, i) => isMap(p.value) && (keys[i] === undefined || !Object.hasOwn(value, keys[i]) || keys.indexOf(keys[i]) !== i),
+  );
+  const added = Object.keys(value).filter((k) => !keys.includes(k));
+  for (const k of added) {
+    const id = idOf(value[k]);
+    if (id === undefined || added.some((o) => o !== k && idOf(value[o]) === id)) continue;
+    const matches = removed.filter((p) => idOf(toJS(doc, p.value)) === id);
+    if (matches.length === 1) renames.set(matches[0]!, k);
+  }
+  return renames;
+}
+
 function updateMap(doc: Document, map: YAMLMap, value: Record<string, Plain>, isRoot: boolean): void {
   const wasEmpty = map.items.length === 0;
+  const keys = map.items.map((p) => keyString(p.key));
+  const renames = findRenames(doc, map, keys, value);
   const seen = new Set<string>();
   const items: YAMLMap['items'] = [];
-  for (const pair of map.items) {
-    const k = keyString(pair.key);
-    if (k === undefined || !Object.hasOwn(value, k) || seen.has(k)) continue;
+  for (const [i, pair] of map.items.entries()) {
+    let k = renames.get(pair);
+    if (k !== undefined) {
+      // Same entry under a new key (e.g. a repo renamed on GitHub): rename in place so comments inside survive.
+      if (isScalar(pair.key)) pair.key.value = k;
+      else pair.key = doc.createNode(k);
+    } else {
+      k = keys[i];
+      if (k === undefined || !Object.hasOwn(value, k) || seen.has(k)) continue;
+    }
     seen.add(k);
     const before = pair.value;
     const wasFlow = isCollection(before) && before.flow;
