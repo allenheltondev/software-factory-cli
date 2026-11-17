@@ -152,6 +152,7 @@ export function commitPollBatch(
           status: 'queued',
           statusReason: null,
           attempts: 0,
+          startFailures: 0,
           createdAt: at,
           updatedAt: at,
         });
