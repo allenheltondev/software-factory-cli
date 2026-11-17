@@ -238,10 +238,12 @@ describe('finishRun', () => {
       expect(getRun(db, c.run.id)).toMatchObject({ outcome, endedAt: new Date(T0).toISOString() });
     }
     expect(ids.map((id) => getJob(db, id)?.status)).toEqual([...outcomes]);
-    // idempotent
-    const anyRun = db.prepare('SELECT id FROM runs LIMIT 1').get() as { id: string };
-    finishRun(db, anyRun.id, { outcome: 'failed', now });
-    expect(getRun(db, anyRun.id)?.outcome).toBe('succeeded');
+    // idempotent: finishing the already-succeeded run again changes nothing.
+    // (Select by outcome; run IDs created in the same millisecond have random order.)
+    const doneRun = db.prepare("SELECT id FROM runs WHERE outcome = 'succeeded'").get() as { id: string };
+    finishRun(db, doneRun.id, { outcome: 'failed', now });
+    expect(getRun(db, doneRun.id)?.outcome).toBe('succeeded');
+    expect(getJob(db, ids[0]!)?.status).toBe('succeeded');
   });
 
   it('requeues on start_failed, prefers another agent, and caps repeated start failures', () => {
