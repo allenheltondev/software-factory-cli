@@ -142,8 +142,9 @@ describe('runDoctor', () => {
     expect(r2.checks.some((c) => c.name === 'agent kiro')).toBe(false);
   });
 
-  it('agentChecks: off-PATH and unknown sign-in warn; problems become failures outside log-only', () => {
+  it('agentChecks: off-PATH and unknown sign-in warn; problems are failures only in live mode', () => {
     expect(agentProblemSeverity('log-only')).toBe('warn');
+    expect(agentProblemSeverity('prepare-only')).toBe('warn');
     expect(agentProblemSeverity('live')).toBe('fail');
     const offPath = agentChecks(fakeAgentReport('codex', { onPath: false, signedIn: 'unknown', notes: ['found outside PATH'] }), 'fail');
     expect(offPath.map((c) => c.status)).toEqual(['ok', 'warn', 'warn']);

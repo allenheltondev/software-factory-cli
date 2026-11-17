@@ -15,11 +15,11 @@ import { checkConfig } from './validate.js';
 export const MIN_NODE = [22, 13] as const;
 
 /**
- * Severity for agent problems. Log-only mode never starts an agent, so they are warnings. This is
- * the hook for live execution (#8): any other `execution.mode` makes them failures.
+ * Severity for agent problems. Only live execution (#8) starts agents, so problems are failures
+ * there and warnings in every other mode (log-only, prepare-only, ...).
  */
 export function agentProblemSeverity(mode: string): CheckStatus {
-  return mode === 'log-only' ? 'warn' : 'fail';
+  return mode === 'live' ? 'fail' : 'warn';
 }
 
 /** Doctor checks for one enabled agent's discovery report. */
