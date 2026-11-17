@@ -164,6 +164,14 @@ function taskkillTree(child: ChildProcess): Promise<void> {
   });
 }
 
+/** The agent started, then the worker stopped it before the run could proceed. Not a start failure. */
+class AgentStoppedError extends Error {
+  constructor(msg: string, opts?: ErrorOptions) {
+    super(msg, opts);
+    this.name = 'AgentStoppedError';
+  }
+}
+
 interface AgentRun {
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -230,7 +238,18 @@ async function runAgent(o: {
   child.on('error', () => undefined);
   const pid = child.pid!;
   track(child);
-  o.onSpawn(pid);
+  try {
+    o.onSpawn(pid);
+  } catch (err) {
+    // The agent is running but the worker couldn't record it, so nothing else would stop it.
+    // Stop it now and wait, and report a started run that failed: a start_failed outcome would
+    // let the queue try another agent while this one might still be working in the worktree.
+    await Promise.race([isWindows ? taskkillTree(child) : stopGroup(pid, o.killGraceMs), idle(o.killGraceMs + EXIT_WAIT_MS)]);
+    await Promise.race([exit, idle(EXIT_WAIT_MS)]);
+    if (!isWindows && groupAlive(pid)) await stopGroup(pid, Math.min(o.killGraceMs, 2_000));
+    if (!exited) running.delete(child);
+    throw new AgentStoppedError(`could not record the started agent process (${message(err)}); it was stopped`, { cause: err });
+  }
 
   let stopped: AgentRun['stopped'] = null;
   let killing: Promise<void> | null = null;
@@ -475,6 +494,11 @@ export class LiveExecutor implements Executor {
       });
     } catch (err) {
       const why = message(err);
+      if (err instanceof AgentStoppedError) {
+        await log(['---- end of agent output ----', `error: ${why}`, 'outcome: failed', `The worktree is kept for inspection: ${prepared.worktreePath}`]);
+        ctx.log.warn('agent stopped after it started', { error: why, logPath });
+        return { outcome: 'failed', error: why };
+      }
       await log(['---- end of agent output ----', `error: ${why}`, 'outcome: start_failed']);
       ctx.log.warn('agent could not start', { error: why, logPath });
       throw err instanceof StartFailedError ? err : new StartFailedError(why, { cause: err });

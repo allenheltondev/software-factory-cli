@@ -159,7 +159,9 @@ In `live` mode the worker runs the routed agent for each `local-branch` job:
 3. It prepares the branch and worktree as above. A failure there fails the run.
 4. It spawns the agent directly (no shell) in the worktree, records its pid and the OS start
    time of that process, and writes its stdout and stderr to `run.log`. `GH_TOKEN` and
-   `GITHUB_TOKEN` are not passed to the agent unless `agents.<name>.env` sets them.
+   `GITHUB_TOKEN` are not passed to the agent unless `agents.<name>.env` sets them. If the
+   worker can't record the pid, it stops the agent at once and fails the run (it is not a
+   start failure, so no other agent is tried).
 5. Exit code 0 is `succeeded`; anything else is `failed`. At `timeoutMinutes` the agent's
    process tree is killed and the run fails. Failed runs keep their worktree for inspection.
 6. It appends a summary to `run.log` and stores it for `factory status`: commits on the job
@@ -216,7 +218,10 @@ environment before relying on it. Details, log locations and troubleshooting:
 
 - Only GitHub logins in `dispatch.allowedActors` (or a workflow's `allowedActors`) can
   dispatch work. The check uses the actor on the label event; with an empty list, no events
-  are queued.
+  are queued. In live mode the worker checks again right before it starts an agent: the label
+  application that queued the job must still be the latest one for that label on the issue,
+  and its actor must still be allowed. If the label was removed and put back since, the old
+  job is canceled; a reapplication by an allowed actor has queued its own job.
 - Issue titles, bodies and labels are untrusted input. In live mode they reach the agent
   only through a prompt file (on stdin or by path), never a command line, fenced and
   labelled as untrusted; the default prompt

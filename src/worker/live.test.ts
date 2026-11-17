@@ -259,6 +259,33 @@ describe('LiveExecutor (fake adapter)', { timeout: 120_000 }, () => {
     expect(readFileSync(c.run.logPath!, 'utf8')).toMatch(/exit: .* \(stopped by the worker: timeout\)/);
   });
 
+  it('stops the agent and fails the run (not a start failure) when its pid cannot be recorded', async () => {
+    const { paths, config, db, agent } = setup();
+    config.agents.claude = agentSchema.parse(agent('hang'));
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 9 });
+    const c = claim(db, config, paths);
+    let spawned = 0;
+    const ctx = context(db, config, paths, c.run.id);
+    ctx.recordProcess = (info) => {
+      if (typeof info.pid === 'number') {
+        spawned = info.pid;
+        strays.push(info.pid);
+        throw new Error('database is locked');
+      }
+      setRunProcess(db, c.run.id, info);
+    };
+
+    const result = await new LiveExecutor({ killGraceMs: 500 }).execute(c, ctx);
+
+    expect(spawned).toBeGreaterThan(0);
+    expect(result).toEqual({
+      outcome: 'failed',
+      error: 'could not record the started agent process (database is locked); it was stopped',
+    });
+    await expectDead(spawned);
+    expect(readFileSync(c.run.logPath!, 'utf8')).toMatch(/outcome: failed\n/);
+  });
+
   it('forwards a worker shutdown to the agent tree and records the run interrupted', async () => {
     const { f, paths, config, db, agent } = setup();
     const pidsFile = join(f.root, 'shutdown pids.json');
