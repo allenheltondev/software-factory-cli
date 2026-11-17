@@ -101,7 +101,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\unregister-task.
 the wrapper, and deletes the wrapper. Config, state and logs are kept. The wrapper records the
 worker's PID, start time and executable in `launcher\<TaskName>.worker.json`, and unregister
 stops a process only when all three match, so a `factory start` you run by hand is never
-stopped, even with the same CLI and config.
+stopped, even with the same CLI and config. Re-running `register-task.ps1` does the same for
+the worker the previous registration started, so the new task doesn't hit the worker lock.
+
+`Stop-ScheduledTask` on its own ends the wrapper but can leave that `node.exe` worker running.
+To stop the worker without unregistering, re-run `register-task.ps1 -NoStart`.
 
 Notes:
 

@@ -268,9 +268,39 @@ if ($PSCmdlet.ShouldProcess($wrapperPath, 'Write launcher wrapper')) {
     [System.IO.File]::WriteAllText($wrapperPath, $wrapper, (New-Object System.Text.UTF8Encoding($true)))
 }
 
+# Stopping a task ends its wrapper but can leave the node.exe worker it started running; that
+# worker would hold the worker lock and make the re-registered task exit as "already running".
+# Same logic as unregister-task.ps1: stop the recorded process only if its PID, start time and
+# executable all still match, so a `factory start` run by hand is never touched.
+function Stop-RecordedWorker([string]$PidFile) {
+    if (-not (Test-Path -LiteralPath $PidFile -PathType Leaf)) { return }
+    $record = $null
+    try { $record = [System.IO.File]::ReadAllText($PidFile) | ConvertFrom-Json } catch { }
+    if ($record -and $record.pid -and $record.startTimeUtcTicks) {
+        $proc = Get-Process -Id ([int]$record.pid) -ErrorAction SilentlyContinue
+        if ($proc) {
+            $actualTicks = $null
+            try { $actualTicks = $proc.StartTime.ToUniversalTime().Ticks } catch { }
+            $sameStart = $null -ne $actualTicks -and [Math]::Abs($actualTicks - [long]$record.startTimeUtcTicks) -lt [TimeSpan]::TicksPerSecond
+            $sameExe = $proc.Path -and $record.node -and ($proc.Path -ieq [string]$record.node)
+            if ($sameStart -and $sameExe) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                Write-Host "Stopped worker process $($proc.Id) started by the previous registration."
+            } else {
+                Write-Host "PID $($record.pid) is no longer the worker this task started; leaving it alone."
+            }
+        }
+    } else {
+        Write-Warning "Could not read $PidFile; no worker process was stopped."
+    }
+    Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
+}
+
 if ($PSCmdlet.ShouldProcess($TaskName, 'Register scheduled task')) {
     $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($existing -and $existing.State -eq 'Running') { Stop-ScheduledTask -TaskName $TaskName }
+    # Also covers a worker orphaned earlier (task stopped by hand while node kept running).
+    Stop-RecordedWorker $pidFilePath
     Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
     Write-Host "Registered scheduled task '$TaskName'."
     if (-not $NoStart) {
