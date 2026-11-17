@@ -10,6 +10,12 @@ export interface Checkpoint {
   lastEventId: number | null;
   /** created_at of the newest event seen by the last committed scan (GitHub's clock). */
   lastEventCreatedAt: string | null;
+  /** Events with id <= this existed before the subscription started; never dispatched. */
+  startEventId: number | null;
+  /** Events created before this (backfillSince at subscription time) are never dispatched. */
+  startCreatedAt: string | null;
+  /** Whether page 1 of the last scan reached past the overlap boundary; null if unknown. */
+  page1CoversOverlap: boolean | null;
   etag: string | null;
   initializedAt: string;
   updatedAt: string;
@@ -31,6 +37,9 @@ interface CheckpointRow {
   full_name: string;
   last_event_id: number | null;
   last_event_created_at: string | null;
+  start_event_id: number | null;
+  start_created_at: string | null;
+  page1_covers_overlap: number | null;
   etag: string | null;
   initialized_at: string;
   updated_at: string;
@@ -46,6 +55,9 @@ export function getCheckpoint(db: Db, repoId: number): Checkpoint | null {
     fullName: r.full_name,
     lastEventId: r.last_event_id,
     lastEventCreatedAt: r.last_event_created_at,
+    startEventId: r.start_event_id,
+    startCreatedAt: r.start_created_at,
+    page1CoversOverlap: r.page1_covers_overlap === null ? null : r.page1_covers_overlap !== 0,
     etag: r.etag,
     initializedAt: r.initialized_at,
     updatedAt: r.updated_at,
@@ -55,7 +67,8 @@ export function getCheckpoint(db: Db, repoId: number): Checkpoint | null {
 /**
  * In ONE transaction: insert jobs (ignoring duplicates on repo_id+workflow_id+event_id)
  * and advance the repo checkpoint. Returns the jobs actually inserted, in batch order.
- * The stored last_event_id never moves backwards.
+ * The stored last_event_id never moves backwards. `subscriptionStart` is written only
+ * when the checkpoint is first created and never changes afterwards.
  */
 export function commitPollBatch(
   db: Db,
@@ -65,6 +78,10 @@ export function commitPollBatch(
     lastEventId: number | null;
     /** ISO created_at of the newest event scanned. Never moves backwards. */
     lastEventCreatedAt?: string | null;
+    /** Recorded only on the first commit for a repo. */
+    subscriptionStart?: { eventId: number | null; createdAt: string | null };
+    /** Omit (or null) to keep the stored value. */
+    page1CoversOverlap?: boolean | null;
     etag: string | null;
     jobs: NewJob[];
     now?: () => number;
@@ -81,8 +98,10 @@ export function commitPollBatch(
      ON CONFLICT (repo_id, workflow_id, event_id) DO NOTHING`,
   );
   const upsert = db.prepare(
-    `INSERT INTO repo_checkpoints (repo_id, full_name, last_event_id, last_event_created_at, etag, initialized_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO repo_checkpoints
+       (repo_id, full_name, last_event_id, last_event_created_at, start_event_id, start_created_at,
+        page1_covers_overlap, etag, initialized_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (repo_id) DO UPDATE SET
        full_name     = excluded.full_name,
        last_event_id = CASE
@@ -97,6 +116,7 @@ export function commitPollBatch(
                            THEN excluded.last_event_created_at
                          ELSE repo_checkpoints.last_event_created_at
                        END,
+       page1_covers_overlap = COALESCE(excluded.page1_covers_overlap, repo_checkpoints.page1_covers_overlap),
        etag          = excluded.etag,
        updated_at    = excluded.updated_at`,
   );
@@ -137,7 +157,19 @@ export function commitPollBatch(
         });
       }
     }
-    upsert.run(batch.repoId, batch.fullName, batch.lastEventId, batch.lastEventCreatedAt ?? null, batch.etag, at, at);
+    const covers = batch.page1CoversOverlap;
+    upsert.run(
+      batch.repoId,
+      batch.fullName,
+      batch.lastEventId,
+      batch.lastEventCreatedAt ?? null,
+      batch.subscriptionStart?.eventId ?? null,
+      batch.subscriptionStart?.createdAt ?? null,
+      covers === undefined || covers === null ? null : covers ? 1 : 0,
+      batch.etag,
+      at,
+      at,
+    );
     return inserted;
   });
 }

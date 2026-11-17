@@ -115,8 +115,17 @@ class FakeGitHub implements GitHubApi {
     for (let i = 0; i < count; i++) this.pushEvent(repoId, number, 'mentioned');
   }
 
-  private etag(r: FakeRepo): string {
-    return `W/"v${r.version}"`;
+  private newestFirst(r: FakeRepo): GitHubIssueEvent[] {
+    // Like GitHub: ordered by created_at desc, so ids are not monotonic in page order.
+    return [...r.events].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.id - a.id);
+  }
+
+  /** Like GitHub, the page-1 ETag reflects page 1's content only, not deeper pages. */
+  private etag(r: FakeRepo, perPage: number): string {
+    const ids = this.newestFirst(r)
+      .slice(0, perPage)
+      .map((e) => e.id);
+    return `W/"${perPage}:${ids.join(',')}"`;
   }
 
   async getViewer() {
@@ -139,19 +148,18 @@ class FakeGitHub implements GitHubApi {
     this.calls.push({ method: 'listIssueEvents', repoId: repo.id, arg: opts });
     const r = this.repo(repo.id);
     if (r.fail) throw r.fail;
-    if (opts.page === 1 && opts.etag && opts.etag === this.etag(r)) {
+    const perPage = opts.perPage ?? 30;
+    if (opts.page === 1 && opts.etag && opts.etag === this.etag(r, perPage)) {
       return { events: [], nextPage: null, etag: opts.etag, notModified: true };
     }
     if (opts.page > this.maxPages) throw new GitHubError('pagination is limited for this resource', 422);
-    const perPage = opts.perPage ?? 30;
-    // Like GitHub: ordered by created_at desc, so ids are not monotonic in page order.
-    const newestFirst = [...r.events].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.id - a.id);
+    const newestFirst = this.newestFirst(r);
     const start = (opts.page - 1) * perPage;
     const events = newestFirst.slice(start, start + perPage);
     return {
       events,
       nextPage: start + perPage < newestFirst.length ? opts.page + 1 : null,
-      etag: this.etag(r),
+      etag: this.etag(r, perPage),
       notModified: false,
     };
   }
@@ -268,6 +276,26 @@ describe('pollOnce: subscription start', () => {
     // The checkpoint now exists, so backfill is not repeated.
     expect((await pollOnce(deps)).repos[0]!.jobsEnqueued).toBe(0);
     expect(allJobs(db)).toHaveLength(1);
+    // A later scan's overlap reaches back over the pre-backfill label; it stays excluded.
+    gh.noise(REPO, 2, 1);
+    expect((await pollOnce(deps)).repos[0]!.jobsEnqueued).toBe(0);
+    expect(allJobs(db).map((j) => j.issue_number)).toEqual([2]);
+  });
+
+  it('never dispatches a label applied before the subscription started', async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.label(REPO, 1, READY); // already labeled when the repo is added
+    await init(deps);
+    expect(getCheckpoint(db, REPO)!.startEventId).toBe(gh.repos.get(REPO)!.events.at(-1)!.id);
+    gh.noise(REPO, 1, 1); // one unrelated event; the overlap now covers the old label
+    const s = await pollOnce(deps);
+    expect(s.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 0 });
+    expect(allJobs(db)).toHaveLength(0);
+    // Re-applying the label after the subscription started does dispatch.
+    gh.unlabel(REPO, 1, READY);
+    gh.label(REPO, 1, READY);
+    expect((await pollOnce(deps)).repos[0]!.jobsEnqueued).toBe(1);
   });
 });
 
@@ -648,6 +676,38 @@ describe('pollOnce: errors and paging', () => {
       .slice(1)
       .map((c) => (c.arg as { page: number }).page);
     expect(pages).toEqual([1, 2]);
+  });
+
+  it('keeps scanning after a page-1 304 when the overlap extends past page 1', async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.createIssue(REPO, 2);
+    gh.noise(REPO, 1, 150); // 150s of events: page 1 alone does not reach the 5-minute boundary
+    await init(deps);
+    expect(getCheckpoint(db, REPO)!.page1CoversOverlap).toBe(false);
+    // A delayed label whose created_at sorts onto page 2; page 1 (and its ETag) is unchanged.
+    const events = gh.repos.get(REPO)!.events;
+    const late = gh.labelAt(REPO, 2, READY, Date.parse(events[30]!.createdAt) + 500);
+    const s = await pollOnce(deps);
+    expect(s.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
+    expect(listQueuedJobs(db).map((j) => j.eventId)).toEqual([String(late.id)]);
+    const calls = gh.calls.filter((c) => c.method === 'listIssueEvents').slice(1);
+    expect(calls.map((c) => (c.arg as { page: number }).page)).toEqual([1, 2]);
+    expect(calls[0]!.arg).toMatchObject({ etag: expect.any(String) }); // page 1 was conditional (304)
+  });
+
+  it('ends the cycle on a page-1 304 when page 1 already covers the overlap', async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.noise(REPO, 1, 5);
+    await init(deps);
+    expect(getCheckpoint(db, REPO)!.page1CoversOverlap).toBe(true);
+    await pollOnce(deps);
+    const pages = gh.calls
+      .filter((c) => c.method === 'listIssueEvents')
+      .slice(1)
+      .map((c) => (c.arg as { page: number }).page);
+    expect(pages).toEqual([1]);
   });
 
   it('stops once events are older than the overlap window', async () => {

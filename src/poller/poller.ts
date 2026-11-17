@@ -194,11 +194,15 @@ async function pollRepo(
   if (!cp && !cfg.backfillSince) {
     const page1 = await api.listIssueEvents(repo, { page: 1, perPage: EVENTS_PER_PAGE });
     const newest = maxId(page1.events);
+    const newestAt = maxCreatedAt(page1.events);
     commitPollBatch(db, {
       repoId: repo.id,
       fullName: repo.fullName,
       lastEventId: newest,
-      lastEventCreatedAt: maxCreatedAt(page1.events),
+      lastEventCreatedAt: newestAt,
+      // Everything up to the newest visible event predates the subscription.
+      subscriptionStart: { eventId: newest ?? 0, createdAt: null },
+      page1CoversOverlap: coversOverlap(page1.events, page1.nextPage === null, newestAt),
       etag: page1.etag,
       jobs: [],
       now: deps.now,
@@ -209,13 +213,17 @@ async function pollRepo(
     return base;
   }
 
-  const window = scanWindow(cp, !cp && cfg.backfillSince ? Date.parse(cfg.backfillSince) : null);
+  const firstBackfill = !cp && cfg.backfillSince ? cfg.backfillSince : null;
+  const window = scanWindow(cp, firstBackfill !== null ? Date.parse(firstBackfill) : null);
+  const afterStart = subscriptionFilter(cp);
 
   const byId = new Map<number, GitHubIssueEvent>();
   let page1Etag: string | null = null;
   let page = 1;
   let historyEnd: string | null = null;
   let legacyExtraPage = false;
+  let page1Events: GitHubIssueEvent[] | null = null;
+  let page1IsWholeStream = false;
   for (let fetched = 0; ; fetched++) {
     if (fetched >= MAX_PAGES) {
       historyEnd = `reached GitHub's ${MAX_PAGES}-page limit for issue events`;
@@ -237,8 +245,18 @@ async function pollRepo(
       throw err; // checkpoint stays where it was; the whole range is retried later
     }
     if (page === 1) {
-      if (res.notModified) return base;
+      if (res.notModified) {
+        // Page 1 is unchanged. That only proves nothing in the overlap changed when page 1
+        // already reached past the overlap boundary: a late event that sorts deeper (page 2+)
+        // leaves page 1, and so its ETag, untouched. Otherwise keep scanning from page 2.
+        if (!window.timeBounded || cp?.page1CoversOverlap === true) return base;
+        page1Etag = cp?.etag ?? null;
+        page = 2;
+        continue;
+      }
       page1Etag = res.etag;
+      page1Events = res.events;
+      page1IsWholeStream = res.nextPage === null;
     }
     // Pages shift while new events arrive, so dedupe by id across pages.
     for (const e of res.events) byId.set(e.id, e);
@@ -259,13 +277,19 @@ async function pollRepo(
   }
 
   const all = [...byId.values()];
-  const unseen = all.filter(window.inWindow).sort((a, b) => a.id - b.id);
+  const unseen = all.filter((e) => window.inWindow(e) && afterStart(e)).sort((a, b) => a.id - b.id);
   const jobs = await buildJobs(deps, repo, cfg, unseen, getIssue, log);
   const inserted = commitPollBatch(db, {
     repoId: repo.id,
     fullName: repo.fullName,
     lastEventId: maxId(all),
     lastEventCreatedAt: maxCreatedAt(all),
+    subscriptionStart: { eventId: null, createdAt: firstBackfill },
+    // Page 1 not refetched (304): it is unchanged, so whether it covers the overlap is too.
+    page1CoversOverlap:
+      page1Events === null
+        ? null
+        : coversOverlap(page1Events, page1IsWholeStream, newestCreatedAt(cp?.lastEventCreatedAt ?? null, maxCreatedAt(all))),
     etag: page1Etag,
     jobs,
     now: deps.now,
@@ -288,6 +312,33 @@ interface ScanWindow {
   boundaryKnown: boolean;
   /** Checkpoint predates last_event_created_at: fall back to the id boundary plus one page. */
   legacy: boolean;
+  /** Stop condition is the created_at overlap boundary (the normal steady state). */
+  timeBounded: boolean;
+}
+
+/**
+ * Events that existed before the subscription started are never dispatched, even when a
+ * later scan's overlap window reaches back over them (initialization creates no jobs, so
+ * the jobs unique key cannot suppress them).
+ */
+function subscriptionFilter(cp: Checkpoint | null): (e: GitHubIssueEvent) => boolean {
+  const startId = cp?.startEventId ?? null;
+  const startAt = cp?.startCreatedAt ? Date.parse(cp.startCreatedAt) : null;
+  return (e) => (startId === null || e.id > startId) && (startAt === null || Date.parse(e.createdAt) >= startAt);
+}
+
+/** Does page 1 reach past the overlap boundary that the *next* scan will use? */
+function coversOverlap(page1: GitHubIssueEvent[], wholeStream: boolean, newestAt: string | null): boolean {
+  if (wholeStream) return true;
+  if (newestAt === null) return false;
+  const boundary = Date.parse(newestAt) - OVERLAP_MS;
+  return page1.some((e) => Date.parse(e.createdAt) < boundary);
+}
+
+function newestCreatedAt(a: string | null, b: string | null): string | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Date.parse(b) > Date.parse(a) ? b : a;
 }
 
 /**
@@ -305,6 +356,7 @@ function scanWindow(cp: Checkpoint | null, backfillSince: number | null): ScanWi
       pastBoundary: (e) => t(e) < backfillSince,
       boundaryKnown: true,
       legacy: false,
+      timeBounded: false,
     };
   }
   const watermark = cp?.lastEventId ?? null;
@@ -316,6 +368,7 @@ function scanWindow(cp: Checkpoint | null, backfillSince: number | null): ScanWi
       pastBoundary: (e) => t(e) < boundary,
       boundaryKnown: true,
       legacy: false,
+      timeBounded: true,
     };
   }
   return {
@@ -323,6 +376,7 @@ function scanWindow(cp: Checkpoint | null, backfillSince: number | null): ScanWi
     pastBoundary: (e) => watermark !== null && e.id <= watermark,
     boundaryKnown: watermark !== null,
     legacy: watermark !== null,
+    timeBounded: false,
   };
 }
 

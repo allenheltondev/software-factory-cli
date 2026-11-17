@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const MIGRATIONS: Record<number, string> = {
   1: `
@@ -113,6 +113,15 @@ const MIGRATIONS: Record<number, string> = {
     -- endpoint orders by created_at (not id), so the poller scans back to this time
     -- minus an overlap instead of stopping at the first already-seen id.
     ALTER TABLE repo_checkpoints ADD COLUMN last_event_created_at TEXT;
+  `,
+  3: `
+    -- Where the subscription started. Events at or before it are never dispatched, even
+    -- when a later scan's overlap window reaches back over them.
+    ALTER TABLE repo_checkpoints ADD COLUMN start_event_id INTEGER;
+    ALTER TABLE repo_checkpoints ADD COLUMN start_created_at TEXT;
+    -- 1 when page 1 of the last scan reached past the overlap boundary (or was the whole
+    -- stream). Only then does a page-1 304 prove nothing in the overlap changed.
+    ALTER TABLE repo_checkpoints ADD COLUMN page1_covers_overlap INTEGER;
   `,
 };
 
