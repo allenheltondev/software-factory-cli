@@ -16,7 +16,7 @@ import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_proces
 import { closeSync, openSync } from 'node:fs';
 import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { getAdapter, defaultVerdict, type AgentAdapter, type AgentInvocation } from '../agents/adapters/registry.js';
+import { getAdapter, defaultVerdict, RAW_OUTPUT_BYTES, type AgentAdapter, type AgentInvocation } from '../agents/adapters/registry.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { renderPrompt, type IssueContext } from '../agents/prompt.js';
 import { agentAdapter, DEFAULT_TIMEOUT_MINUTES, type AdapterName, type AgentConfig } from '../config/schema.js';
@@ -32,7 +32,7 @@ import {
   type Executor,
 } from './executor.js';
 import { processStartTime, taskkillPath } from './process.js';
-import { renderSummary, summarizeRun, tailLines } from './run-summary.js';
+import { cleanSummaryLines, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 
 const isWindows = process.platform === 'win32';
 const DEFAULT_KILL_GRACE_MS = 5_000;
@@ -483,7 +483,17 @@ export class LiveExecutor implements Executor {
     await identity; // never record anything for this run after it is finished
 
     // 6. Outcome.
-    const lastOutput = await tailLines(logPath, outputStart);
+    const outputTail = await tailLines(logPath, outputStart);
+    const rawOutput = adapter.interpretExit || adapter.summarizeOutput ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    let lastOutput = outputTail;
+    if (adapter.summarizeOutput) {
+      try {
+        const lines = adapter.summarizeOutput(rawOutput);
+        if (lines?.length) lastOutput = cleanSummaryLines(lines);
+      } catch (err) {
+        ctx.log.warn('adapter could not summarize the agent output; using its last lines', { adapter: adapterName, error: message(err) });
+      }
+    }
     let outcome: RunOutcome;
     let error: string | undefined;
     if (agentRun.stopped === 'timeout') {
@@ -493,8 +503,15 @@ export class LiveExecutor implements Executor {
       outcome = 'interrupted';
       error = 'worker stopped before the run finished; the agent process tree was stopped';
     } else {
-      const exit = { code: agentRun.code, signal: agentRun.signal, outputTail: lastOutput };
-      const verdict = adapter.interpretExit ? adapter.interpretExit(exit) : defaultVerdict(exit);
+      const exit = { code: agentRun.code, signal: agentRun.signal, outputTail, output: rawOutput };
+      let verdict = defaultVerdict(exit);
+      if (adapter.interpretExit) {
+        try {
+          verdict = adapter.interpretExit(exit);
+        } catch (err) {
+          ctx.log.warn('adapter could not interpret the agent exit; judging by exit code', { adapter: adapterName, error: message(err) });
+        }
+      }
       outcome = verdict.outcome;
       error = verdict.error ?? (outcome === 'failed' ? defaultVerdict(exit).error : undefined);
     }

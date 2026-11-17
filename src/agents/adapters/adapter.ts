@@ -48,9 +48,18 @@ export interface AgentExit {
   /** Exit code, or null when a signal ended it. */
   code: number | null;
   signal: NodeJS.Signals | null;
-  /** The last lines of the agent's combined stdout and stderr. */
+  /** The last lines of the agent's combined stdout and stderr, cleaned and capped for display. */
   outputTail: string[];
+  /**
+   * The agent's raw combined stdout and stderr from run.log: all of it, or its last
+   * {@link RAW_OUTPUT_BYTES} bytes starting at a line boundary. For adapters that parse
+   * structured output (lines are not cut or cleaned here).
+   */
+  output: string;
 }
+
+/** How much of the agent's raw output {@link AgentExit.output} and {@link AgentAdapter.summarizeOutput} see. */
+export const RAW_OUTPUT_BYTES = 1024 * 1024;
 
 export interface AgentVerdict {
   outcome: 'succeeded' | 'failed';
@@ -64,6 +73,13 @@ export interface AgentAdapter {
   buildInvocation(req: InvocationRequest): AgentInvocation;
   /** Map the exit to an outcome. Defaults to {@link defaultVerdict}: exit 0 succeeds, anything else fails. */
   interpretExit?(exit: AgentExit): AgentVerdict;
+  /**
+   * Lines for the run summary's "last agent output", read from the agent's raw output (see
+   * {@link AgentExit.output}): typically the agent's final message. Called for every run whose
+   * agent started, including timed-out and interrupted ones. Return null (or nothing) to use the
+   * generic last lines of output. The executor strips control characters and caps the lines.
+   */
+  summarizeOutput?(output: string): string[] | null;
 }
 
 export function defaultVerdict(exit: AgentExit): AgentVerdict {

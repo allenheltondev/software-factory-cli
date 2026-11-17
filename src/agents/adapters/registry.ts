@@ -8,7 +8,7 @@
 import type { AgentAdapter } from './adapter.js';
 
 export type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
-export { defaultVerdict } from './adapter.js';
+export { defaultVerdict, RAW_OUTPUT_BYTES } from './adapter.js';
 
 const BUILT_IN_ADAPTERS: readonly AgentAdapter[] = [];
 

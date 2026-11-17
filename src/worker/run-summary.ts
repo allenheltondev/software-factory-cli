@@ -45,6 +45,52 @@ export async function tailLines(file: string, from = 0, lines = TAIL_LINES): Pro
   }
 }
 
+/**
+ * The raw text of a file from byte `from` on, or only its last `maxBytes` bytes, starting at a
+ * line boundary, when there is more. '' when the file can't be read.
+ */
+export async function readOutput(file: string, from: number, maxBytes: number): Promise<string> {
+  let fh;
+  try {
+    fh = await open(file, 'r');
+  } catch {
+    return '';
+  }
+  try {
+    const size = (await fh.stat()).size;
+    const start = Math.max(from, size - maxBytes);
+    const length = size - start;
+    if (length <= 0) return '';
+    const buf = Buffer.alloc(length);
+    await fh.read(buf, 0, length, start);
+    const text = buf.toString('utf8');
+    if (start === from) return text;
+    const nl = text.indexOf('\n');
+    return nl < 0 ? '' : text.slice(nl + 1);
+  } finally {
+    await fh.close();
+  }
+}
+
+const MAX_ADAPTER_LINES = 60;
+const MAX_ADAPTER_LINE = 1000;
+
+/**
+ * An adapter's summary lines (AgentAdapter.summarizeOutput) made safe to store and print: no
+ * control sequences or blank lines, each line capped, and at most MAX_ADAPTER_LINES lines (the
+ * first ones, plus the last, which adapters use for a one-line status).
+ */
+export function cleanSummaryLines(lines: readonly string[]): string[] {
+  const clean = lines
+    .flatMap((l) => l.split(/\r?\n|\r/))
+    .map((l) => l.replace(ANSI, '').trimEnd())
+    .filter((l) => l.trim() !== '')
+    .map((l) => (l.length > MAX_ADAPTER_LINE ? `${l.slice(0, MAX_ADAPTER_LINE - 1)}…` : l));
+  if (clean.length <= MAX_ADAPTER_LINES) return clean;
+  const head = clean.slice(0, MAX_ADAPTER_LINES - 2);
+  return [...head, `… (${clean.length - head.length - 1} more lines in run.log)`, clean[clean.length - 1]!];
+}
+
 export interface SummaryInput {
   worktree: string;
   branch: string;
