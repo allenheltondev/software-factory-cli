@@ -51,7 +51,7 @@ function setup(repoOver: Record<string, unknown> = {}, over: Partial<FactoryConf
 }
 
 function claim(db: Db, config: FactoryConfig, paths: FactoryPaths): Claim {
-  const c = claimNextJob(db, config, { workerId: 'wrk_test', leaseSeconds: 60, runsDir: paths.runsDir });
+  const c = claimNextJob(db, config, { workerId: 'wrk_test', hostname: 'test-host', leaseSeconds: 60, runsDir: paths.runsDir });
   if (!c) throw new Error('nothing to claim');
   return c;
 }

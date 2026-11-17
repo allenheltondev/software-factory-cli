@@ -66,7 +66,7 @@ describe('factory clean', { timeout: 60_000 }, () => {
     /** Prepare a worktree for a new job, then close its run as `close` says. */
     const run = async (issue: number, close: RunOutcome | 'canceled' | 'open') => {
       insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue });
-      const c = claimNextJob(db, config, { workerId: 'w', leaseSeconds: 60, runsDir: paths.runsDir })!;
+      const c = claimNextJob(db, config, { workerId: 'w', hostname: 'test-host', leaseSeconds: 60, runsDir: paths.runsDir })!;
       const result = await new PrepareOnlyExecutor().execute(c, {
         config,
         paths,
