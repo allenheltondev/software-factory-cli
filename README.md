@@ -211,8 +211,10 @@ claude -p --output-format stream-json --verbose --permission-mode bypassPermissi
 - The run is `succeeded` only when Claude Code exits 0 with a `success` result. An error
   result (`is_error`, such as a sign-in failure), the turn limit (`error_max_turns`), the
   spending limit (`error_max_budget_usd`) or an error during execution fails the run with
-  that reason. The summary shows Claude's final message, then a line with the result, turns,
-  estimated cost, any permission denials and the session id. To look at a run afterwards,
+  that reason, and so does exiting 0 without a result the worker can read. The result line
+  is read in full however long it is (up to 16 MiB). The summary shows Claude's final
+  message, then a line with the result, turns, estimated cost, any permission denials and the
+  session id. To look at a run afterwards,
   run `claude --resume <session id>` in its worktree.
 
 **Default permission profile: full auto.** `--permission-mode bypassPermissions` (the same as
@@ -244,8 +246,8 @@ In a `-p` run anything that would prompt is denied (and listed as a permission d
 summary), so with a narrower profile allow every command the action needs, including
 `git add`/`git commit`. `--max-budget-usd` caps estimated spend the same way. Other flags
 from the [CLI reference](https://code.claude.com/docs/en/cli-reference), such as `--model`,
-pass through unchanged. Don't override `--output-format`: the adapter then can't read the
-result and falls back to the exit code.
+pass through unchanged. Leave `--output-format` alone: `json` also works, but with `text`
+the adapter can't read a result and goes by the exit code alone.
 
 Without `--bare`, Claude Code loads the worktree's `CLAUDE.md`, `.claude/settings.json`
 (including hooks) and `.mcp.json` as it would interactively, and `-p` skips the workspace trust

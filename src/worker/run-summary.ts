@@ -72,6 +72,42 @@ export async function readOutput(file: string, from: number, maxBytes: number): 
   }
 }
 
+const isBlank = (b: number) => b === 0x0a || b === 0x0d || b === 0x20 || b === 0x09;
+
+/**
+ * The last non-blank line of `file` at or after byte `from`, read in full however long it is
+ * (up to `maxBytes`), without its line ending. Null when there is none or it is longer.
+ */
+export async function readLastLine(file: string, from: number, maxBytes: number): Promise<string | null> {
+  let fh;
+  try {
+    fh = await open(file, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    let pos = (await fh.stat()).size;
+    let buf = Buffer.alloc(0);
+    for (;;) {
+      let end = buf.length;
+      while (end > 0 && isBlank(buf[end - 1]!)) end--;
+      buf = buf.subarray(0, end);
+      const nl = buf.lastIndexOf(0x0a);
+      if (nl >= 0) return buf.length - nl - 1 > maxBytes ? null : buf.subarray(nl + 1).toString('utf8');
+      if (buf.length > maxBytes) return null;
+      if (pos <= from) return buf.length ? buf.toString('utf8') : null;
+      // Read backwards, doubling the chunk so a long line costs linear copying.
+      const n = Math.min(Math.max(64 * 1024, buf.length), pos - from);
+      pos -= n;
+      const chunk = Buffer.alloc(n);
+      await fh.read(chunk, 0, n, pos);
+      buf = Buffer.concat([chunk, buf]);
+    }
+  } finally {
+    await fh.close();
+  }
+}
+
 const MAX_ADAPTER_LINES = 60;
 const MAX_ADAPTER_LINE = 1000;
 

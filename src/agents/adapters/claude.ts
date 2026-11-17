@@ -31,7 +31,9 @@
  * "error_max_turns" | "error_during_execution" | "error_max_budget_usd" |
  * "error_max_structured_output_retries" (with `errors: string[]`); both carry `session_id`,
  * `num_turns`, `total_cost_usd`, `permission_denials` and optionally `terminal_reason`.
- * Only those documented fields are read here.
+ * Only those documented fields are read here. With a JSON output format, a run that exits 0
+ * without a readable result fails; with `--output-format text` in the config args, the exit
+ * code decides.
  */
 import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';
@@ -100,6 +102,29 @@ function isResult(ev: Record<string, unknown>): ev is Record<string, unknown> & 
 /** The last `result` message in the output (a run whose background work starts another turn prints one per turn). */
 export function findResult(output: string): ResultMessage | null {
   return scan(output).events.find(isResult) ?? null;
+}
+
+/**
+ * The run's result: the final output line when it is one (read in full by the executor, since a
+ * long final message can exceed the output window), else the last result in the window. A null
+ * `lastLine` means there was no output or the final line was too long to read: no result, so a
+ * failure that line reported can't pass for success.
+ */
+function runResult(output: string, lastLine: string | null): ResultMessage | null {
+  if (lastLine === null) return null;
+  const last = parseLine(lastLine);
+  if (last && isResult(last)) return last;
+  return findResult(output);
+}
+
+/** The `--output-format` in effect: the last one in `args`, else Claude Code's default, text. */
+export function outputFormat(args: readonly string[]): string {
+  let format = 'text';
+  args.forEach((a, i) => {
+    if (a === OUTPUT_FORMAT_FLAG && i + 1 < args.length) format = args[i + 1]!;
+    else if (a.startsWith(`${OUTPUT_FORMAT_FLAG}=`)) format = a.slice(OUTPUT_FORMAT_FLAG.length + 1);
+  });
+  return format;
 }
 
 const firstLine = (s: string | undefined) => (s ?? '').split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? '';
@@ -181,10 +206,18 @@ export const claudeAdapter: AgentAdapter = {
   },
 
   interpretExit(exit: AgentExit): AgentVerdict {
-    const result = findResult(exit.output);
+    const result = runResult(exit.output, exit.lastLine);
     if (!result) {
       const fallback = defaultVerdict(exit);
-      if (fallback.outcome === 'succeeded') return fallback;
+      if (fallback.outcome === 'succeeded') {
+        // Only plain text output (chosen in agents.<name>.args) has no result to read.
+        const format = outputFormat(exit.args);
+        if (format === 'text') return fallback;
+        return {
+          outcome: 'failed',
+          error: `claude exited with code 0, but no result message could be read from its ${format} output (none was printed, or it was too large to read)`,
+        };
+      }
       // Typically a bad flag or a crash before the run started; Claude Code prints those on stderr.
       const said = scan(exit.output).text[0];
       return { outcome: 'failed', error: `${fallback.error} before reporting a result${said ? `: ${clip(said)}` : ''}` };
@@ -205,9 +238,9 @@ export const claudeAdapter: AgentAdapter = {
    * be inspected with `claude --resume <id>` in the worktree). Without a result (timeout, crash),
    * the last thing Claude said and the session id.
    */
-  summarizeOutput(output: string): string[] | null {
+  summarizeOutput(output: string, lastLine: string | null): string[] | null {
     const { events } = scan(output);
-    const result = events.find(isResult);
+    const result = runResult(output, lastLine);
     if (result) {
       const body =
         result.subtype === 'success'

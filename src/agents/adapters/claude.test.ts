@@ -16,12 +16,27 @@ function request(o: Partial<InvocationRequest> = {}): InvocationRequest {
   };
 }
 
-const exit = (output: string, code: number | null = 0, signal: NodeJS.Signals | null = null): AgentExit => ({
+/** What the executor's readLastLine returns for output that fits in the window. */
+const lastLineOf = (output: string) => output.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.trim()).at(-1) ?? null;
+
+/** Args as the adapter builds them by default (stream-json). */
+const STREAM_ARGS = claudeAdapter.buildInvocation(request()).args;
+
+const exit = (
+  output: string,
+  code: number | null = 0,
+  signal: NodeJS.Signals | null = null,
+  o: { args?: readonly string[]; lastLine?: string | null } = {},
+): AgentExit => ({
   code,
   signal,
   output,
   outputTail: output.split('\n').filter(Boolean).slice(-20),
+  lastLine: o.lastLine === undefined ? lastLineOf(output) : o.lastLine,
+  args: o.args ?? STREAM_ARGS,
 });
+
+const summary = (output: string) => claudeAdapter.summarizeOutput!(output, lastLineOf(output));
 
 const FINAL = [
   '## Summary',
@@ -96,7 +111,7 @@ describe('claude adapter: results', () => {
   it('success: exit 0 and a success result; the summary is the final message plus a status line', () => {
     const out = run(assistantText(FINAL), success(FINAL));
     expect(claudeAdapter.interpretExit!(exit(out))).toEqual({ outcome: 'succeeded' });
-    expect(claudeAdapter.summarizeOutput!(out)).toEqual([
+    expect(summary(out)).toEqual([
       ...FINAL.split('\n'),
       `claude: success after 14 turns, $0.42 estimated, session ${SESSION}`,
     ]);
@@ -118,13 +133,13 @@ describe('claude adapter: results', () => {
       outcome: 'failed',
       error: 'claude reported an error (API status 401) (api_error): Invalid API key · Please run /login',
     });
-    expect(claudeAdapter.summarizeOutput!(out)?.at(-1)).toBe(`claude: success (is_error) after 1 turn, $0.42 estimated, session ${SESSION}`);
+    expect(summary(out)?.at(-1)).toBe(`claude: success (is_error) after 1 turn, $0.42 estimated, session ${SESSION}`);
   });
 
   it('error_max_turns fails, and the summary keeps what Claude last said', () => {
     const out = run(assistantText('Still working on the roster tests.'), errorResult('error_max_turns', { terminal_reason: 'max_turns' }));
     expect(claudeAdapter.interpretExit!(exit(out, 1))).toEqual({ outcome: 'failed', error: 'claude stopped at its turn limit (--max-turns) after 30 turns' });
-    expect(claudeAdapter.summarizeOutput!(out)).toEqual([
+    expect(summary(out)).toEqual([
       'Still working on the roster tests.',
       `claude: error_max_turns after 30 turns, $1.25 estimated, session ${SESSION}`,
     ]);
@@ -142,7 +157,7 @@ describe('claude adapter: results', () => {
     const out = run(errorResult('error_during_execution', { errors: ['Tool execution failed\nstack...', 'second'], terminal_reason: 'model_error' }));
     const verdict = claudeAdapter.interpretExit!(exit(out, 1));
     expect(verdict).toEqual({ outcome: 'failed', error: 'claude failed during execution (model_error): Tool execution failed; second' });
-    expect(claudeAdapter.summarizeOutput!(out)).toContain('Tool execution failed');
+    expect(summary(out)).toContain('Tool execution failed');
   });
 
   it('an unknown error subtype still fails', () => {
@@ -160,7 +175,7 @@ describe('claude adapter: results', () => {
 
   it('lists permission denials in the status line', () => {
     const out = run(success('done', { permission_denials: [{ tool_name: 'WebFetch', tool_use_id: 't1', tool_input: {} }, { tool_name: 'WebFetch', tool_use_id: 't2', tool_input: {} }] }));
-    expect(claudeAdapter.summarizeOutput!(out)?.at(-1)).toBe(`claude: success after 14 turns, $0.42 estimated, 2 permission denial(s): WebFetch, session ${SESSION}`);
+    expect(summary(out)?.at(-1)).toBe(`claude: success after 14 turns, $0.42 estimated, 2 permission denial(s): WebFetch, session ${SESSION}`);
   });
 
   it('no result: a bad flag before the run fails with what stderr said', () => {
@@ -169,16 +184,44 @@ describe('claude adapter: results', () => {
       outcome: 'failed',
       error: "agent exited with code 1 before reporting a result: error: unknown option '--frobnicate'",
     });
-    expect(claudeAdapter.summarizeOutput!(out)).toBeNull();
+    expect(summary(out)).toBeNull();
   });
 
-  it('no result: exit 0 falls back to the exit code', () => {
-    expect(claudeAdapter.interpretExit!(exit('plain text output\n', 0))).toEqual({ outcome: 'succeeded' });
+  it('no result: exit 0 succeeds only when text output was chosen in the config args', () => {
+    const text = claudeAdapter.buildInvocation(request({ extraArgs: ['--output-format=text'] })).args;
+    expect(claudeAdapter.interpretExit!(exit('plain text output\n', 0, null, { args: text }))).toEqual({ outcome: 'succeeded' });
+    for (const format of ['stream-json', 'json']) {
+      const args = claudeAdapter.buildInvocation(request({ extraArgs: ['--output-format', format] })).args;
+      expect(claudeAdapter.interpretExit!(exit(stream(init()), 0, null, { args }))).toEqual({
+        outcome: 'failed',
+        error: `claude exited with code 0, but no result message could be read from its ${format} output (none was printed, or it was too large to read)`,
+      });
+    }
+  });
+
+  it('reads a final result line that is larger than the output window', () => {
+    // The executor's raw output window starts after a line boundary, so it misses a long final
+    // line entirely; readLastLine supplies it in full.
+    const huge = 'x'.repeat(2 * 1024 * 1024);
+    const before = run(assistantText('Done, I think.'));
+    const failed = stream(success(huge, { is_error: true, terminal_reason: 'api_error' })).trim();
+    const verdict = claudeAdapter.interpretExit!(exit(before, 0, null, { lastLine: failed }));
+    expect(verdict.outcome).toBe('failed');
+    expect(verdict.error).toMatch(/^claude reported an error \(api_error\): x+…$/);
+    expect(claudeAdapter.summarizeOutput!(before, failed)?.at(-1)).toBe(`claude: success (is_error) after 14 turns, $0.42 estimated, session ${SESSION}`);
+
+    const ok = stream(success(huge)).trim();
+    expect(claudeAdapter.interpretExit!(exit(before, 0, null, { lastLine: ok }))).toEqual({ outcome: 'succeeded' });
+  });
+
+  it('a final line too large to read is no result, even with an earlier success in the window', () => {
+    const out = run(success('first turn'));
+    expect(claudeAdapter.interpretExit!(exit(out, 0, null, { lastLine: null }))).toMatchObject({ outcome: 'failed' });
   });
 
   it('no result (timed out): the summary is the last main-conversation message and the session', () => {
     const out = run(assistantText('Running the full test suite now.'), assistantText('subagent chatter', 'toolu_9'), assistantToolUse('toolu_2', 'npm test'));
-    expect(claudeAdapter.summarizeOutput!(out)).toEqual(['Running the full test suite now.', `claude: no result message, session ${SESSION}`]);
+    expect(summary(out)).toEqual(['Running the full test suite now.', `claude: no result message, session ${SESSION}`]);
   });
 
   it('tolerates junk and partial lines around the JSON', () => {

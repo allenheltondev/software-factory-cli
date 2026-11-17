@@ -53,13 +53,24 @@ export interface AgentExit {
   /**
    * The agent's raw combined stdout and stderr from run.log: all of it, or its last
    * {@link RAW_OUTPUT_BYTES} bytes starting at a line boundary. For adapters that parse
-   * structured output (lines are not cut or cleaned here).
+   * structured output (lines are not cut or cleaned here). A line longer than that window is
+   * missing from it; see {@link lastLine}.
    */
   output: string;
+  /**
+   * The last non-blank line of the agent's output, complete even when it is larger than
+   * {@link output}'s window (up to {@link LAST_LINE_BYTES}), for CLIs that end with a structured
+   * result. Null when there is no output, or the line is longer than that.
+   */
+  lastLine: string | null;
+  /** The arguments the agent ran with (InvocationResult.args), so an adapter knows which output mode was in effect. */
+  args: readonly string[];
 }
 
 /** How much of the agent's raw output {@link AgentExit.output} and {@link AgentAdapter.summarizeOutput} see. */
 export const RAW_OUTPUT_BYTES = 1024 * 1024;
+/** The longest {@link AgentExit.lastLine} the executor reads. */
+export const LAST_LINE_BYTES = 16 * 1024 * 1024;
 
 export interface AgentVerdict {
   outcome: 'succeeded' | 'failed';
@@ -78,8 +89,9 @@ export interface AgentAdapter {
    * {@link AgentExit.output}): typically the agent's final message. Called for every run whose
    * agent started, including timed-out and interrupted ones. Return null (or nothing) to use the
    * generic last lines of output. The executor strips control characters and caps the lines.
+   * `lastLine` is {@link AgentExit.lastLine}.
    */
-  summarizeOutput?(output: string): string[] | null;
+  summarizeOutput?(output: string, lastLine: string | null): string[] | null;
 }
 
 export function defaultVerdict(exit: AgentExit): AgentVerdict {

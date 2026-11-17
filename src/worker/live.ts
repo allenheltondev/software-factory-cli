@@ -16,7 +16,14 @@ import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_proces
 import { closeSync, openSync } from 'node:fs';
 import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { getAdapter, defaultVerdict, RAW_OUTPUT_BYTES, type AgentAdapter, type AgentInvocation } from '../agents/adapters/registry.js';
+import {
+  getAdapter,
+  defaultVerdict,
+  LAST_LINE_BYTES,
+  RAW_OUTPUT_BYTES,
+  type AgentAdapter,
+  type AgentInvocation,
+} from '../agents/adapters/registry.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { renderPrompt, type IssueContext } from '../agents/prompt.js';
 import { agentAdapter, DEFAULT_TIMEOUT_MINUTES, type AdapterName, type AgentConfig } from '../config/schema.js';
@@ -32,7 +39,7 @@ import {
   type Executor,
 } from './executor.js';
 import { processStartTime, taskkillPath } from './process.js';
-import { cleanSummaryLines, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
+import { cleanSummaryLines, readLastLine, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 
 const isWindows = process.platform === 'win32';
 const DEFAULT_KILL_GRACE_MS = 5_000;
@@ -508,11 +515,14 @@ export class LiveExecutor implements Executor {
 
     // 6. Outcome.
     const outputTail = await tailLines(logPath, outputStart);
-    const rawOutput = adapter.interpretExit || adapter.summarizeOutput ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    const wantsRaw = Boolean(adapter.interpretExit || adapter.summarizeOutput);
+    const rawOutput = wantsRaw ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    // Read on its own: a structured result can be longer than rawOutput's window.
+    const lastLine = wantsRaw ? await readLastLine(logPath, outputStart, LAST_LINE_BYTES) : null;
     let lastOutput = outputTail;
     if (adapter.summarizeOutput) {
       try {
-        const lines = adapter.summarizeOutput(rawOutput);
+        const lines = adapter.summarizeOutput(rawOutput, lastLine);
         if (lines?.length) lastOutput = cleanSummaryLines(lines);
       } catch (err) {
         ctx.log.warn('adapter could not summarize the agent output; using its last lines', { adapter: adapterName, error: message(err) });
@@ -527,7 +537,7 @@ export class LiveExecutor implements Executor {
       outcome = 'interrupted';
       error = 'worker stopped before the run finished; the agent process tree was stopped';
     } else {
-      const exit = { code: agentRun.code, signal: agentRun.signal, outputTail, output: rawOutput };
+      const exit = { code: agentRun.code, signal: agentRun.signal, outputTail, output: rawOutput, lastLine, args: invocation.args };
       let verdict = defaultVerdict(exit);
       if (adapter.interpretExit) {
         try {

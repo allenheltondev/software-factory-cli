@@ -482,6 +482,19 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
     expect(log).toContain('outcome: succeeded');
   });
 
+  it('an error result larger than the raw output window still fails the run', async () => {
+    const huge = `Invalid API key · Please run /login ${'x'.repeat(2 * 1024 * 1024)}`;
+    const { paths, config, db } = claudeSetup([init(), success(huge, { is_error: true, terminal_reason: 'api_error' })], {});
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 9 });
+    const c = claim(db, config, paths);
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await executor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result.outcome).toBe('failed');
+    expect(result.error).toMatch(/^claude reported an error \(api_error\): Invalid API key · Please run \/login x+…$/);
+    expect(result.summary?.lastOutput.at(-1)).toBe(`claude: success (is_error) after 14 turns, $0.42 estimated, session ${SESSION}`);
+  });
+
   it('a run that hits --max-turns fails with that reason and keeps its worktree', async () => {
     const { paths, config, db } = claudeSetup(
       [init(), assistantText('Half the roster is done; tests still failing.'), errorResult('error_max_turns', { terminal_reason: 'max_turns' })],
