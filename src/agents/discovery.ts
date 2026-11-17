@@ -47,6 +47,12 @@ export interface DiscoveryProbes {
   /** glibc runtime version on Linux ("2.35"); null for musl or other OSes. */
   glibcVersion: string | null;
   env: NodeJS.ProcessEnv;
+  /**
+   * The directory lookups run from (the process's working directory). A relative PATH entry such
+   * as `./bin` resolves against it, and every path discovery returns is made absolute with it,
+   * because live execution spawns the CLI from the job worktree, not from here.
+   */
+  cwd?: string;
   homedir: string;
   /** The Node binary running factory, used when a shim says plain `node` and none is on PATH. */
   execPath: string;
@@ -337,16 +343,28 @@ export function commonInstallDirs(probes: Pick<DiscoveryProbes, 'platform' | 'en
   return [...new Set(dirs)];
 }
 
+/**
+ * `which`, with the result made absolute against the directory the lookup ran from. A relative
+ * PATH entry (`./bin`) or command (`bin/codex`) yields a relative path, which would point
+ * somewhere else once the CLI is spawned with the job worktree as its working directory.
+ */
+function findExecutable(command: string, probes: DiscoveryProbes, opts: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform } = {}): string | null {
+  const platform = opts.platform ?? probes.platform;
+  const found = which(command, { env: opts.env ?? probes.env, platform, isExecutable: probes.isExecutable });
+  if (!found) return null;
+  const p = pathFor(platform);
+  return p.isAbsolute(found) ? found : p.resolve(probes.cwd ?? process.cwd(), found);
+}
+
 function locate(spec: AgentSpec, probes: DiscoveryProbes): { path: string | null; onPath: boolean } {
   const { platform, env } = probes;
-  const opts = { platform, isExecutable: probes.isExecutable };
-  const onPath = which(spec.command, { ...opts, env });
+  const onPath = findExecutable(spec.command, probes);
   if (onPath) return { path: onPath, onPath: true };
   const p = pathFor(platform);
   const dirs = [...commonInstallDirs(probes), ...(spec.extraDirs?.(probes.homedir, p) ?? [])];
   const pathext = getEnv(env, 'PATHEXT', platform);
   const offEnv: NodeJS.ProcessEnv = { PATH: dirs.join(p.delimiter), ...(pathext ? { PATHEXT: pathext } : {}) };
-  return { path: which(spec.command, { ...opts, env: offEnv }), onPath: false };
+  return { path: findExecutable(spec.command, probes, { env: offEnv }), onPath: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +439,7 @@ export function resolveLaunch(found: string, probes: DiscoveryProbes): { launch:
     let file: string | null = null;
     if (win32.isAbsolute(interp)) file = probes.isExecutable(interp) ? interp : null;
     else {
-      file = which(interp, { env: probes.env, platform: 'win32', isExecutable: probes.isExecutable });
+      file = findExecutable(interp, probes, { platform: 'win32' });
       if (!file && /^node(\.exe)?$/i.test(interp)) file = probes.execPath;
     }
     if (file) return { launch: { file, args: [shim.script] } };
@@ -448,7 +466,7 @@ function findConfigured(command: string, baseDir: string | undefined, probes: Di
   const p = pathFor(probes.platform);
   const hasSep = probes.platform === 'win32' ? /[\\/]/.test(command) : command.includes('/');
   const target = hasSep && !p.isAbsolute(command) && baseDir ? p.resolve(baseDir, command) : command;
-  const path = which(target, { env: probes.env, platform: probes.platform, isExecutable: probes.isExecutable });
+  const path = findExecutable(target, probes);
   return { target, path, problem: `configured command ${target} was not found${hasSep ? '' : ' on PATH'} or is not executable` };
 }
 
@@ -792,6 +810,7 @@ export function defaultDiscoveryProbes(env: NodeJS.ProcessEnv = process.env): Di
     osRelease: release(),
     glibcVersion: glibcRuntime(),
     env,
+    cwd: process.cwd(),
     homedir: homedir(),
     execPath: process.execPath,
     isExecutable: (p) => {
