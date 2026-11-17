@@ -77,6 +77,16 @@ describe('commander wiring', () => {
     expect(codes).toEqual([0, 1, 0, 0, 0]);
   });
 
+  it('parses clean with and without --dry-run', async () => {
+    const clean = vi.fn(async (_ctx: unknown, _o: { dryRun?: boolean }) => 0);
+    const { parse, codes } = setup({ clean });
+    await parse('clean', '--dry-run');
+    await parse('clean');
+    expect(clean.mock.calls[0]?.[1]).toEqual({ dryRun: true });
+    expect(clean.mock.calls[1]?.[1]).not.toHaveProperty('dryRun', true);
+    expect(codes).toEqual([0, 0]);
+  });
+
   it('rejects a missing argument and prints the version', async () => {
     const { parse } = setup();
     await expect(parse('add')).rejects.toMatchObject({ code: 'commander.missingArgument' });

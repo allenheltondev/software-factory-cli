@@ -67,7 +67,11 @@ export const repositorySchema = z.strictObject({
   id: z.number().int().positive(),
   /** Base branch for per-job worktrees; defaults to the repo's default branch at run time. */
   baseBranch: z.string().min(1).optional(),
-  /** Local clone used as the worktree source (needed once live execution is enabled). */
+  /**
+   * Local clone used as the source for per-job branches and worktrees, relative to the
+   * config file's directory. Required in prepare-only mode for workflows whose action
+   * has output local-branch.
+   */
   checkoutPath: z.string().min(1).optional(),
   /**
    * New subscriptions start at the current event stream position. Set an ISO timestamp
@@ -84,8 +88,11 @@ export const configSchema = z.strictObject({
   maxConcurrent: z.number().int().min(1).max(64).default(2),
   execution: z
     .strictObject({
-      /** Only log-only is implemented in this release. */
-      mode: z.enum(['log-only']).default('log-only'),
+      /**
+       * log-only: record each run in run.log; no checkout, no agent.
+       * prepare-only: also create the job's branch and worktree; still no agent.
+       */
+      mode: z.enum(['log-only', 'prepare-only']).default('log-only'),
     })
     .default({ mode: 'log-only' }),
   dispatch: z
@@ -115,6 +122,13 @@ export function workflowId(wf: Pick<WorkflowConfig, 'id' | 'action' | 'trigger'>
 
 export function agentAdapter(agentName: string, agent: AgentConfig): string {
   return agent.adapter ?? agentName;
+}
+
+/** True if any of the repo's workflows runs an action whose output is a local branch (needs a checkout). */
+export function repoNeedsCheckout(config: Pick<FactoryConfig, 'actions'>, repo: Pick<RepositoryConfig, 'workflows'>): boolean {
+  return repo.workflows.some(
+    (wf) => Object.hasOwn(config.actions, wf.action) && config.actions[wf.action]!.output === 'local-branch',
+  );
 }
 
 export function allowedActorsFor(config: FactoryConfig, wf: WorkflowConfig): string[] {

@@ -8,8 +8,9 @@ sign-in, and keeps its queue in a local SQLite database.
 
 Pilot. This release covers repository discovery, config validation, issue-event polling, a
 durable queue and a **log-only** worker: jobs are claimed, routed to a pool and agent, and
-recorded, but no agent is started and no code is changed. Worktrees, agent execution and PR
-creation come next. See [docs/design.md](docs/design.md).
+recorded, but no agent is started and no code is changed. The opt-in **prepare-only** mode
+also creates a branch and Git worktree per job (still without an agent). Agent execution and
+PR creation come next. See [docs/design.md](docs/design.md).
 
 ## Install
 
@@ -48,6 +49,7 @@ the per-user default.
 | `factory status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
 | `factory doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access, labels and agent commands in the current environment |
 | `factory retry JOB_ID` | Requeue a failed, interrupted or canceled job |
+| `factory clean [--dry-run]` | Remove job worktrees of succeeded or canceled runs. Keeps failed and interrupted runs' worktrees, and all branches. See [Per-job worktrees](#per-job-worktrees) |
 
 ## Configuration
 
@@ -90,7 +92,7 @@ repositories:
 | `version` | required | Config schema version; must be `1` |
 | `pollIntervalSeconds` | `60` | GitHub poll interval, 10-3600 |
 | `maxConcurrent` | `2` | Global cap on simultaneous runs, 1-64 |
-| `execution.mode` | `log-only` | Only `log-only` is available in this release |
+| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either |
 | `dispatch.allowedActors` | `[]` | GitHub logins allowed to dispatch work by applying a trigger label. Empty means nobody |
 | `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
@@ -100,8 +102,8 @@ repositories:
 | `actions.<name>.prompt` | none | Prompt file, relative to the config file's directory |
 | `actions.<name>.output` | `local-branch` | `local-branch` or `log` |
 | `repositories.<OWNER/REPO>.id` | required | Stable GitHub repository ID (filled in by `configure` / `add`) |
-| `repositories.<OWNER/REPO>.baseBranch` | repo default branch | Base for per-job worktrees |
-| `repositories.<OWNER/REPO>.checkoutPath` | none | Local clone used as the worktree source (needed once execution is enabled) |
+| `repositories.<OWNER/REPO>.baseBranch` | remote's default branch | Branch that per-job branches start from (fetched first) |
+| `repositories.<OWNER/REPO>.checkoutPath` | none | Local clone of the repo that per-job worktrees are created from, relative to the config file's directory. Required in `prepare-only` mode when a workflow's action has `output: local-branch` |
 | `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
@@ -112,12 +114,34 @@ repositories:
 Names of agents, pools, actions and workflow IDs use letters, digits, `.`, `_` and `-`.
 Config changes take effect when the worker restarts.
 
+## Per-job worktrees
+
+In `prepare-only` mode, each job whose action has `output: local-branch` gets:
+
+- a fetch of the base branch (`baseBranch`, else the remote's default branch) from the
+  remote of `checkoutPath` that points at the repo (`origin` if several do);
+- a new branch `factory/issue-<n>-<jobId>` at the fetched commit. A retried job's later
+  attempts add `-<attempt>`. An existing branch is never reused; the run fails instead;
+- a worktree at `<state dir>/worktrees/<repoId>/<jobId>[-<attempt>]`, recorded as the run's
+  checkout, and `run.log` describing it.
+
+Your clone's own checkout is not touched. Git operations on one clone are serialized, so
+concurrent jobs in one repo do not race. `factory doctor` checks that each `checkoutPath`
+exists, is a Git repository and has a remote for the configured repo; its repository check
+confirms the repo ID behind that name.
+
+Worktrees of failed and interrupted runs are kept for inspection. `factory clean` removes
+worktrees of succeeded runs, runs closed before they started (canceled), and runs whose agent
+never started. It only touches worktrees under `<state dir>/worktrees`, skips any with
+uncommitted changes, and keeps every branch, since the branch is the job's output. Delete
+branches with `git branch -D` when you no longer need them.
+
 ## Files and locations
 
 | | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | Config | `%APPDATA%\software-factory\config.yaml` | `~/Library/Application Support/software-factory/config.yaml` | `$XDG_CONFIG_HOME/software-factory/config.yaml` (default `~/.config`) |
-| State (`state.db`) | `%LOCALAPPDATA%\software-factory\` | `~/Library/Application Support/software-factory/` | `$XDG_STATE_HOME/software-factory/` (default `~/.local/state`) |
+| State (`state.db`, `worktrees/`) | `%LOCALAPPDATA%\software-factory\` | `~/Library/Application Support/software-factory/` | `$XDG_STATE_HOME/software-factory/` (default `~/.local/state`) |
 | Logs (`factory.log`, `runs/`) | `%LOCALAPPDATA%\software-factory\logs\` | `~/Library/Logs/software-factory/` | `$XDG_STATE_HOME/software-factory/logs/` |
 
 Overrides:
@@ -154,8 +178,10 @@ environment before relying on it. Details, log locations and troubleshooting:
   receive them through stdin or a prompt file, not shell command strings, and the default
   prompt ([examples/prompts/implement-issue.md](examples/prompts/implement-issue.md)) tells
   agents not to follow instructions in them.
-- Agents are disabled in this release (`execution.mode: log-only`): nothing runs repository
-  code, writes to a checkout or pushes to GitHub. The worker only reads from GitHub.
+- Agents are disabled in this release: nothing runs repository code or pushes to GitHub, and
+  the worker only reads from GitHub. In `prepare-only` mode the worker fetches into your
+  clone and creates branches and worktrees; Git hooks configured for the clone (such as
+  `post-checkout`) run as they would for any `git worktree add`.
 - GitHub access uses `GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`. The CLI
   does not store tokens.
 

@@ -1,5 +1,6 @@
 import { Command, Option } from 'commander';
 import { addCommand, type AddOptions } from './add.js';
+import { cleanCommand } from './clean.js';
 import { configureCommand } from './configure.js';
 import { createDefaultContext, println, type CommandContext, type GlobalOptions } from './context.js';
 import { doctorCommand } from './doctor.js';
@@ -17,6 +18,7 @@ export interface Handlers {
   status(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   doctor(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   retry(ctx: CommandContext, jobId: string): Promise<number>;
+  clean(ctx: CommandContext, opts: { dryRun?: boolean }): Promise<number>;
 }
 
 export const defaultHandlers: Handlers = {
@@ -27,6 +29,7 @@ export const defaultHandlers: Handlers = {
   status: statusCommand,
   doctor: (ctx, opts) => doctorCommand(ctx, opts),
   retry: (ctx, jobId) => retryCommand(ctx, jobId),
+  clean: (ctx, opts) => cleanCommand(ctx, opts),
 };
 
 export interface ProgramOptions {
@@ -108,6 +111,12 @@ export function buildProgram(opts: ProgramOptions): Command {
     .description('Requeue a failed, interrupted or canceled job')
     .argument('<jobId>', 'job id (see "factory status")')
     .action((jobId: string) => exec((ctx) => handlers.retry(ctx, jobId)));
+
+  program
+    .command('clean')
+    .description('Remove worktrees of succeeded or canceled runs; keeps failed/interrupted ones and all branches')
+    .option('--dry-run', 'list what would be removed without removing anything')
+    .action((o: { dryRun?: boolean }) => exec((ctx) => handlers.clean(ctx, o)));
 
   return program;
 }

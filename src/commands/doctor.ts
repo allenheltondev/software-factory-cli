@@ -8,6 +8,7 @@ import type { FactoryPaths } from '../paths.js';
 import { labelEquals } from '../routing.js';
 import { pathEntries, which } from '../util/which.js';
 import { println, type CommandContext } from './context.js';
+import { checkRepoCheckouts } from './doctor-checkout.js';
 import { EXIT, describeGitHubError } from './errors.js';
 import { checkConfig } from './validate.js';
 
@@ -196,6 +197,9 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
       }
     }
   }
+
+  // Local clones that per-job worktrees are created from.
+  if (config) checks.push(...(await checkRepoCheckouts(config, paths, probes)));
 
   // Agents: warnings while execution is log-only.
   if (config) {

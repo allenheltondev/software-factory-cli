@@ -5,7 +5,9 @@ pollIntervalSeconds: 60
 maxConcurrent: 2
 
 execution:
-  mode: log-only # live agent execution is not available yet
+  # log-only: record each run in run.log. prepare-only: also create a branch and
+  # worktree per job (needs checkoutPath). Live agent execution is not available yet.
+  mode: log-only
 
 dispatch:
   allowedActors: [allenheltondev]
@@ -33,6 +35,9 @@ actions:
 repositories:
   allenheltondev/kids-and-dragons:
     id: 1 # replaced with the real GitHub repository ID by `factory add` / `configure`
+    # Local clone that per-job worktrees branch from (relative to this file); required in prepare-only mode.
+    # checkoutPath: ../clones/kids-and-dragons
+    # baseBranch: main # defaults to the remote's default branch
     workflows:
       - id: implement
         trigger:
