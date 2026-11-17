@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../config/io.js';
+import { syncPublishSettings } from '../db/publish-settings.js';
 import { resolveGitHubToken } from '../github/client.js';
 import { publishRun, type PublishDeps } from '../publish/publish.js';
 import { createLogger } from '../util/log.js';
@@ -26,6 +27,7 @@ export async function publishCommand(ctx: CommandContext, runId: string, deps: P
   const { config } = loadConfig(ctx.paths.configFile);
   const db = ctx.openDb(ctx.paths.dbFile);
   try {
+    syncPublishSettings(db, config, ctx.now);
     const log = createLogger({ stream: null });
     const api = await ctx.createApi({ log });
     const r = await publishRun(

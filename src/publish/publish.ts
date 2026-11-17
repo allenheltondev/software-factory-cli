@@ -31,6 +31,7 @@ import {
   PublicationSupersededError,
   recordPublicationProgress,
 } from '../db/publications.js';
+import { listUnpublishedSinceEnabled } from '../db/publish-settings.js';
 import { recordError, type Db } from '../db/database.js';
 import { publishMode, type FactoryConfig } from '../config/schema.js';
 import {
@@ -62,6 +63,8 @@ export const PUBLISH_LEASE_SECONDS = 10 * 60;
 export const PUBLISH_ATTEMPT_SECONDS = 8 * 60;
 /** Attempts (first try included) before the worker stops retrying a transient failure on its own. */
 export const MAX_AUTO_ATTEMPTS = 5;
+/** Runs the startup sweep publishes at most, oldest first; the rest wait for the next start or `factory publish`. */
+export const STARTUP_SWEEP_LIMIT = 10;
 const BASE_BACKOFF_SECONDS = 60;
 const MAX_BACKOFF_SECONDS = 60 * 60;
 const NETWORK_TIMEOUT_MS = 5 * 60_000;
@@ -371,14 +374,19 @@ function eligibility(deps: PublishDeps, runId: string): { ok: true; e: Eligible 
  * Publish one run, or resume its publication. Never throws for publication problems: the result
  * (and the publications table) says what happened. A run that is not eligible is left untouched.
  */
-export async function publishRun(deps: PublishDeps, runId: string, opts: { signal?: AbortSignal } = {}): Promise<PublishResult> {
+export async function publishRun(
+  deps: PublishDeps,
+  runId: string,
+  /** `source` names what started this publication (e.g. "startup sweep") in the logs and run.log. */
+  opts: { signal?: AbortSignal; source?: string } = {},
+): Promise<PublishResult> {
   const now = deps.now ?? Date.now;
   const check = eligibility(deps, runId);
   if (!check.ok) return { status: 'not-eligible', reason: check.reason };
   const { run, job, repoFullName, repo, mode, checkoutPath } = check.e;
   const repoRef = { id: job.repoId, fullName: repoFullName };
   const branch = run.summary.branch;
-  const log = deps.log.child({ runId, repo: repoFullName, issue: job.issueNumber });
+  const log = deps.log.child({ runId, repo: repoFullName, issue: job.issueNumber, ...(opts.source ? { source: opts.source } : {}) });
 
   const begun = beginPublication(deps.db, {
     runId,
@@ -422,7 +430,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
     pub = getPublication(deps.db, runId)!;
   };
 
-  await runLog([`attempt ${pub.attempts} (${mode}) at ${new Date(now()).toISOString()}`]);
+  await runLog([`attempt ${pub.attempts} (${mode}${opts.source ? `, ${opts.source}` : ''}) at ${new Date(now()).toISOString()}`]);
   const hooksDir = mkdtempSync(join(tmpdir(), 'factory-publish-nohooks-'));
   try {
     const run1 = deps.runGit ?? defaultRunGit;
@@ -658,19 +666,30 @@ export interface Publisher {
   afterRun(runId: string, signal?: AbortSignal): Promise<void>;
   /** Retry transient failures whose time has come, and publications a stopped worker left. Never throws. */
   retryDue(signal?: AbortSignal): Promise<void>;
+  /**
+   * At worker start: publish succeeded runs that have no publication record at all (the worker
+   * stopped between recording the run and publishing it), but only runs that ended at or after
+   * publish was turned on for their repository (publish_settings.enabled_at; call
+   * syncPublishSettings first). At most STARTUP_SWEEP_LIMIT, oldest first. Never throws.
+   */
+  sweepUnpublished(signal?: AbortSignal, opts?: { limit?: number }): Promise<void>;
 }
 
 export function createPublisher(deps: PublishDeps): Publisher {
-  const run = async (runId: string, signal?: AbortSignal) => {
+  const run = async (runId: string, signal?: AbortSignal, source?: string) => {
     try {
-      const r = await publishRun(deps, runId, { signal });
+      const r = await publishRun(deps, runId, { signal, ...(source ? { source } : {}) });
       if (r.status === 'not-eligible') deps.log.debug('run not published', { runId, reason: r.reason });
+      return r;
     } catch (err) {
       deps.log.error('publication crashed', { runId, error: message(err) });
+      return null;
     }
   };
   return {
-    afterRun: run,
+    async afterRun(runId, signal) {
+      await run(runId, signal);
+    },
     async retryDue(signal) {
       let due: string[];
       try {
@@ -682,6 +701,53 @@ export function createPublisher(deps: PublishDeps): Publisher {
       for (const runId of due) {
         if (signal?.aborted) return;
         await run(runId, signal);
+      }
+    },
+    async sweepUnpublished(signal, opts = {}) {
+      const source = 'startup sweep';
+      const limit = opts.limit ?? STARTUP_SWEEP_LIMIT;
+      let candidates: string[];
+      try {
+        candidates = listUnpublishedSinceEnabled(deps.db);
+      } catch (err) {
+        deps.log.error('startup sweep: could not list unpublished runs', { error: message(err) });
+        return;
+      }
+      let attempted = 0;
+      for (const [i, runId] of candidates.entries()) {
+        if (signal?.aborted) return;
+        if (attempted >= limit) {
+          deps.log.info('startup sweep: limit reached; the rest wait for the next start or "factory publish RUN_ID"', {
+            limit,
+            unchecked: candidates.length - i,
+          });
+          return;
+        }
+        // The same rules as every other publication; the query above only narrows by time.
+        let check: ReturnType<typeof eligibility>;
+        try {
+          check = eligibility(deps, runId);
+        } catch (err) {
+          deps.log.error('startup sweep: could not check run', { runId, error: message(err) });
+          continue;
+        }
+        if (!check.ok) {
+          deps.log.debug('startup sweep: run not published', { runId, reason: check.reason });
+          continue;
+        }
+        if (check.e.run.summary.commitCount === 0) {
+          deps.log.debug('startup sweep: run not published', { runId, reason: 'the run left no commits' });
+          continue;
+        }
+        attempted++;
+        deps.log.info('startup sweep: publishing a succeeded run that has no publication record', {
+          runId,
+          repo: check.e.repoFullName,
+          issue: check.e.job.issueNumber,
+          endedAt: check.e.run.endedAt,
+        });
+        const r = await run(runId, signal, source);
+        if (r) deps.log.info('startup sweep: done', { runId, status: r.status });
       }
     },
   };

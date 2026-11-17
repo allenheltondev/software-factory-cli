@@ -16,6 +16,7 @@ import {
   WorkerLockLostError,
   type Claim,
 } from '../db/queue.js';
+import { syncPublishSettings } from '../db/publish-settings.js';
 import type { FactoryPaths } from '../paths.js';
 import type { Publisher } from '../publish/publish.js';
 import type { IssueSnapshot, Job } from '../types.js';
@@ -68,8 +69,9 @@ export interface DaemonDeps {
   /** Process liveness/termination; injectable for tests. */
   processControl?: ProcessControl;
   /**
-   * Publication (repositories.<repo>.publish): called after a succeeded run is recorded, and after
-   * each poll to retry transient failures. Never changes a run's outcome. Absent: nothing is published.
+   * Publication (repositories.<repo>.publish): called after a succeeded run is recorded, after
+   * each poll to retry transient failures, and once at start (after reconcile) for succeeded runs
+   * left without a publication record. Never changes a run's outcome. Absent: nothing is published.
    */
   publisher?: Publisher;
   /** Identity overrides, mainly for tests. */
@@ -342,6 +344,19 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const heartbeatTimer = setInterval(heartbeat, heartbeatMs);
   try {
     await reconcileInterruptedRuns(db, { hostname, processControl, log, now });
+
+    // Record when publish was turned on or off per repository (the config has no history), then
+    // publish succeeded runs a previous worker stopped before publishing, if they ended since.
+    let settingsSynced = false;
+    try {
+      for (const c of syncPublishSettings(db, config, now)) {
+        log.info('publish setting changed', { repo: c.repoFullName, from: c.from, to: c.to, enabledAt: c.enabledAt });
+      }
+      settingsSynced = true;
+    } catch (err) {
+      log.error('could not record publish settings; skipping the startup publication sweep', { error: message(err) });
+    }
+    if (settingsSynced && deps.publisher && !signal.aborted && !lockLost) await deps.publisher.sweepUnpublished(signal);
 
     let nextPollAt = now();
     while (!signal.aborted && !lockLost) {

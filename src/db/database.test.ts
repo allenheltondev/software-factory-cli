@@ -125,9 +125,18 @@ describe('migration v6', () => {
       `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at, ended_at, outcome)
        VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'wrk_1', 't', 't', 't', 'succeeded')`,
     ).run();
-    migrate(db);
+    migrate(db, 6);
     expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 6 });
     expect(db.prepare('SELECT count(*) AS n FROM publications').get()).toEqual({ n: 0 });
     expect(db.prepare('SELECT outcome FROM runs').get()).toEqual({ outcome: 'succeeded' });
+  });
+});
+
+describe('migration v7', () => {
+  it('adds an empty publish_settings table, so publish counts as turned on at the next start', () => {
+    const db = openDatabase(':memory:', { migrateTo: 6 });
+    migrate(db, 7);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 7 });
+    expect(db.prepare('SELECT count(*) AS n FROM publish_settings').get()).toEqual({ n: 0 });
   });
 });
