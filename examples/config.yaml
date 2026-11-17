@@ -6,7 +6,8 @@ maxConcurrent: 2
 
 execution:
   # log-only: record each run in run.log. prepare-only: also create a branch and
-  # worktree per job (needs checkoutPath). Live agent execution is not available yet.
+  # worktree per job (needs checkoutPath). live: also run the agent in the worktree;
+  # no agent adapter ships in this release yet, so live mode does not validate.
   mode: log-only
 
 dispatch:
@@ -17,6 +18,11 @@ agents:
     maxConcurrent: 1
   claude:
     maxConcurrent: 1
+    # Live mode only: the CLI to run instead of the one found on PATH, extra arguments,
+    # and environment variables for the agent process.
+    # command: /usr/local/bin/claude
+    # args: [--model, sonnet]
+    # env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000" }
   kiro:
     maxConcurrent: 1
 
@@ -31,11 +37,12 @@ actions:
   implement-issue:
     prompt: ./prompts/implement-issue.md
     output: local-branch
+    # timeoutMinutes: 60 # live mode: stop the agent and fail the run after this long
 
 repositories:
   allenheltondev/kids-and-dragons:
     id: 1 # replaced with the real GitHub repository ID by `factory add` / `configure`
-    # Local clone that per-job worktrees branch from (relative to this file); required in prepare-only mode.
+    # Local clone that per-job worktrees branch from (relative to this file); required in prepare-only and live mode.
     # checkoutPath: ../clones/kids-and-dragons
     # baseBranch: main # defaults to the remote's default branch
     # remote: origin # only needed when the GitHub remote uses an SSH host alias (git@github-work:OWNER/REPO)

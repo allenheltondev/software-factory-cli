@@ -2,9 +2,20 @@ import { z } from 'zod';
 
 export const CONFIG_VERSION = 1;
 
-/** Agent adapters the CLI knows about. Execution for these is not implemented yet (log-only mode). */
+/**
+ * Agent adapters the CLI knows about. Whether an adapter can run agents in live mode is a separate
+ * question: see src/agents/adapters/registry.ts (no production adapter is implemented yet).
+ */
 export const KNOWN_ADAPTERS = ['codex', 'claude', 'kiro'] as const;
 export type AdapterName = (typeof KNOWN_ADAPTERS)[number];
+
+export const EXECUTION_MODES = ['log-only', 'prepare-only', 'live'] as const;
+export type ExecutionMode = (typeof EXECUTION_MODES)[number];
+
+/** Modes that create a per-job branch and worktree (and so need repositories.*.checkoutPath). */
+export function modeNeedsCheckout(mode: ExecutionMode): boolean {
+  return mode === 'prepare-only' || mode === 'live';
+}
 
 const name = z
   .string()
@@ -18,6 +29,15 @@ export const agentSchema = z.strictObject({
   adapter: z.enum(KNOWN_ADAPTERS).optional(),
   enabled: z.boolean().default(true),
   maxConcurrent: z.number().int().min(1).max(32).default(1),
+  /**
+   * Live mode: the agent CLI to run instead of the one discovery finds (an absolute path, or a
+   * name looked up on PATH). Windows npm `.cmd` shims are resolved to their target.
+   */
+  command: z.string().min(1).optional(),
+  /** Live mode: extra arguments for the agent CLI; the adapter places them where its CLI accepts options. */
+  args: z.array(z.string()).optional(),
+  /** Live mode: environment variables set for the agent process, on top of the worker's environment. */
+  env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'an environment variable name'), z.string()).optional(),
 });
 
 export const poolSchema = z.strictObject({
@@ -29,7 +49,12 @@ export const actionSchema = z.strictObject({
   /** Prompt file, relative to the config file's directory. */
   prompt: z.string().min(1).optional(),
   output: z.enum(['local-branch', 'log']).default('local-branch'),
+  /** Live mode: stop the agent (and fail the run) after this many minutes. Default 60. */
+  timeoutMinutes: z.number().positive().max(24 * 60).optional(),
 });
+
+/** Agent run time limit when an action sets no timeoutMinutes. */
+export const DEFAULT_TIMEOUT_MINUTES = 60;
 
 export const poolRuleSchema = z.strictObject({
   hasLabel: z.string().min(1),
@@ -100,8 +125,10 @@ export const configSchema = z.strictObject({
       /**
        * log-only: record each run in run.log; no checkout, no agent.
        * prepare-only: also create the job's branch and worktree; still no agent.
+       * live: also run the routed agent in the worktree. Requires an implemented adapter for
+       * every enabled agent.
        */
-      mode: z.enum(['log-only', 'prepare-only']).default('log-only'),
+      mode: z.enum(EXECUTION_MODES).default('log-only'),
     })
     .default({ mode: 'log-only' }),
   dispatch: z

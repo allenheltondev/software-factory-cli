@@ -6,6 +6,8 @@ import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js'
 import type { AdapterName } from '../config/schema.js';
 import { agentChecks, agentProblemSeverity, doctorCommand, nodeVersionOk, renderDoctor, runDoctor, type DoctorProbes } from './doctor.js';
 import { fakeAgentReport, fakeApi, fakeContext, fakeRepo, missingAgentReport, tempHome } from './fakes.js';
+import { registerAdapter } from '../agents/adapters/registry.js';
+import { fakeAdapter } from '../../test/fake-adapter.js';
 
 function setup(o: { labels?: string[]; repoId?: number; kiro?: boolean } = {}) {
   const home = tempHome();
@@ -140,6 +142,38 @@ describe('runDoctor', () => {
     const noKiro = setup({ kiro: false });
     const r2 = await runDoctor(noKiro.paths, { ...noKiro.probes, env: { PATH: '/bin' } });
     expect(r2.checks.some((c) => c.name === 'agent kiro')).toBe(false);
+  });
+
+  it('fails on agent problems for enabled agents in live mode', async () => {
+    const restore = (['codex', 'claude', 'kiro'] as const).map((name) => registerAdapter(fakeAdapter({ name })));
+    try {
+      const home = tempHome();
+      const paths = resolvePaths({ env: { FACTORY_HOME: home } });
+      const cfg = upsertRepoWorkflow(
+        seedConfig('allen'),
+        { id: 10, fullName: 'o/r' },
+        buildWorkflow({ label: 'factory:ready', action: 'implement-issue', pool: 'general', routes: [] }),
+      ).config;
+      cfg.execution = { mode: 'live' };
+      cfg.repositories!['o/r']!.checkoutPath = 'clones/r';
+      writeFileSync(paths.configFile, stringify(cfg));
+      const { probes } = setup();
+      const r = await runDoctor(paths, {
+        ...probes,
+        discoverAgents: async () => [
+          missingAgentReport('codex'),
+          fakeAgentReport('claude', { signedIn: 'no', auth: 'not signed in; run "claude auth login"', usable: false }),
+          fakeAgentReport('kiro'),
+        ],
+      });
+      expect(status(r.checks, /^config: valid/)).toBe('ok');
+      expect(status(r.checks, /agent codex: codex not found on PATH/)).toBe('fail');
+      expect(status(r.checks, /agent claude: not signed in/)).toBe('fail');
+      expect(status(r.checks, /agent kiro: kiro-cli 1\.0\.0/)).toBe('ok');
+      expect(r.ok).toBe(false);
+    } finally {
+      for (const r of restore) r();
+    }
   });
 
   it('agentChecks: off-PATH and unknown sign-in warn; problems are failures only in live mode', () => {

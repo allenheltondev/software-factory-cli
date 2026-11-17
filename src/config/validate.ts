@@ -1,9 +1,11 @@
 import type { z } from 'zod';
+import { getAdapter } from '../agents/adapters/registry.js';
 import {
   KNOWN_ADAPTERS,
   agentAdapter,
   allowedActorsFor,
   configSchema,
+  modeNeedsCheckout,
   repoNeedsCheckout,
   workflowId,
   type FactoryConfig,
@@ -41,12 +43,24 @@ export function validateConfig(raw: unknown): ValidationResult {
         message: `unknown adapter "${adapter}"; set adapter to one of ${KNOWN_ADAPTERS.join(', ')}`,
       });
     }
+    if (config.execution.mode === 'live' && agent.enabled && (KNOWN_ADAPTERS as readonly string[]).includes(adapter) && !getAdapter(adapter)) {
+      errors.push({
+        path: `agents.${agentName}`,
+        message:
+          `live execution is not implemented for adapter "${adapter}" in this release, so live mode cannot run this agent yet; ` +
+          'use execution.mode prepare-only, or disable the agent',
+      });
+    }
     if (agent.maxConcurrent > config.maxConcurrent) {
       warnings.push({
         path: `agents.${agentName}.maxConcurrent`,
         message: `exceeds global maxConcurrent (${config.maxConcurrent}); the global limit applies`,
       });
     }
+  }
+
+  if (config.execution.mode === 'live' && !Object.values(config.agents).some((a) => a.enabled)) {
+    errors.push({ path: 'agents', message: 'live mode needs at least one enabled agent' });
   }
 
   for (const [poolName, pool] of Object.entries(config.pools)) {
@@ -67,11 +81,10 @@ export function validateConfig(raw: unknown): ValidationResult {
     if (dup) errors.push({ path: `repositories.${repoName}.id`, message: `same repository ID as ${dup}` });
     repoIds.set(repo.id, repoName);
 
-    if (config.execution.mode === 'prepare-only' && !repo.checkoutPath && repoNeedsCheckout(config, repo)) {
+    if (modeNeedsCheckout(config.execution.mode) && !repo.checkoutPath && repoNeedsCheckout(config, repo)) {
       errors.push({
         path: `repositories.${repoName}.checkoutPath`,
-        message:
-          'required in prepare-only mode because a workflow runs an action with output local-branch; set it to a local clone of the repo',
+        message: `required in ${config.execution.mode} mode because a workflow runs an action with output local-branch; set it to a local clone of the repo`,
       });
     }
 
@@ -96,6 +109,26 @@ export function validateConfig(raw: unknown): ValidationResult {
         });
       }
     });
+  }
+
+  if (config.execution.mode === 'live') {
+    const used = new Set(Object.values(config.repositories).flatMap((r) => r.workflows.map((wf) => wf.action)));
+    for (const name of used) {
+      const action = Object.hasOwn(config.actions, name) ? config.actions[name] : undefined;
+      if (!action) continue; // reported above
+      if (action.output === 'local-branch' && !action.prompt) {
+        errors.push({
+          path: `actions.${name}.prompt`,
+          message: 'required in live mode: the prompt file tells the agent what to do with the issue',
+        });
+      }
+      if (action.output === 'log') {
+        warnings.push({
+          path: `actions.${name}.output`,
+          message: 'live mode only starts agents for actions with output local-branch; runs of this action are only logged',
+        });
+      }
+    }
   }
 
   return errors.length ? { ok: false, errors, warnings } : { ok: true, config, warnings };

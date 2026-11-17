@@ -3,6 +3,7 @@ import {
   checkPlatform,
   commonInstallDirs,
   discoverAgents,
+  locateLaunch,
   parseCmdShim,
   parseVersion,
   runProcess,
@@ -500,4 +501,42 @@ describe('runProcess (real child processes)', () => {
       expect(dead).toBe(true);
     },
   );
+});
+
+describe('locateLaunch (live execution)', () => {
+  const npm = 'C:\\Users\\Jane Doe\\AppData\\Roaming\\npm';
+  const codexJs = `${npm}\\node_modules\\@openai\\codex\\bin\\codex.js`;
+  const node = 'C:\\Program Files\\nodejs\\node.exe';
+  const win = () =>
+    machine({
+      platform: 'win32',
+      homedir: 'C:\\Users\\Jane Doe',
+      env: { Path: `C:\\Windows\\system32;${npm}`, PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+      execPath: node,
+      files: { [`${npm}\\codex.cmd`]: NODE_SHIM, [codexJs]: true, [node]: true, 'C:\\agents\\my codex.exe': true },
+    });
+
+  it('finds the CLI without running it and resolves npm shims', () => {
+    const m = win();
+    expect(locateLaunch('codex', m)).toEqual({ path: `${npm}\\codex.cmd`, launch: { file: node, args: [codexJs] } });
+    expect(m.calls).toEqual([]);
+    expect(locateLaunch('kiro', m)).toEqual({ path: null, launch: null, problem: 'kiro-cli not found on PATH or in common install locations' });
+  });
+
+  it('uses agents.<name>.command: absolute, relative to the config dir, or a name on PATH', () => {
+    const m = win();
+    expect(locateLaunch('codex', m, { command: 'C:\\agents\\my codex.exe' }).launch).toEqual({ file: 'C:\\agents\\my codex.exe', args: [] });
+    expect(locateLaunch('codex', m, { command: '..\\agents\\my codex.exe', baseDir: 'C:\\config' }).launch).toEqual({
+      file: 'C:\\agents\\my codex.exe',
+      args: [],
+    });
+    expect(locateLaunch('claude', m, { command: 'codex' }).launch).toEqual({ file: node, args: [codexJs] });
+    expect(locateLaunch('codex', m, { command: 'C:\\nowhere\\codex.exe' })).toEqual({
+      path: null,
+      launch: null,
+      problem: 'configured command C:\\nowhere\\codex.exe was not found or is not executable',
+    });
+    const posixMachine = machine({ platform: 'linux', homedir: '/home/jane', env: { PATH: '/usr/bin' }, files: {} });
+    expect(locateLaunch('claude', posixMachine, { command: 'claude-dev' }).problem).toBe('configured command claude-dev was not found on PATH or is not executable');
+  });
 });

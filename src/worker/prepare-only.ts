@@ -132,5 +132,8 @@ export function createExecutor(config: Pick<FactoryConfig, 'execution'>): Execut
       return new PrepareOnlyExecutor();
     case 'log-only':
       return new LogOnlyExecutor();
+    case 'live':
+      // Unreachable through validation until an adapter is implemented; the executor comes next.
+      throw new Error('live execution is not available yet');
   }
 }

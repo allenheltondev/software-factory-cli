@@ -29,7 +29,7 @@ export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array
   const out: Array<Omit<CheckResult, 'name'>> = [];
   const notes = r.notes.length ? ` (${r.notes.join('; ')})` : '';
   if (!r.installed) {
-    out.push({ status: sev, detail: `${r.command} not found on PATH or in common install locations (needed once live execution is enabled)` });
+    out.push({ status: sev, detail: `${r.command} not found on PATH or in common install locations${sev === 'fail' ? '' : ' (needed in live mode)'}` });
   } else if (r.runnable !== 'yes') {
     out.push({ status: sev, detail: `${r.command} found at ${r.path} but did not run${notes}` });
   } else {

@@ -1,0 +1,73 @@
+/**
+ * The contract between live execution (src/worker/live.ts) and one coding-agent CLI.
+ *
+ * An adapter only describes its CLI: how to invoke it headlessly for one prompt, and how to read
+ * the result. The executor owns everything else, identically for every agent: locating the CLI
+ * (discovery, or agents.<name>.command), the worktree, spawning without a shell in its own process
+ * group, recording the pid and its OS start time, stdout/stderr capture into run.log, the timeout,
+ * shutdown, and the post-run summary.
+ *
+ * Rules for implementations:
+ * - Never put prompt or issue text in `args`. Deliver the prompt file on stdin (`promptVia: 'stdin'`)
+ *   or pass its path (`promptVia: 'file-arg'`). The file holds untrusted issue text.
+ * - Build on `launch`: on Windows it is the resolved target of an npm `.cmd` shim (for example
+ *   `node.exe` with the CLI's script in `launch.args`), never the shim itself.
+ * - Be pure: no I/O in buildInvocation; the executor may call it before anything is spawned.
+ */
+import type { LaunchSpec } from '../discovery.js';
+
+export interface InvocationRequest {
+  /** Spawn target for the agent CLI: `launch.file` with `launch.args` before the adapter's own arguments. */
+  launch: LaunchSpec;
+  /** Absolute path of the rendered prompt (UTF-8 Markdown) in the run directory. */
+  promptFile: string;
+  /** The job's worktree. The agent runs with this as its working directory. */
+  worktree: string;
+  /** The run's directory (run.log, prompt.md). An adapter may name extra output files here. */
+  runDir: string;
+  /** agents.<name>.args from the config; the adapter places them where its CLI accepts options. */
+  extraArgs: readonly string[];
+  platform: NodeJS.Platform;
+}
+
+export interface AgentInvocation {
+  /** Executable to spawn directly, never through a shell. */
+  file: string;
+  args: string[];
+  /**
+   * How the prompt reaches the agent. 'stdin': the prompt file is opened as the agent's stdin.
+   * 'file-arg': `args` contains `promptFile`, and stdin is closed.
+   */
+  promptVia: 'stdin' | 'file-arg';
+  /** Variables the adapter needs set. Applied over the worker's environment; agents.<name>.env wins over these. */
+  env?: Record<string, string>;
+}
+
+/** How the agent process ended on its own (not timed out, not stopped by the worker). */
+export interface AgentExit {
+  /** Exit code, or null when a signal ended it. */
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  /** The last lines of the agent's combined stdout and stderr. */
+  outputTail: string[];
+}
+
+export interface AgentVerdict {
+  outcome: 'succeeded' | 'failed';
+  /** Why the run failed, for the job's status reason. */
+  error?: string;
+}
+
+export interface AgentAdapter {
+  /** The adapter name agents.<name>.adapter refers to (e.g. "claude"). */
+  readonly name: string;
+  buildInvocation(req: InvocationRequest): AgentInvocation;
+  /** Map the exit to an outcome. Defaults to {@link defaultVerdict}: exit 0 succeeds, anything else fails. */
+  interpretExit?(exit: AgentExit): AgentVerdict;
+}
+
+export function defaultVerdict(exit: AgentExit): AgentVerdict {
+  if (exit.code === 0) return { outcome: 'succeeded' };
+  if (exit.code !== null) return { outcome: 'failed', error: `agent exited with code ${exit.code}` };
+  return { outcome: 'failed', error: `agent was ended by ${exit.signal ?? 'an unknown signal'}` };
+}
