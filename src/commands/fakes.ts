@@ -103,3 +103,52 @@ export function fakeContext(
     now: () => Date.parse('2026-01-01T00:00:00Z'),
   };
 }
+
+/** A hand-edited config with comments, blank lines and mixed styles, shared by save round-trip tests. */
+export const COMMENTED_CONFIG = `# Factory config, edited by hand
+version: 1
+
+# Poll every two minutes; rate limits are tight.
+pollIntervalSeconds: 120
+maxConcurrent: 2
+
+dispatch:
+  allowedActors:
+    - allen # me
+    - "bot-user"
+
+agents:
+  # Codex is flaky right now
+  codex:
+    enabled: false
+  claude: {} # defaults are fine
+  kiro:
+    maxConcurrent: 1
+
+pools:
+  general:
+    agents: [claude, kiro]
+  art:
+    agents: [kiro]
+
+actions:
+  implement-issue:
+    prompt: ./prompts/implement-issue.md # starter prompt
+
+repositories:
+  # The main app
+  o/app:
+    id: 1
+    baseBranch: main # release branch later
+    workflows:
+      - trigger:
+          event: issue.labeled
+          label: factory:ready
+        action: implement-issue
+        pool: general # default pool
+      # Old experiment, to be removed
+      - id: old
+        trigger: {event: issue.labeled, label: try-me}
+        action: implement-issue
+        pool: art
+`;
