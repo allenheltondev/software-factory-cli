@@ -32,6 +32,14 @@ export interface EventEnvelope {
   createdAt: string;
 }
 
+/** The issue as fetched by the worker's pre-start check, handed to the executor. Untrusted text. */
+export interface IssueSnapshot {
+  title: string;
+  body: string;
+  labels: string[];
+  url: string;
+}
+
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'canceled';
 
 export const TERMINAL_JOB_STATUSES: readonly JobStatus[] = ['succeeded', 'failed', 'interrupted', 'canceled'];
@@ -70,6 +78,11 @@ export interface Run {
   /** Host of the worker that claimed the run (null for runs from before it was recorded). */
   hostname: string | null;
   pid: number | null;
+  /**
+   * OS start time of `pid`, platform-tagged (see processStartTime). A pid is only signalled when
+   * this still matches, so a reused pid is never killed. Null for runs recorded before v5.
+   */
+  pidStartTime: string | null;
   leaseExpiresAt: string;
   /** When the job was claimed. */
   startedAt: string;
@@ -78,4 +91,26 @@ export interface Run {
   endedAt: string | null;
   outcome: RunOutcome | null;
   error: string | null;
+  /** What a live agent run left behind; null for log-only and prepare-only runs. */
+  summary: RunSummary | null;
+}
+
+/** Recorded after a live agent run, in run.log and the state DB (`factory status`). */
+export interface RunSummary {
+  branch: string;
+  baseSha: string;
+  worktree: string;
+  /** Commits on the job branch since the base commit, newest first ("<short sha> <subject>"), capped. */
+  commits: string[];
+  commitCount: number;
+  /** Tracked files that differ from the base commit, committed or not. */
+  filesChanged: number;
+  /** Last line of `git diff --stat <base>`, e.g. "3 files changed, 10 insertions(+), 2 deletions(-)". */
+  diffStat: string;
+  /** Files in the worktree that git does not track yet. */
+  untracked: number;
+  /** The agent's last output lines (stdout and stderr). */
+  lastOutput: string[];
+  /** Parts of the summary that could not be computed. */
+  notes: string[];
 }

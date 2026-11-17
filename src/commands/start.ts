@@ -55,7 +55,7 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
 
   const controller = new AbortController();
   const uninstall = deps.onShutdownSignal((signal) => {
-    log.info('shutdown requested; finishing current work', { signal });
+    log.info(config.execution.mode === 'live' ? 'shutdown requested; stopping running agents' : 'shutdown requested; finishing current work', { signal });
     controller.abort();
   });
 

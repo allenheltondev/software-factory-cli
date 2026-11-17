@@ -12,11 +12,12 @@ import {
   markExecutionStarted,
   releaseClaim,
   setRunProcess,
+  setRunSummary,
   WorkerLockLostError,
   type Claim,
 } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
-import type { Job } from '../types.js';
+import type { IssueSnapshot, Job } from '../types.js';
 import { newId } from '../util/ids.js';
 import type { Logger } from '../util/log.js';
 import {
@@ -33,7 +34,7 @@ import {
   heartbeatWorkerLock,
   releaseWorkerLock,
 } from './lock.js';
-import { defaultProcessControl, type ProcessControl } from './process.js';
+import { defaultProcessControl, terminateIfSameProcess, type ProcessControl } from './process.js';
 import { reconcileInterruptedRuns } from './reconcile.js';
 
 export { WorkerLockedError } from './lock.js';
@@ -56,12 +57,12 @@ export interface DaemonDeps {
   log: Logger;
   /** One poll cycle (wired to poller.pollOnce by `factory start`). */
   poll: () => Promise<unknown>;
-  /** Final pre-start check (wired to poller.checkJobDispatchable). */
-  checkDispatchable: (job: Job) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  /** Final pre-start check (wired to poller.checkJobDispatchable). `issue` is passed to the executor. */
+  checkDispatchable: (job: Job) => Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }>;
   /** Abort to stop gracefully (SIGINT/SIGTERM). */
   signal: AbortSignal;
   now?: () => number;
-  /** Defaults to the log-only executor (the only one in this release). */
+  /** Defaults to the log-only executor. */
   executor?: Executor;
   /** Process liveness/termination; injectable for tests. */
   processControl?: ProcessControl;
@@ -125,7 +126,7 @@ interface InFlight {
  * The long-running worker behind `factory start`:
  * acquire the single-worker lock, reconcile interrupted runs from a previous
  * process, then loop: poll every pollIntervalSeconds, claim and execute jobs
- * (log-only in this release), heartbeat leases, and exit cleanly on abort.
+ * with the configured executor, heartbeat leases, and exit cleanly on abort.
  * Rejects with WorkerLockedError if another live worker holds the lock.
  */
 export async function runDaemon(deps: DaemonDeps): Promise<void> {
@@ -174,7 +175,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     wake.notify();
   };
 
-  const launch = (claim: Claim) => {
+  const launch = (claim: Claim, issue: IssueSnapshot | undefined) => {
     const { run, job } = claim;
     const controller = new AbortController();
     const runLog = log.child({ runId: run.id, jobId: job.id, agent: run.agent });
@@ -183,7 +184,9 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       paths,
       log: runLog,
       signal: controller.signal,
+      workerStopping: signal,
       now,
+      ...(issue ? { issue } : {}),
       recordProcess: (info) => setRunProcess(db, run.id, info),
     };
     runLog.info('run started', { repo: job.repoFullName, issue: job.issueNumber, pool: run.pool, logPath: run.logPath });
@@ -193,6 +196,13 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         result = await executor.execute(claim, ctx);
       } catch (err) {
         result = { outcome: err instanceof StartFailedError ? 'start_failed' : 'failed', error: message(err) };
+      }
+      if (result.summary) {
+        try {
+          setRunSummary(db, run.id, result.summary);
+        } catch (err) {
+          runLog.error('could not record run summary', { error: message(err) });
+        }
       }
       try {
         finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });
@@ -232,7 +242,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       if (!claim) return;
       const { job, run } = claim;
 
-      let check: { ok: true } | { ok: false; reason: string };
+      let check: Awaited<ReturnType<DaemonDeps['checkDispatchable']>>;
       try {
         check = await deps.checkDispatchable(job);
       } catch (err) {
@@ -266,7 +276,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         if (lockLost) return;
         continue;
       }
-      launch({ job, run: { ...run, executionStartedAt } });
+      launch({ job, run: { ...run, executionStartedAt } }, check.issue);
     }
   };
 
@@ -297,14 +307,17 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     await settleWithin([...inFlight.values()].map((f) => f.done), interruptGraceMs);
 
     for (const [runId, f] of inFlight) {
+      // The executor did not stop its agent within the grace period. Same host by construction;
+      // still verify the start time so a pid the OS reused is never killed.
       const current = getRun(db, runId);
-      if (current?.pid != null && processControl.isAlive(current.pid)) {
-        await processControl.terminate(current.pid).catch(() => undefined);
+      let note = '';
+      if (current?.pid != null) {
+        note = (await terminateIfSameProcess(processControl, current.pid, current.pidStartTime).catch(() => ({ note: '' }))).note;
       }
       try {
         finishRun(db, runId, {
           outcome: 'interrupted',
-          error: 'worker stopped before the run finished',
+          error: `worker stopped before the run finished${note ? `; ${note}` : ''}`,
           now,
         });
       } catch (err) {

@@ -3,7 +3,7 @@
 import { join } from 'node:path';
 import type { FactoryConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
-import type { Job, JobStatus, Run, RunOutcome } from '../types.js';
+import type { Job, JobStatus, Run, RunOutcome, RunSummary } from '../types.js';
 import { newId, nowIso } from '../util/ids.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
 
@@ -196,12 +196,14 @@ export function claimNextJob(
         worker_id: opts.workerId,
         hostname: opts.hostname,
         pid: null,
+        pid_start_time: null,
         lease_expires_at: new Date(nowMs + opts.leaseSeconds * 1000).toISOString(),
         started_at: at,
         execution_started_at: null,
         ended_at: null,
         outcome: null,
         error: null,
+        summary: null,
       };
       db.prepare(
         `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, hostname, pid, lease_expires_at, started_at)
@@ -237,11 +239,28 @@ export function heartbeatRun(db: Db, runId: string, leaseSeconds: number, now?: 
   );
 }
 
+export interface RunProcessInfo {
+  /** Agent pid. Setting it clears any start time recorded for an earlier pid. */
+  pid?: number | null;
+  /** OS start time of `pid` (see processStartTime); recorded once known, right after the pid. */
+  pidStartTime?: string | null;
+  checkoutPath?: string | null;
+}
+
 /** Record the agent subprocess and/or checkout for a running run (used by live adapters and reconcile). */
-export function setRunProcess(db: Db, runId: string, info: { pid?: number | null; checkoutPath?: string | null }): void {
-  if (info.pid !== undefined) db.prepare('UPDATE runs SET pid = ? WHERE id = ?').run(info.pid, runId);
+export function setRunProcess(db: Db, runId: string, info: RunProcessInfo): void {
+  if (info.pid !== undefined) {
+    db.prepare('UPDATE runs SET pid = ?, pid_start_time = ? WHERE id = ?').run(info.pid, info.pidStartTime ?? null, runId);
+  } else if (info.pidStartTime !== undefined) {
+    db.prepare('UPDATE runs SET pid_start_time = ? WHERE id = ?').run(info.pidStartTime, runId);
+  }
   if (info.checkoutPath !== undefined)
     db.prepare('UPDATE runs SET checkout_path = ? WHERE id = ?').run(info.checkoutPath, runId);
+}
+
+/** Store the post-run summary of a live agent run. */
+export function setRunSummary(db: Db, runId: string, summary: RunSummary): void {
+  db.prepare('UPDATE runs SET summary = ? WHERE id = ?').run(JSON.stringify(summary), runId);
 }
 
 /**
@@ -417,6 +436,8 @@ export interface StatusSnapshot {
   agents: AgentLoad[];
   activeRuns: Array<{ run: Run; job: Job }>;
   recentJobs: Job[];
+  /** Finished live agent runs (those with a summary), newest first. */
+  recentAgentRuns: Array<{ run: Run; job: Job }>;
   recentErrors: Array<{ at: string; scope: string; repoFullName: string | null; jobId: string | null; message: string }>;
   checkpoints: Array<{ repoId: number; fullName: string; lastEventId: number | null; updatedAt: string }>;
 }
@@ -464,6 +485,15 @@ export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => num
     db.prepare('SELECT * FROM jobs ORDER BY updated_at DESC, rowid DESC LIMIT 10').all() as unknown as JobRow[]
   ).map(rowToJob);
 
+  const recentAgentRuns = (
+    db
+      .prepare('SELECT * FROM runs WHERE ended_at IS NOT NULL AND summary IS NOT NULL ORDER BY ended_at DESC, rowid DESC LIMIT 5')
+      .all() as unknown as RunRow[]
+  ).map((row) => {
+    const run = rowToRun(row);
+    return { run, job: rowToJob(getJobRow(db, run.jobId)!) };
+  });
+
   const recentErrors = (
     db.prepare('SELECT at, scope, repo_full_name, job_id, message FROM errors ORDER BY id DESC LIMIT 10').all() as {
       at: string;
@@ -480,5 +510,5 @@ export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => num
       .all() as { repo_id: number; full_name: string; last_event_id: number | null; updated_at: string }[]
   ).map((c) => ({ repoId: c.repo_id, fullName: c.full_name, lastEventId: c.last_event_id, updatedAt: c.updated_at }));
 
-  return { worker, counts, agents, activeRuns, recentJobs, recentErrors, checkpoints };
+  return { worker, counts, agents, activeRuns, recentJobs, recentAgentRuns, recentErrors, checkpoints };
 }

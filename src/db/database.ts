@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { createRequire } from 'node:module';
-import type { EventEnvelope, Job, JobStatus, Run, RunOutcome } from '../types.js';
+import type { EventEnvelope, Job, JobStatus, Run, RunOutcome, RunSummary } from '../types.js';
 
 export type Db = DatabaseSyncType;
 
@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -152,6 +152,15 @@ const MIGRATIONS: Record<number, Migration> = {
     backfillStartFailures(db);
     db.exec("DELETE FROM meta WHERE substr(key, 1, 12) = 'retry_floor:'");
   },
+  5: `
+    -- OS start time of runs.pid, platform-tagged ("linux:<boot id>:<ticks>", "darwin:<lstart>",
+    -- "win32:<filetime>"). Reconcile and shutdown signal a pid only when its current start time
+    -- still matches, so a pid the OS reused is never killed. Earlier runs have none and are
+    -- never signalled.
+    ALTER TABLE runs ADD COLUMN pid_start_time TEXT;
+    -- JSON RunSummary written after a live agent run: commits, changed files, last output.
+    ALTER TABLE runs ADD COLUMN summary TEXT;
+  `,
 };
 
 /**
@@ -293,12 +302,23 @@ export interface RunRow {
   worker_id: string;
   hostname: string | null;
   pid: number | null;
+  pid_start_time: string | null;
   lease_expires_at: string;
   started_at: string;
   execution_started_at: string | null;
   ended_at: string | null;
   outcome: RunOutcome | null;
   error: string | null;
+  summary: string | null;
+}
+
+function parseSummary(json: string | null): RunSummary | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as RunSummary;
+  } catch {
+    return null;
+  }
 }
 
 export function rowToRun(r: RunRow): Run {
@@ -313,11 +333,13 @@ export function rowToRun(r: RunRow): Run {
     workerId: r.worker_id,
     hostname: r.hostname,
     pid: r.pid,
+    pidStartTime: r.pid_start_time,
     leaseExpiresAt: r.lease_expires_at,
     startedAt: r.started_at,
     executionStartedAt: r.execution_started_at,
     endedAt: r.ended_at,
     outcome: r.outcome,
     error: r.error,
+    summary: parseSummary(r.summary),
   };
 }

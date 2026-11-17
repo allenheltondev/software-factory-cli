@@ -11,6 +11,7 @@ import { resolvePaths, type FactoryPaths } from '../paths.js';
 import { silentLogger } from '../util/log.js';
 import { runDaemon } from './daemon.js';
 import { LogOnlyExecutor, type ExecutionContext } from './executor.js';
+import { LiveExecutor } from './live.js';
 import { createExecutor, PrepareOnlyExecutor } from './prepare-only.js';
 
 const fixtures: GitFixture[] = [];
@@ -92,7 +93,7 @@ describe('PrepareOnlyExecutor', { timeout: 60_000 }, () => {
         }
       },
       checkDispatchable: async () => ({ ok: true }),
-      processControl: { isAlive: () => false, terminate: async () => {} },
+      processControl: { isAlive: () => false, startTime: async () => null, terminate: async () => {} },
       hostname: 'host-a',
       pid: 4242,
     });
@@ -205,5 +206,6 @@ describe('createExecutor', () => {
   it('selects the executor from execution.mode', () => {
     expect(createExecutor({ execution: { mode: 'prepare-only' } })).toBeInstanceOf(PrepareOnlyExecutor);
     expect(createExecutor({ execution: { mode: 'log-only' } })).toBeInstanceOf(LogOnlyExecutor);
+    expect(createExecutor({ execution: { mode: 'live' } })).toBeInstanceOf(LiveExecutor);
   });
 });

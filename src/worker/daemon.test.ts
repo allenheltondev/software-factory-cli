@@ -80,7 +80,7 @@ function makePaths(): FactoryPaths {
   };
 }
 
-const noProcesses: ProcessControl = { isAlive: () => false, terminate: async () => {} };
+const noProcesses: ProcessControl = { isAlive: () => false, startTime: async () => null, terminate: async () => {} };
 
 function baseDeps(db: Db, over: Partial<DaemonDeps> = {}): DaemonDeps & { controller: AbortController } {
   const controller = new AbortController();
@@ -120,7 +120,7 @@ describe('worker lock', () => {
   it('runDaemon rejects with WorkerLockedError when another worker holds the lock', async () => {
     const db = openDatabase(':memory:');
     acquireWorkerLock(db, { workerId: 'wrk_a', pid: 1, hostname: 'host-a' }, { isPidAlive: () => true });
-    const deps = baseDeps(db, { processControl: { isAlive: () => true, terminate: async () => {} } });
+    const deps = baseDeps(db, { processControl: { isAlive: () => true, startTime: async () => null, terminate: async () => {} } });
     await expect(runDaemon(deps)).rejects.toBeInstanceOf(WorkerLockedError);
     expect(readWorkerLock(db)?.workerId).toBe('wrk_a');
   });
@@ -209,6 +209,59 @@ describe('runDaemon', () => {
     expect(readWorkerLock(db)).toBeNull();
   });
 
+  it('on shutdown, signals a stuck run\'s agent only if its recorded start time still matches', async () => {
+    const db = openDatabase(':memory:');
+    const never = deferred<ExecutionResult>();
+    const seen: Array<{ stopping: boolean; issue: unknown }> = [];
+    const executor: Executor = {
+      name: 'stuck',
+      execute: async (c, ctx) => {
+        seen.push({ stopping: Boolean(ctx.workerStopping?.aborted), issue: ctx.issue });
+        // codex's agent is still the same process; claude's pid now belongs to another process.
+        const pid = c.run.agent === 'codex' ? 7001 : 7002;
+        ctx.recordProcess({ pid });
+        ctx.recordProcess({ pidStartTime: `t:${pid}` });
+        ctx.workerStopping?.addEventListener('abort', () => seen.push({ stopping: true, issue: null }));
+        return never.promise;
+      },
+    };
+    const terminated: number[] = [];
+    const processControl: ProcessControl = {
+      isAlive: (pid) => [7001, 7002].includes(pid) && !terminated.includes(pid),
+      startTime: async (pid) => (pid === 7001 ? 't:7001' : 't:someone-else'),
+      terminate: async (pid) => {
+        terminated.push(pid);
+      },
+    };
+    const issue = { title: 'T', body: 'B', labels: ['factory:ready'], url: 'u' };
+    const deps = baseDeps(db, {
+      executor,
+      processControl,
+      checkDispatchable: async () => ({ ok: true, issue }),
+      timing: { shutdownTimeoutMs: 20, interruptGraceMs: 20 },
+    });
+    const a = insertJob(db, { pool: 'art' });
+    const b = insertJob(db);
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    expect(seen).toEqual([
+      { stopping: false, issue },
+      { stopping: false, issue },
+    ]);
+    deps.controller.abort();
+    await done;
+
+    // workerStopping fired as soon as shutdown began, before the per-run signal.
+    expect(seen.filter((s) => s.stopping)).toHaveLength(2);
+    expect(terminated).toEqual([7001]);
+    const runA = db.prepare('SELECT error FROM runs WHERE job_id = ?').get(a) as { error: string };
+    const runB = db.prepare('SELECT error FROM runs WHERE job_id = ?').get(b) as { error: string };
+    expect(runA.error).toBe('worker stopped before the run finished; terminated leftover agent process 7001');
+    expect(runB.error).toBe(
+      'worker stopped before the run finished; agent pid 7002 was not signalled (it now belongs to a different process)',
+    );
+  });
+
   it('cancels a job that fails the pre-start check without running it', async () => {
     const db = openDatabase(':memory:');
     const execute = vi.fn(async (): Promise<ExecutionResult> => ({ outcome: 'succeeded' }));
@@ -280,11 +333,12 @@ describe('runDaemon', () => {
     const id = insertJob(db);
     const claim = claimNextJob(db, config, { workerId: 'wrk_old', hostname: 'host-a', leaseSeconds: 60, runsDir: join('x', 'runs') })!;
     expect(markExecutionStarted(db, claim.run.id, { workerId: 'wrk_old' })).not.toBeNull();
-    setRunProcess(db, claim.run.id, { pid: 4242, checkoutPath: join('x', 'work trees', id) });
+    setRunProcess(db, claim.run.id, { pid: 4242, pidStartTime: 'test:4242', checkoutPath: join('x', 'work trees', id) });
 
     const terminated: number[] = [];
     const processControl: ProcessControl = {
       isAlive: (pid) => pid === 4242 && !terminated.includes(pid),
+      startTime: async (pid) => `test:${pid}`,
       terminate: async (pid) => {
         terminated.push(pid);
       },
@@ -314,7 +368,7 @@ describe('runDaemon', () => {
     markExecutionStarted(db, claim.run.id, { workerId: 'wrk_old' });
     setRunProcess(db, claim.run.id, { pid: 4242 });
     const terminate = vi.fn(async () => {});
-    const deps = baseDeps(db, { config, processControl: { isAlive: () => true, terminate } });
+    const deps = baseDeps(db, { config, processControl: { isAlive: () => true, startTime: async () => 'test:4242', terminate } });
     deps.controller.abort();
     await runDaemon(deps); // lock is stale relative to real time, so it is taken over
     expect(terminate).not.toHaveBeenCalled();
@@ -389,7 +443,7 @@ describe('runDaemon: lock ownership', () => {
       workerId: 'wrk_b',
       pid: 6000,
       executor: { name: 'new', execute: newExecute },
-      processControl: { isAlive: (p) => p !== 5000, terminate: async () => {} },
+      processControl: { isAlive: (p) => p !== 5000, startTime: async () => null, terminate: async () => {} },
     });
     const doneB = runDaemon(b);
     await vi.waitFor(() => expect(getJob(db, id)?.status).toBe('succeeded'));
@@ -436,7 +490,7 @@ describe('runDaemon: lock ownership', () => {
     const b = baseDeps(db, {
       workerId: 'wrk_b',
       pid: 6000,
-      processControl: { isAlive: (p) => p !== 5000, terminate: async () => {} },
+      processControl: { isAlive: (p) => p !== 5000, startTime: async () => null, terminate: async () => {} },
     });
     b.controller.abort(); // take over and reconcile only
     await runDaemon(b);

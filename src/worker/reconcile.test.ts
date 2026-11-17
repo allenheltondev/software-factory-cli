@@ -47,7 +47,7 @@ function insertJob(db: Db): string {
 }
 
 /** A run left open by an earlier worker: started with an agent pid, or claimed and never started. */
-function openRun(db: Db, o: { workerId: string; hostname: string; pid?: number }): Claim {
+function openRun(db: Db, o: { workerId: string; hostname: string; pid?: number; startTime?: string | null }): Claim {
   insertJob(db);
   const claim = claimNextJob(db, makeConfig(), {
     workerId: o.workerId,
@@ -58,7 +58,7 @@ function openRun(db: Db, o: { workerId: string; hostname: string; pid?: number }
   })!;
   if (o.pid !== undefined) {
     db.prepare('UPDATE runs SET execution_started_at = started_at WHERE id = ?').run(claim.run.id);
-    setRunProcess(db, claim.run.id, { pid: o.pid });
+    setRunProcess(db, claim.run.id, { pid: o.pid, pidStartTime: o.startTime === undefined ? `t:${o.pid}` : o.startTime });
   }
   return claim;
 }
@@ -67,6 +67,8 @@ function fakeProcesses(alive: number[]) {
   const terminated: number[] = [];
   const pc: ProcessControl = {
     isAlive: (pid) => alive.includes(pid) && !terminated.includes(pid),
+    // The live process with each pid; a test reuses a pid by recording a different start time.
+    startTime: async (pid) => (alive.includes(pid) ? `t:${pid}` : null),
     terminate: vi.fn(async (pid: number) => {
       terminated.push(pid);
     }),
@@ -103,6 +105,26 @@ describe('reconcileInterruptedRuns: which pids are signalled', () => {
     expect(getRun(db, unknown.run.id)?.error).toMatch(/pid 202 was not signalled \(recorded on an unknown host\)/);
     expect(getJob(db, remote.job.id)?.status).toBe('interrupted');
     expect(getJob(db, unknown.job.id)?.status).toBe('interrupted');
+  });
+});
+
+describe('reconcileInterruptedRuns: process identity', () => {
+  it('signals a pid only when its OS start time still matches the one recorded at spawn', async () => {
+    const db = openDatabase(':memory:');
+    const same = openRun(db, { workerId: 'wrk_1', hostname: 'host-a', pid: 401 });
+    const reused = openRun(db, { workerId: 'wrk_1', hostname: 'host-a', pid: 402, startTime: 't:an-earlier-process' });
+    const legacy = openRun(db, { workerId: 'wrk_1', hostname: 'host-a', pid: 403, startTime: null });
+    const gone = openRun(db, { workerId: 'wrk_1', hostname: 'host-a', pid: 404 });
+    const { pc, terminated } = fakeProcesses([401, 402, 403]);
+
+    await reconcileInterruptedRuns(db, { hostname: 'host-a', processControl: pc, log: silentLogger, now });
+
+    expect(terminated).toEqual([401]);
+    expect(getRun(db, same.run.id)?.error).toMatch(/terminated leftover agent process 401/);
+    expect(getRun(db, reused.run.id)?.error).toMatch(/pid 402 was not signalled \(it now belongs to a different process\)/);
+    expect(getRun(db, legacy.run.id)?.error).toMatch(/pid 403 was not signalled \(no process start time was recorded/);
+    expect(getRun(db, gone.run.id)?.error).toBe('worker wrk_1 stopped while the run was in progress');
+    for (const c of [same, reused, legacy, gone]) expect(getJob(db, c.job.id)?.status).toBe('interrupted');
   });
 });
 

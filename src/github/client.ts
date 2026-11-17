@@ -146,6 +146,7 @@ interface RawLabel {
 interface RawIssue {
   number: number;
   title: string;
+  body?: string | null;
   html_url: string;
   state: string;
   labels: Array<string | { name?: string }>;
@@ -180,6 +181,7 @@ function mapIssue(r: RawIssue): GitHubIssue {
   return {
     number: r.number,
     title: r.title,
+    body: r.body ?? '',
     htmlUrl: r.html_url,
     state: r.state === 'closed' ? 'closed' : 'open',
     labels: r.labels.map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter((l) => l !== ''),
@@ -340,6 +342,11 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       // A 301 here means the issue was transferred; surface it as GitHubError(301).
       const res = await request<RawIssue>(`${repoPath(repo)}/issues/${issueNumber}`, { redirect: 'manual' });
       return mapIssue(res.data!);
+    },
+
+    async listEventsForIssue(repo, issueNumber) {
+      const raw = await paginate<RawIssueEvent>(`${repoPath(repo)}/issues/${issueNumber}/events`);
+      return raw.map(mapEvent);
     },
   };
 }

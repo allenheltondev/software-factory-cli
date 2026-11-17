@@ -9,8 +9,10 @@ sign-in, and keeps its queue in a local SQLite database.
 Pilot. This release covers repository discovery, config validation, issue-event polling, a
 durable queue and a **log-only** worker: jobs are claimed, routed to a pool and agent, and
 recorded, but no agent is started and no code is changed. The opt-in **prepare-only** mode
-also creates a branch and Git worktree per job (still without an agent). Agent execution and
-PR creation come next. See [docs/design.md](docs/design.md).
+also creates a branch and Git worktree per job (still without an agent). The **live** mode's
+execution framework is in place, but no agent adapter ships yet, so a config that selects it
+does not validate; the Claude Code, Codex and Kiro adapters and PR creation come next. See
+[docs/design.md](docs/design.md).
 
 ## Install
 
@@ -93,18 +95,22 @@ repositories:
 | `version` | required | Config schema version; must be `1` |
 | `pollIntervalSeconds` | `60` | GitHub poll interval, 10-3600 |
 | `maxConcurrent` | `2` | Global cap on simultaneous runs, 1-64 |
-| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either |
+| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree (see [Live execution](#live-execution)); it is rejected unless every enabled agent's adapter is implemented, and none is in this release |
 | `dispatch.allowedActors` | `[]` | GitHub logins allowed to dispatch work by applying a trigger label. Empty means nobody |
 | `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
 | `agents.<name>.maxConcurrent` | `1` | Per-agent cap across all pools and repos, 1-32 |
+| `agents.<name>.command` | found by discovery | Live mode: the agent CLI to run. An absolute path, a path relative to the config file's directory, or a name looked up on `PATH`. Windows npm `.cmd` shims are resolved to the real executable or Node entry point |
+| `agents.<name>.args` | none | Live mode: extra arguments for the agent CLI; the adapter places them where its CLI takes options |
+| `agents.<name>.env` | none | Live mode: environment variables for the agent process, on top of the worker's |
 | `pools.<name>.agents` | required | Agent names in the pool (at least one) |
 | `pools.<name>.strategy` | `round-robin` | Rotates among agents with free capacity |
 | `actions.<name>.prompt` | none | Prompt file, relative to the config file's directory |
-| `actions.<name>.output` | `local-branch` | `local-branch` or `log` |
+| `actions.<name>.output` | `local-branch` | `local-branch` or `log`. Live mode starts agents only for `local-branch` actions |
+| `actions.<name>.timeoutMinutes` | `60` | Live mode: stop the agent and fail the run after this long |
 | `repositories.<OWNER/REPO>.id` | required | Stable GitHub repository ID (filled in by `configure` / `add`) |
 | `repositories.<OWNER/REPO>.baseBranch` | remote's default branch | Branch that per-job branches start from (fetched first) |
-| `repositories.<OWNER/REPO>.checkoutPath` | none | Local clone of the repo that per-job worktrees are created from, relative to the config file's directory. Required in `prepare-only` mode when a workflow's action has `output: local-branch` |
+| `repositories.<OWNER/REPO>.checkoutPath` | none | Local clone of the repo that per-job worktrees are created from, relative to the config file's directory. Required in `prepare-only` and `live` mode when a workflow's action has `output: local-branch` |
 | `repositories.<OWNER/REPO>.remote` | a github.com remote | Remote of `checkoutPath` to fetch from. Without it, only a remote whose URL is on `github.com` with path `OWNER/REPO` qualifies (`origin` preferred). Set it for an SSH host alias such as `git@github-work:OWNER/REPO`; any host is then accepted, but `OWNER/REPO` must still match |
 | `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
@@ -118,7 +124,7 @@ Config changes take effect when the worker restarts.
 
 ## Per-job worktrees
 
-In `prepare-only` mode, each job whose action has `output: local-branch` gets:
+In `prepare-only` and `live` mode, each job whose action has `output: local-branch` gets:
 
 - a fetch of the base branch (`baseBranch`, else the remote's default branch) from the
   repo's remote in `checkoutPath`: the one named by `remote`, else a remote whose URL is on
@@ -139,6 +145,41 @@ worktrees of succeeded runs, runs closed before they started (canceled), and run
 never started. It only touches worktrees under `<state dir>/worktrees`, skips any with
 uncommitted changes, and keeps every branch, since the branch is the job's output. Delete
 branches with `git branch -D` when you no longer need them.
+
+## Live execution
+
+In `live` mode the worker runs the routed agent for each `local-branch` job:
+
+1. It renders the action's prompt file plus the issue's title, body, labels and URL into
+   `prompt.md` in the run's log directory. The issue text is fenced and labelled as untrusted
+   input. The adapter hands the file to the agent on stdin or by path, never in a command line.
+2. It finds the agent CLI (`agents.<name>.command`, else the same lookup as `factory agents`).
+   If it can't, or the process can't be spawned, the run is `start_failed` and the job is
+   requeued for the next eligible agent (up to three start failures in a row).
+3. It prepares the branch and worktree as above. A failure there fails the run.
+4. It spawns the agent directly (no shell) in the worktree, records its pid and the OS start
+   time of that process, and writes its stdout and stderr to `run.log`. `GH_TOKEN` and
+   `GITHUB_TOKEN` are not passed to the agent unless `agents.<name>.env` sets them. If the
+   worker can't record the pid, it stops the agent at once and fails the run (it is not a
+   start failure, so no other agent is tried).
+5. Exit code 0 is `succeeded`; anything else is `failed`. At `timeoutMinutes` the agent's
+   process tree is killed and the run fails. Failed runs keep their worktree for inspection.
+6. It appends a summary to `run.log` and stores it for `factory status`: commits on the job
+   branch since the base commit, files changed (`git diff --stat` against the base, committed
+   or not), untracked files, and the agent's last output lines.
+
+On macOS and Linux each agent runs in its own process group, so a timeout or shutdown also
+stops whatever it started. Pressing Ctrl-C in a terminal therefore doesn't reach the agent
+directly: the worker forwards its own shutdown (SIGINT or SIGTERM) to the agent's group as
+SIGTERM, then SIGKILL after five seconds, and records the run `interrupted`. On Windows the
+worker stops the agent's tree with `taskkill /t /f`. If the worker itself is killed, the
+agent keeps running; the next `factory start` on the same host stops it, but only after
+checking that the recorded pid still belongs to the same process (same start time), so a pid
+the OS has since reused is never signalled. Runs recorded before this release have no start
+time and are not signalled.
+
+In live mode, `factory doctor` reports a missing, broken or signed-out agent CLI as a failure
+rather than a warning.
 
 ## Files and locations
 
@@ -177,15 +218,22 @@ environment before relying on it. Details, log locations and troubleshooting:
 
 - Only GitHub logins in `dispatch.allowedActors` (or a workflow's `allowedActors`) can
   dispatch work. The check uses the actor on the label event; with an empty list, no events
-  are queued.
-- Issue titles, bodies and labels are untrusted input. Agent adapters (next release) will
-  receive them through stdin or a prompt file, not shell command strings, and the default
-  prompt ([examples/prompts/implement-issue.md](examples/prompts/implement-issue.md)) tells
+  are queued. In live mode the worker checks again right before it starts an agent: the label
+  application that queued the job must still be the latest one for that label on the issue,
+  and its actor must still be allowed. If the label was removed and put back since, the old
+  job is canceled; a reapplication by an allowed actor has queued its own job.
+- Issue titles, bodies and labels are untrusted input. In live mode they reach the agent
+  only through a prompt file (on stdin or by path), never a command line, fenced and
+  labelled as untrusted; the default prompt
+  ([examples/prompts/implement-issue.md](examples/prompts/implement-issue.md)) also tells
   agents not to follow instructions in them.
-- Agents are disabled in this release: nothing runs repository code or pushes to GitHub, and
-  the worker only reads from GitHub. In `prepare-only` mode the worker fetches into your
-  clone and creates branches and worktrees; Git hooks configured for the clone (such as
-  `post-checkout`) run as they would for any `git worktree add`.
+- No agent adapter ships in this release, so nothing runs repository code or pushes to
+  GitHub, and the worker only reads from GitHub. In `prepare-only` mode the worker fetches
+  into your clone and creates branches and worktrees; Git hooks configured for the clone
+  (such as `post-checkout`) run as they would for any `git worktree add`.
+- In live mode the agent runs as your user, in the job's worktree, with the worker's
+  environment minus `GH_TOKEN`/`GITHUB_TOKEN`. That is not a sandbox: what the agent may do
+  is up to the agent CLI's own permission settings.
 - GitHub access uses `GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`. The CLI
   does not store tokens.
 

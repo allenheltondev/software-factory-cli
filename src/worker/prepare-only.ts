@@ -1,24 +1,21 @@
 // Step-2 executor: prepares the job's branch and worktree, writes run.log, and stops
-// there. No agent runs. A live adapter (#8) can reuse prepareJobWorktree the same way.
+// there. No agent runs. The live executor (live.ts) prepares the worktree the same way.
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { agentAdapter, type FactoryConfig, type RepositoryConfig } from '../config/schema.js';
+import { agentAdapter, type FactoryConfig } from '../config/schema.js';
 import { ownEntry, type Claim } from '../db/queue.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree, type PreparedWorktree } from '../git/worktree.js';
-import type { Job } from '../types.js';
-import { LogOnlyExecutor, resolvePromptPath, type ExecutionContext, type ExecutionResult, type Executor } from './executor.js';
+import {
+  findRepoConfig,
+  LogOnlyExecutor,
+  resolvePromptPath,
+  type ExecutionContext,
+  type ExecutionResult,
+  type Executor,
+} from './executor.js';
+import { LiveExecutor } from './live.js';
 
-/** The repo's config entry, matched by stable ID first, then by name. */
-export function findRepoConfig(
-  config: FactoryConfig,
-  job: Pick<Job, 'repoId' | 'repoFullName'>,
-): { fullName: string; repo: RepositoryConfig } | null {
-  for (const [fullName, repo] of Object.entries(config.repositories)) {
-    if (repo.id === job.repoId) return { fullName, repo };
-  }
-  const repo = ownEntry(config.repositories, job.repoFullName);
-  return repo ? { fullName: job.repoFullName, repo } : null;
-}
+export { findRepoConfig } from './executor.js';
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -132,5 +129,7 @@ export function createExecutor(config: Pick<FactoryConfig, 'execution'>): Execut
       return new PrepareOnlyExecutor();
     case 'log-only':
       return new LogOnlyExecutor();
+    case 'live':
+      return new LiveExecutor();
   }
 }

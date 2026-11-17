@@ -133,6 +133,20 @@ export function renderStatus(v: StatusView): string {
     );
   }
 
+  if (s.recentAgentRuns.length) {
+    lines.push('', 'Recent agent runs:');
+    for (const { run, job } of s.recentAgentRuns) {
+      const sum = run.summary!;
+      lines.push(
+        `  ${run.id}  ${run.outcome ?? 'closed'}  ${job.repoFullName}#${job.issueNumber}  agent ${run.agent}  ended ${run.endedAt}`,
+        `    ${sum.commitCount} commit(s), ${sum.filesChanged} file(s) changed (${sum.diffStat}), ${sum.untracked} untracked`,
+        `    worktree ${sum.worktree} (branch ${sum.branch})`,
+      );
+      const last = sum.lastOutput.at(-1);
+      if (last) lines.push(`    last output: ${oneLine(last, 120)}`);
+    }
+  }
+
   lines.push('', 'Recent errors:');
   if (!s.recentErrors.length) lines.push('  (none)');
   for (const e of s.recentErrors) {

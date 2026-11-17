@@ -418,6 +418,39 @@ export function resolveLaunch(found: string, probes: DiscoveryProbes): { launch:
   return { launch: null, note: `shim ${found} needs ${shim.interpreters.join(' or ')}, which was not found` };
 }
 
+export interface LocatedLaunch {
+  /** Where the command was found (may be a `.cmd` shim on Windows); null when not found. */
+  path: string | null;
+  /** Direct spawn target; null when not found or the shim could not be resolved. */
+  launch: LaunchSpec | null;
+  /** Why there is no launch, when there isn't one. */
+  problem?: string;
+}
+
+/**
+ * Tier 1 only, for live execution: where an agent's CLI is and how to spawn it without a shell,
+ * without running it. `command` (agents.<name>.command) replaces the lookup: an absolute path, a
+ * path relative to `baseDir`, or a name looked up on PATH. Shims are resolved as in discovery.
+ */
+export function locateLaunch(adapter: AdapterName, probes: DiscoveryProbes, opts: { command?: string; baseDir?: string } = {}): LocatedLaunch {
+  const spec = AGENT_SPECS[adapter];
+  let path: string | null;
+  if (opts.command) {
+    const p = pathFor(probes.platform);
+    const hasSep = probes.platform === 'win32' ? /[\\/]/.test(opts.command) : opts.command.includes('/');
+    const target = hasSep && !p.isAbsolute(opts.command) && opts.baseDir ? p.resolve(opts.baseDir, opts.command) : opts.command;
+    path = which(target, { env: probes.env, platform: probes.platform, isExecutable: probes.isExecutable });
+    if (!path) {
+      return { path: null, launch: null, problem: `configured command ${target} was not found${hasSep ? '' : ' on PATH'} or is not executable` };
+    }
+  } else {
+    path = locate(spec, probes).path;
+    if (!path) return { path: null, launch: null, problem: `${spec.command} not found on PATH or in common install locations` };
+  }
+  const resolved = resolveLaunch(path, probes);
+  return resolved.launch ? { path, launch: resolved.launch } : { path, launch: null, problem: resolved.note ?? `cannot start ${path}` };
+}
+
 // ---------------------------------------------------------------------------
 // Tier 4: platform
 // ---------------------------------------------------------------------------

@@ -96,3 +96,20 @@ describe('migration v4', () => {
     expect(started.find((r) => r.id === 'run_job_c_2')?.execution_started_at).toBe(at);
   });
 });
+
+describe('migration v5', () => {
+  it('adds an empty process start time and summary to existing runs (reconcile never signals such a pid)', () => {
+    const db = openDatabase(':memory:', { migrateTo: 4 });
+    db.prepare(
+      `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
+       VALUES ('job_1', 1, 'o/r', 'wf', 'e1', 1, 'implement-issue', 'general', '{}', 'running', 1, 't', 't')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, hostname, pid, lease_expires_at, started_at, execution_started_at)
+       VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'wrk_1', 'host-a', 4242, 't', 't', 't')`,
+    ).run();
+    migrate(db);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+    expect(db.prepare('SELECT pid, pid_start_time, summary FROM runs').get()).toEqual({ pid: 4242, pid_start_time: null, summary: null });
+  });
+});

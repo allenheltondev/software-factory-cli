@@ -3,6 +3,8 @@ import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { validateConfig } from './validate.js';
 import { selectPool } from '../routing.js';
+import { registerAdapter } from '../agents/adapters/registry.js';
+import { fakeAdapter } from '../../test/fake-adapter.js';
 
 const example = () => parse(readFileSync(new URL('../../examples/config.yaml', import.meta.url), 'utf8'));
 
@@ -55,6 +57,68 @@ describe('validateConfig', () => {
     cfg.actions['implement-issue'].output = 'local-branch';
     cfg.execution = { mode: 'log-only' };
     expect(validateConfig(cfg).ok).toBe(true);
+  });
+
+  it('rejects live mode while an enabled agent has no implemented adapter (none ship yet)', () => {
+    const cfg = example();
+    cfg.execution = { mode: 'live' };
+    const r = validateConfig(cfg);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    for (const agent of ['codex', 'claude', 'kiro']) {
+      expect(r.errors).toContainEqual({
+        path: `agents.${agent}`,
+        message: expect.stringMatching(/live execution is not implemented for adapter ".+" in this release/),
+      });
+    }
+  });
+
+  it('accepts live mode once every enabled agent has an adapter, a checkout and a prompt', () => {
+    const repo = 'allenheltondev/kids-and-dragons';
+    const restore = ['codex', 'claude', 'kiro'].map((name) => registerAdapter(fakeAdapter({ name })));
+    try {
+      const cfg = example();
+      cfg.execution = { mode: 'live' };
+      cfg.repositories[repo].checkoutPath = '../clones/kids and dragons';
+      cfg.agents.claude.command = '/opt/agents/claude';
+      cfg.agents.claude.args = ['--model', 'x'];
+      cfg.agents.claude.env = { ANTHROPIC_LOG: 'debug' };
+      cfg.actions['implement-issue'].timeoutMinutes = 45;
+      expect(validateConfig(cfg)).toMatchObject({ ok: true, warnings: [] });
+
+      cfg.agents.kiro.enabled = false;
+      restore.pop()!(); // kiro no longer has an adapter, but it's disabled
+      expect(validateConfig(cfg).ok).toBe(true);
+
+      cfg.agents.claude.env = { 'NOT A NAME': 'x' };
+      expect(validateConfig(cfg).ok).toBe(false);
+      delete cfg.agents.claude.env;
+
+      delete cfg.repositories[repo].checkoutPath;
+      const prompt = cfg.actions['implement-issue'].prompt;
+      delete cfg.actions['implement-issue'].prompt;
+      const r = validateConfig(cfg);
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.errors).toEqual([
+        { path: `repositories.${repo}.checkoutPath`, message: expect.stringMatching(/required in live mode/) },
+        { path: 'actions.implement-issue.prompt', message: expect.stringMatching(/required in live mode/) },
+      ]);
+
+      cfg.actions['implement-issue'] = { prompt, output: 'log' };
+      const logOnly = validateConfig(cfg);
+      expect(logOnly).toMatchObject({
+        ok: true,
+        warnings: [{ path: 'actions.implement-issue.output', message: expect.stringMatching(/only starts agents for actions with output local-branch/) }],
+      });
+
+      for (const a of Object.values(cfg.agents) as { enabled?: boolean }[]) a.enabled = false;
+      const none = validateConfig(cfg);
+      expect(none.ok).toBe(false);
+      if (!none.ok) expect(none.errors).toContainEqual({ path: 'agents', message: 'live mode needs at least one enabled agent' });
+    } finally {
+      for (const r of restore) r();
+    }
   });
 
   it('requires an actor allowlist', () => {

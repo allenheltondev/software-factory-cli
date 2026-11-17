@@ -2,7 +2,7 @@
 // chosen with the same rule the worker uses (selectRepoRemote); the repo check confirms
 // the ID behind the configured name via the API.
 import { resolve } from 'node:path';
-import { repoNeedsCheckout, type FactoryConfig } from '../config/schema.js';
+import { modeNeedsCheckout, repoNeedsCheckout, type FactoryConfig } from '../config/schema.js';
 import { redactRemoteUrl, selectRepoRemote, type Remote } from '../git/git.js';
 import type { FactoryPaths } from '../paths.js';
 import type { CheckResult, CheckStatus, DoctorProbes } from './doctor.js';
@@ -17,7 +17,7 @@ export async function checkRepoCheckouts(
   for (const [fullName, repo] of Object.entries(config.repositories)) {
     if (!repo.checkoutPath) continue; // validation already requires it where the mode needs it
     const name = `checkout ${fullName}`;
-    const required = config.execution.mode === 'prepare-only' && repoNeedsCheckout(config, repo);
+    const required = modeNeedsCheckout(config.execution.mode) && repoNeedsCheckout(config, repo);
     const sev: CheckStatus = required ? 'fail' : 'warn';
     const add = (status: CheckStatus, detail: string) => checks.push({ status, name, detail });
     const dir = resolve(paths.configDir, repo.checkoutPath);
