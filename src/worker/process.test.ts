@@ -28,16 +28,18 @@ describe('process control', { timeout: 60_000 }, () => {
     await vi.waitFor(() => expect(isPidAlive(s.pid)).toBe(false));
   });
 
-  it('reads a stable, platform-tagged start time that tells processes apart', async () => {
+  it('reads a stable, platform-tagged start time for a live process', async () => {
     const a = sleeper();
     const b = sleeper();
     try {
       const [a1, a2, b1] = await Promise.all([processStartTime(a.pid), processStartTime(a.pid), processStartTime(b.pid)]);
       expect(a1).toMatch(new RegExp(`^${process.platform}:.+`));
+      expect(b1).toMatch(new RegExp(`^${process.platform}:.+`));
       expect(a2).toBe(a1);
-      expect(await processStartTime(process.pid)).not.toBe(a1);
-      // Two processes started back to back can share a one-second `ps lstart` on macOS; elsewhere they differ.
-      if (process.platform !== 'darwin') expect(b1).not.toBe(a1);
+      // Start times alone don't tell processes apart: the resolution is one second for macOS
+      // `ps lstart` and one clock tick on Linux, so processes started back to back can share one.
+      // Identity is pid + start time; the next test checks that a different recorded start time
+      // for the same pid blocks signalling.
       expect(await processStartTime(0)).toBeNull();
     } finally {
       a.kill();
