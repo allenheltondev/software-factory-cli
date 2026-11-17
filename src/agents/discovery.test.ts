@@ -480,4 +480,24 @@ describe('runProcess (real child processes)', () => {
     const pid = pidFrom(r.stdout);
     if (pid) expect(await waitDead(pid, 3000)).toBe(true);
   });
+
+  it.skipIf(process.platform === 'win32')(
+    'SIGKILLs a SIGTERM-ignoring grandchild even after its parent exits on SIGTERM',
+    async () => {
+      const grandchild = 'process.on("SIGTERM", () => {}); process.stdout.write("grandchild pid " + process.pid + " ready\\n"); setInterval(() => {}, 1000);';
+      const parent = [
+        'const { spawn } = require("node:child_process");',
+        `spawn(process.execPath, ["-e", ${JSON.stringify(grandchild)}], { stdio: ["ignore", "inherit", "inherit"] });`,
+        'setInterval(() => {}, 1000);',
+      ].join('\n');
+      const start = Date.now();
+      const r = await runProcess(node, ['-e', parent], { timeoutMs: 800, killGraceMs: 200 });
+      expect(Date.now() - start).toBeLessThan(800 + 1000);
+      expect(r).toMatchObject({ code: null, timedOut: true, stdout: expect.stringMatching(/grandchild pid \d+ ready/) });
+      const pid = pidFrom(r.stdout);
+      const dead = await waitDead(pid, 200 + 3000);
+      if (!dead) process.kill(pid, 'SIGKILL');
+      expect(dead).toBe(true);
+    },
+  );
 });

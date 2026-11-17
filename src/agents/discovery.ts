@@ -617,6 +617,10 @@ function killTree(child: ChildProcess, graceMs: number, exited: () => boolean): 
   const pid = child.pid;
   if (!pid) return;
   if (process.platform === 'win32') {
+    // Limitation: once the direct child has exited, `taskkill /t` can't find its descendants
+    // (they're matched through the live parent), and the pid may already belong to an unrelated
+    // process, so we don't kill by pid then. Orphans are left to finish on their own.
+    if (exited()) return;
     const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
     const taskkill = systemRoot ? win32.join(systemRoot, 'System32', 'taskkill.exe') : 'taskkill.exe';
     try {
@@ -629,16 +633,20 @@ function killTree(child: ChildProcess, graceMs: number, exited: () => boolean): 
     }
     return;
   }
-  const signal = (sig: NodeJS.Signals) => {
+  // The group outlives its leader: members that ignore SIGTERM keep it alive after the direct child
+  // exits, so escalation checks the group, not the child. ESRCH (empty group) and EPERM count as done.
+  const group = (sig: NodeJS.Signals | 0): boolean => {
     try {
       process.kill(-pid, sig);
+      return true;
     } catch {
-      child.kill(sig);
+      return false;
     }
   };
-  signal('SIGTERM');
+  if (!group('SIGTERM') && !exited()) child.kill('SIGTERM');
   unrefTimer(graceMs, () => {
-    if (!exited()) signal('SIGKILL');
+    if (group(0)) group('SIGKILL');
+    else if (!exited()) child.kill('SIGKILL');
   });
 }
 
@@ -682,7 +690,8 @@ export function runProcess(file: string, args: string[], opts: RunProcessOptions
     };
     settleTimers.push(
       unrefTimer(opts.timeoutMs, () => {
-        if (!exited) killTree(child, opts.killGraceMs ?? KILL_GRACE_MS, () => exited);
+        // Even if the direct child already exited: on POSIX its process group may still be live.
+        killTree(child, opts.killGraceMs ?? KILL_GRACE_MS, () => exited);
         finish({ code: null, stdout, stderr, timedOut: true });
       }),
     );
