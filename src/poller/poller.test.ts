@@ -219,9 +219,11 @@ function setup(config: FactoryConfig = makeConfig()) {
 }
 
 /** First poll initializes the checkpoint at the current position (enqueues nothing). */
+/** Clears the fake's recorded calls afterwards, so tests see only later polls. */
 async function init(deps: PollerDeps) {
   const s = await pollOnce(deps);
   expect(s.repos.every((r) => r.ok)).toBe(true);
+  (deps.api as FakeGitHub).calls.length = 0;
   return s;
 }
 
@@ -280,6 +282,25 @@ describe('pollOnce: subscription start', () => {
     gh.noise(REPO, 2, 1);
     expect((await pollOnce(deps)).repos[0]!.jobsEnqueued).toBe(0);
     expect(allJobs(db).map((j) => j.issue_number)).toEqual([2]);
+  });
+
+  it('initial snapshot covers an existing higher-id label that sorts onto page 2', async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.createIssue(REPO, 2);
+    gh.createIssue(REPO, 3);
+    gh.noise(REPO, 1, EVENTS_PER_PAGE); // page 1 at initialization
+    // Already exists before the subscription: highest id, but older than all of page 1.
+    const oldest = Date.parse(gh.repos.get(REPO)!.events[0]!.createdAt);
+    const existing = gh.labelAt(REPO, 2, READY, oldest - 1000);
+    await init(deps);
+    expect(getCheckpoint(db, REPO)!.startEventId).toBe(existing.id);
+    // Zero changes between polls: nothing is queued.
+    expect((await pollOnce(deps)).repos[0]).toMatchObject({ ok: true, jobsEnqueued: 0 });
+    // A genuinely new arrival still dispatches.
+    const fresh = gh.label(REPO, 3, READY);
+    expect((await pollOnce(deps)).repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
+    expect(allJobs(db).map((j) => j.event_id)).toEqual([String(fresh.id)]);
   });
 
   it('never dispatches a label applied before the subscription started', async () => {
@@ -652,7 +673,6 @@ describe('pollOnce: errors and paging', () => {
     expect(listQueuedJobs(db).map((j) => j.issueNumber)).toEqual([1, 2]);
     const pages = gh.calls
       .filter((c) => c.method === 'listIssueEvents')
-      .slice(1)
       .map((c) => (c.arg as { page: number }).page);
     expect(pages).toEqual([1, 2, 3]);
   });
@@ -673,7 +693,6 @@ describe('pollOnce: errors and paging', () => {
     expect(listQueuedJobs(db).map((j) => j.eventId)).toEqual([String(late.id)]);
     const pages = gh.calls
       .filter((c) => c.method === 'listIssueEvents')
-      .slice(1)
       .map((c) => (c.arg as { page: number }).page);
     expect(pages).toEqual([1, 2]);
   });
@@ -691,7 +710,7 @@ describe('pollOnce: errors and paging', () => {
     const s = await pollOnce(deps);
     expect(s.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
     expect(listQueuedJobs(db).map((j) => j.eventId)).toEqual([String(late.id)]);
-    const calls = gh.calls.filter((c) => c.method === 'listIssueEvents').slice(1);
+    const calls = gh.calls.filter((c) => c.method === 'listIssueEvents');
     expect(calls.map((c) => (c.arg as { page: number }).page)).toEqual([1, 2]);
     expect(calls[0]!.arg).toMatchObject({ etag: null }); // no 304 shortcut while the overlap spans pages
   });
@@ -737,7 +756,6 @@ describe('pollOnce: errors and paging', () => {
     await pollOnce(deps);
     const pages = gh.calls
       .filter((c) => c.method === 'listIssueEvents')
-      .slice(1)
       .map((c) => (c.arg as { page: number }).page);
     expect(pages).toEqual([1]);
   });
@@ -751,7 +769,6 @@ describe('pollOnce: errors and paging', () => {
     await pollOnce(deps);
     const pages = gh.calls
       .filter((c) => c.method === 'listIssueEvents')
-      .slice(1)
       .map((c) => (c.arg as { page: number }).page);
     // 150 new + OVERLAP_MS of rescanned history (1 event/s in the fake) fits in 5 pages, not 6.
     expect(OVERLAP_MS).toBe(300_000);

@@ -190,25 +190,44 @@ async function pollRepo(
   const cp = getCheckpoint(db, repo.id);
   const base: RepoPollResult = { repo: repo.fullName, ok: true, eventsSeen: 0, jobsEnqueued: 0 };
 
-  // First poll without backfill: start at the current stream position.
+  // First poll without backfill: start at the current stream position. The stream is in
+  // created_at order, so an event that already exists can sort onto page 2+ with a higher id
+  // than anything on page 1. Snapshot the same overlap later scans re-read, and take the
+  // highest id in it as the subscription start; only events inserted after that are new.
   if (!cp && !cfg.backfillSince) {
     const page1 = await api.listIssueEvents(repo, { page: 1, perPage: EVENTS_PER_PAGE });
-    const newest = maxId(page1.events);
     const newestAt = maxCreatedAt(page1.events);
+    const snapshot = [...page1.events];
+    if (newestAt !== null) {
+      const boundary = Date.parse(newestAt) - OVERLAP_MS;
+      let res = page1;
+      for (let page = 2; res.nextPage !== null && !res.events.some((e) => Date.parse(e.createdAt) < boundary); page++) {
+        if (page > MAX_PAGES) break;
+        try {
+          res = await api.listIssueEvents(repo, { page: res.nextPage, perPage: EVENTS_PER_PAGE });
+        } catch (err) {
+          if (err instanceof GitHubError && err.status === 422) break; // nothing older is served
+          throw err; // no checkpoint yet; initialization is retried next cycle
+        }
+        snapshot.push(...res.events);
+      }
+    }
+    const startId = maxId(snapshot);
     commitPollBatch(db, {
       repoId: repo.id,
       fullName: repo.fullName,
-      lastEventId: newest,
+      lastEventId: startId,
       lastEventCreatedAt: newestAt,
-      // Everything up to the newest visible event predates the subscription.
-      subscriptionStart: { eventId: newest ?? 0, createdAt: null },
+      // Everything visible in the overlap snapshot predates the subscription.
+      subscriptionStart: { eventId: startId ?? 0, createdAt: null },
       page1CoversOverlap: coversOverlap(page1.events, page1.nextPage, newestAt),
       etag: page1.etag,
       jobs: [],
       now: deps.now,
     });
     log.info('subscription initialized at current event position; earlier events are not enqueued', {
-      lastEventId: newest,
+      lastEventId: startId,
+      snapshotEvents: snapshot.length,
     });
     return base;
   }
