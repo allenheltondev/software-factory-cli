@@ -122,7 +122,7 @@ describe('factory add', () => {
     mkdirSync(dirname(ctx.paths.configFile), { recursive: true });
     writeFileSync(ctx.paths.configFile, COMMENTED_CONFIG);
 
-    expect(await addCommand(ctx, 'new-owner/app', {})).toBe(EXIT.OK);
+    expect(await addCommand(ctx, 'new-owner/app', { label: 'factory:ready' })).toBe(EXIT.OK);
     expect(ctx.out.text).toContain('moved from o/app');
     const text = readFileSync(ctx.paths.configFile, 'utf8');
     expect(text).toBe(COMMENTED_CONFIG.replace('  # The main app\n  o/app:\n', '  # The main app\n  new-owner/app:\n'));
