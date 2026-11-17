@@ -1,5 +1,6 @@
 import { Command, Option } from 'commander';
 import { addCommand, type AddOptions } from './add.js';
+import { agentsCommand, type AgentsOptions } from './agents.js';
 import { configureCommand } from './configure.js';
 import { DEFAULT_LABEL } from './config-edit.js';
 import { createDefaultContext, println, type CommandContext, type GlobalOptions } from './context.js';
@@ -18,6 +19,7 @@ export interface Handlers {
   status(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   doctor(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   retry(ctx: CommandContext, jobId: string): Promise<number>;
+  agents(ctx: CommandContext, opts: AgentsOptions): Promise<number>;
 }
 
 export const defaultHandlers: Handlers = {
@@ -28,6 +30,7 @@ export const defaultHandlers: Handlers = {
   status: statusCommand,
   doctor: (ctx, opts) => doctorCommand(ctx, opts),
   retry: (ctx, jobId) => retryCommand(ctx, jobId),
+  agents: agentsCommand,
 };
 
 export interface ProgramOptions {
@@ -103,6 +106,13 @@ export function buildProgram(opts: ProgramOptions): Command {
     .description('Check Node, config, state, git, gh, GitHub access, labels and agent commands in this environment')
     .addOption(new Option('--json', 'machine-readable output'))
     .action((o: { json?: boolean }) => exec((ctx) => handlers.doctor(ctx, o)));
+
+  program
+    .command('agents')
+    .description('List coding agents found on this machine: path, version, sign-in and platform support')
+    .addOption(new Option('--json', 'machine-readable output'))
+    .addOption(new Option('--deep', 'also send one trivial headless prompt to each usable agent (uses tokens)'))
+    .action((o: AgentsOptions) => exec((ctx) => handlers.agents(ctx, o)));
 
   program
     .command('retry')

@@ -77,6 +77,15 @@ describe('commander wiring', () => {
     expect(codes).toEqual([0, 1, 0, 0, 0]);
   });
 
+  it('parses agents --json --deep', async () => {
+    const agents = vi.fn(async (_ctx: unknown, _o: { json?: boolean; deep?: boolean }) => 0);
+    const { parse } = setup({ agents });
+    await parse('agents');
+    await parse('agents', '--json', '--deep');
+    expect(agents.mock.calls[0]?.[1]).toEqual({});
+    expect(agents.mock.calls[1]?.[1]).toEqual({ json: true, deep: true });
+  });
+
   it('rejects a missing argument and prints the version', async () => {
     const { parse } = setup();
     await expect(parse('add')).rejects.toMatchObject({ code: 'commander.missingArgument' });

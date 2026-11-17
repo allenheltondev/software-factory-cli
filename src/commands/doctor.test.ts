@@ -3,8 +3,9 @@ import { describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { resolvePaths } from '../paths.js';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
-import { doctorCommand, nodeVersionOk, renderDoctor, runDoctor, type DoctorProbes } from './doctor.js';
-import { fakeApi, fakeContext, fakeRepo, tempHome } from './fakes.js';
+import type { AdapterName } from '../config/schema.js';
+import { agentChecks, agentProblemSeverity, doctorCommand, nodeVersionOk, renderDoctor, runDoctor, type DoctorProbes } from './doctor.js';
+import { fakeAgentReport, fakeApi, fakeContext, fakeRepo, missingAgentReport, tempHome } from './fakes.js';
 
 function setup(o: { labels?: string[]; repoId?: number; kiro?: boolean } = {}) {
   const home = tempHome();
@@ -29,6 +30,7 @@ function setup(o: { labels?: string[]; repoId?: number; kiro?: boolean } = {}) {
     env: { PATH: '/usr/bin:/bin:/opt/bin', KIRO_API_KEY: 'x' },
     which: (cmd) => (['git', 'gh', 'codex', 'claude', 'kiro-cli'].includes(cmd) ? `/usr/bin/${cmd}` : null),
     run: async (file) => ({ code: 0, stdout: file.endsWith('git') ? 'git version 2.50.0\n' : '', stderr: '' }),
+    discoverAgents: async (adapters) => adapters.map((a) => fakeAgentReport(a as AdapterName)),
     checkWritable: () => {},
     checkDb: () => {},
     createApi: async () => api,
@@ -59,7 +61,8 @@ describe('runDoctor', () => {
     expect(status(r.checks, /git: \/usr\/bin\/git \(git version 2\.50\.0\)/)).toBe('ok');
     expect(status(r.checks, /github: token works; authenticated as allen/)).toBe('ok');
     expect(status(r.checks, /trigger label "factory:ready" exists/)).toBe('ok');
-    expect(status(r.checks, /agent kiro: kiro-cli found/)).toBe('ok');
+    expect(status(r.checks, /agent kiro: kiro-cli 1\.0\.0: \/usr\/bin\/kiro-cli/)).toBe('ok');
+    expect(status(r.checks, /agent claude: signed in: test/)).toBe('ok');
     const text = renderDoctor(r);
     expect(text).toContain('✓ node: v22.13.0');
     expect(text).toContain('All checks passed.');
@@ -113,17 +116,48 @@ describe('runDoctor', () => {
     expect(r.checks.some((c) => c.name.startsWith('repo '))).toBe(false);
   });
 
-  it('only warns about agent commands and KIRO_API_KEY in log-only mode', async () => {
+  it('only warns about agent problems in log-only mode, using discovery for enabled agents', async () => {
     const { paths, probes } = setup();
-    const r = await runDoctor(paths, { ...probes, env: { PATH: '/bin' }, which: (c) => (c === 'git' || c === 'gh' ? `/bin/${c}` : null) });
-    expect(status(r.checks, /agent codex: codex not found/)).toBe('warn');
+    const asked: string[][] = [];
+    const r = await runDoctor(paths, {
+      ...probes,
+      discoverAgents: async (adapters) => {
+        asked.push(adapters);
+        return [
+          missingAgentReport('codex'),
+          fakeAgentReport('claude', { signedIn: 'no', auth: 'not signed in; run "claude auth login"', usable: false }),
+          { ...missingAgentReport('kiro'), signedIn: 'no', auth: 'KIRO_API_KEY is not set; headless Kiro requires it' },
+        ];
+      },
+    });
+    expect(asked).toEqual([['codex', 'claude', 'kiro']]);
+    expect(status(r.checks, /agent codex: codex not found on PATH or in common install locations/)).toBe('warn');
+    expect(status(r.checks, /agent claude: not signed in/)).toBe('warn');
     expect(status(r.checks, /agent kiro: kiro-cli not found/)).toBe('warn');
-    expect(status(r.checks, /agent kiro: KIRO_API_KEY is not set/)).toBe('warn');
+    expect(status(r.checks, /agent kiro: not signed in: KIRO_API_KEY is not set/)).toBe('warn');
     expect(r.ok).toBe(true);
 
     const noKiro = setup({ kiro: false });
     const r2 = await runDoctor(noKiro.paths, { ...noKiro.probes, env: { PATH: '/bin' } });
     expect(r2.checks.some((c) => c.name === 'agent kiro')).toBe(false);
+  });
+
+  it('agentChecks: off-PATH and unknown sign-in warn; problems are failures only in live mode', () => {
+    expect(agentProblemSeverity('log-only')).toBe('warn');
+    expect(agentProblemSeverity('prepare-only')).toBe('warn');
+    expect(agentProblemSeverity('live')).toBe('fail');
+    const offPath = agentChecks(fakeAgentReport('codex', { onPath: false, signedIn: 'unknown', notes: ['found outside PATH'] }), 'fail');
+    expect(offPath.map((c) => c.status)).toEqual(['ok', 'warn', 'warn']);
+    expect(offPath[1]?.detail).toMatch(/not on this PATH/);
+    const broken = agentChecks(
+      fakeAgentReport('claude', { runnable: 'no', version: null, signedIn: 'unknown', platform: { supported: 'no', detail: 'ppc64 is not supported' } }),
+      'fail',
+    );
+    expect(broken).toEqual([
+      { status: 'fail', detail: expect.stringMatching(/found at \/usr\/bin\/claude but did not run/) },
+      { status: 'fail', detail: 'not supported on this machine: ppc64 is not supported' },
+    ]);
+    expect(agentChecks(undefined, 'warn')).toEqual([{ status: 'warn', detail: 'unknown adapter; not checked' }]);
   });
 
   it('reports state dir and DB failures', async () => {
