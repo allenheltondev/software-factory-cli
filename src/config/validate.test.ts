@@ -28,6 +28,35 @@ describe('validateConfig', () => {
     );
   });
 
+  it('requires checkoutPath in prepare-only mode only for repos that produce a local branch', () => {
+    const repo = 'allenheltondev/kids-and-dragons';
+    const cfg = example();
+    cfg.execution = { mode: 'prepare-only' };
+    delete cfg.repositories[repo].checkoutPath;
+    const r = validateConfig(cfg);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.errors).toEqual([
+      { path: `repositories.${repo}.checkoutPath`, message: expect.stringMatching(/required in prepare-only mode/) },
+    ]);
+
+    cfg.repositories[repo].checkoutPath = '../clones/kids and dragons';
+    expect(validateConfig(cfg).ok).toBe(true);
+    cfg.repositories[repo].remote = 'github-work';
+    expect(validateConfig(cfg).ok).toBe(true);
+    cfg.repositories[repo].remote = '--upload-pack=x';
+    expect(validateConfig(cfg).ok).toBe(false);
+    delete cfg.repositories[repo].remote;
+
+    delete cfg.repositories[repo].checkoutPath;
+    cfg.actions['implement-issue'].output = 'log';
+    expect(validateConfig(cfg).ok).toBe(true);
+
+    cfg.actions['implement-issue'].output = 'local-branch';
+    cfg.execution = { mode: 'log-only' };
+    expect(validateConfig(cfg).ok).toBe(true);
+  });
+
   it('requires an actor allowlist', () => {
     const cfg = example();
     cfg.dispatch.allowedActors = [];

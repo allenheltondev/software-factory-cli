@@ -4,6 +4,7 @@ import type { Db } from '../db/database.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import { runDaemon, type DaemonDeps } from '../worker/daemon.js';
+import { createExecutor } from '../worker/prepare-only.js';
 import type { CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 
@@ -79,6 +80,7 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       poll: () => deps.pollOnce({ db: openDb, api, config, log: pollLog }),
       checkDispatchable: (job) => deps.checkJobDispatchable({ api, config }, job),
       signal: controller.signal,
+      executor: createExecutor(config),
     });
     log.info('worker stopped');
     return EXIT.OK;

@@ -4,6 +4,7 @@ import {
   agentAdapter,
   allowedActorsFor,
   configSchema,
+  repoNeedsCheckout,
   workflowId,
   type FactoryConfig,
 } from './schema.js';
@@ -65,6 +66,14 @@ export function validateConfig(raw: unknown): ValidationResult {
     const dup = repoIds.get(repo.id);
     if (dup) errors.push({ path: `repositories.${repoName}.id`, message: `same repository ID as ${dup}` });
     repoIds.set(repo.id, repoName);
+
+    if (config.execution.mode === 'prepare-only' && !repo.checkoutPath && repoNeedsCheckout(config, repo)) {
+      errors.push({
+        path: `repositories.${repoName}.checkoutPath`,
+        message:
+          'required in prepare-only mode because a workflow runs an action with output local-branch; set it to a local clone of the repo',
+      });
+    }
 
     const wfIds = new Set<string>();
     repo.workflows.forEach((wf, i) => {

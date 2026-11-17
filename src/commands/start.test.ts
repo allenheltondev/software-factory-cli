@@ -5,6 +5,8 @@ import { ConfigError } from '../config/io.js';
 import type { Job } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { WorkerLockedError, type DaemonDeps } from '../worker/daemon.js';
+import { LogOnlyExecutor } from '../worker/executor.js';
+import { PrepareOnlyExecutor } from '../worker/prepare-only.js';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
 import { fakeApi, fakeContext } from './fakes.js';
 import { startCommand, type StartDeps } from './start.js';
@@ -29,8 +31,10 @@ function setup(runDaemon: StartDeps['runDaemon']) {
   return { ctx, api, deps, closed, uninstall, abort: (s: string) => abortFn?.(s) };
 }
 
-function writeConfig(path: string) {
+function writeConfig(path: string, mode: 'log-only' | 'prepare-only' = 'log-only') {
   const cfg = upsertRepoWorkflow(seedConfig('me'), { id: 1, fullName: 'o/r' }, buildWorkflow({ label: 'go', action: 'implement-issue', pool: 'general' })).config;
+  cfg.execution = { mode };
+  if (mode === 'prepare-only') cfg.repositories!['o/r']!.checkoutPath = '../clones/o r';
   writeFileSync(path, stringify(cfg));
 }
 
@@ -58,6 +62,19 @@ describe('factory start', () => {
     expect(s.deps.createLogger).toHaveBeenCalledWith(expect.objectContaining({ file: expect.stringMatching(/factory\.log$/) }));
     expect(s.closed).toEqual([s.ctx.paths.dbFile]);
     expect(s.uninstall).toHaveBeenCalledOnce();
+  });
+
+  it('selects the executor from execution.mode', async () => {
+    const executors: unknown[] = [];
+    for (const mode of ['log-only', 'prepare-only'] as const) {
+      const s = setup(async (d) => {
+        executors.push(d.executor);
+      });
+      writeConfig(s.ctx.paths.configFile, mode);
+      expect(await startCommand(s.ctx, s.deps)).toBe(0);
+    }
+    expect(executors[0]).toBeInstanceOf(LogOnlyExecutor);
+    expect(executors[1]).toBeInstanceOf(PrepareOnlyExecutor);
   });
 
   it('propagates WorkerLockedError and still closes the DB', async () => {
