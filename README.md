@@ -303,7 +303,9 @@ To change the profile, set it in `agents.codex.args`. Any of `--sandbox`/`-s`,
 `--ask-for-approval`/`-a`, `--full-auto`, `--approve-for-me`, `--yolo`,
 `--dangerously-bypass-approvals-and-sandbox`, or `-c sandbox_mode=...` /
 `-c approval_policy=...` there replaces the default. Settings in `~/.codex/config.toml` or a
-`--profile` do not; put them in `args`. Config arguments go last, after the adapter's own:
+`--profile` do not; put them in `args`. Config arguments go last, after the adapter's own,
+except `--ask-for-approval`/`-a`, which `codex exec` only accepts before the subcommand, so
+the adapter moves it there:
 
 ```yaml
 agents:

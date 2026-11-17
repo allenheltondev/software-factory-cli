@@ -38,7 +38,8 @@
  *   `--full-auto` still exists in codex-cli 0.104.0, but the current docs say it "is no longer
  *   supported".
  * - Config args go last: options such as `--image <FILE>...` take several values and would
- *   swallow anything after them.
+ *   swallow anything after them. The exception is `--ask-for-approval` / `-a`, a top-level option
+ *   that `codex exec` rejects; it goes before `exec` (see splitGlobalArgs).
  *
  * Result: the docs don't state exit codes. The exec source exits 1 when the turn fails or is
  * interrupted, or a non-retried error was reported, "for automation-friendly signaling"
@@ -101,6 +102,28 @@ export function setsPermissions(args: readonly string[]): boolean {
     PERMISSION_SHORT_FLAGS.some((f) => hasShortOption(args, f)) ||
     configKeys(args).some((k) => PERMISSION_CONFIG_KEYS.includes(k))
   );
+}
+
+/**
+ * Split config args into options that belong before the `exec` subcommand and the rest.
+ * `--ask-for-approval` / `-a` is a top-level `codex` option: `codex exec` rejects it as an
+ * unexpected argument (checked with codex-cli 0.167.0-alpha.4), while `codex --ask-for-approval
+ * never exec` accepts it. Everything else keeps its order, after the adapter's own flags.
+ */
+export function splitGlobalArgs(args: readonly string[]): { global: string[]; rest: string[] } {
+  const global: string[] = [];
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--ask-for-approval' || a === '-a') {
+      global.push(a, ...(i + 1 < args.length ? [args[++i]!] : []));
+    } else if (a.startsWith('--ask-for-approval=') || (a.startsWith('-a') && !a.startsWith('--'))) {
+      global.push(a);
+    } else {
+      rest.push(a);
+    }
+  }
+  return { global, rest };
 }
 
 /** Was the run's output JSONL (`--json` or its alias)? */
@@ -201,10 +224,11 @@ export const codexAdapter: AgentAdapter = {
 
   buildInvocation(req: InvocationRequest): AgentInvocation {
     const extra = [...req.extraArgs];
-    const args = [...req.launch.args, 'exec'];
+    const { global, rest } = splitGlobalArgs(extra);
+    const args = [...req.launch.args, ...global, 'exec'];
     if (!jsonMode(extra)) args.push('--json');
     if (!setsPermissions(extra)) args.push(BYPASS_FLAG);
-    args.push(...extra);
+    args.push(...rest);
     return { file: req.launch.file, args, promptVia: 'stdin' };
   },
 

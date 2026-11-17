@@ -95,8 +95,6 @@ describe('codex adapter: invocation', () => {
     [['--sandbox=read-only']],
     [['-s', 'workspace-write']],
     [['-sworkspace-write']],
-    [['--ask-for-approval', 'never']],
-    [['-a', 'on-request']],
     [['--full-auto']],
     [['--approve-for-me']],
     [['--not-so-yolo']],
@@ -110,6 +108,16 @@ describe('codex adapter: invocation', () => {
     const inv = codexAdapter.buildInvocation(request({ extraArgs }));
     expect(inv.args.filter((a) => a === '--dangerously-bypass-approvals-and-sandbox')).toHaveLength(extraArgs.includes('--dangerously-bypass-approvals-and-sandbox') ? 1 : 0);
     expect(inv.args.slice(-extraArgs.length)).toEqual(extraArgs);
+  });
+
+  it.each([
+    [['--ask-for-approval', 'never'], ['--ask-for-approval', 'never']],
+    [['--ask-for-approval=never'], ['--ask-for-approval=never']],
+    [['-a', 'on-request'], ['-a', 'on-request']],
+    [['-anever'], ['-anever']],
+  ])('an approval policy replaces the default and goes before exec, where codex accepts it: %j', (extraArgs, global) => {
+    const inv = codexAdapter.buildInvocation(request({ extraArgs: ['--model', 'o3', ...extraArgs, '--add-dir', '/tmp'] }));
+    expect(inv.args).toEqual(['C:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js', ...global, 'exec', '--json', '--model', 'o3', '--add-dir', '/tmp']);
   });
 
   it('other -c overrides, --cd and --model keep the default', () => {
