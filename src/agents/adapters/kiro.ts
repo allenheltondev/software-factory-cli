@@ -17,8 +17,9 @@
  *   no harness named runs V2, except that `--trust-all-tools` takes the interactive default
  *   (V3 on a capable machine, V2 on older-glibc Linux), so "pass `--v2` or `--v3` explicitly so
  *   the pipeline doesn't change when defaults do" (https://kiro.dev/docs/cli/agent-harness/).
- *   V3 needs Kiro CLI 3.0.0 or later. `--v2`, `--v3` or `--agent-engine` in agents.<name>.args
- *   replaces it (they conflict with each other, https://kiro.dev/docs/reference/cli-commands/).
+ *   V3 needs Kiro CLI 3.0.0 or later (discovery and doctor flag an older one). `--v2`, `--v3` or
+ *   `--agent-engine` in agents.<name>.args replaces it (they conflict with each other,
+ *   https://kiro.dev/docs/reference/cli-commands/).
  * - `--trust-all-tools` ("Allow the model to use any tool without confirmation",
  *   https://kiro.dev/docs/reference/cli-commands/) is the project's default profile: full auto
  *   inside the job worktree. Headless runs can't answer approval prompts, so without it a tool
@@ -54,6 +55,43 @@ const TRUST_FLAGS = ['--trust-all-tools', '--trust-tools'];
 const HARNESS_FLAGS = ['--v3', '--v2', '--agent-engine'];
 const NO_INTERACTIVE = '--no-interactive';
 
+/** The oldest Kiro CLI with the V3 harness, which the adapter selects with `--v3` by default. */
+export const KIRO_V3_MIN_VERSION = '3.0.0';
+
+/** True when agents.<name>.args select the harness themselves, so the adapter adds no `--v3`. */
+export function kiroArgsChooseHarness(args: readonly string[]): boolean {
+  return HARNESS_FLAGS.some((f) => hasOption(args, f));
+}
+
+/**
+ * Whether a Kiro CLI version (as discovery parsed it from `kiro-cli --version`) is
+ * {@link KIRO_V3_MIN_VERSION} or later: 'unknown' when there is no `major.minor.patch` to read.
+ * Only the numeric part is compared, so a 3.0.0 pre-release counts as 3.0.0 rather than failing.
+ */
+export function kiroSupportsV3(version: string | null): 'yes' | 'no' | 'unknown' {
+  const m = version?.match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return 'unknown';
+  const have = m.slice(1, 4).map(Number);
+  const need = KIRO_V3_MIN_VERSION.split('.').map(Number);
+  for (let i = 0; i < need.length; i++) {
+    if (have[i]! !== need[i]!) return have[i]! > need[i]! ? 'yes' : 'no';
+  }
+  return 'yes';
+}
+
+/**
+ * What to tell the user when the Kiro CLI is too old for `--v3` ('no') or its version could not be
+ * read ('unknown'); null when it is new enough. `argsKey` names the config args to change.
+ */
+export function kiroV3Problem(version: string | null, supported: 'yes' | 'no' | 'unknown', argsKey = 'agents.<name>.args'): string | null {
+  if (supported === 'yes') return null;
+  const needs = `factory starts Kiro with --v3, which needs Kiro CLI ${KIRO_V3_MIN_VERSION} or later`;
+  if (supported === 'no') {
+    return `Kiro CLI ${version} is older than ${KIRO_V3_MIN_VERSION}: ${needs}, so live runs fail. Upgrade Kiro CLI, or add --v2 to ${argsKey}`;
+  }
+  return `could not read a Kiro CLI version${version ? ` from "${version}"` : ''}; ${needs}`;
+}
+
 /** What Kiro's documented non-zero exit codes mean (https://kiro.dev/docs/reference/exit-codes/). */
 const EXIT_MEANINGS: Readonly<Record<number, string>> = {
   1: 'general failure: an auth error, invalid arguments or a failed operation',
@@ -83,7 +121,7 @@ export const kiroAdapter: AgentAdapter = {
     const extra = [...req.extraArgs];
     const args = [...req.launch.args, 'chat'];
     if (!extra.includes(NO_INTERACTIVE)) args.push(NO_INTERACTIVE);
-    if (!HARNESS_FLAGS.some((f) => hasOption(extra, f))) args.push('--v3');
+    if (!kiroArgsChooseHarness(extra)) args.push('--v3');
     if (!TRUST_FLAGS.some((f) => hasOption(extra, f))) args.push('--trust-all-tools');
     args.push(...extra);
     return { file: req.launch.file, args, promptVia: 'stdin' };

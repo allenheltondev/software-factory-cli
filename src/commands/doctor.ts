@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
+import { kiroArgsChooseHarness, kiroV3Problem } from '../agents/adapters/kiro.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { agentAdapter, publishMode, type FactoryConfig } from '../config/schema.js';
 import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
@@ -25,8 +26,15 @@ export function agentProblemSeverity(mode: string): CheckStatus {
   return mode === 'live' ? 'fail' : 'warn';
 }
 
-/** Doctor checks for one enabled agent's discovery report. */
-export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array<Omit<CheckResult, 'name'>> {
+/**
+ * Doctor checks for one enabled agent's discovery report. `agent` is its config entry, for checks
+ * that depend on agents.<name>.args (Kiro's version: see {@link kiroV3Problem}).
+ */
+export function agentChecks(
+  r: AgentReport | undefined,
+  sev: CheckStatus,
+  agent: { name: string; args?: readonly string[] } = { name: '<name>' },
+): Array<Omit<CheckResult, 'name'>> {
   if (!r) return [{ status: sev, detail: 'unknown adapter; not checked' }];
   const out: Array<Omit<CheckResult, 'name'>> = [];
   const notes = r.notes.length ? ` (${r.notes.join('; ')})` : '';
@@ -38,6 +46,11 @@ export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array
   } else {
     out.push({ status: 'ok', detail: `${r.command} ${r.version ?? '(unknown version)'}: ${r.path}` });
     if (!r.onPath) out.push({ status: 'warn', detail: `${r.command} is not on this PATH; the worker may not find it${notes}` });
+    // The adapter adds --v3, which needs Kiro CLI 3.0.0+, unless the args pick a harness themselves.
+    if (r.kiroV3 && r.kiroV3 !== 'yes' && !kiroArgsChooseHarness(agent.args ?? [])) {
+      const problem = kiroV3Problem(r.version, r.kiroV3, `agents.${agent.name}.args`)!;
+      out.push({ status: r.kiroV3 === 'no' ? sev : 'warn', detail: problem });
+    }
   }
   if (r.signedIn === 'yes') out.push({ status: 'ok', detail: `signed in: ${r.auth ?? 'yes'}` });
   else if (r.signedIn === 'no') out.push({ status: sev, detail: `not signed in: ${r.auth ?? 'no'}` });
@@ -258,8 +271,8 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
         }),
       ),
     );
-    enabled.forEach(([agentName], i) => {
-      for (const c of agentChecks(reports[i], sev)) add(c.status, `agent ${agentName}`, c.detail);
+    enabled.forEach(([agentName, agent], i) => {
+      for (const c of agentChecks(reports[i], sev, { name: agentName, args: agent.args })) add(c.status, `agent ${agentName}`, c.detail);
     });
   }
 

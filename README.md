@@ -354,7 +354,10 @@ neither.
 Prerequisites, under the account and environment the worker runs as (the background
 launchers' account, not just your terminal):
 
-- Kiro CLI 3.0.0 or later (`kiro-cli --version`) on a platform Kiro supports. Kiro lists
+- Kiro CLI 3.0.0 or later (`kiro-cli --version`), because factory starts Kiro with `--v3`.
+  `factory agents` notes an older CLI, and `factory doctor` flags it (a failure in live mode)
+  unless the agent's `args` pick a harness themselves, such as `--v2`. It must also run on a
+  platform Kiro supports. Kiro lists
   "macOS, Windows 11 (PowerShell), or Linux (glibc 2.34+ or musl variant)" for the CLI
   ([installation](https://kiro.dev/docs/getting-started/installation/)) and doesn't document
   which CPU architectures the CLI supports. `factory agents` shows the platform check, and in

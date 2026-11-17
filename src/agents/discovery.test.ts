@@ -327,6 +327,24 @@ describe('sign-in checks', () => {
     expect(none).toMatchObject({ signedIn: 'no', usable: false });
   });
 
+  it('kiro: records whether the CLI is new enough for --v3, without making it unusable', async () => {
+    const kiroAt = async (out: string) => {
+      const m = machine({
+        platform: 'linux',
+        homedir: '/home/j',
+        env: { PATH: '/usr/bin', KIRO_API_KEY: 'k' },
+        files: { '/usr/bin/kiro-cli': true },
+        respond: (_f, a) => (a[0] === '--version' ? ok(out) : undefined),
+      });
+      return (await discoverAgents(m, { adapters: ['kiro'] }))[0]!;
+    };
+    expect(await kiroAt('kiro-cli 2.4.1\n')).toMatchObject({ version: '2.4.1', kiroV3: 'no', usable: true });
+    expect(await kiroAt('kiro-cli 3.0.0\n')).toMatchObject({ kiroV3: 'yes' });
+    expect(await kiroAt('kiro-cli nightly\n')).toMatchObject({ version: 'kiro-cli nightly', kiroV3: 'unknown' });
+    const [codex] = await discoverAgents(linux(() => ok('Logged in\n')), { adapters: ['codex'] });
+    expect(codex!.kiroV3).toBeUndefined();
+  });
+
   it('skips auth when --version fails or times out', async () => {
     const m = machine({
       platform: 'linux',

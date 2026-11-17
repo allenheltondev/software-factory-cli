@@ -45,6 +45,18 @@ describe('factory agents', () => {
     expect(ctx.err.text).toMatch(/uses tokens/);
   });
 
+  it('notes a Kiro CLI older than 3.0, or one whose version could not be read', async () => {
+    const ctx = fakeContext({ agents: [fakeAgentReport('kiro', { version: '2.4.1', kiroV3: 'no' })] });
+    expect(await agentsCommand(ctx)).toBe(EXIT.OK);
+    expect(ctx.out.text).toContain(
+      'note      Kiro CLI 2.4.1 is older than 3.0.0: factory starts Kiro with --v3, which needs Kiro CLI 3.0.0 or later, so live runs fail. Upgrade Kiro CLI, or add --v2 to agents.<name>.args',
+    );
+    expect(renderAgents([fakeAgentReport('kiro', { version: 'nightly', kiroV3: 'unknown' })])).toContain(
+      'note      could not read a Kiro CLI version from "nightly"; factory starts Kiro with --v3, which needs Kiro CLI 3.0.0 or later',
+    );
+    expect(renderAgents([fakeAgentReport('kiro', { version: '3.0.0', kiroV3: 'yes' })])).not.toContain('note');
+  });
+
   it('shows the prompt result in deep mode', () => {
     expect(renderAgents([fakeAgentReport('codex', { deep: { ok: true, detail: 'headless prompt succeeded' } })], true)).toContain(
       'prompt    ok (headless prompt succeeded)',

@@ -19,6 +19,7 @@ import { accessSync, constants, readFileSync, statSync } from 'node:fs';
 import { homedir, release, tmpdir } from 'node:os';
 import { posix, win32 } from 'node:path';
 import { KNOWN_ADAPTERS, type AdapterName } from '../config/schema.js';
+import { kiroSupportsV3 } from './adapters/kiro.js';
 import { which } from '../util/which.js';
 
 export type Tri = 'yes' | 'no' | 'unknown';
@@ -100,6 +101,12 @@ export interface AgentReport {
   usable: boolean;
   /** True when `command` came from agents.<name>.command rather than the adapter's default. */
   configuredCommand?: boolean;
+  /**
+   * Kiro only, when it ran: whether this Kiro CLI is 3.0.0 or later, which the `--v3` the adapter
+   * adds by default needs; 'unknown' when the version could not be read. Not in `notes`, because
+   * agents.<name>.args can pick another harness (doctor checks it with the args).
+   */
+  kiroV3?: Tri;
   notes: string[];
 }
 
@@ -593,6 +600,7 @@ async function discoverOne(
     if (r.code === 0) {
       report.runnable = 'yes';
       report.version = parseVersion(r.stdout) ?? parseVersion(r.stderr);
+      if (spec.adapter === 'kiro') report.kiroV3 = kiroSupportsV3(report.version);
     } else {
       const why = r.timedOut ? `timed out after ${VERSION_TIMEOUT_MS / 1000}s` : r.error ?? (firstLine(r.stderr || r.stdout) || `exit ${r.code}`);
       notes.push(`"${spec.command} --version" failed: ${why}`);
