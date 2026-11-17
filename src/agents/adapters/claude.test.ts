@@ -45,7 +45,7 @@ const FINAL = [
 describe('claude adapter: invocation', () => {
   it('is registered as the built-in claude adapter', () => {
     expect(getAdapter('claude')).toBe(claudeAdapter);
-    expect(implementedAdapters()).toEqual(['claude']);
+    expect(implementedAdapters()).toContain('claude');
   });
 
   it('runs claude -p after the resolved launch target, streaming JSON, full auto, prompt on stdin', () => {
