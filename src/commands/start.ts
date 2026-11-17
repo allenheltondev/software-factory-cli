@@ -1,10 +1,12 @@
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../config/io.js';
 import type { Db } from '../db/database.js';
 import { resolveGitHubToken } from '../github/client.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { createPublisher, publicationEnabled } from '../publish/publish.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
+import { isInNpxCache, NPX_START_WARNING } from '../util/npx.js';
 import { runDaemon, type DaemonDeps } from '../worker/daemon.js';
 import { createExecutor } from '../worker/prepare-only.js';
 import type { CommandContext } from './context.js';
@@ -17,6 +19,8 @@ export interface StartDeps {
   createLogger: (opts: LoggerOptions) => Logger;
   /** Install SIGINT/SIGTERM handlers that call `abort`; returns an uninstaller. */
   onShutdownSignal: (abort: (signal: string) => void) => () => void;
+  /** This CLI's own file, checked for the npx cache (see {@link isInNpxCache}); unset skips the check. */
+  cliFile?: string;
 }
 
 export function installSignalHandlers(abort: (signal: string) => void): () => void {
@@ -43,6 +47,7 @@ export const defaultStartDeps: StartDeps = {
   checkJobDispatchable,
   createLogger,
   onShutdownSignal: installSignalHandlers,
+  cliFile: fileURLToPath(import.meta.url),
 };
 
 /** `factory start`: non-interactive worker. Never prompts. */
@@ -51,6 +56,7 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
   const { config, warnings } = loadConfig(paths.configFile);
   // The logger only calls write(); ctx.err is process.stderr outside tests.
   const log = deps.createLogger({ stream: ctx.err as NodeJS.WritableStream, file: join(paths.logDir, 'factory.log') });
+  if (deps.cliFile && isInNpxCache(deps.cliFile)) log.warn(NPX_START_WARNING, { cli: deps.cliFile });
   for (const w of warnings) log.warn(`config: ${w.path}: ${w.message}`);
   const repoCount = Object.keys(config.repositories).length;
   if (repoCount === 0) log.warn('no repositories configured; add one with "factory add OWNER/REPO"');
