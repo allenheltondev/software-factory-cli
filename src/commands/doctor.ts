@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
+import type { AgentReport } from '../agents/discovery.js';
 import { agentAdapter, type FactoryConfig } from '../config/schema.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import type { FactoryPaths } from '../paths.js';
@@ -13,12 +14,33 @@ import { checkConfig } from './validate.js';
 
 export const MIN_NODE = [22, 13] as const;
 
-/** CLI binaries for each adapter. Kiro's headless CLI is `kiro-cli` (https://kiro.dev/docs/cli/headless/). */
-export const ADAPTER_COMMANDS: Record<string, string> = {
-  codex: 'codex',
-  claude: 'claude',
-  kiro: 'kiro-cli',
-};
+/**
+ * Severity for agent problems. Log-only mode never starts an agent, so they are warnings. This is
+ * the hook for live execution (#8): any other `execution.mode` makes them failures.
+ */
+export function agentProblemSeverity(mode: string): CheckStatus {
+  return mode === 'log-only' ? 'warn' : 'fail';
+}
+
+/** Doctor checks for one enabled agent's discovery report. */
+export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array<Omit<CheckResult, 'name'>> {
+  if (!r) return [{ status: sev, detail: 'unknown adapter; not checked' }];
+  const out: Array<Omit<CheckResult, 'name'>> = [];
+  const notes = r.notes.length ? ` (${r.notes.join('; ')})` : '';
+  if (!r.installed) {
+    out.push({ status: sev, detail: `${r.command} not found on PATH or in common install locations (needed once live execution is enabled)` });
+  } else if (r.runnable !== 'yes') {
+    out.push({ status: sev, detail: `${r.command} found at ${r.path} but did not run${notes}` });
+  } else {
+    out.push({ status: 'ok', detail: `${r.command} ${r.version ?? '(unknown version)'}: ${r.path}` });
+    if (!r.onPath) out.push({ status: 'warn', detail: `${r.command} is not on this PATH; the worker may not find it${notes}` });
+  }
+  if (r.signedIn === 'yes') out.push({ status: 'ok', detail: `signed in: ${r.auth ?? 'yes'}` });
+  else if (r.signedIn === 'no') out.push({ status: sev, detail: `not signed in: ${r.auth ?? 'no'}` });
+  else if (r.runnable === 'yes') out.push({ status: 'warn', detail: `sign-in status unknown${notes}` });
+  if (r.platform.supported === 'no') out.push({ status: sev, detail: `not supported on this machine: ${r.platform.detail}` });
+  return out;
+}
 
 export type CheckStatus = 'ok' | 'warn' | 'fail';
 
@@ -44,6 +66,8 @@ export interface DoctorProbes {
   which(command: string): string | null;
   /** Run an executable directly (no shell). */
   run(file: string, args: string[]): Promise<RunResult>;
+  /** Agent discovery (see src/agents/discovery.ts) for these adapters. */
+  discoverAgents(adapters: string[]): Promise<AgentReport[]>;
   /** Throws if the directory can't be created or written. */
   checkWritable(dir: string): void;
   /** Open (creating/migrating if needed) and close the state DB; throws on failure. */
@@ -197,21 +221,15 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
     }
   }
 
-  // Agents: warnings while execution is log-only.
+  // Agents: the same discovery as "factory agents", run in this process's environment, so running
+  // doctor under the background launcher shows exactly what the worker will see.
   if (config) {
-    const sev: CheckStatus = config.execution.mode === 'log-only' ? 'warn' : 'fail';
-    for (const [agentName, agent] of Object.entries(config.agents)) {
-      if (!agent.enabled) continue;
-      const adapter = agentAdapter(agentName, agent);
-      const cmd = ADAPTER_COMMANDS[adapter] ?? adapter;
-      const found = probes.which(cmd);
-      const name = `agent ${agentName}`;
-      if (found) add('ok', name, `${cmd} found: ${found}`);
-      else add(sev, name, `${cmd} not found on PATH (needed once live execution is enabled)`);
-      if (adapter === 'kiro') {
-        if (probes.env.KIRO_API_KEY) add('ok', name, 'KIRO_API_KEY is set');
-        else add(sev, name, 'KIRO_API_KEY is not set (required for headless Kiro)');
-      }
+    const sev = agentProblemSeverity(config.execution.mode);
+    const enabled = Object.entries(config.agents).filter(([, a]) => a.enabled);
+    const reports = await probes.discoverAgents([...new Set(enabled.map(([n, a]) => agentAdapter(n, a)))]);
+    for (const [agentName, agent] of enabled) {
+      const report = reports.find((r) => r.adapter === agentAdapter(agentName, agent));
+      for (const c of agentChecks(report, sev)) add(c.status, `agent ${agentName}`, c.detail);
     }
   }
 
@@ -284,6 +302,7 @@ export function defaultDoctorProbes(ctx: CommandContext): DoctorProbes {
       writeFileSync(probe, 'ok');
       rmSync(probe, { force: true });
     },
+    discoverAgents: (adapters) => ctx.discoverAgents({ adapters }),
     checkDb: (file) => ctx.openDb(file).close(),
     createApi: () => ctx.createApi(),
     fileExists: existsSync,

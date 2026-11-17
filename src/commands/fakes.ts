@@ -5,6 +5,8 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { AgentReport } from '../agents/discovery.js';
+import { KNOWN_ADAPTERS, type AdapterName } from '../config/schema.js';
 import { GitHubError, type GitHubApi, type GitHubLabel, type GitHubRepo } from '../github/api.js';
 import { resolvePaths } from '../paths.js';
 import type { CommandContext } from './context.js';
@@ -78,8 +80,54 @@ export function tempHome(): string {
   return mkdtempSync(join(tmpdir(), 'factory-cmd-'));
 }
 
+/** A discovery report for one agent; usable (found, runnable, signed in, supported) by default. */
+export function fakeAgentReport(adapter: AdapterName, extra: Partial<AgentReport> = {}): AgentReport {
+  const command = adapter === 'kiro' ? 'kiro-cli' : adapter;
+  return {
+    adapter,
+    name: adapter,
+    command,
+    installed: true,
+    path: `/usr/bin/${command}`,
+    onPath: true,
+    launch: { file: `/usr/bin/${command}`, args: [] },
+    runnable: 'yes',
+    version: '1.0.0',
+    signedIn: 'yes',
+    auth: 'test',
+    platform: { supported: 'yes', detail: 'linux x64' },
+    usable: true,
+    notes: [],
+    ...extra,
+  };
+}
+
+/** A missing agent report. */
+export function missingAgentReport(adapter: AdapterName): AgentReport {
+  return fakeAgentReport(adapter, {
+    installed: false,
+    path: null,
+    onPath: false,
+    launch: null,
+    runnable: 'no',
+    version: null,
+    signedIn: 'unknown',
+    auth: null,
+    usable: false,
+    notes: ['not found on PATH or in common install locations'],
+  });
+}
+
 export function fakeContext(
-  o: { home?: string; api?: GitHubApi; isTTY?: boolean; prompter?: Prompter; env?: NodeJS.ProcessEnv } = {},
+  o: {
+    home?: string;
+    api?: GitHubApi;
+    isTTY?: boolean;
+    prompter?: Prompter;
+    env?: NodeJS.ProcessEnv;
+    /** Discovery results; defaults to every known adapter usable. */
+    agents?: AgentReport[];
+  } = {},
 ): CommandContext & { out: MemoryOutput; err: MemoryOutput } {
   const home = o.home ?? tempHome();
   const env = { ...o.env, FACTORY_HOME: home };
@@ -101,5 +149,9 @@ export function fakeContext(
       throw new Error('no db in this test');
     },
     now: () => Date.parse('2026-01-01T00:00:00Z'),
+    discoverAgents: async (opts) => {
+      const all = o.agents ?? KNOWN_ADAPTERS.map((a) => fakeAgentReport(a));
+      return opts?.adapters ? all.filter((r) => opts.adapters!.includes(r.adapter)) : all;
+    },
   };
 }

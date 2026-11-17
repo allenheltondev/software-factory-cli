@@ -2,9 +2,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { parse, stringify } from 'yaml';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
-import { buildRepoChoices, configureCommand } from './configure.js';
+import { buildAgentChoices, buildRepoChoices, configureCommand, suggestedPools } from './configure.js';
 import { EXIT } from './errors.js';
-import { fakeApi, fakeContext, fakeRepo } from './fakes.js';
+import { fakeAgentReport, fakeApi, fakeContext, fakeRepo, missingAgentReport } from './fakes.js';
 import type { Prompter } from './prompter.js';
 
 type Answer = { method: keyof Prompter; value: unknown; expect?: RegExp };
@@ -147,5 +147,74 @@ describe('factory configure', () => {
     const ctx = fakeContext({ home: ctx0.paths.configDir, isTTY: true, api, prompter: p });
     expect(await configureCommand(ctx)).toBe(EXIT.OK);
     expect(shown.at(-1)).toBe('outro: No changes.');
+  });
+
+  it('pre-selects discovered agents, marks missing ones, and only offers pools with a usable agent', async () => {
+    const api = fakeApi({ login: 'allen', repos: [fakeRepo('o/a', 1)], labels: { 'o/a': ['factory:ready'] } });
+    const base = seedConfig('allen');
+    base.pools.art = { agents: ['codex'], strategy: 'round-robin' };
+    let agentPrompt: { initialValues: string[]; options: Array<{ value: string; hint?: string }> } | undefined;
+    let poolOptions: string[] = [];
+    const { p, shown, remaining } = scripted([
+      {
+        method: 'multiselect',
+        expect: /Enabled agents/,
+        value: (o: typeof agentPrompt) => {
+          agentPrompt = o;
+          return o!.initialValues;
+        },
+      },
+      { method: 'searchMultiselect', value: [1] },
+      { method: 'searchSelect', value: 'factory:ready' },
+      { method: 'select', expect: /Action/, value: 'implement-issue' },
+      { method: 'confirm', expect: /different pool/, value: false },
+      {
+        method: 'select',
+        expect: /Pool/,
+        value: (o: { options: Array<{ value: string }>; initialValue: string }) => {
+          poolOptions = o.options.map((x) => x.value);
+          return o.initialValue;
+        },
+      },
+      { method: 'confirm', expect: /another workflow/, value: false },
+      { method: 'select', expect: /is new/, value: 'now' },
+      { method: 'confirm', expect: /Save to/, value: true },
+    ]);
+    const ctx = fakeContext({
+      isTTY: true,
+      api,
+      prompter: p,
+      agents: [missingAgentReport('codex'), fakeAgentReport('claude'), fakeAgentReport('kiro', { signedIn: 'no', usable: false })],
+    });
+    writeFileSync(ctx.paths.configFile, stringify(base));
+    expect(await configureCommand(ctx)).toBe(EXIT.OK);
+    expect(remaining).toEqual([]);
+    expect(agentPrompt?.initialValues).toEqual(['claude']);
+    expect(agentPrompt?.options.find((o) => o.value === 'codex')?.hint).toBe('codex · missing');
+    expect(agentPrompt?.options.find((o) => o.value === 'kiro')?.hint).toBe('kiro-cli · not signed in · 1.0.0');
+    expect(poolOptions).toEqual(['general', '\u0000custom']);
+    expect(shown).toContain('info: Not offering pool(s) with no usable agent here: art');
+    const cfg = parse(readFileSync(ctx.paths.configFile, 'utf8'));
+    expect(cfg.agents.codex.enabled).toBe(false);
+    expect(cfg.agents.kiro.enabled).toBe(false);
+  });
+});
+
+describe('buildAgentChoices / suggestedPools', () => {
+  it('keeps agents the existing config disabled deselected even when usable', () => {
+    const r = buildAgentChoices(
+      { codex: { enabled: false }, claude: {}, mine: { adapter: 'claude' } },
+      [fakeAgentReport('codex'), fakeAgentReport('claude')],
+      true,
+    );
+    expect(r.initialValues).toEqual(['claude', 'mine']);
+    expect([...r.usable]).toEqual(['codex', 'claude', 'mine']);
+    expect(buildAgentChoices({ codex: { enabled: false } }, [fakeAgentReport('codex')], false).initialValues).toEqual(['codex']);
+  });
+
+  it('falls back to every pool when none has a usable agent', () => {
+    const pools = { a: { agents: ['x'] }, b: { agents: ['y'] } };
+    expect(suggestedPools(pools, new Set(['y']))).toEqual({ pools: ['b'], hidden: ['a'] });
+    expect(suggestedPools(pools, new Set())).toEqual({ pools: ['a', 'b'], hidden: [] });
   });
 });

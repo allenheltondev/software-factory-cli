@@ -1,3 +1,4 @@
+import { defaultDiscoveryProbes, discoverAgents, type AgentReport, type DiscoverOptions } from '../agents/discovery.js';
 import { openDatabase, type Db } from '../db/database.js';
 import type { GitHubApi } from '../github/api.js';
 import { createGitHubApi } from '../github/client.js';
@@ -24,6 +25,8 @@ export interface CommandContext {
   prompter(): Prompter;
   openDb(file: string): Db;
   now(): number;
+  /** Find installed and usable coding agents in this process's environment (runs their CLIs). */
+  discoverAgents(opts?: DiscoverOptions): Promise<AgentReport[]>;
 }
 
 export interface GlobalOptions {
@@ -43,6 +46,7 @@ export function createDefaultContext(globals: GlobalOptions = {}): CommandContex
     prompter: () => (prompter ??= createClackPrompter()),
     openDb: (file) => openDatabase(file),
     now: () => Date.now(),
+    discoverAgents: (opts) => discoverAgents(defaultDiscoveryProbes(env), opts),
   };
 }
 
