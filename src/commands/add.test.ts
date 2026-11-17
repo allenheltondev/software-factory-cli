@@ -10,7 +10,7 @@ const readYaml = (p: string) => parse(readFileSync(p, 'utf8'));
 
 describe('factory add', () => {
   it('creates a config with defaults when none exists', async () => {
-    const api = fakeApi({ login: 'allen', repos: [fakeRepo('o/r', 99)], labels: { 'o/r': ['factory:ready'] } });
+    const api = fakeApi({ login: 'allen', repos: [fakeRepo('o/r', 99)], labels: { 'o/r': ['ready'] } });
     const ctx = fakeContext({ api });
     const code = await addCommand(ctx, 'o/r', {});
     expect(code).toBe(EXIT.OK);
@@ -19,7 +19,7 @@ describe('factory add', () => {
     expect(cfg.pools.general.agents).toEqual(['claude', 'kiro']);
     expect(cfg.repositories['o/r']).toEqual({
       id: 99,
-      workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+      workflows: [{ trigger: { event: 'issue.labeled', label: 'ready' }, action: 'implement-issue', pool: 'general' }],
     });
     expect(ctx.out.text).toContain('Created');
     expect(ctx.out.text).toContain('+ repo o/r (id 99)');

@@ -37,7 +37,7 @@ describe('commander wiring', () => {
     const { parse, codes } = setup({ add });
     await parse('add', 'o/r', '--route', 'art=art', '--route', 'ui=design', '--backfill-since', '2025-01-01', '--workflow-id', 'impl');
     expect(add).toHaveBeenCalledWith(expect.anything(), 'o/r', {
-      label: 'factory:ready',
+      label: 'ready',
       action: 'implement-issue',
       pool: 'general',
       route: ['art=art', 'ui=design'],

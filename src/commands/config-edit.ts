@@ -20,7 +20,7 @@ export interface RouteRule {
   use: string;
 }
 
-export const DEFAULT_LABEL = 'factory:ready';
+export const DEFAULT_LABEL = 'ready';
 export const DEFAULT_ACTION = 'implement-issue';
 export const DEFAULT_POOL = 'general';
 export const DEFAULT_AGENTS = ['codex', 'claude', 'kiro'] as const;

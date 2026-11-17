@@ -65,7 +65,7 @@ describe('factory configure', () => {
     const api = fakeApi({
       login: 'allen',
       repos: [fakeRepo('o/a', 1), fakeRepo('o/b', 2)],
-      labels: { 'o/a': ['bug', 'factory:ready', 'art'] },
+      labels: { 'o/a': ['bug', 'ready', 'art'] },
     });
     const { p, shown, remaining } = scripted([
       { method: 'multiselect', expect: /Enabled agents/, value: (o: { initialValues: string[] }) => o.initialValues.filter((a) => a !== 'codex') },
@@ -98,7 +98,7 @@ describe('factory configure', () => {
         backfillSince: '2025-03-01T00:00:00.000Z',
         workflows: [
           {
-            trigger: { event: 'issue.labeled', label: 'factory:ready' },
+            trigger: { event: 'issue.labeled', label: 'ready' },
             action: 'implement-issue',
             pool: { rules: [{ hasLabel: 'art', use: 'art' }], default: 'general' },
           },

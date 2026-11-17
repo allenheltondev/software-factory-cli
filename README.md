@@ -28,7 +28,7 @@ factory doctor
 2. Add your GitHub login to `dispatch.allowedActors` in the config (only these users can
    dispatch work), then run `factory validate`.
 3. `factory start` - polls GitHub and processes the queue until you stop it (Ctrl+C).
-4. Add the `factory:ready` label to an open issue. Within one poll interval, `factory status`
+4. Add the `ready` label to an open issue. Within one poll interval, `factory status`
    shows the queued job and, in log-only mode, its run.
 
 To run the worker in the background at login, see
@@ -42,7 +42,7 @@ the per-user default.
 | Command | Behavior |
 | --- | --- |
 | `factory configure` | Interactively select repos, trigger labels, actions and pools (needs a terminal) |
-| `factory add OWNER/REPO` | Add or update a repo workflow non-interactively. Options: `--label` (default `factory:ready`), `--action` (default `implement-issue`), `--pool` (default `general`), `--route LABEL=POOL` (repeatable), `--backfill-since DATE`, `--workflow-id ID` |
+| `factory add OWNER/REPO` | Add or update a repo workflow non-interactively. Options: `--label` (default `ready`), `--action` (default `implement-issue`), `--pool` (default `general`), `--route LABEL=POOL` (repeatable), `--backfill-since DATE`, `--workflow-id ID` |
 | `factory validate` | Check the config without network access; exit 1 if invalid |
 | `factory start` | Run the worker: poll GitHub and process the queue (non-interactive). Exits with code 3 if another worker holds the lock |
 | `factory status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
@@ -77,7 +77,7 @@ repositories:
     id: 123456789
     workflows:
       - id: implement
-        trigger: { event: issue.labeled, label: "factory:ready" }
+        trigger: { event: issue.labeled, label: "ready" }
         action: implement-issue
         pool:
           rules:
