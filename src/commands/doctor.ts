@@ -8,6 +8,7 @@ import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import type { FactoryPaths } from '../paths.js';
 import { labelEquals } from '../routing.js';
+import { agentLookupEnv } from '../worker/live.js';
 import { pathEntries, which } from '../util/which.js';
 import { println, type CommandContext } from './context.js';
 import { checkRepoCheckouts } from './doctor-checkout.js';
@@ -30,7 +31,8 @@ export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array
   const out: Array<Omit<CheckResult, 'name'>> = [];
   const notes = r.notes.length ? ` (${r.notes.join('; ')})` : '';
   if (!r.installed) {
-    out.push({ status: sev, detail: `${r.command} not found on PATH or in common install locations${sev === 'fail' ? '' : ' (needed in live mode)'}` });
+    const where = r.configuredCommand ? 'configured command ' + r.command + ' was not found or is not executable' : `${r.command} not found on PATH or in common install locations`;
+    out.push({ status: sev, detail: `${where}${sev === 'fail' ? '' : ' (needed in live mode)'}` });
   } else if (r.runnable !== 'yes') {
     out.push({ status: sev, detail: `${r.command} found at ${r.path} but did not run${notes}` });
   } else {
@@ -68,8 +70,11 @@ export interface DoctorProbes {
   which(command: string): string | null;
   /** Run an executable directly (no shell). */
   run(file: string, args: string[]): Promise<RunResult>;
-  /** Agent discovery (see src/agents/discovery.ts) for these adapters. */
-  discoverAgents(adapters: string[]): Promise<AgentReport[]>;
+  /**
+   * Agent discovery (see src/agents/discovery.ts) for one configured agent: its adapter, in `env`,
+   * with agents.<name>.command when set. Undefined for an unknown adapter.
+   */
+  discoverAgent(adapter: string, opts: { env: NodeJS.ProcessEnv; command?: string; baseDir: string }): Promise<AgentReport | undefined>;
   /** Throws if the directory can't be created or written. */
   checkWritable(dir: string): void;
   /** Open (creating/migrating if needed) and close the state DB; throws on failure. */
@@ -238,16 +243,24 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
   // Local clones that per-job worktrees are created from.
   if (config) checks.push(...(await checkRepoCheckouts(config, paths, probes)));
 
-  // Agents: the same discovery as "factory agents", run in this process's environment, so running
-  // doctor under the background launcher shows exactly what the worker will see.
+  // Agents: the same discovery as "factory agents", for each enabled agent as a live run starts it:
+  // its agents.<name>.command, in this process's environment minus the GitHub tokens plus its
+  // agents.<name>.env. Running doctor under the background launcher shows what the worker will see.
   if (config) {
     const sev = agentProblemSeverity(config.execution.mode);
     const enabled = Object.entries(config.agents).filter(([, a]) => a.enabled);
-    const reports = await probes.discoverAgents([...new Set(enabled.map(([n, a]) => agentAdapter(n, a)))]);
-    for (const [agentName, agent] of enabled) {
-      const report = reports.find((r) => r.adapter === agentAdapter(agentName, agent));
-      for (const c of agentChecks(report, sev)) add(c.status, `agent ${agentName}`, c.detail);
-    }
+    const reports = await Promise.all(
+      enabled.map(([agentName, agent]) =>
+        probes.discoverAgent(agentAdapter(agentName, agent), {
+          env: agentLookupEnv(probes.env, agent),
+          ...(agent.command ? { command: agent.command } : {}),
+          baseDir: paths.configDir,
+        }),
+      ),
+    );
+    enabled.forEach(([agentName], i) => {
+      for (const c of agentChecks(reports[i], sev)) add(c.status, `agent ${agentName}`, c.detail);
+    });
   }
 
   const overrides: Record<string, string> = {};
@@ -319,7 +332,7 @@ export function defaultDoctorProbes(ctx: CommandContext): DoctorProbes {
       writeFileSync(probe, 'ok');
       rmSync(probe, { force: true });
     },
-    discoverAgents: (adapters) => ctx.discoverAgents({ adapters }),
+    discoverAgent: async (adapter, opts) => (await ctx.discoverAgents({ adapters: [adapter], ...opts }))[0],
     checkDb: (file) => ctx.openDb(file).close(),
     createApi: () => ctx.createApi(),
     fileExists: existsSync,

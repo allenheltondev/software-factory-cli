@@ -25,8 +25,11 @@ export interface CommandContext {
   prompter(): Prompter;
   openDb(file: string): Db;
   now(): number;
-  /** Find installed and usable coding agents in this process's environment (runs their CLIs). */
-  discoverAgents(opts?: DiscoverOptions): Promise<AgentReport[]>;
+  /**
+   * Find installed and usable coding agents (runs their CLIs), in this process's environment or
+   * in `env` when given.
+   */
+  discoverAgents(opts?: DiscoverOptions & { env?: NodeJS.ProcessEnv }): Promise<AgentReport[]>;
 }
 
 export interface GlobalOptions {
@@ -46,7 +49,7 @@ export function createDefaultContext(globals: GlobalOptions = {}): CommandContex
     prompter: () => (prompter ??= createClackPrompter()),
     openDb: (file) => openDatabase(file),
     now: () => Date.now(),
-    discoverAgents: (opts) => discoverAgents(defaultDiscoveryProbes(env), opts),
+    discoverAgents: (opts) => discoverAgents(defaultDiscoveryProbes(opts?.env ?? env), opts),
   };
 }
 

@@ -5,6 +5,7 @@ import { resolvePaths } from '../paths.js';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
 import type { AdapterName } from '../config/schema.js';
 import { agentChecks, agentProblemSeverity, doctorCommand, nodeVersionOk, renderDoctor, runDoctor, type DoctorProbes } from './doctor.js';
+import type { AgentReport } from '../agents/discovery.js';
 import { fakeAgentReport, fakeApi, fakeContext, fakeRepo, missingAgentReport, tempHome } from './fakes.js';
 import { registerAdapter } from '../agents/adapters/registry.js';
 import { fakeAdapter } from '../../test/fake-adapter.js';
@@ -32,7 +33,7 @@ function setup(o: { labels?: string[]; repoId?: number; kiro?: boolean } = {}) {
     env: { PATH: '/usr/bin:/bin:/opt/bin', KIRO_API_KEY: 'x' },
     which: (cmd) => (['git', 'gh', 'codex', 'claude', 'kiro-cli'].includes(cmd) ? `/usr/bin/${cmd}` : null),
     run: async (file) => ({ code: 0, stdout: file.endsWith('git') ? 'git version 2.50.0\n' : '', stderr: '' }),
-    discoverAgents: async (adapters) => adapters.map((a) => fakeAgentReport(a as AdapterName)),
+    discoverAgent: async (adapter) => fakeAgentReport(adapter as AdapterName),
     checkWritable: () => {},
     checkDb: () => {},
     createApi: async () => api,
@@ -120,19 +121,20 @@ describe('runDoctor', () => {
 
   it('only warns about agent problems in log-only mode, using discovery for enabled agents', async () => {
     const { paths, probes } = setup();
-    const asked: string[][] = [];
+    const asked: string[] = [];
+    const reports: Record<string, AgentReport> = {
+      codex: missingAgentReport('codex'),
+      claude: fakeAgentReport('claude', { signedIn: 'no', auth: 'not signed in; run "claude auth login"', usable: false }),
+      kiro: { ...missingAgentReport('kiro'), signedIn: 'no', auth: 'KIRO_API_KEY is not set; headless Kiro requires it' },
+    };
     const r = await runDoctor(paths, {
       ...probes,
-      discoverAgents: async (adapters) => {
-        asked.push(adapters);
-        return [
-          missingAgentReport('codex'),
-          fakeAgentReport('claude', { signedIn: 'no', auth: 'not signed in; run "claude auth login"', usable: false }),
-          { ...missingAgentReport('kiro'), signedIn: 'no', auth: 'KIRO_API_KEY is not set; headless Kiro requires it' },
-        ];
+      discoverAgent: async (adapter) => {
+        asked.push(adapter);
+        return reports[adapter];
       },
     });
-    expect(asked).toEqual([['codex', 'claude', 'kiro']]);
+    expect(asked.sort()).toEqual(['claude', 'codex', 'kiro']);
     expect(status(r.checks, /agent codex: codex not found on PATH or in common install locations/)).toBe('warn');
     expect(status(r.checks, /agent claude: not signed in/)).toBe('warn');
     expect(status(r.checks, /agent kiro: kiro-cli not found/)).toBe('warn');
@@ -142,6 +144,46 @@ describe('runDoctor', () => {
     const noKiro = setup({ kiro: false });
     const r2 = await runDoctor(noKiro.paths, { ...noKiro.probes, env: { PATH: '/bin' } });
     expect(r2.checks.some((c) => c.name === 'agent kiro')).toBe(false);
+  });
+
+  it('checks each agent as a live run starts it: its command, and its env without the GitHub tokens', async () => {
+    const home = tempHome();
+    const paths = resolvePaths({ env: { FACTORY_HOME: home } });
+    const cfg = upsertRepoWorkflow(
+      seedConfig('allen'),
+      { id: 10, fullName: 'o/r' },
+      buildWorkflow({ label: 'factory:ready', action: 'implement-issue', pool: 'general', routes: [] }),
+    ).config;
+    cfg.agents = {
+      ...cfg.agents,
+      codex: { maxConcurrent: 1, command: './bin/codex', env: { CODEX_API_KEY: 'from-config' } },
+      'claude-2': { adapter: 'claude', maxConcurrent: 1, command: 'claude-nightly' },
+    };
+    writeFileSync(paths.configFile, stringify(cfg));
+    const { probes } = setup();
+    const asked: Array<{ adapter: string; command?: string; baseDir: string; env: NodeJS.ProcessEnv }> = [];
+    const r = await runDoctor(paths, {
+      ...probes,
+      env: { PATH: '/usr/bin', GH_TOKEN: 'gh-secret', GITHUB_TOKEN: 'gh-secret-2', KIRO_API_KEY: 'k' },
+      discoverAgent: async (adapter, opts) => {
+        asked.push({ adapter, ...opts });
+        return opts.command
+          ? { ...missingAgentReport(adapter as AdapterName), command: opts.command, configuredCommand: true }
+          : fakeAgentReport(adapter as AdapterName);
+      },
+    });
+
+    const codex = asked.find((a) => a.adapter === 'codex')!;
+    expect(codex).toMatchObject({ command: './bin/codex', baseDir: paths.configDir });
+    expect(codex.env).toMatchObject({ PATH: '/usr/bin', CODEX_API_KEY: 'from-config', KIRO_API_KEY: 'k' });
+    expect(codex.env.GH_TOKEN).toBeUndefined();
+    expect(codex.env.GITHUB_TOKEN).toBeUndefined();
+    expect(asked.find((a) => a.adapter === 'kiro')).toMatchObject({ baseDir: paths.configDir });
+    expect(asked.find((a) => a.adapter === 'kiro')!.command).toBeUndefined();
+    // Two agents on the same adapter are checked separately.
+    expect(asked.filter((a) => a.adapter === 'claude').map((a) => a.command ?? null).sort()).toEqual(['claude-nightly', null].sort());
+    expect(status(r.checks, /agent codex: configured command \.\/bin\/codex was not found or is not executable/)).toBe('warn');
+    expect(status(r.checks, /agent claude-2: configured command claude-nightly was not found/)).toBe('warn');
   });
 
   it('fails on agent problems for enabled agents in live mode', async () => {
@@ -160,11 +202,12 @@ describe('runDoctor', () => {
       const { probes } = setup();
       const r = await runDoctor(paths, {
         ...probes,
-        discoverAgents: async () => [
-          missingAgentReport('codex'),
-          fakeAgentReport('claude', { signedIn: 'no', auth: 'not signed in; run "claude auth login"', usable: false }),
-          fakeAgentReport('kiro'),
-        ],
+        discoverAgent: async (adapter) =>
+          ({
+            codex: missingAgentReport('codex'),
+            claude: fakeAgentReport('claude', { signedIn: 'no', auth: 'not signed in; run "claude auth login"', usable: false }),
+            kiro: fakeAgentReport('kiro'),
+          })[adapter],
       });
       expect(status(r.checks, /^config: valid/)).toBe('ok');
       expect(status(r.checks, /agent codex: codex not found on PATH/)).toBe('fail');

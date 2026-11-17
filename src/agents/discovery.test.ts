@@ -1,8 +1,11 @@
+import { tmpdir } from 'node:os';
+import { dirname, isAbsolute, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   AGENT_SPECS,
   checkPlatform,
   commonInstallDirs,
+  defaultDiscoveryProbes,
   discoverAgents,
   locateLaunch,
   parseCmdShim,
@@ -513,6 +516,54 @@ describe('runProcess (real child processes)', () => {
       expect(dead).toBe(true);
     },
   );
+});
+
+describe('paths found through a relative PATH entry', () => {
+  it('are made absolute against the lookup directory, for the default lookup and a configured command', async () => {
+    const m = machine({
+      platform: 'linux',
+      homedir: '/home/jane',
+      env: { PATH: './bin:/usr/bin' },
+      files: { 'bin/codex': true, 'bin/codex-nightly': true },
+      respond: (_file, args) => (args[0] === '--version' ? { code: 0, stdout: 'codex-cli 1.2.3\n', stderr: '' } : undefined),
+    });
+    m.cwd = '/home/jane/config';
+    const [r] = await discoverAgents(m, { adapters: ['codex'] });
+    expect(r).toMatchObject({ path: '/home/jane/config/bin/codex', launch: { file: '/home/jane/config/bin/codex', args: [] }, runnable: 'yes' });
+    expect(m.calls[0]!.file).toBe('/home/jane/config/bin/codex');
+    expect(locateLaunch('codex', m, { command: 'codex-nightly' }).launch).toEqual({ file: '/home/jane/config/bin/codex-nightly', args: [] });
+  });
+
+  it('can be spawned from another working directory, as live mode spawns from the job worktree', async () => {
+    // node, found through a PATH entry relative to this process's working directory.
+    const rel = relative(process.cwd(), dirname(process.execPath));
+    if (isAbsolute(rel)) return; // a different drive on Windows: no relative path to test
+    const probes = defaultDiscoveryProbes({ PATH: rel || '.', PATHEXT: process.env.PATHEXT ?? '' });
+    const located = locateLaunch('codex', probes, { command: 'node' });
+    expect(located.launch).not.toBeNull();
+    expect(isAbsolute(located.launch!.file)).toBe(true);
+    const r = await runProcess(located.launch!.file, ['--version'], { timeoutMs: 15_000, cwd: tmpdir() });
+    expect(r).toMatchObject({ code: 0, stdout: expect.stringMatching(/^v\d+/) });
+  });
+});
+
+describe('discoverAgents with agents.<name>.command', () => {
+  it('checks the configured CLI instead of looking the adapter up, and says so when it is missing', async () => {
+    const custom = '/opt/agents/codex-nightly';
+    const m = machine({
+      platform: 'linux',
+      homedir: '/home/jane',
+      env: { PATH: '/usr/bin', CODEX_API_KEY: 'k' },
+      files: { '/usr/bin/codex': true, [custom]: true },
+      respond: (file, args) => (args[0] === '--version' ? { code: 0, stdout: `codex-cli ${file === custom ? '9.9.9' : '0.1.0'}\n`, stderr: '' } : undefined),
+    });
+    const [r] = await discoverAgents(m, { adapters: ['codex'], command: '../agents/codex-nightly', baseDir: '/opt/config' });
+    expect(r).toMatchObject({ command: custom, configuredCommand: true, installed: true, path: custom, version: '9.9.9', launch: { file: custom, args: [] } });
+
+    const [missing] = await discoverAgents(m, { adapters: ['codex'], command: '/nowhere/codex' });
+    expect(missing).toMatchObject({ installed: false, configuredCommand: true, command: '/nowhere/codex' });
+    expect(missing!.notes).toContain('configured command /nowhere/codex was not found or is not executable');
+  });
 });
 
 describe('locateLaunch (live execution)', () => {

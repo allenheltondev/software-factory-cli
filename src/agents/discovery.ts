@@ -47,6 +47,12 @@ export interface DiscoveryProbes {
   /** glibc runtime version on Linux ("2.35"); null for musl or other OSes. */
   glibcVersion: string | null;
   env: NodeJS.ProcessEnv;
+  /**
+   * The directory lookups run from (the process's working directory). A relative PATH entry such
+   * as `./bin` resolves against it, and every path discovery returns is made absolute with it,
+   * because live execution spawns the CLI from the job worktree, not from here.
+   */
+  cwd?: string;
   homedir: string;
   /** The Node binary running factory, used when a shim says plain `node` and none is on PATH. */
   execPath: string;
@@ -92,6 +98,8 @@ export interface AgentReport {
   deep?: { ok: boolean; detail: string };
   /** Installed, runnable, not known to be signed out, and not known to be unsupported here. */
   usable: boolean;
+  /** True when `command` came from agents.<name>.command rather than the adapter's default. */
+  configuredCommand?: boolean;
   notes: string[];
 }
 
@@ -100,6 +108,12 @@ export interface DiscoverOptions {
   adapters?: readonly string[];
   /** Send one trivial headless prompt to each otherwise-usable agent. Uses tokens. */
   deep?: boolean;
+  /**
+   * agents.<name>.command: use this CLI instead of looking the adapter's command up (an absolute
+   * path, a path relative to `baseDir`, or a name on PATH), as live execution does.
+   */
+  command?: string;
+  baseDir?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,16 +343,28 @@ export function commonInstallDirs(probes: Pick<DiscoveryProbes, 'platform' | 'en
   return [...new Set(dirs)];
 }
 
+/**
+ * `which`, with the result made absolute against the directory the lookup ran from. A relative
+ * PATH entry (`./bin`) or command (`bin/codex`) yields a relative path, which would point
+ * somewhere else once the CLI is spawned with the job worktree as its working directory.
+ */
+function findExecutable(command: string, probes: DiscoveryProbes, opts: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform } = {}): string | null {
+  const platform = opts.platform ?? probes.platform;
+  const found = which(command, { env: opts.env ?? probes.env, platform, isExecutable: probes.isExecutable });
+  if (!found) return null;
+  const p = pathFor(platform);
+  return p.isAbsolute(found) ? found : p.resolve(probes.cwd ?? process.cwd(), found);
+}
+
 function locate(spec: AgentSpec, probes: DiscoveryProbes): { path: string | null; onPath: boolean } {
   const { platform, env } = probes;
-  const opts = { platform, isExecutable: probes.isExecutable };
-  const onPath = which(spec.command, { ...opts, env });
+  const onPath = findExecutable(spec.command, probes);
   if (onPath) return { path: onPath, onPath: true };
   const p = pathFor(platform);
   const dirs = [...commonInstallDirs(probes), ...(spec.extraDirs?.(probes.homedir, p) ?? [])];
   const pathext = getEnv(env, 'PATHEXT', platform);
   const offEnv: NodeJS.ProcessEnv = { PATH: dirs.join(p.delimiter), ...(pathext ? { PATHEXT: pathext } : {}) };
-  return { path: which(spec.command, { ...opts, env: offEnv }), onPath: false };
+  return { path: findExecutable(spec.command, probes, { env: offEnv }), onPath: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +439,7 @@ export function resolveLaunch(found: string, probes: DiscoveryProbes): { launch:
     let file: string | null = null;
     if (win32.isAbsolute(interp)) file = probes.isExecutable(interp) ? interp : null;
     else {
-      file = which(interp, { env: probes.env, platform: 'win32', isExecutable: probes.isExecutable });
+      file = findExecutable(interp, probes, { platform: 'win32' });
       if (!file && /^node(\.exe)?$/i.test(interp)) file = probes.execPath;
     }
     if (file) return { launch: { file, args: [shim.script] } };
@@ -435,17 +461,22 @@ export interface LocatedLaunch {
  * without running it. `command` (agents.<name>.command) replaces the lookup: an absolute path, a
  * path relative to `baseDir`, or a name looked up on PATH. Shims are resolved as in discovery.
  */
+/** Find agents.<name>.command: an absolute path, a path relative to `baseDir`, or a name on PATH. */
+function findConfigured(command: string, baseDir: string | undefined, probes: DiscoveryProbes): { target: string; path: string | null; problem: string } {
+  const p = pathFor(probes.platform);
+  const hasSep = probes.platform === 'win32' ? /[\\/]/.test(command) : command.includes('/');
+  const target = hasSep && !p.isAbsolute(command) && baseDir ? p.resolve(baseDir, command) : command;
+  const path = findExecutable(target, probes);
+  return { target, path, problem: `configured command ${target} was not found${hasSep ? '' : ' on PATH'} or is not executable` };
+}
+
 export function locateLaunch(adapter: AdapterName, probes: DiscoveryProbes, opts: { command?: string; baseDir?: string } = {}): LocatedLaunch {
   const spec = AGENT_SPECS[adapter];
   let path: string | null;
   if (opts.command) {
-    const p = pathFor(probes.platform);
-    const hasSep = probes.platform === 'win32' ? /[\\/]/.test(opts.command) : opts.command.includes('/');
-    const target = hasSep && !p.isAbsolute(opts.command) && opts.baseDir ? p.resolve(opts.baseDir, opts.command) : opts.command;
-    path = which(target, { env: probes.env, platform: probes.platform, isExecutable: probes.isExecutable });
-    if (!path) {
-      return { path: null, launch: null, problem: `configured command ${target} was not found${hasSep ? '' : ' on PATH'} or is not executable` };
-    }
+    const found = findConfigured(opts.command, opts.baseDir, probes);
+    path = found.path;
+    if (!path) return { path: null, launch: null, problem: found.problem };
   } else {
     path = locate(spec, probes).path;
     if (!path) return { path: null, launch: null, problem: `${spec.command} not found on PATH or in common install locations` };
@@ -503,7 +534,12 @@ export function parseVersion(output: string): string | null {
   return line.match(/\d+\.\d+\.\d+[\w.+-]*/)?.[0] ?? line;
 }
 
-async function discoverOne(spec: AgentSpec, probes: DiscoveryProbes, deep: boolean): Promise<AgentReport> {
+async function discoverOne(
+  spec: AgentSpec,
+  probes: DiscoveryProbes,
+  deep: boolean,
+  configured?: { command: string; baseDir?: string },
+): Promise<AgentReport> {
   const notes: string[] = [];
   const platform = checkPlatform(spec.platform, probes);
   const report: AgentReport = {
@@ -525,9 +561,18 @@ async function discoverOne(spec: AgentSpec, probes: DiscoveryProbes, deep: boole
   if (platform.supported === 'no') notes.push(`not supported here: ${platform.detail}`);
 
   // Tier 1
-  const found = locate(spec, probes);
+  let found: { path: string | null; onPath: boolean };
+  if (configured) {
+    const c = findConfigured(configured.command, configured.baseDir, probes);
+    report.command = c.target;
+    report.configuredCommand = true;
+    found = { path: c.path, onPath: true };
+    if (!c.path) notes.push(c.problem);
+  } else {
+    found = locate(spec, probes);
+    if (!found.path) notes.push(`${spec.command} not found on PATH or in common install locations`);
+  }
   if (!found.path) {
-    notes.push(`${spec.command} not found on PATH or in common install locations`);
     if (!spec.authRunsCli) Object.assign(report, pick(await spec.auth({ probes, launch: null }), notes));
     return report;
   }
@@ -608,7 +653,7 @@ export async function discoverAgents(probes: DiscoveryProbes, opts: DiscoverOpti
   return Promise.all(
     adapters.map((a) =>
       isKnownAdapter(a)
-        ? discoverOne(AGENT_SPECS[a], probes, Boolean(opts.deep)).catch((err: unknown) => ({
+        ? discoverOne(AGENT_SPECS[a], probes, Boolean(opts.deep), opts.command ? { command: opts.command, baseDir: opts.baseDir } : undefined).catch((err: unknown) => ({
             ...unknownAdapter(a),
             name: AGENT_SPECS[a].name,
             command: AGENT_SPECS[a].command,
@@ -765,6 +810,7 @@ export function defaultDiscoveryProbes(env: NodeJS.ProcessEnv = process.env): Di
     osRelease: release(),
     glibcVersion: glibcRuntime(),
     env,
+    cwd: process.cwd(),
     homedir: homedir(),
     execPath: process.execPath,
     isExecutable: (p) => {
