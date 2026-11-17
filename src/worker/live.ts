@@ -19,7 +19,6 @@ import { dirname, join, resolve } from 'node:path';
 import {
   getAdapter,
   defaultVerdict,
-  LAST_LINE_BYTES,
   RAW_OUTPUT_BYTES,
   type AgentAdapter,
   type AgentInvocation,
@@ -39,7 +38,7 @@ import {
   type Executor,
 } from './executor.js';
 import { processStartTime, taskkillPath } from './process.js';
-import { cleanSummaryLines, readLastLine, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
+import { cleanSummaryLines, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 
 const isWindows = process.platform === 'win32';
 const DEFAULT_KILL_GRACE_MS = 5_000;
@@ -515,14 +514,11 @@ export class LiveExecutor implements Executor {
 
     // 6. Outcome.
     const outputTail = await tailLines(logPath, outputStart);
-    const wantsRaw = Boolean(adapter.interpretExit || adapter.summarizeOutput);
-    const rawOutput = wantsRaw ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
-    // Read on its own: a structured result can be longer than rawOutput's window.
-    const lastLine = wantsRaw ? await readLastLine(logPath, outputStart, LAST_LINE_BYTES) : null;
+    const rawOutput = adapter.interpretExit || adapter.summarizeOutput ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
     let lastOutput = outputTail;
     if (adapter.summarizeOutput) {
       try {
-        const lines = adapter.summarizeOutput(rawOutput, lastLine);
+        const lines = adapter.summarizeOutput(rawOutput);
         if (lines?.length) lastOutput = cleanSummaryLines(lines);
       } catch (err) {
         ctx.log.warn('adapter could not summarize the agent output; using its last lines', { adapter: adapterName, error: message(err) });
@@ -537,7 +533,7 @@ export class LiveExecutor implements Executor {
       outcome = 'interrupted';
       error = 'worker stopped before the run finished; the agent process tree was stopped';
     } else {
-      const exit = { code: agentRun.code, signal: agentRun.signal, outputTail, output: rawOutput, lastLine, args: invocation.args };
+      const exit = { code: agentRun.code, signal: agentRun.signal, outputTail, output: rawOutput, args: invocation.args };
       let verdict = defaultVerdict(exit);
       if (adapter.interpretExit) {
         try {

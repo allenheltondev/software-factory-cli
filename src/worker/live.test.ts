@@ -518,6 +518,18 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
     expect(readFileSync(join(worktree, 'half-done.txt'), 'utf8')).toBe('partial\n');
     expect(readFileSync(c.run.logPath!, 'utf8')).toContain(`The worktree is kept for inspection: ${worktree}`);
   });
+
+  it('a large success result followed by stderr output still succeeds', async () => {
+    const huge = `Done. ${'x'.repeat(2 * 1024 * 1024)}`;
+    const { paths, config, db } = claudeSetup([init(), success(huge)], { FAKE_CLAUDE_STDERR: 'Warning: a diagnostic on stderr' });
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 10 });
+    const c = claim(db, config, paths);
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await executor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({ outcome: 'succeeded' });
+    expect(readFileSync(c.run.logPath!, 'utf8')).toContain('Warning: a diagnostic on stderr');
+  });
 });
 
 describe('worker crash during a live run', { timeout: 120_000 }, () => {

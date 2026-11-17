@@ -16,9 +16,6 @@ function request(o: Partial<InvocationRequest> = {}): InvocationRequest {
   };
 }
 
-/** What the executor's readLastLine returns for output that fits in the window. */
-const lastLineOf = (output: string) => output.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.trim()).at(-1) ?? null;
-
 /** Args as the adapter builds them by default (stream-json). */
 const STREAM_ARGS = claudeAdapter.buildInvocation(request()).args;
 
@@ -26,17 +23,16 @@ const exit = (
   output: string,
   code: number | null = 0,
   signal: NodeJS.Signals | null = null,
-  o: { args?: readonly string[]; lastLine?: string | null } = {},
+  o: { args?: readonly string[] } = {},
 ): AgentExit => ({
   code,
   signal,
   output,
   outputTail: output.split('\n').filter(Boolean).slice(-20),
-  lastLine: o.lastLine === undefined ? lastLineOf(output) : o.lastLine,
   args: o.args ?? STREAM_ARGS,
 });
 
-const summary = (output: string) => claudeAdapter.summarizeOutput!(output, lastLineOf(output));
+const summary = (output: string) => claudeAdapter.summarizeOutput!(output);
 
 const FINAL = [
   '## Summary',
@@ -199,24 +195,22 @@ describe('claude adapter: results', () => {
     }
   });
 
-  it('reads a final result line that is larger than the output window', () => {
-    // The executor's raw output window starts after a line boundary, so it misses a long final
-    // line entirely; readLastLine supplies it in full.
+  it('finds a large result behind stderr diagnostics printed after it', () => {
     const huge = 'x'.repeat(2 * 1024 * 1024);
-    const before = run(assistantText('Done, I think.'));
-    const failed = stream(success(huge, { is_error: true, terminal_reason: 'api_error' })).trim();
-    const verdict = claudeAdapter.interpretExit!(exit(before, 0, null, { lastLine: failed }));
+    const diag = 'Warning: something on stderr\n(node:123) ExperimentalWarning: ...\n';
+    const ok = `${run(success(huge))}${diag}`;
+    expect(claudeAdapter.interpretExit!(exit(ok))).toEqual({ outcome: 'succeeded' });
+
+    const failed = `${run(success(huge, { is_error: true, terminal_reason: 'api_error' }))}${diag}`;
+    const verdict = claudeAdapter.interpretExit!(exit(failed));
     expect(verdict.outcome).toBe('failed');
     expect(verdict.error).toMatch(/^claude reported an error \(api_error\): x+…$/);
-    expect(claudeAdapter.summarizeOutput!(before, failed)?.at(-1)).toBe(`claude: success (is_error) after 14 turns, $0.42 estimated, session ${SESSION}`);
-
-    const ok = stream(success(huge)).trim();
-    expect(claudeAdapter.interpretExit!(exit(before, 0, null, { lastLine: ok }))).toEqual({ outcome: 'succeeded' });
+    expect(summary(failed)?.at(-1)).toBe(`claude: success (is_error) after 14 turns, $0.42 estimated, session ${SESSION}`);
   });
 
-  it('a final line too large to read is no result, even with an earlier success in the window', () => {
-    const out = run(success('first turn'));
-    expect(claudeAdapter.interpretExit!(exit(out, 0, null, { lastLine: null }))).toMatchObject({ outcome: 'failed' });
+  it('a result cut off at the start of the output window is no result', () => {
+    // What the executor passes when the last result is longer than the window: only the lines after it.
+    expect(claudeAdapter.interpretExit!(exit('Warning: something on stderr\n'))).toMatchObject({ outcome: 'failed' });
   });
 
   it('no result (timed out): the summary is the last main-conversation message and the session', () => {

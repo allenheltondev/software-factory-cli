@@ -99,22 +99,25 @@ function isResult(ev: Record<string, unknown>): ev is Record<string, unknown> & 
   return ev.type === 'result' && typeof ev.subtype === 'string';
 }
 
-/** The last `result` message in the output (a run whose background work starts another turn prints one per turn). */
-export function findResult(output: string): ResultMessage | null {
-  return scan(output).events.find(isResult) ?? null;
-}
-
 /**
- * The run's result: the final output line when it is one (read in full by the executor, since a
- * long final message can exceed the output window), else the last result in the window. A null
- * `lastLine` means there was no output or the final line was too long to read: no result, so a
- * failure that line reported can't pass for success.
+ * The last `result` message in the output (a run whose background work starts another turn
+ * prints one per turn), looking back past anything printed after it, such as stderr diagnostics.
+ * Only complete lines reach the adapter, and the output window is a suffix of run.log, so when
+ * the last result is too long to fit, every earlier result is outside the window too: the run
+ * then has no result, and can't be mistaken for an earlier turn's.
  */
-function runResult(output: string, lastLine: string | null): ResultMessage | null {
-  if (lastLine === null) return null;
-  const last = parseLine(lastLine);
-  if (last && isResult(last)) return last;
-  return findResult(output);
+export function findResult(output: string): ResultMessage | null {
+  let end = output.length;
+  while (end > 0) {
+    const start = output.lastIndexOf('\n', end - 1) + 1;
+    const line = output.slice(start, end);
+    if (line.includes('"result"')) {
+      const ev = parseLine(line);
+      if (ev && isResult(ev)) return ev;
+    }
+    end = start - 1;
+  }
+  return null;
 }
 
 /** The `--output-format` in effect: the last one in `args`, else Claude Code's default, text. */
@@ -206,7 +209,7 @@ export const claudeAdapter: AgentAdapter = {
   },
 
   interpretExit(exit: AgentExit): AgentVerdict {
-    const result = runResult(exit.output, exit.lastLine);
+    const result = findResult(exit.output);
     if (!result) {
       const fallback = defaultVerdict(exit);
       if (fallback.outcome === 'succeeded') {
@@ -238,9 +241,9 @@ export const claudeAdapter: AgentAdapter = {
    * be inspected with `claude --resume <id>` in the worktree). Without a result (timeout, crash),
    * the last thing Claude said and the session id.
    */
-  summarizeOutput(output: string, lastLine: string | null): string[] | null {
+  summarizeOutput(output: string): string[] | null {
     const { events } = scan(output);
-    const result = runResult(output, lastLine);
+    const result = findResult(output);
     if (result) {
       const body =
         result.subtype === 'success'

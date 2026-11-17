@@ -9,7 +9,7 @@ import type { AgentAdapter } from './adapter.js';
 import { claudeAdapter } from './claude.js';
 
 export type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
-export { defaultVerdict, LAST_LINE_BYTES, RAW_OUTPUT_BYTES } from './adapter.js';
+export { defaultVerdict, RAW_OUTPUT_BYTES } from './adapter.js';
 
 const BUILT_IN_ADAPTERS: readonly AgentAdapter[] = [claudeAdapter];
 

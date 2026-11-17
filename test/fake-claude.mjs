@@ -7,6 +7,7 @@
 //   FAKE_CLAUDE_COMMIT  "1": write CLAUDE_WAS_HERE.md in the working directory and commit it
 //   FAKE_CLAUDE_EDIT    "1": write half-done.txt (uncommitted)
 //   FAKE_CLAUDE_EVENTS  path: a JSON array of events to print, one JSON object per line
+//   FAKE_CLAUDE_STDERR  text to write to stderr after the events
 //   FAKE_CLAUDE_EXIT    exit code (default 0)
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -27,4 +28,5 @@ if (env.FAKE_CLAUDE_COMMIT === '1') {
 if (env.FAKE_CLAUDE_EDIT === '1') writeFileSync('half-done.txt', 'partial\n');
 const events = env.FAKE_CLAUDE_EVENTS ? JSON.parse(readFileSync(env.FAKE_CLAUDE_EVENTS, 'utf8')) : [];
 for (const e of events) process.stdout.write(`${JSON.stringify(e)}\n`);
+if (env.FAKE_CLAUDE_STDERR) process.stderr.write(`${env.FAKE_CLAUDE_STDERR}\n`);
 process.exit(Number(env.FAKE_CLAUDE_EXIT ?? 0));

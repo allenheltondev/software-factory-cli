@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { cleanSummaryLines, readLastLine, readOutput } from './run-summary.js';
+import { cleanSummaryLines, readOutput } from './run-summary.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -20,25 +20,6 @@ describe('readOutput', () => {
     // Only the last 10 bytes: the cut first line is dropped.
     expect(await readOutput(file, header.length, 10)).toBe('{"b":2}\n');
     expect(await readOutput(join(dir, 'missing.log'), 0, 10)).toBe('');
-  });
-});
-
-describe('readLastLine', () => {
-  it('returns the last non-blank line in full, however long, up to the cap', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'factory-lastline-'));
-    dirs.push(dir);
-    const file = join(dir, 'run.log');
-    const header = 'header line\n';
-    const long = `{"type":"result","result":"${'y'.repeat(300 * 1024)}"}`;
-    writeFileSync(file, `${header}{"a":1}\r\n${long}\r\n\n  \n`);
-    expect(await readLastLine(file, header.length, 1024 * 1024)).toBe(long);
-    expect(await readLastLine(file, header.length, 1024)).toBeNull(); // longer than the cap
-
-    writeFileSync(file, `${header}only line`);
-    expect(await readLastLine(file, header.length, 1024)).toBe('only line'); // no line ending, stops at the offset
-    writeFileSync(file, `${header}\n\n`);
-    expect(await readLastLine(file, header.length, 1024)).toBeNull();
-    expect(await readLastLine(join(dir, 'missing.log'), 0, 10)).toBeNull();
   });
 });
 

@@ -211,11 +211,11 @@ claude -p --output-format stream-json --verbose --permission-mode bypassPermissi
 - The run is `succeeded` only when Claude Code exits 0 with a `success` result. An error
   result (`is_error`, such as a sign-in failure), the turn limit (`error_max_turns`), the
   spending limit (`error_max_budget_usd`) or an error during execution fails the run with
-  that reason, and so does exiting 0 without a result the worker can read. The result line
-  is read in full however long it is (up to 16 MiB). The summary shows Claude's final
-  message, then a line with the result, turns, estimated cost, any permission denials and the
-  session id. To look at a run afterwards,
-  run `claude --resume <session id>` in its worktree.
+  that reason, and so does exiting 0 without a result the worker can read. The worker looks
+  for the result in the last 16 MiB of output, past anything printed on stderr after it.
+  The summary shows Claude's final message, then a line with the result, turns, estimated
+  cost, any permission denials and the session id. To look at a run afterwards, run
+  `claude --resume <session id>` in its worktree.
 
 **Default permission profile: full auto.** `--permission-mode bypassPermissions` (the same as
 `--dangerously-skip-permissions`) lets Claude edit files and run any command inside the job's
