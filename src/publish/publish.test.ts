@@ -25,6 +25,7 @@ import { silentLogger } from '../util/log.js';
 import { summarizeRun } from '../worker/run-summary.js';
 import {
   createPublisher,
+  PUBLISH_LEASE_SECONDS,
   publicationMarker,
   publishGitEnv,
   publishRun,
@@ -256,7 +257,11 @@ interface GitCall {
   env: NodeJS.ProcessEnv | undefined;
 }
 
-function recordingGit(o: { fakePushUrl?: string; failPushWith?: GitError } = {}): { runGit: RunGit; calls: GitCall[] } {
+/**
+ * Real git, recording each call. `fakePushUrl` makes the remote report that push URL; reads of
+ * that URL (ls-remote) go to `realUrl` (the fixture's bare remote) so no network is touched.
+ */
+function recordingGit(o: { fakePushUrl?: string; realUrl?: string; failPushWith?: GitError } = {}): { runGit: RunGit; calls: GitCall[] } {
   const calls: GitCall[] = [];
   return {
     calls,
@@ -264,7 +269,8 @@ function recordingGit(o: { fakePushUrl?: string; failPushWith?: GitError } = {})
       calls.push({ args: [...args], env: opts.env });
       if (o.fakePushUrl && args[0] === 'remote' && args[1] === 'get-url') return { stdout: `${o.fakePushUrl}\n`, stderr: '' };
       if (o.failPushWith && args[0] === 'push') throw o.failPushWith;
-      return runGit(args, opts);
+      const real = o.fakePushUrl && o.realUrl ? args.map((a) => (a === o.fakePushUrl ? o.realUrl! : a)) : args;
+      return runGit(real, opts);
     },
   };
 }
@@ -487,7 +493,7 @@ describe('publishRun', { timeout: 60_000 }, () => {
 
   it('keeps the token out of git arguments, run.log and errors', async () => {
     const s = await scenario();
-    const git = recordingGit({ fakePushUrl: 'https://github.com/octo/widgets.git' });
+    const git = recordingGit({ fakePushUrl: 'https://github.com/octo/widgets.git', realUrl: s.f.remoteDir });
     let asked = 0;
     const r = await publishRun(deps(s, new FakePublishApi(), { runGit: git.runGit, token: async () => (asked++, TOKEN) }), s.runId);
     expect(r.status).toBe('published');
@@ -506,6 +512,7 @@ describe('publishRun', { timeout: 60_000 }, () => {
     const s2 = await scenario({ f: s.f, db: s.db });
     const leaky = recordingGit({
       fakePushUrl: 'https://github.com/octo/widgets.git',
+      realUrl: s2.f.remoteDir,
       failPushWith: new GitError('git push failed', ['push'], 128, `fatal: unable to access: Authentication failed for ${TOKEN}\n`),
     });
     const failed = await publishRun(deps(s2, new FakePublishApi(), { runGit: leaky.runGit }), s2.runId);
@@ -536,6 +543,69 @@ describe('publishRun', { timeout: 60_000 }, () => {
     expect(r).toMatchObject({ status: 'failed', retryable: false });
     if (r.status === 'failed') expect(r.error).toMatch(/does not point at octo\/widgets/);
     expect(git.calls.some((c) => c.args[0] === 'push')).toBe(false);
+  });
+
+  it('refuses a remote with more than one push URL, since git would push to all of them', async () => {
+    const s = await scenario();
+    // A second bare repository laid out as OWNER/NAME.git too, so each URL alone would pass the check.
+    const second = join(s.f.root, 'mirror repos', `${FULL}.git`);
+    mkdirSync(second, { recursive: true });
+    s.f.git(second, 'init', '--bare', '--quiet', '-b', 'main');
+    s.f.git(s.f.clone, 'remote', 'set-url', '--add', '--push', 'origin', s.f.remoteDir);
+    s.f.git(s.f.clone, 'remote', 'set-url', '--add', '--push', 'origin', second);
+
+    const api = new FakePublishApi();
+    const r = await publishRun(deps(s, api), s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false });
+    if (r.status === 'failed') expect(r.error).toMatch(/remote "origin" has 2 push URLs .*exactly one destination/);
+    expect(remoteSha(s)).toBeNull();
+    expect(s.f.git(s.f.root, 'ls-remote', second, `refs/heads/${s.branch}`)).toBe('');
+    expect(api.calls.filter((c) => c.startsWith('createPr') || c.startsWith('createComment'))).toEqual([]);
+
+    // With a single push URL again, it publishes there.
+    s.f.git(s.f.clone, 'config', '--unset-all', 'remote.origin.pushurl');
+    expect(await publishRun(deps(s, api), s.runId)).toMatchObject({ status: 'published' });
+    expect(remoteSha(s)).toBe(s.localSha);
+  });
+
+  it('an attempt that outlived its lease cannot record anything over the attempt that took over', async () => {
+    const s = await scenario();
+    let t = T0;
+    const now = () => t;
+    // The first attempt's comment reaches GitHub, but its response is held back past the lease.
+    let release!: () => void;
+    let reached!: () => void;
+    const reachedComment = new Promise<void>((r) => (reached = r));
+    const held = new Promise<void>((r) => (release = r));
+    class SlowCommentApi extends FakePublishApi {
+      private first = true;
+      override async createIssueComment(repo: RepoRef, issue: number, body: string) {
+        const c = await super.createIssueComment(repo, issue, body);
+        if (this.first) {
+          this.first = false;
+          reached();
+          await held;
+        }
+        return c;
+      }
+    }
+    const api = new SlowCommentApi();
+    const first = publishRun(deps(s, api, { now }), s.runId);
+    await reachedComment;
+
+    t += (PUBLISH_LEASE_SECONDS + 1) * 1000;
+    const second = await publishRun(deps(s, api, { now }), s.runId);
+    expect(second).toMatchObject({ status: 'published', already: false });
+    // The second attempt found the first attempt's comment by its marker instead of posting another.
+    expect(api.comments).toHaveLength(1);
+    const owned = getPublication(s.db, s.runId)!;
+    expect(owned).toMatchObject({ state: 'published', attempts: 2, commentId: api.comments[0]!.id });
+
+    release();
+    const stale = await first;
+    expect(stale).toMatchObject({ status: 'busy', reason: expect.stringMatching(/attempt 1 was superseded/) });
+    expect(api.comments).toHaveLength(1);
+    expect(getPublication(s.db, s.runId)).toEqual(owned);
   });
 });
 

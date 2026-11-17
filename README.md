@@ -309,7 +309,9 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
 1. **Push** the job branch to the repo's remote in `checkoutPath` (the same remote the
    worktree was fetched from): `git push <remote> <sha>:refs/heads/factory/issue-<n>-<jobId>`.
    It never force-pushes, never pushes the base branch, and refuses any branch other than the
-   run's job branch. If the branch already exists on the remote at the same commit, the push is
+   run's job branch. The remote must have exactly one push URL, and it must point at the
+   configured repository (`git push` sends to every `pushurl` a remote has, so a remote with
+   several is refused). If the branch already exists at that URL at the same commit, the push is
    skipped; at a different commit, publication fails and the remote branch is left alone.
 2. **Open a PR** from the job branch into the base branch (draft for `draft-pr`), titled with
    the issue title. The body says `Closes #<n>`, lists the commits and the diffstat, quotes the
@@ -331,6 +333,9 @@ from the run, so publication never changes a run's outcome), and each step check
 before writing: the remote branch before pushing, any PR for the head branch in any state
 (open, closed or merged) before opening one, and an issue comment with the run's marker before
 commenting. A retry resumes where the last attempt stopped and never creates a duplicate.
+Only one attempt owns a publication at a time: it holds a lease that it renews before each
+push, PR and comment, every GitHub request gives up after 60 seconds, and an attempt that
+lost its lease can neither write to GitHub again nor change the recorded state.
 
 **Failures.** Network errors, GitHub 5xx responses and rate limits are retried by the worker
 on its own after each poll, with backoff, up to five attempts. Other failures wait for you:

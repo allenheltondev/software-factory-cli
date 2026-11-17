@@ -26,6 +26,8 @@ import {
   finishPublication,
   getPublication,
   listDuePublications,
+  holdPublication,
+  PublicationSupersededError,
   recordPublicationProgress,
 } from '../db/publications.js';
 import { recordError, type Db } from '../db/database.js';
@@ -370,6 +372,10 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
     return { status: 'busy', reason: `run ${runId} is being published by another process (lease until ${begun.publication.leaseExpiresAt})` };
   }
   let pub = begun.publication;
+  // This attempt's fence: every state write and every external write checks it still owns the
+  // publication, so an attempt that outlived its lease can't act after a newer one took over.
+  const fence = { attempt: pub.attempts, leaseSeconds: PUBLISH_LEASE_SECONDS, now };
+  const hold = () => holdPublication(deps.db, runId, fence);
 
   let token: string | null = null;
   const runLog = async (lines: string[]) => {
@@ -380,8 +386,8 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       log.warn('could not write to run.log', { error: message(err) });
     }
   };
-  const progress = (p: Parameters<typeof recordPublicationProgress>[2]) => {
-    recordPublicationProgress(deps.db, runId, p, now);
+  const progress = (p: Parameters<typeof recordPublicationProgress>[3]) => {
+    recordPublicationProgress(deps.db, runId, fence, p);
     pub = getPublication(deps.db, runId)!;
   };
 
@@ -398,7 +404,20 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       if (!selection.ok) throw new PublishRefusal(`${checkoutPath}: ${selection.error}`);
       const remoteName = selection.remote.name;
       // Push to exactly the repository the run was for, even if a push URL was configured since.
-      const pushUrlRaw = (await run1(['remote', 'get-url', '--push', remoteName], local)).stdout.trim();
+      // `git push <remote>` pushes to every pushurl the remote has, so all of them are listed
+      // (after insteadOf rewriting, as push applies it) and exactly one is allowed.
+      const pushUrls = (await run1(['remote', 'get-url', '--push', '--all', remoteName], local)).stdout
+        .split(/\r?\n/)
+        .map((u) => u.trim())
+        .filter(Boolean);
+      if (pushUrls.length !== 1) {
+        throw new PublishRefusal(
+          `remote "${remoteName}" has ${pushUrls.length} push URLs (${pushUrls.map(redactRemoteUrl).join(', ') || 'none'}); ` +
+            'publication pushes to exactly one destination. Leave the remote with a single push URL, or set ' +
+            `repositories.${repoFullName}.remote to a remote that has one`,
+        );
+      }
+      const pushUrlRaw = pushUrls[0]!;
       const matches = repo.remote !== undefined ? remoteOwnerNameMatches(pushUrlRaw, repoFullName) : isGitHubRemoteFor(pushUrlRaw, repoFullName);
       if (!matches) {
         throw new PublishRefusal(`the push URL of remote "${remoteName}" (${redactRemoteUrl(pushUrlRaw)}) does not point at ${repoFullName}`);
@@ -418,7 +437,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
 
     if (commitCount === 0) {
       const reason = `the job branch ${branch} has no commits since the base ${run.summary.baseSha.slice(0, 12)}; nothing to publish`;
-      finishPublication(deps.db, runId, { state: 'skipped', error: reason, now });
+      if (!finishPublication(deps.db, runId, fence.attempt, { state: 'skipped', error: reason, now })) throw new PublicationSupersededError(runId, fence.attempt);
       await runLog([`skipped: ${reason}`]);
       log.info('publication skipped', { reason });
       return { status: 'skipped', reason, publication: getPublication(deps.db, runId)! };
@@ -430,7 +449,8 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
 
     // 2. Push, unless the remote already has exactly this commit. Never forced.
     const remoteRef = `refs/heads/${branch}`;
-    const listed = (await run1(['ls-remote', remote, remoteRef], net)).stdout;
+    hold();
+    const listed = (await run1(['ls-remote', pushUrl, remoteRef], net)).stdout;
     const remoteSha =
       listed
         .split(/\r?\n/)
@@ -458,6 +478,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
 
     // 3. The PR: recorded, found by head, or new.
     let pr: GitHubPullRequest | null = null;
+    if (!pub.prNumber || !pub.prUrl) hold();
     if (pub.prNumber && pub.prUrl) {
       pr = { number: pub.prNumber, htmlUrl: pub.prUrl, state: 'open', draft: mode === 'draft-pr', merged: false, headRef: branch, headRepoId: job.repoId, baseRef: baseBranch, body: '' };
     } else {
@@ -484,6 +505,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
 
     // 4. The issue comment: recorded, found by marker, or new.
     if (!pub.commentId) {
+      hold();
       const marker = publicationMarker(runId);
       const found = (await deps.api.listIssueComments(repoRef, job.issueNumber)).find((c) => c.body.includes(marker));
       const comment = found ?? (await deps.api.createIssueComment(repoRef, job.issueNumber, renderIssueComment({ runId, pr, commitCount, summary: run.summary })));
@@ -491,10 +513,16 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       await runLog([found ? `issue comment already there: ${comment.htmlUrl}` : `commented on issue #${job.issueNumber}: ${comment.htmlUrl}`]);
     }
 
-    finishPublication(deps.db, runId, { state: 'published', now });
+    if (!finishPublication(deps.db, runId, fence.attempt, { state: 'published', now })) throw new PublicationSupersededError(runId, fence.attempt);
     log.info('published', { pr: pub.prUrl });
     return { status: 'published', publication: getPublication(deps.db, runId)!, already: false };
   } catch (err) {
+    if (err instanceof PublicationSupersededError) {
+      // A newer attempt owns the row now; leave it, and GitHub, to that attempt.
+      log.warn('publication attempt superseded', { attempt: fence.attempt });
+      await runLog([`attempt ${fence.attempt} stopped: a newer attempt took over`]);
+      return { status: 'busy', reason: err.message };
+    }
     let error: string;
     let retryable: boolean;
     let retryAfter: number | null = null;
@@ -526,7 +554,10 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       const backoff = retryAfter ?? Math.min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * 2 ** (attempts - 1));
       nextAttemptAt = new Date(now() + backoff * 1000).toISOString();
     }
-    finishPublication(deps.db, runId, { state: 'failed', error, retryable, nextAttemptAt, now });
+    if (!finishPublication(deps.db, runId, fence.attempt, { state: 'failed', error, retryable, nextAttemptAt, now })) {
+      log.warn('publication attempt superseded', { attempt: fence.attempt, error });
+      return { status: 'busy', reason: new PublicationSupersededError(runId, fence.attempt).message };
+    }
     const hint = nextAttemptAt
       ? `the worker retries at ${nextAttemptAt}; "factory publish ${runId}" retries now`
       : `fix the cause, then run "factory publish ${runId}"`;

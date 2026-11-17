@@ -112,6 +112,39 @@ export function beginPublication(db: Db, b: BeginPublication): BeginResult {
   });
 }
 
+/**
+ * The attempt that wrote this no longer owns the publication: a newer attempt took it over (its
+ * lease had expired), or it was finished. The stale attempt must stop without touching GitHub or
+ * the row again.
+ */
+export class PublicationSupersededError extends Error {
+  constructor(runId: string, attempt: number) {
+    super(`publication of run ${runId}: attempt ${attempt} was superseded by a newer attempt`);
+    this.name = 'PublicationSupersededError';
+  }
+}
+
+/** Which attempt is writing, and how long each write extends its lease. */
+export interface PublicationFence {
+  attempt: number;
+  leaseSeconds: number;
+  now?: () => number;
+}
+
+const OWNED = `run_id = ? AND attempts = ? AND state = 'publishing'`;
+
+/**
+ * Confirm `fence.attempt` still owns the publication and extend its lease. Call before each
+ * external write (push, PR, comment), each of which is bounded well inside the lease, so a newer
+ * attempt can only take over once this one can no longer write. Throws PublicationSupersededError.
+ */
+export function holdPublication(db: Db, runId: string, fence: PublicationFence): void {
+  const clock = fence.now ?? Date.now;
+  const lease = new Date(clock() + fence.leaseSeconds * 1000).toISOString();
+  const res = db.prepare(`UPDATE publications SET lease_expires_at = ?, updated_at = ? WHERE ${OWNED}`).run(lease, nowIso(clock), runId, fence.attempt);
+  if (Number(res.changes) === 0) throw new PublicationSupersededError(runId, fence.attempt);
+}
+
 /** Progress recorded as each step completes, so a retry resumes after it. */
 export interface PublicationProgress {
   baseBranch?: string;
@@ -133,9 +166,11 @@ const PROGRESS_COLUMNS: Record<keyof PublicationProgress, string> = {
   commentUrl: 'comment_url',
 };
 
-export function recordPublicationProgress(db: Db, runId: string, p: PublicationProgress, now?: () => number): void {
-  const sets: string[] = [];
-  const values: Array<string | number> = [];
+/** Record progress for the owning attempt (and extend its lease). Throws PublicationSupersededError. */
+export function recordPublicationProgress(db: Db, runId: string, fence: PublicationFence, p: PublicationProgress): void {
+  const clock = fence.now ?? Date.now;
+  const sets: string[] = ['lease_expires_at = ?'];
+  const values: Array<string | number> = [new Date(clock() + fence.leaseSeconds * 1000).toISOString()];
   for (const [key, column] of Object.entries(PROGRESS_COLUMNS) as Array<[keyof PublicationProgress, string]>) {
     const v = p[key];
     if (v !== undefined) {
@@ -143,21 +178,31 @@ export function recordPublicationProgress(db: Db, runId: string, p: PublicationP
       values.push(v);
     }
   }
-  if (!sets.length) return;
-  db.prepare(`UPDATE publications SET ${sets.join(', ')}, updated_at = ? WHERE run_id = ?`).run(...values, nowIso(now), runId);
+  const res = db
+    .prepare(`UPDATE publications SET ${sets.join(', ')}, updated_at = ? WHERE ${OWNED}`)
+    .run(...values, nowIso(clock), runId, fence.attempt);
+  if (Number(res.changes) === 0) throw new PublicationSupersededError(runId, fence.attempt);
 }
 
+/**
+ * Close the owning attempt's publication. Returns false (and changes nothing) when `attempt` no
+ * longer owns it, so a stale attempt can't overwrite a newer attempt's state.
+ */
 export function finishPublication(
   db: Db,
   runId: string,
+  attempt: number,
   r: { state: 'published' | 'failed' | 'skipped'; error?: string | null; retryable?: boolean; nextAttemptAt?: string | null; now?: () => number },
-): void {
+): boolean {
   const at = nowIso(r.now);
-  db.prepare(
-    `UPDATE publications SET state = ?, error = ?, retryable = ?, next_attempt_at = ?, lease_expires_at = NULL,
-            published_at = CASE WHEN ? = 'published' THEN ? ELSE published_at END, updated_at = ?
-     WHERE run_id = ?`,
-  ).run(r.state, r.error ?? null, r.retryable ? 1 : 0, r.nextAttemptAt ?? null, r.state, at, at, runId);
+  const res = db
+    .prepare(
+      `UPDATE publications SET state = ?, error = ?, retryable = ?, next_attempt_at = ?, lease_expires_at = NULL,
+              published_at = CASE WHEN ? = 'published' THEN ? ELSE published_at END, updated_at = ?
+       WHERE ${OWNED}`,
+    )
+    .run(r.state, r.error ?? null, r.retryable ? 1 : 0, r.nextAttemptAt ?? null, r.state, at, at, runId, attempt);
+  return Number(res.changes) > 0;
 }
 
 /**

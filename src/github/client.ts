@@ -45,7 +45,12 @@ export interface CreateGitHubApiOptions {
   fetch?: typeof fetch;
   log?: Logger;
   env?: NodeJS.ProcessEnv;
+  /** Per-request deadline, including reading the response body. Defaults to {@link REQUEST_TIMEOUT_MS}. */
+  requestTimeoutMs?: number;
 }
+
+/** No GitHub request (headers and body) may take longer than this; a hung one fails as a network error. */
+export const REQUEST_TIMEOUT_MS = 60_000;
 
 export const USER_AGENT = 'software-factory-cli';
 export const API_VERSION = '2022-11-28';
@@ -261,11 +266,18 @@ interface RawResponse<T> {
   headers: Headers;
 }
 
+function networkError(method: string, display: string, err: unknown, timeoutMs: number): GitHubError {
+  const e = err as Error;
+  const why = e?.name === 'TimeoutError' ? `timed out after ${Math.round(timeoutMs / 1000)}s` : (e?.message ?? String(err));
+  return new GitHubError(`${method} ${display}: network error: ${why}`, 0);
+}
+
 export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promise<GitHubApi> {
   const token = opts.token ?? (await resolveGitHubToken(opts.env ?? process.env));
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
   const doFetch = opts.fetch ?? globalThis.fetch;
   const log = opts.log;
+  const timeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
 
   const buildUrl = (pathOrUrl: string, query?: Record<string, string | number>): string => {
     const url = new URL(/^https?:\/\//.test(pathOrUrl) ? pathOrUrl : `${baseUrl}${pathOrUrl}`);
@@ -283,7 +295,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     };
     if (ro.etag) headers['If-None-Match'] = ro.etag;
     const method = ro.method ?? 'GET';
-    const init: RequestInit = { method, headers, redirect: ro.redirect ?? 'follow' };
+    const init: RequestInit = { method, headers, redirect: ro.redirect ?? 'follow', signal: AbortSignal.timeout(timeoutMs) };
     if (ro.body !== undefined) {
       headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(ro.body);
@@ -294,7 +306,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     try {
       res = await doFetch(url, init);
     } catch (err) {
-      throw new GitHubError(`${method} ${display}: network error: ${(err as Error).message}`, 0);
+      throw networkError(method, display, err, timeoutMs);
     }
     log?.debug('github request', { method, url: display, status: res.status });
 
@@ -328,7 +340,15 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         retryAfter,
       );
     }
-    return { status: res.status, data: (await res.json()) as T, headers: res.headers };
+    let data: T;
+    try {
+      data = (await res.json()) as T;
+    } catch (err) {
+      // A body cut off by the deadline (or the connection) is a network error, not a bad response.
+      if (err instanceof SyntaxError) throw err;
+      throw networkError(method, display, err, timeoutMs);
+    }
+    return { status: res.status, data, headers: res.headers };
   }
 
   async function paginate<T>(path: string, query: Record<string, string | number> = {}): Promise<T[]> {

@@ -188,6 +188,17 @@ describe('createGitHubApi', () => {
     expect(e2.isRateLimit).toBe(true);
   });
 
+  it('gives up on a request that hangs, as a retryable network error', async () => {
+    // Never answers; only the client's deadline ends the request.
+    const hang = ((_url: string, init?: RequestInit) =>
+      new Promise<Response>((_, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal!.reason)))) as typeof fetch;
+    const api = await createGitHubApi({ token: 't', fetch: hang, requestTimeoutMs: 50 });
+    const err = (await api.createIssueComment({ id: 42, fullName: 'o/r' }, 7, 'hi').catch((e: unknown) => e)) as GitHubError;
+    expect(err).toBeInstanceOf(GitHubError);
+    expect(err.status).toBe(0);
+    expect(err.message).toBe('POST /repositories/42/issues/7/comments: network error: timed out after 0s');
+  });
+
   it('maps plain errors without retry info and network failures to status 0', async () => {
     const { fn } = fakeFetch(() => json({ message: 'Not Found' }, { status: 404 }));
     const api = await createGitHubApi({ token: 't', fetch: fn });
