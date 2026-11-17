@@ -9,10 +9,11 @@ sign-in, and keeps its queue in a local SQLite database.
 Pilot. This release covers repository discovery, config validation, issue-event polling, a
 durable queue and a **log-only** worker: jobs are claimed, routed to a pool and agent, and
 recorded, but no agent is started and no code is changed. The opt-in **prepare-only** mode
-also creates a branch and Git worktree per job (still without an agent). The **live** mode's
-execution framework is in place, but no agent adapter ships yet, so a config that selects it
-does not validate; the Claude Code, Codex and Kiro adapters and PR creation come next. See
-[docs/design.md](docs/design.md).
+also creates a branch and Git worktree per job (still without an agent). The **live** mode
+runs the routed agent in that worktree; this release ships the Claude Code adapter (see
+[Live mode with Claude Code](#live-mode-with-claude-code)), so a live config validates only
+while Claude Code is the only enabled agent. The Codex and Kiro adapters and PR creation come
+next. See [docs/design.md](docs/design.md).
 
 ## Install
 
@@ -95,7 +96,7 @@ repositories:
 | `version` | required | Config schema version; must be `1` |
 | `pollIntervalSeconds` | `60` | GitHub poll interval, 10-3600 |
 | `maxConcurrent` | `2` | Global cap on simultaneous runs, 1-64 |
-| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree (see [Live execution](#live-execution)); it is rejected unless every enabled agent's adapter is implemented, and none is in this release |
+| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree (see [Live execution](#live-execution)); it is rejected unless every enabled agent's adapter is implemented, which in this release means `claude` only |
 | `dispatch.allowedActors` | `[]` | GitHub logins allowed to dispatch work by applying a trigger label. Empty means nobody |
 | `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
@@ -160,11 +161,13 @@ In `live` mode the worker runs the routed agent for each `local-branch` job:
 4. It spawns the agent directly (no shell) in the worktree, records its pid and the OS start
    time of that process, and writes its stdout and stderr to `run.log`. `GH_TOKEN` and
    `GITHUB_TOKEN` are not passed to the agent unless `agents.<name>.env` sets them.
-5. Exit code 0 is `succeeded`; anything else is `failed`. At `timeoutMinutes` the agent's
-   process tree is killed and the run fails. Failed runs keep their worktree for inspection.
+5. The adapter decides the outcome from the exit code and, where the CLI reports one, its
+   machine-readable result (exit code 0 alone means `succeeded` otherwise). At
+   `timeoutMinutes` the agent's process tree is killed and the run fails. Failed runs keep
+   their worktree for inspection.
 6. It appends a summary to `run.log` and stores it for `factory status`: commits on the job
    branch since the base commit, files changed (`git diff --stat` against the base, committed
-   or not), untracked files, and the agent's last output lines.
+   or not), untracked files, and the agent's final message (or its last output lines).
 
 On macOS and Linux each agent runs in its own process group, so a timeout or shutdown also
 stops whatever it started. Pressing Ctrl-C in a terminal therefore doesn't reach the agent
@@ -178,6 +181,78 @@ time and are not signalled.
 
 In live mode, `factory doctor` reports a missing, broken or signed-out agent CLI as a failure
 rather than a warning.
+
+### Live mode with Claude Code
+
+Prerequisites, under the account and environment the worker runs as (the background
+launchers' account, not just your terminal):
+
+- Claude Code installed and signed in: `claude auth status` reports `loggedIn: true` (a
+  claude.ai login, or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the environment).
+  `factory agents` and `factory doctor` run the same check.
+- On Linux and macOS, a non-root user: Claude Code refuses the default full-auto profile as
+  root or under `sudo`.
+- Only `claude` enabled among the agents (Codex and Kiro have no live adapter yet), a
+  `checkoutPath` for the repository and a `prompt` for the action. `factory validate` checks
+  all three.
+
+Each job runs, in its worktree, with the prompt file on stdin:
+
+```
+claude -p --output-format stream-json --verbose --permission-mode bypassPermissions <agents.claude.args>
+```
+
+- `-p` is Claude Code's [headless mode](https://code.claude.com/docs/en/headless); with no
+  prompt argument it reads the prompt from stdin.
+- `stream-json` writes one JSON event per line to `run.log` as the run goes, so a run that
+  times out still leaves a transcript. The last event is the run's result.
+- The run is `succeeded` only when Claude Code exits 0 with a `success` result. An error
+  result (`is_error`, such as a sign-in failure), the turn limit (`error_max_turns`), the
+  spending limit (`error_max_budget_usd`) or an error during execution fails the run with
+  that reason. The summary shows Claude's final message, then a line with the result, turns,
+  estimated cost, any permission denials and the session id. To look at a run afterwards,
+  run `claude --resume <session id>` in its worktree.
+
+**Default permission profile: full auto.** `--permission-mode bypassPermissions` (the same as
+`--dangerously-skip-permissions`) lets Claude edit files and run any command inside the job's
+worktree without asking, as decided for the pilot. It is not a sandbox: commands run as your
+user, can reach the network and can read or write outside the worktree. Anthropic recommends
+this mode only in isolated environments; see
+[permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode).
+
+To narrow it, set a permission mode in `agents.claude.args`; any `--permission-mode` or
+`--dangerously-skip-permissions` there replaces the default. Config arguments go last, after
+the adapter's own:
+
+```yaml
+agents:
+  claude:
+    args:
+      - --permission-mode
+      - acceptEdits        # edits files without asking; other commands need an allow rule
+      - --max-turns
+      - "60"               # stop a run after 60 agentic turns (fails as error_max_turns)
+      - --allowedTools     # variadic: keep it last
+      - "Bash(npm test *)"
+      - "Bash(git add *)"
+      - "Bash(git commit *)"
+```
+
+In a `-p` run anything that would prompt is denied (and listed as a permission denial in the
+summary), so with a narrower profile allow every command the action needs, including
+`git add`/`git commit`. `--max-budget-usd` caps estimated spend the same way. Other flags
+from the [CLI reference](https://code.claude.com/docs/en/cli-reference), such as `--model`,
+pass through unchanged. Don't override `--output-format`: the adapter then can't read the
+result and falls back to the exit code.
+
+Without `--bare`, Claude Code loads the worktree's `CLAUDE.md`, `.claude/settings.json`
+(including hooks) and `.mcp.json` as it would interactively, and `-p` skips the workspace trust
+dialog. Point live mode only at repositories whose checked-in Claude settings you trust.
+
+**Windows:** Claude Code's native Windows setup has no built-in command sandbox; commands run
+unsandboxed ([sandboxing](https://code.claude.com/docs/en/sandboxing)). When an action needs
+sandboxed command execution, run the worker and Claude Code inside WSL2, where the sandbox is
+available, or inside another isolation boundary such as a VM or container.
 
 ## Files and locations
 
@@ -222,13 +297,14 @@ environment before relying on it. Details, log locations and troubleshooting:
   labelled as untrusted; the default prompt
   ([examples/prompts/implement-issue.md](examples/prompts/implement-issue.md)) also tells
   agents not to follow instructions in them.
-- No agent adapter ships in this release, so nothing runs repository code or pushes to
-  GitHub, and the worker only reads from GitHub. In `prepare-only` mode the worker fetches
-  into your clone and creates branches and worktrees; Git hooks configured for the clone
-  (such as `post-checkout`) run as they would for any `git worktree add`.
+- The worker only reads from GitHub and never pushes. In `prepare-only` and `live` mode it
+  fetches into your clone and creates branches and worktrees; Git hooks configured for the
+  clone (such as `post-checkout`) run as they would for any `git worktree add`.
 - In live mode the agent runs as your user, in the job's worktree, with the worker's
   environment minus `GH_TOKEN`/`GITHUB_TOKEN`. That is not a sandbox: what the agent may do
-  is up to the agent CLI's own permission settings.
+  is up to the agent CLI's own permission settings. Claude Code runs in full-auto mode by
+  default (see [Live mode with Claude Code](#live-mode-with-claude-code)); the allowlist of
+  actors who can dispatch work is the guard on who can start such a run.
 - GitHub access uses `GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`. The CLI
   does not store tokens.
 
