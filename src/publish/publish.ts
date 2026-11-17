@@ -5,8 +5,9 @@
 //
 // Every step is idempotent, keyed by the run id, so a retry (automatic or `factory publish`)
 // never creates a duplicate:
-// - push: the remote branch is checked first. Absent: push (never forced). Same SHA: already
-//   pushed. Different SHA: refuse; it is never overwritten.
+// - push: the remote branch is checked first. Absent: a create-only push, which Git refuses if
+//   the branch appeared meanwhile. Same SHA: already pushed. Different SHA (before or during the
+//   push): refuse; an existing branch is never moved.
 // - PR: the recorded PR, else any PR (open, closed or merged) whose head is the job branch, else
 //   a new one.
 // - comment: the recorded comment, else an issue comment carrying the run's marker, else a new one.
@@ -494,33 +495,53 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
     if (baseBranch !== pub.baseBranch) progress({ baseBranch });
     if (branch === baseBranch) throw new PublishRefusal(`the job branch ${branch} is the base branch; refusing to push to it`);
 
-    // 2. Push, unless the remote already has exactly this commit. Never forced.
+    // 2. Create the branch on the remote, unless it already has exactly this commit. The push
+    // only ever creates it: anything already there is left alone.
     const remoteRef = `refs/heads/${branch}`;
-    hold();
-    const listed = (await run1(['ls-remote', pushUrl, remoteRef], net)).stdout;
-    const remoteSha =
-      listed
-        .split(/\r?\n/)
-        .map((l) => l.trim().split(/\s+/))
-        .find(([, ref]) => ref === remoteRef)?.[0] ?? null;
-    if (remoteSha && remoteSha !== localSha) {
-      throw new PublishRefusal(
-        `${remoteRef} on ${remote} is at ${remoteSha.slice(0, 12)}, but the job branch is at ${localSha.slice(0, 12)}; ` +
+    const readRemoteSha = async (): Promise<string | null> => {
+      const listed = (await run1(['ls-remote', pushUrl, remoteRef], net)).stdout;
+      return (
+        listed
+          .split(/\r?\n/)
+          .map((l) => l.trim().split(/\s+/))
+          .find(([, ref]) => ref === remoteRef)?.[0] ?? null
+      );
+    };
+    const refuseOther = (sha: string) =>
+      new PublishRefusal(
+        `${remoteRef} on ${remote} is at ${sha.slice(0, 12)}, but the job branch is at ${localSha.slice(0, 12)}; ` +
           'refusing to overwrite it. Inspect the remote branch; delete it there if it should be replaced, then run ' +
           `"factory publish ${runId}"`,
       );
-    }
+    hold();
+    const remoteSha = await readRemoteSha();
+    if (remoteSha && remoteSha !== localSha) throw refuseOther(remoteSha);
     if (remoteSha === localSha) {
       await runLog([`${remoteRef} is already on ${remote} at ${localSha.slice(0, 12)}`]);
     } else {
       await runLog([`pushing ${branch} (${localSha.slice(0, 12)}, ${commitCount} commit(s)) to ${remote} (${redactRemoteUrl(pushUrl)})`]);
       hold();
       try {
-        // To the validated URL, from the isolated repository.
-        await run1(['push', '--no-verify', '--recurse-submodules=no', '--porcelain', pushUrl, `${localSha}:${remoteRef}`], net);
+        // To the validated URL, from the isolated repository. --force-with-lease=<ref>: with an
+        // empty expected value makes this create-only: Git refuses the update unless the branch
+        // is still absent when the push runs, so a branch someone created after the check above
+        // is never moved, not even fast-forwarded. It cannot overwrite anything.
+        await run1(
+          ['push', '--no-verify', '--recurse-submodules=no', '--porcelain', `--force-with-lease=${remoteRef}:`, pushUrl, `${localSha}:${remoteRef}`],
+          net,
+        );
       } catch (err) {
-        if (err instanceof GitError) throw classifyGit(err, 'push', remote, repoFullName);
-        throw err;
+        if (!(err instanceof GitError)) throw err;
+        // Rejected, or the outcome is unknown: look again. Our exact commit there means an earlier
+        // or concurrent push of this run already landed it; any other commit is left alone.
+        const after = await readRemoteSha().catch(() => undefined);
+        if (after === localSha) {
+          await runLog([`${remoteRef} is already on ${remote} at ${localSha.slice(0, 12)} (pushed concurrently)`]);
+        } else if (after) {
+          throw refuseOther(after);
+        } else {
+          throw classifyGit(err, 'push', remote, repoFullName);
+        }
       }
     }
     if (pub.headSha !== localSha || !pub.pushedAt) progress({ headSha: localSha, pushedAt: pub.pushedAt ?? new Date(now()).toISOString() });

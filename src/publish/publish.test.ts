@@ -334,7 +334,8 @@ describe('publishRun', { timeout: 60_000 }, () => {
     const pushes = git.calls.filter((c) => c.args[0] === 'push');
     expect(pushes).toHaveLength(1);
     const push = pushes[0]!.args;
-    expect(push.some((a) => /^(-f|--force.*|\+.*)$/.test(a))).toBe(false);
+    // The only lease is create-only (empty expected value): it can create the branch, never move it.
+    expect(push.filter((a) => /^(-f|--force.*|\+.*)$/.test(a))).toEqual([`--force-with-lease=refs/heads/${s.branch}:`]);
     expect(push.at(-1)).toBe(`${s.localSha}:refs/heads/${s.branch}`);
     expect(push).toContain('--no-verify');
     expect(push.join(' ')).not.toContain('refs/heads/main');
@@ -607,6 +608,48 @@ describe('publishRun', { timeout: 60_000 }, () => {
     expect(stale).toMatchObject({ status: 'busy', reason: expect.stringMatching(/attempt 1 was superseded/) });
     expect(api.comments).toHaveLength(1);
     expect(getPublication(s.db, s.runId)).toEqual(owned);
+  });
+
+  it('leaves alone a branch created after the check, even one the push could fast-forward', async () => {
+    const s = await scenario();
+    const base = s.f.git(s.f.clone, 'rev-parse', 'refs/heads/main');
+    let created = false;
+    // Right after the absence check, another writer creates the branch at the base commit, an
+    // ancestor of the job branch.
+    const racing: RunGit = async (args, opts) => {
+      const r = await runGit(args, opts);
+      if (args[0] === 'ls-remote' && !created) {
+        created = true;
+        s.f.git(s.f.remoteDir, 'update-ref', `refs/heads/${s.branch}`, base);
+      }
+      return r;
+    };
+    const api = new FakePublishApi();
+    const r = await publishRun(deps(s, api, { runGit: racing }), s.runId);
+    expect(created).toBe(true);
+    expect(r).toMatchObject({ status: 'failed', retryable: false });
+    if (r.status === 'failed') expect(r.error).toMatch(new RegExp(`is at ${base.slice(0, 12)}, but the job branch is at ${s.localSha.slice(0, 12)}; refusing to overwrite it`));
+    expect(remoteSha(s)).toBe(base);
+    expect(api.calls.filter((c) => c.startsWith('createPr'))).toEqual([]);
+  });
+
+  it('treats the branch appearing at exactly the job commit during the push as already pushed', async () => {
+    const s = await scenario();
+    let raced = false;
+    // A concurrent push of the same run lands the same commit between the check and this push.
+    const racing: RunGit = async (args, opts) => {
+      const r = await runGit(args, opts);
+      if (args[0] === 'ls-remote' && !raced) {
+        raced = true;
+        s.f.git(s.f.clone, 'push', '--quiet', s.f.remoteDir, `${s.localSha}:refs/heads/${s.branch}`);
+      }
+      return r;
+    };
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: racing }), s.runId);
+    expect(raced).toBe(true);
+    expect(r).toMatchObject({ status: 'published' });
+    // Git sees the branch already at the pushed commit and reports it up to date.
+    expect(remoteSha(s)).toBe(s.localSha);
   });
 
   it('pushes to the validated URL even if the remote is changed after the check', async () => {

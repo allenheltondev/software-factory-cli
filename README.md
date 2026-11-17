@@ -476,15 +476,17 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
 
 1. **Push** the job branch to the repo's remote in `checkoutPath` (the same remote the
    worktree was fetched from): `git push <remote> <sha>:refs/heads/factory/issue-<n>-<jobId>`.
-   It never force-pushes, never pushes the base branch, and refuses any branch other than the
-   run's job branch. The remote must have exactly one push URL, and it must point at the
+   The push only ever creates the branch: it carries `--force-with-lease=<ref>:` with an empty
+   expected value, so Git refuses it if the branch exists by the time it runs, and it never
+   moves an existing branch, not even by a fast-forward. It never pushes the base branch and
+   refuses any branch other than the run's job branch. The remote must have exactly one push URL, and it must point at the
    configured repository (`git push` sends to every `pushurl` a remote has, so a remote with
    several is refused). The check and the push then both name that URL directly, from a
    throwaway repository that borrows the clone's objects but none of its configuration, with
    global and system Git config switched off, so a remote, `insteadOf` rule or hook changed
    after the check can't send the push elsewhere. If the branch already exists at that URL at
-   the same commit, the push is skipped; at a different commit, publication fails and the
-   remote branch is left alone.
+   the same commit, the push is skipped; at a different commit, before or during the push,
+   publication fails and the remote branch is left alone.
 2. **Open a PR** from the job branch into the base branch (draft for `draft-pr`), titled with
    the issue title. The body says `Closes #<n>`, lists the commits and the diffstat, quotes the
    agent's final message (capped, in a code block so mentions and closing keywords in it stay
@@ -543,8 +545,8 @@ that the active account has push access to every repository with `publish` set.
   and `live` mode it fetches into your clone and creates branches and worktrees; Git hooks
   configured for the clone (such as `post-checkout`) run as they would for any
   `git worktree add`. With `publish` set for a repository, the worker also writes to GitHub
-  as your `gh` account: it pushes job branches (never forced, never the base branch), opens
-  PRs and comments on issues (see [Publication](#publication)). It never merges.
+  as your `gh` account: it creates job branches (never moving an existing one, never the
+  base branch), opens PRs and comments on issues (see [Publication](#publication)). It never merges.
 - Publication is done by the worker after the agent has exited; the agent itself is not given
   `GH_TOKEN`/`GITHUB_TOKEN`. That is a guard against accidental use, not isolation: the agent
   runs as your user, so it can still reach whatever that user can, including `gh auth token`,
