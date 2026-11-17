@@ -55,6 +55,8 @@ repositories:
     # checkoutPath: ../clones/kids-and-dragons
     # baseBranch: main # defaults to the remote's default branch
     # remote: origin # only needed when the GitHub remote uses an SSH host alias (git@github-work:OWNER/REPO)
+    # Live mode: push the job branch of a succeeded run and open a PR as your gh account (none, draft-pr or pr).
+    # publish: draft-pr
     workflows:
       - id: implement
         trigger:

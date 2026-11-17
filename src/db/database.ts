@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -160,6 +160,38 @@ const MIGRATIONS: Record<number, Migration> = {
     ALTER TABLE runs ADD COLUMN pid_start_time TEXT;
     -- JSON RunSummary written after a live agent run: commits, changed files, last output.
     ALTER TABLE runs ADD COLUMN summary TEXT;
+  `,
+  6: `
+    -- Publication of a succeeded live run (repositories.<repo>.publish): push the job branch,
+    -- open a PR, comment on the issue. Kept apart from runs so it never changes a run's outcome.
+    -- Each step's result is recorded as it completes; a retry resumes from what is recorded and
+    -- re-checks GitHub before every write, so it never creates a duplicate.
+    CREATE TABLE publications (
+      run_id           TEXT    PRIMARY KEY REFERENCES runs (id),
+      job_id           TEXT    NOT NULL,
+      repo_id          INTEGER NOT NULL,
+      repo_full_name   TEXT    NOT NULL,
+      issue_number     INTEGER NOT NULL,
+      mode             TEXT    NOT NULL CHECK (mode IN ('draft-pr','pr')),
+      state            TEXT    NOT NULL CHECK (state IN ('publishing','published','failed','skipped')),
+      branch           TEXT    NOT NULL,
+      base_branch      TEXT,
+      head_sha         TEXT,               -- commit pushed (or found already on the remote)
+      pushed_at        TEXT,
+      pr_number        INTEGER,
+      pr_url           TEXT,
+      comment_id       INTEGER,
+      comment_url      TEXT,
+      error            TEXT,               -- why it failed, or why it was skipped
+      retryable        INTEGER NOT NULL DEFAULT 0,
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,               -- while state = 'publishing'
+      next_attempt_at  TEXT,               -- automatic retry of a retryable failure
+      created_at       TEXT    NOT NULL,
+      updated_at       TEXT    NOT NULL,
+      published_at     TEXT
+    );
+    CREATE INDEX publications_by_state ON publications (state, next_attempt_at);
   `,
 };
 

@@ -13,7 +13,11 @@ also creates a branch and Git worktree per job (still without an agent). The **l
 runs the routed agent in that worktree; this release ships the Claude Code, Codex and Kiro
 adapters (see [Live mode with Claude Code](#live-mode-with-claude-code),
 [Live mode with Codex](#live-mode-with-codex) and [Live mode with Kiro](#live-mode-with-kiro)).
-PR creation comes next. See [docs/design.md](docs/design.md).
+See [docs/design.md](docs/design.md).
+
+Publication is opt-in per repository: with `publish: draft-pr` (or `pr`), a live run that
+succeeded and left commits gets its branch pushed and a PR opened as your `gh` account. See
+[Publication](#publication).
 
 ## Install
 
@@ -53,6 +57,7 @@ the per-user default.
 | `factory doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access, labels and agent commands in the current environment |
 | `factory agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
 | `factory retry JOB_ID` | Requeue a failed, interrupted or canceled job |
+| `factory publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [Publication](#publication) |
 | `factory clean [--dry-run]` | Remove job worktrees of succeeded or canceled runs. Keeps failed and interrupted runs' worktrees, and all branches. See [Per-job worktrees](#per-job-worktrees) |
 
 ## Configuration
@@ -113,6 +118,7 @@ repositories:
 | `repositories.<OWNER/REPO>.baseBranch` | remote's default branch | Branch that per-job branches start from (fetched first) |
 | `repositories.<OWNER/REPO>.checkoutPath` | none | Local clone of the repo that per-job worktrees are created from, relative to the config file's directory. Required in `prepare-only` and `live` mode when a workflow's action has `output: local-branch` |
 | `repositories.<OWNER/REPO>.remote` | a github.com remote | Remote of `checkoutPath` to fetch from. Without it, only a remote whose URL is on `github.com` with path `OWNER/REPO` qualifies (`origin` preferred). Set it for an SSH host alias such as `git@github-work:OWNER/REPO`; any host is then accepted, but `OWNER/REPO` must still match |
+| `repositories.<OWNER/REPO>.publish` | `none` | Live mode, `local-branch` actions: `draft-pr` pushes the job branch of a succeeded run that left commits and opens a draft PR; `pr` opens a ready-for-review PR instead (for private repos where your plan has no draft PRs). Set in another mode, it is a validation warning and does nothing. See [Publication](#publication) |
 | `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
@@ -459,6 +465,69 @@ working directory and an explicit `PATH`. Run `factory doctor` under the same ac
 environment before relying on it. Details, log locations and troubleshooting:
 [docs/background-operation.md](docs/background-operation.md).
 
+## Publication
+
+Off by default. Set `repositories.<OWNER/REPO>.publish` to `draft-pr` or `pr` to have the
+worker publish a live run's work. It applies only in `live` mode, to actions with
+`output: local-branch`, and only to runs that **succeeded and left at least one commit** on
+the job branch. Failed runs keep their local worktree as before; a run with no commits is
+recorded as "not published". The worker publishes, never the agent, as the active `gh`
+account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
+
+1. **Push** the job branch to the repo's remote in `checkoutPath` (the same remote the
+   worktree was fetched from): `git push <remote> <sha>:refs/heads/factory/issue-<n>-<jobId>`.
+   The push only ever creates the branch: it carries `--force-with-lease=<ref>:` with an empty
+   expected value, so Git refuses it if the branch exists by the time it runs, and it never
+   moves an existing branch, not even by a fast-forward. It never pushes the base branch and
+   refuses any branch other than the run's job branch. The remote must have exactly one push URL, and it must point at the
+   configured repository (`git push` sends to every `pushurl` a remote has, so a remote with
+   several is refused). The check and the push then both name that URL directly, from a
+   throwaway repository that borrows the clone's objects but none of its configuration, with
+   global and system Git config switched off, so a remote, `insteadOf` rule or hook changed
+   after the check can't send the push elsewhere. If the branch already exists at that URL at
+   the same commit, the push is skipped; at a different commit, before or during the push,
+   publication fails and the remote branch is left alone.
+2. **Open a PR** from the job branch into the base branch (draft for `draft-pr`), titled with
+   the issue title. The body says `Closes #<n>`, lists the commits and the diffstat, quotes the
+   agent's final message (capped, in a code block so mentions and closing keywords in it stay
+   inert), and carries the run id and a hidden `<!-- factory-run: <runId> -->` marker.
+3. **Comment on the issue** with a link to the PR and a short summary, with the same marker.
+
+Merging stays a human decision: the worker never merges, approves or marks a PR ready for
+review.
+
+**Authentication.** API calls use the token. For an `https://github.com/...` remote, the push
+uses the same token, handed to that one `git` process as an `Authorization` header scoped to
+`https://github.com/` through `GIT_CONFIG_*` environment variables, so it is not in the command
+line, the remote URL, a file or the logs. For SSH remotes (including host aliases) the push uses
+your SSH key and `~/.ssh/config`; because Git config files are ignored for the push, a
+`core.sshCommand` there does not apply (set `GIT_SSH_COMMAND` in the worker's environment
+instead). Git hooks and tracing are turned off for these commands.
+
+**Idempotent retries.** Each step is recorded as it completes (in the state DB, separately
+from the run, so publication never changes a run's outcome), and each step checks GitHub
+before writing: the remote branch before pushing, any PR for the head branch in any state
+(open, closed or merged) before opening one, and an issue comment with the run's marker before
+commenting. A retry resumes where the last attempt stopped and never creates a duplicate.
+Only one attempt owns a publication at a time. Right before each push, PR and comment it
+confirms it still owns the publication and renews its lease, so a slow lookup can't lead to
+a late write. Every GitHub request gives up after 60 seconds, an attempt stops after 8
+minutes (and is retried later), and an attempt that lost its lease can neither write to
+GitHub again nor change the recorded state.
+
+**Failures.** Network errors, GitHub 5xx responses and rate limits are retried by the worker
+on its own after each poll, with backoff, up to five attempts. Other failures wait for you:
+`factory status` shows the error, and `factory publish RUN_ID` retries through the same path.
+`factory publish` also publishes a succeeded run the worker did not publish, for example one
+from before you turned `publish` on. Permission errors say what is needed: push access to the
+repository and a token with the classic `repo` scope, or a fine-grained token with Contents,
+Pull requests and Issues set to read and write (`gh auth refresh -h github.com -s repo`).
+GitHub refuses draft PRs for private repositories on some plans; publication then fails with
+a message to set `publish: pr`. It never falls back on its own.
+
+`factory status` shows each run's PR link or publication error, and `factory doctor` checks
+that the active account has push access to every repository with `publish` set.
+
 ## Security
 
 - Only GitHub logins in `dispatch.allowedActors` (or a workflow's `allowedActors`) can
@@ -472,13 +541,23 @@ environment before relying on it. Details, log locations and troubleshooting:
   labelled as untrusted; the default prompt
   ([examples/prompts/implement-issue.md](examples/prompts/implement-issue.md)) also tells
   agents not to follow instructions in them.
-- The worker only reads from GitHub and never pushes. In `prepare-only` and `live` mode it
-  fetches into your clone and creates branches and worktrees; Git hooks configured for the
-  clone (such as `post-checkout`) run as they would for any `git worktree add`.
+- Without `publish`, the worker only reads from GitHub and never pushes. In `prepare-only`
+  and `live` mode it fetches into your clone and creates branches and worktrees; Git hooks
+  configured for the clone (such as `post-checkout`) run as they would for any
+  `git worktree add`. With `publish` set for a repository, the worker also writes to GitHub
+  as your `gh` account: it creates job branches (never moving an existing one, never the
+  base branch), opens PRs and comments on issues (see [Publication](#publication)). It never merges.
+- Publication is done by the worker after the agent has exited; the agent itself is not given
+  `GH_TOKEN`/`GITHUB_TOKEN`. That is a guard against accidental use, not isolation: the agent
+  runs as your user, so it can still reach whatever that user can, including `gh auth token`,
+  Git credential helpers (such as the one `gh auth setup-git` installs) and SSH keys, and so
+  could push or call the API itself. Only an isolation boundary such as a separate account,
+  VM or container would prevent that.
 - In live mode the agent runs as your user, in the job's worktree, with the worker's
   environment minus `GH_TOKEN`/`GITHUB_TOKEN`. That is not a sandbox: what the agent may do
   is up to the agent CLI's own permission settings. Claude Code runs in full-auto mode by
-  default (see [Live mode with Claude Code](#live-mode-with-claude-code)), and so does Kiro
+  default (see [Live mode with Claude Code](#live-mode-with-claude-code)), and so do Codex
+  (see [Live mode with Codex](#live-mode-with-codex)) and Kiro
   (see [Live mode with Kiro](#live-mode-with-kiro)); the allowlist of actors who can dispatch
   work is the guard on who can start such a run.
 - Agent credentials such as `KIRO_API_KEY` belong in the worker's environment, set by its

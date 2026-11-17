@@ -55,6 +55,37 @@ export interface IssueEventsPage {
   notModified: boolean;
 }
 
+export interface GitHubPullRequest {
+  number: number;
+  htmlUrl: string;
+  state: 'open' | 'closed';
+  draft: boolean;
+  merged: boolean;
+  /** Branch name of the head (without refs/heads/). */
+  headRef: string;
+  /** Stable ID of the head's repository; null when that repository was deleted. */
+  headRepoId: number | null;
+  baseRef: string;
+  /** Markdown body; '' when it has none. */
+  body: string;
+}
+
+export interface CreatePullRequestInput {
+  title: string;
+  /** Branch in the same repository. */
+  head: string;
+  base: string;
+  body: string;
+  draft: boolean;
+}
+
+export interface GitHubIssueComment {
+  id: number;
+  htmlUrl: string;
+  body: string;
+  user: string | null;
+}
+
 export interface GitHubApi {
   getViewer(): Promise<{ login: string; id: number }>;
   /** All repos the account owns, collaborates on, or reaches through an org (paginated internally). */
@@ -67,6 +98,17 @@ export interface GitHubApi {
   getIssue(repo: RepoRef, issueNumber: number): Promise<GitHubIssue>;
   /** Every event on one issue, oldest first (paginated internally). `issue` is null on these. */
   listEventsForIssue(repo: RepoRef, issueNumber: number): Promise<GitHubIssueEvent[]>;
+  /**
+   * Pull requests whose head is `headOwner:head`, in any state (open, closed or merged), newest
+   * first (paginated internally).
+   */
+  listPullRequestsForHead(repo: RepoRef, opts: { headOwner: string; head: string }): Promise<GitHubPullRequest[]>;
+  /** Write: open a pull request. Used only by the publication step, never by an agent. */
+  createPullRequest(repo: RepoRef, input: CreatePullRequestInput): Promise<GitHubPullRequest>;
+  /** Every comment on one issue, oldest first (paginated internally). */
+  listIssueComments(repo: RepoRef, issueNumber: number): Promise<GitHubIssueComment[]>;
+  /** Write: comment on an issue. Used only by the publication step. */
+  createIssueComment(repo: RepoRef, issueNumber: number, body: string): Promise<GitHubIssueComment>;
 }
 
 export class GitHubError extends Error {

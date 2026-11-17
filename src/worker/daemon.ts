@@ -17,6 +17,7 @@ import {
   type Claim,
 } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
+import type { Publisher } from '../publish/publish.js';
 import type { IssueSnapshot, Job } from '../types.js';
 import { newId } from '../util/ids.js';
 import type { Logger } from '../util/log.js';
@@ -66,6 +67,11 @@ export interface DaemonDeps {
   executor?: Executor;
   /** Process liveness/termination; injectable for tests. */
   processControl?: ProcessControl;
+  /**
+   * Publication (repositories.<repo>.publish): called after a succeeded run is recorded, and after
+   * each poll to retry transient failures. Never changes a run's outcome. Absent: nothing is published.
+   */
+  publisher?: Publisher;
   /** Identity overrides, mainly for tests. */
   workerId?: string;
   hostname?: string;
@@ -204,11 +210,17 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
           runLog.error('could not record run summary', { error: message(err) });
         }
       }
+      let recorded = false;
       try {
         finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });
+        recorded = true;
         runLog.info('run finished', { outcome: result.outcome, ...(result.error ? { error: result.error } : {}) });
       } catch (err) {
         runLog.error('could not record run result', { error: message(err) });
+      }
+      // The run is closed (its slot is free); publishing it is a separate step with its own record.
+      if (recorded && result.outcome === 'succeeded' && deps.publisher) {
+        await deps.publisher.afterRun(run.id, controller.signal);
       }
     })().finally(() => {
       inFlight.delete(run.id);
@@ -342,6 +354,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         }
         nextPollAt = now() + pollMs;
         deferred.clear();
+        if (deps.publisher && !signal.aborted && !lockLost) await deps.publisher.retryDue(signal);
       }
       if (signal.aborted) break;
 

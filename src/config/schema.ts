@@ -10,6 +10,14 @@ export const KNOWN_ADAPTERS = ['codex', 'claude', 'kiro'] as const;
 export type AdapterName = (typeof KNOWN_ADAPTERS)[number];
 
 export const EXECUTION_MODES = ['log-only', 'prepare-only', 'live'] as const;
+
+/**
+ * What the worker does with a live run's job branch (repositories.<repo>.publish):
+ * none: leave the local branch; draft-pr: push it and open a draft PR; pr: push it and open a
+ * ready-for-review PR (for repos where GitHub refuses drafts).
+ */
+export const PUBLISH_MODES = ['none', 'draft-pr', 'pr'] as const;
+export type PublishMode = (typeof PUBLISH_MODES)[number];
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 
 /** Modes that create a per-job branch and worktree (and so need repositories.*.checkoutPath). */
@@ -112,6 +120,11 @@ export const repositorySchema = z.strictObject({
    * to enqueue matching events created at or after it on the first poll instead.
    */
   backfillSince: z.iso.datetime({ offset: true }).optional(),
+  /**
+   * Live mode, local-branch actions only: after a succeeded run that left commits, push the job
+   * branch and open a PR as the active gh account. Default none (the branch stays local).
+   */
+  publish: z.enum(PUBLISH_MODES).optional(),
   workflows: z.array(workflowSchema).min(1),
 });
 
@@ -165,6 +178,11 @@ export function repoNeedsCheckout(config: Pick<FactoryConfig, 'actions'>, repo: 
   return repo.workflows.some(
     (wf) => Object.hasOwn(config.actions, wf.action) && config.actions[wf.action]!.output === 'local-branch',
   );
+}
+
+/** The repo's publication mode; none unless the config opts in. */
+export function publishMode(repo: Pick<RepositoryConfig, 'publish'>): PublishMode {
+  return repo.publish ?? 'none';
 }
 
 export function allowedActorsFor(config: FactoryConfig, wf: WorkflowConfig): string[] {

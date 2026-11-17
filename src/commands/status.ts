@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { configSchema, type FactoryConfig } from '../config/schema.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
-import type { JobStatus } from '../types.js';
+import type { JobStatus, Publication } from '../types.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 import { checkConfig } from './validate.js';
@@ -66,6 +66,27 @@ export function buildStatusView(o: {
 function oneLine(s: string, max = 160): string {
   const flat = s.replace(/\s+/g, ' ').trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/** One line: the PR, or why there is none yet and how to retry. */
+export function renderPublication(p: Publication): string {
+  const pr = p.prUrl ? `PR #${p.prNumber}: ${p.prUrl}` : null;
+  switch (p.state) {
+    case 'published':
+      return `${p.mode === 'draft-pr' ? 'draft ' : ''}${pr ?? 'published'}`;
+    case 'publishing':
+      return `publishing (attempt ${p.attempts})${pr ? `; ${pr}` : p.pushedAt ? '; branch pushed' : ''}`;
+    case 'skipped':
+      return `not published: ${oneLine(p.error ?? 'nothing to publish', 140)}`;
+    case 'failed': {
+      const next = p.nextAttemptAt ? `worker retries at ${p.nextAttemptAt}, or ` : '';
+      const done = [p.pushedAt ? 'branch pushed' : null, pr].filter(Boolean).join(', ');
+      return (
+        `publication failed (attempt ${p.attempts}${done ? `; ${done}` : ''}): ${oneLine(p.error ?? 'unknown error', 140)}` +
+        ` — ${next}run "factory publish ${p.runId}"`
+      );
+    }
+  }
 }
 
 export function renderStatus(v: StatusView): string {
@@ -133,6 +154,8 @@ export function renderStatus(v: StatusView): string {
     );
   }
 
+  const publications = s.publications ?? [];
+  const pubByRun = new Map(publications.map((p) => [p.runId, p]));
   if (s.recentAgentRuns.length) {
     lines.push('', 'Recent agent runs:');
     for (const { run, job } of s.recentAgentRuns) {
@@ -144,6 +167,16 @@ export function renderStatus(v: StatusView): string {
       );
       const last = sum.lastOutput.at(-1);
       if (last) lines.push(`    last output: ${oneLine(last, 120)}`);
+      const pub = pubByRun.get(run.id);
+      if (pub) lines.push(`    ${renderPublication(pub)}`);
+    }
+  }
+
+  if (publications.length) {
+    lines.push('', 'Publications:');
+    for (const p of publications) {
+      lines.push(`  ${p.runId}  ${p.state.padEnd(10)}  ${p.repoFullName}#${p.issueNumber}  ${p.branch}  updated ${p.updatedAt}`);
+      lines.push(`    ${renderPublication(p)}`);
     }
   }
 

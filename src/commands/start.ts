@@ -1,7 +1,9 @@
 import { join } from 'node:path';
 import { loadConfig } from '../config/io.js';
 import type { Db } from '../db/database.js';
+import { resolveGitHubToken } from '../github/client.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
+import { createPublisher, publicationEnabled } from '../publish/publish.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import { runDaemon, type DaemonDeps } from '../worker/daemon.js';
 import { createExecutor } from '../worker/prepare-only.js';
@@ -81,6 +83,19 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       checkDispatchable: (job) => deps.checkJobDispatchable({ api, config }, job),
       signal: controller.signal,
       executor: createExecutor(config),
+      ...(publicationEnabled(config)
+        ? {
+            publisher: createPublisher({
+              db: openDb,
+              config,
+              paths,
+              api,
+              log: log.child({ component: 'publish' }),
+              token: () => resolveGitHubToken(ctx.env),
+              env: ctx.env,
+            }),
+          }
+        : {}),
     });
     log.info('worker stopped');
     return EXIT.OK;

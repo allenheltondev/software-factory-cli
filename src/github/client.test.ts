@@ -6,6 +6,8 @@ interface Call {
   url: string;
   headers: Record<string, string>;
   redirect: string | undefined;
+  method: string | undefined;
+  body: string | undefined;
 }
 
 function fakeFetch(handler: (url: URL, call: Call) => Response) {
@@ -15,6 +17,8 @@ function fakeFetch(handler: (url: URL, call: Call) => Response) {
       url: String(input),
       headers: { ...(init?.headers as Record<string, string>) },
       redirect: init?.redirect,
+      method: init?.method,
+      body: typeof init?.body === 'string' ? init.body : undefined,
     };
     calls.push(call);
     return handler(new URL(String(input)), call);
@@ -184,6 +188,17 @@ describe('createGitHubApi', () => {
     expect(e2.isRateLimit).toBe(true);
   });
 
+  it('gives up on a request that hangs, as a retryable network error', async () => {
+    // Never answers; only the client's deadline ends the request.
+    const hang = ((_url: string, init?: RequestInit) =>
+      new Promise<Response>((_, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal!.reason)))) as typeof fetch;
+    const api = await createGitHubApi({ token: 't', fetch: hang, requestTimeoutMs: 50 });
+    const err = (await api.createIssueComment({ id: 42, fullName: 'o/r' }, 7, 'hi').catch((e: unknown) => e)) as GitHubError;
+    expect(err).toBeInstanceOf(GitHubError);
+    expect(err.status).toBe(0);
+    expect(err.message).toBe('POST /repositories/42/issues/7/comments: network error: timed out after 0s');
+  });
+
   it('maps plain errors without retry info and network failures to status 0', async () => {
     const { fn } = fakeFetch(() => json({ message: 'Not Found' }, { status: 404 }));
     const api = await createGitHubApi({ token: 't', fetch: fn });
@@ -222,6 +237,92 @@ describe('createGitHubApi', () => {
     const e = (await api.getIssue(repo, 9).catch((x: unknown) => x)) as GitHubError;
     expect(e).toBeInstanceOf(GitHubError);
     expect(e.status).toBe(301);
+  });
+});
+
+describe('createGitHubApi: publication writes', () => {
+  const rawPull = (n: number, extra: Record<string, unknown> = {}) => ({
+    number: n,
+    html_url: `https://github.com/o/r/pull/${n}`,
+    state: 'open',
+    draft: true,
+    merged_at: null,
+    body: 'b',
+    head: { ref: 'factory/issue-7-job_x', repo: { id: 42 } },
+    base: { ref: 'main' },
+    ...extra,
+  });
+
+  it('opens a PR with POST on the stable-ID route and maps the response', async () => {
+    const { fn, calls } = fakeFetch(() => json(rawPull(5), { status: 201 }));
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const pr = await api.createPullRequest({ id: 42, fullName: 'o/r' }, { title: 'T', head: 'factory/issue-7-job_x', base: 'main', body: 'B', draft: true });
+    expect(calls[0]).toMatchObject({ method: 'POST', url: 'https://api.github.com/repositories/42/pulls' });
+    expect(calls[0]!.headers).toMatchObject({ Authorization: 'Bearer t', 'Content-Type': 'application/json' });
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ title: 'T', head: 'factory/issue-7-job_x', base: 'main', body: 'B', draft: true });
+    expect(pr).toEqual({
+      number: 5,
+      htmlUrl: 'https://github.com/o/r/pull/5',
+      state: 'open',
+      draft: true,
+      merged: false,
+      headRef: 'factory/issue-7-job_x',
+      headRepoId: 42,
+      baseRef: 'main',
+      body: 'b',
+    });
+  });
+
+  it('lists PRs for a head in every state, and comments', async () => {
+    const { fn, calls } = fakeFetch((url, call) => {
+      if (url.pathname.endsWith('/pulls')) {
+        return json([rawPull(5, { state: 'closed', merged_at: '2026-01-01T00:00:00Z', head: { ref: 'x', repo: null } })]);
+      }
+      if (call.method === 'POST') return json({ id: 4, html_url: 'h4', body: 'hi', user: { login: 'allen' } }, { status: 201 });
+      return json([{ id: 3, html_url: 'h', body: null, user: null }]);
+    });
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const repo = { id: 42, fullName: 'o/r' };
+    const pulls = await api.listPullRequestsForHead(repo, { headOwner: 'o', head: 'x' });
+    const q = new URL(calls[0]!.url).searchParams;
+    expect(calls[0]!.method).toBe('GET');
+    expect([q.get('state'), q.get('head')]).toEqual(['all', 'o:x']);
+    expect(pulls[0]).toMatchObject({ state: 'closed', merged: true, headRepoId: null });
+    expect(await api.listIssueComments(repo, 7)).toEqual([{ id: 3, htmlUrl: 'h', body: '', user: null }]);
+    expect(new URL(calls[1]!.url).pathname).toBe('/repositories/42/issues/7/comments');
+    const c = await api.createIssueComment(repo, 7, 'hello');
+    expect(calls[2]).toMatchObject({ method: 'POST', url: 'https://api.github.com/repositories/42/issues/7/comments' });
+    expect(JSON.parse(calls[2]!.body!)).toEqual({ body: 'hello' });
+    expect(c).toEqual({ id: 4, htmlUrl: 'h4', body: 'hi', user: 'allen' });
+  });
+
+  it('keeps the error mapping for writes, including validation details and rate limits', async () => {
+    const draft = fakeFetch(() =>
+      json({ message: 'Validation Failed', errors: [{ message: 'Draft pull requests are not supported in this repository.' }] }, { status: 422 }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: draft.fn });
+    const err = await api
+      .createPullRequest({ id: 42, fullName: 'o/r' }, { title: 'T', head: 'h', base: 'main', body: '', draft: true })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GitHubError);
+    expect((err as GitHubError).status).toBe(422);
+    expect((err as GitHubError).message).toBe(
+      'POST /repositories/42/pulls failed: 422 Validation Failed: Draft pull requests are not supported in this repository.',
+    );
+
+    const limited = fakeFetch(() => json({ message: 'API rate limit exceeded' }, { status: 403, headers: { 'retry-after': '30' } }));
+    const api2 = await createGitHubApi({ token: 't', fetch: limited.fn });
+    const e2 = (await api2.createIssueComment({ id: 42, fullName: 'o/r' }, 1, 'x').catch((e: unknown) => e)) as GitHubError;
+    expect(e2.isRateLimit).toBe(true);
+    expect(e2.retryAfterSeconds).toBe(30);
+
+    const down = (async () => {
+      throw new Error('ECONNRESET');
+    }) as unknown as typeof fetch;
+    const api3 = await createGitHubApi({ token: 't', fetch: down });
+    const e3 = (await api3.createIssueComment({ id: 42, fullName: 'o/r' }, 1, 'x').catch((e: unknown) => e)) as GitHubError;
+    expect(e3.status).toBe(0);
+    expect(e3.message).toMatch(/^POST .*network error: ECONNRESET/);
   });
 });
 

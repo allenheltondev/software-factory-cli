@@ -149,7 +149,7 @@ The initial review destination is the dedicated ChatGPT chat. To close the loop 
 | Decision | Proposed pilot behavior |
 | --- | --- |
 | Who can dispatch work? | Use an explicit GitHub actor allowlist for the pilot, starting with Allen. Check the actor on the label event. Expand to collaborators or planned bot accounts only if needed. |
-| What counts as done? | Leave a local branch and summarize changes and checks. If the desired first release includes hands-off PR creation, decide whether the CLI should push and open a draft PR and which GitHub identity it should use. |
+| What counts as done? | Leave a local branch and summarize changes and checks. **Decided (#12):** publication is opt-in per repository (`publish: none`, the default, `draft-pr` or `pr`), applies in live mode to `local-branch` actions, and only to runs that succeeded and left commits. The CLI's worker pushes the job branch (create-only: it never moves an existing branch) and opens the PR as the user's own `gh` account, then comments on the issue; the agent gets no GitHub token. Each step is idempotent by run id. `pr` exists for private repos whose plan refuses draft PRs; the CLI never falls back to it on its own. Merging stays a human decision. |
 | Where does feedback go? | Deliver reviews in ChatGPT and hand findings back to the implementer manually. Decide where machine-readable reviews should live before automating fix-and-review cycles. |
 | What can agents execute? | Configure the commands, credentials and tool permissions needed by each action before running it unattended. Validate Kiro headless auth and each adapter's exit behavior under the worker account. |
 

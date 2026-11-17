@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { StatusSnapshot } from '../db/queue.js';
-import type { Job } from '../types.js';
+import type { Job, Publication } from '../types.js';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
 import { configSchema } from '../config/schema.js';
 import { fakeContext } from './fakes.js';
-import { buildStatusView, emptyConfig, renderStatus, statusCommand } from './status.js';
+import { buildStatusView, emptyConfig, renderPublication, renderStatus, statusCommand } from './status.js';
 
 const emptySnapshot = (): StatusSnapshot => ({
   worker: null,
@@ -96,6 +96,68 @@ describe('renderStatus', () => {
     expect(text).toContain('job_1  failed       o/a#12');
     expect(text).toContain('— agent exited 1');
     expect(text).toContain('t3  [poll] o/b: GitHub 502 bad gateway');
+  });
+
+  it('shows each publication: the PR, or the error and how to retry', () => {
+    const base = {
+      jobId: 'job_1',
+      repoId: 1,
+      repoFullName: 'o/a',
+      issueNumber: 12,
+      mode: 'draft-pr' as const,
+      branch: 'factory/issue-12-job_1',
+      baseBranch: 'main',
+      headSha: 'abc',
+      pushedAt: 't',
+      commentId: null,
+      commentUrl: null,
+      retryable: false,
+      attempts: 1,
+      leaseExpiresAt: null,
+      nextAttemptAt: null,
+      createdAt: 't',
+      updatedAt: 't9',
+      publishedAt: null,
+    };
+    const publications: Publication[] = [
+      { ...base, runId: 'run_ok', state: 'published', prNumber: 4, prUrl: 'https://github.com/o/a/pull/4', error: null },
+      {
+        ...base,
+        runId: 'run_bad',
+        state: 'failed',
+        prNumber: null,
+        prUrl: null,
+        error: 'GitHub is unavailable for now: 502',
+        retryable: true,
+        nextAttemptAt: 't10',
+      },
+    ];
+    const snapshot: StatusSnapshot = {
+      ...emptySnapshot(),
+      recentAgentRuns: [
+        {
+          run: {
+            id: 'run_ok',
+            outcome: 'succeeded',
+            agent: 'claude',
+            endedAt: 't8',
+            summary: { commitCount: 1, filesChanged: 1, diffStat: '1 file changed', untracked: 0, worktree: '/w', branch: 'b', lastOutput: [] },
+          } as never,
+          job: job({ status: 'succeeded' }),
+        },
+      ],
+      publications,
+    };
+    const text = renderStatus(
+      buildStatusView({ configPath: '/c', configState: 'ok', configMessage: null, config: null, dbFile: '/d', dbExists: true, snapshot }),
+    );
+    expect(text).toContain('    draft PR #4: https://github.com/o/a/pull/4');
+    expect(text).toContain('Publications:');
+    expect(text).toMatch(/run_bad  failed .*o\/a#12/);
+    expect(text).toContain(
+      'publication failed (attempt 1; branch pushed): GitHub is unavailable for now: 502 — worker retries at t10, or run "factory publish run_bad"',
+    );
+    expect(renderPublication({ ...publications[1]!, state: 'skipped', error: 'no commits' })).toBe('not published: no commits');
   });
 
   it('renders an empty state with a missing config', () => {

@@ -28,8 +28,10 @@ import {
   GitHubError,
   type GitHubApi,
   type GitHubIssue,
+  type GitHubIssueComment,
   type GitHubIssueEvent,
   type GitHubLabel,
+  type GitHubPullRequest,
   type GitHubRepo,
   type IssueEventsPage,
 } from './api.js';
@@ -43,7 +45,12 @@ export interface CreateGitHubApiOptions {
   fetch?: typeof fetch;
   log?: Logger;
   env?: NodeJS.ProcessEnv;
+  /** Per-request deadline, including reading the response body. Defaults to {@link REQUEST_TIMEOUT_MS}. */
+  requestTimeoutMs?: number;
 }
+
+/** No GitHub request (headers and body) may take longer than this; a hung one fails as a network error. */
+export const REQUEST_TIMEOUT_MS = 60_000;
 
 export const USER_AGENT = 'software-factory-cli';
 export const API_VERSION = '2022-11-28';
@@ -161,6 +168,41 @@ interface RawIssueEvent {
   issue?: { number: number; title: string; html_url: string; pull_request?: unknown } | null;
 }
 
+interface RawPullRequest {
+  number: number;
+  html_url: string;
+  state: string;
+  draft?: boolean;
+  merged_at?: string | null;
+  body?: string | null;
+  head: { ref: string; repo: { id: number } | null };
+  base: { ref: string };
+}
+interface RawComment {
+  id: number;
+  html_url: string;
+  body?: string | null;
+  user: { login: string } | null;
+}
+
+function mapPull(r: RawPullRequest): GitHubPullRequest {
+  return {
+    number: r.number,
+    htmlUrl: r.html_url,
+    state: r.state === 'closed' ? 'closed' : 'open',
+    draft: Boolean(r.draft),
+    merged: r.merged_at != null,
+    headRef: r.head.ref,
+    headRepoId: r.head.repo?.id ?? null,
+    baseRef: r.base.ref,
+    body: r.body ?? '',
+  };
+}
+
+function mapComment(r: RawComment): GitHubIssueComment {
+  return { id: r.id, htmlUrl: r.html_url, body: r.body ?? '', user: r.user?.login ?? null };
+}
+
 function mapRepo(r: RawRepo): GitHubRepo {
   return {
     id: r.id,
@@ -208,6 +250,10 @@ function mapEvent(r: RawIssueEvent): GitHubIssueEvent {
 }
 
 interface RequestOptions {
+  /** GET unless set. Writes (POST) are used only by the publication step. */
+  method?: 'GET' | 'POST';
+  /** JSON request body (POST). */
+  body?: unknown;
   query?: Record<string, string | number>;
   etag?: string | null;
   /** 'manual' surfaces 3xx as GitHubError(status) instead of following it. */
@@ -220,11 +266,18 @@ interface RawResponse<T> {
   headers: Headers;
 }
 
+function networkError(method: string, display: string, err: unknown, timeoutMs: number): GitHubError {
+  const e = err as Error;
+  const why = e?.name === 'TimeoutError' ? `timed out after ${Math.round(timeoutMs / 1000)}s` : (e?.message ?? String(err));
+  return new GitHubError(`${method} ${display}: network error: ${why}`, 0);
+}
+
 export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promise<GitHubApi> {
   const token = opts.token ?? (await resolveGitHubToken(opts.env ?? process.env));
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
   const doFetch = opts.fetch ?? globalThis.fetch;
   const log = opts.log;
+  const timeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
 
   const buildUrl = (pathOrUrl: string, query?: Record<string, string | number>): string => {
     const url = new URL(/^https?:\/\//.test(pathOrUrl) ? pathOrUrl : `${baseUrl}${pathOrUrl}`);
@@ -241,26 +294,38 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       Authorization: `Bearer ${token}`,
     };
     if (ro.etag) headers['If-None-Match'] = ro.etag;
+    const method = ro.method ?? 'GET';
+    const init: RequestInit = { method, headers, redirect: ro.redirect ?? 'follow', signal: AbortSignal.timeout(timeoutMs) };
+    if (ro.body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(ro.body);
+    }
     const display = url.replace(baseUrl, '');
 
     let res: Response;
     try {
-      res = await doFetch(url, { method: 'GET', headers, redirect: ro.redirect ?? 'follow' });
+      res = await doFetch(url, init);
     } catch (err) {
-      throw new GitHubError(`GET ${display}: network error: ${(err as Error).message}`, 0);
+      throw networkError(method, display, err, timeoutMs);
     }
-    log?.debug('github request', { url: display, status: res.status });
+    log?.debug('github request', { method, url: display, status: res.status });
 
     if (res.status === 304) return { status: 304, data: null, headers: res.headers };
     if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
       // Only reachable with redirect: 'manual' (getIssue): the subject moved.
-      throw new GitHubError(`GET ${display}: moved (${res.status || 301})`, res.status || 301);
+      throw new GitHubError(`${method} ${display}: moved (${res.status || 301})`, res.status || 301);
     }
     if (!res.ok) {
       let detail = '';
       try {
-        const body = (await res.json()) as { message?: string };
-        detail = body?.message ?? '';
+        // Validation failures (422) carry the specific reason in errors[].message.
+        const body = (await res.json()) as { message?: string; errors?: Array<{ message?: string } | string> };
+        const parts = [body?.message ?? ''];
+        for (const e of Array.isArray(body?.errors) ? body.errors : []) {
+          const m = typeof e === 'string' ? e : e?.message;
+          if (m && !parts.includes(m)) parts.push(m);
+        }
+        detail = parts.filter(Boolean).join(': ');
       } catch {
         // non-JSON error body
       }
@@ -270,12 +335,20 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       else if (retryAfter !== null && (res.status === 403 || res.status === 429))
         hint = ` (rate limited; retry in ${retryAfter}s)`;
       throw new GitHubError(
-        `GET ${display} failed: ${res.status}${detail ? ` ${detail}` : ''}${hint}`,
+        `${method} ${display} failed: ${res.status}${detail ? ` ${detail}` : ''}${hint}`,
         res.status,
         retryAfter,
       );
     }
-    return { status: res.status, data: (await res.json()) as T, headers: res.headers };
+    let data: T;
+    try {
+      data = (await res.json()) as T;
+    } catch (err) {
+      // A body cut off by the deadline (or the connection) is a network error, not a bad response.
+      if (err instanceof SyntaxError) throw err;
+      throw networkError(method, display, err, timeoutMs);
+    }
+    return { status: res.status, data, headers: res.headers };
   }
 
   async function paginate<T>(path: string, query: Record<string, string | number> = {}): Promise<T[]> {
@@ -347,6 +420,37 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     async listEventsForIssue(repo, issueNumber) {
       const raw = await paginate<RawIssueEvent>(`${repoPath(repo)}/issues/${issueNumber}/events`);
       return raw.map(mapEvent);
+    },
+
+    async listPullRequestsForHead(repo, { headOwner, head }) {
+      const raw = await paginate<RawPullRequest>(`${repoPath(repo)}/pulls`, {
+        state: 'all',
+        head: `${headOwner}:${head}`,
+        sort: 'created',
+        direction: 'desc',
+      });
+      return raw.map(mapPull);
+    },
+
+    async createPullRequest(repo, input) {
+      const res = await request<RawPullRequest>(`${repoPath(repo)}/pulls`, {
+        method: 'POST',
+        body: { title: input.title, head: input.head, base: input.base, body: input.body, draft: input.draft },
+      });
+      return mapPull(res.data!);
+    },
+
+    async listIssueComments(repo, issueNumber) {
+      const raw = await paginate<RawComment>(`${repoPath(repo)}/issues/${issueNumber}/comments`);
+      return raw.map(mapComment);
+    },
+
+    async createIssueComment(repo, issueNumber, body) {
+      const res = await request<RawComment>(`${repoPath(repo)}/issues/${issueNumber}/comments`, {
+        method: 'POST',
+        body: { body },
+      });
+      return mapComment(res.data!);
     },
   };
 }

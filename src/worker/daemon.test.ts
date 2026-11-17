@@ -309,6 +309,36 @@ describe('runDaemon', () => {
     ]);
   });
 
+  it('hands only succeeded runs to the publisher, after recording them, and retries due publications after each poll', async () => {
+    const db = openDatabase(':memory:');
+    const executor: Executor = {
+      name: 'mixed',
+      execute: async (c): Promise<ExecutionResult> =>
+        c.job.issueNumber === 1 ? { outcome: 'failed', error: 'tests failed' } : { outcome: 'succeeded' },
+    };
+    const published: Array<{ runId: string; outcome: string | null }> = [];
+    let retries = 0;
+    const publisher = {
+      afterRun: async (runId: string) => {
+        published.push({ runId, outcome: getRun(db, runId)?.outcome ?? null });
+      },
+      retryDue: async () => {
+        retries++;
+      },
+    };
+    const deps = baseDeps(db, { executor, publisher });
+    const failing = insertJob(db, { issue: 1 });
+    const passing = insertJob(db, { issue: 2 });
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect([getJob(db, failing)?.status, getJob(db, passing)?.status]).toEqual(['failed', 'succeeded']));
+    await vi.waitFor(() => expect(published).toHaveLength(1));
+    deps.controller.abort();
+    await done;
+    const passingRun = db.prepare('SELECT id FROM runs WHERE job_id = ?').get(passing) as { id: string };
+    expect(published).toEqual([{ runId: passingRun.id, outcome: 'succeeded' }]);
+    expect(retries).toBeGreaterThanOrEqual(1);
+  });
+
   it('records poll failures and keeps running', async () => {
     const db = openDatabase(':memory:');
     const deps = baseDeps(db, {

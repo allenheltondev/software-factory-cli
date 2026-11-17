@@ -114,3 +114,35 @@ export interface RunSummary {
   /** Parts of the summary that could not be computed. */
   notes: string[];
 }
+
+export type PublicationState = 'publishing' | 'published' | 'failed' | 'skipped';
+
+/** Publication of a succeeded live run: job branch pushed, PR opened, issue commented. */
+export interface Publication {
+  runId: string;
+  jobId: string;
+  repoId: number;
+  repoFullName: string;
+  issueNumber: number;
+  mode: 'draft-pr' | 'pr';
+  state: PublicationState;
+  branch: string;
+  baseBranch: string | null;
+  /** The commit pushed, or found already on the remote at the same SHA. */
+  headSha: string | null;
+  pushedAt: string | null;
+  prNumber: number | null;
+  prUrl: string | null;
+  commentId: number | null;
+  commentUrl: string | null;
+  /** Why it failed, or why it was skipped. */
+  error: string | null;
+  /** A transient failure (network, 5xx, rate limit) the worker retries on its own. */
+  retryable: boolean;
+  attempts: number;
+  leaseExpiresAt: string | null;
+  nextAttemptAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  publishedAt: string | null;
+}
