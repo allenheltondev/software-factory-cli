@@ -515,6 +515,25 @@ describe('runProcess (real child processes)', () => {
   );
 });
 
+describe('discoverAgents with agents.<name>.command', () => {
+  it('checks the configured CLI instead of looking the adapter up, and says so when it is missing', async () => {
+    const custom = '/opt/agents/codex-nightly';
+    const m = machine({
+      platform: 'linux',
+      homedir: '/home/jane',
+      env: { PATH: '/usr/bin', CODEX_API_KEY: 'k' },
+      files: { '/usr/bin/codex': true, [custom]: true },
+      respond: (file, args) => (args[0] === '--version' ? { code: 0, stdout: `codex-cli ${file === custom ? '9.9.9' : '0.1.0'}\n`, stderr: '' } : undefined),
+    });
+    const [r] = await discoverAgents(m, { adapters: ['codex'], command: '../agents/codex-nightly', baseDir: '/opt/config' });
+    expect(r).toMatchObject({ command: custom, configuredCommand: true, installed: true, path: custom, version: '9.9.9', launch: { file: custom, args: [] } });
+
+    const [missing] = await discoverAgents(m, { adapters: ['codex'], command: '/nowhere/codex' });
+    expect(missing).toMatchObject({ installed: false, configuredCommand: true, command: '/nowhere/codex' });
+    expect(missing!.notes).toContain('configured command /nowhere/codex was not found or is not executable');
+  });
+});
+
 describe('locateLaunch (live execution)', () => {
   const npm = 'C:\\Users\\Jane Doe\\AppData\\Roaming\\npm';
   const codexJs = `${npm}\\node_modules\\@openai\\codex\\bin\\codex.js`;

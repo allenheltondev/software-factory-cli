@@ -57,9 +57,9 @@ own environment on to the agent, minus `GH_TOKEN` and `GITHUB_TOKEN`, so the key
 the environment the **launcher** gives the worker. Setting it in your terminal isn't enough.
 
 Don't put it in the factory config, and in particular not in `agents.kiro.env`. The config is a
-plain-text file that is easy to copy, share or commit, and `factory agents` and
-`factory doctor` look only at the worker's own environment, so they would still report Kiro as
-signed out. Kiro calls API keys "long-lived credentials"; keep them in a file or store only
+plain-text file that is easy to copy, share or commit. (`factory doctor` would accept a key
+there, since it checks each agent with its `agents.<name>.env` as a live run does; `factory
+agents` would still report Kiro as signed out.) Kiro calls API keys "long-lived credentials"; keep them in a file or store only
 your account can read, and rotate them as your policy requires
 ([authentication](https://kiro.dev/docs/getting-started/authentication/)).
 

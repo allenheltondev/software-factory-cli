@@ -83,6 +83,15 @@ export function mergeEnv(base: NodeJS.ProcessEnv, ...layers: Array<Record<string
   return out;
 }
 
+/**
+ * The environment an agent's CLI is looked up and checked in: the worker's, minus the GitHub
+ * tokens it withholds, plus agents.<name>.env. `factory doctor` uses the same rule, so it checks
+ * what a live run will see.
+ */
+export function agentLookupEnv(base: NodeJS.ProcessEnv, agent: Pick<AgentConfig, 'env'>): NodeJS.ProcessEnv {
+  return mergeEnv(withoutKeys(base, WITHHELD_ENV), agent.env);
+}
+
 function withoutKeys(env: NodeJS.ProcessEnv, keys: readonly string[]): NodeJS.ProcessEnv {
   const drop = new Set(keys.map((k) => k.toUpperCase()));
   return Object.fromEntries(Object.entries(env).filter(([k]) => !(isWindows ? drop.has(k.toUpperCase()) : keys.includes(k))));
@@ -399,7 +408,7 @@ export class LiveExecutor implements Executor {
     // 2. Find the CLI before touching the clone, so a missing binary leaves no worktree behind.
     const baseEnv = withoutKeys(this.opts.env ?? process.env, WITHHELD_ENV);
     const located = (this.opts.locate ?? defaultLocate)(adapterName, agentCfg, {
-      env: mergeEnv(baseEnv, agentCfg.env),
+      env: agentLookupEnv(this.opts.env ?? process.env, agentCfg),
       configDir: ctx.paths.configDir,
     });
     if (!located.launch) {

@@ -92,6 +92,8 @@ export interface AgentReport {
   deep?: { ok: boolean; detail: string };
   /** Installed, runnable, not known to be signed out, and not known to be unsupported here. */
   usable: boolean;
+  /** True when `command` came from agents.<name>.command rather than the adapter's default. */
+  configuredCommand?: boolean;
   notes: string[];
 }
 
@@ -100,6 +102,12 @@ export interface DiscoverOptions {
   adapters?: readonly string[];
   /** Send one trivial headless prompt to each otherwise-usable agent. Uses tokens. */
   deep?: boolean;
+  /**
+   * agents.<name>.command: use this CLI instead of looking the adapter's command up (an absolute
+   * path, a path relative to `baseDir`, or a name on PATH), as live execution does.
+   */
+  command?: string;
+  baseDir?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -435,17 +443,22 @@ export interface LocatedLaunch {
  * without running it. `command` (agents.<name>.command) replaces the lookup: an absolute path, a
  * path relative to `baseDir`, or a name looked up on PATH. Shims are resolved as in discovery.
  */
+/** Find agents.<name>.command: an absolute path, a path relative to `baseDir`, or a name on PATH. */
+function findConfigured(command: string, baseDir: string | undefined, probes: DiscoveryProbes): { target: string; path: string | null; problem: string } {
+  const p = pathFor(probes.platform);
+  const hasSep = probes.platform === 'win32' ? /[\\/]/.test(command) : command.includes('/');
+  const target = hasSep && !p.isAbsolute(command) && baseDir ? p.resolve(baseDir, command) : command;
+  const path = which(target, { env: probes.env, platform: probes.platform, isExecutable: probes.isExecutable });
+  return { target, path, problem: `configured command ${target} was not found${hasSep ? '' : ' on PATH'} or is not executable` };
+}
+
 export function locateLaunch(adapter: AdapterName, probes: DiscoveryProbes, opts: { command?: string; baseDir?: string } = {}): LocatedLaunch {
   const spec = AGENT_SPECS[adapter];
   let path: string | null;
   if (opts.command) {
-    const p = pathFor(probes.platform);
-    const hasSep = probes.platform === 'win32' ? /[\\/]/.test(opts.command) : opts.command.includes('/');
-    const target = hasSep && !p.isAbsolute(opts.command) && opts.baseDir ? p.resolve(opts.baseDir, opts.command) : opts.command;
-    path = which(target, { env: probes.env, platform: probes.platform, isExecutable: probes.isExecutable });
-    if (!path) {
-      return { path: null, launch: null, problem: `configured command ${target} was not found${hasSep ? '' : ' on PATH'} or is not executable` };
-    }
+    const found = findConfigured(opts.command, opts.baseDir, probes);
+    path = found.path;
+    if (!path) return { path: null, launch: null, problem: found.problem };
   } else {
     path = locate(spec, probes).path;
     if (!path) return { path: null, launch: null, problem: `${spec.command} not found on PATH or in common install locations` };
@@ -503,7 +516,12 @@ export function parseVersion(output: string): string | null {
   return line.match(/\d+\.\d+\.\d+[\w.+-]*/)?.[0] ?? line;
 }
 
-async function discoverOne(spec: AgentSpec, probes: DiscoveryProbes, deep: boolean): Promise<AgentReport> {
+async function discoverOne(
+  spec: AgentSpec,
+  probes: DiscoveryProbes,
+  deep: boolean,
+  configured?: { command: string; baseDir?: string },
+): Promise<AgentReport> {
   const notes: string[] = [];
   const platform = checkPlatform(spec.platform, probes);
   const report: AgentReport = {
@@ -525,9 +543,18 @@ async function discoverOne(spec: AgentSpec, probes: DiscoveryProbes, deep: boole
   if (platform.supported === 'no') notes.push(`not supported here: ${platform.detail}`);
 
   // Tier 1
-  const found = locate(spec, probes);
+  let found: { path: string | null; onPath: boolean };
+  if (configured) {
+    const c = findConfigured(configured.command, configured.baseDir, probes);
+    report.command = c.target;
+    report.configuredCommand = true;
+    found = { path: c.path, onPath: true };
+    if (!c.path) notes.push(c.problem);
+  } else {
+    found = locate(spec, probes);
+    if (!found.path) notes.push(`${spec.command} not found on PATH or in common install locations`);
+  }
   if (!found.path) {
-    notes.push(`${spec.command} not found on PATH or in common install locations`);
     if (!spec.authRunsCli) Object.assign(report, pick(await spec.auth({ probes, launch: null }), notes));
     return report;
   }
@@ -608,7 +635,7 @@ export async function discoverAgents(probes: DiscoveryProbes, opts: DiscoverOpti
   return Promise.all(
     adapters.map((a) =>
       isKnownAdapter(a)
-        ? discoverOne(AGENT_SPECS[a], probes, Boolean(opts.deep)).catch((err: unknown) => ({
+        ? discoverOne(AGENT_SPECS[a], probes, Boolean(opts.deep), opts.command ? { command: opts.command, baseDir: opts.baseDir } : undefined).catch((err: unknown) => ({
             ...unknownAdapter(a),
             name: AGENT_SPECS[a].name,
             command: AGENT_SPECS[a].command,

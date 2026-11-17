@@ -54,7 +54,7 @@ the per-user default.
 | `factory validate` | Check the config without network access; exit 1 if invalid |
 | `factory start` | Run the worker: poll GitHub and process the queue (non-interactive). Exits with code 3 if another worker holds the lock |
 | `factory status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
-| `factory doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access, labels and agent commands in the current environment |
+| `factory doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access, labels and each enabled agent in the current environment, the way a live run starts it (its `command` and `env`) |
 | `factory agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
 | `factory retry JOB_ID` | Requeue a failed, interrupted or canceled job |
 | `factory publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [Publication](#publication) |
@@ -369,8 +369,9 @@ launchers' account, not just your terminal):
   [Agent credentials](docs/background-operation.md#agent-credentials) shows how to give it to
   each launcher.
 - **Don't put the key in `agents.kiro.env`** or anywhere else in the config file. The config
-  is plain text that is easy to copy, share or commit, and `factory agents` / `factory doctor`
-  check only the worker's own environment, so they would report Kiro as signed out anyway.
+  is plain text that is easy to copy, share or commit. (`factory doctor` checks each agent
+  with its `agents.<name>.env`, as a live run does, but `factory agents` looks only at the
+  worker's own environment.)
 - A `checkoutPath` for the repository and a `prompt` for the action, as for Claude Code.
 
 Each job runs, in its worktree, with the prompt file on stdin:
