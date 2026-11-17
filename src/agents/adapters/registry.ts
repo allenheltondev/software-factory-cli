@@ -2,11 +2,12 @@
  * Adapters that can run agents in live mode, keyed by adapter name.
  *
  * `execution.mode: live` validates only when every enabled agent's adapter is listed here.
- * Claude Code (#9) and Kiro (#11) ship; Codex (#10) adds a module under this directory and
- * lists it in BUILT_IN_ADAPTERS. Tests register a fake with registerAdapter.
+ * Claude Code (#9), Codex (#10) and Kiro (#11) ship. A new adapter adds a module under this
+ * directory and lists it in BUILT_IN_ADAPTERS. Tests register a fake with registerAdapter.
  */
 import type { AgentAdapter } from './adapter.js';
 import { claudeAdapter } from './claude.js';
+import { codexAdapter } from './codex.js';
 import { kiroAdapter } from './kiro.js';
 
 export type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
@@ -14,6 +15,7 @@ export { defaultVerdict, RAW_OUTPUT_BYTES } from './adapter.js';
 
 const BUILT_IN_ADAPTERS: readonly AgentAdapter[] = [
   claudeAdapter,
+  codexAdapter,
   kiroAdapter,
 ];
 

@@ -3,7 +3,7 @@ import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { validateConfig } from './validate.js';
 import { selectPool } from '../routing.js';
-import { registerAdapter } from '../agents/adapters/registry.js';
+import { getAdapter, registerAdapter } from '../agents/adapters/registry.js';
 import { fakeAdapter } from '../../test/fake-adapter.js';
 
 const example = () => parse(readFileSync(new URL('../../examples/config.yaml', import.meta.url), 'utf8'));
@@ -59,19 +59,29 @@ describe('validateConfig', () => {
     expect(validateConfig(cfg).ok).toBe(true);
   });
 
-  it('rejects live mode while an enabled agent has no implemented adapter (claude and kiro ship)', () => {
+  it('rejects live mode while an enabled agent has no implemented adapter', () => {
     const cfg = example();
     cfg.execution = { mode: 'live' };
     cfg.repositories['allenheltondev/kids-and-dragons'].checkoutPath = '../clones/kids-and-dragons';
+    // Independent of which adapters ship: every enabled agent without one is reported.
+    const missing = ['codex', 'claude', 'kiro'].filter((a) => !getAdapter(a));
     const r = validateConfig(cfg);
-    expect(r.ok).toBe(false);
+    expect(r.ok).toBe(missing.length === 0);
     if (r.ok) return;
-    expect(r.errors).toEqual([
-      { path: 'agents.codex', message: expect.stringMatching(/live execution is not implemented for adapter "codex" in this release/) },
-    ]);
+    expect(r.errors).toEqual(
+      missing.map((a) => ({ path: `agents.${a}`, message: expect.stringMatching(new RegExp(`live execution is not implemented for adapter "${a}" in this release`)) })),
+    );
+  });
 
-    cfg.agents.codex.enabled = false;
-    expect(validateConfig(cfg).ok).toBe(true);
+  it('accepts live mode with the built-in Codex adapter when codex is the only enabled agent', () => {
+    const cfg = example();
+    cfg.execution = { mode: 'live' };
+    cfg.repositories['allenheltondev/kids-and-dragons'].checkoutPath = '../clones/kids-and-dragons';
+    cfg.agents.claude.enabled = false;
+    cfg.agents.kiro.enabled = false;
+    cfg.agents.codex.args = ['--sandbox', 'workspace-write'];
+    const r = validateConfig(cfg);
+    expect(r.ok).toBe(true);
   });
 
   it('accepts live mode with the built-in Kiro adapter, alone or alongside claude', () => {

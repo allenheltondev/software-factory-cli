@@ -6,8 +6,10 @@ import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fileURLToPath } from 'node:url';
 import { assistantText, errorResult, init, SESSION, success } from '../../test/claude-stream.js';
+import * as cx from '../../test/codex-stream.js';
 import { FAKE_AGENT, fakeAdapter } from '../../test/fake-adapter.js';
 import { claudeAdapter } from '../agents/adapters/claude.js';
+import { codexAdapter } from '../agents/adapters/codex.js';
 import { kiroAdapter } from '../agents/adapters/kiro.js';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
@@ -623,6 +625,91 @@ describe('LiveExecutor (Kiro adapter, fake kiro-cli)', { timeout: 120_000 }, () 
       { agent: 'kiro', outcome: 'succeeded', commits: 1, last: 'Kiro did it.' },
       { agent: 'claude', outcome: 'succeeded', commits: 1, last: 'Claude did it.' },
     ]);
+  });
+});
+
+describe('LiveExecutor (Codex adapter, fake codex CLI)', { timeout: 120_000 }, () => {
+  const FAKE_CODEX = fileURLToPath(new URL('../../test/fake-codex.mjs', import.meta.url));
+  // The real adapter, with discovery replaced: "codex" resolves to node + the fake CLI, as the
+  // npm shim does on Windows.
+  const executor = () => new LiveExecutor({ locate: () => ({ path: FAKE_CODEX, launch: { file: process.execPath, args: [FAKE_CODEX] } }) });
+
+  function codexSetup(events: Array<Record<string, unknown>>, env: Record<string, string>) {
+    restores.push(registerAdapter(codexAdapter));
+    const s = setup();
+    const eventsFile = join(s.f.root, 'codex events.json');
+    writeFileSync(eventsFile, JSON.stringify(events));
+    const record = join(s.f.root, 'codex record.json');
+    const gitEnv = s.agent('unused').env;
+    s.config.agents = {
+      codex: agentSchema.parse({
+        args: ['--model', 'gpt-5-codex'],
+        env: { ...gitEnv, FAKE_CODEX_EVENTS: eventsFile, FAKE_CODEX_RECORD: record, ...env },
+      }),
+    };
+    s.config.pools.general!.agents = ['codex'];
+    return { ...s, record };
+  }
+
+  const start = (...events: Array<Record<string, unknown>>) => [cx.threadStarted(), cx.turnStarted(), cx.command('item_1', 'bash -lc "npm test"', 'ok'), ...events];
+
+  it('runs codex exec with the prompt on stdin; the final message lands in the run summary', async () => {
+    const final = '## Summary\n- Added the art page.\n- `npm test` passed.';
+    const { paths, config, db, record } = codexSetup(start(cx.agentMessage('item_2', final), cx.turnCompleted()), { FAKE_CODEX_COMMIT: '1' });
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    expect(c.run.agent).toBe('codex');
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await executor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({ outcome: 'succeeded', summary: { commitCount: 1, commits: [expect.stringMatching(/ Add the dragon art page \(#7\)$/)] } });
+    const got = JSON.parse(readFileSync(record, 'utf8')) as { argv: string[]; prompt: string };
+    expect(got.argv).toEqual(['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5-codex']);
+    expect(got.prompt).toBe(readFileSync(join(paths.runsDir, c.run.id, 'prompt.md'), 'utf8'));
+    expect(result.summary?.lastOutput).toEqual([
+      '## Summary',
+      '- Added the art page.',
+      '- `npm test` passed.',
+      `codex: turn completed, 24763 input tokens (24448 cached), 122 output tokens, thread ${cx.THREAD}`,
+    ]);
+
+    const log = readFileSync(c.run.logPath!, 'utf8');
+    expect(log).toContain('"type":"turn.completed"'); // the raw JSONL stays in run.log
+    expect(log).toContain('  | - Added the art page.\n');
+    expect(log).toContain('outcome: succeeded');
+  });
+
+  it('a failed turn fails the run with its message and keeps the worktree', async () => {
+    const { paths, config, db } = codexSetup(
+      start(cx.agentMessage('item_2', 'Half the art page is done.'), cx.turnFailed('You have hit your usage limit.')),
+      { FAKE_CODEX_EDIT: '1', FAKE_CODEX_EXIT: '1' },
+    );
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 8 });
+    const c = claim(db, config, paths);
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await executor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      error: 'codex turn failed: You have hit your usage limit.',
+      summary: { commitCount: 0, untracked: 1 },
+    });
+    expect(result.summary?.lastOutput).toEqual(['Half the art page is done.', 'You have hit your usage limit.', `codex: turn failed, thread ${cx.THREAD}`]);
+    const worktree = join(worktreesRoot(paths), '42', c.job.id);
+    expect(readFileSync(join(worktree, 'half-done.txt'), 'utf8')).toBe('partial\n');
+  });
+
+  it('exit 0 without a turn end fails closed; stderr after the events is still read past', async () => {
+    const { paths, config, db } = codexSetup(start(cx.agentMessage('item_2', 'Done, I think.')), { FAKE_CODEX_STDERR: 'Warning: a diagnostic on stderr' });
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 9 });
+    const c = claim(db, config, paths);
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await executor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result.outcome).toBe('failed');
+    expect(result.error).toMatch(/^codex exited with code 0, but no turn\.completed or turn\.failed event could be read/);
+    expect(result.summary?.lastOutput).toEqual(['Done, I think.', `codex: no turn result, thread ${cx.THREAD}`]);
+    expect(readFileSync(c.run.logPath!, 'utf8')).toContain('Warning: a diagnostic on stderr');
   });
 });
 
