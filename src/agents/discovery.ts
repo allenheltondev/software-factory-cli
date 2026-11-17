@@ -206,7 +206,10 @@ async function codexAuth(ctx: AuthContext): Promise<AuthResult> {
  * Kiro: "Headless mode requires an API key set as the KIRO_API_KEY environment variable"
  * (https://kiro.dev/docs/cli/headless/). `kiro-cli whoami` reports interactive login sessions,
  * which headless runs can't rely on, so presence of the env var is the check. We can't validate
- * the key without a prompt (see --deep).
+ * the key without a prompt (see --deep). The check reads the worker's own environment, not
+ * agents.<name>.env: the key belongs in the launcher's environment, not the config file. An
+ * active browser login takes precedence over the key when both exist
+ * (https://kiro.dev/docs/getting-started/authentication/).
  */
 async function kiroAuth(ctx: AuthContext): Promise<AuthResult> {
   return ctx.probes.env.KIRO_API_KEY
