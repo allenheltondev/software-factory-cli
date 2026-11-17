@@ -98,7 +98,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\unregister-task.
 ```
 
 `unregister-task.ps1` stops and removes the task, stops a leftover worker process started by
-the wrapper, and deletes the wrapper. Config, state and logs are kept.
+the wrapper, and deletes the wrapper. Config, state and logs are kept. The wrapper records the
+worker's PID, start time and executable in `launcher\<TaskName>.worker.json`, and unregister
+stops a process only when all three match, so a `factory start` you run by hand is never
+stopped, even with the same CLI and config.
 
 Notes:
 

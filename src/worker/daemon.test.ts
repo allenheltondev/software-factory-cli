@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
-import { claimNextJob, getJob, getRun, retryJob, setRunProcess } from '../db/queue.js';
+import { claimNextJob, getJob, getRun, retryJob, setRunProcess, WorkerLockLostError } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job } from '../types.js';
 import { silentLogger } from '../util/log.js';
@@ -309,5 +309,56 @@ describe('runDaemon', () => {
     await runDaemon(deps); // lock is stale relative to real time, so it is taken over
     expect(terminate).not.toHaveBeenCalled();
     expect(getJob(db, id)?.status).toBe('interrupted');
+  });
+});
+
+describe('runDaemon: lock ownership', () => {
+  it('keeps the lock heartbeat fresh while a poll is slow', async () => {
+    const db = openDatabase(':memory:');
+    const heartbeats: string[] = [];
+    const deps = baseDeps(db, { timing: { heartbeatMs: 10 } });
+    deps.poll = async () => {
+      // Simulate a slow GitHub round-trip spanning several heartbeat intervals.
+      for (let i = 0; i < 6; i++) {
+        await new Promise((r) => setTimeout(r, 15));
+        heartbeats.push(readWorkerLock(db)!.heartbeatAt);
+      }
+    };
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(heartbeats).toHaveLength(6));
+    deps.controller.abort();
+    await done;
+    expect(new Set(heartbeats).size).toBeGreaterThan(2);
+  });
+
+  it('does not start a job when its lock is taken over during the pre-start check', async () => {
+    const db = openDatabase(':memory:');
+    const execute = vi.fn(async (): Promise<ExecutionResult> => ({ outcome: 'succeeded' }));
+    const deps = baseDeps(db, {
+      executor: { name: 'spy', execute },
+      checkDispatchable: async () => {
+        // Another worker takes over while this check is waiting on GitHub.
+        db.prepare("UPDATE worker_lock SET worker_id = 'wrk_other', pid = 9999").run();
+        return { ok: true };
+      },
+    });
+    const id = insertJob(db);
+    await runDaemon(deps); // stops by itself after losing the lock
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(getJob(db, id)?.status).toBe('queued');
+    expect(readWorkerLock(db)?.workerId).toBe('wrk_other'); // the new holder's lock is untouched
+    const errors = db.prepare("SELECT message FROM errors WHERE scope = 'worker'").all() as { message: string }[];
+    expect(errors.map((e) => e.message).join('\n')).toMatch(/lost the worker lock/);
+  });
+
+  it('claimNextJob refuses to claim for a worker that does not hold the lock', () => {
+    const db = openDatabase(':memory:');
+    acquireWorkerLock(db, { workerId: 'wrk_new', pid: 2, hostname: 'host-a' }, { isPidAlive: () => true });
+    insertJob(db);
+    const opts = { workerId: 'wrk_old', leaseSeconds: 90, runsDir: makePaths().runsDir, lockWorkerId: 'wrk_old' };
+    expect(() => claimNextJob(db, makeConfig(), opts)).toThrow(WorkerLockLostError);
+    expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 0 });
+    expect(claimNextJob(db, makeConfig(), { ...opts, workerId: 'wrk_new', lockWorkerId: 'wrk_new' })).not.toBeNull();
   });
 });

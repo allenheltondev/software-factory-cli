@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const MIGRATIONS: Record<number, string> = {
   1: `
@@ -107,6 +107,12 @@ const MIGRATIONS: Record<number, string> = {
       message        TEXT    NOT NULL
     );
     CREATE INDEX errors_by_time ON errors (at);
+  `,
+  2: `
+    -- created_at of the newest event seen by the last committed scan. The events
+    -- endpoint orders by created_at (not id), so the poller scans back to this time
+    -- minus an overlap instead of stopping at the first already-seen id.
+    ALTER TABLE repo_checkpoints ADD COLUMN last_event_created_at TEXT;
   `,
 };
 

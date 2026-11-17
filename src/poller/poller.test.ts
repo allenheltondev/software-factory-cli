@@ -4,7 +4,7 @@ import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../co
 import { openDatabase, type Db } from '../db/database.js';
 import { getCheckpoint, listQueuedJobs } from '../db/ingest.js';
 import { silentLogger } from '../util/log.js';
-import { MAX_PAGES, backoffSeconds, checkJobDispatchable, pollOnce, type PollerDeps } from './poller.js';
+import { OVERLAP_MS, backoffSeconds, checkJobDispatchable, pollOnce, type PollerDeps } from './poller.js';
 import {
   GitHubError,
   type GitHubApi,
@@ -28,6 +28,8 @@ class FakeGitHub implements GitHubApi {
   readonly repos = new Map<number, FakeRepo>();
   private nextEventId = 1000;
   clock = Date.parse('2026-01-01T00:00:00Z');
+  /** Pages past this answer 422, like GitHub's pagination limit. */
+  maxPages = Number.POSITIVE_INFINITY;
   readonly calls: Array<{ method: string; repoId?: number; arg?: unknown }> = [];
 
   addRepo(id: number, fullName: string): void {
@@ -83,6 +85,16 @@ class FakeGitHub implements GitHubApi {
     return this.pushEvent(repoId, number, 'labeled', { label, actor });
   }
 
+  /** A labeled event inserted now (highest id) whose created_at is in the past. */
+  labelAt(repoId: number, number: number, label: string, createdAtMs: number): GitHubIssueEvent {
+    const issue = this.repo(repoId).issues.get(number)!;
+    if (!issue.labels.includes(label)) issue.labels.push(label);
+    const saved = this.clock;
+    const ev = this.pushEvent(repoId, number, 'labeled', { label, actor: 'allen', createdAt: new Date(createdAtMs).toISOString() });
+    this.clock = saved;
+    return ev;
+  }
+
   unlabel(repoId: number, number: number, label: string, actor = 'allen'): GitHubIssueEvent {
     const issue = this.repo(repoId).issues.get(number)!;
     issue.labels = issue.labels.filter((l) => l !== label);
@@ -130,8 +142,10 @@ class FakeGitHub implements GitHubApi {
     if (opts.page === 1 && opts.etag && opts.etag === this.etag(r)) {
       return { events: [], nextPage: null, etag: opts.etag, notModified: true };
     }
+    if (opts.page > this.maxPages) throw new GitHubError('pagination is limited for this resource', 422);
     const perPage = opts.perPage ?? 30;
-    const newestFirst = [...r.events].reverse();
+    // Like GitHub: ordered by created_at desc, so ids are not monotonic in page order.
+    const newestFirst = [...r.events].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.id - a.id);
     const start = (opts.page - 1) * perPage;
     const events = newestFirst.slice(start, start + perPage);
     return {
@@ -615,19 +629,111 @@ describe('pollOnce: errors and paging', () => {
     expect(pages).toEqual([1, 2, 3]);
   });
 
-  it('records an error when the page cap is hit but still advances', async () => {
+  it('finds a new event that sorts below an already-seen one across a page boundary', async () => {
     const { gh, db, deps } = setup();
     gh.createIssue(REPO, 1);
-    gh.noise(REPO, 1, 1); // non-null starting checkpoint
+    gh.createIssue(REPO, 2);
+    gh.noise(REPO, 1, 5);
     await init(deps);
-    gh.noise(REPO, 1, MAX_PAGES * 100 + 5);
-    gh.label(REPO, 1, READY);
+    const seenAt = Date.parse(getCheckpoint(db, REPO)!.lastEventCreatedAt!);
+    // 99 newer events fill page 1 together with the newest already-seen event...
+    gh.noise(REPO, 1, 99);
+    // ...and a label inserted now (highest id) but created 2s before that event sorts onto page 2.
+    const late = gh.labelAt(REPO, 2, READY, seenAt - 2000);
     const s = await pollOnce(deps);
     expect(s.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
-    const errors = db.prepare('SELECT message FROM errors').all() as unknown as Array<{ message: string }>;
-    expect(errors[0]!.message).toMatch(/may have been missed/);
+    expect(listQueuedJobs(db).map((j) => j.eventId)).toEqual([String(late.id)]);
+    const pages = gh.calls
+      .filter((c) => c.method === 'listIssueEvents')
+      .slice(1)
+      .map((c) => (c.arg as { page: number }).page);
+    expect(pages).toEqual([1, 2]);
+  });
+
+  it('stops once events are older than the overlap window', async () => {
+    const { gh, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.noise(REPO, 1, 400); // 400s of history before the checkpoint
+    await init(deps);
+    gh.noise(REPO, 1, 150);
+    await pollOnce(deps);
+    const pages = gh.calls
+      .filter((c) => c.method === 'listIssueEvents')
+      .slice(1)
+      .map((c) => (c.arg as { page: number }).page);
+    // 150 new + OVERLAP_MS of rescanned history (1 event/s in the fake) fits in 5 pages, not 6.
+    expect(OVERLAP_MS).toBe(300_000);
+    expect(pages).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('reads a long backlog back to the checkpoint in one pass', async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.noise(REPO, 1, 1);
+    await init(deps);
+    gh.label(REPO, 1, READY); // oldest new event, on page 16
+    gh.noise(REPO, 1, 1500);
+    const s = await pollOnce(deps);
+    expect(s.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
+    expect(db.prepare('SELECT count(*) AS n FROM errors').get()).toEqual({ n: 0 });
     const newest = gh.repos.get(REPO)!.events.at(-1)!.id;
     expect(getCheckpoint(db, REPO)!.lastEventId).toBe(newest);
+  });
+
+  it('keeps the checkpoint when the backlog scan fails partway, then recovers', async () => {
+    const { gh, db, deps, advance } = setup();
+    gh.createIssue(REPO, 1);
+    gh.noise(REPO, 1, 1);
+    await init(deps);
+    const before = getCheckpoint(db, REPO)!;
+    gh.label(REPO, 1, READY);
+    gh.noise(REPO, 1, 1500);
+    // Transient failure on page 6 of 16.
+    const original = gh.listIssueEvents.bind(gh);
+    gh.listIssueEvents = async (repo, opts) => {
+      if (opts.page === 6) throw new GitHubError('server error', 502);
+      return original(repo, opts);
+    };
+    const failed = await pollOnce(deps);
+    expect(failed.repos[0]).toMatchObject({ ok: false });
+    expect(getCheckpoint(db, REPO)).toMatchObject({ lastEventId: before.lastEventId, etag: before.etag });
+    expect(listQueuedJobs(db)).toHaveLength(0);
+
+    gh.listIssueEvents = original;
+    advance(3600);
+    const ok = await pollOnce(deps);
+    expect(ok.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
+  });
+
+  it("records an error and advances only when GitHub can't serve older events", async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.noise(REPO, 1, 1);
+    await init(deps);
+    gh.label(REPO, 1, READY); // on page 5, past GitHub's limit below
+    gh.noise(REPO, 1, 400);
+    gh.maxPages = 3;
+    const s = await pollOnce(deps);
+    expect(s.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 0 });
+    const errors = db.prepare('SELECT message FROM errors').all() as unknown as Array<{ message: string }>;
+    expect(errors[0]!.message).toMatch(/GitHub stopped serving issue events at page 4.*may have been missed/);
+    const newest = gh.repos.get(REPO)!.events.at(-1)!.id;
+    expect(getCheckpoint(db, REPO)!.lastEventId).toBe(newest);
+  });
+
+  it('falls back to the id boundary plus one page for checkpoints without a stored time', async () => {
+    const { gh, db, deps } = setup();
+    gh.createIssue(REPO, 1);
+    gh.createIssue(REPO, 2);
+    gh.noise(REPO, 1, 5);
+    await init(deps);
+    db.prepare('UPDATE repo_checkpoints SET last_event_created_at = NULL').run();
+    const seenAt = Date.parse(gh.repos.get(REPO)!.events.at(-1)!.createdAt);
+    gh.noise(REPO, 1, 99);
+    gh.labelAt(REPO, 2, READY, seenAt - 2000);
+    const s = await pollOnce(deps);
+    expect(s.repos[0]).toMatchObject({ ok: true, jobsEnqueued: 1 });
+    expect(getCheckpoint(db, REPO)!.lastEventCreatedAt).not.toBeNull();
   });
 });
 

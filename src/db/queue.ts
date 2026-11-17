@@ -12,6 +12,20 @@ export interface Claim {
   run: Run;
 }
 
+/** The claiming worker no longer holds the single-worker lock. */
+export class WorkerLockLostError extends Error {
+  constructor(readonly workerId: string) {
+    super(`worker ${workerId} no longer holds the worker lock`);
+    this.name = 'WorkerLockLostError';
+  }
+}
+
+/** True if `workerId` currently holds the single-worker lock. */
+export function holdsWorkerLock(db: Db, workerId: string): boolean {
+  const row = db.prepare('SELECT worker_id FROM worker_lock WHERE id = 1').get() as { worker_id: string } | undefined;
+  return row?.worker_id === workerId;
+}
+
 /**
  * How many consecutive start failures (adapter could not start) a job may have
  * before it is marked failed instead of being requeued for another agent.
@@ -127,6 +141,10 @@ function pickAgent(
  * A queued job whose pool or action is no longer in the config is marked
  * `failed` with a reason and an error row (never silently dropped); the user can
  * `factory retry` it after fixing the config. Jobs in `excludeJobIds` are skipped.
+ *
+ * With `lockWorkerId`, the claim first checks, inside the same transaction, that this
+ * worker still holds the single-worker lock, and throws WorkerLockLostError otherwise.
+ * A worker whose lock was taken over can never start new work.
  */
 export function claimNextJob(
   db: Db,
@@ -137,10 +155,14 @@ export function claimNextJob(
     runsDir: string;
     now?: () => number;
     excludeJobIds?: ReadonlySet<string>;
+    lockWorkerId?: string;
   },
 ): Claim | null {
   const clock = opts.now ?? Date.now;
   return transaction(db, () => {
+    if (opts.lockWorkerId !== undefined && !holdsWorkerLock(db, opts.lockWorkerId)) {
+      throw new WorkerLockLostError(opts.lockWorkerId);
+    }
     const open = (db.prepare('SELECT count(*) AS n FROM runs WHERE ended_at IS NULL').get() as { n: number }).n;
     if (open >= config.maxConcurrent) return null;
 

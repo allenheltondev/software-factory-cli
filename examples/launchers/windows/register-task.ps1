@@ -173,6 +173,7 @@ $safeName = $TaskName
 foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) { $safeName = $safeName.Replace([string]$c, '_') }
 $wrapperDir = Join-Path $dataDir 'launcher'
 $wrapperPath = Join-Path $wrapperDir "$safeName.ps1"
+$pidFilePath = Join-Path $wrapperDir "$safeName.worker.json"
 
 $pathLiterals = ($pathDirs | ForEach-Object { ConvertTo-PsLiteral $_ }) -join ', '
 $factoryHomeLiteral = if ($FactoryHome) { ConvertTo-PsLiteral $FactoryHome } else { '$null' }
@@ -188,6 +189,7 @@ $wrapper = @"
 `$logDir = $(ConvertTo-PsLiteral $logDir)
 `$pathPrepend = @($pathLiterals)
 `$factoryHome = $factoryHomeLiteral
+`$pidFilePath = $(ConvertTo-PsLiteral $pidFilePath)
 
 trap {
     try {
@@ -212,7 +214,21 @@ foreach (`$f in @(`$out, `$err)) {
 `$proc = Start-Process -FilePath `$node -ArgumentList `$argList -WorkingDirectory `$workDir ``
     -NoNewWindow -PassThru -RedirectStandardOutput `$out -RedirectStandardError `$err
 `$null = `$proc.Handle  # keep the handle so ExitCode is available after exit
-`$proc.WaitForExit()
+
+# Record exactly which process this wrapper started, so unregister-task.ps1 can stop it
+# without touching a manually started worker that uses the same CLI and config.
+`$pidFile = `$pidFilePath
+try {
+    `$record = New-Object PSObject -Property @{
+        pid = `$proc.Id
+        startTimeUtcTicks = `$proc.StartTime.ToUniversalTime().Ticks
+        node = `$proc.Path
+    }
+    [System.IO.File]::WriteAllText(`$pidFile, (`$record | ConvertTo-Json -Compress))
+    `$proc.WaitForExit()
+} finally {
+    Remove-Item -LiteralPath `$pidFile -Force -ErrorAction SilentlyContinue
+}
 exit `$proc.ExitCode
 "@
 

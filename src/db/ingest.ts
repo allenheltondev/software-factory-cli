@@ -8,6 +8,8 @@ export interface Checkpoint {
   repoId: number;
   fullName: string;
   lastEventId: number | null;
+  /** created_at of the newest event seen by the last committed scan (GitHub's clock). */
+  lastEventCreatedAt: string | null;
   etag: string | null;
   initializedAt: string;
   updatedAt: string;
@@ -28,6 +30,7 @@ interface CheckpointRow {
   repo_id: number;
   full_name: string;
   last_event_id: number | null;
+  last_event_created_at: string | null;
   etag: string | null;
   initialized_at: string;
   updated_at: string;
@@ -42,6 +45,7 @@ export function getCheckpoint(db: Db, repoId: number): Checkpoint | null {
     repoId: r.repo_id,
     fullName: r.full_name,
     lastEventId: r.last_event_id,
+    lastEventCreatedAt: r.last_event_created_at,
     etag: r.etag,
     initializedAt: r.initialized_at,
     updatedAt: r.updated_at,
@@ -59,6 +63,8 @@ export function commitPollBatch(
     repoId: number;
     fullName: string;
     lastEventId: number | null;
+    /** ISO created_at of the newest event scanned. Never moves backwards. */
+    lastEventCreatedAt?: string | null;
     etag: string | null;
     jobs: NewJob[];
     now?: () => number;
@@ -75,14 +81,21 @@ export function commitPollBatch(
      ON CONFLICT (repo_id, workflow_id, event_id) DO NOTHING`,
   );
   const upsert = db.prepare(
-    `INSERT INTO repo_checkpoints (repo_id, full_name, last_event_id, etag, initialized_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO repo_checkpoints (repo_id, full_name, last_event_id, last_event_created_at, etag, initialized_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (repo_id) DO UPDATE SET
        full_name     = excluded.full_name,
        last_event_id = CASE
                          WHEN repo_checkpoints.last_event_id IS NULL THEN excluded.last_event_id
                          WHEN excluded.last_event_id IS NULL THEN repo_checkpoints.last_event_id
                          ELSE MAX(repo_checkpoints.last_event_id, excluded.last_event_id)
+                       END,
+       last_event_created_at = CASE
+                         WHEN repo_checkpoints.last_event_created_at IS NULL THEN excluded.last_event_created_at
+                         WHEN excluded.last_event_created_at IS NULL THEN repo_checkpoints.last_event_created_at
+                         WHEN julianday(excluded.last_event_created_at) > julianday(repo_checkpoints.last_event_created_at)
+                           THEN excluded.last_event_created_at
+                         ELSE repo_checkpoints.last_event_created_at
                        END,
        etag          = excluded.etag,
        updated_at    = excluded.updated_at`,
@@ -124,7 +137,7 @@ export function commitPollBatch(
         });
       }
     }
-    upsert.run(batch.repoId, batch.fullName, batch.lastEventId, batch.etag, at, at);
+    upsert.run(batch.repoId, batch.fullName, batch.lastEventId, batch.lastEventCreatedAt ?? null, batch.etag, at, at);
     return inserted;
   });
 }

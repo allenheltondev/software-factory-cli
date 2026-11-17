@@ -5,13 +5,13 @@
 //      unless `backfillSince` is set, in which case matching events created at/after it
 //      are processed.
 //   2. Otherwise conditional GET of page 1 with the stored ETag (304 → nothing new), then
-//      page back until a page contains an event id <= lastEventId, or the last page, or
-//      MAX_PAGES (recorded as an error: older events may have been missed).
-//   3. Unseen events (id > lastEventId) are processed oldest → newest. The endpoint is
-//      ordered by created_at desc and ids are not strictly monotonic within a second (see
-//      client.ts), so we never stop at the first already-seen id; we filter whole pages
-//      by id. Ids behave like an insertion sequence, so `id > lastEventId` is "new since
-//      the last poll".
+//      page back until events are older than (newest created_at seen by the last scan
+//      minus OVERLAP_MS), or GitHub's last servable page. API errors leave the checkpoint
+//      untouched so the whole range is retried.
+//   3. Events newer than the id watermark, or inside the overlap window, are evaluated
+//      oldest → newest. The endpoint orders by created_at, and ids are not monotonic in
+//      that order (see client.ts), so stopping at the first already-seen id could skip a
+//      new event on the next page. Re-evaluated events dedupe on the jobs unique key.
 //   4. Matching labeled events are checked against the issue's current state and routed;
 //      jobs and the new checkpoint are committed in one transaction, so a crash replays
 //      the batch and the unique (repo, workflow, event) key drops the duplicates.
@@ -19,16 +19,22 @@
 //      label, or its workflow disappeared from config.
 import { allowedActorsFor, workflowId, type FactoryConfig, type RepositoryConfig, type WorkflowConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
-import { cancelQueuedJob, commitPollBatch, getCheckpoint, listQueuedJobs, type NewJob } from '../db/ingest.js';
-import { GitHubError, type GitHubApi, type GitHubIssue, type GitHubIssueEvent } from '../github/api.js';
+import { cancelQueuedJob, commitPollBatch, getCheckpoint, listQueuedJobs, type Checkpoint, type NewJob } from '../db/ingest.js';
+import { GitHubError, type GitHubApi, type GitHubIssue, type GitHubIssueEvent, type IssueEventsPage } from '../github/api.js';
 import { labelEquals, selectPool } from '../routing.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job, type RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
 
 /** Events per page. Keep constant: the stored page-1 ETag depends on the query string. */
 export const EVENTS_PER_PAGE = 100;
-/** Max event pages fetched per repo per cycle. */
-export const MAX_PAGES = 10;
+/**
+ * Max event pages per scan. Equal to GitHub's own limit for this endpoint (page 301
+ * returns 422), so a scan only stops short of the checkpoint when GitHub cannot serve
+ * older events at all.
+ */
+export const MAX_PAGES = 300;
+/** How far before the newest previously seen created_at to rescan (see scanWindow). */
+export const OVERLAP_MS = 5 * 60 * 1000;
 export const BACKOFF_BASE_SECONDS = 30;
 export const BACKOFF_MAX_SECONDS = 15 * 60;
 
@@ -188,60 +194,78 @@ async function pollRepo(
   if (!cp && !cfg.backfillSince) {
     const page1 = await api.listIssueEvents(repo, { page: 1, perPage: EVENTS_PER_PAGE });
     const newest = maxId(page1.events);
-    commitPollBatch(db, { repoId: repo.id, fullName: repo.fullName, lastEventId: newest, etag: page1.etag, jobs: [], now: deps.now });
+    commitPollBatch(db, {
+      repoId: repo.id,
+      fullName: repo.fullName,
+      lastEventId: newest,
+      lastEventCreatedAt: maxCreatedAt(page1.events),
+      etag: page1.etag,
+      jobs: [],
+      now: deps.now,
+    });
     log.info('subscription initialized at current event position; earlier events are not enqueued', {
       lastEventId: newest,
     });
     return base;
   }
 
-  const since = !cp && cfg.backfillSince ? Date.parse(cfg.backfillSince) : null;
-  const watermark = cp?.lastEventId ?? null;
-  const isUnseen = (e: GitHubIssueEvent) =>
-    since !== null ? Date.parse(e.createdAt) >= since : watermark === null || e.id > watermark;
-  const reachedKnown = (e: GitHubIssueEvent) =>
-    since !== null ? Date.parse(e.createdAt) < since : watermark !== null && e.id <= watermark;
+  const window = scanWindow(cp, !cp && cfg.backfillSince ? Date.parse(cfg.backfillSince) : null);
 
   const byId = new Map<number, GitHubIssueEvent>();
   let page1Etag: string | null = null;
   let page = 1;
-  let truncated = false;
+  let historyEnd: string | null = null;
+  let legacyExtraPage = false;
   for (let fetched = 0; ; fetched++) {
     if (fetched >= MAX_PAGES) {
-      truncated = true;
+      historyEnd = `reached GitHub's ${MAX_PAGES}-page limit for issue events`;
       break;
     }
-    const res = await api.listIssueEvents(repo, {
-      page,
-      perPage: EVENTS_PER_PAGE,
-      etag: page === 1 ? (cp?.etag ?? null) : null,
-    });
+    let res: IssueEventsPage;
+    try {
+      res = await api.listIssueEvents(repo, {
+        page,
+        perPage: EVENTS_PER_PAGE,
+        etag: page === 1 ? (cp?.etag ?? null) : null,
+      });
+    } catch (err) {
+      // GitHub answers 422 past the last page it is willing to serve.
+      if (page > 1 && err instanceof GitHubError && err.status === 422) {
+        historyEnd = `GitHub stopped serving issue events at page ${page}`;
+        break;
+      }
+      throw err; // checkpoint stays where it was; the whole range is retried later
+    }
     if (page === 1) {
       if (res.notModified) return base;
       page1Etag = res.etag;
     }
     // Pages shift while new events arrive, so dedupe by id across pages.
     for (const e of res.events) byId.set(e.id, e);
-    // Finish the page that reaches known territory, then stop (no early stop mid-page).
-    if (res.events.some(reachedKnown) || res.nextPage === null) break;
+    if (res.nextPage === null || legacyExtraPage) break;
+    if (res.events.some(window.pastBoundary)) {
+      if (!window.legacy) break;
+      legacyExtraPage = true; // no stored time: read one more page past the id boundary
+    }
     page = res.nextPage;
   }
 
-  if (truncated) {
-    const message = `more than ${MAX_PAGES} pages of new issue events since the last checkpoint; older events may have been missed`;
+  if (historyEnd && window.boundaryKnown) {
+    // The boundary was never reached and GitHub will not serve anything older, so the
+    // unread gap cannot be recovered by retrying. Record it loudly, then advance.
+    const message = `${historyEnd} before reaching the last checkpoint; older events were not seen and may have been missed`;
     log.error(message);
     safeRecordError(deps, { scope: 'poll', repoFullName: repo.fullName, message });
   }
 
   const all = [...byId.values()];
-  const unseen = all.filter(isUnseen).sort((a, b) => a.id - b.id);
+  const unseen = all.filter(window.inWindow).sort((a, b) => a.id - b.id);
   const jobs = await buildJobs(deps, repo, cfg, unseen, getIssue, log);
-  const newMax = maxId(all);
-  const lastEventId = watermark === null ? newMax : newMax === null ? watermark : Math.max(watermark, newMax);
   const inserted = commitPollBatch(db, {
     repoId: repo.id,
     fullName: repo.fullName,
-    lastEventId,
+    lastEventId: maxId(all),
+    lastEventCreatedAt: maxCreatedAt(all),
     etag: page1Etag,
     jobs,
     now: deps.now,
@@ -252,8 +276,64 @@ async function pollRepo(
   return { ...base, eventsSeen: unseen.length, jobsEnqueued: inserted.length };
 }
 
+interface ScanWindow {
+  /**
+   * Events to evaluate. Re-evaluating an already-processed event is harmless: the
+   * jobs table's (repo, workflow, event) key drops duplicates.
+   */
+  inWindow: (e: GitHubIssueEvent) => boolean;
+  /** True for an event at or past the point where scanning can stop. */
+  pastBoundary: (e: GitHubIssueEvent) => boolean;
+  /** Whether a boundary exists at all (false: scan everything GitHub serves). */
+  boundaryKnown: boolean;
+  /** Checkpoint predates last_event_created_at: fall back to the id boundary plus one page. */
+  legacy: boolean;
+}
+
+/**
+ * Which events to read and where to stop. The endpoint orders by created_at desc while
+ * ids follow insertion order, so an event with a new (higher) id can sit below an
+ * already-seen one, even on the next page. Any event inserted after the last scan has
+ * created_at >= (newest created_at that scan saw) - (insertion/replication lag), so
+ * scanning back to that time minus OVERLAP_MS covers every unseen event.
+ */
+function scanWindow(cp: Checkpoint | null, backfillSince: number | null): ScanWindow {
+  const t = (e: GitHubIssueEvent) => Date.parse(e.createdAt);
+  if (backfillSince !== null) {
+    return {
+      inWindow: (e) => t(e) >= backfillSince,
+      pastBoundary: (e) => t(e) < backfillSince,
+      boundaryKnown: true,
+      legacy: false,
+    };
+  }
+  const watermark = cp?.lastEventId ?? null;
+  const newestSeen = cp?.lastEventCreatedAt ? Date.parse(cp.lastEventCreatedAt) : Number.NaN;
+  if (Number.isFinite(newestSeen)) {
+    const boundary = newestSeen - OVERLAP_MS;
+    return {
+      inWindow: (e) => watermark === null || e.id > watermark || t(e) >= boundary,
+      pastBoundary: (e) => t(e) < boundary,
+      boundaryKnown: true,
+      legacy: false,
+    };
+  }
+  return {
+    inWindow: (e) => watermark === null || e.id > watermark,
+    pastBoundary: (e) => watermark !== null && e.id <= watermark,
+    boundaryKnown: watermark !== null,
+    legacy: watermark !== null,
+  };
+}
+
 function maxId(events: GitHubIssueEvent[]): number | null {
   return events.length ? Math.max(...events.map((e) => e.id)) : null;
+}
+
+function maxCreatedAt(events: GitHubIssueEvent[]): string | null {
+  let best: string | null = null;
+  for (const e of events) if (best === null || Date.parse(e.createdAt) > Date.parse(best)) best = e.createdAt;
+  return best;
 }
 
 async function buildJobs(

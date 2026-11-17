@@ -8,8 +8,10 @@ import {
   finishRun,
   getRun,
   heartbeatRun,
+  holdsWorkerLock,
   releaseClaim,
   setRunProcess,
+  WorkerLockLostError,
   type Claim,
 } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
@@ -163,6 +165,14 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const deferred = new Set<string>();
   let lockLost = false;
 
+  const markLockLost = () => {
+    if (lockLost) return;
+    lockLost = true;
+    log.error('worker lock was taken over by another worker; stopping');
+    safeRecordError('worker', `worker ${workerId} lost the worker lock; stopping`);
+    wake.notify();
+  };
+
   const launch = (claim: Claim) => {
     const { run, job } = claim;
     const controller = new AbortController();
@@ -206,8 +216,13 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
           runsDir: paths.runsDir,
           now,
           excludeJobIds: deferred,
+          lockWorkerId: workerId,
         });
       } catch (err) {
+        if (err instanceof WorkerLockLostError) {
+          markLockLost();
+          return;
+        }
         log.error('claim failed', { error: message(err) });
         safeRecordError('worker', `claim failed: ${message(err)}`);
         return;
@@ -226,8 +241,11 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         releaseClaim(db, run.id, msg, now);
         continue;
       }
+      // The check awaited GitHub; the lock may have changed hands meanwhile. If so, the new
+      // holder has already reconciled this run, and releaseClaim is a no-op on a closed run.
+      if (!lockLost && !holdsWorkerLock(db, workerId)) markLockLost();
       if (signal.aborted || lockLost) {
-        releaseClaim(db, run.id, 'worker stopping', now);
+        releaseClaim(db, run.id, lockLost ? 'worker lost its lock' : 'worker stopping', now);
         return;
       }
       if (!check.ok) {
@@ -239,12 +257,15 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     }
   };
 
+  /**
+   * Runs on its own timer, so slow GitHub calls in poll() or the pre-start check never
+   * delay it (SQLite calls are synchronous; the timer fires whenever the loop awaits).
+   */
   const heartbeat = () => {
+    if (lockLost) return;
     try {
       if (!heartbeatWorkerLock(db, workerId, now)) {
-        lockLost = true;
-        log.error('worker lock was taken over by another worker; stopping');
-        safeRecordError('worker', `worker ${workerId} lost the worker lock; stopping`);
+        markLockLost();
         return;
       }
       for (const runId of inFlight.keys()) heartbeatRun(db, runId, leaseSeconds, now);
@@ -280,11 +301,11 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     }
   };
 
+  const heartbeatTimer = setInterval(heartbeat, heartbeatMs);
   try {
     await reconcileInterruptedRuns(db, { previousHolder: previous, hostname, processControl, log, now });
 
     let nextPollAt = now();
-    let nextHeartbeatAt = now() + heartbeatMs;
     while (!signal.aborted && !lockLost) {
       if (now() >= nextPollAt) {
         try {
@@ -300,15 +321,13 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
 
       await startJobs();
 
-      if (now() >= nextHeartbeatAt) {
-        heartbeat();
-        nextHeartbeatAt = now() + heartbeatMs;
-      }
-      await wake.wait(Math.min(nextPollAt, nextHeartbeatAt) - now(), signal);
+      // Bounded by heartbeatMs so a stalled clock or missed notify can't park the loop.
+      await wake.wait(Math.min(nextPollAt - now(), heartbeatMs), signal);
     }
   } finally {
     log.info('worker stopping', { inFlight: inFlight.size });
     await shutdown();
+    clearInterval(heartbeatTimer);
     releaseWorkerLock(db, workerId);
     log.info('worker stopped');
   }
