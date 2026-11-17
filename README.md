@@ -479,8 +479,12 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
    It never force-pushes, never pushes the base branch, and refuses any branch other than the
    run's job branch. The remote must have exactly one push URL, and it must point at the
    configured repository (`git push` sends to every `pushurl` a remote has, so a remote with
-   several is refused). If the branch already exists at that URL at the same commit, the push is
-   skipped; at a different commit, publication fails and the remote branch is left alone.
+   several is refused). The check and the push then both name that URL directly, from a
+   throwaway repository that borrows the clone's objects but none of its configuration, with
+   global and system Git config switched off, so a remote, `insteadOf` rule or hook changed
+   after the check can't send the push elsewhere. If the branch already exists at that URL at
+   the same commit, the push is skipped; at a different commit, publication fails and the
+   remote branch is left alone.
 2. **Open a PR** from the job branch into the base branch (draft for `draft-pr`), titled with
    the issue title. The body says `Closes #<n>`, lists the commits and the diffstat, quotes the
    agent's final message (capped, in a code block so mentions and closing keywords in it stay
@@ -494,16 +498,20 @@ review.
 uses the same token, handed to that one `git` process as an `Authorization` header scoped to
 `https://github.com/` through `GIT_CONFIG_*` environment variables, so it is not in the command
 line, the remote URL, a file or the logs. For SSH remotes (including host aliases) the push uses
-your SSH key. Git hooks and tracing are turned off for these commands.
+your SSH key and `~/.ssh/config`; because Git config files are ignored for the push, a
+`core.sshCommand` there does not apply (set `GIT_SSH_COMMAND` in the worker's environment
+instead). Git hooks and tracing are turned off for these commands.
 
 **Idempotent retries.** Each step is recorded as it completes (in the state DB, separately
 from the run, so publication never changes a run's outcome), and each step checks GitHub
 before writing: the remote branch before pushing, any PR for the head branch in any state
 (open, closed or merged) before opening one, and an issue comment with the run's marker before
 commenting. A retry resumes where the last attempt stopped and never creates a duplicate.
-Only one attempt owns a publication at a time: it holds a lease that it renews before each
-push, PR and comment, every GitHub request gives up after 60 seconds, and an attempt that
-lost its lease can neither write to GitHub again nor change the recorded state.
+Only one attempt owns a publication at a time. Right before each push, PR and comment it
+confirms it still owns the publication and renews its lease, so a slow lookup can't lead to
+a late write. Every GitHub request gives up after 60 seconds, an attempt stops after 8
+minutes (and is retried later), and an attempt that lost its lease can neither write to
+GitHub again nor change the recorded state.
 
 **Failures.** Network errors, GitHub 5xx responses and rate limits are retried by the worker
 on its own after each poll, with backoff, up to five attempts. Other failures wait for you:

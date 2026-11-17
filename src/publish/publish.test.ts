@@ -25,6 +25,7 @@ import { silentLogger } from '../util/log.js';
 import { summarizeRun } from '../worker/run-summary.js';
 import {
   createPublisher,
+  PUBLISH_ATTEMPT_SECONDS,
   PUBLISH_LEASE_SECONDS,
   publicationMarker,
   publishGitEnv,
@@ -606,6 +607,82 @@ describe('publishRun', { timeout: 60_000 }, () => {
     expect(stale).toMatchObject({ status: 'busy', reason: expect.stringMatching(/attempt 1 was superseded/) });
     expect(api.comments).toHaveLength(1);
     expect(getPublication(s.db, s.runId)).toEqual(owned);
+  });
+
+  it('pushes to the validated URL even if the remote is changed after the check', async () => {
+    const s = await scenario();
+    const second = join(s.f.root, 'mirror repos', `${FULL}.git`);
+    mkdirSync(second, { recursive: true });
+    s.f.git(second, 'init', '--bare', '--quiet', '-b', 'main');
+    let changed = false;
+    // Right after the existence check, add a second push URL and a rewrite of the first to it.
+    const runGitAndTamper: RunGit = async (args, opts) => {
+      const r = await runGit(args, opts);
+      if (args[0] === 'ls-remote' && !changed) {
+        changed = true;
+        s.f.git(s.f.clone, 'remote', 'set-url', '--add', '--push', 'origin', s.f.remoteDir);
+        s.f.git(s.f.clone, 'remote', 'set-url', '--add', '--push', 'origin', second);
+        s.f.git(s.f.clone, 'config', `url.${second}.pushInsteadOf`, s.f.remoteDir);
+      }
+      return r;
+    };
+
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: runGitAndTamper }), s.runId);
+    expect(changed).toBe(true);
+    expect(r).toMatchObject({ status: 'published' });
+    expect(remoteSha(s)).toBe(s.localSha);
+    expect(s.f.git(s.f.root, 'ls-remote', second, `refs/heads/${s.branch}`)).toBe('');
+  });
+
+  it('rechecks ownership after a lookup that outlived the lease, before posting', async () => {
+    const s = await scenario();
+    let t = T0;
+    const now = () => t;
+    let release!: () => void;
+    let reached!: () => void;
+    const reachedLookup = new Promise<void>((r) => (reached = r));
+    const held = new Promise<void>((r) => (release = r));
+    // The first attempt's comment lookup comes back empty, but only after the lease ran out.
+    class SlowLookupApi extends FakePublishApi {
+      private first = true;
+      override async listIssueComments(repo: RepoRef, issue: number) {
+        const found = await super.listIssueComments(repo, issue);
+        if (this.first) {
+          this.first = false;
+          reached();
+          await held;
+        }
+        return found;
+      }
+    }
+    const api = new SlowLookupApi();
+    const first = publishRun(deps(s, api, { now }), s.runId);
+    await reachedLookup;
+
+    t += (PUBLISH_LEASE_SECONDS + 1) * 1000;
+    expect(await publishRun(deps(s, api, { now }), s.runId)).toMatchObject({ status: 'published' });
+    expect(api.comments).toHaveLength(1);
+
+    release();
+    expect(await first).toMatchObject({ status: 'busy', reason: expect.stringMatching(/attempt 1 was superseded/) });
+    expect(api.comments).toHaveLength(1);
+  });
+
+  it('an attempt past its deadline stops before writing, and is retried later', async () => {
+    const s = await scenario();
+    let t = T0;
+    class SlowPrLookupApi extends FakePublishApi {
+      override async listPullRequestsForHead(...a: Parameters<FakePublishApi['listPullRequestsForHead']>) {
+        t += (PUBLISH_ATTEMPT_SECONDS + 1) * 1000; // still inside the lease, past the attempt deadline
+        return super.listPullRequestsForHead(...a);
+      }
+    }
+    const api = new SlowPrLookupApi();
+    const r = await publishRun(deps(s, api, { now: () => t }), s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: true });
+    if (r.status === 'failed') expect(r.error).toMatch(/ran past its 8-minute deadline/);
+    expect(api.calls.filter((c) => c.startsWith('createPr') || c.startsWith('createComment'))).toEqual([]);
+    expect(getPublication(s.db, s.runId)).toMatchObject({ state: 'failed', retryable: true, nextAttemptAt: expect.any(String) });
   });
 });
 

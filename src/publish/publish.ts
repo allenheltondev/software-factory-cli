@@ -16,7 +16,7 @@
 // scoped to https://github.com/ (never in argv, a URL or a file); other remotes (SSH, host
 // aliases) use git's own credentials. Hooks are disabled for these git commands, since the agent
 // could have written them.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -54,6 +54,11 @@ import { findRepoConfig } from '../worker/executor.js';
 
 /** How long a publication may hold its lease before another process may take it over. */
 export const PUBLISH_LEASE_SECONDS = 10 * 60;
+/**
+ * How long one attempt may run. Shorter than the lease, and checked (with ownership) right
+ * before every write, so an attempt held up by slow requests stops instead of writing late.
+ */
+export const PUBLISH_ATTEMPT_SECONDS = 8 * 60;
 /** Attempts (first try included) before the worker stops retrying a transient failure on its own. */
 export const MAX_AUTO_ATTEMPTS = 5;
 const BASE_BACKOFF_SECONDS = 60;
@@ -139,6 +144,9 @@ export function redactSecret(text: string, token: string | null): string {
 }
 
 const DEBUG_ENV = /^(GIT_TRACE.*|GIT_CURL_VERBOSE|GIT_REDACT_COOKIES|GIT_TRACE2.*)$/i;
+/** Inherited variables that carry Git config or point Git at another repository. */
+const ISOLATED_DROP_ENV =
+  /^(GIT_CONFIG|GIT_CONFIG_PARAMETERS|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_CONFIG_SYSTEM|GIT_CONFIG_GLOBAL|GIT_CONFIG_NOSYSTEM|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_NAMESPACE|GIT_CEILING_DIRECTORIES)$/i;
 
 /**
  * Environment for publication's git commands: no tracing (which could print headers), hooks
@@ -151,9 +159,24 @@ export function publishGitEnv(o: {
   pushUrl: string;
   token: string | null;
   hooksPath: string;
+  /**
+   * Ignore every Git config file and inherited config: no system or global config (the global
+   * path is pointed at this empty file), no `-c`/GIT_CONFIG_* from the environment, and no
+   * repository-location overrides. With a throwaway repository as the working directory, the
+   * only settings in effect are the ones set here, so nothing can rewrite or redirect the URL.
+   */
+  isolateWith?: { emptyGlobalConfig: string };
 }): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(o.base)) if (!DEBUG_ENV.test(k)) env[k] = v;
+  for (const [k, v] of Object.entries(o.base)) {
+    if (DEBUG_ENV.test(k)) continue;
+    if (o.isolateWith && ISOLATED_DROP_ENV.test(k)) continue;
+    env[k] = v;
+  }
+  if (o.isolateWith) {
+    env.GIT_CONFIG_NOSYSTEM = '1';
+    env.GIT_CONFIG_GLOBAL = o.isolateWith.emptyGlobalConfig;
+  }
   const pairs: Array<[string, string]> = [['core.hooksPath', o.hooksPath]];
   if (o.token && isHttpsGitHub(o.pushUrl)) {
     pairs.push(['http.https://github.com/.extraheader', '']);
@@ -375,7 +398,14 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
   // This attempt's fence: every state write and every external write checks it still owns the
   // publication, so an attempt that outlived its lease can't act after a newer one took over.
   const fence = { attempt: pub.attempts, leaseSeconds: PUBLISH_LEASE_SECONDS, now };
-  const hold = () => holdPublication(deps.db, runId, fence);
+  const attemptStarted = now();
+  /** Before each write to GitHub: still the owner (renewing the lease) and within the deadline. */
+  const hold = () => {
+    holdPublication(deps.db, runId, fence);
+    if (now() - attemptStarted > PUBLISH_ATTEMPT_SECONDS * 1000) {
+      throw new TransientError(`publication attempt ${fence.attempt} ran past its ${PUBLISH_ATTEMPT_SECONDS / 60}-minute deadline`);
+    }
+  };
 
   let token: string | null = null;
   const runLog = async (lines: string[]) => {
@@ -423,8 +453,25 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
         throw new PublishRefusal(`the push URL of remote "${remoteName}" (${redactRemoteUrl(pushUrlRaw)}) does not point at ${repoFullName}`);
       }
       if (isHttpsGitHub(pushUrlRaw)) token = await deps.token();
-      const env = publishGitEnv({ base: deps.env ?? process.env, pushUrl: pushUrlRaw, token, hooksPath: join(hooksDir, 'none') });
-      const netOpts: GitOptions = { ...local, env, signal };
+      const emptyGlobalConfig = join(hooksDir, 'empty-gitconfig');
+      writeFileSync(emptyGlobalConfig, '');
+      const env = publishGitEnv({
+        base: deps.env ?? process.env,
+        pushUrl: pushUrlRaw,
+        token,
+        hooksPath: join(hooksDir, 'none'),
+        isolateWith: { emptyGlobalConfig },
+      });
+      // Network commands run in a throwaway bare repository that borrows the clone's objects
+      // (alternates) and nothing else: no remotes, no url.*.insteadOf rules, no hooks. They name
+      // the validated URL itself, so Git can't resolve it to a different destination later.
+      const pushRepo = join(hooksDir, 'push.git');
+      const netOpts: GitOptions = { cwd: hooksDir, git: deps.git, env, signal };
+      await run1(['init', '--bare', '--quiet', pushRepo], netOpts);
+      // Relative to the clone on older Git; resolve() leaves an absolute one as it is.
+      const commonDir = resolve(checkoutPath, (await run1(['rev-parse', '--git-common-dir'], local)).stdout.trim());
+      const objects = join(commonDir, 'objects');
+      writeFileSync(join(pushRepo, 'objects', 'info', 'alternates'), `${objects}\n`);
 
       const expected = jobBranchName(job, run.attempt);
       if (branch !== expected) throw new PublishRefusal(`run ${runId} recorded branch ${branch}, not the job branch ${expected}; refusing to push it`);
@@ -432,7 +479,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       const sha = (await run1(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`], local).catch(() => null))?.stdout.trim();
       if (!sha) throw new PublishRefusal(`the job branch ${branch} no longer exists in ${checkoutPath}`);
       const count = Number((await run1(['rev-list', '--count', `${run.summary.baseSha}..${sha}`], local)).stdout.trim()) || 0;
-      return { remote: remoteName, pushUrl: pushUrlRaw, net: netOpts, localSha: sha, commitCount: count };
+      return { remote: remoteName, pushUrl: pushUrlRaw, net: { ...netOpts, cwd: pushRepo }, localSha: sha, commitCount: count };
     });
 
     if (commitCount === 0) {
@@ -443,7 +490,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       return { status: 'skipped', reason, publication: getPublication(deps.db, runId)! };
     }
 
-    const baseBranch = pub.baseBranch ?? repo.baseBranch ?? (await remoteDefaultBranch(remote, net));
+    const baseBranch = pub.baseBranch ?? repo.baseBranch ?? (await remoteDefaultBranch(pushUrl, net));
     if (baseBranch !== pub.baseBranch) progress({ baseBranch });
     if (branch === baseBranch) throw new PublishRefusal(`the job branch ${branch} is the base branch; refusing to push to it`);
 
@@ -467,8 +514,10 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       await runLog([`${remoteRef} is already on ${remote} at ${localSha.slice(0, 12)}`]);
     } else {
       await runLog([`pushing ${branch} (${localSha.slice(0, 12)}, ${commitCount} commit(s)) to ${remote} (${redactRemoteUrl(pushUrl)})`]);
+      hold();
       try {
-        await run1(['push', '--no-verify', '--recurse-submodules=no', '--porcelain', remote, `${localSha}:${remoteRef}`], net);
+        // To the validated URL, from the isolated repository.
+        await run1(['push', '--no-verify', '--recurse-submodules=no', '--porcelain', pushUrl, `${localSha}:${remoteRef}`], net);
       } catch (err) {
         if (err instanceof GitError) throw classifyGit(err, 'push', remote, repoFullName);
         throw err;
@@ -491,6 +540,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
         await runLog([`reusing PR #${pr.number} (${pr.state}${pr.merged ? ', merged' : ''}): ${pr.htmlUrl}`]);
       } else {
         const title = cap(job.envelope.issue.title.replace(/\s+/g, ' ').trim() || `Issue #${job.issueNumber}`, MAX_TITLE);
+        hold(); // the lookup may have outlived the lease
         pr = await deps.api.createPullRequest(repoRef, {
           title,
           head: branch,
@@ -508,7 +558,11 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       hold();
       const marker = publicationMarker(runId);
       const found = (await deps.api.listIssueComments(repoRef, job.issueNumber)).find((c) => c.body.includes(marker));
-      const comment = found ?? (await deps.api.createIssueComment(repoRef, job.issueNumber, renderIssueComment({ runId, pr, commitCount, summary: run.summary })));
+      let comment = found;
+      if (!comment) {
+        hold(); // the lookup may have outlived the lease
+        comment = await deps.api.createIssueComment(repoRef, job.issueNumber, renderIssueComment({ runId, pr, commitCount, summary: run.summary }));
+      }
       progress({ commentId: comment.id, commentUrl: comment.htmlUrl });
       await runLog([found ? `issue comment already there: ${comment.htmlUrl}` : `commented on issue #${job.issueNumber}: ${comment.htmlUrl}`]);
     }
