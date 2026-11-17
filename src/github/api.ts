@@ -37,6 +37,8 @@ export interface GitHubIssueEvent {
 export interface GitHubIssue {
   number: number;
   title: string;
+  /** Markdown body; '' when the issue has none. */
+  body: string;
   htmlUrl: string;
   state: 'open' | 'closed';
   labels: string[];

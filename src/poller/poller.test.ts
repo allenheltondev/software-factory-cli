@@ -51,6 +51,7 @@ class FakeGitHub implements GitHubApi {
     r.issues.set(number, {
       number,
       title: opts.title ?? `Issue ${number}`,
+      body: `Body of issue ${number}`,
       htmlUrl: `https://github.com/${r.fullName}/issues/${number}`,
       state: 'open',
       labels: [...(opts.labels ?? [])],
@@ -854,7 +855,15 @@ describe('checkJobDispatchable', () => {
     gh.label(REPO, 1, READY);
     await pollOnce(deps);
     const [job] = listQueuedJobs(db);
-    expect(await checkJobDispatchable(deps, job!)).toEqual({ ok: true });
+    expect(await checkJobDispatchable(deps, job!)).toEqual({
+      ok: true,
+      issue: {
+        title: 'Issue 1',
+        body: 'Body of issue 1',
+        labels: [READY],
+        url: 'https://github.com/allen/kids/issues/1',
+      },
+    });
 
     gh.unlabel(REPO, 1, READY);
     expect(await checkJobDispatchable(deps, job!)).toMatchObject({ ok: false, reason: expect.stringMatching(/trigger label/) });

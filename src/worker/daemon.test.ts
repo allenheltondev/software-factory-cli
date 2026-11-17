@@ -212,15 +212,16 @@ describe('runDaemon', () => {
   it('on shutdown, signals a stuck run\'s agent only if its recorded start time still matches', async () => {
     const db = openDatabase(':memory:');
     const never = deferred<ExecutionResult>();
-    const seen: string[] = [];
+    const seen: Array<{ stopping: boolean; issue: unknown }> = [];
     const executor: Executor = {
       name: 'stuck',
       execute: async (c, ctx) => {
-        seen.push(c.run.agent);
+        seen.push({ stopping: Boolean(ctx.workerStopping?.aborted), issue: ctx.issue });
         // codex's agent is still the same process; claude's pid now belongs to another process.
         const pid = c.run.agent === 'codex' ? 7001 : 7002;
         ctx.recordProcess({ pid });
         ctx.recordProcess({ pidStartTime: `t:${pid}` });
+        ctx.workerStopping?.addEventListener('abort', () => seen.push({ stopping: true, issue: null }));
         return never.promise;
       },
     };
@@ -232,18 +233,26 @@ describe('runDaemon', () => {
         terminated.push(pid);
       },
     };
+    const issue = { title: 'T', body: 'B', labels: ['factory:ready'], url: 'u' };
     const deps = baseDeps(db, {
       executor,
       processControl,
+      checkDispatchable: async () => ({ ok: true, issue }),
       timing: { shutdownTimeoutMs: 20, interruptGraceMs: 20 },
     });
     const a = insertJob(db, { pool: 'art' });
     const b = insertJob(db);
     const done = runDaemon(deps);
     await vi.waitFor(() => expect(seen).toHaveLength(2));
+    expect(seen).toEqual([
+      { stopping: false, issue },
+      { stopping: false, issue },
+    ]);
     deps.controller.abort();
     await done;
 
+    // workerStopping fired as soon as shutdown began, before the per-run signal.
+    expect(seen.filter((s) => s.stopping)).toHaveLength(2);
     expect(terminated).toEqual([7001]);
     const runA = db.prepare('SELECT error FROM runs WHERE job_id = ?').get(a) as { error: string };
     const runB = db.prepare('SELECT error FROM runs WHERE job_id = ?').get(b) as { error: string };

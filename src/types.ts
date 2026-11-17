@@ -32,6 +32,14 @@ export interface EventEnvelope {
   createdAt: string;
 }
 
+/** The issue as fetched by the worker's pre-start check, handed to the executor. Untrusted text. */
+export interface IssueSnapshot {
+  title: string;
+  body: string;
+  labels: string[];
+  url: string;
+}
+
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'canceled';
 
 export const TERMINAL_JOB_STATUSES: readonly JobStatus[] = ['succeeded', 'failed', 'interrupted', 'canceled'];

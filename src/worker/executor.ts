@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { agentAdapter, type FactoryConfig } from '../config/schema.js';
 import { ownEntry, type Claim, type RunProcessInfo } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
-import type { RunOutcome } from '../types.js';
+import type { IssueSnapshot, RunOutcome } from '../types.js';
 import type { Logger } from '../util/log.js';
 
 export interface ExecutionContext {
@@ -18,7 +18,14 @@ export interface ExecutionContext {
    * A live adapter should stop its agent and resolve with outcome 'interrupted'.
    */
   signal: AbortSignal;
+  /**
+   * Aborted as soon as the worker is asked to stop (SIGINT/SIGTERM), before `signal`. An executor
+   * whose work can't finish quickly (a live agent) stops on this instead of waiting for `signal`.
+   */
+  workerStopping?: AbortSignal;
   now: () => number;
+  /** The issue as fetched by the pre-start check, when available. Untrusted text. */
+  issue?: IssueSnapshot;
   /**
    * Persist the agent subprocess pid (then its OS start time) and/or the job's checkout path
    * as soon as they exist, so a later worker can reap the process and keep the checkout after

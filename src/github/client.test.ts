@@ -179,13 +179,14 @@ describe('createGitHubApi', () => {
   it('getIssue does not follow transfer redirects and maps labels/PR flag', async () => {
     const { fn, calls } = fakeFetch((url) => {
       if (url.pathname.endsWith('/9')) return new Response(null, { status: 301, headers: { location: 'https://api.github.com/repositories/2/issues/1' } });
-      return json({ number: 5, title: 'x', html_url: 'h', state: 'open', labels: [{ name: 'art' }, 'factory:ready'] });
+      return json({ number: 5, title: 'x', body: 'do it', html_url: 'h', state: 'open', labels: [{ name: 'art' }, 'factory:ready'] });
     });
     const api = await createGitHubApi({ token: 't', fetch: fn });
     const repo = { id: 1, fullName: 'o/r' };
     expect(await api.getIssue(repo, 5)).toEqual({
       number: 5,
       title: 'x',
+      body: 'do it',
       htmlUrl: 'h',
       state: 'open',
       labels: ['art', 'factory:ready'],

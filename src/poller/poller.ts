@@ -22,7 +22,7 @@ import { recordError, type Db } from '../db/database.js';
 import { cancelQueuedJob, commitPollBatch, getCheckpoint, listQueuedJobs, type Checkpoint, type NewJob } from '../db/ingest.js';
 import { GitHubError, type GitHubApi, type GitHubIssue, type GitHubIssueEvent, type IssueEventsPage } from '../github/api.js';
 import { labelEquals, selectPool } from '../routing.js';
-import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job, type RepoRef } from '../types.js';
+import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
 
 /** Events per page. Keep constant: the stored page-1 ETag depends on the query string. */
@@ -484,7 +484,8 @@ async function buildJobs(
   return jobs;
 }
 
-export type DispatchCheck = { ok: true } | { ok: false; reason: string };
+/** `issue` is the issue as fetched by the check, for the executor (live runs render it into the prompt). */
+export type DispatchCheck = { ok: true; issue?: IssueSnapshot } | { ok: false; reason: string };
 
 /** Shared dispatchability check. Throws for transient API errors (never a cancel reason). */
 async function evaluateJob(config: FactoryConfig, job: Job, getIssue: IssueLookup): Promise<DispatchCheck> {
@@ -505,7 +506,7 @@ async function evaluateJob(config: FactoryConfig, job: Job, getIssue: IssueLooku
   if (!issue.labels.some((l) => labelEquals(l, wf.trigger.label))) {
     return { ok: false, reason: `issue #${job.issueNumber} no longer carries trigger label "${wf.trigger.label}"` };
   }
-  return { ok: true };
+  return { ok: true, issue: { title: issue.title, body: issue.body, labels: issue.labels, url: issue.htmlUrl } };
 }
 
 async function recheckQueuedJobs(

@@ -146,6 +146,7 @@ interface RawLabel {
 interface RawIssue {
   number: number;
   title: string;
+  body?: string | null;
   html_url: string;
   state: string;
   labels: Array<string | { name?: string }>;
@@ -180,6 +181,7 @@ function mapIssue(r: RawIssue): GitHubIssue {
   return {
     number: r.number,
     title: r.title,
+    body: r.body ?? '',
     htmlUrl: r.html_url,
     state: r.state === 'closed' ? 'closed' : 'open',
     labels: r.labels.map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter((l) => l !== ''),
