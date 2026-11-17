@@ -7,7 +7,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AgentReport } from '../agents/discovery.js';
 import { KNOWN_ADAPTERS, type AdapterName } from '../config/schema.js';
-import { GitHubError, type GitHubApi, type GitHubLabel, type GitHubRepo } from '../github/api.js';
+import {
+  GitHubError,
+  type GitHubApi,
+  type GitHubLabel,
+  type GitHubPullRequestDetail,
+  type GitHubPullRequestReview,
+  type GitHubRepo,
+} from '../github/api.js';
 import { resolvePaths } from '../paths.js';
 import type { CommandContext } from './context.js';
 import type { Prompter } from './prompter.js';
@@ -42,6 +49,10 @@ export interface FakeApiData {
   /** Accessible via getRepo but not listed by listUserRepos (e.g. public repos). */
   publicRepos?: GitHubRepo[];
   labels?: Record<string, string[]>;
+  /** Pull requests by "OWNER/REPO#N", for getPullRequest. */
+  pulls?: Record<string, GitHubPullRequestDetail>;
+  /** Reviews by "OWNER/REPO#N", oldest first, for listPullRequestReviews. */
+  reviews?: Record<string, GitHubPullRequestReview[]>;
 }
 
 export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] } {
@@ -87,6 +98,16 @@ export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] }
     },
     async createIssueComment() {
       throw new Error('not used');
+    },
+    async getPullRequest(repo, n) {
+      calls.push(`getPullRequest ${repo.fullName}#${n}`);
+      const pr = data.pulls?.[`${repo.fullName}#${n}`];
+      if (!pr) throw new GitHubError(`Pull request ${repo.fullName}#${n}`, 404);
+      return pr;
+    },
+    async listPullRequestReviews(repo, n) {
+      calls.push(`listPullRequestReviews ${repo.fullName}#${n}`);
+      return data.reviews?.[`${repo.fullName}#${n}`] ?? [];
     },
   };
 }

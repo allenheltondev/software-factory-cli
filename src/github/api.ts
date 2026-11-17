@@ -70,6 +70,28 @@ export interface GitHubPullRequest {
   body: string;
 }
 
+/** One pull request with its current head commit (getPullRequest). */
+export interface GitHubPullRequestDetail extends GitHubPullRequest {
+  /** SHA of the commit at the head of the PR right now. */
+  headSha: string;
+}
+
+/** A submitted (or pending) review on a pull request. */
+export interface GitHubPullRequestReview {
+  id: number;
+  /** Login of the review's author; null when the account was deleted. */
+  user: string | null;
+  /** APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED or PENDING. */
+  state: string;
+  /** Markdown body; '' when it has none. */
+  body: string;
+  /** The commit the review was made on, as GitHub recorded it. */
+  commitId: string | null;
+  /** Null while the review is pending (not submitted). */
+  submittedAt: string | null;
+  htmlUrl: string;
+}
+
 export interface CreatePullRequestInput {
   title: string;
   /** Branch in the same repository. */
@@ -109,6 +131,10 @@ export interface GitHubApi {
   listIssueComments(repo: RepoRef, issueNumber: number): Promise<GitHubIssueComment[]>;
   /** Write: comment on an issue. Used only by the publication step. */
   createIssueComment(repo: RepoRef, issueNumber: number, body: string): Promise<GitHubIssueComment>;
+  /** One pull request, with its current head SHA. */
+  getPullRequest(repo: RepoRef, prNumber: number): Promise<GitHubPullRequestDetail>;
+  /** Every review on one pull request, oldest first (paginated internally). */
+  listPullRequestReviews(repo: RepoRef, prNumber: number): Promise<GitHubPullRequestReview[]>;
 }
 
 export class GitHubError extends Error {

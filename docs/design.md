@@ -124,6 +124,8 @@ Create a dedicated Kids and Dragons review chat and configure a GitHub event-tri
 
 The initial review destination is the dedicated ChatGPT chat. To close the loop automatically later, the factory will need a review result it can read reliably, with PR number, head SHA and blocker status. Options include an authorized GitHub review output or a local Codex reviewer with structured output. Define that handoff before letting the factory send findings back to an implementation agent. Keep merges a human decision in the pilot.
 
+**Decided (#13):** the result is a GitHub PR review carrying a hidden `factory-review v1` block with the reviewed head SHA and `blockers: yes|no`, trusted only from logins in `review.reviewers` and only when the block's head matches the review's `commit_id`. The blocker status lives in the block because reviews posted from the PR author's own account are always `COMMENTED`. `factory reviews` reads it; findings are not yet sent to agents. See [review-result.md](review-result.md).
+
 ## 6. First build and acceptance
 
 1. Ship repo discovery, config validation, issue-event polling and a durable queue. Run a log-only action before enabling agents.
@@ -150,7 +152,7 @@ The initial review destination is the dedicated ChatGPT chat. To close the loop 
 | --- | --- |
 | Who can dispatch work? | Use an explicit GitHub actor allowlist for the pilot, starting with Allen. Check the actor on the label event. Expand to collaborators or planned bot accounts only if needed. |
 | What counts as done? | Leave a local branch and summarize changes and checks. **Decided (#12):** publication is opt-in per repository (`publish: none`, the default, `draft-pr` or `pr`), applies in live mode to `local-branch` actions, and only to runs that succeeded and left commits. The CLI's worker pushes the job branch (create-only: it never moves an existing branch) and opens the PR as the user's own `gh` account, then comments on the issue; the agent gets no GitHub token. Each step is idempotent by run id. `pr` exists for private repos whose plan refuses draft PRs; the CLI never falls back to it on its own. Merging stays a human decision. |
-| Where does feedback go? | Deliver reviews in ChatGPT and hand findings back to the implementer manually. Decide where machine-readable reviews should live before automating fix-and-review cycles. |
+| Where does feedback go? | Deliver reviews in ChatGPT and hand findings back to the implementer manually. **Decided (#13):** machine-readable results live in GitHub PR reviews as a `factory-review v1` block from a trusted reviewer ([review-result.md](review-result.md)). Findings still go back by hand until the fix cycle is built on it. |
 | What can agents execute? | Configure the commands, credentials and tool permissions needed by each action before running it unattended. Validate Kiro headless auth and each adapter's exit behavior under the worker account. |
 
 The first coding step can begin with repo selection, event ingestion and a log-only worker. The trigger label, authorized dispatchers and publication behavior need to be settled before enabling live implementation runs. ChatGPT webhook activation is an integration dependency for the review phase.

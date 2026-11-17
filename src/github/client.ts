@@ -32,6 +32,8 @@ import {
   type GitHubIssueEvent,
   type GitHubLabel,
   type GitHubPullRequest,
+  type GitHubPullRequestDetail,
+  type GitHubPullRequestReview,
   type GitHubRepo,
   type IssueEventsPage,
 } from './api.js';
@@ -175,8 +177,17 @@ interface RawPullRequest {
   draft?: boolean;
   merged_at?: string | null;
   body?: string | null;
-  head: { ref: string; repo: { id: number } | null };
+  head: { ref: string; sha: string; repo: { id: number } | null };
   base: { ref: string };
+}
+interface RawReview {
+  id: number;
+  user: { login: string } | null;
+  state: string;
+  body?: string | null;
+  commit_id?: string | null;
+  submitted_at?: string | null;
+  html_url: string;
 }
 interface RawComment {
   id: number;
@@ -196,6 +207,18 @@ function mapPull(r: RawPullRequest): GitHubPullRequest {
     headRepoId: r.head.repo?.id ?? null,
     baseRef: r.base.ref,
     body: r.body ?? '',
+  };
+}
+
+function mapReview(r: RawReview): GitHubPullRequestReview {
+  return {
+    id: r.id,
+    user: r.user?.login ?? null,
+    state: r.state,
+    body: r.body ?? '',
+    commitId: r.commit_id ?? null,
+    submittedAt: r.submitted_at ?? null,
+    htmlUrl: r.html_url,
   };
 }
 
@@ -451,6 +474,18 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         body: { body },
       });
       return mapComment(res.data!);
+    },
+
+    async getPullRequest(repo, prNumber): Promise<GitHubPullRequestDetail> {
+      const res = await request<RawPullRequest>(`${repoPath(repo)}/pulls/${prNumber}`);
+      return { ...mapPull(res.data!), headSha: res.data!.head.sha };
+    },
+
+    async listPullRequestReviews(repo, prNumber) {
+      // Verified read-only against cli/cli (2026-11-17): chronological order, Link-header pages on
+      // the stable-ID route, and body '' (not null) for a review with only inline comments.
+      const raw = await paginate<RawReview>(`${repoPath(repo)}/pulls/${prNumber}/reviews`);
+      return raw.map(mapReview);
     },
   };
 }

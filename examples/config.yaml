@@ -20,6 +20,11 @@ execution:
 dispatch:
   allowedActors: [allenheltondev]
 
+# Logins whose PR reviews carry a trusted factory-review block (see docs/review-result.md).
+# Empty (the default) trusts no review result.
+review:
+  reviewers: [allenheltondev]
+
 agents:
   codex:
     maxConcurrent: 1

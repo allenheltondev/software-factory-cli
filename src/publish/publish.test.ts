@@ -142,6 +142,14 @@ class FakePublishApi implements GitHubApi {
     return c;
   }
 
+  // Publication never reads reviews; these exist only to satisfy the interface.
+  async getPullRequest(): Promise<never> {
+    throw new Error('not used');
+  }
+  async listPullRequestReviews(): Promise<never> {
+    throw new Error('not used');
+  }
+
   get creates(): string[] {
     return this.calls.filter((c) => c.startsWith('create'));
   }

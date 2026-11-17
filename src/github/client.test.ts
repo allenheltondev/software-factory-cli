@@ -326,6 +326,77 @@ describe('createGitHubApi: publication writes', () => {
   });
 });
 
+describe('createGitHubApi: pull requests and reviews (read-only)', () => {
+  const sha = 'f'.repeat(40);
+
+  it('gets one PR with its head SHA on the stable-ID route', async () => {
+    const { fn, calls } = fakeFetch(() =>
+      json({
+        number: 5,
+        html_url: 'https://github.com/o/r/pull/5',
+        state: 'closed',
+        draft: false,
+        merged_at: '2026-01-01T00:00:00Z',
+        body: null,
+        head: { ref: 'factory/issue-7-job_x', sha, repo: { id: 42 } },
+        base: { ref: 'main' },
+      }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const pr = await api.getPullRequest({ id: 42, fullName: 'o/r' }, 5);
+    expect(calls[0]).toMatchObject({ method: 'GET', url: 'https://api.github.com/repositories/42/pulls/5' });
+    expect(pr).toEqual({
+      number: 5,
+      htmlUrl: 'https://github.com/o/r/pull/5',
+      state: 'closed',
+      draft: false,
+      merged: true,
+      headRef: 'factory/issue-7-job_x',
+      headRepoId: 42,
+      baseRef: 'main',
+      body: '',
+      headSha: sha,
+    });
+  });
+
+  it('lists every page of reviews and maps them', async () => {
+    const raw = (id: number, extra: Record<string, unknown> = {}) => ({
+      id,
+      user: { login: 'allen' },
+      state: 'COMMENTED',
+      body: `review ${id}`,
+      commit_id: sha,
+      submitted_at: '2026-11-17T17:25:19Z',
+      html_url: `https://github.com/o/r/pull/5#pullrequestreview-${id}`,
+      ...extra,
+    });
+    const { fn, calls } = fakeFetch((url) => {
+      if (url.searchParams.get('page') === '2') {
+        return json([raw(2, { user: null, body: null, commit_id: null, submitted_at: null, state: 'PENDING' })]);
+      }
+      return json([raw(1)], {
+        headers: { link: '<https://api.github.com/repositories/42/pulls/5/reviews?per_page=100&page=2>; rel="next"' },
+      });
+    });
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const reviews = await api.listPullRequestReviews({ id: 42, fullName: 'o/r' }, 5);
+    expect(new URL(calls[0]!.url).pathname).toBe('/repositories/42/pulls/5/reviews');
+    expect(calls.map((c) => c.method)).toEqual(['GET', 'GET']);
+    expect(reviews).toEqual([
+      {
+        id: 1,
+        user: 'allen',
+        state: 'COMMENTED',
+        body: 'review 1',
+        commitId: sha,
+        submittedAt: '2026-11-17T17:25:19Z',
+        htmlUrl: 'https://github.com/o/r/pull/5#pullrequestreview-1',
+      },
+      { id: 2, user: null, state: 'PENDING', body: '', commitId: null, submittedAt: null, htmlUrl: 'https://github.com/o/r/pull/5#pullrequestreview-2' },
+    ]);
+  });
+});
+
 describe('helpers', () => {
   it('parses Link headers', () => {
     expect(parseLinkHeader('<https://x/a?page=2>; rel="next", <https://x/a?page=9>; rel="last"')).toEqual({

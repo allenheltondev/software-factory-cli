@@ -150,6 +150,15 @@ export const configSchema = z.strictObject({
       allowedActors: z.array(z.string().min(1)).default([]),
     })
     .default({ allowedActors: [] }),
+  review: z
+    .strictObject({
+      /**
+       * GitHub logins whose PR reviews carry a trusted factory-review result (see
+       * docs/review-result.md). Compared case-insensitively. Empty trusts no review result.
+       */
+      reviewers: z.array(z.string().min(1)).default([]),
+    })
+    .default({ reviewers: [] }),
   agents: z.record(name, agentSchema),
   pools: z.record(name, poolSchema),
   actions: z.record(name, actionSchema),

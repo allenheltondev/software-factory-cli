@@ -58,6 +58,7 @@ the per-user default.
 | `factory agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
 | `factory retry JOB_ID` | Requeue a failed, interrupted or canceled job |
 | `factory publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [Publication](#publication) |
+| `factory reviews [--json] [--limit N]` | For each PR the factory published (newest first, default 20), show its head SHA and the current review result: blockers yes/no, reviewer and link, or "no review for this head" / "not reviewed". Read-only. See [Review results](#review-results) |
 | `factory clean [--dry-run]` | Remove job worktrees of succeeded or canceled runs. Keeps failed and interrupted runs' worktrees, and all branches. See [Per-job worktrees](#per-job-worktrees) |
 
 ## Configuration
@@ -103,6 +104,7 @@ repositories:
 | `maxConcurrent` | `2` | Global cap on simultaneous runs, 1-64 |
 | `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree (see [Live execution](#live-execution)); it is rejected unless every enabled agent's adapter is implemented, which in this release means `claude`, `codex` or `kiro` |
 | `dispatch.allowedActors` | `[]` | GitHub logins allowed to dispatch work by applying a trigger label. Empty means nobody |
+| `review.reviewers` | `[]` | GitHub logins whose PR reviews carry a trusted review result (case-insensitive). Empty means no review result is trusted. See [Review results](#review-results) |
 | `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
 | `agents.<name>.maxConcurrent` | `1` | Per-agent cap across all pools and repos, 1-32 |
@@ -528,6 +530,24 @@ a message to set `publish: pr`. It never falls back on its own.
 
 `factory status` shows each run's PR link or publication error, and `factory doctor` checks
 that the active account has push access to every repository with `publish` set.
+
+## Review results
+
+A reviewer (for example a ChatGPT review task posting as your account) marks its verdict with a
+hidden block at the end of a GitHub PR review:
+
+```
+<!-- factory-review v1
+head: <full 40-character SHA of the reviewed commit>
+blockers: yes | no
+-->
+```
+
+The factory trusts the block only from logins in `review.reviewers`, and only when its `head`
+matches the commit GitHub attached the review to. `factory reviews` shows, for each published
+PR, the newest trusted result for the PR's current head, or says the head has no review yet.
+Findings are not sent to agents automatically. The format, the trust rules and an instruction
+to paste into your reviewer are in [docs/review-result.md](docs/review-result.md).
 
 ## Security
 

@@ -207,6 +207,14 @@ class FakeGitHub implements GitHubApi {
   async createIssueComment(): Promise<GitHubIssueComment> {
     throw new Error('not used by the poller');
   }
+
+  async getPullRequest(): Promise<never> {
+    throw new Error('not used by the poller');
+  }
+
+  async listPullRequestReviews(): Promise<never> {
+    throw new Error('not used by the poller');
+  }
 }
 
 // ---------------------------------------------------------------------------
