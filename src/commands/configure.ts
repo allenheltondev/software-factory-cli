@@ -24,8 +24,9 @@ import {
   type RouteRule,
   type WorkflowInput,
 } from './config-edit.js';
+import type { AgentReport } from '../agents/discovery.js';
+import { agentHint } from './agents.js';
 import type { CommandContext } from './context.js';
-import { ADAPTER_COMMANDS } from './doctor.js';
 import { CliError, EXIT } from './errors.js';
 import type { Choice, Prompter } from './prompter.js';
 
@@ -74,6 +75,42 @@ interface Session {
   api: GitHubApi;
   /** Working copy; new pools/actions created during prompts are added here. */
   config: FactoryConfigInput;
+  /** Agent names that are enabled and usable on this machine (from discovery). */
+  usable: Set<string>;
+  /** Discovery hint per agent name, for pickers. */
+  agentHints: Map<string, string>;
+}
+
+/**
+ * Agent picker options from discovery. Pre-selects agents that are usable here and not explicitly
+ * disabled in the existing config; missing or signed-out agents are listed with why. Pure.
+ */
+export function buildAgentChoices(
+  agents: Record<string, { adapter?: string; enabled?: boolean }>,
+  reports: AgentReport[],
+  hasConfig: boolean,
+): { options: Choice<string>[]; initialValues: string[]; hints: Map<string, string>; usable: Set<string> } {
+  const hints = new Map<string, string>();
+  const usable = new Set<string>();
+  for (const [n, a] of Object.entries(agents)) {
+    const r = reports.find((x) => x.adapter === (a.adapter ?? n));
+    hints.set(n, r ? `${r.command} · ${agentHint(r)}` : 'unknown adapter');
+    if (r?.usable) usable.add(n);
+  }
+  const names = Object.keys(agents);
+  return {
+    options: names.map((n) => ({ value: n, label: n, hint: hints.get(n) })),
+    initialValues: names.filter((n) => usable.has(n) && (!hasConfig || agents[n]!.enabled !== false)),
+    hints,
+    usable,
+  };
+}
+
+/** Pools worth suggesting: those with at least one usable agent. Falls back to all pools if none qualify. */
+export function suggestedPools(pools: Record<string, { agents: string[] }>, usable: Set<string>): { pools: string[]; hidden: string[] } {
+  const all = Object.keys(pools);
+  const ok = all.filter((n) => pools[n]!.agents.some((a) => usable.has(a)));
+  return ok.length ? { pools: ok, hidden: all.filter((n) => !ok.includes(n)) } : { pools: all, hidden: [] };
 }
 
 async function pickLabel(
@@ -112,7 +149,8 @@ async function pickLabel(
 }
 
 async function pickPool(s: Session, message: string, initial?: string): Promise<string> {
-  const pools = Object.keys(s.config.pools);
+  const { pools, hidden } = suggestedPools(s.config.pools, s.usable);
+  if (hidden.length) s.p.info(`Not offering pool(s) with no usable agent here: ${hidden.join(', ')}`);
   const choice = await s.p.select<string>({
     message,
     options: [
@@ -131,7 +169,8 @@ async function pickPool(s: Session, message: string, initial?: string): Promise<
   ).trim();
   const agents = await s.p.multiselect<string>({
     message: `Agents in pool ${name} (round-robin)`,
-    options: Object.keys(s.config.agents).map((a) => ({ value: a, label: a })),
+    options: Object.keys(s.config.agents).map((a) => ({ value: a, label: a, hint: s.agentHints.get(a) })),
+    initialValues: Object.keys(s.config.agents).filter((a) => s.usable.has(a)),
     required: true,
   });
   s.config.pools[name] = { agents, strategy: 'round-robin' };
@@ -243,23 +282,24 @@ export async function configureCommand(ctx: CommandContext): Promise<number> {
   const viewer = await api.getViewer();
   p.info(`GitHub account: ${viewer.login}`);
   const seed = seedConfig(viewer.login);
-  const s: Session = { p, api, config: structuredClone(existing ?? seed) };
+  const s: Session = { p, api, config: structuredClone(existing ?? seed), usable: new Set(), agentHints: new Map() };
   if (!existing) {
     p.info(`No config at ${configPath}; starting from defaults (allowed dispatcher: ${viewer.login}).`);
   }
 
-  // Agents
-  const agentNames = Object.keys(s.config.agents);
+  // Agents: pre-select the ones discovery finds usable here; list the rest with why.
+  const reports = await p.spin('Looking for coding agents', () => ctx.discoverAgents());
+  const agentChoices = buildAgentChoices(s.config.agents, reports, Boolean(existing));
+  s.agentHints = agentChoices.hints;
+  if (!agentChoices.usable.size) p.warn('No usable coding agent found on this machine. Run "factory agents" for details.');
   const enabled = await p.multiselect<string>({
     message: 'Enabled agents',
-    options: agentNames.map((n) => {
-      const adapter = s.config.agents[n]!.adapter ?? n;
-      return { value: n, label: n, hint: ADAPTER_COMMANDS[adapter] ?? adapter };
-    }),
-    initialValues: agentNames.filter((n) => s.config.agents[n]!.enabled !== false),
+    options: agentChoices.options,
+    initialValues: agentChoices.initialValues,
     required: true,
   });
   s.config = setEnabledAgents(s.config, enabled);
+  s.usable = new Set(enabled.filter((n) => agentChoices.usable.has(n)));
 
   // Repositories (matched by stable ID)
   const listed = await p.spin('Loading repositories', () => api.listUserRepos());

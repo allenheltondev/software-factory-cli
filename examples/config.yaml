@@ -43,7 +43,7 @@ repositories:
       - id: implement
         trigger:
           event: issue.labeled
-          label: "factory:ready"
+          label: "ready"
         action: implement-issue
         pool:
           rules:

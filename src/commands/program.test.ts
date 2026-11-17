@@ -37,7 +37,7 @@ describe('commander wiring', () => {
     const { parse, codes } = setup({ add });
     await parse('add', 'o/r', '--route', 'art=art', '--route', 'ui=design', '--backfill-since', '2025-01-01', '--workflow-id', 'impl');
     expect(add).toHaveBeenCalledWith(expect.anything(), 'o/r', {
-      label: 'factory:ready',
+      label: 'ready',
       action: 'implement-issue',
       pool: 'general',
       route: ['art=art', 'ui=design'],
@@ -85,6 +85,15 @@ describe('commander wiring', () => {
     expect(clean.mock.calls[0]?.[1]).toEqual({ dryRun: true });
     expect(clean.mock.calls[1]?.[1]).not.toHaveProperty('dryRun', true);
     expect(codes).toEqual([0, 0]);
+  });
+
+  it('parses agents --json --deep', async () => {
+    const agents = vi.fn(async (_ctx: unknown, _o: { json?: boolean; deep?: boolean }) => 0);
+    const { parse } = setup({ agents });
+    await parse('agents');
+    await parse('agents', '--json', '--deep');
+    expect(agents.mock.calls[0]?.[1]).toEqual({});
+    expect(agents.mock.calls[1]?.[1]).toEqual({ json: true, deep: true });
   });
 
   it('rejects a missing argument and prints the version', async () => {
