@@ -59,7 +59,7 @@ describe('validateConfig', () => {
     expect(validateConfig(cfg).ok).toBe(true);
   });
 
-  it('rejects live mode while an enabled agent has no implemented adapter (only claude ships)', () => {
+  it('rejects live mode while an enabled agent has no implemented adapter (claude and kiro ship)', () => {
     const cfg = example();
     cfg.execution = { mode: 'live' };
     cfg.repositories['allenheltondev/kids-and-dragons'].checkoutPath = '../clones/kids-and-dragons';
@@ -68,13 +68,21 @@ describe('validateConfig', () => {
     if (r.ok) return;
     expect(r.errors).toEqual([
       { path: 'agents.codex', message: expect.stringMatching(/live execution is not implemented for adapter "codex" in this release/) },
-      { path: 'agents.kiro', message: expect.stringMatching(/live execution is not implemented for adapter "kiro" in this release/) },
     ]);
 
     cfg.agents.codex.enabled = false;
-    const kiroOnly = validateConfig(cfg);
-    expect(kiroOnly.ok).toBe(false);
-    if (!kiroOnly.ok) expect(kiroOnly.errors.map((e) => e.path)).toEqual(['agents.kiro']);
+    expect(validateConfig(cfg).ok).toBe(true);
+  });
+
+  it('accepts live mode with the built-in Kiro adapter, alone or alongside claude', () => {
+    const cfg = example();
+    cfg.execution = { mode: 'live' };
+    cfg.repositories['allenheltondev/kids-and-dragons'].checkoutPath = '../clones/kids-and-dragons';
+    cfg.agents.codex.enabled = false;
+    cfg.agents.kiro.args = ['--trust-tools=read_file,grep_search'];
+    expect(validateConfig(cfg).ok).toBe(true);
+    cfg.agents.claude.enabled = false;
+    expect(validateConfig(cfg).ok).toBe(true);
   });
 
   it('accepts live mode with the built-in Claude Code adapter when claude is the only enabled agent', () => {

@@ -49,6 +49,78 @@ case for the interactive logon task on Windows and for a LaunchAgent on macOS. O
 lingering enabled, the service may run without a desktop keyring; see
 [Linux](#linux-systemd---user).
 
+## Agent credentials
+
+Some agent CLIs read their credentials from the environment. Kiro's headless mode requires
+`KIRO_API_KEY` ([headless mode](https://kiro.dev/docs/cli/headless/)). The worker passes its
+own environment on to the agent, minus `GH_TOKEN` and `GITHUB_TOKEN`, so the key has to be in
+the environment the **launcher** gives the worker. Setting it in your terminal isn't enough.
+
+Don't put it in the factory config, and in particular not in `agents.kiro.env`. The config is a
+plain-text file that is easy to copy, share or commit, and `factory agents` and
+`factory doctor` look only at the worker's own environment, so they would still report Kiro as
+signed out. Kiro calls API keys "long-lived credentials"; keep them in a file or store only
+your account can read, and rotate them as your policy requires
+([authentication](https://kiro.dev/docs/getting-started/authentication/)).
+
+The examples below read the key without echoing it, so it doesn't land in your shell history.
+
+**Windows (Task Scheduler).** The task runs at your logon with your user environment, and the
+wrapper passes it on to the worker. Store the key as a user environment variable (kept in your
+registry hive, `HKCU\Environment`, readable by your account and administrators):
+
+```powershell
+$key = Read-Host -AsSecureString 'KIRO_API_KEY'
+[Environment]::SetEnvironmentVariable('KIRO_API_KEY', [Net.NetworkCredential]::new('', $key).Password, 'User')
+Remove-Variable key
+```
+
+Then sign out and back in. That restarts the logon task with the new environment; a task
+restarted any other way may still have the old one. Check from a new PowerShell window with
+`factory doctor`. Kiro supports the CLI on Windows 11 only, and `factory doctor` reports
+earlier Windows builds as unsupported.
+
+**macOS (LaunchAgent).** launchd has no environment-file option, so add the key to the
+installed plist's `EnvironmentVariables` and reload it:
+
+```sh
+plist="$HOME/Library/LaunchAgents/local.software-factory.plist"
+read -rs -p 'KIRO_API_KEY: ' key; echo
+plutil -replace EnvironmentVariables.KIRO_API_KEY -string "$key" "$plist"; unset key
+chmod 600 "$plist"
+plutil -lint "$plist"
+launchctl bootout "gui/$(id -u)/local.software-factory"
+launchctl bootstrap "gui/$(id -u)" "$plist"
+```
+
+`~/Library` is private to your account by default, and `chmod 600` keeps the plist that way.
+`plutil` gets the key as an argument for the moment it runs. Re-running
+`install-launchagent.sh` rewrites the plist without the key, so add it again afterwards. Use
+your own label in place of `local.software-factory` if you passed `--label`.
+
+**Linux (systemd --user).** The unit reads an optional environment file,
+`~/.config/software-factory/worker.env` by default (`$FACTORY_HOME/worker.env` with
+`FACTORY_HOME`, or the path given to `install-systemd-user.sh --env-file`). A missing file is
+ignored. Create it readable only by you:
+
+```sh
+envfile="${XDG_CONFIG_HOME:-$HOME/.config}/software-factory/worker.env"
+mkdir -p "$(dirname "$envfile")"
+install -m 600 /dev/null "$envfile"
+read -rs -p 'KIRO_API_KEY: ' key; echo
+printf 'KIRO_API_KEY=%s\n' "$key" > "$envfile"; unset key
+# Once, with the options you installed with, if the unit predates its EnvironmentFile line:
+bash "$(npm root -g)/software-factory-cli/examples/launchers/linux/install-systemd-user.sh"
+systemctl --user restart software-factory
+```
+
+The file uses systemd's `KEY=value` format, one variable per line
+([`EnvironmentFile=`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=)).
+The install script prints the file's path and warns if other users can read it.
+
+**Other hosts.** Give the variable to the worker through your supervisor's own secret or
+environment mechanism, not the factory config.
+
 ## Logs
 
 | Platform | Worker log | Launcher stdout/stderr |
@@ -162,8 +234,9 @@ The script fills `software-factory.service.template` (quoting paths and escaping
 installing and `--no-start` to enable without starting.
 
 The unit uses `Restart=on-failure` with `RestartSec=30`, an explicit
-`Environment="PATH=..."`, `WorkingDirectory=`, and `KillMode=mixed` so the worker receives
-SIGTERM and can stop gracefully before anything left over is killed.
+`Environment="PATH=..."`, an optional `EnvironmentFile=` for secrets such as `KIRO_API_KEY`
+(see [Agent credentials](#agent-credentials)), `WorkingDirectory=`, and `KillMode=mixed` so the
+worker receives SIGTERM and can stop gracefully before anything left over is killed.
 
 ```sh
 systemctl --user status software-factory

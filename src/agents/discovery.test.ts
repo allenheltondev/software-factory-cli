@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  AGENT_SPECS,
   checkPlatform,
   commonInstallDirs,
   discoverAgents,
@@ -386,6 +387,17 @@ describe('checkPlatform and helpers', () => {
     expect(checkPlatform(claude, p('darwin', 'arm64', '21.6.0')).supported).toBe('no');
     expect(checkPlatform(claude, p('darwin', 'arm64', '23.4.0')).supported).toBe('yes');
     expect(checkPlatform(claude, p('darwin', 'ia32', '23.4.0'))).toMatchObject({ supported: 'no', detail: expect.stringMatching(/ia32/) });
+  });
+
+  it("Kiro's documented platforms: macOS, Windows 11, Linux with glibc 2.34+ or musl; CPUs undocumented", () => {
+    const rule = AGENT_SPECS.kiro.platform;
+    expect(checkPlatform(rule, p('win32', 'x64', '10.0.19045'))).toEqual({ supported: 'no', detail: 'needs Windows 11; this is Windows build 19045' });
+    expect(checkPlatform(rule, p('win32', 'arm64', '10.0.26100'))).toMatchObject({ supported: 'unknown', detail: expect.stringMatching(/Windows 11 is supported; CPU architectures are not documented/) });
+    expect(checkPlatform(rule, p('linux', 'x64', '6.1.0', '2.31'))).toMatchObject({ supported: 'no', detail: expect.stringMatching(/needs glibc 2\.34\+; this has glibc 2\.31/) });
+    expect(checkPlatform(rule, p('linux', 'x64', '6.1.0', '2.35')).supported).toBe('unknown');
+    expect(checkPlatform(rule, p('linux', 'arm64', '6.6.0', null)).supported).toBe('unknown'); // musl
+    expect(checkPlatform(rule, p('darwin', 'arm64', '24.0.0')).supported).toBe('unknown');
+    expect(checkPlatform(rule, p('freebsd', 'x64', '14.0'))).toMatchObject({ supported: 'no', detail: expect.stringMatching(/^freebsd is not supported/) });
   });
 
   it('parses versions from common --version formats', () => {

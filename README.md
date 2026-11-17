@@ -10,10 +10,10 @@ Pilot. This release covers repository discovery, config validation, issue-event 
 durable queue and a **log-only** worker: jobs are claimed, routed to a pool and agent, and
 recorded, but no agent is started and no code is changed. The opt-in **prepare-only** mode
 also creates a branch and Git worktree per job (still without an agent). The **live** mode
-runs the routed agent in that worktree; this release ships the Claude Code adapter (see
-[Live mode with Claude Code](#live-mode-with-claude-code)), so a live config validates only
-while Claude Code is the only enabled agent. The Codex and Kiro adapters and PR creation come
-next. See [docs/design.md](docs/design.md).
+runs the routed agent in that worktree; this release ships the Claude Code and Kiro adapters
+(see [Live mode with Claude Code](#live-mode-with-claude-code) and
+[Live mode with Kiro](#live-mode-with-kiro)), so a live config validates only while Codex is
+disabled. The Codex adapter and PR creation come next. See [docs/design.md](docs/design.md).
 
 ## Install
 
@@ -96,14 +96,14 @@ repositories:
 | `version` | required | Config schema version; must be `1` |
 | `pollIntervalSeconds` | `60` | GitHub poll interval, 10-3600 |
 | `maxConcurrent` | `2` | Global cap on simultaneous runs, 1-64 |
-| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree (see [Live execution](#live-execution)); it is rejected unless every enabled agent's adapter is implemented, which in this release means `claude` only |
+| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree (see [Live execution](#live-execution)); it is rejected unless every enabled agent's adapter is implemented, which in this release means `claude` and `kiro` |
 | `dispatch.allowedActors` | `[]` | GitHub logins allowed to dispatch work by applying a trigger label. Empty means nobody |
 | `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
 | `agents.<name>.maxConcurrent` | `1` | Per-agent cap across all pools and repos, 1-32 |
 | `agents.<name>.command` | found by discovery | Live mode: the agent CLI to run. An absolute path, a path relative to the config file's directory, or a name looked up on `PATH`. Windows npm `.cmd` shims are resolved to the real executable or Node entry point |
 | `agents.<name>.args` | none | Live mode: extra arguments for the agent CLI; the adapter places them where its CLI takes options |
-| `agents.<name>.env` | none | Live mode: environment variables for the agent process, on top of the worker's |
+| `agents.<name>.env` | none | Live mode: environment variables for the agent process, on top of the worker's. Not for secrets such as `KIRO_API_KEY`; see [Agent credentials](docs/background-operation.md#agent-credentials) |
 | `pools.<name>.agents` | required | Agent names in the pool (at least one) |
 | `pools.<name>.strategy` | `round-robin` | Rotates among agents with free capacity |
 | `actions.<name>.prompt` | none | Prompt file, relative to the config file's directory |
@@ -194,7 +194,7 @@ launchers' account, not just your terminal):
   `factory agents` and `factory doctor` run the same check.
 - On Linux and macOS, a non-root user: Claude Code refuses the default full-auto profile as
   root or under `sudo`.
-- Only `claude` enabled among the agents (Codex and Kiro have no live adapter yet), a
+- Only `claude` and `kiro` enabled among the agents (Codex has no live adapter yet), a
   `checkoutPath` for the repository and a `prompt` for the action. `factory validate` checks
   all three.
 
@@ -258,6 +258,89 @@ unsandboxed ([sandboxing](https://code.claude.com/docs/en/sandboxing)). When an 
 sandboxed command execution, run the worker and Claude Code inside WSL2, where the sandbox is
 available, or inside another isolation boundary such as a VM or container.
 
+### Live mode with Kiro
+
+Prerequisites, under the account and environment the worker runs as (the background
+launchers' account, not just your terminal):
+
+- Kiro CLI 3.0.0 or later (`kiro-cli --version`) on a platform Kiro supports. Kiro lists
+  "macOS, Windows 11 (PowerShell), or Linux (glibc 2.34+ or musl variant)" for the CLI
+  ([installation](https://kiro.dev/docs/getting-started/installation/)) and doesn't document
+  which CPU architectures the CLI supports. `factory agents` shows the platform check, and in
+  live mode `factory doctor` fails on an OS outside that list, such as Windows 10 or a Linux
+  with an older glibc. Elsewhere the CPU shows as "not documented" rather than supported.
+- `KIRO_API_KEY` in the worker's environment. "Headless mode requires an API key set as the
+  `KIRO_API_KEY` environment variable" ([headless mode](https://kiro.dev/docs/cli/headless/)).
+  API keys are available on Kiro Pro, Pro+, Pro Max and Power subscriptions and are created
+  at app.kiro.dev ([authentication](https://kiro.dev/docs/getting-started/authentication/)).
+  `factory agents` and `factory doctor` check that the variable is set, but can't tell
+  whether the key works without sending a prompt (`factory agents --deep` does).
+  [Agent credentials](docs/background-operation.md#agent-credentials) shows how to give it to
+  each launcher.
+- **Don't put the key in `agents.kiro.env`** or anywhere else in the config file. The config
+  is plain text that is easy to copy, share or commit, and `factory agents` / `factory doctor`
+  check only the worker's own environment, so they would report Kiro as signed out anyway.
+- A `checkoutPath` for the repository and a `prompt` for the action, as for Claude Code.
+
+Each job runs, in its worktree, with the prompt file on stdin:
+
+```
+kiro-cli chat --no-interactive --v3 --trust-all-tools <agents.kiro.args>
+```
+
+- `chat --no-interactive` is Kiro's [headless mode](https://kiro.dev/docs/cli/headless/).
+  With no prompt argument it reads the whole instruction from stdin. Don't add a positional
+  argument in `agents.kiro.args`: Kiro would use it as the prompt and ignore stdin.
+- `--v3` pins the agent harness, as Kiro recommends for scripts, so a change in Kiro's
+  defaults doesn't change how jobs run ([agent harness](https://kiro.dev/docs/cli/agent-harness/)).
+  `--v2`, `--v3` or `--agent-engine` in `agents.kiro.args` replaces it.
+- The run's outcome is Kiro's exit code ([exit codes](https://kiro.dev/docs/reference/exit-codes/)):
+  0 is `succeeded`. Anything else fails the run, with what the code means (1 is a general
+  failure such as an authentication error or invalid arguments, 3 a required MCP server that
+  didn't start, 4 an agent named by `--agent` that isn't available) and the last line Kiro
+  printed. The summary shows Kiro's last output lines.
+- Kiro also has `--output-format stream-json` (JSON Lines on stdout), but its docs don't yet
+  describe the record format, so the adapter doesn't ask for it or read it. If you add it to
+  `agents.kiro.args`, `run.log` keeps the event stream, the exit code still decides the
+  outcome, and the summary shows the last JSON lines.
+
+**Default permission profile: full auto.** `--trust-all-tools` lets Kiro use any tool
+without asking, inside the job's worktree. As with Claude Code, that is not a sandbox: commands
+run as your user and can reach the network and files outside the worktree. To narrow it, set
+`--trust-tools` in `agents.kiro.args`. Any `--trust-tools` or `--trust-all-tools` there
+replaces the default:
+
+```yaml
+agents:
+  kiro:
+    args:
+      - --trust-tools=read_file,grep_search   # comma-separated tool ids; others are denied
+      - --model
+      - <model id>                            # see: kiro-cli chat --list-models
+```
+
+A headless run can't ask for approval, so a tool that isn't trusted is denied, sub-agents'
+tool calls included. With a narrower profile, trust every tool the action needs, including
+the one that runs `git add` and `git commit` (tool ids are in Kiro's
+[built-in tools](https://kiro.dev/docs/tools/)). `--trust-tools` can't approve hook
+confirmations; only `--trust-all-tools` does. On V3, `--sandbox` makes the run fail rather
+than run commands without Kiro's
+[local command sandbox](https://kiro.dev/docs/sandbox/).
+Other flags from the [CLI reference](https://kiro.dev/docs/reference/cli-commands/), such as
+`--model`, `--agent` and `--effort`, pass through unchanged after the adapter's own.
+
+Kiro may load project configuration checked into the repository (for example agents, hooks
+and MCP servers under `.kiro/`). Point live mode only at repositories whose
+checked-in Kiro settings you trust.
+
+**Windows:** Kiro supports the CLI on Windows 11 only. The worker starts `kiro-cli` directly,
+without PowerShell. Live runs on Windows have been tested only against a stand-in CLI, not a
+real Kiro install.
+
+**Claude Code and Kiro together:** with both in a pool, such as the default
+`general: { agents: [claude, kiro] }`, the queue hands consecutive jobs to them in turn
+(round-robin). Each still needs its own prerequisites above.
+
 ## Files and locations
 
 | | Windows | macOS | Linux |
@@ -310,8 +393,12 @@ environment before relying on it. Details, log locations and troubleshooting:
 - In live mode the agent runs as your user, in the job's worktree, with the worker's
   environment minus `GH_TOKEN`/`GITHUB_TOKEN`. That is not a sandbox: what the agent may do
   is up to the agent CLI's own permission settings. Claude Code runs in full-auto mode by
-  default (see [Live mode with Claude Code](#live-mode-with-claude-code)); the allowlist of
-  actors who can dispatch work is the guard on who can start such a run.
+  default (see [Live mode with Claude Code](#live-mode-with-claude-code)), and so does Kiro
+  (see [Live mode with Kiro](#live-mode-with-kiro)); the allowlist of actors who can dispatch
+  work is the guard on who can start such a run.
+- Agent credentials such as `KIRO_API_KEY` belong in the worker's environment, set by its
+  launcher, not in the config file
+  (see [Agent credentials](docs/background-operation.md#agent-credentials)).
 - GitHub access uses `GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`. The CLI
   does not store tokens.
 

@@ -11,6 +11,8 @@
 #   --workdir DIR        working directory (default: the config file's directory)
 #   --extra-path DIR     extra directory for the service's PATH (repeatable)
 #   --factory-home DIR   set FACTORY_HOME for the service (default: current $FACTORY_HOME)
+#   --env-file PATH      optional KEY=value file for secrets such as KIRO_API_KEY
+#                        (default: worker.env in the per-user config directory)
 #   --no-start           install and enable, but do not start now
 #   --print              print the rendered unit and exit without installing
 #   --uninstall          stop, disable and remove the unit
@@ -26,7 +28,7 @@ PACKAGE=software-factory-cli
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 
 name=software-factory
-config= node= cli= workdir= mode=install start=1
+config= node= cli= workdir= env_file= mode=install start=1
 factory_home=${FACTORY_HOME:-}
 extra_path=()
 
@@ -42,10 +44,11 @@ while [ $# -gt 0 ]; do
     --workdir) workdir=${2:?--workdir needs a value}; shift 2 ;;
     --extra-path) extra_path+=("${2:?--extra-path needs a value}"); shift 2 ;;
     --factory-home) factory_home=${2:?--factory-home needs a value}; shift 2 ;;
+    --env-file) env_file=${2:?--env-file needs a value}; shift 2 ;;
     --no-start) start=0; shift ;;
     --print) mode=print; shift ;;
     --uninstall) mode=uninstall; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -89,6 +92,8 @@ else
   default_config="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_DIR/config.yaml"
   log_hint="${XDG_STATE_HOME:-$HOME/.local/state}/$APP_DIR/logs"
 fi
+# Secrets for agent CLIs (e.g. KIRO_API_KEY) live in their own file, never in config.yaml.
+env_file=$(abspath "${env_file:-$(dirname "$default_config")/worker.env}")
 
 config=$(abspath "${config:-$default_config}")
 [ -f "$config" ] || warn "config file not found: $config (run 'factory configure' or pass --config)"
@@ -129,7 +134,7 @@ done
 for d in ${extra_path[@]+"${extra_path[@]}"}; do add_path "$(abspath "$d")"; done
 for d in /usr/local/bin /usr/bin /bin; do add_path "$d"; done
 
-for v in "$node" "$cli" "$config" "$workdir" "$path_value" "$factory_home"; do
+for v in "$node" "$cli" "$config" "$workdir" "$path_value" "$factory_home" "$env_file"; do
   case $v in *$'\n'*) die "paths must not contain newlines" ;; esac
 done
 
@@ -144,6 +149,7 @@ render() {
   SF_WORKDIR=$(q_raw "$workdir") \
   SF_PATH=$(q_env "$path_value") \
   SF_FACTORY_HOME=$(q_env "$factory_home") \
+  SF_ENV_FILE=$(q_raw "$env_file") \
   awk '
     # Literal (non-regex, no & or \ processing) replacement.
     function repl(s, pat, val,   out, i) {
@@ -162,6 +168,7 @@ render() {
       line = repl(line, "__CONFIG__", ENVIRON["SF_CONFIG"])
       line = repl(line, "__WORKDIR__", ENVIRON["SF_WORKDIR"])
       line = repl(line, "__PATH__", ENVIRON["SF_PATH"])
+      line = repl(line, "__ENV_FILE__", ENVIRON["SF_ENV_FILE"])
       print line
     }
   ' "$template"
@@ -182,6 +189,14 @@ echo "cli.js:            $cli"
 echo "Config:            $config"
 echo "Working directory: $workdir"
 echo "PATH:              $path_value"
+if [ -f "$env_file" ]; then
+  echo "Environment file:  $env_file"
+  if [ -n "$(find "$env_file" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+    warn "$env_file is readable by other users; run: chmod 600 \"$env_file\""
+  fi
+else
+  echo "Environment file:  $env_file (optional, not present; put KIRO_API_KEY=... there, chmod 600)"
+fi
 echo "Logs:              journalctl --user -u $name, plus the worker log under $log_hint"
 
 if [ "$start" = 1 ]; then

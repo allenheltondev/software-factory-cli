@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { assistantText, errorResult, init, SESSION, success } from '../../test/claude-stream.js';
 import { FAKE_AGENT, fakeAdapter } from '../../test/fake-adapter.js';
 import { claudeAdapter } from '../agents/adapters/claude.js';
+import { kiroAdapter } from '../agents/adapters/kiro.js';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { registerAdapter } from '../agents/adapters/registry.js';
@@ -15,7 +16,7 @@ import { buildStatusView, renderStatus } from '../commands/status.js';
 import { cleanVerdict } from '../commands/clean.js';
 import { agentSchema, configSchema, type FactoryConfig } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
-import { claimNextJob, getJob, getRun, getStatusSnapshot, markExecutionStarted, setRunProcess, type Claim } from '../db/queue.js';
+import { claimNextJob, finishRun, getJob, getRun, getStatusSnapshot, markExecutionStarted, setRunProcess, type Claim } from '../db/queue.js';
 import { worktreesRoot } from '../git/worktree.js';
 import { resolvePaths, type FactoryPaths } from '../paths.js';
 import type { IssueSnapshot } from '../types.js';
@@ -529,6 +530,99 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
 
     expect(result).toMatchObject({ outcome: 'succeeded' });
     expect(readFileSync(c.run.logPath!, 'utf8')).toContain('Warning: a diagnostic on stderr');
+  });
+});
+
+describe('LiveExecutor (Kiro adapter, fake kiro-cli)', { timeout: 120_000 }, () => {
+  const FAKES: Record<string, string> = {
+    kiro: fileURLToPath(new URL('../../test/fake-kiro.mjs', import.meta.url)),
+    claude: fileURLToPath(new URL('../../test/fake-claude.mjs', import.meta.url)),
+  };
+  // The real adapters, with discovery replaced: each adapter's CLI resolves to node + its fake.
+  const executor = (env?: NodeJS.ProcessEnv) =>
+    new LiveExecutor({
+      ...(env ? { env } : {}),
+      locate: (adapter) => ({ path: FAKES[adapter]!, launch: { file: process.execPath, args: [FAKES[adapter]!] } }),
+    });
+  const API_KEY = 'ksk_test_not_a_real_key';
+
+  function kiroSetup(env: Record<string, string>, args: string[] = []) {
+    restores.push(registerAdapter(kiroAdapter));
+    const s = setup();
+    const record = join(s.f.root, 'kiro record.json');
+    s.config.agents = { kiro: agentSchema.parse({ args, env: { ...s.agent('unused').env, FAKE_KIRO_RECORD: record, ...env } }) };
+    s.config.pools.general!.agents = ['kiro'];
+    return { ...s, record };
+  }
+
+  it('runs kiro-cli chat --no-interactive with the prompt on stdin and KIRO_API_KEY from the worker environment', async () => {
+    const { paths, config, db, record } = kiroSetup(
+      { FAKE_KIRO_COMMIT: '1', FAKE_KIRO_STDOUT: 'Added the roster page.\nnpm test passed.' },
+      ['--model', 'some-model'],
+    );
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await executor({ ...process.env, KIRO_API_KEY: API_KEY, GH_TOKEN: 'secret-token' }).execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({ outcome: 'succeeded', summary: { commitCount: 1, commits: [expect.stringMatching(/ Add the roster page with Kiro$/)] } });
+    const got = JSON.parse(readFileSync(record, 'utf8')) as { argv: string[]; prompt: string; hasApiKey: boolean };
+    expect(got.argv).toEqual(['chat', '--no-interactive', '--v3', '--trust-all-tools', '--model', 'some-model']);
+    expect(got.prompt).toBe(readFileSync(join(paths.runsDir, c.run.id, 'prompt.md'), 'utf8'));
+    expect(got.hasApiKey).toBe(true);
+    expect(result.summary?.lastOutput).toEqual(['Added the roster page.', 'npm test passed.']);
+
+    const log = readFileSync(c.run.logPath!, 'utf8');
+    expect(log).not.toContain(API_KEY);
+    expect(log).not.toContain('secret-token');
+    expect(log).toContain('outcome: succeeded');
+  });
+
+  it('a non-zero exit fails with its documented meaning and what Kiro printed, and keeps the worktree', async () => {
+    const { paths, config, db, record } = kiroSetup({ FAKE_KIRO_STDERR: 'error: no credentials; set KIRO_API_KEY', FAKE_KIRO_EXIT: '1' });
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 8 });
+    const c = claim(db, config, paths);
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const env = { ...process.env };
+    delete env.KIRO_API_KEY;
+    const result = await executor(env).execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      error: 'kiro-cli exited with code 1 (general failure: an auth error, invalid arguments or a failed operation): error: no credentials; set KIRO_API_KEY',
+      summary: { commitCount: 0 },
+    });
+    expect((JSON.parse(readFileSync(record, 'utf8')) as { hasApiKey: boolean }).hasApiKey).toBe(false);
+    const worktree = join(worktreesRoot(paths), '42', c.job.id);
+    expect(readFileSync(c.run.logPath!, 'utf8')).toContain(`The worktree is kept for inspection: ${worktree}`);
+  });
+
+  it('with claude and kiro in the general pool, consecutive jobs alternate and both leave a commit and a summary', async () => {
+    restores.push(registerAdapter(claudeAdapter), registerAdapter(kiroAdapter));
+    const { f, paths, config, db, agent } = setup();
+    const gitEnv = agent('unused').env;
+    const events = join(f.root, 'claude events.json');
+    writeFileSync(events, JSON.stringify([init(), assistantText('Claude did it.'), success('Claude did it.')]));
+    config.agents = {
+      claude: agentSchema.parse({ env: { ...gitEnv, FAKE_CLAUDE_EVENTS: events, FAKE_CLAUDE_COMMIT: '1' } }),
+      kiro: agentSchema.parse({ env: { ...gitEnv, FAKE_KIRO_COMMIT: '1', FAKE_KIRO_STDOUT: 'Kiro did it.' } }),
+    };
+    config.pools.general!.agents = ['claude', 'kiro'];
+
+    const runs: Array<{ agent: string; outcome: string; commits: number; last: string | undefined }> = [];
+    for (const issue of [21, 22, 23]) {
+      insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue });
+      const c = claim(db, config, paths);
+      markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+      const result = await executor({ ...process.env, KIRO_API_KEY: API_KEY }).execute(c, context(db, config, paths, c.run.id));
+      finishRun(db, c.run.id, { outcome: result.outcome, error: result.error ?? null });
+      runs.push({ agent: c.run.agent, outcome: result.outcome, commits: result.summary?.commitCount ?? 0, last: result.summary?.lastOutput[0] });
+    }
+    expect(runs).toEqual([
+      { agent: 'claude', outcome: 'succeeded', commits: 1, last: 'Claude did it.' },
+      { agent: 'kiro', outcome: 'succeeded', commits: 1, last: 'Kiro did it.' },
+      { agent: 'claude', outcome: 'succeeded', commits: 1, last: 'Claude did it.' },
+    ]);
   });
 });
 
