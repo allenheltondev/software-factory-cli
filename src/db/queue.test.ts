@@ -13,6 +13,7 @@ import {
   getJob,
   getRun,
   getStatusSnapshot,
+  markExecutionStarted,
   releaseClaim,
   retryJob,
   type Claim,
@@ -310,6 +311,28 @@ describe('cancelClaim / releaseClaim', () => {
     releaseClaim(db, c.run.id, 'GitHub unreachable', now);
     expect(getJob(db, id)?.status).toBe('queued');
     expect(claim(db, makeConfig())?.job.id).toBe(id);
+  });
+});
+
+describe('markExecutionStarted', () => {
+  it('marks an open, unstarted run only while the worker holds the lock', () => {
+    const db = openDatabase(':memory:');
+    insertJob(db);
+    const c = claim(db, makeConfig())!;
+    expect(c.run.executionStartedAt).toBeNull();
+    // wrk_test does not hold the lock (nobody does).
+    expect(markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now })).toBeNull();
+    db.prepare(
+      "INSERT INTO worker_lock (id, worker_id, pid, hostname, started_at, heartbeat_at) VALUES (1, 'wrk_test', 1, 'host-a', ?, ?)",
+    ).run(new Date(T0).toISOString(), new Date(T0).toISOString());
+    expect(markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now })).toBe(new Date(T0).toISOString());
+    expect(getRun(db, c.run.id)?.executionStartedAt).toBe(new Date(T0).toISOString());
+    expect(markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now })).toBeNull(); // only once
+
+    insertJob(db);
+    const closed = claim(db, makeConfig())!;
+    releaseClaim(db, closed.run.id, 'requeued by another worker', now);
+    expect(markExecutionStarted(db, closed.run.id, { workerId: 'wrk_test', now })).toBeNull();
   });
 });
 

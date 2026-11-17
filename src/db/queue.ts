@@ -198,6 +198,7 @@ export function claimNextJob(
         pid: null,
         lease_expires_at: new Date(nowMs + opts.leaseSeconds * 1000).toISOString(),
         started_at: at,
+        execution_started_at: null,
         ended_at: null,
         outcome: null,
         error: null,
@@ -241,6 +242,24 @@ export function setRunProcess(db: Db, runId: string, info: { pid?: number | null
   if (info.pid !== undefined) db.prepare('UPDATE runs SET pid = ? WHERE id = ?').run(info.pid, runId);
   if (info.checkoutPath !== undefined)
     db.prepare('UPDATE runs SET checkout_path = ? WHERE id = ?').run(info.checkoutPath, runId);
+}
+
+/**
+ * Mark a claimed run as executing, immediately before the worker hands it to the executor.
+ * Atomic with the lock check: succeeds only while the run is open, not yet started, and
+ * `workerId` still holds the worker lock. Returns the timestamp, or null if the worker must
+ * not start it (the lock changed hands, and the new holder may already have requeued it).
+ */
+export function markExecutionStarted(db: Db, runId: string, opts: { workerId: string; now?: () => number }): string | null {
+  const at = nowIso(opts.now ?? Date.now);
+  const res = db
+    .prepare(
+      `UPDATE runs SET execution_started_at = ?
+       WHERE id = ? AND ended_at IS NULL AND execution_started_at IS NULL
+         AND EXISTS (SELECT 1 FROM worker_lock WHERE id = 1 AND worker_id = ?)`,
+    )
+    .run(at, runId, opts.workerId);
+  return Number(res.changes) > 0 ? at : null;
 }
 
 export function getRun(db: Db, runId: string): Run | null {

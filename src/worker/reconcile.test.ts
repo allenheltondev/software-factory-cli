@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { configSchema, type FactoryConfig } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
-import { claimNextJob, getJob, getRun, setRunProcess, type Claim } from '../db/queue.js';
+import { buildStatusView, renderStatus } from '../commands/status.js';
+import { claimNextJob, getJob, getRun, getStatusSnapshot, setRunProcess, type Claim } from '../db/queue.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import type { ProcessControl } from './process.js';
@@ -45,8 +46,8 @@ function insertJob(db: Db): string {
   return id;
 }
 
-/** A run left open by an earlier worker, with an agent pid recorded. */
-function openRun(db: Db, o: { workerId: string; hostname: string; pid: number }): Claim {
+/** A run left open by an earlier worker: started with an agent pid, or claimed and never started. */
+function openRun(db: Db, o: { workerId: string; hostname: string; pid?: number }): Claim {
   insertJob(db);
   const claim = claimNextJob(db, makeConfig(), {
     workerId: o.workerId,
@@ -55,7 +56,10 @@ function openRun(db: Db, o: { workerId: string; hostname: string; pid: number })
     runsDir: 'runs',
     now,
   })!;
-  setRunProcess(db, claim.run.id, { pid: o.pid });
+  if (o.pid !== undefined) {
+    db.prepare('UPDATE runs SET execution_started_at = started_at WHERE id = ?').run(claim.run.id);
+    setRunProcess(db, claim.run.id, { pid: o.pid });
+  }
   return claim;
 }
 
@@ -101,3 +105,47 @@ describe('reconcileInterruptedRuns: which pids are signalled', () => {
     expect(getJob(db, unknown.job.id)?.status).toBe('interrupted');
   });
 });
+
+describe('reconcileInterruptedRuns: started vs never started', () => {
+  it('requeues a run that never started and interrupts one that did, and status tells them apart', async () => {
+    const db = openDatabase(':memory:');
+    const pending = openRun(db, { workerId: 'wrk_1', hostname: 'host-a' }); // was in the pre-start check
+    const started = openRun(db, { workerId: 'wrk_1', hostname: 'host-a', pid: 301 });
+    const config = makeConfig();
+
+    // Before reconcile, status shows which open run had started.
+    const before = renderStatus(statusView(getStatusSnapshot(db, config, now)));
+    expect(before).toMatch(new RegExp(`${pending.run.id} .*claimed .*, not started yet`));
+    expect(before).toMatch(new RegExp(`${started.run.id} .*running since `));
+
+    const { pc } = fakeProcesses([]);
+    const result = await reconcileInterruptedRuns(db, { hostname: 'host-a', processControl: pc, log: silentLogger, now });
+    expect(result.requeued.map((r) => r.id)).toEqual([pending.run.id]);
+    expect(result.interrupted.map((r) => r.id)).toEqual([started.run.id]);
+
+    expect(getJob(db, pending.job.id)).toMatchObject({
+      status: 'queued',
+      statusReason: 'requeued: worker wrk_1 stopped before the run started',
+    });
+    expect(getRun(db, pending.run.id)).toMatchObject({ outcome: null, executionStartedAt: null });
+    expect(getRun(db, pending.run.id)?.endedAt).not.toBeNull();
+    expect(getJob(db, started.job.id)?.status).toBe('interrupted');
+    expect(getRun(db, started.run.id)?.outcome).toBe('interrupted');
+
+    const after = renderStatus(statusView(getStatusSnapshot(db, config, now)));
+    expect(after).toMatch(new RegExp(`${pending.job.id}  queued .*requeued: worker wrk_1 stopped before the run started`));
+    expect(after).toMatch(new RegExp(`${started.job.id}  interrupted .*stopped while the run was in progress`));
+  });
+});
+
+function statusView(snapshot: ReturnType<typeof getStatusSnapshot>) {
+  return buildStatusView({
+    configPath: 'config.yaml',
+    configState: 'ok',
+    configMessage: null,
+    config: makeConfig(),
+    dbFile: 'state.db',
+    dbExists: true,
+    snapshot,
+  });
+}

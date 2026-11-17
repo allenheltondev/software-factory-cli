@@ -71,7 +71,10 @@ export interface Run {
   hostname: string | null;
   pid: number | null;
   leaseExpiresAt: string;
+  /** When the job was claimed. */
   startedAt: string;
+  /** When the worker handed the run to the executor; null while claimed but not started. */
+  executionStartedAt: string | null;
   endedAt: string | null;
   outcome: RunOutcome | null;
   error: string | null;

@@ -134,7 +134,15 @@ const MIGRATIONS: Record<number, Migration> = {
       -- Consecutive start failures since the job was enqueued or last retried by the user.
       -- Replaces the retry_floor:<jobId> rows in meta.
       ALTER TABLE jobs ADD COLUMN start_failures INTEGER NOT NULL DEFAULT 0;
+      -- When the worker handed the run to the executor (after the pre-start check). NULL
+      -- means the agent never started, so reconcile can requeue the job instead of
+      -- marking it interrupted.
+      ALTER TABLE runs ADD COLUMN execution_started_at TEXT;
     `);
+    // v3 did not record this. Closed runs with an outcome did execute. Open runs might
+    // have, so treat them as started: they stay 'interrupted' for inspection, as before.
+    // Runs closed without an outcome (canceled/released before start) stay NULL.
+    db.exec('UPDATE runs SET execution_started_at = started_at WHERE outcome IS NOT NULL OR ended_at IS NULL');
     // A run's host was only known for the current lock holder; carry that over so the
     // next worker can still reap that holder's processes. Other runs stay NULL.
     db.exec(`
@@ -287,6 +295,7 @@ export interface RunRow {
   pid: number | null;
   lease_expires_at: string;
   started_at: string;
+  execution_started_at: string | null;
   ended_at: string | null;
   outcome: RunOutcome | null;
   error: string | null;
@@ -306,6 +315,7 @@ export function rowToRun(r: RunRow): Run {
     pid: r.pid,
     leaseExpiresAt: r.lease_expires_at,
     startedAt: r.started_at,
+    executionStartedAt: r.execution_started_at,
     endedAt: r.ended_at,
     outcome: r.outcome,
     error: r.error,

@@ -82,4 +82,17 @@ describe('migration v4', () => {
       { id: 'run_job_c_2', hostname: 'host-a' },
     ]);
   });
+
+  it('treats runs with an outcome or still open as started, and runs closed without one as never started', () => {
+    const db = v3Database();
+    migrate(db);
+    const started = db.prepare('SELECT id, execution_started_at FROM runs ORDER BY id').all() as {
+      id: string;
+      execution_started_at: string | null;
+    }[];
+    const never = started.filter((r) => r.execution_started_at === null).map((r) => r.id);
+    // The released claim never started; the open run might have, so reconcile keeps it 'interrupted'.
+    expect(never).toEqual(['run_job_a_2']);
+    expect(started.find((r) => r.id === 'run_job_c_2')?.execution_started_at).toBe(at);
+  });
 });
