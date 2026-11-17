@@ -4,7 +4,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fileURLToPath } from 'node:url';
+import { assistantText, errorResult, init, SESSION, success } from '../../test/claude-stream.js';
 import { FAKE_AGENT, fakeAdapter } from '../../test/fake-adapter.js';
+import { claudeAdapter } from '../agents/adapters/claude.js';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { registerAdapter } from '../agents/adapters/registry.js';
@@ -404,6 +407,76 @@ describe('LiveExecutor (fake adapter)', { timeout: 120_000 }, () => {
     const log = readFileSync(c.run.logPath!, 'utf8');
     expect(log).toContain(`agent cli: ${join(prefix, 'fake-agent.cmd')}`);
     expect(log).toContain(JSON.stringify(join(prefix, 'node_modules', 'fake', 'fake-agent.mjs')));
+  });
+});
+
+describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_000 }, () => {
+  const FAKE_CLAUDE = fileURLToPath(new URL('../../test/fake-claude.mjs', import.meta.url));
+  // The real adapter, with discovery replaced: "claude" resolves to node + the fake CLI, as an
+  // npm shim does on Windows.
+  const executor = () => new LiveExecutor({ locate: () => ({ path: FAKE_CLAUDE, launch: { file: process.execPath, args: [FAKE_CLAUDE] } }) });
+
+  function claudeSetup(events: Array<Record<string, unknown>>, env: Record<string, string>) {
+    restores.push(registerAdapter(claudeAdapter));
+    const s = setup();
+    const eventsFile = join(s.f.root, 'claude events.json');
+    writeFileSync(eventsFile, JSON.stringify(events));
+    const record = join(s.f.root, 'claude record.json');
+    const gitEnv = s.agent('unused').env;
+    s.config.agents.claude = agentSchema.parse({
+      args: ['--max-turns', '30'],
+      env: { ...gitEnv, FAKE_CLAUDE_EVENTS: eventsFile, FAKE_CLAUDE_RECORD: record, ...env },
+    });
+    return { ...s, record };
+  }
+
+  it('runs claude -p with the prompt on stdin; the final message lands in the run summary', async () => {
+    const final = '## Summary\n- Added the roster page.\n- `npm test` passed.';
+    const { paths, config, db, record } = claudeSetup([init(), assistantText(final), success(final)], { FAKE_CLAUDE_COMMIT: '1' });
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await executor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({ outcome: 'succeeded', summary: { commitCount: 1, commits: [expect.stringMatching(/ Add the roster page \(#7\)$/)] } });
+    const got = JSON.parse(readFileSync(record, 'utf8')) as { argv: string[]; prompt: string };
+    expect(got.argv).toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions', '--max-turns', '30']);
+    expect(got.prompt).toBe(readFileSync(join(paths.runsDir, c.run.id, 'prompt.md'), 'utf8'));
+    expect(result.summary?.lastOutput).toEqual([
+      '## Summary',
+      '- Added the roster page.',
+      '- `npm test` passed.',
+      `claude: success after 14 turns, $0.42 estimated, session ${SESSION}`,
+    ]);
+
+    const log = readFileSync(c.run.logPath!, 'utf8');
+    expect(log).toContain('"type":"result"'); // the raw stream stays in run.log
+    expect(log).toContain('  | - Added the roster page.\n');
+    expect(log).toContain('outcome: succeeded');
+  });
+
+  it('a run that hits --max-turns fails with that reason and keeps its worktree', async () => {
+    const { paths, config, db } = claudeSetup(
+      [init(), assistantText('Half the roster is done; tests still failing.'), errorResult('error_max_turns', { terminal_reason: 'max_turns' })],
+      { FAKE_CLAUDE_EDIT: '1', FAKE_CLAUDE_EXIT: '1' },
+    );
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 8 });
+    const c = claim(db, config, paths);
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await executor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      error: 'claude stopped at its turn limit (--max-turns) after 30 turns',
+      summary: { commitCount: 0, untracked: 1 },
+    });
+    expect(result.summary?.lastOutput).toEqual([
+      'Half the roster is done; tests still failing.',
+      `claude: error_max_turns after 30 turns, $1.25 estimated, session ${SESSION}`,
+    ]);
+    const worktree = join(worktreesRoot(paths), '42', c.job.id);
+    expect(readFileSync(join(worktree, 'half-done.txt'), 'utf8')).toBe('partial\n');
+    expect(readFileSync(c.run.logPath!, 'utf8')).toContain(`The worktree is kept for inspection: ${worktree}`);
   });
 });
 
