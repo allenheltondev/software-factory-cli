@@ -1,6 +1,7 @@
 import { Command, Option } from 'commander';
 import { addCommand, type AddOptions } from './add.js';
 import { configureCommand } from './configure.js';
+import { DEFAULT_LABEL } from './config-edit.js';
 import { createDefaultContext, println, type CommandContext, type GlobalOptions } from './context.js';
 import { doctorCommand } from './doctor.js';
 import { describeError } from './errors.js';
@@ -73,7 +74,7 @@ export function buildProgram(opts: ProgramOptions): Command {
     .command('add')
     .description('Add or update a repo workflow non-interactively')
     .argument('<repo>', 'OWNER/REPO')
-    .option('--label <label>', 'trigger label', 'factory:ready')
+    .option('--label <label>', 'trigger label', DEFAULT_LABEL)
     .option('--action <action>', 'action to run', 'implement-issue')
     .option('--pool <pool>', 'default pool', 'general')
     .option('--route <label=pool>', 'route issues with LABEL to POOL (repeatable)', collect, [])
