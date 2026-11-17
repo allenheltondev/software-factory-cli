@@ -1,38 +1,51 @@
 // OWNER: queue/worker workstream. Startup reconciliation of runs left open by a previous worker.
 import { recordError, type Db } from '../db/database.js';
-import { finishRun, listOpenRuns } from '../db/queue.js';
+import { finishRun, listOpenRuns, releaseClaim } from '../db/queue.js';
 import type { Run } from '../types.js';
 import { nowIso } from '../util/ids.js';
 import type { Logger } from '../util/log.js';
-import type { LockHolder } from './lock.js';
 import type { ProcessControl } from './process.js';
 
 export interface ReconcileOptions {
-  /** Holder whose lock this worker took over (from acquireWorkerLock), if any. */
-  previousHolder: LockHolder | null;
+  /** This worker's host. Only pids recorded by runs claimed on this host are signalled. */
   hostname: string;
   processControl: ProcessControl;
   log: Logger;
   now?: () => number;
 }
 
+export interface ReconcileResult {
+  /** Runs whose execution had started; they and their jobs are now 'interrupted'. */
+  interrupted: Run[];
+  /** Runs that were claimed but never started; closed without an outcome, jobs requeued. */
+  requeued: Run[];
+}
+
 /**
- * Close every run a previous worker left open: if its recorded agent pid is alive on
- * this host, terminate it (best effort), then mark the run and its job 'interrupted'.
- * The run's checkout and log are kept. Jobs are NOT requeued; the user decides with
- * `factory retry`. Returns the runs that were interrupted.
+ * Close every run a previous worker left open.
  *
- * A pid is only signalled when the run belongs to the previous lock holder and that
- * holder was on this host, so a pid recorded on another machine (or reused) is never killed.
+ * - Never started (no execution_started_at and no recorded pid; e.g. the worker was still
+ *   in the pre-start check, or died between claim and launch): close the run without an
+ *   outcome and put the job back to 'queued'. No agent touched anything, so no human is needed.
+ * - Started: if its recorded agent pid is alive on this host, terminate it (best effort),
+ *   then mark the run and its job 'interrupted'. The run's checkout and log are kept. The
+ *   job is NOT requeued; the user decides with `factory retry`.
+ *
+ * A pid is only signalled when the run was claimed on this host (runs.hostname), whichever
+ * earlier worker claimed it, so a pid recorded on another machine is never killed. Runs
+ * with no recorded host are never signalled.
  */
-export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): Promise<Run[]> {
+export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): Promise<ReconcileResult> {
   const now = opts.now ?? Date.now;
-  const open = listOpenRuns(db);
-  for (const run of open) {
-    const sameHost =
-      opts.previousHolder !== null &&
-      opts.previousHolder.workerId === run.workerId &&
-      opts.previousHolder.hostname === opts.hostname;
+  const result: ReconcileResult = { interrupted: [], requeued: [] };
+  for (const run of listOpenRuns(db)) {
+    if (run.executionStartedAt === null && run.pid === null) {
+      releaseClaim(db, run.id, `requeued: worker ${run.workerId} stopped before the run started`, now);
+      opts.log.info('requeued run that never started', { runId: run.id, jobId: run.jobId, agent: run.agent });
+      result.requeued.push(run);
+      continue;
+    }
+    const sameHost = run.hostname !== null && run.hostname === opts.hostname;
     let note = '';
     if (run.pid !== null) {
       if (sameHost && opts.processControl.isAlive(run.pid)) {
@@ -44,7 +57,7 @@ export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): 
           note = `; could not terminate agent process ${run.pid}: ${(err as Error).message}`;
         }
       } else if (!sameHost) {
-        note = `; agent pid ${run.pid} was not signalled (recorded by another worker/host)`;
+        note = `; agent pid ${run.pid} was not signalled (recorded on ${run.hostname ? `host ${run.hostname}` : 'an unknown host'})`;
       }
     }
     finishRun(db, run.id, {
@@ -53,6 +66,7 @@ export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): 
       now,
     });
     opts.log.warn('marked run interrupted', { runId: run.id, jobId: run.jobId, agent: run.agent });
+    result.interrupted.push(run);
   }
 
   // Defensive: a job left 'running' with no open run would block its issue forever.
@@ -72,5 +86,5 @@ export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): 
     );
     recordError(db, { scope: 'worker', jobId: j.id, repoFullName: j.repo_full_name, message: reason, at });
   }
-  return open;
+  return result;
 }

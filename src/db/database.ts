@@ -24,9 +24,12 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
-const MIGRATIONS: Record<number, string> = {
+/** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
+type Migration = string | ((db: Db) => void);
+
+const MIGRATIONS: Record<number, Migration> = {
   1: `
     CREATE TABLE meta (
       key   TEXT PRIMARY KEY,
@@ -123,9 +126,59 @@ const MIGRATIONS: Record<number, string> = {
     -- stream). Only then does a page-1 304 prove nothing in the overlap changed.
     ALTER TABLE repo_checkpoints ADD COLUMN page1_covers_overlap INTEGER;
   `,
+  4: (db) => {
+    db.exec(`
+      -- Host the claiming worker ran on. Reconcile only signals a recorded pid when this
+      -- equals its own host. NULL (unknown) is never signalled.
+      ALTER TABLE runs ADD COLUMN hostname TEXT;
+      -- Consecutive start failures since the job was enqueued or last retried by the user.
+      -- Replaces the retry_floor:<jobId> rows in meta.
+      ALTER TABLE jobs ADD COLUMN start_failures INTEGER NOT NULL DEFAULT 0;
+      -- When the worker handed the run to the executor (after the pre-start check). NULL
+      -- means the agent never started, so reconcile can requeue the job instead of
+      -- marking it interrupted.
+      ALTER TABLE runs ADD COLUMN execution_started_at TEXT;
+    `);
+    // v3 did not record this. Closed runs with an outcome did execute. Open runs might
+    // have, so treat them as started: they stay 'interrupted' for inspection, as before.
+    // Runs closed without an outcome (canceled/released before start) stay NULL.
+    db.exec('UPDATE runs SET execution_started_at = started_at WHERE outcome IS NOT NULL OR ended_at IS NULL');
+    // A run's host was only known for the current lock holder; carry that over so the
+    // next worker can still reap that holder's processes. Other runs stay NULL.
+    db.exec(`
+      UPDATE runs SET hostname = (SELECT l.hostname FROM worker_lock l WHERE l.worker_id = runs.worker_id)
+      WHERE hostname IS NULL
+    `);
+    backfillStartFailures(db);
+    db.exec("DELETE FROM meta WHERE substr(key, 1, 12) = 'retry_floor:'");
+  },
 };
 
-export function openDatabase(file: string): Db {
+/**
+ * v4: derive jobs.start_failures from run history the way v3 computed the streak:
+ * walk the job's runs after its retry floor, newest first, counting start_failed runs,
+ * skipping runs closed without an outcome, and stopping at any other run.
+ */
+function backfillStartFailures(db: Db): void {
+  const jobs = db.prepare("SELECT DISTINCT job_id FROM runs WHERE outcome = 'start_failed'").all() as { job_id: string }[];
+  const floorOf = db.prepare('SELECT value FROM meta WHERE key = ?');
+  const runsOf = db.prepare('SELECT outcome, ended_at FROM runs WHERE job_id = ? AND attempt > ? ORDER BY attempt DESC');
+  const set = db.prepare('UPDATE jobs SET start_failures = ? WHERE id = ?');
+  for (const { job_id } of jobs) {
+    const floorRow = floorOf.get(`retry_floor:${job_id}`) as { value: string } | undefined;
+    const floor = floorRow ? Number(floorRow.value) || 0 : 0;
+    let count = 0;
+    for (const r of runsOf.all(job_id, floor) as { outcome: RunOutcome | null; ended_at: string | null }[]) {
+      if (r.outcome === 'start_failed') count++;
+      else if (r.outcome === null && r.ended_at !== null) continue;
+      else break;
+    }
+    if (count > 0) set.run(count, job_id);
+  }
+}
+
+/** `migrateTo` stops at an older schema version; only migration tests should pass it. */
+export function openDatabase(file: string, opts: { migrateTo?: number } = {}): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
   const { DatabaseSync } = loadSqlite();
   const db = new DatabaseSync(file);
@@ -133,20 +186,22 @@ export function openDatabase(file: string): Db {
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA synchronous = NORMAL;');
-  migrate(db);
+  migrate(db, opts.migrateTo);
   return db;
 }
 
-function migrate(db: Db): void {
+/** Apply pending migrations up to `target` (default: the current schema). Exported for migration tests. */
+export function migrate(db: Db, target = SCHEMA_VERSION): void {
   const current = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
   if (current > SCHEMA_VERSION) {
     throw new Error(`state database schema v${current} is newer than this CLI supports (v${SCHEMA_VERSION})`);
   }
-  for (let v = current + 1; v <= SCHEMA_VERSION; v++) {
-    const sql = MIGRATIONS[v];
-    if (!sql) throw new Error(`missing migration ${v}`);
+  for (let v = current + 1; v <= target; v++) {
+    const step = MIGRATIONS[v];
+    if (!step) throw new Error(`missing migration ${v}`);
     transaction(db, () => {
-      db.exec(sql);
+      if (typeof step === 'string') db.exec(step);
+      else step(db);
       db.exec(`PRAGMA user_version = ${v}`);
     });
   }
@@ -202,6 +257,7 @@ export interface JobRow {
   status: JobStatus;
   status_reason: string | null;
   attempts: number;
+  start_failures: number;
   created_at: string;
   updated_at: string;
 }
@@ -220,6 +276,7 @@ export function rowToJob(r: JobRow): Job {
     status: r.status,
     statusReason: r.status_reason,
     attempts: r.attempts,
+    startFailures: r.start_failures,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -234,9 +291,11 @@ export interface RunRow {
   checkout_path: string | null;
   log_path: string | null;
   worker_id: string;
+  hostname: string | null;
   pid: number | null;
   lease_expires_at: string;
   started_at: string;
+  execution_started_at: string | null;
   ended_at: string | null;
   outcome: RunOutcome | null;
   error: string | null;
@@ -252,9 +311,11 @@ export function rowToRun(r: RunRow): Run {
     checkoutPath: r.checkout_path,
     logPath: r.log_path,
     workerId: r.worker_id,
+    hostname: r.hostname,
     pid: r.pid,
     leaseExpiresAt: r.lease_expires_at,
     startedAt: r.started_at,
+    executionStartedAt: r.execution_started_at,
     endedAt: r.ended_at,
     outcome: r.outcome,
     error: r.error,

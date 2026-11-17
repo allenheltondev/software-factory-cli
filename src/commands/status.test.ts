@@ -56,8 +56,12 @@ describe('renderStatus', () => {
       ],
       activeRuns: [
         {
-          run: { id: 'run_1', agent: 'claude', pool: 'general', startedAt: 't2' } as never,
+          run: { id: 'run_1', agent: 'claude', pool: 'general', startedAt: 't2', executionStartedAt: 't2b' } as never,
           job: job({ id: 'job_2', status: 'running', issueNumber: 7 }),
+        },
+        {
+          run: { id: 'run_2', agent: 'kiro', pool: 'general', startedAt: 't6', executionStartedAt: null } as never,
+          job: job({ id: 'job_3', status: 'running', issueNumber: 8 }),
         },
       ],
       recentJobs: [job()],
@@ -86,6 +90,8 @@ describe('renderStatus', () => {
     expect(text).toMatch(/codex\s+disabled\s+0\/1 running/);
     expect(text).toContain('Queue: queued 2, running 1, succeeded 3, failed 1, interrupted 0, canceled 0');
     expect(text).toContain('run_1  o/a#7');
+    expect(text).toMatch(/run_1 .*agent claude \(pool general\)  running since t2b/);
+    expect(text).toMatch(/run_2 .*agent kiro \(pool general\)  claimed t6, not started yet/);
     expect(text).toContain('job_1  failed       o/a#12');
     expect(text).toContain('— agent exited 1');
     expect(text).toContain('t3  [poll] o/b: GitHub 502 bad gateway');

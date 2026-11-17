@@ -4,7 +4,15 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
-import { claimNextJob, getJob, getRun, retryJob, setRunProcess, WorkerLockLostError } from '../db/queue.js';
+import {
+  claimNextJob,
+  getJob,
+  getRun,
+  markExecutionStarted,
+  retryJob,
+  setRunProcess,
+  WorkerLockLostError,
+} from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job } from '../types.js';
 import { silentLogger } from '../util/log.js';
@@ -270,7 +278,8 @@ describe('runDaemon', () => {
     // A previous worker on this host crashed mid-run.
     acquireWorkerLock(db, { workerId: 'wrk_old', pid: 4000, hostname: 'host-a' }, { now: () => Date.now(), isPidAlive: () => true });
     const id = insertJob(db);
-    const claim = claimNextJob(db, config, { workerId: 'wrk_old', leaseSeconds: 60, runsDir: join('x', 'runs') })!;
+    const claim = claimNextJob(db, config, { workerId: 'wrk_old', hostname: 'host-a', leaseSeconds: 60, runsDir: join('x', 'runs') })!;
+    expect(markExecutionStarted(db, claim.run.id, { workerId: 'wrk_old' })).not.toBeNull();
     setRunProcess(db, claim.run.id, { pid: 4242, checkoutPath: join('x', 'work trees', id) });
 
     const terminated: number[] = [];
@@ -301,7 +310,8 @@ describe('runDaemon', () => {
     const config = makeConfig();
     acquireWorkerLock(db, { workerId: 'wrk_old', pid: 4000, hostname: 'host-b' }, { now: () => T0, isPidAlive: () => true });
     const id = insertJob(db);
-    const claim = claimNextJob(db, config, { workerId: 'wrk_old', leaseSeconds: 60, runsDir: 'runs' })!;
+    const claim = claimNextJob(db, config, { workerId: 'wrk_old', hostname: 'host-b', leaseSeconds: 60, runsDir: 'runs' })!;
+    markExecutionStarted(db, claim.run.id, { workerId: 'wrk_old' });
     setRunProcess(db, claim.run.id, { pid: 4242 });
     const terminate = vi.fn(async () => {});
     const deps = baseDeps(db, { config, processControl: { isAlive: () => true, terminate } });
@@ -309,6 +319,7 @@ describe('runDaemon', () => {
     await runDaemon(deps); // lock is stale relative to real time, so it is taken over
     expect(terminate).not.toHaveBeenCalled();
     expect(getJob(db, id)?.status).toBe('interrupted');
+    expect(getRun(db, claim.run.id)?.error).toMatch(/pid 4242 was not signalled \(recorded on host host-b\)/);
   });
 });
 
@@ -352,11 +363,99 @@ describe('runDaemon: lock ownership', () => {
     expect(errors.map((e) => e.message).join('\n')).toMatch(/lost the worker lock/);
   });
 
+  it('a worker that takes over during the pre-start check requeues the claimed job (and runs it)', async () => {
+    const db = openDatabase(':memory:');
+    const checking = deferred<void>();
+    const github = deferred<{ ok: true }>();
+    const oldExecute = vi.fn(async (): Promise<ExecutionResult> => ({ outcome: 'succeeded' }));
+    const a = baseDeps(db, {
+      workerId: 'wrk_a',
+      pid: 5000,
+      executor: { name: 'old', execute: oldExecute },
+      checkDispatchable: async () => {
+        checking.resolve();
+        return github.promise; // worker A hangs on GitHub, then its process dies
+      },
+    });
+    const id = insertJob(db);
+    const doneA = runDaemon(a);
+    await checking.promise;
+    const claimed = db.prepare('SELECT id FROM runs WHERE job_id = ?').get(id) as { id: string };
+    expect(getRun(db, claimed.id)?.executionStartedAt).toBeNull();
+
+    // Worker B on the same host sees A's pid is dead, takes over and reconciles.
+    const newExecute = vi.fn(async (): Promise<ExecutionResult> => ({ outcome: 'succeeded' }));
+    const b = baseDeps(db, {
+      workerId: 'wrk_b',
+      pid: 6000,
+      executor: { name: 'new', execute: newExecute },
+      processControl: { isAlive: (p) => p !== 5000, terminate: async () => {} },
+    });
+    const doneB = runDaemon(b);
+    await vi.waitFor(() => expect(getJob(db, id)?.status).toBe('succeeded'));
+    b.controller.abort();
+    await doneB;
+
+    // A's check finally returns; it notices it lost the lock and never executes.
+    github.resolve({ ok: true });
+    await doneA;
+    expect(oldExecute).not.toHaveBeenCalled();
+    expect(newExecute).toHaveBeenCalledTimes(1);
+    const runs = db.prepare('SELECT worker_id, outcome, error FROM runs WHERE job_id = ? ORDER BY attempt').all(id) as {
+      worker_id: string;
+      outcome: string | null;
+      error: string | null;
+    }[];
+    expect(runs).toHaveLength(2);
+    expect(runs[0]).toMatchObject({ worker_id: 'wrk_a', outcome: null });
+    expect(runs[0]?.error).toMatch(/released before start: requeued: worker wrk_a stopped before the run started/);
+    expect(runs[1]).toMatchObject({ worker_id: 'wrk_b', outcome: 'succeeded' });
+  });
+
+  it('a worker that takes over mid-run marks the started run interrupted', async () => {
+    const db = openDatabase(':memory:');
+    const executing = deferred<void>();
+    const agent = deferred<ExecutionResult>();
+    const a = baseDeps(db, {
+      workerId: 'wrk_a',
+      pid: 5000,
+      executor: {
+        name: 'slow',
+        execute: async () => {
+          executing.resolve();
+          return agent.promise;
+        },
+      },
+    });
+    const id = insertJob(db);
+    const doneA = runDaemon(a);
+    await executing.promise;
+    const run = db.prepare('SELECT id FROM runs WHERE job_id = ?').get(id) as { id: string };
+    expect(getRun(db, run.id)?.executionStartedAt).not.toBeNull();
+
+    const b = baseDeps(db, {
+      workerId: 'wrk_b',
+      pid: 6000,
+      processControl: { isAlive: (p) => p !== 5000, terminate: async () => {} },
+    });
+    b.controller.abort(); // take over and reconcile only
+    await runDaemon(b);
+    expect(getJob(db, id)?.status).toBe('interrupted');
+    expect(getRun(db, run.id)).toMatchObject({ outcome: 'interrupted' });
+    expect(getRun(db, run.id)?.error).toMatch(/worker wrk_a stopped while the run was in progress/);
+
+    // A's late result does not overwrite the reconciled state; A then stops on its lost lock.
+    agent.resolve({ outcome: 'succeeded' });
+    await doneA;
+    expect(getJob(db, id)?.status).toBe('interrupted');
+    expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 1 });
+  });
+
   it('claimNextJob refuses to claim for a worker that does not hold the lock', () => {
     const db = openDatabase(':memory:');
     acquireWorkerLock(db, { workerId: 'wrk_new', pid: 2, hostname: 'host-a' }, { isPidAlive: () => true });
     insertJob(db);
-    const opts = { workerId: 'wrk_old', leaseSeconds: 90, runsDir: makePaths().runsDir, lockWorkerId: 'wrk_old' };
+    const opts = { workerId: 'wrk_old', hostname: 'host-a', leaseSeconds: 90, runsDir: makePaths().runsDir, lockWorkerId: 'wrk_old' };
     expect(() => claimNextJob(db, makeConfig(), opts)).toThrow(WorkerLockLostError);
     expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 0 });
     expect(claimNextJob(db, makeConfig(), { ...opts, workerId: 'wrk_new', lockWorkerId: 'wrk_new' })).not.toBeNull();

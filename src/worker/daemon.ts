@@ -9,6 +9,7 @@ import {
   getRun,
   heartbeatRun,
   holdsWorkerLock,
+  markExecutionStarted,
   releaseClaim,
   setRunProcess,
   WorkerLockLostError,
@@ -212,6 +213,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       try {
         claim = claimNextJob(db, config, {
           workerId,
+          hostname,
           leaseSeconds,
           runsDir: paths.runsDir,
           now,
@@ -253,7 +255,18 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         log.info('job canceled before start', { jobId: job.id, reason: check.reason });
         continue;
       }
-      launch(claim);
+      // Recorded just before execute, atomically with the lock check: from here on a worker
+      // that takes over treats the run as started (interrupted), not as safe to requeue.
+      const executionStartedAt = markExecutionStarted(db, run.id, { workerId, now });
+      if (!executionStartedAt) {
+        // The lock changed hands after the check above; the new holder may already have
+        // requeued this run, in which case releaseClaim is a no-op.
+        if (!holdsWorkerLock(db, workerId)) markLockLost();
+        releaseClaim(db, run.id, lockLost ? 'worker lost its lock' : 'run was closed before it started', now);
+        if (lockLost) return;
+        continue;
+      }
+      launch({ job, run: { ...run, executionStartedAt } });
     }
   };
 
@@ -303,7 +316,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
 
   const heartbeatTimer = setInterval(heartbeat, heartbeatMs);
   try {
-    await reconcileInterruptedRuns(db, { previousHolder: previous, hostname, processControl, log, now });
+    await reconcileInterruptedRuns(db, { hostname, processControl, log, now });
 
     let nextPollAt = now();
     while (!signal.aborted && !lockLost) {

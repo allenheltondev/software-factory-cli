@@ -13,6 +13,7 @@ import {
   getJob,
   getRun,
   getStatusSnapshot,
+  markExecutionStarted,
   releaseClaim,
   retryJob,
   type Claim,
@@ -64,7 +65,7 @@ function insertJob(
 }
 
 const claim = (db: Db, config: FactoryConfig): Claim | null =>
-  claimNextJob(db, config, { workerId: 'wrk_test', leaseSeconds: 60, runsDir: RUNS_DIR, now });
+  claimNextJob(db, config, { workerId: 'wrk_test', hostname: 'host-a', leaseSeconds: 60, runsDir: RUNS_DIR, now });
 
 describe('claimNextJob', () => {
   const tmpDirs: string[] = [];
@@ -253,8 +254,10 @@ describe('finishRun', () => {
 
     const c1 = claim(db, config)!;
     expect(c1.run.agent).toBe('claude');
+    expect(c1.run.hostname).toBe('host-a');
+    expect(getRun(db, c1.run.id)?.hostname).toBe('host-a');
     finishRun(db, c1.run.id, { outcome: 'start_failed', error: 'claude not found', now });
-    expect(getJob(db, id)).toMatchObject({ status: 'queued', attempts: 1 });
+    expect(getJob(db, id)).toMatchObject({ status: 'queued', attempts: 1, startFailures: 1 });
     expect(getJob(db, id)?.statusReason).toMatch(/claude could not start/);
 
     // Even with the cursor pointing back at claude, the agent that just failed is avoided.
@@ -263,19 +266,28 @@ describe('finishRun', () => {
     expect(c2.run.agent).toBe('kiro');
     expect(c2.run.attempt).toBe(2);
     finishRun(db, c2.run.id, { outcome: 'start_failed', error: 'KIRO_API_KEY missing', now });
-    expect(getJob(db, id)?.status).toBe('queued');
+    expect(getJob(db, id)).toMatchObject({ status: 'queued', startFailures: 2 });
+
+    // A claim released before start (no outcome) neither counts nor breaks the streak.
+    const released = claim(db, config)!;
+    releaseClaim(db, released.run.id, 'GitHub unreachable', now);
+    expect(getJob(db, id)?.startFailures).toBe(2);
 
     const c3 = claim(db, config)!;
     finishRun(db, c3.run.id, { outcome: 'start_failed', error: 'still broken', now });
     expect(MAX_START_FAILURES).toBe(3);
-    expect(getJob(db, id)?.status).toBe('failed');
+    expect(getJob(db, id)).toMatchObject({ status: 'failed', startFailures: 3 });
     expect(getJob(db, id)?.statusReason).toMatch(/no agent could start after 3 attempts/);
 
-    // A deliberate retry resets the start-failure streak.
-    retryJob(db, id, now);
+    // A deliberate retry resets the start-failure count, and nothing is kept in meta.
+    expect(retryJob(db, id, now).startFailures).toBe(0);
+    expect(db.prepare('SELECT count(*) AS n FROM meta').get()).toEqual({ n: 0 });
     const c4 = claim(db, config)!;
     finishRun(db, c4.run.id, { outcome: 'start_failed', error: 'once more', now });
-    expect(getJob(db, id)?.status).toBe('queued');
+    expect(getJob(db, id)).toMatchObject({ status: 'queued', startFailures: 1 });
+    // After a retry, earlier start failures no longer steer agent choice: only c4's agent is avoided.
+    db.prepare("UPDATE pool_cursors SET next_index = 0 WHERE pool = 'general'").run();
+    expect(claim(db, config)?.run.agent).toBe(c4.run.agent === 'claude' ? 'kiro' : 'claude');
   });
 });
 
@@ -299,6 +311,28 @@ describe('cancelClaim / releaseClaim', () => {
     releaseClaim(db, c.run.id, 'GitHub unreachable', now);
     expect(getJob(db, id)?.status).toBe('queued');
     expect(claim(db, makeConfig())?.job.id).toBe(id);
+  });
+});
+
+describe('markExecutionStarted', () => {
+  it('marks an open, unstarted run only while the worker holds the lock', () => {
+    const db = openDatabase(':memory:');
+    insertJob(db);
+    const c = claim(db, makeConfig())!;
+    expect(c.run.executionStartedAt).toBeNull();
+    // wrk_test does not hold the lock (nobody does).
+    expect(markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now })).toBeNull();
+    db.prepare(
+      "INSERT INTO worker_lock (id, worker_id, pid, hostname, started_at, heartbeat_at) VALUES (1, 'wrk_test', 1, 'host-a', ?, ?)",
+    ).run(new Date(T0).toISOString(), new Date(T0).toISOString());
+    expect(markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now })).toBe(new Date(T0).toISOString());
+    expect(getRun(db, c.run.id)?.executionStartedAt).toBe(new Date(T0).toISOString());
+    expect(markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now })).toBeNull(); // only once
+
+    insertJob(db);
+    const closed = claim(db, makeConfig())!;
+    releaseClaim(db, closed.run.id, 'requeued by another worker', now);
+    expect(markExecutionStarted(db, closed.run.id, { workerId: 'wrk_test', now })).toBeNull();
   });
 });
 

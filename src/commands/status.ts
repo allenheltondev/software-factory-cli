@@ -115,8 +115,12 @@ export function renderStatus(v: StatusView): string {
   lines.push('', `Active runs (${s.activeRuns.length}):`);
   if (!s.activeRuns.length) lines.push('  (none)');
   for (const { run, job } of s.activeRuns) {
+    // A claimed run that has not started yet is requeued if its worker stops; a started one is interrupted.
+    const phase = run.executionStartedAt
+      ? `running since ${run.executionStartedAt}`
+      : `claimed ${run.startedAt}, not started yet`;
     lines.push(
-      `  ${run.id}  ${job.repoFullName}#${job.issueNumber}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  since ${run.startedAt}`,
+      `  ${run.id}  ${job.repoFullName}#${job.issueNumber}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}`,
     );
   }
 

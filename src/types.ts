@@ -50,6 +50,8 @@ export interface Job {
   status: JobStatus;
   statusReason: string | null;
   attempts: number;
+  /** Consecutive start failures since enqueue or the user's last retry (capped by MAX_START_FAILURES). */
+  startFailures: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -65,9 +67,14 @@ export interface Run {
   checkoutPath: string | null;
   logPath: string | null;
   workerId: string;
+  /** Host of the worker that claimed the run (null for runs from before it was recorded). */
+  hostname: string | null;
   pid: number | null;
   leaseExpiresAt: string;
+  /** When the job was claimed. */
   startedAt: string;
+  /** When the worker handed the run to the executor; null while claimed but not started. */
+  executionStartedAt: string | null;
   endedAt: string | null;
   outcome: RunOutcome | null;
   error: string | null;
