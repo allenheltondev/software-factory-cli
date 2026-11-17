@@ -5,6 +5,7 @@ import {
   discoverAgents,
   parseCmdShim,
   parseVersion,
+  runProcess,
   type AgentReport,
   type DiscoveryProbes,
   type ProcessResult,
@@ -399,5 +400,84 @@ describe('checkPlatform and helpers', () => {
     const [r] = await discoverAgents(m, { adapters: ['gemini'] });
     expect(r).toMatchObject({ installed: false, usable: false, notes: [expect.stringMatching(/not a known adapter/)] });
     expect(m.calls).toEqual([]);
+  });
+});
+
+describe('runProcess (real child processes)', () => {
+  const node = process.execPath;
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const waitDead = async (pid: number, ms: number) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (!alive(pid)) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return !alive(pid);
+  };
+  const pidFrom = (s: string) => Number(s.match(/pid (\d+)/)?.[1] ?? NaN);
+
+  it('returns output and exit code, and reports spawn errors', async () => {
+    const r = await runProcess(node, ['-e', 'process.stdout.write("hi"); process.stderr.write("err"); process.exitCode = 3'], { timeoutMs: 10_000 });
+    expect(r).toEqual({ code: 3, stdout: 'hi', stderr: 'err' });
+    const missing = await runProcess('/definitely/not/here/tool', [], { timeoutMs: 10_000 });
+    expect(missing).toMatchObject({ code: null, error: expect.stringMatching(/ENOENT/) });
+  });
+
+  it('settles shortly after exit when a grandchild keeps stdout open', async () => {
+    const script = [
+      'const { spawn } = require("node:child_process");',
+      'const g = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { stdio: ["ignore", "inherit", "inherit"] });',
+      'process.stdout.write("grandchild pid " + g.pid + "\\n");',
+      'g.unref();',
+    ].join('\n');
+    const start = Date.now();
+    const r = await runProcess(node, ['-e', script], { timeoutMs: 10_000 });
+    const elapsed = Date.now() - start;
+    const pid = pidFrom(r.stdout);
+    try {
+      expect(r).toMatchObject({ code: 0, stdout: expect.stringMatching(/grandchild pid \d+/) });
+      expect(r.timedOut).toBeUndefined();
+      // Well under the grandchild's 5s lifetime: settled on exit + drain, not on close.
+      expect(elapsed).toBeLessThan(3000);
+    } finally {
+      if (pid && alive(pid)) process.kill(pid);
+    }
+  });
+
+  it('settles at the timeout and kills the whole tree when child and grandchild keep running', async () => {
+    const script = [
+      'const { spawn } = require("node:child_process");',
+      'const g = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], { stdio: ["ignore", "inherit", "inherit"] });',
+      'process.stdout.write("grandchild pid " + g.pid + "\\n");',
+      'setTimeout(() => {}, 10000);',
+    ].join('\n');
+    const start = Date.now();
+    const r = await runProcess(node, ['-e', script], { timeoutMs: 600, killGraceMs: 200 });
+    const elapsed = Date.now() - start;
+    expect(r).toMatchObject({ code: null, timedOut: true });
+    expect(elapsed).toBeLessThan(600 + 1000);
+    const pid = pidFrom(r.stdout);
+    if (pid) {
+      const dead = await waitDead(pid, 5000);
+      if (!dead) process.kill(pid);
+      expect(dead).toBe(true);
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('settles at the timeout and SIGKILLs a child that ignores SIGTERM', async () => {
+    const script = 'process.on("SIGTERM", () => {}); process.stdout.write("pid " + process.pid + "\\n"); setInterval(() => {}, 1000);';
+    const start = Date.now();
+    const r = await runProcess(node, ['-e', script], { timeoutMs: 150, killGraceMs: 200 });
+    expect(Date.now() - start).toBeLessThan(1500);
+    expect(r).toMatchObject({ code: null, timedOut: true });
+    const pid = pidFrom(r.stdout);
+    if (pid) expect(await waitDead(pid, 3000)).toBe(true);
   });
 });

@@ -14,7 +14,7 @@
  * because Node refuses to spawn `.cmd`/`.bat` files without a shell
  * (https://nodejs.org/api/child_process.html#spawning-bat-and-cmd-files-on-windows).
  */
-import { spawn } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { accessSync, constants, readFileSync, statSync } from 'node:fs';
 import { homedir, release, tmpdir } from 'node:os';
 import { posix, win32 } from 'node:path';
@@ -590,38 +590,115 @@ export async function discoverAgents(probes: DiscoveryProbes, opts: DiscoverOpti
 
 const MAX_OUTPUT = 1024 * 1024;
 
-/** Spawn without a shell, stdin closed (so `-p` modes don't wait on it), killed on timeout. */
-export function runProcess(file: string, args: string[], opts: RunOptions & { env?: NodeJS.ProcessEnv }): Promise<ProcessResult> {
+/** After `exit`, how long to wait for `close` (a descendant may hold the pipes open forever). */
+const EXIT_DRAIN_MS = 200;
+/** After SIGTERM, how long before SIGKILL. */
+const KILL_GRACE_MS = 1_500;
+
+export interface RunProcessOptions extends RunOptions {
+  env?: NodeJS.ProcessEnv;
+  /** Overrides the SIGTERM-to-SIGKILL grace period (tests). */
+  killGraceMs?: number;
+}
+
+/** A timer that never keeps the event loop alive on its own. */
+function unrefTimer(ms: number, fn: () => void): NodeJS.Timeout {
+  const t = setTimeout(fn, ms);
+  t.unref();
+  return t;
+}
+
+/**
+ * Kill a process and its descendants. POSIX: the child leads its own process group (spawned
+ * detached), so signal the group, escalating SIGTERM to SIGKILL after a grace period; a CLI can
+ * ignore SIGTERM. Windows: signals don't reach descendants, so `taskkill /t /f` the tree.
+ */
+function killTree(child: ChildProcess, graceMs: number, exited: () => boolean): void {
+  const pid = child.pid;
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+    const taskkill = systemRoot ? win32.join(systemRoot, 'System32', 'taskkill.exe') : 'taskkill.exe';
+    try {
+      const tk = execFile(taskkill, ['/pid', String(pid), '/t', '/f'], { windowsHide: true }, (err) => {
+        if (err && !exited()) child.kill();
+      });
+      tk.unref();
+    } catch {
+      child.kill();
+    }
+    return;
+  }
+  const signal = (sig: NodeJS.Signals) => {
+    try {
+      process.kill(-pid, sig);
+    } catch {
+      child.kill(sig);
+    }
+  };
+  signal('SIGTERM');
+  unrefTimer(graceMs, () => {
+    if (!exited()) signal('SIGKILL');
+  });
+}
+
+/**
+ * Spawn without a shell, stdin closed (so `-p` modes don't wait on it). Settles no later than
+ * `timeoutMs` even if the child ignores SIGTERM or a descendant holds the pipes: on timeout it
+ * resolves `timedOut`, closes the pipes and kills the process tree in the background; after a
+ * normal `exit` it waits at most EXIT_DRAIN_MS for `close`.
+ */
+export function runProcess(file: string, args: string[], opts: RunProcessOptions): Promise<ProcessResult> {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
-    let timedOut = false;
     let settled = false;
-    const done = (r: ProcessResult) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(r);
-    };
-    let child: ReturnType<typeof spawn>;
+    let exited = false;
+    let child: ChildProcess;
     try {
-      child = spawn(file, args, { shell: false, windowsHide: true, env: opts.env, cwd: opts.cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn(file, args, {
+        shell: false,
+        windowsHide: true,
+        // Own process group on POSIX so a timeout can kill descendants too.
+        detached: process.platform !== 'win32',
+        env: opts.env,
+        cwd: opts.cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
     } catch (err) {
       resolve({ code: null, stdout: '', stderr: '', error: err instanceof Error ? err.message : String(err) });
       return;
     }
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, opts.timeoutMs);
+    const settleTimers: NodeJS.Timeout[] = [];
+    const finish = (r: ProcessResult) => {
+      if (settled) return;
+      settled = true;
+      for (const t of settleTimers) clearTimeout(t);
+      for (const s of [child.stdout, child.stderr]) {
+        s?.removeAllListeners('data');
+        s?.destroy();
+      }
+      resolve(r);
+    };
+    settleTimers.push(
+      unrefTimer(opts.timeoutMs, () => {
+        if (!exited) killTree(child, opts.killGraceMs ?? KILL_GRACE_MS, () => exited);
+        finish({ code: null, stdout, stderr, timedOut: true });
+      }),
+    );
     child.stdout?.on('data', (d: Buffer) => {
       if (stdout.length < MAX_OUTPUT) stdout += d.toString();
     });
     child.stderr?.on('data', (d: Buffer) => {
       if (stderr.length < MAX_OUTPUT) stderr += d.toString();
     });
-    child.on('error', (err) => done({ code: null, stdout, stderr, error: err.message }));
-    child.on('close', (code) => done({ code: timedOut ? null : code, stdout, stderr, ...(timedOut ? { timedOut } : {}) }));
+    // Handlers stay attached after settling (guarded by `settled`) so a late 'error' is never unhandled.
+    child.on('error', (err) => finish({ code: null, stdout, stderr, error: err.message }));
+    child.on('exit', (code) => {
+      exited = true;
+      settleTimers.push(unrefTimer(EXIT_DRAIN_MS, () => finish({ code, stdout, stderr })));
+    });
+    child.on('close', (code) => finish({ code, stdout, stderr }));
   });
 }
 
