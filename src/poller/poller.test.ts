@@ -9,8 +9,10 @@ import {
   GitHubError,
   type GitHubApi,
   type GitHubIssue,
+  type GitHubIssueComment,
   type GitHubIssueEvent,
   type GitHubLabel,
+  type GitHubPullRequest,
   type GitHubRepo,
   type IssueEventsPage,
 } from '../github/api.js';
@@ -187,6 +189,23 @@ class FakeGitHub implements GitHubApi {
       .filter((e) => e.issue?.number === issueNumber)
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id - b.id)
       .map((e) => ({ ...e, issue: null }));
+  }
+
+  // The poller never publishes; these exist only to satisfy the interface.
+  async listPullRequestsForHead(): Promise<GitHubPullRequest[]> {
+    throw new Error('not used by the poller');
+  }
+
+  async createPullRequest(): Promise<GitHubPullRequest> {
+    throw new Error('not used by the poller');
+  }
+
+  async listIssueComments(): Promise<GitHubIssueComment[]> {
+    throw new Error('not used by the poller');
+  }
+
+  async createIssueComment(): Promise<GitHubIssueComment> {
+    throw new Error('not used by the poller');
   }
 }
 

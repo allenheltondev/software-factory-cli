@@ -176,6 +176,41 @@ describe('runDoctor', () => {
     }
   });
 
+  it('checks push access for repos that publish: a failure in live mode, a warning otherwise', async () => {
+    const restore = (['codex', 'claude', 'kiro'] as const).map((name) => registerAdapter(fakeAdapter({ name })));
+    try {
+      const run = async (mode: 'live' | 'log-only', push: boolean | null) => {
+        const home = tempHome();
+        const paths = resolvePaths({ env: { FACTORY_HOME: home } });
+        const cfg = upsertRepoWorkflow(
+          seedConfig('allen'),
+          { id: 10, fullName: 'o/r' },
+          buildWorkflow({ label: 'factory:ready', action: 'implement-issue', pool: 'general', routes: [] }),
+        ).config;
+        cfg.execution = { mode };
+        cfg.repositories!['o/r']!.checkoutPath = 'clones/r';
+        (cfg.repositories!['o/r'] as { publish?: string }).publish = 'draft-pr';
+        writeFileSync(paths.configFile, stringify(cfg));
+        const { probes } = setup();
+        const repo = fakeRepo('o/r', 10, {
+          private: true,
+          permissions: push === null ? null : { admin: false, push, pull: true },
+        });
+        const api = fakeApi({ login: 'allen', repos: [repo], labels: { 'o/r': ['factory:ready'] } });
+        return runDoctor(paths, { ...probes, createApi: async () => api });
+      };
+      const denied = await run('live', false);
+      expect(status(denied.checks, /repo o\/r: publish: draft-pr, but the active GitHub account has no push access.*"repo" scope/)).toBe('fail');
+      expect(denied.ok).toBe(false);
+      expect(status((await run('log-only', false)).checks, /no push access/)).toBe('warn');
+      const ok = await run('live', true);
+      expect(status(ok.checks, /repo o\/r: publish: draft-pr; the active GitHub account can push.*use publish: pr/)).toBe('ok');
+      expect(status((await run('live', null)).checks, /push access is unverified/)).toBe('warn');
+    } finally {
+      for (const r of restore) r();
+    }
+  });
+
   it('agentChecks: off-PATH and unknown sign-in warn; problems are failures only in live mode', () => {
     expect(agentProblemSeverity('log-only')).toBe('warn');
     expect(agentProblemSeverity('prepare-only')).toBe('warn');

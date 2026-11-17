@@ -6,6 +6,7 @@ import {
   allowedActorsFor,
   configSchema,
   modeNeedsCheckout,
+  publishMode,
   repoNeedsCheckout,
   workflowId,
   type FactoryConfig,
@@ -86,6 +87,20 @@ export function validateConfig(raw: unknown): ValidationResult {
         path: `repositories.${repoName}.checkoutPath`,
         message: `required in ${config.execution.mode} mode because a workflow runs an action with output local-branch; set it to a local clone of the repo`,
       });
+    }
+
+    if (publishMode(repo) !== 'none') {
+      if (config.execution.mode !== 'live') {
+        warnings.push({
+          path: `repositories.${repoName}.publish`,
+          message: `only applies in live mode; in ${config.execution.mode} mode nothing is pushed and no PR is opened`,
+        });
+      } else if (!repoNeedsCheckout(config, repo)) {
+        warnings.push({
+          path: `repositories.${repoName}.publish`,
+          message: 'only applies to actions with output local-branch, and no workflow of this repo runs one',
+        });
+      }
     }
 
     const wfIds = new Set<string>();

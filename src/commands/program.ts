@@ -7,6 +7,7 @@ import { DEFAULT_LABEL } from './config-edit.js';
 import { createDefaultContext, println, type CommandContext, type GlobalOptions } from './context.js';
 import { doctorCommand } from './doctor.js';
 import { describeError } from './errors.js';
+import { publishCommand } from './publish.js';
 import { retryCommand } from './retry.js';
 import { startCommand } from './start.js';
 import { statusCommand } from './status.js';
@@ -22,6 +23,7 @@ export interface Handlers {
   retry(ctx: CommandContext, jobId: string): Promise<number>;
   agents(ctx: CommandContext, opts: AgentsOptions): Promise<number>;
   clean(ctx: CommandContext, opts: { dryRun?: boolean }): Promise<number>;
+  publish(ctx: CommandContext, runId: string): Promise<number>;
 }
 
 export const defaultHandlers: Handlers = {
@@ -34,6 +36,7 @@ export const defaultHandlers: Handlers = {
   retry: (ctx, jobId) => retryCommand(ctx, jobId),
   agents: agentsCommand,
   clean: (ctx, opts) => cleanCommand(ctx, opts),
+  publish: (ctx, runId) => publishCommand(ctx, runId),
 };
 
 export interface ProgramOptions {
@@ -122,6 +125,12 @@ export function buildProgram(opts: ProgramOptions): Command {
     .description('Requeue a failed, interrupted or canceled job')
     .argument('<jobId>', 'job id (see "factory status")')
     .action((jobId: string) => exec((ctx) => handlers.retry(ctx, jobId)));
+
+  program
+    .command('publish')
+    .description('Push the branch of a succeeded live run and open its PR, or finish a failed publication (never duplicates)')
+    .argument('<runId>', 'run id (see "factory status")')
+    .action((runId: string) => exec((ctx) => handlers.publish(ctx, runId)));
 
   program
     .command('clean')

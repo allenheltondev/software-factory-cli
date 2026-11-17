@@ -108,8 +108,26 @@ describe('migration v5', () => {
       `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, hostname, pid, lease_expires_at, started_at, execution_started_at)
        VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'wrk_1', 'host-a', 4242, 't', 't', 't')`,
     ).run();
-    migrate(db);
+    migrate(db, 5);
     expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 5 });
     expect(db.prepare('SELECT pid, pid_start_time, summary FROM runs').get()).toEqual({ pid: 4242, pid_start_time: null, summary: null });
+  });
+});
+
+describe('migration v6', () => {
+  it('adds an empty publications table; existing runs stay unpublished', () => {
+    const db = openDatabase(':memory:', { migrateTo: 5 });
+    db.prepare(
+      `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
+       VALUES ('job_1', 1, 'o/r', 'wf', 'e1', 1, 'implement-issue', 'general', '{}', 'succeeded', 1, 't', 't')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at, ended_at, outcome)
+       VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'wrk_1', 't', 't', 't', 'succeeded')`,
+    ).run();
+    migrate(db);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 6 });
+    expect(db.prepare('SELECT count(*) AS n FROM publications').get()).toEqual({ n: 0 });
+    expect(db.prepare('SELECT outcome FROM runs').get()).toEqual({ outcome: 'succeeded' });
   });
 });

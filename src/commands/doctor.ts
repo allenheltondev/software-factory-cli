@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import type { AgentReport } from '../agents/discovery.js';
-import { agentAdapter, type FactoryConfig } from '../config/schema.js';
+import { agentAdapter, publishMode, type FactoryConfig } from '../config/schema.js';
+import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import type { FactoryPaths } from '../paths.js';
 import { labelEquals } from '../routing.js';
@@ -205,6 +206,18 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
           add('warn', name, `renamed to ${gr.fullName} on GitHub; update the config key`);
         }
         add(gr.archived ? 'warn' : 'ok', name, `accessible (id ${gr.id})${gr.archived ? '; archived' : ''}`);
+        const publish = publishMode(repo);
+        if (publish !== 'none') {
+          // Publication pushes and opens PRs as this account; a miss here is a failure only when it would run.
+          const sev: CheckStatus = config.execution.mode === 'live' ? 'fail' : 'warn';
+          if (gr.permissions === null) {
+            add('warn', name, `publish: ${publish}, but GitHub did not report this account's permissions; push access is unverified`);
+          } else if (!gr.permissions.push) {
+            add(sev, name, `publish: ${publish}, but the active GitHub account has no push access to ${fullName}. ${TOKEN_SCOPES_HINT}`);
+          } else {
+            add('ok', name, `publish: ${publish}; the active GitHub account can push${gr.private && publish === 'draft-pr' ? ' (private repo: if GitHub refuses draft PRs on your plan, use publish: pr)' : ''}`);
+          }
+        }
         const labels = await api.listLabels({ id: repo.id, fullName });
         const has = (l: string) => labels.some((x) => labelEquals(x.name, l));
         for (const wf of repo.workflows) {

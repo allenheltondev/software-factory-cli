@@ -18,6 +18,21 @@ describe('validateConfig', () => {
     expect(r.config.agents.codex?.enabled).toBe(true);
   });
 
+  it('defaults publish to none and warns when it is set outside live mode', () => {
+    const repo = 'allenheltondev/kids-and-dragons';
+    const plain = validateConfig(example());
+    expect(plain.ok && plain.warnings.some((w) => w.path.endsWith('.publish'))).toBe(false);
+
+    const cfg = example();
+    cfg.repositories[repo].publish = 'draft-pr';
+    const r = validateConfig(cfg);
+    expect(r.ok).toBe(true);
+    expect(r.warnings).toContainEqual({ path: `repositories.${repo}.publish`, message: expect.stringMatching(/only applies in live mode/) });
+
+    cfg.repositories[repo].publish = 'always';
+    expect(validateConfig(cfg).ok).toBe(false);
+  });
+
   it('rejects dangling references', () => {
     const cfg = example();
     cfg.pools.general.agents.push('nobody');
