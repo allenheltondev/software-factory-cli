@@ -270,7 +270,7 @@ describe('runDaemon', () => {
     // A previous worker on this host crashed mid-run.
     acquireWorkerLock(db, { workerId: 'wrk_old', pid: 4000, hostname: 'host-a' }, { now: () => Date.now(), isPidAlive: () => true });
     const id = insertJob(db);
-    const claim = claimNextJob(db, config, { workerId: 'wrk_old', leaseSeconds: 60, runsDir: join('x', 'runs') })!;
+    const claim = claimNextJob(db, config, { workerId: 'wrk_old', hostname: 'host-a', leaseSeconds: 60, runsDir: join('x', 'runs') })!;
     setRunProcess(db, claim.run.id, { pid: 4242, checkoutPath: join('x', 'work trees', id) });
 
     const terminated: number[] = [];
@@ -301,7 +301,7 @@ describe('runDaemon', () => {
     const config = makeConfig();
     acquireWorkerLock(db, { workerId: 'wrk_old', pid: 4000, hostname: 'host-b' }, { now: () => T0, isPidAlive: () => true });
     const id = insertJob(db);
-    const claim = claimNextJob(db, config, { workerId: 'wrk_old', leaseSeconds: 60, runsDir: 'runs' })!;
+    const claim = claimNextJob(db, config, { workerId: 'wrk_old', hostname: 'host-b', leaseSeconds: 60, runsDir: 'runs' })!;
     setRunProcess(db, claim.run.id, { pid: 4242 });
     const terminate = vi.fn(async () => {});
     const deps = baseDeps(db, { config, processControl: { isAlive: () => true, terminate } });
@@ -309,6 +309,7 @@ describe('runDaemon', () => {
     await runDaemon(deps); // lock is stale relative to real time, so it is taken over
     expect(terminate).not.toHaveBeenCalled();
     expect(getJob(db, id)?.status).toBe('interrupted');
+    expect(getRun(db, claim.run.id)?.error).toMatch(/pid 4242 was not signalled \(recorded on host host-b\)/);
   });
 });
 
@@ -356,7 +357,7 @@ describe('runDaemon: lock ownership', () => {
     const db = openDatabase(':memory:');
     acquireWorkerLock(db, { workerId: 'wrk_new', pid: 2, hostname: 'host-a' }, { isPidAlive: () => true });
     insertJob(db);
-    const opts = { workerId: 'wrk_old', leaseSeconds: 90, runsDir: makePaths().runsDir, lockWorkerId: 'wrk_old' };
+    const opts = { workerId: 'wrk_old', hostname: 'host-a', leaseSeconds: 90, runsDir: makePaths().runsDir, lockWorkerId: 'wrk_old' };
     expect(() => claimNextJob(db, makeConfig(), opts)).toThrow(WorkerLockLostError);
     expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 0 });
     expect(claimNextJob(db, makeConfig(), { ...opts, workerId: 'wrk_new', lockWorkerId: 'wrk_new' })).not.toBeNull();

@@ -4,12 +4,10 @@ import { finishRun, listOpenRuns } from '../db/queue.js';
 import type { Run } from '../types.js';
 import { nowIso } from '../util/ids.js';
 import type { Logger } from '../util/log.js';
-import type { LockHolder } from './lock.js';
 import type { ProcessControl } from './process.js';
 
 export interface ReconcileOptions {
-  /** Holder whose lock this worker took over (from acquireWorkerLock), if any. */
-  previousHolder: LockHolder | null;
+  /** This worker's host. Only pids recorded by runs claimed on this host are signalled. */
   hostname: string;
   processControl: ProcessControl;
   log: Logger;
@@ -22,17 +20,15 @@ export interface ReconcileOptions {
  * The run's checkout and log are kept. Jobs are NOT requeued; the user decides with
  * `factory retry`. Returns the runs that were interrupted.
  *
- * A pid is only signalled when the run belongs to the previous lock holder and that
- * holder was on this host, so a pid recorded on another machine (or reused) is never killed.
+ * A pid is only signalled when the run was claimed on this host (runs.hostname), whichever
+ * earlier worker claimed it, so a pid recorded on another machine is never killed. Runs
+ * with no recorded host are never signalled.
  */
 export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): Promise<Run[]> {
   const now = opts.now ?? Date.now;
   const open = listOpenRuns(db);
   for (const run of open) {
-    const sameHost =
-      opts.previousHolder !== null &&
-      opts.previousHolder.workerId === run.workerId &&
-      opts.previousHolder.hostname === opts.hostname;
+    const sameHost = run.hostname !== null && run.hostname === opts.hostname;
     let note = '';
     if (run.pid !== null) {
       if (sameHost && opts.processControl.isAlive(run.pid)) {
@@ -44,7 +40,7 @@ export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): 
           note = `; could not terminate agent process ${run.pid}: ${(err as Error).message}`;
         }
       } else if (!sameHost) {
-        note = `; agent pid ${run.pid} was not signalled (recorded by another worker/host)`;
+        note = `; agent pid ${run.pid} was not signalled (recorded on ${run.hostname ? `host ${run.hostname}` : 'an unknown host'})`;
       }
     }
     finishRun(db, run.id, {

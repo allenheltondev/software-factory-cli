@@ -29,7 +29,7 @@ export function holdsWorkerLock(db: Db, workerId: string): boolean {
 /**
  * How many consecutive start failures (adapter could not start) a job may have
  * before it is marked failed instead of being requeued for another agent.
- * The count resets when the user retries the job.
+ * Counted in jobs.start_failures; the count resets when the user retries the job.
  */
 export const MAX_START_FAILURES = 3;
 
@@ -40,9 +40,6 @@ const RETRYABLE: readonly JobStatus[] = ['failed', 'interrupted', 'canceled'];
 export function ownEntry<T>(map: Record<string, T>, key: string): T | undefined {
   return Object.hasOwn(map, key) ? map[key] : undefined;
 }
-
-/** meta key holding the attempt count at the user's last `factory retry`; start failures before it don't count. */
-const retryFloorKey = (jobId: string) => `retry_floor:${jobId}`;
 
 function getJobRow(db: Db, jobId: string): JobRow | undefined {
   return db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as JobRow | undefined;
@@ -63,31 +60,15 @@ function runningByAgent(db: Db): Map<string, number> {
 const issueKey = (repoId: number, issue: number) => `${repoId}#${issue}`;
 
 /**
- * Agents that failed to start this job in the current streak of start failures
- * (since the user's last retry), and how many such failures there were.
- * Claims closed without an outcome (canceled/released before start) are ignored.
+ * Agents that failed to start this job in its current streak of start failures: the
+ * agents of its newest `start_failures` start_failed runs. Empty after a user retry.
  */
-function startFailureStreak(db: Db, jobId: string): { count: number; agents: Set<string> } {
-  const floorRow = db.prepare('SELECT value FROM meta WHERE key = ?').get(retryFloorKey(jobId)) as
-    | { value: string }
-    | undefined;
-  const floor = floorRow ? Number(floorRow.value) : 0;
+function startFailedAgents(db: Db, jobId: string, startFailures: number): Set<string> {
+  if (startFailures <= 0) return new Set();
   const rows = db
-    .prepare('SELECT agent, outcome, ended_at FROM runs WHERE job_id = ? AND attempt > ? ORDER BY attempt DESC')
-    .all(jobId, floor) as { agent: string; outcome: RunOutcome | null; ended_at: string | null }[];
-  const agents = new Set<string>();
-  let count = 0;
-  for (const r of rows) {
-    if (r.outcome === 'start_failed') {
-      count++;
-      agents.add(r.agent);
-    } else if (r.outcome === null && r.ended_at !== null) {
-      continue;
-    } else {
-      break;
-    }
-  }
-  return { count, agents };
+    .prepare("SELECT agent FROM runs WHERE job_id = ? AND outcome = 'start_failed' ORDER BY attempt DESC LIMIT ?")
+    .all(jobId, startFailures) as { agent: string }[];
+  return new Set(rows.map((r) => r.agent));
 }
 
 function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void {
@@ -105,7 +86,7 @@ function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void 
 function pickAgent(
   db: Db,
   config: FactoryConfig,
-  jobId: string,
+  job: JobRow,
   poolName: string,
   poolAgents: readonly string[],
   load: Map<string, number>,
@@ -124,7 +105,7 @@ function pickAgent(
     if (agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) capable.push({ name, index });
   }
   if (capable.length === 0) return null;
-  const failed = startFailureStreak(db, jobId).agents;
+  const failed = startFailedAgents(db, job.id, job.start_failures);
   const choice = capable.find((c) => !failed.has(c.name)) ?? capable[0]!;
   db.prepare(
     'INSERT INTO pool_cursors (pool, next_index) VALUES (?, ?) ON CONFLICT (pool) DO UPDATE SET next_index = excluded.next_index',
@@ -145,12 +126,17 @@ function pickAgent(
  * With `lockWorkerId`, the claim first checks, inside the same transaction, that this
  * worker still holds the single-worker lock, and throws WorkerLockLostError otherwise.
  * A worker whose lock was taken over can never start new work.
+ *
+ * `hostname` is recorded on the run so a later worker only signals the run's agent pid
+ * when it is on the same host.
  */
 export function claimNextJob(
   db: Db,
   config: FactoryConfig,
   opts: {
     workerId: string;
+    /** Host the claiming worker runs on (os.hostname()). */
+    hostname: string;
     leaseSeconds: number;
     runsDir: string;
     now?: () => number;
@@ -195,7 +181,7 @@ export function claimNextJob(
         continue;
       }
 
-      const agent = pickAgent(db, config, row.id, row.pool, pool.agents, load);
+      const agent = pickAgent(db, config, row, row.pool, pool.agents, load);
       if (!agent) continue; // this pool is saturated; later jobs in other pools may still start
 
       const runId = newId('run');
@@ -208,6 +194,7 @@ export function claimNextJob(
         checkout_path: null,
         log_path: join(opts.runsDir, runId, 'run.log'),
         worker_id: opts.workerId,
+        hostname: opts.hostname,
         pid: null,
         lease_expires_at: new Date(nowMs + opts.leaseSeconds * 1000).toISOString(),
         started_at: at,
@@ -216,8 +203,8 @@ export function claimNextJob(
         error: null,
       };
       db.prepare(
-        `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, pid, lease_expires_at, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, hostname, pid, lease_expires_at, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         runRow.id,
         runRow.job_id,
@@ -227,6 +214,7 @@ export function claimNextJob(
         runRow.checkout_path,
         runRow.log_path,
         runRow.worker_id,
+        runRow.hostname,
         runRow.pid,
         runRow.lease_expires_at,
         runRow.started_at,
@@ -310,7 +298,8 @@ export function finishRun(
         reason = error ?? `run ${runId} on ${run.agent} was interrupted`;
         break;
       case 'start_failed': {
-        const { count } = startFailureStreak(db, job.id);
+        const count = job.start_failures + 1;
+        db.prepare('UPDATE jobs SET start_failures = ? WHERE id = ?').run(count, job.id);
         const detail = error ?? 'unknown error';
         if (count >= MAX_START_FAILURES) {
           status = 'failed';
@@ -377,7 +366,10 @@ export function releaseClaim(db: Db, runId: string, reason: string, now?: () => 
   closeClaim(db, runId, 'queued', reason, now);
 }
 
-/** Deliberately requeue a failed, interrupted or canceled job. Throws for other states. */
+/**
+ * Deliberately requeue a failed, interrupted or canceled job and reset its start-failure
+ * count, so it gets a fresh MAX_START_FAILURES budget. Throws for other states.
+ */
 export function retryJob(db: Db, jobId: string, now?: () => number): Job {
   const at = nowIso(now ?? Date.now);
   return transaction(db, () => {
@@ -386,14 +378,9 @@ export function retryJob(db: Db, jobId: string, now?: () => number): Job {
     if (!RETRYABLE.includes(row.status)) {
       throw new Error(`job ${jobId} is ${row.status}; only failed, interrupted or canceled jobs can be retried`);
     }
-    db.prepare("UPDATE jobs SET status = 'queued', status_reason = ?, updated_at = ? WHERE id = ?").run(
-      `retried by user (was ${row.status})`,
-      at,
-      jobId,
-    );
     db.prepare(
-      'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
-    ).run(retryFloorKey(jobId), String(row.attempts));
+      "UPDATE jobs SET status = 'queued', status_reason = ?, start_failures = 0, updated_at = ? WHERE id = ?",
+    ).run(`retried by user (was ${row.status})`, at, jobId);
     return rowToJob(getJobRow(db, jobId)!);
   });
 }

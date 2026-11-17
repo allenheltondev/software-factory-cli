@@ -212,6 +212,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       try {
         claim = claimNextJob(db, config, {
           workerId,
+          hostname,
           leaseSeconds,
           runsDir: paths.runsDir,
           now,
@@ -303,7 +304,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
 
   const heartbeatTimer = setInterval(heartbeat, heartbeatMs);
   try {
-    await reconcileInterruptedRuns(db, { previousHolder: previous, hostname, processControl, log, now });
+    await reconcileInterruptedRuns(db, { hostname, processControl, log, now });
 
     let nextPollAt = now();
     while (!signal.aborted && !lockLost) {
