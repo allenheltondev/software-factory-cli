@@ -176,9 +176,14 @@ can't be relied on after a crash. Instead:
   once a worker you started by hand stops. Each restart is a line in `launcher.wrapper.log`.
 - **The repeating trigger restarts the wrapper.** It covers a wrapper that was ended, for
   example by `Stop-ScheduledTask`, a closed console window, or a clean exit. If the worker
-  that wrapper started is still running (PID, start time and executable all match
-  `launcher\<TaskName>.worker.json`), the new wrapper waits on it instead of starting a
-  second copy.
+  that wrapper started is still running, the new wrapper waits on it instead of starting a
+  second copy. The worker is found one of two ways:
+  - **By its PID record:** PID, start time and executable all match
+    `launcher\<TaskName>.worker.json`.
+  - **By its marker:** if a wrapper ended between starting the worker and writing that
+    record, the worker is found by the marker the wrapper puts on its command line,
+    `--title=updraft-task:<TaskName>` (a Node option that only sets the process title). A
+    `updraft start` you run yourself has no marker, so it is never adopted or stopped.
 - **Console events can't reach the worker.** Because the worker has its own hidden console, a
   Ctrl+C or close event that reaches the wrapper's console ends only the wrapper.
 - **A locked log can't block a launch.** If `launcher.*.log` is still held open by a running
@@ -200,12 +205,13 @@ Stop-ScheduledTask    -TaskName Updraft
 powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\unregister-task.ps1"
 ```
 
-`unregister-task.ps1` stops and removes the task, stops a leftover worker process started by
-the wrapper, and deletes the wrapper. Config, state and logs are kept. The wrapper records the
-worker's PID, start time and executable in `launcher\<TaskName>.worker.json`, and unregister
-stops a process only when all three match, so a `updraft start` you run by hand is never
+`unregister-task.ps1` disables and stops the task, stops the worker the wrapper started, then
+unregisters the task and deletes the wrapper. Disabling comes first so that no repeat can start
+a wrapper while it is being torn down. Config, state and logs are kept. The worker is matched
+by its PID record or by its marker (see above), so a `updraft start` you run by hand is never
 stopped, even with the same CLI and config. Re-running `register-task.ps1` does the same for
-the worker the previous registration started, so the new task doesn't hit the worker lock.
+the worker the previous registration started, so the new task doesn't hit the worker lock, and
+registers the task again, enabled.
 
 `Stop-ScheduledTask` on its own is not a way to stop the worker: it ends the wrapper but
 leaves the `node.exe` worker running, and the next repeat starts a wrapper that adopts it. To

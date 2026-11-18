@@ -96,6 +96,11 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+# Loaded up front, with -WhatIf off, so a -WhatIf run is not filled with the module's own alias
+# setup. (Import-Module has no -WhatIf parameter of its own.)
+$whatIf = $WhatIfPreference; $WhatIfPreference = $false
+Import-Module CimCmdlets
+$WhatIfPreference = $whatIf
 
 $AppDir = 'updraft'
 $PackageName = '@allenheltondev/updraft'
@@ -197,6 +202,9 @@ foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) { $safeName = $safeN
 $wrapperDir = Join-Path $dataDir 'launcher'
 $wrapperPath = Join-Path $wrapperDir "$safeName.ps1"
 $pidFilePath = Join-Path $wrapperDir "$safeName.worker.json"
+# Put on the worker's command line as --title=<marker>, so the worker can be found without its PID
+# record. Built from the file-safe task name, which has no quotes.
+$workerMarker = "updraft-task:$safeName"
 
 $pathLiterals = ($pathDirs | ForEach-Object { ConvertTo-PsLiteral $_ }) -join ', '
 $updraftHomeLiteral = if ($UpdraftHome) { ConvertTo-PsLiteral $UpdraftHome } else { '$null' }
@@ -213,6 +221,7 @@ $wrapper = @"
 `$pathPrepend = @($pathLiterals)
 `$updraftHome = $updraftHomeLiteral
 `$pidFilePath = $(ConvertTo-PsLiteral $pidFilePath)
+`$workerMarker = $(ConvertTo-PsLiteral $workerMarker)
 `$minBackoffSeconds = $MinBackoffSeconds
 `$maxBackoffSeconds = $MaxBackoffSeconds
 # A run at least this long counts as healthy: the next restart starts from the minimum delay again.
@@ -235,19 +244,47 @@ trap {
 if (`$updraftHome) { `$env:UPDRAFT_HOME = `$updraftHome }
 New-Item -ItemType Directory -Force -Path `$logDir | Out-Null
 
-# The worker an earlier wrapper of this task started, if it is still running: same PID, start
-# time and executable as recorded. A wrapper can end while its worker keeps running
-# (Stop-ScheduledTask, or the wrapper's console closing), and starting a second worker then would
-# only fail on the worker lock. This wrapper waits on that worker instead.
+# Record exactly which process is this task's worker, so a later wrapper can adopt it and
+# unregister-task.ps1 can stop it without touching a manually started worker that uses the same
+# CLI and config. Path can still be empty right after a start; the file started is `$node then.
+function Write-WorkerRecord(`$p) {
+    `$exe = `$p.Path
+    if (-not `$exe) { `$exe = [System.IO.Path]::GetFullPath(`$node) }
+    `$record = New-Object PSObject -Property @{
+        pid = `$p.Id
+        startTimeUtcTicks = `$p.StartTime.ToUniversalTime().Ticks
+        node = `$exe
+    }
+    [System.IO.File]::WriteAllText(`$pidFilePath, (`$record | ConvertTo-Json -Compress))
+}
+
+# The worker an earlier wrapper of this task started, if it is still running. A wrapper can end
+# while its worker keeps running (Stop-ScheduledTask, or the wrapper's console closing), and
+# starting a second worker then would only fail on the worker lock, so this wrapper waits on that
+# worker instead. It is found by the PID file (same PID, start time and executable as recorded),
+# or, when a wrapper ended between starting the worker and writing that file, by the marker the
+# wrapper puts on the worker's command line (--title=<marker>; a hand-started worker has none).
 function Get-RecordedWorker {
-    if (-not (Test-Path -LiteralPath `$pidFilePath -PathType Leaf)) { return `$null }
-    try {
-        `$record = [System.IO.File]::ReadAllText(`$pidFilePath) | ConvertFrom-Json
-        `$p = Get-Process -Id ([int]`$record.pid) -ErrorAction Stop
-        `$sameStart = [Math]::Abs(`$p.StartTime.ToUniversalTime().Ticks - [long]`$record.startTimeUtcTicks) -lt [TimeSpan]::TicksPerSecond
-        `$sameExe = `$p.Path -and (`$p.Path -ieq [string]`$record.node)
-        if (`$sameStart -and `$sameExe) { return `$p }
-    } catch { }
+    if (Test-Path -LiteralPath `$pidFilePath -PathType Leaf) {
+        try {
+            `$record = [System.IO.File]::ReadAllText(`$pidFilePath) | ConvertFrom-Json
+            `$p = Get-Process -Id ([int]`$record.pid) -ErrorAction Stop
+            `$sameStart = [Math]::Abs(`$p.StartTime.ToUniversalTime().Ticks - [long]`$record.startTimeUtcTicks) -lt [TimeSpan]::TicksPerSecond
+            `$sameExe = `$p.Path -and (`$p.Path -ieq [string]`$record.node)
+            if (`$sameStart -and `$sameExe) { return `$p }
+        } catch { }
+    }
+    `$needle = '"--title=' + `$workerMarker + '"'
+    `$marked = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains(`$needle) } |
+        ForEach-Object { Get-Process -Id `$_.ProcessId -ErrorAction SilentlyContinue } |
+        Where-Object { `$_ } | Sort-Object StartTime)
+    if (`$marked.Count -gt 0) {
+        `$p = `$marked[0]
+        Write-WrapperLog ('found worker process {0} by its marker (no usable PID record); recording it' -f `$p.Id)
+        Write-WorkerRecord `$p
+        return `$p
+    }
     return `$null
 }
 
@@ -283,22 +320,15 @@ while (`$true) {
         # Start-Process joins arguments with spaces, so quote each one. -WindowStyle Hidden (not
         # -NoNewWindow) gives node a console of its own, so a console control event that reaches
         # this wrapper's console (Ctrl+C, close) does not end the worker.
-        `$argList = @(`$cli, 'start', '--config', `$config) | ForEach-Object { '"' + `$_ + '"' }
+        # --title=<marker> (a node option: it only sets the process title) identifies this task's
+        # worker on its command line, so it can be found even if this wrapper ends before the
+        # record below is written.
+        `$argList = @("--title=`$workerMarker", `$cli, 'start', '--config', `$config) | ForEach-Object { '"' + `$_ + '"' }
         `$proc = Start-Process -FilePath `$node -ArgumentList `$argList -WorkingDirectory `$workDir ``
             -WindowStyle Hidden -PassThru -RedirectStandardOutput `$logs[0] -RedirectStandardError `$logs[1]
         `$null = `$proc.Handle  # keep the handle so ExitCode is available after exit
 
-        # Record exactly which process this wrapper started, so unregister-task.ps1 can stop it
-        # without touching a manually started worker that uses the same CLI and config. Path can
-        # still be empty right after the start; the file started is `$node in that case.
-        `$exe = `$proc.Path
-        if (-not `$exe) { `$exe = [System.IO.Path]::GetFullPath(`$node) }
-        `$record = New-Object PSObject -Property @{
-            pid = `$proc.Id
-            startTimeUtcTicks = `$proc.StartTime.ToUniversalTime().Ticks
-            node = `$exe
-        }
-        [System.IO.File]::WriteAllText(`$pidFilePath, (`$record | ConvertTo-Json -Compress))
+        Write-WorkerRecord `$proc
     }
 
     `$started = Get-Date
@@ -397,11 +427,34 @@ function Stop-RecordedWorker([string]$PidFile) {
     Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
 }
 
+# A worker whose wrapper ended between starting it and writing its PID record has no record, but
+# carries the task's marker on its command line (--title=<marker>). A `updraft start` run by hand
+# never does.
+function Stop-MarkedWorkers([string]$Marker, [string]$Why) {
+    $needle = '"--title=' + $Marker + '"'
+    $marked = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($needle) })
+    foreach ($m in $marked) {
+        if ($PSCmdlet.ShouldProcess("node.exe pid $($m.ProcessId)", "Stop the worker $Why")) {
+            Stop-Process -Id $m.ProcessId -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped worker process $($m.ProcessId) started by $Why (found by its marker)."
+        }
+    }
+}
+
 if ($PSCmdlet.ShouldProcess($TaskName, 'Register scheduled task')) {
     $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($existing -and $existing.State -eq 'Running') { Stop-ScheduledTask -TaskName $TaskName }
-    # Also covers a worker orphaned earlier (task stopped by hand while node kept running).
+    if ($existing) {
+        # Disable first: stopping the running wrapper leaves the repeating triggers armed, and a
+        # repeat in the gap would start a wrapper that adopts the worker and outlives this.
+        Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        if ((Get-ScheduledTask -TaskName $TaskName).State -eq 'Running') { Stop-ScheduledTask -TaskName $TaskName }
+    }
+    # Also covers a worker orphaned earlier (task stopped by hand while node kept running), and
+    # one whose wrapper ended before recording it.
     Stop-RecordedWorker $pidFilePath
+    Stop-MarkedWorkers $workerMarker 'the previous registration'
+    # Registering again replaces the definition, enabled.
     Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
     Write-Host "Registered scheduled task '$TaskName'."
     if (-not $NoStart) {
