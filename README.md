@@ -152,7 +152,7 @@ repositories:
 | `repositories.<OWNER/REPO>.autoMerge` | off | With `review`: `squash`, `merge` or `rebase`. Updraft merges a PR whose current head its reviewer found ready, once the head's checks passed and nothing else stands in the way, with the reviewed commit pinned. The issue and the code are untrusted and could talk a reviewer into approving: read [Auto-merge](docs/review-loop.md#auto-merge) before setting it |
 | `repositories.<OWNER/REPO>.autoMergeWaitMinutes` | `60` | With `autoMerge`: how long to wait for pending checks before giving up and leaving the PR for a person |
 | `repositories.<OWNER/REPO>.autoMergeRequiredChecks` | none | With `autoMerge`: names of the commit statuses or check runs (for example `test`) that must each report success on the commit. Without it, any one successful check is enough. A skipped or neutral check never counts as a success |
-| `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
+| `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll. "First poll" means whenever `state.db` has no checkpoint for the repository, including with a new or deleted `state.db`, which then has no record of jobs already run. Remove it once the first poll has run |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
 | `workflows[].action` | required | Action name |
@@ -374,10 +374,16 @@ behind:
      copied `prompts/`);
    - `agents.*.command` and `agents.*.container.runtime` when they are paths;
    - `github.app.privateKeyPath`, and move the key file if it lived in the old folder.
+
+   Then remove every `repositories.*.backfillSince` from the copied config, or move it to a
+   cutoff after the last job the old install handled. A repository with no checkpoint is
+   scanned back to its `backfillSince`, and the new `state.db` has no record of the jobs the
+   old install already queued. Label events since that date would be dispatched again and
+   open duplicate PRs.
 3. Leave `state.db`, `logs/` and `worktrees/` where they are. `~/.updraft` gets a new, empty
    `state.db`:
-   - polling starts again at each repository's current event, so old label events are not
-     queued again;
+   - with no `backfillSince`, polling starts at each repository's current event, so earlier
+     label events are not queued again;
    - `updraft logs`, `retry`, `publish`, `status` and `stats` no longer know earlier jobs;
    - PRs opened before the switch get no further revisions or reviews.
 
