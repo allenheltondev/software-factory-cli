@@ -27,12 +27,17 @@ describe('safeMarkdown', () => {
     expect(out).toContain('> ```ts\n> const a = 1; // @notamention closes #1\n> ```');
   });
 
-  it('breaks mentions and team mentions, but not emails or URL paths', () => {
-    const out = safeMarkdown('ping @octocat and (@org/team), mail me@example.com, see https://github.com/@x', 1_000);
+  it('breaks mentions and team mentions, but not emails', () => {
+    const out = safeMarkdown('ping @octocat and (@org/team), mail me@example.com', 1_000);
     expect(out).toContain(`@${Z}octocat`);
     expect(out).toContain(`(@${Z}org/team)`);
     expect(out).toContain('me@example.com');
-    expect(out).toContain('https://github.com/@x');
+  });
+
+  it.each(['a|@bob', 'a=@bob', 'a/@bob', '-@bob', '| x |@bob|'])('breaks mentions after punctuation: %s', (s) => {
+    const out = safeMarkdown(s, 1_000);
+    expect(out).toContain(`@${Z}bob`);
+    expect(out).not.toContain('@bob');
   });
 
   it('breaks closing keywords for issues, cross-repo issues and issue URLs', () => {

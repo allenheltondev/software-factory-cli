@@ -18,7 +18,7 @@ const ZWSP = '\u200B';
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const CLOSING_KEYWORD =
   /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b(:?\s+|:)(?=(?:[\w.-]+\/[\w.-]+)?#\d|https?:\/\/(?:www\.)?github\.com\/)/gi;
-const MENTION = /(^|[\s([{>"'*_~,;:!?])@(?=[A-Za-z0-9])/g;
+const MENTION = /(?<![\w`])@(?=[A-Za-z0-9])/g;
 const CODE_SPAN = /(?<!`)(`+)(?!`)([\s\S]*?[^`])\1(?!`)/g;
 
 const noComments = (s: string) => s.replace(/<!--/g, `<!${ZWSP}--`).replace(/-->/g, `--${ZWSP}>`);
@@ -27,7 +27,7 @@ const noComments = (s: string) => s.replace(/<!--/g, `<!${ZWSP}--`).replace(/-->
 function neutralizeProse(s: string): string {
   return noComments(s)
     .replace(/<(?=[A-Za-z/!?])/g, '&lt;')
-    .replace(MENTION, `$1@${ZWSP}`)
+    .replace(MENTION, `@${ZWSP}`)
     .replace(CLOSING_KEYWORD, (_m, kw: string, sep: string) => `${kw}${sep.replace(/\s+$/, ' ')}${ZWSP}`);
 }
 
