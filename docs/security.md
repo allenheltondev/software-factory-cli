@@ -58,7 +58,7 @@ What the worker and the agents it starts can do, and which guards exist. The
   verdict is read from one exact line of its final message and anything else fails the run
   rather than counting as approval; a verdict only ever applies to the one commit that was
   reviewed; the rounds are capped by `maxRevisions`; and the review is posted as a comment,
-  with the findings fenced, because GitHub does not let an account approve its own PR. Without
+  with the findings as sanitized Markdown, because GitHub does not let an account approve its own PR. Without
   `autoMerge` the worst a fooled reviewer can do is mark a draft ready for review. See
   [The review loop](review-loop.md).
 - **`autoMerge` is the most dangerous option Updraft has, and it is off unless you set it.**

@@ -321,7 +321,7 @@ describe('postReview', () => {
     expect(body).toContain('**Updraft review: changes requested**');
     expect(body).toContain(`\`${H1.slice(0, 12)}\``);
     expect(body).toContain('agent codex');
-    expect(body).toContain('```text\nBlockers:\n- a.ts:3 is wrong\n```');
+    expect(body).toContain('> Blockers:\n> - a.ts:3 is wrong');
     expect(body).toContain('revision 1 of at most 3');
     expect(body.endsWith(reviewMarker(runId))).toBe(true);
     // Decided without reading anything back: the poller's view of the PR was never asked for.

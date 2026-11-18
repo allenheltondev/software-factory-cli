@@ -61,6 +61,7 @@ import { reviewOf, revisionOf, type Job, type Publication, type Run, type RunSum
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { verificationLines, verificationNotes } from '../worker/verify.js';
+import { safeMarkdown } from './markdown.js';
 
 /** How long a publication may hold its lease before another process may take it over. */
 export const PUBLISH_LEASE_SECONDS = 10 * 60;
@@ -326,13 +327,13 @@ export function inline(text: string): string {
 
 /**
  * What a run left, for a PR body or a PR comment: its commits, the diff stat, the verification
- * result and the agent's final message. Everything the agent or the repository controls is fenced
- * or flattened, so it stays inert.
+ * result and the agent's final message. Machine-generated output is fenced or flattened; the
+ * agent's prose is rendered as sanitized Markdown (see markdown.ts).
  */
 export function renderRunResult(s: RunSummary, commitCount: number): string[] {
   const commits = s.commits.length ? s.commits.join('\n') : '(none listed)';
   const more = commitCount > s.commits.length ? `\n… ${commitCount - s.commits.length} more` : '';
-  const finalMessage = cap(s.lastOutput.join('\n').trim() || '(no output)', MAX_FINAL_MESSAGE);
+  const finalMessage = safeMarkdown(s.lastOutput.join('\n').trim() || '(no output)', MAX_FINAL_MESSAGE);
   return [
     `**Commits** (${commitCount})`,
     '',
@@ -351,7 +352,7 @@ export function renderRunResult(s: RunSummary, commitCount: number): string[] {
       : []),
     "**The agent's final message**",
     '',
-    fenced(finalMessage),
+    finalMessage,
   ];
 }
 

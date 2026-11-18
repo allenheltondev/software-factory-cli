@@ -225,8 +225,9 @@ considered, the verdict is stale and nothing follows from it.
 
 One comment review per reviewer run, attached to the reviewed commit, with the verdict, the
 reviewed commit, the reviewing agent and the findings. The findings are an agent's text about
-untrusted code, so they are inside a code fence: mentions, links and closing keywords in them
-do nothing. A hidden marker with the run id lets a retry find the review instead of posting a
+untrusted code, so they are rendered as sanitized Markdown (headings, lists and code display
+normally in a blockquote): mentions, closing keywords and HTML comments in them do nothing.
+See [Publication](publication.md). A hidden marker with the run id lets a retry find the review instead of posting a
 second one (only among the worker's own reviews). Posting uses the same lease, retries and
 `updraft publish RUN_ID` as publication.
 

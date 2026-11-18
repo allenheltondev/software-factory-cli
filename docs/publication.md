@@ -33,9 +33,20 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
    publication fails and the remote branch is left alone.
 2. **Open a PR** from the job branch into the base branch (draft for `draft-pr`), titled with
    the issue title. The body says `Closes #<n>`, lists the commits and the diffstat, quotes the
-   agent's final message (capped, in a code block so mentions and closing keywords in it stay
-   inert), and carries the run id and a hidden `<!-- updraft-run: <runId> -->` marker.
+   agent's final message (capped, as sanitized Markdown, see below), and carries the run id and a hidden `<!-- updraft-run: <runId> -->` marker.
 3. **Comment on the issue** with a link to the PR and a short summary, with the same marker.
+
+The agent's prose (its final message here, the findings of a review, the replies to a review)
+is rendered as GitHub Markdown, so headings, lists, emphasis, links, inline code and code
+blocks display normally. Before it is published it is made inert: `@`mentions and
+team mentions, closing keywords before an issue reference or URL (`Closes #1`), HTML comments
+(and so any forged `updraft-run` or `updraft-review` marker) and raw HTML are neutralized
+with a zero-width space or an escape, everything else is kept, and code blocks and inline code
+are left as written. The text is capped first, a fence the cap leaves open is closed, and every
+line sits in a blockquote, so it reads as the agent's words and cannot pose as one of the
+worker's sections. The worker's own machine-generated output (**Commits**, **Verification**,
+reasons) is still shown in plain-text code fences, and the hidden markers are added by the
+worker only.
 
 Merging stays a human decision: publication never merges, approves or marks a PR ready for
 review.
