@@ -311,9 +311,15 @@ export interface RunProcessInfo {
 }
 
 /** Record the agent subprocess and/or checkout for a running run (used by live adapters and reconcile). */
-export function setRunProcess(db: Db, runId: string, info: RunProcessInfo): void {
+export function setRunProcess(db: Db, runId: string, info: RunProcessInfo, now: () => number = Date.now): void {
   if (info.pid !== undefined) {
-    db.prepare('UPDATE runs SET pid = ?, pid_start_time = ? WHERE id = ?').run(info.pid, info.pidStartTime ?? null, runId);
+    // agent_started_at: the first time a pid is recorded is when the agent process was spawned.
+    db.prepare('UPDATE runs SET pid = ?, pid_start_time = ?, agent_started_at = coalesce(agent_started_at, ?) WHERE id = ?').run(
+      info.pid,
+      info.pidStartTime ?? null,
+      info.pid === null ? null : nowIso(now),
+      runId,
+    );
   } else if (info.pidStartTime !== undefined) {
     db.prepare('UPDATE runs SET pid_start_time = ? WHERE id = ?').run(info.pidStartTime, runId);
   }
@@ -528,7 +534,7 @@ export function retryJob(db: Db, jobId: string, now?: () => number): Job {
       throw new Error(`job ${jobId} is ${row.status}; only failed, interrupted or canceled jobs can be retried`);
     }
     db.prepare(
-      "UPDATE jobs SET status = 'queued', status_reason = ?, start_failures = 0, updated_at = ? WHERE id = ?",
+      "UPDATE jobs SET status = 'queued', status_reason = ?, start_failures = 0, retries = retries + 1, updated_at = ? WHERE id = ?",
     ).run(`retried by user (was ${row.status})`, at, jobId);
     return rowToJob(getJobRow(db, jobId)!);
   });

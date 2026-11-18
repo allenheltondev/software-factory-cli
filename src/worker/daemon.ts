@@ -218,7 +218,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       workerStopping: signal,
       now,
       ...(issue ? { issue } : {}),
-      recordProcess: (info) => setRunProcess(db, run.id, info),
+      recordProcess: (info) => setRunProcess(db, run.id, info, now),
     };
     runLog.info('run started', { repo: job.repoFullName, issue: job.issueNumber, pool: run.pool, logPath: run.logPath });
     const done = (async () => {

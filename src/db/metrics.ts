@@ -150,23 +150,29 @@ const TAIL = '$backfilled, $recorded';
  */
 const SOURCES: Record<MetricKind, (o?: { reason?: string }) => string> = {
   // outcome: the run's outcome, or 'canceled' (the user asked) / 'not-started' (closed before its
-  // agent started) for a run closed without one. start_at: when the agent started. wait_ms: for the
-  // job's first run whose agent started, how long the job waited from being queued.
+  // agent started) for a run closed without one. start_at: when the agent process was spawned
+  // (runs.agent_started_at), NULL when it never was: a start_failed run, or one that failed while
+  // its checkout was prepared, has no agent run time. wait_ms: for the job's first run whose agent
+  // was spawned, how long the job waited from being queued; attempts that never launched an agent
+  // do not end the wait.
   'run.ended': () => `
     SELECT 'run.ended', r.id, r.ended_at, j.repo_id, j.repo_full_name, j.id, ${KIND_OF('j.envelope')}, ${PR_OF('j.envelope')}, r.agent, r.pool,
       coalesce(r.outcome, CASE WHEN r.cancel_requested_at IS NOT NULL THEN 'canceled' ELSE 'not-started' END),
       CASE WHEN json_valid(r.summary) THEN CASE json_extract(r.summary, '$.verification.passed') WHEN 1 THEN 'verify-passed' WHEN 0 THEN 'verify-failed' END END,
-      r.execution_started_at,
-      CASE WHEN r.execution_started_at IS NOT NULL AND NOT EXISTS (
-          SELECT 1 FROM runs p WHERE p.job_id = r.job_id AND p.id != r.id AND p.execution_started_at IS NOT NULL
-            AND (p.execution_started_at < r.execution_started_at OR (p.execution_started_at = r.execution_started_at AND p.attempt < r.attempt)))
-        THEN ${MS_BETWEEN('j.created_at', 'r.execution_started_at')} END,
+      r.agent_started_at,
+      CASE WHEN r.agent_started_at IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM runs p WHERE p.job_id = r.job_id AND p.id != r.id AND p.agent_started_at IS NOT NULL
+            AND (p.agent_started_at < r.agent_started_at OR (p.agent_started_at = r.agent_started_at AND p.attempt < r.attempt)))
+        THEN ${MS_BETWEEN('j.created_at', 'r.agent_started_at')} END,
       NULL, ${TAIL}
     FROM runs r JOIN jobs j ON j.id = r.job_id
     WHERE r.ended_at IS NOT NULL`,
-  // agent: of the job's latest run. start_at: when the job was queued.
+  // agent: of the job's latest run. start_at: when the job was queued. subject: the job with its
+  // attempts (bumped by each claim) and retries (bumped by each "updraft retry"), so every terminal
+  // state the job reaches is its own fact, including two with no claim in between (canceled,
+  // retried, canceled again).
   'job.finished': () => `
-    SELECT 'job.finished', j.id || ':' || j.attempts || ':' || j.status, j.updated_at, j.repo_id, j.repo_full_name, j.id,
+    SELECT 'job.finished', j.id || ':' || j.attempts || ':' || j.retries || ':' || j.status, j.updated_at, j.repo_id, j.repo_full_name, j.id,
       ${KIND_OF('j.envelope')}, ${PR_OF('j.envelope')},
       (SELECT r.agent FROM runs r WHERE r.job_id = j.id ORDER BY r.attempt DESC LIMIT 1), j.pool, j.status, NULL,
       j.created_at, NULL, NULL, ${TAIL}

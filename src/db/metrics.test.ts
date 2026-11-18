@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildHistory, DAY, History, HOUR, metricRows, MIN } from '../../test/factory-history.js';
+import { buildHistory, DAY, History, historyConfig, HOUR, metricRows, MIN } from '../../test/factory-history.js';
 import { openDatabase, transaction, type Db } from './database.js';
 import { cancelQueuedJob } from './ingest.js';
 import {
@@ -18,8 +18,9 @@ import {
 } from './metrics.js';
 import { finishPublication } from './publications.js';
 import { getLoopPr, setMergeState } from './pr-reviews.js';
-import { finishRun, requestJobCancel } from './queue.js';
+import { claimNextJob, finishRun, requestJobCancel, retryJob } from './queue.js';
 import { closeRevisionPr, holdRevision, recordReviewRequest } from './revisions.js';
+import { computeStats } from './stats.js';
 
 const END = Date.parse('2026-11-18T12:00:00.000Z');
 const W = { repoId: 42, fullName: 'octo/widgets' };
@@ -185,6 +186,57 @@ describe('metric_events writers', () => {
   });
 });
 
+describe('review fixes: terminal transitions and agent launch', () => {
+  it('records each terminal state of a job retried with no claim in between (cancel, retry, cancel)', () => {
+    const h = new History(END - 3 * DAY);
+    const job = h.queueIssue({ ...W, issue: 1 });
+    h.advance(HOUR);
+    expect(requestJobCancel(h.db, job, h.now).kind).toBe('canceled');
+    h.advance(2 * DAY);
+    retryJob(h.db, job, h.now);
+    h.advance(HOUR);
+    expect(requestJobCancel(h.db, job, h.now).kind).toBe('canceled');
+    const finished = rowsOf(h.db, 'job.finished');
+    expect(finished.map((r) => r.subject_id)).toEqual([`${job}:0:0:canceled`, `${job}:0:1:canceled`]);
+    // Only the second cancellation is in the last day; it is counted.
+    const report = computeStats(h.db, { since: h.t - DAY, now: h.t, label: '1d' });
+    expect(report.overall.work.finished.canceled.implement).toBe(1);
+  });
+
+  it('records each failure of an unroutable job that is retried and fails again', () => {
+    const h = new History(END - DAY);
+    // Routed to a pool the config no longer has: each claim attempt fails the job without a run.
+    const job = h.queueIssue({ ...W, issue: 2, pool: 'removed' });
+    const claim = () => claimNextJob(h.db, historyConfig, { workerId: 'wrk_history', hostname: 'host', leaseSeconds: 60, runsDir: '/runs', now: h.now });
+    expect(claim()).toBeNull();
+    h.advance(HOUR);
+    retryJob(h.db, job, h.now);
+    expect(claim()).toBeNull();
+    expect(rowsOf(h.db, 'job.finished').map((r) => r.subject_id)).toEqual([`${job}:0:0:failed`, `${job}:0:1:failed`]);
+  });
+
+  it('gives the queue wait to the first run whose agent launched, and no agent run time to runs that never launched one', () => {
+    const h = new History(END - DAY);
+    h.queueIssue({ ...W, issue: 3 });
+    // First attempt: the adapter cannot start. Second: it fails while preparing the checkout,
+    // after its execution started but before any agent process. Third: the agent runs.
+    // A start_failed run requeues its job on its own; the failed one is retried by the user.
+    const a = h.run({ wait: 5 * MIN, outcome: 'start_failed' });
+    const b = h.run({ wait: 5 * MIN, runMs: MIN, outcome: 'failed', launched: false });
+    retryJob(h.db, a.jobId, h.now);
+    const c = h.run({ wait: 5 * MIN, runMs: 20 * MIN, outcome: 'succeeded' });
+    const byRun = new Map(rowsOf(h.db, 'run.ended').map((r) => [r.subject_id, r]));
+    expect(byRun.get(a.runId)).toMatchObject({ start_at: null, wait_ms: null });
+    expect(byRun.get(b.runId)).toMatchObject({ start_at: null, wait_ms: null });
+    // Queued at 0; claimed at 5 (could not start), 10 (failed before launch, 1 min), 16 (launched).
+    expect(byRun.get(c.runId)).toMatchObject({ wait_ms: 16 * MIN });
+    const report = computeStats(h.db, { since: null, now: h.t, label: 'all' });
+    // The failed pre-launch run is counted as not measured, never as a one-minute agent run.
+    expect(report.overall.time.agentRun.all).toMatchObject({ count: 1, total: 2 });
+    expect(report.overall.time.queueWait.all.count).toBe(1);
+  });
+});
+
 describe('mergeReasonCodeSql', () => {
   const code = (db: Db, reason: string | null) =>
     (db.prepare(`SELECT ${mergeReasonCodeSql('t.r')} AS code FROM (SELECT ? AS r) t`).get(reason) as { code: MergeBlockCode }).code;
@@ -227,7 +279,7 @@ describe('backfillMetrics', () => {
     // The one difference: issue 3 failed, was retried and succeeded. The jobs table only holds
     // its final status, so the backfill cannot know of the failure before the retry.
     const lost = live.filter((r) => !backfilled.some((b) => b.kind === r.kind && b.subject_id === r.subject_id));
-    expect(lost).toMatchObject([{ kind: 'job.finished', outcome: 'failed', subject_id: expect.stringMatching(/:1:failed$/) }]);
+    expect(lost).toMatchObject([{ kind: 'job.finished', outcome: 'failed', subject_id: expect.stringMatching(/:1:0:failed$/) }]);
     expect(backfilled).toEqual(live.filter((r) => !lost.includes(r)));
     expect(h.db.prepare('SELECT DISTINCT backfilled FROM metric_events').all()).toEqual([{ backfilled: 1 }]);
     // The merge block code read from the recorded reason matches the one the live writer was given.

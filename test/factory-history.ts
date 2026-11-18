@@ -6,7 +6,7 @@ import { configSchema, type UpdraftConfig } from '../src/config/schema.js';
 import { openDatabase, type Db } from '../src/db/database.js';
 import { beginPublication, finishPublication, recordPublicationProgress } from '../src/db/publications.js';
 import { adoptOwnPushes, beginPrReview, enqueueReviewJob, finishPrReview, getLoopPr, setMergeState, startMergeFor, type MergeStep } from '../src/db/pr-reviews.js';
-import { claimNextJob, finishRun, markExecutionStarted, retryJob, setRunSummary } from '../src/db/queue.js';
+import { claimNextJob, finishRun, markExecutionStarted, retryJob, setRunProcess, setRunSummary } from '../src/db/queue.js';
 import { beginRevision, enqueueRevision, finishRevision, holdRevision, revisionJob, syncRevisionPrs, getRevisionPr } from '../src/db/revisions.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type RunOutcome, type RunSummary, type ReviewVerdict } from '../src/types.js';
 
@@ -75,13 +75,20 @@ export class History {
 
   /**
    * Claim the oldest queued job after waiting `wait` ms, run its agent for `runMs` and close it
-   * with `outcome`. Returns the run id.
+   * with `outcome`. Returns the run id. `launched: false` is a run that entered the executor but
+   * failed before its agent process was spawned (checkout preparation, for example): it has an
+   * execution start but no agent start. A start_failed run has neither.
    */
-  run(o: { wait?: number; runMs?: number; outcome?: RunOutcome; verify?: boolean; review?: RunSummary['review'] } = {}): { runId: string; jobId: string } {
+  run(
+    o: { wait?: number; runMs?: number; outcome?: RunOutcome; verify?: boolean; review?: RunSummary['review']; launched?: boolean } = {},
+  ): { runId: string; jobId: string } {
     this.advance(o.wait ?? 0);
     const c = claimNextJob(this.db, historyConfig, { workerId: WORKER, hostname: 'host', leaseSeconds: 3600, runsDir: '/runs', now: this.now });
     if (!c) throw new Error('nothing to claim');
-    if (o.outcome !== 'start_failed') markExecutionStarted(this.db, c.run.id, { workerId: WORKER, now: this.now });
+    if (o.outcome !== 'start_failed') {
+      markExecutionStarted(this.db, c.run.id, { workerId: WORKER, now: this.now });
+      if (o.launched !== false) setRunProcess(this.db, c.run.id, { pid: 4242 }, this.now);
+    }
     this.advance(o.runMs ?? 0);
     if (o.verify !== undefined || o.review) {
       const summary: RunSummary = {
@@ -323,6 +330,7 @@ export function buildHistory(end: number, db?: Db): History {
   h.advance(MIN);
   const c = claimNextJob(h.db, historyConfig, { workerId: WORKER, hostname: 'host', leaseSeconds: 3600, runsDir: '/runs', now: h.now })!;
   markExecutionStarted(h.db, c.run.id, { workerId: WORKER, now: h.now });
+  setRunProcess(h.db, c.run.id, { pid: 4242 }, h.now);
   h.queueIssue({ ...W, issue: 5 });
   h.t = end;
   return h;

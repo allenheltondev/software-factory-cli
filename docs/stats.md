@@ -51,9 +51,12 @@ kind: `implement` (an issue's label), `revision` (a change request on a PR), `re
 job that was retried and is queued or running again still counts with its last final status,
 and in the "now" rows.
 
-**Time taken.** *Agent run*: from the agent's start to the run's end, over runs whose agent
-ran (succeeded, failed, interrupted, canceled), by kind and by agent. *Queue wait*: from the job
-being queued to the start of its first run whose agent started; later attempts are not counted.
+**Time taken.** *Agent run*: from the moment the agent process was spawned to the run's end,
+by kind and by agent. It covers runs that ended succeeded, failed, interrupted or canceled. A
+run that failed before its agent was spawned (while its checkout was prepared, for example) is
+counted in `n of m` but not measured, and a `start_failed` run is not counted. *Queue wait*:
+from the job being queued to the spawn of its first run's agent that actually launched.
+Attempts that never launched an agent don't end the wait, and later attempts are not counted.
 *Label to PR opened*: from the trigger label being applied (the label event's time on GitHub) to
 the publication finishing. *PR opened to merged*: only PRs Updraft merged itself. Each shows
 `n`, average, median and 90th percentile (linear interpolation between closest ranks). Where
@@ -92,7 +95,11 @@ matched by any name it was recorded under). `--json` has the full breakdown for 
 - **History that was pruned before the upgrade.** The backfill can only read rows that are still
   there. After the upgrade nothing is lost to pruning.
 - **A retried job's earlier final statuses from before the upgrade**: the jobs table only holds
-  the latest one.
+  the latest one. After the upgrade, each one is its own fact, including two with no claim in
+  between (canceled, retried with `updraft retry`, canceled again).
+- **Exact agent start times from before the upgrade.** Older runs recorded no spawn time. A run
+  with a recorded agent pid is measured from its execution start, which is slightly earlier,
+  because it includes preparing the checkout. A run without a pid is not measured.
 - **PRs merged or closed by people.** Updraft records only its own merges, so "PR opened to
   merged" is about auto-merge. A PR closed without a merge is not a fact.
 - **Timeouts apart from other failures.** Both end a run `failed`; the difference is only in

@@ -470,6 +470,19 @@ const MIGRATIONS: Record<number, Migration> = {
       -- The reviewer's UPDRAFT-FINDINGS count of each verdict (telemetry; never part of the
       -- verdict). NULL: the line was missing, repeated or malformed, or the review predates it.
       ALTER TABLE pr_reviews ADD COLUMN findings_count INTEGER;
+
+      -- When the run's agent process was spawned (setRunProcess with a pid). execution_started_at
+      -- is earlier: it is set before the executor prepares the checkout, so a run that failed
+      -- before its agent launched has it too. Agent run time and queue wait use this instead.
+      -- Earlier runs: a recorded pid is the evidence that the agent launched, and
+      -- execution_started_at is the closest time there is; runs without a pid stay NULL (unknown).
+      ALTER TABLE runs ADD COLUMN agent_started_at TEXT;
+      UPDATE runs SET agent_started_at = execution_started_at WHERE pid IS NOT NULL AND execution_started_at IS NOT NULL;
+
+      -- How many times "updraft retry" requeued the job. A retry does not change attempts (only a
+      -- claim does), so this tells apart two terminal states a job reached with no claim in
+      -- between (canceled, retried, canceled again), which the job.finished fact is keyed on.
+      ALTER TABLE jobs ADD COLUMN retries INTEGER NOT NULL DEFAULT 0;
     `);
     backfillMetrics(db);
   },
