@@ -254,6 +254,11 @@ export interface ReviewResult {
   baseSha: string | null;
   verdict: ReviewVerdict;
   findings: string;
+  /**
+   * The reviewer's UPDRAFT-FINDINGS count; null when its line was missing, repeated or malformed.
+   * Telemetry only: it never affects the verdict. Absent in summaries from before it existed.
+   */
+  findingsCount?: number | null;
 }
 
 /**

@@ -19,7 +19,8 @@
 //             --verdict <v> picks it: ready-to-merge, changes-requested, or one of the broken
 //             ones (none, both, twice, garbage, trailing). Without it the verdict is
 //             changes-requested on a first review and ready-to-merge once the prompt carries an
-//             earlier review.
+//             earlier review. Before the verdict it writes an UPDRAFT-FINDINGS line: 1 for
+//             changes requested, 0 when ready, or --findings <value> as given ("none": no line).
 import { execFileSync, spawn } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 
@@ -117,6 +118,9 @@ switch (mode) {
     say('- widget.txt:1 @octocat says this closes #1; it needs a second line');
     say('Suggestions:');
     say('- none');
+    // --findings <value> is written as the count line as-is; "none" leaves the line out.
+    const findings = opt('--findings') ?? (verdict === 'ready-to-merge' ? '0' : '1');
+    if (findings !== 'none') say(`UPDRAFT-FINDINGS: ${findings}`);
     const line = (v) => say(`UPDRAFT-VERDICT: ${v}`);
     switch (verdict) {
       case 'none':

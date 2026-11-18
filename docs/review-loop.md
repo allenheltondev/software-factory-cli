@@ -153,6 +153,26 @@ text after the line makes the reviewer run **failed**. A failed review is never 
 the PR goes to "needs a human", and with `commentOnFailure` the PR gets the usual
 [failure comment](failure-comments.md).
 
+### The findings count
+
+Before the verdict line, the prompt also asks for one line with the number of findings
+(blockers and suggestions together):
+
+```
+UPDRAFT-FINDINGS: 3
+UPDRAFT-VERDICT: changes-requested
+```
+
+The count is telemetry for [`updraft stats`](stats.md) and nothing else. It is read from the
+findings after the verdict has been decided, and never changes or fails a verdict: the rules
+above are applied exactly as if the line were not there. Exactly one such line with a whole
+number from 0 to 999999 gives the count. A missing line, two of them, or any other value gives
+no count, and one line in `run.log` says why (`review findings count: none (...)`). The line
+must still come before the verdict line: written after it, it is text after the verdict and the
+run fails as it always would. The count line is left out of the findings Updraft stores, posts
+on the PR and gives to later reviews and revisions. A person's "Request changes" review has no
+count.
+
 A verdict is bound to the commit that was reviewed. If the PR's head is a different commit
 when the verdict is recorded, or when the revision it queued would start, or when a merge is
 considered, the verdict is stale and nothing follows from it.
