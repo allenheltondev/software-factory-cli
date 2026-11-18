@@ -109,6 +109,8 @@ try {
   check(existsSync(cliJs), `installed ${cliJs}`);
   for (const rel of [
     'README.md',
+    'docs/live-execution.md',
+    'docs/agents/claude.md',
     'examples/config.yaml',
     'examples/prompts/implement-issue.md',
     'examples/launchers/windows/register-task.ps1',

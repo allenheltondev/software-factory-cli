@@ -7,8 +7,9 @@ maxConcurrent: 2
 execution:
   # log-only: record each run in run.log. prepare-only: also create a branch and
   # worktree per job (needs checkoutPath). live: also run the agent in the worktree
-  # (needs checkoutPath and an action prompt). Only the Claude Code adapter ships in
-  # this release, so live mode validates only with codex and kiro disabled:
+  # (needs checkoutPath and an action prompt). Live mode can run all three agents below
+  # (Claude Code, Codex and Kiro), each in full-auto by default. Disable the ones you do
+  # not use; this runs Claude Code only:
   #
   #   execution: { mode: live }
   #   agents:
@@ -27,7 +28,7 @@ agents:
     maxConcurrent: 1
     # Live mode only: the CLI to run instead of the one found on PATH, extra arguments,
     # and environment variables for the agent process. Arguments go after the adapter's
-    # own; a --permission-mode here replaces the full-auto default (see the README).
+    # own; a --permission-mode here replaces the full-auto default (see docs/agents/claude.md).
     # command: /usr/local/bin/claude
     # args: [--model, sonnet, --max-turns, "60"]
     # args: [--permission-mode, acceptEdits, --allowedTools, "Bash(npm test *)", "Bash(git add *)", "Bash(git commit *)"]
