@@ -21,6 +21,12 @@ execution:
 dispatch:
   allowedActors: [allenheltondev]
 
+# Logins whose PR reviews carry a trusted updraft-review-result block, shown by `updraft reviews`
+# (see docs/review-result.md). Empty (the default) trusts no review result. This is for a
+# reviewer outside Updraft; Updraft's own reviewer is repositories.<repo>.review.
+review:
+  reviewers: [allenheltondev]
+
 # Optional: act on GitHub as a GitHub App (`<app-slug>[bot]`) instead of your gh account, so
 # PRs and comments are the bot's and you can approve them. The key file stays outside the
 # config. See docs/github-app.md.

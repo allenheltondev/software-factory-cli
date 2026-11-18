@@ -1,5 +1,5 @@
 import { defaultDiscoveryProbes, discoverAgents, type AgentReport, type DiscoverOptions } from '../agents/discovery.js';
-import { openDatabase, type Db } from '../db/database.js';
+import { openDatabase, type Db, openDatabaseReadOnly } from '../db/database.js';
 import type { GitHubApi } from '../github/api.js';
 import type { UpdraftConfig } from '../config/schema.js';
 import { createGitHubApi, resolveGitHubToken } from '../github/client.js';
@@ -35,6 +35,8 @@ export interface CommandContext {
   /** Lazily created so non-interactive commands never touch the terminal. */
   prompter(): Prompter;
   openDb(file: string): Db;
+  /** Open an existing state database without migrating or writing to it. */
+  openDbReadOnly(file: string): Db;
   now(): number;
   /**
    * Find installed and usable coding agents (runs their CLIs), in this process's environment or
@@ -62,6 +64,7 @@ export function createDefaultContext(globals: GlobalOptions = {}): CommandContex
       createWorkerCredentials(config, { configDir: paths.configDir, env, userToken: () => resolveGitHubToken(env), ...(opts?.log ? { log: opts.log } : {}) }),
     prompter: () => (prompter ??= createClackPrompter()),
     openDb: (file) => openDatabase(file),
+    openDbReadOnly: (file) => openDatabaseReadOnly(file),
     now: () => Date.now(),
     discoverAgents: (opts) => discoverAgents(defaultDiscoveryProbes(opts?.env ?? env), opts),
   };

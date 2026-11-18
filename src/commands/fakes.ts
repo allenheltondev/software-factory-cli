@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { ReviewLoopApiStubs } from '../../test/review-loop-api-stubs.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { KNOWN_ADAPTERS, type AdapterName } from '../config/schema.js';
-import { GitHubError, type GitHubApi, type GitHubLabel, type GitHubRepo } from '../github/api.js';
+import { GitHubError, type GitHubApi, type GitHubLabel, type GitHubRepo, type PullRequestDetails, type PullRequestReviewSummary } from '../github/api.js';
 import { createUserCredentials, userIdentity } from '../github/credentials.js';
 import { resolvePaths } from '../paths.js';
 import type { CommandContext } from './context.js';
@@ -44,6 +44,10 @@ export interface FakeApiData {
   /** Accessible via getRepo but not listed by listUserRepos (e.g. public repos). */
   publicRepos?: GitHubRepo[];
   labels?: Record<string, string[]>;
+  /** Pull requests by "OWNER/REPO#N", for getPullRequest. */
+  pulls?: Record<string, PullRequestDetails>;
+  /** Reviews by "OWNER/REPO#N", oldest first, for listPullRequestReviews. */
+  reviews?: Record<string, PullRequestReviewSummary[]>;
 }
 
 export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] } {
@@ -103,6 +107,16 @@ export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] }
     },
     async createIssueComment() {
       throw new Error('not used');
+    },
+    async getPullRequest(repo, n) {
+      calls.push(`getPullRequest ${repo.fullName}#${n}`);
+      const pr = data.pulls?.[`${repo.fullName}#${n}`];
+      if (!pr) throw new GitHubError(`Pull request ${repo.fullName}#${n}`, 404);
+      return pr;
+    },
+    async listPullRequestReviews(repo, n) {
+      calls.push(`listPullRequestReviews ${repo.fullName}#${n}`);
+      return data.reviews?.[`${repo.fullName}#${n}`] ?? [];
     },
   };
 }
@@ -178,6 +192,9 @@ export function fakeContext(
       return o.prompter;
     },
     openDb: () => {
+      throw new Error('no db in this test');
+    },
+    openDbReadOnly: () => {
       throw new Error('no db in this test');
     },
     now: () => Date.parse('2026-01-01T00:00:00Z'),

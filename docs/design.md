@@ -153,6 +153,8 @@ Create a dedicated Kids and Dragons review chat and configure a GitHub event-tri
 
 The initial review destination is the dedicated ChatGPT chat. To close the loop automatically later, Updraft will need a review result it can read reliably, with PR number, head SHA and blocker status. Options include an authorized GitHub review output or a local Codex reviewer with structured output. Define that handoff before letting Updraft send findings back to an implementation agent. Keep merges a human decision in the pilot.
 
+**Decided (#13):** a result from an outside reviewer is a GitHub PR review carrying a hidden `updraft-review-result v1` block with the reviewed head SHA and `blockers: yes|no`, trusted only from logins in `review.reviewers` and only when the block's head matches the review's `commit_id`. The blocker status lives in the block because reviews posted from the PR author's own account are always `COMMENTED`. `updraft reviews` reads it; it acts on nothing. Updraft's own reviewer and fix cycle were built separately ([review-loop.md](review-loop.md)). See [review-result.md](review-result.md).
+
 ## 6. First build and acceptance
 
 1. Ship repo discovery, config validation, issue-event polling and a durable queue. Run a log-only action before enabling agents.

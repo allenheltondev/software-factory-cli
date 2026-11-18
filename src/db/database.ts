@@ -470,6 +470,26 @@ export function openDatabase(file: string, opts: { migrateTo?: number } = {}): D
   return db;
 }
 
+/**
+ * Open an existing state database to look at it and nothing more: no migration, no switch to
+ * WAL, no pragma that writes. For commands that must not change state as a side effect of
+ * reading it. The caller checks {@link schemaVersion} before relying on a table.
+ */
+export function openDatabaseReadOnly(file: string): Db {
+  const { DatabaseSync } = loadSqlite();
+  const db = new DatabaseSync(file, { readOnly: true });
+  db.exec('PRAGMA busy_timeout = 5000;');
+  return db;
+}
+
+/** The schema version a state database is at (PRAGMA user_version). */
+export function schemaVersion(db: Db): number {
+  return (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
+}
+
+/** The schema version that added the publications table. */
+export const PUBLICATIONS_SCHEMA_VERSION = 6;
+
 /** Apply pending migrations up to `target` (default: the current schema). Exported for migration tests. */
 export function migrate(db: Db, target = SCHEMA_VERSION): void {
   const current = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;

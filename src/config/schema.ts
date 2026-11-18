@@ -278,6 +278,16 @@ export const configSchema = z.strictObject({
       allowedActors: z.array(z.string().min(1)).default([]),
     })
     .default({ allowedActors: [] }),
+  review: z
+    .strictObject({
+      /**
+       * GitHub logins whose PR reviews carry a trusted updraft-review-result block (see
+       * docs/review-result.md). Compared case-insensitively. Empty trusts no review result.
+       * Not to be confused with repositories.<repo>.review, which turns on Updraft's own reviewer.
+       */
+      reviewers: z.array(z.string().min(1)).default([]),
+    })
+    .default({ reviewers: [] }),
   agents: z.record(name, agentSchema),
   pools: z.record(name, poolSchema),
   actions: z.record(name, actionSchema),

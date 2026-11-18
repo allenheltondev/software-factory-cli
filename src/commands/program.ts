@@ -11,6 +11,7 @@ import { describeError } from './errors.js';
 import { logsCommand, type LogsOptions } from './logs.js';
 import { publishCommand } from './publish.js';
 import { retryCommand } from './retry.js';
+import { reviewsCommand, type ReviewsOptions } from './reviews.js';
 import { startCommand } from './start.js';
 import { statusCommand } from './status.js';
 import { validateCommand } from './validate.js';
@@ -26,6 +27,7 @@ export interface Handlers {
   agents(ctx: CommandContext, opts: AgentsOptions): Promise<number>;
   clean(ctx: CommandContext, opts: { dryRun?: boolean; olderThan?: string }): Promise<number>;
   publish(ctx: CommandContext, runId: string): Promise<number>;
+  reviews(ctx: CommandContext, opts: ReviewsOptions): Promise<number>;
   cancel(ctx: CommandContext, jobId: string): Promise<number>;
   logs(ctx: CommandContext, id: string, opts: LogsOptions): Promise<number>;
 }
@@ -41,6 +43,7 @@ export const defaultHandlers: Handlers = {
   agents: agentsCommand,
   clean: (ctx, opts) => cleanCommand(ctx, opts),
   publish: (ctx, runId) => publishCommand(ctx, runId),
+  reviews: (ctx, opts) => reviewsCommand(ctx, opts),
   cancel: (ctx, jobId) => cancelCommand(ctx, jobId),
   logs: (ctx, id, opts) => logsCommand(ctx, id, opts),
 };
@@ -151,6 +154,13 @@ export function buildProgram(opts: ProgramOptions): Command {
     .description('Push the branch of a succeeded live run and open its PR, or finish a failed publication (never duplicates)')
     .argument('<runId>', 'run id (see "updraft status")')
     .action((runId: string) => exec((ctx) => handlers.publish(ctx, runId)));
+
+  program
+    .command('reviews')
+    .description('Show the review result for the current head of each published PR (read-only; see docs/review-result.md)')
+    .addOption(new Option('--json', 'machine-readable output'))
+    .option('--limit <n>', 'most recent published PRs to check', '20')
+    .action((o: ReviewsOptions) => exec((ctx) => handlers.reviews(ctx, o)));
 
   program
     .command('clean')

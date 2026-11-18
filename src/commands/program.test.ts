@@ -111,6 +111,16 @@ describe('commander wiring', () => {
     await expect(parse('logs')).rejects.toMatchObject({ code: 'commander.missingArgument' });
   });
 
+  it('parses reviews with --json and --limit', async () => {
+    const reviews = vi.fn(async (_ctx: unknown, _o: { json?: boolean; limit?: string }) => 0);
+    const { parse, codes } = setup({ reviews });
+    await parse('reviews');
+    await parse('reviews', '--json', '--limit', '5');
+    expect(reviews.mock.calls[0]?.[1]).toEqual({ limit: '20' });
+    expect(reviews.mock.calls[1]?.[1]).toEqual({ json: true, limit: '5' });
+    expect(codes).toEqual([0, 0]);
+  });
+
   it('parses agents --json --deep', async () => {
     const agents = vi.fn(async (_ctx: unknown, _o: { json?: boolean; deep?: boolean }) => 0);
     const { parse } = setup({ agents });

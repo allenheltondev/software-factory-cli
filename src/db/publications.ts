@@ -225,6 +225,32 @@ export function listDuePublications(db: Db, opts: { maxAttempts: number; now?: (
 }
 
 /** Newest first, for `updraft status`. */
+/**
+ * Pull requests Updraft published, newest first, one row per PR (its newest published
+ * publication), and how many there are in all. Filtered and deduplicated before the limit is
+ * applied, so `limit` PRs come back whenever that many exist, however many failed or repeated
+ * publications sit between them, and `total` counts the same set.
+ */
+export function listPublishedPulls(db: Db, limit: number): { pulls: Array<Publication & { prNumber: number }>; total: number } {
+  const rows = db
+    .prepare(
+      `SELECT p.* FROM publications p
+       WHERE p.state = 'published' AND p.pr_number IS NOT NULL
+         AND p.rowid = (
+           SELECT q.rowid FROM publications q
+           WHERE q.state = 'published' AND q.repo_id = p.repo_id AND q.pr_number = p.pr_number
+           ORDER BY q.updated_at DESC, q.rowid DESC LIMIT 1
+         )
+       ORDER BY p.updated_at DESC, p.rowid DESC
+       LIMIT ?`,
+    )
+    .all(limit) as unknown as PublicationRow[];
+  const { n } = db
+    .prepare("SELECT count(*) AS n FROM (SELECT DISTINCT repo_id, pr_number FROM publications WHERE state = 'published' AND pr_number IS NOT NULL)")
+    .get() as { n: number };
+  return { pulls: rows.map(rowToPublication) as Array<Publication & { prNumber: number }>, total: n };
+}
+
 export function listRecentPublications(db: Db, limit = 10): Publication[] {
   return (
     db.prepare('SELECT * FROM publications ORDER BY updated_at DESC, rowid DESC LIMIT ?').all(limit) as unknown as PublicationRow[]
