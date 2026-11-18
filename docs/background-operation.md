@@ -354,7 +354,18 @@ its own while the worker stays on the host, see [Isolating agents](isolation.md)
 `state.db`, `worktrees/`, `logs/`) is in one directory, `~/.updraft` by default. Inside a
 container that is the image's home directory, which is lost with the container and, on
 platforms that run containers under an arbitrary uid, may be `/` or read-only. Set
-`UPDRAFT_HOME` explicitly and mount a volume there:
+`UPDRAFT_HOME` explicitly and mount a volume there.
+
+The worker must be able to write that directory as the user it runs as. A new named volume is
+owned by root unless the image already has the directory: on first use Docker and Podman copy
+the image's directory at the mount point, including its owner, into an empty volume. So
+create it in the image, owned by the user the container runs as:
+
+```dockerfile
+# In your image, after installing node, git, gh, updraft and the agent CLIs:
+RUN mkdir -p /data && chown 1000:1000 /data
+USER 1000:1000
+```
 
 ```sh
 docker run -d --name updraft --init --restart unless-stopped --stop-timeout 60 \
@@ -365,6 +376,14 @@ docker run -d --name updraft --init --restart unless-stopped --stop-timeout 60 \
   -v updraft-data:/data \
   your-updraft-image updraft start
 ```
+
+The copy only happens into an empty named volume. For a volume that already exists and is
+owned by root, fix its owner once, for example
+`docker run --rm -v updraft-data:/data alpine chown 1000:1000 /data`. For a bind mount
+(`-v /srv/updraft:/data`), make the host directory owned by that uid, since nothing is copied.
+In Kubernetes, set `securityContext.fsGroup` (and `runAsUser`) to match. Then check with
+`docker exec updraft updraft doctor`, which reports whether the state and log directories are
+writable.
 
 - **A local volume, not a network share.** `state.db` is SQLite in WAL mode, which needs a
   filesystem with working locks and shared memory. A named volume or a bind mount of a local

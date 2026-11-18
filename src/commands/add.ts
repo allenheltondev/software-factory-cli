@@ -16,7 +16,7 @@ import {
   seedConfig,
   upsertRepoWorkflow,
 } from './config-edit.js';
-import { println, type CommandContext } from './context.js';
+import { legacyNotice, println, type CommandContext } from './context.js';
 import { CliError, EXIT } from './errors.js';
 
 export interface AddOptions {
@@ -65,6 +65,7 @@ export async function addCommand(ctx: CommandContext, repoArg: string, opts: Add
 
   const configPath = ctx.paths.configFile;
   const existing = loadEditableConfig(configPath);
+  if (!existing) for (const line of legacyNotice(ctx)) println(ctx.err, `! ${line}`);
   const api = await ctx.createApi();
   const repo = await api.getRepo(repoArg);
   const base = existing ?? seedConfig((await api.getViewer()).login);

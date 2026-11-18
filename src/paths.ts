@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { homedir as osHomedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -55,4 +56,62 @@ export function resolvePaths(opts: ResolvePathsOptions = {}): UpdraftPaths {
     logDir,
     runsDir: join(logDir, 'runs'),
   };
+}
+
+/** Where builds before `~/.updraft` kept their files. */
+export interface LegacyInstall {
+  configFile: string;
+  /** Held state.db and worktrees/ (and, except on macOS, logs/). */
+  dataDir: string;
+}
+
+export interface FindLegacyInstallOptions extends ResolvePathsOptions {
+  platform?: NodeJS.Platform;
+  exists?: (path: string) => boolean;
+}
+
+/** The per-OS locations earlier builds used, whether or not anything is there. */
+export function legacyLocations(opts: FindLegacyInstallOptions = {}): LegacyInstall {
+  const env = opts.env ?? process.env;
+  const platform = opts.platform ?? process.platform;
+  const home = opts.homedir ?? osHomedir();
+  const app = 'updraft';
+  if (platform === 'win32') {
+    const roaming = env.APPDATA ?? join(home, 'AppData', 'Roaming');
+    const local = env.LOCALAPPDATA ?? join(home, 'AppData', 'Local');
+    return { configFile: join(roaming, app, 'config.yaml'), dataDir: join(local, app) };
+  }
+  if (platform === 'darwin') {
+    const dir = join(home, 'Library', 'Application Support', app);
+    return { configFile: join(dir, 'config.yaml'), dataDir: dir };
+  }
+  const xdgConfig = env.XDG_CONFIG_HOME || join(home, '.config');
+  const xdgState = env.XDG_STATE_HOME || join(home, '.local', 'state');
+  return { configFile: join(xdgConfig, app, 'config.yaml'), dataDir: join(xdgState, app) };
+}
+
+/**
+ * An install left in the per-OS locations, when this run uses the default `~/.updraft` and has
+ * no config there yet. Null when UPDRAFT_HOME, UPDRAFT_CONFIG or --config is set: then the
+ * user already chose where the files are.
+ */
+export function findLegacyInstall(opts: FindLegacyInstallOptions = {}): LegacyInstall | null {
+  const env = opts.env ?? process.env;
+  if (opts.configPath || env.UPDRAFT_HOME || env.UPDRAFT_CONFIG) return null;
+  const exists = opts.exists ?? existsSync;
+  if (exists(resolvePaths(opts).configFile)) return null;
+  const legacy = legacyLocations(opts);
+  return exists(legacy.configFile) ? legacy : null;
+}
+
+/** What to tell the user about a legacy install: how to keep it as is, or where to read about moving. */
+export function legacyInstallNotice(legacy: LegacyInstall, paths: Pick<UpdraftPaths, 'configDir'>): string[] {
+  return [
+    `An install from an earlier version is still at ${legacy.configFile} (state in ${legacy.dataDir}).`,
+    `This version keeps its files in ${paths.configDir} and does not read the old folders. To keep`,
+    `using that install unchanged, with its history, set both:`,
+    `  UPDRAFT_CONFIG=${legacy.configFile}`,
+    `  UPDRAFT_HOME=${legacy.dataDir}`,
+    `To start over in ${paths.configDir} instead, see "Moving from the per-OS locations" in the README.`,
+  ];
 }

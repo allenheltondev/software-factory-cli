@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { ConfigError, configExists, readRawConfig, resolveConfigRelative } from '../config/io.js';
 import type { UpdraftConfig } from '../config/schema.js';
 import { validateConfig, type ConfigIssue } from '../config/validate.js';
-import { println, type CommandContext } from './context.js';
+import { legacyNotice, println, type CommandContext } from './context.js';
 import { appKeyProblem } from './doctor-app.js';
 import { EXIT } from './errors.js';
 
@@ -51,6 +51,7 @@ export async function validateCommand(ctx: CommandContext): Promise<number> {
   switch (check.state) {
     case 'missing':
       println(ctx.err, `✗ No config at ${check.path}. Run "updraft configure" or pass --config.`);
+      for (const line of legacyNotice(ctx)) println(ctx.err, line);
       return EXIT.FAILURE;
     case 'unreadable':
       println(ctx.err, `✗ ${check.message}`);

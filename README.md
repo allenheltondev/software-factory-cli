@@ -327,14 +327,64 @@ Overrides:
 
 ## Moving from the per-OS locations
 
-Earlier builds kept config, state and logs in per-OS folders (`%APPDATA%\updraft` and
-`%LOCALAPPDATA%\updraft` on Windows, `~/Library/Application Support/updraft` and
-`~/Library/Logs/updraft` on macOS, `~/.config/updraft` and `~/.local/state/updraft` on Linux).
-Nothing reads those any more. Stop the worker, move `config.yaml` and `prompts/` from the old
-config folder and `state.db`, `worktrees/` and `logs/` from the old state folder into
-`~/.updraft`, then reinstall the launcher so it points at the new config path. Move worktrees
-with `git worktree move` from your clone, or run `updraft clean` beforehand, so Git's records
-of them stay right.
+Earlier builds kept their files in per-OS folders:
+
+| | Config folder (`config.yaml`, `prompts/`) | State folder (`state.db`, `worktrees/`, `logs/`) |
+| --- | --- | --- |
+| Windows | `%APPDATA%\updraft` | `%LOCALAPPDATA%\updraft` |
+| macOS | `~/Library/Application Support/updraft` | the same folder; logs in `~/Library/Logs/updraft` |
+| Linux | `~/.config/updraft` | `~/.local/state/updraft` |
+
+Nothing reads those folders by default any more. When `~/.updraft` has no config and the old
+config folder does, `updraft doctor`, `configure`, `add` and every command that stops for lack
+of a config say where it is. Don't just move the files into `~/.updraft`:
+
+- `state.db` records each run's log file and worktree by absolute path, so after a move
+  `updraft logs` can't find old runs and `updraft clean` skips their worktrees.
+- Relative paths in `config.yaml`, such as `checkoutPath: ../my-clone`, resolve against the
+  config file's folder, so moving the file changes where they point.
+
+Choose one of these instead:
+
+**Keep the install where it is.** Nothing is lost. Point Updraft at the old folders, in your
+user environment and in the launcher:
+
+| | Set |
+| --- | --- |
+| Environment | `UPDRAFT_CONFIG=<config folder>/config.yaml` and `UPDRAFT_HOME=<state folder>` |
+| Windows launcher | `register-task.ps1 -ConfigPath <config folder>\config.yaml -UpdraftHome <state folder>` |
+| macOS launcher | `install-launchagent.sh --config <config folder>/config.yaml --updraft-home <state folder>` |
+| Linux launcher | `install-systemd-user.sh --config <config folder>/config.yaml --updraft-home <state folder> --env-file ~/.config/updraft/worker.env` |
+
+Config-relative paths, state and worktrees then resolve exactly as before. On macOS, logs of new
+runs go to `<state folder>/logs`; logs of earlier runs stay in `~/Library/Logs/updraft` and are
+still found. On Windows the folders stay under `AppData`, with the redirection problem
+described above for packaged apps.
+
+**Start over in `~/.updraft`.** Only the config moves. The queue, run history and stats stay
+behind:
+
+1. Let queued and running jobs finish, or cancel them. Publish any succeeded run you still
+   want (`updraft publish RUN_ID`). Optionally run `updraft clean` to remove finished
+   worktrees. Then stop the worker and remove its launcher.
+2. Copy `config.yaml` and `prompts/` into `~/.updraft`. Then make every config-relative path
+   absolute, or rewrite it relative to `~/.updraft`:
+   - `repositories.*.checkoutPath`;
+   - `actions.*.prompt`, `revisePrompt` and `reviewPrompt` (unchanged if they point into the
+     copied `prompts/`);
+   - `agents.*.command` and `agents.*.container.runtime` when they are paths;
+   - `github.app.privateKeyPath`, and move the key file if it lived in the old folder.
+3. Leave `state.db`, `logs/` and `worktrees/` where they are. `~/.updraft` gets a new, empty
+   `state.db`:
+   - polling starts again at each repository's current event, so old label events are not
+     queued again;
+   - `updraft logs`, `retry`, `publish`, `status` and `stats` no longer know earlier jobs;
+   - PRs opened before the switch get no further revisions or reviews.
+
+   Earlier runs' logs stay readable as files in the old state folder. Their branches are
+   untouched. Remove leftover worktrees with `git worktree remove <path>` from the clone.
+4. Run `updraft validate` and `updraft doctor`, which check each `checkoutPath` and prompt
+   file, then reinstall the launcher.
 
 ## Upgrading from software-factory-cli
 
@@ -344,8 +394,10 @@ clean break: nothing reads the old names. To move an existing install:
 1. Stop the worker and remove its launcher using the old package's scripts (the Task Scheduler
    task, LaunchAgent or systemd unit), then `npm uninstall -g software-factory-cli` and
    `npm install -g @allenheltondev/updraft`.
-2. Move the `software-factory` config, state and logs into `~/.updraft` (see
-   [Files and locations](#files-and-locations)). The worker log is now `updraft.log`.
+2. Keep the `software-factory` config and state folders where they are, or start over in
+   `~/.updraft`, as described in [Moving from the per-OS locations](#moving-from-the-per-os-locations),
+   with `software-factory` in place of `updraft` in the folder names. Don't just move or rename
+   them, for the same reasons. The worker log is now `updraft.log`.
 3. Replace `FACTORY_HOME` and `FACTORY_CONFIG` with `UPDRAFT_HOME` and `UPDRAFT_CONFIG`
    wherever you set them, and install the launcher again from the new package.
 4. Let queued and running jobs finish before you switch, or re-apply the label afterwards.

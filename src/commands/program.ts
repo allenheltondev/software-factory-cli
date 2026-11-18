@@ -5,7 +5,8 @@ import { cancelCommand } from './cancel.js';
 import { cleanCommand } from './clean.js';
 import { configureCommand } from './configure.js';
 import { DEFAULT_LABEL } from './config-edit.js';
-import { createDefaultContext, println, type CommandContext, type GlobalOptions } from './context.js';
+import { MissingConfigError } from '../config/io.js';
+import { createDefaultContext, legacyNotice, println, type CommandContext, type GlobalOptions } from './context.js';
 import { doctorCommand } from './doctor.js';
 import { describeError } from './errors.js';
 import { logsCommand, type LogsOptions } from './logs.js';
@@ -82,6 +83,7 @@ export function buildProgram(opts: ProgramOptions): Command {
     } catch (err) {
       const { message, exitCode } = describeError(err);
       println(ctx.err, `error: ${message}`);
+      if (err instanceof MissingConfigError) for (const line of legacyNotice(ctx)) println(ctx.err, line);
       setExitCode(exitCode);
     }
   };
