@@ -92,8 +92,22 @@ function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void 
 }
 
 /**
- * Pick an agent for a job in `poolName` using the pool's persisted round-robin
- * cursor: walk the pool from next_index and take the first enabled agent with
+ * The pool_cursors key of a job's round-robin rotation. Reviewer jobs rotate on a cursor of their
+ * own, so who reviews takes turns among the reviewers whatever coding jobs the same pool runs in
+ * between (with one shared cursor, a pool that both codes and reviews would hand each review to
+ * whichever agent follows the author). Pool names cannot contain ":", so the keys never collide.
+ */
+export function cursorKey(row: Pick<JobRow, 'pool' | 'event_id'>): string {
+  return isReviewJobRow(row) ? `review:${row.pool}` : row.pool;
+}
+
+function isReviewJobRow(row: Pick<JobRow, 'event_id'>): boolean {
+  return row.event_id.startsWith('pr-review:');
+}
+
+/**
+ * Pick an agent for a job from `poolAgents` using the persisted round-robin cursor `cursor`
+ * (cursorKey): walk the pool from next_index and take the first enabled agent with
  * capacity, preferring agents that have not just failed to start this job.
  * Advances the cursor past the chosen agent. Returns null if none has capacity.
  */
@@ -101,7 +115,7 @@ function pickAgent(
   db: Db,
   config: UpdraftConfig,
   job: JobRow,
-  poolName: string,
+  cursor: string,
   poolAgents: readonly string[],
   load: Map<string, number>,
   /** Never picked, whatever its capacity (the author of the code a reviewer job reviews). */
@@ -109,7 +123,7 @@ function pickAgent(
 ): string | null {
   const n = poolAgents.length;
   if (n === 0) return null;
-  const cursorRow = db.prepare('SELECT next_index FROM pool_cursors WHERE pool = ?').get(poolName) as
+  const cursorRow = db.prepare('SELECT next_index FROM pool_cursors WHERE pool = ?').get(cursor) as
     | { next_index: number }
     | undefined;
   const start = (((cursorRow?.next_index ?? 0) % n) + n) % n;
@@ -125,7 +139,7 @@ function pickAgent(
   const choice = capable.find((c) => !failed.has(c.name)) ?? capable[0]!;
   db.prepare(
     'INSERT INTO pool_cursors (pool, next_index) VALUES (?, ?) ON CONFLICT (pool) DO UPDATE SET next_index = excluded.next_index',
-  ).run(poolName, (choice.index + 1) % n);
+  ).run(cursor, (choice.index + 1) % n);
   return choice.name;
 }
 
@@ -137,7 +151,7 @@ function pickAgent(
  * (review: { allowSameAgent: true }); otherwise the job cannot be routed (`problem`).
  */
 function reviewerExclusion(config: UpdraftConfig, row: JobRow, poolAgents: readonly string[]): { exclude: string | null; problem?: string } {
-  if (!row.event_id.startsWith('pr-review:')) return { exclude: null };
+  if (!isReviewJobRow(row)) return { exclude: null };
   let author: string | null;
   try {
     author = reviewOf(rowToJob(row))?.authorAgent ?? null;
@@ -237,7 +251,7 @@ export function claimNextJob(
         failUnroutable(db, row, reviewer.problem, at);
         continue;
       }
-      const agent = pickAgent(db, config, row, row.pool, pool.agents, load, reviewer.exclude);
+      const agent = pickAgent(db, config, row, cursorKey(row), pool.agents, load, reviewer.exclude);
       if (!agent) continue; // this pool is saturated; later jobs in other pools may still start
 
       const runId = newId('run');

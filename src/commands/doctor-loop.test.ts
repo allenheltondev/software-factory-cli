@@ -74,6 +74,10 @@ describe('loopChecks', () => {
       'warn review: workflow wf, code from pool general, reviewers from pool general: claude reviews its own work (review.allowSameAgent)',
     );
     expect(lines({ repo: { revise: false } })).toContain('warn review: revise is off, so a "changes requested" verdict is only posted');
+    // The repository's review.pool is where reviewers come from when the workflow names none.
+    expect(lines({ workflow: { reviewPool: undefined }, repo: { review: { pool: 'reviewers' } } })).toContain(
+      'ok review: workflow wf, code from pool general, reviewers from pool reviewers: a reviewer other than the author is always available (codex)',
+    );
     expect(lines({ mode: 'log-only' })).toEqual([
       'warn revise is set but does nothing here: it needs execution.mode live and publish',
       'warn review is set but does nothing here: it needs execution.mode live and publish',

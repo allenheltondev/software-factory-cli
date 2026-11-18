@@ -5,7 +5,7 @@
 //
 // The PRs are the rows of revision_prs (src/db/revisions.ts): one row per PR Updraft opened,
 // shared with the revision loop. The columns this module owns were added by migration 11.
-import { allowedActorsFor, reviewActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
+import { allowedActorsFor, reviewActive, reviewPoolFor, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import {
   ENVELOPE_SCHEMA_VERSION,
   type EventEnvelope,
@@ -237,7 +237,7 @@ function humanChangeRequests(db: Db, repoId: number, prNumber: number, allowedAc
 /**
  * Queue the reviewer job for the PR's current head, unless one exists or existed (the jobs unique
  * key and the pruned_events tombstones, as for every job). Same workflow, action and issue as the
- * job that opened the PR; the pool is the workflow's reviewPool, else that job's pool. Returns
+ * job that opened the PR; the pool is chosen by reviewPoolFor (`o.pool`). Returns
  * the job, or null when nothing was queued.
  */
 export function enqueueReviewJob(
@@ -310,7 +310,7 @@ export function scheduleReviews(db: Db, config: UpdraftConfig, repoFullName: str
     const job = enqueueReviewJob(db, {
       repo: { id: cfg.id, fullName: repoFullName },
       pr,
-      pool: wf?.reviewPool ?? pr.pool,
+      pool: reviewPoolFor(cfg, wf, pr.pool),
       // Without its workflow there is no allowlist: nobody's change request is passed on.
       allowedActors: wf ? allowedActorsFor(config, wf) : [],
       now,

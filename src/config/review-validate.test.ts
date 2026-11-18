@@ -1,6 +1,6 @@
-// Validation of the review loop's options: review, reviewPrompt, reviewPool, autoMerge.
+// Validation of the review loop's options: review, review.pool, reviewPrompt, reviewPool, autoMerge.
 import { describe, expect, it } from 'vitest';
-import { autoMergeMethod, configSchema, reviewActive, reviewSettings } from './schema.js';
+import { autoMergeMethod, configSchema, reviewActive, reviewPoolFor, reviewSettings } from './schema.js';
 import { validateConfig } from './validate.js';
 
 const REPO = 'octo/widgets';
@@ -35,7 +35,7 @@ const errorsOf = (raw: unknown) => {
 describe('review loop options', () => {
   it('are off by default and accepted when complete', () => {
     const plain = configSchema.parse(base({ repo: { review: undefined } }));
-    expect(reviewSettings(plain.repositories[REPO]!)).toEqual({ enabled: false, allowSameAgent: false });
+    expect(reviewSettings(plain.repositories[REPO]!)).toEqual({ enabled: false, allowSameAgent: false, pool: null });
     expect(reviewActive(plain, plain.repositories[REPO]!)).toBe(false);
     expect(autoMergeMethod(plain, plain.repositories[REPO]!)).toBeNull();
 
@@ -43,10 +43,11 @@ describe('review loop options', () => {
     expect(r).toMatchObject({ ok: true, warnings: [] });
     if (!r.ok) return;
     const repo = r.config.repositories[REPO]!;
-    expect(reviewSettings(repo)).toEqual({ enabled: true, allowSameAgent: false });
+    expect(reviewSettings(repo)).toEqual({ enabled: true, allowSameAgent: false, pool: null });
     expect(autoMergeMethod(r.config, repo)).toBe('squash');
-    expect(reviewSettings(configSchema.parse(base({ repo: { review: { allowSameAgent: true } } })).repositories[REPO]!)).toEqual({ enabled: true, allowSameAgent: true });
-    expect(reviewSettings(configSchema.parse(base({ repo: { review: {} } })).repositories[REPO]!)).toEqual({ enabled: true, allowSameAgent: false });
+    expect(reviewSettings(configSchema.parse(base({ repo: { review: { allowSameAgent: true } } })).repositories[REPO]!)).toEqual({ enabled: true, allowSameAgent: true, pool: null });
+    expect(reviewSettings(configSchema.parse(base({ repo: { review: {} } })).repositories[REPO]!)).toEqual({ enabled: true, allowSameAgent: false, pool: null });
+    expect(reviewSettings(configSchema.parse(base({ repo: { review: { pool: 'reviewers' } } })).repositories[REPO]!)).toEqual({ enabled: true, allowSameAgent: false, pool: 'reviewers' });
 
     expect(errorsOf(base({ repo: { autoMerge: 'fast-forward' } }))).not.toEqual([]);
     expect(errorsOf(base({ repo: { review: { allowOwnAgent: true } } }))).not.toEqual([]);
@@ -76,6 +77,32 @@ describe('review loop options', () => {
 
   it('rejects an unknown reviewPool', () => {
     expect(errorsOf(base({ workflow: { reviewPool: 'nobody' } }))).toContainEqual({ path: `repositories.${REPO}.workflows.0.reviewPool`, message: 'unknown pool "nobody"' });
+  });
+
+  it('takes the reviewer pool from the workflow, else review.pool, else the coding pool', () => {
+    const at = (repo: Record<string, unknown>, workflow: Record<string, unknown>) => {
+      const config = configSchema.parse(base({ repo, workflow }));
+      const r = config.repositories[REPO]!;
+      return reviewPoolFor(r, r.workflows[0], 'general');
+    };
+    expect(at({ review: { pool: 'reviewers' } }, { reviewPool: undefined })).toBe('reviewers');
+    expect(at({ review: { pool: 'general' } }, { reviewPool: 'reviewers' })).toBe('reviewers');
+    expect(at({ review: true }, { reviewPool: undefined })).toBe('general');
+    expect(at({ review: { pool: 'reviewers' } }, {})).toBe('reviewers');
+  });
+
+  it('checks review.pool: it must exist, it must hold someone other than the author, and a warning when no workflow uses it', () => {
+    expect(validateConfig(base({ repo: { review: { pool: 'reviewers' } }, workflow: { reviewPool: undefined } }))).toMatchObject({ ok: true, warnings: [] });
+    expect(errorsOf(base({ repo: { review: { pool: 'nobody' } }, workflow: { reviewPool: undefined } }))).toContainEqual({
+      path: `repositories.${REPO}.review.pool`,
+      message: 'unknown pool "nobody"',
+    });
+    expect(errorsOf(base({ repo: { review: { pool: 'general' } }, workflow: { reviewPool: undefined } }))).toEqual([
+      { path: `repositories.${REPO}.review.pool`, message: expect.stringMatching(/"claude" is the only enabled agent in pool "general"/) },
+    ]);
+    expect(validateConfig(base({ repo: { review: { pool: 'general' } } })).warnings).toEqual([
+      { path: `repositories.${REPO}.review.pool`, message: 'has no effect: every workflow of this repository sets its own reviewPool' },
+    ]);
   });
 
   it('rejects a configuration in which the reviewer could only be the author, unless allowSameAgent is set', () => {
