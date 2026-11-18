@@ -193,7 +193,7 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
     }
 
     if (review.pool !== null) {
-      if (!config.pools[review.pool]) errors.push({ path: `repositories.${repoName}.review.pool`, message: `unknown pool "${review.pool}"` });
+      if (!Object.hasOwn(config.pools, review.pool)) errors.push({ path: `repositories.${repoName}.review.pool`, message: `unknown pool "${review.pool}"` });
       else if (repo.workflows.every((wf) => wf.reviewPool !== undefined)) {
         warnings.push({ path: `repositories.${repoName}.review.pool`, message: 'has no effect: every workflow of this repository sets its own reviewPool' });
       }
@@ -206,14 +206,14 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       if (wfIds.has(id)) errors.push({ path: `${base}.id`, message: `duplicate workflow id "${id}"; set a unique id` });
       wfIds.add(id);
 
-      if (!config.actions[wf.action]) errors.push({ path: `${base}.action`, message: `unknown action "${wf.action}"` });
+      if (!Object.hasOwn(config.actions, wf.action)) errors.push({ path: `${base}.action`, message: `unknown action "${wf.action}"` });
 
       const pools = typeof wf.pool === 'string' ? [wf.pool] : [...wf.pool.rules.map((r) => r.use), wf.pool.default];
       for (const p of pools) {
-        if (!config.pools[p]) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
+        if (!Object.hasOwn(config.pools, p)) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
       }
       if (wf.reviewPool !== undefined) {
-        if (!config.pools[wf.reviewPool]) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
+        if (!Object.hasOwn(config.pools, wf.reviewPool)) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
         if (!review.enabled) warnings.push({ path: `${base}.reviewPool`, message: `has no effect without repositories.${repoName}.review` });
       }
       // The reviewer must be able to be a different agent than the one that wrote the code. For

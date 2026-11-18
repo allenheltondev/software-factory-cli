@@ -13,7 +13,7 @@ import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../co
 import { openDatabase, type Db } from '../db/database.js';
 import { getLoopPr, getPrReview, observeHead, prStage, reviewEventId, scheduleAllReviews } from '../db/pr-reviews.js';
 import { pruneJob } from '../db/prune.js';
-import { claimNextJob, finishRun, getJob, getStatusSnapshot } from '../db/queue.js';
+import { claimNextJob, finishRun, getJob, getStatusSnapshot, retryJob } from '../db/queue.js';
 import { getReviewRequest } from '../db/revisions.js';
 import { GitHubError } from '../github/api.js';
 import { resolvePaths, type UpdraftPaths } from '../paths.js';
@@ -222,6 +222,32 @@ describe('reviewer jobs', () => {
     expect(setup({ workflow: { reviewPool: undefined }, repo: { review: { pool: 'reviewers' } } }).schedule()[0]).toMatchObject({ pool: 'reviewers' });
     const both = setup({ pools: { general: { agents: ['claude'] }, reviewers: { agents: ['codex'] }, others: { agents: ['codex'] } }, repo: { review: { pool: 'others' } } });
     expect(both.schedule()[0]).toMatchObject({ pool: 'reviewers' });
+  });
+
+  it('routes a review queued under an old reviewPool to the current route when it is claimed, and again when retried', () => {
+    // Queued under the workflow's reviewPool "old"...
+    const s = setup({ pools: { general: { agents: ['claude'] }, old: { agents: ['codex'] }, reviewers: { agents: ['codex'] } }, workflow: { reviewPool: 'old' } });
+    const [job] = s.schedule();
+    expect(job).toMatchObject({ pool: 'old' });
+    // ...then the config moves to a repository-wide review.pool and drops "old".
+    const repo = s.config.repositories[FULL]!;
+    const moved: UpdraftConfig = {
+      ...s.config,
+      pools: { general: s.config.pools.general!, reviewers: s.config.pools.reviewers! },
+      repositories: { [FULL]: { ...repo, review: { pool: 'reviewers', allowSameAgent: false }, workflows: repo.workflows.map((w) => ({ ...w, reviewPool: undefined })) } },
+    };
+    // The head already has its job, so scheduling queues nothing new.
+    expect(scheduleAllReviews(s.db, moved, s.now)).toEqual([]);
+    const claimOpts = { workerId: 'w', hostname: 'h', leaseSeconds: 60, runsDir: s.paths.runsDir, now: s.now };
+    const claim = claimNextJob(s.db, moved, claimOpts);
+    expect(claim).toMatchObject({ job: { id: job!.id, pool: 'reviewers' }, run: { pool: 'reviewers', agent: 'codex' } });
+    expect(getJob(s.db, job!.id)).toMatchObject({ status: 'running', pool: 'reviewers' });
+
+    // A retry of a job recorded under a pool that is gone is rerouted the same way.
+    finishRun(s.db, claim!.run.id, { outcome: 'failed', error: 'boom', now: s.now });
+    s.db.prepare("UPDATE jobs SET status = 'failed', pool = 'old' WHERE id = ?").run(job!.id);
+    retryJob(s.db, job!.id, s.now);
+    expect(claimNextJob(s.db, moved, claimOpts)).toMatchObject({ job: { id: job!.id, pool: 'reviewers' }, run: { agent: 'codex' } });
   });
 
   it('takes reviewers in turn, skipping the author, on a rotation of their own', () => {

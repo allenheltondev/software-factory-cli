@@ -1,12 +1,12 @@
 // OWNER: queue/worker workstream. Claim-side persistence: atomic claims, runs,
 // leases, retry, and status queries.
 import { join } from 'node:path';
-import { DEFAULT_MAX_REVISIONS, reviewSettings, type UpdraftConfig } from '../config/schema.js';
+import { DEFAULT_MAX_REVISIONS, reviewPoolFor, reviewSettings, workflowId, type UpdraftConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
 import { reviewOf, type Job, type JobStatus, type Publication, type Revision, type Run, type RunContainer, type RunOutcome, type RunSummary } from '../types.js';
 import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
 import { listRecentPublications } from './publications.js';
-import { listRecentLoopPrs, listRecentPrReviews, prStage, type LoopPr, type PrReview, type PrStageInfo } from './pr-reviews.js';
+import { getLoopPr, listRecentLoopPrs, listRecentPrReviews, prStage, type LoopPr, type PrReview, type PrStageInfo } from './pr-reviews.js';
 import {
   issuesAwaitingRevisionPush,
   listLimitedRevisionPrs,
@@ -144,6 +144,28 @@ function pickAgent(
 }
 
 /**
+ * The pool a reviewer job is routed to under the current config (reviewPoolFor). A job records
+ * the pool it was queued for, but the config may have changed since: a workflow's reviewPool
+ * replaced by the repository's review.pool, or the old pool removed. A head is reviewed once, so
+ * scheduling never queues a second job for it; the route is settled here, when the job (queued
+ * earlier or retried) is claimed. Falls back to the recorded pool when the repository, the job's
+ * review request or its pull request cannot be found.
+ */
+function currentReviewPool(db: Db, config: UpdraftConfig, row: JobRow): string {
+  const repo = Object.values(config.repositories).find((r) => r.id === row.repo_id);
+  if (!repo) return row.pool;
+  let prNumber: number | undefined;
+  try {
+    prNumber = reviewOf(rowToJob(row))?.pullRequest.number;
+  } catch {
+    return row.pool;
+  }
+  if (prNumber === undefined) return row.pool;
+  const wf = repo.workflows.find((w) => workflowId(w) === row.workflow_id);
+  return reviewPoolFor(repo, wf, getLoopPr(db, row.repo_id, prNumber)?.pool ?? row.pool);
+}
+
+/**
  * A reviewer job (repositories.<repo>.review) must not be run by the agent that wrote the code
  * under review while the pool has another enabled agent: that agent is excluded from the pick,
  * and the job waits for one of the others to have capacity. When the pool has no other enabled
@@ -232,9 +254,18 @@ export function claimNextJob(
     const nowMs = clock();
     const at = new Date(nowMs).toISOString();
 
-    for (const row of queued) {
-      if (opts.excludeJobIds?.has(row.id)) continue;
-      if (busyIssues.has(issueKey(row.repo_id, row.issue_number))) continue;
+    for (const queuedRow of queued) {
+      if (opts.excludeJobIds?.has(queuedRow.id)) continue;
+      if (busyIssues.has(issueKey(queuedRow.repo_id, queuedRow.issue_number))) continue;
+
+      let row = queuedRow;
+      if (isReviewJobRow(row)) {
+        const route = currentReviewPool(db, config, row);
+        if (route !== row.pool) {
+          db.prepare('UPDATE jobs SET pool = ?, updated_at = ? WHERE id = ?').run(route, at, row.id);
+          row = { ...row, pool: route, updated_at: at };
+        }
+      }
 
       const pool = ownEntry(config.pools, row.pool);
       if (!pool) {

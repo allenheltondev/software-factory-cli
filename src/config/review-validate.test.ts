@@ -79,6 +79,16 @@ describe('review loop options', () => {
     expect(errorsOf(base({ workflow: { reviewPool: 'nobody' } }))).toContainEqual({ path: `repositories.${REPO}.workflows.0.reviewPool`, message: 'unknown pool "nobody"' });
   });
 
+  it('does not take an inherited Object property for a declared pool or action', () => {
+    expect(errorsOf(base({ workflow: { reviewPool: 'constructor' } }))).toContainEqual({ path: `repositories.${REPO}.workflows.0.reviewPool`, message: 'unknown pool "constructor"' });
+    expect(errorsOf(base({ repo: { review: { pool: 'toString' } }, workflow: { reviewPool: undefined } }))).toContainEqual({
+      path: `repositories.${REPO}.review.pool`,
+      message: 'unknown pool "toString"',
+    });
+    expect(errorsOf(base({ workflow: { pool: 'valueOf' } }))).toContainEqual({ path: `repositories.${REPO}.workflows.0.pool`, message: 'unknown pool "valueOf"' });
+    expect(errorsOf(base({ workflow: { action: 'hasOwnProperty' } }))).toContainEqual({ path: `repositories.${REPO}.workflows.0.action`, message: 'unknown action "hasOwnProperty"' });
+  });
+
   it('takes the reviewer pool from the workflow, else review.pool, else the coding pool', () => {
     const at = (repo: Record<string, unknown>, workflow: Record<string, unknown>) => {
       const config = configSchema.parse(base({ repo, workflow }));
