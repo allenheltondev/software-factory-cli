@@ -326,6 +326,113 @@ describe('createGitHubApi: publication writes', () => {
   });
 });
 
+describe('createGitHubApi: issue body edits (GraphQL)', () => {
+  const repo = { id: 42, fullName: 'o/r' };
+  const answer = (issue: unknown, databaseId: number | null = 42) => json({ data: { repository: { databaseId, issue } } });
+
+  it('asks GraphQL for the last edit of the issue, with the query variables kept out of the query text', async () => {
+    const { fn, calls } = fakeFetch(() => answer({ lastEditedAt: '2026-01-02T03:04:05Z', editor: { login: 'mallory' } }));
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    expect(await api.getIssueBodyEdit(repo, 7)).toEqual({ lastEditedAt: '2026-01-02T03:04:05Z', editor: 'mallory' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe('POST');
+    expect(new URL(calls[0]!.url).pathname).toBe('/graphql');
+    expect(calls[0]!.headers['Authorization']).toBe('Bearer t');
+    const sent = JSON.parse(calls[0]!.body!) as { query: string; variables: unknown };
+    expect(sent.variables).toEqual({ owner: 'o', name: 'r', number: 7 });
+    expect(sent.query).toMatch(/repository\(owner: \$owner, name: \$name\)/);
+    expect(sent.query).toMatch(/databaseId[\s\S]*issue\(number: \$number\)[\s\S]*lastEditedAt[\s\S]*editor \{ login \}/);
+  });
+
+  it('maps a never-edited body and a deleted editor account to nulls', async () => {
+    const never = await createGitHubApi({ token: 't', fetch: fakeFetch(() => answer({ lastEditedAt: null, editor: null })).fn });
+    expect(await never.getIssueBodyEdit(repo, 7)).toEqual({ lastEditedAt: null, editor: null });
+    const ghost = await createGitHubApi({
+      token: 't',
+      fetch: fakeFetch(() => answer({ lastEditedAt: '2026-01-02T03:04:05Z', editor: null })).fn,
+    });
+    expect(await ghost.getIssueBodyEdit(repo, 7)).toEqual({ lastEditedAt: '2026-01-02T03:04:05Z', editor: null });
+  });
+
+  it('refuses an answer about a different repository that now has the name', async () => {
+    const { fn } = fakeFetch(() => answer({ lastEditedAt: null, editor: null }, 999));
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const err = (await api.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(err).toBeInstanceOf(GitHubError);
+    expect(err.status).toBe(502);
+    expect(err.message).toMatch(/"o\/r" now names repository 999, not 42/);
+  });
+
+  it('reports a missing issue as 404, and nothing else as "gone"', async () => {
+    const missingIssue = fakeFetch(() =>
+      json({
+        data: { repository: { databaseId: 42, issue: null } },
+        errors: [{ type: 'NOT_FOUND', path: ['repository', 'issue'], message: 'Could not resolve to an Issue with the number of 7.' }],
+      }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: missingIssue.fn });
+    expect(((await api.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError).status).toBe(404);
+
+    const nullIssue = await createGitHubApi({ token: 't', fetch: fakeFetch(() => answer(null)).fn });
+    expect(((await nullIssue.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError).status).toBe(404);
+
+    // The repository not resolving by name says nothing about the issue: REST reaches it by ID.
+    const missingRepo = fakeFetch(() =>
+      json({
+        data: { repository: null },
+        errors: [{ type: 'NOT_FOUND', path: ['repository'], message: "Could not resolve to a Repository with the name 'o/r'." }],
+      }),
+    );
+    const api2 = await createGitHubApi({ token: 't', fetch: missingRepo.fn });
+    const e2 = (await api2.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(e2.status).toBe(502);
+    expect(e2.message).toMatch(/edit history of o\/r#7\) failed: Could not resolve to a Repository/);
+
+    for (const body of [{}, { data: null }, { data: { repository: null } }]) {
+      const odd = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json(body)).fn });
+      expect(((await odd.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError).status).toBe(502);
+    }
+  });
+
+  it('turns GraphQL errors sent with 200 into GitHubErrors, even next to usable-looking data', async () => {
+    const partial = fakeFetch(() =>
+      json({
+        data: { repository: { databaseId: 42, issue: { lastEditedAt: null, editor: null } } },
+        errors: [{ type: 'FORBIDDEN', path: ['repository', 'issue', 'editor'], message: 'Resource not accessible by personal access token' }],
+      }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: partial.fn });
+    const err = (await api.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(err).toBeInstanceOf(GitHubError);
+    expect(err.status).toBe(502);
+    expect(err.message).toMatch(/Resource not accessible/);
+
+    const limited = fakeFetch(() =>
+      json({ errors: [{ type: 'RATE_LIMITED', message: 'API rate limit exceeded' }] }, { headers: { 'retry-after': '30' } }),
+    );
+    const api2 = await createGitHubApi({ token: 't', fetch: limited.fn });
+    const e2 = (await api2.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(e2.isRateLimit).toBe(true);
+    expect(e2.retryAfterSeconds).toBe(30);
+  });
+
+  it('keeps the HTTP error mapping (401, 5xx, network)', async () => {
+    const unauthorized = await createGitHubApi({
+      token: 't',
+      fetch: fakeFetch(() => json({ message: 'Bad credentials' }, { status: 401 })).fn,
+    });
+    const e1 = (await unauthorized.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(e1.status).toBe(401);
+    expect(e1.message).toMatch(/^POST \/graphql failed: 401 Bad credentials/);
+
+    const down = (async () => {
+      throw new Error('ECONNRESET');
+    }) as unknown as typeof fetch;
+    const api = await createGitHubApi({ token: 't', fetch: down });
+    expect(((await api.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError).status).toBe(0);
+  });
+});
+
 describe('helpers', () => {
   it('parses Link headers', () => {
     expect(parseLinkHeader('<https://x/a?page=2>; rel="next", <https://x/a?page=9>; rel="last"')).toEqual({
