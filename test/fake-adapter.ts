@@ -18,6 +18,8 @@ export interface FakeAdapterOptions {
   addScript?: boolean;
   /** Replace the executable (e.g. a path that doesn't exist, to force a spawn error). */
   file?: string;
+  /** Ask for AgentInvocation.separateStderr, as the Kiro adapter does. */
+  separateStderr?: boolean;
 }
 
 export function fakeAdapter(o: FakeAdapterOptions = {}): AgentAdapter {
@@ -27,7 +29,13 @@ export function fakeAdapter(o: FakeAdapterOptions = {}): AgentAdapter {
     buildInvocation(req) {
       const args = [...req.launch.args, ...(o.addScript === false ? [] : [FAKE_AGENT]), ...req.extraArgs];
       if (via === 'file-arg') args.push('--prompt-file', req.promptFile);
-      return { file: o.file ?? req.launch.file, args, promptVia: via, env: { FAKE_ADAPTER_ENV: 'from-adapter' } };
+      return {
+        file: o.file ?? req.launch.file,
+        args,
+        promptVia: via,
+        env: { FAKE_ADAPTER_ENV: 'from-adapter' },
+        ...(o.separateStderr ? { separateStderr: true } : {}),
+      };
     },
   };
 }

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentExit, InvocationRequest } from './adapter.js';
-import { kiroAdapter, kiroArgsChooseHarness, kiroSupportsV3, stripKiroLogRecords } from './kiro.js';
-import { readReviewVerdict } from '../../worker/review-run.js';
+import { kiroAdapter, kiroArgsChooseHarness, kiroSupportsV3 } from './kiro.js';
 import { getAdapter, implementedAdapters } from './registry.js';
 
 function request(o: Partial<InvocationRequest> = {}): InvocationRequest {
@@ -36,7 +35,7 @@ describe('kiro adapter: invocation', () => {
   it('runs kiro-cli chat --no-interactive on V3, trusting all tools, with the prompt on stdin', () => {
     const req = request();
     const inv = kiroAdapter.buildInvocation(req);
-    expect(inv).toEqual({ file: req.launch.file, args: DEFAULT_ARGS, promptVia: 'stdin' });
+    expect(inv).toEqual({ file: req.launch.file, args: DEFAULT_ARGS, promptVia: 'stdin', separateStderr: true });
     expect(inv.env).toBeUndefined();
     // Never a prompt (or the prompt's path) on the command line: a positional would replace stdin.
     expect(inv.args).not.toContain(req.promptFile);
@@ -138,46 +137,13 @@ describe('kiro adapter: results', () => {
   });
 });
 
-describe('kiro reviewer output', () => {
-  // The end of a real kiro-cli 3.5.0 reviewer run as run.log captured it: stderr's log records
-  // interleaved with stdout, the last one glued onto the verdict line.
-  const real = [
-    '[tool] status: Completed',
-    '[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=139',
-    '**Blockers**',
-    'none',
-    '**Suggestions**',
-    '- `src/util/log.ts`: lifecycle highlighting can color unrelated messages.',
-    'UPDRAFT-FINDINGS: 1',
-    'UPDRAFT-VERDICT: ready-to-merge[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=140',
-    '',
-  ].join('\n');
-
-  it('reads the verdict that a glued-on log record used to hide', () => {
-    const reading = readReviewVerdict(kiroAdapter, real);
-    expect(reading).toMatchObject({ ok: true, verdict: 'ready-to-merge', findingsCount: 1 });
-    if (reading.ok) {
-      expect(reading.findings).toContain('**Blockers**');
-      expect(reading.findings).not.toMatch(/\[KRS\]/);
-    }
+describe('kiro streams', () => {
+  it('asks for separate stderr, so its log records never mix into the answer it gives on stdout', () => {
+    expect(kiroAdapter.buildInvocation(request()).separateStderr).toBe(true);
+    expect(kiroAdapter.buildInvocation(request({ extraArgs: ['--v2', '--trust-tools=read_file'] })).separateStderr).toBe(true);
   });
 
-  it('also drops a log record on its own line after the verdict, and colored records', () => {
-    const out = 'UPDRAFT-VERDICT: changes-requested\n\u001b[32m[INFO] [KRS] <-- done totalEvents=3\u001b[0m\n[WARN] [KRS] slow stream\n';
-    expect(readReviewVerdict(kiroAdapter, out)).toMatchObject({ ok: true, verdict: 'changes-requested' });
-  });
-
-  it('still fails closed: other trailing text, two verdicts, or no verdict', () => {
-    expect(readReviewVerdict(kiroAdapter, 'UPDRAFT-VERDICT: ready-to-merge and ship it\n')).toMatchObject({ ok: false });
-    expect(readReviewVerdict(kiroAdapter, 'UPDRAFT-VERDICT: ready-to-merge\nmore text\n')).toMatchObject({ ok: false });
-    expect(
-      readReviewVerdict(kiroAdapter, 'UPDRAFT-VERDICT: changes-requested\n[INFO] [KRS] x\nUPDRAFT-VERDICT: ready-to-merge\n'),
-    ).toMatchObject({ ok: false });
-    expect(readReviewVerdict(kiroAdapter, '[INFO] [KRS] <-- done\n')).toMatchObject({ ok: false });
-  });
-
-  it('leaves bracketed text that is not a Kiro log record alone', () => {
-    expect(stripKiroLogRecords('[INFO] note for the reader\n[KRS] alone\n- [x] done')).toBe('[INFO] note for the reader\n[KRS] alone\n- [x] done');
-    expect(stripKiroLogRecords('a[ERROR] [KRS] boom\nb')).toBe('a\nb');
+  it('reads the whole stdout as the message: no finalMessage that could drop text', () => {
+    expect(kiroAdapter.finalMessage).toBeUndefined();
   });
 });

@@ -41,8 +41,14 @@
  * 3 an MCP server required by `--require-mcp-startup` did not start; 4 the agent a
  * non-interactive run named is unavailable (possibly after tool calls already ran). "If stdout
  * closes before completion, Kiro exits with a nonzero status" (https://kiro.dev/docs/cli/headless/).
- * The summary is the run's last output lines (the executor's default). A reviewer run's verdict is
- * read from the output with Kiro's own `[LEVEL] [KRS]` log records taken out (finalMessage).
+ * The summary is the run's last output lines (the executor's default).
+ *
+ * Streams: kiro-cli writes its answer to stdout and its own log records, such as
+ * `[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=140` (kiro-cli 3.5.0), to
+ * stderr. Through one shared file descriptor the two interleave in no guaranteed order, and a
+ * record once landed on the end of a reviewer's unterminated verdict line, which then did not
+ * read as a verdict. So the invocation asks for `separateStderr`: stdout alone is the agent's
+ * output, and the stderr is appended to run.log after the run.
  *
  * Authentication: "Headless mode requires an API key set as the KIRO_API_KEY environment
  * variable" (https://kiro.dev/docs/cli/headless/). The worker passes its environment through, so
@@ -115,28 +121,6 @@ const EXIT_MEANINGS: Readonly<Record<number, string>> = {
 
 const clip = (s: string, n = 200) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-// ANSI CSI sequences, which a log record may be wrapped in.
-const ANSI = /\u001b\[[0-?]*[ -/]*[@-~]/g;
-
-/**
- * Kiro CLI's own log records, e.g. `[INFO] [KRS] <-- GenerateAssistantResponseCommand done
- * totalEvents=140` (kiro-cli 3.5.0). They go to stderr, which run.log interleaves with stdout, and
- * the last one can land on the same line as the agent's final line when that has no trailing
- * newline: `UPDRAFT-VERDICT: ready-to-merge[INFO] [KRS] <-- ...`. A record runs to the end of its
- * line. Only Kiro's `[KRS]` component with a log level is matched, so ordinary bracketed text in
- * the agent's message is left alone.
- */
-const KIRO_LOG_RECORD = /\[(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR)\] \[KRS\][^\r\n]*/g;
-
-/**
- * The output with Kiro's own log records taken out, so that what is left is the agent's text.
- * Taking text out can't create a verdict: the verdict parser still requires exactly one verdict
- * line, with nothing after it, in what remains.
- */
-export function stripKiroLogRecords(output: string): string {
-  return output.replace(ANSI, '').replace(KIRO_LOG_RECORD, '');
-}
-
 export const kiroAdapter: AgentAdapter = {
   name: 'kiro',
 
@@ -147,7 +131,8 @@ export const kiroAdapter: AgentAdapter = {
     if (!kiroArgsChooseHarness(extra)) args.push('--v3');
     if (!TRUST_FLAGS.some((f) => hasOption(extra, f))) args.push('--trust-all-tools');
     args.push(...extra);
-    return { file: req.launch.file, args, promptVia: 'stdin' };
+    // kiro-cli logs to stderr while it answers on stdout; keep them apart (see the header).
+    return { file: req.launch.file, args, promptVia: 'stdin', separateStderr: true };
   },
 
   interpretExit(exit: AgentExit): AgentVerdict {
@@ -159,14 +144,5 @@ export const kiroAdapter: AgentAdapter = {
       outcome: 'failed',
       error: `kiro-cli exited with code ${exit.code}${meaning ? ` (${meaning})` : ''}${said ? `: ${clip(said)}` : ''}`,
     };
-  },
-
-  /**
-   * Kiro's output is plain text, so the whole output is the message, minus Kiro's own log records
-   * (see {@link stripKiroLogRecords}). Without this, a reviewer run's verdict line can carry a log
-   * record on its end and is then not read as a verdict.
-   */
-  finalMessage(output: string): string {
-    return stripKiroLogRecords(output);
   },
 };

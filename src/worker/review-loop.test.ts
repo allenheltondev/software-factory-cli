@@ -324,4 +324,44 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(pr.mergeState).toBeNull();
     expect(prStage(db, pr, 3)).toMatchObject({ stage: 'ready-to-merge' });
   });
+
+  // kiro-cli logs to stderr while answering on stdout. Through one shared descriptor a record can
+  // land on either end of an unterminated verdict line (seen on a real Kiro review of PR #47).
+  const stderrLogs = ['--mode', 'review', '--verdict', 'ready-to-merge', '--stderr-logs'];
+
+  it('reads the verdict from stdout alone when the adapter asks for separate stderr, and keeps the stderr in run.log', async () => {
+    restores.push(registerAdapter(fakeAdapter({ name: 'codex', separateStderr: true })));
+    const s = setup({ repo: { autoMerge: undefined }, reviewerArgs: stderrLogs });
+    const { db, gh } = s;
+    const worker = start(s);
+    await vi.waitFor(() => expect(gh.writes.some((w) => w.startsWith('ready '))).toBe(true), { timeout: 150_000, interval: 100 });
+    await worker.stop();
+
+    const job = jobsOf(db).find((j) => j.envelope.type === 'pull_request.review')!;
+    const run = latestRunOfJob(db, job.id)!;
+    expect(run.outcome).toBe('succeeded');
+    expect(getPrReview(db, run.id)).toMatchObject({ verdict: 'ready-to-merge', outcome: 'ready' });
+    const log = readFileSync(run.logPath!, 'utf8');
+    expect(log).toContain('---- agent output (stdout; stderr follows once the agent has exited) ----');
+    // The stdout ends with the bare verdict; both records follow, in a section of their own.
+    const out = log.slice(log.indexOf('---- agent output'), log.indexOf('---- agent stderr ----'));
+    expect(out).toMatch(/UPDRAFT-VERDICT: ready-to-merge\s*$/);
+    expect(out).not.toContain('[KRS]');
+    expect(log.slice(log.indexOf('---- agent stderr ----'))).toMatch(/totalEvents=139\[INFO\] \[KRS\] <-- GenerateAssistantResponseCommand done totalEvents=140/);
+    expect(log.indexOf('---- agent stderr ----')).toBeLessThan(log.indexOf('---- end of agent output ----'));
+  });
+
+  it('without separate stderr the same output glues the records onto the verdict, which fails closed', async () => {
+    const s = setup({ repo: { autoMerge: undefined }, reviewerArgs: stderrLogs });
+    const { db, gh } = s;
+    const worker = start(s);
+    const reviewJob = () => jobsOf(db).find((j) => j.envelope.type === 'pull_request.review');
+    await vi.waitFor(() => expect(reviewJob()?.status).toBe('failed'), { timeout: 150_000, interval: 100 });
+    await worker.stop();
+
+    expect(reviewJob()!.statusReason).toMatch(/^no verdict: /);
+    expect(gh.writes.some((w) => w.startsWith('ready '))).toBe(false);
+    const log = readFileSync(latestRunOfJob(db, reviewJob()!.id)!.logPath!, 'utf8');
+    expect(log).toContain('totalEvents=139UPDRAFT-VERDICT: ready-to-merge[INFO] [KRS]');
+  });
 });

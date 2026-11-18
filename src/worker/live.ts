@@ -250,6 +250,8 @@ async function runAgent(o: {
   cwd: string;
   env: NodeJS.ProcessEnv;
   logPath: string;
+  /** Stderr goes here instead of logPath (AgentInvocation.separateStderr). Appended to, never truncated. */
+  stderrPath?: string;
   /** Read on stdin when the invocation asks for the prompt there. */
   promptFile?: string;
   timeoutMs: number;
@@ -268,8 +270,10 @@ async function runAgent(o: {
   };
   let child: ChildProcess;
   const out = openSync(o.logPath, 'a');
+  let err: number = out;
   let stdin: number | 'ignore' = 'ignore';
   try {
+    if (o.stderrPath) err = openSync(o.stderrPath, 'a');
     if (inv.promptVia === 'stdin' && o.promptFile) stdin = openSync(o.promptFile, 'r');
     child = spawn(inv.file, inv.args, {
       cwd: o.cwd,
@@ -278,13 +282,14 @@ async function runAgent(o: {
       windowsHide: true,
       windowsVerbatimArguments: inv.verbatim === true,
       detached: !isWindows,
-      stdio: [stdin, out, out],
+      stdio: [stdin, out, err],
     });
-  } catch (err) {
-    throw new StartFailedError(`could not start ${inv.file}: ${message(err)}`, { cause: err });
+  } catch (e) {
+    throw new StartFailedError(`could not start ${inv.file}: ${message(e)}`, { cause: e });
   } finally {
     // The child has its own copies now.
     closeSync(out);
+    if (err !== out) closeSync(err);
     if (typeof stdin === 'number') closeSync(stdin);
   }
 
@@ -761,6 +766,20 @@ export class LiveExecutor implements Executor {
     let contained: (ContainedInvocation & { runtime: string }) | null = null;
     // What the adapter asked for, which is what it later interprets the exit against.
     const agentArgs = invocation.args;
+    // AgentInvocation.separateStderr: stderr is written apart while the agent runs and appended to
+    // run.log afterwards, so what the verdict is read from is stdout alone. Decided before a
+    // container wraps the invocation; the runtime client passes the two streams through.
+    const stderrPath = invocation.separateStderr === true ? join(runDir, 'agent-stderr.log') : undefined;
+    let stderrMoved: Promise<string> | null = null;
+    /** Append the agent's stderr to run.log under its own header (once) and return it. '' without separateStderr. */
+    const moveStderr = (): Promise<string> =>
+      (stderrMoved ??= (async () => {
+        if (!stderrPath) return '';
+        const text = await readOutput(stderrPath, 0, RAW_OUTPUT_BYTES);
+        // A leading empty line: the agent's stdout may not have ended with a newline.
+        if (text.trim()) await log(['', '---- agent stderr ----', text.replace(/\r?\n$/, '')]);
+        return text;
+      })());
     if (agentCfg.container && containerReady?.runtime) {
       try {
         contained = {
@@ -804,7 +823,7 @@ export class LiveExecutor implements Executor {
       ...(committer ? [`commit identity: ${committer.name} <${committer.email}> (github.app.commitAsApp)`] : []),
       `timeout: ${timeoutMinutes} min`,
       '',
-      '---- agent output (stdout and stderr) ----',
+      stderrPath ? '---- agent output (stdout; stderr follows once the agent has exited) ----' : '---- agent output (stdout and stderr) ----',
     ]);
     const outputStart = await sizeOf(logPath);
 
@@ -825,6 +844,7 @@ export class LiveExecutor implements Executor {
         cwd: prepared.worktreePath,
         env: agentEnv,
         logPath,
+        ...(stderrPath ? { stderrPath } : {}),
         promptFile,
         timeoutMs,
         stop: ctx.workerStopping ? AbortSignal.any([ctx.signal, ctx.workerStopping]) : ctx.signal,
@@ -843,6 +863,7 @@ export class LiveExecutor implements Executor {
       });
     } catch (err) {
       const why = message(err);
+      await moveStderr();
       if (err instanceof AgentStoppedError) {
         await log(['---- end of agent output ----', `error: ${why}`, 'outcome: failed', ...(review ? [] : [`The worktree is kept for inspection: ${prepared.worktreePath}`])]);
         ctx.log.warn('agent stopped after it started', { error: why, logPath });
@@ -863,8 +884,12 @@ export class LiveExecutor implements Executor {
     await identity; // never record anything for this run after it is finished
 
     // 6. Outcome.
+    // Read before the stderr is appended: with separateStderr this is the agent's stdout alone.
     const outputTail = await tailLines(logPath, outputStart);
-    const rawOutput = adapter.interpretExit || adapter.summarizeOutput || review ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || review ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    const stderrText = await moveStderr();
+    // What exit interpretation and summaries see: stdout, then stderr (an error is often only there).
+    const rawOutput = stderrText.trim() ? (agentOutput ? `${agentOutput.replace(/\r?\n$/, '')}\n${stderrText}` : stderrText) : agentOutput;
     let lastOutput = outputTail;
     if (adapter.summarizeOutput) {
       try {
@@ -978,7 +1003,8 @@ export class LiveExecutor implements Executor {
     // Anything else (no line, two lines, another value) fails the run; it is never an approval.
     let reviewResult: ReviewResult | undefined;
     if (review && outcome === 'succeeded') {
-      const parsed = readReviewVerdict(adapter, rawOutput);
+      // The agent's own output: with separateStderr, stdout alone, so nothing it logged can land on the verdict line.
+      const parsed = readReviewVerdict(adapter, agentOutput);
       if (parsed.ok) {
         reviewResult = {
           headSha: prepared.baseSha,
