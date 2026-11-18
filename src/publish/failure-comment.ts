@@ -28,7 +28,7 @@ import { jobBranchName } from '../git/worktree.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import { GitHubAppError } from '../github/app-auth.js';
 import type { UpdraftPaths } from '../paths.js';
-import { revisionOf, type Job, type Run } from '../types.js';
+import { reviewOf, revisionOf, type Job, type Run } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { cap, fenced, MAX_AUTO_ATTEMPTS, PUBLISH_ATTEMPT_SECONDS, PUBLISH_LEASE_SECONDS } from './publish.js';
@@ -137,19 +137,23 @@ export function renderFailureComment(o: {
   triggerLabel: string;
   /** Set for a revision run: the comment goes on the pull request and says how to ask again. */
   revision?: boolean;
+  /** Set for a reviewer run: the comment goes on the pull request, which then has no verdict for that commit. */
+  review?: { headSha: string };
 }): string {
   const reason = o.agentStarted
     ? o.reason
     : `no agent could start after ${o.startFailures ?? MAX_START_FAILURES} consecutive attempts; the last one, on ${o.agent}: ${o.reason}`;
   return [
-    o.revision
-      ? 'An Updraft revision run for this pull request failed, so nothing was pushed to it.'
-      : 'An Updraft run for this issue failed, so no pull request was opened for it.',
+    o.review
+      ? `An Updraft reviewer run for this pull request failed, so there is no verdict for commit ${code(o.review.headSha.slice(0, 12))}. Nothing was approved, merged or changed.`
+      : o.revision
+        ? 'An Updraft revision run for this pull request failed, so nothing was pushed to it.'
+        : 'An Updraft run for this issue failed, so no pull request was opened for it.',
     '',
     `- Run: ${code(o.runId)} (attempt ${o.attempt} of job ${code(o.jobId)})`,
     `- Agent: ${code(o.agent)}${o.agentStarted ? '' : ' (the last one tried)'}`,
     `- Ran for: ${o.agentStarted && o.ranMs !== null ? duration(o.ranMs) : 'the agent did not start'}`,
-    ...(o.branch ? [`- Branch: ${code(o.branch)} (on the worker's machine; not pushed)`] : []),
+    ...(o.branch && !o.review ? [`- Branch: ${code(o.branch)} (on the worker's machine; not pushed)`] : []),
     '',
     '**Reason**',
     '',
@@ -157,9 +161,11 @@ export function renderFailureComment(o: {
     '',
     "The agent's output is not posted here; the full error and the run log are on the machine running the worker (`updraft status`).",
     '',
-    o.revision
-      ? `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine, or submit a new review that requests changes.`
-      : `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine, or remove the ${code(o.triggerLabel)} label from this issue and apply it again.`,
+    o.review
+      ? `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine. A new commit on this branch gets a new review by itself.`
+      : o.revision
+        ? `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine, or submit a new review that requests changes.`
+        : `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine, or remove the ${code(o.triggerLabel)} label from this issue and apply it again.`,
     '',
     failureCommentMarker(o.runId),
   ].join('\n');
@@ -263,10 +269,13 @@ export async function postFailureComment(deps: FailureCommentDeps, runId: string
   const repoRef = { id: job.repoId, fullName: repoFullName };
   // A revision run's comment goes on the pull request it was revising (a PR takes issue
   // comments under its own number), with the same text rules.
+  // So does a reviewer run's.
   const revision = revisionOf(job);
-  const target = revision ? revision.pullRequest.number : job.issueNumber;
-  const where = `${revision ? 'pull request' : 'issue'} #${target}`;
-  const log = deps.log.child({ runId, repo: repoFullName, issue: job.issueNumber, ...(revision ? { pr: target } : {}) });
+  const review = reviewOf(job);
+  const onPr = revision?.pullRequest.number ?? review?.pullRequest.number ?? null;
+  const target = onPr ?? job.issueNumber;
+  const where = `${onPr !== null ? 'pull request' : 'issue'} #${target}`;
+  const log = deps.log.child({ runId, repo: repoFullName, issue: job.issueNumber, ...(onPr !== null ? { pr: target } : {}) });
 
   const begun = beginFailureComment(deps.db, {
     runId,
@@ -348,6 +357,7 @@ export async function postFailureComment(deps: FailureCommentDeps, runId: string
         branch: run.summary?.branch ?? (run.checkoutPath ? jobBranchName(job, run.attempt) : null),
         triggerLabel: job.envelope.label,
         revision: revision !== null,
+        ...(review ? { review: { headSha: review.headSha } } : {}),
       });
       hold(); // the lookup may have outlived the lease
       comment = await deps.api.createIssueComment(repoRef, target, body);

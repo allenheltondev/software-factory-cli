@@ -179,11 +179,13 @@ const covers = (granted: string | undefined, needed: PermissionLevel) => granted
  * comments, and a revision (which only exists with publication) reads reviews, pushes and comments
  * on the pull request; a failure comment is an issue comment.
  */
-export function requiredAppPermissions(o: { publish: boolean; commentOnFailure: boolean }): Record<string, PermissionLevel> {
+export function requiredAppPermissions(o: { publish: boolean; commentOnFailure: boolean; autoMerge?: boolean }): Record<string, PermissionLevel> {
   return {
     metadata: 'read',
     ...(o.publish ? { contents: 'write' as const, pull_requests: 'write' as const } : {}),
     issues: o.publish || o.commentOnFailure ? 'write' : 'read',
+    // Auto-merge reads the head commit's check runs and statuses before it merges.
+    ...(o.autoMerge ? { checks: 'read' as const, statuses: 'read' as const } : {}),
   };
 }
 

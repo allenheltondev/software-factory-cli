@@ -83,6 +83,13 @@ export interface AgentAdapter {
    * generic last lines of output. The executor strips control characters and caps the lines.
    */
   summarizeOutput?(output: string): string[] | null;
+  /**
+   * The agent's own final message and nothing else (no status line, no tool output), read from
+   * its raw output. A reviewer run's verdict is parsed from this. Null: the output is structured
+   * but holds no final message (the run did not end normally). Undefined, or no such method: the
+   * output is plain text, and the whole of it is the message.
+   */
+  finalMessage?(output: string): string | null | undefined;
 }
 
 export function defaultVerdict(exit: AgentExit): AgentVerdict {

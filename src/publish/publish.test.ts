@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
+import { ReviewLoopApiStubs } from '../../test/review-loop-api-stubs.js';
 import { publishCommand } from '../commands/publish.js';
 import { fakeContext } from '../commands/fakes.js';
 import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
@@ -43,7 +44,7 @@ const TOKEN = 'ghp_SECRETtoken0123456789';
 const T0 = Date.parse('2026-11-17T12:00:00.000Z');
 
 /** GitHub's side of publication, in memory. Optionally checks that a PR's head is on the bare remote. */
-class FakePublishApi implements GitHubApi {
+class FakePublishApi extends ReviewLoopApiStubs implements GitHubApi {
   pulls: Array<GitHubPullRequest & { title: string }> = [];
   comments: GitHubIssueComment[] = [];
   readonly calls: string[] = [];
@@ -54,7 +55,9 @@ class FakePublishApi implements GitHubApi {
   loseNextPullResponse = false;
   private nextId = 1;
 
-  constructor(private readonly remoteHas?: (branch: string) => boolean) {}
+  constructor(private readonly remoteHas?: (branch: string) => boolean) {
+    super();
+  }
 
   private maybeFail(name: keyof FakePublishApi['failNext']): void {
     const err = this.failNext[name];

@@ -68,7 +68,7 @@ export async function appRepoChecks(
   auth: AppAuth,
   config: Pick<UpdraftConfig, 'execution' | 'github'>,
   fullName: string,
-  repo: Pick<RepositoryConfig, 'publish' | 'commentOnFailure' | 'revise'>,
+  repo: Pick<RepositoryConfig, 'publish' | 'commentOnFailure' | 'revise' | 'review' | 'autoMerge'>,
 ): Promise<Check[]> {
   const out: Check[] = [];
   let installationId: number;
@@ -116,13 +116,15 @@ export async function appRepoChecks(
   // Writes happen only in live mode, so a gap there is a warning in the other modes, as it is for
   // a gh account without push access.
   const reads = missingAppPermissions(granted, requiredAppPermissions({ publish: false, commentOnFailure: false }));
-  const all = missingAppPermissions(granted, requiredAppPermissions({ publish, commentOnFailure }));
+  const all = missingAppPermissions(granted, requiredAppPermissions({ publish, commentOnFailure, autoMerge: repo.autoMerge !== undefined }));
   const writes = all.filter((m) => !reads.includes(m));
   const writeSeverity: CheckStatus = config.execution.mode === 'live' ? 'fail' : 'warn';
   const uses = [
     'polling',
     ...(publish ? [`publish: ${publishMode(repo)}`] : []),
     ...(publish && repo.revise ? ['revise'] : []),
+    ...(publish && repo.review ? ['review'] : []),
+    ...(repo.autoMerge !== undefined ? [`autoMerge: ${repo.autoMerge}`] : []),
     ...(commentOnFailure ? ['commentOnFailure'] : []),
   ].join(', ');
   const fix = `change it under the App's settings, "Permissions & events", then accept the new permissions on the installation (${APP_DOC})`;

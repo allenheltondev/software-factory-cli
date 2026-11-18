@@ -36,6 +36,16 @@ const RUN_TABLES: ReadonlyArray<{ table: string; runColumn: string; what: string
     busy: "state = 'publishing' OR (state = 'failed' AND retryable = 1)",
     touched: 'updated_at',
   },
+  // The verdict of a reviewer run and its posting. The PR's newest verdict and its merge state
+  // are on revision_prs and stay; so does the reviewer job's dedupe key (pruned_events), so a
+  // head that was reviewed is not reviewed again.
+  {
+    table: 'pr_reviews',
+    runColumn: 'run_id',
+    what: 'review',
+    busy: "state = 'publishing' OR (state = 'failed' AND retryable = 1)",
+    touched: 'updated_at',
+  },
 ];
 
 export interface PrunableRun {

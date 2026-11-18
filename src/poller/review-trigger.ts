@@ -2,8 +2,13 @@
 // every review it has not seen before and does what it says; the queue, the executor and the push
 // never look at a review's state or author themselves. A new kind of trigger (for example a
 // review carrying a marker) is a new branch here, a new RevisionTriggerKind, and nothing else.
+//
+// There are two kinds. changes_requested: a person's "Request changes" review, read from GitHub
+// (reviewTrigger). updraft_review: a changes-requested verdict of Updraft's own reviewer run
+// (verdictTrigger), taken from the worker's database at the moment the verdict is recorded; the
+// comment review the worker posts for people to read is never read back to decide anything.
 import type { GitHubReview, GitHubReviewComment } from '../github/api.js';
-import type { RevisionRequest, RevisionTriggerKind } from '../types.js';
+import type { ReviewSnapshot, ReviewVerdict, RevisionRequest, RevisionTriggerKind } from '../types.js';
 
 export type ReviewDecision =
   /** Not a change request of any kind (a comment, an approval, a pending or dismissed review). Nothing is recorded. */
@@ -66,6 +71,69 @@ export function reviewTrigger(review: GitHubReview, allowedActors: readonly stri
     };
   }
   return { triggers: true, kind, author: review.author, body: review.body, comments, omittedComments: review.commentCount - comments.length };
+}
+
+/** Review id (the dedupe key in review_requests) of the change request a reviewer run's verdict makes. */
+export function verdictReviewId(runId: string): string {
+  return `updraft-review:${runId}`;
+}
+
+export type VerdictDecision =
+  /** Not a change request (ready to merge). */
+  | { triggers: false; kind: null }
+  /** Queue a revision for the reviewer's findings. `review.body` is the only text that may reach the prompt. */
+  | { triggers: true; kind: RevisionTriggerKind; reviewId: string; review: ReviewSnapshot; reviewedSha: string };
+
+/**
+ * Does a verdict of Updraft's own reviewer ask for a revision?
+ *
+ * - Trigger: `changes-requested`, and nothing else. Whether it is still about the PR's current
+ *   head is checked by the caller when it is recorded, and again before the revision starts
+ *   (verdictStale): a verdict is bound to the commit it reviewed.
+ * - Text: the reviewer's findings as the worker recorded them. They are an agent's output about
+ *   untrusted code, so the revision prompt fences them like any review.
+ * - Who: the worker itself, as `reviewer` (its own GitHub login). No allowlist applies: that
+ *   reviewer runs exist at all is the repository's `review` setting.
+ */
+export function verdictTrigger(v: {
+  runId: string;
+  verdict: ReviewVerdict;
+  findings: string;
+  headSha: string;
+  reviewer: string;
+  /** Link shown in the revision's reply: the posted comment review. */
+  reviewUrl: string;
+  recordedAt: string;
+}): VerdictDecision {
+  if (v.verdict !== 'changes-requested') return { triggers: false, kind: null };
+  return {
+    triggers: true,
+    kind: 'updraft_review',
+    reviewId: verdictReviewId(v.runId),
+    reviewedSha: v.headSha,
+    review: { id: verdictReviewId(v.runId), url: v.reviewUrl, author: v.reviewer, submittedAt: v.recordedAt, body: v.findings, comments: [], omittedComments: 0 },
+  };
+}
+
+/**
+ * Why whoever asked for a queued revision may no longer do so, or null. A person must still be an
+ * allowed actor; Updraft's own reviewer needs `reviewOn` (the repository still has review on).
+ */
+export function requesterProblem(revision: RevisionRequest, allowedActors: readonly string[], reviewOn: boolean): string | null {
+  if (revision.trigger === 'updraft_review') return reviewOn ? null : 'review is off for this repository now, so its reviewer verdicts are no longer acted on';
+  return isAllowedActor(allowedActors, revision.review.author)
+    ? null
+    : `${revision.review.author}, who requested the changes, is no longer an allowed actor for this workflow`;
+}
+
+/**
+ * A verdict is for one commit. Returns why a revision queued by a verdict must be dropped given
+ * the PR's head now (`headSha`; null when it is not known), or null when it still applies.
+ * Change requests by people are not bound to a commit and are never stale.
+ */
+export function verdictStale(revision: RevisionRequest, headSha: string | null): string | null {
+  if (revision.trigger !== 'updraft_review' || !revision.reviewedSha || headSha === null || headSha === revision.reviewedSha) return null;
+  return `the reviewer's verdict was for ${revision.reviewedSha.slice(0, 12)}, but the pull request is now at ${headSha.slice(0, 12)}; the verdict is stale`;
 }
 
 /**

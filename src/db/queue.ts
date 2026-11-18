@@ -1,11 +1,12 @@
 // OWNER: queue/worker workstream. Claim-side persistence: atomic claims, runs,
 // leases, retry, and status queries.
 import { join } from 'node:path';
-import type { UpdraftConfig } from '../config/schema.js';
+import { DEFAULT_MAX_REVISIONS, reviewSettings, type UpdraftConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
-import type { Job, JobStatus, Publication, Revision, Run, RunContainer, RunOutcome, RunSummary } from '../types.js';
+import { reviewOf, type Job, type JobStatus, type Publication, type Revision, type Run, type RunContainer, type RunOutcome, type RunSummary } from '../types.js';
 import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
 import { listRecentPublications } from './publications.js';
+import { listRecentLoopPrs, listRecentPrReviews, prStage, type LoopPr, type PrReview, type PrStageInfo } from './pr-reviews.js';
 import {
   issuesAwaitingRevisionPush,
   listLimitedRevisionPrs,
@@ -103,6 +104,8 @@ function pickAgent(
   poolName: string,
   poolAgents: readonly string[],
   load: Map<string, number>,
+  /** Never picked, whatever its capacity (the author of the code a reviewer job reviews). */
+  exclude: string | null = null,
 ): string | null {
   const n = poolAgents.length;
   if (n === 0) return null;
@@ -115,7 +118,7 @@ function pickAgent(
     const index = (start + k) % n;
     const name = poolAgents[index]!;
     const agent = ownEntry(config.agents, name);
-    if (agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) capable.push({ name, index });
+    if (name !== exclude && agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) capable.push({ name, index });
   }
   if (capable.length === 0) return null;
   const failed = startFailedAgents(db, job.id, job.start_failures);
@@ -127,11 +130,41 @@ function pickAgent(
 }
 
 /**
+ * A reviewer job (repositories.<repo>.review) must not be run by the agent that wrote the code
+ * under review while the pool has another enabled agent: that agent is excluded from the pick,
+ * and the job waits for one of the others to have capacity. When the pool has no other enabled
+ * agent, the author reviews its own work only if the repository says so
+ * (review: { allowSameAgent: true }); otherwise the job cannot be routed (`problem`).
+ */
+function reviewerExclusion(config: UpdraftConfig, row: JobRow, poolAgents: readonly string[]): { exclude: string | null; problem?: string } {
+  if (!row.event_id.startsWith('pr-review:')) return { exclude: null };
+  let author: string | null;
+  try {
+    author = reviewOf(rowToJob(row))?.authorAgent ?? null;
+  } catch {
+    author = null;
+  }
+  if (!author) return { exclude: null };
+  const others = poolAgents.filter((a) => a !== author && ownEntry(config.agents, a)?.enabled);
+  if (others.length > 0) return { exclude: author };
+  const repo = Object.values(config.repositories).find((r) => r.id === row.repo_id);
+  if (repo && reviewSettings(repo).allowSameAgent) return { exclude: null };
+  return {
+    exclude: author,
+    problem:
+      `pool "${row.pool}" has no enabled agent other than "${author}", which wrote the code under review; add another agent to the review pool, ` +
+      'or set review: { allowSameAgent: true } for the repository',
+  };
+}
+
+/**
  * Atomically pick the oldest claimable queued job and start a run for it on an
  * eligible agent with capacity, honoring the global limit, per-agent limits
  * (across pools and repos), round-robin order per pool, and at most one running
  * job per (repo, issue). A revision job belongs to the issue of the PR it revises, so it also
  * waits for that issue's other jobs, and for an earlier revision whose push has not settled.
+ * A reviewer job is the same, and is never given to the agent that wrote the code it reviews
+ * while another agent can take it (reviewerExclusion).
  * Returns null when nothing can start now.
  *
  * A queued job whose pool or action is no longer in the config is marked
@@ -199,7 +232,12 @@ export function claimNextJob(
         continue;
       }
 
-      const agent = pickAgent(db, config, row, row.pool, pool.agents, load);
+      const reviewer = reviewerExclusion(config, row, pool.agents);
+      if (reviewer.problem) {
+        failUnroutable(db, row, reviewer.problem, at);
+        continue;
+      }
+      const agent = pickAgent(db, config, row, row.pool, pool.agents, load, reviewer.exclude);
       if (!agent) continue; // this pool is saturated; later jobs in other pools may still start
 
       const runId = newId('run');
@@ -580,6 +618,10 @@ export interface StatusSnapshot {
   reviewRequests?: ReviewRequest[];
   /** PRs that reached maxRevisions, newest first. */
   limitedPullRequests?: RevisionPr[];
+  /** Watched PRs with their stage in the review loop (repositories.<repo>.review), most recently changed first. */
+  pullRequests?: Array<{ pr: LoopPr; stage: PrStageInfo }>;
+  /** Recent reviewer verdicts and their posting, newest first. */
+  reviews?: PrReview[];
 }
 
 export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => number): StatusSnapshot {
@@ -668,5 +710,11 @@ export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => num
     revisions: listRecentRevisions(db, 10),
     reviewRequests: listRecentReviewRequests(db, 10),
     limitedPullRequests: listLimitedRevisionPrs(db, 10),
+    // Only where the review loop is configured: without it a watched PR has no stage to speak of.
+    pullRequests: listRecentLoopPrs(db, 20).flatMap((pr) => {
+      const repo = Object.values(config.repositories).find((r) => r.id === pr.repoId);
+      return repo && reviewSettings(repo).enabled ? [{ pr, stage: prStage(db, pr, repo.maxRevisions ?? DEFAULT_MAX_REVISIONS) }] : [];
+    }),
+    reviews: listRecentPrReviews(db, 10),
   };
 }

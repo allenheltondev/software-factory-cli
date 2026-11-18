@@ -1,5 +1,6 @@
 // In-memory GitHubApi fake, then the poller tests.
 import { describe, expect, it } from 'vitest';
+import { ReviewLoopApiStubs } from '../../test/review-loop-api-stubs.js';
 import { configSchema, workflowId, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getCheckpoint, listQueuedJobs } from '../db/ingest.js';
@@ -30,7 +31,7 @@ interface FakeRepo {
   failBodyEdit: GitHubError | null;
 }
 
-class FakeGitHub implements GitHubApi {
+class FakeGitHub extends ReviewLoopApiStubs implements GitHubApi {
   readonly repos = new Map<number, FakeRepo>();
   private nextEventId = 1000;
   clock = Date.parse('2026-01-01T00:00:00Z');

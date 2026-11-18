@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
+import { ReviewLoopApiStubs } from '../../test/review-loop-api-stubs.js';
 import { claudeAdapter } from '../agents/adapters/claude.js';
 import { codexAdapter } from '../agents/adapters/codex.js';
 import { kiroAdapter } from '../agents/adapters/kiro.js';
@@ -31,7 +32,7 @@ const T0 = Date.parse('2026-11-17T12:00:00.000Z');
 const SECRET = 'ghp_SECRETtoken0123456789';
 
 /** GitHub's issue comments, in memory. */
-class FakeCommentApi implements GitHubApi {
+class FakeCommentApi extends ReviewLoopApiStubs implements GitHubApi {
   comments: GitHubIssueComment[] = [];
   readonly calls: string[] = [];
   /** Errors to throw on the next call of a method (consumed once). */

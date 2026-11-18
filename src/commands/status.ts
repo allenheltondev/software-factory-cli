@@ -1,9 +1,10 @@
 import { existsSync } from 'node:fs';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import type { FailureComment } from '../db/failure-comments.js';
+import type { PrReview, PrStage } from '../db/pr-reviews.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
 import type { ReviewRequest } from '../db/revisions.js';
-import { revisionOf, type Job, type JobStatus, type Publication, type Revision } from '../types.js';
+import { reviewOf, revisionOf, type Job, type JobStatus, type Publication, type Revision } from '../types.js';
 import { verificationLines, verificationNotes } from '../worker/verify.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
@@ -131,7 +132,7 @@ export function renderReviewRequest(r: ReviewRequest): string {
   const who = `by ${r.reviewer ?? 'an unknown user'}${r.submittedAt ? ` at ${r.submittedAt}` : ''}`;
   switch (r.state) {
     case 'queued':
-      return `${who}: revision job ${r.jobId ?? '(pruned)'}`;
+      return `${who}${r.trigger === 'updraft_review' ? " (Updraft's reviewer)" : ''}: revision job ${r.jobId ?? '(pruned)'}`;
     case 'over-limit':
       return `${who}: not acted on — ${oneLine(r.reason ?? 'the pull request reached maxRevisions', 140)}`;
     default:
@@ -139,10 +140,51 @@ export function renderReviewRequest(r: ReviewRequest): string {
   }
 }
 
-/** " (revision of PR #n)" for a revision job, so its issue number is not read as the whole story. */
+/** " (revision of PR #n)" for a revision job, " (review of PR #n)" for a reviewer job, so its issue number is not read as the whole story. */
 function revisionNote(job: Job): string {
   const revision = revisionOf(job);
-  return revision ? ` (revision of PR #${revision.pullRequest.number})` : '';
+  if (revision) return ` (revision of PR #${revision.pullRequest.number}${revision.trigger === 'updraft_review' ? ', requested by the reviewer' : ''})`;
+  const review = reviewOf(job);
+  return review ? ` (review of PR #${review.pullRequest.number} at ${review.headSha.slice(0, 12)})` : '';
+}
+
+/** The stages of a watched PR in the review loop, as `updraft status` names them (docs/review-loop.md). */
+export const STAGE_LABELS: Record<PrStage, string> = {
+  'awaiting-review': 'awaiting review',
+  reviewing: 'reviewing',
+  'changes-requested': 'changes requested',
+  revising: 'revising',
+  'ready-to-merge': 'ready to merge',
+  merging: 'merging / waiting for checks',
+  merged: 'merged',
+  'needs-human': 'needs a human',
+  closed: 'closed',
+};
+
+/** One line: a reviewer run's verdict, where it was posted and what the worker did with it. */
+export function renderReview(r: PrReview): string {
+  const verdict = `${r.verdict} for ${r.headSha.slice(0, 12)} by agent ${r.agent}`;
+  switch (r.state) {
+    case 'published': {
+      const did: Record<NonNullable<PrReview['outcome']>, string> = {
+        ready: 'ready for a person to merge (or for auto-merge)',
+        'revision-queued': `revision job ${r.revisionJobId ?? '(pruned)'} queued`,
+        'over-limit': 'not acted on: the pull request reached maxRevisions',
+        'no-revise': 'not acted on: revise is off',
+        stale: 'not acted on: the pull request had moved on from that commit',
+        closed: 'not acted on: the pull request was closed',
+      };
+      return `${verdict}; ${r.outcome ? did[r.outcome] : 'recorded'}; review ${r.reviewUrl ?? '(none)'}`;
+    }
+    case 'publishing':
+      return `${verdict}; posting the review (attempt ${r.attempts})`;
+    case 'skipped':
+      return `${verdict}; not posted: ${oneLine(r.error ?? 'nothing to post', 140)}`;
+    case 'failed': {
+      const next = r.nextAttemptAt ? `worker retries at ${r.nextAttemptAt}, or ` : '';
+      return `${verdict}; not posted or not acted on yet (attempt ${r.attempts}): ${oneLine(r.error ?? 'unknown error', 140)} — ${next}run "updraft publish ${r.runId}"`;
+    }
+  }
 }
 
 export function renderStatus(v: StatusView): string {
@@ -228,6 +270,7 @@ export function renderStatus(v: StatusView): string {
       );
       const last = sum.lastOutput.at(-1);
       if (last) lines.push(`    last output: ${oneLine(last, 120)}`);
+      if (sum.review) lines.push(`    review verdict: ${sum.review.verdict} for ${sum.review.headSha.slice(0, 12)} (the worktree was removed; nothing was pushed)`);
       if (sum.verification) {
         lines.push(`    verification: ${sum.verification.passed ? 'passed' : 'did not pass'}`);
         for (const l of verificationLines(sum.verification)) lines.push(`      ${oneLine(l)}`);
@@ -258,9 +301,31 @@ export function renderStatus(v: StatusView): string {
     }
   }
 
+  const repoName = new Map(v.repos.map((r) => [r.id, r.fullName]));
+  const pullRequests = s.pullRequests ?? [];
+  if (pullRequests.length) {
+    lines.push('', 'Pull requests (review loop):');
+    for (const { pr, stage } of pullRequests) {
+      lines.push(`  ${repoName.get(pr.repoId) ?? `repository ${pr.repoId}`} PR #${pr.prNumber}  ${STAGE_LABELS[stage.stage]}  ${pr.prUrl}`);
+      lines.push(`    ${oneLine(stage.detail, 200)}`);
+      if (pr.mergeState === 'blocked' && pr.mergeSha === pr.headSha) {
+        const comment = pr.mergeCommentUrl ?? (pr.mergeCommentError ? `not posted yet: ${oneLine(pr.mergeCommentError, 100)}` : 'not posted yet');
+        lines.push(`    comment about the merge: ${comment}`);
+      }
+    }
+  }
+
+  const reviews = s.reviews ?? [];
+  if (reviews.length) {
+    lines.push('', 'Reviews:');
+    for (const r of reviews) {
+      lines.push(`  ${r.runId}  ${r.state.padEnd(10)}  ${r.repoFullName} PR #${r.prNumber}  updated ${r.updatedAt}`);
+      lines.push(`    ${renderReview(r)}`);
+    }
+  }
+
   const reviewRequests = s.reviewRequests ?? [];
   if (reviewRequests.length) {
-    const repoName = new Map(v.repos.map((r) => [r.id, r.fullName]));
     lines.push('', 'Change requests:');
     for (const r of reviewRequests) {
       lines.push(`  ${repoName.get(r.repoId) ?? `repository ${r.repoId}`} PR #${r.prNumber}  ${r.state.padEnd(10)}  ${r.reviewUrl ?? r.reviewId}`);

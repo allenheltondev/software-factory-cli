@@ -8,6 +8,8 @@ import {
   modeNeedsCheckout,
   publishMode,
   reviseActive,
+  reviewActive,
+  reviewSettings,
   repoNeedsCheckout,
   workflowId,
   type UpdraftConfig,
@@ -153,6 +155,39 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       warnings.push({ path: `repositories.${repoName}.maxRevisions`, message: 'has no effect without revise' });
     }
 
+    const review = reviewSettings(repo);
+    if (review.enabled) {
+      if (config.execution.mode !== 'live') {
+        warnings.push({
+          path: `repositories.${repoName}.review`,
+          message: `only applies in live mode; in ${config.execution.mode} mode no reviewer run is started`,
+        });
+      } else if (publishMode(repo) === 'none') {
+        warnings.push({
+          path: `repositories.${repoName}.review`,
+          message: 'only applies together with publish: the reviewer reviews pull requests the worker opened, and it opens none here',
+        });
+      } else if (!repo.revise) {
+        warnings.push({
+          path: `repositories.${repoName}.review`,
+          message: 'revise is off, so nothing acts on a "changes requested" verdict: the review is posted and the pull request waits for a person',
+        });
+      }
+      if (repo.autoMergeWaitMinutes !== undefined && repo.autoMerge === undefined) {
+        warnings.push({ path: `repositories.${repoName}.autoMergeWaitMinutes`, message: 'has no effect without autoMerge' });
+      }
+    } else {
+      if (repo.autoMerge !== undefined) {
+        warnings.push({
+          path: `repositories.${repoName}.autoMerge`,
+          message: 'has no effect without review: Updraft only merges a pull request its own reviewer found ready to merge',
+        });
+      }
+      if (repo.autoMergeWaitMinutes !== undefined) {
+        warnings.push({ path: `repositories.${repoName}.autoMergeWaitMinutes`, message: 'has no effect without review and autoMerge' });
+      }
+    }
+
     const wfIds = new Set<string>();
     repo.workflows.forEach((wf, i) => {
       const base = `repositories.${repoName}.workflows.${i}`;
@@ -165,6 +200,30 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       const pools = typeof wf.pool === 'string' ? [wf.pool] : [...wf.pool.rules.map((r) => r.use), wf.pool.default];
       for (const p of pools) {
         if (!config.pools[p]) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
+      }
+      if (wf.reviewPool !== undefined) {
+        if (!config.pools[wf.reviewPool]) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
+        if (!review.enabled) warnings.push({ path: `${base}.reviewPool`, message: `has no effect without repositories.${repoName}.review` });
+      }
+      // The reviewer must be able to be a different agent than the one that wrote the code. For
+      // each pool the job can be routed to: is there a coding agent that would leave the review
+      // pool (reviewPool, else that same pool) with nobody else enabled?
+      if (reviewActive(config, repo) && !review.allowSameAgent) {
+        const enabledIn = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
+        for (const p of new Set(pools)) {
+          const reviewPool = wf.reviewPool ?? p;
+          const reviewers = enabledIn(reviewPool);
+          const alone = enabledIn(p).find((author) => reviewers.every((r) => r === author));
+          if (alone !== undefined && reviewers.length > 0) {
+            errors.push({
+              path: wf.reviewPool !== undefined ? `${base}.reviewPool` : `${base}.pool`,
+              message:
+                `review needs a reviewer other than the agent that wrote the code, but "${alone}" is the only enabled agent in pool "${reviewPool}" ` +
+                `and also writes code in pool "${p}"; add another agent, set reviewPool to a pool with a different agent, or set ` +
+                `repositories.${repoName}.review: { allowSameAgent: true } to let an agent review its own work`,
+            });
+          }
+        }
       }
 
       if (allowedActorsFor(config, wf).length === 0) {
@@ -212,6 +271,15 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
         errors.push({
           path: `actions.${name}.revisePrompt`,
           message: `required because repositories.${revising[0]}.revise is on: the prompt file tells the agent what to do with a review that requested changes`,
+        });
+      }
+      const reviewing = Object.entries(config.repositories).find(
+        ([, r]) => reviewActive(config, r) && r.workflows.some((wf) => wf.action === name),
+      );
+      if (action.output === 'local-branch' && reviewing && !action.reviewPrompt) {
+        errors.push({
+          path: `actions.${name}.reviewPrompt`,
+          message: `required because repositories.${reviewing[0]}.review is on: the prompt file tells the reviewing agent how to review a pull request`,
         });
       }
       if (action.output === 'log') {

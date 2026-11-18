@@ -5,6 +5,7 @@ import { appCommitIdentity } from '../github/credentials.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
+import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
 import { createRevisionPublisher, revisionsEnabled } from '../publish/revision.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import { runDaemon, type DaemonDeps } from '../worker/daemon.js';
@@ -89,7 +90,12 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       workerKind: credentials.kind,
       env: ctx.env,
     });
-    const publisher = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
+    const publication = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
+    // With the revision loop on, revision runs are pushed to their PR and every other run goes
+    // to the publisher as before. With the review loop on, reviewer runs are posted as reviews,
+    // and whatever the other two pushed gets a reviewer run.
+    const revising = revisionsEnabled(config) ? createRevisionPublisher(publishDeps('revision'), publication) : publication;
+    const publisher = reviewsEnabled(config) ? createReviewLoopPublisher(publishDeps('review'), revising) : revising;
     const appAuth = credentials.app;
     await deps.runDaemon({
       db: openDb,
@@ -100,13 +106,7 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       checkDispatchable: (job) => deps.checkJobDispatchable({ api, config }, job),
       signal: controller.signal,
       executor: createExecutor(config, appAuth && config.github?.app?.commitAsApp ? { commitIdentity: (repoFullName) => appCommitIdentity(appAuth, repoFullName) } : {}),
-      // With the revision loop on, revision runs are pushed to their PR and every other run goes
-      // to the publisher as before.
-      ...(revisionsEnabled(config)
-        ? { publisher: createRevisionPublisher(publishDeps('revision'), publisher) }
-        : publisher
-          ? { publisher }
-          : {}),
+      ...(publisher ? { publisher } : {}),
       ...(failureCommentsEnabled(config)
         ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }) }) }
         : {}),

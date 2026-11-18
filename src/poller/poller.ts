@@ -23,7 +23,8 @@
 //
 // With repositories.<repo>.revise, each repository's cycle also reads change requests on the PRs
 // the worker opened and queues revision jobs (reviews.ts). Those jobs sit in the same queue but
-// are checked by their own rules, in step 5 and before start.
+// are checked by their own rules, in step 5 and before start. With repositories.<repo>.review the
+// same read also queues a reviewer job for each new head of such a PR (review-jobs.ts).
 import { allowedActorsFor, workflowId, type UpdraftConfig, type RepositoryConfig, type WorkflowConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
 import { cancelQueuedJob, commitPollBatch, getCheckpoint, listQueuedJobs, type Checkpoint, type NewJob } from '../db/ingest.js';
@@ -36,8 +37,9 @@ import {
   type IssueEventsPage,
 } from '../github/api.js';
 import { labelEquals, selectPool } from '../routing.js';
-import { ENVELOPE_SCHEMA_VERSION, revisionOf, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
+import { ENVELOPE_SCHEMA_VERSION, reviewOf, revisionOf, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
+import { checkReviewDispatchable, queuedReviewProblem } from './review-jobs.js';
 import { checkRevisionDispatchable, pollRepoReviews, queuedRevisionProblem } from './reviews.js';
 
 /** Events per page. Keep constant: the stored page-1 ETag depends on the query string. */
@@ -79,6 +81,8 @@ export interface RepoPollResult {
   jobsEnqueued: number;
   /** Revision jobs queued from change requests (repositories.<repo>.revise); absent when that is off. */
   revisionsQueued?: number;
+  /** Reviewer jobs queued (repositories.<repo>.review); absent when nothing was queued. */
+  reviewsQueued?: number;
   error?: string;
   /** True when the repo was skipped because it is backing off after errors. */
   skipped?: boolean;
@@ -176,7 +180,9 @@ export async function pollOnce(deps: PollerDeps): Promise<PollSummary> {
       // failure here backs the repository off, and each of the two keeps its own checkpoint.
       const reviews = await pollRepoReviews(deps, repo, cfg, log);
       revisionJobsCanceled += reviews?.jobsCanceled ?? 0;
-      results.push(reviews ? { ...polled, revisionsQueued: reviews.revisionsQueued } : polled);
+      results.push(
+        reviews ? { ...polled, revisionsQueued: reviews.revisionsQueued, ...(reviews.reviewsQueued ? { reviewsQueued: reviews.reviewsQueued } : {}) } : polled,
+      );
       backoff.delete(repo.id);
     } catch (err) {
       const failures = (b?.failures ?? 0) + 1;
@@ -657,6 +663,10 @@ async function recheckQueuedJobs(
         // A revision job is not judged by its issue's label: see reviews.ts.
         const problem = queuedRevisionProblem(deps.config, deps.db, job);
         check = problem ? { ok: false, reason: problem } : { ok: true };
+      } else if (reviewOf(job)) {
+        // Nor is a reviewer job: see review-jobs.ts.
+        const problem = queuedReviewProblem(deps.config, deps.db, job);
+        check = problem ? { ok: false, reason: problem } : { ok: true };
       } else {
         check = await evaluateJob(
           deps.config,
@@ -698,5 +708,6 @@ export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'confi
     );
   // A revision job has its own check; the issue check above only decides whether the issue's
   // text may still be given to the agent.
+  if (reviewOf(job)) return checkReviewDispatchable(deps, job, check);
   return revisionOf(job) ? checkRevisionDispatchable(deps, job, check) : check(job);
 }

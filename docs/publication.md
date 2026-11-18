@@ -35,7 +35,7 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
    inert), and carries the run id and a hidden `<!-- updraft-run: <runId> -->` marker.
 3. **Comment on the issue** with a link to the PR and a short summary, with the same marker.
 
-Merging stays a human decision: the worker never merges, approves or marks a PR ready for
+Merging stays a human decision: publication never merges, approves or marks a PR ready for
 review.
 
 ### When a branch can move

@@ -13,14 +13,14 @@
 //      once whatever is replayed.
 //   5. The checkpoint (ETag, newest updated_at) is stored only after every PR was processed; an
 //      API error leaves it where it was and the scan is repeated.
-import { allowedActorsFor, DEFAULT_MAX_REVISIONS, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
+import { allowedActorsFor, DEFAULT_MAX_REVISIONS, reviewActive, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
+import { getLoopPr, observeHead, scheduleReviews } from '../db/pr-reviews.js';
 import {
   closeRevisionPr,
   enqueueRevision,
   getReviewCheckpoint,
   getReviewRequest,
-  getRevisionPr,
   listOpenRevisionPrs,
   markRevisionPrSeen,
   recordReviewRequest,
@@ -32,7 +32,7 @@ import {
 import { GitHubError, type GitHubApi, type GitHubReview, type PullRequestReviews, type PullRequestUpdate } from '../github/api.js';
 import { revisionOf, type IssueSnapshot, type Job, type RepoRef, type ReviewSnapshot, type RevisionRequest } from '../types.js';
 import type { Logger } from '../util/log.js';
-import { isAllowedActor, reviewTrigger, reviewWithdrawn } from './review-trigger.js';
+import { requesterProblem, reviewTrigger, reviewWithdrawn, verdictStale } from './review-trigger.js';
 
 /** Pull requests per page. Keep constant: the stored page-1 ETag depends on the query string. */
 export const PULLS_PER_PAGE = 100;
@@ -50,6 +50,8 @@ export interface ReviewPollResult {
   /** Watched PRs whose reviews were read this cycle (one request each). */
   pullRequestsRead: number;
   revisionsQueued: number;
+  /** Reviewer jobs queued this cycle (repositories.<repo>.review). */
+  reviewsQueued: number;
   jobsCanceled: number;
 }
 
@@ -96,16 +98,31 @@ function snapshotReview(review: GitHubReview, decision: Extract<ReturnType<typeo
 }
 
 /**
- * Poll one repository's watched PRs for change requests. Returns null when the revision loop is
- * off for it (no request is made, no state is touched). Throws for API errors, like pollRepo.
+ * Poll one repository's watched PRs for change requests. Returns null when the revision loop and
+ * the review loop are both off for it (no request is made, no state is touched). Throws for API
+ * errors, like pollRepo.
+ *
+ * With repositories.<repo>.review the same read also tells the worker where each PR's head is, so
+ * a head someone else pushed gets its reviewer run. That costs no further request: the PR's
+ * reviews are read whenever the PR changed, and a push changes it.
  */
 export async function pollRepoReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: RepositoryConfig, log: Logger): Promise<ReviewPollResult | null> {
-  if (!reviseActive(deps.config, cfg)) return null;
+  const revising = reviseActive(deps.config, cfg);
+  const reviewing = reviewActive(deps.config, cfg);
+  if (!revising && !reviewing) return null;
   const { db, api } = deps;
-  const result: ReviewPollResult = { pullRequestsRead: 0, revisionsQueued: 0, jobsCanceled: 0 };
+  const result: ReviewPollResult = { pullRequestsRead: 0, revisionsQueued: 0, reviewsQueued: 0, jobsCanceled: 0 };
+  const scheduleReviewJobs = () => {
+    for (const job of scheduleReviews(db, deps.config, repo.fullName, cfg, deps.now)) {
+      result.reviewsQueued++;
+      log.info('reviewer job queued', { job: job.id, pr: job.envelope.review?.pullRequest.number, head: job.envelope.review?.headSha, pool: job.pool });
+    }
+  };
 
   const added = syncRevisionPrs(db, repo.id, deps.now);
-  if (added) log.info('watching pull requests for change requests', { added });
+  if (added) log.info('watching pull requests', { added });
+  // From local state, so also after a restart: heads the worker pushed itself need no read.
+  scheduleReviewJobs();
   const watched = new Map(listOpenRevisionPrs(db, repo.id).map((w) => [w.prNumber, w]));
   if (watched.size === 0) return result;
 
@@ -153,6 +170,8 @@ export async function pollRepoReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: 
     if (seen ? sameTime(w.seenUpdatedAt, seen.updatedAt) : w.seenUpdatedAt !== null && complete) continue;
 
     let pr: PullRequestReviews;
+    // Taken before the read: a head the worker pushes while the read is under way is newer than it.
+    const readAt = new Date((deps.now ?? Date.now)()).toISOString();
     try {
       pr = await api.getPullRequestReviews(repo, w.prNumber);
     } catch (err) {
@@ -165,11 +184,16 @@ export async function pollRepoReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: 
       close(w, `pull request #${w.prNumber} was ${pr.merged ? 'merged' : 'closed'}`);
       continue;
     }
-    result.revisionsQueued += ingestReviews(deps, repo, cfg, w, pr, log);
+    if (reviewing && pr.headRef === w.branch && observeHead(db, repo.id, w.prNumber, pr.headSha, readAt)) {
+      log.info('pull request head changed', { pr: w.prNumber, head: pr.headSha });
+    }
+    if (revising) result.revisionsQueued += ingestReviews(deps, repo, cfg, w, pr, log);
     // The listed time, not the read's: a review that landed between the two is then read again.
     markRevisionPrSeen(db, repo.id, w.prNumber, seen?.updatedAt ?? pr.updatedAt, deps.now);
   }
 
+  // Heads read just now.
+  scheduleReviewJobs();
   saveReviewCheckpoint(db, repo.id, { etag, lastUpdatedAt: newest }, deps.now);
   return result;
 }
@@ -238,10 +262,7 @@ function configProblem(config: UpdraftConfig, job: Job, revision: RevisionReques
   }
   const wf = cfg.workflows.find((w) => workflowId(w) === job.workflowId);
   if (!wf) return `workflow "${job.workflowId}" no longer exists in config for ${fullName}`;
-  if (!isAllowedActor(allowedActorsFor(config, wf), revision.review.author)) {
-    return `${revision.review.author}, who requested the changes, is no longer an allowed actor for this workflow`;
-  }
-  return null;
+  return requesterProblem(revision, allowedActorsFor(config, wf), reviewActive(config, cfg));
 }
 
 /**
@@ -253,9 +274,10 @@ export function queuedRevisionProblem(config: UpdraftConfig, db: Db, job: Job): 
   if (!revision) return 'the job has no revision request';
   const problem = configProblem(config, job, revision);
   if (problem) return problem;
-  const pr = getRevisionPr(db, job.repoId, revision.pullRequest.number);
+  const pr = getLoopPr(db, job.repoId, revision.pullRequest.number);
   if (pr && pr.state !== 'open') return `pull request #${revision.pullRequest.number} is closed`;
-  return null;
+  // A reviewer's verdict is for one commit; the head the worker knows of may have moved since.
+  return verdictStale(revision, pr?.headSha ?? null);
 }
 
 /**
@@ -296,6 +318,8 @@ export async function checkRevisionDispatchable(
   }
   const withdrawn = reviewWithdrawn(revision, pr.reviews);
   if (withdrawn) return { ok: false, reason: withdrawn };
+  const stale = verdictStale(revision, pr.headSha);
+  if (stale) return { ok: false, reason: stale };
 
   const issue = await vouchIssue({ ...job, eventId: revision.originalEventId });
   if (issue.ok) return issue;

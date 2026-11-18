@@ -528,6 +528,7 @@ describe('App permissions', () => {
   });
 
   it('names each gap and what to set', () => {
+    expect(requiredAppPermissions({ publish: true, commentOnFailure: false, autoMerge: true })).toMatchObject({ checks: 'read', statuses: 'read' });
     const need = requiredAppPermissions({ publish: true, commentOnFailure: true });
     expect(missingAppPermissions({ metadata: 'read', contents: 'write', pull_requests: 'write', issues: 'write' }, need)).toEqual([]);
     expect(missingAppPermissions({ metadata: 'read', contents: 'read', issues: 'write' }, need)).toEqual([

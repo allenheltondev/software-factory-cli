@@ -6,6 +6,11 @@ worker queues a revision job, runs the agent on the PR's branch with the review,
 result, pushes the new commits to the PR and replies there. Merging, approving and resolving
 stay with people.
 
+Reviews by people are one of two things that can ask for a revision. With
+`repositories.<repo>.review` on as well, Updraft's own reviewer run does too: see
+[The review loop](review-loop.md). Everything on this page applies to both unless it says
+otherwise.
+
 ```yaml
 actions:
   implement-issue:
@@ -38,6 +43,12 @@ invalid. A starting point is
   they are open. No other PR is ever read for reviews, and none is ever pushed to. A PR stays
   watched after `updraft clean --older-than` pruned the job that opened it. A PR that was
   closed or merged is no longer watched; reopening it does not resume revisions.
+- **Updraft's own reviewer.** With `review` on, a "changes requested" verdict of a reviewer
+  run queues a revision too. It is taken from the worker's own record when the verdict is
+  recorded, not read from GitHub, and it is not subject to the allowlist (the `review` setting
+  is what allows it). It is bound to the commit that was reviewed: if the PR's head is another
+  commit by the time the revision would start, the job is canceled as stale. The rest of this
+  list is about reviews by people.
 - **Which reviews.** A submitted review with state "Request changes" (`CHANGES_REQUESTED`)
   whose author is an allowed actor for the workflow that produced the PR: the workflow's
   `allowedActors`, else `dispatch.allowedActors`, the same list that decides who may dispatch
@@ -123,7 +134,8 @@ If the revision run itself fails and `commentOnFailure` is on, the PR gets one s
 
 ## Limits
 
-- `maxRevisions` (default 3, at most 20) is the number of revision jobs one PR gets. A job
+- `maxRevisions` (default 3, at most 20) is the number of revision jobs one PR gets, whoever
+  asked for them: change requests by people and by Updraft's reviewer count together. A job
   canceled before it ran does not count; `updraft retry` of a failed revision does not use
   another. Once the limit is reached, further change requests are recorded and listed in
   `updraft status`, not acted on, and one comment on the PR says so. Raising the limit lets
@@ -151,6 +163,10 @@ Errors are handled as for issue events: the repository backs off, and the positi
 listing is only stored after every changed PR was processed, so nothing is skipped.
 
 ## Status
+
+With `review` on, the reviewer's findings take the place of the review in the prompt (fenced
+the same way), the reply names the worker's own comment review, and each pushed revision is
+followed by a new reviewer run.
 
 `updraft status` marks revision jobs as `(revision of PR #n)`, lists each revision run with
 the commit range it pushed (or why it pushed nothing) under "Revisions", and under "Change

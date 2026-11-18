@@ -21,11 +21,13 @@ export interface EventEnvelope {
   /**
    * issue.labeled: a trigger label was applied to an issue. pull_request.changes_requested: a
    * review asked for changes on a PR Updraft published; `revision` then says which and with what text.
+   * pull_request.review: Updraft's own reviewer run of one head commit of such a PR
+   * (repositories.<repo>.review); `review` then says which commit and with what context.
    */
-  type: 'issue.labeled' | 'pull_request.changes_requested';
+  type: 'issue.labeled' | 'pull_request.changes_requested' | 'pull_request.review';
   repo: RepoRef;
   issue: { number: number; title: string; url: string };
-  /** GitHub issue-event ID (stringified). For a revision: "review:<review node id>". */
+  /** GitHub issue-event ID (stringified). For a revision: "review:<review id>". For a reviewer run: "pr-review:<pr>:<head sha>". */
   eventId: string;
   /** Link to the event's subject (the issue URL). */
   url: string;
@@ -36,13 +38,17 @@ export interface EventEnvelope {
   createdAt: string;
   /** Present exactly when `type` is pull_request.changes_requested. */
   revision?: RevisionRequest;
+  /** Present exactly when `type` is pull_request.review. */
+  review?: ReviewRunRequest;
 }
 
 /**
  * What made a review count as a change request (see reviewTrigger in src/poller/review-trigger.ts).
  * changes_requested: a submitted review with state CHANGES_REQUESTED by an allowed actor.
+ * updraft_review: a changes-requested verdict of Updraft's own reviewer run, taken from the
+ * worker's database when the verdict is recorded (never read back from GitHub).
  */
-export type RevisionTriggerKind = 'changes_requested';
+export type RevisionTriggerKind = 'changes_requested' | 'updraft_review';
 
 /** One inline comment of the triggering review, as it read when the review was ingested. Untrusted text. */
 export interface ReviewCommentSnapshot {
@@ -80,6 +86,46 @@ export interface RevisionRequest {
   /** Event id of the label application that queued the original job; the issue text is vouched for against it. */
   originalEventId: string;
   review: ReviewSnapshot;
+  /**
+   * updraft_review only: the head commit the verdict was for. The revision is dropped as stale
+   * unless the pull request is still at this commit when it starts.
+   */
+  reviewedSha?: string;
+}
+
+/** What Updraft's reviewer concluded about one head commit. Anything else is not a verdict. */
+export type ReviewVerdict = 'ready-to-merge' | 'changes-requested';
+export const REVIEW_VERDICTS: readonly ReviewVerdict[] = ['ready-to-merge', 'changes-requested'];
+
+/** An earlier Updraft review of the same pull request, as given to a later reviewer run. Untrusted text. */
+export interface PriorReviewSnapshot {
+  headSha: string;
+  verdict: ReviewVerdict;
+  agent: string;
+  findings: string;
+}
+
+/** The reviewer run a pull_request.review job carries out. */
+export interface ReviewRunRequest {
+  /** `branch` is the PR's head branch, `baseBranch` the branch it was opened against (null when unknown). */
+  pullRequest: { number: number; url: string; branch: string; baseBranch: string | null };
+  /** The commit to review. The verdict is bound to it. */
+  headSha: string;
+  /** Agent of the pull request's latest code run when the job was queued; never picked as the reviewer while another agent can be. */
+  authorAgent: string | null;
+  /** The run whose publication opened the PR. */
+  sourceRunId: string;
+  /** Event id of the label application that queued the original job; the issue text is vouched for against it. */
+  originalEventId: string;
+  /** Findings of earlier Updraft reviews of this PR, oldest first, as recorded when this job was queued. */
+  priorReviews: PriorReviewSnapshot[];
+  /** Change requests by allowed actors that queued a revision of this PR, oldest first, as snapshotted when each was ingested. */
+  changeRequests: ReviewSnapshot[];
+}
+
+/** The reviewer run a job carries out, or null for any other job. */
+export function reviewOf(job: { envelope?: EventEnvelope }): ReviewRunRequest | null {
+  return job.envelope?.type === 'pull_request.review' ? (job.envelope.review ?? null) : null;
 }
 
 /** The revision a job carries out, or null for an issue job. */
@@ -192,6 +238,16 @@ export interface RunSummary {
   notes: string[];
   /** Result of the action's verify commands; absent when none ran (and in summaries from before they existed). */
   verification?: VerificationSummary;
+  /** A reviewer run only: the commit it reviewed and what it concluded. Absent when no verdict could be read. */
+  review?: ReviewResult;
+}
+
+/** The parsed result of a reviewer run. `findings` is the reviewer's text before the verdict line: untrusted. */
+export interface ReviewResult {
+  headSha: string;
+  baseSha: string | null;
+  verdict: ReviewVerdict;
+  findings: string;
 }
 
 /**

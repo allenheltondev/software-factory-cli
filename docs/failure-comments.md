@@ -43,6 +43,9 @@ If you retry the job and a later attempt succeeds and is published, the publicat
 follows on the issue. The failure comment is left as it is: the worker never edits or deletes it.
 A later attempt that fails again gets a comment of its own.
 
+A failed revision run or reviewer run (one that timed out, or whose final message had no
+readable verdict) is announced on the pull request instead of the issue, with the same rules.
+
 ## What the comment says
 
 ````markdown

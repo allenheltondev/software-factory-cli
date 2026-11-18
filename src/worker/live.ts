@@ -30,6 +30,7 @@ import {
 } from '../agents/adapters/registry.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { renderPrompt, renderRevisionPrompt, type IssueContext } from '../agents/prompt.js';
+import { renderReviewPrompt } from '../agents/review-prompt.js';
 import {
   agentAdapter,
   DEFAULT_TIMEOUT_MINUTES,
@@ -40,7 +41,7 @@ import {
 } from '../config/schema.js';
 import { ownEntry, type Claim } from '../db/queue.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree, type PreparedWorktree } from '../git/worktree.js';
-import { revisionOf, type RunOutcome, type RunSummary, type VerificationCommandResult, type VerificationSummary } from '../types.js';
+import { reviewOf, revisionOf, type ReviewResult, type RunOutcome, type RunSummary, type VerificationCommandResult, type VerificationSummary } from '../types.js';
 import {
   canceledByUser,
   findRepoConfig,
@@ -69,6 +70,7 @@ import {
 import { APP_KEY_PATH_ENV } from '../github/app-auth.js';
 import { commitIdentityEnv, type CommitIdentity } from '../github/credentials.js';
 import { processStartTime, taskkillPath } from './process.js';
+import { discardReviewWorktree, readReviewVerdict, reviewBase, type ReviewRunState } from './review-run.js';
 import { cleanSummaryLines, countUncommitted, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 import { displayVerifyCommand, verifyInvocation, type VerifyInvocation } from './verify.js';
 
@@ -515,6 +517,26 @@ export class LiveExecutor implements Executor {
   constructor(private readonly opts: LiveExecutorOptions = {}) {}
 
   async execute(claim: Claim, ctx: ExecutionContext): Promise<ExecutionResult> {
+    const request = reviewOf(claim.job);
+    if (!request) return this.run(claim, ctx, null);
+    // A reviewer run (review-run.ts) publishes nothing: its worktree and branch are removed
+    // whatever the outcome, including a failure, a timeout, a cancel and a worker shutdown.
+    const review: ReviewRunState = { request, worktree: null };
+    try {
+      return await this.run(claim, ctx, review);
+    } finally {
+      await discardReviewWorktree(review, { git: this.opts.git, logPath: claim.run.logPath ?? join(ctx.paths.runsDir, claim.run.id, 'run.log') });
+      if (review.worktree) {
+        try {
+          ctx.recordProcess({ checkoutPath: null });
+        } catch {
+          // the run row keeps a path that no longer exists; `updraft clean` copes with that
+        }
+      }
+    }
+  }
+
+  private async run(claim: Claim, ctx: ExecutionContext, review: ReviewRunState | null): Promise<ExecutionResult> {
     const { job, run } = claim;
     const logPath = run.logPath ?? join(ctx.paths.runsDir, run.id, 'run.log');
     const runDir = dirname(logPath);
@@ -530,7 +552,7 @@ export class LiveExecutor implements Executor {
     // action's revisePrompt plus the review, its worktree starts at the PR branch's remote head
     // instead of the base branch, and what is pushed afterwards (src/publish/revision.ts).
     const revision = revisionOf(job);
-    const promptKey = revision ? 'revisePrompt' : 'prompt';
+    const promptKey = review ? 'reviewPrompt' : revision ? 'revisePrompt' : 'prompt';
     const promptSource = resolvePromptPath(ctx.config, ctx.paths, job.action, promptKey);
     const env = job.envelope;
     const timeoutMinutes = action?.timeoutMinutes ?? DEFAULT_TIMEOUT_MINUTES;
@@ -553,7 +575,13 @@ export class LiveExecutor implements Executor {
               `pull request: #${revision.pullRequest.number} ${revision.pullRequest.url}`,
               `review: ${revision.review.url} (${revision.review.comments.length} inline comment(s), as read when it was ingested)`,
             ]
-          : [`trigger: ${env.type} label "${env.label}" by ${env.actor ?? '(unknown actor)'} at ${env.createdAt}`]),
+          : review
+            ? [
+                `trigger: ${env.type} of head ${review.request.headSha}`,
+                `pull request: #${review.request.pullRequest.number} ${review.request.pullRequest.url}`,
+                `code written by agent: ${review.request.authorAgent ?? '(unknown)'}; this run reviews it and publishes nothing`,
+              ]
+            : [`trigger: ${env.type} label "${env.label}" by ${env.actor ?? '(unknown actor)'} at ${env.createdAt}`]),
         '',
         `pool: ${run.pool}`,
         `agent: ${run.agent}${adapterName ? ` (adapter ${adapterName})` : ' (no longer configured)'}`,
@@ -586,7 +614,9 @@ export class LiveExecutor implements Executor {
     if (!found || !checkoutSource) {
       return fail('failed', `repositories.${found?.fullName ?? job.repoFullName}.checkoutPath is not set; live mode needs a local clone`);
     }
-    if (!promptSource) return fail('failed', `actions.${job.action}.${promptKey} is not set; ${revision ? 'a revision run' : 'live mode'} needs a prompt`);
+    if (!promptSource) {
+      return fail('failed', `actions.${job.action}.${promptKey} is not set; ${review ? 'a reviewer run' : revision ? 'a revision run' : 'live mode'} needs a prompt`);
+    }
     const stopping = () => ctx.signal.aborted || Boolean(ctx.workerStopping?.aborted);
     // Who stopped the run, for run.log and the error. A user cancel is still reported as
     // 'interrupted' here; the daemon records it as canceled.
@@ -609,7 +639,18 @@ export class LiveExecutor implements Executor {
       url: ctx.issue?.url ?? env.issue.url,
     };
     const promptFile = join(runDir, 'prompt.md');
-    await writeFile(promptFile, revision ? renderRevisionPrompt(actionPrompt, issue, revision) : renderPrompt(actionPrompt, issue), 'utf8');
+    // A reviewer's prompt names the base commit, which is only known once the clone was fetched (step 3).
+    const reviewPrompt = (r: ReviewRunState, base: { baseBranch: string | null; baseSha: string | null }) =>
+      renderReviewPrompt(actionPrompt, issue, r.request, { headSha: r.request.headSha, baseBranch: base.baseBranch, baseSha: base.baseSha });
+    await writeFile(
+      promptFile,
+      review
+        ? reviewPrompt(review, { baseBranch: review.request.pullRequest.baseBranch, baseSha: null })
+        : revision
+          ? renderRevisionPrompt(actionPrompt, issue, revision)
+          : renderPrompt(actionPrompt, issue),
+      'utf8',
+    );
     if (ctx.issue?.withheld) await log([`issue body: withheld from the agent (${ctx.issue.withheld})`]);
 
     // 2. Find the CLI before touching the clone, so a missing binary leaves no worktree behind.
@@ -654,13 +695,16 @@ export class LiveExecutor implements Executor {
         remote: found.repo.remote,
         // A revision builds on whatever the PR branch holds on the remote now, including commits
         // a person pushed to it; its own branch and worktree are new, like any attempt's.
-        baseBranch: revision ? revision.pullRequest.branch : found.repo.baseBranch,
+        // A reviewer run gets exactly the commit it was queued for, on a branch nobody keeps.
+        baseBranch: review ? review.request.pullRequest.branch : revision ? revision.pullRequest.branch : found.repo.baseBranch,
+        ...(review ? { atSha: review.request.headSha } : {}),
         branch,
         worktreePath,
         git: this.opts.git,
         signal: ctx.workerStopping ? AbortSignal.any([ctx.signal, ctx.workerStopping]) : ctx.signal,
         onCheckout: (path) => {
           checkout = path;
+          if (review) review.worktree = { checkoutPath: checkoutSource, worktreePath: path, branch };
           ctx.recordProcess({ checkoutPath: path });
         },
       });
@@ -674,6 +718,18 @@ export class LiveExecutor implements Executor {
     if (stopping()) {
       await log([`checkout: ${prepared.worktreePath}`]);
       return fail('interrupted', `${stopper()} before the agent started`);
+    }
+    let reviewedBase: { baseBranch: string | null; baseSha: string | null; note?: string } | null = null;
+    if (review) {
+      reviewedBase = await reviewBase({
+        checkoutPath: checkoutSource,
+        remote: prepared.remote,
+        baseBranch: review.request.pullRequest.baseBranch ?? found.repo.baseBranch,
+        headSha: prepared.baseSha,
+        git: this.opts.git,
+        signal: ctx.workerStopping ? AbortSignal.any([ctx.signal, ctx.workerStopping]) : ctx.signal,
+      });
+      await writeFile(promptFile, reviewPrompt(review, reviewedBase), 'utf8');
     }
 
     // 4. Invocation.
@@ -710,6 +766,7 @@ export class LiveExecutor implements Executor {
             worktree: prepared.worktreePath,
             promptFile,
             agentEnv: commitEnv ? { ...commitEnv, ...agentCfg.env } : agentCfg.env,
+            readOnlyGit: review !== null,
           }),
         };
       } catch (err) {
@@ -721,7 +778,8 @@ export class LiveExecutor implements Executor {
     await log([
       `source clone: ${checkoutSource}`,
       `remote: ${prepared.remote} (${prepared.remoteUrl})`,
-      `base: ${prepared.baseBranch} at ${prepared.baseSha}${revision ? ` (the head of pull request #${revision.pullRequest.number}; only a fast-forward from this commit is pushed)` : ''}`,
+      `base: ${prepared.baseBranch} at ${prepared.baseSha}${revision ? ` (the head of pull request #${revision.pullRequest.number}; only a fast-forward from this commit is pushed)` : ''}${review ? ' (the commit under review; nothing from this run is pushed)' : ''}`,
+      ...(reviewedBase ? [`review base: ${reviewedBase.baseBranch ?? '(unknown branch)'} at ${reviewedBase.baseSha ?? '(unknown)'}${reviewedBase.note ? ` (${reviewedBase.note})` : ''}`] : []),
       `branch: ${prepared.branch}`,
       `checkout: ${prepared.worktreePath}`,
       '',
@@ -779,7 +837,7 @@ export class LiveExecutor implements Executor {
     } catch (err) {
       const why = message(err);
       if (err instanceof AgentStoppedError) {
-        await log(['---- end of agent output ----', `error: ${why}`, 'outcome: failed', `The worktree is kept for inspection: ${prepared.worktreePath}`]);
+        await log(['---- end of agent output ----', `error: ${why}`, 'outcome: failed', ...(review ? [] : [`The worktree is kept for inspection: ${prepared.worktreePath}`])]);
         ctx.log.warn('agent stopped after it started', { error: why, logPath });
         return { outcome: 'failed', error: why };
       }
@@ -799,7 +857,7 @@ export class LiveExecutor implements Executor {
 
     // 6. Outcome.
     const outputTail = await tailLines(logPath, outputStart);
-    const rawOutput = adapter.interpretExit || adapter.summarizeOutput ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    const rawOutput = adapter.interpretExit || adapter.summarizeOutput || review ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
     let lastOutput = outputTail;
     if (adapter.summarizeOutput) {
       try {
@@ -851,7 +909,8 @@ export class LiveExecutor implements Executor {
     // mounts, network and extra arguments, but none of the variables named in container.env:
     // those are the agent's credentials, and checking its work does not need them.
     let verification: VerificationSummary | undefined;
-    if (outcome === 'succeeded' && action.verify?.length) {
+    // Not for a reviewer run: the commands ran for the code run that produced the commit under review.
+    if (outcome === 'succeeded' && action.verify?.length && !review) {
       const verified = await runVerification({
         commands: action.verify,
         ...(box && agentCfg.container
@@ -905,6 +964,21 @@ export class LiveExecutor implements Executor {
       if (verified.failure) ({ outcome, error } = verified.failure);
     }
 
+    // 6c. A reviewer run succeeded only if its final message carries a verdict that can be read.
+    // Anything else (no line, two lines, another value) fails the run; it is never an approval.
+    let reviewResult: ReviewResult | undefined;
+    if (review && outcome === 'succeeded') {
+      const parsed = readReviewVerdict(adapter, rawOutput);
+      if (parsed.ok) {
+        reviewResult = { headSha: prepared.baseSha, baseSha: reviewedBase?.baseSha ?? null, verdict: parsed.verdict, findings: parsed.findings };
+        await log([`review verdict for ${prepared.baseSha}: ${parsed.verdict}`]);
+      } else {
+        outcome = 'failed';
+        error = `no verdict: ${parsed.problem}`;
+        await log([`review verdict for ${prepared.baseSha}: none (${parsed.problem})`]);
+      }
+    }
+
     // 7. Summary.
     let summary: RunSummary | null = null;
     const tail: string[] = ['', 'summary:'];
@@ -919,12 +993,18 @@ export class LiveExecutor implements Executor {
       });
       summary = detail.summary;
       if (verification) summary.verification = verification;
+      if (reviewResult) summary.review = reviewResult;
       tail.push(...renderSummary(detail).map((l) => `  ${l}`));
     } catch (err) {
       tail.push(`  could not summarize the run: ${message(err)}`);
     }
+    if (reviewResult && !summary) {
+      // The verdict travels in the summary; without one there is nothing to post or act on.
+      outcome = 'failed';
+      error = 'the review result could not be recorded';
+    }
     tail.push('', `outcome: ${outcome}${error ? ` (${error})` : ''}`);
-    if (outcome !== 'succeeded') tail.push(`The worktree is kept for inspection: ${prepared.worktreePath}`);
+    if (outcome !== 'succeeded' && !review) tail.push(`The worktree is kept for inspection: ${prepared.worktreePath}`);
     await log(tail);
     ctx.log.info('agent finished', { outcome, ...(error ? { error } : {}), seconds, logPath });
     return { outcome, ...(error ? { error } : {}), summary };
