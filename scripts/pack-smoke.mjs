@@ -127,7 +127,8 @@ try {
     const shim = join(prefix, 'updraft.cmd');
     check(existsSync(shim), `bin shim exists: ${shim}`);
     const shimText = readFileSync(shim, 'utf8');
-    check(shimText.includes(`node_modules\\${pkg.name}\\dist\\cli.js`), 'shim points at dist\\cli.js');
+    // A scoped name (@scope/name) is a directory under node_modules, so its slash is a backslash here.
+    check(shimText.includes(`node_modules\\${pkg.name.replaceAll('/', '\\')}\\dist\\cli.js`), 'shim points at dist\\cli.js');
     // cmd.exe /s /c strips the outer quotes and keeps the quoted shim path intact.
     const viaShim = run(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `""${shim}" --version"`], {
       verbatim: true,
