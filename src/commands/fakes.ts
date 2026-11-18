@@ -76,6 +76,9 @@ export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] }
     async listEventsForIssue() {
       throw new Error('not used');
     },
+    async getIssueBodyEdit() {
+      throw new Error('not used');
+    },
     async listPullRequestsForHead() {
       throw new Error('not used');
     },

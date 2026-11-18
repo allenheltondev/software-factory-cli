@@ -45,6 +45,14 @@ export interface GitHubIssue {
   isPullRequest: boolean;
 }
 
+/** Who last edited an issue's body, and when. Title changes are `renamed` issue events instead. */
+export interface GitHubIssueBodyEdit {
+  /** ISO time of the newest body edit; null when the body was never edited. */
+  lastEditedAt: string | null;
+  /** Login of that edit's author; null when never edited or the account no longer exists. */
+  editor: string | null;
+}
+
 export interface IssueEventsPage {
   events: GitHubIssueEvent[];
   /** Next page number, or null when this is the last page. */
@@ -98,6 +106,12 @@ export interface GitHubApi {
   getIssue(repo: RepoRef, issueNumber: number): Promise<GitHubIssue>;
   /** Every event on one issue, oldest first (paginated internally). `issue` is null on these. */
   listEventsForIssue(repo: RepoRef, issueNumber: number): Promise<GitHubIssueEvent[]>;
+  /**
+   * The newest edit of one issue's body. REST does not expose the editor, so this is a GraphQL
+   * query. Throws GitHubError(404) when the issue no longer exists; any other failure (including
+   * the repository not resolving to `repo.id`) is an error callers must not read as "not edited".
+   */
+  getIssueBodyEdit(repo: RepoRef, issueNumber: number): Promise<GitHubIssueBodyEdit>;
   /**
    * Pull requests whose head is `headOwner:head`, in any state (open, closed or merged), newest
    * first (paginated internally).

@@ -21,6 +21,14 @@
 // - Issues that were transferred return 301 (to a repo you can read), 404 (one you
 //   cannot) or 410 when deleted. getIssue does not follow redirects so a transferred
 //   issue surfaces as GitHubError(301) instead of silently returning another repo's issue.
+//
+// Body edits (getIssueBodyEdit) are not in the REST API: an issue there has `updated_at` but no
+// editor. GraphQL's Issue has `lastEditedAt` and `editor` (checked against the published schema,
+// @octokit/graphql-schema 15.26.1; not against a live repository). GraphQL addresses a
+// repository by owner and name, which can be stale after a rename or point at a different
+// repository that took the name, so the query also returns the repository's `databaseId` and
+// the result is refused unless it is `repo.id`. GraphQL reports most failures as 200 with an
+// `errors` array; those become GitHubErrors here.
 import { execFile } from 'node:child_process';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -28,6 +36,7 @@ import {
   GitHubError,
   type GitHubApi,
   type GitHubIssue,
+  type GitHubIssueBodyEdit,
   type GitHubIssueComment,
   type GitHubIssueEvent,
   type GitHubLabel,
@@ -184,6 +193,27 @@ interface RawComment {
   body?: string | null;
   user: { login: string } | null;
 }
+
+interface GraphQLResponse<T> {
+  data?: T | null;
+  errors?: Array<{ type?: string; message?: string; path?: Array<string | number> }>;
+}
+interface RawIssueBodyEdit {
+  repository: {
+    databaseId: number | null;
+    issue: { lastEditedAt: string | null; editor: { login: string } | null } | null;
+  } | null;
+}
+
+const ISSUE_BODY_EDIT_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    databaseId
+    issue(number: $number) {
+      lastEditedAt
+      editor { login }
+    }
+  }
+}`;
 
 function mapPull(r: RawPullRequest): GitHubPullRequest {
   return {
@@ -420,6 +450,42 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     async listEventsForIssue(repo, issueNumber) {
       const raw = await paginate<RawIssueEvent>(`${repoPath(repo)}/issues/${issueNumber}/events`);
       return raw.map(mapEvent);
+    },
+
+    async getIssueBodyEdit(repo, issueNumber): Promise<GitHubIssueBodyEdit> {
+      const [owner, name, ...rest] = repo.fullName.split('/');
+      if (!owner || !name || rest.length) throw new GitHubError(`invalid repository name "${repo.fullName}"`, 502);
+      const what = `edit history of ${repo.fullName}#${issueNumber}`;
+      const res = await request<GraphQLResponse<RawIssueBodyEdit>>('/graphql', {
+        method: 'POST',
+        body: { query: ISSUE_BODY_EDIT_QUERY, variables: { owner, name, number: issueNumber } },
+      });
+      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
+      const repository = res.data?.data?.repository ?? null;
+      const onlyIssueMissing =
+        repository !== null && errors.every((e) => e.type === 'NOT_FOUND' && e.path?.at(-1) === 'issue');
+      if (errors.length && !onlyIssueMissing) {
+        const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
+        // 429 so callers back off as they do for REST. Everything else is 502, deliberately not
+        // a "gone" status: a lookup that failed (even NOT_FOUND for the repository, which REST
+        // reaches by ID) must leave jobs queued, neither canceled nor run.
+        const limited = errors.some((e) => e.type === 'RATE_LIMITED');
+        throw new GitHubError(
+          `POST /graphql (${what}) failed: ${detail}`,
+          limited ? 429 : 502,
+          limited ? (retryAfterFrom(res.headers) ?? 60) : null,
+        );
+      }
+      if (!repository) throw new GitHubError(`POST /graphql (${what}) returned no repository`, 502);
+      if (repository.databaseId !== repo.id) {
+        throw new GitHubError(
+          `POST /graphql (${what}): "${repo.fullName}" now names repository ${repository.databaseId ?? 'unknown'}, not ${repo.id}; ` +
+            'the repository was renamed or replaced, so update its name in the config',
+          502,
+        );
+      }
+      if (!repository.issue) throw new GitHubError(`POST /graphql (${what}): issue not found`, 404);
+      return { lastEditedAt: repository.issue.lastEditedAt ?? null, editor: repository.issue.editor?.login ?? null };
     },
 
     async listPullRequestsForHead(repo, { headOwner, head }) {

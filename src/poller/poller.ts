@@ -16,11 +16,21 @@
 //      jobs and the new checkpoint are committed in one transaction, so a crash replays
 //      the batch and the unique (repo, workflow, event) key drops the duplicates.
 //   5. Every queued job is re-checked and canceled if its issue closed, lost the trigger
-//      label, or its workflow disappeared from config.
+//      label, or its workflow disappeared from config; in live mode also if the label
+//      application was superseded or the issue was edited since by someone not allowed to
+//      dispatch. That includes jobs queued in this same cycle, so an edit made between the
+//      label and the poll that ingested it is caught here (and again before the agent starts).
 import { allowedActorsFor, workflowId, type FactoryConfig, type RepositoryConfig, type WorkflowConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
 import { cancelQueuedJob, commitPollBatch, getCheckpoint, listQueuedJobs, type Checkpoint, type NewJob } from '../db/ingest.js';
-import { GitHubError, type GitHubApi, type GitHubIssue, type GitHubIssueEvent, type IssueEventsPage } from '../github/api.js';
+import {
+  GitHubError,
+  type GitHubApi,
+  type GitHubIssue,
+  type GitHubIssueBodyEdit,
+  type GitHubIssueEvent,
+  type IssueEventsPage,
+} from '../github/api.js';
 import { labelEquals, selectPool } from '../routing.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -489,38 +499,88 @@ export type DispatchCheck = { ok: true; issue?: IssueSnapshot } | { ok: false; r
 
 /** Shared dispatchability check. Throws for transient API errors (never a cancel reason). */
 type IssueEventsLookup = (repo: RepoRef, issueNumber: number) => Promise<GitHubIssueEvent[]>;
+type IssueBodyEditLookup = (repo: RepoRef, issueNumber: number) => Promise<GitHubIssueBodyEdit>;
 
 /**
  * Live mode: is the label application that queued this job still the one in force, and is its
  * actor still allowed? The issue carrying the label isn't enough: if the label was removed and
  * reapplied by someone outside the allowlist, the reapplication is rejected at ingestion but the
  * label is back on the issue. A newer application by an allowed actor queues its own job.
- * Returns a cancel reason, or null when the job may run.
+ * Returns a cancel reason, or the issue's events and the application's position in them.
  */
-async function triggerApplicationProblem(
+async function triggerApplication(
   config: FactoryConfig,
   wf: WorkflowConfig,
   job: Job,
   repo: RepoRef,
   getEvents: IssueEventsLookup,
-): Promise<string | null> {
+): Promise<{ problem: string } | { events: GitHubIssueEvent[]; index: number }> {
   let events: GitHubIssueEvent[];
   try {
     events = await getEvents(repo, job.issueNumber);
   } catch (err) {
-    if (isGone(err)) return `issue #${job.issueNumber} was deleted, transferred or is no longer accessible`;
+    if (isGone(err)) return { problem: `issue #${job.issueNumber} was deleted, transferred or is no longer accessible` };
     throw err;
   }
   const label = wf.trigger.label;
   // Oldest first, in GitHub's order (created_at ties keep their real order).
-  const latest = events
-    .filter((e) => (e.event === 'labeled' || e.event === 'unlabeled') && e.label !== null && labelEquals(e.label, label))
-    .at(-1);
+  const index = events.findLastIndex(
+    (e) => (e.event === 'labeled' || e.event === 'unlabeled') && e.label !== null && labelEquals(e.label, label),
+  );
+  const latest = events[index];
   if (!latest || latest.event !== 'labeled' || String(latest.id) !== job.eventId) {
-    return `the "${label}" label application that queued this job is no longer the current one (the label was removed or reapplied since)`;
+    return {
+      problem: `the "${label}" label application that queued this job is no longer the current one (the label was removed or reapplied since)`,
+    };
   }
   if (!actorAllowed(config, wf, latest.actor)) {
-    return `"${label}" was applied by ${latest.actor ?? 'an unknown actor'}, who is not an allowed actor for this workflow`;
+    return { problem: `"${label}" was applied by ${latest.actor ?? 'an unknown actor'}, who is not an allowed actor for this workflow` };
+  }
+  return { events, index };
+}
+
+/**
+ * Live mode: is the issue text the agent would be given text an allowed actor stands behind?
+ * Applying the trigger label approves the title and body as they were then. Whoever opened the
+ * issue can still edit both without being able to label, so an edit made after the application
+ * by anyone outside the allowlist withdraws that approval; applying the label again (a new event
+ * and a new job) approves the edited text. Only the newest edit of each counts: an allowed
+ * actor who edits the text has seen what they saved.
+ *
+ * Call this only after the text handed to the agent was fetched. An edit that lands after these
+ * lookups is then not in that text, and one that landed before them is seen here.
+ * Returns a cancel reason, or null when the text is approved.
+ */
+async function issueEditProblem(
+  config: FactoryConfig,
+  wf: WorkflowConfig,
+  job: Job,
+  repo: RepoRef,
+  application: { events: GitHubIssueEvent[]; index: number },
+  getBodyEdit: IssueBodyEditLookup,
+): Promise<string | null> {
+  const { events, index } = application;
+  const appliedAt = Date.parse(events[index]!.createdAt);
+  // Timestamps have one-second resolution, so "not provably before" is the only safe reading of
+  // a tie (and of a time that does not parse).
+  const beforeApplication = (at: string) => Date.parse(at) < appliedAt;
+  const reason = (what: string, who: string | null) =>
+    `issue #${job.issueNumber}'s ${what} was edited by ${who ?? 'an unknown user'} after the "${wf.trigger.label}" label was applied; ` +
+    'remove and re-apply the label to dispatch the edited issue';
+
+  // Title changes are `renamed` events, with the actor who made them.
+  const rename = events.findLast((e, i) => e.event === 'renamed' && (i > index || !beforeApplication(e.createdAt)));
+  if (rename && !actorAllowed(config, wf, rename.actor)) return reason('title', rename.actor);
+
+  let edit: GitHubIssueBodyEdit;
+  try {
+    edit = await getBodyEdit(repo, job.issueNumber);
+  } catch (err) {
+    if (isGone(err)) return `issue #${job.issueNumber} was deleted, transferred or is no longer accessible`;
+    throw err; // unknown is not "unedited": the job stays queued until this can be read
+  }
+  if (edit.lastEditedAt !== null && !beforeApplication(edit.lastEditedAt) && !actorAllowed(config, wf, edit.editor)) {
+    return reason('body', edit.editor);
   }
   return null;
 }
@@ -530,6 +590,7 @@ async function evaluateJob(
   job: Job,
   getIssue: IssueLookup,
   getEvents: IssueEventsLookup,
+  getBodyEdit: IssueBodyEditLookup,
 ): Promise<DispatchCheck> {
   const found = findRepo(config, job.repoId);
   if (!found) return { ok: false, reason: `repository ${job.repoFullName} is no longer configured` };
@@ -549,8 +610,12 @@ async function evaluateJob(
     return { ok: false, reason: `issue #${job.issueNumber} no longer carries trigger label "${wf.trigger.label}"` };
   }
   if (config.execution.mode === 'live') {
-    const problem = await triggerApplicationProblem(config, wf, job, { id: job.repoId, fullName: found.fullName }, getEvents);
-    if (problem) return { ok: false, reason: problem };
+    const repo: RepoRef = { id: job.repoId, fullName: found.fullName };
+    // Both lookups run after `issue` was fetched; issueEditProblem depends on that order.
+    const application = await triggerApplication(config, wf, job, repo, getEvents);
+    if ('problem' in application) return { ok: false, reason: application.problem };
+    const edited = await issueEditProblem(config, wf, job, repo, application, getBodyEdit);
+    if (edited) return { ok: false, reason: edited };
   }
   return { ok: true, issue: { title: issue.title, body: issue.body, labels: issue.labels, url: issue.htmlUrl } };
 }
@@ -575,7 +640,13 @@ async function recheckQueuedJobs(
     if (b && b.until > now()) continue; // don't hammer a repo that is failing
     let check: DispatchCheck;
     try {
-      check = await evaluateJob(deps.config, job, getIssue, (repo, n) => deps.api.listEventsForIssue(repo, n));
+      check = await evaluateJob(
+        deps.config,
+        job,
+        getIssue,
+        (repo, n) => deps.api.listEventsForIssue(repo, n),
+        (repo, n) => deps.api.getIssueBodyEdit(repo, n),
+      );
     } catch (err) {
       deps.log.warn('could not re-check queued job; leaving it queued', { job: job.id, error: errMessage(err) });
       continue;
@@ -591,7 +662,8 @@ async function recheckQueuedJobs(
 /**
  * Final check before the worker starts a job: issue still open and still carries
  * the workflow's trigger label; in live mode, also that the label application that queued
- * the job is still the current one and its actor is still allowed. Used by the worker immediately before a claim.
+ * the job is still the current one, its actor is still allowed, and nobody outside the allowlist
+ * has edited the issue's title or body since. Used by the worker immediately before a claim.
  * Resolves `{ ok: false, reason }` when the job should be canceled; rejects with a
  * GitHubError for transient API failures (rate limit, network, 5xx), in which case
  * the caller should leave the job queued and try later.
@@ -602,5 +674,6 @@ export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'confi
     job,
     (repo, n) => deps.api.getIssue(repo, n),
     (repo, n) => deps.api.listEventsForIssue(repo, n),
+    (repo, n) => deps.api.getIssueBodyEdit(repo, n),
   );
 }
