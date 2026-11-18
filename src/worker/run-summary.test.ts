@@ -11,7 +11,7 @@ afterEach(() => {
 
 describe('readOutput', () => {
   it('returns everything after the offset, or the last bytes from a line boundary', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'factory-output-'));
+    const dir = mkdtempSync(join(tmpdir(), 'updraft-output-'));
     dirs.push(dir);
     const file = join(dir, 'run.log');
     const header = 'header line\n';

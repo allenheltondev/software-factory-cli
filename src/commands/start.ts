@@ -1,9 +1,12 @@
 import { join } from 'node:path';
 import { loadConfig } from '../config/io.js';
 import type { Db } from '../db/database.js';
-import { resolveGitHubToken } from '../github/client.js';
+import { appCommitIdentity } from '../github/credentials.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
-import { createPublisher, publicationEnabled } from '../publish/publish.js';
+import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
+import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
+import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
+import { createRevisionPublisher, revisionsEnabled } from '../publish/revision.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import { runDaemon, type DaemonDeps } from '../worker/daemon.js';
 import { createExecutor } from '../worker/prepare-only.js';
@@ -45,15 +48,15 @@ export const defaultStartDeps: StartDeps = {
   onShutdownSignal: installSignalHandlers,
 };
 
-/** `factory start`: non-interactive worker. Never prompts. */
+/** `updraft start`: non-interactive worker. Never prompts. */
 export async function startCommand(ctx: CommandContext, deps: StartDeps = defaultStartDeps): Promise<number> {
   const { paths } = ctx;
   const { config, warnings } = loadConfig(paths.configFile);
   // The logger only calls write(); ctx.err is process.stderr outside tests.
-  const log = deps.createLogger({ stream: ctx.err as NodeJS.WritableStream, file: join(paths.logDir, 'factory.log') });
+  const log = deps.createLogger({ stream: ctx.err as NodeJS.WritableStream, file: join(paths.logDir, 'updraft.log') });
   for (const w of warnings) log.warn(`config: ${w.path}: ${w.message}`);
   const repoCount = Object.keys(config.repositories).length;
-  if (repoCount === 0) log.warn('no repositories configured; add one with "factory add OWNER/REPO"');
+  if (repoCount === 0) log.warn('no repositories configured; add one with "updraft add OWNER/REPO"');
 
   const controller = new AbortController();
   const uninstall = deps.onShutdownSignal((signal) => {
@@ -64,8 +67,11 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
   let db: Db | undefined;
   try {
     db = ctx.openDb(paths.dbFile);
-    const api = await ctx.createApi({ log: log.child({ component: 'github' }) });
+    // The gh account, or the GitHub App of github.app: one provider for the API and for pushes.
+    const credentials = ctx.createCredentials(config, { log: log.child({ component: 'github' }) });
+    const api = await ctx.createApi({ log: log.child({ component: 'github' }), credentials });
     log.info('worker starting', {
+      github: credentials.kind === 'app' ? 'GitHub App' : 'gh account',
       config: paths.configFile,
       db: paths.dbFile,
       repos: repoCount,
@@ -74,6 +80,23 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
     });
     const openDb = db;
     const pollLog = log.child({ component: 'poller' });
+    const publishDeps = (component: string): PublishDeps => ({
+      db: openDb,
+      config,
+      paths,
+      api,
+      log: log.child({ component }),
+      token: (repoFullName) => credentials.token(repoFullName, { fresh: true }),
+      workerKind: credentials.kind,
+      env: ctx.env,
+    });
+    const publication = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
+    // With the revision loop on, revision runs are pushed to their PR and every other run goes
+    // to the publisher as before. With the review loop on, reviewer runs are posted as reviews,
+    // and whatever the other two pushed gets a reviewer run.
+    const revising = revisionsEnabled(config) ? createRevisionPublisher(publishDeps('revision'), publication) : publication;
+    const publisher = reviewsEnabled(config) ? createReviewLoopPublisher(publishDeps('review'), revising) : revising;
+    const appAuth = credentials.app;
     await deps.runDaemon({
       db: openDb,
       config,
@@ -82,19 +105,10 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       poll: () => deps.pollOnce({ db: openDb, api, config, log: pollLog }),
       checkDispatchable: (job) => deps.checkJobDispatchable({ api, config }, job),
       signal: controller.signal,
-      executor: createExecutor(config),
-      ...(publicationEnabled(config)
-        ? {
-            publisher: createPublisher({
-              db: openDb,
-              config,
-              paths,
-              api,
-              log: log.child({ component: 'publish' }),
-              token: () => resolveGitHubToken(ctx.env),
-              env: ctx.env,
-            }),
-          }
+      executor: createExecutor(config, appAuth && config.github?.app?.commitAsApp ? { commitIdentity: (repoFullName) => appCommitIdentity(appAuth, repoFullName) } : {}),
+      ...(publisher ? { publisher } : {}),
+      ...(failureCommentsEnabled(config)
+        ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }) }) }
         : {}),
     });
     log.info('worker stopped');

@@ -1,7 +1,11 @@
 import { existsSync } from 'node:fs';
-import { configSchema, type FactoryConfig } from '../config/schema.js';
+import { configSchema, type UpdraftConfig } from '../config/schema.js';
+import type { FailureComment } from '../db/failure-comments.js';
+import type { PrReview, PrStage } from '../db/pr-reviews.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
-import type { JobStatus, Publication } from '../types.js';
+import type { ReviewRequest } from '../db/revisions.js';
+import { reviewOf, revisionOf, type Job, type JobStatus, type Publication, type Revision } from '../types.js';
+import { describeVerifyResult, verificationNotes } from '../worker/verify.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 import { checkConfig } from './validate.js';
@@ -27,7 +31,7 @@ export interface StatusView {
 
 const JOB_STATUSES: JobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'interrupted', 'canceled'];
 
-export function emptyConfig(): FactoryConfig {
+export function emptyConfig(): UpdraftConfig {
   return configSchema.parse({ version: 1, agents: {}, pools: {}, actions: {} });
 }
 
@@ -35,7 +39,7 @@ export function buildStatusView(o: {
   configPath: string;
   configState: StatusView['configState'];
   configMessage: string | null;
-  config: FactoryConfig | null;
+  config: UpdraftConfig | null;
   dbFile: string;
   dbExists: boolean;
   snapshot: StatusSnapshot;
@@ -83,8 +87,102 @@ export function renderPublication(p: Publication): string {
       const done = [p.pushedAt ? 'branch pushed' : null, pr].filter(Boolean).join(', ');
       return (
         `publication failed (attempt ${p.attempts}${done ? `; ${done}` : ''}): ${oneLine(p.error ?? 'unknown error', 140)}` +
-        ` — ${next}run "factory publish ${p.runId}"`
+        ` — ${next}run "updraft publish ${p.runId}"`
       );
+    }
+  }
+}
+
+/** One line: the failure comment on the issue, or why there is none. */
+export function renderFailureComment(c: FailureComment): string {
+  switch (c.state) {
+    case 'posted':
+      return `failure comment posted: ${c.commentUrl ?? `on issue #${c.issueNumber}`}`;
+    case 'posting':
+      return `posting the failure comment (attempt ${c.attempts})`;
+    case 'skipped':
+      return `failure comment not posted: ${oneLine(c.error ?? 'no longer applies', 140)}`;
+    case 'failed': {
+      const next = c.nextAttemptAt ? `worker retries at ${c.nextAttemptAt}` : 'the worker will not retry it';
+      return `failure comment not posted (attempt ${c.attempts}): ${oneLine(c.error ?? 'unknown error', 140)} — ${next}`;
+    }
+  }
+}
+
+/** One line: what happened to a revision run's commits. */
+export function renderRevision(r: Revision): string {
+  const range = `${r.baseSha?.slice(0, 12) ?? '?'}..${r.headSha?.slice(0, 12) ?? '?'}`;
+  switch (r.state) {
+    case 'published':
+      return `pushed ${range} to ${r.branch}; reply ${r.commentUrl ?? '(none)'}`;
+    case 'publishing':
+      return `pushing (attempt ${r.attempts})${r.pushedAt ? '; branch pushed' : ''}`;
+    case 'skipped':
+      return `not pushed: ${oneLine(r.error ?? 'nothing to push', 140)}`;
+    case 'failed': {
+      if (r.moved) return `not pushed, the branch moved: ${oneLine(r.error ?? 'unknown error', 140)} — not retried; request changes again to revise the current head`;
+      const next = r.nextAttemptAt ? `worker retries at ${r.nextAttemptAt}, or ` : '';
+      return `revision push failed (attempt ${r.attempts}${r.pushedAt ? '; branch pushed' : ''}): ${oneLine(r.error ?? 'unknown error', 140)} — ${next}run "updraft publish ${r.runId}"`;
+    }
+  }
+}
+
+/** One line: a change request and what was decided about it. */
+export function renderReviewRequest(r: ReviewRequest): string {
+  const who = `by ${r.reviewer ?? 'an unknown user'}${r.submittedAt ? ` at ${r.submittedAt}` : ''}`;
+  switch (r.state) {
+    case 'queued':
+      return `${who}${r.trigger === 'updraft_review' ? " (Updraft's reviewer)" : ''}: revision job ${r.jobId ?? '(pruned)'}`;
+    case 'over-limit':
+      return `${who}: not acted on — ${oneLine(r.reason ?? 'the pull request reached maxRevisions', 140)}`;
+    default:
+      return `${who}: ignored — ${oneLine(r.reason ?? 'no reason recorded', 140)}`;
+  }
+}
+
+/** " (revision of PR #n)" for a revision job, " (review of PR #n)" for a reviewer job, so its issue number is not read as the whole story. */
+function revisionNote(job: Job): string {
+  const revision = revisionOf(job);
+  if (revision) return ` (revision of PR #${revision.pullRequest.number}${revision.trigger === 'updraft_review' ? ', requested by the reviewer' : ''})`;
+  const review = reviewOf(job);
+  return review ? ` (review of PR #${review.pullRequest.number} at ${review.headSha.slice(0, 12)})` : '';
+}
+
+/** The stages of a watched PR in the review loop, as `updraft status` names them (docs/review-loop.md). */
+export const STAGE_LABELS: Record<PrStage, string> = {
+  'awaiting-review': 'awaiting review',
+  reviewing: 'reviewing',
+  'changes-requested': 'changes requested',
+  revising: 'revising',
+  'ready-to-merge': 'ready to merge',
+  merging: 'merging / waiting for checks',
+  merged: 'merged',
+  'needs-human': 'needs a human',
+  closed: 'closed',
+};
+
+/** One line: a reviewer run's verdict, where it was posted and what the worker did with it. */
+export function renderReview(r: PrReview): string {
+  const verdict = `${r.verdict} for ${r.headSha.slice(0, 12)} by agent ${r.agent}`;
+  switch (r.state) {
+    case 'published': {
+      const did: Record<NonNullable<PrReview['outcome']>, string> = {
+        ready: 'ready for a person to merge (or for auto-merge)',
+        'revision-queued': `revision job ${r.revisionJobId ?? '(pruned)'} queued`,
+        'over-limit': 'not acted on: the pull request reached maxRevisions',
+        'no-revise': 'not acted on: revise is off',
+        stale: 'not acted on: the pull request had moved on from that commit',
+        closed: 'not acted on: the pull request was closed',
+      };
+      return `${verdict}; ${r.outcome ? did[r.outcome] : 'recorded'}; review ${r.reviewUrl ?? '(none)'}`;
+    }
+    case 'publishing':
+      return `${verdict}; posting the review (attempt ${r.attempts})`;
+    case 'skipped':
+      return `${verdict}; not posted: ${oneLine(r.error ?? 'nothing to post', 140)}`;
+    case 'failed': {
+      const next = r.nextAttemptAt ? `worker retries at ${r.nextAttemptAt}, or ` : '';
+      return `${verdict}; not posted or not acted on yet (attempt ${r.attempts}): ${oneLine(r.error ?? 'unknown error', 140)} — ${next}run "updraft publish ${r.runId}"`;
     }
   }
 }
@@ -96,8 +194,8 @@ export function renderStatus(v: StatusView): string {
     v.configState === 'ok'
       ? ''
       : v.configState === 'missing'
-        ? ' (not found; run "factory configure" or "factory add")'
-        : ` (invalid: ${oneLine(v.configMessage ?? 'see "factory validate"')})`;
+        ? ' (not found; run "updraft configure" or "updraft add")'
+        : ` (invalid: ${oneLine(v.configMessage ?? 'see "updraft validate"')})`;
   lines.push(`Config: ${v.configPath}${configNote}`);
   lines.push(`State:  ${v.dbFile}${v.dbExists ? '' : ' (not created yet)'}`);
 
@@ -140,8 +238,9 @@ export function renderStatus(v: StatusView): string {
     const phase = run.executionStartedAt
       ? `running since ${run.executionStartedAt}`
       : `claimed ${run.startedAt}, not started yet`;
+    const canceling = run.cancelRequestedAt ? ', cancel requested' : '';
     lines.push(
-      `  ${run.id}  ${job.repoFullName}#${job.issueNumber}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}`,
+      `  ${run.id}  ${job.repoFullName}#${job.issueNumber}${revisionNote(job)}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}${canceling}`,
     );
   }
 
@@ -150,25 +249,41 @@ export function renderStatus(v: StatusView): string {
   for (const j of s.recentJobs) {
     const reason = j.statusReason ? ` — ${oneLine(j.statusReason, 100)}` : '';
     lines.push(
-      `  ${j.id}  ${j.status.padEnd(11)}  ${j.repoFullName}#${j.issueNumber}  ${j.workflowId}  updated ${j.updatedAt}${reason}`,
+      `  ${j.id}  ${j.status.padEnd(11)}  ${j.repoFullName}#${j.issueNumber}${revisionNote(j)}  ${j.workflowId}  updated ${j.updatedAt}${reason}`,
     );
   }
 
   const publications = s.publications ?? [];
   const pubByRun = new Map(publications.map((p) => [p.runId, p]));
+  const failureComments = s.failureComments ?? [];
+  const failureCommentByRun = new Map(failureComments.map((c) => [c.runId, c]));
+  const revisions = s.revisions ?? [];
+  const revisionByRun = new Map(revisions.map((r) => [r.runId, r]));
   if (s.recentAgentRuns.length) {
     lines.push('', 'Recent agent runs:');
     for (const { run, job } of s.recentAgentRuns) {
       const sum = run.summary!;
       lines.push(
-        `  ${run.id}  ${run.outcome ?? 'closed'}  ${job.repoFullName}#${job.issueNumber}  agent ${run.agent}  ended ${run.endedAt}`,
+        `  ${run.id}  ${run.outcome ?? (run.cancelRequestedAt ? 'canceled' : 'closed')}  ${job.repoFullName}#${job.issueNumber}${revisionNote(job)}  agent ${run.agent}  ended ${run.endedAt}`,
         `    ${sum.commitCount} commit(s), ${sum.filesChanged} file(s) changed (${sum.diffStat}), ${sum.untracked} untracked`,
         `    worktree ${sum.worktree} (branch ${sum.branch})`,
       );
       const last = sum.lastOutput.at(-1);
       if (last) lines.push(`    last output: ${oneLine(last, 120)}`);
+      if (sum.review) lines.push(`    review verdict: ${sum.review.verdict} for ${sum.review.headSha.slice(0, 12)} (the worktree was removed; nothing was pushed)`);
+      if (sum.verification) {
+        lines.push(`    verification: ${sum.verification.passed ? 'passed' : 'did not pass'}`);
+        // Shorten the command, never the result: a long command (an absolute interpreter path)
+        // must not push "passed in 4s" off the end of the line.
+        for (const c of sum.verification.commands) lines.push(`      ${oneLine(c.command, 120)}: ${describeVerifyResult(c)}`);
+        for (const note of verificationNotes(sum.verification)) lines.push(`      note: ${note}`);
+      }
       const pub = pubByRun.get(run.id);
       if (pub) lines.push(`    ${renderPublication(pub)}`);
+      const revision = revisionByRun.get(run.id);
+      if (revision) lines.push(`    ${renderRevision(revision)}`);
+      const failureComment = failureCommentByRun.get(run.id);
+      if (failureComment) lines.push(`    ${renderFailureComment(failureComment)}`);
     }
   }
 
@@ -177,6 +292,59 @@ export function renderStatus(v: StatusView): string {
     for (const p of publications) {
       lines.push(`  ${p.runId}  ${p.state.padEnd(10)}  ${p.repoFullName}#${p.issueNumber}  ${p.branch}  updated ${p.updatedAt}`);
       lines.push(`    ${renderPublication(p)}`);
+    }
+  }
+
+  if (revisions.length) {
+    lines.push('', 'Revisions:');
+    for (const r of revisions) {
+      lines.push(`  ${r.runId}  ${r.state.padEnd(10)}  ${r.repoFullName} PR #${r.prNumber}  ${r.branch}  updated ${r.updatedAt}`);
+      lines.push(`    ${renderRevision(r)}`);
+    }
+  }
+
+  const repoName = new Map(v.repos.map((r) => [r.id, r.fullName]));
+  const pullRequests = s.pullRequests ?? [];
+  if (pullRequests.length) {
+    lines.push('', 'Pull requests (review loop):');
+    for (const { pr, stage } of pullRequests) {
+      lines.push(`  ${repoName.get(pr.repoId) ?? `repository ${pr.repoId}`} PR #${pr.prNumber}  ${STAGE_LABELS[stage.stage]}  ${pr.prUrl}`);
+      lines.push(`    ${oneLine(stage.detail, 200)}`);
+      if (pr.mergeState === 'blocked' && pr.mergeSha === pr.headSha) {
+        const comment = pr.mergeCommentUrl ?? (pr.mergeCommentError ? `not posted yet: ${oneLine(pr.mergeCommentError, 100)}` : 'not posted yet');
+        lines.push(`    comment about the merge: ${comment}`);
+      }
+    }
+  }
+
+  const reviews = s.reviews ?? [];
+  if (reviews.length) {
+    lines.push('', 'Reviews:');
+    for (const r of reviews) {
+      lines.push(`  ${r.runId}  ${r.state.padEnd(10)}  ${r.repoFullName} PR #${r.prNumber}  updated ${r.updatedAt}`);
+      lines.push(`    ${renderReview(r)}`);
+    }
+  }
+
+  const reviewRequests = s.reviewRequests ?? [];
+  if (reviewRequests.length) {
+    lines.push('', 'Change requests:');
+    for (const r of reviewRequests) {
+      lines.push(`  ${repoName.get(r.repoId) ?? `repository ${r.repoId}`} PR #${r.prNumber}  ${r.state.padEnd(10)}  ${r.reviewUrl ?? r.reviewId}`);
+      lines.push(`    ${renderReviewRequest(r)}`);
+    }
+    for (const pr of s.limitedPullRequests ?? []) {
+      const comment = pr.limitCommentUrl ?? (pr.limitCommentError ? `not posted yet: ${oneLine(pr.limitCommentError, 100)}` : 'not posted yet');
+      lines.push(`  ${repoName.get(pr.repoId) ?? `repository ${pr.repoId}`} PR #${pr.prNumber} reached maxRevisions at ${pr.limitReachedAt}; comment: ${comment}`);
+    }
+  }
+
+  // Its own section too: a run that failed before its agent started is not among the agent runs.
+  if (failureComments.length) {
+    lines.push('', 'Failure comments:');
+    for (const c of failureComments) {
+      lines.push(`  ${c.runId}  ${c.state.padEnd(7)}  ${c.repoFullName}#${c.issueNumber}  updated ${c.updatedAt}`);
+      lines.push(`    ${renderFailureComment(c)}`);
     }
   }
 
@@ -191,7 +359,7 @@ export function renderStatus(v: StatusView): string {
 
 export async function statusCommand(ctx: CommandContext, opts: { json?: boolean }): Promise<number> {
   const check = checkConfig(ctx.paths.configFile);
-  let config: FactoryConfig | null = null;
+  let config: UpdraftConfig | null = null;
   let configState: StatusView['configState'] = 'missing';
   let configMessage: string | null = null;
   if (check.state === 'ok') {

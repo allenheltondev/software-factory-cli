@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Per-user LaunchAgent for `factory start`.
+  Per-user LaunchAgent for `updraft start`.
   install-launchagent.sh fills the __PLACEHOLDERS__ (XML-escaped) and writes the result to
   ~/Library/LaunchAgents/<label>.plist. To fill it by hand, use absolute paths everywhere:
   launchd does not expand ~ or $VARS and gives agents a minimal PATH.

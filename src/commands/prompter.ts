@@ -21,7 +21,7 @@ export interface MultiOpts<T> {
 }
 
 /**
- * The interactive surface `factory configure` uses. The default implementation
+ * The interactive surface `updraft configure` uses. The default implementation
  * wraps @clack/prompts; tests script answers with a fake. Every prompt throws
  * CancelledError when the user cancels (Ctrl+C / Esc).
  */

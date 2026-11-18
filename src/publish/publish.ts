@@ -3,7 +3,7 @@
 // account, and comments on the issue. Merging stays a human decision: nothing here merges,
 // approves or marks a PR ready.
 //
-// Every step is idempotent, keyed by the run id, so a retry (automatic or `factory publish`)
+// Every step is idempotent, keyed by the run id, so a retry (automatic or `updraft publish`)
 // never creates a duplicate:
 // - push: the remote branch is checked first. Absent: a create-only push, which Git refuses if
 //   the branch appeared meanwhile. Same SHA: already pushed. Different SHA (before or during the
@@ -17,6 +17,11 @@
 // scoped to https://github.com/ (never in argv, a URL or a file); other remotes (SSH, host
 // aliases) use git's own credentials. Hooks are disabled for these git commands, since the agent
 // could have written them.
+//
+// With a GitHub App configured (github.app), "the gh account" above is the App's installation:
+// the token is an installation token issued for the push, and the push always goes over HTTPS to
+// https://github.com/OWNER/REPO.git, whatever protocol the clone's remote uses, because an SSH
+// push would be made with the person's key and so as the person (docs/github-app.md).
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -32,7 +37,7 @@ import {
   recordPublicationProgress,
 } from '../db/publications.js';
 import { recordError, type Db } from '../db/database.js';
-import { publishMode, type FactoryConfig } from '../config/schema.js';
+import { publishMode, type UpdraftConfig } from '../config/schema.js';
 import {
   assertValidBranchName,
   GitError,
@@ -48,10 +53,13 @@ import {
 } from '../git/git.js';
 import { jobBranchName, withCheckoutLock } from '../git/worktree.js';
 import { GitHubError, type GitHubApi, type GitHubPullRequest } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
-import type { Job, Publication, Run, RunSummary } from '../types.js';
+import { APP_PERMISSIONS_HINT, GitHubAppError, redactGitHubSecrets } from '../github/app-auth.js';
+import type { WorkerKind } from '../github/credentials.js';
+import type { UpdraftPaths } from '../paths.js';
+import { reviewOf, revisionOf, type Job, type Publication, type Run, type RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
+import { verificationLines, verificationNotes } from '../worker/verify.js';
 
 /** How long a publication may hold its lease before another process may take it over. */
 export const PUBLISH_LEASE_SECONDS = 10 * 60;
@@ -72,18 +80,28 @@ const MAX_TITLE = 256;
 /** The scopes publication needs, for permission errors. */
 export const TOKEN_SCOPES_HINT =
   'Publication needs push access to the repository and a token with the classic "repo" scope, or a fine-grained ' +
-  'token with Contents, Pull requests and Issues set to read and write. With gh: gh auth refresh -h github.com -s repo';
+  'token with Contents, Pull requests and Issues set to read and write. With gh: gh auth refresh -h github.com -s repo. ' +
+  `With a GitHub App (github.app) instead: ${APP_PERMISSIONS_HINT}`;
 
 export type RunGit = (args: readonly string[], opts: GitOptions) => Promise<GitOutput>;
 
 export interface PublishDeps {
   db: Db;
-  config: FactoryConfig;
-  paths: FactoryPaths;
+  config: UpdraftConfig;
+  paths: UpdraftPaths;
   api: GitHubApi;
   log: Logger;
-  /** The active gh account's token (GH_TOKEN / GITHUB_TOKEN, else `gh auth token`). Read only for https remotes. */
-  token: () => Promise<string>;
+  /**
+   * A newly read token for a push to `repoFullName`, from the worker's credentials
+   * (src/github/credentials.ts): the gh account's (GH_TOKEN / GITHUB_TOKEN, else `gh auth token`),
+   * or an installation token of the GitHub App. Read only for pushes over https.
+   */
+  token: (repoFullName: string) => Promise<string>;
+  /**
+   * 'app' when the worker acts as a GitHub App: pushes then always go over HTTPS with the
+   * installation token, never with the SSH key of the clone's remote. Default 'user'.
+   */
+  workerKind?: WorkerKind;
   git?: string;
   /** Injected in tests to record what reaches git. */
   runGit?: RunGit;
@@ -104,7 +122,7 @@ export type PublishResult =
 
 /** Hidden marker on the PR body and the issue comment; finds them again on a retry. */
 export function publicationMarker(runId: string): string {
-  return `<!-- factory-run: ${runId} -->`;
+  return `<!-- updraft-run: ${runId} -->`;
 }
 
 /** Raised for conditions a retry alone cannot fix. */
@@ -115,7 +133,7 @@ export class PublishRefusal extends Error {
   }
 }
 
-class TransientError extends Error {
+export class TransientError extends Error {
   constructor(
     message: string,
     readonly retryAfterSeconds: number | null = null,
@@ -135,13 +153,16 @@ function basicAuth(token: string): string {
   return Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
 }
 
-/** Replace the token (and its encoded header form) wherever it might appear. */
+/**
+ * Replace the token (and its encoded header form) wherever it might appear, and anything shaped
+ * like a GitHub token, a JWT or a private key, whether or not this attempt held it.
+ */
 export function redactSecret(text: string, token: string | null): string {
-  if (!token) return text;
+  if (!token) return redactGitHubSecrets(text);
   let out = text.split(token).join('***');
   const b = basicAuth(token);
   out = out.split(b).join('***');
-  return out;
+  return redactGitHubSecrets(out);
 }
 
 const DEBUG_ENV = /^(GIT_TRACE.*|GIT_CURL_VERBOSE|GIT_REDACT_COOKIES|GIT_TRACE2.*)$/i;
@@ -204,7 +225,9 @@ export function isHttpsGitHub(url: string): boolean {
 // Error classification
 // ---------------------------------------------------------------------------
 
-function classifyGitHub(err: GitHubError, repoFullName: string, runId: string): { error: string; retryable: boolean; retryAfter: number | null } {
+export function classifyGitHub(err: GitHubError, repoFullName: string, runId: string): { error: string; retryable: boolean; retryAfter: number | null } {
+  // A GitHub App problem that waiting does not fix; its message already says what to change.
+  if (err instanceof GitHubAppError) return { error: err.message, retryable: false, retryAfter: null };
   if (err.status === 0 || err.status >= 500 || err.isRateLimit) {
     return { error: `GitHub is unavailable for now: ${err.message}`, retryable: true, retryAfter: err.retryAfterSeconds };
   }
@@ -213,7 +236,7 @@ function classifyGitHub(err: GitHubError, repoFullName: string, runId: string): 
       error:
         `GitHub refused a draft PR for ${repoFullName} (${err.message}). Draft PRs are not available for private ` +
         `repositories on some plans. Set repositories.${repoFullName}.publish: pr to open ready-for-review PRs ` +
-        `instead, then run "factory publish ${runId}".`,
+        `instead, then run "updraft publish ${runId}".`,
       retryable: false,
       retryAfter: null,
     };
@@ -234,8 +257,16 @@ function classifyGitHub(err: GitHubError, repoFullName: string, runId: string): 
 const GIT_AUTH = /authentication failed|permission to .* denied|permission denied|could not read (username|password)|terminal prompts disabled|invalid username or password|returned error: 40[13]|repository not found|write access to repository not granted/i;
 const GIT_NETWORK = /could not resolve host|failed to connect|connection (timed out|reset|refused)|operation timed out|the remote end hung up|early eof|returned error: 5\d\d|ssl_|gnutls|tls connection|network is unreachable|rpc failed/i;
 
-function classifyGit(err: GitError, what: string, remote: string, repoFullName: string): Error {
-  const detail = err.stderr.trim().split(/\r?\n/).filter(Boolean).slice(-3).join('; ') || err.message;
+export function classifyGit(err: GitError, what: string, remote: string, repoFullName: string): Error {
+  // Redacted before it is cut down to its last lines: a secret cut in half no longer looks like one.
+  const detail = redactGitHubSecrets(err.stderr).trim().split(/\r?\n/).filter(Boolean).slice(-3).join('; ') || err.message;
+  if (/without `?workflows?`? permission/i.test(err.stderr)) {
+    return new PublishRefusal(
+      `${what} to ${remote} was rejected (${detail}): the commits change files under .github/workflows, which a GitHub App may ` +
+        'push only with the "Workflows" repository permission (read and write). Grant it to the App and accept it on the installation, ' +
+        'then publish the run again',
+    );
+  }
   if (GIT_AUTH.test(err.stderr)) {
     return new PublishRefusal(
       `${what} to ${remote} was refused for lack of access (${detail}). For an https remote the worker uses the gh ` +
@@ -251,24 +282,74 @@ function classifyGit(err: GitError, what: string, remote: string, repoFullName: 
   return new PublishRefusal(`${what} to ${remote} failed (${detail})`);
 }
 
+/** What went wrong in a publication or revision attempt, and whether trying again can help. */
+export function classifyFailure(
+  err: unknown,
+  o: { repoFullName: string; runId: string; aborted: boolean },
+): { error: string; retryable: boolean; retryAfter: number | null } {
+  if (err instanceof GitHubError) return classifyGitHub(err, o.repoFullName, o.runId);
+  if (err instanceof TransientError) return { error: err.message, retryable: true, retryAfter: err.retryAfterSeconds };
+  if (err instanceof PublishRefusal) return { error: err.message, retryable: false, retryAfter: null };
+  if (err instanceof GitError) {
+    // ls-remote and friends: network trouble is worth retrying, anything else is not.
+    const e = classifyGit(err, 'git', 'the remote', o.repoFullName);
+    return { error: e.message, retryable: e instanceof TransientError, retryAfter: null };
+  }
+  if (o.aborted || (err instanceof Error && err.name === 'AbortError')) {
+    return { error: 'publication was stopped before it finished', retryable: true, retryAfter: null };
+  }
+  return { error: message(err), retryable: false, retryAfter: null };
+}
+
 // ---------------------------------------------------------------------------
 // PR and comment text
 // ---------------------------------------------------------------------------
 
 /** A Markdown code fence that the text cannot close, so mentions, links and closing keywords in it stay inert. */
-function fenced(text: string, lang = 'text'): string {
+export function fenced(text: string, lang = 'text'): string {
   const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map((m) => m[0].length));
   const ticks = '`'.repeat(Math.max(3, longest + 1));
   return `${ticks}${lang}\n${text}\n${ticks}`;
 }
 
-function cap(text: string, max: number): string {
+export function cap(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 /** One-line text for places Markdown is not fenced: no newlines, mentions or HTML comments. */
-function inline(text: string): string {
+export function inline(text: string): string {
   return text.replace(/\s+/g, ' ').replace(/@/g, '@​').replace(/<!--|-->/g, '').trim();
+}
+
+/**
+ * What a run left, for a PR body or a PR comment: its commits, the diff stat, the verification
+ * result and the agent's final message. Everything the agent or the repository controls is fenced
+ * or flattened, so it stays inert.
+ */
+export function renderRunResult(s: RunSummary, commitCount: number): string[] {
+  const commits = s.commits.length ? s.commits.join('\n') : '(none listed)';
+  const more = commitCount > s.commits.length ? `\n… ${commitCount - s.commits.length} more` : '';
+  const finalMessage = cap(s.lastOutput.join('\n').trim() || '(no output)', MAX_FINAL_MESSAGE);
+  return [
+    `**Commits** (${commitCount})`,
+    '',
+    fenced(cap(commits + more, 8_000)),
+    '',
+    `**Changes:** ${inline(s.diffStat)}`,
+    '',
+    ...(s.verification
+      ? [
+          `**Verification** (${s.verification.passed ? 'passed' : 'did not pass'}; commands run by the worker after the agent finished)`,
+          '',
+          fenced(cap(verificationLines(s.verification).join('\n') || '(no commands)', 4_000)),
+          '',
+          ...verificationNotes(s.verification).flatMap((n) => [`Note: ${inline(n)}.`, '']),
+        ]
+      : []),
+    "**The agent's final message**",
+    '',
+    fenced(finalMessage),
+  ];
 }
 
 export function renderPrBody(o: {
@@ -279,25 +360,13 @@ export function renderPrBody(o: {
   commitCount: number;
   mode: 'draft-pr' | 'pr';
 }): string {
-  const s = o.summary;
-  const commits = s.commits.length ? s.commits.join('\n') : '(none listed)';
-  const more = o.commitCount > s.commits.length ? `\n… ${o.commitCount - s.commits.length} more` : '';
-  const finalMessage = cap(s.lastOutput.join('\n').trim() || '(no output)', MAX_FINAL_MESSAGE);
   const body = [
     `Closes #${o.issueNumber}`,
     '',
-    `Opened by software-factory from run \`${o.runId}\` (agent ${inline(o.agent)})${o.mode === 'draft-pr' ? ' as a draft' : ''}. ` +
+    `Opened by updraft from run \`${o.runId}\` (agent ${inline(o.agent)})${o.mode === 'draft-pr' ? ' as a draft' : ''}. ` +
       'Review it before merging; merging is up to a person.',
     '',
-    `**Commits** (${o.commitCount})`,
-    '',
-    fenced(cap(commits + more, 8_000)),
-    '',
-    `**Changes:** ${inline(s.diffStat)}`,
-    '',
-    "**The agent's final message**",
-    '',
-    fenced(finalMessage),
+    ...renderRunResult(o.summary, o.commitCount),
     '',
     `Run id: \`${o.runId}\``,
   ].join('\n');
@@ -334,6 +403,10 @@ function eligibility(deps: PublishDeps, runId: string): { ok: true; e: Eligible 
   if (!run) return { ok: false, reason: `run ${runId} not found` };
   const job = getJob(deps.db, run.jobId);
   if (!job) return { ok: false, reason: `job ${run.jobId} of run ${runId} not found` };
+  // A revision run never opens a PR: its commits go to the PR that exists (src/publish/revision.ts).
+  if (revisionOf(job)) return { ok: false, reason: `run ${runId} is a revision of an existing pull request, not a publication` };
+  // A reviewer run publishes nothing at all: its result is a verdict (src/publish/review.ts).
+  if (reviewOf(job)) return { ok: false, reason: `run ${runId} is a review of an existing pull request, not a publication` };
   if (deps.config.execution.mode !== 'live') {
     return { ok: false, reason: `publication applies only in live mode (execution.mode is ${deps.config.execution.mode})` };
   }
@@ -361,6 +434,86 @@ function eligibility(deps: PublishDeps, runId: string): { ok: true; e: Eligible 
       checkoutPath: resolve(deps.paths.configDir, found.repo.checkoutPath),
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Where a push goes
+// ---------------------------------------------------------------------------
+
+/** The one validated destination of a push, and the isolated repository to run it from. */
+export interface PushTarget {
+  /** Name of the clone's remote, for messages. */
+  remote: string;
+  /** The remote's single push URL; network commands name it directly. */
+  pushUrl: string;
+  /** Options for network commands: the throwaway repository as cwd, hooks off, no config files, the token if any. */
+  net: GitOptions;
+}
+
+/**
+ * Validate where a push for `repoFullName` would go and set up the isolated repository it runs
+ * from. Shared by publication and the revision push, so both hold to the same rules. Call it
+ * inside withCheckoutLock. `scratchDir` is a fresh temporary directory the caller removes.
+ * `onToken` receives the token as soon as it is read, so the caller can redact it from any error.
+ */
+export async function openPushTarget(
+  deps: Pick<PublishDeps, 'token' | 'workerKind' | 'env' | 'git' | 'runGit'>,
+  o: { checkoutPath: string; repoFullName: string; remote: string | undefined; scratchDir: string; signal: AbortSignal; onToken: (token: string) => void },
+): Promise<PushTarget> {
+  const { checkoutPath, repoFullName, scratchDir } = o;
+  const run1 = deps.runGit ?? defaultRunGit;
+  const local: GitOptions = { cwd: checkoutPath, git: deps.git };
+  const selection = selectRepoRemote(await listRemotes(local), repoFullName, o.remote);
+  if (!selection.ok) throw new PublishRefusal(`${checkoutPath}: ${selection.error}`);
+  const remoteName = selection.remote.name;
+  // Push to exactly the repository the run was for, even if a push URL was configured since.
+  // `git push <remote>` pushes to every pushurl the remote has, so all of them are listed
+  // (after insteadOf rewriting, as push applies it) and exactly one is allowed.
+  const pushUrls = (await run1(['remote', 'get-url', '--push', '--all', remoteName], local)).stdout
+    .split(/\r?\n/)
+    .map((u) => u.trim())
+    .filter(Boolean);
+  if (pushUrls.length !== 1) {
+    throw new PublishRefusal(
+      `remote "${remoteName}" has ${pushUrls.length} push URLs (${pushUrls.map(redactRemoteUrl).join(', ') || 'none'}); ` +
+        'publication pushes to exactly one destination. Leave the remote with a single push URL, or set ' +
+        `repositories.${repoFullName}.remote to a remote that has one`,
+    );
+  }
+  const pushUrlRaw = pushUrls[0]!;
+  const matches = o.remote !== undefined ? remoteOwnerNameMatches(pushUrlRaw, repoFullName) : isGitHubRemoteFor(pushUrlRaw, repoFullName);
+  if (!matches) {
+    throw new PublishRefusal(`the push URL of remote "${remoteName}" (${redactRemoteUrl(pushUrlRaw)}) does not point at ${repoFullName}`);
+  }
+  // As a GitHub App the push must carry the installation token, so it goes over HTTPS to the
+  // repository the remote was just validated to be, never over SSH with the person's key (and
+  // never with credentials embedded in the remote's URL).
+  const pushUrl = deps.workerKind === 'app' ? `https://github.com/${repoFullName}.git` : pushUrlRaw;
+  let token: string | null = null;
+  if (isHttpsGitHub(pushUrl)) {
+    token = await deps.token(repoFullName);
+    o.onToken(token);
+  }
+  const emptyGlobalConfig = join(scratchDir, 'empty-gitconfig');
+  writeFileSync(emptyGlobalConfig, '');
+  const env = publishGitEnv({
+    base: deps.env ?? process.env,
+    pushUrl,
+    token,
+    hooksPath: join(scratchDir, 'none'),
+    isolateWith: { emptyGlobalConfig },
+  });
+  // Network commands run in a throwaway bare repository that borrows the clone's objects
+  // (alternates) and nothing else: no remotes, no url.*.insteadOf rules, no hooks. They name
+  // the validated URL itself, so Git can't resolve it to a different destination later.
+  const pushRepo = join(scratchDir, 'push.git');
+  const netOpts: GitOptions = { cwd: scratchDir, git: deps.git, env, signal: o.signal };
+  await run1(['init', '--bare', '--quiet', pushRepo], netOpts);
+  // Relative to the clone on older Git; resolve() leaves an absolute one as it is.
+  const commonDir = resolve(checkoutPath, (await run1(['rev-parse', '--git-common-dir'], local)).stdout.trim());
+  const objects = join(commonDir, 'objects');
+  writeFileSync(join(pushRepo, 'objects', 'info', 'alternates'), `${objects}\n`);
+  return { remote: remoteName, pushUrl, net: { ...netOpts, cwd: pushRepo } };
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +576,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
   };
 
   await runLog([`attempt ${pub.attempts} (${mode}) at ${new Date(now()).toISOString()}`]);
-  const hooksDir = mkdtempSync(join(tmpdir(), 'factory-publish-nohooks-'));
+  const hooksDir = mkdtempSync(join(tmpdir(), 'updraft-publish-nohooks-'));
   try {
     const run1 = deps.runGit ?? defaultRunGit;
     const signal = opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(NETWORK_TIMEOUT_MS)]) : AbortSignal.timeout(NETWORK_TIMEOUT_MS);
@@ -431,56 +584,32 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
 
     // 1. The clone, its remote, the base branch and the job branch's commit.
     const { remote, pushUrl, net, localSha, commitCount } = await withCheckoutLock(checkoutPath, async () => {
-      const selection = selectRepoRemote(await listRemotes(local), repoFullName, repo.remote);
-      if (!selection.ok) throw new PublishRefusal(`${checkoutPath}: ${selection.error}`);
-      const remoteName = selection.remote.name;
-      // Push to exactly the repository the run was for, even if a push URL was configured since.
-      // `git push <remote>` pushes to every pushurl the remote has, so all of them are listed
-      // (after insteadOf rewriting, as push applies it) and exactly one is allowed.
-      const pushUrls = (await run1(['remote', 'get-url', '--push', '--all', remoteName], local)).stdout
-        .split(/\r?\n/)
-        .map((u) => u.trim())
-        .filter(Boolean);
-      if (pushUrls.length !== 1) {
-        throw new PublishRefusal(
-          `remote "${remoteName}" has ${pushUrls.length} push URLs (${pushUrls.map(redactRemoteUrl).join(', ') || 'none'}); ` +
-            'publication pushes to exactly one destination. Leave the remote with a single push URL, or set ' +
-            `repositories.${repoFullName}.remote to a remote that has one`,
-        );
-      }
-      const pushUrlRaw = pushUrls[0]!;
-      const matches = repo.remote !== undefined ? remoteOwnerNameMatches(pushUrlRaw, repoFullName) : isGitHubRemoteFor(pushUrlRaw, repoFullName);
-      if (!matches) {
-        throw new PublishRefusal(`the push URL of remote "${remoteName}" (${redactRemoteUrl(pushUrlRaw)}) does not point at ${repoFullName}`);
-      }
-      if (isHttpsGitHub(pushUrlRaw)) token = await deps.token();
-      const emptyGlobalConfig = join(hooksDir, 'empty-gitconfig');
-      writeFileSync(emptyGlobalConfig, '');
-      const env = publishGitEnv({
-        base: deps.env ?? process.env,
-        pushUrl: pushUrlRaw,
-        token,
-        hooksPath: join(hooksDir, 'none'),
-        isolateWith: { emptyGlobalConfig },
+      const target = await openPushTarget(deps, {
+        checkoutPath,
+        repoFullName,
+        remote: repo.remote,
+        scratchDir: hooksDir,
+        signal,
+        onToken: (t) => (token = t),
       });
-      // Network commands run in a throwaway bare repository that borrows the clone's objects
-      // (alternates) and nothing else: no remotes, no url.*.insteadOf rules, no hooks. They name
-      // the validated URL itself, so Git can't resolve it to a different destination later.
-      const pushRepo = join(hooksDir, 'push.git');
-      const netOpts: GitOptions = { cwd: hooksDir, git: deps.git, env, signal };
-      await run1(['init', '--bare', '--quiet', pushRepo], netOpts);
-      // Relative to the clone on older Git; resolve() leaves an absolute one as it is.
-      const commonDir = resolve(checkoutPath, (await run1(['rev-parse', '--git-common-dir'], local)).stdout.trim());
-      const objects = join(commonDir, 'objects');
-      writeFileSync(join(pushRepo, 'objects', 'info', 'alternates'), `${objects}\n`);
+      const { remote: remoteName, pushUrl: pushUrlRaw, net: netOpts } = target;
 
       const expected = jobBranchName(job, run.attempt);
       if (branch !== expected) throw new PublishRefusal(`run ${runId} recorded branch ${branch}, not the job branch ${expected}; refusing to push it`);
       await assertValidBranchName(branch, local);
       const sha = (await run1(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`], local).catch(() => null))?.stdout.trim();
       if (!sha) throw new PublishRefusal(`the job branch ${branch} no longer exists in ${checkoutPath}`);
+      // Publish the commit the run ended on, or nothing: the run's summary and verification are
+      // about that commit, and a retry long after must not attach them to whatever is there now.
+      const ended = run.summary.headSha;
+      if (ended && sha !== ended) {
+        throw new PublishRefusal(
+          `the job branch ${branch} is at ${sha.slice(0, 12)}, not at ${ended.slice(0, 12)} where run ${runId} ended; ` +
+            'the branch was changed after the run, so its result and verification do not describe this commit. Nothing was pushed',
+        );
+      }
       const count = Number((await run1(['rev-list', '--count', `${run.summary.baseSha}..${sha}`], local)).stdout.trim()) || 0;
-      return { remote: remoteName, pushUrl: pushUrlRaw, net: { ...netOpts, cwd: pushRepo }, localSha: sha, commitCount: count };
+      return { remote: remoteName, pushUrl: pushUrlRaw, net: netOpts, localSha: sha, commitCount: count };
     });
 
     if (commitCount === 0) {
@@ -511,7 +640,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       new PublishRefusal(
         `${remoteRef} on ${remote} is at ${sha.slice(0, 12)}, but the job branch is at ${localSha.slice(0, 12)}; ` +
           'refusing to overwrite it. Inspect the remote branch; delete it there if it should be replaced, then run ' +
-          `"factory publish ${runId}"`,
+          `"updraft publish ${runId}"`,
       );
     hold();
     const remoteSha = await readRemoteSha();
@@ -598,31 +727,9 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       await runLog([`attempt ${fence.attempt} stopped: a newer attempt took over`]);
       return { status: 'busy', reason: err.message };
     }
-    let error: string;
-    let retryable: boolean;
-    let retryAfter: number | null = null;
-    if (err instanceof GitHubError) {
-      ({ error, retryable, retryAfter } = classifyGitHub(err, repoFullName, runId));
-    } else if (err instanceof TransientError) {
-      error = err.message;
-      retryable = true;
-      retryAfter = err.retryAfterSeconds;
-    } else if (err instanceof PublishRefusal) {
-      error = err.message;
-      retryable = false;
-    } else if (err instanceof GitError) {
-      // ls-remote and friends: network trouble is worth retrying, anything else is not.
-      const e = classifyGit(err, 'git', 'the remote', repoFullName);
-      error = e.message;
-      retryable = e instanceof TransientError;
-    } else if (opts.signal?.aborted || (err instanceof Error && err.name === 'AbortError')) {
-      error = 'publication was stopped before it finished';
-      retryable = true;
-    } else {
-      error = message(err);
-      retryable = false;
-    }
-    error = redactSecret(error, token);
+    const classified = classifyFailure(err, { repoFullName, runId, aborted: Boolean(opts.signal?.aborted) });
+    const { retryable, retryAfter } = classified;
+    const error = redactSecret(classified.error, token);
     const attempts = pub.attempts;
     let nextAttemptAt: string | null = null;
     if (retryable && attempts < MAX_AUTO_ATTEMPTS) {
@@ -634,8 +741,8 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       return { status: 'busy', reason: new PublicationSupersededError(runId, fence.attempt).message };
     }
     const hint = nextAttemptAt
-      ? `the worker retries at ${nextAttemptAt}; "factory publish ${runId}" retries now`
-      : `fix the cause, then run "factory publish ${runId}"`;
+      ? `the worker retries at ${nextAttemptAt}; "updraft publish ${runId}" retries now`
+      : `fix the cause, then run "updraft publish ${runId}"`;
     await runLog([`failed: ${error}`, hint]);
     log.warn('publication failed', { error, retryable, attempts });
     try {
@@ -688,6 +795,6 @@ export function createPublisher(deps: PublishDeps): Publisher {
 }
 
 /** True when any repository opts in to publication and the mode runs agents. */
-export function publicationEnabled(config: FactoryConfig): boolean {
+export function publicationEnabled(config: UpdraftConfig): boolean {
   return config.execution.mode === 'live' && Object.values(config.repositories).some((r) => publishMode(r) !== 'none');
 }

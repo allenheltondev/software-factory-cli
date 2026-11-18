@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 11;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -193,6 +193,232 @@ const MIGRATIONS: Record<number, Migration> = {
     );
     CREATE INDEX publications_by_state ON publications (state, next_attempt_at);
   `,
+  7: `
+    -- The comment that tells an issue its live run failed (repositories.<repo>.commentOnFailure).
+    -- One row per run that left its job failed; like publications, kept apart from runs so it
+    -- never changes a run's outcome, with the same lease and attempt counter for retries.
+    CREATE TABLE failure_comments (
+      run_id           TEXT    PRIMARY KEY REFERENCES runs (id),
+      job_id           TEXT    NOT NULL,
+      repo_id          INTEGER NOT NULL,
+      repo_full_name   TEXT    NOT NULL,
+      issue_number     INTEGER NOT NULL,
+      state            TEXT    NOT NULL CHECK (state IN ('posting','posted','failed','skipped')),
+      comment_id       INTEGER,
+      comment_url      TEXT,
+      error            TEXT,               -- why it failed, or why it was skipped
+      retryable        INTEGER NOT NULL DEFAULT 0,
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,               -- while state = 'posting'
+      next_attempt_at  TEXT,               -- automatic retry of a retryable failure
+      created_at       TEXT    NOT NULL,
+      updated_at       TEXT    NOT NULL,
+      posted_at        TEXT
+    );
+    CREATE INDEX failure_comments_by_state ON failure_comments (state, next_attempt_at);
+  `,
+  8: `
+    -- Set by "updraft cancel" on a run that is claimed or executing. The CLI is not the worker
+    -- process, so it only records the request; the worker stops the run and closes it with no
+    -- outcome and its job 'canceled'. It is on the run, not the job, so a request can never
+    -- carry over to a later attempt after "updraft retry".
+    ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT;
+    -- Dedupe keys of jobs deleted by "updraft clean --older-than". The poller re-reads the
+    -- newest events of a repository on every scan (for a quiet repository, indefinitely), and
+    -- only the jobs unique key stops such an event from being enqueued again. A deleted job
+    -- leaves its key here, and commitPollBatch refuses any event listed.
+    CREATE TABLE pruned_events (
+      repo_id     INTEGER NOT NULL,
+      workflow_id TEXT    NOT NULL,
+      event_id    TEXT    NOT NULL,
+      pruned_at   TEXT    NOT NULL,
+      PRIMARY KEY (repo_id, workflow_id, event_id)
+    ) WITHOUT ROWID;
+  `,
+  9: `
+    -- A containerized live run (agents.<name>.container): the runtime client that started the
+    -- container (an absolute path) and the container's name. Recorded before the container
+    -- starts, so that a later worker on the same host can remove it after a crash. The config may
+    -- have changed by then, which is why the runtime is recorded and not derived. NULL: the
+    -- agent ran on the host.
+    ALTER TABLE runs ADD COLUMN container_runtime TEXT;
+    ALTER TABLE runs ADD COLUMN container_name TEXT;
+  `,
+  10: `
+    -- The revision loop (repositories.<repo>.revise): a review that requests changes on a PR
+    -- Updraft opened queues a revision job, an ordinary row in jobs whose envelope has type
+    -- pull_request.changes_requested and whose event_id is "review:<review node id>".
+
+    -- The PRs the loop watches: one row per PR of a published publication, copied here with what
+    -- a revision job needs, so a PR stays watched after "updraft clean --older-than" deleted the
+    -- job that opened it. 'closed' is final (closed or merged on GitHub, or no longer readable).
+    CREATE TABLE revision_prs (
+      repo_id                INTEGER NOT NULL,
+      pr_number              INTEGER NOT NULL,
+      pr_url                 TEXT    NOT NULL,
+      source_run_id          TEXT    NOT NULL,   -- the run whose publication opened the PR
+      original_event_id      TEXT    NOT NULL,   -- label event that queued that run's job
+      workflow_id            TEXT    NOT NULL,
+      issue_number           INTEGER NOT NULL,
+      issue_title            TEXT    NOT NULL,
+      issue_url              TEXT    NOT NULL,
+      label                  TEXT    NOT NULL,
+      labels                 TEXT    NOT NULL,   -- JSON array: the original job's labelsAtEnqueue
+      action                 TEXT    NOT NULL,
+      pool                   TEXT    NOT NULL,
+      branch                 TEXT    NOT NULL,   -- the PR's head: the job branch that was pushed
+      base_branch            TEXT,
+      state                  TEXT    NOT NULL CHECK (state IN ('open','closed')),
+      seen_updated_at        TEXT,               -- the PR's updated_at when its reviews were last read
+      limit_reached_at       TEXT,               -- first change request refused by maxRevisions
+      limit_comment_id       INTEGER,            -- the one comment that says so
+      limit_comment_url      TEXT,
+      limit_comment_attempts INTEGER NOT NULL DEFAULT 0,
+      limit_comment_error    TEXT,
+      created_at             TEXT    NOT NULL,
+      updated_at             TEXT    NOT NULL,
+      PRIMARY KEY (repo_id, pr_number)
+    ) WITHOUT ROWID;
+
+    -- Position in a repository's pull request listing (most recently updated first), like
+    -- repo_checkpoints for issue events.
+    CREATE TABLE review_checkpoints (
+      repo_id         INTEGER PRIMARY KEY,
+      etag            TEXT,                      -- ETag of page 1, for conditional polling
+      last_updated_at TEXT,                      -- newest updated_at seen by the last committed scan
+      updated_at      TEXT    NOT NULL
+    );
+
+    -- Every change request seen on a watched PR, by review id, with what was decided about it the
+    -- first time it was seen. A review listed here is never evaluated again, across restarts,
+    -- replays and pruning (rows are kept when their job is pruned; job_id then points nowhere).
+    CREATE TABLE review_requests (
+      repo_id      INTEGER NOT NULL,
+      review_id    TEXT    NOT NULL,             -- GitHub node id of the review
+      pr_number    INTEGER NOT NULL,
+      reviewer     TEXT,
+      trigger_kind TEXT    NOT NULL,             -- what kind of change request it is, e.g. changes_requested
+      review_url   TEXT,
+      submitted_at TEXT,
+      state        TEXT    NOT NULL CHECK (state IN ('queued','over-limit','ignored','not-allowed')),
+      reason       TEXT,                         -- why it was not queued
+      job_id       TEXT,                         -- the revision job, when state = 'queued'
+      created_at   TEXT    NOT NULL,
+      PRIMARY KEY (repo_id, review_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX review_requests_by_pr ON review_requests (repo_id, pr_number);
+
+    -- The push and reply of one revision run; the counterpart of publications, with the same
+    -- lease and attempt fence. base_sha is the remote head of the PR branch the run started
+    -- from (the push fast-forwards from exactly that commit or not at all), head_sha what was
+    -- pushed. moved = 1: the push was refused because the branch was no longer at base_sha.
+    CREATE TABLE revisions (
+      run_id           TEXT    PRIMARY KEY REFERENCES runs (id),
+      job_id           TEXT    NOT NULL,
+      repo_id          INTEGER NOT NULL,
+      repo_full_name   TEXT    NOT NULL,
+      issue_number     INTEGER NOT NULL,
+      pr_number        INTEGER NOT NULL,
+      review_id        TEXT    NOT NULL,
+      trigger_kind     TEXT    NOT NULL,
+      state            TEXT    NOT NULL CHECK (state IN ('publishing','published','failed','skipped')),
+      branch           TEXT    NOT NULL,
+      base_sha         TEXT,
+      head_sha         TEXT,
+      pushed_at        TEXT,
+      moved            INTEGER NOT NULL DEFAULT 0,
+      comment_id       INTEGER,
+      comment_url      TEXT,
+      error            TEXT,
+      retryable        INTEGER NOT NULL DEFAULT 0,
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,
+      next_attempt_at  TEXT,
+      created_at       TEXT    NOT NULL,
+      updated_at       TEXT    NOT NULL,
+      published_at     TEXT
+    );
+    CREATE INDEX revisions_by_state ON revisions (state, next_attempt_at);
+  `,
+  11: `
+    -- The review loop (repositories.<repo>.review, autoMerge): a reviewer run for every head
+    -- commit of a PR Updraft opened. A reviewer run is an ordinary row in jobs whose envelope has
+    -- type pull_request.review and whose event_id is "pr-review:<pr number>:<head sha>", so the
+    -- jobs unique key (and pruned_events) gives one review per PR and head, across restarts.
+
+    -- Where each watched PR stands. These live on the PR's row, not on a run, so they survive
+    -- "updraft clean --older-than".
+    ALTER TABLE revision_prs ADD COLUMN head_sha TEXT;               -- newest head commit the worker knows of
+    ALTER TABLE revision_prs ADD COLUMN head_at TEXT;                -- when it learned of it (its own push, or a read of the PR)
+    ALTER TABLE revision_prs ADD COLUMN author_agent TEXT;           -- agent of the PR's latest code run; not picked as reviewer
+    ALTER TABLE revision_prs ADD COLUMN verdict TEXT;                -- newest recorded verdict: ready-to-merge | changes-requested
+    ALTER TABLE revision_prs ADD COLUMN verdict_sha TEXT;            -- the head commit that verdict is for
+    ALTER TABLE revision_prs ADD COLUMN verdict_run_id TEXT;
+    ALTER TABLE revision_prs ADD COLUMN verdict_at TEXT;
+    ALTER TABLE revision_prs ADD COLUMN ready_marked_at TEXT;        -- when the worker marked the draft ready for review
+    -- Auto-merge of the head in merge_sha: waiting (for checks), merging (the request was sent),
+    -- merged, or blocked (see merge_reason; final for that head). NULL: not looked at yet.
+    ALTER TABLE revision_prs ADD COLUMN merge_state TEXT CHECK (merge_state IN ('waiting','merging','merged','blocked'));
+    ALTER TABLE revision_prs ADD COLUMN merge_sha TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_reason TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_wait_started_at TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE revision_prs ADD COLUMN merged_at TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_commit_sha TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_comment_id INTEGER;    -- the one comment that says why it was not merged
+    ALTER TABLE revision_prs ADD COLUMN merge_comment_url TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_comment_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE revision_prs ADD COLUMN merge_comment_error TEXT;
+
+    -- PRs watched before this version: their head is what the worker last pushed to them.
+    UPDATE revision_prs SET
+      head_sha = (SELECT p.head_sha FROM publications p WHERE p.run_id = revision_prs.source_run_id),
+      head_at = (SELECT p.pushed_at FROM publications p WHERE p.run_id = revision_prs.source_run_id),
+      author_agent = (SELECT r.agent FROM runs r WHERE r.id = revision_prs.source_run_id);
+    UPDATE revision_prs SET
+      head_sha = (SELECT v.head_sha FROM revisions v WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
+                    AND v.pushed_at IS NOT NULL AND v.head_sha IS NOT NULL ORDER BY v.pushed_at DESC LIMIT 1),
+      head_at = (SELECT v.pushed_at FROM revisions v WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
+                    AND v.pushed_at IS NOT NULL AND v.head_sha IS NOT NULL ORDER BY v.pushed_at DESC LIMIT 1),
+      author_agent = coalesce((SELECT r.agent FROM revisions v JOIN runs r ON r.id = v.run_id WHERE v.repo_id = revision_prs.repo_id
+                    AND v.pr_number = revision_prs.pr_number AND v.pushed_at IS NOT NULL AND v.head_sha IS NOT NULL
+                    ORDER BY v.pushed_at DESC LIMIT 1), author_agent)
+    WHERE EXISTS (SELECT 1 FROM revisions v WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
+                    AND v.pushed_at IS NOT NULL AND v.head_sha IS NOT NULL);
+
+    -- The verdict of one reviewer run and its posting as a COMMENT review on the PR; the
+    -- counterpart of publications and revisions, with the same lease and attempt fence. The
+    -- verdict is the worker's own record: GitHub only gets a comment for people to read.
+    -- outcome is what the worker did with the verdict once the review was posted.
+    CREATE TABLE pr_reviews (
+      run_id           TEXT    PRIMARY KEY REFERENCES runs (id),
+      job_id           TEXT    NOT NULL,
+      repo_id          INTEGER NOT NULL,
+      repo_full_name   TEXT    NOT NULL,
+      issue_number     INTEGER NOT NULL,
+      pr_number        INTEGER NOT NULL,
+      head_sha         TEXT    NOT NULL,   -- the commit that was reviewed; the verdict is for it only
+      agent            TEXT    NOT NULL,   -- the reviewing agent
+      verdict          TEXT    NOT NULL CHECK (verdict IN ('ready-to-merge','changes-requested')),
+      findings         TEXT    NOT NULL,
+      state            TEXT    NOT NULL CHECK (state IN ('publishing','published','failed','skipped')),
+      review_id        INTEGER,            -- the COMMENT review on GitHub
+      review_url       TEXT,
+      outcome          TEXT CHECK (outcome IN ('ready','revision-queued','over-limit','no-revise','stale','closed')),
+      outcome_detail   TEXT,
+      revision_job_id  TEXT,               -- the revision job a changes-requested verdict queued
+      error            TEXT,
+      retryable        INTEGER NOT NULL DEFAULT 0,
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,
+      next_attempt_at  TEXT,
+      created_at       TEXT    NOT NULL,
+      updated_at       TEXT    NOT NULL,
+      published_at     TEXT
+    );
+    CREATE INDEX pr_reviews_by_state ON pr_reviews (state, next_attempt_at);
+    CREATE INDEX pr_reviews_by_pr ON pr_reviews (repo_id, pr_number, created_at);
+  `,
 };
 
 /**
@@ -342,6 +568,9 @@ export interface RunRow {
   outcome: RunOutcome | null;
   error: string | null;
   summary: string | null;
+  cancel_requested_at: string | null;
+  container_runtime: string | null;
+  container_name: string | null;
 }
 
 function parseSummary(json: string | null): RunSummary | null {
@@ -373,5 +602,7 @@ export function rowToRun(r: RunRow): Run {
     outcome: r.outcome,
     error: r.error,
     summary: parseSummary(r.summary),
+    cancelRequestedAt: r.cancel_requested_at,
+    container: r.container_runtime && r.container_name ? { runtime: r.container_runtime, name: r.container_name } : null,
   };
 }

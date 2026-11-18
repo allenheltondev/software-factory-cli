@@ -1,16 +1,16 @@
 #!/bin/bash
-# Installs (or removes) a per-user launchd LaunchAgent that runs `factory start`.
+# Installs (or removes) a per-user launchd LaunchAgent that runs `updraft start`.
 #
 #   bash install-launchagent.sh [options]
 #
 # Options:
 #   --config PATH        Config file (default: per-user config location, see README)
-#   --label LABEL        launchd label and plist name (default: local.software-factory)
+#   --label LABEL        launchd label and plist name (default: local.updraft)
 #   --node PATH          node binary (default: `command -v node`)
-#   --cli PATH           installed dist/cli.js (default: $(npm root -g)/software-factory-cli/dist/cli.js)
+#   --cli PATH           installed dist/cli.js (default: $(npm root -g)/@allenheltondev/updraft/dist/cli.js)
 #   --workdir DIR        working directory (default: the config file's directory)
 #   --extra-path DIR     extra directory for the agent's PATH (repeatable)
-#   --factory-home DIR   set FACTORY_HOME for the agent (default: current $FACTORY_HOME)
+#   --updraft-home DIR   set UPDRAFT_HOME for the agent (default: current $UPDRAFT_HOME)
 #   --no-start           write the plist but do not load it (it loads at next login)
 #   --print              print the rendered plist and exit without installing
 #   --uninstall          unload the agent and remove its plist
@@ -18,13 +18,13 @@
 # Works with macOS's /bin/bash 3.2. Paths may contain spaces.
 set -euo pipefail
 
-APP_DIR=software-factory
-PACKAGE=software-factory-cli
+APP_DIR=updraft
+PACKAGE=@allenheltondev/updraft
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 
-label=local.software-factory
+label=local.updraft
 config= node= cli= workdir= mode=install start=1
-factory_home=${FACTORY_HOME:-}
+updraft_home=${UPDRAFT_HOME:-}
 extra_path=()
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
     --cli) cli=${2:?--cli needs a value}; shift 2 ;;
     --workdir) workdir=${2:?--workdir needs a value}; shift 2 ;;
     --extra-path) extra_path+=("${2:?--extra-path needs a value}"); shift 2 ;;
-    --factory-home) factory_home=${2:?--factory-home needs a value}; shift 2 ;;
+    --updraft-home) updraft_home=${2:?--updraft-home needs a value}; shift 2 ;;
     --no-start) start=0; shift ;;
     --print) mode=print; shift ;;
     --uninstall) mode=uninstall; shift ;;
@@ -70,16 +70,16 @@ if [ "$mode" = uninstall ]; then
 fi
 
 # --- Per-user locations (mirrors src/paths.ts) ---------------------------------------------
-if [ -n "$factory_home" ]; then
-  factory_home=$(abspath "$factory_home")
-  default_config="$factory_home/config.yaml"
+if [ -n "$updraft_home" ]; then
+  updraft_home=$(abspath "$updraft_home")
+  default_config="$updraft_home/config.yaml"
 else
   default_config="$HOME/Library/Application Support/$APP_DIR/config.yaml"
 fi
 log_dir="$HOME/Library/Logs/$APP_DIR"
 
 config=$(abspath "${config:-$default_config}")
-[ -f "$config" ] || warn "config file not found: $config (run 'factory configure' or pass --config)"
+[ -f "$config" ] || warn "config file not found: $config (run 'updraft configure' or pass --config)"
 workdir=$(abspath "${workdir:-$(dirname "$config")}")
 
 # --- node and the installed cli.js ---------------------------------------------------------
@@ -117,12 +117,12 @@ done
 for d in ${extra_path[@]+"${extra_path[@]}"}; do add_path "$(abspath "$d")"; done
 for d in /opt/homebrew/bin /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do add_path "$d"; done
 
-for v in "$node" "$cli" "$config" "$workdir" "$path_value" "$factory_home"; do
+for v in "$node" "$cli" "$config" "$workdir" "$path_value" "$updraft_home"; do
   case $v in *$'\n'*) die "paths must not contain newlines" ;; esac
 done
 
 # --- Render ---------------------------------------------------------------------------------
-template="$SCRIPT_DIR/software-factory.plist.template"
+template="$SCRIPT_DIR/updraft.plist.template"
 [ -f "$template" ] || die "template not found: $template"
 
 render() {
@@ -134,7 +134,7 @@ render() {
   SF_PATH=$(xml_escape "$path_value") \
   SF_HOME=$(xml_escape "$HOME") \
   SF_LOGDIR=$(xml_escape "$log_dir") \
-  SF_FACTORY_HOME=$(xml_escape "$factory_home") \
+  SF_UPDRAFT_HOME=$(xml_escape "$updraft_home") \
   awk '
     # Literal (non-regex, no & or \ processing) replacement.
     function repl(s, pat, val,   out, i) {
@@ -143,9 +143,9 @@ render() {
       return out s
     }
     /<!--__EXTRA_ENV__-->/ {
-      if (ENVIRON["SF_FACTORY_HOME"] != "") {
-        print "    <key>FACTORY_HOME</key>"
-        print "    <string>" ENVIRON["SF_FACTORY_HOME"] "</string>"
+      if (ENVIRON["SF_UPDRAFT_HOME"] != "") {
+        print "    <key>UPDRAFT_HOME</key>"
+        print "    <string>" ENVIRON["SF_UPDRAFT_HOME"] "</string>"
       }
       next
     }

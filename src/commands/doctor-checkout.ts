@@ -1,15 +1,15 @@
-// `factory doctor`: each repo's checkoutPath must be a clone of that repo. The remote is
+// `updraft doctor`: each repo's checkoutPath must be a clone of that repo. The remote is
 // chosen with the same rule the worker uses (selectRepoRemote); the repo check confirms
 // the ID behind the configured name via the API.
 import { resolve } from 'node:path';
-import { modeNeedsCheckout, repoNeedsCheckout, type FactoryConfig } from '../config/schema.js';
+import { modeNeedsCheckout, repoNeedsCheckout, type UpdraftConfig } from '../config/schema.js';
 import { redactRemoteUrl, selectRepoRemote, type Remote } from '../git/git.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { CheckResult, CheckStatus, DoctorProbes } from './doctor.js';
 
 export async function checkRepoCheckouts(
-  config: FactoryConfig,
-  paths: Pick<FactoryPaths, 'configDir'>,
+  config: UpdraftConfig,
+  paths: Pick<UpdraftPaths, 'configDir'>,
   probes: Pick<DoctorProbes, 'which' | 'run' | 'fileExists'>,
 ): Promise<CheckResult[]> {
   const checks: CheckResult[] = [];

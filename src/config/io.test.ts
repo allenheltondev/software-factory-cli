@@ -5,17 +5,17 @@ import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import { COMMENTED_CONFIG } from '../commands/fakes.js';
 import { ConfigError, loadConfig, readRawConfig, saveConfig } from './io.js';
-import type { FactoryConfigInput } from './schema.js';
+import type { UpdraftConfigInput } from './schema.js';
 import { updateYamlText } from './yaml-update.js';
 
 function tempConfig(text?: string): string {
-  const file = join(mkdtempSync(join(tmpdir(), 'factory-io-')), 'config.yaml');
+  const file = join(mkdtempSync(join(tmpdir(), 'updraft-io-')), 'config.yaml');
   if (text !== undefined) writeFileSync(file, text);
   return file;
 }
 
-const edit = (text: string, fn: (c: FactoryConfigInput) => void): FactoryConfigInput => {
-  const c = parse(text) as FactoryConfigInput;
+const edit = (text: string, fn: (c: UpdraftConfigInput) => void): UpdraftConfigInput => {
+  const c = parse(text) as UpdraftConfigInput;
   fn(c);
   return c;
 };
@@ -23,7 +23,7 @@ const edit = (text: string, fn: (c: FactoryConfigInput) => void): FactoryConfigI
 describe('saveConfig', () => {
   it('writes a fresh config when no file exists', () => {
     const file = join(tempConfig(), '..', 'nested', 'config.yaml');
-    const input = parse(COMMENTED_CONFIG) as FactoryConfigInput;
+    const input = parse(COMMENTED_CONFIG) as UpdraftConfigInput;
     saveConfig(file, input);
     expect(parse(readFileSync(file, 'utf8'))).toEqual(input);
     expect(loadConfig(file).config.repositories['o/app']!.id).toBe(1);
@@ -31,7 +31,7 @@ describe('saveConfig', () => {
 
   it('leaves the file byte-for-byte alone when nothing changed', () => {
     const file = tempConfig(COMMENTED_CONFIG);
-    saveConfig(file, readRawConfig(file) as FactoryConfigInput);
+    saveConfig(file, readRawConfig(file) as UpdraftConfigInput);
     expect(readFileSync(file, 'utf8')).toBe(COMMENTED_CONFIG);
   });
 
@@ -73,7 +73,7 @@ describe('saveConfig', () => {
     expect(text).toContain('  # The main app\n  o/app:\n    id: 1\n    workflows:\n');
     expect(text).toContain('        pool: general # default pool\n');
     expect(text).toContain('    - "bot-user"\n');
-    expect(text.startsWith('# Factory config, edited by hand\nversion: 1\n\n')).toBe(true);
+    expect(text.startsWith('# Updraft config, edited by hand\nversion: 1\n\n')).toBe(true);
   });
 
   it('preserves CRLF line endings', () => {
@@ -100,7 +100,7 @@ describe('saveConfig', () => {
 
   it('rewrites an existing file that cannot be parsed', () => {
     const file = tempConfig('version: [1\n');
-    const input = parse(COMMENTED_CONFIG) as FactoryConfigInput;
+    const input = parse(COMMENTED_CONFIG) as UpdraftConfigInput;
     saveConfig(file, input);
     expect(parse(readFileSync(file, 'utf8'))).toEqual(input);
   });

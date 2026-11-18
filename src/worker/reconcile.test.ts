@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { configSchema, type FactoryConfig } from '../config/schema.js';
+import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { buildStatusView, renderStatus } from '../commands/status.js';
 import { claimNextJob, getJob, getRun, getStatusSnapshot, setRunProcess, type Claim } from '../db/queue.js';
@@ -11,7 +11,7 @@ import { reconcileInterruptedRuns } from './reconcile.js';
 const T0 = Date.parse('2026-11-17T10:00:00.000Z');
 const now = () => T0;
 
-function makeConfig(): FactoryConfig {
+function makeConfig(): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     maxConcurrent: 5,
@@ -35,13 +35,13 @@ function insertJob(db: Db): string {
     eventId: String(seq),
     url: `https://github.com/owner/repo/issues/${seq}`,
     actor: 'allen',
-    label: 'factory:ready',
-    labelsAtEnqueue: ['factory:ready'],
+    label: 'updraft:ready',
+    labelsAtEnqueue: ['updraft:ready'],
     createdAt,
   };
   db.prepare(
     `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
-     VALUES (?, 1, 'owner/repo', 'implement-issue:factory:ready', ?, ?, 'implement-issue', 'general', ?, 'queued', 0, ?, ?)`,
+     VALUES (?, 1, 'owner/repo', 'implement-issue:updraft:ready', ?, ?, 'implement-issue', 'general', ?, 'queued', 0, ?, ?)`,
   ).run(id, envelope.eventId, seq, JSON.stringify(envelope), createdAt, createdAt);
   return id;
 }

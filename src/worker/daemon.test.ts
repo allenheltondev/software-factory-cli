@@ -2,28 +2,33 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import {
+  CANCELED_BY_USER,
   claimNextJob,
   getJob,
   getRun,
   markExecutionStarted,
+  MAX_START_FAILURES,
+  requestJobCancel,
   retryJob,
   setRunProcess,
   WorkerLockLostError,
 } from '../db/queue.js';
-import type { FactoryPaths } from '../paths.js';
+import type { GitHubApi } from '../github/api.js';
+import type { UpdraftPaths } from '../paths.js';
+import { createFailureCommenter } from '../publish/failure-comment.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { runDaemon, WorkerLockedError, type DaemonDeps } from './daemon.js';
-import { StartFailedError, type ExecutionResult, type Executor } from './executor.js';
+import { canceledByUser, StartFailedError, type ExecutionResult, type Executor } from './executor.js';
 import { acquireWorkerLock, readWorkerLock, WORKER_STALE_MS } from './lock.js';
 import type { ProcessControl } from './process.js';
 
 const T0 = Date.parse('2026-11-17T10:00:00.000Z');
 
-function makeConfig(over: Partial<FactoryConfigInput> = {}): FactoryConfig {
+function makeConfig(over: Partial<UpdraftConfigInput> = {}): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     maxConcurrent: 2,
@@ -49,13 +54,13 @@ function insertJob(db: Db, o: { issue?: number; pool?: string } = {}): string {
     eventId: String(1000 + seq),
     url: `https://github.com/owner/repo/issues/${issue}`,
     actor: 'allen',
-    label: 'factory:ready',
-    labelsAtEnqueue: ['factory:ready'],
+    label: 'updraft:ready',
+    labelsAtEnqueue: ['updraft:ready'],
     createdAt,
   };
   db.prepare(
     `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
-     VALUES (?, 1, 'owner/repo', 'implement-issue:factory:ready', ?, ?, 'implement-issue', ?, ?, 'queued', 0, ?, ?)`,
+     VALUES (?, 1, 'owner/repo', 'implement-issue:updraft:ready', ?, ?, 'implement-issue', ?, ?, 'queued', 0, ?, ?)`,
   ).run(id, envelope.eventId, issue, o.pool ?? 'general', JSON.stringify(envelope), createdAt, createdAt);
   return id;
 }
@@ -65,8 +70,8 @@ afterEach(() => {
   for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-function makePaths(): FactoryPaths {
-  const root = mkdtempSync(join(tmpdir(), 'factory daemon '));
+function makePaths(): UpdraftPaths {
+  const root = mkdtempSync(join(tmpdir(), 'updraft daemon '));
   tmpDirs.push(root);
   const configDir = join(root, 'my config');
   const logDir = join(root, 'state and logs', 'logs');
@@ -173,7 +178,7 @@ describe('runDaemon', () => {
     expect(run.outcome).toBe('succeeded');
     expect(run.log_path).toBe(join(deps.paths.runsDir, run.id, 'run.log'));
     const text = readFileSync(run.log_path, 'utf8');
-    expect(text).toContain('Live execution is disabled');
+    expect(text).toContain('mode: log-only. No agent process was started');
     expect(text).toContain(`prompt: ${join(deps.paths.configDir, 'prompts', 'implement issue.md')}\n`);
     expect(text).toContain('agent: claude (adapter claude)');
     expect(text).toContain('pool: general');
@@ -233,7 +238,7 @@ describe('runDaemon', () => {
         terminated.push(pid);
       },
     };
-    const issue = { title: 'T', body: 'B', labels: ['factory:ready'], url: 'u' };
+    const issue = { title: 'T', body: 'B', labels: ['updraft:ready'], url: 'u' };
     const deps = baseDeps(db, {
       executor,
       processControl,
@@ -270,7 +275,7 @@ describe('runDaemon', () => {
       executor: { name: 'spy', execute },
       checkDispatchable: async (job) => {
         checked.push(job);
-        return { ok: false, reason: 'issue no longer has the factory:ready label' };
+        return { ok: false, reason: 'issue no longer has the updraft:ready label' };
       },
     });
     const id = insertJob(db);
@@ -281,7 +286,7 @@ describe('runDaemon', () => {
 
     expect(execute).not.toHaveBeenCalled();
     expect(checked.map((j) => j.id)).toEqual([id]);
-    expect(getJob(db, id)?.statusReason).toBe('issue no longer has the factory:ready label');
+    expect(getJob(db, id)?.statusReason).toBe('issue no longer has the updraft:ready label');
     const run = db.prepare('SELECT outcome, ended_at FROM runs WHERE job_id = ?').get(id) as { outcome: string | null; ended_at: string | null };
     expect(run.outcome).toBeNull();
     expect(run.ended_at).not.toBeNull();
@@ -337,6 +342,122 @@ describe('runDaemon', () => {
     const passingRun = db.prepare('SELECT id FROM runs WHERE job_id = ?').get(passing) as { id: string };
     expect(published).toEqual([{ runId: passingRun.id, outcome: 'succeeded' }]);
     expect(retries).toBeGreaterThanOrEqual(1);
+  });
+
+  it('hands failed and start_failed runs to the failure commenter, after recording them, and retries after each poll', async () => {
+    const db = openDatabase(':memory:');
+    const outcomes: Record<number, ExecutionResult> = {
+      1: { outcome: 'failed', error: 'tests failed' },
+      2: { outcome: 'succeeded' },
+      3: { outcome: 'start_failed', error: 'agent CLI not found' },
+      4: { outcome: 'interrupted', error: 'worker stopped' },
+    };
+    const started = new Map<number, number>();
+    const executor: Executor = {
+      name: 'mixed',
+      execute: async (c): Promise<ExecutionResult> => {
+        const n = (started.get(c.job.issueNumber) ?? 0) + 1;
+        started.set(c.job.issueNumber, n);
+        // The requeued start failure succeeds on the next agent.
+        return c.job.issueNumber === 3 && n > 1 ? { outcome: 'succeeded' } : outcomes[c.job.issueNumber]!;
+      },
+    };
+    const seen: Array<{ issue: number; outcome: string | null; jobStatus: string | undefined }> = [];
+    let retries = 0;
+    const failureCommenter = {
+      afterRun: async (runId: string) => {
+        const run = getRun(db, runId)!;
+        const job = getJob(db, run.jobId)!;
+        seen.push({ issue: job.issueNumber, outcome: run.outcome, jobStatus: job.status });
+      },
+      retryDue: async () => {
+        retries++;
+      },
+    };
+    const deps = baseDeps(db, { executor, failureCommenter, config: makeConfig({ maxConcurrent: 1 }) });
+    const jobs = [1, 2, 3, 4].map((issue) => insertJob(db, { issue }));
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(jobs.map((j) => getJob(db, j)?.status)).toEqual(['failed', 'succeeded', 'succeeded', 'interrupted']));
+    deps.controller.abort();
+    await done;
+    expect(seen).toEqual([
+      { issue: 1, outcome: 'failed', jobStatus: 'failed' },
+      { issue: 3, outcome: 'start_failed', jobStatus: 'queued' },
+    ]);
+    expect(retries).toBeGreaterThanOrEqual(1);
+  });
+
+  it('with commentOnFailure, comments once when a job ends failed and not when it is requeued, canceled or interrupted', async () => {
+    const db = openDatabase(':memory:');
+    const config = makeConfig({
+      execution: { mode: 'live' },
+      repositories: {
+        'owner/repo': {
+          id: 1,
+          commentOnFailure: true,
+          workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
+        },
+      },
+    });
+    const comments: Array<{ issue: number; body: string }> = [];
+    const api = {
+      listIssueComments: async (_repo: unknown, issue: number) => comments.filter((c) => c.issue === issue).map((c, i) => ({ id: i, htmlUrl: 'u', body: c.body, user: 'allen' })),
+      createIssueComment: async (_repo: unknown, issue: number, body: string) => {
+        comments.push({ issue, body });
+        return { id: comments.length, htmlUrl: `https://github.com/owner/repo/issues/${issue}#issuecomment-${comments.length}`, body, user: 'allen' };
+      },
+    } as unknown as GitHubApi;
+    const stuck = deferred<ExecutionResult>();
+    const executor: Executor = {
+      name: 'mixed',
+      execute: async (c): Promise<ExecutionResult> => {
+        switch (c.job.issueNumber) {
+          case 1:
+            return { outcome: 'failed', error: 'agent exited with code 1: the agent said SECRET' };
+          case 2:
+            throw new StartFailedError(`${c.run.agent} cannot start: agent CLI not found`);
+          case 4:
+            return stuck.promise;
+          default:
+            return { outcome: 'succeeded' };
+        }
+      },
+    };
+    const paths = makePaths();
+    const deps = baseDeps(db, {
+      executor,
+      config,
+      paths,
+      checkDispatchable: async (job) => (job.issueNumber === 3 ? { ok: false, reason: 'issue was closed' } : { ok: true }),
+      failureCommenter: createFailureCommenter({ db, config, paths, api, log: silentLogger }),
+      timing: { shutdownTimeoutMs: 20, interruptGraceMs: 20 },
+    });
+    const [failing, unstartable, canceled, hanging] = [1, 2, 3, 4].map((issue) => insertJob(db, { issue }));
+    const done = runDaemon(deps);
+    await vi.waitFor(() =>
+      expect([failing, unstartable, canceled, hanging].map((j) => getJob(db, j!)?.status)).toEqual(['failed', 'failed', 'canceled', 'running']),
+    );
+    await vi.waitFor(() => expect(comments).toHaveLength(2));
+    deps.controller.abort();
+    await done;
+    stuck.resolve({ outcome: 'interrupted' });
+    expect(getJob(db, hanging!)?.status).toBe('interrupted');
+
+    // One comment per failed job: the failed run, and the last of the start failures.
+    expect(comments.map((c) => c.issue).sort()).toEqual([getJob(db, failing!)!.issueNumber, getJob(db, unstartable!)!.issueNumber]);
+    const failed = comments.find((c) => c.issue === 1)!.body;
+    expect(failed).toContain('agent exited with code 1');
+    expect(failed).not.toContain('SECRET');
+    expect(failed).toContain(`updraft retry ${failing}`);
+    const startRuns = db.prepare('SELECT id FROM runs WHERE job_id = ? ORDER BY attempt').all(unstartable!) as { id: string }[];
+    expect(startRuns).toHaveLength(MAX_START_FAILURES);
+    const noStart = comments.find((c) => c.issue === 2)!.body;
+    expect(noStart).toContain(`no agent could start after ${MAX_START_FAILURES} consecutive attempts`);
+    expect(noStart).toContain(`<!-- updraft-run-failed: ${startRuns.at(-1)!.id} -->`);
+    expect(db.prepare("SELECT run_id, state FROM failure_comments ORDER BY issue_number").all()).toEqual([
+      { run_id: (db.prepare('SELECT id FROM runs WHERE job_id = ?').get(failing!) as { id: string }).id, state: 'posted' },
+      { run_id: startRuns.at(-1)!.id, state: 'posted' },
+    ]);
   });
 
   it('records poll failures and keeps running', async () => {
@@ -543,5 +664,164 @@ describe('runDaemon: lock ownership', () => {
     expect(() => claimNextJob(db, makeConfig(), opts)).toThrow(WorkerLockLostError);
     expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 0 });
     expect(claimNextJob(db, makeConfig(), { ...opts, workerId: 'wrk_new', lockWorkerId: 'wrk_new' })).not.toBeNull();
+  });
+});
+
+describe('runDaemon: updraft cancel', () => {
+  const noPublisher = () => {
+    const published: string[] = [];
+    return {
+      published,
+      publisher: {
+        afterRun: async (runId: string) => {
+          published.push(runId);
+        },
+        retryDue: async () => {},
+      },
+    };
+  };
+
+  it('stops a running run the way a shutdown does, and records the run and job as canceled', async () => {
+    const db = openDatabase(':memory:');
+    const executing = deferred<void>();
+    const stops: Array<{ byUser: boolean; reason: unknown; workerStopping: boolean }> = [];
+    const executor: Executor = {
+      name: 'stoppable',
+      // Like the live executor: stop on the run's signal and report the stop as 'interrupted'.
+      execute: (_c, ctx) =>
+        new Promise<ExecutionResult>((resolve) => {
+          ctx.signal.addEventListener('abort', () => {
+            stops.push({ byUser: canceledByUser(ctx.signal), reason: ctx.signal.reason, workerStopping: Boolean(ctx.workerStopping?.aborted) });
+            resolve({ outcome: 'interrupted', error: 'canceled by user before the run finished; the agent process tree was stopped' });
+          });
+          executing.resolve();
+        }),
+    };
+    const { published, publisher } = noPublisher();
+    const deps = baseDeps(db, { executor, publisher, timing: { cancelCheckMs: 10, shutdownTimeoutMs: 20, interruptGraceMs: 20 } });
+    const id = insertJob(db);
+    const other = insertJob(db);
+    const done = runDaemon(deps);
+    await executing.promise;
+    await vi.waitFor(() => expect(getJob(db, other)?.status).toBe('running'));
+
+    expect(requestJobCancel(db, id)).toMatchObject({ kind: 'requested', alreadyRequested: false });
+    await vi.waitFor(() => expect(getJob(db, id)?.status).toBe('canceled'));
+    // Only the canceled run was stopped, and by its own signal rather than a worker shutdown.
+    expect(stops).toEqual([{ byUser: true, reason: CANCELED_BY_USER, workerStopping: false }]);
+    expect(getJob(db, other)?.status).toBe('running');
+    expect(getJob(db, id)).toMatchObject({ statusReason: CANCELED_BY_USER, attempts: 1 });
+    const runs = db.prepare('SELECT outcome, error, ended_at FROM runs WHERE job_id = ?').all(id) as Array<{
+      outcome: string | null;
+      error: string;
+      ended_at: string | null;
+    }>;
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ outcome: null, error: CANCELED_BY_USER });
+    expect(runs[0]?.ended_at).not.toBeNull();
+
+    deps.controller.abort();
+    await done;
+    // Not requeued, not published, and no error row for a deliberate cancel.
+    expect(getJob(db, id)?.status).toBe('canceled');
+    expect(published).toEqual([]);
+    expect(db.prepare('SELECT count(*) AS n FROM errors WHERE job_id = ?').get(id)).toEqual({ n: 0 });
+  });
+
+  it('a cancel that races with the run succeeding on its own ends canceled and is not published', async () => {
+    const db = openDatabase(':memory:');
+    const executing = deferred<void>();
+    const agent = deferred<ExecutionResult>();
+    const { published, publisher } = noPublisher();
+    const deps = baseDeps(db, {
+      publisher,
+      // The check never fires here: the request is only seen when the run is recorded.
+      timing: { cancelCheckMs: 60_000 },
+      executor: {
+        name: 'finishing',
+        execute: async () => {
+          executing.resolve();
+          return agent.promise;
+        },
+      },
+    });
+    const id = insertJob(db);
+    const done = runDaemon(deps);
+    await executing.promise;
+    expect(requestJobCancel(db, id).kind).toBe('requested');
+    agent.resolve({ outcome: 'succeeded' });
+    await vi.waitFor(() => expect(getJob(db, id)?.status).toBe('canceled'));
+    deps.controller.abort();
+    await done;
+    expect(db.prepare('SELECT outcome, error FROM runs WHERE job_id = ?').get(id)).toEqual({
+      outcome: null,
+      error: `${CANCELED_BY_USER} (the run had already ended: succeeded)`,
+    });
+    expect(published).toEqual([]);
+  });
+
+  it('a cancel during the pre-start check keeps the agent from starting and does not requeue the job', async () => {
+    const db = openDatabase(':memory:');
+    const checking = deferred<void>();
+    const check = deferred<{ ok: true }>();
+    const execute = vi.fn(async (): Promise<ExecutionResult> => ({ outcome: 'succeeded' }));
+    const deps = baseDeps(db, {
+      executor: { name: 'spy', execute },
+      checkDispatchable: async () => {
+        checking.resolve();
+        return check.promise;
+      },
+    });
+    const id = insertJob(db);
+    const done = runDaemon(deps);
+    await checking.promise;
+    expect(requestJobCancel(db, id).kind).toBe('requested');
+    check.resolve({ ok: true });
+    await vi.waitFor(() => expect(getJob(db, id)?.status).toBe('canceled'));
+    deps.controller.abort();
+    await done;
+    expect(execute).not.toHaveBeenCalled();
+    expect(getJob(db, id)).toMatchObject({ statusReason: CANCELED_BY_USER, attempts: 1 });
+    expect(db.prepare('SELECT outcome, execution_started_at, error FROM runs WHERE job_id = ?').all(id)).toEqual([
+      { outcome: null, execution_started_at: null, error: `canceled before start: ${CANCELED_BY_USER}` },
+    ]);
+  });
+
+  it('a worker that takes over a run with a pending cancel records it canceled, not interrupted', async () => {
+    const db = openDatabase(':memory:');
+    const executing = deferred<void>();
+    const agent = deferred<ExecutionResult>();
+    const a = baseDeps(db, {
+      workerId: 'wrk_a',
+      pid: 5000,
+      timing: { cancelCheckMs: 60_000 }, // A stops responding before it sees the request
+      executor: {
+        name: 'slow',
+        execute: async () => {
+          executing.resolve();
+          return agent.promise;
+        },
+      },
+    });
+    const id = insertJob(db);
+    const doneA = runDaemon(a);
+    await executing.promise;
+    expect(requestJobCancel(db, id).kind).toBe('requested');
+
+    const b = baseDeps(db, {
+      workerId: 'wrk_b',
+      pid: 6000,
+      processControl: { isAlive: (p) => p !== 5000, startTime: async () => null, terminate: async () => {} },
+    });
+    b.controller.abort(); // take over and reconcile only
+    await runDaemon(b);
+    expect(getJob(db, id)).toMatchObject({ status: 'canceled', statusReason: CANCELED_BY_USER });
+    // The run now belongs to nobody the CLI could ask; a second cancel says the job is done.
+    expect(requestJobCancel(db, id).kind).toBe('terminal');
+
+    agent.resolve({ outcome: 'succeeded' });
+    await doneA;
+    expect(getJob(db, id)?.status).toBe('canceled');
+    expect(db.prepare('SELECT outcome FROM runs WHERE job_id = ?').all(id)).toEqual([{ outcome: null }]);
   });
 });

@@ -12,10 +12,10 @@ const isolatedEnv = (root: string): NodeJS.ProcessEnv => {
     ...process.env,
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: globalConfig,
-    GIT_AUTHOR_NAME: 'Factory Test',
-    GIT_AUTHOR_EMAIL: 'factory@example.com',
-    GIT_COMMITTER_NAME: 'Factory Test',
-    GIT_COMMITTER_EMAIL: 'factory@example.com',
+    GIT_AUTHOR_NAME: 'Updraft Test',
+    GIT_AUTHOR_EMAIL: 'updraft@example.com',
+    GIT_COMMITTER_NAME: 'Updraft Test',
+    GIT_COMMITTER_EMAIL: 'updraft@example.com',
   };
 };
 
@@ -33,7 +33,7 @@ export interface GitFixture {
 }
 
 export function createGitFixture(fullName = 'octo/widgets', defaultBranch = 'main'): GitFixture {
-  const root = mkdtempSync(join(tmpdir(), 'factory git '));
+  const root = mkdtempSync(join(tmpdir(), 'updraft git '));
   const env = isolatedEnv(root);
   const git = (cwd: string, ...args: string[]) =>
     execFileSync('git', args, { cwd, env, encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim();

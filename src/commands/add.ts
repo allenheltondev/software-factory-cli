@@ -1,6 +1,6 @@
 import { configExists, readRawConfig, saveConfig } from '../config/io.js';
 import { writeStarterPrompts } from '../config/prompts.js';
-import type { FactoryConfigInput } from '../config/schema.js';
+import type { UpdraftConfigInput } from '../config/schema.js';
 import { validateConfig } from '../config/validate.js';
 import { labelEquals } from '../routing.js';
 import {
@@ -31,17 +31,17 @@ export interface AddOptions {
 const REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 
 /** Read the existing config for editing; refuses to edit an invalid one. */
-export function loadEditableConfig(path: string): FactoryConfigInput | null {
+export function loadEditableConfig(path: string): UpdraftConfigInput | null {
   if (!configExists(path)) return null;
   const raw = readRawConfig(path);
   const result = validateConfig(raw);
   if (!result.ok) {
     throw new CliError(
-      `The config at ${path} is invalid; fix it first ("factory validate" lists the problems).`,
+      `The config at ${path} is invalid; fix it first ("updraft validate" lists the problems).`,
       EXIT.FAILURE,
     );
   }
-  return raw as FactoryConfigInput;
+  return raw as UpdraftConfigInput;
 }
 
 export async function addCommand(ctx: CommandContext, repoArg: string, opts: AddOptions): Promise<number> {
