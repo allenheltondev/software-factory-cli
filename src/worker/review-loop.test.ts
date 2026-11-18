@@ -223,8 +223,9 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(posted[0]!.body).toContain('**Updraft review: changes requested**');
     expect(posted[0]!.body).toContain(reviewMarker(runOf(review1).id));
     expect(posted[1]!.body).toContain('**Updraft review: ready to merge**');
-    // The findings are inert: the mention and the closing keyword sit inside a code fence.
-    expect(posted[0]!.body).toMatch(/```text\n[\s\S]*@octocat says this closes #1[\s\S]*\n```/);
+    // The findings are inert: the mention is broken up.
+    expect(posted[0]!.body).toContain('@\u200Boctocat says this closes \u200B#1');
+    expect(posted[0]!.body).not.toContain('@octocat');
 
     // The second reviewer was given the first review's findings and both commits to diff.
     const reviewPrompt = readFileSync(join(paths.runsDir, runOf(review2).id, 'prompt.md'), 'utf8');

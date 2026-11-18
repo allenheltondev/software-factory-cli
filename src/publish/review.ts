@@ -44,10 +44,10 @@ import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type Revi
 import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
 import { evaluateAutoMerges, postMergeNotices } from './merge.js';
+import { safeMarkdown } from './markdown.js';
 import {
   cap,
   classifyFailure,
-  fenced,
   inline,
   PUBLISH_ATTEMPT_SECONDS,
   PUBLISH_LEASE_SECONDS,
@@ -60,6 +60,7 @@ import {
 const BASE_BACKOFF_SECONDS = 60;
 const MAX_BACKOFF_SECONDS = 60 * 60;
 const MAX_BODY = 60_000;
+const MAX_FINDINGS = 50_000;
 
 export type ReviewPostResult =
   /** The review is on the PR and the verdict was acted on (see `review.outcome`). */
@@ -84,8 +85,8 @@ const VERDICT_WORDS: Record<ReviewVerdict, string> = { 'ready-to-merge': 'ready 
 
 /**
  * The body of the comment review: the verdict, the reviewed commit, the reviewing agent and the
- * findings. The findings are an agent's text about untrusted code, so they are fenced: mentions,
- * links and closing keywords in them stay inert, as in the PR body.
+ * findings. The findings are an agent's text about untrusted code, so they are rendered as
+ * sanitized Markdown: mentions, closing keywords and HTML comments in them stay inert.
  */
 export function renderReview(o: {
   runId: string;
@@ -105,7 +106,7 @@ export function renderReview(o: {
     '',
     '**Findings**',
     '',
-    fenced(o.findings.trim() || '(the reviewer wrote no findings)'),
+    safeMarkdown(o.findings.trim() || '(the reviewer wrote no findings)', MAX_FINDINGS),
     '',
     o.next,
   ].join('\n');

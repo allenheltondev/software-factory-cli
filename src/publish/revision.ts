@@ -44,6 +44,7 @@ import { GitHubError, type GitHubIssueComment } from '../github/api.js';
 import { revisionOf, type Job, type Revision, type RevisionRequest, type Run, type RunSummary } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
+import { safeMarkdown } from './markdown.js';
 import {
   cap,
   classifyFailure,
@@ -135,7 +136,7 @@ export function renderNoChangeReply(o: { runId: string; agent: string; review: R
       '',
       "**The agent's final message**",
       '',
-      fenced(cap(o.summary.lastOutput.join('\n').trim() || '(no output)', MAX_FINAL_MESSAGE)),
+      safeMarkdown(o.summary.lastOutput.join('\n').trim() || '(no output)', MAX_FINAL_MESSAGE),
     ],
     revisionMarker(o.runId),
   );

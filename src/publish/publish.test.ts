@@ -1066,10 +1066,10 @@ describe('helpers', () => {
       },
     });
     expect(body.startsWith('Closes #3\n')).toBe(true);
-    // The final message is inside a fence longer than any backtick run in it.
-    expect(body).toContain('`````text\ndone ```` tricky');
+    // The final message is Markdown in a blockquote; its forged marker is broken, the worker's is not.
+    expect(body).toContain('> done ```` tricky');
+    expect(body).not.toContain('<!-- updraft-run: run_other -->');
     expect(body.match(/<!-- updraft-run: run_x -->/g)).toHaveLength(1);
-    expect(body.indexOf('closes #9')).toBeGreaterThan(body.indexOf('```text'));
   });
 });
 
