@@ -12,6 +12,7 @@ import { logsCommand, type LogsOptions } from './logs.js';
 import { publishCommand } from './publish.js';
 import { retryCommand } from './retry.js';
 import { reviewsCommand, type ReviewsOptions } from './reviews.js';
+import { runEventCommand, type RunEventOptions } from './run-event.js';
 import { startCommand } from './start.js';
 import { statusCommand } from './status.js';
 import { validateCommand } from './validate.js';
@@ -21,6 +22,7 @@ export interface Handlers {
   add(ctx: CommandContext, repo: string, opts: AddOptions): Promise<number>;
   validate(ctx: CommandContext): Promise<number>;
   start(ctx: CommandContext): Promise<number>;
+  runEvent(ctx: CommandContext, opts: RunEventOptions): Promise<number>;
   status(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   doctor(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   retry(ctx: CommandContext, jobId: string): Promise<number>;
@@ -37,6 +39,7 @@ export const defaultHandlers: Handlers = {
   add: addCommand,
   validate: validateCommand,
   start: (ctx) => startCommand(ctx),
+  runEvent: (ctx, opts) => runEventCommand(ctx, opts),
   status: statusCommand,
   doctor: (ctx, opts) => doctorCommand(ctx, opts),
   retry: (ctx, jobId) => retryCommand(ctx, jobId),
@@ -109,6 +112,17 @@ export function buildProgram(opts: ProgramOptions): Command {
     .command('start')
     .description('Run the worker: poll GitHub and process the queue (non-interactive)')
     .action(() => exec((ctx) => handlers.start(ctx)));
+
+  program
+    .command('run-event')
+    .description('Handle one GitHub webhook event to the end, then exit: run its job, verify, publish (no polling; see docs/run-event.md)')
+    .requiredOption('--event-file <path>', 'file holding the webhook payload (the JSON body GitHub POSTs)')
+    .option('--event-name <name>', 'the X-GitHub-Event header of the delivery', 'issues')
+    .option('--delivery-id <id>', 'the X-GitHub-Delivery header, for the logs and the summary')
+    .option('--deadline-minutes <n>', 'stop everything, a running agent included, after this many minutes')
+    .option('--worker-git-credentials', "fetch with the worker's GitHub credentials even into a clone run-event did not create")
+    .addOption(new Option('--json', 'print one JSON summary object on stdout'))
+    .action((o: RunEventOptions) => exec((ctx) => handlers.runEvent(ctx, o)));
 
   program
     .command('status')

@@ -64,6 +64,8 @@ export interface DaemonTiming {
   shutdownTimeoutMs?: number;
   /** After signalling unfinished runs to stop, how long to wait before marking them interrupted. Default 5s. */
   interruptGraceMs?: number;
+  /** Time between polls (and so between retry passes). Default config.pollIntervalSeconds. */
+  pollMs?: number;
 }
 
 export interface DaemonDeps {
@@ -77,6 +79,12 @@ export interface DaemonDeps {
   checkDispatchable: (job: Job) => Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }>;
   /** Abort to stop gracefully (SIGINT/SIGTERM). */
   signal: AbortSignal;
+  /**
+   * Drain mode (src/worker/drain.ts, behind `updraft run-event`): asked after each pass that
+   * leaves nothing in flight, that is, with no run executing, being published or being commented
+   * on. Returning true ends the loop as an abort would. Absent: the worker runs until aborted.
+   */
+  idle?: () => boolean;
   now?: () => number;
   /** Defaults to the log-only executor. */
   executor?: Executor;
@@ -172,7 +180,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const leaseSeconds = deps.timing?.leaseSeconds ?? Math.ceil((2 * WORKER_STALE_MS) / 1000);
   const shutdownTimeoutMs = deps.timing?.shutdownTimeoutMs ?? 20_000;
   const interruptGraceMs = deps.timing?.interruptGraceMs ?? 5_000;
-  const pollMs = config.pollIntervalSeconds * 1000;
+  const pollMs = deps.timing?.pollMs ?? config.pollIntervalSeconds * 1000;
   const log = deps.log.child({ workerId });
 
   const safeRecordError = (scope: string, msg: string, extra: { jobId?: string; repoFullName?: string } = {}) => {
@@ -435,6 +443,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       if (signal.aborted) break;
 
       await startJobs();
+      if (deps.idle && inFlight.size === 0 && !signal.aborted && !lockLost && deps.idle()) break;
 
       // Bounded by heartbeatMs so a stalled clock or missed notify can't park the loop.
       await wake.wait(Math.min(nextPollAt - now(), heartbeatMs), signal);

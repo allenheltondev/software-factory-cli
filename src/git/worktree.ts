@@ -151,6 +151,12 @@ export interface PrepareRequest {
   /** Aborts network operations (ls-remote, fetch). */
   signal?: AbortSignal;
   /**
+   * Environment for the network operations only (ls-remote, fetch): how the worker's own GitHub
+   * credentials reach git when the machine has none (src/git/clone.ts). Default: the worker's
+   * environment, so git uses the machine's credentials.
+   */
+  networkEnv?: NodeJS.ProcessEnv | undefined;
+  /**
    * Called as soon as the job's worktree exists, including when `git worktree add` created it
    * and then failed (e.g. a post-checkout hook exited non-zero), so the run can record it.
    */
@@ -215,7 +221,7 @@ export function prepareJobWorktree(req: PrepareRequest): Promise<PreparedWorktre
     if (!selection.ok) throw new PrepareError(`${checkoutPath}: ${selection.error}`);
     const remote = selection.remote;
 
-    const net: GitOptions = { ...opts, signal: req.signal };
+    const net: GitOptions = { ...opts, signal: req.signal, ...(req.networkEnv ? { env: req.networkEnv } : {}) };
     const baseBranch = req.baseBranch ?? (await remoteDefaultBranch(remote.name, net));
     await assertValidBranchName(baseBranch, opts);
     await assertValidBranchName(branch, opts);
