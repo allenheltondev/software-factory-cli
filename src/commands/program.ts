@@ -171,7 +171,7 @@ export function buildProgram(opts: ProgramOptions): Command {
     .command('stats')
     .description('Show how the factory is doing: work done, time taken, outcomes, reviews and revisions (read-only; see docs/stats.md)')
     .addOption(new Option('--json', 'machine-readable output'))
-    .option('--since <age>', 'window: a number and a unit (h, d, w), or "all"', '30d')
+    .option('--since <age>', 'window: a number and a unit (h, d, w), "today" (since local midnight), or "all"', '30d')
     .option('--repo <owner/repo>', 'only this repository')
     .action((o: StatsOptions) => exec((ctx) => handlers.stats(ctx, o)));
 
