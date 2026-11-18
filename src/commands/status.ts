@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { configSchema, type FactoryConfig } from '../config/schema.js';
+import type { FailureComment } from '../db/failure-comments.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
 import type { JobStatus, Publication } from '../types.js';
 import { println, type CommandContext } from './context.js';
@@ -89,6 +90,22 @@ export function renderPublication(p: Publication): string {
   }
 }
 
+/** One line: the failure comment on the issue, or why there is none. */
+export function renderFailureComment(c: FailureComment): string {
+  switch (c.state) {
+    case 'posted':
+      return `failure comment posted: ${c.commentUrl ?? `on issue #${c.issueNumber}`}`;
+    case 'posting':
+      return `posting the failure comment (attempt ${c.attempts})`;
+    case 'skipped':
+      return `failure comment not posted: ${oneLine(c.error ?? 'no longer applies', 140)}`;
+    case 'failed': {
+      const next = c.nextAttemptAt ? `worker retries at ${c.nextAttemptAt}` : 'the worker will not retry it';
+      return `failure comment not posted (attempt ${c.attempts}): ${oneLine(c.error ?? 'unknown error', 140)} — ${next}`;
+    }
+  }
+}
+
 export function renderStatus(v: StatusView): string {
   const s = v.snapshot;
   const lines: string[] = [];
@@ -156,6 +173,8 @@ export function renderStatus(v: StatusView): string {
 
   const publications = s.publications ?? [];
   const pubByRun = new Map(publications.map((p) => [p.runId, p]));
+  const failureComments = s.failureComments ?? [];
+  const failureCommentByRun = new Map(failureComments.map((c) => [c.runId, c]));
   if (s.recentAgentRuns.length) {
     lines.push('', 'Recent agent runs:');
     for (const { run, job } of s.recentAgentRuns) {
@@ -169,6 +188,8 @@ export function renderStatus(v: StatusView): string {
       if (last) lines.push(`    last output: ${oneLine(last, 120)}`);
       const pub = pubByRun.get(run.id);
       if (pub) lines.push(`    ${renderPublication(pub)}`);
+      const failureComment = failureCommentByRun.get(run.id);
+      if (failureComment) lines.push(`    ${renderFailureComment(failureComment)}`);
     }
   }
 
@@ -177,6 +198,15 @@ export function renderStatus(v: StatusView): string {
     for (const p of publications) {
       lines.push(`  ${p.runId}  ${p.state.padEnd(10)}  ${p.repoFullName}#${p.issueNumber}  ${p.branch}  updated ${p.updatedAt}`);
       lines.push(`    ${renderPublication(p)}`);
+    }
+  }
+
+  // Its own section too: a run that failed before its agent started is not among the agent runs.
+  if (failureComments.length) {
+    lines.push('', 'Failure comments:');
+    for (const c of failureComments) {
+      lines.push(`  ${c.runId}  ${c.state.padEnd(7)}  ${c.repoFullName}#${c.issueNumber}  updated ${c.updatedAt}`);
+      lines.push(`    ${renderFailureComment(c)}`);
     }
   }
 

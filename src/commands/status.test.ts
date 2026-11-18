@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { FailureComment } from '../db/failure-comments.js';
 import type { StatusSnapshot } from '../db/queue.js';
 import type { Job, Publication } from '../types.js';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
 import { configSchema } from '../config/schema.js';
 import { fakeContext } from './fakes.js';
-import { buildStatusView, emptyConfig, renderPublication, renderStatus, statusCommand } from './status.js';
+import { buildStatusView, emptyConfig, renderFailureComment, renderPublication, renderStatus, statusCommand } from './status.js';
 
 const emptySnapshot = (): StatusSnapshot => ({
   worker: null,
@@ -158,6 +159,72 @@ describe('renderStatus', () => {
       'publication failed (attempt 1; branch pushed): GitHub is unavailable for now: 502 — worker retries at t10, or run "factory publish run_bad"',
     );
     expect(renderPublication({ ...publications[1]!, state: 'skipped', error: 'no commits' })).toBe('not published: no commits');
+  });
+
+  it('shows each failure comment: where it was posted, or why it was not', () => {
+    const base: FailureComment = {
+      runId: 'run_f1',
+      jobId: 'job_1',
+      repoId: 1,
+      repoFullName: 'o/a',
+      issueNumber: 12,
+      state: 'posted',
+      commentId: 9,
+      commentUrl: 'https://github.com/o/a/issues/12#issuecomment-9',
+      error: null,
+      retryable: false,
+      attempts: 1,
+      leaseExpiresAt: null,
+      nextAttemptAt: null,
+      createdAt: 't',
+      updatedAt: 't9',
+      postedAt: 't9',
+    };
+    const waiting: FailureComment = {
+      ...base,
+      runId: 'run_f2',
+      state: 'failed',
+      commentId: null,
+      commentUrl: null,
+      error: 'GitHub is unavailable for now: 502',
+      retryable: true,
+      nextAttemptAt: 't10',
+      postedAt: null,
+    };
+    const snapshot: StatusSnapshot = {
+      ...emptySnapshot(),
+      recentAgentRuns: [
+        {
+          run: {
+            id: 'run_f1',
+            outcome: 'failed',
+            agent: 'claude',
+            endedAt: 't8',
+            summary: { commitCount: 0, filesChanged: 0, diffStat: 'no changes', untracked: 0, worktree: '/w', branch: 'b', lastOutput: [] },
+          } as never,
+          job: job({ status: 'failed' }),
+        },
+      ],
+      failureComments: [base, waiting],
+    };
+    const text = renderStatus(
+      buildStatusView({ configPath: '/c', configState: 'ok', configMessage: null, config: null, dbFile: '/d', dbExists: true, snapshot }),
+    );
+    // Under the run, and in a section of its own (a run that failed before its agent started has no summary).
+    expect(text).toContain('    worktree /w (branch b)\n    failure comment posted: https://github.com/o/a/issues/12#issuecomment-9');
+    expect(text).toContain('Failure comments:');
+    expect(text).toMatch(/run_f2  failed  +o\/a#12  updated t9/);
+    expect(text).toContain('failure comment not posted (attempt 1): GitHub is unavailable for now: 502 — worker retries at t10');
+    expect(renderFailureComment({ ...waiting, retryable: false, nextAttemptAt: null, error: 'cannot comment' })).toBe(
+      'failure comment not posted (attempt 1): cannot comment — the worker will not retry it',
+    );
+    expect(renderFailureComment({ ...waiting, state: 'skipped', error: 'job job_1 is queued now, not failed' })).toBe(
+      'failure comment not posted: job job_1 is queued now, not failed',
+    );
+    expect(renderFailureComment({ ...waiting, state: 'posting', attempts: 2 })).toBe('posting the failure comment (attempt 2)');
+    expect(renderStatus(buildStatusView({ configPath: '/c', configState: 'ok', configMessage: null, config: null, dbFile: '/d', dbExists: true, snapshot: emptySnapshot() }))).not.toContain(
+      'Failure comments',
+    );
   });
 
   it('renders an empty state with a missing config', () => {

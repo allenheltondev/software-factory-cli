@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { FactoryConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
 import type { Job, JobStatus, Publication, Run, RunOutcome, RunSummary } from '../types.js';
+import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
 import { listRecentPublications } from './publications.js';
 import { newId, nowIso } from '../util/ids.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
@@ -443,6 +444,8 @@ export interface StatusSnapshot {
   checkpoints: Array<{ repoId: number; fullName: string; lastEventId: number | null; updatedAt: string }>;
   /** Recent publications (pushed branches and PRs), newest first. */
   publications?: Publication[];
+  /** Recent failure comments (posted, pending or not posted), newest first. */
+  failureComments?: FailureComment[];
 }
 
 export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => number): StatusSnapshot {
@@ -515,5 +518,7 @@ export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => num
 
   const publications = listRecentPublications(db, 10);
 
-  return { worker, counts, agents, activeRuns, recentJobs, recentAgentRuns, recentErrors, checkpoints, publications };
+  const failureComments = listRecentFailureComments(db, 10);
+
+  return { worker, counts, agents, activeRuns, recentJobs, recentAgentRuns, recentErrors, checkpoints, publications, failureComments };
 }

@@ -125,6 +125,11 @@ export const repositorySchema = z.strictObject({
    * branch and open a PR as the active gh account. Default none (the branch stays local).
    */
   publish: z.enum(PUBLISH_MODES).optional(),
+  /**
+   * Live mode: when a run leaves its job failed, comment on the issue as the active gh account
+   * (run id, agent, duration, reason, how to retry; never agent output). Default false.
+   */
+  commentOnFailure: z.boolean().optional(),
   workflows: z.array(workflowSchema).min(1),
 });
 

@@ -33,6 +33,27 @@ describe('validateConfig', () => {
     expect(validateConfig(cfg).ok).toBe(false);
   });
 
+  it('defaults commentOnFailure to off and warns when it is set outside live mode', () => {
+    const repo = 'allenheltondev/kids-and-dragons';
+    const plain = validateConfig(example());
+    expect(plain.ok && plain.config.repositories[repo]?.commentOnFailure).toBeUndefined();
+
+    const cfg = example();
+    cfg.repositories[repo].commentOnFailure = true;
+    const r = validateConfig(cfg);
+    expect(r.ok).toBe(true);
+    expect(r.warnings).toContainEqual({
+      path: `repositories.${repo}.commentOnFailure`,
+      message: 'only applies in live mode; in log-only mode no comment is posted when a run fails',
+    });
+
+    cfg.repositories[repo].commentOnFailure = false;
+    expect(validateConfig(cfg).warnings.some((w) => w.path.endsWith('.commentOnFailure'))).toBe(false);
+
+    cfg.repositories[repo].commentOnFailure = 'yes';
+    expect(validateConfig(cfg).ok).toBe(false);
+  });
+
   it('rejects dangling references', () => {
     const cfg = example();
     cfg.pools.general.agents.push('nobody');

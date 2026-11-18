@@ -3,6 +3,7 @@ import { loadConfig } from '../config/io.js';
 import type { Db } from '../db/database.js';
 import { resolveGitHubToken } from '../github/client.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
+import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled } from '../publish/publish.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import { runDaemon, type DaemonDeps } from '../worker/daemon.js';
@@ -95,6 +96,9 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
               env: ctx.env,
             }),
           }
+        : {}),
+      ...(failureCommentsEnabled(config)
+        ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }) }) }
         : {}),
     });
     log.info('worker stopped');

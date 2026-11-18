@@ -254,6 +254,46 @@ describe('runDoctor', () => {
     }
   });
 
+  it('checks what a failure comment needs for repos with commentOnFailure: read access and a repository that is not archived', async () => {
+    const restore = (['codex', 'claude', 'kiro'] as const).map((name) => registerAdapter(fakeAdapter({ name })));
+    try {
+      const run = async (mode: 'live' | 'log-only', extra: Parameters<typeof fakeRepo>[2], commentOnFailure = true) => {
+        const home = tempHome();
+        const paths = resolvePaths({ env: { FACTORY_HOME: home } });
+        const cfg = upsertRepoWorkflow(
+          seedConfig('allen'),
+          { id: 10, fullName: 'o/r' },
+          buildWorkflow({ label: 'factory:ready', action: 'implement-issue', pool: 'general', routes: [] }),
+        ).config;
+        cfg.execution = { mode };
+        cfg.repositories!['o/r']!.checkoutPath = 'clones/r';
+        if (commentOnFailure) (cfg.repositories!['o/r'] as { commentOnFailure?: boolean }).commentOnFailure = true;
+        writeFileSync(paths.configFile, stringify(cfg));
+        const { probes } = setup();
+        const api = fakeApi({ login: 'allen', repos: [fakeRepo('o/r', 10, extra)], labels: { 'o/r': ['factory:ready'] } });
+        return runDoctor(paths, { ...probes, createApi: async () => api });
+      };
+      // Read access is enough: no push access is needed to comment.
+      const readOnly = await run('live', { permissions: { admin: false, push: false, pull: true } });
+      expect(status(readOnly.checks, /repo o\/r: commentOnFailure: the active GitHub account can read the repository/)).toBe('ok');
+      expect(readOnly.checks.some((c) => /push access/.test(c.detail))).toBe(false);
+
+      const archived = await run('live', { archived: true });
+      expect(status(archived.checks, /repo o\/r: commentOnFailure: o\/r is archived \(read-only\)/)).toBe('fail');
+      expect(archived.ok).toBe(false);
+      expect(status((await run('log-only', { archived: true })).checks, /commentOnFailure: o\/r is archived/)).toBe('warn');
+
+      const noRead = await run('live', { permissions: { admin: false, push: false, pull: false } });
+      expect(status(noRead.checks, /commentOnFailure: the active GitHub account has no read access to o\/r.*Issues set to read and write/)).toBe('fail');
+      expect(status((await run('live', { permissions: null })).checks, /commentOnFailure: .*read access is unverified/)).toBe('warn');
+
+      const off = await run('live', { archived: true }, false);
+      expect(off.checks.some((c) => /commentOnFailure/.test(c.detail))).toBe(false);
+    } finally {
+      for (const r of restore) r();
+    }
+  });
+
   it('agentChecks: off-PATH and unknown sign-in warn; problems are failures only in live mode', () => {
     expect(agentProblemSeverity('log-only')).toBe('warn');
     expect(agentProblemSeverity('prepare-only')).toBe('warn');

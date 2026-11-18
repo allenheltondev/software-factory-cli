@@ -9,11 +9,14 @@ import {
   getJob,
   getRun,
   markExecutionStarted,
+  MAX_START_FAILURES,
   retryJob,
   setRunProcess,
   WorkerLockLostError,
 } from '../db/queue.js';
+import type { GitHubApi } from '../github/api.js';
 import type { FactoryPaths } from '../paths.js';
+import { createFailureCommenter } from '../publish/failure-comment.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { runDaemon, WorkerLockedError, type DaemonDeps } from './daemon.js';
@@ -337,6 +340,122 @@ describe('runDaemon', () => {
     const passingRun = db.prepare('SELECT id FROM runs WHERE job_id = ?').get(passing) as { id: string };
     expect(published).toEqual([{ runId: passingRun.id, outcome: 'succeeded' }]);
     expect(retries).toBeGreaterThanOrEqual(1);
+  });
+
+  it('hands failed and start_failed runs to the failure commenter, after recording them, and retries after each poll', async () => {
+    const db = openDatabase(':memory:');
+    const outcomes: Record<number, ExecutionResult> = {
+      1: { outcome: 'failed', error: 'tests failed' },
+      2: { outcome: 'succeeded' },
+      3: { outcome: 'start_failed', error: 'agent CLI not found' },
+      4: { outcome: 'interrupted', error: 'worker stopped' },
+    };
+    const started = new Map<number, number>();
+    const executor: Executor = {
+      name: 'mixed',
+      execute: async (c): Promise<ExecutionResult> => {
+        const n = (started.get(c.job.issueNumber) ?? 0) + 1;
+        started.set(c.job.issueNumber, n);
+        // The requeued start failure succeeds on the next agent.
+        return c.job.issueNumber === 3 && n > 1 ? { outcome: 'succeeded' } : outcomes[c.job.issueNumber]!;
+      },
+    };
+    const seen: Array<{ issue: number; outcome: string | null; jobStatus: string | undefined }> = [];
+    let retries = 0;
+    const failureCommenter = {
+      afterRun: async (runId: string) => {
+        const run = getRun(db, runId)!;
+        const job = getJob(db, run.jobId)!;
+        seen.push({ issue: job.issueNumber, outcome: run.outcome, jobStatus: job.status });
+      },
+      retryDue: async () => {
+        retries++;
+      },
+    };
+    const deps = baseDeps(db, { executor, failureCommenter, config: makeConfig({ maxConcurrent: 1 }) });
+    const jobs = [1, 2, 3, 4].map((issue) => insertJob(db, { issue }));
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(jobs.map((j) => getJob(db, j)?.status)).toEqual(['failed', 'succeeded', 'succeeded', 'interrupted']));
+    deps.controller.abort();
+    await done;
+    expect(seen).toEqual([
+      { issue: 1, outcome: 'failed', jobStatus: 'failed' },
+      { issue: 3, outcome: 'start_failed', jobStatus: 'queued' },
+    ]);
+    expect(retries).toBeGreaterThanOrEqual(1);
+  });
+
+  it('with commentOnFailure, comments once when a job ends failed and not when it is requeued, canceled or interrupted', async () => {
+    const db = openDatabase(':memory:');
+    const config = makeConfig({
+      execution: { mode: 'live' },
+      repositories: {
+        'owner/repo': {
+          id: 1,
+          commentOnFailure: true,
+          workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+        },
+      },
+    });
+    const comments: Array<{ issue: number; body: string }> = [];
+    const api = {
+      listIssueComments: async (_repo: unknown, issue: number) => comments.filter((c) => c.issue === issue).map((c, i) => ({ id: i, htmlUrl: 'u', body: c.body, user: 'allen' })),
+      createIssueComment: async (_repo: unknown, issue: number, body: string) => {
+        comments.push({ issue, body });
+        return { id: comments.length, htmlUrl: `https://github.com/owner/repo/issues/${issue}#issuecomment-${comments.length}`, body, user: 'allen' };
+      },
+    } as unknown as GitHubApi;
+    const stuck = deferred<ExecutionResult>();
+    const executor: Executor = {
+      name: 'mixed',
+      execute: async (c): Promise<ExecutionResult> => {
+        switch (c.job.issueNumber) {
+          case 1:
+            return { outcome: 'failed', error: 'agent exited with code 1: the agent said SECRET' };
+          case 2:
+            throw new StartFailedError(`${c.run.agent} cannot start: agent CLI not found`);
+          case 4:
+            return stuck.promise;
+          default:
+            return { outcome: 'succeeded' };
+        }
+      },
+    };
+    const paths = makePaths();
+    const deps = baseDeps(db, {
+      executor,
+      config,
+      paths,
+      checkDispatchable: async (job) => (job.issueNumber === 3 ? { ok: false, reason: 'issue was closed' } : { ok: true }),
+      failureCommenter: createFailureCommenter({ db, config, paths, api, log: silentLogger }),
+      timing: { shutdownTimeoutMs: 20, interruptGraceMs: 20 },
+    });
+    const [failing, unstartable, canceled, hanging] = [1, 2, 3, 4].map((issue) => insertJob(db, { issue }));
+    const done = runDaemon(deps);
+    await vi.waitFor(() =>
+      expect([failing, unstartable, canceled, hanging].map((j) => getJob(db, j!)?.status)).toEqual(['failed', 'failed', 'canceled', 'running']),
+    );
+    await vi.waitFor(() => expect(comments).toHaveLength(2));
+    deps.controller.abort();
+    await done;
+    stuck.resolve({ outcome: 'interrupted' });
+    expect(getJob(db, hanging!)?.status).toBe('interrupted');
+
+    // One comment per failed job: the failed run, and the last of the start failures.
+    expect(comments.map((c) => c.issue).sort()).toEqual([getJob(db, failing!)!.issueNumber, getJob(db, unstartable!)!.issueNumber]);
+    const failed = comments.find((c) => c.issue === 1)!.body;
+    expect(failed).toContain('agent exited with code 1');
+    expect(failed).not.toContain('SECRET');
+    expect(failed).toContain(`factory retry ${failing}`);
+    const startRuns = db.prepare('SELECT id FROM runs WHERE job_id = ? ORDER BY attempt').all(unstartable!) as { id: string }[];
+    expect(startRuns).toHaveLength(MAX_START_FAILURES);
+    const noStart = comments.find((c) => c.issue === 2)!.body;
+    expect(noStart).toContain(`no agent could start after ${MAX_START_FAILURES} consecutive attempts`);
+    expect(noStart).toContain(`<!-- factory-run-failed: ${startRuns.at(-1)!.id} -->`);
+    expect(db.prepare("SELECT run_id, state FROM failure_comments ORDER BY issue_number").all()).toEqual([
+      { run_id: (db.prepare('SELECT id FROM runs WHERE job_id = ?').get(failing!) as { id: string }).id, state: 'posted' },
+      { run_id: startRuns.at(-1)!.id, state: 'posted' },
+    ]);
   });
 
   it('records poll failures and keeps running', async () => {

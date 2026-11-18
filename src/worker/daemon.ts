@@ -17,6 +17,7 @@ import {
   type Claim,
 } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
+import type { FailureCommenter } from '../publish/failure-comment.js';
 import type { Publisher } from '../publish/publish.js';
 import type { IssueSnapshot, Job } from '../types.js';
 import { newId } from '../util/ids.js';
@@ -72,6 +73,12 @@ export interface DaemonDeps {
    * each poll to retry transient failures. Never changes a run's outcome. Absent: nothing is published.
    */
   publisher?: Publisher;
+  /**
+   * Failure comments (repositories.<repo>.commentOnFailure): called after a failed or start_failed
+   * run is recorded (it decides whether the job ended failed), and after each poll to retry
+   * transient failures. Never changes a run's outcome. Absent: nothing is posted.
+   */
+  failureCommenter?: FailureCommenter;
   /** Identity overrides, mainly for tests. */
   workerId?: string;
   hostname?: string;
@@ -222,6 +229,10 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       if (recorded && result.outcome === 'succeeded' && deps.publisher) {
         await deps.publisher.afterRun(run.id, controller.signal);
       }
+      // Not for interrupted runs: the worker is stopping, and whoever stops it is there to retry.
+      if (recorded && (result.outcome === 'failed' || result.outcome === 'start_failed') && deps.failureCommenter) {
+        await deps.failureCommenter.afterRun(run.id, controller.signal);
+      }
     })().finally(() => {
       inFlight.delete(run.id);
       wake.notify();
@@ -355,6 +366,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         nextPollAt = now() + pollMs;
         deferred.clear();
         if (deps.publisher && !signal.aborted && !lockLost) await deps.publisher.retryDue(signal);
+        if (deps.failureCommenter && !signal.aborted && !lockLost) await deps.failureCommenter.retryDue(signal);
       }
       if (signal.aborted) break;
 

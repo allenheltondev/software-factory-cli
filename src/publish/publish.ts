@@ -256,13 +256,13 @@ function classifyGit(err: GitError, what: string, remote: string, repoFullName: 
 // ---------------------------------------------------------------------------
 
 /** A Markdown code fence that the text cannot close, so mentions, links and closing keywords in it stay inert. */
-function fenced(text: string, lang = 'text'): string {
+export function fenced(text: string, lang = 'text'): string {
   const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map((m) => m[0].length));
   const ticks = '`'.repeat(Math.max(3, longest + 1));
   return `${ticks}${lang}\n${text}\n${ticks}`;
 }
 
-function cap(text: string, max: number): string {
+export function cap(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
