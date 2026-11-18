@@ -292,6 +292,11 @@ export interface VerificationSummary {
    * was never committed). Absent in older summaries, which is read as false.
    */
   exact?: boolean;
+  /**
+   * Set for a containerized run whose tree has submodules: the worker does not run git inside
+   * them on the host, so uncommitted files there were not counted and `exact` is false.
+   */
+  submodulesNotInspected?: boolean;
 }
 
 export type PublicationState = 'publishing' | 'published' | 'failed' | 'skipped';

@@ -160,6 +160,13 @@ async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: 
   if (checks.failing.length) return block(`${checks.failing.length} check(s) of ${short(sha)} did not pass: ${names(checks.failing)}`);
   // Checked after failing (a failure seen is a failure) and before anything is read as green.
   if (!checks.complete) return block(`the checks of ${short(sha)} could not all be read (${checks.total} seen), so it is unknown whether they passed`);
+  // The worker's own verify commands ran in the worktree the agent left, where ignored files
+  // (build output from an earlier step) can make a test pass that would fail on the commit
+  // alone. So a merge also needs a check GitHub ran itself, on a checkout of its own. None
+  // reported is waited for like a pending one: CI often registers a moment after the push.
+  if (checks.total === 0) {
+    return { action: 'wait', reason: `no check has been reported for ${short(sha)}; auto-merge needs at least one GitHub check (CI run independently of the worker) to pass on it` };
+  }
   if (checks.pending.length) return { action: 'wait', reason: `${checks.pending.length} check(s) of ${short(sha)} are pending: ${names(checks.pending)}` };
   if (live.mergeable === null) return { action: 'wait', reason: 'GitHub has not finished working out whether it can be merged' };
   return { action: 'merge' };

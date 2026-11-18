@@ -88,7 +88,9 @@ export function verificationNotes(v: VerificationSummary): string[] {
       `${before} uncommitted change(s) were in the worktree when verification ran: the commands saw them, but only commits are published`,
     );
   }
-  if (v.exact === false && before === 0) {
+  if (v.submodulesNotInspected) {
+    notes.push('the repository has submodules, which are not inspected for a containerized agent, so it is unknown whether the commands ran on exactly the committed files');
+  } else if (v.exact === false && before === 0) {
     notes.push('the checked-out commit changed while the commands ran, so the result is not a test of one known commit');
   }
   if (after !== before) {

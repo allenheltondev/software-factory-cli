@@ -146,8 +146,14 @@ it is not counted as verification of the commit: a test can pass because of a fi
 never committed. [Auto-merge](review-loop.md) requires an exact pass on the commit it merges.
 
 Ignored files (build output, `node_modules`) are not part of this check. They are not in the
-commit either, so a command that depends on one can still pass here and fail in CI on a fresh
-checkout; the PR's own CI checks are the guard for that.
+commit either, so a command that depends on one can pass here and fail on a fresh checkout.
+That is why the worker's verification alone never authorizes a merge: auto-merge also requires
+at least one check that GitHub ran on the commit, on a checkout of its own, to have passed.
+
+For a containerized agent the worker does not run git inside submodules on the host (a
+submodule's own Git config can name commands to run). Uncommitted files inside a submodule are
+then not counted, so in a repository with submodules a containerized run's result is never
+recorded as exact, and is not auto-merged.
 
 Publication pushes the commit the run ended on. If the job branch is at any other commit when
 the push is attempted (for example on a retry after someone committed to it), nothing is pushed.

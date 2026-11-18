@@ -96,10 +96,29 @@ export function cleanSummaryLines(lines: readonly string[]): string[] {
  * files don't count), or null when git can't tell. Paths with a line break are quoted by git, so
  * one line is one entry.
  */
-export async function countUncommitted(worktree: string, git?: string): Promise<number | null> {
+export async function countUncommitted(worktree: string, git?: string, untrustedWorktree = false): Promise<number | null> {
   try {
-    const { stdout } = await runGit(['status', '--porcelain'], { cwd: worktree, git, signal: AbortSignal.timeout(GIT_TIMEOUT_MS) });
+    // In a worktree a contained agent wrote, host git must not look inside submodules: status
+    // would run a nested `git status` in each populated one, under that repository's own config
+    // (see SummaryInput.untrustedWorktree). What is inside them is then not counted here;
+    // hasSubmodules says whether that leaves anything unknown.
+    const args = untrustedWorktree ? ['status', '--porcelain', '--ignore-submodules=dirty'] : ['status', '--porcelain'];
+    const { stdout } = await runGit(args, { cwd: worktree, git, signal: AbortSignal.timeout(GIT_TIMEOUT_MS) });
     return stdout.split('\n').filter((l) => l.trim() !== '').length;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does the index of `worktree` record any submodule? Read from the index alone (`ls-files`), so
+ * nothing inside a submodule is opened. Null when git cannot tell.
+ */
+export async function hasSubmodules(worktree: string, git?: string): Promise<boolean | null> {
+  try {
+    const { stdout } = await runGit(['ls-files', '--stage', '-z'], { cwd: worktree, git, signal: AbortSignal.timeout(GIT_TIMEOUT_MS) });
+    // "<mode> <object> <stage>\t<path>"; mode 160000 is a gitlink.
+    return stdout.split('\0').some((entry) => entry.startsWith('160000 '));
   } catch {
     return null;
   }

@@ -581,6 +581,28 @@ describe('auto-merge', () => {
     expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
   });
 
+  it('does not merge a commit no GitHub check has run on: the worker\'s own verify is not enough', async () => {
+    // The verify commands ran in the worktree the agent left; only independent CI tests the commit alone.
+    const s = await ready({ action: { verify: ['npm test'] }, verified: true, repo: { autoMergeWaitMinutes: 30 } });
+    s.gh.checks = { total: 0, failing: [], pending: [], complete: true };
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+    expect(s.pr()).toMatchObject({ mergeState: 'waiting', mergeReason: expect.stringMatching(/no check has been reported for 111111111111/) });
+    // CI that registers a moment after the push is picked up.
+    s.gh.checks = { total: 1, failing: [], pending: [], complete: true };
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+
+    // A repository with no CI at all: given up on, and left for a person.
+    const none = await ready({ repo: { autoMergeWaitMinutes: 30 } });
+    none.gh.checks = { total: 0, failing: [], pending: [], complete: true };
+    await none.mergeStep();
+    none.tick(31 * 60_000);
+    await none.mergeStep();
+    expect(none.gh.merges).toEqual([]);
+    expect(none.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/^gave up after waiting 30 minute\(s\): no check has been reported/) });
+  });
+
   it('gives up on checks that stay pending past autoMergeWaitMinutes', async () => {
     const s = await ready({ repo: { autoMergeWaitMinutes: 30 } });
     s.gh.checks = { total: 1, failing: [], pending: ['ci / build'], complete: true };

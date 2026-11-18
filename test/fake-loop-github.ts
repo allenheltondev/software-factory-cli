@@ -31,7 +31,8 @@ export class FakeLoopGitHub {
   /** People's reviews as the review poller reads them (GraphQL). */
   humanReviews: GitHubReview[] = [];
   comments: Array<GitHubIssueComment & { issue: number }> = [];
-  checks: CommitChecks = { total: 0, failing: [], pending: [], complete: true };
+  /** One passing check by default: auto-merge needs independent CI to have passed. */
+  checks: CommitChecks = { total: 1, failing: [], pending: [], complete: true };
   issueEvents: GitHubIssueEvent[] = [];
   /** Every write, in order. */
   readonly writes: string[] = [];

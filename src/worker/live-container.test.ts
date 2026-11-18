@@ -26,7 +26,7 @@ import { createExecutor } from './prepare-only.js';
 import { isPidAlive } from './process.js';
 import { reconcileInterruptedRuns } from './reconcile.js';
 import { removeContainer } from './container.js';
-import { summarizeRun } from './run-summary.js';
+import { countUncommitted, hasSubmodules, summarizeRun } from './run-summary.js';
 
 const fixtures: GitFixture[] = [];
 const dbs: Db[] = [];
@@ -445,6 +445,13 @@ describe.skipIf(process.platform === 'win32')('run summary of a worktree a conta
     expect(existsSync(marker)).toBe(false);
     // The submodule's commit still counts as a change.
     expect(contained.summary).toMatchObject({ commitCount: 1, filesChanged: 1, notes: [] });
+
+    // The verification step's own look at the worktree obeys the same rule: it does not enter the
+    // submodule, reports the superproject as clean, and says there is a submodule it did not inspect.
+    expect(await countUncommitted(wt, undefined, true)).toBe(0);
+    expect(await hasSubmodules(wt)).toBe(true);
+    expect(await hasSubmodules(f.clone)).toBe(false);
+    expect(existsSync(marker)).toBe(false);
 
     // The same summary without the flag is what the flag is for: host git runs the nested config's command.
     await summarizeRun({ worktree: wt, branch: 'updraft/issue-3', baseSha, lastOutput: [] });
