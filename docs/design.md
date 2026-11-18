@@ -72,7 +72,7 @@ Publish one npm package with the same `updraft` commands and YAML schema across 
 | Linux with systemd | A `systemd --user` service with restart on failure. Enable lingering if the machine needs to run jobs before login or after logout. |
 | Other Linux hosts | Run `updraft start` in the foreground under the host's existing process supervisor. |
 
-Launchers specify the executable, config path, working directory, and environment they need. Test `updraft doctor` under the same account and environment as the launcher, since a background process may get a different PATH and credential context from a terminal. Keep config, queue and logs in per-user locations resolved for the host OS, with a config path override. The worker resumes polling from saved checkpoints after sleep or restart.
+Launchers specify the executable, config path, working directory, and environment they need. Test `updraft doctor` under the same account and environment as the launcher, since a background process may get a different PATH and credential context from a terminal. Keep config, queue and logs in one per-user directory, `~/.updraft` on every OS, with `UPDRAFT_HOME` and a config path override. The worker resumes polling from saved checkpoints after sleep or restart.
 
 On Windows, use one execution environment for the worker, checkout and agents. Prefer the native Windows setup for Windows-hosted repos. WSL2 can run the Linux setup when repos and tooling already live there or a runner needs Linux-native tools. In that case, keep the relevant binaries, credentials and worktrees inside WSL.
 

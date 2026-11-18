@@ -234,8 +234,13 @@ Notes:
 ### Platforms
 
 - **Linux and macOS.** Same-path mounts work. With Docker Desktop on macOS, the worktree
-  directory (under Updraft's data directory) and the clone must be inside a path Docker
-  Desktop shares with its VM.
+  directory (`~/.updraft/worktrees`) and the clone must be inside a path Docker Desktop shares
+  with its VM; the default share, `/Users`, covers both.
+- **Docker installed as a snap** (Ubuntu) cannot bind-mount hidden directories in your home
+  directory, which includes `~/.updraft`. Set `UPDRAFT_HOME` to a path outside them, such as
+  `/srv/updraft`, or install Docker from Docker's own packages.
+- **The worker itself in a container.** Not supported together with `container`: see
+  [In a container](background-operation.md#in-a-container).
 - **Windows.** `container` is a validation error on native Windows: a Windows path cannot
   exist inside a Linux container, so the worktree's Git pointer would not resolve. Run the
   worker inside WSL2, with the clone and Updraft's data directory on the WSL filesystem.

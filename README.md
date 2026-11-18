@@ -252,6 +252,7 @@ default and should stay off until you have read what its checks do and do not co
 | macOS | `macos/install-launchagent.sh` installs a per-user LaunchAgent from `updraft.plist.template` (`--uninstall` removes it) |
 | Linux (systemd) | `linux/install-systemd-user.sh` installs a `systemd --user` service; `loginctl enable-linger` keeps it running without a login session |
 | Other hosts | Run `updraft start --config <path>` in the foreground under your existing supervisor |
+| Container | Run `updraft start` with `UPDRAFT_HOME` on a local volume; see [In a container](docs/background-operation.md#in-a-container) |
 
 Each launcher runs `node <package>/dist/cli.js start --config <path>` with absolute paths, a
 working directory and an explicit `PATH`. Run `updraft doctor` under the same account and
@@ -298,19 +299,42 @@ The key points; [docs/security.md](docs/security.md) has the full statement of e
 
 ## Files and locations
 
-| | Windows | macOS | Linux |
-| --- | --- | --- | --- |
-| Config | `%APPDATA%\updraft\config.yaml` | `~/Library/Application Support/updraft/config.yaml` | `$XDG_CONFIG_HOME/updraft/config.yaml` (default `~/.config`) |
-| State (`state.db`, `worktrees/`) | `%LOCALAPPDATA%\updraft\` | `~/Library/Application Support/updraft/` | `$XDG_STATE_HOME/updraft/` (default `~/.local/state`) |
-| Logs (`updraft.log`, `runs/`) | `%LOCALAPPDATA%\updraft\logs\` | `~/Library/Logs/updraft/` | `$XDG_STATE_HOME/updraft/logs/` |
+Everything lives in one directory, `~/.updraft`, on every OS (`%USERPROFILE%\.updraft` on
+Windows, for example `C:\Users\you\.updraft`):
+
+```text
+~/.updraft/
+  config.yaml      config
+  prompts/         starter prompts written by configure / add
+  state.db         queue, runs and checkpoints
+  worktrees/       per-job worktrees
+  logs/
+    updraft.log    worker log
+    runs/<runId>/  one run.log per run
+```
+
+On Windows it is deliberately outside `AppData`: Windows redirects new `AppData` folders that a
+packaged (MSIX) app creates into that app's private storage, so a CLI run from such an app
+(a desktop IDE or agent host) and one run from a terminal would each see their own files.
 
 Overrides:
 
-- `UPDRAFT_HOME=<dir>` puts config (`<dir>/config.yaml`), state (`<dir>/state.db`) and logs
-  (`<dir>/logs/`) under one directory.
+- `UPDRAFT_HOME=<dir>` moves the whole directory: config (`<dir>/config.yaml`), state
+  (`<dir>/state.db`) and logs (`<dir>/logs/`).
 - `--config <path>` or `UPDRAFT_CONFIG=<path>` changes only the config file; `--config` wins.
   Relative paths in the config (such as prompt files) resolve against the config file's
   directory.
+
+## Moving from the per-OS locations
+
+Earlier builds kept config, state and logs in per-OS folders (`%APPDATA%\updraft` and
+`%LOCALAPPDATA%\updraft` on Windows, `~/Library/Application Support/updraft` and
+`~/Library/Logs/updraft` on macOS, `~/.config/updraft` and `~/.local/state/updraft` on Linux).
+Nothing reads those any more. Stop the worker, move `config.yaml` and `prompts/` from the old
+config folder and `state.db`, `worktrees/` and `logs/` from the old state folder into
+`~/.updraft`, then reinstall the launcher so it points at the new config path. Move worktrees
+with `git worktree move` from your clone, or run `updraft clean` beforehand, so Git's records
+of them stay right.
 
 ## Upgrading from software-factory-cli
 
@@ -320,7 +344,7 @@ clean break: nothing reads the old names. To move an existing install:
 1. Stop the worker and remove its launcher using the old package's scripts (the Task Scheduler
    task, LaunchAgent or systemd unit), then `npm uninstall -g software-factory-cli` and
    `npm install -g @allenheltondev/updraft`.
-2. Rename the `software-factory` config and state directories to `updraft` (see
+2. Move the `software-factory` config, state and logs into `~/.updraft` (see
    [Files and locations](#files-and-locations)). The worker log is now `updraft.log`.
 3. Replace `FACTORY_HOME` and `FACTORY_CONFIG` with `UPDRAFT_HOME` and `UPDRAFT_CONFIG`
    wherever you set them, and install the launcher again from the new package.
