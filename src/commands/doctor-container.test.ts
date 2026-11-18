@@ -140,7 +140,9 @@ function configWithContainer(home: string) {
   return paths;
 }
 
-describe('updraft doctor with a containerized agent', () => {
+// These two run the whole command, which loads the config for the host it runs on, and on native
+// Windows a config with `container` is invalid by design (covered above with platform: 'win32').
+describe.skipIf(process.platform === 'win32')('updraft doctor with a containerized agent', () => {
   it('checks the runtime, image and in-image CLI for that agent and host discovery for the others', async () => {
     const paths = configWithContainer(tempHome());
     const discovered: string[] = [];
@@ -179,7 +181,7 @@ describe('updraft doctor with a containerized agent', () => {
   });
 });
 
-describe('updraft agents with a containerized agent in the config', () => {
+describe.skipIf(process.platform === 'win32')('updraft agents with a containerized agent in the config', () => {
   it('lists it after the host CLIs, and counts it as usable', async () => {
     const home = tempHome();
     configWithContainer(home);

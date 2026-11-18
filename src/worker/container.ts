@@ -25,7 +25,12 @@
 //   container itself. Killing the runtime client does not reliably stop the container.
 import { execFile, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, openSync, readFileSync, statSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { posix } from 'node:path';
+
+// POSIX path rules throughout, whatever the host: a containerized agent is only supported on
+// Linux and macOS (it is a validation error on native Windows), and every path here is mounted
+// at the same path inside a Linux container. On those hosts this is exactly node:path.
+const { basename, dirname, isAbsolute, join, resolve } = posix;
 import type { AgentInvocation } from '../agents/adapters/registry.js';
 import { AGENT_SPECS, isKnownAdapter, type LaunchSpec } from '../agents/discovery.js';
 import type { AgentConfig, ContainerConfig } from '../config/schema.js';
