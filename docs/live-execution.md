@@ -10,6 +10,10 @@ on its own page:
 - [Codex](agents/codex.md)
 - [Kiro](agents/kiro.md)
 
+`updraft start` runs these jobs as they are queued by polling. To run the job of one GitHub
+webhook event and exit, on a machine that has no clone and no state yet, see
+[Running one event](run-event.md); the run itself is the one described here.
+
 ## Requirements
 
 `updraft validate` accepts `execution.mode: live` only when:
