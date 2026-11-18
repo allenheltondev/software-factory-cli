@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentExit, InvocationRequest } from './adapter.js';
-import { kiroAdapter, kiroArgsChooseHarness, kiroSupportsV3 } from './kiro.js';
+import { kiroAdapter, kiroArgsChooseHarness, kiroSupportsV3, stripKiroLogRecords } from './kiro.js';
+import { readReviewVerdict } from '../../worker/review-run.js';
 import { getAdapter, implementedAdapters } from './registry.js';
 
 function request(o: Partial<InvocationRequest> = {}): InvocationRequest {
@@ -134,5 +135,49 @@ describe('kiro adapter: results', () => {
   it('the reason is the error Kiro printed, not a line it printed after it', () => {
     const out = 'Thinking...\nError: The model is currently overloaded\nSee https://kiro.dev/docs/cli/ for help\n';
     expect(kiroAdapter.interpretExit!(exit(out, 101)).error).toBe('kiro-cli exited with code 101: Error: The model is currently overloaded');
+  });
+});
+
+describe('kiro reviewer output', () => {
+  // The end of a real kiro-cli 3.5.0 reviewer run as run.log captured it: stderr's log records
+  // interleaved with stdout, the last one glued onto the verdict line.
+  const real = [
+    '[tool] status: Completed',
+    '[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=139',
+    '**Blockers**',
+    'none',
+    '**Suggestions**',
+    '- `src/util/log.ts`: lifecycle highlighting can color unrelated messages.',
+    'UPDRAFT-FINDINGS: 1',
+    'UPDRAFT-VERDICT: ready-to-merge[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=140',
+    '',
+  ].join('\n');
+
+  it('reads the verdict that a glued-on log record used to hide', () => {
+    const reading = readReviewVerdict(kiroAdapter, real);
+    expect(reading).toMatchObject({ ok: true, verdict: 'ready-to-merge', findingsCount: 1 });
+    if (reading.ok) {
+      expect(reading.findings).toContain('**Blockers**');
+      expect(reading.findings).not.toMatch(/\[KRS\]/);
+    }
+  });
+
+  it('also drops a log record on its own line after the verdict, and colored records', () => {
+    const out = 'UPDRAFT-VERDICT: changes-requested\n\u001b[32m[INFO] [KRS] <-- done totalEvents=3\u001b[0m\n[WARN] [KRS] slow stream\n';
+    expect(readReviewVerdict(kiroAdapter, out)).toMatchObject({ ok: true, verdict: 'changes-requested' });
+  });
+
+  it('still fails closed: other trailing text, two verdicts, or no verdict', () => {
+    expect(readReviewVerdict(kiroAdapter, 'UPDRAFT-VERDICT: ready-to-merge and ship it\n')).toMatchObject({ ok: false });
+    expect(readReviewVerdict(kiroAdapter, 'UPDRAFT-VERDICT: ready-to-merge\nmore text\n')).toMatchObject({ ok: false });
+    expect(
+      readReviewVerdict(kiroAdapter, 'UPDRAFT-VERDICT: changes-requested\n[INFO] [KRS] x\nUPDRAFT-VERDICT: ready-to-merge\n'),
+    ).toMatchObject({ ok: false });
+    expect(readReviewVerdict(kiroAdapter, '[INFO] [KRS] <-- done\n')).toMatchObject({ ok: false });
+  });
+
+  it('leaves bracketed text that is not a Kiro log record alone', () => {
+    expect(stripKiroLogRecords('[INFO] note for the reader\n[KRS] alone\n- [x] done')).toBe('[INFO] note for the reader\n[KRS] alone\n- [x] done');
+    expect(stripKiroLogRecords('a[ERROR] [KRS] boom\nb')).toBe('a\nb');
   });
 });
