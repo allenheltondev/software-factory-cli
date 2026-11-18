@@ -43,6 +43,13 @@
  * closes before completion, Kiro exits with a nonzero status" (https://kiro.dev/docs/cli/headless/).
  * The summary is the run's last output lines (the executor's default).
  *
+ * Streams: kiro-cli writes its answer to stdout and its own log records, such as
+ * `[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=140` (kiro-cli 3.5.0), to
+ * stderr. Through one shared file descriptor the two interleave in no guaranteed order, and a
+ * record once landed on the end of a reviewer's unterminated verdict line, which then did not
+ * read as a verdict. So the invocation asks for `separateStderr`: stdout alone is the agent's
+ * output, and the stderr is appended to run.log after the run.
+ *
  * Authentication: KIRO_API_KEY ("Headless mode requires an API key set as the KIRO_API_KEY
  * environment variable", https://kiro.dev/docs/cli/headless/), or a `kiro-cli login` session for
  * the worker's user, which headless runs also accept (verified with kiro-cli 3.5.0 and IAM
@@ -127,7 +134,8 @@ export const kiroAdapter: AgentAdapter = {
     if (!kiroArgsChooseHarness(extra)) args.push('--v3');
     if (!TRUST_FLAGS.some((f) => hasOption(extra, f))) args.push('--trust-all-tools');
     args.push(...extra);
-    return { file: req.launch.file, args, promptVia: 'stdin' };
+    // kiro-cli logs to stderr while it answers on stdout; keep them apart (see the header).
+    return { file: req.launch.file, args, promptVia: 'stdin', separateStderr: true };
   },
 
   interpretExit(exit: AgentExit): AgentVerdict {

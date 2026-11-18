@@ -41,6 +41,15 @@ export interface AgentInvocation {
   promptVia: 'stdin' | 'file-arg';
   /** Variables the adapter needs set. Applied over the worker's environment; agents.<name>.env wins over these. */
   env?: Record<string, string>;
+  /**
+   * Keep the agent's stderr apart from its stdout. Normally both go to run.log through one file
+   * descriptor, so their writes interleave in no guaranteed order and a line of one can end up
+   * glued to a line of the other. With this set, stderr goes to a file of its own while the agent
+   * runs. The verdict and {@link AgentAdapter.finalMessage} then see stdout alone, and the stderr
+   * is appended to run.log, under its own header, once the agent has exited. For CLIs that log to
+   * stderr while writing their answer to stdout.
+   */
+  separateStderr?: boolean;
 }
 
 /** How the agent process ended on its own (not timed out, not stopped by the worker). */
@@ -48,13 +57,17 @@ export interface AgentExit {
   /** Exit code, or null when a signal ended it. */
   code: number | null;
   signal: NodeJS.Signals | null;
-  /** The last lines of the agent's combined stdout and stderr, cleaned and capped for display. */
+  /**
+   * The last lines of the agent's combined stdout and stderr, cleaned and capped for display.
+   * With {@link AgentInvocation.separateStderr}, the last lines of its stdout.
+   */
   outputTail: string[];
   /**
    * The agent's raw combined stdout and stderr from run.log: all of it, or its last
    * {@link RAW_OUTPUT_BYTES} bytes starting at a line boundary. For adapters that parse
    * structured output (lines are not cut or cleaned here). The line the window starts in is
-   * left out, so a line is either complete here or absent, never partial.
+   * left out, so a line is either complete here or absent, never partial. With
+   * {@link AgentInvocation.separateStderr}, its stdout followed by its stderr, each read the same way.
    */
   output: string;
   /** The arguments the agent ran with (InvocationResult.args), so an adapter knows which output mode was in effect. */

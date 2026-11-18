@@ -35,7 +35,7 @@ describe('kiro adapter: invocation', () => {
   it('runs kiro-cli chat --no-interactive on V3, trusting all tools, with the prompt on stdin', () => {
     const req = request();
     const inv = kiroAdapter.buildInvocation(req);
-    expect(inv).toEqual({ file: req.launch.file, args: DEFAULT_ARGS, promptVia: 'stdin' });
+    expect(inv).toEqual({ file: req.launch.file, args: DEFAULT_ARGS, promptVia: 'stdin', separateStderr: true });
     expect(inv.env).toBeUndefined();
     // Never a prompt (or the prompt's path) on the command line: a positional would replace stdin.
     expect(inv.args).not.toContain(req.promptFile);
@@ -134,5 +134,16 @@ describe('kiro adapter: results', () => {
   it('the reason is the error Kiro printed, not a line it printed after it', () => {
     const out = 'Thinking...\nError: The model is currently overloaded\nSee https://kiro.dev/docs/cli/ for help\n';
     expect(kiroAdapter.interpretExit!(exit(out, 101)).error).toBe('kiro-cli exited with code 101: Error: The model is currently overloaded');
+  });
+});
+
+describe('kiro streams', () => {
+  it('asks for separate stderr, so its log records never mix into the answer it gives on stdout', () => {
+    expect(kiroAdapter.buildInvocation(request()).separateStderr).toBe(true);
+    expect(kiroAdapter.buildInvocation(request({ extraArgs: ['--v2', '--trust-tools=read_file'] })).separateStderr).toBe(true);
+  });
+
+  it('reads the whole stdout as the message: no finalMessage that could drop text', () => {
+    expect(kiroAdapter.finalMessage).toBeUndefined();
   });
 });

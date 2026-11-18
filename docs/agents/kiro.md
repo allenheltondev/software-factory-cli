@@ -67,6 +67,13 @@ kiro-cli chat --no-interactive --v3 --trust-all-tools <agents.kiro.args>
   failure such as an authentication error or invalid arguments, 3 a required MCP server that
   didn't start, 4 an agent named by `--agent` that isn't available) and the last line Kiro
   printed. The summary shows Kiro's last output lines.
+- Kiro's stdout and stderr are kept apart. `kiro-cli` writes its answer to stdout and its own
+  log records (`[INFO] [KRS] ...`) to stderr. Sharing one file, a record could land on the same
+  line as a reviewer's verdict, which then didn't read as a verdict. While Kiro runs, `run.log`
+  gets its stdout, and its stderr goes to `agent-stderr.log` in the same run directory. When
+  Kiro exits, the stderr is appended to `run.log` under `---- agent stderr ----`. So
+  `updraft logs --follow` shows Kiro's stderr only once the run has ended. The verdict and the
+  summary come from stdout. A failed run's reason is looked for in both.
 - Kiro also has `--output-format stream-json` (JSON Lines on stdout), but its docs don't yet
   describe the record format, so the adapter doesn't ask for it or read it. If you add it to
   `agents.kiro.args`, `run.log` keeps the event stream, the exit code still decides the
