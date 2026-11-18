@@ -450,3 +450,35 @@ describe.skipIf(process.platform === 'win32')('run summary of a worktree a conta
     expect(existsSync(marker)).toBe(true);
   });
 });
+
+describe.skipIf(process.platform === 'win32')('verify commands of a containerized agent (fake runtime)', { timeout: 120_000 }, () => {
+  it('run in their own containers, with the agent mounts and none of its credentials', async () => {
+    const { paths, config, db, runtime } = setup();
+    // The commands execute code the agent wrote, so they must not run on the host.
+    config.actions['implement-issue']!.verify = [[process.execPath, '-e', 'process.exit(0)'], 'exit 3'];
+    const c = claim(db, config, paths);
+    const result = await new LiveExecutor({ env: workerEnv(), locate: noHostLookup }).execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({ outcome: 'failed', error: 'verification failed: "exit 3" exited 3' });
+    expect(result.summary?.verification).toMatchObject({ passed: false, commands: [{ status: 'passed' }, { status: 'failed', exitCode: 3 }] });
+
+    const [agent, first, second] = runtime.callsOf('run');
+    const worktree = join(worktreesRoot(paths), '42', c.job.id);
+    expect(first!.started).toBe(`factory-${c.run.id}-verify-1`);
+    expect(second!.started).toBe(`factory-${c.run.id}-verify-2`);
+    expect(first!.argv.slice(first!.argv.indexOf('runner:test'))).toEqual(['runner:test', process.execPath, '-e', 'process.exit(0)']);
+    // A string command goes to the shell inside the container.
+    expect(second!.argv.slice(second!.argv.indexOf('runner:test'))).toEqual(['runner:test', '/bin/sh', '-c', 'exit 3']);
+    for (const call of [first!, second!]) {
+      expect(valuesOf(call.argv, '--workdir')).toEqual([worktree]);
+      expect(valuesOf(call.argv, '--mount')).toEqual(valuesOf(agent!.argv, '--mount'));
+      // Only the runtime's own options: the first command has a `-e` of its own after the image.
+      expect(valuesOf(call.argv.slice(0, call.argv.indexOf('runner:test')), '-e')).toEqual([`HOME=${CONTAINER_HOME}`]);
+      expect(call.env).not.toHaveProperty('FAKE_API_KEY');
+      expect(call.env).not.toHaveProperty('GH_TOKEN');
+    }
+    // Nothing is left behind, and the last container recorded for the run is the last one started.
+    for (const name of [agent!.started!, first!.started!, second!.started!]) expect(runtime.containerPid(name)).toBeNull();
+    expect(getRun(db, c.run.id)?.container?.name).toBe(`factory-${c.run.id}-verify-2`);
+  });
+});

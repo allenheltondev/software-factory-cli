@@ -147,6 +147,16 @@ inside submodules (`--ignore-submodules=dirty`): otherwise Git would run `git st
 nested repository the agent left, under that repository's own config. A changed submodule
 commit still counts in the summary; uncommitted changes inside a submodule do not.
 
+### Verify commands
+
+An action's `verify` commands ([Verification](verification.md)) execute code the agent wrote,
+so for a containerized agent the worker runs them in containers too, one per command, named
+`factory-<run id>-verify-<n>`, from the same image with the same mounts, user, `network` and
+`args`. A string command runs through `/bin/sh -c` inside the container. They get none of the
+variables named in `container.env`: those are the agent's credentials, and checking its work
+does not need them. The image therefore needs whatever the commands use (the test runner, the
+package manager and network access to its registry if a command installs dependencies).
+
 ### Stopping
 
 A container is not a child process of the worker: killing the runtime client does not

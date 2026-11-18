@@ -42,7 +42,7 @@
  *
  * Authentication: "Headless mode requires an API key set as the KIRO_API_KEY environment
  * variable" (https://kiro.dev/docs/cli/headless/). The worker passes its environment through, so
- * the key belongs in the worker's runtime environment, not in agents.<name>.env (see the README).
+ * the key belongs in the worker's runtime environment, not in agents.<name>.env (see docs/agents/kiro.md).
  */
 import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';

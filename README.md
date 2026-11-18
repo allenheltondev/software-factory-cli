@@ -109,9 +109,14 @@ repositories:
 | `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
 | `agents.<name>.maxConcurrent` | `1` | Per-agent cap across all pools and repos, 1-32 |
-| `agents.<name>.command` | found by discovery | Live mode: the agent CLI to run. An absolute path, a path relative to the config file's directory, or a name looked up on `PATH`. Windows npm `.cmd` shims are resolved to the real executable or Node entry point |
+| `agents.<name>.command` | found by discovery | Live mode: the agent CLI to run. An absolute path, a path relative to the config file's directory, or a name looked up on `PATH`. Windows npm `.cmd` shims are resolved to the real executable or Node entry point. With `container`, a name or path inside the image, used as written |
 | `agents.<name>.args` | none | Live mode: extra arguments for the agent CLI; the adapter places them where its CLI takes options |
-| `agents.<name>.env` | none | Live mode: environment variables for the agent process, on top of the worker's. Not for secrets such as `KIRO_API_KEY`; see [Agent credentials](docs/background-operation.md#agent-credentials) |
+| `agents.<name>.env` | none | Live mode: environment variables for the agent process, on top of the worker's. Not for secrets such as `KIRO_API_KEY`; see [Agent credentials](docs/background-operation.md#agent-credentials). With `container`, set inside the container |
+| `agents.<name>.container.image` | none | Live mode: run this agent, and the action's `verify` commands, in a container from this image instead of on the host (see [Isolating agents](docs/isolation.md)). The image must contain the agent CLI, `git` and the repository's toolchain, and must already be present locally; a run never pulls. Not supported on native Windows (use WSL2) |
+| `agents.<name>.container.runtime` | `docker` | `docker` or `podman` looked up on `PATH`, or a path relative to the config file's directory |
+| `agents.<name>.container.env` | `[]` | Names of variables to pass from the worker's environment into the agent's container, such as its API key. Names only, never values. Nothing else of the worker's environment reaches the container |
+| `agents.<name>.container.network` | the runtime's default | Passed as `--network`, for example `none`, `bridge` or a network you created |
+| `agents.<name>.container.args` | none | Extra arguments for `<runtime> run`, such as `["--memory", "4g"]`. They can widen what the container reaches |
 | `pools.<name>.agents` | required | Agent names in the pool (at least one) |
 | `pools.<name>.strategy` | `round-robin` | Rotates among agents with free capacity |
 | `actions.<name>.prompt` | none | Prompt file, relative to the config file's directory |
@@ -229,6 +234,9 @@ The key points; [docs/security.md](docs/security.md) has the full statement of e
   not isolation: it can still reach whatever your user can, including `gh auth token`, Git
   credential helpers and SSH keys. Only an isolation boundary such as a separate account, VM
   or container would prevent that.
+- `agents.<name>.container` puts that boundary in place: the agent and the verify commands run
+  in containers that see only the job's worktree and what a commit needs. See
+  [Isolating agents](docs/isolation.md) for what that does and does not protect against.
 - Without `publish`, the worker only reads from GitHub and never pushes. With `publish`, it
   creates job branches, opens PRs and comments on issues as your `gh` account. It never
   merges.

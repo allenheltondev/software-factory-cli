@@ -162,7 +162,7 @@ describe('validateConfig', () => {
     expect(r.ok).toBe(missing.length === 0);
     if (r.ok) return;
     expect(r.errors).toEqual(
-      missing.map((a) => ({ path: `agents.${a}`, message: expect.stringMatching(new RegExp(`live execution is not implemented for adapter "${a}" in this release`)) })),
+      missing.map((a) => ({ path: `agents.${a}`, message: expect.stringMatching(new RegExp(`live execution is not implemented for adapter "${a}"`)) })),
     );
   });
 

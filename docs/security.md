@@ -42,6 +42,13 @@ What the worker and the agents it starts can do, and which guards exist. The
   Git credential helpers (such as the one `gh auth setup-git` installs) and SSH keys, and so
   could push or call the API itself. Only an isolation boundary such as a separate account,
   VM or container would prevent that.
+- To put that boundary in place, set `agents.<name>.container`: the agent, and the action's
+  `verify` commands, then run in containers that see only the job's worktree and the parts of
+  the clone's Git directory a commit writes (hooks and Git config stay read-only), as your uid,
+  with only the environment variables you name. A lighter alternative is to run the worker
+  under a dedicated OS account with its own `gh` login scoped to the watched repositories.
+  Both, and what each does not protect against (the network and the credentials you pass in,
+  among others), are described in [Isolating agents](isolation.md).
 - In live mode the agent runs as your user, in the job's worktree, with the worker's
   environment minus `GH_TOKEN`/`GITHUB_TOKEN`. That is not a sandbox: what the agent may do
   is up to the agent CLI's own permission settings. Claude Code runs in full-auto mode by

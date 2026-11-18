@@ -116,7 +116,7 @@ export class LogOnlyExecutor implements Executor {
     const lines = [
       `software-factory run ${run.id}`,
       `written: ${new Date(ctx.now()).toISOString()}`,
-      `mode: log-only. Live execution is disabled in this release; no agent process was started and no checkout was created.`,
+      `mode: log-only. No agent process was started and no checkout was created.`,
       '',
       `job: ${job.id} (attempt ${run.attempt})`,
       `repository: ${job.repoFullName} (id ${job.repoId})`,

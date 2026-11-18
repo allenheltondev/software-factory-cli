@@ -84,6 +84,13 @@ Each command runs with:
 `verifyTimeoutMinutes` covers the whole list, not each command, so the worst case for a run is
 `timeoutMinutes + verifyTimeoutMinutes`. A slot of the agent stays occupied during verification.
 
+### With a containerized agent
+
+When the agent that ran the job has `agents.<name>.container` set, the commands do not run on
+the host: each runs in its own container from the agent's image, with the worktree mounted and
+none of the agent's credentials. A string command is then always run by `/bin/sh -c`, whatever
+the host is. See [Isolating agents](isolation.md#verify-commands).
+
 ## Where the result shows up
 
 `run.log` gets a delimited section after the agent's output, with each command's own output:

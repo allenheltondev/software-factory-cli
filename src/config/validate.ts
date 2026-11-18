@@ -53,7 +53,7 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       errors.push({
         path: `agents.${agentName}`,
         message:
-          `live execution is not implemented for adapter "${adapter}" in this release, so live mode cannot run this agent yet; ` +
+          `live execution is not implemented for adapter "${adapter}", so live mode cannot run this agent; ` +
           'use execution.mode prepare-only, or disable the agent',
       });
     }

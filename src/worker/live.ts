@@ -51,15 +51,19 @@ import {
   type Executor,
 } from './executor.js';
 import {
+  buildContainerRunArgs,
   checkContainerReady,
   CONTAINER_RUN_FAILED,
   containerLaunch,
+  containerName,
   containerStopBudgetMs,
   containInvocation,
   forceRemoveContainer,
+  hostUser,
   stopContainer,
   trackContainer,
   untrackContainer,
+  worktreeMounts,
   type ContainedInvocation,
 } from './container.js';
 import { processStartTime, taskkillPath } from './process.js';
@@ -358,12 +362,16 @@ interface VerificationRun {
  * process like the agent's (runAgent): own group, killed at the time limit and on shutdown, pid
  * recorded for a later worker's reconcile, output straight into run.log. Never throws.
  *
- * `wrap` turns a command into the process to spawn; it is the one place to change to run the
- * commands somewhere else (for example behind a container prefix).
+ * `contain`, for a containerized agent, turns a command into the runtime client's command line
+ * and the container it will start. The commands execute code the agent wrote, so when the agent
+ * was kept in a container they must be too; each gets its own container, with the agent's
+ * lifecycle (name recorded before it can exist, stopped by name, removed afterwards).
  */
 async function runVerification(o: {
   commands: readonly VerifyCommand[];
-  wrap?: (command: VerifyCommand) => VerifyInvocation;
+  contain?: (command: VerifyCommand, index: number) => { invocation: VerifyInvocation; box: { runtime: string; name: string } };
+  /** Record a container before it can exist, so a crash leaves a name for the next worker to remove. */
+  onContainer?: (box: { runtime: string; name: string }) => void;
   cwd: string;
   env: NodeJS.ProcessEnv;
   logPath: string;
@@ -395,7 +403,22 @@ async function runVerification(o: {
       failure = { outcome: 'interrupted', error: `worker stopped during verification, before ${quoted(command)} started` };
       continue;
     }
-    const invocation = (o.wrap ?? verifyInvocation)(command);
+    let invocation: VerifyInvocation;
+    let box: { runtime: string; name: string } | null = null;
+    try {
+      if (o.contain) ({ invocation, box } = o.contain(command, i));
+      else invocation = verifyInvocation(command);
+    } catch (err) {
+      results.push({ command: shown, status: 'failed', exitCode: null, seconds: 0 });
+      failure = { outcome: 'failed', error: `verification failed: ${quoted(command)}: ${message(err)}` };
+      await o.log([`---- verify ${i + 1}/${o.commands.length}: ${shown} ----`, `error: ${message(err)}`]);
+      continue;
+    }
+    if (box) {
+      o.onContainer?.(box);
+      trackContainer(box.runtime, box.name, o.env);
+    }
+    const held = box;
     await o.log([`---- verify ${i + 1}/${o.commands.length}: ${shown} ----`, `command: ${JSON.stringify([invocation.file, ...invocation.args])}`]);
     const startedAt = o.now();
     let identity: Promise<void> = Promise.resolve();
@@ -411,9 +434,14 @@ async function runVerification(o: {
         timeoutMs: Math.max(1, deadline - startedAt),
         stop: o.stop,
         killGraceMs: o.killGraceMs,
+        ...(held ? { stopContainer: () => stopContainer(held.runtime, held.name, o.killGraceMs, o.env) } : {}),
         onSpawn: (pid) => o.onSpawn(pid, (done) => (identity = done)),
       });
     } catch (err) {
+      if (held) {
+        await forceRemoveContainer(held.runtime, held.name, o.env);
+        untrackContainer(held.name);
+      }
       // Not started (no such executable), or started and stopped because it could not be recorded.
       await identity;
       results.push({ command: shown, status: 'failed', exitCode: null, seconds: Math.round((o.now() - startedAt) / 1000) });
@@ -422,6 +450,11 @@ async function runVerification(o: {
       continue;
     }
     await identity; // never record anything for a command after it is finished
+    if (held) {
+      // As for the agent: --rm normally removed it already; make sure nothing is left.
+      await forceRemoveContainer(held.runtime, held.name, o.env);
+      untrackContainer(held.name);
+    }
     const seconds = Math.round((o.now() - startedAt) / 1000);
     const exit = ran.code !== null ? `code ${ran.code}` : `signal ${ran.signal ?? 'unknown'}`;
     await o.log([
@@ -772,10 +805,37 @@ export class LiveExecutor implements Executor {
     // counts as succeeded (and so before anything can be published). The commands run code the
     // agent wrote, so they get the worker's environment without the GitHub tokens, like the agent;
     // agents.<name>.env is the agent's own configuration and is not passed on.
+    // A containerized agent's commands run in containers from the same image with the same
+    // mounts, network and extra arguments, but none of the variables named in container.env:
+    // those are the agent's credentials, and checking its work does not need them.
     let verification: VerificationSummary | undefined;
     if (outcome === 'succeeded' && action.verify?.length) {
       const verified = await runVerification({
         commands: action.verify,
+        ...(box && agentCfg.container
+          ? {
+              contain: (command: VerifyCommand, index: number) => {
+                // Inside the container it is always a POSIX shell, whatever the host is.
+                const inner = verifyInvocation(command, 'linux');
+                const name = containerName(run.id, `verify-${index + 1}`);
+                const args = buildContainerRunArgs(
+                  { file: inner.file, args: inner.args },
+                  {
+                    image: agentCfg.container!.image,
+                    name,
+                    mounts: worktreeMounts(prepared.worktreePath),
+                    workdir: prepared.worktreePath,
+                    user: hostUser(),
+                    network: agentCfg.container!.network,
+                    runLabel: run.id,
+                    extraArgs: agentCfg.container!.args,
+                  },
+                );
+                return { invocation: { file: box.runtime, args, verbatim: false }, box: { runtime: box.runtime, name } };
+              },
+              onContainer: (c: { runtime: string; name: string }) => ctx.recordProcess({ container: c }),
+            }
+          : {}),
         cwd: prepared.worktreePath,
         env: baseEnv,
         logPath,
