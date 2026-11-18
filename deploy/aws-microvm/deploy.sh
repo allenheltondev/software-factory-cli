@@ -17,7 +17,8 @@
 #   BASE_IMAGE_ARN    Lambda-managed MicroVM base image
 #                     (default: arn:aws:lambda:<region>:aws:microvm-image:al2023-1)
 #   BASE_IMAGE_VERSION  pin a base image version                     (default: latest)
-#   NODE_VERSION, UPDRAFT_SPEC, AGENT_PACKAGES, TOOL_PACKAGES   override image/build.env
+#   NODE_VERSION, UPDRAFT_SPEC, AGENT_PACKAGES, TOOL_PACKAGES,
+#   SYSTEM_PACKAGES, PYTHON_COMMAND                              override image/build.env
 #   UPDRAFT_TARBALL   path of an `npm pack` tarball to install instead of UPDRAFT_SPEC
 #   BUILD_TIMEOUT_SECONDS  how long to wait for the image build      (default: 2400)
 #   SAM_PARAMETER_OVERRIDES  extra template parameters, e.g.
@@ -119,6 +120,8 @@ build_image() {
     [ -z "${UPDRAFT_SPEC:-}" ] || printf 'UPDRAFT_SPEC="%s"\n' "$UPDRAFT_SPEC"
     [ -z "${AGENT_PACKAGES+set}" ] || printf 'AGENT_PACKAGES="%s"\n' "$AGENT_PACKAGES"
     [ -z "${TOOL_PACKAGES+set}" ] || printf 'TOOL_PACKAGES="%s"\n' "$TOOL_PACKAGES"
+    [ -z "${SYSTEM_PACKAGES+set}" ] || printf 'SYSTEM_PACKAGES="%s"\n' "$SYSTEM_PACKAGES"
+    [ -z "${PYTHON_COMMAND+set}" ] || printf 'PYTHON_COMMAND="%s"\n' "$PYTHON_COMMAND"
   } >> "$stage/context/build.env"
 
   local stamp key uri

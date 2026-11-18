@@ -63,6 +63,24 @@ RUN set -eu; . /opt/updraft/build.env; \
     if [ -n "${AGENT_PACKAGES}" ]; then npm install -g --no-fund --no-audit ${AGENT_PACKAGES}; fi; \
     npm cache clean --force >/dev/null 2>&1 || true
 
+# System packages for the repositories (SYSTEM_PACKAGES in build.env). Installed one at a time
+# so that a build with several unknown names reports all of them at once.
+RUN set -eu; . /opt/updraft/build.env; \
+    PM="$(command -v dnf || command -v microdnf)"; \
+    missing=""; \
+    for pkg in ${SYSTEM_PACKAGES:-}; do \
+      if ! "$PM" install -y "$pkg"; then missing="$missing $pkg"; fi; \
+    done; \
+    "$PM" clean all; \
+    if [ -n "$missing" ]; then \
+      echo "these SYSTEM_PACKAGES could not be installed:$missing (edit image/build.env)" >&2; exit 1; \
+    fi; \
+    if [ -n "${PYTHON_COMMAND:-}" ]; then \
+      PY="$(command -v "$PYTHON_COMMAND")" || { echo "PYTHON_COMMAND $PYTHON_COMMAND is not installed" >&2; exit 1; }; \
+      ln -sf "$PY" /usr/local/bin/python3; ln -sf "$PY" /usr/local/bin/python; \
+      python3 --version; python3 -m pip --version; \
+    fi
+
 # Toolchain for the repositories the agents work on (TOOL_PACKAGES in build.env), on PATH for
 # the agent and for the verify commands alike.
 RUN set -eu; . /opt/updraft/build.env; \

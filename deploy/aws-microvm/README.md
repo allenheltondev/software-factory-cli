@@ -148,7 +148,8 @@ hard-coded.
    `create-microvm-image` (or `update-microvm-image` when the image exists) and polls the new
    version until it is `SUCCESSFUL` or `FAILED`. Build logs are in the log group
    `/aws/lambda-microvms/<image-name>`. Other settings: `IMAGE_ARCH` (`ARM_64`), `IMAGE_MEMORY_MIB`
-   (`4096`), `AGENT_PACKAGES`, `TOOL_PACKAGES`, `NODE_VERSION`, `BASE_IMAGE_ARN`, `BASE_IMAGE_VERSION`.
+   (`4096`), `AGENT_PACKAGES`, `TOOL_PACKAGES`, `SYSTEM_PACKAGES`, `PYTHON_COMMAND`, `NODE_VERSION`,
+   `BASE_IMAGE_ARN`, `BASE_IMAGE_VERSION`.
 
    `./deploy.sh` with no argument does steps 1, 2 (if `config/config.yaml` exists) and 4.
 
@@ -380,7 +381,9 @@ that would leave only a `stateReason`.
 
 **Build settings are a file, not build arguments.** `CreateMicrovmImage` has no build-argument
 input. `image/build.env` holds `NODE_VERSION` (Node.js 24 by default), `UPDRAFT_SPEC`,
-`AGENT_PACKAGES` and `TOOL_PACKAGES` (global npm tools for the repositories, TypeScript by default);
+`AGENT_PACKAGES`, `TOOL_PACKAGES` (global npm tools for the repositories, TypeScript by default),
+`SYSTEM_PACKAGES` (system packages: Python 3.12 with pip, a C/C++ toolchain, make and a few
+small tools by default) and `PYTHON_COMMAND` (what `python` and `python3` mean on PATH);
 `deploy.sh` appends overrides from its environment to the copy in the build context.
 
 **4 GB baseline memory by default.** The documented sizes give 8 GB of disk up to a 2 GB
