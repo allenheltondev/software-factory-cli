@@ -12,6 +12,9 @@
 //   reap it after a crash without ever signalling a reused pid
 // - stdout and stderr go straight to run.log (file descriptors, not pipes), so output survives a
 //   worker crash and a descendant holding a pipe open can't stall the run
+//
+// After an agent succeeded, the action's verify commands (if any) run in the same worktree with
+// the same lifecycle; only a string command differs, in that it is handed to a shell (verify.ts).
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
 import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
@@ -25,10 +28,17 @@ import {
 } from '../agents/adapters/registry.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { renderPrompt, type IssueContext } from '../agents/prompt.js';
-import { agentAdapter, DEFAULT_TIMEOUT_MINUTES, type AdapterName, type AgentConfig } from '../config/schema.js';
+import {
+  agentAdapter,
+  DEFAULT_TIMEOUT_MINUTES,
+  DEFAULT_VERIFY_TIMEOUT_MINUTES,
+  type AdapterName,
+  type AgentConfig,
+  type VerifyCommand,
+} from '../config/schema.js';
 import { ownEntry, type Claim } from '../db/queue.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree, type PreparedWorktree } from '../git/worktree.js';
-import type { RunOutcome, RunSummary } from '../types.js';
+import type { RunOutcome, RunSummary, VerificationCommandResult, VerificationSummary } from '../types.js';
 import {
   findRepoConfig,
   resolvePromptPath,
@@ -38,7 +48,8 @@ import {
   type Executor,
 } from './executor.js';
 import { processStartTime, taskkillPath } from './process.js';
-import { cleanSummaryLines, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
+import { cleanSummaryLines, countUncommitted, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
+import { displayVerifyCommand, verifyInvocation, type VerifyInvocation } from './verify.js';
 
 const isWindows = process.platform === 'win32';
 const DEFAULT_KILL_GRACE_MS = 5_000;
@@ -197,15 +208,19 @@ interface AgentRun {
 }
 
 /**
- * Spawn the agent and wait for it. Rejects with StartFailedError when the process can't be
- * started; once it has started, always resolves.
+ * Spawn the agent (or a verify command) and wait for it. Rejects with StartFailedError when the
+ * process can't be started; once it has started, always resolves.
  */
 async function runAgent(o: {
-  invocation: AgentInvocation;
+  /** `verbatim` (Windows): the arguments are a finished command line for cmd.exe; don't re-quote them. */
+  invocation: Pick<AgentInvocation, 'file' | 'args'> & { promptVia?: AgentInvocation['promptVia']; verbatim?: boolean };
+  /** What the process is, for error messages. Default "agent". */
+  what?: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
   logPath: string;
-  promptFile: string;
+  /** Read on stdin when the invocation asks for the prompt there. */
+  promptFile?: string;
   timeoutMs: number;
   stop: AbortSignal;
   killGraceMs: number;
@@ -216,12 +231,13 @@ async function runAgent(o: {
   const out = openSync(o.logPath, 'a');
   let stdin: number | 'ignore' = 'ignore';
   try {
-    if (inv.promptVia === 'stdin') stdin = openSync(o.promptFile, 'r');
+    if (inv.promptVia === 'stdin' && o.promptFile) stdin = openSync(o.promptFile, 'r');
     child = spawn(inv.file, inv.args, {
       cwd: o.cwd,
       env: o.env,
       shell: false,
       windowsHide: true,
+      windowsVerbatimArguments: inv.verbatim === true,
       detached: !isWindows,
       stdio: [stdin, out, out],
     });
@@ -263,7 +279,7 @@ async function runAgent(o: {
     await Promise.race([exit, idle(EXIT_WAIT_MS)]);
     if (!isWindows && groupAlive(pid)) await stopGroup(pid, Math.min(o.killGraceMs, 2_000));
     if (!exited) running.delete(child);
-    throw new AgentStoppedError(`could not record the started agent process (${message(err)}); it was stopped`, { cause: err });
+    throw new AgentStoppedError(`could not record the started ${o.what ?? 'agent'} process (${message(err)}); it was stopped`, { cause: err });
   }
 
   let stopped: AgentRun['stopped'] = null;
@@ -306,6 +322,112 @@ async function runAgent(o: {
     await stopGroup(pid, Math.min(o.killGraceMs, 2_000));
   }
   return { ...result, stopped, leftovers };
+}
+
+interface VerificationRun {
+  summary: VerificationSummary;
+  /** Set when the step did not pass: what the run's outcome and error become. */
+  failure: { outcome: 'failed' | 'interrupted'; error: string } | null;
+}
+
+/**
+ * Run an action's verify commands in the worktree, in order, until one does not pass. Each is a
+ * process like the agent's (runAgent): own group, killed at the time limit and on shutdown, pid
+ * recorded for a later worker's reconcile, output straight into run.log. Never throws.
+ *
+ * `wrap` turns a command into the process to spawn; it is the one place to change to run the
+ * commands somewhere else (for example behind a container prefix).
+ */
+async function runVerification(o: {
+  commands: readonly VerifyCommand[];
+  wrap?: (command: VerifyCommand) => VerifyInvocation;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  logPath: string;
+  log: (lines: string[]) => Promise<void>;
+  timeoutMinutes: number;
+  stop: AbortSignal;
+  killGraceMs: number;
+  now: () => number;
+  git?: string;
+  /** Record a started command's pid; hand `recording` the promise that settles once its start time is recorded too. */
+  onSpawn: (pid: number, recording: (done: Promise<void>) => void) => void;
+}): Promise<VerificationRun> {
+  // Quoted without escaping: the command is shown as the user wrote it in the config.
+  const quoted = (c: VerifyCommand) => `"${displayVerifyCommand(c)}"`;
+  const deadline = o.now() + Math.round(o.timeoutMinutes * 60_000);
+  const results: VerificationCommandResult[] = [];
+  let failure: VerificationRun['failure'] = null;
+  const uncommittedBefore = await countUncommitted(o.cwd, o.git);
+  await o.log(['', `---- verification (run by the worker: ${o.commands.length} command(s), ${o.timeoutMinutes} min in total) ----`]);
+
+  for (const [i, command] of o.commands.entries()) {
+    const shown = displayVerifyCommand(command);
+    if (failure) {
+      results.push({ command: shown, status: 'not_run', exitCode: null, seconds: 0 });
+      continue;
+    }
+    if (o.stop.aborted) {
+      results.push({ command: shown, status: 'not_run', exitCode: null, seconds: 0 });
+      failure = { outcome: 'interrupted', error: `worker stopped during verification, before ${quoted(command)} started` };
+      continue;
+    }
+    const invocation = (o.wrap ?? verifyInvocation)(command);
+    await o.log([`---- verify ${i + 1}/${o.commands.length}: ${shown} ----`, `command: ${JSON.stringify([invocation.file, ...invocation.args])}`]);
+    const startedAt = o.now();
+    let identity: Promise<void> = Promise.resolve();
+    let ran: AgentRun;
+    try {
+      ran = await runAgent({
+        invocation,
+        what: 'verify command',
+        cwd: o.cwd,
+        env: o.env,
+        logPath: o.logPath,
+        // Past the limit already: the command still starts, so the failure is reported as its timeout.
+        timeoutMs: Math.max(1, deadline - startedAt),
+        stop: o.stop,
+        killGraceMs: o.killGraceMs,
+        onSpawn: (pid) => o.onSpawn(pid, (done) => (identity = done)),
+      });
+    } catch (err) {
+      // Not started (no such executable), or started and stopped because it could not be recorded.
+      await identity;
+      results.push({ command: shown, status: 'failed', exitCode: null, seconds: Math.round((o.now() - startedAt) / 1000) });
+      failure = { outcome: 'failed', error: `verification failed: ${quoted(command)}: ${message(err)}` };
+      await o.log([`error: ${message(err)}`]);
+      continue;
+    }
+    await identity; // never record anything for a command after it is finished
+    const seconds = Math.round((o.now() - startedAt) / 1000);
+    const exit = ran.code !== null ? `code ${ran.code}` : `signal ${ran.signal ?? 'unknown'}`;
+    await o.log([
+      `exit: ${exit} after ${seconds}s${ran.stopped ? ` (stopped by the worker: ${ran.stopped})` : ''}`,
+      ...(ran.leftovers ? ['note: processes the command left running in its process group were stopped'] : []),
+    ]);
+    if (ran.stopped === 'shutdown') {
+      results.push({ command: shown, status: 'interrupted', exitCode: null, seconds });
+      failure = { outcome: 'interrupted', error: `worker stopped during verification; the process tree of ${quoted(command)} was stopped` };
+    } else if (ran.stopped === 'timeout') {
+      results.push({ command: shown, status: 'timed_out', exitCode: null, seconds });
+      failure = {
+        outcome: 'failed',
+        error: `verification failed: ${quoted(command)} timed out (the verify commands have ${o.timeoutMinutes} min in total); its process tree was stopped`,
+      };
+    } else if (ran.code === 0) {
+      results.push({ command: shown, status: 'passed', exitCode: 0, seconds });
+    } else {
+      results.push({ command: shown, status: 'failed', exitCode: ran.code, seconds });
+      failure = {
+        outcome: 'failed',
+        error: `verification failed: ${quoted(command)} ${ran.code !== null ? `exited ${ran.code}` : `was killed by ${ran.signal ?? 'a signal'}`}`,
+      };
+    }
+  }
+
+  const uncommittedAfter = await countUncommitted(o.cwd, o.git);
+  await o.log([`---- end of verification: ${failure ? (failure.outcome === 'interrupted' ? 'interrupted' : 'failed') : 'passed'} ----`]);
+  return { summary: { passed: failure === null, commands: results, uncommittedBefore, uncommittedAfter }, failure };
 }
 
 /** Byte size of a file, 0 if it doesn't exist. */
@@ -555,16 +677,51 @@ export class LiveExecutor implements Executor {
       error = verdict.error ?? (outcome === 'failed' ? defaultVerdict(exit).error : undefined);
     }
 
-    // 7. Summary.
-    let summary: RunSummary | null = null;
-    const tail: string[] = [
+    await log([
       '---- end of agent output ----',
       `exit: ${agentRun.code !== null ? `code ${agentRun.code}` : `signal ${agentRun.signal ?? 'unknown'}`} after ${seconds}s` +
         (agentRun.stopped ? ` (stopped by the worker: ${agentRun.stopped})` : ''),
       ...(agentRun.leftovers ? ['note: processes the agent left running in its process group were stopped'] : []),
-      '',
-      'summary:',
-    ];
+    ]);
+
+    // 6b. Verification: the worker's own check of what a successful agent left, before the run
+    // counts as succeeded (and so before anything can be published). The commands run code the
+    // agent wrote, so they get the worker's environment without the GitHub tokens, like the agent;
+    // agents.<name>.env is the agent's own configuration and is not passed on.
+    let verification: VerificationSummary | undefined;
+    if (outcome === 'succeeded' && action.verify?.length) {
+      const verified = await runVerification({
+        commands: action.verify,
+        cwd: prepared.worktreePath,
+        env: baseEnv,
+        logPath,
+        log,
+        timeoutMinutes: action.verifyTimeoutMinutes ?? DEFAULT_VERIFY_TIMEOUT_MINUTES,
+        stop: ctx.workerStopping ? AbortSignal.any([ctx.signal, ctx.workerStopping]) : ctx.signal,
+        killGraceMs: this.opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS,
+        now: ctx.now,
+        git: this.opts.git,
+        onSpawn: (pid, recording) => {
+          // Replaces the agent's pid (it has exited): from here this is the process to reap after a crash.
+          ctx.recordProcess({ pid });
+          ctx.log.info('verify command started', { pid, worktree: prepared.worktreePath });
+          recording(
+            (this.opts.startTime ?? processStartTime)(pid)
+              .then((startTime) => {
+                if (startTime) ctx.recordProcess({ pidStartTime: startTime });
+                else ctx.log.warn('could not read the verify command start time; a later worker will not signal it', { pid });
+              })
+              .catch((err: unknown) => ctx.log.warn('could not record the verify command start time', { pid, error: message(err) })),
+          );
+        },
+      });
+      verification = verified.summary;
+      if (verified.failure) ({ outcome, error } = verified.failure);
+    }
+
+    // 7. Summary.
+    let summary: RunSummary | null = null;
+    const tail: string[] = ['', 'summary:'];
     try {
       const detail = await summarizeRun({
         worktree: prepared.worktreePath,
@@ -574,6 +731,7 @@ export class LiveExecutor implements Executor {
         git: this.opts.git,
       });
       summary = detail.summary;
+      if (verification) summary.verification = verification;
       tail.push(...renderSummary(detail).map((l) => `  ${l}`));
     } catch (err) {
       tail.push(`  could not summarize the run: ${message(err)}`);

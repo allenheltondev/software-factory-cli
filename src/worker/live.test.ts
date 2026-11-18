@@ -28,6 +28,7 @@ import { StartFailedError, type ExecutionContext } from './executor.js';
 import { LiveExecutor } from './live.js';
 import { createExecutor } from './prepare-only.js';
 import { acquireWorkerLock } from './lock.js';
+import { renderPrBody } from '../publish/publish.js';
 import { isPidAlive } from './process.js';
 
 const isWindows = process.platform === 'win32';
@@ -208,6 +209,9 @@ describe('LiveExecutor (fake adapter)', { timeout: 120_000 }, () => {
     expect(log).toContain('commits since base: 1');
     expect(log).toContain('FAKE_AGENT.md | 3 +++');
     expect(log).toContain('outcome: succeeded');
+    // No verify commands are configured: nothing about verification anywhere.
+    expect(r.summary).not.toHaveProperty('verification');
+    expect(log).not.toContain('verif');
 
     const status = renderStatus(
       buildStatusView({
@@ -710,6 +714,194 @@ describe('LiveExecutor (Codex adapter, fake codex CLI)', { timeout: 120_000 }, (
     expect(result.error).toMatch(/^codex exited with code 0, but no turn\.completed or turn\.failed event could be read/);
     expect(result.summary?.lastOutput).toEqual(['Done, I think.', `codex: no turn result, thread ${cx.THREAD}`]);
     expect(readFileSync(c.run.logPath!, 'utf8')).toContain('Warning: a diagnostic on stderr');
+  });
+});
+
+describe('LiveExecutor verification (actions.<name>.verify)', { timeout: 120_000 }, () => {
+  // Command lines that mean the same to sh and cmd.exe: double quotes only, no shell metacharacters.
+  const node = `"${process.execPath}"`;
+  const exits = (code: number) => `${node} -e "process.exit(${code})"`;
+  const setVerify = (config: FactoryConfig, verify: Array<string | string[]>, verifyTimeoutMinutes?: number) => {
+    config.actions['implement-issue'] = { ...config.actions['implement-issue']!, verify, ...(verifyTimeoutMinutes ? { verifyTimeoutMinutes } : {}) };
+  };
+  /** A verify command that starts a child, writes both pids, and waits: the fake agent's hang mode. */
+  const hangs = (f: GitFixture, pidsFile: string) => {
+    const prompt = join(f.root, 'verify prompt.txt');
+    writeFileSync(prompt, 'unused');
+    return [process.execPath, FAKE_AGENT, '--mode', 'hang', '--prompt-file', prompt, '--pids-file', pidsFile];
+  };
+
+  it('runs the commands in the worktree after the agent, without the GitHub token; the result is in run.log, status and the PR body', async () => {
+    const { paths, config, db } = setup();
+    setVerify(config, [
+      `${node} -e "require('fs').writeFileSync('verify-out.txt', process.cwd()); console.log('tok=' + (process.env.GH_TOKEN || 'unset'))"`,
+      [process.execPath, '-e', "console.log('argv form: ' + process.argv.slice(1).join('|'))", 'two words', '&&'],
+    ]);
+    const ids: string[] = [];
+    const controller = new AbortController();
+    const done = runDaemon({
+      db,
+      config,
+      paths,
+      log: silentLogger,
+      signal: controller.signal,
+      executor: new LiveExecutor({ env: { ...process.env, GH_TOKEN: 'ghs_worker_secret', GITHUB_TOKEN: 'ghs_worker_secret' } }),
+      poll: async () => {
+        if (ids.length === 0) ids.push(insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 20 }));
+      },
+      checkDispatchable: async () => ({ ok: true, issue: ISSUE }),
+      hostname: hostname(),
+      pid: process.pid,
+    });
+    await vi.waitFor(() => expect(getJob(db, ids[0]!)?.status).toMatch(/succeeded|failed/), { timeout: 90_000, interval: 100 });
+    controller.abort();
+    await done;
+
+    const r = getRun(db, (db.prepare('SELECT id FROM runs WHERE job_id = ?').get(ids[0]!) as { id: string }).id)!;
+    const log = readFileSync(r.logPath!, 'utf8');
+    expect(r.outcome, log).toBe('succeeded');
+    // The first command ran in the worktree and left a file there; nothing was committed for it.
+    expect(existsSync(join(r.checkoutPath!, 'verify-out.txt'))).toBe(true);
+    expect(r.summary).toMatchObject({ commitCount: 1, untracked: 1 });
+    const v = r.summary!.verification!;
+    expect(v).toMatchObject({ passed: true, uncommittedBefore: 0, uncommittedAfter: 1 });
+    expect(v.commands.map((c) => [c.status, c.exitCode])).toEqual([['passed', 0], ['passed', 0]]);
+    expect(v.commands[1]!.command).toMatch(/ "two words" "&&"$/);
+
+    expect(log).toContain('exit: code 0');
+    expect(log.indexOf('---- end of agent output ----')).toBeLessThan(log.indexOf('---- verification (run by the worker: 2 command(s), 15 min in total) ----'));
+    expect(log).toMatch(/---- verify 1\/2: .*\ncommand: \[.*\ntok=unset\r?\nexit: code 0 after \d+s\n/);
+    // The argv form reaches the process as written: no shell split or interpreted its arguments.
+    expect(log).toMatch(/argv form: two words\|&&\r?\n/);
+    expect(log).not.toContain('ghs_worker_secret');
+    expect(log).toContain('---- end of verification: passed ----');
+    expect(log).toContain('  verification: passed\n');
+    expect(log).toContain('note: uncommitted changes in the worktree went from 0 to 1 during verification');
+    expect(log.indexOf('---- end of verification')).toBeLessThan(log.indexOf('outcome: succeeded'));
+
+    const status = renderStatus(
+      buildStatusView({
+        configPath: 'config.yaml',
+        configState: 'ok',
+        configMessage: null,
+        config,
+        dbFile: 'state.db',
+        dbExists: true,
+        snapshot: getStatusSnapshot(db, config),
+      }),
+    );
+    expect(status).toMatch(/\n {4}verification: passed\n {6}.*: passed in \d+s\n {6}.*: passed in \d+s\n {6}note: uncommitted changes in the worktree went from 0 to 1/);
+
+    const body = renderPrBody({ runId: r.id, issueNumber: 20, agent: 'claude', summary: r.summary!, commitCount: 1, mode: 'draft-pr' });
+    expect(body).toMatch(/\*\*Verification\*\* \(passed; commands run by the worker after the agent finished\)\n\n```text\n.*: passed in \d+s\n.*: passed in \d+s\n```\n\nNote: uncommitted changes/);
+  });
+
+  it('the first failing command fails the run, later ones do not run, and the worktree is kept', async () => {
+    const { paths, config, db } = setup();
+    const failing = `${node} -e "console.error('2 tests failed'); process.exit(3)"`;
+    setVerify(config, [exits(0), failing, `${node} -e "require('fs').writeFileSync('never.txt', 'x')"`]);
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 21 });
+    const c = claim(db, config, paths);
+    const result = await new LiveExecutor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({ outcome: 'failed', error: `verification failed: "${failing}" exited 3` });
+    expect(result.summary?.verification).toMatchObject({ passed: false, uncommittedBefore: 0, uncommittedAfter: 0 });
+    expect(result.summary?.verification?.commands.map((x) => [x.status, x.exitCode])).toEqual([['passed', 0], ['failed', 3], ['not_run', null]]);
+    // The agent's commit is still there, as is its last output; only the verdict changed.
+    expect(result.summary).toMatchObject({ commitCount: 1 });
+    expect(result.summary?.lastOutput.at(-1)).toBe('fake agent: all done');
+    const worktree = join(worktreesRoot(paths), '42', c.job.id);
+    expect(existsSync(join(worktree, 'never.txt'))).toBe(false);
+    const log = readFileSync(c.run.logPath!, 'utf8');
+    expect(log).toMatch(/2 tests failed\r?\nexit: code 3 after \d+s\n---- end of verification: failed ----/);
+    expect(log).toContain('  verification: did not pass\n');
+    expect(log).toContain(`outcome: failed (verification failed: "${failing}" exited 3)`);
+    expect(log).toContain(`The worktree is kept for inspection: ${worktree}`);
+  });
+
+  it('a command that cannot be started fails the run with the reason', async () => {
+    const { paths, config, db } = setup();
+    setVerify(config, [['factory-no-such-verify-command', '--flag']]);
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 22 });
+    const c = claim(db, config, paths);
+    const result = await new LiveExecutor().execute(c, context(db, config, paths, c.run.id));
+    expect(result.outcome).toBe('failed');
+    expect(result.error).toMatch(/^verification failed: "factory-no-such-verify-command --flag": could not start factory-no-such-verify-command: /);
+    expect(result.summary?.verification?.commands).toMatchObject([{ status: 'failed', exitCode: null }]);
+  });
+
+  it('kills a hung command and its descendants at verifyTimeoutMinutes, having recorded its pid, and fails the run', async () => {
+    const { f, paths, config, db } = setup();
+    const pidsFile = join(f.root, 'verify hang pids.json');
+    setVerify(config, [hangs(f, pidsFile), exits(0)], 0.05);
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 23 });
+    const c = claim(db, config, paths);
+    const running = new LiveExecutor({ killGraceMs: 500 }).execute(c, context(db, config, paths, c.run.id));
+    const pids = await readPids(pidsFile);
+    // The run's recorded process is now the verify command, so a later worker would reap it after a crash.
+    expect(getRun(db, c.run.id)?.pid).toBe(pids.agent);
+    const result = await running;
+
+    expect(result.outcome).toBe('failed');
+    expect(result.error).toMatch(/^verification failed: ".*" timed out \(the verify commands have 0\.05 min in total\); its process tree was stopped$/);
+    expect(result.summary?.verification?.commands.map((x) => x.status)).toEqual(['timed_out', 'not_run']);
+    await expectDead(pids.agent, pids.child);
+    expect(existsSync(join(worktreesRoot(paths), '42', c.job.id))).toBe(true);
+    expect(readFileSync(c.run.logPath!, 'utf8')).toMatch(/exit: .* \(stopped by the worker: timeout\)\n---- end of verification: failed ----/);
+  });
+
+  it('a worker shutdown during verification stops the shell command tree and interrupts the run', async () => {
+    const { f, paths, config, db } = setup();
+    const pidsFile = join(f.root, 'verify shutdown pids.json');
+    // String form, so the tree to stop is shell -> node -> child; paths with spaces are quoted.
+    setVerify(config, [hangs(f, pidsFile).map((a) => `"${a}"`).join(' ')]);
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 24 });
+    const c = claim(db, config, paths);
+    const stopping = new AbortController();
+    const running = new LiveExecutor({ killGraceMs: 2_000 }).execute(c, context(db, config, paths, c.run.id, { stopping: stopping.signal }));
+    const pids = await readPids(pidsFile);
+    stopping.abort();
+    const result = await running;
+
+    expect(result.outcome).toBe('interrupted');
+    expect(result.error).toMatch(/^worker stopped during verification; the process tree of ".*" was stopped$/);
+    expect(result.summary?.verification).toMatchObject({ passed: false, commands: [{ status: 'interrupted' }] });
+    await expectDead(pids.agent, pids.child);
+    expect(readFileSync(c.run.logPath!, 'utf8')).toContain('---- end of verification: interrupted ----');
+  });
+
+  it('does not verify a run whose agent failed', async () => {
+    const { paths, config, db, agent } = setup();
+    config.agents.claude = agentSchema.parse(agent('fail'));
+    setVerify(config, [`${node} -e "require('fs').writeFileSync('verified.txt', 'x')"`]);
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 25 });
+    const c = claim(db, config, paths);
+    const result = await new LiveExecutor().execute(c, context(db, config, paths, c.run.id));
+
+    expect(result).toMatchObject({ outcome: 'failed', error: 'agent exited with code 3' });
+    expect(result.summary).toBeTruthy();
+    expect(result.summary).not.toHaveProperty('verification');
+    expect(existsSync(join(worktreesRoot(paths), '42', c.job.id, 'verified.txt'))).toBe(false);
+    expect(readFileSync(c.run.logPath!, 'utf8')).not.toContain('verif');
+  });
+
+  it('reports uncommitted files the agent left, which the commands see but a PR would not contain', async () => {
+    const { paths, config, db } = setup();
+    // Stands in for an agent that forgot to commit one of its files.
+    setVerify(config, [`${node} -e "require('fs').writeFileSync('forgotten.txt', 'x')"`, exits(0)]);
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 26 });
+    const c = claim(db, config, paths);
+    const first = await new LiveExecutor().execute(c, context(db, config, paths, c.run.id));
+    expect(first.summary?.verification).toMatchObject({ passed: true, uncommittedBefore: 0, uncommittedAfter: 1 });
+    const body = renderPrBody({
+      runId: c.run.id,
+      issueNumber: 26,
+      agent: 'claude',
+      commitCount: 1,
+      mode: 'pr',
+      summary: { ...first.summary!, verification: { ...first.summary!.verification!, uncommittedBefore: 2, uncommittedAfter: 2 } },
+    });
+    expect(body).toContain('Note: 2 uncommitted change(s) were in the worktree when verification ran: the commands saw them, but only commits are published.');
   });
 });
 

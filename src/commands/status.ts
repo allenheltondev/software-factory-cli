@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { configSchema, type FactoryConfig } from '../config/schema.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
 import type { JobStatus, Publication } from '../types.js';
+import { verificationLines, verificationNotes } from '../worker/verify.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 import { checkConfig } from './validate.js';
@@ -167,6 +168,11 @@ export function renderStatus(v: StatusView): string {
       );
       const last = sum.lastOutput.at(-1);
       if (last) lines.push(`    last output: ${oneLine(last, 120)}`);
+      if (sum.verification) {
+        lines.push(`    verification: ${sum.verification.passed ? 'passed' : 'did not pass'}`);
+        for (const l of verificationLines(sum.verification)) lines.push(`      ${oneLine(l)}`);
+        for (const note of verificationNotes(sum.verification)) lines.push(`      note: ${note}`);
+      }
       const pub = pubByRun.get(run.id);
       if (pub) lines.push(`    ${renderPublication(pub)}`);
     }

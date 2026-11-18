@@ -126,6 +126,24 @@ export function validateConfig(raw: unknown): ValidationResult {
     });
   }
 
+  for (const [name, action] of Object.entries(config.actions)) {
+    if (action.verify) {
+      if (config.execution.mode !== 'live') {
+        warnings.push({
+          path: `actions.${name}.verify`,
+          message: `only applies in live mode; in ${config.execution.mode} mode no agent runs and no verify command is run`,
+        });
+      } else if (action.output !== 'local-branch') {
+        warnings.push({
+          path: `actions.${name}.verify`,
+          message: `only applies to actions with output local-branch; this action's output is ${action.output}, so no verify command is run`,
+        });
+      }
+    } else if (action.verifyTimeoutMinutes !== undefined) {
+      warnings.push({ path: `actions.${name}.verifyTimeoutMinutes`, message: 'has no effect without verify' });
+    }
+  }
+
   if (config.execution.mode === 'live') {
     const used = new Set(Object.values(config.repositories).flatMap((r) => r.workflows.map((wf) => wf.action)));
     for (const name of used) {
