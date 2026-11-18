@@ -234,9 +234,9 @@ settles one way or the other:
    run that was skipped or ended neutral does not block, but it is not a pass either: a commit
    whose only checks were skipped is not merged. With `autoMergeRequiredChecks`, each check
    named there must have reported success; name your test job there so that some other
-   check passing is not enough. A commit with no checks, or still missing a required one, is
-   waited for like a pending one (CI often registers a moment after the push) and then given
-   up on: a repository with no CI is never auto-merged. Every page of both listings is read; if either cannot be read to
+   check passing is not enough. A commit on which no check has succeeded yet, or which is
+   still missing a required one, is waited for like a pending one (CI often registers a moment
+   after the push, and a passing workflow can arrive after a skipped one) and then given up on: a repository with no CI is never auto-merged. Every page of both listings is read; if either cannot be read to
    its end, it is unknown whether the checks passed and the PR is not merged.
 
 Pending checks, and mergeability GitHub is still computing, are waited for up to

@@ -172,11 +172,11 @@ async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: 
     const what = required
       ? `required check(s) have not reported success on ${short(sha)}: ${names(missing)}`
       : `no check has reported success on ${short(sha)}; auto-merge needs at least one GitHub check (CI run independently of the worker) to pass on it`;
-    // Waited for like a pending check: CI often registers a moment after the push, and a named
-    // check may come from a workflow that starts later than the others. Without names, checks
-    // that have all finished without a success will not change, so that is final.
-    if (required || checks.total === 0) return { action: 'wait', reason: what };
-    return block(`${what} (${checks.total} check(s) finished, none of them failing; skipped and neutral results do not count as a pass)`);
+    // Waited for like a pending check, up to autoMergeWaitMinutes: CI often registers a moment
+    // after the push, and the check that will pass may come from a workflow that starts later
+    // than one whose job was skipped. Checks seen so far that were skipped or neutral say so.
+    const seen = checks.total > 0 ? ` (${checks.total} check(s) finished, none of them failing; skipped and neutral results do not count as a pass)` : '';
+    return { action: 'wait', reason: `${what}${seen}` };
   }
   if (live.mergeable === null) return { action: 'wait', reason: 'GitHub has not finished working out whether it can be merged' };
   return { action: 'merge' };

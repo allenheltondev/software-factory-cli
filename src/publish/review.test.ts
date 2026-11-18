@@ -605,11 +605,25 @@ describe('auto-merge', () => {
 
   it('does not count a skipped or neutral check as the independent pass', async () => {
     // One check run exists and nothing failed, but it was skipped by its workflow condition: no test ran.
-    const s = await ready();
+    const s = await ready({ repo: { autoMergeWaitMinutes: 30 } });
     s.gh.checks = { total: 1, failing: [], pending: [], succeeded: [], complete: true };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([]);
-    expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/no check has reported success on 111111111111.*skipped and neutral results do not count as a pass/) });
+    // Waiting, not blocked: a workflow that registers later may still pass on this commit.
+    expect(s.pr()).toMatchObject({ mergeState: 'waiting', mergeReason: expect.stringMatching(/no check has reported success on 111111111111.*skipped and neutral results do not count as a pass/) });
+    s.tick(60_000);
+    s.gh.checks = { total: 2, failing: [], pending: [], succeeded: ['test'], complete: true };
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+
+    // Nothing ever passes: given up on after the wait, and left for a person.
+    const never = await ready({ repo: { autoMergeWaitMinutes: 30 } });
+    never.gh.checks = { total: 1, failing: [], pending: [], succeeded: [], complete: true };
+    await never.mergeStep();
+    never.tick(31 * 60_000);
+    await never.mergeStep();
+    expect(never.gh.merges).toEqual([]);
+    expect(never.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/^gave up after waiting 30 minute\(s\): no check has reported success/) });
   });
 
   it('with autoMergeRequiredChecks, merges only when each named check reported success', async () => {
