@@ -258,6 +258,14 @@ working directory and an explicit `PATH`. Run `updraft doctor` under the same ac
 environment before relying on it. Details, log locations and troubleshooting:
 [docs/background-operation.md](docs/background-operation.md).
 
+## Running jobs in AWS Lambda MicroVMs
+
+[deploy/aws-microvm/](deploy/aws-microvm/README.md) is a reference deployment without a
+long-lived worker: a GitHub App webhook reaches a small Lambda function, which starts one AWS
+Lambda MicroVM per labelled issue; the microVM runs `updraft run-event`, opens the pull
+request and terminates itself. It was written from the service's documentation and has not
+yet been run on AWS; its README lists what is tested and what is not.
+
 ## Security
 
 The key points; [docs/security.md](docs/security.md) has the full statement of each.

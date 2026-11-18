@@ -2,7 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'test/**/*.test.ts', 'deploy/**/test/**/*.test.mjs'],
     environment: 'node',
     setupFiles: ['test/setup-env.ts'],
     // node:sqlite is a builtin; keep vitest from trying to bundle it.
