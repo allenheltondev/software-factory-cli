@@ -5,7 +5,7 @@ import type { PrReview, PrStage } from '../db/pr-reviews.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
 import type { ReviewRequest } from '../db/revisions.js';
 import { reviewOf, revisionOf, type Job, type JobStatus, type Publication, type Revision } from '../types.js';
-import { verificationLines, verificationNotes } from '../worker/verify.js';
+import { describeVerifyResult, verificationNotes } from '../worker/verify.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 import { checkConfig } from './validate.js';
@@ -273,7 +273,9 @@ export function renderStatus(v: StatusView): string {
       if (sum.review) lines.push(`    review verdict: ${sum.review.verdict} for ${sum.review.headSha.slice(0, 12)} (the worktree was removed; nothing was pushed)`);
       if (sum.verification) {
         lines.push(`    verification: ${sum.verification.passed ? 'passed' : 'did not pass'}`);
-        for (const l of verificationLines(sum.verification)) lines.push(`      ${oneLine(l)}`);
+        // Shorten the command, never the result: a long command (an absolute interpreter path)
+        // must not push "passed in 4s" off the end of the line.
+        for (const c of sum.verification.commands) lines.push(`      ${oneLine(c.command, 120)}: ${describeVerifyResult(c)}`);
         for (const note of verificationNotes(sum.verification)) lines.push(`      note: ${note}`);
       }
       const pub = pubByRun.get(run.id);
