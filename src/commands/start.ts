@@ -4,7 +4,8 @@ import type { Db } from '../db/database.js';
 import { resolveGitHubToken } from '../github/client.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
-import { createPublisher, publicationEnabled } from '../publish/publish.js';
+import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
+import { createRevisionPublisher, revisionsEnabled } from '../publish/revision.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import { runDaemon, type DaemonDeps } from '../worker/daemon.js';
 import { createExecutor } from '../worker/prepare-only.js';
@@ -75,6 +76,16 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
     });
     const openDb = db;
     const pollLog = log.child({ component: 'poller' });
+    const publishDeps = (component: string): PublishDeps => ({
+      db: openDb,
+      config,
+      paths,
+      api,
+      log: log.child({ component }),
+      token: () => resolveGitHubToken(ctx.env),
+      env: ctx.env,
+    });
+    const publisher = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
     await deps.runDaemon({
       db: openDb,
       config,
@@ -84,19 +95,13 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       checkDispatchable: (job) => deps.checkJobDispatchable({ api, config }, job),
       signal: controller.signal,
       executor: createExecutor(config),
-      ...(publicationEnabled(config)
-        ? {
-            publisher: createPublisher({
-              db: openDb,
-              config,
-              paths,
-              api,
-              log: log.child({ component: 'publish' }),
-              token: () => resolveGitHubToken(ctx.env),
-              env: ctx.env,
-            }),
-          }
-        : {}),
+      // With the revision loop on, revision runs are pushed to their PR and every other run goes
+      // to the publisher as before.
+      ...(revisionsEnabled(config)
+        ? { publisher: createRevisionPublisher(publishDeps('revision'), publisher) }
+        : publisher
+          ? { publisher }
+          : {}),
       ...(failureCommentsEnabled(config)
         ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }) }) }
         : {}),

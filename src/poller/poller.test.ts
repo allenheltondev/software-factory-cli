@@ -225,6 +225,15 @@ class FakeGitHub implements GitHubApi {
     throw new Error('not used by the poller');
   }
 
+  // The review poller has its own tests (reviews.test.ts); with revise off it asks for nothing.
+  async listPullRequestUpdates(): Promise<never> {
+    throw new Error('not used unless revise is on');
+  }
+
+  async getPullRequestReviews(): Promise<never> {
+    throw new Error('not used unless revise is on');
+  }
+
   async createPullRequest(): Promise<GitHubPullRequest> {
     throw new Error('not used by the poller');
   }

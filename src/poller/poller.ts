@@ -20,6 +20,10 @@
 //      application was superseded or the issue was edited since by someone not allowed to
 //      dispatch. That includes jobs queued in this same cycle, so an edit made between the
 //      label and the poll that ingested it is caught here (and again before the agent starts).
+//
+// With repositories.<repo>.revise, each repository's cycle also reads change requests on the PRs
+// the worker opened and queues revision jobs (reviews.ts). Those jobs sit in the same queue but
+// are checked by their own rules, in step 5 and before start.
 import { allowedActorsFor, workflowId, type UpdraftConfig, type RepositoryConfig, type WorkflowConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
 import { cancelQueuedJob, commitPollBatch, getCheckpoint, listQueuedJobs, type Checkpoint, type NewJob } from '../db/ingest.js';
@@ -32,8 +36,9 @@ import {
   type IssueEventsPage,
 } from '../github/api.js';
 import { labelEquals, selectPool } from '../routing.js';
-import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
+import { ENVELOPE_SCHEMA_VERSION, revisionOf, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
+import { checkRevisionDispatchable, pollRepoReviews, queuedRevisionProblem } from './reviews.js';
 
 /** Events per page. Keep constant: the stored page-1 ETag depends on the query string. */
 export const EVENTS_PER_PAGE = 100;
@@ -72,6 +77,8 @@ export interface RepoPollResult {
   ok: boolean;
   eventsSeen: number;
   jobsEnqueued: number;
+  /** Revision jobs queued from change requests (repositories.<repo>.revise); absent when that is off. */
+  revisionsQueued?: number;
   error?: string;
   /** True when the repo was skipped because it is backing off after errors. */
   skipped?: boolean;
@@ -145,6 +152,7 @@ export async function pollOnce(deps: PollerDeps): Promise<PollSummary> {
   const backoff = backoffFor(deps);
   const getIssue = cachedIssueLookup(deps.api);
   const results: RepoPollResult[] = [];
+  let revisionJobsCanceled = 0;
 
   for (const [fullName, cfg] of Object.entries(deps.config.repositories)) {
     const repo: RepoRef = { id: cfg.id, fullName };
@@ -163,7 +171,12 @@ export async function pollOnce(deps: PollerDeps): Promise<PollSummary> {
       continue;
     }
     try {
-      results.push(await pollRepo(deps, repo, cfg, getIssue, log));
+      const polled = await pollRepo(deps, repo, cfg, getIssue, log);
+      // Change requests on PRs the worker opened (reviews.ts). Under the same error handling: a
+      // failure here backs the repository off, and each of the two keeps its own checkpoint.
+      const reviews = await pollRepoReviews(deps, repo, cfg, log);
+      revisionJobsCanceled += reviews?.jobsCanceled ?? 0;
+      results.push(reviews ? { ...polled, revisionsQueued: reviews.revisionsQueued } : polled);
       backoff.delete(repo.id);
     } catch (err) {
       const failures = (b?.failures ?? 0) + 1;
@@ -178,7 +191,7 @@ export async function pollOnce(deps: PollerDeps): Promise<PollSummary> {
   }
 
   const jobsCanceled = await recheckQueuedJobs(deps, getIssue, backoff);
-  return { repos: results, jobsCanceled };
+  return { repos: results, jobsCanceled: jobsCanceled + revisionJobsCanceled };
 }
 
 function safeRecordError(deps: PollerDeps, e: { scope: string; message: string; repoFullName?: string; jobId?: string }) {
@@ -640,13 +653,19 @@ async function recheckQueuedJobs(
     if (b && b.until > now()) continue; // don't hammer a repo that is failing
     let check: DispatchCheck;
     try {
-      check = await evaluateJob(
-        deps.config,
-        job,
-        getIssue,
-        (repo, n) => deps.api.listEventsForIssue(repo, n),
-        (repo, n) => deps.api.getIssueBodyEdit(repo, n),
-      );
+      if (revisionOf(job)) {
+        // A revision job is not judged by its issue's label: see reviews.ts.
+        const problem = queuedRevisionProblem(deps.config, deps.db, job);
+        check = problem ? { ok: false, reason: problem } : { ok: true };
+      } else {
+        check = await evaluateJob(
+          deps.config,
+          job,
+          getIssue,
+          (repo, n) => deps.api.listEventsForIssue(repo, n),
+          (repo, n) => deps.api.getIssueBodyEdit(repo, n),
+        );
+      }
     } catch (err) {
       deps.log.warn('could not re-check queued job; leaving it queued', { job: job.id, error: errMessage(err) });
       continue;
@@ -669,11 +688,15 @@ async function recheckQueuedJobs(
  * the caller should leave the job queued and try later.
  */
 export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'config'>, job: Job): Promise<DispatchCheck> {
-  return evaluateJob(
-    deps.config,
-    job,
-    (repo, n) => deps.api.getIssue(repo, n),
-    (repo, n) => deps.api.listEventsForIssue(repo, n),
-    (repo, n) => deps.api.getIssueBodyEdit(repo, n),
-  );
+  const check = (j: Job) =>
+    evaluateJob(
+      deps.config,
+      j,
+      (repo, n) => deps.api.getIssue(repo, n),
+      (repo, n) => deps.api.listEventsForIssue(repo, n),
+      (repo, n) => deps.api.getIssueBodyEdit(repo, n),
+    );
+  // A revision job has its own check; the issue check above only decides whether the issue's
+  // text may still be given to the agent.
+  return revisionOf(job) ? checkRevisionDispatchable(deps, job, check) : check(job);
 }

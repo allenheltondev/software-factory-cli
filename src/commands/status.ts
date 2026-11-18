@@ -2,7 +2,8 @@ import { existsSync } from 'node:fs';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import type { FailureComment } from '../db/failure-comments.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
-import type { JobStatus, Publication } from '../types.js';
+import type { ReviewRequest } from '../db/revisions.js';
+import { revisionOf, type Job, type JobStatus, type Publication, type Revision } from '../types.js';
 import { verificationLines, verificationNotes } from '../worker/verify.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
@@ -107,6 +108,43 @@ export function renderFailureComment(c: FailureComment): string {
   }
 }
 
+/** One line: what happened to a revision run's commits. */
+export function renderRevision(r: Revision): string {
+  const range = `${r.baseSha?.slice(0, 12) ?? '?'}..${r.headSha?.slice(0, 12) ?? '?'}`;
+  switch (r.state) {
+    case 'published':
+      return `pushed ${range} to ${r.branch}; reply ${r.commentUrl ?? '(none)'}`;
+    case 'publishing':
+      return `pushing (attempt ${r.attempts})${r.pushedAt ? '; branch pushed' : ''}`;
+    case 'skipped':
+      return `not pushed: ${oneLine(r.error ?? 'nothing to push', 140)}`;
+    case 'failed': {
+      if (r.moved) return `not pushed, the branch moved: ${oneLine(r.error ?? 'unknown error', 140)} — not retried; request changes again to revise the current head`;
+      const next = r.nextAttemptAt ? `worker retries at ${r.nextAttemptAt}, or ` : '';
+      return `revision push failed (attempt ${r.attempts}${r.pushedAt ? '; branch pushed' : ''}): ${oneLine(r.error ?? 'unknown error', 140)} — ${next}run "updraft publish ${r.runId}"`;
+    }
+  }
+}
+
+/** One line: a change request and what was decided about it. */
+export function renderReviewRequest(r: ReviewRequest): string {
+  const who = `by ${r.reviewer ?? 'an unknown user'}${r.submittedAt ? ` at ${r.submittedAt}` : ''}`;
+  switch (r.state) {
+    case 'queued':
+      return `${who}: revision job ${r.jobId ?? '(pruned)'}`;
+    case 'over-limit':
+      return `${who}: not acted on — ${oneLine(r.reason ?? 'the pull request reached maxRevisions', 140)}`;
+    default:
+      return `${who}: ignored — ${oneLine(r.reason ?? 'no reason recorded', 140)}`;
+  }
+}
+
+/** " (revision of PR #n)" for a revision job, so its issue number is not read as the whole story. */
+function revisionNote(job: Job): string {
+  const revision = revisionOf(job);
+  return revision ? ` (revision of PR #${revision.pullRequest.number})` : '';
+}
+
 export function renderStatus(v: StatusView): string {
   const s = v.snapshot;
   const lines: string[] = [];
@@ -160,7 +198,7 @@ export function renderStatus(v: StatusView): string {
       : `claimed ${run.startedAt}, not started yet`;
     const canceling = run.cancelRequestedAt ? ', cancel requested' : '';
     lines.push(
-      `  ${run.id}  ${job.repoFullName}#${job.issueNumber}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}${canceling}`,
+      `  ${run.id}  ${job.repoFullName}#${job.issueNumber}${revisionNote(job)}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}${canceling}`,
     );
   }
 
@@ -169,7 +207,7 @@ export function renderStatus(v: StatusView): string {
   for (const j of s.recentJobs) {
     const reason = j.statusReason ? ` — ${oneLine(j.statusReason, 100)}` : '';
     lines.push(
-      `  ${j.id}  ${j.status.padEnd(11)}  ${j.repoFullName}#${j.issueNumber}  ${j.workflowId}  updated ${j.updatedAt}${reason}`,
+      `  ${j.id}  ${j.status.padEnd(11)}  ${j.repoFullName}#${j.issueNumber}${revisionNote(j)}  ${j.workflowId}  updated ${j.updatedAt}${reason}`,
     );
   }
 
@@ -177,12 +215,14 @@ export function renderStatus(v: StatusView): string {
   const pubByRun = new Map(publications.map((p) => [p.runId, p]));
   const failureComments = s.failureComments ?? [];
   const failureCommentByRun = new Map(failureComments.map((c) => [c.runId, c]));
+  const revisions = s.revisions ?? [];
+  const revisionByRun = new Map(revisions.map((r) => [r.runId, r]));
   if (s.recentAgentRuns.length) {
     lines.push('', 'Recent agent runs:');
     for (const { run, job } of s.recentAgentRuns) {
       const sum = run.summary!;
       lines.push(
-        `  ${run.id}  ${run.outcome ?? (run.cancelRequestedAt ? 'canceled' : 'closed')}  ${job.repoFullName}#${job.issueNumber}  agent ${run.agent}  ended ${run.endedAt}`,
+        `  ${run.id}  ${run.outcome ?? (run.cancelRequestedAt ? 'canceled' : 'closed')}  ${job.repoFullName}#${job.issueNumber}${revisionNote(job)}  agent ${run.agent}  ended ${run.endedAt}`,
         `    ${sum.commitCount} commit(s), ${sum.filesChanged} file(s) changed (${sum.diffStat}), ${sum.untracked} untracked`,
         `    worktree ${sum.worktree} (branch ${sum.branch})`,
       );
@@ -195,6 +235,8 @@ export function renderStatus(v: StatusView): string {
       }
       const pub = pubByRun.get(run.id);
       if (pub) lines.push(`    ${renderPublication(pub)}`);
+      const revision = revisionByRun.get(run.id);
+      if (revision) lines.push(`    ${renderRevision(revision)}`);
       const failureComment = failureCommentByRun.get(run.id);
       if (failureComment) lines.push(`    ${renderFailureComment(failureComment)}`);
     }
@@ -205,6 +247,28 @@ export function renderStatus(v: StatusView): string {
     for (const p of publications) {
       lines.push(`  ${p.runId}  ${p.state.padEnd(10)}  ${p.repoFullName}#${p.issueNumber}  ${p.branch}  updated ${p.updatedAt}`);
       lines.push(`    ${renderPublication(p)}`);
+    }
+  }
+
+  if (revisions.length) {
+    lines.push('', 'Revisions:');
+    for (const r of revisions) {
+      lines.push(`  ${r.runId}  ${r.state.padEnd(10)}  ${r.repoFullName} PR #${r.prNumber}  ${r.branch}  updated ${r.updatedAt}`);
+      lines.push(`    ${renderRevision(r)}`);
+    }
+  }
+
+  const reviewRequests = s.reviewRequests ?? [];
+  if (reviewRequests.length) {
+    const repoName = new Map(v.repos.map((r) => [r.id, r.fullName]));
+    lines.push('', 'Change requests:');
+    for (const r of reviewRequests) {
+      lines.push(`  ${repoName.get(r.repoId) ?? `repository ${r.repoId}`} PR #${r.prNumber}  ${r.state.padEnd(10)}  ${r.reviewUrl ?? r.reviewId}`);
+      lines.push(`    ${renderReviewRequest(r)}`);
+    }
+    for (const pr of s.limitedPullRequests ?? []) {
+      const comment = pr.limitCommentUrl ?? (pr.limitCommentError ? `not posted yet: ${oneLine(pr.limitCommentError, 100)}` : 'not posted yet');
+      lines.push(`  ${repoName.get(pr.repoId) ?? `repository ${pr.repoId}`} PR #${pr.prNumber} reached maxRevisions at ${pr.limitReachedAt}; comment: ${comment}`);
     }
   }
 

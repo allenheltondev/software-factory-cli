@@ -1,0 +1,671 @@
+// The revision push and reply, against real git (test/git-fixtures.ts) and an in-memory GitHub.
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { stringify } from 'yaml';
+import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
+import { insertQueuedJob } from '../../test/queue-fixtures.js';
+import { fakeContext } from '../commands/fakes.js';
+import { publishCommand } from '../commands/publish.js';
+import { configSchema, type UpdraftConfig } from '../config/schema.js';
+import { openDatabase, type Db } from '../db/database.js';
+import { getFailureComment } from '../db/failure-comments.js';
+import { getPublication } from '../db/publications.js';
+import { claimNextJob, getJob } from '../db/queue.js';
+import { enqueueRevision, getRevision, getRevisionPr, listDueRevisions, recordReviewRequest, revisionJob, syncRevisionPrs } from '../db/revisions.js';
+import { GitError, runGit, type GitOptions } from '../git/git.js';
+import { jobBranchName, jobWorktreePath, prepareJobWorktree } from '../git/worktree.js';
+import { GitHubError, type GitHubApi, type GitHubIssueComment } from '../github/api.js';
+import type { UpdraftPaths } from '../paths.js';
+import type { RepoRef, RevisionRequest, RunOutcome } from '../types.js';
+import { silentLogger } from '../util/log.js';
+import { summarizeRun } from '../worker/run-summary.js';
+import { failureCommentMarker, postFailureComment } from './failure-comment.js';
+import { publishRun, type PublishDeps, type Publisher, type RunGit } from './publish.js';
+import { createRevisionPublisher, postLimitNotices, REVISION_LIMIT_MARKER, reviseRun, revisionMarker } from './revision.js';
+
+const REPO_ID = 42;
+const FULL = 'octo/widgets';
+const PR = 100;
+const TOKEN = 'ghp_SECRETtoken0123456789';
+const T0 = Date.parse('2026-11-18T12:00:00.000Z');
+const REVIEW_URL = `https://github.com/${FULL}/pull/${PR}#pullrequestreview-9001`;
+
+/** The comment side of GitHub. Any other method is a bug in the code under test. */
+class FakeCommentsApi {
+  comments: Array<GitHubIssueComment & { issue: number }> = [];
+  readonly calls: string[] = [];
+  failNext: Partial<Record<'createIssueComment' | 'listIssueComments', GitHubError>> = {};
+  /** Create the comment, then fail as if the response was lost. */
+  loseNextCommentResponse = false;
+  private nextId = 1;
+
+  private maybeFail(name: 'createIssueComment' | 'listIssueComments'): void {
+    const err = this.failNext[name];
+    if (err) {
+      delete this.failNext[name];
+      throw err;
+    }
+  }
+
+  async listIssueComments(repo: RepoRef, issue: number): Promise<GitHubIssueComment[]> {
+    this.calls.push(`listComments ${repo.id} #${issue}`);
+    this.maybeFail('listIssueComments');
+    return this.comments.filter((c) => c.issue === issue);
+  }
+
+  async createIssueComment(repo: RepoRef, issue: number, body: string): Promise<GitHubIssueComment> {
+    this.calls.push(`createComment ${repo.id} #${issue}`);
+    this.maybeFail('createIssueComment');
+    const id = this.nextId++;
+    const c = { id, htmlUrl: `https://github.com/${FULL}/pull/${issue}#issuecomment-${id}`, body, user: 'allen', issue };
+    this.comments.push(c);
+    if (this.loseNextCommentResponse) {
+      this.loseNextCommentResponse = false;
+      throw new GitHubError('POST /repositories/42/issues/100/comments: network error: socket hang up', 0);
+    }
+    return c;
+  }
+
+  get api(): GitHubApi {
+    return new Proxy(this, {
+      get(target, prop) {
+        // Not a thenable: an awaited api must resolve to itself.
+        if (prop in target || prop === 'then' || typeof prop === 'symbol') return Reflect.get(target, prop, target) as unknown;
+        return () => {
+          throw new Error(`the revision push must not call ${String(prop)}`);
+        };
+      },
+    }) as unknown as GitHubApi;
+  }
+}
+
+const fixtures: GitFixture[] = [];
+const dbs: Db[] = [];
+afterEach(() => {
+  for (const d of dbs.splice(0)) d.close();
+  for (const f of fixtures.splice(0)) f.cleanup();
+});
+
+function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, mode = 'live'): UpdraftConfig {
+  return configSchema.parse({
+    version: 1,
+    execution: { mode },
+    dispatch: { allowedActors: ['allen'] },
+    agents: { claude: {} },
+    pools: { general: { agents: ['claude'] } },
+    actions: { 'implement-issue': { prompt: './prompt.md', revisePrompt: './revise.md', output: 'local-branch' } },
+    repositories: {
+      [FULL]: {
+        id: REPO_ID,
+        checkoutPath: f.clone,
+        remote: 'origin',
+        baseBranch: 'main',
+        publish: 'draft-pr',
+        revise: true,
+        commentOnFailure: true,
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
+        ...repoOver,
+      },
+    },
+  });
+}
+
+function makePaths(root: string): UpdraftPaths {
+  const dataDir = join(root, 'updraft state');
+  const logDir = join(dataDir, 'logs');
+  return { configFile: join(root, 'cfg', 'config.yaml'), configDir: join(root, 'cfg'), dataDir, dbFile: join(dataDir, 'state.db'), logDir, runsDir: join(logDir, 'runs') };
+}
+
+interface Published {
+  f: GitFixture;
+  db: Db;
+  paths: UpdraftPaths;
+  /** The PR's branch: the original job's branch, on the remote. */
+  prBranch: string;
+  originalRunId: string;
+}
+
+function insertRun(db: Db, o: { runId: string; jobId: string; worktree: string; logPath: string; outcome: RunOutcome; summary: unknown; error?: string }): void {
+  const at = new Date(T0).toISOString();
+  db.prepare(
+    `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, lease_expires_at, started_at,
+                       execution_started_at, ended_at, outcome, error, summary)
+     VALUES (?, ?, 1, 'general', 'claude', ?, ?, 'wrk_1', ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(o.runId, o.jobId, o.worktree, o.logPath, at, at, at, at, o.outcome, o.error ?? null, JSON.stringify(o.summary));
+  db.prepare('UPDATE jobs SET status = ?, attempts = 1 WHERE id = ?').run(o.outcome === 'failed' ? 'failed' : 'succeeded', o.jobId);
+}
+
+/** An issue job whose run was published: its branch is on the remote and PR #100 is recorded for it. */
+async function published(o: { db?: Db; paths?: UpdraftPaths } = {}): Promise<Published> {
+  const f = createGitFixture(FULL);
+  fixtures.push(f);
+  const db = o.db ?? openDatabase(':memory:');
+  if (!o.db) dbs.push(db);
+  const paths = o.paths ?? makePaths(f.root);
+  const jobId = insertQueuedJob(db, { repoId: REPO_ID, fullName: FULL, issue: 7 });
+  const job = getJob(db, jobId)!;
+  const prBranch = jobBranchName(job, 1);
+  const prepared = await prepareJobWorktree({ checkoutPath: f.clone, repoFullName: FULL, remote: 'origin', baseBranch: 'main', branch: prBranch, worktreePath: jobWorktreePath(paths, job, 1) });
+  writeFileSync(join(prepared.worktreePath, 'widget.txt'), 'a widget\n');
+  f.git(prepared.worktreePath, 'add', '.');
+  f.git(prepared.worktreePath, 'commit', '--quiet', '-m', 'Add the widget');
+  f.git(f.clone, 'push', '--quiet', 'origin', `${prBranch}:refs/heads/${prBranch}`);
+  const { summary } = await summarizeRun({ worktree: prepared.worktreePath, branch: prBranch, baseSha: prepared.baseSha, lastOutput: ['Done.'] });
+  const originalRunId = `run_${jobId}`;
+  insertRun(db, { runId: originalRunId, jobId, worktree: prepared.worktreePath, logPath: join(paths.runsDir, originalRunId, 'run.log'), outcome: 'succeeded', summary });
+  const at = new Date(T0).toISOString();
+  db.prepare(
+    `INSERT INTO publications (run_id, job_id, repo_id, repo_full_name, issue_number, mode, state, branch, base_branch, head_sha, pushed_at,
+                               pr_number, pr_url, attempts, created_at, updated_at, published_at)
+     VALUES (?, ?, ?, ?, 7, 'draft-pr', 'published', ?, 'main', ?, ?, ?, ?, 1, ?, ?, ?)`,
+  ).run(originalRunId, jobId, REPO_ID, FULL, prBranch, f.git(f.clone, 'rev-parse', prBranch), at, PR, `https://github.com/${FULL}/pull/${PR}`, at, at, at);
+  expect(syncRevisionPrs(db, REPO_ID)).toBe(1);
+  return { f, db, paths, prBranch, originalRunId };
+}
+
+let reviewSeq = 0;
+
+function request(p: Published, over: Partial<RevisionRequest['pullRequest']> = {}): RevisionRequest {
+  reviewSeq++;
+  return {
+    trigger: 'changes_requested',
+    pullRequest: { number: PR, url: `https://github.com/${FULL}/pull/${PR}`, branch: p.prBranch, ...over },
+    sourceRunId: p.originalRunId,
+    originalEventId: '5001',
+    review: { id: `PRR_${reviewSeq}`, url: REVIEW_URL, author: 'allen', submittedAt: '2026-11-18T11:00:00Z', body: 'Please rename it.', comments: [], omittedComments: 0 },
+  };
+}
+
+interface RevisionScenario extends Published {
+  jobId: string;
+  runId: string;
+  logPath: string;
+  /** The revision run's own branch in the clone. */
+  localBranch: string;
+  worktree: string;
+  /** The remote head of the PR branch when the run started. */
+  baseSha: string;
+  localSha: string;
+}
+
+/**
+ * A finished revision run for PR #100: its worktree created from the PR branch's remote head (as
+ * the live executor does), `commits` commits made in it, its summary stored. `edit` can rewrite
+ * the worktree before the run is recorded; `req` replaces the request the job carries.
+ */
+async function revised(
+  p: Published,
+  o: { commits?: number; outcome?: RunOutcome; edit?: (worktree: string) => void; req?: RevisionRequest; error?: string } = {},
+): Promise<RevisionScenario> {
+  const { f, db, paths } = p;
+  const req = o.req ?? request(p);
+  const watched = getRevisionPr(db, REPO_ID, PR)!;
+  const queued = enqueueRevision(db, {
+    repoId: REPO_ID,
+    reviewId: req.review.id,
+    prNumber: PR,
+    reviewer: 'allen',
+    trigger: 'changes_requested',
+    reviewUrl: REVIEW_URL,
+    submittedAt: req.review.submittedAt,
+    job: revisionJob({ id: REPO_ID, fullName: FULL }, watched, req),
+    max: 10,
+  });
+  if (queued.status !== 'queued') throw new Error(`not queued: ${queued.status}`);
+  const job = queued.job;
+  const localBranch = jobBranchName(job, 1);
+  // Exactly the executor's call for a revision job: the PR branch is the base.
+  const prepared = await prepareJobWorktree({ checkoutPath: f.clone, repoFullName: FULL, remote: 'origin', baseBranch: p.prBranch, branch: localBranch, worktreePath: jobWorktreePath(paths, job, 1) });
+  for (let i = 0; i < (o.commits ?? 1); i++) {
+    writeFileSync(join(prepared.worktreePath, `revision-${i}.txt`), `revision ${i} of ${job.id}\n`);
+    f.git(prepared.worktreePath, 'add', '.');
+    f.git(prepared.worktreePath, 'commit', '--quiet', '-m', `Rename it (${i}), thanks @someone`);
+  }
+  o.edit?.(prepared.worktreePath);
+  const { summary } = await summarizeRun({ worktree: prepared.worktreePath, branch: localBranch, baseSha: prepared.baseSha, lastOutput: ['Renamed it.', 'Ping @octocat ```not a fence```'] });
+  const runId = `run_${job.id}`;
+  const logPath = join(paths.runsDir, runId, 'run.log');
+  mkdirSync(join(paths.runsDir, runId), { recursive: true });
+  writeFileSync(logPath, 'updraft run\n');
+  insertRun(db, { runId, jobId: job.id, worktree: prepared.worktreePath, logPath, outcome: o.outcome ?? 'succeeded', summary, ...(o.error ? { error: o.error } : {}) });
+  return { ...p, jobId: job.id, runId, logPath, localBranch, worktree: prepared.worktreePath, baseSha: prepared.baseSha, localSha: f.git(f.clone, 'rev-parse', `refs/heads/${localBranch}`) };
+}
+
+function remoteSha(p: Published, branch = p.prBranch): string | null {
+  const out = p.f.git(p.f.root, 'ls-remote', p.f.remoteDir, `refs/heads/${branch}`);
+  return out ? out.split(/\s+/)[0]! : null;
+}
+
+/** Real git, recording each call. `beforePush` runs once, right before the push reaches git. */
+function recordingGit(o: { beforePush?: () => void; failPushWith?: GitError } = {}): { runGit: RunGit; calls: Array<readonly string[]> } {
+  const calls: Array<readonly string[]> = [];
+  let hook = o.beforePush;
+  return {
+    calls,
+    runGit: async (args, opts: GitOptions) => {
+      calls.push([...args]);
+      if (args[0] === 'push') {
+        hook?.();
+        hook = undefined;
+        if (o.failPushWith) throw o.failPushWith;
+      }
+      return runGit(args, opts);
+    },
+  };
+}
+
+function deps(p: Published, api: FakeCommentsApi, over: Partial<PublishDeps> = {}): PublishDeps {
+  return { db: p.db, config: makeConfig(p.f), paths: p.paths, api: api.api, log: silentLogger, token: async () => TOKEN, now: () => T0, ...over };
+}
+
+describe('reviseRun', { timeout: 120_000 }, () => {
+  it('fast-forwards the PR branch from the head the run started from and replies once on the PR', async () => {
+    const s = await revised(await published(), { commits: 2 });
+    const api = new FakeCommentsApi();
+    const git = recordingGit();
+    const r = await reviseRun(deps(s, api, { runGit: git.runGit }), s.runId);
+
+    expect(r.status).toBe('published');
+    expect(remoteSha(s)).toBe(s.localSha);
+    // Only the PR branch moved; main is where it was.
+    expect(remoteSha(s, 'main')).toBe(s.f.git(s.f.clone, 'rev-parse', 'origin/main'));
+
+    const pushes = git.calls.filter((c) => c[0] === 'push');
+    expect(pushes).toHaveLength(1);
+    const push = pushes[0]!;
+    expect(push).toContain(`--force-with-lease=refs/heads/${s.prBranch}:${s.baseSha}`);
+    expect(push.at(-1)).toBe(`${s.localSha}:refs/heads/${s.prBranch}`);
+    expect(push.some((a) => a.startsWith('+') || a === '--force' || a === '-f')).toBe(false);
+    expect(push.at(-2)).toBe(s.f.remoteDir);
+
+    expect(api.comments).toHaveLength(1);
+    const reply = api.comments[0]!;
+    expect(reply.issue).toBe(PR);
+    expect(reply.body).toContain('pushed 2 commit(s)');
+    expect(reply.body).toContain(REVIEW_URL);
+    expect(reply.body).toContain('Renamed it.');
+    expect(reply.body.trimEnd().endsWith(revisionMarker(s.runId))).toBe(true);
+    // The agent's words and the commit subjects are fenced: a mention in them notifies nobody.
+    const outsideFences = reply.body.split(/^(`{3,})[^\n]*\n[\s\S]*?\n\1$/m).join('\n');
+    expect(outsideFences).not.toContain('@octocat');
+    expect(outsideFences).not.toContain('@someone');
+
+    expect(getRevision(s.db, s.runId)).toMatchObject({
+      state: 'published',
+      prNumber: PR,
+      branch: s.prBranch,
+      baseSha: s.baseSha,
+      headSha: s.localSha,
+      moved: false,
+      trigger: 'changes_requested',
+      commentId: reply.id,
+      attempts: 1,
+      error: null,
+    });
+    expect(readFileSync(s.logPath, 'utf8')).toContain(`revision: commented on pull request #${PR}`);
+    // Never a PR, a review, a merge: the fake throws on anything but comments.
+    expect(api.calls).toEqual([`listComments ${REPO_ID} #${PR}`, `createComment ${REPO_ID} #${PR}`]);
+  });
+
+  it('builds on commits a person pushed to the PR branch before the run started', async () => {
+    const p = await published();
+    const theirs = p.f.pushCommit(p.prBranch, 'by-hand.txt', 'pushed by a person\n');
+    const s = await revised(p);
+    expect(s.baseSha).toBe(theirs);
+    const r = await reviseRun(deps(s, new FakeCommentsApi()), s.runId);
+    expect(r.status).toBe('published');
+    expect(remoteSha(s)).toBe(s.localSha);
+    expect(s.f.git(s.f.clone, 'merge-base', '--is-ancestor', theirs, s.localSha)).toBe('');
+  });
+
+  it('does not push when the PR branch moved after the run started, says so on the PR once, and never retries', async () => {
+    const s = await revised(await published());
+    const theirs = s.f.pushCommit(s.prBranch, 'by-hand.txt', 'pushed while the agent ran\n');
+    const api = new FakeCommentsApi();
+    const git = recordingGit();
+    const r = await reviseRun(deps(s, api, { runGit: git.runGit }), s.runId);
+
+    expect(r).toMatchObject({ status: 'failed', moved: true, retryable: false });
+    expect(remoteSha(s)).toBe(theirs);
+    expect(git.calls.some((c) => c[0] === 'push')).toBe(false);
+    expect(api.comments).toHaveLength(1);
+    const notice = api.comments[0]!.body;
+    expect(notice).toContain('did not push it');
+    expect(notice).toContain(`moved from ${s.baseSha.slice(0, 12)} to ${theirs.slice(0, 12)}`);
+    expect(notice).toContain(revisionMarker(s.runId));
+    // The worker's own words only: no agent output, no local paths.
+    expect(notice).not.toContain('Renamed it.');
+    expect(notice).not.toContain(s.f.root);
+    expect(getRevision(s.db, s.runId)).toMatchObject({ state: 'failed', moved: true, retryable: false, headSha: null, nextAttemptAt: null });
+    expect(listDueRevisions(s.db, { now: () => T0 + 24 * 3600_000 })).toEqual([]);
+
+    // `updraft publish` on it again: still refused, still one comment, still nothing pushed.
+    const again = await reviseRun(deps(s, api, { runGit: git.runGit }), s.runId);
+    expect(again).toMatchObject({ status: 'failed', moved: true });
+    expect(api.comments).toHaveLength(1);
+    expect(remoteSha(s)).toBe(theirs);
+  });
+
+  it('is refused by the remote itself when the branch moves between the check and the push', async () => {
+    const s = await revised(await published());
+    let theirs = '';
+    const git = recordingGit({ beforePush: () => (theirs = s.f.pushCommit(s.prBranch, 'race.txt', 'landed in between\n')) });
+    const api = new FakeCommentsApi();
+    const r = await reviseRun(deps(s, api, { runGit: git.runGit }), s.runId);
+
+    // The push did reach git, with the lease, and git left the branch at the other commit.
+    expect(git.calls.filter((c) => c[0] === 'push')).toHaveLength(1);
+    expect(theirs).not.toBe('');
+    expect(remoteSha(s)).toBe(theirs);
+    expect(r).toMatchObject({ status: 'failed', moved: true, retryable: false });
+    expect(api.comments).toHaveLength(1);
+  });
+
+  it('does not push a result that does not descend from the head the run started from', async () => {
+    const p = await published();
+    const s = await revised(p, {
+      commits: 0,
+      // The agent rewrote history: dropped the PR's commit and committed something else on main.
+      edit: (worktree) => {
+        p.f.git(worktree, 'reset', '--quiet', '--hard', 'origin/main');
+        writeFileSync(join(worktree, 'rewritten.txt'), 'instead\n');
+        p.f.git(worktree, 'add', '.');
+        p.f.git(worktree, 'commit', '--quiet', '-m', 'Rewrite');
+      },
+    });
+    const api = new FakeCommentsApi();
+    const git = recordingGit();
+    const r = await reviseRun(deps(s, api, { runGit: git.runGit }), s.runId);
+
+    expect(r).toMatchObject({ status: 'failed', moved: false, retryable: false });
+    expect(r.status === 'failed' && r.error).toContain('does not descend from');
+    expect(git.calls.some((c) => c[0] === 'push')).toBe(false);
+    expect(remoteSha(s)).toBe(s.baseSha);
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]!.body).toContain('would not be a fast-forward');
+  });
+
+  it('checks ancestry itself because git does not: a lease alone lets a rewrite through', async () => {
+    // What the push would do without the worker's merge-base check, on a branch nobody needs.
+    const p = await published();
+    const base = p.f.pushCommit('probe', 'probe.txt', 'one\n');
+    const scratch = join(p.f.root, 'probe work');
+    p.f.git(p.f.root, 'clone', '--quiet', p.f.remoteDir, scratch);
+    writeFileSync(join(scratch, 'unrelated.txt'), 'not a descendant of probe\n');
+    p.f.git(scratch, 'add', '.');
+    p.f.git(scratch, 'commit', '--quiet', '-m', 'unrelated');
+    const rewritten = p.f.git(scratch, 'rev-parse', 'HEAD');
+    p.f.git(scratch, 'push', '--quiet', `--force-with-lease=refs/heads/probe:${base}`, p.f.remoteDir, `${rewritten}:refs/heads/probe`);
+    expect(remoteSha(p, 'probe')).toBe(rewritten);
+  });
+
+  it('refuses the base branch, a foreign branch and a PR it did not publish, before anything reaches the network', async () => {
+    const cases: Array<{ name: string; arrange: (p: Published) => RevisionRequest; error: RegExp }> = [
+      { name: 'base branch in the request', arrange: (p) => request(p, { branch: 'main' }), error: /published from updraft\/issue-7-\S+, not main/ },
+      {
+        name: 'base branch in the request and the record',
+        arrange: (p) => {
+          p.db.prepare("UPDATE revision_prs SET branch = 'main'").run();
+          return request(p, { branch: 'main' });
+        },
+        error: /main is not a job branch/,
+      },
+      {
+        name: 'a foreign branch',
+        arrange: (p) => {
+          p.f.pushCommit('feature/x', 'x.txt', 'x\n');
+          p.db.prepare("UPDATE revision_prs SET branch = 'feature/x'").run();
+          return request(p, { branch: 'feature/x' });
+        },
+        error: /feature\/x is not a job branch/,
+      },
+      {
+        name: 'a PR that is not in the record',
+        arrange: (p) => {
+          p.db.prepare('DELETE FROM revision_prs').run();
+          return request(p);
+        },
+        error: /not one this worker published/,
+      },
+    ];
+    for (const c of cases) {
+      const p = await published();
+      // The job is queued while the record is intact, then the record is tampered with.
+      const good = request(p);
+      const s = await revised(p, { req: good });
+      const bad = c.arrange(p);
+      const envelope = getJob(p.db, s.jobId)!.envelope;
+      p.db.prepare('UPDATE jobs SET envelope = ? WHERE id = ?').run(JSON.stringify({ ...envelope, revision: { ...bad, review: good.review } }), s.jobId);
+      const before = { pr: remoteSha(p), main: remoteSha(p, 'main'), other: remoteSha(p, 'feature/x') };
+
+      const api = new FakeCommentsApi();
+      const git = recordingGit();
+      const r = await reviseRun(deps(s, api, { runGit: git.runGit }), s.runId);
+      expect(r, c.name).toMatchObject({ status: 'failed', retryable: false, moved: false });
+      expect(r.status === 'failed' && r.error, c.name).toMatch(c.error);
+      expect(git.calls, c.name).toEqual([]);
+      expect(api.calls, c.name).toEqual([]);
+      expect({ pr: remoteSha(p), main: remoteSha(p, 'main'), other: remoteSha(p, 'feature/x') }, c.name).toEqual(before);
+    }
+  });
+
+  it('refuses a job branch that is also the configured base branch', async () => {
+    const s = await revised(await published());
+    const git = recordingGit();
+    const r = await reviseRun(deps(s, new FakeCommentsApi(), { runGit: git.runGit, config: makeConfig(s.f, { baseBranch: s.prBranch }) }), s.runId);
+    expect(r.status === 'failed' && r.error).toContain('is the base or default branch');
+    expect(git.calls.some((c) => c[0] === 'push')).toBe(false);
+    expect(remoteSha(s)).toBe(s.baseSha);
+  });
+
+  it('never posts the reply twice: a lost response and a failed request are both resumed', async () => {
+    const s = await revised(await published());
+    const api = new FakeCommentsApi();
+    api.loseNextCommentResponse = true;
+    const first = await reviseRun(deps(s, api), s.runId);
+    expect(first).toMatchObject({ status: 'failed', retryable: true });
+    expect(remoteSha(s)).toBe(s.localSha);
+    expect(getRevision(s.db, s.runId)).toMatchObject({ state: 'failed', retryable: true, headSha: s.localSha, commentId: null });
+    expect(listDueRevisions(s.db, { now: () => T0 + 3600_000 })).toEqual([s.runId]);
+
+    const git = recordingGit();
+    const second = await reviseRun(deps(s, api, { runGit: git.runGit }), s.runId);
+    expect(second.status).toBe('published');
+    expect(git.calls.some((c) => c[0] === 'push')).toBe(false);
+    expect(api.comments).toHaveLength(1);
+    expect(getRevision(s.db, s.runId)).toMatchObject({ state: 'published', attempts: 2, commentId: api.comments[0]!.id });
+
+    const third = await reviseRun(deps(s, api), s.runId);
+    expect(third).toMatchObject({ status: 'published', already: true });
+    expect(api.comments).toHaveLength(1);
+
+    const t = await revised(s);
+    const api2 = new FakeCommentsApi();
+    api2.failNext.createIssueComment = new GitHubError('POST ... failed: 502', 502);
+    expect(await reviseRun(deps(t, api2), t.runId)).toMatchObject({ status: 'failed', retryable: true });
+    expect(await reviseRun(deps(t, api2), t.runId)).toMatchObject({ status: 'published' });
+    expect(api2.comments).toHaveLength(1);
+  });
+
+  it('retries a push that failed for the network, with the same lease', async () => {
+    const s = await revised(await published());
+    const api = new FakeCommentsApi();
+    const failing = recordingGit({ failPushWith: new GitError('git push failed', ['push'], 128, 'fatal: unable to access: Could not resolve host: github.com') });
+    expect(await reviseRun(deps(s, api, { runGit: failing.runGit }), s.runId)).toMatchObject({ status: 'failed', retryable: true, moved: false });
+    expect(remoteSha(s)).toBe(s.baseSha);
+    expect(api.comments).toHaveLength(0);
+    expect(await reviseRun(deps(s, api), s.runId)).toMatchObject({ status: 'published' });
+    expect(remoteSha(s)).toBe(s.localSha);
+  });
+
+  it('pushes nothing when the agent made no commits, but still answers the review', async () => {
+    const s = await revised(await published(), { commits: 0 });
+    const api = new FakeCommentsApi();
+    const git = recordingGit();
+    const r = await reviseRun(deps(s, api, { runGit: git.runGit }), s.runId);
+    expect(r.status).toBe('skipped');
+    expect(git.calls.some((c) => c[0] === 'push')).toBe(false);
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]!.body).toContain('made no commits');
+    expect(getRevision(s.db, s.runId)).toMatchObject({ state: 'skipped', headSha: null });
+  });
+
+  it('pushes nothing to a PR that was closed while the revision ran', async () => {
+    const s = await revised(await published());
+    s.db.prepare("UPDATE revision_prs SET state = 'closed'").run();
+    const api = new FakeCommentsApi();
+    const r = await reviseRun(deps(s, api), s.runId);
+    expect(r.status).toBe('skipped');
+    expect(remoteSha(s)).toBe(s.baseSha);
+    expect(api.calls).toEqual([]);
+  });
+
+  it('applies only to succeeded revision runs, with revise on, in live mode', async () => {
+    const p = await published();
+    const s = await revised(p);
+    const api = new FakeCommentsApi();
+    expect(await reviseRun(deps(s, api), p.originalRunId)).toMatchObject({ status: 'not-eligible', reason: expect.stringContaining('not a revision run') as string });
+    expect(await reviseRun(deps(s, api, { config: makeConfig(s.f, { revise: false }) }), s.runId)).toMatchObject({ status: 'not-eligible' });
+    expect(await reviseRun(deps(s, api, { config: makeConfig(s.f, { publish: 'none' }) }), s.runId)).toMatchObject({ status: 'not-eligible' });
+    expect(await reviseRun(deps(s, api, { config: makeConfig(s.f, {}, 'prepare-only') }), s.runId)).toMatchObject({ status: 'not-eligible' });
+    const failed = await revised(p, { outcome: 'failed' });
+    expect(await reviseRun(deps(failed, api), failed.runId)).toMatchObject({ status: 'not-eligible' });
+    expect(remoteSha(s)).toBe(s.baseSha);
+    expect(api.calls).toEqual([]);
+    expect(getRevision(s.db, s.runId)).toBeNull();
+  });
+
+  it('is never published as a new PR: publication refuses a revision run', async () => {
+    const s = await revised(await published());
+    const r = await publishRun(deps(s, new FakeCommentsApi()), s.runId);
+    expect(r).toMatchObject({ status: 'not-eligible', reason: expect.stringContaining('revision of an existing pull request') as string });
+    expect(getPublication(s.db, s.runId)).toBeNull();
+    expect(remoteSha(s, s.localBranch)).toBeNull();
+  });
+});
+
+describe('a failed revision run', { timeout: 120_000 }, () => {
+  it('gets one failure comment on the pull request, without agent output or local paths', async () => {
+    const p = await published();
+    const s = await revised(p, { outcome: 'failed', error: `verification failed: "npm test" exited 1: see ${p.f.root}/secret output` });
+    const api = new FakeCommentsApi();
+    const d = { db: s.db, config: makeConfig(s.f), paths: s.paths, api: api.api, log: silentLogger, now: () => T0 };
+    expect((await postFailureComment(d, s.runId)).status).toBe('posted');
+    expect((await postFailureComment(d, s.runId)).status).toBe('posted');
+    expect(api.comments).toHaveLength(1);
+    const c = api.comments[0]!;
+    expect(c.issue).toBe(PR);
+    expect(c.body).toContain('revision run for this pull request failed');
+    expect(c.body).toContain('submit a new review that requests changes');
+    expect(c.body).toContain(failureCommentMarker(s.runId));
+    expect(c.body).not.toContain('Renamed it.');
+    expect(c.body).not.toContain(s.f.root);
+    expect(getFailureComment(s.db, s.runId)).toMatchObject({ state: 'posted', issueNumber: PR });
+  });
+
+  it('gets none with commentOnFailure off', async () => {
+    const s = await revised(await published(), { outcome: 'failed', error: 'agent exited 1' });
+    const api = new FakeCommentsApi();
+    const r = await postFailureComment({ db: s.db, config: makeConfig(s.f, { commentOnFailure: false }), paths: s.paths, api: api.api, log: silentLogger }, s.runId);
+    expect(r.status).toBe('not-eligible');
+    expect(api.calls).toEqual([]);
+  });
+});
+
+describe('the worker side', { timeout: 120_000 }, () => {
+  it('sends revision runs to the revision push and every other run to the publisher, and holds the next revision back', async () => {
+    const p = await published();
+    const s = await revised(p);
+    // A second change request, queued while the first revision's push is still to come.
+    const watched = getRevisionPr(p.db, REPO_ID, PR)!;
+    const next = request(p);
+    const second = enqueueRevision(p.db, {
+      repoId: REPO_ID,
+      reviewId: next.review.id,
+      prNumber: PR,
+      reviewer: 'allen',
+      trigger: 'changes_requested',
+      reviewUrl: REVIEW_URL,
+      submittedAt: next.review.submittedAt,
+      job: revisionJob({ id: REPO_ID, fullName: FULL }, watched, next),
+      max: 10,
+    });
+    expect(second.status).toBe('queued');
+
+    const seen: string[] = [];
+    const inner: Publisher = { afterRun: async (id) => void seen.push(id), retryDue: async () => void seen.push('retryDue') };
+    const api = new FakeCommentsApi();
+    api.failNext.listIssueComments = new GitHubError('GET ... failed: 503', 503);
+    const config = makeConfig(p.f);
+    const publisher = createRevisionPublisher(deps(s, api), inner);
+    const claimOpts = { workerId: 'wrk_1', hostname: hostname(), leaseSeconds: 60, runsDir: p.paths.runsDir, now: () => T0 };
+
+    const pushing = publisher.afterRun(s.runId);
+    // The row exists before afterRun yields, so the worker cannot claim the next revision in between.
+    expect(getRevision(p.db, s.runId)).toMatchObject({ state: 'publishing' });
+    expect(claimNextJob(p.db, config, claimOpts)).toBeNull();
+    await pushing;
+    expect(seen).toEqual([]);
+    // Pushed, but the reply failed for now: still unsettled, so the next revision keeps waiting.
+    expect(getRevision(p.db, s.runId)).toMatchObject({ state: 'failed', retryable: true, headSha: s.localSha });
+    expect(claimNextJob(p.db, config, claimOpts)).toBeNull();
+
+    await createRevisionPublisher(deps(s, api, { now: () => T0 + 3600_000 }), inner).retryDue();
+    expect(seen).toEqual(['retryDue']);
+    expect(getRevision(p.db, s.runId)).toMatchObject({ state: 'published' });
+    expect(api.comments).toHaveLength(1);
+    const claimed = claimNextJob(p.db, config, claimOpts);
+    expect(claimed?.job.id).toBe(second.status === 'queued' ? second.job.id : '');
+
+    await publisher.afterRun(p.originalRunId);
+    expect(seen).toEqual(['retryDue', p.originalRunId]);
+  });
+
+  it('comments once per PR that it reached maxRevisions', async () => {
+    const p = await published();
+    for (const id of ['PRR_over_1', 'PRR_over_2']) {
+      recordReviewRequest(p.db, { repoId: REPO_ID, reviewId: id, prNumber: PR, reviewer: 'allen', trigger: 'changes_requested', reviewUrl: REVIEW_URL, submittedAt: null, state: 'over-limit', reason: 'limit' });
+    }
+    const api = new FakeCommentsApi();
+    const d = deps(p, api, { config: makeConfig(p.f, { maxRevisions: 2 }) });
+    api.failNext.createIssueComment = new GitHubError('POST ... failed: 502', 502);
+    await postLimitNotices(d);
+    expect(api.comments).toHaveLength(0);
+    expect(getRevisionPr(p.db, REPO_ID, PR)).toMatchObject({ limitCommentId: null, limitCommentAttempts: 1 });
+    await postLimitNotices(d);
+    await postLimitNotices(d);
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]!.issue).toBe(PR);
+    expect(api.comments[0]!.body).toContain('limit of 2 automatic revision(s)');
+    expect(api.comments[0]!.body).toContain(REVISION_LIMIT_MARKER);
+    expect(getRevisionPr(p.db, REPO_ID, PR)!.limitCommentId).toBe(api.comments[0]!.id);
+  });
+});
+
+describe('updraft publish RUN_ID on a revision run', { timeout: 120_000 }, () => {
+  it('pushes it to its PR by the same path as the worker, and never opens a PR for it', async () => {
+    const api = new FakeCommentsApi();
+    const home = mkdtempSync(join(tmpdir(), 'updraft revise cli '));
+    try {
+      const ctx = { ...fakeContext({ api: api.api, home }), openDb: (file: string) => openDatabase(file) };
+      mkdirSync(ctx.paths.configDir, { recursive: true });
+      const db = openDatabase(ctx.paths.dbFile);
+      const s = await revised(await published({ db, paths: ctx.paths }));
+      writeFileSync(ctx.paths.configFile, stringify(makeConfig(s.f)));
+      db.close();
+
+      expect(await publishCommand(ctx, s.runId, { fileExists: () => true, token: async () => TOKEN })).toBe(0);
+      expect(ctx.out.text).toContain(`Pushed ${s.runId} to pull request #${PR}: branch ${s.prBranch} at ${s.localSha.slice(0, 12)}`);
+      expect(remoteSha(s)).toBe(s.localSha);
+      expect(api.comments).toHaveLength(1);
+
+      expect(await publishCommand(ctx, s.runId, { fileExists: () => true, token: async () => TOKEN })).toBe(0);
+      expect(ctx.out.text).toContain(`Already pushed ${s.runId}`);
+      expect(api.comments).toHaveLength(1);
+    } finally {
+      rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
+});

@@ -29,7 +29,7 @@ import {
   type AgentInvocation,
 } from '../agents/adapters/registry.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
-import { renderPrompt, type IssueContext } from '../agents/prompt.js';
+import { renderPrompt, renderRevisionPrompt, type IssueContext } from '../agents/prompt.js';
 import {
   agentAdapter,
   DEFAULT_TIMEOUT_MINUTES,
@@ -40,7 +40,7 @@ import {
 } from '../config/schema.js';
 import { ownEntry, type Claim } from '../db/queue.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree, type PreparedWorktree } from '../git/worktree.js';
-import type { RunOutcome, RunSummary, VerificationCommandResult, VerificationSummary } from '../types.js';
+import { revisionOf, type RunOutcome, type RunSummary, type VerificationCommandResult, type VerificationSummary } from '../types.js';
 import {
   canceledByUser,
   findRepoConfig,
@@ -512,7 +512,12 @@ export class LiveExecutor implements Executor {
     const adapterName = agentCfg ? agentAdapter(run.agent, agentCfg) : null;
     const found = findRepoConfig(ctx.config, job);
     const checkoutSource = found?.repo.checkoutPath ? resolve(ctx.paths.configDir, found.repo.checkoutPath) : null;
-    const promptSource = resolvePromptPath(ctx.config, ctx.paths, job.action);
+    // A revision job (repositories.<repo>.revise) differs in three places only: its prompt is the
+    // action's revisePrompt plus the review, its worktree starts at the PR branch's remote head
+    // instead of the base branch, and what is pushed afterwards (src/publish/revision.ts).
+    const revision = revisionOf(job);
+    const promptKey = revision ? 'revisePrompt' : 'prompt';
+    const promptSource = resolvePromptPath(ctx.config, ctx.paths, job.action, promptKey);
     const env = job.envelope;
     const timeoutMinutes = action?.timeoutMinutes ?? DEFAULT_TIMEOUT_MINUTES;
 
@@ -528,7 +533,13 @@ export class LiveExecutor implements Executor {
         `issue: #${env.issue.number} ${env.issue.title}`,
         `issue url: ${env.issue.url}`,
         `workflow: ${job.workflowId}`,
-        `trigger: ${env.type} label "${env.label}" by ${env.actor ?? '(unknown actor)'} at ${env.createdAt}`,
+        ...(revision
+          ? [
+              `trigger: ${env.type} (${revision.trigger}) by ${revision.review.author} at ${revision.review.submittedAt}`,
+              `pull request: #${revision.pullRequest.number} ${revision.pullRequest.url}`,
+              `review: ${revision.review.url} (${revision.review.comments.length} inline comment(s), as read when it was ingested)`,
+            ]
+          : [`trigger: ${env.type} label "${env.label}" by ${env.actor ?? '(unknown actor)'} at ${env.createdAt}`]),
         '',
         `pool: ${run.pool}`,
         `agent: ${run.agent}${adapterName ? ` (adapter ${adapterName})` : ' (no longer configured)'}`,
@@ -561,7 +572,7 @@ export class LiveExecutor implements Executor {
     if (!found || !checkoutSource) {
       return fail('failed', `repositories.${found?.fullName ?? job.repoFullName}.checkoutPath is not set; live mode needs a local clone`);
     }
-    if (!promptSource) return fail('failed', `actions.${job.action}.prompt is not set; live mode needs a prompt`);
+    if (!promptSource) return fail('failed', `actions.${job.action}.${promptKey} is not set; ${revision ? 'a revision run' : 'live mode'} needs a prompt`);
     const stopping = () => ctx.signal.aborted || Boolean(ctx.workerStopping?.aborted);
     // Who stopped the run, for run.log and the error. A user cancel is still reported as
     // 'interrupted' here; the daemon records it as canceled.
@@ -579,12 +590,13 @@ export class LiveExecutor implements Executor {
       repoFullName: job.repoFullName,
       number: env.issue.number,
       title: ctx.issue?.title ?? env.issue.title,
-      body: ctx.issue ? ctx.issue.body : null,
+      body: ctx.issue && !ctx.issue.withheld ? ctx.issue.body : null,
       labels: ctx.issue?.labels ?? env.labelsAtEnqueue,
       url: ctx.issue?.url ?? env.issue.url,
     };
     const promptFile = join(runDir, 'prompt.md');
-    await writeFile(promptFile, renderPrompt(actionPrompt, issue), 'utf8');
+    await writeFile(promptFile, revision ? renderRevisionPrompt(actionPrompt, issue, revision) : renderPrompt(actionPrompt, issue), 'utf8');
+    if (ctx.issue?.withheld) await log([`issue body: withheld from the agent (${ctx.issue.withheld})`]);
 
     // 2. Find the CLI before touching the clone, so a missing binary leaves no worktree behind.
     const baseEnv = withoutKeys(this.opts.env ?? process.env, WITHHELD_ENV);
@@ -613,7 +625,9 @@ export class LiveExecutor implements Executor {
         checkoutPath: checkoutSource,
         repoFullName: found.fullName,
         remote: found.repo.remote,
-        baseBranch: found.repo.baseBranch,
+        // A revision builds on whatever the PR branch holds on the remote now, including commits
+        // a person pushed to it; its own branch and worktree are new, like any attempt's.
+        baseBranch: revision ? revision.pullRequest.branch : found.repo.baseBranch,
         branch,
         worktreePath,
         git: this.opts.git,
@@ -680,7 +694,7 @@ export class LiveExecutor implements Executor {
     await log([
       `source clone: ${checkoutSource}`,
       `remote: ${prepared.remote} (${prepared.remoteUrl})`,
-      `base: ${prepared.baseBranch} at ${prepared.baseSha}`,
+      `base: ${prepared.baseBranch} at ${prepared.baseSha}${revision ? ` (the head of pull request #${revision.pullRequest.number}; only a fast-forward from this commit is pushed)` : ''}`,
       `branch: ${prepared.branch}`,
       `checkout: ${prepared.worktreePath}`,
       '',

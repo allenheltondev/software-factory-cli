@@ -94,6 +94,66 @@ export interface GitHubIssueComment {
   user: string | null;
 }
 
+/** One pull request in the by-update listing: enough to tell whether it changed and whether it is still open. */
+export interface PullRequestUpdate {
+  number: number;
+  state: 'open' | 'closed';
+  merged: boolean;
+  /** ISO time of the newest change GitHub counts for the PR (a review, a comment, a push...). */
+  updatedAt: string;
+}
+
+export interface PullRequestUpdatesPage {
+  pulls: PullRequestUpdate[];
+  nextPage: number | null;
+  /** ETag of this response (only meaningful for page 1). */
+  etag: string | null;
+  /** True when an If-None-Match request returned 304. `pulls` is empty then. */
+  notModified: boolean;
+}
+
+/** One inline comment of a review. `editor`/`lastEditedAt` are null when it was never edited. */
+export interface GitHubReviewComment {
+  author: string | null;
+  body: string;
+  path: string;
+  line: number | null;
+  diffHunk: string;
+  lastEditedAt: string | null;
+  editor: string | null;
+}
+
+export interface GitHubReview {
+  /** GraphQL node id: stable, and unlike the numeric database id not limited to 32 bits. */
+  id: string;
+  /** PENDING, COMMENTED, APPROVED, CHANGES_REQUESTED or DISMISSED. */
+  state: string;
+  author: string | null;
+  submittedAt: string | null;
+  body: string;
+  url: string;
+  /** ISO time of the newest edit of the body; null when it was never edited. */
+  lastEditedAt: string | null;
+  /** Who made that edit; null when never edited or the account no longer exists. */
+  editor: string | null;
+  /** The review's own inline comments, oldest first (at most the first 100). */
+  comments: GitHubReviewComment[];
+  /** How many inline comments the review has in all. */
+  commentCount: number;
+}
+
+/** A pull request with its newest reviews, read in one request. */
+export interface PullRequestReviews {
+  number: number;
+  state: 'open' | 'closed';
+  merged: boolean;
+  updatedAt: string;
+  headRef: string;
+  headSha: string;
+  /** Oldest first; at most the newest 50. */
+  reviews: GitHubReview[];
+}
+
 export interface GitHubApi {
   getViewer(): Promise<{ login: string; id: number }>;
   /** All repos the account owns, collaborates on, or reaches through an org (paginated internally). */
@@ -117,6 +177,18 @@ export interface GitHubApi {
    * first (paginated internally).
    */
   listPullRequestsForHead(repo: RepoRef, opts: { headOwner: string; head: string }): Promise<GitHubPullRequest[]>;
+  /**
+   * One page of the repository's pull requests in any state, most recently updated first. Page 1
+   * takes an ETag, like listIssueEvents. Used by the revision loop to notice new reviews and
+   * closed PRs with one request per repository.
+   */
+  listPullRequestUpdates(repo: RepoRef, opts: { page: number; perPage?: number; etag?: string | null }): Promise<PullRequestUpdatesPage>;
+  /**
+   * One pull request with its newest reviews, their inline comments, and who last edited each
+   * text. REST exposes no editor, so this is a GraphQL query with the same repository-id check as
+   * getIssueBodyEdit. Throws GitHubError(404) when the pull request no longer exists.
+   */
+  getPullRequestReviews(repo: RepoRef, pullNumber: number): Promise<PullRequestReviews>;
   /** Write: open a pull request. Used only by the publication step, never by an agent. */
   createPullRequest(repo: RepoRef, input: CreatePullRequestInput): Promise<GitHubPullRequest>;
   /** Every comment on one issue, oldest first (paginated internally). */

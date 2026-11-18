@@ -24,4 +24,12 @@ describe('writeStarterPrompts', () => {
     mkdirSync(join(dir, 'x'));
     expect(writeStarterPrompts(join(dir, 'config.yaml'), { ...cfg, actions: { a: { prompt: './x/custom.md' } } })).toEqual([]);
   });
+
+  it('also copies the packaged revise prompt of an action that names one', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'updraft prompts '));
+    const actions = { 'implement-issue': { prompt: './prompts/implement-issue.md', revisePrompt: './prompts/revise-pr.md' } };
+    const written = writeStarterPrompts(join(dir, 'config.yaml'), { ...cfg, actions });
+    expect(written).toEqual([join(dir, 'prompts', 'implement-issue.md'), join(dir, 'prompts', 'revise-pr.md')]);
+    expect(readFileSync(written[1]!, 'utf8')).toContain('Do not amend, rebase, squash');
+  });
 });

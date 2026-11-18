@@ -3,9 +3,17 @@
 import { join } from 'node:path';
 import type { UpdraftConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
-import type { Job, JobStatus, Publication, Run, RunContainer, RunOutcome, RunSummary } from '../types.js';
+import type { Job, JobStatus, Publication, Revision, Run, RunContainer, RunOutcome, RunSummary } from '../types.js';
 import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
 import { listRecentPublications } from './publications.js';
+import {
+  issuesAwaitingRevisionPush,
+  listLimitedRevisionPrs,
+  listRecentReviewRequests,
+  listRecentRevisions,
+  type ReviewRequest,
+  type RevisionPr,
+} from './revisions.js';
 import { newId, nowIso } from '../util/ids.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
 
@@ -122,7 +130,9 @@ function pickAgent(
  * Atomically pick the oldest claimable queued job and start a run for it on an
  * eligible agent with capacity, honoring the global limit, per-agent limits
  * (across pools and repos), round-robin order per pool, and at most one running
- * job per (repo, issue). Returns null when nothing can start now.
+ * job per (repo, issue). A revision job belongs to the issue of the PR it revises, so it also
+ * waits for that issue's other jobs, and for an earlier revision whose push has not settled.
+ * Returns null when nothing can start now.
  *
  * A queued job whose pool or action is no longer in the config is marked
  * `failed` with a reason and an error row (never silently dropped); the user can
@@ -168,6 +178,9 @@ export function claimNextJob(
           .all() as { repo_id: number; issue_number: number }[]
       ).map((r) => issueKey(r.repo_id, r.issue_number)),
     );
+    // A revision starts from the PR branch's remote head: it must not start while the previous
+    // revision's commits are still on their way there.
+    for (const r of issuesAwaitingRevisionPush(db, clock)) busyIssues.add(issueKey(r.repoId, r.issueNumber));
     const queued = db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, rowid").all() as unknown as JobRow[];
     const nowMs = clock();
     const at = new Date(nowMs).toISOString();
@@ -561,6 +574,12 @@ export interface StatusSnapshot {
   publications?: Publication[];
   /** Recent failure comments (posted, pending or not posted), newest first. */
   failureComments?: FailureComment[];
+  /** Recent revision pushes and replies (repositories.<repo>.revise), newest first. */
+  revisions?: Revision[];
+  /** Recent change requests on watched PRs and what was decided about each, newest first. */
+  reviewRequests?: ReviewRequest[];
+  /** PRs that reached maxRevisions, newest first. */
+  limitedPullRequests?: RevisionPr[];
 }
 
 export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => number): StatusSnapshot {
@@ -635,5 +654,19 @@ export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => num
 
   const failureComments = listRecentFailureComments(db, 10);
 
-  return { worker, counts, agents, activeRuns, recentJobs, recentAgentRuns, recentErrors, checkpoints, publications, failureComments };
+  return {
+    worker,
+    counts,
+    agents,
+    activeRuns,
+    recentJobs,
+    recentAgentRuns,
+    recentErrors,
+    checkpoints,
+    publications,
+    failureComments,
+    revisions: listRecentRevisions(db, 10),
+    reviewRequests: listRecentReviewRequests(db, 10),
+    limitedPullRequests: listLimitedRevisionPrs(db, 10),
+  };
 }

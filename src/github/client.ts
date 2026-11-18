@@ -29,6 +29,17 @@
 // repository that took the name, so the query also returns the repository's `databaseId` and
 // the result is refused unless it is `repo.id`. GraphQL reports most failures as 200 with an
 // `errors` array; those become GitHubErrors here.
+//
+// The revision loop (getPullRequestReviews, listPullRequestUpdates) could NOT be checked against
+// GitHub at all; it is written from the REST and GraphQL documentation as remembered:
+// - `GET .../pulls?state=all&sort=updated&direction=desc` lists PRs most recently updated first,
+//   each with `number`, `state`, `merged_at` and `updated_at`, and a submitted review moves the
+//   PR's `updated_at`. Page 1 is assumed to take If-None-Match like the events listing.
+// - GraphQL `PullRequest` has `number`, `state` (OPEN/CLOSED/MERGED), `updatedAt`, `headRefName`,
+//   `headRefOid` and `reviews(last:)`; `PullRequestReview` has `id`, `state`, `submittedAt`,
+//   `body`, `url`, `author`, `lastEditedAt`, `editor` and `comments(first:)` with `totalCount`;
+//   `PullRequestReviewComment` has `path`, `line`, `diffHunk`, `body`, `author`, `lastEditedAt`
+//   and `editor`. A wrong field name fails the whole query, loudly, as a 502.
 import { execFile } from 'node:child_process';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -42,7 +53,10 @@ import {
   type GitHubLabel,
   type GitHubPullRequest,
   type GitHubRepo,
+  type GitHubReview,
   type IssueEventsPage,
+  type PullRequestReviews,
+  type PullRequestUpdatesPage,
 } from './api.js';
 
 export interface CreateGitHubApiOptions {
@@ -214,6 +228,108 @@ const ISSUE_BODY_EDIT_QUERY = `query($owner: String!, $name: String!, $number: I
     }
   }
 }`;
+
+interface RawActor {
+  login: string;
+}
+interface RawReviewComment {
+  path: string | null;
+  line: number | null;
+  diffHunk: string | null;
+  body: string | null;
+  author: RawActor | null;
+  lastEditedAt: string | null;
+  editor: RawActor | null;
+}
+interface RawReview {
+  id: string;
+  state: string;
+  submittedAt: string | null;
+  body: string | null;
+  url: string;
+  author: RawActor | null;
+  lastEditedAt: string | null;
+  editor: RawActor | null;
+  comments: { totalCount: number; nodes: Array<RawReviewComment | null> | null } | null;
+}
+interface RawPullRequestReviews {
+  repository: {
+    databaseId: number | null;
+    pullRequest: {
+      number: number;
+      state: string;
+      updatedAt: string;
+      headRefName: string;
+      headRefOid: string;
+      reviews: { nodes: Array<RawReview | null> | null } | null;
+    } | null;
+  } | null;
+}
+
+/** How many of a pull request's newest reviews, and of each review's comments, one read fetches. */
+export const REVIEWS_PER_READ = 50;
+export const REVIEW_COMMENTS_PER_READ = 100;
+
+const PULL_REQUEST_REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    databaseId
+    pullRequest(number: $number) {
+      number
+      state
+      updatedAt
+      headRefName
+      headRefOid
+      reviews(last: ${REVIEWS_PER_READ}) {
+        nodes {
+          id
+          state
+          submittedAt
+          body
+          url
+          author { login }
+          lastEditedAt
+          editor { login }
+          comments(first: ${REVIEW_COMMENTS_PER_READ}) {
+            totalCount
+            nodes {
+              path
+              line
+              diffHunk
+              body
+              author { login }
+              lastEditedAt
+              editor { login }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+function mapReview(r: RawReview): GitHubReview {
+  const comments = (r.comments?.nodes ?? []).filter((c) => c !== null);
+  return {
+    id: r.id,
+    state: r.state,
+    author: r.author?.login ?? null,
+    submittedAt: r.submittedAt ?? null,
+    body: r.body ?? '',
+    url: r.url,
+    lastEditedAt: r.lastEditedAt ?? null,
+    editor: r.editor?.login ?? null,
+    comments: comments.map((c) => ({
+      author: c.author?.login ?? null,
+      body: c.body ?? '',
+      path: c.path ?? '',
+      line: c.line ?? null,
+      diffHunk: c.diffHunk ?? '',
+      lastEditedAt: c.lastEditedAt ?? null,
+      editor: c.editor?.login ?? null,
+    })),
+    commentCount: Math.max(r.comments?.totalCount ?? 0, comments.length),
+  };
+}
 
 function mapPull(r: RawPullRequest): GitHubPullRequest {
   return {
@@ -486,6 +602,75 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       }
       if (!repository.issue) throw new GitHubError(`POST /graphql (${what}): issue not found`, 404);
       return { lastEditedAt: repository.issue.lastEditedAt ?? null, editor: repository.issue.editor?.login ?? null };
+    },
+
+    async listPullRequestUpdates(repo, { page, perPage = 100, etag }): Promise<PullRequestUpdatesPage> {
+      const res = await request<Array<{ number: number; state: string; merged_at?: string | null; updated_at: string }>>(`${repoPath(repo)}/pulls`, {
+        query: { state: 'all', sort: 'updated', direction: 'desc', per_page: perPage, page },
+        etag: etag ?? null,
+      });
+      if (res.status === 304) return { pulls: [], nextPage: null, etag: etag ?? null, notModified: true };
+      const nextUrl = parseLinkHeader(res.headers.get('link'))['next'];
+      let nextPage: number | null = null;
+      if (nextUrl) {
+        const p = Number(new URL(nextUrl).searchParams.get('page'));
+        nextPage = Number.isFinite(p) && p > 0 ? p : page + 1;
+      }
+      return {
+        pulls: (res.data ?? []).map((r) => ({
+          number: r.number,
+          state: r.state === 'closed' ? 'closed' : 'open',
+          merged: r.merged_at != null,
+          updatedAt: r.updated_at,
+        })),
+        nextPage,
+        etag: res.headers.get('etag'),
+        notModified: false,
+      };
+    },
+
+    async getPullRequestReviews(repo, pullNumber): Promise<PullRequestReviews> {
+      const [owner, name, ...rest] = repo.fullName.split('/');
+      if (!owner || !name || rest.length) throw new GitHubError(`invalid repository name "${repo.fullName}"`, 502);
+      const what = `reviews of ${repo.fullName}#${pullNumber}`;
+      const res = await request<GraphQLResponse<RawPullRequestReviews>>('/graphql', {
+        method: 'POST',
+        body: { query: PULL_REQUEST_REVIEWS_QUERY, variables: { owner, name, number: pullNumber } },
+      });
+      // The same reading of GraphQL failures as getIssueBodyEdit: only "this pull request does
+      // not exist" in a repository that did resolve is a 404; everything else must not look gone.
+      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
+      const repository = res.data?.data?.repository ?? null;
+      const onlyPullMissing =
+        repository !== null && errors.every((e) => e.type === 'NOT_FOUND' && e.path?.at(-1) === 'pullRequest');
+      if (errors.length && !onlyPullMissing) {
+        const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
+        const limited = errors.some((e) => e.type === 'RATE_LIMITED');
+        throw new GitHubError(
+          `POST /graphql (${what}) failed: ${detail}`,
+          limited ? 429 : 502,
+          limited ? (retryAfterFrom(res.headers) ?? 60) : null,
+        );
+      }
+      if (!repository) throw new GitHubError(`POST /graphql (${what}) returned no repository`, 502);
+      if (repository.databaseId !== repo.id) {
+        throw new GitHubError(
+          `POST /graphql (${what}): "${repo.fullName}" now names repository ${repository.databaseId ?? 'unknown'}, not ${repo.id}; ` +
+            'the repository was renamed or replaced, so update its name in the config',
+          502,
+        );
+      }
+      const pr = repository.pullRequest;
+      if (!pr) throw new GitHubError(`POST /graphql (${what}): pull request not found`, 404);
+      return {
+        number: pr.number,
+        state: pr.state === 'OPEN' ? 'open' : 'closed',
+        merged: pr.state === 'MERGED',
+        updatedAt: pr.updatedAt,
+        headRef: pr.headRefName,
+        headSha: pr.headRefOid,
+        reviews: (pr.reviews?.nodes ?? []).filter((r) => r !== null).map(mapReview),
+      };
     },
 
     async listPullRequestsForHead(repo, { headOwner, head }) {

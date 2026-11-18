@@ -27,6 +27,15 @@ const RUN_TABLES: ReadonlyArray<{ table: string; runColumn: string; what: string
     busy: "state = 'posting' OR (state = 'failed' AND retryable = 1)",
     touched: 'updated_at',
   },
+  // The push and reply of a revision run. review_requests and revision_prs are deliberately not
+  // here: they are what stops a review from being acted on twice, and keep a PR watched.
+  {
+    table: 'revisions',
+    runColumn: 'run_id',
+    what: 'revision push',
+    busy: "state = 'publishing' OR (state = 'failed' AND retryable = 1)",
+    touched: 'updated_at',
+  },
 ];
 
 export interface PrunableRun {

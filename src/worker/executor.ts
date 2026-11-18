@@ -81,9 +81,12 @@ export function findRepoConfig(
   return repo ? { fullName: job.repoFullName, repo } : null;
 }
 
-/** Resolve an action's prompt file against the config file's directory. */
-export function resolvePromptPath(config: UpdraftConfig, paths: UpdraftPaths, action: string): string | null {
-  const prompt = ownEntry(config.actions, action)?.prompt;
+/**
+ * Resolve an action's prompt file against the config file's directory: its `prompt`, or for a
+ * revision run its `revisePrompt`.
+ */
+export function resolvePromptPath(config: UpdraftConfig, paths: UpdraftPaths, action: string, which: 'prompt' | 'revisePrompt' = 'prompt'): string | null {
+  const prompt = ownEntry(config.actions, action)?.[which];
   return prompt ? resolve(paths.configDir, prompt) : null;
 }
 

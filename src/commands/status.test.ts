@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { FailureComment } from '../db/failure-comments.js';
 import type { StatusSnapshot } from '../db/queue.js';
-import type { Job, Publication } from '../types.js';
+import type { Job, Publication, Revision } from '../types.js';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
 import { configSchema } from '../config/schema.js';
 import { fakeContext } from './fakes.js';
-import { buildStatusView, emptyConfig, renderFailureComment, renderPublication, renderStatus, statusCommand } from './status.js';
+import { buildStatusView, emptyConfig, renderFailureComment, renderPublication, renderRevision, renderStatus, statusCommand } from './status.js';
 
 const emptySnapshot = (): StatusSnapshot => ({
   worker: null,
@@ -266,5 +266,71 @@ describe('updraft status', () => {
     const json = JSON.parse(jctx.out.text);
     expect(json.configState).toBe('missing');
     expect(json.snapshot.counts.queued).toBe(0);
+  });
+});
+
+describe('renderStatus: the revision loop', () => {
+  const revision = (over: Partial<Revision> = {}): Revision => ({
+    runId: 'run_r1',
+    jobId: 'job_r1',
+    repoId: 1,
+    repoFullName: 'o/a',
+    issueNumber: 12,
+    prNumber: 40,
+    reviewId: 'PRR_1',
+    trigger: 'changes_requested',
+    state: 'published',
+    branch: 'updraft/issue-12-job_1',
+    baseSha: 'a'.repeat(40),
+    headSha: 'b'.repeat(40),
+    pushedAt: 't1',
+    moved: false,
+    commentId: 5,
+    commentUrl: 'https://github.com/o/a/pull/40#issuecomment-5',
+    error: null,
+    retryable: false,
+    attempts: 1,
+    leaseExpiresAt: null,
+    nextAttemptAt: null,
+    createdAt: 't0',
+    updatedAt: 't1',
+    publishedAt: 't1',
+    ...over,
+  });
+
+  it('says what each revision run pushed, or why it did not, and how to go on', () => {
+    expect(renderRevision(revision())).toBe(`pushed ${'a'.repeat(12)}..${'b'.repeat(12)} to updraft/issue-12-job_1; reply https://github.com/o/a/pull/40#issuecomment-5`);
+    expect(renderRevision(revision({ state: 'failed', moved: true, headSha: null, error: 'refs/heads/x is at 123, not at abc' }))).toMatch(
+      /^not pushed, the branch moved: refs\/heads\/x is at 123, not at abc — not retried; request changes again/,
+    );
+    expect(renderRevision(revision({ state: 'failed', retryable: true, nextAttemptAt: 't9', error: 'GitHub is unavailable' }))).toBe(
+      'revision push failed (attempt 1; branch pushed): GitHub is unavailable — worker retries at t9, or run "updraft publish run_r1"',
+    );
+    expect(renderRevision(revision({ state: 'skipped', error: 'the agent made no commits' }))).toBe('not pushed: the agent made no commits');
+  });
+
+  it('lists revisions, change requests that were not acted on, and PRs at their limit; marks revision jobs', () => {
+    const revisionJob = {
+      ...job({ id: 'job_r1', status: 'succeeded', statusReason: null }),
+      envelope: { type: 'pull_request.changes_requested', revision: { pullRequest: { number: 40 } } },
+    } as unknown as Job;
+    const snapshot: StatusSnapshot = {
+      ...emptySnapshot(),
+      recentJobs: [revisionJob, job()],
+      revisions: [revision()],
+      reviewRequests: [
+        { repoId: 1, reviewId: 'PRR_1', prNumber: 40, reviewer: 'allen', trigger: 'changes_requested', reviewUrl: 'https://github.com/o/a/pull/40#pullrequestreview-1', submittedAt: 't0', state: 'queued', reason: null, jobId: 'job_r1', createdAt: 't0' },
+        { repoId: 1, reviewId: 'PRR_2', prNumber: 40, reviewer: 'allen', trigger: 'changes_requested', reviewUrl: null, submittedAt: null, state: 'over-limit', reason: 'pull request #40 already has 3 revision(s)', jobId: null, createdAt: 't2' },
+      ],
+      limitedPullRequests: [{ repoId: 1, prNumber: 40, limitReachedAt: 't2', limitCommentUrl: null, limitCommentError: 'GitHub 502' } as never],
+    };
+    const config = configSchema.parse(upsertRepoWorkflow(seedConfig('me'), { id: 1, fullName: 'o/a' }, buildWorkflow({ label: 'go', action: 'implement-issue', pool: 'general' })).config);
+    const text = renderStatus(buildStatusView({ configPath: '/c', configState: 'ok', configMessage: null, config, dbFile: '/d', dbExists: true, snapshot }));
+    expect(text).toContain('job_r1  succeeded    o/a#12 (revision of PR #40)');
+    expect(text).toContain('job_1  failed       o/a#12  implement-issue');
+    expect(text).toContain('Revisions:\n  run_r1  published   o/a PR #40  updraft/issue-12-job_1  updated t1\n    pushed ');
+    expect(text).toContain('Change requests:\n  o/a PR #40  queued      https://github.com/o/a/pull/40#pullrequestreview-1\n    by allen at t0: revision job job_r1');
+    expect(text).toContain('  o/a PR #40  over-limit  PRR_2\n    by allen: not acted on — pull request #40 already has 3 revision(s)');
+    expect(text).toContain('o/a PR #40 reached maxRevisions at t2; comment: not posted yet: GitHub 502');
   });
 });

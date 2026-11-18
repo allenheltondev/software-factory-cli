@@ -184,3 +184,49 @@ describe('migration v9', () => {
     expect(db.prepare('SELECT pid, container_runtime, container_name FROM runs').get()).toEqual({ pid: 4242, container_runtime: null, container_name: null });
   });
 });
+
+describe('migration v10', () => {
+  it('adds the empty revision tables; existing jobs, runs and publications are untouched and nothing is watched yet', () => {
+    const db = openDatabase(':memory:', { migrateTo: 9 });
+    db.prepare(
+      `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
+       VALUES ('job_1', 1, 'o/r', 'wf', 'e1', 1, 'implement-issue', 'general', '{}', 'succeeded', 1, 't', 't')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at, ended_at, outcome)
+       VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'wrk_1', 't', 't', 't', 'succeeded')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO publications (run_id, job_id, repo_id, repo_full_name, issue_number, mode, state, branch, pr_number, pr_url, attempts, created_at, updated_at)
+       VALUES ('run_1', 'job_1', 1, 'o/r', 1, 'pr', 'published', 'updraft/issue-1-job_1', 5, 'https://github.com/o/r/pull/5', 1, 't', 't')`,
+    ).run();
+    migrate(db, 10);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+    for (const table of ['revision_prs', 'review_checkpoints', 'review_requests', 'revisions']) {
+      expect(db.prepare(`SELECT count(*) AS n FROM ${table}`).get(), table).toEqual({ n: 0 });
+    }
+    expect(db.prepare('SELECT state, pr_number FROM publications').get()).toEqual({ state: 'published', pr_number: 5 });
+    expect(db.prepare('SELECT status FROM jobs').get()).toEqual({ status: 'succeeded' });
+
+    // The new tables hold what the revision loop writes, and refuse what it never does.
+    db.prepare(
+      `INSERT INTO review_requests (repo_id, review_id, pr_number, reviewer, trigger_kind, state, created_at) VALUES (1, 'PRR_1', 5, 'allen', 'changes_requested', 'over-limit', 't')`,
+    ).run();
+    expect(() =>
+      db.prepare(`INSERT INTO review_requests (repo_id, review_id, pr_number, trigger_kind, state, created_at) VALUES (1, 'PRR_1', 5, 'changes_requested', 'queued', 't')`).run(),
+    ).toThrow(/UNIQUE|PRIMARY/i);
+    db.prepare(
+      `INSERT INTO revisions (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, review_id, trigger_kind, state, branch, base_sha, created_at, updated_at)
+       VALUES ('run_1', 'job_1', 1, 'o/r', 1, 5, 'PRR_1', 'changes_requested', 'publishing', 'updraft/issue-1-job_1', 'abc', 't', 't')`,
+    ).run();
+    expect(db.prepare('SELECT moved, attempts, head_sha FROM revisions').get()).toEqual({ moved: 0, attempts: 0, head_sha: null });
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO revisions (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, review_id, trigger_kind, state, branch, created_at, updated_at)
+           VALUES ('run_missing', 'job_1', 1, 'o/r', 1, 5, 'PRR_2', 'changes_requested', 'publishing', 'b', 't', 't')`,
+        )
+        .run(),
+    ).toThrow(/FOREIGN KEY/i);
+  });
+});
