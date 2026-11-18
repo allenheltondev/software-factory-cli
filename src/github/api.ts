@@ -15,6 +15,8 @@ export interface GitHubRepo {
   defaultBranch: string;
   description: string | null;
   permissions: { admin: boolean; push: boolean; pull: boolean } | null;
+  /** Which merge methods the repository allows; absent or null when GitHub did not say. */
+  mergeMethods?: { squash: boolean; merge: boolean; rebase: boolean } | null;
 }
 
 export interface GitHubLabel {
@@ -154,6 +156,55 @@ export interface PullRequestReviews {
   reviews: GitHubReview[];
 }
 
+/** One pull request as REST reports it, for the end of the review loop (ready for review, auto-merge). */
+export interface PullRequestDetails {
+  number: number;
+  /** GraphQL node id; the markPullRequestReadyForReview mutation takes it. */
+  nodeId: string;
+  htmlUrl: string;
+  state: 'open' | 'closed';
+  merged: boolean;
+  draft: boolean;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  /** Whether GitHub can merge it without conflicts; null while GitHub is still working that out. */
+  mergeable: boolean | null;
+  /** GitHub's own word for it: clean, dirty, blocked, behind, unstable, draft, unknown... For messages only. */
+  mergeableState: string;
+}
+
+/** A submitted review as REST lists it (no editors, no inline comments). */
+export interface PullRequestReviewSummary {
+  id: number;
+  /** COMMENTED, APPROVED, CHANGES_REQUESTED, DISMISSED or PENDING. */
+  state: string;
+  user: string | null;
+  body: string;
+  htmlUrl: string;
+  submittedAt: string | null;
+  /** The commit the review was submitted against. */
+  commitId: string | null;
+}
+
+/**
+ * The checks GitHub reports for one commit: commit statuses and check runs together, newest per
+ * context or name. A commit with none has `total` 0 and both lists empty.
+ */
+export interface CommitChecks {
+  total: number;
+  /** Names of statuses in state failure or error, and of completed check runs that did not conclude success, neutral or skipped. */
+  failing: string[];
+  /** Names of statuses in state pending and of check runs that have not completed. */
+  pending: string[];
+}
+
+export interface MergePullRequestInput {
+  /** The head commit the merge is for; GitHub refuses the merge when the head is anything else. */
+  sha: string;
+  method: 'squash' | 'merge' | 'rebase';
+}
+
 export interface GitHubApi {
   getViewer(): Promise<{ login: string; id: number }>;
   /** All repos the account owns, collaborates on, or reaches through an org (paginated internally). */
@@ -195,6 +246,25 @@ export interface GitHubApi {
   listIssueComments(repo: RepoRef, issueNumber: number): Promise<GitHubIssueComment[]>;
   /** Write: comment on an issue. Used only by the publication step. */
   createIssueComment(repo: RepoRef, issueNumber: number, body: string): Promise<GitHubIssueComment>;
+  /** One pull request with its head, base, draft flag and mergeability (REST). Throws GitHubError(404) when it does not exist. */
+  getPullRequest(repo: RepoRef, pullNumber: number): Promise<PullRequestDetails>;
+  /** Every submitted review of one pull request, oldest first (REST, paginated internally). */
+  listPullRequestReviews(repo: RepoRef, pullNumber: number): Promise<PullRequestReviewSummary[]>;
+  /**
+   * Write: submit a COMMENT review on a pull request. Never an approval or a change request: the
+   * account that opened a pull request may not submit those on it. `commitId` pins it to a commit.
+   */
+  createPullRequestReview(repo: RepoRef, pullNumber: number, input: { body: string; commitId?: string }): Promise<PullRequestReviewSummary>;
+  /** Write: turn a draft pull request into one that is ready for review (GraphQL; REST cannot). */
+  markPullRequestReady(repo: RepoRef, nodeId: string): Promise<void>;
+  /** Commit statuses and check runs of one commit (two REST requests, plus one per further 100 check runs). */
+  getCommitChecks(repo: RepoRef, sha: string): Promise<CommitChecks>;
+  /**
+   * Write: merge a pull request at exactly `sha`. Used only by auto-merge. Throws GitHubError with
+   * GitHub's status when the merge is refused: 405 not mergeable (conflicts, branch protection, a
+   * draft), 409 the head is no longer `sha`, 403/404 no permission, 422 invalid.
+   */
+  mergePullRequest(repo: RepoRef, pullNumber: number, input: MergePullRequestInput): Promise<{ merged: boolean; sha: string | null; message: string }>;
 }
 
 export class GitHubError extends Error {

@@ -40,11 +40,32 @@
 //   `body`, `url`, `author`, `lastEditedAt`, `editor` and `comments(first:)` with `totalCount`;
 //   `PullRequestReviewComment` has `path`, `line`, `diffHunk`, `body`, `author`, `lastEditedAt`
 //   and `editor`. A wrong field name fails the whole query, loudly, as a 502.
+//
+// The review loop's calls (getPullRequest, listPullRequestReviews, createPullRequestReview,
+// markPullRequestReady, getCommitChecks, mergePullRequest) could not be checked against GitHub
+// either; they are written from the REST and GraphQL documentation as remembered:
+// - `GET .../pulls/{n}` has `node_id`, `state`, `merged`, `draft`, `head.ref`, `head.sha`,
+//   `base.ref`, `mergeable` (true, false, or null while GitHub computes it) and `mergeable_state`.
+// - `GET .../pulls/{n}/reviews` lists reviews oldest first, each with `id`, `state`, `user`,
+//   `body`, `html_url`, `submitted_at` and `commit_id`; a dismissed review has state DISMISSED.
+// - `POST .../pulls/{n}/reviews` with `event: "COMMENT"`, a `body` and a `commit_id` submits a
+//   comment review at once; the PR's own author may submit one (only APPROVE and REQUEST_CHANGES
+//   are refused for the author), and a `commit_id` that is not in the PR is answered with 422.
+// - GraphQL mutation `markPullRequestReadyForReview(input: {pullRequestId})` takes the PR's node
+//   id and returns `pullRequest { isDraft }`.
+// - `GET .../commits/{sha}/status` has `statuses[]` with `context` and `state` (success, pending,
+//   failure, error), newest per context; its top-level `state` is "pending" when there are none,
+//   so it is not used. `GET .../commits/{sha}/check-runs` returns `{ total_count, check_runs[] }`,
+//   by default only the latest run per name, each with `name`, `status` (completed or not) and
+//   `conclusion` (success, neutral, skipped, failure, cancelled, timed_out, action_required, stale).
+// - `PUT .../pulls/{n}/merge` with `sha` and `merge_method` answers 200 `{ merged, sha, message }`,
+//   405 when the PR cannot be merged, 409 when the head is not `sha`.
 import { execFile } from 'node:child_process';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
 import {
   GitHubError,
+  type CommitChecks,
   type GitHubApi,
   type GitHubIssue,
   type GitHubIssueBodyEdit,
@@ -54,6 +75,8 @@ import {
   type GitHubRepo,
   type GitHubReview,
   type IssueEventsPage,
+  type PullRequestDetails,
+  type PullRequestReviewSummary,
   type PullRequestReviews,
   type PullRequestUpdatesPage,
 } from './api.js';
@@ -168,6 +191,9 @@ interface RawRepo {
   default_branch: string;
   description: string | null;
   permissions?: { admin?: boolean; push?: boolean; pull?: boolean };
+  allow_squash_merge?: boolean;
+  allow_merge_commit?: boolean;
+  allow_rebase_merge?: boolean;
 }
 interface RawLabel {
   name: string;
@@ -363,6 +389,11 @@ function mapRepo(r: RawRepo): GitHubRepo {
     permissions: r.permissions
       ? { admin: !!r.permissions.admin, push: !!r.permissions.push, pull: !!r.permissions.pull }
       : null,
+    // GitHub includes these only for accounts that may change the repository.
+    mergeMethods:
+      typeof r.allow_squash_merge === 'boolean' && typeof r.allow_merge_commit === 'boolean' && typeof r.allow_rebase_merge === 'boolean'
+        ? { squash: r.allow_squash_merge, merge: r.allow_merge_commit, rebase: r.allow_rebase_merge }
+        : null,
   };
 }
 
@@ -377,6 +408,48 @@ function mapIssue(r: RawIssue): GitHubIssue {
     isPullRequest: r.pull_request != null,
   };
 }
+
+interface RawPullRequestDetails {
+  number: number;
+  node_id: string;
+  html_url: string;
+  state: string;
+  merged?: boolean;
+  merged_at?: string | null;
+  draft?: boolean;
+  head: { ref: string; sha: string };
+  base: { ref: string };
+  mergeable?: boolean | null;
+  mergeable_state?: string;
+}
+
+interface RawReviewSummary {
+  id: number;
+  state?: string;
+  user?: { login?: string } | null;
+  body?: string | null;
+  html_url?: string;
+  submitted_at?: string | null;
+  commit_id?: string | null;
+}
+
+function mapReviewSummary(r: RawReviewSummary): PullRequestReviewSummary {
+  return {
+    id: r.id,
+    state: r.state ?? '',
+    user: r.user?.login ?? null,
+    body: r.body ?? '',
+    htmlUrl: r.html_url ?? '',
+    submittedAt: r.submitted_at ?? null,
+    commitId: r.commit_id ?? null,
+  };
+}
+
+const MARK_READY_MUTATION = `mutation($id: ID!) {
+  markPullRequestReadyForReview(input: { pullRequestId: $id }) {
+    pullRequest { isDraft }
+  }
+}`;
 
 function mapEvent(r: RawIssueEvent): GitHubIssueEvent {
   return {
@@ -397,8 +470,8 @@ function mapEvent(r: RawIssueEvent): GitHubIssueEvent {
 }
 
 interface RequestOptions {
-  /** GET unless set. Writes (POST) are used only by the publication step. */
-  method?: 'GET' | 'POST';
+  /** GET unless set. Writes are used only by the publication, revision and review steps. */
+  method?: 'GET' | 'POST' | 'PUT';
   /** JSON request body (POST). */
   body?: unknown;
   query?: Record<string, string | number>;
@@ -703,6 +776,87 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         body: { body },
       });
       return mapComment(res.data!);
+    },
+
+    async getPullRequest(repo, pullNumber): Promise<PullRequestDetails> {
+      const r = (await request<RawPullRequestDetails>(`${repoPath(repo)}/pulls/${pullNumber}`)).data!;
+      return {
+        number: r.number,
+        nodeId: r.node_id,
+        htmlUrl: r.html_url,
+        state: r.state === 'closed' ? 'closed' : 'open',
+        merged: r.merged === true || r.merged_at != null,
+        draft: r.draft === true,
+        headRef: r.head.ref,
+        headSha: r.head.sha,
+        baseRef: r.base.ref,
+        mergeable: typeof r.mergeable === 'boolean' ? r.mergeable : null,
+        mergeableState: r.mergeable_state ?? 'unknown',
+      };
+    },
+
+    async listPullRequestReviews(repo, pullNumber) {
+      const raw = await paginate<RawReviewSummary>(`${repoPath(repo)}/pulls/${pullNumber}/reviews`);
+      return raw.map(mapReviewSummary);
+    },
+
+    async createPullRequestReview(repo, pullNumber, input) {
+      const res = await request<RawReviewSummary>(`${repoPath(repo)}/pulls/${pullNumber}/reviews`, {
+        method: 'POST',
+        // COMMENT, always: this client has no way to approve or to request changes.
+        body: { event: 'COMMENT', body: input.body, ...(input.commitId ? { commit_id: input.commitId } : {}) },
+      });
+      return mapReviewSummary(res.data!);
+    },
+
+    async markPullRequestReady(repo, nodeId) {
+      const what = `marking a pull request of ${repo.fullName} ready for review`;
+      const res = await request<GraphQLResponse<{ markPullRequestReadyForReview?: { pullRequest?: { isDraft?: boolean } | null } | null }>>('/graphql', {
+        method: 'POST',
+        body: { query: MARK_READY_MUTATION, variables: { id: nodeId } },
+      });
+      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
+      if (errors.length) {
+        const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
+        const limited = errors.some((e) => e.type === 'RATE_LIMITED');
+        const denied = errors.some((e) => e.type === 'FORBIDDEN' || e.type === 'NOT_FOUND');
+        throw new GitHubError(`POST /graphql (${what}) failed: ${detail}`, limited ? 429 : denied ? 403 : 422, limited ? (retryAfterFrom(res.headers) ?? 60) : null);
+      }
+    },
+
+    async getCommitChecks(repo, sha): Promise<CommitChecks> {
+      const failing: string[] = [];
+      const pending: string[] = [];
+      let total = 0;
+      const status = await request<{ statuses?: Array<{ context?: string; state?: string }> }>(`${repoPath(repo)}/commits/${encodeURIComponent(sha)}/status`, {
+        query: { per_page: 100 },
+      });
+      for (const s of status.data?.statuses ?? []) {
+        total++;
+        const name = s.context ?? '(status)';
+        if (s.state === 'pending') pending.push(name);
+        else if (s.state !== 'success') failing.push(name);
+      }
+      let next: string | undefined = buildUrl(`${repoPath(repo)}/commits/${encodeURIComponent(sha)}/check-runs`, { per_page: 100 });
+      for (let i = 0; next && i < MAX_LIST_PAGES; i++) {
+        const res: RawResponse<{ check_runs?: Array<{ name?: string; status?: string; conclusion?: string | null }> }> = await request(next);
+        for (const c of res.data?.check_runs ?? []) {
+          total++;
+          const name = c.name ?? '(check run)';
+          if (c.status !== 'completed') pending.push(name);
+          else if (!['success', 'neutral', 'skipped'].includes(c.conclusion ?? '')) failing.push(name);
+        }
+        next = parseLinkHeader(res.headers.get('link'))['next'];
+      }
+      return { total, failing, pending };
+    },
+
+    async mergePullRequest(repo, pullNumber, input) {
+      const res = await request<{ merged?: boolean; sha?: string | null; message?: string }>(`${repoPath(repo)}/pulls/${pullNumber}/merge`, {
+        method: 'PUT',
+        body: { sha: input.sha, merge_method: input.method },
+      });
+      return { merged: res.data?.merged === true, sha: res.data?.sha ?? null, message: res.data?.message ?? '' };
     },
   };
 }

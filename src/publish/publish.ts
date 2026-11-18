@@ -49,7 +49,7 @@ import {
 import { jobBranchName, withCheckoutLock } from '../git/worktree.js';
 import { GitHubError, type GitHubApi, type GitHubPullRequest } from '../github/api.js';
 import type { UpdraftPaths } from '../paths.js';
-import { revisionOf, type Job, type Publication, type Run, type RunSummary } from '../types.js';
+import { reviewOf, revisionOf, type Job, type Publication, type Run, type RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { verificationLines, verificationNotes } from '../worker/verify.js';
@@ -375,6 +375,8 @@ function eligibility(deps: PublishDeps, runId: string): { ok: true; e: Eligible 
   if (!job) return { ok: false, reason: `job ${run.jobId} of run ${runId} not found` };
   // A revision run never opens a PR: its commits go to the PR that exists (src/publish/revision.ts).
   if (revisionOf(job)) return { ok: false, reason: `run ${runId} is a revision of an existing pull request, not a publication` };
+  // A reviewer run publishes nothing at all: its result is a verdict (src/publish/review.ts).
+  if (reviewOf(job)) return { ok: false, reason: `run ${runId} is a review of an existing pull request, not a publication` };
   if (deps.config.execution.mode !== 'live') {
     return { ok: false, reason: `publication applies only in live mode (execution.mode is ${deps.config.execution.mode})` };
   }

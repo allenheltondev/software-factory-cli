@@ -41,7 +41,7 @@ export interface RevisionPr {
   limitCommentError: string | null;
 }
 
-interface RevisionPrRow {
+export interface RevisionPrRow {
   repo_id: number;
   pr_number: number;
   pr_url: string;
@@ -75,7 +75,7 @@ function parseLabels(json: string): string[] {
   }
 }
 
-function rowToRevisionPr(r: RevisionPrRow): RevisionPr {
+export function rowToRevisionPr(r: RevisionPrRow): RevisionPr {
   return {
     repoId: r.repo_id,
     prNumber: r.pr_number,

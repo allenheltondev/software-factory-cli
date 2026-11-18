@@ -3,8 +3,9 @@ import { loadConfig } from '../config/io.js';
 import { resolveGitHubToken } from '../github/client.js';
 import { getJob, getRun } from '../db/queue.js';
 import { publishRun, type PublishDeps } from '../publish/publish.js';
+import { postReview } from '../publish/review.js';
 import { reviseRun } from '../publish/revision.js';
-import { revisionOf } from '../types.js';
+import { reviewOf, revisionOf } from '../types.js';
 import { createLogger } from '../util/log.js';
 import { println, type CommandContext } from './context.js';
 import { CliError, EXIT } from './errors.js';
@@ -60,6 +61,27 @@ export async function publishCommand(ctx: CommandContext, runId: string, deps: P
           throw new CliError(`${rev.reason}; try again later.`);
         case 'failed':
           throw new CliError(`Pushing the revision ${runId} failed: ${rev.error}`);
+      }
+    }
+    // A reviewer run has nothing to push either: its verdict is posted on the PR as a comment review.
+    if (job && reviewOf(job)) {
+      const posted = await postReview(publishDeps, runId);
+      switch (posted.status) {
+        case 'published':
+          println(
+            ctx.out,
+            `${posted.already ? 'Already posted' : 'Posted'} the review of ${runId} on pull request #${posted.review.prNumber}: ${posted.review.verdict} for ${posted.review.headSha.slice(0, 12)} (${posted.review.outcome ?? 'recorded'}); ${posted.review.reviewUrl ?? '(no link)'}.`,
+          );
+          return EXIT.OK;
+        case 'skipped':
+          println(ctx.out, `Nothing posted for ${runId}: ${posted.reason}.`);
+          return EXIT.OK;
+        case 'not-eligible':
+          throw new CliError(`Cannot post the review of ${runId}: ${posted.reason}.`);
+        case 'busy':
+          throw new CliError(`${posted.reason}; try again later.`);
+        case 'failed':
+          throw new CliError(`Posting the review of ${runId} failed: ${posted.error}`);
       }
     }
     const r = await publishRun(publishDeps, runId);

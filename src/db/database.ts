@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -339,6 +339,85 @@ const MIGRATIONS: Record<number, Migration> = {
       published_at     TEXT
     );
     CREATE INDEX revisions_by_state ON revisions (state, next_attempt_at);
+  `,
+  11: `
+    -- The review loop (repositories.<repo>.review, autoMerge): a reviewer run for every head
+    -- commit of a PR Updraft opened. A reviewer run is an ordinary row in jobs whose envelope has
+    -- type pull_request.review and whose event_id is "pr-review:<pr number>:<head sha>", so the
+    -- jobs unique key (and pruned_events) gives one review per PR and head, across restarts.
+
+    -- Where each watched PR stands. These live on the PR's row, not on a run, so they survive
+    -- "updraft clean --older-than".
+    ALTER TABLE revision_prs ADD COLUMN head_sha TEXT;               -- newest head commit the worker knows of
+    ALTER TABLE revision_prs ADD COLUMN head_at TEXT;                -- when it learned of it (its own push, or a read of the PR)
+    ALTER TABLE revision_prs ADD COLUMN author_agent TEXT;           -- agent of the PR's latest code run; not picked as reviewer
+    ALTER TABLE revision_prs ADD COLUMN verdict TEXT;                -- newest recorded verdict: ready-to-merge | changes-requested
+    ALTER TABLE revision_prs ADD COLUMN verdict_sha TEXT;            -- the head commit that verdict is for
+    ALTER TABLE revision_prs ADD COLUMN verdict_run_id TEXT;
+    ALTER TABLE revision_prs ADD COLUMN verdict_at TEXT;
+    ALTER TABLE revision_prs ADD COLUMN ready_marked_at TEXT;        -- when the worker marked the draft ready for review
+    -- Auto-merge of the head in merge_sha: waiting (for checks), merging (the request was sent),
+    -- merged, or blocked (see merge_reason; final for that head). NULL: not looked at yet.
+    ALTER TABLE revision_prs ADD COLUMN merge_state TEXT CHECK (merge_state IN ('waiting','merging','merged','blocked'));
+    ALTER TABLE revision_prs ADD COLUMN merge_sha TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_reason TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_wait_started_at TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE revision_prs ADD COLUMN merged_at TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_commit_sha TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_comment_id INTEGER;    -- the one comment that says why it was not merged
+    ALTER TABLE revision_prs ADD COLUMN merge_comment_url TEXT;
+    ALTER TABLE revision_prs ADD COLUMN merge_comment_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE revision_prs ADD COLUMN merge_comment_error TEXT;
+
+    -- PRs watched before this version: their head is what the worker last pushed to them.
+    UPDATE revision_prs SET
+      head_sha = (SELECT p.head_sha FROM publications p WHERE p.run_id = revision_prs.source_run_id),
+      head_at = (SELECT p.pushed_at FROM publications p WHERE p.run_id = revision_prs.source_run_id),
+      author_agent = (SELECT r.agent FROM runs r WHERE r.id = revision_prs.source_run_id);
+    UPDATE revision_prs SET
+      head_sha = (SELECT v.head_sha FROM revisions v WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
+                    AND v.pushed_at IS NOT NULL AND v.head_sha IS NOT NULL ORDER BY v.pushed_at DESC LIMIT 1),
+      head_at = (SELECT v.pushed_at FROM revisions v WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
+                    AND v.pushed_at IS NOT NULL AND v.head_sha IS NOT NULL ORDER BY v.pushed_at DESC LIMIT 1),
+      author_agent = coalesce((SELECT r.agent FROM revisions v JOIN runs r ON r.id = v.run_id WHERE v.repo_id = revision_prs.repo_id
+                    AND v.pr_number = revision_prs.pr_number AND v.pushed_at IS NOT NULL AND v.head_sha IS NOT NULL
+                    ORDER BY v.pushed_at DESC LIMIT 1), author_agent)
+    WHERE EXISTS (SELECT 1 FROM revisions v WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
+                    AND v.pushed_at IS NOT NULL AND v.head_sha IS NOT NULL);
+
+    -- The verdict of one reviewer run and its posting as a COMMENT review on the PR; the
+    -- counterpart of publications and revisions, with the same lease and attempt fence. The
+    -- verdict is the worker's own record: GitHub only gets a comment for people to read.
+    -- outcome is what the worker did with the verdict once the review was posted.
+    CREATE TABLE pr_reviews (
+      run_id           TEXT    PRIMARY KEY REFERENCES runs (id),
+      job_id           TEXT    NOT NULL,
+      repo_id          INTEGER NOT NULL,
+      repo_full_name   TEXT    NOT NULL,
+      issue_number     INTEGER NOT NULL,
+      pr_number        INTEGER NOT NULL,
+      head_sha         TEXT    NOT NULL,   -- the commit that was reviewed; the verdict is for it only
+      agent            TEXT    NOT NULL,   -- the reviewing agent
+      verdict          TEXT    NOT NULL CHECK (verdict IN ('ready-to-merge','changes-requested')),
+      findings         TEXT    NOT NULL,
+      state            TEXT    NOT NULL CHECK (state IN ('publishing','published','failed','skipped')),
+      review_id        INTEGER,            -- the COMMENT review on GitHub
+      review_url       TEXT,
+      outcome          TEXT CHECK (outcome IN ('ready','revision-queued','over-limit','no-revise','stale','closed')),
+      outcome_detail   TEXT,
+      revision_job_id  TEXT,               -- the revision job a changes-requested verdict queued
+      error            TEXT,
+      retryable        INTEGER NOT NULL DEFAULT 0,
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,
+      next_attempt_at  TEXT,
+      created_at       TEXT    NOT NULL,
+      updated_at       TEXT    NOT NULL,
+      published_at     TEXT
+    );
+    CREATE INDEX pr_reviews_by_state ON pr_reviews (state, next_attempt_at);
+    CREATE INDEX pr_reviews_by_pr ON pr_reviews (repo_id, pr_number, created_at);
   `,
 };
 

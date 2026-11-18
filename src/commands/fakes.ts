@@ -5,6 +5,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ReviewLoopApiStubs } from '../../test/review-loop-api-stubs.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { KNOWN_ADAPTERS, type AdapterName } from '../config/schema.js';
 import { GitHubError, type GitHubApi, type GitHubLabel, type GitHubRepo } from '../github/api.js';
@@ -48,6 +49,7 @@ export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] }
   const calls: string[] = [];
   const all = [...(data.repos ?? []), ...(data.publicRepos ?? [])];
   return {
+    ...new ReviewLoopApiStubs(),
     calls,
     async getViewer() {
       calls.push('getViewer');

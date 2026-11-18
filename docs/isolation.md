@@ -296,6 +296,15 @@ With the default settings, an agent that has been talked into misbehaving cannot
   memory and counts against the container's memory. Set limits in `container.args`.
 - **Cost.** A contained agent can still spend your API quota until `timeoutMinutes`.
 
+### Reviewer runs
+
+A reviewer run ([The review loop](review-loop.md)) of a containerized agent gets narrower
+mounts than a code run: the worktree and its private index are writable (the reviewer may
+build and run tests), and the whole git directory of the clone is read-only, including
+`objects` and `refs`. Nothing it does can add a commit or a branch to the clone; `git commit`
+fails inside the container, while `git diff`, `git log` and `git show` work. The worktree is
+deleted after the run in any case, and nothing of a reviewer run is ever pushed.
+
 ## Run the worker under a dedicated account
 
 A separate OS account is a boundary your operating system already enforces. Run the worker,

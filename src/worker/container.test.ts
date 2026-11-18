@@ -156,6 +156,21 @@ describe('buildContainerRunArgs', () => {
 describe('gitMounts', () => {
   const byPath = (mounts: ContainerMount[]) => Object.fromEntries(mounts.map((m) => [m.path, m.readOnly ? 'ro' : 'rw']));
 
+  it('for a reviewer run opens nothing of the clone: the worktree and its own index are writable, objects and refs are not', () => {
+    expect(byPath(gitMounts(WT, LAYOUT, everything, ['/shared/objects'], true))).toEqual({
+      [WT]: 'rw',
+      [`${WT}/.git`]: 'ro',
+      [COMMON]: 'ro',
+      [ADMIN]: 'rw',
+      [`${ADMIN}/commondir`]: 'ro',
+      [`${ADMIN}/gitdir`]: 'ro',
+      [`${ADMIN}/config.worktree`]: 'ro',
+      '/shared/objects': 'ro',
+    });
+    // The ordinary mounts do open what a commit writes.
+    expect(byPath(gitMounts(WT, LAYOUT, everything))).toMatchObject({ [`${COMMON}/objects`]: 'rw', [`${COMMON}/refs`]: 'rw' });
+  });
+
   it('opens the worktree and only what a commit writes; everything host git obeys stays read-only', () => {
     expect(byPath(gitMounts(WT, LAYOUT, everything))).toEqual({
       [WT]: 'rw',

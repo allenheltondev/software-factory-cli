@@ -121,6 +121,7 @@ repositories:
 | `pools.<name>.strategy` | `round-robin` | Rotates among agents with free capacity |
 | `actions.<name>.prompt` | none | Prompt file, relative to the config file's directory |
 | `actions.<name>.revisePrompt` | none | Prompt file for revision runs, relative to the config file's directory. Required in live mode for every action used by a repository with `revise` on. See [Revisions](docs/revisions.md) |
+| `actions.<name>.reviewPrompt` | none | Prompt file for reviewer runs, relative to the config file's directory. Required in live mode for every action used by a repository with `review` on. See [The review loop](docs/review-loop.md) |
 | `actions.<name>.output` | `local-branch` | `local-branch` or `log`. Live mode starts agents only for `local-branch` actions |
 | `actions.<name>.timeoutMinutes` | `60` | Live mode: stop the agent and fail the run after this long |
 | `actions.<name>.verify` | none | Live mode, `local-branch` actions: commands the worker runs in the job worktree after the agent succeeded, in order; the first that fails fails the run, so it is not published. A string runs through the shell (`sh -c`, or `cmd.exe /d /s /c` on Windows); an array is an executable and its arguments, run without a shell. Set in another mode or on a `log` action, it is a validation warning and does nothing. See [Verification](docs/verification.md) |
@@ -133,11 +134,15 @@ repositories:
 | `repositories.<OWNER/REPO>.commentOnFailure` | `false` | Live mode: when a run leaves its job failed (agent error, timeout, failed verification, worktree preparation failure, or no agent could start), the worker comments once on the issue with the run id, agent, duration, reason and how to retry. Never includes agent output or local paths. Set in another mode, it is a validation warning and does nothing. See [Failure comments](docs/failure-comments.md) |
 | `repositories.<OWNER/REPO>.revise` | `false` | Live mode, together with `publish`: when an allowed actor requests changes on a PR the worker opened, run the agent on that PR's branch with the review, verify, push the new commits to the PR as a fast-forward and reply there. Set in another mode or without `publish`, it is a validation warning and does nothing. See [Revisions](docs/revisions.md) |
 | `repositories.<OWNER/REPO>.maxRevisions` | `3` | With `revise`: how many revision jobs one PR gets. Further change requests are recorded and shown in `updraft status` but not acted on, and one comment on the PR says so |
+| `repositories.<OWNER/REPO>.review` | `false` | Live mode, together with `publish`: a second agent reviews every head commit of a PR the worker opened and its verdict is posted as a comment review. "Changes requested" queues a revision when `revise` is on; "ready to merge" marks a draft ready for review. `true`, or `{ allowSameAgent: true }` to let the agent that wrote the code review it when the pool has no other. Set in another mode or without `publish`, it is a validation warning and does nothing. See [The review loop](docs/review-loop.md) |
+| `repositories.<OWNER/REPO>.autoMerge` | off | With `review`: `squash`, `merge` or `rebase`. Updraft merges a PR whose current head its reviewer found ready, once the head's checks passed and nothing else stands in the way, with the reviewed commit pinned. The issue and the code are untrusted and could talk a reviewer into approving: read [Auto-merge](docs/review-loop.md#auto-merge) before setting it |
+| `repositories.<OWNER/REPO>.autoMergeWaitMinutes` | `60` | With `autoMerge`: how long to wait for pending checks before giving up and leaving the PR for a person |
 | `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
 | `workflows[].action` | required | Action name |
 | `workflows[].pool` | required | A pool name, or `{ rules: [{ hasLabel, use }], default }`. The first matching rule wins; routing uses the issue's labels when the job is queued |
+| `workflows[].reviewPool` | the job's pool | With `review`: the pool reviewer runs are routed to. The agent that wrote the code is never picked while the pool has another enabled agent; a configuration where it is the only one is invalid unless `review.allowSameAgent` is set |
 | `workflows[].allowedActors` | `dispatch.allowedActors` | Per-workflow override of the allowlist |
 
 Names of agents, pools, actions and workflow IDs use letters, digits, `.`, `_` and `-`.
@@ -196,8 +201,9 @@ branch. The worker does this after the agent has exited, as your `gh` account:
 
 Each step is recorded and checks GitHub before writing, so a retry never opens a second PR
 or comment. Transient failures are retried by the worker; others wait for
-`updraft publish RUN_ID`. Merging stays a human decision: the worker never merges, approves
-or marks a PR ready for review.
+`updraft publish RUN_ID`. Merging stays a human decision: publication never merges, approves
+or marks a PR ready for review (the opt-in review loop below can do the last, and with
+`autoMerge` the first).
 
 Details, including authentication, retries and failure handling:
 [docs/publication.md](docs/publication.md).
@@ -206,6 +212,15 @@ With `revise: true` as well, a "Request changes" review by an allowed actor on s
 queues a revision: the agent runs on the PR's branch with the review, and the worker pushes
 the new commits as a fast-forward and replies on the PR. See
 [docs/revisions.md](docs/revisions.md).
+
+With `review: true`, the loop closes without a person in it: a second agent (never the one
+that wrote the code, unless you allow that) reviews every head of such a PR in a throwaway
+worktree and ends with a verdict. "Changes requested" queues a revision, up to `maxRevisions`
+rounds; "ready to merge" marks the draft ready for review, and there it stops. GitHub does
+not let an account approve its own PR, so the verdict is recorded by Updraft and posted as a
+comment review. Merging is still up to a person unless `autoMerge` is set, which is off by
+default and should stay off until you have read what its checks do and do not cover. See
+[docs/review-loop.md](docs/review-loop.md).
 
 ## Background operation
 
@@ -248,7 +263,11 @@ The key points; [docs/security.md](docs/security.md) has the full statement of e
   [Isolating agents](docs/isolation.md) for what that does and does not protect against.
 - Without `publish`, the worker only reads from GitHub and never pushes. With `publish`, it
   creates job branches, opens PRs and comments on issues as your `gh` account. It never
-  merges.
+  merges, unless you set `autoMerge`.
+- `autoMerge` (off by default, needs `review`) lets Updraft merge a PR that its own reviewing
+  agent found ready. That agent read untrusted issue text and untrusted code, either of which
+  can be written to talk it into approving. The checks before the merge are listed, with what
+  they do not cover, in [docs/review-loop.md](docs/review-loop.md#auto-merge).
 - Agent credentials such as `KIRO_API_KEY` belong in the worker's environment, not in the
   config file. The CLI does not store tokens.
 

@@ -49,6 +49,7 @@ actions:
     output: local-branch
     # timeoutMinutes: 60 # live mode: stop the agent and fail the run after this long
     # revisePrompt: ./prompts/revise-pr.md # needed when a repository below sets revise: true
+    # reviewPrompt: ./prompts/review-pr.md # needed when a repository below sets review: true
 
 repositories:
   allenheltondev/kids-and-dragons:
@@ -62,6 +63,11 @@ repositories:
     # With publish: when an allowed actor requests changes on such a PR, run the agent on its branch and push the result.
     # revise: true
     # maxRevisions: 3
+    # With publish: have a second agent review every head of such a PR; with revise, its "changes requested" starts a revision.
+    # The reviewer is never the agent that wrote the code, so a pool used for reviews needs two agents (or set workflows[].reviewPool).
+    # review: true
+    # With review: merge a PR the reviewer found ready, once its checks passed. Off unless set; read docs/review-loop.md first.
+    # autoMerge: squash
     workflows:
       - id: implement
         trigger:

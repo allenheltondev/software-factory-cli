@@ -230,3 +230,70 @@ describe('migration v10', () => {
     ).toThrow(/FOREIGN KEY/i);
   });
 });
+
+describe('migration v11', () => {
+  it('adds the review loop columns and table; a watched PR starts at the head the worker last pushed, with no verdict', () => {
+    const db = openDatabase(':memory:', { migrateTo: 10 });
+    db.prepare(
+      `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
+       VALUES ('job_1', 1, 'o/r', 'wf', 'e1', 1, 'implement-issue', 'general', '{}', 'succeeded', 1, 't', 't'),
+              ('job_2', 1, 'o/r', 'wf', 'review:PRR_1', 1, 'implement-issue', 'general', '{}', 'succeeded', 1, 't', 't'),
+              ('job_3', 1, 'o/r', 'wf', 'e3', 2, 'implement-issue', 'general', '{}', 'succeeded', 1, 't', 't')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at, ended_at, outcome)
+       VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'w', 't', 't', 't', 'succeeded'),
+              ('run_2', 'job_2', 1, 'general', 'codex', 'w', 't', 't', 't', 'succeeded'),
+              ('run_3', 'job_3', 1, 'general', 'kiro', 'w', 't', 't', 't', 'succeeded')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO publications (run_id, job_id, repo_id, repo_full_name, issue_number, mode, state, branch, head_sha, pushed_at, pr_number, pr_url, attempts, created_at, updated_at)
+       VALUES ('run_1', 'job_1', 1, 'o/r', 1, 'pr', 'published', 'b1', 'sha_a', '2026-01-01T00:00:00.000Z', 5, 'u5', 1, 't', 't'),
+              ('run_3', 'job_3', 1, 'o/r', 2, 'pr', 'published', 'b3', 'sha_c', '2026-01-03T00:00:00.000Z', 6, 'u6', 1, 't', 't')`,
+    ).run();
+    const watch = db.prepare(
+      `INSERT INTO revision_prs (repo_id, pr_number, pr_url, source_run_id, original_event_id, workflow_id, issue_number, issue_title, issue_url, label, labels,
+                                 action, pool, branch, state, created_at, updated_at)
+       VALUES (1, ?, ?, ?, 'e', 'wf', ?, 't', 'u', 'l', '[]', 'implement-issue', 'general', ?, 'open', 't', 't')`,
+    );
+    watch.run(5, 'u5', 'run_1', 1, 'b1');
+    watch.run(6, 'u6', 'run_3', 2, 'b3');
+    watch.run(7, 'u7', 'run_pruned', 3, 'b7');
+    // PR 5 was revised once since.
+    db.prepare(
+      `INSERT INTO revisions (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, review_id, trigger_kind, state, branch, base_sha, head_sha, pushed_at, created_at, updated_at)
+       VALUES ('run_2', 'job_2', 1, 'o/r', 1, 5, 'PRR_1', 'changes_requested', 'published', 'b1', 'sha_a', 'sha_b', '2026-01-02T00:00:00.000Z', 't', 't')`,
+    ).run();
+
+    migrate(db, 11);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 });
+    const rows = db
+      .prepare('SELECT pr_number, head_sha, head_at, author_agent, verdict, verdict_sha, merge_state, merge_attempts, merge_comment_attempts, ready_marked_at FROM revision_prs ORDER BY pr_number')
+      .all();
+    const blank = { verdict: null, verdict_sha: null, merge_state: null, merge_attempts: 0, merge_comment_attempts: 0, ready_marked_at: null };
+    expect(rows).toEqual([
+      { pr_number: 5, head_sha: 'sha_b', head_at: '2026-01-02T00:00:00.000Z', author_agent: 'codex', ...blank },
+      { pr_number: 6, head_sha: 'sha_c', head_at: '2026-01-03T00:00:00.000Z', author_agent: 'kiro', ...blank },
+      { pr_number: 7, head_sha: null, head_at: null, author_agent: null, ...blank },
+    ]);
+    expect(db.prepare('SELECT count(*) AS n FROM pr_reviews').get()).toEqual({ n: 0 });
+    expect(db.prepare('SELECT count(*) AS n FROM jobs').get()).toEqual({ n: 3 });
+
+    // The new table and columns hold what the review loop writes, and refuse what it never does.
+    const review = (runId: string, verdict: string) =>
+      db
+        .prepare(
+          `INSERT INTO pr_reviews (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, head_sha, agent, verdict, findings, state, created_at, updated_at)
+           VALUES (?, 'job_1', 1, 'o/r', 1, 5, 'sha_b', 'codex', ?, 'f', 'publishing', 't', 't')`,
+        )
+        .run(runId, verdict);
+    review('run_1', 'ready-to-merge');
+    expect(db.prepare('SELECT attempts, retryable, outcome, review_id FROM pr_reviews').get()).toEqual({ attempts: 0, retryable: 0, outcome: null, review_id: null });
+    expect(() => review('run_2', 'approved')).toThrow(/CHECK/i);
+    expect(() => review('run_1', 'changes-requested')).toThrow(/UNIQUE|PRIMARY/i);
+    expect(() => review('run_missing', 'ready-to-merge')).toThrow(/FOREIGN KEY/i);
+    expect(() => db.prepare("UPDATE pr_reviews SET outcome = 'merged'").run()).toThrow(/CHECK/i);
+    db.prepare("UPDATE revision_prs SET merge_state = 'waiting' WHERE pr_number = 5").run();
+    expect(() => db.prepare("UPDATE revision_prs SET merge_state = 'forced' WHERE pr_number = 5").run()).toThrow(/CHECK/i);
+  });
+});

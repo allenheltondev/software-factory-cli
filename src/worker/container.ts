@@ -196,15 +196,26 @@ const PINNED_ADMIN = ['commondir', 'gitdir', 'config.worktree'] as const;
  * The cost: git commands that rewrite files directly in the common dir fail inside the container
  * (`git gc`, `git pack-refs`, deleting a packed ref, `git config` without --global). Ordinary
  * add, commit, checkout, stash, rebase, tag and branch creation work.
+ *
+ * `readOnlyGit` (a reviewer run) leaves the whole common git dir read-only: nothing the agent does
+ * can add an object, move a ref or create a branch in the clone, so `git commit` fails. Reading
+ * history (`git diff`, `git log`, `git show`) works. The worktree and its admin directory (its
+ * index and HEAD) stay writable so tests can be run and files staged; both are deleted after the run.
  */
-export function gitMounts(worktree: string, layout: WorktreeGitLayout, exists: (path: string) => boolean, alternates: readonly string[] = []): ContainerMount[] {
+export function gitMounts(
+  worktree: string,
+  layout: WorktreeGitLayout,
+  exists: (path: string) => boolean,
+  alternates: readonly string[] = [],
+  readOnlyGit = false,
+): ContainerMount[] {
   const ro = (path: string): ContainerMount => ({ path, readOnly: true });
   const rw = (path: string): ContainerMount => ({ path, readOnly: false });
   return [
     rw(worktree),
     ro(layout.pointer),
     ro(layout.commonDir),
-    ...WRITABLE_COMMON.map((d) => join(layout.commonDir, d)).filter(exists).map(rw),
+    ...(readOnlyGit ? [] : WRITABLE_COMMON.map((d) => join(layout.commonDir, d)).filter(exists).map(rw)),
     rw(layout.adminDir),
     ...PINNED_ADMIN.map((f) => join(layout.adminDir, f)).filter(exists).map(ro),
     // Object stores the clone borrows from (git clone --reference/--shared): readable, never writable.
@@ -234,7 +245,7 @@ function readAlternates(commonDir: string): string[] {
  * agent's. Creates an empty `config.worktree` in the worktree's admin dir when there is none, so
  * that it can be pinned read-only (a bind mount needs an existing file).
  */
-export function worktreeMounts(worktree: string): ContainerMount[] {
+export function worktreeMounts(worktree: string, opts: { readOnlyGit?: boolean } = {}): ContainerMount[] {
   const layout = readWorktreeLayout(worktree);
   const perWorktreeConfig = join(layout.adminDir, 'config.worktree');
   if (!existsSync(perWorktreeConfig)) {
@@ -244,7 +255,7 @@ export function worktreeMounts(worktree: string): ContainerMount[] {
       throw new ContainerSetupError(`cannot create ${perWorktreeConfig}: ${(err as Error).message}`, { cause: err });
     }
   }
-  return gitMounts(worktree, layout, existsSync, readAlternates(layout.commonDir));
+  return gitMounts(worktree, layout, existsSync, readAlternates(layout.commonDir), opts.readOnlyGit === true);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,10 +357,12 @@ export function containInvocation(o: {
   agentEnv?: Record<string, string>;
   /** `uid:gid`; defaults to the worker's own. */
   user?: string;
+  /** A reviewer run: the clone's git directory is mounted read-only (see {@link gitMounts}). */
+  readOnlyGit?: boolean;
 }): ContainedInvocation {
   const inv = o.invocation;
   const name = containerName(o.runId);
-  const mounts = worktreeMounts(o.worktree);
+  const mounts = worktreeMounts(o.worktree, { readOnlyGit: o.readOnlyGit === true });
   if (inv.promptVia === 'file-arg') mounts.push({ path: o.promptFile, readOnly: true });
   const envNames = [...new Set([...o.container.env, ...Object.keys(inv.env ?? {}), ...Object.keys(o.agentEnv ?? {})])];
   const args = buildContainerRunArgs(

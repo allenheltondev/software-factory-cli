@@ -1,9 +1,9 @@
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { AgentReport } from '../agents/discovery.js';
-import { agentAdapter, publishMode, type UpdraftConfig } from '../config/schema.js';
+import { agentAdapter, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviewSettings, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
 import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
@@ -49,6 +49,53 @@ export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array
 }
 
 export type CheckStatus = 'ok' | 'warn' | 'fail';
+
+/**
+ * Doctor checks for one repository's revision loop and review loop (revise, review), from the
+ * config and the prompt files alone: no request. Nothing when both are off.
+ */
+export function loopChecks(config: UpdraftConfig, fullName: string, repo: RepositoryConfig, configDir: string, fileExists: (path: string) => boolean): Array<Omit<CheckResult, 'name'>> {
+  const out: Array<Omit<CheckResult, 'name'>> = [];
+  const actions = [...new Set(repo.workflows.map((wf) => wf.action))].filter((a) => config.actions[a]?.output === 'local-branch');
+  const promptCheck = (option: 'revise' | 'review', key: 'revisePrompt' | 'reviewPrompt') => {
+    for (const a of actions) {
+      const file = config.actions[a]?.[key];
+      if (!file) out.push({ status: 'fail', detail: `${option}: actions.${a}.${key} is not set` });
+      else if (!fileExists(resolve(configDir, file))) out.push({ status: 'fail', detail: `${option}: prompt file ${resolve(configDir, file)} (actions.${a}.${key}) does not exist` });
+      else out.push({ status: 'ok', detail: `${option}: prompt ${resolve(configDir, file)} (actions.${a}.${key})` });
+    }
+  };
+  if (repo.revise) {
+    if (!reviseActive(config, repo)) out.push({ status: 'warn', detail: 'revise is set but does nothing here: it needs execution.mode live and publish' });
+    else {
+      promptCheck('revise', 'revisePrompt');
+      out.push({ status: 'ok', detail: `revise: up to ${repo.maxRevisions ?? DEFAULT_MAX_REVISIONS} revision(s) per pull request; they are pushed with the same access as publish` });
+    }
+  }
+  const review = reviewSettings(repo);
+  if (review.enabled) {
+    if (!reviewActive(config, repo)) out.push({ status: 'warn', detail: 'review is set but does nothing here: it needs execution.mode live and publish' });
+    else {
+      promptCheck('review', 'reviewPrompt');
+      const enabledIn = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
+      for (const wf of repo.workflows) {
+        const pools = typeof wf.pool === 'string' ? [wf.pool] : [...wf.pool.rules.map((r) => r.use), wf.pool.default];
+        for (const p of new Set(pools)) {
+          const reviewPool = wf.reviewPool ?? p;
+          const reviewers = enabledIn(reviewPool);
+          const alone = enabledIn(p).find((author) => reviewers.every((r) => r === author));
+          const where = `review: workflow ${workflowId(wf)}, code from pool ${p}, reviewers from pool ${reviewPool}`;
+          if (reviewers.length === 0) out.push({ status: 'fail', detail: `${where}: no enabled agent in the review pool` });
+          else if (alone === undefined) out.push({ status: 'ok', detail: `${where}: a reviewer other than the author is always available (${reviewers.join(', ')})` });
+          else if (review.allowSameAgent) out.push({ status: 'warn', detail: `${where}: ${alone} reviews its own work (review.allowSameAgent)` });
+          else out.push({ status: 'fail', detail: `${where}: ${alone} is the only enabled reviewer and also writes the code` });
+        }
+      }
+      if (!repo.revise) out.push({ status: 'warn', detail: 'review: revise is off, so a "changes requested" verdict is only posted' });
+    }
+  }
+  return out;
+}
 
 export interface CheckResult {
   status: CheckStatus;
@@ -239,6 +286,24 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
             add('ok', name, 'commentOnFailure: the active GitHub account can read the repository (the token must also allow issue comments, which is not checked: doctor does not write)');
           }
         }
+        const autoMerge = autoMergeMethod(config, repo);
+        if (repo.autoMerge && !autoMerge) {
+          add('warn', name, `autoMerge: ${repo.autoMerge} is set but does nothing here: it needs execution.mode live, publish and review`);
+        } else if (autoMerge) {
+          // Merging needs write access; GitHub applies branch protection when the merge is asked for.
+          if (gr.archived) add('fail', name, `autoMerge: ${fullName} is archived (read-only), so nothing can be merged`);
+          else if (gr.permissions === null) add('warn', name, "autoMerge: GitHub did not report this account's permissions; whether it can merge is unverified");
+          else if (!gr.permissions.push) add('fail', name, `autoMerge: the active GitHub account has no write access to ${fullName}, so it cannot merge. ${TOKEN_SCOPES_HINT}`);
+          else if (gr.mergeMethods && !gr.mergeMethods[autoMerge]) add('fail', name, `autoMerge: ${autoMerge} merges are turned off in the settings of ${fullName}`);
+          else {
+            add(
+              'ok',
+              name,
+              `autoMerge: ${autoMerge}; the active GitHub account can merge${gr.mergeMethods ? '' : ' (whether the repository allows this merge method is unverified)'}. ` +
+                'Branch protection is not checked here: GitHub applies it when Updraft asks for the merge',
+            );
+          }
+        }
         const labels = await api.listLabels({ id: repo.id, fullName });
         const has = (l: string) => labels.some((x) => labelEquals(x.name, l));
         for (const wf of repo.workflows) {
@@ -253,6 +318,13 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
       } catch (err) {
         add('fail', name, errMessage(err));
       }
+    }
+  }
+
+  // The revision loop and the review loop: prompts and who can review whom.
+  if (config) {
+    for (const [fullName, repo] of Object.entries(config.repositories)) {
+      for (const c of loopChecks(config, fullName, repo, paths.configDir, probes.fileExists)) add(c.status, `repo ${fullName}`, c.detail);
     }
   }
 

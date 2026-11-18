@@ -241,6 +241,13 @@ export const claudeAdapter: AgentAdapter = {
    * be inspected with `claude --resume <id>` in the worktree). Without a result (timeout, crash),
    * the last thing Claude said and the session id.
    */
+  finalMessage(output: string): string | null | undefined {
+    const result = findResult(output);
+    if (result) return result.subtype === 'success' && !result.is_error && typeof result.result === 'string' ? result.result : null;
+    // No JSON at all: plain text output was chosen in agents.<name>.args.
+    return scan(output).events.length ? null : undefined;
+  },
+
   summarizeOutput(output: string): string[] | null {
     const { events } = scan(output);
     const result = findResult(output);

@@ -35,7 +35,7 @@ What the worker and the agents it starts can do, and which guards exist. The
   `git worktree add`. With `publish` set for a repository, the worker also writes to GitHub
   as your `gh` account: it creates job branches (never moving an existing one, never the
   base branch), opens PRs and comments on issues (see [Publication](publication.md)). It
-  never merges. The one exception to "never moving an existing one" is the push of a
+  never merges unless `autoMerge` is set (below). The one exception to "never moving an existing one" is the push of a
   revision, which is off unless `revise` is set too (next point).
 - With `revise` set as well, a "Request changes" review on a PR the worker opened starts
   another agent run, so the same allowlist guards it: only a review whose author is an
@@ -49,6 +49,31 @@ What the worker and the agents it starts can do, and which guards exist. The
   that moved meanwhile is left alone). The number of revisions per PR is capped by
   `maxRevisions`. It never approves, merges, dismisses a review or resolves a thread. See
   [Revisions](revisions.md).
+- With `review` set, a second agent reviews every head commit of a PR the worker opened, and
+  its "changes requested" verdict starts a revision without a person asking for it. The
+  reviewer is an agent reading untrusted input (the code, the issue, earlier reviews), so its
+  verdict is only as good as that: text in any of them can try to steer it. What limits the
+  damage: the reviewer runs in a throwaway worktree that is deleted afterwards and nothing of
+  it is ever pushed; it is not the agent that wrote the code unless you allow that; its
+  verdict is read from one exact line of its final message and anything else fails the run
+  rather than counting as approval; a verdict only ever applies to the one commit that was
+  reviewed; the rounds are capped by `maxRevisions`; and the review is posted as a comment,
+  with the findings fenced, because GitHub does not let an account approve its own PR. Without
+  `autoMerge` the worst a fooled reviewer can do is mark a draft ready for review. See
+  [The review loop](review-loop.md).
+- **`autoMerge` is the most dangerous option Updraft has, and it is off unless you set it.**
+  With it, a "ready to merge" verdict leads to a merge into your base branch with no person
+  in between, and the verdict comes from an agent that read untrusted issue text and
+  untrusted code, either of which can be written to talk it into approving. Updraft merges
+  only the exact commit that was reviewed (the merge request names it, so GitHub refuses if
+  anything was pushed since), only if the worker's own `verify` commands passed on it, only
+  if GitHub reports no failing or pending check and no conflict, only if no allowed actor has
+  a "Request changes" review outstanding, and it never forces, bypasses branch protection or
+  retries a refused merge. None of that tells you the reviewer was right: no checks at all
+  counts as passing, a PR can change the tests and CI it is judged by, and silence from people
+  is not approval. Use it only where every allowed actor could push to the base branch anyway,
+  and put required checks on that branch in GitHub. See
+  [Auto-merge](review-loop.md#auto-merge).
 - Publication is done by the worker after the agent has exited; the agent itself is not given
   `GH_TOKEN`/`GITHUB_TOKEN`. That is a guard against accidental use, not isolation: the agent
   runs as your user, so it can still reach whatever that user can, including `gh auth token`,

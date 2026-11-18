@@ -18,6 +18,9 @@ export const EXECUTION_MODES = ['log-only', 'prepare-only', 'live'] as const;
  */
 export const PUBLISH_MODES = ['none', 'draft-pr', 'pr'] as const;
 export type PublishMode = (typeof PUBLISH_MODES)[number];
+/** repositories.<repo>.autoMerge: how Updraft merges a PR its reviewer found ready. */
+export const MERGE_METHODS = ['squash', 'merge', 'rebase'] as const;
+export type MergeMethod = (typeof MERGE_METHODS)[number];
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 
 /** Modes that create a per-job branch and worktree (and so need repositories.*.checkoutPath). */
@@ -112,6 +115,12 @@ export const actionSchema = z.strictObject({
    * mode when a repository with revise on runs this action.
    */
   revisePrompt: z.string().min(1).optional(),
+  /**
+   * Prompt file for reviewer runs (repositories.<repo>.review), relative to the config file's
+   * directory: how to review a pull request Updraft opened. Required in live mode when a
+   * repository with review on runs this action.
+   */
+  reviewPrompt: z.string().min(1).optional(),
 });
 
 /** Agent run time limit when an action sets no timeoutMinutes. */
@@ -148,6 +157,8 @@ export const workflowSchema = z.strictObject({
   pool: poolSelectorSchema,
   /** Overrides dispatch.allowedActors for this workflow. */
   allowedActors: z.array(z.string().min(1)).optional(),
+  /** With repositories.<repo>.review: the pool reviewer runs are routed to. Default: the pool the job itself was routed to. */
+  reviewPool: name.optional(),
 });
 
 export const repositorySchema = z.strictObject({
@@ -192,6 +203,27 @@ export const repositorySchema = z.strictObject({
   revise: z.boolean().optional(),
   /** With revise: how many revision jobs one PR gets before further change requests are only recorded. Default 3. */
   maxRevisions: z.number().int().min(1).max(20).optional(),
+  /**
+   * Live mode, together with publish: run a second agent as reviewer on every head commit of a PR
+   * Updraft opened, and post its verdict as a comment review. `true`, or an object for options.
+   * Default false.
+   */
+  review: z
+    .union([
+      z.boolean(),
+      z.strictObject({
+        /** Let the agent that wrote the code also review it when the review pool has no other enabled agent. Default false. */
+        allowSameAgent: z.boolean().default(false),
+      }),
+    ])
+    .optional(),
+  /**
+   * With review: merge a PR whose current head the reviewer found ready to merge, once the checks
+   * in docs/review-loop.md hold, with this merge method. Absent: never merge; a person does.
+   */
+  autoMerge: z.enum(MERGE_METHODS).optional(),
+  /** With autoMerge: how long to wait for pending checks before giving up, in minutes. Default 60. */
+  autoMergeWaitMinutes: z.number().positive().max(24 * 60).optional(),
   workflows: z.array(workflowSchema).min(1),
 });
 
@@ -261,6 +293,26 @@ export const DEFAULT_MAX_REVISIONS = 3;
 /** True when the revision loop runs for this repository: live mode, publication on, revise on. */
 export function reviseActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'revise'>): boolean {
   return config.execution.mode === 'live' && repo.revise === true && publishMode(repo) !== 'none';
+}
+
+/** repositories.<repo>.review as settings: off unless set to true or to an options object. */
+export function reviewSettings(repo: Pick<RepositoryConfig, 'review'>): { enabled: boolean; allowSameAgent: boolean } {
+  if (repo.review === undefined || repo.review === false) return { enabled: false, allowSameAgent: false };
+  if (repo.review === true) return { enabled: true, allowSameAgent: false };
+  return { enabled: true, allowSameAgent: repo.review.allowSameAgent };
+}
+
+/** True when reviewer runs happen for this repository: live mode, publication on, review on. */
+export function reviewActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'review'>): boolean {
+  return config.execution.mode === 'live' && reviewSettings(repo).enabled && publishMode(repo) !== 'none';
+}
+
+/** Minutes auto-merge waits for pending checks when repositories.<repo>.autoMergeWaitMinutes is not set. */
+export const DEFAULT_AUTO_MERGE_WAIT_MINUTES = 60;
+
+/** The merge method when Updraft may merge this repository's reviewed PRs itself, else null. */
+export function autoMergeMethod(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'review' | 'autoMerge'>): MergeMethod | null {
+  return reviewActive(config, repo) ? (repo.autoMerge ?? null) : null;
 }
 
 export function allowedActorsFor(config: UpdraftConfig, wf: WorkflowConfig): string[] {
