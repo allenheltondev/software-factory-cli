@@ -1,17 +1,21 @@
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { AgentReport } from '../agents/discovery.js';
-import { agentAdapter, publishMode, type FactoryConfig } from '../config/schema.js';
+import { agentAdapter, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviewSettings, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
+import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
 import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import type { GitHubCredentials } from '../github/credentials.js';
+import type { UpdraftPaths } from '../paths.js';
 import { labelEquals } from '../routing.js';
 import { agentLookupEnv } from '../worker/live.js';
 import { pathEntries, which } from '../util/which.js';
 import { println, type CommandContext } from './context.js';
+import { appKeyChecks, appRepoChecks } from './doctor-app.js';
 import { checkRepoCheckouts } from './doctor-checkout.js';
+import { containerAgentChecks } from './doctor-container.js';
 import { EXIT, describeGitHubError } from './errors.js';
 import { checkConfig } from './validate.js';
 
@@ -48,6 +52,53 @@ export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array
 
 export type CheckStatus = 'ok' | 'warn' | 'fail';
 
+/**
+ * Doctor checks for one repository's revision loop and review loop (revise, review), from the
+ * config and the prompt files alone: no request. Nothing when both are off.
+ */
+export function loopChecks(config: UpdraftConfig, fullName: string, repo: RepositoryConfig, configDir: string, fileExists: (path: string) => boolean): Array<Omit<CheckResult, 'name'>> {
+  const out: Array<Omit<CheckResult, 'name'>> = [];
+  const actions = [...new Set(repo.workflows.map((wf) => wf.action))].filter((a) => config.actions[a]?.output === 'local-branch');
+  const promptCheck = (option: 'revise' | 'review', key: 'revisePrompt' | 'reviewPrompt') => {
+    for (const a of actions) {
+      const file = config.actions[a]?.[key];
+      if (!file) out.push({ status: 'fail', detail: `${option}: actions.${a}.${key} is not set` });
+      else if (!fileExists(resolve(configDir, file))) out.push({ status: 'fail', detail: `${option}: prompt file ${resolve(configDir, file)} (actions.${a}.${key}) does not exist` });
+      else out.push({ status: 'ok', detail: `${option}: prompt ${resolve(configDir, file)} (actions.${a}.${key})` });
+    }
+  };
+  if (repo.revise) {
+    if (!reviseActive(config, repo)) out.push({ status: 'warn', detail: 'revise is set but does nothing here: it needs execution.mode live and publish' });
+    else {
+      promptCheck('revise', 'revisePrompt');
+      out.push({ status: 'ok', detail: `revise: up to ${repo.maxRevisions ?? DEFAULT_MAX_REVISIONS} revision(s) per pull request; they are pushed with the same access as publish` });
+    }
+  }
+  const review = reviewSettings(repo);
+  if (review.enabled) {
+    if (!reviewActive(config, repo)) out.push({ status: 'warn', detail: 'review is set but does nothing here: it needs execution.mode live and publish' });
+    else {
+      promptCheck('review', 'reviewPrompt');
+      const enabledIn = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
+      for (const wf of repo.workflows) {
+        const pools = typeof wf.pool === 'string' ? [wf.pool] : [...wf.pool.rules.map((r) => r.use), wf.pool.default];
+        for (const p of new Set(pools)) {
+          const reviewPool = wf.reviewPool ?? p;
+          const reviewers = enabledIn(reviewPool);
+          const alone = enabledIn(p).find((author) => reviewers.every((r) => r === author));
+          const where = `review: workflow ${workflowId(wf)}, code from pool ${p}, reviewers from pool ${reviewPool}`;
+          if (reviewers.length === 0) out.push({ status: 'fail', detail: `${where}: no enabled agent in the review pool` });
+          else if (alone === undefined) out.push({ status: 'ok', detail: `${where}: a reviewer other than the author is always available (${reviewers.join(', ')})` });
+          else if (review.allowSameAgent) out.push({ status: 'warn', detail: `${where}: ${alone} reviews its own work (review.allowSameAgent)` });
+          else out.push({ status: 'fail', detail: `${where}: ${alone} is the only enabled reviewer and also writes the code` });
+        }
+      }
+      if (!repo.revise) out.push({ status: 'warn', detail: 'review: revise is off, so a "changes requested" verdict is only posted' });
+    }
+  }
+  return out;
+}
+
 export interface CheckResult {
   status: CheckStatus;
   name: string;
@@ -79,7 +130,15 @@ export interface DoctorProbes {
   checkWritable(dir: string): void;
   /** Open (creating/migrating if needed) and close the state DB; throws on failure. */
   checkDb(file: string): void;
-  createApi(): Promise<GitHubApi>;
+  /** The API as the worker uses it: with `credentials` when given, else the person's gh sign-in. */
+  createApi(credentials?: GitHubCredentials): Promise<GitHubApi>;
+  /**
+   * The worker's GitHub credentials for this config (the GitHub App of github.app, else the gh
+   * sign-in). Throws when an App is configured and its key cannot be used. Absent: the gh sign-in.
+   */
+  createCredentials?(config: UpdraftConfig): GitHubCredentials;
+  /** Permission bits of a file, or null when it cannot be read; for the App's private key. */
+  fileMode?(path: string): number | null;
   fileExists(path: string): boolean;
 }
 
@@ -111,7 +170,7 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Promise<DoctorReport> {
+export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Promise<DoctorReport> {
   const checks: CheckResult[] = [];
   const add = (status: CheckStatus, name: string, detail: string) => checks.push({ status, name, detail });
 
@@ -124,8 +183,8 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
 
   // Config
   const cfg = checkConfig(paths.configFile, probes.fileExists);
-  let config: FactoryConfig | null = null;
-  if (cfg.state === 'missing') add('fail', 'config', `not found at ${paths.configFile}; run "factory configure"`);
+  let config: UpdraftConfig | null = null;
+  if (cfg.state === 'missing') add('fail', 'config', `not found at ${paths.configFile}; run "updraft configure"`);
   else if (cfg.state === 'unreadable') add('fail', 'config', cfg.message);
   else if (cfg.state === 'invalid') {
     add('fail', 'config', `invalid: ${paths.configFile}`);
@@ -164,10 +223,15 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
   }
 
   // gh and token
-  const envToken = Boolean(probes.env.GH_TOKEN || probes.env.GITHUB_TOKEN);
+  // With a GitHub App the worker does not use gh at all; only "updraft configure" and "updraft add" do.
+  const appConfig = config?.github?.app;
+  const envToken = Boolean(probes.env.GH_TOKEN || probes.env.GITHUB_TOKEN || appConfig);
+  const ghOptional = appConfig
+    ? ' (a GitHub App is configured, so gh is needed only by "updraft configure" and "updraft add")'
+    : ' (GH_TOKEN/GITHUB_TOKEN is set, so it is optional)';
   const gh = probes.which('gh');
   if (!gh) {
-    add(envToken ? 'warn' : 'fail', 'gh', `not found on PATH${envToken ? ' (GH_TOKEN/GITHUB_TOKEN is set, so it is optional)' : ''}`);
+    add(envToken ? 'warn' : 'fail', 'gh', `not found on PATH${envToken ? ghOptional : ''}`);
   } else {
     const auth = await probes.run(gh, ['auth', 'status', '--hostname', 'github.com']).catch((err: unknown) => ({
       code: null,
@@ -177,19 +241,36 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
     if (auth.code === 0) add('ok', 'gh', `${gh} (authenticated)`);
     else {
       const why = (auth.stderr || auth.stdout).trim().split(/\r?\n/)[0] ?? '';
-      add(envToken ? 'warn' : 'fail', 'gh', `${gh} is not authenticated; run "gh auth login"${why ? ` (${why})` : ''}`);
+      add(envToken ? 'warn' : 'fail', 'gh', `${gh} is not authenticated; run "gh auth login"${why ? ` (${why})` : ''}${appConfig ? ghOptional : ''}`);
     }
   }
 
+  // GitHub App (github.app): the private key first; nothing else about the App works without it.
+  let appKeyOk = true;
+  if (appConfig) {
+    const key = appKeyChecks(appConfig, { configDir: paths.configDir, env: probes.env, platform: probes.platform, ...(probes.fileMode ? { fileMode: probes.fileMode } : {}) });
+    appKeyOk = key.ok;
+    for (const c of key.checks) add(c.status, 'github app', c.detail);
+  }
+
   let api: GitHubApi | null = null;
+  let credentials: GitHubCredentials | undefined;
   try {
-    api = await probes.createApi();
-    const viewer = await api.getViewer();
-    add('ok', 'github', `token works; authenticated as ${viewer.login}`);
-    if (config) {
-      const actors = new Set(config.dispatch.allowedActors.map((a) => a.toLowerCase()));
-      if (actors.size && !actors.has(viewer.login.toLowerCase())) {
-        add('warn', 'github', `${viewer.login} is not in dispatch.allowedActors`);
+    if (!appKeyOk) throw new Error("the GitHub App's private key cannot be used (see above)");
+    credentials = config ? probes.createCredentials?.(config) : undefined;
+    api = await probes.createApi(credentials);
+    // Who the worker is: the gh account, or the App's bot (never GET /user under an App).
+    const who = await api.getWorkerIdentity();
+    const listed = config ? new Set(config.dispatch.allowedActors.map((a) => a.toLowerCase())).has(who.login.toLowerCase()) : false;
+    if (who.kind === 'app') {
+      add('ok', 'github', `the GitHub App authenticates; the worker acts as ${who.login} (app id ${who.id})`);
+      if (listed) {
+        add('warn', 'github', `${who.login} is in dispatch.allowedActors, so a label applied by the worker's own bot would dispatch work; remove it unless that is intended`);
+      }
+    } else {
+      add('ok', 'github', `token works; authenticated as ${who.login}`);
+      if (config && config.dispatch.allowedActors.length && !listed) {
+        add('warn', 'github', `${who.login} is not in dispatch.allowedActors`);
       }
     }
   } catch (err) {
@@ -204,15 +285,18 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
       try {
         const gr = await api.getRepo(fullName);
         if (gr.id !== repo.id) {
-          add('fail', name, `ID mismatch: config has ${repo.id}, GitHub has ${gr.id}; re-run "factory add ${fullName}"`);
+          add('fail', name, `ID mismatch: config has ${repo.id}, GitHub has ${gr.id}; re-run "updraft add ${fullName}"`);
           continue;
         }
         if (gr.fullName.toLowerCase() !== fullName.toLowerCase()) {
           add('warn', name, `renamed to ${gr.fullName} on GitHub; update the config key`);
         }
         add(gr.archived ? 'warn' : 'ok', name, `accessible (id ${gr.id})${gr.archived ? '; archived' : ''}`);
+        // Under a GitHub App, access is the installation's permissions, not an account's.
+        const appAuth = credentials?.app;
+        if (appAuth) for (const c of await appRepoChecks(appAuth, config, fullName, repo)) add(c.status, name, c.detail);
         const publish = publishMode(repo);
-        if (publish !== 'none') {
+        if (publish !== 'none' && !appAuth) {
           // Publication pushes and opens PRs as this account; a miss here is a failure only when it would run.
           const sev: CheckStatus = config.execution.mode === 'live' ? 'fail' : 'warn';
           if (gr.permissions === null) {
@@ -221,6 +305,38 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
             add(sev, name, `publish: ${publish}, but the active GitHub account has no push access to ${fullName}. ${TOKEN_SCOPES_HINT}`);
           } else {
             add('ok', name, `publish: ${publish}; the active GitHub account can push${gr.private && publish === 'draft-pr' ? ' (private repo: if GitHub refuses draft PRs on your plan, use publish: pr)' : ''}`);
+          }
+        }
+        if (repo.commentOnFailure && !appAuth) {
+          // Commenting on an issue needs only read access, but GitHub refuses comments on an
+          // archived repository. Whether the token may write issue comments shows only on a write.
+          const sev: CheckStatus = config.execution.mode === 'live' ? 'fail' : 'warn';
+          if (gr.archived) {
+            add(sev, name, `commentOnFailure: ${fullName} is archived (read-only), so GitHub will refuse the failure comment`);
+          } else if (gr.permissions === null) {
+            add('warn', name, "commentOnFailure: GitHub did not report this account's permissions; read access is unverified");
+          } else if (!gr.permissions.pull) {
+            add(sev, name, `commentOnFailure: the active GitHub account has no read access to ${fullName}. ${COMMENT_SCOPES_HINT}`);
+          } else {
+            add('ok', name, 'commentOnFailure: the active GitHub account can read the repository (the token must also allow issue comments, which is not checked: doctor does not write)');
+          }
+        }
+        const autoMerge = autoMergeMethod(config, repo);
+        if (repo.autoMerge && !autoMerge) {
+          add('warn', name, `autoMerge: ${repo.autoMerge} is set but does nothing here: it needs execution.mode live, publish and review`);
+        } else if (autoMerge) {
+          // Merging needs write access; GitHub applies branch protection when the merge is asked for.
+          if (gr.archived) add('fail', name, `autoMerge: ${fullName} is archived (read-only), so nothing can be merged`);
+          else if (gr.permissions === null) add('warn', name, "autoMerge: GitHub did not report this account's permissions; whether it can merge is unverified");
+          else if (!gr.permissions.push) add('fail', name, `autoMerge: the active GitHub account has no write access to ${fullName}, so it cannot merge. ${TOKEN_SCOPES_HINT}`);
+          else if (gr.mergeMethods && !gr.mergeMethods[autoMerge]) add('fail', name, `autoMerge: ${autoMerge} merges are turned off in the settings of ${fullName}`);
+          else {
+            add(
+              'ok',
+              name,
+              `autoMerge: ${autoMerge}; the active GitHub account can merge${gr.mergeMethods ? '' : ' (whether the repository allows this merge method is unverified)'}. ` +
+                'Branch protection is not checked here: GitHub applies it when Updraft asks for the merge',
+            );
           }
         }
         const labels = await api.listLabels({ id: repo.id, fullName });
@@ -240,31 +356,42 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
     }
   }
 
+  // The revision loop and the review loop: prompts and who can review whom.
+  if (config) {
+    for (const [fullName, repo] of Object.entries(config.repositories)) {
+      for (const c of loopChecks(config, fullName, repo, paths.configDir, probes.fileExists)) add(c.status, `repo ${fullName}`, c.detail);
+    }
+  }
+
   // Local clones that per-job worktrees are created from.
   if (config) checks.push(...(await checkRepoCheckouts(config, paths, probes)));
 
-  // Agents: the same discovery as "factory agents", for each enabled agent as a live run starts it:
+  // Agents: the same discovery as "updraft agents", for each enabled agent as a live run starts it:
   // its agents.<name>.command, in this process's environment minus the GitHub tokens plus its
   // agents.<name>.env. Running doctor under the background launcher shows what the worker will see.
+  // A containerized agent's CLI is in its image, so the runtime, the image and the CLI inside it
+  // are checked instead of anything on the host.
   if (config) {
     const sev = agentProblemSeverity(config.execution.mode);
     const enabled = Object.entries(config.agents).filter(([, a]) => a.enabled);
-    const reports = await Promise.all(
-      enabled.map(([agentName, agent]) =>
-        probes.discoverAgent(agentAdapter(agentName, agent), {
-          env: agentLookupEnv(probes.env, agent),
-          ...(agent.command ? { command: agent.command } : {}),
-          baseDir: paths.configDir,
-        }),
-      ),
+    const results = await Promise.all(
+      enabled.map(async ([agentName, agent]) => {
+        const adapter = agentAdapter(agentName, agent);
+        const env = agentLookupEnv(probes.env, agent);
+        if (agent.container) {
+          return containerAgentChecks(agentName, adapter, agent, paths.configDir, { platform: probes.platform, env, which: probes.which, run: probes.run }, sev);
+        }
+        const report = await probes.discoverAgent(adapter, { env, ...(agent.command ? { command: agent.command } : {}), baseDir: paths.configDir });
+        return agentChecks(report, sev);
+      }),
     );
     enabled.forEach(([agentName], i) => {
-      for (const c of agentChecks(reports[i], sev)) add(c.status, `agent ${agentName}`, c.detail);
+      for (const c of results[i]!) add(c.status, `agent ${agentName}`, c.detail);
     });
   }
 
   const overrides: Record<string, string> = {};
-  for (const k of ['FACTORY_HOME', 'FACTORY_CONFIG']) {
+  for (const k of ['UPDRAFT_HOME', 'UPDRAFT_CONFIG']) {
     const v = probes.env[k];
     if (v) overrides[k] = v;
   }
@@ -328,13 +455,14 @@ export function defaultDoctorProbes(ctx: CommandContext): DoctorProbes {
       }),
     checkWritable: (dir) => {
       mkdirSync(dir, { recursive: true });
-      const probe = join(dir, `.factory-doctor-${process.pid}.tmp`);
+      const probe = join(dir, `.updraft-doctor-${process.pid}.tmp`);
       writeFileSync(probe, 'ok');
       rmSync(probe, { force: true });
     },
     discoverAgent: async (adapter, opts) => (await ctx.discoverAgents({ adapters: [adapter], ...opts }))[0],
     checkDb: (file) => ctx.openDb(file).close(),
-    createApi: () => ctx.createApi(),
+    createApi: (credentials) => ctx.createApi(credentials ? { credentials } : undefined),
+    createCredentials: (config) => ctx.createCredentials(config),
     fileExists: existsSync,
   };
 }

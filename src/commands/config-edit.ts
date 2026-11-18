@@ -1,5 +1,5 @@
 /**
- * Pure config editing used by `factory configure` and `factory add`: seeding
+ * Pure config editing used by `updraft configure` and `updraft add`: seeding
  * defaults, merging repo selections, and describing what changed. Works on the
  * config *input* shape so saved files don't freeze schema defaults.
  */
@@ -7,7 +7,7 @@ import type { z } from 'zod';
 import {
   CONFIG_VERSION,
   workflowId,
-  type FactoryConfigInput,
+  type UpdraftConfigInput,
   type repositorySchema,
   type workflowSchema,
 } from '../config/schema.js';
@@ -26,7 +26,7 @@ export const DEFAULT_POOL = 'general';
 export const DEFAULT_AGENTS = ['codex', 'claude', 'kiro'] as const;
 
 /** Defaults for a first run. */
-export function seedConfig(viewerLogin: string): FactoryConfigInput {
+export function seedConfig(viewerLogin: string): UpdraftConfigInput {
   return {
     version: CONFIG_VERSION,
     pollIntervalSeconds: 60,
@@ -88,11 +88,11 @@ export function normalizeBackfillSince(input: string): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-export function findRepoKeyById(config: FactoryConfigInput, id: number): string | undefined {
+export function findRepoKeyById(config: UpdraftConfigInput, id: number): string | undefined {
   return Object.entries(config.repositories ?? {}).find(([, r]) => r.id === id)?.[0];
 }
 
-function findRepoKey(config: FactoryConfigInput, id: number, fullName: string): string | undefined {
+function findRepoKey(config: UpdraftConfigInput, id: number, fullName: string): string | undefined {
   return (
     findRepoKeyById(config, id) ??
     Object.keys(config.repositories ?? {}).find((k) => k.toLowerCase() === fullName.toLowerCase())
@@ -100,7 +100,7 @@ function findRepoKey(config: FactoryConfigInput, id: number, fullName: string): 
 }
 
 export interface UpsertResult {
-  config: FactoryConfigInput;
+  config: UpdraftConfigInput;
   /** True when a workflow with the same ID was replaced (vs. appended). */
   replaced: boolean;
   /** Previous config key when the repo was renamed/transferred on GitHub. */
@@ -112,7 +112,7 @@ export interface UpsertResult {
  * creating the repo entry if needed. The repo is keyed by its current full name.
  */
 export function upsertRepoWorkflow(
-  base: FactoryConfigInput,
+  base: UpdraftConfigInput,
   repo: { id: number; fullName: string },
   workflow: WorkflowInput,
   opts: { backfillSince?: string } = {},
@@ -151,7 +151,7 @@ export interface RepoSelection {
  * Repos are matched by GitHub ID so renames keep their settings; repos not
  * selected are removed. Other repo settings (baseBranch, checkoutPath) are kept.
  */
-export function applyRepoSelections(base: FactoryConfigInput, selections: RepoSelection[]): FactoryConfigInput {
+export function applyRepoSelections(base: UpdraftConfigInput, selections: RepoSelection[]): UpdraftConfigInput {
   const config = clone(base);
   const repos: Record<string, RepositoryInput> = {};
   for (const sel of selections) {
@@ -168,7 +168,7 @@ export function applyRepoSelections(base: FactoryConfigInput, selections: RepoSe
 }
 
 /** Enable exactly the named agents (others stay configured but disabled). */
-export function setEnabledAgents(base: FactoryConfigInput, enabled: readonly string[]): FactoryConfigInput {
+export function setEnabledAgents(base: UpdraftConfigInput, enabled: readonly string[]): UpdraftConfigInput {
   const config = clone(base);
   for (const [name, agent] of Object.entries(config.agents)) {
     if (enabled.includes(name)) delete agent.enabled;
@@ -211,7 +211,7 @@ export function describeWorkflow(wf: WorkflowInput): string {
   return `"${wf.trigger.label}" → ${wf.action} via pool ${pool}`;
 }
 
-function reposById(c: FactoryConfigInput | null): Map<number, { fullName: string; repo: RepositoryInput }> {
+function reposById(c: UpdraftConfigInput | null): Map<number, { fullName: string; repo: RepositoryInput }> {
   const m = new Map<number, { fullName: string; repo: RepositoryInput }>();
   for (const [fullName, repo] of Object.entries(c?.repositories ?? {})) m.set(repo.id, { fullName, repo });
   return m;
@@ -230,9 +230,9 @@ function diffRecord(kind: string, a: Record<string, unknown> = {}, b: Record<str
  * `seed` (the defaults the new config started from) is used to report setting changes.
  */
 export function diffConfigs(
-  before: FactoryConfigInput | null,
-  after: FactoryConfigInput,
-  opts: { seed?: FactoryConfigInput } = {},
+  before: UpdraftConfigInput | null,
+  after: UpdraftConfigInput,
+  opts: { seed?: UpdraftConfigInput } = {},
 ): ConfigDiff {
   const diff: ConfigDiff = {
     reposAdded: [],
@@ -322,4 +322,4 @@ export function formatDiff(d: ConfigDiff): string[] {
   return lines;
 }
 
-export const RESTART_REMINDER = 'Changes apply when the worker restarts ("factory start").';
+export const RESTART_REMINDER = 'Changes apply when the worker restarts ("updraft start").';

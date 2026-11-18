@@ -1,5 +1,5 @@
-# Example factory config. `factory configure` writes one like this to your
-# per-user config location; `factory validate --config <file>` checks it.
+# Example updraft config. `updraft configure` writes one like this to your
+# per-user config location; `updraft validate --config <file>` checks it.
 version: 1
 pollIntervalSeconds: 60
 maxConcurrent: 2
@@ -7,8 +7,9 @@ maxConcurrent: 2
 execution:
   # log-only: record each run in run.log. prepare-only: also create a branch and
   # worktree per job (needs checkoutPath). live: also run the agent in the worktree
-  # (needs checkoutPath and an action prompt). Only the Claude Code adapter ships in
-  # this release, so live mode validates only with codex and kiro disabled:
+  # (needs checkoutPath and an action prompt). Live mode can run all three agents below
+  # (Claude Code, Codex and Kiro), each in full-auto by default. Disable the ones you do
+  # not use; this runs Claude Code only:
   #
   #   execution: { mode: live }
   #   agents:
@@ -20,6 +21,15 @@ execution:
 dispatch:
   allowedActors: [allenheltondev]
 
+# Optional: act on GitHub as a GitHub App (`<app-slug>[bot]`) instead of your gh account, so
+# PRs and comments are the bot's and you can approve them. The key file stays outside the
+# config. See docs/github-app.md.
+#
+# github:
+#   app:
+#     appId: 1234567
+#     privateKeyPath: ./github-app.pem
+
 agents:
   codex:
     maxConcurrent: 1
@@ -27,7 +37,7 @@ agents:
     maxConcurrent: 1
     # Live mode only: the CLI to run instead of the one found on PATH, extra arguments,
     # and environment variables for the agent process. Arguments go after the adapter's
-    # own; a --permission-mode here replaces the full-auto default (see the README).
+    # own; a --permission-mode here replaces the full-auto default (see docs/agents/claude.md).
     # command: /usr/local/bin/claude
     # args: [--model, sonnet, --max-turns, "60"]
     # args: [--permission-mode, acceptEdits, --allowedTools, "Bash(npm test *)", "Bash(git add *)", "Bash(git commit *)"]
@@ -47,16 +57,26 @@ actions:
     prompt: ./prompts/implement-issue.md
     output: local-branch
     # timeoutMinutes: 60 # live mode: stop the agent and fail the run after this long
+    # revisePrompt: ./prompts/revise-pr.md # needed when a repository below sets revise: true
+    # reviewPrompt: ./prompts/review-pr.md # needed when a repository below sets review: true
 
 repositories:
   allenheltondev/kids-and-dragons:
-    id: 1 # replaced with the real GitHub repository ID by `factory add` / `configure`
+    id: 1 # replaced with the real GitHub repository ID by `updraft add` / `configure`
     # Local clone that per-job worktrees branch from (relative to this file); required in prepare-only and live mode.
     # checkoutPath: ../clones/kids-and-dragons
     # baseBranch: main # defaults to the remote's default branch
     # remote: origin # only needed when the GitHub remote uses an SSH host alias (git@github-work:OWNER/REPO)
     # Live mode: push the job branch of a succeeded run and open a PR as your gh account (none, draft-pr or pr).
     # publish: draft-pr
+    # With publish: when an allowed actor requests changes on such a PR, run the agent on its branch and push the result.
+    # revise: true
+    # maxRevisions: 3
+    # With publish: have a second agent review every head of such a PR; with revise, its "changes requested" starts a revision.
+    # The reviewer is never the agent that wrote the code, so a pool used for reviews needs two agents (or set workflows[].reviewPool).
+    # review: true
+    # With review: merge a PR the reviewer found ready, once its checks passed. Off unless set; read docs/review-loop.md first.
+    # autoMerge: squash
     workflows:
       - id: implement
         trigger:

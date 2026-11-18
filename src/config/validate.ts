@@ -7,9 +7,12 @@ import {
   configSchema,
   modeNeedsCheckout,
   publishMode,
+  reviseActive,
+  reviewActive,
+  reviewSettings,
   repoNeedsCheckout,
   workflowId,
-  type FactoryConfig,
+  type UpdraftConfig,
 } from './schema.js';
 
 export interface ConfigIssue {
@@ -18,18 +21,23 @@ export interface ConfigIssue {
 }
 
 export type ValidationResult =
-  | { ok: true; config: FactoryConfig; warnings: ConfigIssue[] }
+  | { ok: true; config: UpdraftConfig; warnings: ConfigIssue[] }
   | { ok: false; errors: ConfigIssue[]; warnings: ConfigIssue[] };
 
 function zodIssues(err: z.ZodError): ConfigIssue[] {
   return err.issues.map((i) => ({ path: i.path.map(String).join('.') || '(root)', message: i.message }));
 }
 
+/** The worker's own GitHub credentials, which a live run never passes on (WITHHELD_ENV in src/worker/live.ts). */
+const WITHHELD_FROM_AGENTS = ['GH_TOKEN', 'GITHUB_TOKEN', 'UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH'];
+
 /**
  * Parse and cross-check a config object: referenced actions, pools, agents,
  * limits and actor allowlists. Pure; does not touch the filesystem or network.
+ * `platform` is the one the worker runs on (injectable for tests).
  */
-export function validateConfig(raw: unknown): ValidationResult {
+export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform } = {}): ValidationResult {
+  const platform = opts.platform ?? process.platform;
   const parsed = configSchema.safeParse(raw);
   if (!parsed.success) return { ok: false, errors: zodIssues(parsed.error), warnings: [] };
   const config = parsed.data;
@@ -48,9 +56,30 @@ export function validateConfig(raw: unknown): ValidationResult {
       errors.push({
         path: `agents.${agentName}`,
         message:
-          `live execution is not implemented for adapter "${adapter}" in this release, so live mode cannot run this agent yet; ` +
+          `live execution is not implemented for adapter "${adapter}", so live mode cannot run this agent; ` +
           'use execution.mode prepare-only, or disable the agent',
       });
+    }
+    if (agent.container) {
+      const base = `agents.${agentName}.container`;
+      if (platform === 'win32') {
+        // The container sees the worktree and the git directory at their host paths, and a
+        // Windows path can't exist inside a Linux container. Refuse rather than half-isolate.
+        errors.push({
+          path: base,
+          message:
+            'containerized agents are not supported on native Windows yet; run the worker inside WSL2 with the clone on the WSL filesystem, or remove container',
+        });
+      }
+      for (const v of agent.container.env.filter((n) => WITHHELD_FROM_AGENTS.includes(n.toUpperCase()))) {
+        warnings.push({
+          path: `${base}.env`,
+          message: `${v} is withheld from every agent, so it will not reach the container; to hand the agent a GitHub token on purpose, set agents.${agentName}.env.${v}`,
+        });
+      }
+      if (config.execution.mode !== 'live') {
+        warnings.push({ path: base, message: `only applies in live mode; in ${config.execution.mode} mode no agent is started` });
+      }
     }
     if (agent.maxConcurrent > config.maxConcurrent) {
       warnings.push({
@@ -103,6 +132,65 @@ export function validateConfig(raw: unknown): ValidationResult {
       }
     }
 
+    if (repo.commentOnFailure && config.execution.mode !== 'live') {
+      warnings.push({
+        path: `repositories.${repoName}.commentOnFailure`,
+        message: `only applies in live mode; in ${config.execution.mode} mode no comment is posted when a run fails`,
+      });
+    }
+
+    if (repo.revise) {
+      if (config.execution.mode !== 'live') {
+        warnings.push({
+          path: `repositories.${repoName}.revise`,
+          message: `only applies in live mode; in ${config.execution.mode} mode no review is read and no revision is run`,
+        });
+      } else if (publishMode(repo) === 'none') {
+        warnings.push({
+          path: `repositories.${repoName}.revise`,
+          message: 'only applies together with publish: revisions are made to pull requests the worker opened, and it opens none here',
+        });
+      }
+    } else if (repo.maxRevisions !== undefined) {
+      warnings.push({ path: `repositories.${repoName}.maxRevisions`, message: 'has no effect without revise' });
+    }
+
+    const review = reviewSettings(repo);
+    if (review.enabled) {
+      if (config.execution.mode !== 'live') {
+        warnings.push({
+          path: `repositories.${repoName}.review`,
+          message: `only applies in live mode; in ${config.execution.mode} mode no reviewer run is started`,
+        });
+      } else if (publishMode(repo) === 'none') {
+        warnings.push({
+          path: `repositories.${repoName}.review`,
+          message: 'only applies together with publish: the reviewer reviews pull requests the worker opened, and it opens none here',
+        });
+      } else if (!repo.revise) {
+        warnings.push({
+          path: `repositories.${repoName}.review`,
+          message: 'revise is off, so nothing acts on a "changes requested" verdict: the review is posted and the pull request waits for a person',
+        });
+      }
+      if (repo.autoMergeWaitMinutes !== undefined && repo.autoMerge === undefined) {
+        warnings.push({ path: `repositories.${repoName}.autoMergeWaitMinutes`, message: 'has no effect without autoMerge' });
+      }
+      if (repo.autoMergeRequiredChecks !== undefined && repo.autoMerge === undefined) {
+        warnings.push({ path: `repositories.${repoName}.autoMergeRequiredChecks`, message: 'has no effect without autoMerge' });
+      }
+    } else {
+      if (repo.autoMerge !== undefined) {
+        warnings.push({
+          path: `repositories.${repoName}.autoMerge`,
+          message: 'has no effect without review: Updraft only merges a pull request its own reviewer found ready to merge',
+        });
+      }
+      if (repo.autoMergeWaitMinutes !== undefined) {
+        warnings.push({ path: `repositories.${repoName}.autoMergeWaitMinutes`, message: 'has no effect without review and autoMerge' });
+      }
+    }
+
     const wfIds = new Set<string>();
     repo.workflows.forEach((wf, i) => {
       const base = `repositories.${repoName}.workflows.${i}`;
@@ -116,6 +204,30 @@ export function validateConfig(raw: unknown): ValidationResult {
       for (const p of pools) {
         if (!config.pools[p]) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
       }
+      if (wf.reviewPool !== undefined) {
+        if (!config.pools[wf.reviewPool]) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
+        if (!review.enabled) warnings.push({ path: `${base}.reviewPool`, message: `has no effect without repositories.${repoName}.review` });
+      }
+      // The reviewer must be able to be a different agent than the one that wrote the code. For
+      // each pool the job can be routed to: is there a coding agent that would leave the review
+      // pool (reviewPool, else that same pool) with nobody else enabled?
+      if (reviewActive(config, repo) && !review.allowSameAgent) {
+        const enabledIn = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
+        for (const p of new Set(pools)) {
+          const reviewPool = wf.reviewPool ?? p;
+          const reviewers = enabledIn(reviewPool);
+          const alone = enabledIn(p).find((author) => reviewers.every((r) => r === author));
+          if (alone !== undefined && reviewers.length > 0) {
+            errors.push({
+              path: wf.reviewPool !== undefined ? `${base}.reviewPool` : `${base}.pool`,
+              message:
+                `review needs a reviewer other than the agent that wrote the code, but "${alone}" is the only enabled agent in pool "${reviewPool}" ` +
+                `and also writes code in pool "${p}"; add another agent, set reviewPool to a pool with a different agent, or set ` +
+                `repositories.${repoName}.review: { allowSameAgent: true } to let an agent review its own work`,
+            });
+          }
+        }
+      }
 
       if (allowedActorsFor(config, wf).length === 0) {
         errors.push({
@@ -124,6 +236,24 @@ export function validateConfig(raw: unknown): ValidationResult {
         });
       }
     });
+  }
+
+  for (const [name, action] of Object.entries(config.actions)) {
+    if (action.verify) {
+      if (config.execution.mode !== 'live') {
+        warnings.push({
+          path: `actions.${name}.verify`,
+          message: `only applies in live mode; in ${config.execution.mode} mode no agent runs and no verify command is run`,
+        });
+      } else if (action.output !== 'local-branch') {
+        warnings.push({
+          path: `actions.${name}.verify`,
+          message: `only applies to actions with output local-branch; this action's output is ${action.output}, so no verify command is run`,
+        });
+      }
+    } else if (action.verifyTimeoutMinutes !== undefined) {
+      warnings.push({ path: `actions.${name}.verifyTimeoutMinutes`, message: 'has no effect without verify' });
+    }
   }
 
   if (config.execution.mode === 'live') {
@@ -135,6 +265,24 @@ export function validateConfig(raw: unknown): ValidationResult {
         errors.push({
           path: `actions.${name}.prompt`,
           message: 'required in live mode: the prompt file tells the agent what to do with the issue',
+        });
+      }
+      const revising = Object.entries(config.repositories).find(
+        ([, r]) => reviseActive(config, r) && r.workflows.some((wf) => wf.action === name),
+      );
+      if (action.output === 'local-branch' && revising && !action.revisePrompt) {
+        errors.push({
+          path: `actions.${name}.revisePrompt`,
+          message: `required because repositories.${revising[0]}.revise is on: the prompt file tells the agent what to do with a review that requested changes`,
+        });
+      }
+      const reviewing = Object.entries(config.repositories).find(
+        ([, r]) => reviewActive(config, r) && r.workflows.some((wf) => wf.action === name),
+      );
+      if (action.output === 'local-branch' && reviewing && !action.reviewPrompt) {
+        errors.push({
+          path: `actions.${name}.reviewPrompt`,
+          message: `required because repositories.${reviewing[0]}.review is on: the prompt file tells the reviewing agent how to review a pull request`,
         });
       }
       if (action.output === 'log') {

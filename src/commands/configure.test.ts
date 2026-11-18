@@ -55,10 +55,10 @@ describe('buildRepoChoices', () => {
   });
 });
 
-describe('factory configure', () => {
+describe('updraft configure', () => {
   it('refuses to run without a TTY', async () => {
     const ctx = fakeContext({ isTTY: false });
-    await expect(configureCommand(ctx)).rejects.toMatchObject({ exitCode: EXIT.USAGE, message: expect.stringMatching(/factory add/) });
+    await expect(configureCommand(ctx)).rejects.toMatchObject({ exitCode: EXIT.USAGE, message: expect.stringMatching(/updraft add/) });
   });
 
   it('first run: seeds defaults, picks a repo, label, routing and backfill, and saves', async () => {
@@ -150,7 +150,7 @@ describe('factory configure', () => {
   });
 
   it('pre-selects discovered agents, marks missing ones, and only offers pools with a usable agent', async () => {
-    const api = fakeApi({ login: 'allen', repos: [fakeRepo('o/a', 1)], labels: { 'o/a': ['factory:ready'] } });
+    const api = fakeApi({ login: 'allen', repos: [fakeRepo('o/a', 1)], labels: { 'o/a': ['updraft:ready'] } });
     const base = seedConfig('allen');
     base.pools.art = { agents: ['codex'], strategy: 'round-robin' };
     let agentPrompt: { initialValues: string[]; options: Array<{ value: string; hint?: string }> } | undefined;
@@ -165,7 +165,7 @@ describe('factory configure', () => {
         },
       },
       { method: 'searchMultiselect', value: [1] },
-      { method: 'searchSelect', value: 'factory:ready' },
+      { method: 'searchSelect', value: 'updraft:ready' },
       { method: 'select', expect: /Action/, value: 'implement-issue' },
       { method: 'confirm', expect: /different pool/, value: false },
       {

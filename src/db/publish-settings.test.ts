@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { configSchema, type FactoryConfig } from '../config/schema.js';
+import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import { openDatabase, type Db } from './database.js';
 import { getPublishSetting, listUnpublishedSinceEnabled, syncPublishSettings } from './publish-settings.js';
 
 const T0 = Date.parse('2026-11-17T12:00:00.000Z');
 const iso = (ms: number) => new Date(ms).toISOString();
 
-function config(repos: Record<string, { id: number; publish?: 'none' | 'draft-pr' | 'pr' }>): FactoryConfig {
+function config(repos: Record<string, { id: number; publish?: 'none' | 'draft-pr' | 'pr' }>): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     execution: { mode: 'live' },

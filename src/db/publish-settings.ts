@@ -3,7 +3,7 @@
 // repository's publish mode with what it saw last and records the change. The worker's startup
 // sweep (src/publish/publish.ts) uses enabled_at so that turning publish on never publishes runs
 // that finished before then.
-import { publishMode, type FactoryConfig, type PublishMode } from '../config/schema.js';
+import { publishMode, type UpdraftConfig, type PublishMode } from '../config/schema.js';
 import { nowIso } from '../util/ids.js';
 import { transaction, type Db } from './database.js';
 
@@ -52,7 +52,7 @@ export interface PublishSettingChange {
  * - draft-pr to pr or back: enabled_at kept.
  * Returns what changed. Repositories are matched by GitHub id, as jobs are.
  */
-export function syncPublishSettings(db: Db, config: Pick<FactoryConfig, 'repositories'>, now: () => number = Date.now): PublishSettingChange[] {
+export function syncPublishSettings(db: Db, config: Pick<UpdraftConfig, 'repositories'>, now: () => number = Date.now): PublishSettingChange[] {
   const at = nowIso(now);
   return transaction(db, () => {
     const changes: PublishSettingChange[] = [];

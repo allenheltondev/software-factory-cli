@@ -8,33 +8,33 @@ is still running (matched by the recorded PID, start time and executable, never 
 line), and deletes the generated wrapper. Config, state and logs are kept.
 
 .PARAMETER TaskName
-Scheduled task name. Default: SoftwareFactory.
+Scheduled task name. Default: Updraft.
 
-.PARAMETER FactoryHome
-The FACTORY_HOME used at registration, if any (locates the generated wrapper).
+.PARAMETER UpdraftHome
+The UPDRAFT_HOME used at registration, if any (locates the generated wrapper).
 
 .PARAMETER KeepWrapper
 Leave the generated wrapper script in place.
 
 .EXAMPLE
-.\unregister-task.ps1 -TaskName "SoftwareFactory (pilot)"
+.\unregister-task.ps1 -TaskName "Updraft (pilot)"
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$TaskName = 'SoftwareFactory',
-    [string]$FactoryHome = $env:FACTORY_HOME,
+    [string]$TaskName = 'Updraft',
+    [string]$UpdraftHome = $env:UPDRAFT_HOME,
     [switch]$KeepWrapper
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-if ($FactoryHome) {
-    $dataDir = [System.IO.Path]::GetFullPath($FactoryHome)
+if ($UpdraftHome) {
+    $dataDir = [System.IO.Path]::GetFullPath($UpdraftHome)
 } else {
     $localAppData = $env:LOCALAPPDATA
     if (-not $localAppData) { $localAppData = Join-Path $env:USERPROFILE 'AppData\Local' }
-    $dataDir = Join-Path $localAppData 'software-factory'
+    $dataDir = Join-Path $localAppData 'updraft'
 }
 $safeName = $TaskName
 foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) { $safeName = $safeName.Replace([string]$c, '_') }
@@ -54,7 +54,7 @@ if ($task) {
 
 # Ending a task stops the wrapper, which can leave the node.exe worker it started running.
 # The wrapper records that worker's PID, start time and executable. Stop the process only if
-# all three still match, so a `factory start` you launched by hand (same CLI and config) or a
+# all three still match, so a `updraft start` you launched by hand (same CLI and config) or a
 # process that reused the PID is never touched.
 function Stop-RecordedWorker([string]$PidFile) {
     if (-not (Test-Path -LiteralPath $PidFile -PathType Leaf)) { return }

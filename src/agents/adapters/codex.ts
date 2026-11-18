@@ -260,6 +260,13 @@ export const codexAdapter: AgentAdapter = {
    * ended, token usage and the thread id (so the session can be inspected with
    * `codex resume <id>` in the worktree). A failed turn adds its error after what Codex last said.
    */
+  finalMessage(output: string): string | null | undefined {
+    const { events } = scan(output);
+    // No JSON at all: --json was turned off in agents.<name>.args, and the output is plain text.
+    if (!events.length) return undefined;
+    return findTurnEnd(output)?.type === 'turn.completed' ? lastAgentMessage(events) : null;
+  },
+
   summarizeOutput(output: string): string[] | null {
     const { events } = scan(output);
     if (!events.length) return null;

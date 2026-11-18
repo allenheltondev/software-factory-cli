@@ -23,7 +23,7 @@ describe('agentStatus / agentHint', () => {
   });
 });
 
-describe('factory agents', () => {
+describe('updraft agents', () => {
   it('renders path, shim launch target, version, sign-in, platform and notes', async () => {
     const ctx = fakeContext({ agents: [windowsClaude, missingAgentReport('kiro')] });
     expect(await agentsCommand(ctx)).toBe(EXIT.OK);

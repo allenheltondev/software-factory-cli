@@ -18,7 +18,7 @@ export interface LockHolder {
 export class WorkerLockedError extends Error {
   constructor(readonly holder: { workerId: string; pid: number; hostname: string; heartbeatAt: string }) {
     super(
-      `another factory worker is running (pid ${holder.pid} on ${holder.hostname}, last heartbeat ${holder.heartbeatAt})`,
+      `another updraft worker is running (pid ${holder.pid} on ${holder.hostname}, last heartbeat ${holder.heartbeatAt})`,
     );
     this.name = 'WorkerLockedError';
   }

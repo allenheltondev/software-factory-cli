@@ -4,13 +4,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
+import { ReviewLoopApiStubs } from '../../test/review-loop-api-stubs.js';
 import { publishCommand } from '../commands/publish.js';
 import { fakeContext } from '../commands/fakes.js';
-import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getPublication } from '../db/publications.js';
 import { getPublishSetting, syncPublishSettings } from '../db/publish-settings.js';
-import { getJob } from '../db/queue.js';
+import { getJob, getRun } from '../db/queue.js';
 import { GitError, runGit, type GitOptions } from '../git/git.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree } from '../git/worktree.js';
 import {
@@ -20,7 +21,8 @@ import {
   type GitHubIssueComment,
   type GitHubPullRequest,
 } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import { GitHubAppError } from '../github/app-auth.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { RepoRef, RunOutcome } from '../types.js';
 import { createLogger, silentLogger } from '../util/log.js';
 import { summarizeRun } from '../worker/run-summary.js';
@@ -43,7 +45,7 @@ const TOKEN = 'ghp_SECRETtoken0123456789';
 const T0 = Date.parse('2026-11-17T12:00:00.000Z');
 
 /** GitHub's side of publication, in memory. Optionally checks that a PR's head is on the bare remote. */
-class FakePublishApi implements GitHubApi {
+class FakePublishApi extends ReviewLoopApiStubs implements GitHubApi {
   pulls: Array<GitHubPullRequest & { title: string }> = [];
   comments: GitHubIssueComment[] = [];
   readonly calls: string[] = [];
@@ -54,7 +56,9 @@ class FakePublishApi implements GitHubApi {
   loseNextPullResponse = false;
   private nextId = 1;
 
-  constructor(private readonly remoteHas?: (branch: string) => boolean) {}
+  constructor(private readonly remoteHas?: (branch: string) => boolean) {
+    super();
+  }
 
   private maybeFail(name: keyof FakePublishApi['failNext']): void {
     const err = this.failNext[name];
@@ -66,6 +70,9 @@ class FakePublishApi implements GitHubApi {
 
   async getViewer() {
     return { login: 'allen', id: 1 };
+  }
+  async getWorkerIdentity() {
+    return { kind: 'user' as const, login: 'allen', id: 1 };
   }
   async listUserRepos(): Promise<never[]> {
     return [];
@@ -84,6 +91,15 @@ class FakePublishApi implements GitHubApi {
   }
   async listEventsForIssue(): Promise<never[]> {
     return [];
+  }
+  async getIssueBodyEdit(): Promise<never> {
+    throw new Error('not used');
+  }
+  async listPullRequestUpdates(): Promise<never> {
+    throw new Error('not used');
+  }
+  async getPullRequestReviews(): Promise<never> {
+    throw new Error('not used');
   }
 
   async listPullRequestsForHead(repo: RepoRef, opts: { headOwner: string; head: string }) {
@@ -155,7 +171,7 @@ afterEach(() => {
   for (const f of fixtures.splice(0)) f.cleanup();
 });
 
-function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over: Partial<FactoryConfigInput> = {}): FactoryConfig {
+function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over: Partial<UpdraftConfigInput> = {}): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     execution: { mode: 'live' },
@@ -170,7 +186,7 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over:
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
-        workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
         ...repoOver,
       },
     },
@@ -178,8 +194,8 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over:
   });
 }
 
-function makePaths(root: string): FactoryPaths {
-  const dataDir = join(root, 'factory state');
+function makePaths(root: string): UpdraftPaths {
+  const dataDir = join(root, 'updraft state');
   const logDir = join(dataDir, 'logs');
   return {
     configFile: join(root, 'cfg', 'config.yaml'),
@@ -194,7 +210,7 @@ function makePaths(root: string): FactoryPaths {
 interface Scenario {
   f: GitFixture;
   db: Db;
-  paths: FactoryPaths;
+  paths: UpdraftPaths;
   runId: string;
   jobId: string;
   branch: string;
@@ -237,7 +253,7 @@ async function scenario(o: { commits?: number; outcome?: RunOutcome; db?: Db; f?
   const runId = `run_${jobId}`;
   const logPath = join(paths.runsDir, runId, 'run.log');
   mkdirSync(join(paths.runsDir, runId), { recursive: true });
-  writeFileSync(logPath, 'software-factory run\n');
+  writeFileSync(logPath, 'updraft run\n');
   const at = new Date(T0).toISOString();
   db.prepare(
     `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, lease_expires_at, started_at,
@@ -277,7 +293,7 @@ function recordingGit(o: { fakePushUrl?: string; realUrl?: string; failPushWith?
   };
 }
 
-function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config?: FactoryConfig } = {}): PublishDeps {
+function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config?: UpdraftConfig } = {}): PublishDeps {
   return {
     db: s.db,
     config: makeConfig(s.f),
@@ -291,6 +307,21 @@ function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config
 }
 
 describe('publishRun', { timeout: 60_000 }, () => {
+  it('refuses to publish a branch that moved after the run ended: its result and verification are about another commit', async () => {
+    const s = await scenario();
+    // Someone (or a leftover process) commits on the job branch after the run was recorded.
+    const worktree = getRun(s.db, s.runId)!.checkoutPath!;
+    writeFileSync(join(worktree, 'late.txt'), 'added after the run\n');
+    s.f.git(worktree, 'add', '.');
+    s.f.git(worktree, 'commit', '--quiet', '-m', 'late change');
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    const r = await publishRun(deps(s, api), s.runId);
+
+    expect(r).toMatchObject({ status: 'failed', retryable: false, error: expect.stringMatching(new RegExp(`not at ${s.localSha.slice(0, 12)} where run ${s.runId} ended`)) });
+    expect(remoteSha(s)).toBeNull();
+    expect(api.pulls).toEqual([]);
+  });
+
   it('pushes the job branch, opens a draft PR and comments on the issue', async () => {
     const s = await scenario();
     const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
@@ -448,7 +479,7 @@ describe('publishRun', { timeout: 60_000 }, () => {
     if (r.status === 'failed') {
       expect(r.error).toMatch(/refused a draft PR/);
       expect(r.error).toContain(`repositories.${FULL}.publish: pr`);
-      expect(r.error).toContain(`factory publish ${s.runId}`);
+      expect(r.error).toContain(`updraft publish ${s.runId}`);
     }
     expect(api.pulls).toEqual([]);
 
@@ -751,7 +782,7 @@ describe('createPublisher', { timeout: 60_000 }, () => {
 
 describe('startup sweep', { timeout: 60_000 }, () => {
   /** Record the publish setting as the CLI would on loading `config` at `at`. */
-  const observe = (db: Db, config: FactoryConfig, at: number) => syncPublishSettings(db, config, () => at);
+  const observe = (db: Db, config: UpdraftConfig, at: number) => syncPublishSettings(db, config, () => at);
   const capture = () => {
     const lines: string[] = [];
     const stream = { write: (c: string) => (lines.push(c), true) } as unknown as NodeJS.WritableStream;
@@ -902,9 +933,46 @@ describe('startup sweep', { timeout: 60_000 }, () => {
     expect(getPublication(db, newer.runId)).toBeNull();
     expect(out.text()).toMatch(/startup sweep: limit reached.*unchecked=1/);
   });
+
+  it('does not publish a stranded run whose branch moved before the restart: that commit is not the run\'s', async () => {
+    const s = await scenario(); // ended at T0
+    const config = makeConfig(s.f);
+    observe(s.db, config, T0 - 60_000);
+    // Committed on the job branch after the run succeeded and before the worker came back.
+    const worktree = getRun(s.db, s.runId)!.checkoutPath!;
+    writeFileSync(join(worktree, 'late.txt'), 'added after the run\n');
+    s.f.git(worktree, 'add', '.');
+    s.f.git(worktree, 'commit', '--quiet', '-m', 'late change');
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    await createPublisher(deps(s, api, { config })).sweepUnpublished();
+
+    expect(remoteSha(s)).toBeNull();
+    expect(api.pulls).toEqual([]);
+    expect(getPublication(s.db, s.runId)).toMatchObject({ state: 'failed', retryable: false, error: expect.stringMatching(/where run .* ended/) });
+  });
+
+  it('leaves a run that does not record the commit it ended on to "updraft publish"', async () => {
+    const s = await scenario(); // ended at T0
+    const config = makeConfig(s.f);
+    observe(s.db, config, T0 - 60_000);
+    // A run recorded by a version that did not store the head commit: nothing to hold the push to.
+    const summary = { ...getRun(s.db, s.runId)!.summary! };
+    delete summary.headSha;
+    s.db.prepare('UPDATE runs SET summary = ? WHERE id = ?').run(JSON.stringify(summary), s.runId);
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    const out = capture();
+    await createPublisher(deps(s, api, { config, log: out.log })).sweepUnpublished();
+
+    expect(getPublication(s.db, s.runId)).toBeNull();
+    expect(remoteSha(s)).toBeNull();
+    expect(api.calls).toEqual([]);
+    expect(out.text()).toMatch(/does not record the commit it ended on/);
+    // Asked for by a person, it is still published.
+    expect((await publishRun(deps(s, api, { config }), s.runId)).status).toBe('published');
+  });
 });
 
-describe('factory publish', { timeout: 60_000 }, () => {
+describe('updraft publish', { timeout: 60_000 }, () => {
   it('publishes a succeeded run through the same idempotent path, then reports it as already published', async () => {
     const f = createGitFixture(FULL);
     fixtures.push(f);
@@ -993,14 +1061,147 @@ describe('helpers', () => {
         filesChanged: 1,
         diffStat: '1 file changed',
         untracked: 0,
-        lastOutput: ['done ```` tricky', '<!-- factory-run: run_other -->'],
+        lastOutput: ['done ```` tricky', '<!-- updraft-run: run_other -->'],
         notes: [],
       },
     });
     expect(body.startsWith('Closes #3\n')).toBe(true);
     // The final message is inside a fence longer than any backtick run in it.
     expect(body).toContain('`````text\ndone ```` tricky');
-    expect(body.match(/<!-- factory-run: run_x -->/g)).toHaveLength(1);
+    expect(body.match(/<!-- updraft-run: run_x -->/g)).toHaveLength(1);
     expect(body.indexOf('closes #9')).toBeGreaterThan(body.indexOf('```text'));
+  });
+});
+
+describe('publishRun as a GitHub App (github.app)', { timeout: 60_000 }, () => {
+  const APP_TOKEN = 'ghs_16C7e42F292c6912E7710c838347Ae178B4a';
+  const HTTPS = `https://github.com/${FULL}.git`;
+  const SSH = `git@github.com:${FULL}.git`;
+
+  /** Real git; the clone's remote reports an SSH push URL, and the HTTPS URL is served by the fixture's bare remote. */
+  function sshRemoteGit(s: Scenario, o: { failPushWith?: GitError } = {}): { runGit: RunGit; calls: GitCall[] } {
+    const calls: GitCall[] = [];
+    return {
+      calls,
+      runGit: async (args, opts: GitOptions) => {
+        calls.push({ args: [...args], env: opts.env });
+        if (args[0] === 'remote' && args[1] === 'get-url') return { stdout: `${SSH}\n`, stderr: '' };
+        if (o.failPushWith && args[0] === 'push') throw o.failPushWith;
+        return runGit(args.map((a) => (a === HTTPS ? s.f.remoteDir : a)), opts);
+      },
+    };
+  }
+
+  it('pushes over HTTPS with a token for that repository, in the environment and never in argv, even for an SSH remote', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s);
+    const asked: string[] = [];
+    const api = new FakePublishApi();
+    const r = await publishRun(
+      deps(s, api, {
+        runGit: git.runGit,
+        workerKind: 'app',
+        token: async (repoFullName) => {
+          asked.push(repoFullName);
+          return APP_TOKEN;
+        },
+      }),
+      s.runId,
+    );
+    expect(r.status).toBe('published');
+    expect(remoteSha(s)).toBe(s.localSha);
+    // One token, asked for the repository being pushed to.
+    expect(asked).toEqual([FULL]);
+
+    const push = git.calls.find((c) => c.args[0] === 'push')!;
+    expect(push.args).toContain(HTTPS);
+    // Nothing goes to the SSH URL: that would push as the person, with their key.
+    for (const c of git.calls) {
+      expect(c.args).not.toContain(SSH);
+      expect(c.args.join(' ')).not.toContain(APP_TOKEN);
+    }
+    for (const c of git.calls.filter((x) => ['push', 'ls-remote'].includes(x.args[0]!))) {
+      const header = Object.entries(c.env ?? {}).find(([, v]) => typeof v === 'string' && v.startsWith('AUTHORIZATION: basic '));
+      expect(header).toBeDefined();
+      const idx = header![0].replace('GIT_CONFIG_VALUE_', '');
+      expect(c.env![`GIT_CONFIG_KEY_${idx}`]).toBe('http.https://github.com/.extraheader');
+      expect(Buffer.from(header![1]!.slice('AUTHORIZATION: basic '.length), 'base64').toString()).toBe(`x-access-token:${APP_TOKEN}`);
+    }
+    const log = readFileSync(s.logPath, 'utf8');
+    expect(log).toContain(`to origin (${HTTPS})`);
+    expect(log).not.toContain(APP_TOKEN);
+    expect(api.pulls).toHaveLength(1);
+  });
+
+  it('still pushes with git\'s own credentials for an SSH remote when no App is configured', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s, { failPushWith: new GitError('git push failed', ['push'], 128, 'ssh: connect to host github.com port 22: Connection timed out\n') });
+    let asked = 0;
+    // ls-remote of the SSH URL would touch the network; the base branch is configured, so the push is the first network command.
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: async (args, opts) => (args[0] === 'ls-remote' ? { stdout: '', stderr: '' } : git.runGit(args, opts)), token: async () => (asked++, TOKEN) }), s.runId);
+    expect(r.status).toBe('failed');
+    expect(asked).toBe(0);
+    expect(git.calls.find((c) => c.args[0] === 'push')!.args).toContain(SSH);
+  });
+
+  it('redacts an installation token, a JWT and a private key from errors and run.log even when it did not hold them', async () => {
+    const s = await scenario();
+    const other = 'ghs_anotherInstallationToken0123456789';
+    const jwt = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3MDAwMDAwMDAsImlzcyI6MTIzNDV9.c2lnbmF0dXJlLXNpZ25hdHVyZQ';
+    const git = sshRemoteGit(s, {
+      failPushWith: new GitError('git push failed', ['push'], 128, `remote: denied ${other} ${jwt} -----BEGIN RSA PRIVATE KEY-----\nMIIEsecret\n-----END RSA PRIVATE KEY-----\nfatal: Authentication failed for ${APP_TOKEN}\n`),
+    });
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r.status).toBe('failed');
+    const recorded = [
+      r.status === 'failed' ? r.error : '',
+      getPublication(s.db, s.runId)!.error ?? '',
+      readFileSync(s.logPath, 'utf8'),
+      (s.db.prepare('SELECT message FROM errors').all() as { message: string }[]).map((e) => e.message).join('\n'),
+    ].join('\n');
+    for (const secret of [APP_TOKEN, other, jwt, 'MIIEsecret']) expect(recorded).not.toContain(secret);
+    expect(redactSecret(`x ${other} y`, null)).toBe('x *** y');
+  });
+
+  it('stops retrying, with the App\'s own advice, for a GitHub App problem', async () => {
+    const s = await scenario();
+    const api = new FakePublishApi();
+    api.failNext.createPullRequest = new GitHubAppError('the GitHub App updraft-bot is not installed on octo/widgets. Install it there', 'not-installed');
+    const git = sshRemoteGit(s);
+    const r = await publishRun(deps(s, api, { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false, error: 'the GitHub App updraft-bot is not installed on octo/widgets. Install it there' });
+    expect(getPublication(s.db, s.runId)!.nextAttemptAt).toBeNull();
+  });
+
+  it('retries when GitHub could not be reached for a token', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s);
+    const r = await publishRun(
+      deps(s, new FakePublishApi(), {
+        runGit: git.runGit,
+        workerKind: 'app',
+        token: async () => {
+          throw new GitHubError('POST /app/installations/11/access_tokens: network error: fetch failed', 0);
+        },
+      }),
+      s.runId,
+    );
+    expect(r).toMatchObject({ status: 'failed', retryable: true });
+    expect(git.calls.some((c) => c.args[0] === 'push')).toBe(false);
+  });
+
+  it('says which permission is missing when a push changes workflow files', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s, {
+      failPushWith: new GitError(
+        'git push failed',
+        ['push'],
+        1,
+        ' ! [remote rejected] abc -> updraft/issue-7 (refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission)\n',
+      ),
+    });
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false });
+    if (r.status === 'failed') expect(r.error).toMatch(/"Workflows" repository permission/);
   });
 });
