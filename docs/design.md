@@ -67,7 +67,7 @@ Publish one npm package with the same `updraft` commands and YAML schema across 
 
 | Environment | Background runner |
 | --- | --- |
-| Windows | Task Scheduler task at login, under the developer's account. Use fully qualified executable paths, restart on failure, ignore overlapping launches, and remove the default runtime limit. |
+| Windows | Task Scheduler task at login, under the developer's account. Use fully qualified executable paths, ignore overlapping launches, and remove the default runtime limit. Task Scheduler's restart on failure does not fire on a non-zero exit, so the launcher's wrapper restarts the worker itself, and a repeating trigger restarts the wrapper. |
 | macOS | A per-user `launchd` LaunchAgent with explicit program arguments and log paths. |
 | Linux with systemd | A `systemd --user` service with restart on failure. Enable lingering if the machine needs to run jobs before login or after logout. |
 | Other Linux hosts | Run `updraft start` in the foreground under the host's existing process supervisor. |
