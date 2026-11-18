@@ -16,6 +16,7 @@ import {
   type RevisionPr,
 } from './revisions.js';
 import { newId, nowIso } from '../util/ids.js';
+import { noteJobFinished, noteRunEnded } from './metrics.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
 
 export interface Claim {
@@ -88,6 +89,7 @@ function startFailedAgents(db: Db, jobId: string, startFailures: number): Set<st
 function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void {
   const reason = `${problem}; fix the config, restart the worker and run "updraft retry ${row.id}"`;
   db.prepare("UPDATE jobs SET status = 'failed', status_reason = ?, updated_at = ? WHERE id = ?").run(reason, at, row.id);
+  noteJobFinished(db, row.id);
   recordError(db, { scope: 'queue', repoFullName: row.repo_full_name, jobId: row.id, message: reason, at });
 }
 
@@ -407,10 +409,13 @@ export function finishRun(
         at,
         run.job_id,
       );
+      noteRunEnded(db, runId);
+      noteJobFinished(db, run.job_id);
       return { outcome: null, canceledByUser: true };
     }
 
     db.prepare('UPDATE runs SET ended_at = ?, outcome = ?, error = ? WHERE id = ?').run(at, result.outcome, error, runId);
+    noteRunEnded(db, runId);
     const finished: FinishedRun = { outcome: result.outcome, canceledByUser: false };
 
     const job = getJobRow(db, run.job_id);
@@ -451,6 +456,7 @@ export function finishRun(
       at,
       job.id,
     );
+    noteJobFinished(db, job.id);
     if (result.outcome !== 'succeeded') {
       recordError(db, {
         scope: 'worker',
@@ -488,6 +494,8 @@ function closeClaim(db: Db, runId: string, jobStatus: 'canceled' | 'queued', rea
       at,
       run.job_id,
     );
+    noteRunEnded(db, runId);
+    noteJobFinished(db, run.job_id);
   });
 }
 
@@ -555,6 +563,7 @@ export function requestJobCancel(db: Db, jobId: string, now?: () => number): Can
     if (!row) return { kind: 'not-found' };
     if (row.status === 'queued') {
       db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ?").run(CANCELED_BY_USER, at, jobId);
+      noteJobFinished(db, jobId);
       return { kind: 'canceled', job: rowToJob(getJobRow(db, jobId)!) };
     }
     const job = rowToJob(row);

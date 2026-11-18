@@ -31,6 +31,7 @@ import {
   type LoopPr,
 } from '../db/pr-reviews.js';
 import { getRun, ownEntry } from '../db/queue.js';
+import type { MergeBlockCode } from '../db/metrics.js';
 import { closeRevisionPr } from '../db/revisions.js';
 import { GitHubError, type PullRequestReviewSummary } from '../github/api.js';
 import { sameLogin, workerLogin } from '../github/identity.js';
@@ -91,7 +92,7 @@ export function outstandingChangeRequests(reviews: readonly PullRequestReviewSum
   return allowedActors.filter((a) => latest.get(a.toLowerCase())?.state === 'CHANGES_REQUESTED');
 }
 
-type Gate = { action: 'merge' } | { action: 'wait'; reason: string } | { action: 'block'; reason: string } | { action: 'none' };
+type Gate = { action: 'merge' } | { action: 'wait'; reason: string } | { action: 'block'; reason: string; code: MergeBlockCode } | { action: 'none' };
 
 /**
  * Evaluate every gate for the merge of `pr` at `sha`. Makes up to four requests, cheapest
@@ -100,31 +101,32 @@ type Gate = { action: 'merge' } | { action: 'wait'; reason: string } | { action:
 async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: LoopPr, sha: string): Promise<Gate> {
   const { db, config, api } = deps;
   const now = deps.now ?? Date.now;
-  const block = (reason: string): Gate => ({ action: 'block', reason });
+  const block = (code: MergeBlockCode, reason: string): Gate => ({ action: 'block', reason, code });
 
   // 1. The worker's own check of the commit.
   const action = ownEntry(config.actions, pr.action);
-  if (!action) return block(`action "${pr.action}" is no longer configured, so it is unknown which verify commands apply`);
+  if (!action) return block('config', `action "${pr.action}" is no longer configured, so it is unknown which verify commands apply`);
   if (action.verify?.length) {
     const runId = codeRunForHead(db, pr.repoId, pr.prNumber, sha);
-    if (!runId) return block(`${short(sha)} was not pushed by an Updraft run, so the verify commands of action "${pr.action}" never ran on it`);
+    if (!runId) return block('not-verified', `${short(sha)} was not pushed by an Updraft run, so the verify commands of action "${pr.action}" never ran on it`);
     const run = getRun(db, runId);
     if (run?.outcome !== 'succeeded' || run.summary?.verification?.passed !== true) {
-      return block(`there is no record that the verify commands passed in run ${runId}, which pushed ${short(sha)}`);
+      return block('not-verified', `there is no record that the verify commands passed in run ${runId}, which pushed ${short(sha)}`);
     }
     // A pass counts for this commit only if the commands tested exactly it.
     const v = run.summary.verification;
     if (v.sha !== sha) {
-      return block(`the verify commands of run ${runId} ran on ${v.sha ? short(v.sha) : 'an unrecorded commit'}, not on ${short(sha)}, the commit to merge`);
+      return block('not-verified', `the verify commands of run ${runId} ran on ${v.sha ? short(v.sha) : 'an unrecorded commit'}, not on ${short(sha)}, the commit to merge`);
     }
     if (v.exact !== true) {
       return block(
+        'not-verified',
         `the verify commands of run ${runId} passed, but not on exactly ${short(sha)}: the worktree held uncommitted files, or its commit changed, while they ran`,
       );
     }
   }
   const wf = cfg.workflows.find((w) => workflowId(w) === pr.workflowId);
-  if (!wf) return block(`workflow "${pr.workflowId}" no longer exists in the config, so nobody's change requests could be honoured`);
+  if (!wf) return block('config', `workflow "${pr.workflowId}" no longer exists in the config, so nobody's change requests could be honoured`);
 
   // 2. The pull request as it is on GitHub now.
   const readAt = new Date(now()).toISOString();
@@ -142,24 +144,24 @@ async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: 
     return { action: 'none' };
   }
   if (pr.mergeState === 'merging' && pr.mergeAttempts >= MAX_MERGE_ATTEMPTS) {
-    return block(`the merge was requested ${pr.mergeAttempts} times without an answer from GitHub, and the pull request is still open`);
+    return block('no-answer', `the merge was requested ${pr.mergeAttempts} times without an answer from GitHub, and the pull request is still open`);
   }
-  if (!pr.baseBranch) return block('the branch this pull request was opened against is not on record');
-  if (live.baseRef !== pr.baseBranch) return block(`its base branch is now ${live.baseRef}, not ${pr.baseBranch}, which it was opened against`);
-  if (live.draft) return block('it is still a draft');
-  if (live.mergeable === false) return block(`GitHub reports that it cannot be merged as it is (${live.mergeableState}); it probably conflicts with ${live.baseRef}`);
+  if (!pr.baseBranch) return block('base-changed', 'the branch this pull request was opened against is not on record');
+  if (live.baseRef !== pr.baseBranch) return block('base-changed', `its base branch is now ${live.baseRef}, not ${pr.baseBranch}, which it was opened against`);
+  if (live.draft) return block('draft', 'it is still a draft');
+  if (live.mergeable === false) return block('unmergeable', `GitHub reports that it cannot be merged as it is (${live.mergeableState}); it probably conflicts with ${live.baseRef}`);
 
   // 3. People.
   const outstanding = outstandingChangeRequests(await api.listPullRequestReviews(repo, pr.prNumber), allowedActorsFor(config, wf));
   if (outstanding.length) {
-    return block(`a "Request changes" review by ${names(outstanding)} is outstanding; it has to be approved or dismissed by a person`);
+    return block('changes-requested', `a "Request changes" review by ${names(outstanding)} is outstanding; it has to be approved or dismissed by a person`);
   }
 
   // 4. Checks.
   const checks = await api.getCommitChecks(repo, sha);
-  if (checks.failing.length) return block(`${checks.failing.length} check(s) of ${short(sha)} did not pass: ${names(checks.failing)}`);
+  if (checks.failing.length) return block('checks-failed', `${checks.failing.length} check(s) of ${short(sha)} did not pass: ${names(checks.failing)}`);
   // Checked after failing (a failure seen is a failure) and before anything is read as green.
-  if (!checks.complete) return block(`the checks of ${short(sha)} could not all be read (${checks.total} seen), so it is unknown whether they passed`);
+  if (!checks.complete) return block('checks-unreadable', `the checks of ${short(sha)} could not all be read (${checks.total} seen), so it is unknown whether they passed`);
   // The worker's own verify commands ran in the worktree the agent left, where ignored files
   // (build output from an earlier step) can make a test pass that would fail on the commit
   // alone. So a merge also needs a check GitHub ran itself, on a checkout of its own, to have
@@ -195,8 +197,8 @@ export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: Rep
     const pr = getLoopPr(db, candidate.repoId, candidate.prNumber);
     if (!pr || pr.state !== 'open' || pr.verdict !== 'ready-to-merge' || pr.verdictSha !== sha || pr.headSha !== sha) return;
     if (pr.mergeState === 'merged' || pr.mergeState === 'blocked') return;
-    const blocked = (reason: string) => {
-      if (setMergeState(db, pr.repoId, pr.prNumber, sha, { state: 'blocked', reason }, now)) log.warn('not merged; left for a person', { reason });
+    const blocked = (code: MergeBlockCode, reason: string) => {
+      if (setMergeState(db, pr.repoId, pr.prNumber, sha, { state: 'blocked', reason, code }, now)) log.warn('not merged; left for a person', { reason });
     };
 
     let gate: Gate;
@@ -207,15 +209,15 @@ export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: Rep
         log.warn('could not evaluate the merge for now', { error: message(err) });
         return;
       }
-      blocked(`GitHub could not be asked what the merge needs to know: ${message(err)}`);
+      blocked('github-error', `GitHub could not be asked what the merge needs to know: ${message(err)}`);
       return;
     }
     if (gate.action === 'none') return;
-    if (gate.action === 'block') return blocked(gate.reason);
+    if (gate.action === 'block') return blocked(gate.code, gate.reason);
     if (gate.action === 'wait') {
       const waitMinutes = cfg.autoMergeWaitMinutes ?? DEFAULT_AUTO_MERGE_WAIT_MINUTES;
       const since = pr.mergeWaitStartedAt ? Date.parse(pr.mergeWaitStartedAt) : now();
-      if (now() - since >= waitMinutes * 60_000) return blocked(`gave up after waiting ${waitMinutes} minute(s): ${gate.reason}`);
+      if (now() - since >= waitMinutes * 60_000) return blocked('wait-timeout', `gave up after waiting ${waitMinutes} minute(s): ${gate.reason}`);
       setMergeState(db, pr.repoId, pr.prNumber, sha, { state: 'waiting', reason: gate.reason }, now);
       log.info('waiting before merging', { reason: gate.reason });
       return;
@@ -226,7 +228,7 @@ export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: Rep
     if (!setMergeState(db, pr.repoId, pr.prNumber, sha, { state: 'merging' }, now)) return;
     try {
       const res = await api.mergePullRequest(repo, pr.prNumber, { sha, method });
-      if (!res.merged) return blocked(`GitHub did not merge it: ${res.message || 'no reason given'}`);
+      if (!res.merged) return blocked('merge-refused', `GitHub did not merge it: ${res.message || 'no reason given'}`);
       setMergeState(db, pr.repoId, pr.prNumber, sha, { state: 'merged', mergeCommitSha: res.sha }, now);
       // Stop watching it now rather than at the next poll, so nothing more is queued for it.
       closeRevisionPr(db, pr.repoId, pr.prNumber, `pull request #${pr.prNumber} was merged by Updraft`, now);
@@ -237,7 +239,7 @@ export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: Rep
         return;
       }
       const status = err instanceof GitHubError ? ` (${err.status})` : '';
-      blocked(`GitHub refused the merge${status}: ${message(err)}`);
+      blocked('merge-refused', `GitHub refused the merge${status}: ${message(err)}`);
     }
   } catch (err) {
     log.error('auto-merge step crashed', { error: message(err) });

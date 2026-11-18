@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { createRequire } from 'node:module';
 import type { EventEnvelope, Job, JobStatus, Run, RunOutcome, RunSummary } from '../types.js';
+import { backfillMetrics } from './metrics.js';
 
 export type Db = DatabaseSyncType;
 
@@ -24,7 +25,10 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
+
+/** The schema version that added the metric_events rollup (`updraft stats`). */
+export const METRICS_SCHEMA_VERSION = 13;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -432,6 +436,43 @@ const MIGRATIONS: Record<number, Migration> = {
       updated_at     TEXT    NOT NULL
     );
   `,
+  13: (db) => {
+    db.exec(`
+      -- The operator rollup behind "updraft stats" (src/db/metrics.ts, docs/stats.md): one row per
+      -- fact, appended in the transaction of the state change it describes and never updated.
+      -- (kind, subject_id) is the idempotency key, so a replay, retry or restart records nothing
+      -- twice. "updraft clean --older-than" never deletes these rows. Ids, numbers, timestamps,
+      -- agent/pool names and fixed outcome codes only: no issue, review or findings text, no paths.
+      CREATE TABLE metric_events (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind           TEXT    NOT NULL,   -- run.ended, job.finished, pr.opened, pr.merged, ... (MetricKind)
+        subject_id     TEXT    NOT NULL,   -- what the fact is about: a run id, "<repo id>#<pr>", ...
+        at             TEXT    NOT NULL,   -- when it happened; the --since window filters on this
+        repo_id        INTEGER NOT NULL,
+        repo_full_name TEXT,               -- OWNER/REPO when it happened, display only
+        job_id         TEXT,
+        job_kind       TEXT,               -- implement | revision | review
+        pr_number      INTEGER,
+        agent          TEXT,
+        pool           TEXT,
+        outcome        TEXT,               -- run outcome, job status, verdict, change request state, ...
+        reason         TEXT,               -- a fixed code: verify result, merge block code, trigger kind
+        start_at       TEXT,               -- start of the interval that ends at "at", when there is one
+        wait_ms        INTEGER,            -- run.ended: queue wait of the job's first started run
+        findings       INTEGER,            -- review.verdict: the reviewer's UPDRAFT-FINDINGS count
+        backfilled     INTEGER NOT NULL DEFAULT 0,   -- 1: recorded by this migration from existing rows
+        recorded_at    TEXT    NOT NULL,
+        UNIQUE (kind, subject_id)
+      );
+      CREATE INDEX metric_events_by_kind_at ON metric_events (kind, at);
+      CREATE INDEX metric_events_by_repo ON metric_events (repo_id, at);
+
+      -- The reviewer's UPDRAFT-FINDINGS count of each verdict (telemetry; never part of the
+      -- verdict). NULL: the line was missing, repeated or malformed, or the review predates it.
+      ALTER TABLE pr_reviews ADD COLUMN findings_count INTEGER;
+    `);
+    backfillMetrics(db);
+  },
 };
 
 /**

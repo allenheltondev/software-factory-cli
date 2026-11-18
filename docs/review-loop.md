@@ -170,8 +170,9 @@ number from 0 to 999999 gives the count. A missing line, two of them, or any oth
 no count, and one line in `run.log` says why (`review findings count: none (...)`). The line
 must still come before the verdict line: written after it, it is text after the verdict and the
 run fails as it always would. The count line is left out of the findings Updraft stores, posts
-on the PR and gives to later reviews and revisions. A person's "Request changes" review has no
-count.
+on the PR and gives to later reviews and revisions. It is stored with the verdict
+(`pr_reviews.findings_count`) and in the stats rollup. A person's "Request changes" review has
+no count; it counts as a round only.
 
 A verdict is bound to the commit that was reviewed. If the PR's head is a different commit
 when the verdict is recorded, or when the revision it queued would start, or when a merge is

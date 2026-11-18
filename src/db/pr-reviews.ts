@@ -19,6 +19,7 @@ import {
 } from '../types.js';
 import { newId, nowIso } from '../util/ids.js';
 import { rowToJob, transaction, type Db, type JobRow } from './database.js';
+import { noteMergeBlocked, notePrMerged, noteReview, type MergeBlockCode } from './metrics.js';
 import { countRevisions, rowToRevisionPr, syncRevisionPrs, type RevisionPr, type RevisionPrRow } from './revisions.js';
 
 /** Attempts (first try included) before the worker stops retrying the posting of a review on its own. */
@@ -349,6 +350,8 @@ export interface PrReview {
   agent: string;
   verdict: ReviewVerdict;
   findings: string;
+  /** The reviewer's UPDRAFT-FINDINGS count; null when it gave none that could be read. Telemetry only. */
+  findingsCount: number | null;
   state: PublicationState;
   reviewId: number | null;
   reviewUrl: string | null;
@@ -376,6 +379,7 @@ interface PrReviewRow {
   agent: string;
   verdict: ReviewVerdict;
   findings: string;
+  findings_count: number | null;
   state: PublicationState;
   review_id: number | null;
   review_url: string | null;
@@ -404,6 +408,7 @@ function rowToPrReview(r: PrReviewRow): PrReview {
     agent: r.agent,
     verdict: r.verdict,
     findings: r.findings,
+    findingsCount: r.findings_count,
     state: r.state,
     reviewId: r.review_id,
     reviewUrl: r.review_url,
@@ -437,6 +442,8 @@ export interface BeginPrReview {
   agent: string;
   verdict: ReviewVerdict;
   findings: string;
+  /** The reviewer's UPDRAFT-FINDINGS count, or null. */
+  findingsCount?: number | null;
   leaseSeconds: number;
   now?: () => number;
 }
@@ -456,10 +463,11 @@ export function beginPrReview(db: Db, b: BeginPrReview): BeginPrReviewResult {
     const existing = getPrReview(db, b.runId);
     if (!existing) {
       db.prepare(
-        `INSERT INTO pr_reviews (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, head_sha, agent, verdict, findings, state,
-                                 attempts, lease_expires_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', 1, ?, ?, ?)`,
-      ).run(b.runId, b.jobId, b.repoId, b.repoFullName, b.issueNumber, b.prNumber, b.headSha, b.agent, b.verdict, b.findings, lease, at, at);
+        `INSERT INTO pr_reviews (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, head_sha, agent, verdict, findings,
+                                 findings_count, state, attempts, lease_expires_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'publishing', 1, ?, ?, ?)`,
+      ).run(b.runId, b.jobId, b.repoId, b.repoFullName, b.issueNumber, b.prNumber, b.headSha, b.agent, b.verdict, b.findings, b.findingsCount ?? null, lease, at, at);
+      noteReview(db, b.runId);
       return { ok: true, review: getPrReview(db, b.runId)! };
     }
     if (existing.state === 'published' || existing.state === 'skipped') return { ok: false, reason: 'done', review: existing };
@@ -622,10 +630,23 @@ export type MergeStep =
   | { state: 'waiting'; reason: string }
   | { state: 'merging' }
   | { state: 'merged'; mergeCommitSha: string | null }
-  | { state: 'blocked'; reason: string };
+  /** `code` sorts `reason` for `updraft stats`, which never keeps the reason's text. */
+  | { state: 'blocked'; reason: string; code: MergeBlockCode };
 
-/** Record a step of the merge of `sha`. Changes nothing unless the merge columns are still about `sha` and not final. */
+/**
+ * Record a step of the merge of `sha`. Changes nothing unless the merge columns are still about
+ * `sha` and not final. A merge or a block is recorded in the rollup in the same transaction.
+ */
 export function setMergeState(db: Db, repoId: number, prNumber: number, sha: string, s: MergeStep, now?: () => number): boolean {
+  return transaction(db, () => {
+    const changed = applyMergeStep(db, repoId, prNumber, sha, s, now);
+    if (changed && s.state === 'merged') notePrMerged(db, repoId, prNumber);
+    if (changed && s.state === 'blocked') noteMergeBlocked(db, repoId, prNumber, s.code);
+    return changed;
+  });
+}
+
+function applyMergeStep(db: Db, repoId: number, prNumber: number, sha: string, s: MergeStep, now?: () => number): boolean {
   const at = nowIso(now);
   const where = `repo_id = ? AND pr_number = ? AND merge_sha = ? AND (merge_state IS NULL OR merge_state IN ('waiting', 'merging'))`;
   let changes: number | bigint;

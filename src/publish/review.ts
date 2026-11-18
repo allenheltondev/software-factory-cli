@@ -197,6 +197,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     agent: run.agent,
     verdict: result.verdict,
     findings: result.findings,
+    findingsCount: result.findingsCount ?? null,
     leaseSeconds: PUBLISH_LEASE_SECONDS,
     now,
   });
