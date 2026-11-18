@@ -16,7 +16,8 @@ concurrent jobs in one repo do not race. `factory doctor` checks that each `chec
 exists and is a Git repository, and shows which remote it selected (by the same rule) and
 why; its repository check confirms the repo ID behind the configured name.
 
-Worktrees of failed and interrupted runs are kept for inspection. `factory clean` removes
+Worktrees of failed and interrupted runs, and of runs canceled with `factory cancel` after
+their agent started, are kept for inspection. `factory clean` removes
 worktrees of succeeded runs, runs closed before they started (canceled), and runs whose agent
 never started. It only touches worktrees under `<state dir>/worktrees`, skips any with
 uncommitted changes, and keeps every branch, since the branch is the job's output. Delete

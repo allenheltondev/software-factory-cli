@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -217,6 +217,24 @@ const MIGRATIONS: Record<number, Migration> = {
     );
     CREATE INDEX failure_comments_by_state ON failure_comments (state, next_attempt_at);
   `,
+  8: `
+    -- Set by "factory cancel" on a run that is claimed or executing. The CLI is not the worker
+    -- process, so it only records the request; the worker stops the run and closes it with no
+    -- outcome and its job 'canceled'. It is on the run, not the job, so a request can never
+    -- carry over to a later attempt after "factory retry".
+    ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT;
+    -- Dedupe keys of jobs deleted by "factory clean --older-than". The poller re-reads the
+    -- newest events of a repository on every scan (for a quiet repository, indefinitely), and
+    -- only the jobs unique key stops such an event from being enqueued again. A deleted job
+    -- leaves its key here, and commitPollBatch refuses any event listed.
+    CREATE TABLE pruned_events (
+      repo_id     INTEGER NOT NULL,
+      workflow_id TEXT    NOT NULL,
+      event_id    TEXT    NOT NULL,
+      pruned_at   TEXT    NOT NULL,
+      PRIMARY KEY (repo_id, workflow_id, event_id)
+    ) WITHOUT ROWID;
+  `,
 };
 
 /**
@@ -366,6 +384,7 @@ export interface RunRow {
   outcome: RunOutcome | null;
   error: string | null;
   summary: string | null;
+  cancel_requested_at: string | null;
 }
 
 function parseSummary(json: string | null): RunSummary | null {
@@ -397,5 +416,6 @@ export function rowToRun(r: RunRow): Run {
     outcome: r.outcome,
     error: r.error,
     summary: parseSummary(r.summary),
+    cancelRequestedAt: r.cancel_requested_at,
   };
 }

@@ -87,6 +87,30 @@ describe('commander wiring', () => {
     expect(codes).toEqual([0, 0]);
   });
 
+  it('parses clean --older-than, cancel, and logs with its flags', async () => {
+    const h = {
+      clean: vi.fn(async (_ctx: unknown, _o: { dryRun?: boolean; olderThan?: string }) => 0),
+      cancel: vi.fn(async () => 1),
+      logs: vi.fn(async (_ctx: unknown, _id: string, _o: { follow?: boolean; path?: boolean }) => 0),
+    };
+    const { parse, codes } = setup(h);
+    await parse('clean', '--older-than', '30d', '--dry-run');
+    await parse('cancel', 'job_abc');
+    await parse('logs', 'run_abc');
+    await parse('logs', 'job_abc', '--follow');
+    await parse('logs', '-f', '--path', 'job_abc');
+    expect(h.clean.mock.calls[0]?.[1]).toEqual({ olderThan: '30d', dryRun: true });
+    expect(h.cancel).toHaveBeenCalledWith(expect.anything(), 'job_abc');
+    expect(h.logs.mock.calls.map((c) => [c[1], c[2]])).toEqual([
+      ['run_abc', {}],
+      ['job_abc', { follow: true }],
+      ['job_abc', { follow: true, path: true }],
+    ]);
+    expect(codes).toEqual([0, 1, 0, 0, 0]);
+    await expect(parse('cancel')).rejects.toMatchObject({ code: 'commander.missingArgument' });
+    await expect(parse('logs')).rejects.toMatchObject({ code: 'commander.missingArgument' });
+  });
+
   it('parses agents --json --deep', async () => {
     const agents = vi.fn(async (_ctx: unknown, _o: { json?: boolean; deep?: boolean }) => 0);
     const { parse } = setup({ agents });

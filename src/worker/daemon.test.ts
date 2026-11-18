@@ -5,11 +5,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import {
+  CANCELED_BY_USER,
   claimNextJob,
   getJob,
   getRun,
   markExecutionStarted,
   MAX_START_FAILURES,
+  requestJobCancel,
   retryJob,
   setRunProcess,
   WorkerLockLostError,
@@ -20,7 +22,7 @@ import { createFailureCommenter } from '../publish/failure-comment.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { runDaemon, WorkerLockedError, type DaemonDeps } from './daemon.js';
-import { StartFailedError, type ExecutionResult, type Executor } from './executor.js';
+import { canceledByUser, StartFailedError, type ExecutionResult, type Executor } from './executor.js';
 import { acquireWorkerLock, readWorkerLock, WORKER_STALE_MS } from './lock.js';
 import type { ProcessControl } from './process.js';
 
@@ -662,5 +664,164 @@ describe('runDaemon: lock ownership', () => {
     expect(() => claimNextJob(db, makeConfig(), opts)).toThrow(WorkerLockLostError);
     expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 0 });
     expect(claimNextJob(db, makeConfig(), { ...opts, workerId: 'wrk_new', lockWorkerId: 'wrk_new' })).not.toBeNull();
+  });
+});
+
+describe('runDaemon: factory cancel', () => {
+  const noPublisher = () => {
+    const published: string[] = [];
+    return {
+      published,
+      publisher: {
+        afterRun: async (runId: string) => {
+          published.push(runId);
+        },
+        retryDue: async () => {},
+      },
+    };
+  };
+
+  it('stops a running run the way a shutdown does, and records the run and job as canceled', async () => {
+    const db = openDatabase(':memory:');
+    const executing = deferred<void>();
+    const stops: Array<{ byUser: boolean; reason: unknown; workerStopping: boolean }> = [];
+    const executor: Executor = {
+      name: 'stoppable',
+      // Like the live executor: stop on the run's signal and report the stop as 'interrupted'.
+      execute: (_c, ctx) =>
+        new Promise<ExecutionResult>((resolve) => {
+          ctx.signal.addEventListener('abort', () => {
+            stops.push({ byUser: canceledByUser(ctx.signal), reason: ctx.signal.reason, workerStopping: Boolean(ctx.workerStopping?.aborted) });
+            resolve({ outcome: 'interrupted', error: 'canceled by user before the run finished; the agent process tree was stopped' });
+          });
+          executing.resolve();
+        }),
+    };
+    const { published, publisher } = noPublisher();
+    const deps = baseDeps(db, { executor, publisher, timing: { cancelCheckMs: 10, shutdownTimeoutMs: 20, interruptGraceMs: 20 } });
+    const id = insertJob(db);
+    const other = insertJob(db);
+    const done = runDaemon(deps);
+    await executing.promise;
+    await vi.waitFor(() => expect(getJob(db, other)?.status).toBe('running'));
+
+    expect(requestJobCancel(db, id)).toMatchObject({ kind: 'requested', alreadyRequested: false });
+    await vi.waitFor(() => expect(getJob(db, id)?.status).toBe('canceled'));
+    // Only the canceled run was stopped, and by its own signal rather than a worker shutdown.
+    expect(stops).toEqual([{ byUser: true, reason: CANCELED_BY_USER, workerStopping: false }]);
+    expect(getJob(db, other)?.status).toBe('running');
+    expect(getJob(db, id)).toMatchObject({ statusReason: CANCELED_BY_USER, attempts: 1 });
+    const runs = db.prepare('SELECT outcome, error, ended_at FROM runs WHERE job_id = ?').all(id) as Array<{
+      outcome: string | null;
+      error: string;
+      ended_at: string | null;
+    }>;
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ outcome: null, error: CANCELED_BY_USER });
+    expect(runs[0]?.ended_at).not.toBeNull();
+
+    deps.controller.abort();
+    await done;
+    // Not requeued, not published, and no error row for a deliberate cancel.
+    expect(getJob(db, id)?.status).toBe('canceled');
+    expect(published).toEqual([]);
+    expect(db.prepare('SELECT count(*) AS n FROM errors WHERE job_id = ?').get(id)).toEqual({ n: 0 });
+  });
+
+  it('a cancel that races with the run succeeding on its own ends canceled and is not published', async () => {
+    const db = openDatabase(':memory:');
+    const executing = deferred<void>();
+    const agent = deferred<ExecutionResult>();
+    const { published, publisher } = noPublisher();
+    const deps = baseDeps(db, {
+      publisher,
+      // The check never fires here: the request is only seen when the run is recorded.
+      timing: { cancelCheckMs: 60_000 },
+      executor: {
+        name: 'finishing',
+        execute: async () => {
+          executing.resolve();
+          return agent.promise;
+        },
+      },
+    });
+    const id = insertJob(db);
+    const done = runDaemon(deps);
+    await executing.promise;
+    expect(requestJobCancel(db, id).kind).toBe('requested');
+    agent.resolve({ outcome: 'succeeded' });
+    await vi.waitFor(() => expect(getJob(db, id)?.status).toBe('canceled'));
+    deps.controller.abort();
+    await done;
+    expect(db.prepare('SELECT outcome, error FROM runs WHERE job_id = ?').get(id)).toEqual({
+      outcome: null,
+      error: `${CANCELED_BY_USER} (the run had already ended: succeeded)`,
+    });
+    expect(published).toEqual([]);
+  });
+
+  it('a cancel during the pre-start check keeps the agent from starting and does not requeue the job', async () => {
+    const db = openDatabase(':memory:');
+    const checking = deferred<void>();
+    const check = deferred<{ ok: true }>();
+    const execute = vi.fn(async (): Promise<ExecutionResult> => ({ outcome: 'succeeded' }));
+    const deps = baseDeps(db, {
+      executor: { name: 'spy', execute },
+      checkDispatchable: async () => {
+        checking.resolve();
+        return check.promise;
+      },
+    });
+    const id = insertJob(db);
+    const done = runDaemon(deps);
+    await checking.promise;
+    expect(requestJobCancel(db, id).kind).toBe('requested');
+    check.resolve({ ok: true });
+    await vi.waitFor(() => expect(getJob(db, id)?.status).toBe('canceled'));
+    deps.controller.abort();
+    await done;
+    expect(execute).not.toHaveBeenCalled();
+    expect(getJob(db, id)).toMatchObject({ statusReason: CANCELED_BY_USER, attempts: 1 });
+    expect(db.prepare('SELECT outcome, execution_started_at, error FROM runs WHERE job_id = ?').all(id)).toEqual([
+      { outcome: null, execution_started_at: null, error: `canceled before start: ${CANCELED_BY_USER}` },
+    ]);
+  });
+
+  it('a worker that takes over a run with a pending cancel records it canceled, not interrupted', async () => {
+    const db = openDatabase(':memory:');
+    const executing = deferred<void>();
+    const agent = deferred<ExecutionResult>();
+    const a = baseDeps(db, {
+      workerId: 'wrk_a',
+      pid: 5000,
+      timing: { cancelCheckMs: 60_000 }, // A stops responding before it sees the request
+      executor: {
+        name: 'slow',
+        execute: async () => {
+          executing.resolve();
+          return agent.promise;
+        },
+      },
+    });
+    const id = insertJob(db);
+    const doneA = runDaemon(a);
+    await executing.promise;
+    expect(requestJobCancel(db, id).kind).toBe('requested');
+
+    const b = baseDeps(db, {
+      workerId: 'wrk_b',
+      pid: 6000,
+      processControl: { isAlive: (p) => p !== 5000, startTime: async () => null, terminate: async () => {} },
+    });
+    b.controller.abort(); // take over and reconcile only
+    await runDaemon(b);
+    expect(getJob(db, id)).toMatchObject({ status: 'canceled', statusReason: CANCELED_BY_USER });
+    // The run now belongs to nobody the CLI could ask; a second cancel says the job is done.
+    expect(requestJobCancel(db, id).kind).toBe('terminal');
+
+    agent.resolve({ outcome: 'succeeded' });
+    await doneA;
+    expect(getJob(db, id)?.status).toBe('canceled');
+    expect(db.prepare('SELECT outcome FROM runs WHERE job_id = ?').all(id)).toEqual([{ outcome: null }]);
   });
 });

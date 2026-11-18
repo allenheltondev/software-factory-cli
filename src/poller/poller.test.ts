@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { configSchema, workflowId, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getCheckpoint, listQueuedJobs } from '../db/ingest.js';
+import { pruneJob } from '../db/prune.js';
 import { silentLogger } from '../util/log.js';
 import { EVENTS_PER_PAGE, OVERLAP_MS, backoffSeconds, checkJobDispatchable, pollOnce, type PollerDeps } from './poller.js';
 import {
@@ -1234,5 +1235,46 @@ describe('issue edits after the trigger label (live mode)', () => {
     await checkJobDispatchable(deps, job);
     // The order is what makes the check sound: an edit after the lookups is not in the fetched text.
     expect(gh.calls.map((c) => c.method)).toEqual(['getIssue', 'listEventsForIssue', 'getIssueBodyEdit']);
+  });
+});
+
+describe('retention: a pruned job is never enqueued again', () => {
+  it('keeps refusing an event the poller still rescans after "factory clean --older-than" deleted its job', async () => {
+    const { gh, db, deps, advance } = setup();
+    gh.createIssue(REPO, 1);
+    await init(deps);
+    const labeled = gh.label(REPO, 1, READY);
+    const scan = async () => (await pollOnce(deps)).repos[0]!;
+    expect((await scan()).jobsEnqueued).toBe(1);
+    const [job] = listQueuedJobs(db);
+    db.prepare("UPDATE jobs SET status = 'succeeded' WHERE id = ?").run(job!.id);
+
+    // The repository then goes quiet for two months. The scan window is anchored to the newest
+    // event GitHub has (not to the clock), so the labeled event stays inside the overlap, and
+    // any later scan evaluates it again: the issue is still open and still carries the label.
+    advance(60 * 24 * 3600);
+    gh.noise(REPO, 1, 1); // changes page 1's ETag, so the next poll really rescans
+    expect(Date.parse(labeled.createdAt)).toBeGreaterThan(gh.clock - OVERLAP_MS);
+    expect(await scan()).toMatchObject({ ok: true, eventsSeen: 2, jobsEnqueued: 0 });
+
+    // Prune the job. Its age does not matter, and the checkpoint does not protect it: only the
+    // dedupe key did, and that now lives in pruned_events.
+    const cutoff = new Date(deps.now!() - 30 * 24 * 3600 * 1000).toISOString();
+    expect(pruneJob(db, job!.id, cutoff, deps.now)).toMatchObject({ pruned: true });
+    expect(db.prepare('SELECT count(*) AS n FROM jobs').get()).toEqual({ n: 0 });
+    expect(db.prepare('SELECT repo_id, workflow_id, event_id FROM pruned_events').all()).toEqual([
+      { repo_id: REPO, workflow_id: job!.workflowId, event_id: String(labeled.id) },
+    ]);
+
+    gh.noise(REPO, 1, 1);
+    expect(await scan()).toMatchObject({ ok: true, eventsSeen: 3, jobsEnqueued: 0 });
+    expect(db.prepare('SELECT count(*) AS n FROM jobs').get()).toEqual({ n: 0 });
+
+    // Without the tombstone the same scan does enqueue the old event again: the checkpoint and
+    // the job's age alone guarantee nothing.
+    db.prepare('DELETE FROM pruned_events').run();
+    gh.noise(REPO, 1, 1);
+    expect((await scan()).jobsEnqueued).toBe(1);
+    expect(listQueuedJobs(db).map((j) => j.eventId)).toEqual([String(labeled.id)]);
   });
 });

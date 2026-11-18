@@ -1,12 +1,14 @@
 import { Command, Option } from 'commander';
 import { addCommand, type AddOptions } from './add.js';
 import { agentsCommand, type AgentsOptions } from './agents.js';
+import { cancelCommand } from './cancel.js';
 import { cleanCommand } from './clean.js';
 import { configureCommand } from './configure.js';
 import { DEFAULT_LABEL } from './config-edit.js';
 import { createDefaultContext, println, type CommandContext, type GlobalOptions } from './context.js';
 import { doctorCommand } from './doctor.js';
 import { describeError } from './errors.js';
+import { logsCommand, type LogsOptions } from './logs.js';
 import { publishCommand } from './publish.js';
 import { retryCommand } from './retry.js';
 import { startCommand } from './start.js';
@@ -22,8 +24,10 @@ export interface Handlers {
   doctor(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   retry(ctx: CommandContext, jobId: string): Promise<number>;
   agents(ctx: CommandContext, opts: AgentsOptions): Promise<number>;
-  clean(ctx: CommandContext, opts: { dryRun?: boolean }): Promise<number>;
+  clean(ctx: CommandContext, opts: { dryRun?: boolean; olderThan?: string }): Promise<number>;
   publish(ctx: CommandContext, runId: string): Promise<number>;
+  cancel(ctx: CommandContext, jobId: string): Promise<number>;
+  logs(ctx: CommandContext, id: string, opts: LogsOptions): Promise<number>;
 }
 
 export const defaultHandlers: Handlers = {
@@ -37,6 +41,8 @@ export const defaultHandlers: Handlers = {
   agents: agentsCommand,
   clean: (ctx, opts) => cleanCommand(ctx, opts),
   publish: (ctx, runId) => publishCommand(ctx, runId),
+  cancel: (ctx, jobId) => cancelCommand(ctx, jobId),
+  logs: (ctx, id, opts) => logsCommand(ctx, id, opts),
 };
 
 export interface ProgramOptions {
@@ -127,6 +133,20 @@ export function buildProgram(opts: ProgramOptions): Command {
     .action((jobId: string) => exec((ctx) => handlers.retry(ctx, jobId)));
 
   program
+    .command('cancel')
+    .description('Cancel a queued job, or ask the running worker to stop a running one (its worktree is kept)')
+    .argument('<jobId>', 'job id (see "factory status")')
+    .action((jobId: string) => exec((ctx) => handlers.cancel(ctx, jobId)));
+
+  program
+    .command('logs')
+    .description("Print a run's log (run.log); for a job id, the log of its latest run")
+    .argument('<id>', 'run id or job id (see "factory status")')
+    .option('-f, --follow', 'keep printing as the log grows; exits when the run has finished')
+    .option('--path', 'print only the path of the log file')
+    .action((id: string, o: LogsOptions) => exec((ctx) => handlers.logs(ctx, id, o)));
+
+  program
     .command('publish')
     .description('Push the branch of a succeeded live run and open its PR, or finish a failed publication (never duplicates)')
     .argument('<runId>', 'run id (see "factory status")')
@@ -134,9 +154,10 @@ export function buildProgram(opts: ProgramOptions): Command {
 
   program
     .command('clean')
-    .description('Remove worktrees of succeeded or canceled runs; keeps failed/interrupted ones and all branches')
+    .description('Remove worktrees of succeeded or never-started runs; keeps failed/interrupted ones and all branches')
     .option('--dry-run', 'list what would be removed without removing anything')
-    .action((o: { dryRun?: boolean }) => exec((ctx) => handlers.clean(ctx, o)));
+    .option('--older-than <age>', 'also prune jobs that finished longer ago than this (e.g. 30d, 12h, 2w) with their runs and logs, and old errors')
+    .action((o: { dryRun?: boolean; olderThan?: string }) => exec((ctx) => handlers.clean(ctx, o)));
 
   return program;
 }

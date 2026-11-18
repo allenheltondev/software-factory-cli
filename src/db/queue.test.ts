@@ -6,6 +6,7 @@ import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../co
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope } from '../types.js';
 import { openDatabase, type Db } from './database.js';
 import {
+  CANCELED_BY_USER,
   MAX_START_FAILURES,
   cancelClaim,
   claimNextJob,
@@ -13,11 +14,14 @@ import {
   getJob,
   getRun,
   getStatusSnapshot,
+  listCancelRequestedRuns,
   markExecutionStarted,
   releaseClaim,
+  requestJobCancel,
   retryJob,
   type Claim,
 } from './queue.js';
+import { acquireWorkerLock, WORKER_STALE_MS } from '../worker/lock.js';
 
 const T0 = Date.parse('2026-11-17T10:00:00.000Z');
 const now = () => T0;
@@ -382,5 +386,127 @@ describe('getStatusSnapshot', () => {
     expect(s.checkpoints).toEqual([{ repoId: 1, fullName: 'owner/repo', lastEventId: 99, updatedAt: new Date(T0).toISOString() }]);
     expect(s.worker).toMatchObject({ workerId: 'wrk_x', stale: true });
     expect(getStatusSnapshot(db, config, () => T0 - 50_000).worker?.stale).toBe(false);
+  });
+});
+
+describe('requestJobCancel (factory cancel)', () => {
+  /** A database whose worker lock is held, freshly, by the worker that claims in these tests. */
+  function withWorker(workerId = 'wrk_test') {
+    const db = openDatabase(':memory:');
+    acquireWorkerLock(db, { workerId, pid: 1, hostname: 'host-a' }, { now, isPidAlive: () => true });
+    return db;
+  }
+
+  it('cancels a queued job directly, so it is never claimed', () => {
+    const db = withWorker();
+    const id = insertJob(db);
+    expect(requestJobCancel(db, id, now)).toMatchObject({ kind: 'canceled', job: { status: 'canceled', statusReason: CANCELED_BY_USER } });
+    expect(claim(db, makeConfig())).toBeNull();
+    expect(requestJobCancel(db, id, now)).toMatchObject({ kind: 'terminal', job: { status: 'canceled' } });
+    expect(requestJobCancel(db, 'job_missing', now)).toEqual({ kind: 'not-found' });
+  });
+
+  it('records a request on the open run of a running job; closing the run then cancels the job', () => {
+    const db = withWorker();
+    const id = insertJob(db);
+    const c = claim(db, makeConfig())!;
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now });
+    const res = requestJobCancel(db, id, now);
+    expect(res).toMatchObject({ kind: 'requested', alreadyRequested: false, run: { id: c.run.id, cancelRequestedAt: new Date(T0).toISOString() } });
+    expect(requestJobCancel(db, id, now)).toMatchObject({ kind: 'requested', alreadyRequested: true });
+    // Nothing is canceled yet: the worker has to stop the run.
+    expect(getJob(db, id)?.status).toBe('running');
+    expect(listCancelRequestedRuns(db)).toEqual([c.run.id]);
+
+    // The executor reports the stop as 'interrupted'; the request turns that into canceled.
+    expect(finishRun(db, c.run.id, { outcome: 'interrupted', error: 'canceled by user before the run finished', now })).toEqual({
+      outcome: null,
+      canceledByUser: true,
+    });
+    expect(getJob(db, id)).toMatchObject({ status: 'canceled', statusReason: CANCELED_BY_USER });
+    expect(getRun(db, c.run.id)).toMatchObject({ outcome: null, error: CANCELED_BY_USER, endedAt: new Date(T0).toISOString() });
+    expect(listCancelRequestedRuns(db)).toEqual([]);
+    // A user cancel is not an error.
+    expect(db.prepare('SELECT count(*) AS n FROM errors').get()).toEqual({ n: 0 });
+  });
+
+  it.each(['succeeded', 'failed', 'start_failed'] as const)(
+    'a request recorded before the run closes wins over a run that ends %s on its own',
+    (outcome) => {
+      const db = withWorker();
+      const id = insertJob(db);
+      const c = claim(db, makeConfig())!;
+      markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now });
+      expect(requestJobCancel(db, id, now).kind).toBe('requested');
+      expect(finishRun(db, c.run.id, { outcome, error: outcome === 'succeeded' ? null : 'boom', now })).toEqual({
+        outcome: null,
+        canceledByUser: true,
+      });
+      // Not requeued (start_failed normally is), and what really happened stays on the run.
+      expect(getJob(db, id)).toMatchObject({ status: 'canceled', statusReason: CANCELED_BY_USER, startFailures: 0 });
+      expect(getRun(db, c.run.id)?.error).toBe(
+        `${CANCELED_BY_USER} (the run had already ended: ${outcome}${outcome === 'succeeded' ? '' : ', boom'})`,
+      );
+      expect(claim(db, makeConfig())).toBeNull();
+    },
+  );
+
+  it('a run that closes first wins: the request is refused and nothing changes', () => {
+    const db = withWorker();
+    const id = insertJob(db);
+    const c = claim(db, makeConfig())!;
+    expect(finishRun(db, c.run.id, { outcome: 'succeeded', now })).toEqual({ outcome: 'succeeded', canceledByUser: false });
+    expect(requestJobCancel(db, id, now)).toMatchObject({ kind: 'terminal', job: { status: 'succeeded' } });
+    expect(getRun(db, c.run.id)).toMatchObject({ outcome: 'succeeded', cancelRequestedAt: null });
+    expect(finishRun(db, c.run.id, { outcome: 'failed', now })).toBeNull();
+  });
+
+  it('a request made while the run is only claimed stops it from starting, and it is not requeued', () => {
+    const db = withWorker();
+    const id = insertJob(db);
+    const c = claim(db, makeConfig())!;
+    expect(requestJobCancel(db, id, now).kind).toBe('requested');
+    expect(markExecutionStarted(db, c.run.id, { workerId: 'wrk_test', now })).toBeNull();
+    // The worker (or a later worker's reconcile) releases the claim; the cancel wins over the requeue.
+    releaseClaim(db, c.run.id, 'run was closed before it started', now);
+    expect(getJob(db, id)).toMatchObject({ status: 'canceled', statusReason: CANCELED_BY_USER });
+    expect(getRun(db, c.run.id)).toMatchObject({ outcome: null, error: `canceled before start: ${CANCELED_BY_USER}` });
+  });
+
+  it('a request does not carry over to the next attempt after a retry', () => {
+    const db = withWorker();
+    const config = makeConfig();
+    const id = insertJob(db);
+    const first = claim(db, config)!;
+    markExecutionStarted(db, first.run.id, { workerId: 'wrk_test', now });
+    requestJobCancel(db, id, now);
+    finishRun(db, first.run.id, { outcome: 'interrupted', now });
+
+    // retry and cancel never apply to the same state, so whichever commits first decides.
+    expect(retryJob(db, id, now).status).toBe('queued');
+    const second = claim(db, config)!;
+    expect(second.run).toMatchObject({ jobId: id, attempt: 2, cancelRequestedAt: null });
+    expect(listCancelRequestedRuns(db)).toEqual([]);
+    expect(markExecutionStarted(db, second.run.id, { workerId: 'wrk_test', now })).not.toBeNull();
+    expect(finishRun(db, second.run.id, { outcome: 'succeeded', now })).toEqual({ outcome: 'succeeded', canceledByUser: false });
+    expect(getJob(db, id)?.status).toBe('succeeded');
+    expect(() => retryJob(db, id, now)).toThrow(/only failed, interrupted or canceled/);
+  });
+
+  it('records nothing for a running job that no live worker owns', () => {
+    const db = openDatabase(':memory:');
+    const id = insertJob(db);
+    const c = claim(db, makeConfig())!;
+    // No lock at all.
+    expect(requestJobCancel(db, id, now)).toMatchObject({ kind: 'stale', run: { id: c.run.id } });
+    // The lock is held by a worker that took over and has not reconciled this run yet.
+    acquireWorkerLock(db, { workerId: 'wrk_new', pid: 2, hostname: 'host-a' }, { now, isPidAlive: () => true });
+    expect(requestJobCancel(db, id, now).kind).toBe('stale');
+    // The claiming worker holds the lock, but its heartbeat is stale.
+    db.prepare("UPDATE worker_lock SET worker_id = 'wrk_test'").run();
+    expect(requestJobCancel(db, id, () => T0 + WORKER_STALE_MS + 1).kind).toBe('stale');
+    expect(getRun(db, c.run.id)?.cancelRequestedAt).toBeNull();
+    expect(getJob(db, id)?.status).toBe('running');
+    expect(requestJobCancel(db, id, () => T0 + WORKER_STALE_MS).kind).toBe('requested');
   });
 });

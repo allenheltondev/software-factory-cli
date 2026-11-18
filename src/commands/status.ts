@@ -158,8 +158,9 @@ export function renderStatus(v: StatusView): string {
     const phase = run.executionStartedAt
       ? `running since ${run.executionStartedAt}`
       : `claimed ${run.startedAt}, not started yet`;
+    const canceling = run.cancelRequestedAt ? ', cancel requested' : '';
     lines.push(
-      `  ${run.id}  ${job.repoFullName}#${job.issueNumber}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}`,
+      `  ${run.id}  ${job.repoFullName}#${job.issueNumber}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}${canceling}`,
     );
   }
 
@@ -181,7 +182,7 @@ export function renderStatus(v: StatusView): string {
     for (const { run, job } of s.recentAgentRuns) {
       const sum = run.summary!;
       lines.push(
-        `  ${run.id}  ${run.outcome ?? 'closed'}  ${job.repoFullName}#${job.issueNumber}  agent ${run.agent}  ended ${run.endedAt}`,
+        `  ${run.id}  ${run.outcome ?? (run.cancelRequestedAt ? 'canceled' : 'closed')}  ${job.repoFullName}#${job.issueNumber}  agent ${run.agent}  ended ${run.endedAt}`,
         `    ${sum.commitCount} commit(s), ${sum.filesChanged} file(s) changed (${sum.diffStat}), ${sum.untracked} untracked`,
         `    worktree ${sum.worktree} (branch ${sum.branch})`,
       );

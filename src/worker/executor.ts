@@ -4,7 +4,7 @@
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { agentAdapter, type FactoryConfig, type RepositoryConfig } from '../config/schema.js';
-import { ownEntry, type Claim, type RunProcessInfo } from '../db/queue.js';
+import { CANCELED_BY_USER, ownEntry, type Claim, type RunProcessInfo } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
 import type { IssueSnapshot, Job, RunOutcome, RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -14,8 +14,10 @@ export interface ExecutionContext {
   paths: FactoryPaths;
   log: Logger;
   /**
-   * Aborted when the worker is shutting down and the run did not finish in time.
-   * A live adapter should stop its agent and resolve with outcome 'interrupted'.
+   * Aborted when the worker is shutting down and the run did not finish in time, or when the
+   * user canceled the run (`factory cancel`; see canceledByUser). Either way a live adapter
+   * should stop its agent and resolve with outcome 'interrupted'; the daemon records a user
+   * cancel as canceled.
    */
   signal: AbortSignal;
   /**
@@ -32,6 +34,14 @@ export interface ExecutionContext {
    * a crash.
    */
   recordProcess(info: RunProcessInfo): void;
+}
+
+/**
+ * True if the run was stopped by `factory cancel` rather than by the worker shutting down: the
+ * daemon aborts `signal` with CANCELED_BY_USER as the reason.
+ */
+export function canceledByUser(signal: AbortSignal): boolean {
+  return signal.aborted && signal.reason === CANCELED_BY_USER;
 }
 
 export interface ExecutionResult {

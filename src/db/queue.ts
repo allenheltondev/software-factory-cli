@@ -35,6 +35,9 @@ export function holdsWorkerLock(db: Db, workerId: string): boolean {
  */
 export const MAX_START_FAILURES = 3;
 
+/** Reason recorded on a job (and its run) canceled with `factory cancel`. */
+export const CANCELED_BY_USER = 'canceled by user';
+
 const JOB_STATUSES: readonly JobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'interrupted', 'canceled'];
 const RETRYABLE: readonly JobStatus[] = ['failed', 'interrupted', 'canceled'];
 
@@ -206,6 +209,7 @@ export function claimNextJob(
         outcome: null,
         error: null,
         summary: null,
+        cancel_requested_at: null,
       };
       db.prepare(
         `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, hostname, pid, lease_expires_at, started_at)
@@ -267,16 +271,17 @@ export function setRunSummary(db: Db, runId: string, summary: RunSummary): void 
 
 /**
  * Mark a claimed run as executing, immediately before the worker hands it to the executor.
- * Atomic with the lock check: succeeds only while the run is open, not yet started, and
- * `workerId` still holds the worker lock. Returns the timestamp, or null if the worker must
- * not start it (the lock changed hands, and the new holder may already have requeued it).
+ * Atomic with the lock check: succeeds only while the run is open, not yet started, not
+ * canceled by the user, and `workerId` still holds the worker lock. Returns the timestamp, or
+ * null if the worker must not start it (the user canceled it, or the lock changed hands and the
+ * new holder may already have requeued it).
  */
 export function markExecutionStarted(db: Db, runId: string, opts: { workerId: string; now?: () => number }): string | null {
   const at = nowIso(opts.now ?? Date.now);
   const res = db
     .prepare(
       `UPDATE runs SET execution_started_at = ?
-       WHERE id = ? AND ended_at IS NULL AND execution_started_at IS NULL
+       WHERE id = ? AND ended_at IS NULL AND execution_started_at IS NULL AND cancel_requested_at IS NULL
          AND EXISTS (SELECT 1 FROM worker_lock WHERE id = 1 AND worker_id = ?)`,
     )
     .run(at, runId, opts.workerId);
@@ -297,30 +302,58 @@ export function listOpenRuns(db: Db): Run[] {
   return (db.prepare('SELECT * FROM runs WHERE ended_at IS NULL ORDER BY started_at').all() as unknown as RunRow[]).map(rowToRun);
 }
 
+/** How finishRun closed a run. `outcome` is null when the run ended as canceled by the user. */
+export interface FinishedRun {
+  outcome: RunOutcome | null;
+  canceledByUser: boolean;
+}
+
 /**
  * Close a run and move its job to the matching terminal state (or back to queued for start_failed).
  *
  * - succeeded / failed / interrupted: job gets the same status (checkout and log are kept).
  * - start_failed: the slot is released and the job requeued so another eligible agent is
  *   tried; after MAX_START_FAILURES consecutive start failures the job is marked failed.
+ * - the user asked to cancel the run (`factory cancel` set cancel_requested_at): whatever
+ *   `result.outcome` says, the run closes with no outcome and the job is 'canceled'. The request
+ *   and this close are both transactions, so exactly one wins: a request recorded before the run
+ *   closed is always honored (never requeued, never published), and one that arrives after sees a
+ *   job that is no longer running.
  *
- * Idempotent: closing an already-closed run is a no-op. Only a job still `running` is moved.
+ * Idempotent: closing an already-closed run is a no-op and returns null. Only a job still
+ * `running` is moved.
  */
 export function finishRun(
   db: Db,
   runId: string,
   result: { outcome: RunOutcome; error?: string | null; now?: () => number },
-): void {
+): FinishedRun | null {
   const at = nowIso(result.now ?? Date.now);
-  transaction(db, () => {
+  return transaction(db, () => {
     const run = getRunRow(db, runId);
     if (!run) throw new Error(`run ${runId} not found`);
-    if (run.ended_at !== null) return;
+    if (run.ended_at !== null) return null;
     const error = result.error ?? null;
+
+    if (run.cancel_requested_at !== null) {
+      // An executor that was stopped reports 'interrupted'; anything else means the agent had
+      // already exited when the request was noticed, which is worth keeping on the run.
+      const detail =
+        result.outcome === 'interrupted' ? '' : ` (the run had already ended: ${result.outcome}${error ? `, ${error}` : ''})`;
+      db.prepare('UPDATE runs SET ended_at = ?, outcome = NULL, error = ? WHERE id = ?').run(at, `${CANCELED_BY_USER}${detail}`, runId);
+      db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ? AND status = 'running'").run(
+        CANCELED_BY_USER,
+        at,
+        run.job_id,
+      );
+      return { outcome: null, canceledByUser: true };
+    }
+
     db.prepare('UPDATE runs SET ended_at = ?, outcome = ?, error = ? WHERE id = ?').run(at, result.outcome, error, runId);
+    const finished: FinishedRun = { outcome: result.outcome, canceledByUser: false };
 
     const job = getJobRow(db, run.job_id);
-    if (!job || job.status !== 'running') return;
+    if (!job || job.status !== 'running') return finished;
 
     let status: JobStatus;
     let reason: string | null;
@@ -366,6 +399,7 @@ export function finishRun(
         at,
       });
     }
+    return finished;
   });
 }
 
@@ -375,6 +409,12 @@ function closeClaim(db: Db, runId: string, jobStatus: 'canceled' | 'queued', rea
     const run = getRunRow(db, runId);
     if (!run) throw new Error(`run ${runId} not found`);
     if (run.ended_at !== null) return;
+    // A user cancel recorded while the run was claimed wins over requeueing it, and over the
+    // pre-start check's own reason: the job must not come back on its own.
+    if (run.cancel_requested_at !== null) {
+      jobStatus = 'canceled';
+      reason = CANCELED_BY_USER;
+    }
     // outcome stays NULL: the agent never started, so this is not an agent failure.
     db.prepare('UPDATE runs SET ended_at = ?, error = ? WHERE id = ?').run(
       at,
@@ -423,6 +463,71 @@ export function retryJob(db: Db, jobId: string, now?: () => number): Job {
     ).run(`retried by user (was ${row.status})`, at, jobId);
     return rowToJob(getJobRow(db, jobId)!);
   });
+}
+
+export type CancelRequest =
+  /** The job was queued; it is canceled now. */
+  | { kind: 'canceled'; job: Job }
+  /** The job is running under a live worker; the request is recorded on `run` for the worker to act on. */
+  | { kind: 'requested'; job: Job; run: Run; alreadyRequested: boolean }
+  /** The job is 'running' but no live worker owns its run, so nobody would act on a request. Nothing changed. */
+  | { kind: 'stale'; job: Job; run: Run | null }
+  /** The job already reached a terminal state. Nothing changed. */
+  | { kind: 'terminal'; job: Job }
+  | { kind: 'not-found' };
+
+/**
+ * `factory cancel`: cancel a queued job directly, or record a cancel request on the open run of
+ * a running one. One transaction, so it serializes with the worker closing the run (finishRun,
+ * closeClaim), a lock takeover and `factory retry`: the job is judged by the state it has when
+ * this commits, and the request lands on the run that is open at that moment and no other.
+ *
+ * A request is only recorded while the worker that claimed the run holds a fresh lock. Otherwise
+ * the run is a leftover that the next worker's reconcile closes, and a recorded request would
+ * only claim something that is not going to happen.
+ */
+export function requestJobCancel(db: Db, jobId: string, now?: () => number): CancelRequest {
+  const clock = now ?? Date.now;
+  const at = nowIso(clock);
+  return transaction(db, (): CancelRequest => {
+    const row = getJobRow(db, jobId);
+    if (!row) return { kind: 'not-found' };
+    if (row.status === 'queued') {
+      db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ?").run(CANCELED_BY_USER, at, jobId);
+      return { kind: 'canceled', job: rowToJob(getJobRow(db, jobId)!) };
+    }
+    const job = rowToJob(row);
+    if (row.status !== 'running') return { kind: 'terminal', job };
+
+    const runRow = db
+      .prepare('SELECT * FROM runs WHERE job_id = ? AND ended_at IS NULL ORDER BY attempt DESC LIMIT 1')
+      .get(jobId) as RunRow | undefined;
+    if (!runRow) return { kind: 'stale', job, run: null };
+    const lock = db.prepare('SELECT worker_id, heartbeat_at FROM worker_lock WHERE id = 1').get() as
+      | { worker_id: string; heartbeat_at: string }
+      | undefined;
+    const owned = lock !== undefined && lock.worker_id === runRow.worker_id && clock() - Date.parse(lock.heartbeat_at) <= WORKER_STALE_MS;
+    if (!owned) return { kind: 'stale', job, run: rowToRun(runRow) };
+
+    const alreadyRequested = runRow.cancel_requested_at !== null;
+    if (!alreadyRequested) db.prepare('UPDATE runs SET cancel_requested_at = ? WHERE id = ?').run(at, runRow.id);
+    return { kind: 'requested', job, run: rowToRun(getRunRow(db, runRow.id)!), alreadyRequested };
+  });
+}
+
+/** Open runs the user asked to cancel; the worker aborts the ones it is executing. */
+export function listCancelRequestedRuns(db: Db): string[] {
+  return (
+    db.prepare('SELECT id FROM runs WHERE ended_at IS NULL AND cancel_requested_at IS NOT NULL').all() as { id: string }[]
+  ).map((r) => r.id);
+}
+
+/** The newest run of a job (by attempt), or null if it never had one. */
+export function latestRunOfJob(db: Db, jobId: string): Run | null {
+  const row = db.prepare('SELECT * FROM runs WHERE job_id = ? ORDER BY attempt DESC, started_at DESC LIMIT 1').get(jobId) as
+    | RunRow
+    | undefined;
+  return row ? rowToRun(row) : null;
 }
 
 export interface AgentLoad {

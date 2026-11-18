@@ -40,6 +40,7 @@ import { ownEntry, type Claim } from '../db/queue.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree, type PreparedWorktree } from '../git/worktree.js';
 import type { RunOutcome, RunSummary, VerificationCommandResult, VerificationSummary } from '../types.js';
 import {
+  canceledByUser,
   findRepoConfig,
   resolvePromptPath,
   StartFailedError,
@@ -507,7 +508,10 @@ export class LiveExecutor implements Executor {
     }
     if (!promptSource) return fail('failed', `actions.${job.action}.prompt is not set; live mode needs a prompt`);
     const stopping = () => ctx.signal.aborted || Boolean(ctx.workerStopping?.aborted);
-    if (stopping()) return fail('interrupted', 'worker stopped before the agent started');
+    // Who stopped the run, for run.log and the error. A user cancel is still reported as
+    // 'interrupted' here; the daemon records it as canceled.
+    const stopper = () => (canceledByUser(ctx.signal) ? 'canceled by user' : 'worker stopped');
+    if (stopping()) return fail('interrupted', `${stopper()} before the agent started`);
 
     // 1. Prompt: the action's prompt plus the issue, as untrusted input, in a file.
     let actionPrompt: string;
@@ -568,7 +572,7 @@ export class LiveExecutor implements Executor {
     }
     if (stopping()) {
       await log([`checkout: ${prepared.worktreePath}`]);
-      return fail('interrupted', 'worker stopped before the agent started');
+      return fail('interrupted', `${stopper()} before the agent started`);
     }
 
     // 4. Invocation.
@@ -662,7 +666,7 @@ export class LiveExecutor implements Executor {
       error = `agent timed out after ${timeoutMinutes} min; its process tree was stopped`;
     } else if (agentRun.stopped === 'shutdown') {
       outcome = 'interrupted';
-      error = 'worker stopped before the run finished; the agent process tree was stopped';
+      error = `${stopper()} before the run finished; the agent process tree was stopped`;
     } else {
       const exit = { code: agentRun.code, signal: agentRun.signal, outputTail, output: rawOutput, args: invocation.args };
       let verdict = defaultVerdict(exit);
