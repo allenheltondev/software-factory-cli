@@ -224,6 +224,11 @@ export const repositorySchema = z.strictObject({
   autoMerge: z.enum(MERGE_METHODS).optional(),
   /** With autoMerge: how long to wait for pending checks before giving up, in minutes. Default 60. */
   autoMergeWaitMinutes: z.number().positive().max(24 * 60).optional(),
+  /**
+   * With autoMerge: names of the commit statuses or check runs that must each report success on
+   * the commit before it is merged. Not set: any one successful check is enough.
+   */
+  autoMergeRequiredChecks: z.array(z.string().min(1)).min(1).optional(),
   workflows: z.array(workflowSchema).min(1),
 });
 

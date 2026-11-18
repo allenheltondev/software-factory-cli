@@ -32,7 +32,7 @@ export class FakeLoopGitHub {
   humanReviews: GitHubReview[] = [];
   comments: Array<GitHubIssueComment & { issue: number }> = [];
   /** One passing check by default: auto-merge needs independent CI to have passed. */
-  checks: CommitChecks = { total: 1, failing: [], pending: [], complete: true };
+  checks: CommitChecks = { total: 1, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
   issueEvents: GitHubIssueEvent[] = [];
   /** Every write, in order. */
   readonly writes: string[] = [];

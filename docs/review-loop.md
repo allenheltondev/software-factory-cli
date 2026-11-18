@@ -227,10 +227,14 @@ settles one way or the other:
 4. GitHub does not report it unmergeable;
 5. no allowed actor has a "Request changes" review outstanding (a later approval or a
    dismissal clears it);
-6. at least one commit status or check run exists for that commit, none is failing, and none
-   is pending. The worker's own `verify` commands run in the worktree the agent left, where
-   ignored files such as earlier build output can make a test pass that would fail on the
-   commit alone, so a merge also needs a check GitHub ran itself. A commit with no checks is
+6. no commit status or check run of that commit is failing, none is pending, and at least one
+   reported success. The worker's own `verify` commands run in the worktree the agent left,
+   where ignored files such as earlier build output can make a test pass that would fail on
+   the commit alone, so a merge also needs a check GitHub ran itself to have passed. A check
+   run that was skipped or ended neutral does not block, but it is not a pass either: a commit
+   whose only checks were skipped is not merged. With `autoMergeRequiredChecks`, each check
+   named there must have reported success; name your test job there so that some other
+   check passing is not enough. A commit with no checks, or still missing a required one, is
    waited for like a pending one (CI often registers a moment after the push) and then given
    up on: a repository with no CI is never auto-merged. Every page of both listings is read; if either cannot be read to
    its end, it is unknown whether the checks passed and the PR is not merged.
@@ -258,7 +262,7 @@ What they do not cover:
 - **whether the reviewer was right.** It is an agent reading untrusted text. A second agent
   makes a successful prompt injection harder, not impossible, and both agents may share blind
   spots;
-- **what the checks check.** Any one passing check satisfies the gate, and a PR can change the tests
+- **what the checks check.** Without `autoMergeRequiredChecks`, any one successful check satisfies the gate, and a PR can change the tests
   or the CI configuration it is judged by. Required checks on the base branch that a PR cannot
   redefine are GitHub's to enforce;
 - **`verify` beyond its exit code**, and only for commits the worker pushed;

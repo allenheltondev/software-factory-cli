@@ -162,12 +162,22 @@ async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: 
   if (!checks.complete) return block(`the checks of ${short(sha)} could not all be read (${checks.total} seen), so it is unknown whether they passed`);
   // The worker's own verify commands ran in the worktree the agent left, where ignored files
   // (build output from an earlier step) can make a test pass that would fail on the commit
-  // alone. So a merge also needs a check GitHub ran itself, on a checkout of its own. None
-  // reported is waited for like a pending one: CI often registers a moment after the push.
-  if (checks.total === 0) {
-    return { action: 'wait', reason: `no check has been reported for ${short(sha)}; auto-merge needs at least one GitHub check (CI run independently of the worker) to pass on it` };
-  }
+  // alone. So a merge also needs a check GitHub ran itself, on a checkout of its own, to have
+  // reported success: one that was skipped or ended neutral ran no tests and proves nothing.
+  // With autoMergeRequiredChecks, each named check must be among the successes.
   if (checks.pending.length) return { action: 'wait', reason: `${checks.pending.length} check(s) of ${short(sha)} are pending: ${names(checks.pending)}` };
+  const required = cfg.autoMergeRequiredChecks;
+  const missing = required ? required.filter((name) => !checks.succeeded.includes(name)) : [];
+  if (required ? missing.length > 0 : checks.succeeded.length === 0) {
+    const what = required
+      ? `required check(s) have not reported success on ${short(sha)}: ${names(missing)}`
+      : `no check has reported success on ${short(sha)}; auto-merge needs at least one GitHub check (CI run independently of the worker) to pass on it`;
+    // Waited for like a pending check: CI often registers a moment after the push, and a named
+    // check may come from a workflow that starts later than the others. Without names, checks
+    // that have all finished without a success will not change, so that is final.
+    if (required || checks.total === 0) return { action: 'wait', reason: what };
+    return block(`${what} (${checks.total} check(s) finished, none of them failing; skipped and neutral results do not count as a pass)`);
+  }
   if (live.mergeable === null) return { action: 'wait', reason: 'GitHub has not finished working out whether it can be merged' };
   return { action: 'merge' };
 }

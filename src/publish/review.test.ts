@@ -539,7 +539,7 @@ describe('auto-merge', () => {
 
   it('is blocked by a failing check, records why, comments once and never tries again for that head', async () => {
     const s = await ready();
-    s.gh.checks = { total: 2, failing: ['ci / test'], pending: [], complete: true };
+    s.gh.checks = { total: 2, failing: ['ci / test'], pending: [], succeeded: [], complete: true };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([]);
     expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: `1 check(s) of ${H1.slice(0, 12)} did not pass: ci / test` });
@@ -551,7 +551,7 @@ describe('auto-merge', () => {
     expect(s.stage()).toMatchObject({ stage: 'ready-to-merge', detail: expect.stringMatching(/not merged by Updraft: 1 check/) });
 
     // The check is fixed later: still a person's call for this head.
-    s.gh.checks = { total: 2, failing: [], pending: [], complete: true };
+    s.gh.checks = { total: 2, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
     s.gh.calls.length = 0;
     await s.mergeStep();
     await s.mergeStep();
@@ -562,7 +562,7 @@ describe('auto-merge', () => {
 
   it('does not merge when the checks could not all be read, even though none seen failed', async () => {
     const s = await ready();
-    s.gh.checks = { total: 100, failing: [], pending: [], complete: false };
+    s.gh.checks = { total: 100, failing: [], pending: [], succeeded: ['ci / build'], complete: false };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([]);
     expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/could not all be read \(100 seen\)/) });
@@ -570,13 +570,13 @@ describe('auto-merge', () => {
 
   it('waits for pending checks and merges when they pass', async () => {
     const s = await ready();
-    s.gh.checks = { total: 1, failing: [], pending: ['ci / build'], complete: true };
+    s.gh.checks = { total: 1, failing: [], pending: ['ci / build'], succeeded: [], complete: true };
     await s.mergeStep();
     expect(s.pr()).toMatchObject({ mergeState: 'waiting', mergeReason: expect.stringMatching(/1 check\(s\) .* are pending: ci \/ build/) });
     expect(s.stage().stage).toBe('merging');
     expect(s.gh.writes).toEqual([]);
     s.tick(5 * 60_000);
-    s.gh.checks = { total: 1, failing: [], pending: [], complete: true };
+    s.gh.checks = { total: 1, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
   });
@@ -584,28 +584,57 @@ describe('auto-merge', () => {
   it('does not merge a commit no GitHub check has run on: the worker\'s own verify is not enough', async () => {
     // The verify commands ran in the worktree the agent left; only independent CI tests the commit alone.
     const s = await ready({ action: { verify: ['npm test'] }, verified: true, repo: { autoMergeWaitMinutes: 30 } });
-    s.gh.checks = { total: 0, failing: [], pending: [], complete: true };
+    s.gh.checks = { total: 0, failing: [], pending: [], succeeded: [], complete: true };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([]);
-    expect(s.pr()).toMatchObject({ mergeState: 'waiting', mergeReason: expect.stringMatching(/no check has been reported for 111111111111/) });
+    expect(s.pr()).toMatchObject({ mergeState: 'waiting', mergeReason: expect.stringMatching(/no check has reported success on 111111111111/) });
     // CI that registers a moment after the push is picked up.
-    s.gh.checks = { total: 1, failing: [], pending: [], complete: true };
+    s.gh.checks = { total: 1, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
 
     // A repository with no CI at all: given up on, and left for a person.
     const none = await ready({ repo: { autoMergeWaitMinutes: 30 } });
-    none.gh.checks = { total: 0, failing: [], pending: [], complete: true };
+    none.gh.checks = { total: 0, failing: [], pending: [], succeeded: [], complete: true };
     await none.mergeStep();
     none.tick(31 * 60_000);
     await none.mergeStep();
     expect(none.gh.merges).toEqual([]);
-    expect(none.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/^gave up after waiting 30 minute\(s\): no check has been reported/) });
+    expect(none.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/^gave up after waiting 30 minute\(s\): no check has reported success/) });
+  });
+
+  it('does not count a skipped or neutral check as the independent pass', async () => {
+    // One check run exists and nothing failed, but it was skipped by its workflow condition: no test ran.
+    const s = await ready();
+    s.gh.checks = { total: 1, failing: [], pending: [], succeeded: [], complete: true };
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+    expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/no check has reported success on 111111111111.*skipped and neutral results do not count as a pass/) });
+  });
+
+  it('with autoMergeRequiredChecks, merges only when each named check reported success', async () => {
+    const s = await ready({ repo: { autoMergeRequiredChecks: ['test'], autoMergeWaitMinutes: 30 } });
+    // Another check passed; the one that matters has not reported success (skipped, or not registered yet).
+    s.gh.checks = { total: 2, failing: [], pending: [], succeeded: ['lint'], complete: true };
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+    expect(s.pr()).toMatchObject({ mergeState: 'waiting', mergeReason: expect.stringMatching(/required check\(s\) have not reported success on 111111111111: test/) });
+    s.gh.checks = { total: 2, failing: [], pending: [], succeeded: ['lint', 'test'], complete: true };
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+
+    const never = await ready({ repo: { autoMergeRequiredChecks: ['test'], autoMergeWaitMinutes: 30 } });
+    never.gh.checks = { total: 1, failing: [], pending: [], succeeded: ['lint'], complete: true };
+    await never.mergeStep();
+    never.tick(31 * 60_000);
+    await never.mergeStep();
+    expect(never.gh.merges).toEqual([]);
+    expect(never.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/^gave up after waiting 30 minute\(s\): required check/) });
   });
 
   it('gives up on checks that stay pending past autoMergeWaitMinutes', async () => {
     const s = await ready({ repo: { autoMergeWaitMinutes: 30 } });
-    s.gh.checks = { total: 1, failing: [], pending: ['ci / build'], complete: true };
+    s.gh.checks = { total: 1, failing: [], pending: ['ci / build'], succeeded: [], complete: true };
     await s.mergeStep();
     s.tick(29 * 60_000);
     await s.mergeStep();
@@ -726,7 +755,7 @@ describe('auto-merge', () => {
 
   it('posts the comment about a blocked merge once even when posting it fails at first', async () => {
     const s = await ready();
-    s.gh.checks = { total: 1, failing: ['lint'], pending: [], complete: true };
+    s.gh.checks = { total: 1, failing: ['lint'], pending: [], succeeded: [], complete: true };
     s.gh.failNext.createIssueComment = new GitHubError('POST failed: 503', 503);
     await s.mergeStep();
     expect(s.gh.writes).toEqual([]);
@@ -758,14 +787,14 @@ describe('auto-merge', () => {
 
   it('starts over for a new head: a new review, a new merge decision', async () => {
     const s = await ready();
-    s.gh.checks = { total: 1, failing: ['lint'], pending: [], complete: true };
+    s.gh.checks = { total: 1, failing: ['lint'], pending: [], succeeded: [], complete: true };
     await s.mergeStep();
     expect(s.pr().mergeState).toBe('blocked');
     // A person pushes a fix; it is reviewed and found ready.
     s.push(H2);
     observeHead(s.db, REPO_ID, PR, H2, new Date(s.tick()).toISOString());
     expect(s.stage().stage).toBe('awaiting-review');
-    s.gh.checks = { total: 1, failing: [], pending: [], complete: true };
+    s.gh.checks = { total: 1, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
     await s.round('ready-to-merge');
     await s.mergeStep();
     expect(s.gh.merges).toEqual([{ sha: H2, method: 'squash' }]);

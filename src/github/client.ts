@@ -878,6 +878,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     async getCommitChecks(repo, sha): Promise<CommitChecks> {
       const failing: string[] = [];
       const pending: string[] = [];
+      const succeeded: string[] = [];
       let total = 0;
       // Both listings are paginated. Every page is read, and a listing that could not be read to
       // its end (more pages than this client follows, or fewer entries than GitHub counted) makes
@@ -901,7 +902,8 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
           seenStatuses.add(name);
           total++;
           if (s.state === 'pending') pending.push(name);
-          else if (s.state !== 'success') failing.push(name);
+          else if (s.state === 'success') succeeded.push(name);
+          else failing.push(name);
         }
         next = parseLinkHeader(res.headers.get('link'))['next'];
       }
@@ -922,12 +924,14 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
           total++;
           const name = c.name ?? '(check run)';
           if (c.status !== 'completed') pending.push(name);
-          else if (!['success', 'neutral', 'skipped'].includes(c.conclusion ?? '')) failing.push(name);
+          else if (c.conclusion === 'success') succeeded.push(name);
+          // Skipped and neutral do not block, and do not count as a pass either.
+          else if (!['neutral', 'skipped'].includes(c.conclusion ?? '')) failing.push(name);
         }
         next = parseLinkHeader(res.headers.get('link'))['next'];
       }
       if (runCount !== null && runsSeen < runCount) complete = false;
-      return { total, failing, pending, complete };
+      return { total, failing, pending, succeeded, complete };
     },
 
     async mergePullRequest(repo, pullNumber, input) {

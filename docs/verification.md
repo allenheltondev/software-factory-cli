@@ -148,7 +148,9 @@ never committed. [Auto-merge](review-loop.md) requires an exact pass on the comm
 Ignored files (build output, `node_modules`) are not part of this check. They are not in the
 commit either, so a command that depends on one can pass here and fail on a fresh checkout.
 That is why the worker's verification alone never authorizes a merge: auto-merge also requires
-at least one check that GitHub ran on the commit, on a checkout of its own, to have passed.
+at least one check that GitHub ran on the commit, on a checkout of its own, to have reported
+success (skipped and neutral results do not count), or every check you name in
+`autoMergeRequiredChecks`.
 
 For a containerized agent the worker does not run git inside submodules on the host (a
 submodule's own Git config can name commands to run). Uncommitted files inside a submodule are

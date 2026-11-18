@@ -176,6 +176,9 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       if (repo.autoMergeWaitMinutes !== undefined && repo.autoMerge === undefined) {
         warnings.push({ path: `repositories.${repoName}.autoMergeWaitMinutes`, message: 'has no effect without autoMerge' });
       }
+      if (repo.autoMergeRequiredChecks !== undefined && repo.autoMerge === undefined) {
+        warnings.push({ path: `repositories.${repoName}.autoMergeRequiredChecks`, message: 'has no effect without autoMerge' });
+      }
     } else {
       if (repo.autoMerge !== undefined) {
         warnings.push({

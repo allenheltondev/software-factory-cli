@@ -67,10 +67,11 @@ What the worker and the agents it starts can do, and which guards exist. The
   untrusted code, either of which can be written to talk it into approving. Updraft merges
   only the exact commit that was reviewed (the merge request names it, so GitHub refuses if
   anything was pushed since), only if the worker's own `verify` commands passed on it, only
-  if GitHub reports at least one check on the commit, none failing or pending, and no conflict, only if no allowed actor has
+  if GitHub reports at least one successful check on the commit (or every check named in
+  `autoMergeRequiredChecks`), none failing or pending, and no conflict, only if no allowed actor has
   a "Request changes" review outstanding, and it never forces, bypasses branch protection or
-  retries a refused merge. None of that tells you the reviewer was right: any one passing
-  check satisfies the gate, a PR can change the tests and CI it is judged by, and silence from people
+  retries a refused merge. None of that tells you the reviewer was right: unless you name the
+  required checks any one successful check satisfies the gate, a PR can change the tests and CI it is judged by, and silence from people
   is not approval. Use it only where every allowed actor could push to the base branch anyway,
   and put required checks on that branch in GitHub. See
   [Auto-merge](review-loop.md#auto-merge).

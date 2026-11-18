@@ -199,6 +199,11 @@ export interface CommitChecks {
   /** Names of statuses in state pending and of check runs that have not completed. */
   pending: string[];
   /**
+   * Names of statuses in state success and of check runs that concluded success. A skipped or
+   * neutral check run is in none of the three lists: it neither failed nor showed anything passed.
+   */
+  succeeded: string[];
+  /**
    * False when a listing could not be read to its end. `failing` and `pending` are then only
    * what was seen, and the commit must not be treated as passing.
    */

@@ -76,7 +76,7 @@ describe('createGitHubApi: the review loop', () => {
       fakeFetch((url) => (url.pathname.endsWith('/status') ? json({ state: 'pending', total_count: statuses.length, statuses }) : json({ total_count: runs.length, check_runs: runs })));
     const none = answer([], []);
     const api = await createGitHubApi({ token: 't', fetch: none.fn });
-    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 0, failing: [], pending: [], complete: true });
+    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 0, failing: [], pending: [], succeeded: [], complete: true });
     expect(none.calls.map((c) => c.url)).toEqual([
       `https://api.github.com/repositories/42/commits/${SHA}/status?per_page=100`,
       `https://api.github.com/repositories/42/commits/${SHA}/check-runs?per_page=100`,
@@ -105,6 +105,8 @@ describe('createGitHubApi: the review loop', () => {
       total: 13,
       failing: ['ci/red', 'ci/err', 'test', 'e2e', 'slow', 'gate'],
       pending: ['ci/wait', 'deploy', 'later'],
+      // Skipped and neutral runs (docs, lint) are in no list: they neither failed nor passed.
+      succeeded: ['ci/ok', 'build'],
       complete: true,
     });
   });
@@ -124,7 +126,7 @@ describe('createGitHubApi: the review loop', () => {
         : json({ total_count: 2, check_runs: [{ name: 'late', status: 'in_progress', conclusion: null }] });
     });
     const api = await createGitHubApi({ token: 't', fetch: fn });
-    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 4, failing: ['ci/late-red'], pending: ['late'], complete: true });
+    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 4, failing: ['ci/late-red'], pending: ['late'], succeeded: ['ci/ok', 'build'], complete: true });
     expect(calls.map((c) => new URL(c.url).pathname.split('/').pop() + new URL(c.url).search)).toEqual([
       'status?per_page=100',
       'status?per_page=100&page=2',
@@ -138,7 +140,7 @@ describe('createGitHubApi: the review loop', () => {
     const short = fakeFetch((url) =>
       url.pathname.endsWith('/status') ? json({ total_count: 3, statuses: [{ context: 'ci/ok', state: 'success' }] }) : json({ total_count: 0, check_runs: [] }),
     );
-    expect(await (await createGitHubApi({ token: 't', fetch: short.fn })).getCommitChecks(repo, SHA)).toEqual({ total: 1, failing: [], pending: [], complete: false });
+    expect(await (await createGitHubApi({ token: 't', fetch: short.fn })).getCommitChecks(repo, SHA)).toEqual({ total: 1, failing: [], pending: [], succeeded: ['ci/ok'], complete: false });
 
     const fewerRuns = fakeFetch((url) =>
       url.pathname.endsWith('/status') ? json({ total_count: 0, statuses: [] }) : json({ total_count: 5, check_runs: [{ name: 'build', status: 'completed', conclusion: 'success' }] }),
