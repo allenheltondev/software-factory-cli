@@ -54,3 +54,9 @@ What the worker and the agents it starts can do, and which guards exist. The
   (see [Agent credentials](background-operation.md#agent-credentials)).
 - GitHub access uses `GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`. The CLI
   does not store tokens.
+- With `commentOnFailure`, the worker also comments on the issue when a run fails, as your `gh`
+  account. The comment carries only what the worker itself knows (run id, agent, duration, its
+  own description of the failure with local paths removed, the job branch name, how to retry),
+  never the agent's output or final message, and its text is rendered so it cannot mention
+  users, reference issues or trigger closing keywords. See
+  [Failure comments](failure-comments.md).
