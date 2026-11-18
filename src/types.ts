@@ -93,6 +93,11 @@ export interface Run {
   error: string | null;
   /** What a live agent run left behind; null for log-only and prepare-only runs. */
   summary: RunSummary | null;
+  /**
+   * When the user asked to cancel this run (`factory cancel`). A run closed with this set has no
+   * outcome and its job is 'canceled', whatever the executor reported.
+   */
+  cancelRequestedAt: string | null;
 }
 
 /** Recorded after a live agent run, in run.log and the state DB (`factory status`). */

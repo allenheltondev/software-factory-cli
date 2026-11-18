@@ -3,18 +3,21 @@ import { hostname as osHostname } from 'node:os';
 import type { FactoryConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
 import {
+  CANCELED_BY_USER,
   cancelClaim,
   claimNextJob,
   finishRun,
   getRun,
   heartbeatRun,
   holdsWorkerLock,
+  listCancelRequestedRuns,
   markExecutionStarted,
   releaseClaim,
   setRunProcess,
   setRunSummary,
   WorkerLockLostError,
   type Claim,
+  type FinishedRun,
 } from '../db/queue.js';
 import type { FactoryPaths } from '../paths.js';
 import type { Publisher } from '../publish/publish.js';
@@ -40,9 +43,18 @@ import { reconcileInterruptedRuns } from './reconcile.js';
 
 export { WorkerLockedError } from './lock.js';
 
+/**
+ * How often the worker looks for `factory cancel` requests on the runs it is executing. The
+ * heartbeat (15s) is too slow for someone watching an agent do the wrong thing, and the check is
+ * one indexed query on the local database, skipped while nothing is running.
+ */
+export const CANCEL_CHECK_MS = 2_000;
+
 export interface DaemonTiming {
   /** Lock heartbeat and run-lease refresh interval. Default 15s. */
   heartbeatMs?: number;
+  /** How often to look for user cancel requests on in-flight runs. Default 2s. */
+  cancelCheckMs?: number;
   /** Run lease length. Default 2x the stale-lock threshold (90s). */
   leaseSeconds?: number;
   /** On abort, how long to wait for in-flight runs to finish on their own. Default 20s. */
@@ -144,6 +156,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const processControl = deps.processControl ?? defaultProcessControl;
   const executor = deps.executor ?? new LogOnlyExecutor();
   const heartbeatMs = deps.timing?.heartbeatMs ?? WORKER_HEARTBEAT_MS;
+  const cancelCheckMs = deps.timing?.cancelCheckMs ?? CANCEL_CHECK_MS;
   const leaseSeconds = deps.timing?.leaseSeconds ?? Math.ceil((2 * WORKER_STALE_MS) / 1000);
   const shutdownTimeoutMs = deps.timing?.shutdownTimeoutMs ?? 20_000;
   const interruptGraceMs = deps.timing?.interruptGraceMs ?? 5_000;
@@ -210,16 +223,19 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
           runLog.error('could not record run summary', { error: message(err) });
         }
       }
-      let recorded = false;
+      // What was recorded can differ from what the executor reported: a run the user canceled
+      // closes as canceled even if its agent finished first, and a run another worker already
+      // reconciled is left as that worker recorded it.
+      let finished: FinishedRun | null = null;
       try {
-        finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });
-        recorded = true;
-        runLog.info('run finished', { outcome: result.outcome, ...(result.error ? { error: result.error } : {}) });
+        finished = finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });
+        if (finished?.canceledByUser) runLog.info('run canceled by user', { executorOutcome: result.outcome });
+        else runLog.info('run finished', { outcome: result.outcome, ...(result.error ? { error: result.error } : {}) });
       } catch (err) {
         runLog.error('could not record run result', { error: message(err) });
       }
       // The run is closed (its slot is free); publishing it is a separate step with its own record.
-      if (recorded && result.outcome === 'succeeded' && deps.publisher) {
+      if (finished?.outcome === 'succeeded' && deps.publisher) {
         await deps.publisher.afterRun(run.id, controller.signal);
       }
     })().finally(() => {
@@ -281,9 +297,11 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       // that takes over treats the run as started (interrupted), not as safe to requeue.
       const executionStartedAt = markExecutionStarted(db, run.id, { workerId, now });
       if (!executionStartedAt) {
-        // The lock changed hands after the check above; the new holder may already have
-        // requeued this run, in which case releaseClaim is a no-op.
+        // Either the user canceled the job while it was being checked (releaseClaim then cancels
+        // it instead of requeueing), or the lock changed hands after the check above; the new
+        // holder may already have requeued this run, in which case releaseClaim is a no-op.
         if (!holdsWorkerLock(db, workerId)) markLockLost();
+        if (getRun(db, run.id)?.cancelRequestedAt) log.info('job canceled by user before start', { jobId: job.id, runId: run.id });
         releaseClaim(db, run.id, lockLost ? 'worker lost its lock' : 'run was closed before it started', now);
         if (lockLost) return;
         continue;
@@ -306,6 +324,26 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       for (const runId of inFlight.keys()) heartbeatRun(db, runId, leaseSeconds, now);
     } catch (err) {
       log.error('heartbeat failed', { error: message(err) });
+    }
+  };
+
+  /**
+   * `factory cancel` runs in another process and can only record its request in the database.
+   * Abort the controller of each requested run: the executor stops the agent's process tree
+   * exactly as it does on shutdown, and finishRun then closes the run as canceled. On its own
+   * timer for the same reason as the heartbeat: the loop may be awaiting GitHub.
+   */
+  const checkCancelRequests = () => {
+    if (lockLost || inFlight.size === 0) return;
+    try {
+      for (const runId of listCancelRequestedRuns(db)) {
+        const f = inFlight.get(runId);
+        if (!f || f.controller.signal.aborted) continue;
+        log.info('cancel requested by user; stopping run', { runId, jobId: f.claim.job.id });
+        f.controller.abort(CANCELED_BY_USER);
+      }
+    } catch (err) {
+      log.error('could not check for cancel requests', { error: message(err) });
     }
   };
 
@@ -340,6 +378,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   };
 
   const heartbeatTimer = setInterval(heartbeat, heartbeatMs);
+  const cancelTimer = setInterval(checkCancelRequests, cancelCheckMs);
   try {
     await reconcileInterruptedRuns(db, { hostname, processControl, log, now });
 
@@ -365,6 +404,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     }
   } finally {
     log.info('worker stopping', { inFlight: inFlight.size });
+    clearInterval(cancelTimer);
     await shutdown();
     clearInterval(heartbeatTimer);
     releaseWorkerLock(db, workerId);

@@ -65,8 +65,8 @@ export function getCheckpoint(db: Db, repoId: number): Checkpoint | null {
 }
 
 /**
- * In ONE transaction: insert jobs (ignoring duplicates on repo_id+workflow_id+event_id)
- * and advance the repo checkpoint. Returns the jobs actually inserted, in batch order.
+ * In ONE transaction: insert jobs (ignoring duplicates on repo_id+workflow_id+event_id, among
+ * existing jobs and jobs since pruned) and advance the repo checkpoint. Returns the jobs actually inserted, in batch order.
  * The stored last_event_id never moves backwards. `subscriptionStart` is written only
  * when the checkpoint is first created and never changes afterwards.
  */
@@ -90,11 +90,14 @@ export function commitPollBatch(
   const at = nowIso(batch.now);
   // Ignore only duplicates of the dedupe key. Plain INSERT OR IGNORE would also swallow
   // NOT NULL / CHECK / primary-key violations and silently drop a job.
+  // The dedupe key of a job that `factory clean --older-than` deleted lives on in pruned_events;
+  // an event listed there already had its job and is never enqueued again.
   const insert = db.prepare(
     `INSERT INTO jobs
        (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope,
         status, status_reason, attempts, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, 0, ?, ?)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, 0, ?, ?
+     WHERE NOT EXISTS (SELECT 1 FROM pruned_events WHERE repo_id = ? AND workflow_id = ? AND event_id = ?)
      ON CONFLICT (repo_id, workflow_id, event_id) DO NOTHING`,
   );
   const upsert = db.prepare(
@@ -137,6 +140,9 @@ export function commitPollBatch(
         JSON.stringify(j.envelope),
         at,
         at,
+        j.repoId,
+        j.workflowId,
+        j.eventId,
       );
       if (Number(res.changes) > 0) {
         inserted.push({

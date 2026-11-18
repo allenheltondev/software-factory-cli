@@ -18,7 +18,7 @@ import { buildStatusView, renderStatus } from '../commands/status.js';
 import { cleanVerdict } from '../commands/clean.js';
 import { agentSchema, configSchema, type FactoryConfig } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
-import { claimNextJob, finishRun, getJob, getRun, getStatusSnapshot, markExecutionStarted, setRunProcess, type Claim } from '../db/queue.js';
+import { CANCELED_BY_USER, claimNextJob, finishRun, getJob, getRun, getStatusSnapshot, markExecutionStarted, setRunProcess, type Claim } from '../db/queue.js';
 import { worktreesRoot } from '../git/worktree.js';
 import { resolvePaths, type FactoryPaths } from '../paths.js';
 import type { IssueSnapshot } from '../types.js';
@@ -305,6 +305,27 @@ describe('LiveExecutor (fake adapter)', { timeout: 120_000 }, () => {
     const result = await running;
     expect(result).toMatchObject({ outcome: 'interrupted', error: expect.stringMatching(/worker stopped before the run finished/) });
     await expectDead(pids.agent, pids.child);
+  });
+
+  it('stops the agent tree when the user cancels the run, and says so in the log', async () => {
+    const { f, paths, config, db, agent } = setup();
+    const pidsFile = join(f.root, 'cancel pids.json');
+    config.agents.claude = agentSchema.parse(agent('hang', { args: ['--mode', 'hang', '--pids-file', pidsFile] }));
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 11 });
+    const c = claim(db, config, paths);
+    const cancel = new AbortController();
+    const running = new LiveExecutor({ killGraceMs: 2_000 }).execute(c, context(db, config, paths, c.run.id, { signal: cancel.signal }));
+    const pids = await readPids(pidsFile);
+    cancel.abort(CANCELED_BY_USER); // what the daemon does for `factory cancel`
+    const result = await running;
+    // Reported as a stop; the daemon's finishRun records it as canceled.
+    expect(result).toMatchObject({ outcome: 'interrupted', error: 'canceled by user before the run finished; the agent process tree was stopped' });
+    await expectDead(pids.agent, pids.child);
+    const text = readFileSync(c.run.logPath!, 'utf8');
+    expect(text).toContain('canceled by user before the run finished');
+    expect(text).not.toContain('worker stopped');
+    // The worktree is kept: the agent may have left work in it.
+    expect(existsSync(getRun(db, c.run.id)!.checkoutPath!)).toBe(true);
   });
 
   it.runIf(!isWindows)('stops processes the agent left running in its process group after it exits', async () => {

@@ -57,7 +57,7 @@ describe('renderStatus', () => {
       ],
       activeRuns: [
         {
-          run: { id: 'run_1', agent: 'claude', pool: 'general', startedAt: 't2', executionStartedAt: 't2b' } as never,
+          run: { id: 'run_1', agent: 'claude', pool: 'general', startedAt: 't2', executionStartedAt: 't2b', cancelRequestedAt: 't2c' } as never,
           job: job({ id: 'job_2', status: 'running', issueNumber: 7 }),
         },
         {
@@ -91,7 +91,7 @@ describe('renderStatus', () => {
     expect(text).toMatch(/codex\s+disabled\s+0\/1 running/);
     expect(text).toContain('Queue: queued 2, running 1, succeeded 3, failed 1, interrupted 0, canceled 0');
     expect(text).toContain('run_1  o/a#7');
-    expect(text).toMatch(/run_1 .*agent claude \(pool general\)  running since t2b/);
+    expect(text).toMatch(/run_1 .*agent claude \(pool general\)  running since t2b, cancel requested$/m);
     expect(text).toMatch(/run_2 .*agent kiro \(pool general\)  claimed t6, not started yet/);
     expect(text).toContain('job_1  failed       o/a#12');
     expect(text).toContain('— agent exited 1');

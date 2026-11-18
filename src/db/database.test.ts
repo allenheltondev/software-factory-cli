@@ -125,9 +125,27 @@ describe('migration v6', () => {
       `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at, ended_at, outcome)
        VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'wrk_1', 't', 't', 't', 'succeeded')`,
     ).run();
-    migrate(db);
+    migrate(db, 6);
     expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 6 });
     expect(db.prepare('SELECT count(*) AS n FROM publications').get()).toEqual({ n: 0 });
     expect(db.prepare('SELECT outcome FROM runs').get()).toEqual({ outcome: 'succeeded' });
+  });
+});
+
+describe('migration v7', () => {
+  it('adds an unset cancel request to existing runs and an empty pruned_events table', () => {
+    const db = openDatabase(':memory:', { migrateTo: 6 });
+    db.prepare(
+      `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
+       VALUES ('job_1', 1, 'o/r', 'wf', 'e1', 1, 'implement-issue', 'general', '{}', 'running', 1, 't', 't')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at)
+       VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'wrk_1', 't', 't')`,
+    ).run();
+    migrate(db, 7);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 7 });
+    expect(db.prepare('SELECT cancel_requested_at FROM runs').get()).toEqual({ cancel_requested_at: null });
+    expect(db.prepare('SELECT count(*) AS n FROM pruned_events').get()).toEqual({ n: 0 });
   });
 });
