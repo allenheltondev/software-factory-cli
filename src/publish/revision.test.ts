@@ -595,7 +595,11 @@ describe('the worker side', { timeout: 120_000 }, () => {
     expect(second.status).toBe('queued');
 
     const seen: string[] = [];
-    const inner: Publisher = { afterRun: async (id) => void seen.push(id), retryDue: async () => void seen.push('retryDue') };
+    const inner: Publisher = {
+      afterRun: async (id) => void seen.push(id),
+      retryDue: async () => void seen.push('retryDue'),
+      sweepUnpublished: async () => void seen.push('sweep'),
+    };
     const api = new FakeCommentsApi();
     api.failNext.listIssueComments = new GitHubError('GET ... failed: 503', 503);
     const config = makeConfig(p.f);

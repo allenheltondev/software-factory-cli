@@ -297,3 +297,17 @@ describe('migration v11', () => {
     expect(() => db.prepare("UPDATE revision_prs SET merge_state = 'forced' WHERE pr_number = 5").run()).toThrow(/CHECK/i);
   });
 });
+
+describe('migration v12', () => {
+  it('adds an empty publish_settings table to a v11 database, so publish counts as turned on at the next start', () => {
+    const db = openDatabase(':memory:', { migrateTo: 11 });
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 });
+    migrate(db, 12);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 12 });
+    expect(db.prepare('SELECT count(*) AS n FROM publish_settings').get()).toEqual({ n: 0 });
+    // The tables the earlier migrations made are untouched.
+    for (const table of ['failure_comments', 'pruned_events', 'revisions', 'pr_reviews']) {
+      expect(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
+    }
+  });
+});

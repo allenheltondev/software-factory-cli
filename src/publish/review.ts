@@ -427,6 +427,9 @@ export function createReviewLoopPublisher(deps: PublishDeps, inner?: Publisher):
   return {
     // Not an async function: `inner` (the revision push) must create its row before this returns to the worker.
     afterRun: (runId, signal) => (isReviewRun(runId) ? post(runId, signal) : (inner?.afterRun(runId, signal) ?? Promise.resolve())).then(schedule),
+    async sweepUnpublished(signal, opts) {
+      await inner?.sweepUnpublished(signal, opts);
+    },
     async retryDue(signal) {
       await inner?.retryDue(signal);
       let due: string[] = [];

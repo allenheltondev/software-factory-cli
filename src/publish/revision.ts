@@ -565,6 +565,10 @@ export function createRevisionPublisher(deps: PublishDeps, inner?: Publisher): P
   return {
     // Not an async function: reviseRun must create its row before this returns to the worker.
     afterRun: (runId, signal) => (isRevisionRun(runId) ? revise(runId, signal) : (inner?.afterRun(runId, signal) ?? Promise.resolve())),
+    // First publications only: a revision's push has its own record and its own retries.
+    async sweepUnpublished(signal, opts) {
+      await inner?.sweepUnpublished(signal, opts);
+    },
     async retryDue(signal) {
       await inner?.retryDue(signal);
       let due: string[];

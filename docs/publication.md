@@ -86,12 +86,46 @@ GitHub again nor change the recorded state.
 Network errors, GitHub 5xx responses and rate limits are retried by the worker
 on its own after each poll, with backoff, up to five attempts. Other failures wait for you:
 `updraft status` shows the error, and `updraft publish RUN_ID` retries through the same path.
-`updraft publish` also publishes a succeeded run the worker did not publish, for example one
-from before you turned `publish` on. Permission errors say what is needed: push access to the
+Permission errors say what is needed: push access to the
 repository and a token with the classic `repo` scope, or a fine-grained token with Contents,
 Pull requests and Issues set to read and write (`gh auth refresh -h github.com -s repo`).
 GitHub refuses draft PRs for private repositories on some plans; publication then fails with
 a message to set `publish: pr`. It never falls back on its own.
+
+## Startup sweep
+
+If the worker stops after a run succeeded but before its publication began (a crash, a kill,
+a reboot), the run has no publication record and the retries above never see it. So each time
+the worker starts, after it has closed runs left open by the previous worker, it publishes
+succeeded runs that have no publication record, through the same idempotent path, up to 10 per
+start, oldest first; the rest wait for the next start.
+
+A run is swept only when all of these hold:
+
+- it still qualifies under the current config (live mode, a `local-branch` action, `publish`
+  on, at least one commit), and it is a first publication: revision and reviewer runs are
+  never swept;
+- it **ended at or after the time `publish` was turned on** for its repository, so turning
+  `publish` on never publishes older runs by surprise;
+- it recorded the commit it ended on. The sweep pushes that commit or nothing: if the job
+  branch moved after the run (someone committed to it before the worker came back), the
+  publication is recorded as failed and nothing is pushed. A run from a version that did not
+  record its end commit is left alone.
+
+The config file has no history, so the state DB records when `publish` was turned on: when
+`updraft start`, `updraft status` or `updraft publish` loads the config and finds `publish`
+changed from `none` to `draft-pr` or `pr` (or a repository newly configured with it), that
+moment counts as turning it on. Switching between `draft-pr` and `pr` keeps it; setting `none`
+(or removing the repository) clears it, so turning `publish` off and on again starts over.
+Turning it off stops new publications (the sweep's included) and automatic retries once the
+worker runs with that config (it reads the config when it starts); existing publication
+records are left as they are. A repository that already had `publish` on when this version
+first ran counts as turned on at that first start, so runs stranded before the upgrade are not
+swept.
+
+These publications are logged as coming from the startup sweep, in the worker log and in
+`run.log`. `updraft publish RUN_ID` still publishes any other succeeded run, for example one
+from before you turned `publish` on.
 
 `updraft status` shows each run's PR link or publication error, and `updraft doctor` checks
 that the active account has push access to every repository with `publish` set.

@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -418,6 +418,19 @@ const MIGRATIONS: Record<number, Migration> = {
     );
     CREATE INDEX pr_reviews_by_state ON pr_reviews (state, next_attempt_at);
     CREATE INDEX pr_reviews_by_pr ON pr_reviews (repo_id, pr_number, created_at);
+  `,
+  12: `
+    -- Each repository's publish setting as the CLI last saw it, keyed by GitHub repo id. The config
+    -- file has no history, so this records when publication was turned on (off -> draft-pr/pr);
+    -- turning it off clears enabled_at, and switching between draft-pr and pr keeps it. The
+    -- worker's startup sweep only publishes runs that ended at or after enabled_at.
+    CREATE TABLE publish_settings (
+      repo_id        INTEGER PRIMARY KEY,
+      repo_full_name TEXT    NOT NULL,
+      mode           TEXT    NOT NULL CHECK (mode IN ('none','draft-pr','pr')),
+      enabled_at     TEXT,               -- NULL while mode = 'none'
+      updated_at     TEXT    NOT NULL
+    );
   `,
 };
 

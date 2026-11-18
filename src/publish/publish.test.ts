@@ -10,6 +10,7 @@ import { fakeContext } from '../commands/fakes.js';
 import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getPublication } from '../db/publications.js';
+import { getPublishSetting, syncPublishSettings } from '../db/publish-settings.js';
 import { getJob, getRun } from '../db/queue.js';
 import { GitError, runGit, type GitOptions } from '../git/git.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree } from '../git/worktree.js';
@@ -23,7 +24,7 @@ import {
 import { GitHubAppError } from '../github/app-auth.js';
 import type { UpdraftPaths } from '../paths.js';
 import type { RepoRef, RunOutcome } from '../types.js';
-import { silentLogger } from '../util/log.js';
+import { createLogger, silentLogger } from '../util/log.js';
 import { summarizeRun } from '../worker/run-summary.js';
 import {
   createPublisher,
@@ -779,6 +780,198 @@ describe('createPublisher', { timeout: 60_000 }, () => {
   });
 });
 
+describe('startup sweep', { timeout: 60_000 }, () => {
+  /** Record the publish setting as the CLI would on loading `config` at `at`. */
+  const observe = (db: Db, config: UpdraftConfig, at: number) => syncPublishSettings(db, config, () => at);
+  const capture = () => {
+    const lines: string[] = [];
+    const stream = { write: (c: string) => (lines.push(c), true) } as unknown as NodeJS.WritableStream;
+    return { log: createLogger({ stream, level: 'debug' }), text: () => lines.join('') };
+  };
+
+  it('publishes a succeeded run left without a publication (crash gap) when it ended after publish was enabled', async () => {
+    const s = await scenario(); // ended at T0
+    const config = makeConfig(s.f);
+    observe(s.db, config, T0 - 60_000);
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    const out = capture();
+    await createPublisher(deps(s, api, { config, log: out.log })).sweepUnpublished();
+
+    expect(getPublication(s.db, s.runId)).toMatchObject({ state: 'published', mode: 'draft-pr', attempts: 1 });
+    expect(remoteSha(s)).toBe(s.localSha);
+    expect(api.pulls).toHaveLength(1);
+    expect(api.comments).toHaveLength(1);
+    expect(readFileSync(s.logPath, 'utf8')).toContain('publication: attempt 1 (draft-pr, startup sweep)');
+    expect(out.text()).toMatch(new RegExp(`startup sweep: publishing a succeeded run that has no publication record .*runId=${s.runId}`));
+    expect(out.text()).toMatch(/INFO {2}published .*source=startup sweep/);
+
+    // Running it again changes nothing: the run has a publication record now.
+    await createPublisher(deps(s, api, { config })).sweepUnpublished();
+    expect(api.creates).toHaveLength(2);
+  });
+
+  it('a run that ended at the enable time counts; one that ended before it is never published by surprise', async () => {
+    const before = await scenario(); // ended at T0
+    const config = makeConfig(before.f);
+    observe(before.db, config, T0 + 1);
+    const api = new FakePublishApi();
+    await createPublisher(deps(before, api, { config })).sweepUnpublished();
+    expect(getPublication(before.db, before.runId)).toBeNull();
+    expect(remoteSha(before)).toBeNull();
+    expect(api.calls).toEqual([]);
+
+    const atEnable = await scenario();
+    observe(atEnable.db, makeConfig(atEnable.f, { publish: 'none' }), T0 - 1);
+    observe(atEnable.db, makeConfig(atEnable.f), T0);
+    await createPublisher(deps(atEnable, new FakePublishApi(), { config: makeConfig(atEnable.f) })).sweepUnpublished();
+    expect(getPublication(atEnable.db, atEnable.runId)?.state).toBe('published');
+  });
+
+  it('turning publish off and on again resets enabled_at, so runs from before the new enable are skipped', async () => {
+    const s = await scenario(); // ended at T0
+    const on = makeConfig(s.f);
+    const off = makeConfig(s.f, { publish: 'none' });
+    observe(s.db, on, T0 - 60_000);
+    expect(getPublishSetting(s.db, REPO_ID)).toMatchObject({ mode: 'draft-pr', enabledAt: new Date(T0 - 60_000).toISOString() });
+    observe(s.db, off, T0 - 30_000);
+    expect(getPublishSetting(s.db, REPO_ID)).toMatchObject({ mode: 'none', enabledAt: null });
+    observe(s.db, on, T0 + 30_000);
+    expect(getPublishSetting(s.db, REPO_ID)).toMatchObject({ mode: 'draft-pr', enabledAt: new Date(T0 + 30_000).toISOString() });
+
+    const api = new FakePublishApi();
+    await createPublisher(deps(s, api, { config: on })).sweepUnpublished();
+    expect(getPublication(s.db, s.runId)).toBeNull();
+    expect(api.calls).toEqual([]);
+  });
+
+  it('switching between draft-pr and pr keeps enabled_at, and the run is published in the current mode', async () => {
+    const s = await scenario(); // ended at T0
+    observe(s.db, makeConfig(s.f), T0 - 60_000);
+    const pr = makeConfig(s.f, { publish: 'pr' });
+    expect(observe(s.db, pr, T0 + 30_000)).toEqual([
+      { repoId: REPO_ID, repoFullName: FULL, from: 'draft-pr', to: 'pr', enabledAt: new Date(T0 - 60_000).toISOString() },
+    ]);
+    expect(getPublishSetting(s.db, REPO_ID)).toMatchObject({ mode: 'pr', enabledAt: new Date(T0 - 60_000).toISOString() });
+    observe(s.db, makeConfig(s.f), T0 + 40_000);
+    observe(s.db, pr, T0 + 50_000);
+    expect(getPublishSetting(s.db, REPO_ID)?.enabledAt).toBe(new Date(T0 - 60_000).toISOString());
+
+    const api = new FakePublishApi();
+    await createPublisher(deps(s, api, { config: pr })).sweepUnpublished();
+    expect(getPublication(s.db, s.runId)).toMatchObject({ state: 'published', mode: 'pr' });
+    expect(api.pulls[0]!.draft).toBe(false);
+  });
+
+  it('skips runs that are not eligible: failed, no commits, publish off now, not live, not a local-branch action', async () => {
+    const failed = await scenario({ outcome: 'failed' });
+    const { f, db } = failed;
+    const noCommits = await scenario({ f, db, commits: 0 });
+    const ok = await scenario({ f, db });
+    const config = makeConfig(f);
+    observe(db, config, T0 - 60_000);
+    const api = new FakePublishApi();
+
+    // Publish is off in the config the worker runs with, even though the record still says on.
+    await createPublisher(deps(ok, api, { config: makeConfig(f, { publish: 'none' }) })).sweepUnpublished();
+    await createPublisher(deps(ok, api, { config: makeConfig(f, {}, { execution: { mode: 'prepare-only' } }) })).sweepUnpublished();
+    await createPublisher(
+      deps(ok, api, { config: makeConfig(f, {}, { actions: { 'implement-issue': { prompt: './prompt.md', output: 'log' } } }) }),
+    ).sweepUnpublished();
+    expect(api.calls).toEqual([]);
+    for (const s of [failed, noCommits, ok]) expect(getPublication(db, s.runId)).toBeNull();
+
+    // Once the record says off too, nothing is a candidate any more.
+    observe(db, makeConfig(f, { publish: 'none' }), T0 + 1);
+    await createPublisher(deps(ok, api, { config })).sweepUnpublished();
+    expect(api.calls).toEqual([]);
+
+    // Back on, enabled after these runs ended: still nothing. Only the eligible run, once it counts.
+    observe(db, config, T0 + 2);
+    await createPublisher(deps(ok, api, { config })).sweepUnpublished();
+    expect(api.calls).toEqual([]);
+    db.prepare('UPDATE publish_settings SET enabled_at = ?').run(new Date(T0 - 1).toISOString());
+    await createPublisher(deps(ok, api, { config })).sweepUnpublished();
+    expect(getPublication(db, ok.runId)?.state).toBe('published');
+    // The failed and the zero-commit run get no publication record at all (not even "skipped").
+    expect(getPublication(db, failed.runId)).toBeNull();
+    expect(getPublication(db, noCommits.runId)).toBeNull();
+    expect(api.pulls).toHaveLength(1);
+  });
+
+  it('leaves published runs and failed publications to the existing retry logic', async () => {
+    const done = await scenario();
+    const { f, db } = done;
+    const refused = await scenario({ f, db });
+    const later = await scenario({ f, db });
+    const config = makeConfig(f);
+    observe(db, config, T0 - 60_000);
+    const api = new FakePublishApi();
+    expect((await publishRun(deps(done, api, { config }), done.runId)).status).toBe('published');
+    api.failNext.createPullRequest = new GitHubError('POST pulls failed: 403 Resource not accessible', 403);
+    expect((await publishRun(deps(refused, api, { config }), refused.runId)).status).toBe('failed');
+    api.failNext.createPullRequest = new GitHubError('POST pulls failed: 503', 503);
+    expect((await publishRun(deps(later, api, { config }), later.runId)).status).toBe('failed');
+    const before = api.calls.length;
+
+    await createPublisher(deps(done, api, { config })).sweepUnpublished();
+    expect(api.calls.length).toBe(before);
+    expect(getPublication(db, done.runId)).toMatchObject({ state: 'published', attempts: 1 });
+    expect(getPublication(db, refused.runId)).toMatchObject({ state: 'failed', retryable: false, attempts: 1 });
+    expect(getPublication(db, later.runId)).toMatchObject({ state: 'failed', retryable: true, attempts: 1 });
+  });
+
+  it('publishes at most the limit, oldest first', async () => {
+    const newer = await scenario();
+    const { f, db } = newer;
+    const older = await scenario({ f, db });
+    db.prepare('UPDATE runs SET ended_at = ? WHERE id = ?').run(new Date(T0 - 1_000).toISOString(), older.runId);
+    const config = makeConfig(f);
+    observe(db, config, T0 - 60_000);
+    const out = capture();
+    await createPublisher(deps(newer, new FakePublishApi(), { config, log: out.log })).sweepUnpublished(undefined, { limit: 1 });
+    expect(getPublication(db, older.runId)?.state).toBe('published');
+    expect(getPublication(db, newer.runId)).toBeNull();
+    expect(out.text()).toMatch(/startup sweep: limit reached.*unchecked=1/);
+  });
+
+  it('does not publish a stranded run whose branch moved before the restart: that commit is not the run\'s', async () => {
+    const s = await scenario(); // ended at T0
+    const config = makeConfig(s.f);
+    observe(s.db, config, T0 - 60_000);
+    // Committed on the job branch after the run succeeded and before the worker came back.
+    const worktree = getRun(s.db, s.runId)!.checkoutPath!;
+    writeFileSync(join(worktree, 'late.txt'), 'added after the run\n');
+    s.f.git(worktree, 'add', '.');
+    s.f.git(worktree, 'commit', '--quiet', '-m', 'late change');
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    await createPublisher(deps(s, api, { config })).sweepUnpublished();
+
+    expect(remoteSha(s)).toBeNull();
+    expect(api.pulls).toEqual([]);
+    expect(getPublication(s.db, s.runId)).toMatchObject({ state: 'failed', retryable: false, error: expect.stringMatching(/where run .* ended/) });
+  });
+
+  it('leaves a run that does not record the commit it ended on to "updraft publish"', async () => {
+    const s = await scenario(); // ended at T0
+    const config = makeConfig(s.f);
+    observe(s.db, config, T0 - 60_000);
+    // A run recorded by a version that did not store the head commit: nothing to hold the push to.
+    const summary = { ...getRun(s.db, s.runId)!.summary! };
+    delete summary.headSha;
+    s.db.prepare('UPDATE runs SET summary = ? WHERE id = ?').run(JSON.stringify(summary), s.runId);
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    const out = capture();
+    await createPublisher(deps(s, api, { config, log: out.log })).sweepUnpublished();
+
+    expect(getPublication(s.db, s.runId)).toBeNull();
+    expect(remoteSha(s)).toBeNull();
+    expect(api.calls).toEqual([]);
+    expect(out.text()).toMatch(/does not record the commit it ended on/);
+    // Asked for by a person, it is still published.
+    expect((await publishRun(deps(s, api, { config }), s.runId)).status).toBe('published');
+  });
+});
+
 describe('updraft publish', { timeout: 60_000 }, () => {
   it('publishes a succeeded run through the same idempotent path, then reports it as already published', async () => {
     const f = createGitFixture(FULL);
@@ -818,6 +1011,10 @@ describe('updraft publish', { timeout: 60_000 }, () => {
     const s = await scenario({ f, db, outcome: 'failed' });
     db.close();
     await expect(publishCommand(ctx, s.runId, { fileExists: () => true, token: async () => TOKEN })).rejects.toThrow(/only succeeded runs are published/);
+    // Loading the config also recorded when publish was turned on, for the worker's startup sweep.
+    const after = openDatabase(ctx.paths.dbFile);
+    dbs.push(after);
+    expect(getPublishSetting(after, REPO_ID)).toMatchObject({ mode: 'draft-pr', enabledAt: new Date(ctx.now()).toISOString() });
   });
 });
 

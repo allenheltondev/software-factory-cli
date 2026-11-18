@@ -330,6 +330,7 @@ describe('runDaemon', () => {
       retryDue: async () => {
         retries++;
       },
+      sweepUnpublished: async () => {},
     };
     const deps = baseDeps(db, { executor, publisher });
     const failing = insertJob(db, { issue: 1 });
@@ -373,6 +374,7 @@ describe('runDaemon', () => {
       retryDue: async () => {
         retries++;
       },
+      sweepUnpublished: async () => {},
     };
     const deps = baseDeps(db, { executor, failureCommenter, config: makeConfig({ maxConcurrent: 1 }) });
     const jobs = [1, 2, 3, 4].map((issue) => insertJob(db, { issue }));
@@ -458,6 +460,40 @@ describe('runDaemon', () => {
       { run_id: (db.prepare('SELECT id FROM runs WHERE job_id = ?').get(failing!) as { id: string }).id, state: 'posted' },
       { run_id: startRuns.at(-1)!.id, state: 'posted' },
     ]);
+  });
+
+  it('at start, records the publish settings and sweeps unpublished runs once, after reconcile and before the first poll', async () => {
+    const db = openDatabase(':memory:');
+    const workflows = [{ trigger: { event: 'issue.labeled' as const, label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }];
+    const config = makeConfig({ repositories: { 'owner/repo': { id: 1, publish: 'draft-pr', workflows } } });
+    // A previous worker crashed mid-run; reconcile closes that run.
+    acquireWorkerLock(db, { workerId: 'wrk_old', pid: 4000, hostname: 'host-a' }, { now: () => Date.now(), isPidAlive: () => true });
+    insertJob(db);
+    const claim = claimNextJob(db, config, { workerId: 'wrk_old', hostname: 'host-a', leaseSeconds: 60, runsDir: join('x', 'runs') })!;
+    markExecutionStarted(db, claim.run.id, { workerId: 'wrk_old' });
+
+    const events: string[] = [];
+    const publisher = {
+      afterRun: async () => {},
+      retryDue: async () => {
+        events.push('retryDue');
+      },
+      sweepUnpublished: async () => {
+        const setting = db.prepare('SELECT mode, enabled_at FROM publish_settings WHERE repo_id = 1').get() as { mode: string; enabled_at: string };
+        events.push(`sweep (left-over run ${getRun(db, claim.run.id)?.outcome}, publish ${setting.mode} since ${setting.enabled_at})`);
+      },
+    };
+    const deps = baseDeps(db, {
+      config,
+      publisher,
+      now: () => T0,
+      poll: async () => {
+        events.push('poll');
+        deps.controller.abort();
+      },
+    });
+    await runDaemon(deps);
+    expect(events).toEqual([`sweep (left-over run interrupted, publish draft-pr since ${new Date(T0).toISOString()})`, 'poll']);
   });
 
   it('records poll failures and keeps running', async () => {
@@ -677,6 +713,7 @@ describe('runDaemon: updraft cancel', () => {
           published.push(runId);
         },
         retryDue: async () => {},
+        sweepUnpublished: async () => {},
       },
     };
   };

@@ -464,6 +464,7 @@ describe('postReview', () => {
     const publisher = createReviewLoopPublisher(s.deps, {
       afterRun: async (runId) => void inner.push(runId),
       retryDue: async () => void inner.push('retryDue'),
+      sweepUnpublished: async () => void inner.push('sweep'),
     });
     // After the code run's publication: the reviewer job is there without any request.
     await publisher.afterRun('run_original');

@@ -19,6 +19,7 @@ import {
   type Claim,
   type FinishedRun,
 } from '../db/queue.js';
+import { syncPublishSettings } from '../db/publish-settings.js';
 import type { UpdraftPaths } from '../paths.js';
 import type { FailureCommenter } from '../publish/failure-comment.js';
 import type { Publisher } from '../publish/publish.js';
@@ -403,6 +404,19 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const cancelTimer = setInterval(checkCancelRequests, cancelCheckMs);
   try {
     await reconcileInterruptedRuns(db, { hostname, processControl, containers, log, now });
+
+    // Record when publish was turned on or off per repository (the config has no history), then
+    // publish succeeded runs a previous worker stopped before publishing, if they ended since.
+    let settingsSynced = false;
+    try {
+      for (const c of syncPublishSettings(db, config, now)) {
+        log.info('publish setting changed', { repo: c.repoFullName, from: c.from, to: c.to, enabledAt: c.enabledAt });
+      }
+      settingsSynced = true;
+    } catch (err) {
+      log.error('could not record publish settings; skipping the startup publication sweep', { error: message(err) });
+    }
+    if (settingsSynced && deps.publisher && !signal.aborted && !lockLost) await deps.publisher.sweepUnpublished(signal);
 
     let nextPollAt = now();
     while (!signal.aborted && !lockLost) {

@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import type { FailureComment } from '../db/failure-comments.js';
 import type { PrReview, PrStage } from '../db/pr-reviews.js';
+import { syncPublishSettings } from '../db/publish-settings.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
 import type { ReviewRequest } from '../db/revisions.js';
 import { reviewOf, revisionOf, type Job, type JobStatus, type Publication, type Revision } from '../types.js';
@@ -378,6 +379,14 @@ export async function statusCommand(ctx: CommandContext, opts: { json?: boolean 
   const db = ctx.openDb(dbExists ? ctx.paths.dbFile : ':memory:');
   let snapshot: StatusSnapshot;
   try {
+    // Note when publish was turned on or off since the CLI last read the config (startup sweep).
+    if (dbExists && config) {
+      try {
+        syncPublishSettings(db, config, ctx.now);
+      } catch {
+        // status is read-mostly; the worker records it at start anyway
+      }
+    }
     snapshot = getStatusSnapshot(db, config ?? emptyConfig(), ctx.now);
   } finally {
     db.close();
