@@ -43,9 +43,12 @@
  * closes before completion, Kiro exits with a nonzero status" (https://kiro.dev/docs/cli/headless/).
  * The summary is the run's last output lines (the executor's default).
  *
- * Authentication: "Headless mode requires an API key set as the KIRO_API_KEY environment
- * variable" (https://kiro.dev/docs/cli/headless/). The worker passes its environment through, so
- * the key belongs in the worker's runtime environment, not in agents.<name>.env (see docs/agents/kiro.md).
+ * Authentication: KIRO_API_KEY ("Headless mode requires an API key set as the KIRO_API_KEY
+ * environment variable", https://kiro.dev/docs/cli/headless/), or a `kiro-cli login` session for
+ * the worker's user, which headless runs also accept (verified with kiro-cli 3.5.0 and IAM
+ * Identity Center; see kiroAuth in ../discovery.ts). The worker passes its environment through,
+ * so a key belongs in the worker's runtime environment, not in agents.<name>.env (see
+ * docs/agents/kiro.md).
  */
 import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';

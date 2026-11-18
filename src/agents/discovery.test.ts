@@ -287,6 +287,7 @@ describe('discoverAgents on macOS and Linux', () => {
       'C:\\node',
       'C:\\Users\\j\\.local\\bin',
       'C:\\Users\\j\\AppData\\Local\\Microsoft\\WinGet\\Links',
+      'C:\\Users\\j\\AppData\\Local\\Kiro-Cli',
     ]);
   });
 });
@@ -321,10 +322,38 @@ describe('sign-in checks', () => {
   it('kiro: KIRO_API_KEY presence, without running the CLI for auth', async () => {
     const m = linux(() => undefined, { KIRO_API_KEY: 'k' });
     const [r] = await discoverAgents(m, { adapters: ['kiro'] });
-    expect(r).toMatchObject({ signedIn: 'yes', usable: true });
+    expect(r).toMatchObject({ signedIn: 'yes', auth: 'KIRO_API_KEY is set', usable: true });
     expect(m.calls.map((c) => c.args)).toEqual([['--version']]);
-    const [none] = await discoverAgents(linux(() => undefined), { adapters: ['kiro'] });
-    expect(none).toMatchObject({ signedIn: 'no', usable: false });
+  });
+
+  it('kiro: without the key, a kiro-cli login session counts (whoami)', async () => {
+    // Real kiro-cli 3.5.0 output for an IAM Identity Center sign-in.
+    const whoami = 'Logged in with IAM Identity Center (https://example.awsapps.com/start)\nEmail: jane@example.com\n\nProfile:\nJane\n';
+    const m = linux((_f, a) => (a[0] === 'whoami' ? ok(whoami) : undefined));
+    const [r] = await discoverAgents(m, { adapters: ['kiro'] });
+    expect(r).toMatchObject({ signedIn: 'yes', auth: 'Logged in with IAM Identity Center (https://example.awsapps.com/start)', usable: true });
+    expect(r?.auth).not.toMatch(/jane@example\.com/);
+    expect(r?.notes.join()).toMatch(/login session, which expires/);
+    expect(m.calls.map((c) => c.args)).toEqual([['--version'], ['whoami']]);
+  });
+
+  it('kiro: signed out without the key is "no"; an unreadable whoami is "unknown" and still usable', async () => {
+    const out = (stdout: string, code = 1) => linux((_f, a) => (a[0] === 'whoami' ? { code, stdout, stderr: '' } : undefined));
+    const [no] = await discoverAgents(out('Not logged in. Run kiro-cli login to sign in.\n'), { adapters: ['kiro'] });
+    expect(no).toMatchObject({ signedIn: 'no', auth: 'not logged in; run "kiro-cli login" or set KIRO_API_KEY', usable: false });
+    const [odd] = await discoverAgents(out('error: unrecognized subcommand \'whoami\'\n', 2), { adapters: ['kiro'] });
+    expect(odd).toMatchObject({ signedIn: 'unknown', usable: true });
+    expect(odd?.notes.join()).toMatch(/"kiro-cli whoami" gave no status \(error: unrecognized subcommand 'whoami'\)/);
+    // Exit 0 without a "Logged in" line is not taken as signed in.
+    const [blank] = await discoverAgents(out('\n', 0), { adapters: ['kiro'] });
+    expect(blank).toMatchObject({ signedIn: 'unknown' });
+  });
+
+  it('kiro: not installed and no key is "no", without running anything for auth', async () => {
+    const m = machine({ platform: 'linux', homedir: '/home/j', env: { PATH: '/usr/bin' }, files: {} });
+    const [r] = await discoverAgents(m, { adapters: ['kiro'] });
+    expect(r).toMatchObject({ installed: false, signedIn: 'no', auth: 'not logged in; run "kiro-cli login" or set KIRO_API_KEY' });
+    expect(m.calls).toEqual([]);
   });
 
   it('kiro: records whether the CLI is new enough for --v3, without making it unusable', async () => {
