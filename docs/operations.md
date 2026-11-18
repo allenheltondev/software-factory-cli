@@ -35,5 +35,6 @@ have such changes is kept whole and listed, so no worktree is left without a rec
 are never deleted.
 
 A pruned job's event is remembered, so the same label event is never enqueued a second time,
-however long ago the job ran. The database file does not shrink after pruning (freed space is
+however long ago the job ran. The rollup behind [`updraft stats`](stats.md) is never pruned, so
+pruning does not change any number it reports. The database file does not shrink after pruning (freed space is
 reused); run `VACUUM` with the worker stopped if you want it smaller.

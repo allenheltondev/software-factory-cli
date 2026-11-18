@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { buildHistory } from '../../test/factory-history.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
+import { computeStats } from './stats.js';
 import { configSchema } from '../config/schema.js';
 import { openDatabase, type Db } from './database.js';
 import { commitPollBatch } from './ingest.js';
-import { listPrunableJobs, pruneJob } from './prune.js';
+import { listPrunableJobs, pruneErrors, pruneJob } from './prune.js';
 import { beginPublication, finishPublication } from './publications.js';
 import { claimNextJob, finishRun, getJob, retryJob } from './queue.js';
 import { beginRevision, finishRevision, getReviewRequest, getRevision, recordReviewRequest } from './revisions.js';
@@ -120,5 +122,37 @@ describe('pruneJob', () => {
     expect(getRevision(db, b.runId)).not.toBeNull();
     expect(getReviewRequest(db, 1, 'PRR_x')).toMatchObject({ state: 'over-limit' });
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+});
+
+describe('pruning and the stats rollup', () => {
+  it('never changes what updraft stats reports: metric_events is not pruned', () => {
+    const end = Date.parse('2026-11-18T12:00:00.000Z');
+    const { db } = buildHistory(end);
+    const windows = [
+      { since: null, now: end, label: 'all' },
+      { since: end - 30 * DAY, now: end, label: '30d' },
+      { since: end - 3 * DAY, now: end, label: '3d', repo: 'octo/widgets' },
+    ];
+    const before = windows.map((w) => computeStats(db, w));
+    const facts = (db.prepare('SELECT count(*) AS n FROM metric_events').get() as { n: number }).n;
+
+    // Prune everything that can go: every job that finished before now, and every error row.
+    const everything = new Date(end).toISOString();
+    const listed = listPrunableJobs(db, everything);
+    for (const j of listed) expect(j.keep, j.id).toBeNull();
+    for (const j of listed) expect(pruneJob(db, j.id, everything)).toMatchObject({ pruned: true });
+    pruneErrors(db, everything);
+    // Every terminal job: the issue, reviewer and revision jobs alike.
+    expect(listed.length).toBe((db.prepare('SELECT count(*) AS n FROM pruned_events').get() as { n: number }).n);
+    expect(listed.length).toBeGreaterThanOrEqual(13);
+    // Only the queued and the running job, and the running job's run, are left.
+    expect(db.prepare('SELECT count(*) AS n FROM jobs').get()).toEqual({ n: 2 });
+    expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 1 });
+    for (const table of ['publications', 'revisions', 'pr_reviews']) expect(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
+
+    expect(db.prepare('SELECT count(*) AS n FROM metric_events').get()).toEqual({ n: facts });
+    expect(windows.map((w) => computeStats(db, w))).toEqual(before);
+    expect(before[1]!.overall.work.finished.total.total).toBe(10);
   });
 });
