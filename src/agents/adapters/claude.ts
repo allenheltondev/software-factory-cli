@@ -37,6 +37,7 @@
  */
 import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';
+import { failureLine } from '../failure-line.js';
 
 /** The flags that set Claude Code's permission profile; any of them in the config's args replaces the default. */
 const PERMISSION_FLAGS = ['--permission-mode', '--dangerously-skip-permissions'];
@@ -222,7 +223,7 @@ export const claudeAdapter: AgentAdapter = {
         };
       }
       // Typically a bad flag or a crash before the run started; Claude Code prints those on stderr.
-      const said = scan(exit.output).text[0];
+      const said = failureLine([...scan(exit.output).text].reverse().join('\n'));
       return { outcome: 'failed', error: `${fallback.error} before reporting a result${said ? `: ${clip(said)}` : ''}` };
     }
     const error = resultError(result);

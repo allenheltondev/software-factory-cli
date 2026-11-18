@@ -392,6 +392,77 @@ describe('deep check', () => {
     const [r] = await discoverAgents(m(1), { adapters: ['claude'], deep: true });
     expect(r).toMatchObject({ usable: false, deep: { ok: false, detail: 'Invalid API key' } });
   });
+
+  const USAGE_LIMIT =
+    "ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 2:33 PM.";
+  const codex = (deep: ProcessResult, loginStderr = 'Logged in using ChatGPT\n') =>
+    machine({
+      platform: 'linux',
+      homedir: '/home/j',
+      env: { PATH: '/usr/bin' },
+      files: { '/usr/bin/codex': true },
+      respond: (_f, a) => (a[0] === '--version' ? ok('codex-cli 0.170.0\n') : a[0] === 'login' ? ok('', loginStderr) : deep),
+    });
+
+  it("reports Codex's error, not the stdin banner it prints first (codex-cli 0.170.0)", async () => {
+    // Real stderr from the probe's command when the ChatGPT plan was over its usage limit.
+    const stderr = [
+      'Reading additional input from stdin...',
+      'OpenAI Codex v0.170.0 (research preview)',
+      '--------',
+      'workdir: /tmp',
+      'model: gpt-5.5',
+      'provider: openai',
+      'approval: never',
+      'sandbox: read-only',
+      '--------',
+      'user',
+      'Reply with the single word OK and nothing else.',
+      USAGE_LIMIT,
+      '',
+    ].join('\n');
+    const m = codex({ code: 1, stdout: '', stderr });
+    const [r] = await discoverAgents(m, { adapters: ['codex'], deep: true });
+    expect(m.calls.find((c) => c.args[0] === 'exec')?.args).toEqual(['exec', '--skip-git-repo-check', '--ephemeral', '--sandbox', 'read-only', expect.stringMatching(/OK/)]);
+    expect(r).toMatchObject({ usable: false, deep: { ok: false, detail: USAGE_LIMIT } });
+  });
+
+  it("skips Codex's config warnings in the prompt test and the sign-in status", async () => {
+    const warning = '⚠ Codex is ignoring 1 unrecognized configuration setting in /home/j/.codex/config.toml: tui.theme';
+    const m = codex({ code: 1, stdout: '', stderr: `${warning}\nReading additional input from stdin...\nunexpected status 401 Unauthorized\n` }, `${warning}\nLogged in using ChatGPT\n`);
+    const [r] = await discoverAgents(m, { adapters: ['codex'], deep: true });
+    expect(r).toMatchObject({ auth: 'Logged in using ChatGPT', deep: { ok: false, detail: 'unexpected status 401 Unauthorized' } });
+    // Nothing but the banner: the exit code says more than the banner would.
+    const [quiet] = await discoverAgents(codex({ code: 1, stdout: '', stderr: 'Reading additional input from stdin...\n' }), { adapters: ['codex'], deep: true });
+    expect(quiet?.deep).toEqual({ ok: false, detail: 'exit 1' });
+  });
+
+  it("reports Claude's error from its JSON result with is_error: true", async () => {
+    const result = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      duration_ms: 388,
+      num_turns: 1,
+      result: 'Invalid API key · Please run /login',
+      session_id: '5b1c3a52-1f0e-4d2b-9a77-0e3c2f6d8a10',
+      total_cost_usd: 0,
+    });
+    const m = machine({
+      platform: 'linux',
+      homedir: '/home/j',
+      env: { PATH: '/usr/bin' },
+      files: { '/usr/bin/claude': true },
+      respond: (_f, a) =>
+        a[0] === '--version'
+          ? ok('2.1.0\n')
+          : a[0] === 'auth'
+            ? ok(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }))
+            : { code: 1, stdout: `${result}\n`, stderr: '' },
+    });
+    const [r] = await discoverAgents(m, { adapters: ['claude'], deep: true });
+    expect(r?.deep).toEqual({ ok: false, detail: 'Invalid API key · Please run /login' });
+  });
 });
 
 describe('checkPlatform and helpers', () => {

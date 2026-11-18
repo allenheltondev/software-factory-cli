@@ -202,6 +202,20 @@ describe('codex adapter: results', () => {
     expect(summary(out)).toBeNull();
   });
 
+  it('no turn end: the error on stderr wins over the stdin banner and config warnings around it', () => {
+    const usage =
+      "ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 2:33 PM.";
+    const out = [
+      'Reading additional input from stdin...',
+      '⚠ Codex is ignoring 1 unrecognized configuration setting in C:\\Users\\jane\\.codex\\config.toml: tui.theme',
+      JSON.stringify(threadStarted()),
+      usage,
+      '',
+    ].join('\n');
+    expect(verdict(out, 1)).toEqual({ outcome: 'failed', error: `agent exited with code 1 before finishing its turn: ${usage}` });
+    expect(verdict('Reading additional input from stdin...\n', 1)).toEqual({ outcome: 'failed', error: 'agent exited with code 1 before finishing its turn' });
+  });
+
   it('an interrupted turn (no turn end, exit 1) fails', () => {
     const out = run(agentMessage('item_3', 'Running the full test suite now.'));
     expect(verdict(out, 1)).toMatchObject({ outcome: 'failed', error: 'agent exited with code 1 before finishing its turn' });

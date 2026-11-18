@@ -183,6 +183,19 @@ describe('claude adapter: results', () => {
     expect(summary(out)).toBeNull();
   });
 
+  it('no result: the error on stderr wins over warnings and lines printed after it', () => {
+    const out = [
+      'Warning: no stdin data received in 3s, proceeding without it.',
+      'Error: Invalid API key · Please run /login',
+      '    at main (file:///usr/lib/node_modules/@anthropic-ai/claude-code/cli.js:1:1)',
+      '',
+    ].join('\n');
+    expect(claudeAdapter.interpretExit!(exit(out, 1))).toEqual({
+      outcome: 'failed',
+      error: 'agent exited with code 1 before reporting a result: Error: Invalid API key · Please run /login',
+    });
+  });
+
   it('no result: exit 0 succeeds only when text output was chosen in the config args', () => {
     const text = claudeAdapter.buildInvocation(request({ extraArgs: ['--output-format=text'] })).args;
     expect(claudeAdapter.interpretExit!(exit('plain text output\n', 0, null, { args: text }))).toEqual({ outcome: 'succeeded' });

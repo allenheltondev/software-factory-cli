@@ -53,6 +53,7 @@
  */
 import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';
+import { failureLine } from '../failure-line.js';
 
 /** Long flags that set Codex's sandbox or approval policy; any of them in the config's args replaces the default. */
 const PERMISSION_FLAGS = [
@@ -251,7 +252,8 @@ export const codexAdapter: AgentAdapter = {
     }
     // An interrupted turn, a fatal error, or a bad flag before the run started (printed on stderr).
     const { events, text } = scan(exit.output);
-    const said = lastError(events) ?? text[0];
+    // `text` is newest first; read it oldest first so the error wins over a stdin banner or config warning.
+    const said = lastError(events) ?? (failureLine([...text].reverse().join('\n')) || undefined);
     return { outcome: 'failed', error: `${fallback.error} before finishing its turn${said ? `: ${clip(firstLine(said))}` : ''}` };
   },
 
