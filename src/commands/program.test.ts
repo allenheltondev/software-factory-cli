@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { ConfigError } from '../config/io.js';
+import { ConfigError, MissingConfigError } from '../config/io.js';
 import { GitHubError } from '../github/api.js';
 import { WorkerLockedError } from '../worker/daemon.js';
 import type { CommandContext } from './context.js';
@@ -166,5 +166,24 @@ describe('default context', () => {
     const { createDefaultContext } = await import('./context.js');
     const ctx: CommandContext = createDefaultContext({ config: 'some/dir/cfg.yaml' });
     expect(ctx.paths.configFile).toBe(resolve('some/dir/cfg.yaml'));
+  });
+});
+
+describe('legacy install notice', () => {
+  const legacy = { configFile: resolve('/old/updraft/config.yaml'), dataDir: resolve('/old/state/updraft') };
+
+  it('follows a missing-config error when an earlier install is still in the per-OS folders', async () => {
+    const { parse, ctx } = setup({ validate: async () => { throw new MissingConfigError('/x/config.yaml'); } });
+    ctx.findLegacyInstall = () => legacy;
+    await parse('validate');
+    expect(ctx.err.text).toContain(`UPDRAFT_CONFIG=${legacy.configFile}`);
+    expect(ctx.err.text).toContain(`UPDRAFT_HOME=${legacy.dataDir}`);
+  });
+
+  it('is not shown for other config errors', async () => {
+    const { parse, ctx } = setup({ validate: async () => { throw new ConfigError('Invalid config /x'); } });
+    ctx.findLegacyInstall = () => legacy;
+    await parse('validate');
+    expect(ctx.err.text).not.toContain('UPDRAFT_CONFIG=');
   });
 });

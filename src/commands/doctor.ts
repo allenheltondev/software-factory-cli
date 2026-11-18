@@ -13,7 +13,7 @@ import type { UpdraftPaths } from '../paths.js';
 import { labelEquals } from '../routing.js';
 import { agentLookupEnv } from '../worker/live.js';
 import { pathEntries, which } from '../util/which.js';
-import { println, type CommandContext } from './context.js';
+import { legacyNotice, println, type CommandContext } from './context.js';
 import { appKeyChecks, appRepoChecks } from './doctor-app.js';
 import { checkRepoCheckouts } from './doctor-checkout.js';
 import { containerAgentChecks } from './doctor-container.js';
@@ -488,5 +488,6 @@ export async function doctorCommand(
 ): Promise<number> {
   const report = await runDoctor(ctx.paths, probes);
   println(ctx.out, opts.json ? JSON.stringify(report, null, 2) : renderDoctor(report));
+  if (!opts.json && !probes.fileExists(ctx.paths.configFile)) for (const line of legacyNotice(ctx)) println(ctx.err, line);
   return report.ok ? EXIT.OK : EXIT.FAILURE;
 }

@@ -39,9 +39,7 @@ $WhatIfPreference = $whatIf
 if ($UpdraftHome) {
     $dataDir = [System.IO.Path]::GetFullPath($UpdraftHome)
 } else {
-    $localAppData = $env:LOCALAPPDATA
-    if (-not $localAppData) { $localAppData = Join-Path $env:USERPROFILE 'AppData\Local' }
-    $dataDir = Join-Path $localAppData 'updraft'
+    $dataDir = Join-Path $env:USERPROFILE '.updraft'
 }
 $safeName = $TaskName
 foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) { $safeName = $safeName.Replace([string]$c, '_') }

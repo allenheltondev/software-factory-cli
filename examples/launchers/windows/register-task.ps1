@@ -30,7 +30,7 @@ elevated) PowerShell window as the user who should run the worker.
 
 .PARAMETER ConfigPath
 Config file passed to `updraft start --config`. Defaults to the per-user location
-(%APPDATA%\updraft\config.yaml, or <UpdraftHome>\config.yaml).
+(%USERPROFILE%\.updraft\config.yaml, or <UpdraftHome>\config.yaml).
 
 .PARAMETER TaskName
 Scheduled task name. Default: Updraft.
@@ -102,7 +102,7 @@ $whatIf = $WhatIfPreference; $WhatIfPreference = $false
 Import-Module CimCmdlets
 $WhatIfPreference = $whatIf
 
-$AppDir = 'updraft'
+$HomeDir = '.updraft'
 $PackageName = '@allenheltondev/updraft'
 
 function Resolve-FullPath([string]$Path) {
@@ -129,12 +129,8 @@ if ($UpdraftHome) {
     $dataDir = $UpdraftHome
     $logDir = Join-Path $UpdraftHome 'logs'
 } else {
-    $localAppData = $env:LOCALAPPDATA
-    if (-not $localAppData) { $localAppData = Join-Path $env:USERPROFILE 'AppData\Local' }
-    $roamingAppData = $env:APPDATA
-    if (-not $roamingAppData) { $roamingAppData = Join-Path $env:USERPROFILE 'AppData\Roaming' }
-    $defaultConfigDir = Join-Path $roamingAppData $AppDir
-    $dataDir = Join-Path $localAppData $AppDir
+    $defaultConfigDir = Join-Path $env:USERPROFILE $HomeDir
+    $dataDir = $defaultConfigDir
     $logDir = Join-Path $dataDir 'logs'
 }
 

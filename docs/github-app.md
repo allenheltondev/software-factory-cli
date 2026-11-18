@@ -46,14 +46,14 @@ It is off unless configured. Without `github.app`, nothing described here applie
    for example next to the config file:
 
    ```sh
-   mv ~/Downloads/yourname-updraft.*.private-key.pem ~/.config/updraft/github-app.pem
-   chmod 600 ~/.config/updraft/github-app.pem
+   mv ~/Downloads/yourname-updraft.*.private-key.pem ~/.updraft/github-app.pem
+   chmod 600 ~/.updraft/github-app.pem
    ```
 
-   On Windows, move it to `%APPDATA%\updraft\github-app.pem` and remove inherited access:
+   On Windows, move it to `%USERPROFILE%\.updraft\github-app.pem` and remove inherited access:
 
    ```powershell
-   icacls "$env:APPDATA\updraft\github-app.pem" /inheritance:r /grant:r "${env:USERNAME}:R"
+   icacls "$env:USERPROFILE\.updraft\github-app.pem" /inheritance:r /grant:r "${env:USERNAME}:R"
    ```
 
 6. **Add it to the config:**

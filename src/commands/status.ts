@@ -7,7 +7,7 @@ import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
 import type { ReviewRequest } from '../db/revisions.js';
 import { reviewOf, revisionOf, type Job, type JobStatus, type Publication, type Revision } from '../types.js';
 import { describeVerifyResult, verificationNotes } from '../worker/verify.js';
-import { println, type CommandContext } from './context.js';
+import { legacyNotice, println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 import { checkConfig } from './validate.js';
 
@@ -403,5 +403,6 @@ export async function statusCommand(ctx: CommandContext, opts: { json?: boolean 
   });
   if (opts.json) println(ctx.out, JSON.stringify(view, null, 2));
   else println(ctx.out, renderStatus(view));
+  if (!opts.json && configState === 'missing') for (const line of legacyNotice(ctx)) println(ctx.err, line);
   return EXIT.OK;
 }

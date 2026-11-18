@@ -4,7 +4,7 @@ import type { GitHubApi } from '../github/api.js';
 import type { UpdraftConfig } from '../config/schema.js';
 import { createGitHubApi, resolveGitHubToken } from '../github/client.js';
 import { createWorkerCredentials, type GitHubCredentials } from '../github/credentials.js';
-import { resolvePaths, type UpdraftPaths } from '../paths.js';
+import { findLegacyInstall, legacyInstallNotice, resolvePaths, type LegacyInstall, type UpdraftPaths } from '../paths.js';
 import type { Logger } from '../util/log.js';
 import { createClackPrompter, type Prompter } from './prompter.js';
 
@@ -37,6 +37,11 @@ export interface CommandContext {
   openDb(file: string): Db;
   /** Open an existing state database without migrating or writing to it. */
   openDbReadOnly(file: string): Db;
+  /**
+   * An install an earlier version left in the per-OS locations, when this run uses the default
+   * home and has no config there. Optional: contexts without it never report one.
+   */
+  findLegacyInstall?(): LegacyInstall | null;
   now(): number;
   /**
    * Find installed and usable coding agents (runs their CLIs), in this process's environment or
@@ -65,9 +70,16 @@ export function createDefaultContext(globals: GlobalOptions = {}): CommandContex
     prompter: () => (prompter ??= createClackPrompter()),
     openDb: (file) => openDatabase(file),
     openDbReadOnly: (file) => openDatabaseReadOnly(file),
+    findLegacyInstall: () => findLegacyInstall({ configPath: globals.config, env }),
     now: () => Date.now(),
     discoverAgents: (opts) => discoverAgents(defaultDiscoveryProbes(opts?.env ?? env), opts),
   };
+}
+
+/** Lines describing a legacy install worth pointing out, or none. */
+export function legacyNotice(ctx: CommandContext): string[] {
+  const legacy = ctx.findLegacyInstall?.() ?? null;
+  return legacy ? legacyInstallNotice(legacy, ctx.paths) : [];
 }
 
 export function println(out: Output, line = ''): void {
