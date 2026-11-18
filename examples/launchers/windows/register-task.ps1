@@ -264,23 +264,41 @@ function Write-WorkerRecord(`$p) {
 # worker instead. It is found by the PID file (same PID, start time and executable as recorded),
 # or, when a wrapper ended between starting the worker and writing that file, by the marker the
 # wrapper puts on the worker's command line (--title=<marker>; a hand-started worker has none).
+# Open a process and hold it. While this handle is open, Windows cannot give the PID to another
+# process, so everything done afterwards (wait, record, stop) goes through this same object and
+# reaches the process that was matched. It is returned only if it started at `$StartUtc, the start
+# time recorded for it or the CreationDate of the CIM match. Both come from the kernel's creation
+# time; CIM keeps whole microseconds, hence the tolerance of under 1 microsecond (10 ticks).
+function Open-SameProcess([int]`$Id, [datetime]`$StartUtc) {
+    try {
+        `$p = [System.Diagnostics.Process]::GetProcessById(`$Id)
+        `$null = `$p.Handle
+        if (-not `$p.HasExited -and [Math]::Abs(`$p.StartTime.ToUniversalTime().Ticks - `$StartUtc.Ticks) -lt 10) { return `$p }
+        `$p.Dispose()
+    } catch { }
+    return `$null
+}
+
 function Get-RecordedWorker {
     if (Test-Path -LiteralPath `$pidFilePath -PathType Leaf) {
         try {
             `$record = [System.IO.File]::ReadAllText(`$pidFilePath) | ConvertFrom-Json
-            `$p = Get-Process -Id ([int]`$record.pid) -ErrorAction Stop
-            `$sameStart = [Math]::Abs(`$p.StartTime.ToUniversalTime().Ticks - [long]`$record.startTimeUtcTicks) -lt [TimeSpan]::TicksPerSecond
-            `$sameExe = `$p.Path -and (`$p.Path -ieq [string]`$record.node)
-            if (`$sameStart -and `$sameExe) { return `$p }
+            `$p = Open-SameProcess ([int]`$record.pid) ([datetime]::new([long]`$record.startTimeUtcTicks, 'Utc'))
+            if (`$p) {
+                if (`$p.Path -and (`$p.Path -ieq [string]`$record.node)) { return `$p }
+                `$p.Dispose()
+            }
         } catch { }
     }
     `$needle = '"--title=' + `$workerMarker + '"'
     `$marked = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains(`$needle) } |
-        ForEach-Object { Get-Process -Id `$_.ProcessId -ErrorAction SilentlyContinue } |
-        Where-Object { `$_ } | Sort-Object StartTime)
-    if (`$marked.Count -gt 0) {
-        `$p = `$marked[0]
+        Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains(`$needle) -and `$_.CreationDate } |
+        Sort-Object CreationDate)
+    foreach (`$m in `$marked) {
+        # Held and checked against the match's own start time, so a worker that exited since the
+        # query (its PID possibly reused) is skipped rather than recorded.
+        `$p = Open-SameProcess ([int]`$m.ProcessId) `$m.CreationDate.ToUniversalTime()
+        if (-not `$p) { continue }
         Write-WrapperLog ('found worker process {0} by its marker (no usable PID record); recording it' -f `$p.Id)
         Write-WorkerRecord `$p
         return `$p
@@ -403,21 +421,40 @@ if ($PSCmdlet.ShouldProcess($wrapperPath, 'Write launcher wrapper')) {
 # worker would hold the worker lock and make the re-registered task exit as "already running".
 # Same logic as unregister-task.ps1: stop the recorded process only if its PID, start time and
 # executable all still match, so a `updraft start` run by hand is never touched.
+# Open a process and hold it. While this handle is open, Windows cannot give the PID to another
+# process, so everything done afterwards (wait, record, stop) goes through this same object and
+# reaches the process that was matched. It is returned only if it started at $StartUtc, the start
+# time recorded for it or the CreationDate of the CIM match. Both come from the kernel's creation
+# time; CIM keeps whole microseconds, hence the tolerance of under 1 microsecond (10 ticks).
+function Open-SameProcess([int]$Id, [datetime]$StartUtc) {
+    try {
+        $p = [System.Diagnostics.Process]::GetProcessById($Id)
+        $null = $p.Handle
+        if (-not $p.HasExited -and [Math]::Abs($p.StartTime.ToUniversalTime().Ticks - $StartUtc.Ticks) -lt 10) { return $p }
+        $p.Dispose()
+    } catch { }
+    return $null
+}
+
+# Stop a process opened with Open-SameProcess, through its held handle.
+function Stop-HeldProcess($p) {
+    try { $p.Kill(); $null = $p.WaitForExit(10000) } catch { }  # it may have exited meanwhile
+    $p.Dispose()
+}
+
 function Stop-RecordedWorker([string]$PidFile) {
     if (-not (Test-Path -LiteralPath $PidFile -PathType Leaf)) { return }
     $record = $null
     try { $record = [System.IO.File]::ReadAllText($PidFile) | ConvertFrom-Json } catch { }
     if ($record -and $record.pid -and $record.startTimeUtcTicks) {
-        $proc = Get-Process -Id ([int]$record.pid) -ErrorAction SilentlyContinue
-        if ($proc) {
-            $actualTicks = $null
-            try { $actualTicks = $proc.StartTime.ToUniversalTime().Ticks } catch { }
-            $sameStart = $null -ne $actualTicks -and [Math]::Abs($actualTicks - [long]$record.startTimeUtcTicks) -lt [TimeSpan]::TicksPerSecond
-            $sameExe = $proc.Path -and $record.node -and ($proc.Path -ieq [string]$record.node)
-            if ($sameStart -and $sameExe) {
-                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                Write-Host "Stopped worker process $($proc.Id) started by the previous registration."
-            } else {
+        $proc = Open-SameProcess ([int]$record.pid) ([datetime]::new([long]$record.startTimeUtcTicks, 'Utc'))
+        if ($proc -and $proc.Path -and $record.node -and ($proc.Path -ieq [string]$record.node)) {
+            $id = $proc.Id
+            Stop-HeldProcess $proc
+            Write-Host "Stopped worker process $id started by the previous registration."
+        } else {
+            if ($proc) { $proc.Dispose() }
+            if (Get-Process -Id ([int]$record.pid) -ErrorAction SilentlyContinue) {
                 Write-Host "PID $($record.pid) is no longer the worker this task started; leaving it alone."
             }
         }
@@ -435,9 +472,18 @@ function Stop-MarkedWorkers([string]$Marker, [string]$Why) {
     $marked = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and $_.CommandLine.Contains($needle) })
     foreach ($m in $marked) {
-        if ($PSCmdlet.ShouldProcess("node.exe pid $($m.ProcessId)", "Stop the worker $Why")) {
-            Stop-Process -Id $m.ProcessId -Force -ErrorAction SilentlyContinue
-            Write-Host "Stopped worker process $($m.ProcessId) started by $Why (found by its marker)."
+        if (-not $m.CreationDate) { continue }
+        # Held and checked against the match's own start time before anything else, and stopped
+        # through that handle: a worker that exited since the query (or during a -Confirm prompt)
+        # cannot be confused with a process that got its PID.
+        $p = Open-SameProcess ([int]$m.ProcessId) $m.CreationDate.ToUniversalTime()
+        if (-not $p) { continue }
+        if ($PSCmdlet.ShouldProcess("node.exe pid $($p.Id)", "Stop the worker $Why")) {
+            $id = $p.Id
+            Stop-HeldProcess $p
+            Write-Host "Stopped worker process $id started by $Why (found by its marker)."
+        } else {
+            $p.Dispose()
         }
     }
 }
