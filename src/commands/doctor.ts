@@ -7,11 +7,13 @@ import { agentAdapter, publishMode, type UpdraftConfig } from '../config/schema.
 import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
 import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
+import type { GitHubCredentials } from '../github/credentials.js';
 import type { UpdraftPaths } from '../paths.js';
 import { labelEquals } from '../routing.js';
 import { agentLookupEnv } from '../worker/live.js';
 import { pathEntries, which } from '../util/which.js';
 import { println, type CommandContext } from './context.js';
+import { appKeyChecks, appRepoChecks } from './doctor-app.js';
 import { checkRepoCheckouts } from './doctor-checkout.js';
 import { containerAgentChecks } from './doctor-container.js';
 import { EXIT, describeGitHubError } from './errors.js';
@@ -81,7 +83,15 @@ export interface DoctorProbes {
   checkWritable(dir: string): void;
   /** Open (creating/migrating if needed) and close the state DB; throws on failure. */
   checkDb(file: string): void;
-  createApi(): Promise<GitHubApi>;
+  /** The API as the worker uses it: with `credentials` when given, else the person's gh sign-in. */
+  createApi(credentials?: GitHubCredentials): Promise<GitHubApi>;
+  /**
+   * The worker's GitHub credentials for this config (the GitHub App of github.app, else the gh
+   * sign-in). Throws when an App is configured and its key cannot be used. Absent: the gh sign-in.
+   */
+  createCredentials?(config: UpdraftConfig): GitHubCredentials;
+  /** Permission bits of a file, or null when it cannot be read; for the App's private key. */
+  fileMode?(path: string): number | null;
   fileExists(path: string): boolean;
 }
 
@@ -166,10 +176,15 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
   }
 
   // gh and token
-  const envToken = Boolean(probes.env.GH_TOKEN || probes.env.GITHUB_TOKEN);
+  // With a GitHub App the worker does not use gh at all; only "updraft configure" and "updraft add" do.
+  const appConfig = config?.github?.app;
+  const envToken = Boolean(probes.env.GH_TOKEN || probes.env.GITHUB_TOKEN || appConfig);
+  const ghOptional = appConfig
+    ? ' (a GitHub App is configured, so gh is needed only by "updraft configure" and "updraft add")'
+    : ' (GH_TOKEN/GITHUB_TOKEN is set, so it is optional)';
   const gh = probes.which('gh');
   if (!gh) {
-    add(envToken ? 'warn' : 'fail', 'gh', `not found on PATH${envToken ? ' (GH_TOKEN/GITHUB_TOKEN is set, so it is optional)' : ''}`);
+    add(envToken ? 'warn' : 'fail', 'gh', `not found on PATH${envToken ? ghOptional : ''}`);
   } else {
     const auth = await probes.run(gh, ['auth', 'status', '--hostname', 'github.com']).catch((err: unknown) => ({
       code: null,
@@ -179,19 +194,36 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
     if (auth.code === 0) add('ok', 'gh', `${gh} (authenticated)`);
     else {
       const why = (auth.stderr || auth.stdout).trim().split(/\r?\n/)[0] ?? '';
-      add(envToken ? 'warn' : 'fail', 'gh', `${gh} is not authenticated; run "gh auth login"${why ? ` (${why})` : ''}`);
+      add(envToken ? 'warn' : 'fail', 'gh', `${gh} is not authenticated; run "gh auth login"${why ? ` (${why})` : ''}${appConfig ? ghOptional : ''}`);
     }
   }
 
+  // GitHub App (github.app): the private key first; nothing else about the App works without it.
+  let appKeyOk = true;
+  if (appConfig) {
+    const key = appKeyChecks(appConfig, { configDir: paths.configDir, env: probes.env, platform: probes.platform, ...(probes.fileMode ? { fileMode: probes.fileMode } : {}) });
+    appKeyOk = key.ok;
+    for (const c of key.checks) add(c.status, 'github app', c.detail);
+  }
+
   let api: GitHubApi | null = null;
+  let credentials: GitHubCredentials | undefined;
   try {
-    api = await probes.createApi();
-    const viewer = await api.getViewer();
-    add('ok', 'github', `token works; authenticated as ${viewer.login}`);
-    if (config) {
-      const actors = new Set(config.dispatch.allowedActors.map((a) => a.toLowerCase()));
-      if (actors.size && !actors.has(viewer.login.toLowerCase())) {
-        add('warn', 'github', `${viewer.login} is not in dispatch.allowedActors`);
+    if (!appKeyOk) throw new Error("the GitHub App's private key cannot be used (see above)");
+    credentials = config ? probes.createCredentials?.(config) : undefined;
+    api = await probes.createApi(credentials);
+    // Who the worker is: the gh account, or the App's bot (never GET /user under an App).
+    const who = await api.getWorkerIdentity();
+    const listed = config ? new Set(config.dispatch.allowedActors.map((a) => a.toLowerCase())).has(who.login.toLowerCase()) : false;
+    if (who.kind === 'app') {
+      add('ok', 'github', `the GitHub App authenticates; the worker acts as ${who.login} (app id ${who.id})`);
+      if (listed) {
+        add('warn', 'github', `${who.login} is in dispatch.allowedActors, so a label applied by the worker's own bot would dispatch work; remove it unless that is intended`);
+      }
+    } else {
+      add('ok', 'github', `token works; authenticated as ${who.login}`);
+      if (config && config.dispatch.allowedActors.length && !listed) {
+        add('warn', 'github', `${who.login} is not in dispatch.allowedActors`);
       }
     }
   } catch (err) {
@@ -213,8 +245,11 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
           add('warn', name, `renamed to ${gr.fullName} on GitHub; update the config key`);
         }
         add(gr.archived ? 'warn' : 'ok', name, `accessible (id ${gr.id})${gr.archived ? '; archived' : ''}`);
+        // Under a GitHub App, access is the installation's permissions, not an account's.
+        const appAuth = credentials?.app;
+        if (appAuth) for (const c of await appRepoChecks(appAuth, config, fullName, repo)) add(c.status, name, c.detail);
         const publish = publishMode(repo);
-        if (publish !== 'none') {
+        if (publish !== 'none' && !appAuth) {
           // Publication pushes and opens PRs as this account; a miss here is a failure only when it would run.
           const sev: CheckStatus = config.execution.mode === 'live' ? 'fail' : 'warn';
           if (gr.permissions === null) {
@@ -225,7 +260,7 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
             add('ok', name, `publish: ${publish}; the active GitHub account can push${gr.private && publish === 'draft-pr' ? ' (private repo: if GitHub refuses draft PRs on your plan, use publish: pr)' : ''}`);
           }
         }
-        if (repo.commentOnFailure) {
+        if (repo.commentOnFailure && !appAuth) {
           // Commenting on an issue needs only read access, but GitHub refuses comments on an
           // archived repository. Whether the token may write issue comments shows only on a write.
           const sev: CheckStatus = config.execution.mode === 'live' ? 'fail' : 'warn';
@@ -354,7 +389,8 @@ export function defaultDoctorProbes(ctx: CommandContext): DoctorProbes {
     },
     discoverAgent: async (adapter, opts) => (await ctx.discoverAgents({ adapters: [adapter], ...opts }))[0],
     checkDb: (file) => ctx.openDb(file).close(),
-    createApi: () => ctx.createApi(),
+    createApi: (credentials) => ctx.createApi(credentials ? { credentials } : undefined),
+    createCredentials: (config) => ctx.createCredentials(config),
     fileExists: existsSync,
   };
 }

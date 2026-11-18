@@ -1,6 +1,5 @@
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../config/io.js';
-import { resolveGitHubToken } from '../github/client.js';
 import { getJob, getRun } from '../db/queue.js';
 import { publishRun, type PublishDeps } from '../publish/publish.js';
 import { reviseRun } from '../publish/revision.js';
@@ -11,12 +10,13 @@ import { CliError, EXIT } from './errors.js';
 
 export interface PublishCommandDeps {
   fileExists: (p: string) => boolean;
-  token: (env: NodeJS.ProcessEnv) => Promise<string>;
+  /** Injected in tests; by default the token comes from the worker's credentials (gh account or GitHub App). */
+  token?: (env: NodeJS.ProcessEnv) => Promise<string>;
   /** Injected in tests. */
   runGit?: PublishDeps['runGit'];
 }
 
-const defaultDeps: PublishCommandDeps = { fileExists: existsSync, token: (env) => resolveGitHubToken(env) };
+const defaultDeps: PublishCommandDeps = { fileExists: existsSync };
 
 /**
  * `updraft publish RUN_ID`: publish a succeeded live run now, or finish a publication that failed
@@ -30,14 +30,17 @@ export async function publishCommand(ctx: CommandContext, runId: string, deps: P
   const db = ctx.openDb(ctx.paths.dbFile);
   try {
     const log = createLogger({ stream: null });
-    const api = await ctx.createApi({ log });
+    const credentials = ctx.createCredentials(config, { log });
+    const api = await ctx.createApi({ log, credentials });
+    const testToken = deps.token;
     const publishDeps: PublishDeps = {
       db,
       config,
       paths: ctx.paths,
       api,
       log,
-      token: () => deps.token(ctx.env),
+      token: testToken ? () => testToken(ctx.env) : (repoFullName) => credentials.token(repoFullName, { fresh: true }),
+      workerKind: credentials.kind,
       env: ctx.env,
       now: ctx.now,
       ...(deps.runGit ? { runGit: deps.runGit } : {}),

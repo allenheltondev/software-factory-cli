@@ -13,7 +13,7 @@ import {
   type ExecutionResult,
   type Executor,
 } from './executor.js';
-import { LiveExecutor } from './live.js';
+import { LiveExecutor, type LiveExecutorOptions } from './live.js';
 
 export { findRepoConfig } from './executor.js';
 
@@ -123,13 +123,13 @@ export class PrepareOnlyExecutor implements Executor {
 }
 
 /** The executor for config.execution.mode. */
-export function createExecutor(config: Pick<UpdraftConfig, 'execution'>): Executor {
+export function createExecutor(config: Pick<UpdraftConfig, 'execution'>, live: LiveExecutorOptions = {}): Executor {
   switch (config.execution.mode) {
     case 'prepare-only':
       return new PrepareOnlyExecutor();
     case 'log-only':
       return new LogOnlyExecutor();
     case 'live':
-      return new LiveExecutor();
+      return new LiveExecutor(live);
   }
 }

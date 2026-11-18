@@ -53,6 +53,9 @@ class FakeCommentApi implements GitHubApi {
   async getViewer() {
     return { login: 'allen', id: 1 };
   }
+  async getWorkerIdentity() {
+    return { kind: 'user' as const, login: 'allen', id: 1 };
+  }
   async listUserRepos(): Promise<never[]> {
     return [];
   }

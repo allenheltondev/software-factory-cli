@@ -25,7 +25,7 @@ import type { IssueSnapshot } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { runDaemon } from './daemon.js';
 import { StartFailedError, type ExecutionContext } from './executor.js';
-import { LiveExecutor } from './live.js';
+import { agentLookupEnv, LiveExecutor } from './live.js';
 import { createExecutor } from './prepare-only.js';
 import { acquireWorkerLock } from './lock.js';
 import { renderPrBody } from '../publish/publish.js';
@@ -1052,5 +1052,67 @@ describe('LiveExecutor: a revision job', { timeout: 120_000 }, () => {
     const result = await new LiveExecutor().execute(c, context(db, config, paths, c.run.id));
     expect(result).toMatchObject({ outcome: 'failed', error: 'actions.implement-issue.revisePrompt is not set; a revision run needs a prompt' });
     expect(getRun(db, c.run.id)!.checkoutPath).toBeNull();
+  });
+});
+
+describe('LiveExecutor: committing as the GitHub App (github.app.commitAsApp)', { timeout: 120_000 }, () => {
+  const BOT = { name: 'updraft-bot[bot]', email: '987654+updraft-bot[bot]@users.noreply.github.com' };
+
+  /** setup(), with an agent that has no commit identity of its own. */
+  function anonymousAgent() {
+    const s = setup();
+    const env = s.config.agents.claude!.env!;
+    s.config.agents.claude!.env = { GIT_CONFIG_NOSYSTEM: env.GIT_CONFIG_NOSYSTEM!, GIT_CONFIG_GLOBAL: env.GIT_CONFIG_GLOBAL! };
+    return s;
+  }
+
+  it("makes the agent's commits the bot's, through the environment", async () => {
+    const { f, paths, config, db } = anonymousAgent();
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    const asked: string[] = [];
+    const executor = createExecutor(config, {
+      commitIdentity: async (repoFullName) => {
+        asked.push(repoFullName);
+        return BOT;
+      },
+    });
+    const result = await executor.execute(c, context(db, config, paths, c.run.id));
+    expect(result.outcome).toBe('succeeded');
+    expect(asked).toEqual(['octo/widgets']);
+    const run = getRun(db, c.run.id)!;
+    expect(f.git(run.checkoutPath!, 'log', '-1', '--format=%an <%ae> | %cn <%ce>')).toBe(`${BOT.name} <${BOT.email}> | ${BOT.name} <${BOT.email}>`);
+    expect(readFileSync(run.logPath!, 'utf8')).toContain(`commit identity: ${BOT.name} <${BOT.email}> (github.app.commitAsApp)`);
+  });
+
+  it('leaves an identity set in agents.<name>.env in charge', async () => {
+    const { f, paths, config, db } = setup();
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    const result = await new LiveExecutor({ commitIdentity: async () => BOT }).execute(c, context(db, config, paths, c.run.id));
+    expect(result.outcome).toBe('succeeded');
+    expect(f.git(getRun(db, c.run.id)!.checkoutPath!, 'log', '-1', '--format=%an')).toBe('Fake Agent');
+  });
+
+  it('fails the run before any worktree exists when the identity cannot be found', async () => {
+    const { paths, config, db } = anonymousAgent();
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    const executor = new LiveExecutor({
+      commitIdentity: async () => {
+        throw new Error('GET /users/updraft-bot%5Bbot%5D: network error: fetch failed');
+      },
+    });
+    const result = await executor.execute(c, context(db, config, paths, c.run.id));
+    expect(result).toMatchObject({ outcome: 'failed', error: expect.stringMatching(/could not find the GitHub App's commit identity \(github\.app\.commitAsApp\): GET \/users/) });
+    expect(getRun(db, c.run.id)!.checkoutPath).toBeNull();
+  });
+
+  it("keeps the App's key path, like the GitHub tokens, out of the agent's environment", () => {
+    const env = agentLookupEnv(
+      { PATH: '/bin', GH_TOKEN: 'a', GITHUB_TOKEN: 'b', UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH: '/secrets/app.pem', KIRO_API_KEY: 'k' },
+      { env: { EXTRA: '1' } },
+    );
+    expect(env).toEqual({ PATH: '/bin', KIRO_API_KEY: 'k', EXTRA: '1' });
   });
 });

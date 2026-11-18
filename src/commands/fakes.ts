@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import type { AgentReport } from '../agents/discovery.js';
 import { KNOWN_ADAPTERS, type AdapterName } from '../config/schema.js';
 import { GitHubError, type GitHubApi, type GitHubLabel, type GitHubRepo } from '../github/api.js';
+import { createUserCredentials, userIdentity } from '../github/credentials.js';
 import { resolvePaths } from '../paths.js';
 import type { CommandContext } from './context.js';
 import type { Prompter } from './prompter.js';
@@ -52,6 +53,10 @@ export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] }
     async getViewer() {
       calls.push('getViewer');
       return { login: data.login ?? 'octocat', id: 1 };
+    },
+    async getWorkerIdentity() {
+      calls.push('getWorkerIdentity');
+      return userIdentity({ login: data.login ?? 'octocat', id: 1 });
     },
     async listUserRepos() {
       calls.push('listUserRepos');
@@ -165,6 +170,7 @@ export function fakeContext(
       if (!o.api) throw new Error('no api in this test');
       return o.api;
     },
+    createCredentials: () => createUserCredentials(async () => 'fake-token'),
     prompter: () => {
       if (!o.prompter) throw new Error('no prompter in this test');
       return o.prompter;

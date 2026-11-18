@@ -55,7 +55,7 @@ the per-user default.
 | `updraft validate` | Check the config without network access; exit 1 if invalid |
 | `updraft start` | Run the worker: poll GitHub and process the queue (non-interactive). Exits with code 3 if another worker holds the lock |
 | `updraft status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
-| `updraft doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access, labels and each enabled agent in the current environment, the way a live run starts it (its `command` and `env`) |
+| `updraft doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access (with `github.app`: the App's key, its installation on each repository and the permissions it grants), labels and each enabled agent in the current environment, the way a live run starts it (its `command` and `env`) |
 | `updraft agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
 | `updraft retry JOB_ID` | Requeue a failed, interrupted or canceled job |
 | `updraft publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [docs/publication.md](docs/publication.md) |
@@ -106,6 +106,10 @@ repositories:
 | `maxConcurrent` | `2` | Global cap on simultaneous runs, 1-64 |
 | `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree; it needs at least one enabled agent. See [docs/live-execution.md](docs/live-execution.md) |
 | `dispatch.allowedActors` | `[]` | GitHub logins allowed to dispatch work by applying a trigger label. Empty means nobody |
+| `github.app.appId` | none | Act on GitHub as a GitHub App installation (`<app-slug>[bot]`) instead of your `gh` account: polling, pushes, PRs and comments. The App's ID or client ID. Needs `privateKeyPath`. See [docs/github-app.md](docs/github-app.md) |
+| `github.app.privateKeyPath` | none | Path of the App's PEM private key file, relative to the config file's directory. The key itself is never in the config. `UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH` in the worker's environment names another file |
+| `github.app.installationId` | looked up per repository | Use this installation for every repository. Leave it out when repositories are under different owners |
+| `github.app.commitAsApp` | `false` | Live mode: agents commit as the App's bot (through `GIT_AUTHOR_*` and `GIT_COMMITTER_*` in the agent's environment) instead of the local Git identity. Commits are never rewritten afterwards |
 | `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
 | `agents.<name>.maxConcurrent` | `1` | Per-agent cap across all pools and repos, 1-32 |
@@ -202,6 +206,10 @@ or marks a PR ready for review.
 Details, including authentication, retries and failure handling:
 [docs/publication.md](docs/publication.md).
 
+To have the PRs and comments authored by a bot instead of you (so that you can approve them,
+and with short-lived credentials limited to the watched repositories), configure a GitHub
+App: [docs/github-app.md](docs/github-app.md).
+
 With `revise: true` as well, a "Request changes" review by an allowed actor on such a PR
 queues a revision: the agent runs on the PR's branch with the review, and the worker pushes
 the new commits as a fast-forward and replies on the PR. See
@@ -251,6 +259,12 @@ The key points; [docs/security.md](docs/security.md) has the full statement of e
   merges.
 - Agent credentials such as `KIRO_API_KEY` belong in the worker's environment, not in the
   config file. The CLI does not store tokens.
+- With `github.app`, the worker acts as a GitHub App installation instead of your account,
+  with one-hour tokens limited to the repositories the App is installed on. The App's private
+  key stays in a file only you can read, never in the config; an agent running as your user
+  can still read that file unless it runs in a container or the worker has its own OS
+  account. The bot cannot dispatch work unless you list it in `allowedActors`. See
+  [docs/github-app.md](docs/github-app.md#security).
 
 ## Files and locations
 

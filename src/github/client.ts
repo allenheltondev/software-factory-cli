@@ -43,6 +43,8 @@
 import { execFile } from 'node:child_process';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
+import { appRequestProblem } from './app-auth.js';
+import { appIdentity, createUserCredentials, repoOfRequest, userIdentity, type GitHubCredentials } from './credentials.js';
 import {
   GitHubError,
   type GitHubApi,
@@ -61,6 +63,11 @@ import {
 export interface CreateGitHubApiOptions {
   /** Explicit token. Otherwise GH_TOKEN, GITHUB_TOKEN, then `gh auth token`. */
   token?: string;
+  /**
+   * Where each request's token comes from (credentials.ts): the person's account, or a GitHub App
+   * installation. Takes precedence over `token`. Default: the person's account, as above.
+   */
+  credentials?: GitHubCredentials;
   /** Defaults to https://api.github.com */
   baseUrl?: string;
   /** Injected for tests. */
@@ -420,7 +427,14 @@ function networkError(method: string, display: string, err: unknown, timeoutMs: 
 }
 
 export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promise<GitHubApi> {
-  const token = opts.token ?? (await resolveGitHubToken(opts.env ?? process.env));
+  const explicitToken = opts.token;
+  const credentials =
+    opts.credentials ??
+    createUserCredentials(() => (explicitToken !== undefined ? Promise.resolve(explicitToken) : resolveGitHubToken(opts.env ?? process.env)));
+  // A missing sign-in fails here, when the client is created, not on the first request.
+  if (credentials.kind === 'user') await credentials.token(null);
+  /** Names of the repositories addressed by id so far: an App's token is chosen by repository. */
+  const repoNames = new Map<number, string>();
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
   const doFetch = opts.fetch ?? globalThis.fetch;
   const log = opts.log;
@@ -434,6 +448,8 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
 
   async function request<T>(pathOrUrl: string, ro: RequestOptions = {}): Promise<RawResponse<T>> {
     const url = buildUrl(pathOrUrl, ro.query);
+    const about = repoOfRequest(url.startsWith(baseUrl) ? url.slice(baseUrl.length) : new URL(url).pathname, ro.body, repoNames);
+    let token = await credentials.token(about);
     const headers: Record<string, string> = {
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': API_VERSION,
@@ -454,6 +470,19 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       res = await doFetch(url, init);
     } catch (err) {
       throw networkError(method, display, err, timeoutMs);
+    }
+    if (res.status === 401 && credentials.kind === 'app') {
+      // An installation token can stop working before it expires (the installation was changed,
+      // the token revoked): drop it and try once with a new one.
+      credentials.reject(token);
+      token = await credentials.token(about);
+      headers.Authorization = `Bearer ${token}`;
+      init.signal = AbortSignal.timeout(timeoutMs);
+      try {
+        res = await doFetch(url, init);
+      } catch (err) {
+        throw networkError(method, display, err, timeoutMs);
+      }
     }
     log?.debug('github request', { method, url: display, status: res.status });
 
@@ -477,6 +506,10 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         // non-JSON error body
       }
       const retryAfter = retryAfterFrom(res.headers);
+      if (credentials.kind === 'app' && retryAfter === null) {
+        const problem = appRequestProblem({ method, path: display, status: res.status, detail, repoFullName: about });
+        if (problem) throw problem;
+      }
       let hint = '';
       if (res.status === 401) hint = ' (token invalid or expired; run `gh auth login` or set GH_TOKEN)';
       else if (retryAfter !== null && (res.status === 403 || res.status === 429))
@@ -509,12 +542,22 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     return all;
   }
 
-  const repoPath = (repo: RepoRef) => `/repositories/${repo.id}`;
+  const repoPath = (repo: RepoRef) => {
+    repoNames.set(repo.id, repo.fullName);
+    return `/repositories/${repo.id}`;
+  };
 
   return {
     async getViewer() {
       const res = await request<{ login: string; id: number }>('/user');
       return { login: res.data!.login, id: res.data!.id };
+    },
+
+    async getWorkerIdentity() {
+      // `GET /user` is for user tokens only; an App is identified by its own `GET /app`.
+      if (credentials.app) return appIdentity(await credentials.app.app());
+      const res = await request<{ login: string; id: number }>('/user');
+      return userIdentity(res.data!);
     },
 
     async listUserRepos() {

@@ -74,6 +74,18 @@ What the worker and the agents it starts can do, and which guards exist. The
   (see [Agent credentials](background-operation.md#agent-credentials)).
 - GitHub access uses `GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`. The CLI
   does not store tokens.
+- With `github.app`, the worker acts as a GitHub App installation (`<app-slug>[bot]`) instead:
+  it signs a short-lived JWT with the App's private key and exchanges it for an installation
+  token that lasts an hour and reaches only the repositories the App is installed on, with
+  only the permissions the App was given. The key is read from a file (only its path is in
+  the config), and neither it, the JWT nor a token is logged, passed on a command line or
+  given to an agent; the variable that can name the key file is withheld from agents like
+  `GH_TOKEN`. The caveat above holds here too, and matters more: an agent runs as the same OS
+  user and can read the key file unless it runs in a container (`agents.<name>.container`) or
+  the worker runs under a dedicated account, and a private key that can mint tokens is a
+  stronger secret than a session token. The bot is not an allowed actor unless you list it,
+  so nothing it does can dispatch or re-trigger work; `updraft configure` and `updraft add`
+  keep using your own `gh` sign-in. See [Acting as a GitHub App](github-app.md).
 - With `commentOnFailure`, the worker also comments on the issue when a run fails, as your `gh`
   account. The comment carries only what the worker itself knows (run id, agent, duration, its
   own description of the failure with local paths removed, the job branch name, how to retry),
