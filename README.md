@@ -212,6 +212,9 @@ The key points; [docs/security.md](docs/security.md) has the full statement of e
 - Only GitHub logins in `dispatch.allowedActors` (or a workflow's `allowedActors`) can
   dispatch work, and with an empty list no events are queued. In live mode the check is
   repeated right before an agent starts.
+- Applying the label approves the issue text as it is then. In live mode a job is canceled
+  if the title or body was edited afterwards by someone who is not an allowed actor;
+  re-apply the label to dispatch the edited issue.
 - Issue titles, bodies and labels are untrusted input. They reach the agent only through a
   prompt file, fenced and labelled as untrusted, never a command line.
 - In live mode the agent runs as your user, in full-auto mode by default. That is not a
