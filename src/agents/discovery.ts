@@ -20,6 +20,7 @@ import { homedir, release, tmpdir } from 'node:os';
 import { posix, win32 } from 'node:path';
 import { KNOWN_ADAPTERS, type AdapterName } from '../config/schema.js';
 import { kiroSupportsV3 } from './adapters/kiro.js';
+import { failureLine, firstMeaningfulLine } from './failure-line.js';
 import { which } from '../util/which.js';
 
 export type Tri = 'yes' | 'no' | 'unknown';
@@ -168,6 +169,13 @@ const DEEP_PROMPT = 'Reply with the single word OK and nothing else.';
 
 const firstLine = (s: string): string => s.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? '';
 
+/**
+ * Why a probe command failed, from its output: the line that reads as the error, not merely the
+ * first one (Codex prints a stdin banner and config warnings ahead of it). stderr comes after
+ * stdout, so its lines win ties.
+ */
+const failureDetail = (r: ProcessResult): string => failureLine(`${r.stdout}\n${r.stderr}`);
+
 function runLaunch(ctx: AuthContext, args: string[], timeoutMs: number, cwd?: string): Promise<ProcessResult> {
   const l = ctx.launch!;
   return ctx.probes.run(l.file, [...l.args, ...args], { timeoutMs, cwd });
@@ -199,7 +207,7 @@ async function claudeAuth(ctx: AuthContext): Promise<AuthResult> {
       : { signedIn: 'no', auth: 'not signed in; run "claude auth login" or set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN' };
   }
   // Older Claude Code builds have no `auth status`; don't guess.
-  const why = firstLine(r.stderr || r.stdout || r.error || '');
+  const why = failureDetail(r) || (r.error ?? '');
   return { signedIn: 'unknown', auth: null, notes: [`"claude auth status" gave no status${why ? ` (${why})` : ''}; update Claude Code`] };
 }
 
@@ -212,7 +220,7 @@ async function claudeAuth(ctx: AuthContext): Promise<AuthResult> {
  */
 async function codexAuth(ctx: AuthContext): Promise<AuthResult> {
   const r = await runLaunch(ctx, ['login', 'status'], AUTH_TIMEOUT_MS);
-  const text = firstLine(r.stderr) || firstLine(r.stdout);
+  const text = firstMeaningfulLine(r.stderr) || firstMeaningfulLine(r.stdout);
   if (r.code === 0) return { signedIn: 'yes', auth: text || 'logged in' };
   if (ctx.probes.env.CODEX_API_KEY) {
     return { signedIn: 'yes', auth: 'CODEX_API_KEY (codex exec only)' };
@@ -602,7 +610,7 @@ async function discoverOne(
       report.version = parseVersion(r.stdout) ?? parseVersion(r.stderr);
       if (spec.adapter === 'kiro') report.kiroV3 = kiroSupportsV3(report.version);
     } else {
-      const why = r.timedOut ? `timed out after ${VERSION_TIMEOUT_MS / 1000}s` : r.error ?? (firstLine(r.stderr || r.stdout) || `exit ${r.code}`);
+      const why = r.timedOut ? `timed out after ${VERSION_TIMEOUT_MS / 1000}s` : r.error ?? (failureDetail(r) || `exit ${r.code}`);
       notes.push(`"${spec.command} --version" failed: ${why}`);
     }
   }
@@ -623,7 +631,7 @@ async function discoverOne(
     report.deep =
       r.code === 0
         ? { ok: true, detail: 'headless prompt succeeded' }
-        : { ok: false, detail: r.timedOut ? `timed out after ${DEEP_TIMEOUT_MS / 1000}s` : r.error ?? (firstLine(r.stderr || r.stdout) || `exit ${r.code}`) };
+        : { ok: false, detail: r.timedOut ? `timed out after ${DEEP_TIMEOUT_MS / 1000}s` : r.error ?? (failureDetail(r) || `exit ${r.code}`) };
     if (report.deep.ok) report.signedIn = 'yes';
     else report.usable = false;
   }

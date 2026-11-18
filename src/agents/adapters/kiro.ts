@@ -49,6 +49,7 @@
  */
 import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';
+import { failureLine } from '../failure-line.js';
 import { hasOption } from './claude.js';
 
 /** The flags that set Kiro's tool-trust profile; any of them in the config's args replaces the default. */
@@ -111,20 +112,7 @@ const EXIT_MEANINGS: Readonly<Record<number, string>> = {
   4: 'the agent the run named (--agent or chat.defaultAgent) is not available',
 };
 
-// CSI and OSC escape sequences, which a CLI may print even when stdout is not a terminal.
-const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
 const clip = (s: string, n = 200) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
-
-/** The last non-blank line of the output, cleaned of escape sequences and carriage-return redraws. */
-export function lastOutputLine(output: string): string | null {
-  const lines = output.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const redraws = lines[i]!.replace(ANSI, '').split('\r');
-    const line = (redraws.reverse().find((l) => l.trim()) ?? '').replace(/[\x00-\x1f\x7f]/g, '').trim();
-    if (line) return line;
-  }
-  return null;
-}
 
 export const kiroAdapter: AgentAdapter = {
   name: 'kiro',
@@ -143,7 +131,7 @@ export const kiroAdapter: AgentAdapter = {
     const fallback = defaultVerdict(exit);
     if (fallback.outcome === 'succeeded' || exit.code === null) return fallback;
     const meaning = EXIT_MEANINGS[exit.code];
-    const said = lastOutputLine(exit.output);
+    const said = failureLine(exit.output);
     return {
       outcome: 'failed',
       error: `kiro-cli exited with code ${exit.code}${meaning ? ` (${meaning})` : ''}${said ? `: ${clip(said)}` : ''}`,

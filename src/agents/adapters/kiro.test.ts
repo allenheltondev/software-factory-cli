@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentExit, InvocationRequest } from './adapter.js';
-import { kiroAdapter, kiroArgsChooseHarness, kiroSupportsV3, lastOutputLine } from './kiro.js';
+import { kiroAdapter, kiroArgsChooseHarness, kiroSupportsV3 } from './kiro.js';
 import { getAdapter, implementedAdapters } from './registry.js';
 
 function request(o: Partial<InvocationRequest> = {}): InvocationRequest {
@@ -124,10 +124,15 @@ describe('kiro adapter: results', () => {
     expect(error.length).toBeLessThan(350);
   });
 
-  it('lastOutputLine skips blank lines, escape sequences and spinner redraws', () => {
-    expect(lastOutputLine('done\r\n\r\n')).toBe('done');
-    expect(lastOutputLine('⠋ Working\r⠙ Working\rFinished: 3 files changed\n')).toBe('Finished: 3 files changed');
-    expect(lastOutputLine('ok\n\x1b]0;title\x07\x1b[2K\n')).toBe('ok');
-    expect(lastOutputLine('\n \n')).toBeNull();
+  it('the reason skips blank lines, escape sequences and spinner redraws', () => {
+    const why = (out: string) => kiroAdapter.interpretExit!(exit(out, 101)).error;
+    expect(why('done\r\n\r\n')).toBe('kiro-cli exited with code 101: done');
+    expect(why('⠋ Working\r⠙ Working\rFinished: 3 files changed\n')).toBe('kiro-cli exited with code 101: Finished: 3 files changed');
+    expect(why('ok\n\x1b]0;title\x07\x1b[2K\n')).toBe('kiro-cli exited with code 101: ok');
+  });
+
+  it('the reason is the error Kiro printed, not a line it printed after it', () => {
+    const out = 'Thinking...\nError: The model is currently overloaded\nSee https://kiro.dev/docs/cli/ for help\n';
+    expect(kiroAdapter.interpretExit!(exit(out, 101)).error).toBe('kiro-cli exited with code 101: Error: The model is currently overloaded');
   });
 });
