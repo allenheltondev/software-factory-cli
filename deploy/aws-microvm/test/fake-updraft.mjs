@@ -28,7 +28,9 @@ if (process.env.FAKE_UPDRAFT_RECORD) {
 const interrupted = { outcome: 'failed', drain: 'stopped', exitCode: 1 };
 // What the real command leaves behind: its own log, and a run log named by the summary.
 const writeLogs = () => {
-  fs.writeFileSync(path.join(home, 'updraft.log'), 'updraft.log contents\n');
+  // Where the real CLI writes it: $UPDRAFT_HOME/logs/updraft.log.
+  fs.mkdirSync(path.join(home, 'logs'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'logs', 'updraft.log'), 'updraft.log contents\n');
   fs.mkdirSync(path.join(home, 'runs', 'r1'), { recursive: true });
   fs.writeFileSync(path.join(home, 'runs', 'r1', 'run.log'), 'agent transcript\n');
   return path.join(home, 'runs', 'r1', 'run.log');

@@ -340,7 +340,8 @@ function jobEnvironment(payload, stateDir, agentEnv, deps) {
  */
 async function uploadLogs(stateDir, summary, keyPrefix, bucket, deps) {
   const maxBytes = deps.maxLogBytes ?? MAX_LOG_BYTES;
-  const candidates = [['updraft.log', path.join(stateDir, 'updraft.log')]];
+  // With UPDRAFT_HOME set, Updraft keeps its worker log under logs/ (src/paths.ts).
+  const candidates = [['updraft.log', path.join(stateDir, 'logs', 'updraft.log')]];
   if (typeof summary?.logPath === 'string' && summary.logPath !== '') {
     candidates.push(['run.log', path.resolve(stateDir, summary.logPath)]);
   }

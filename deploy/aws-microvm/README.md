@@ -682,9 +682,9 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
 20. **`updraft run-event`.** It does not exist in the commit this was written against. The
     runner follows its contract as communicated (`image/runner/job.mjs`: `updraftInvocation`,
     `describeExitCode`) and reads three things from the summary: that it is a JSON object on
-    the last stdout line, `outcome`, and `logPath`. That `updraft.log` is directly in
-    `$UPDRAFT_HOME`, and that `logPath` is an absolute path or relative to it, are
-    assumptions; a log that is not found is skipped silently.
+    the last stdout line, `outcome`, and `logPath`. `updraft.log` is read from
+    `$UPDRAFT_HOME/logs/`, where the CLI writes it. That `logPath` is an absolute path or
+    relative to `$UPDRAFT_HOME` is an assumption; a log that is not found is skipped silently.
 21. **DynamoDB from the microVM.** With internet egress the public endpoint is assumed
     reachable, like S3 and Secrets Manager. With a VPC connector all three (and
     `lambda.<region>.amazonaws.com` for TerminateMicrovm) need a route or endpoints.
