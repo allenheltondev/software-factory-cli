@@ -103,6 +103,13 @@ export function validateConfig(raw: unknown): ValidationResult {
       }
     }
 
+    if (repo.commentOnFailure && config.execution.mode !== 'live') {
+      warnings.push({
+        path: `repositories.${repoName}.commentOnFailure`,
+        message: `only applies in live mode; in ${config.execution.mode} mode no comment is posted when a run fails`,
+      });
+    }
+
     const wfIds = new Set<string>();
     repo.workflows.forEach((wf, i) => {
       const base = `repositories.${repoName}.workflows.${i}`;

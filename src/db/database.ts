@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -192,6 +192,30 @@ const MIGRATIONS: Record<number, Migration> = {
       published_at     TEXT
     );
     CREATE INDEX publications_by_state ON publications (state, next_attempt_at);
+  `,
+  7: `
+    -- The comment that tells an issue its live run failed (repositories.<repo>.commentOnFailure).
+    -- One row per run that left its job failed; like publications, kept apart from runs so it
+    -- never changes a run's outcome, with the same lease and attempt counter for retries.
+    CREATE TABLE failure_comments (
+      run_id           TEXT    PRIMARY KEY REFERENCES runs (id),
+      job_id           TEXT    NOT NULL,
+      repo_id          INTEGER NOT NULL,
+      repo_full_name   TEXT    NOT NULL,
+      issue_number     INTEGER NOT NULL,
+      state            TEXT    NOT NULL CHECK (state IN ('posting','posted','failed','skipped')),
+      comment_id       INTEGER,
+      comment_url      TEXT,
+      error            TEXT,               -- why it failed, or why it was skipped
+      retryable        INTEGER NOT NULL DEFAULT 0,
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,               -- while state = 'posting'
+      next_attempt_at  TEXT,               -- automatic retry of a retryable failure
+      created_at       TEXT    NOT NULL,
+      updated_at       TEXT    NOT NULL,
+      posted_at        TEXT
+    );
+    CREATE INDEX failure_comments_by_state ON failure_comments (state, next_attempt_at);
   `,
 };
 

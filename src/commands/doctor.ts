@@ -4,6 +4,7 @@ import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import type { AgentReport } from '../agents/discovery.js';
 import { agentAdapter, publishMode, type FactoryConfig } from '../config/schema.js';
+import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
 import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import type { FactoryPaths } from '../paths.js';
@@ -221,6 +222,20 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
             add(sev, name, `publish: ${publish}, but the active GitHub account has no push access to ${fullName}. ${TOKEN_SCOPES_HINT}`);
           } else {
             add('ok', name, `publish: ${publish}; the active GitHub account can push${gr.private && publish === 'draft-pr' ? ' (private repo: if GitHub refuses draft PRs on your plan, use publish: pr)' : ''}`);
+          }
+        }
+        if (repo.commentOnFailure) {
+          // Commenting on an issue needs only read access, but GitHub refuses comments on an
+          // archived repository. Whether the token may write issue comments shows only on a write.
+          const sev: CheckStatus = config.execution.mode === 'live' ? 'fail' : 'warn';
+          if (gr.archived) {
+            add(sev, name, `commentOnFailure: ${fullName} is archived (read-only), so GitHub will refuse the failure comment`);
+          } else if (gr.permissions === null) {
+            add('warn', name, "commentOnFailure: GitHub did not report this account's permissions; read access is unverified");
+          } else if (!gr.permissions.pull) {
+            add(sev, name, `commentOnFailure: the active GitHub account has no read access to ${fullName}. ${COMMENT_SCOPES_HINT}`);
+          } else {
+            add('ok', name, 'commentOnFailure: the active GitHub account can read the repository (the token must also allow issue comments, which is not checked: doctor does not write)');
           }
         }
         const labels = await api.listLabels({ id: repo.id, fullName });

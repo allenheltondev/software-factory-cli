@@ -77,6 +77,29 @@ describe('factory start', () => {
     expect(executors[1]).toBeInstanceOf(PrepareOnlyExecutor);
   });
 
+  it('gives the daemon a failure commenter only in live mode with commentOnFailure set', async () => {
+    const wired = async (mode: 'log-only' | 'live', commentOnFailure: boolean) => {
+      let seen: DaemonDeps | undefined;
+      const s = setup(async (d) => {
+        seen = d;
+      });
+      const cfg = upsertRepoWorkflow(seedConfig('me'), { id: 1, fullName: 'o/r' }, buildWorkflow({ label: 'go', action: 'implement-issue', pool: 'general' })).config;
+      cfg.execution = { mode };
+      cfg.agents = { claude: {} };
+      cfg.pools = { general: { agents: ['claude'] } };
+      cfg.repositories!['o/r']!.checkoutPath = '../clones/o r';
+      if (commentOnFailure) (cfg.repositories!['o/r'] as { commentOnFailure?: boolean }).commentOnFailure = true;
+      writeFileSync(s.ctx.paths.configFile, stringify(cfg));
+      expect(await startCommand(s.ctx, s.deps)).toBe(0);
+      return { commenter: seen?.failureCommenter, publisher: seen?.publisher };
+    };
+    expect((await wired('live', true)).commenter).toMatchObject({ afterRun: expect.any(Function), retryDue: expect.any(Function) });
+    // Its own switch: it does not need publish, and publish does not turn it on.
+    expect((await wired('live', true)).publisher).toBeUndefined();
+    expect((await wired('live', false)).commenter).toBeUndefined();
+    expect((await wired('log-only', true)).commenter).toBeUndefined();
+  });
+
   it('propagates WorkerLockedError and still closes the DB', async () => {
     const s = setup(async () => {
       throw new WorkerLockedError({ workerId: 'w', pid: 1, hostname: 'h', heartbeatAt: 't' });
