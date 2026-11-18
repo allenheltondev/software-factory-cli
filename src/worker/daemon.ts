@@ -39,6 +39,7 @@ import {
   heartbeatWorkerLock,
   releaseWorkerLock,
 } from './lock.js';
+import { defaultContainerControl, type ContainerControl } from './container.js';
 import { defaultProcessControl, terminateIfSameProcess, type ProcessControl } from './process.js';
 import { reconcileInterruptedRuns } from './reconcile.js';
 
@@ -80,6 +81,8 @@ export interface DaemonDeps {
   executor?: Executor;
   /** Process liveness/termination; injectable for tests. */
   processControl?: ProcessControl;
+  /** Removal of a containerized run's container; injectable for tests. */
+  containers?: ContainerControl;
   /**
    * Publication (repositories.<repo>.publish): called after a succeeded run is recorded, and after
    * each poll to retry transient failures. Never changes a run's outcome. Absent: nothing is published.
@@ -161,6 +164,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const hostname = deps.hostname ?? osHostname();
   const pid = deps.pid ?? process.pid;
   const processControl = deps.processControl ?? defaultProcessControl;
+  const containers = deps.containers ?? defaultContainerControl;
   const executor = deps.executor ?? new LogOnlyExecutor();
   const heartbeatMs = deps.timing?.heartbeatMs ?? WORKER_HEARTBEAT_MS;
   const cancelCheckMs = deps.timing?.cancelCheckMs ?? CANCEL_CHECK_MS;
@@ -374,8 +378,13 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       // still verify the start time so a pid the OS reused is never killed.
       const current = getRun(db, runId);
       let note = '';
+      if (current?.container) {
+        // Before the client: stopping the runtime client alone can leave the container running.
+        note = (await containers.remove(current.container.runtime, current.container.name).catch(() => ({ note: '' }))).note;
+      }
       if (current?.pid != null) {
-        note = (await terminateIfSameProcess(processControl, current.pid, current.pidStartTime).catch(() => ({ note: '' }))).note;
+        const pidNote = (await terminateIfSameProcess(processControl, current.pid, current.pidStartTime).catch(() => ({ note: '' }))).note;
+        note = [note, pidNote].filter(Boolean).join('; ');
       }
       try {
         finishRun(db, runId, {
@@ -393,7 +402,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const heartbeatTimer = setInterval(heartbeat, heartbeatMs);
   const cancelTimer = setInterval(checkCancelRequests, cancelCheckMs);
   try {
-    await reconcileInterruptedRuns(db, { hostname, processControl, log, now });
+    await reconcileInterruptedRuns(db, { hostname, processControl, containers, log, now });
 
     let nextPollAt = now();
     while (!signal.aborted && !lockLost) {

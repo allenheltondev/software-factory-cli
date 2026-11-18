@@ -4,12 +4,15 @@ import { finishRun, listOpenRuns, releaseClaim } from '../db/queue.js';
 import type { Run } from '../types.js';
 import { nowIso } from '../util/ids.js';
 import type { Logger } from '../util/log.js';
+import { defaultContainerControl, type ContainerControl } from './container.js';
 import { terminateIfSameProcess, type ProcessControl } from './process.js';
 
 export interface ReconcileOptions {
   /** This worker's host. Only pids recorded by runs claimed on this host are signalled. */
   hostname: string;
   processControl: ProcessControl;
+  /** Removes a containerized run's container. Defaults to the real runtime client. */
+  containers?: ContainerControl;
   log: Logger;
   now?: () => number;
 }
@@ -36,12 +39,17 @@ export interface ReconcileResult {
  * at spawn (runs.pid_start_time), so a pid recorded on another machine, or one the OS has
  * since given to another process, is never killed. Runs with no recorded host or start time
  * are never signalled.
+ *
+ * A containerized run (runs.container_name) also has its container removed, first, with the
+ * runtime client recorded for the run: killing the client's pid alone can leave the container
+ * running. The same host rule applies; the name carries the run id, so it can't be another
+ * run's container.
  */
 export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): Promise<ReconcileResult> {
   const now = opts.now ?? Date.now;
   const result: ReconcileResult = { interrupted: [], requeued: [] };
   for (const run of listOpenRuns(db)) {
-    if (run.executionStartedAt === null && run.pid === null) {
+    if (run.executionStartedAt === null && run.pid === null && run.container === null) {
       releaseClaim(db, run.id, `requeued: worker ${run.workerId} stopped before the run started`, now);
       opts.log.info('requeued run that never started', { runId: run.id, jobId: run.jobId, agent: run.agent });
       result.requeued.push(run);
@@ -49,14 +57,25 @@ export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): 
     }
     const sameHost = run.hostname !== null && run.hostname === opts.hostname;
     let note = '';
+    if (run.container !== null) {
+      const c = run.container;
+      if (sameHost) {
+        const r = await (opts.containers ?? defaultContainerControl).remove(c.runtime, c.name);
+        if (r.removed) opts.log.warn('removed container left by previous worker', { runId: run.id, container: c.name });
+        else if (r.note) opts.log.warn('could not remove a recorded container', { runId: run.id, container: c.name, why: r.note });
+        if (r.note) note = `; ${r.note}`;
+      } else {
+        note = `; container ${c.name} was not removed (recorded on ${run.hostname ? `host ${run.hostname}` : 'an unknown host'})`;
+      }
+    }
     if (run.pid !== null) {
       if (sameHost) {
         const r = await terminateIfSameProcess(opts.processControl, run.pid, run.pidStartTime);
         if (r.terminated) opts.log.warn('terminated agent process left by previous worker', { runId: run.id, pid: run.pid });
         else if (r.note) opts.log.warn('left a recorded agent pid alone', { runId: run.id, pid: run.pid, why: r.note });
-        if (r.note) note = `; ${r.note}`;
+        if (r.note) note += `; ${r.note}`;
       } else {
-        note = `; agent pid ${run.pid} was not signalled (recorded on ${run.hostname ? `host ${run.hostname}` : 'an unknown host'})`;
+        note += `; agent pid ${run.pid} was not signalled (recorded on ${run.hostname ? `host ${run.hostname}` : 'an unknown host'})`;
       }
     }
     finishRun(db, run.id, {

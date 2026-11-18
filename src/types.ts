@@ -98,6 +98,18 @@ export interface Run {
    * outcome and its job is 'canceled', whatever the executor reported.
    */
   cancelRequestedAt: string | null;
+  /**
+   * The container a containerized live run started (agents.<name>.container): the runtime client
+   * and the container's name, so a later worker on the same host can remove it. Null when the
+   * agent ran on the host.
+   */
+  container: RunContainer | null;
+}
+
+export interface RunContainer {
+  /** Absolute path of the runtime client (docker, podman) that started the container. */
+  runtime: string;
+  name: string;
 }
 
 /** Recorded after a live agent run, in run.log and the state DB (`factory status`). */

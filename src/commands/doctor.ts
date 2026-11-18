@@ -13,6 +13,7 @@ import { agentLookupEnv } from '../worker/live.js';
 import { pathEntries, which } from '../util/which.js';
 import { println, type CommandContext } from './context.js';
 import { checkRepoCheckouts } from './doctor-checkout.js';
+import { containerAgentChecks } from './doctor-container.js';
 import { EXIT, describeGitHubError } from './errors.js';
 import { checkConfig } from './validate.js';
 
@@ -261,20 +262,24 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
   // Agents: the same discovery as "factory agents", for each enabled agent as a live run starts it:
   // its agents.<name>.command, in this process's environment minus the GitHub tokens plus its
   // agents.<name>.env. Running doctor under the background launcher shows what the worker will see.
+  // A containerized agent's CLI is in its image, so the runtime, the image and the CLI inside it
+  // are checked instead of anything on the host.
   if (config) {
     const sev = agentProblemSeverity(config.execution.mode);
     const enabled = Object.entries(config.agents).filter(([, a]) => a.enabled);
-    const reports = await Promise.all(
-      enabled.map(([agentName, agent]) =>
-        probes.discoverAgent(agentAdapter(agentName, agent), {
-          env: agentLookupEnv(probes.env, agent),
-          ...(agent.command ? { command: agent.command } : {}),
-          baseDir: paths.configDir,
-        }),
-      ),
+    const results = await Promise.all(
+      enabled.map(async ([agentName, agent]) => {
+        const adapter = agentAdapter(agentName, agent);
+        const env = agentLookupEnv(probes.env, agent);
+        if (agent.container) {
+          return containerAgentChecks(agentName, adapter, agent, paths.configDir, { platform: probes.platform, env, which: probes.which, run: probes.run }, sev);
+        }
+        const report = await probes.discoverAgent(adapter, { env, ...(agent.command ? { command: agent.command } : {}), baseDir: paths.configDir });
+        return agentChecks(report, sev);
+      }),
     );
     enabled.forEach(([agentName], i) => {
-      for (const c of agentChecks(reports[i], sev)) add(c.status, `agent ${agentName}`, c.detail);
+      for (const c of results[i]!) add(c.status, `agent ${agentName}`, c.detail);
     });
   }
 

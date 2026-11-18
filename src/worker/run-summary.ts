@@ -112,6 +112,14 @@ export interface SummaryInput {
   baseSha: string;
   lastOutput: string[];
   git?: string;
+  /**
+   * The worktree was written by a contained agent, and this summary runs git on the host. Git
+   * then must not look inside submodules: `git diff` against the working tree runs `git status`
+   * in each populated submodule, under that nested repository's own config (core.fsmonitor and
+   * filters are commands), which the agent controls. A changed submodule commit still counts;
+   * uncommitted changes inside a submodule do not.
+   */
+  untrustedWorktree?: boolean;
 }
 
 export interface SummaryDetail {
@@ -132,10 +140,11 @@ export async function summarizeRun(input: SummaryInput): Promise<SummaryDetail> 
     }
   };
   const range = `${input.baseSha}..HEAD`;
+  const diff = input.untrustedWorktree ? ['diff', '--ignore-submodules=dirty'] : ['diff'];
   const count = await git(['rev-list', '--count', range], 'commits');
   const log = await git(['log', `--max-count=${MAX_COMMITS}`, '--format=%h %s', range], 'commit list');
-  const stat = await git(['diff', '--stat=200', input.baseSha], 'diff --stat');
-  const names = await git(['diff', '--name-only', '-z', input.baseSha], 'changed files');
+  const stat = await git([...diff, '--stat=200', input.baseSha], 'diff --stat');
+  const names = await git([...diff, '--name-only', '-z', input.baseSha], 'changed files');
   const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z'], 'untracked files');
 
   const statLines = (stat ?? '').split('\n').filter((l) => l.trim() !== '');

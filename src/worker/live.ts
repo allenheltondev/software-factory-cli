@@ -15,6 +15,8 @@
 //
 // After an agent succeeded, the action's verify commands (if any) run in the same worktree with
 // the same lifecycle; only a string command differs, in that it is handed to a shell (verify.ts).
+// - with agents.<name>.container, the process is the container runtime's client and the agent
+//   runs in a container (container.ts); stopping then removes the container by name first
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
 import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
@@ -48,6 +50,18 @@ import {
   type ExecutionResult,
   type Executor,
 } from './executor.js';
+import {
+  checkContainerReady,
+  CONTAINER_RUN_FAILED,
+  containerLaunch,
+  containerStopBudgetMs,
+  containInvocation,
+  forceRemoveContainer,
+  stopContainer,
+  trackContainer,
+  untrackContainer,
+  type ContainedInvocation,
+} from './container.js';
 import { processStartTime, taskkillPath } from './process.js';
 import { cleanSummaryLines, countUncommitted, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 import { displayVerifyCommand, verifyInvocation, type VerifyInvocation } from './verify.js';
@@ -225,9 +239,17 @@ async function runAgent(o: {
   timeoutMs: number;
   stop: AbortSignal;
   killGraceMs: number;
+  /** Containerized run: stops the container by name. Called before the process tree is stopped. */
+  stopContainer?: () => Promise<void>;
   onSpawn: (pid: number) => void;
 }): Promise<AgentRun> {
   const inv = o.invocation;
+  // Stopping the runtime client does not reliably stop its container, so that goes first.
+  const containerBudget = o.stopContainer ? containerStopBudgetMs(o.killGraceMs) : 0;
+  const stopProcesses = async (child: ChildProcess, pid: number) => {
+    if (o.stopContainer) await Promise.race([o.stopContainer(), idle(containerBudget)]);
+    await (isWindows ? taskkillTree(child) : stopGroup(pid, o.killGraceMs));
+  };
   let child: ChildProcess;
   const out = openSync(o.logPath, 'a');
   let stdin: number | 'ignore' = 'ignore';
@@ -276,7 +298,7 @@ async function runAgent(o: {
     // The agent is running but the worker couldn't record it, so nothing else would stop it.
     // Stop it now and wait, and report a started run that failed: a start_failed outcome would
     // let the queue try another agent while this one might still be working in the worktree.
-    await Promise.race([isWindows ? taskkillTree(child) : stopGroup(pid, o.killGraceMs), idle(o.killGraceMs + EXIT_WAIT_MS)]);
+    await Promise.race([stopProcesses(child, pid), idle(containerBudget + o.killGraceMs + EXIT_WAIT_MS)]);
     await Promise.race([exit, idle(EXIT_WAIT_MS)]);
     if (!isWindows && groupAlive(pid)) await stopGroup(pid, Math.min(o.killGraceMs, 2_000));
     if (!exited) running.delete(child);
@@ -292,8 +314,8 @@ async function runAgent(o: {
   const stopTree = (why: 'timeout' | 'shutdown') => {
     if (stopped || exited) return;
     stopped = why;
-    killing = isWindows ? taskkillTree(child) : stopGroup(pid, o.killGraceMs);
-    giveUpTimer = setTimeout(giveUp, o.killGraceMs + EXIT_WAIT_MS);
+    killing = stopProcesses(child, pid);
+    giveUpTimer = setTimeout(giveUp, containerBudget + o.killGraceMs + EXIT_WAIT_MS);
   };
   const timer = setTimeout(() => stopTree('timeout'), o.timeoutMs);
   const onStop = () => stopTree('shutdown');
@@ -308,7 +330,7 @@ async function runAgent(o: {
     clearTimeout(giveUpTimer);
     o.stop.removeEventListener('abort', onStop);
   }
-  if (killing) await Promise.race([killing, idle(o.killGraceMs + EXIT_WAIT_MS)]);
+  if (killing) await Promise.race([killing, idle(containerBudget + o.killGraceMs + EXIT_WAIT_MS)]);
   if (result === null) {
     // Still no exit event. Report it as killed rather than hang the worker.
     running.delete(child);
@@ -533,10 +555,15 @@ export class LiveExecutor implements Executor {
 
     // 2. Find the CLI before touching the clone, so a missing binary leaves no worktree behind.
     const baseEnv = withoutKeys(this.opts.env ?? process.env, WITHHELD_ENV);
-    const located = (this.opts.locate ?? defaultLocate)(adapterName, agentCfg, {
-      env: agentLookupEnv(this.opts.env ?? process.env, agentCfg),
-      configDir: ctx.paths.configDir,
-    });
+    const lookup = { env: agentLookupEnv(this.opts.env ?? process.env, agentCfg), configDir: ctx.paths.configDir };
+    // Containerized: the CLI is a name inside the image, so host discovery doesn't apply; what
+    // must be on the host is the runtime and the image.
+    const containerReady = agentCfg.container ? await checkContainerReady(agentCfg.container, lookup) : null;
+    const located: LocatedLaunch = containerReady
+      ? containerReady.runtime
+        ? { path: null, launch: containerLaunch(adapterName, agentCfg) }
+        : { path: null, launch: null, problem: containerReady.problem }
+      : (this.opts.locate ?? defaultLocate)(adapterName, agentCfg, lookup);
     if (!located.launch) {
       const why = `${run.agent} cannot start: ${located.problem ?? 'agent CLI not found'}`;
       await log([`error: ${why}`, 'outcome: start_failed']);
@@ -591,6 +618,32 @@ export class LiveExecutor implements Executor {
     }
     const agentEnv = mergeEnv(baseEnv, invocation.env, agentCfg.env);
     const timeoutMs = Math.round(timeoutMinutes * 60_000);
+    // Containerized: the same command, started by the runtime client inside a container that
+    // sees only the worktree and what git needs. agentEnv stays the client's environment; the
+    // container gets the variables named on its command line and nothing else.
+    let contained: (ContainedInvocation & { runtime: string }) | null = null;
+    // What the adapter asked for, which is what it later interprets the exit against.
+    const agentArgs = invocation.args;
+    if (agentCfg.container && containerReady?.runtime) {
+      try {
+        contained = {
+          runtime: containerReady.runtime,
+          ...containInvocation({
+            invocation,
+            runtime: containerReady.runtime,
+            container: agentCfg.container,
+            runId: run.id,
+            worktree: prepared.worktreePath,
+            promptFile,
+            agentEnv: agentCfg.env,
+          }),
+        };
+      } catch (err) {
+        await log([`checkout: ${prepared.worktreePath}`]);
+        return fail('failed', `could not set up the container for ${run.agent}: ${message(err)}`);
+      }
+      invocation = contained.invocation;
+    }
     await log([
       `source clone: ${checkoutSource}`,
       `remote: ${prepared.remote} (${prepared.remoteUrl})`,
@@ -598,7 +651,14 @@ export class LiveExecutor implements Executor {
       `branch: ${prepared.branch}`,
       `checkout: ${prepared.worktreePath}`,
       '',
-      `agent cli: ${located.path ?? located.launch.file}`,
+      `agent cli: ${located.path ?? located.launch.file}${contained ? ` (inside image ${agentCfg.container!.image})` : ''}`,
+      ...(contained
+        ? [
+            `container: ${contained.name} (runtime ${contained.runtime})`,
+            `  env passed by name: ${contained.envNames.length ? contained.envNames.join(', ') : '(none)'}`,
+            ...contained.mounts.map((m) => `  mount (${m.readOnly ? 'read-only' : 'read-write'}): ${m.path}`),
+          ]
+        : []),
       `command: ${JSON.stringify([invocation.file, ...invocation.args])}`,
       `prompt file: ${promptFile} (${invocation.promptVia === 'stdin' ? 'on stdin' : 'passed by path'})`,
       ...(agentCfg.env && Object.keys(agentCfg.env).length ? [`env from config: ${Object.keys(agentCfg.env).join(', ')}`] : []),
@@ -612,6 +672,13 @@ export class LiveExecutor implements Executor {
     const startedAt = ctx.now();
     let identity: Promise<void> = Promise.resolve();
     let agentRun: AgentRun;
+    const killGraceMs = this.opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+    const box = contained;
+    if (box) {
+      // Recorded before the container can exist, so a crash at any later point leaves a name to remove.
+      ctx.recordProcess({ container: { runtime: box.runtime, name: box.name } });
+      trackContainer(box.runtime, box.name, agentEnv);
+    }
     try {
       agentRun = await runAgent({
         invocation,
@@ -621,7 +688,8 @@ export class LiveExecutor implements Executor {
         promptFile,
         timeoutMs,
         stop: ctx.workerStopping ? AbortSignal.any([ctx.signal, ctx.workerStopping]) : ctx.signal,
-        killGraceMs: this.opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS,
+        killGraceMs,
+        ...(box ? { stopContainer: () => stopContainer(box.runtime, box.name, killGraceMs, agentEnv) } : {}),
         onSpawn: (pid) => {
           ctx.recordProcess({ pid });
           ctx.log.info('agent started', { pid, worktree: prepared.worktreePath });
@@ -643,6 +711,13 @@ export class LiveExecutor implements Executor {
       await log(['---- end of agent output ----', `error: ${why}`, 'outcome: start_failed']);
       ctx.log.warn('agent could not start', { error: why, logPath });
       throw err instanceof StartFailedError ? err : new StartFailedError(why, { cause: err });
+    } finally {
+      if (box) {
+        // --rm removes the container when its command exits. If the client died first (killed
+        // from outside, a runtime restart) the container may still be there: make sure it isn't.
+        await forceRemoveContainer(box.runtime, box.name, agentEnv);
+        untrackContainer(box.name);
+      }
     }
     const seconds = Math.round((ctx.now() - startedAt) / 1000);
     await identity; // never record anything for this run after it is finished
@@ -668,7 +743,7 @@ export class LiveExecutor implements Executor {
       outcome = 'interrupted';
       error = `${stopper()} before the run finished; the agent process tree was stopped`;
     } else {
-      const exit = { code: agentRun.code, signal: agentRun.signal, outputTail, output: rawOutput, args: invocation.args };
+      const exit = { code: agentRun.code, signal: agentRun.signal, outputTail, output: rawOutput, args: agentArgs };
       let verdict = defaultVerdict(exit);
       if (adapter.interpretExit) {
         try {
@@ -679,6 +754,11 @@ export class LiveExecutor implements Executor {
       }
       outcome = verdict.outcome;
       error = verdict.error ?? (outcome === 'failed' ? defaultVerdict(exit).error : undefined);
+      if (box && agentRun.code === CONTAINER_RUN_FAILED) {
+        // The code the runtime exits with when it fails itself (bad option, daemon gone, name in use).
+        outcome = 'failed';
+        error = `${box.runtime} could not start the container (exit ${CONTAINER_RUN_FAILED})${outputTail.length ? `: ${outputTail[outputTail.length - 1]}` : ''}`;
+      }
     }
 
     await log([
@@ -733,6 +813,7 @@ export class LiveExecutor implements Executor {
         baseSha: prepared.baseSha,
         lastOutput,
         git: this.opts.git,
+        untrustedWorktree: Boolean(box),
       });
       summary = detail.summary;
       if (verification) summary.verification = verification;

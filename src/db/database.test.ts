@@ -167,3 +167,20 @@ describe('migration v8', () => {
     expect(db.prepare('SELECT count(*) AS n FROM pruned_events').get()).toEqual({ n: 0 });
   });
 });
+
+describe('migration v9', () => {
+  it('adds empty container columns; an existing open run is treated as a host run', () => {
+    const db = openDatabase(':memory:', { migrateTo: 8 });
+    db.prepare(
+      `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
+       VALUES ('job_1', 1, 'o/r', 'wf', 'e1', 1, 'implement-issue', 'general', '{}', 'running', 1, 't', 't')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, hostname, pid, lease_expires_at, started_at, execution_started_at)
+       VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'wrk_1', 'host-a', 4242, 't', 't', 't')`,
+    ).run();
+    migrate(db, 9);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+    expect(db.prepare('SELECT pid, container_runtime, container_name FROM runs').get()).toEqual({ pid: 4242, container_runtime: null, container_name: null });
+  });
+});

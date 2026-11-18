@@ -24,7 +24,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** A migration is plain SQL, or a function for steps that need to backfill from existing rows. */
 type Migration = string | ((db: Db) => void);
@@ -235,6 +235,15 @@ const MIGRATIONS: Record<number, Migration> = {
       PRIMARY KEY (repo_id, workflow_id, event_id)
     ) WITHOUT ROWID;
   `,
+  9: `
+    -- A containerized live run (agents.<name>.container): the runtime client that started the
+    -- container (an absolute path) and the container's name. Recorded before the container
+    -- starts, so that a later worker on the same host can remove it after a crash. The config may
+    -- have changed by then, which is why the runtime is recorded and not derived. NULL: the
+    -- agent ran on the host.
+    ALTER TABLE runs ADD COLUMN container_runtime TEXT;
+    ALTER TABLE runs ADD COLUMN container_name TEXT;
+  `,
 };
 
 /**
@@ -385,6 +394,8 @@ export interface RunRow {
   error: string | null;
   summary: string | null;
   cancel_requested_at: string | null;
+  container_runtime: string | null;
+  container_name: string | null;
 }
 
 function parseSummary(json: string | null): RunSummary | null {
@@ -417,5 +428,6 @@ export function rowToRun(r: RunRow): Run {
     error: r.error,
     summary: parseSummary(r.summary),
     cancelRequestedAt: r.cancel_requested_at,
+    container: r.container_runtime && r.container_name ? { runtime: r.container_runtime, name: r.container_name } : null,
   };
 }
