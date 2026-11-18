@@ -48,6 +48,7 @@ actions:
     prompt: ./prompts/implement-issue.md
     output: local-branch
     # timeoutMinutes: 60 # live mode: stop the agent and fail the run after this long
+    # revisePrompt: ./prompts/revise-pr.md # needed when a repository below sets revise: true
 
 repositories:
   allenheltondev/kids-and-dragons:
@@ -58,6 +59,9 @@ repositories:
     # remote: origin # only needed when the GitHub remote uses an SSH host alias (git@github-work:OWNER/REPO)
     # Live mode: push the job branch of a succeeded run and open a PR as your gh account (none, draft-pr or pr).
     # publish: draft-pr
+    # With publish: when an allowed actor requests changes on such a PR, run the agent on its branch and push the result.
+    # revise: true
+    # maxRevisions: 3
     workflows:
       - id: implement
         trigger:

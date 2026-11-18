@@ -6,6 +6,7 @@ import { commitPollBatch } from './ingest.js';
 import { listPrunableJobs, pruneJob } from './prune.js';
 import { beginPublication, finishPublication } from './publications.js';
 import { claimNextJob, finishRun, getJob, retryJob } from './queue.js';
+import { beginRevision, finishRevision, getReviewRequest, getRevision, recordReviewRequest } from './revisions.js';
 
 const T0 = Date.parse('2026-11-17T10:00:00.000Z');
 const DAY = 86_400_000;
@@ -96,5 +97,28 @@ describe('pruneJob', () => {
     expect(again().map((j) => j.workflowId)).toEqual(['another-workflow']);
     expect(again()).toEqual([]);
     expect(db.prepare('SELECT count(*) AS n FROM jobs').get()).toEqual({ n: 1 });
+  });
+
+  it('deletes a revision run\'s push record with its job, keeps one that is unfinished, and never forgets the review', () => {
+    const db = openDatabase(':memory:');
+    const a = finishedJob(db, 1, 'succeeded');
+    const b = finishedJob(db, 2, 'succeeded');
+    const rev = { repoId: 1, repoFullName: 'o/r', prNumber: 9, trigger: 'changes_requested' as const, branch: 'updraft/issue-1-job_x', baseSha: 'abc', leaseSeconds: 60 };
+    const a1 = beginRevision(db, { ...rev, runId: a.runId, jobId: a.jobId, issueNumber: 1, reviewId: 'PRR_a', now: old });
+    expect(a1.ok && finishRevision(db, a.runId, a1.revision.attempts, { state: 'published', now: old })).toBe(true);
+    // b: its worker died mid-push long ago; it can still be finished with "updraft publish".
+    beginRevision(db, { ...rev, runId: b.runId, jobId: b.jobId, issueNumber: 2, reviewId: 'PRR_b', now: old });
+    recordReviewRequest(db, { repoId: 1, reviewId: 'PRR_x', prNumber: 9, reviewer: 'allen', trigger: 'changes_requested', reviewUrl: null, submittedAt: null, state: 'over-limit', reason: 'limit' }, old);
+
+    expect(listPrunableJobs(db, cutoff).map((j) => [j.id, j.keep])).toEqual([
+      [a.jobId, null],
+      [b.jobId, `the revision push of run ${b.runId} is in progress or awaiting retry`],
+    ]);
+    expect(pruneJob(db, a.jobId, cutoff)).toMatchObject({ pruned: true });
+    expect(pruneJob(db, b.jobId, cutoff)).toMatchObject({ pruned: false });
+    expect(getRevision(db, a.runId)).toBeNull();
+    expect(getRevision(db, b.runId)).not.toBeNull();
+    expect(getReviewRequest(db, 1, 'PRR_x')).toMatchObject({ state: 'over-limit' });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 });

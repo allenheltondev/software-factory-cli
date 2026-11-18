@@ -31,6 +31,11 @@ export function jobBranchName(job: { id: string; issueNumber: number }, attempt:
   return `updraft/issue-${job.issueNumber}-${job.id}${attempt > 1 ? `-${attempt}` : ''}`;
 }
 
+/** Is `branch` shaped like a job branch? Publication and revisions push to nothing else. */
+export function isJobBranchName(branch: string): boolean {
+  return /^updraft\/issue-\d+-job_[A-Za-z0-9]+(-\d+)?$/.test(branch);
+}
+
 export function jobWorktreePath(
   paths: Pick<UpdraftPaths, 'dataDir'>,
   job: { id: string; repoId: number },

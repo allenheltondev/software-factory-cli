@@ -77,6 +77,12 @@ class FakeCommentApi implements GitHubApi {
   async listPullRequestsForHead(): Promise<never> {
     throw new Error('a failure comment never looks at pull requests');
   }
+  async listPullRequestUpdates(): Promise<never> {
+    throw new Error('a failure comment never looks at pull requests');
+  }
+  async getPullRequestReviews(): Promise<never> {
+    throw new Error('a failure comment never reads reviews');
+  }
   async createPullRequest(): Promise<never> {
     throw new Error('a failure comment never opens a pull request');
   }

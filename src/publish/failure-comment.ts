@@ -27,7 +27,7 @@ import { getJob, getRun, MAX_START_FAILURES } from '../db/queue.js';
 import { jobBranchName } from '../git/worktree.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import type { UpdraftPaths } from '../paths.js';
-import type { Job, Run } from '../types.js';
+import { revisionOf, type Job, type Run } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { cap, fenced, MAX_AUTO_ATTEMPTS, PUBLISH_ATTEMPT_SECONDS, PUBLISH_LEASE_SECONDS } from './publish.js';
@@ -73,7 +73,7 @@ class TransientError extends Error {}
 // ---------------------------------------------------------------------------
 
 /** Inline code the text cannot close, so mentions, links and references in it stay inert. */
-function code(text: string): string {
+export function code(text: string): string {
   const flat = text.replace(/<!--|-->/g, '').replace(/\s+/g, ' ').trim() || '?';
   const longest = Math.max(0, ...[...flat.matchAll(/`+/g)].map((m) => m[0].length));
   const ticks = '`'.repeat(longest + 1);
@@ -133,12 +133,16 @@ export function renderFailureComment(o: {
   reason: string;
   branch: string | null;
   triggerLabel: string;
+  /** Set for a revision run: the comment goes on the pull request and says how to ask again. */
+  revision?: boolean;
 }): string {
   const reason = o.agentStarted
     ? o.reason
     : `no agent could start after ${o.startFailures ?? MAX_START_FAILURES} consecutive attempts; the last one, on ${o.agent}: ${o.reason}`;
   return [
-    'An Updraft run for this issue failed, so no pull request was opened for it.',
+    o.revision
+      ? 'An Updraft revision run for this pull request failed, so nothing was pushed to it.'
+      : 'An Updraft run for this issue failed, so no pull request was opened for it.',
     '',
     `- Run: ${code(o.runId)} (attempt ${o.attempt} of job ${code(o.jobId)})`,
     `- Agent: ${code(o.agent)}${o.agentStarted ? '' : ' (the last one tried)'}`,
@@ -151,7 +155,9 @@ export function renderFailureComment(o: {
     '',
     "The agent's output is not posted here; the full error and the run log are on the machine running the worker (`updraft status`).",
     '',
-    `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine, or remove the ${code(o.triggerLabel)} label from this issue and apply it again.`,
+    o.revision
+      ? `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine, or submit a new review that requests changes.`
+      : `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine, or remove the ${code(o.triggerLabel)} label from this issue and apply it again.`,
     '',
     failureCommentMarker(o.runId),
   ].join('\n');
@@ -251,14 +257,19 @@ export async function postFailureComment(deps: FailureCommentDeps, runId: string
   if (!run || !job) return { status: 'not-eligible', reason: check.ok ? '' : check.reason };
   const repoFullName = check.ok ? check.e.repoFullName : (existing?.repoFullName ?? job.repoFullName);
   const repoRef = { id: job.repoId, fullName: repoFullName };
-  const log = deps.log.child({ runId, repo: repoFullName, issue: job.issueNumber });
+  // A revision run's comment goes on the pull request it was revising (a PR takes issue
+  // comments under its own number), with the same text rules.
+  const revision = revisionOf(job);
+  const target = revision ? revision.pullRequest.number : job.issueNumber;
+  const where = `${revision ? 'pull request' : 'issue'} #${target}`;
+  const log = deps.log.child({ runId, repo: repoFullName, issue: job.issueNumber, ...(revision ? { pr: target } : {}) });
 
   const begun = beginFailureComment(deps.db, {
     runId,
     jobId: job.id,
     repoId: job.repoId,
     repoFullName,
-    issueNumber: job.issueNumber,
+    issueNumber: target,
     leaseSeconds: PUBLISH_LEASE_SECONDS,
     now,
   });
@@ -304,7 +315,7 @@ export async function postFailureComment(deps: FailureCommentDeps, runId: string
   try {
     hold();
     const marker = failureCommentMarker(runId);
-    const found = (await deps.api.listIssueComments(repoRef, job.issueNumber)).find((c) => c.body.includes(marker));
+    const found = (await deps.api.listIssueComments(repoRef, target)).find((c) => c.body.includes(marker));
     let comment = found;
     if (!comment) {
       const agentStarted = run.outcome === 'failed';
@@ -332,19 +343,20 @@ export async function postFailureComment(deps: FailureCommentDeps, runId: string
         // A checkout is recorded once the worktree, and with it the job branch, exists.
         branch: run.summary?.branch ?? (run.checkoutPath ? jobBranchName(job, run.attempt) : null),
         triggerLabel: job.envelope.label,
+        revision: revision !== null,
       });
       hold(); // the lookup may have outlived the lease
-      comment = await deps.api.createIssueComment(repoRef, job.issueNumber, body);
+      comment = await deps.api.createIssueComment(repoRef, target, body);
     }
     if (!finishFailureComment(deps.db, runId, fence.attempt, { state: 'posted', commentId: comment.id, commentUrl: comment.htmlUrl, now })) {
       return superseded();
     }
-    await runLog(found ? `already on issue #${job.issueNumber}: ${comment.htmlUrl}` : `commented on issue #${job.issueNumber}: ${comment.htmlUrl}`);
+    await runLog(found ? `already on ${where}: ${comment.htmlUrl}` : `commented on ${where}: ${comment.htmlUrl}`);
     log.info('failure comment posted', { comment: comment.htmlUrl, found: Boolean(found) });
     return { status: 'posted', comment: getFailureComment(deps.db, runId)!, already: false };
   } catch (err) {
     if (err instanceof FailureCommentSupersededError) return superseded();
-    const { error, retryable, retryAfter } = classify(err, repoFullName, job.issueNumber);
+    const { error, retryable, retryAfter } = classify(err, repoFullName, target);
     const attempts = fence.attempt;
     let nextAttemptAt: string | null = null;
     if (retryable && attempts < MAX_AUTO_ATTEMPTS) {
@@ -360,7 +372,7 @@ export async function postFailureComment(deps: FailureCommentDeps, runId: string
         scope: 'failure-comment',
         repoFullName,
         jobId: job.id,
-        message: `run ${runId}: could not comment on issue #${job.issueNumber}: ${error} (${hint})`,
+        message: `run ${runId}: could not comment on ${where}: ${error} (${hint})`,
         at: new Date(now()).toISOString(),
       });
     } catch {

@@ -106,6 +106,12 @@ export const actionSchema = z.strictObject({
   verify: z.array(z.union([verifyShellCommand, verifyArgvCommand])).min(1).optional(),
   /** Time limit for all verify commands together, in minutes. Default 15. */
   verifyTimeoutMinutes: z.number().positive().max(24 * 60).optional(),
+  /**
+   * Prompt file for revision runs (repositories.<repo>.revise), relative to the config file's
+   * directory: what the agent should do with a review that requested changes. Required in live
+   * mode when a repository with revise on runs this action.
+   */
+  revisePrompt: z.string().min(1).optional(),
 });
 
 /** Agent run time limit when an action sets no timeoutMinutes. */
@@ -179,6 +185,13 @@ export const repositorySchema = z.strictObject({
    * (run id, agent, duration, reason, how to retry; never agent output). Default false.
    */
   commentOnFailure: z.boolean().optional(),
+  /**
+   * Live mode, together with publish: when an allowed actor requests changes on a PR Updraft
+   * opened, run the agent on that PR's branch with the review and push the result. Default false.
+   */
+  revise: z.boolean().optional(),
+  /** With revise: how many revision jobs one PR gets before further change requests are only recorded. Default 3. */
+  maxRevisions: z.number().int().min(1).max(20).optional(),
   workflows: z.array(workflowSchema).min(1),
 });
 
@@ -240,6 +253,14 @@ export function repoNeedsCheckout(config: Pick<UpdraftConfig, 'actions'>, repo: 
 /** The repo's publication mode; none unless the config opts in. */
 export function publishMode(repo: Pick<RepositoryConfig, 'publish'>): PublishMode {
   return repo.publish ?? 'none';
+}
+
+/** Revision jobs one PR gets when repositories.<repo>.maxRevisions is not set. */
+export const DEFAULT_MAX_REVISIONS = 3;
+
+/** True when the revision loop runs for this repository: live mode, publication on, revise on. */
+export function reviseActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'revise'>): boolean {
+  return config.execution.mode === 'live' && repo.revise === true && publishMode(repo) !== 'none';
 }
 
 export function allowedActorsFor(config: UpdraftConfig, wf: WorkflowConfig): string[] {

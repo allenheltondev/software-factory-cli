@@ -120,6 +120,7 @@ repositories:
 | `pools.<name>.agents` | required | Agent names in the pool (at least one) |
 | `pools.<name>.strategy` | `round-robin` | Rotates among agents with free capacity |
 | `actions.<name>.prompt` | none | Prompt file, relative to the config file's directory |
+| `actions.<name>.revisePrompt` | none | Prompt file for revision runs, relative to the config file's directory. Required in live mode for every action used by a repository with `revise` on. See [Revisions](docs/revisions.md) |
 | `actions.<name>.output` | `local-branch` | `local-branch` or `log`. Live mode starts agents only for `local-branch` actions |
 | `actions.<name>.timeoutMinutes` | `60` | Live mode: stop the agent and fail the run after this long |
 | `actions.<name>.verify` | none | Live mode, `local-branch` actions: commands the worker runs in the job worktree after the agent succeeded, in order; the first that fails fails the run, so it is not published. A string runs through the shell (`sh -c`, or `cmd.exe /d /s /c` on Windows); an array is an executable and its arguments, run without a shell. Set in another mode or on a `log` action, it is a validation warning and does nothing. See [Verification](docs/verification.md) |
@@ -130,6 +131,8 @@ repositories:
 | `repositories.<OWNER/REPO>.remote` | a github.com remote | Remote of `checkoutPath` to fetch from. Without it, only a remote whose URL is on `github.com` with path `OWNER/REPO` qualifies (`origin` preferred). Set it for an SSH host alias such as `git@github-work:OWNER/REPO`; any host is then accepted, but `OWNER/REPO` must still match |
 | `repositories.<OWNER/REPO>.publish` | `none` | Live mode, `local-branch` actions: `draft-pr` pushes the job branch of a succeeded run that left commits and opens a draft PR; `pr` opens a ready-for-review PR instead (for private repos where your plan has no draft PRs). Set in another mode, it is a validation warning and does nothing. See [docs/publication.md](docs/publication.md) |
 | `repositories.<OWNER/REPO>.commentOnFailure` | `false` | Live mode: when a run leaves its job failed (agent error, timeout, failed verification, worktree preparation failure, or no agent could start), the worker comments once on the issue with the run id, agent, duration, reason and how to retry. Never includes agent output or local paths. Set in another mode, it is a validation warning and does nothing. See [Failure comments](docs/failure-comments.md) |
+| `repositories.<OWNER/REPO>.revise` | `false` | Live mode, together with `publish`: when an allowed actor requests changes on a PR the worker opened, run the agent on that PR's branch with the review, verify, push the new commits to the PR as a fast-forward and reply there. Set in another mode or without `publish`, it is a validation warning and does nothing. See [Revisions](docs/revisions.md) |
+| `repositories.<OWNER/REPO>.maxRevisions` | `3` | With `revise`: how many revision jobs one PR gets. Further change requests are recorded and shown in `updraft status` but not acted on, and one comment on the PR says so |
 | `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
@@ -186,7 +189,8 @@ worker publishes a live run that **succeeded and left at least one commit** on t
 branch. The worker does this after the agent has exited, as your `gh` account:
 
 - it pushes the job branch to the repository's remote. The push only ever creates the branch;
-  it never moves an existing branch and never pushes the base branch;
+  it never moves an existing branch (unless `revise` is on, see below) and never pushes the
+  base branch;
 - it opens a PR from the job branch into the base branch (a draft for `draft-pr`);
 - it comments on the issue with a link to the PR.
 
@@ -197,6 +201,11 @@ or marks a PR ready for review.
 
 Details, including authentication, retries and failure handling:
 [docs/publication.md](docs/publication.md).
+
+With `revise: true` as well, a "Request changes" review by an allowed actor on such a PR
+queues a revision: the agent runs on the PR's branch with the review, and the worker pushes
+the new commits as a fast-forward and replies on the PR. See
+[docs/revisions.md](docs/revisions.md).
 
 ## Background operation
 

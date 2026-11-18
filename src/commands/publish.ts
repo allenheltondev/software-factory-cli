@@ -1,7 +1,10 @@
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../config/io.js';
 import { resolveGitHubToken } from '../github/client.js';
+import { getJob, getRun } from '../db/queue.js';
 import { publishRun, type PublishDeps } from '../publish/publish.js';
+import { reviseRun } from '../publish/revision.js';
+import { revisionOf } from '../types.js';
 import { createLogger } from '../util/log.js';
 import { println, type CommandContext } from './context.js';
 import { CliError, EXIT } from './errors.js';
@@ -28,20 +31,38 @@ export async function publishCommand(ctx: CommandContext, runId: string, deps: P
   try {
     const log = createLogger({ stream: null });
     const api = await ctx.createApi({ log });
-    const r = await publishRun(
-      {
-        db,
-        config,
-        paths: ctx.paths,
-        api,
-        log,
-        token: () => deps.token(ctx.env),
-        env: ctx.env,
-        now: ctx.now,
-        ...(deps.runGit ? { runGit: deps.runGit } : {}),
-      },
-      runId,
-    );
+    const publishDeps: PublishDeps = {
+      db,
+      config,
+      paths: ctx.paths,
+      api,
+      log,
+      token: () => deps.token(ctx.env),
+      env: ctx.env,
+      now: ctx.now,
+      ...(deps.runGit ? { runGit: deps.runGit } : {}),
+    };
+    // A revision run has no PR to open: its commits go to the PR it revised, by the same path the worker takes.
+    const run = getRun(db, runId);
+    const job = run ? getJob(db, run.jobId) : null;
+    if (job && revisionOf(job)) {
+      const rev = await reviseRun(publishDeps, runId);
+      switch (rev.status) {
+        case 'published':
+          println(ctx.out, `${rev.already ? 'Already pushed' : 'Pushed'} ${runId} to pull request #${rev.revision.prNumber}: branch ${rev.revision.branch} at ${rev.revision.headSha?.slice(0, 12) ?? '?'}; comment ${rev.revision.commentUrl ?? '(none)'}.`);
+          return EXIT.OK;
+        case 'skipped':
+          println(ctx.out, `Nothing pushed for ${runId}: ${rev.reason}.`);
+          return EXIT.OK;
+        case 'not-eligible':
+          throw new CliError(`Cannot push ${runId}: ${rev.reason}.`);
+        case 'busy':
+          throw new CliError(`${rev.reason}; try again later.`);
+        case 'failed':
+          throw new CliError(`Pushing the revision ${runId} failed: ${rev.error}`);
+      }
+    }
+    const r = await publishRun(publishDeps, runId);
     switch (r.status) {
       case 'published': {
         const p = r.publication;

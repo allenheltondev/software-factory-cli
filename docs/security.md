@@ -35,7 +35,20 @@ What the worker and the agents it starts can do, and which guards exist. The
   `git worktree add`. With `publish` set for a repository, the worker also writes to GitHub
   as your `gh` account: it creates job branches (never moving an existing one, never the
   base branch), opens PRs and comments on issues (see [Publication](publication.md)). It
-  never merges.
+  never merges. The one exception to "never moving an existing one" is the push of a
+  revision, which is off unless `revise` is set too (next point).
+- With `revise` set as well, a "Request changes" review on a PR the worker opened starts
+  another agent run, so the same allowlist guards it: only a review whose author is an
+  allowed actor for the workflow that produced the PR counts, and only on PRs the worker
+  recorded as published. The review's body and inline comments are untrusted input like the
+  issue: fenced in the prompt, only text written by allowed actors, and as it read when the
+  worker first saw the review, so a later edit never reaches the agent; a review whose text
+  was last edited by anyone else by then is refused. The worker then pushes to the PR's own
+  job branch, as a fast-forward of exactly the commit the run started from, which is the one
+  case in which it moves an existing branch (never the base branch, never a rewrite; a branch
+  that moved meanwhile is left alone). The number of revisions per PR is capped by
+  `maxRevisions`. It never approves, merges, dismisses a review or resolves a thread. See
+  [Revisions](revisions.md).
 - Publication is done by the worker after the agent has exited; the agent itself is not given
   `GH_TOKEN`/`GITHUB_TOKEN`. That is a guard against accidental use, not isolation: the agent
   runs as your user, so it can still reach whatever that user can, including `gh auth token`,

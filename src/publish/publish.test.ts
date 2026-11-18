@@ -87,6 +87,12 @@ class FakePublishApi implements GitHubApi {
   async getIssueBodyEdit(): Promise<never> {
     throw new Error('not used');
   }
+  async listPullRequestUpdates(): Promise<never> {
+    throw new Error('not used');
+  }
+  async getPullRequestReviews(): Promise<never> {
+    throw new Error('not used');
+  }
 
   async listPullRequestsForHead(repo: RepoRef, opts: { headOwner: string; head: string }) {
     this.calls.push(`listPulls ${repo.id} ${opts.headOwner}:${opts.head}`);

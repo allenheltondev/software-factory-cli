@@ -8,15 +8,16 @@ import type { UpdraftConfigInput } from './schema.js';
 const PACKAGED_PROMPTS_DIR = fileURLToPath(new URL('../../examples/prompts/', import.meta.url));
 
 /**
- * For each action whose prompt file is missing next to the config, copy the packaged
- * prompt with the same file name if one exists. Never overwrites. Returns written paths.
+ * For each action whose prompt file (or revise prompt file) is missing next to the config, copy
+ * the packaged prompt with the same file name if one exists. Never overwrites. Returns written paths.
  */
 export function writeStarterPrompts(configFile: string, config: UpdraftConfigInput, packagedDir = PACKAGED_PROMPTS_DIR): string[] {
   const written: string[] = [];
-  for (const action of Object.values(config.actions)) {
-    if (!action.prompt) continue;
-    const target = resolveConfigRelative(configFile, action.prompt);
-    if (existsSync(target)) continue;
+  const prompts = Object.values(config.actions).flatMap((action) => [action.prompt, action.revisePrompt]);
+  for (const prompt of prompts) {
+    if (!prompt) continue;
+    const target = resolveConfigRelative(configFile, prompt);
+    if (existsSync(target) || written.includes(target)) continue;
     const source = `${packagedDir}${basename(target)}`;
     if (!existsSync(source)) continue;
     mkdirSync(dirname(target), { recursive: true });

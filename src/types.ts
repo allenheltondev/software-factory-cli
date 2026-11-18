@@ -18,10 +18,14 @@ export interface RepoRef {
  */
 export interface EventEnvelope {
   schemaVersion: typeof ENVELOPE_SCHEMA_VERSION;
-  type: 'issue.labeled';
+  /**
+   * issue.labeled: a trigger label was applied to an issue. pull_request.changes_requested: a
+   * review asked for changes on a PR Updraft published; `revision` then says which and with what text.
+   */
+  type: 'issue.labeled' | 'pull_request.changes_requested';
   repo: RepoRef;
   issue: { number: number; title: string; url: string };
-  /** GitHub issue-event ID (stringified). For PR revisions this would be the head SHA. */
+  /** GitHub issue-event ID (stringified). For a revision: "review:<review node id>". */
   eventId: string;
   /** Link to the event's subject (the issue URL). */
   url: string;
@@ -30,6 +34,57 @@ export interface EventEnvelope {
   /** Labels on the issue when the job was enqueued (used for routing). */
   labelsAtEnqueue: string[];
   createdAt: string;
+  /** Present exactly when `type` is pull_request.changes_requested. */
+  revision?: RevisionRequest;
+}
+
+/**
+ * What made a review count as a change request (see reviewTrigger in src/poller/review-trigger.ts).
+ * changes_requested: a submitted review with state CHANGES_REQUESTED by an allowed actor.
+ */
+export type RevisionTriggerKind = 'changes_requested';
+
+/** One inline comment of the triggering review, as it read when the review was ingested. Untrusted text. */
+export interface ReviewCommentSnapshot {
+  path: string;
+  /** Line in the file the comment is attached to; null for a file-level or outdated comment. */
+  line: number | null;
+  body: string;
+  /** The diff hunk GitHub shows above the comment (capped); '' when there is none. */
+  diffHunk: string;
+}
+
+/**
+ * The triggering review as it read when it was ingested. A revision run uses this snapshot and
+ * never re-reads the review, so an edit made after ingestion cannot reach the agent.
+ */
+export interface ReviewSnapshot {
+  /** GitHub's node id of the review; the dedupe key. */
+  id: string;
+  url: string;
+  author: string;
+  submittedAt: string;
+  body: string;
+  comments: ReviewCommentSnapshot[];
+  /** Inline comments left out: beyond the cap, or not written by an allowed actor. */
+  omittedComments: number;
+}
+
+/** The revision a pull_request.changes_requested job carries out. */
+export interface RevisionRequest {
+  trigger: RevisionTriggerKind;
+  /** `branch` is the PR's head: the job branch Updraft pushed when it opened the PR. */
+  pullRequest: { number: number; url: string; branch: string };
+  /** The run whose publication opened the PR. */
+  sourceRunId: string;
+  /** Event id of the label application that queued the original job; the issue text is vouched for against it. */
+  originalEventId: string;
+  review: ReviewSnapshot;
+}
+
+/** The revision a job carries out, or null for an issue job. */
+export function revisionOf(job: { envelope?: EventEnvelope }): RevisionRequest | null {
+  return job.envelope?.type === 'pull_request.changes_requested' ? (job.envelope.revision ?? null) : null;
 }
 
 /** The issue as fetched by the worker's pre-start check, handed to the executor. Untrusted text. */
@@ -38,6 +93,11 @@ export interface IssueSnapshot {
   body: string;
   labels: string[];
   url: string;
+  /**
+   * Revision jobs only: why the body must not be given to the agent (the issue changed since an
+   * allowed actor approved it). `body` is '' then.
+   */
+  withheld?: string;
 }
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'canceled';
@@ -164,6 +224,42 @@ export interface VerificationSummary {
 }
 
 export type PublicationState = 'publishing' | 'published' | 'failed' | 'skipped';
+
+/**
+ * The push and reply of one revision run (src/publish/revision.ts). published: the PR branch was
+ * fast-forwarded and the reply posted. skipped: nothing was pushed (no commits, or the PR was
+ * closed). failed: see `error`; `moved` says the PR branch was no longer where the run started.
+ */
+export interface Revision {
+  runId: string;
+  jobId: string;
+  repoId: number;
+  repoFullName: string;
+  issueNumber: number;
+  prNumber: number;
+  reviewId: string;
+  trigger: RevisionTriggerKind;
+  state: PublicationState;
+  /** The PR's own branch on the remote. */
+  branch: string;
+  /** The remote head of `branch` the run started from; the push only fast-forwards from exactly this. */
+  baseSha: string | null;
+  /** The commit pushed (or found already on the remote at this SHA). */
+  headSha: string | null;
+  pushedAt: string | null;
+  /** True when the push was refused because the PR branch had moved. Never retried automatically. */
+  moved: boolean;
+  commentId: number | null;
+  commentUrl: string | null;
+  error: string | null;
+  retryable: boolean;
+  attempts: number;
+  leaseExpiresAt: string | null;
+  nextAttemptAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  publishedAt: string | null;
+}
 
 /** Publication of a succeeded live run: job branch pushed, PR opened, issue commented. */
 export interface Publication {

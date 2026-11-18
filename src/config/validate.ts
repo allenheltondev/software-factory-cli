@@ -7,6 +7,7 @@ import {
   configSchema,
   modeNeedsCheckout,
   publishMode,
+  reviseActive,
   repoNeedsCheckout,
   workflowId,
   type UpdraftConfig,
@@ -136,6 +137,22 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       });
     }
 
+    if (repo.revise) {
+      if (config.execution.mode !== 'live') {
+        warnings.push({
+          path: `repositories.${repoName}.revise`,
+          message: `only applies in live mode; in ${config.execution.mode} mode no review is read and no revision is run`,
+        });
+      } else if (publishMode(repo) === 'none') {
+        warnings.push({
+          path: `repositories.${repoName}.revise`,
+          message: 'only applies together with publish: revisions are made to pull requests the worker opened, and it opens none here',
+        });
+      }
+    } else if (repo.maxRevisions !== undefined) {
+      warnings.push({ path: `repositories.${repoName}.maxRevisions`, message: 'has no effect without revise' });
+    }
+
     const wfIds = new Set<string>();
     repo.workflows.forEach((wf, i) => {
       const base = `repositories.${repoName}.workflows.${i}`;
@@ -186,6 +203,15 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
         errors.push({
           path: `actions.${name}.prompt`,
           message: 'required in live mode: the prompt file tells the agent what to do with the issue',
+        });
+      }
+      const revising = Object.entries(config.repositories).find(
+        ([, r]) => reviseActive(config, r) && r.workflows.some((wf) => wf.action === name),
+      );
+      if (action.output === 'local-branch' && revising && !action.revisePrompt) {
+        errors.push({
+          path: `actions.${name}.revisePrompt`,
+          message: `required because repositories.${revising[0]}.revise is on: the prompt file tells the agent what to do with a review that requested changes`,
         });
       }
       if (action.output === 'log') {

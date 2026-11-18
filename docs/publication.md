@@ -38,6 +38,18 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
 Merging stays a human decision: the worker never merges, approves or marks a PR ready for
 review.
 
+### When a branch can move
+
+Publication itself never moves a branch: step 1 only creates one. With
+`repositories.<OWNER/REPO>.revise` on, there is exactly one case in which the worker moves a
+branch that exists on the remote: the push of a [revision](revisions.md). It moves only the
+job branch of a pull request the worker published, only forward, and only from the exact
+commit the revision run started from: the worker checks that the new commit descends from
+that commit and pushes with `--force-with-lease=<branch>:<that commit>` and a non-forcing
+refspec, so the remote refuses the push if the branch is anywhere else by then. It is never
+the base or default branch, never a branch of another PR, never a rewrite, and a refused
+push is not retried or rebased. Without `revise`, no existing branch is ever moved.
+
 ## Authentication
 
 API calls use the token. For an `https://github.com/...` remote, the push

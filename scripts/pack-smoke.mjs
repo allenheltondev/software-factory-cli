@@ -113,6 +113,7 @@ try {
     'docs/agents/claude.md',
     'examples/config.yaml',
     'examples/prompts/implement-issue.md',
+    'examples/prompts/revise-pr.md',
     'examples/launchers/windows/register-task.ps1',
     'examples/launchers/macos/updraft.plist.template',
     'examples/launchers/linux/updraft.service.template',
