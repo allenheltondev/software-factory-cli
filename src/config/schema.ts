@@ -148,6 +148,27 @@ export const poolSelectorSchema = z.union([
   }),
 ]);
 
+/**
+ * Opt-in tier routing (docs/tier-routing.md). Absent: routing is exactly `pool` as before.
+ * `pool` is still required and is used for non-tiered paths such as legacy `rules`.
+ */
+export const tierSchema = z.strictObject({
+  pools: z.strictObject({ routine: name, standard: name, complex: name }),
+  /** Pool for high-risk work. Absent: high-risk work is held for a human, never run on a weaker pool. */
+  highRisk: z.strictObject({ pool: name }).optional(),
+  /** Labels people with triage access apply to force a tier. Defaults: tier:routine, tier:standard, tier:complex, tier:high-risk. */
+  overrideLabels: z
+    .strictObject({
+      routine: z.string().min(1).optional(),
+      standard: z.string().min(1).optional(),
+      complex: z.string().min(1).optional(),
+      highRisk: z.string().min(1).optional(),
+    })
+    .optional(),
+  /** Below this confidence the heuristic choice becomes standard. Default 0.6. */
+  minConfidence: z.number().min(0).max(1).optional(),
+});
+
 export const triggerSchema = z.strictObject({
   event: z.literal('issue.labeled'),
   label: z.string().min(1),
@@ -162,6 +183,8 @@ export const workflowSchema = z.strictObject({
   trigger: triggerSchema,
   action: name,
   pool: poolSelectorSchema,
+  /** Opt-in local complexity/risk routing to capability-tier pools. */
+  tiers: tierSchema.optional(),
   /** Overrides dispatch.allowedActors for this workflow. */
   allowedActors: z.array(z.string().min(1)).optional(),
   /**
@@ -320,6 +343,7 @@ export type ActionConfig = z.output<typeof actionSchema>;
 export type VerifyCommand = NonNullable<ActionConfig['verify']>[number];
 export type WorkflowConfig = z.output<typeof workflowSchema>;
 export type RepositoryConfig = z.output<typeof repositorySchema>;
+export type TierConfig = z.output<typeof tierSchema>;
 export type PoolSelector = z.output<typeof poolSelectorSchema>;
 
 export function workflowId(wf: Pick<WorkflowConfig, 'id' | 'action' | 'trigger'>): string {

@@ -16,6 +16,21 @@ export interface RepoRef {
  * Transport-independent description of the GitHub event that caused a job.
  * Polling builds these today; a webhook relay could build the same shape later.
  */
+/** How a job's pool was chosen (see docs/tier-routing.md). Decided at enqueue, then fixed for the job. */
+export interface RoutingDecision {
+  rule: 'default' | 'legacy-label' | 'override-label' | 'heuristic';
+  pool: string;
+  /** Set when tier routing is on. */
+  tier?: 'routine' | 'standard' | 'complex' | 'high-risk';
+  complexity?: 'routine' | 'standard' | 'complex';
+  risk?: 'low' | 'medium' | 'high';
+  confidence?: number;
+  /** Why this rule chose this way. */
+  detail?: string;
+  /** Set when no eligible pool exists: the job is not run and needs a human. */
+  hold?: string;
+}
+
 export interface EventEnvelope {
   schemaVersion: typeof ENVELOPE_SCHEMA_VERSION;
   /**
@@ -36,6 +51,8 @@ export interface EventEnvelope {
   /** Labels on the issue when the job was enqueued (used for routing). */
   labelsAtEnqueue: string[];
   createdAt: string;
+  /** Routing decision for issue jobs when tier routing is on. */
+  routing?: RoutingDecision;
   /** Present exactly when `type` is pull_request.changes_requested. */
   revision?: RevisionRequest;
   /** Present exactly when `type` is pull_request.review. */

@@ -36,7 +36,8 @@ import {
   type GitHubIssueEvent,
   type IssueEventsPage,
 } from '../github/api.js';
-import { labelEquals, selectPool } from '../routing.js';
+import { labelEquals } from '../routing.js';
+import { describeRouting, routeJob } from '../tier-routing.js';
 import { ENVELOPE_SCHEMA_VERSION, reviewOf, revisionOf, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { checkReviewDispatchable, queuedReviewProblem } from './review-jobs.js';
@@ -340,7 +341,19 @@ async function pollRepo(
     now: deps.now,
   });
   for (const j of inserted) {
-    log.info('job queued', { job: j.id, issue: j.issueNumber, workflow: j.workflowId, pool: j.pool, event: j.eventId });
+    const routing = j.envelope.routing;
+    log.info('job queued', {
+      job: j.id,
+      issue: j.issueNumber,
+      workflow: j.workflowId,
+      pool: j.pool,
+      event: j.eventId,
+      ...(routing?.tier ? { tier: routing.tier, risk: routing.risk, rule: routing.rule, routing: describeRouting(routing) } : {}),
+    });
+    if (routing?.hold) {
+      cancelQueuedJob(db, j.id, `needs human: ${routing.hold}`, deps.now);
+      log.warn('job held for a human: no eligible pool', { job: j.id, issue: j.issueNumber, reason: routing.hold });
+    }
   }
   return { ...base, eventsSeen: unseen.length, jobsEnqueued: inserted.length };
 }
@@ -485,7 +498,10 @@ async function buildJobs(
         log.info('skipping event: issue no longer carries the trigger label', ctx);
         continue;
       }
-      const pool = selectPool(wf.pool, issue.labels);
+      const routing = routeJob(wf.pool, wf.tiers, issue, {
+        poolAvailable: (p) => (deps.config.pools[p]?.agents ?? []).some((a) => deps.config.agents[a]?.enabled),
+      });
+      const pool = routing.pool;
       const envelope: EventEnvelope = {
         schemaVersion: ENVELOPE_SCHEMA_VERSION,
         type: 'issue.labeled',
@@ -497,6 +513,7 @@ async function buildJobs(
         label,
         labelsAtEnqueue: [...issue.labels],
         createdAt: ev.createdAt,
+        ...(wf.tiers ? { routing } : {}),
       };
       jobs.push({
         repoId: repo.id,

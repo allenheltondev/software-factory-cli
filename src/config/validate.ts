@@ -216,6 +216,27 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       for (const p of pools) {
         if (!Object.hasOwn(config.pools, p)) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
       }
+      if (wf.tiers) {
+        const t = wf.tiers;
+        const tierPools: [string, string][] = [
+          ['pools.routine', t.pools.routine],
+          ['pools.standard', t.pools.standard],
+          ['pools.complex', t.pools.complex],
+          ...(t.highRisk ? [['highRisk.pool', t.highRisk.pool] as [string, string]] : []),
+        ];
+        for (const [k, p] of tierPools) {
+          if (!Object.hasOwn(config.pools, p)) errors.push({ path: `${base}.tiers.${k}`, message: `unknown pool "${p}"` });
+        }
+        if (t.highRisk && !review.enabled) {
+          errors.push({
+            path: `${base}.tiers.highRisk`,
+            message: `high-risk work requires independent review: enable repositories.${repoName}.review (with allowSameAgent false)`,
+          });
+        } else if (t.highRisk && review.allowSameAgent) {
+          errors.push({ path: `${base}.tiers.highRisk`, message: 'high-risk work requires independent review: review.allowSameAgent must be false' });
+        }
+        if (!t.highRisk) warnings.push({ path: `${base}.tiers.highRisk`, message: 'no high-risk pool: high-risk issues will be held for a human' });
+      }
       if (wf.reviewPool !== undefined) {
         if (!Object.hasOwn(config.pools, wf.reviewPool)) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
         if (!review.enabled) warnings.push({ path: `${base}.reviewPool`, message: `has no effect without repositories.${repoName}.review` });

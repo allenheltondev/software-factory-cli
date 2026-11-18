@@ -578,6 +578,13 @@ export function retryJob(db: Db, jobId: string, now?: () => number): Job {
     if (!RETRYABLE.includes(row.status)) {
       throw new Error(`job ${jobId} is ${row.status}; only failed, interrupted or canceled jobs can be retried`);
     }
+    const held = (JSON.parse(row.envelope) as { routing?: { hold?: string } }).routing?.hold;
+    if (held) {
+      throw new Error(
+        `job ${jobId} was held for a human (${held}); retrying would run it on a pool that was not eligible. ` +
+          'Add a tier override label (or fix the pools) and re-apply the trigger label to queue a new job.',
+      );
+    }
     db.prepare(
       "UPDATE jobs SET status = 'queued', status_reason = ?, start_failures = 0, retries = retries + 1, updated_at = ? WHERE id = ?",
     ).run(`retried by user (was ${row.status})`, at, jobId);
