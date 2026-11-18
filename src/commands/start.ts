@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { loadConfig } from '../config/io.js';
 import type { Db } from '../db/database.js';
-import { resolveGitHubToken } from '../github/client.js';
+import { appCommitIdentity } from '../github/credentials.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
@@ -66,8 +66,11 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
   let db: Db | undefined;
   try {
     db = ctx.openDb(paths.dbFile);
-    const api = await ctx.createApi({ log: log.child({ component: 'github' }) });
+    // The gh account, or the GitHub App of github.app: one provider for the API and for pushes.
+    const credentials = ctx.createCredentials(config, { log: log.child({ component: 'github' }) });
+    const api = await ctx.createApi({ log: log.child({ component: 'github' }), credentials });
     log.info('worker starting', {
+      github: credentials.kind === 'app' ? 'GitHub App' : 'gh account',
       config: paths.configFile,
       db: paths.dbFile,
       repos: repoCount,
@@ -82,10 +85,12 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       paths,
       api,
       log: log.child({ component }),
-      token: () => resolveGitHubToken(ctx.env),
+      token: (repoFullName) => credentials.token(repoFullName, { fresh: true }),
+      workerKind: credentials.kind,
       env: ctx.env,
     });
     const publisher = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
+    const appAuth = credentials.app;
     await deps.runDaemon({
       db: openDb,
       config,
@@ -94,7 +99,7 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       poll: () => deps.pollOnce({ db: openDb, api, config, log: pollLog }),
       checkDispatchable: (job) => deps.checkJobDispatchable({ api, config }, job),
       signal: controller.signal,
-      executor: createExecutor(config),
+      executor: createExecutor(config, appAuth && config.github?.app?.commitAsApp ? { commitIdentity: (repoFullName) => appCommitIdentity(appAuth, repoFullName) } : {}),
       // With the revision loop on, revision runs are pushed to their PR and every other run goes
       // to the publisher as before.
       ...(revisionsEnabled(config)

@@ -1,4 +1,5 @@
 import type { RepoRef } from '../types.js';
+import type { WorkerIdentity } from './credentials.js';
 
 /**
  * The GitHub surface Updraft needs. `client.ts` implements it over the REST
@@ -155,7 +156,18 @@ export interface PullRequestReviews {
 }
 
 export interface GitHubApi {
+  /**
+   * The person behind the `gh` sign-in. Only for the interactive commands that act as that person
+   * (`updraft configure`, `updraft add`); it fails under a GitHub App. For "who is the worker",
+   * use getWorkerIdentity.
+   */
   getViewer(): Promise<{ login: string; id: number }>;
+  /**
+   * Who the worker is on GitHub: the `gh` account, or `<app-slug>[bot]` when a GitHub App is
+   * configured (github.app). Its pull requests, comments and pushes carry this name; compare a
+   * login against it with isWorkerLogin (src/github/credentials.ts).
+   */
+  getWorkerIdentity(): Promise<WorkerIdentity>;
   /** All repos the account owns, collaborates on, or reaches through an org (paginated internally). */
   listUserRepos(): Promise<GitHubRepo[]>;
   /** Look up by OWNER/REPO; throws GitHubError(404) when inaccessible. */

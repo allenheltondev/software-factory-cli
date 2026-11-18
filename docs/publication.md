@@ -60,6 +60,12 @@ your SSH key and `~/.ssh/config`; because Git config files are ignored for the p
 `core.sshCommand` there does not apply (set `GIT_SSH_COMMAND` in the worker's environment
 instead). Git hooks and tracing are turned off for these commands.
 
+With a [GitHub App](github-app.md) configured (`github.app`), the worker publishes as the
+App's bot instead: API calls use an installation token, and the push always goes over HTTPS
+to `https://github.com/OWNER/REPO.git` with an installation token issued for that push, handed
+to `git` the same way. An SSH remote is then used only for fetching, since a push over SSH
+would be made with your key and so as you.
+
 ## Idempotent retries
 
 Each step is recorded as it completes (in the state DB, separately

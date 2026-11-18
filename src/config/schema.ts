@@ -195,6 +195,28 @@ export const repositorySchema = z.strictObject({
   workflows: z.array(workflowSchema).min(1),
 });
 
+/**
+ * Act on GitHub as a GitHub App installation (`<app-slug>[bot]`) instead of the person's `gh`
+ * account: polling, lookups, pushes, pull requests and comments (docs/github-app.md,
+ * src/github/app-auth.ts). The private key is never in the config, only the path of its file.
+ */
+export const githubAppSchema = z.strictObject({
+  /** The App's numeric ID, or its client ID (a string such as Iv23li...). */
+  appId: z.union([z.number().int().positive(), z.string().regex(/^[A-Za-z0-9._-]+$/, "the App's ID or client ID")]),
+  /**
+   * The PEM private key downloaded from the App's settings, relative to the config file's
+   * directory. UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH in the worker's environment names another file.
+   */
+  privateKeyPath: z.string().min(1),
+  /** Use this installation for every repository. Default: look the installation up per repository. */
+  installationId: z.number().int().positive().optional(),
+  /**
+   * Live mode: have agents commit as the App's bot (GIT_AUTHOR_* and GIT_COMMITTER_* in the
+   * agent's environment). Default false: commits carry the local git identity.
+   */
+  commitAsApp: z.boolean().optional(),
+});
+
 export const configSchema = z.strictObject({
   version: z.literal(CONFIG_VERSION),
   pollIntervalSeconds: z.number().int().min(10).max(3600).default(60),
@@ -211,6 +233,8 @@ export const configSchema = z.strictObject({
       mode: z.enum(EXECUTION_MODES).default('log-only'),
     })
     .default({ mode: 'log-only' }),
+  /** How the worker authenticates to GitHub. Absent: as the person's `gh` account. */
+  github: z.strictObject({ app: githubAppSchema.optional() }).optional(),
   dispatch: z
     .strictObject({
       /** GitHub logins allowed to dispatch work by applying a trigger label. */

@@ -21,6 +21,15 @@ execution:
 dispatch:
   allowedActors: [allenheltondev]
 
+# Optional: act on GitHub as a GitHub App (`<app-slug>[bot]`) instead of your gh account, so
+# PRs and comments are the bot's and you can approve them. The key file stays outside the
+# config. See docs/github-app.md.
+#
+# github:
+#   app:
+#     appId: 1234567
+#     privateKeyPath: ./github-app.pem
+
 agents:
   codex:
     maxConcurrent: 1

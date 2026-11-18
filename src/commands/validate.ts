@@ -3,6 +3,7 @@ import { ConfigError, configExists, readRawConfig, resolveConfigRelative } from 
 import type { UpdraftConfig } from '../config/schema.js';
 import { validateConfig, type ConfigIssue } from '../config/validate.js';
 import { println, type CommandContext } from './context.js';
+import { appKeyProblem } from './doctor-app.js';
 import { EXIT } from './errors.js';
 
 /** Warn about action prompt files that don't exist (resolved against the config file's directory). */
@@ -60,6 +61,15 @@ export async function validateCommand(ctx: CommandContext): Promise<number> {
       for (const w of check.warnings) println(ctx.err, `  ! ${w.path}: ${w.message}`);
       return EXIT.FAILURE;
     case 'ok': {
+      // github.app: the key is a file outside the config, so it is checked here (offline), not by the schema.
+      const app = check.config.github?.app;
+      const keyProblem = app ? appKeyProblem(app, { configDir: ctx.paths.configDir, env: ctx.env }) : null;
+      if (keyProblem) {
+        println(ctx.err, `✗ Invalid config ${check.path}`);
+        println(ctx.err, `  ✗ github.app.privateKeyPath: ${keyProblem}`);
+        for (const w of check.warnings) println(ctx.err, `  ! ${w.path}: ${w.message}`);
+        return EXIT.FAILURE;
+      }
       const repos = Object.values(check.config.repositories);
       const workflows = repos.reduce((n, r) => n + r.workflows.length, 0);
       println(ctx.out, `✓ Config is valid: ${check.path}`);

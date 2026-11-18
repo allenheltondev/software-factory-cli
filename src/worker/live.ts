@@ -66,6 +66,8 @@ import {
   worktreeMounts,
   type ContainedInvocation,
 } from './container.js';
+import { APP_KEY_PATH_ENV } from '../github/app-auth.js';
+import { commitIdentityEnv, type CommitIdentity } from '../github/credentials.js';
 import { processStartTime, taskkillPath } from './process.js';
 import { cleanSummaryLines, countUncommitted, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 import { displayVerifyCommand, verifyInvocation, type VerifyInvocation } from './verify.js';
@@ -74,8 +76,11 @@ const isWindows = process.platform === 'win32';
 const DEFAULT_KILL_GRACE_MS = 5_000;
 /** After SIGKILL / taskkill, how long to wait for the exit event before giving up on it. */
 const EXIT_WAIT_MS = 10_000;
-/** Variables the worker may hold for its own GitHub access; an agent working on untrusted input doesn't get them. */
-const WITHHELD_ENV = ['GH_TOKEN', 'GITHUB_TOKEN'];
+/**
+ * Variables the worker may hold for its own GitHub access (its token, or where its GitHub App's
+ * private key is); an agent working on untrusted input doesn't get them.
+ */
+const WITHHELD_ENV = ['GH_TOKEN', 'GITHUB_TOKEN', APP_KEY_PATH_ENV];
 
 export interface LiveExecutorOptions {
   /** git executable for worktree preparation and the summary. */
@@ -88,6 +93,12 @@ export interface LiveExecutorOptions {
   killGraceMs?: number;
   /** Reads a pid's OS start time (see processStartTime). */
   startTime?: (pid: number) => Promise<string | null>;
+  /**
+   * github.app.commitAsApp: who the agent's commits in a run for `repoFullName` are authored and
+   * committed by (the App's bot), set through GIT_AUTHOR_* and GIT_COMMITTER_*. Absent or null:
+   * the local git identity, as git is configured.
+   */
+  commitIdentity?: (repoFullName: string) => Promise<CommitIdentity | null>;
 }
 
 function defaultLocate(adapter: string, agent: AgentConfig, opts: { env: NodeJS.ProcessEnv; configDir: string }): LocatedLaunch {
@@ -618,6 +629,19 @@ export class LiveExecutor implements Executor {
       throw new StartFailedError(why);
     }
 
+    // Who the agent commits as, when that is the GitHub App's bot. Asked before the worktree
+    // exists, so a failure leaves nothing behind; commits are never rewritten afterwards.
+    let commitEnv: Record<string, string> | undefined;
+    let committer: CommitIdentity | null = null;
+    if (this.opts.commitIdentity) {
+      try {
+        committer = await this.opts.commitIdentity(found.fullName);
+      } catch (err) {
+        return fail('failed', `could not find the GitHub App's commit identity (github.app.commitAsApp): ${message(err)}`);
+      }
+      if (committer) commitEnv = commitIdentityEnv(committer);
+    }
+
     // 3. Worktree. A failure here is the job's problem, not the agent's: failed, not start_failed.
     const branch = jobBranchName(job, run.attempt);
     const worktreePath = jobWorktreePath(ctx.paths, job, run.attempt);
@@ -666,7 +690,7 @@ export class LiveExecutor implements Executor {
     } catch (err) {
       throw new StartFailedError(`adapter ${adapterName} could not build the agent command: ${message(err)}`, { cause: err });
     }
-    const agentEnv = mergeEnv(baseEnv, invocation.env, agentCfg.env);
+    const agentEnv = mergeEnv(baseEnv, invocation.env, commitEnv, agentCfg.env);
     const timeoutMs = Math.round(timeoutMinutes * 60_000);
     // Containerized: the same command, started by the runtime client inside a container that
     // sees only the worktree and what git needs. agentEnv stays the client's environment; the
@@ -685,7 +709,7 @@ export class LiveExecutor implements Executor {
             runId: run.id,
             worktree: prepared.worktreePath,
             promptFile,
-            agentEnv: agentCfg.env,
+            agentEnv: commitEnv ? { ...commitEnv, ...agentCfg.env } : agentCfg.env,
           }),
         };
       } catch (err) {
@@ -712,6 +736,7 @@ export class LiveExecutor implements Executor {
       `command: ${JSON.stringify([invocation.file, ...invocation.args])}`,
       `prompt file: ${promptFile} (${invocation.promptVia === 'stdin' ? 'on stdin' : 'passed by path'})`,
       ...(agentCfg.env && Object.keys(agentCfg.env).length ? [`env from config: ${Object.keys(agentCfg.env).join(', ')}`] : []),
+      ...(committer ? [`commit identity: ${committer.name} <${committer.email}> (github.app.commitAsApp)`] : []),
       `timeout: ${timeoutMinutes} min`,
       '',
       '---- agent output (stdout and stderr) ----',

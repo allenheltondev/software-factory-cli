@@ -17,6 +17,11 @@
 // scoped to https://github.com/ (never in argv, a URL or a file); other remotes (SSH, host
 // aliases) use git's own credentials. Hooks are disabled for these git commands, since the agent
 // could have written them.
+//
+// With a GitHub App configured (github.app), "the gh account" above is the App's installation:
+// the token is an installation token issued for the push, and the push always goes over HTTPS to
+// https://github.com/OWNER/REPO.git, whatever protocol the clone's remote uses, because an SSH
+// push would be made with the person's key and so as the person (docs/github-app.md).
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -48,6 +53,8 @@ import {
 } from '../git/git.js';
 import { jobBranchName, withCheckoutLock } from '../git/worktree.js';
 import { GitHubError, type GitHubApi, type GitHubPullRequest } from '../github/api.js';
+import { APP_PERMISSIONS_HINT, GitHubAppError, redactGitHubSecrets } from '../github/app-auth.js';
+import type { WorkerKind } from '../github/credentials.js';
 import type { UpdraftPaths } from '../paths.js';
 import { revisionOf, type Job, type Publication, type Run, type RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -73,7 +80,8 @@ const MAX_TITLE = 256;
 /** The scopes publication needs, for permission errors. */
 export const TOKEN_SCOPES_HINT =
   'Publication needs push access to the repository and a token with the classic "repo" scope, or a fine-grained ' +
-  'token with Contents, Pull requests and Issues set to read and write. With gh: gh auth refresh -h github.com -s repo';
+  'token with Contents, Pull requests and Issues set to read and write. With gh: gh auth refresh -h github.com -s repo. ' +
+  `With a GitHub App (github.app) instead: ${APP_PERMISSIONS_HINT}`;
 
 export type RunGit = (args: readonly string[], opts: GitOptions) => Promise<GitOutput>;
 
@@ -83,8 +91,17 @@ export interface PublishDeps {
   paths: UpdraftPaths;
   api: GitHubApi;
   log: Logger;
-  /** The active gh account's token (GH_TOKEN / GITHUB_TOKEN, else `gh auth token`). Read only for https remotes. */
-  token: () => Promise<string>;
+  /**
+   * A newly read token for a push to `repoFullName`, from the worker's credentials
+   * (src/github/credentials.ts): the gh account's (GH_TOKEN / GITHUB_TOKEN, else `gh auth token`),
+   * or an installation token of the GitHub App. Read only for pushes over https.
+   */
+  token: (repoFullName: string) => Promise<string>;
+  /**
+   * 'app' when the worker acts as a GitHub App: pushes then always go over HTTPS with the
+   * installation token, never with the SSH key of the clone's remote. Default 'user'.
+   */
+  workerKind?: WorkerKind;
   git?: string;
   /** Injected in tests to record what reaches git. */
   runGit?: RunGit;
@@ -136,13 +153,16 @@ function basicAuth(token: string): string {
   return Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
 }
 
-/** Replace the token (and its encoded header form) wherever it might appear. */
+/**
+ * Replace the token (and its encoded header form) wherever it might appear, and anything shaped
+ * like a GitHub token, a JWT or a private key, whether or not this attempt held it.
+ */
 export function redactSecret(text: string, token: string | null): string {
-  if (!token) return text;
+  if (!token) return redactGitHubSecrets(text);
   let out = text.split(token).join('***');
   const b = basicAuth(token);
   out = out.split(b).join('***');
-  return out;
+  return redactGitHubSecrets(out);
 }
 
 const DEBUG_ENV = /^(GIT_TRACE.*|GIT_CURL_VERBOSE|GIT_REDACT_COOKIES|GIT_TRACE2.*)$/i;
@@ -206,6 +226,8 @@ export function isHttpsGitHub(url: string): boolean {
 // ---------------------------------------------------------------------------
 
 export function classifyGitHub(err: GitHubError, repoFullName: string, runId: string): { error: string; retryable: boolean; retryAfter: number | null } {
+  // A GitHub App problem that waiting does not fix; its message already says what to change.
+  if (err instanceof GitHubAppError) return { error: err.message, retryable: false, retryAfter: null };
   if (err.status === 0 || err.status >= 500 || err.isRateLimit) {
     return { error: `GitHub is unavailable for now: ${err.message}`, retryable: true, retryAfter: err.retryAfterSeconds };
   }
@@ -236,7 +258,15 @@ const GIT_AUTH = /authentication failed|permission to .* denied|permission denie
 const GIT_NETWORK = /could not resolve host|failed to connect|connection (timed out|reset|refused)|operation timed out|the remote end hung up|early eof|returned error: 5\d\d|ssl_|gnutls|tls connection|network is unreachable|rpc failed/i;
 
 export function classifyGit(err: GitError, what: string, remote: string, repoFullName: string): Error {
-  const detail = err.stderr.trim().split(/\r?\n/).filter(Boolean).slice(-3).join('; ') || err.message;
+  // Redacted before it is cut down to its last lines: a secret cut in half no longer looks like one.
+  const detail = redactGitHubSecrets(err.stderr).trim().split(/\r?\n/).filter(Boolean).slice(-3).join('; ') || err.message;
+  if (/without `?workflows?`? permission/i.test(err.stderr)) {
+    return new PublishRefusal(
+      `${what} to ${remote} was rejected (${detail}): the commits change files under .github/workflows, which a GitHub App may ` +
+        'push only with the "Workflows" repository permission (read and write). Grant it to the App and accept it on the installation, ' +
+        'then publish the run again',
+    );
+  }
   if (GIT_AUTH.test(err.stderr)) {
     return new PublishRefusal(
       `${what} to ${remote} was refused for lack of access (${detail}). For an https remote the worker uses the gh ` +
@@ -425,7 +455,7 @@ export interface PushTarget {
  * `onToken` receives the token as soon as it is read, so the caller can redact it from any error.
  */
 export async function openPushTarget(
-  deps: Pick<PublishDeps, 'token' | 'env' | 'git' | 'runGit'>,
+  deps: Pick<PublishDeps, 'token' | 'workerKind' | 'env' | 'git' | 'runGit'>,
   o: { checkoutPath: string; repoFullName: string; remote: string | undefined; scratchDir: string; signal: AbortSignal; onToken: (token: string) => void },
 ): Promise<PushTarget> {
   const { checkoutPath, repoFullName, scratchDir } = o;
@@ -453,16 +483,20 @@ export async function openPushTarget(
   if (!matches) {
     throw new PublishRefusal(`the push URL of remote "${remoteName}" (${redactRemoteUrl(pushUrlRaw)}) does not point at ${repoFullName}`);
   }
+  // As a GitHub App the push must carry the installation token, so it goes over HTTPS to the
+  // repository the remote was just validated to be, never over SSH with the person's key (and
+  // never with credentials embedded in the remote's URL).
+  const pushUrl = deps.workerKind === 'app' ? `https://github.com/${repoFullName}.git` : pushUrlRaw;
   let token: string | null = null;
-  if (isHttpsGitHub(pushUrlRaw)) {
-    token = await deps.token();
+  if (isHttpsGitHub(pushUrl)) {
+    token = await deps.token(repoFullName);
     o.onToken(token);
   }
   const emptyGlobalConfig = join(scratchDir, 'empty-gitconfig');
   writeFileSync(emptyGlobalConfig, '');
   const env = publishGitEnv({
     base: deps.env ?? process.env,
-    pushUrl: pushUrlRaw,
+    pushUrl,
     token,
     hooksPath: join(scratchDir, 'none'),
     isolateWith: { emptyGlobalConfig },
@@ -477,7 +511,7 @@ export async function openPushTarget(
   const commonDir = resolve(checkoutPath, (await run1(['rev-parse', '--git-common-dir'], local)).stdout.trim());
   const objects = join(commonDir, 'objects');
   writeFileSync(join(pushRepo, 'objects', 'info', 'alternates'), `${objects}\n`);
-  return { remote: remoteName, pushUrl: pushUrlRaw, net: { ...netOpts, cwd: pushRepo } };
+  return { remote: remoteName, pushUrl, net: { ...netOpts, cwd: pushRepo } };
 }
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ import {
   type GitHubIssueComment,
   type GitHubPullRequest,
 } from '../github/api.js';
+import { GitHubAppError } from '../github/app-auth.js';
 import type { UpdraftPaths } from '../paths.js';
 import type { RepoRef, RunOutcome } from '../types.js';
 import { silentLogger } from '../util/log.js';
@@ -65,6 +66,9 @@ class FakePublishApi implements GitHubApi {
 
   async getViewer() {
     return { login: 'allen', id: 1 };
+  }
+  async getWorkerIdentity() {
+    return { kind: 'user' as const, login: 'allen', id: 1 };
   }
   async listUserRepos(): Promise<never[]> {
     return [];
@@ -851,5 +855,138 @@ describe('helpers', () => {
     expect(body).toContain('`````text\ndone ```` tricky');
     expect(body.match(/<!-- updraft-run: run_x -->/g)).toHaveLength(1);
     expect(body.indexOf('closes #9')).toBeGreaterThan(body.indexOf('```text'));
+  });
+});
+
+describe('publishRun as a GitHub App (github.app)', { timeout: 60_000 }, () => {
+  const APP_TOKEN = 'ghs_16C7e42F292c6912E7710c838347Ae178B4a';
+  const HTTPS = `https://github.com/${FULL}.git`;
+  const SSH = `git@github.com:${FULL}.git`;
+
+  /** Real git; the clone's remote reports an SSH push URL, and the HTTPS URL is served by the fixture's bare remote. */
+  function sshRemoteGit(s: Scenario, o: { failPushWith?: GitError } = {}): { runGit: RunGit; calls: GitCall[] } {
+    const calls: GitCall[] = [];
+    return {
+      calls,
+      runGit: async (args, opts: GitOptions) => {
+        calls.push({ args: [...args], env: opts.env });
+        if (args[0] === 'remote' && args[1] === 'get-url') return { stdout: `${SSH}\n`, stderr: '' };
+        if (o.failPushWith && args[0] === 'push') throw o.failPushWith;
+        return runGit(args.map((a) => (a === HTTPS ? s.f.remoteDir : a)), opts);
+      },
+    };
+  }
+
+  it('pushes over HTTPS with a token for that repository, in the environment and never in argv, even for an SSH remote', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s);
+    const asked: string[] = [];
+    const api = new FakePublishApi();
+    const r = await publishRun(
+      deps(s, api, {
+        runGit: git.runGit,
+        workerKind: 'app',
+        token: async (repoFullName) => {
+          asked.push(repoFullName);
+          return APP_TOKEN;
+        },
+      }),
+      s.runId,
+    );
+    expect(r.status).toBe('published');
+    expect(remoteSha(s)).toBe(s.localSha);
+    // One token, asked for the repository being pushed to.
+    expect(asked).toEqual([FULL]);
+
+    const push = git.calls.find((c) => c.args[0] === 'push')!;
+    expect(push.args).toContain(HTTPS);
+    // Nothing goes to the SSH URL: that would push as the person, with their key.
+    for (const c of git.calls) {
+      expect(c.args).not.toContain(SSH);
+      expect(c.args.join(' ')).not.toContain(APP_TOKEN);
+    }
+    for (const c of git.calls.filter((x) => ['push', 'ls-remote'].includes(x.args[0]!))) {
+      const header = Object.entries(c.env ?? {}).find(([, v]) => typeof v === 'string' && v.startsWith('AUTHORIZATION: basic '));
+      expect(header).toBeDefined();
+      const idx = header![0].replace('GIT_CONFIG_VALUE_', '');
+      expect(c.env![`GIT_CONFIG_KEY_${idx}`]).toBe('http.https://github.com/.extraheader');
+      expect(Buffer.from(header![1]!.slice('AUTHORIZATION: basic '.length), 'base64').toString()).toBe(`x-access-token:${APP_TOKEN}`);
+    }
+    const log = readFileSync(s.logPath, 'utf8');
+    expect(log).toContain(`to origin (${HTTPS})`);
+    expect(log).not.toContain(APP_TOKEN);
+    expect(api.pulls).toHaveLength(1);
+  });
+
+  it('still pushes with git\'s own credentials for an SSH remote when no App is configured', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s, { failPushWith: new GitError('git push failed', ['push'], 128, 'ssh: connect to host github.com port 22: Connection timed out\n') });
+    let asked = 0;
+    // ls-remote of the SSH URL would touch the network; the base branch is configured, so the push is the first network command.
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: async (args, opts) => (args[0] === 'ls-remote' ? { stdout: '', stderr: '' } : git.runGit(args, opts)), token: async () => (asked++, TOKEN) }), s.runId);
+    expect(r.status).toBe('failed');
+    expect(asked).toBe(0);
+    expect(git.calls.find((c) => c.args[0] === 'push')!.args).toContain(SSH);
+  });
+
+  it('redacts an installation token, a JWT and a private key from errors and run.log even when it did not hold them', async () => {
+    const s = await scenario();
+    const other = 'ghs_anotherInstallationToken0123456789';
+    const jwt = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3MDAwMDAwMDAsImlzcyI6MTIzNDV9.c2lnbmF0dXJlLXNpZ25hdHVyZQ';
+    const git = sshRemoteGit(s, {
+      failPushWith: new GitError('git push failed', ['push'], 128, `remote: denied ${other} ${jwt} -----BEGIN RSA PRIVATE KEY-----\nMIIEsecret\n-----END RSA PRIVATE KEY-----\nfatal: Authentication failed for ${APP_TOKEN}\n`),
+    });
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r.status).toBe('failed');
+    const recorded = [
+      r.status === 'failed' ? r.error : '',
+      getPublication(s.db, s.runId)!.error ?? '',
+      readFileSync(s.logPath, 'utf8'),
+      (s.db.prepare('SELECT message FROM errors').all() as { message: string }[]).map((e) => e.message).join('\n'),
+    ].join('\n');
+    for (const secret of [APP_TOKEN, other, jwt, 'MIIEsecret']) expect(recorded).not.toContain(secret);
+    expect(redactSecret(`x ${other} y`, null)).toBe('x *** y');
+  });
+
+  it('stops retrying, with the App\'s own advice, for a GitHub App problem', async () => {
+    const s = await scenario();
+    const api = new FakePublishApi();
+    api.failNext.createPullRequest = new GitHubAppError('the GitHub App updraft-bot is not installed on octo/widgets. Install it there', 'not-installed');
+    const git = sshRemoteGit(s);
+    const r = await publishRun(deps(s, api, { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false, error: 'the GitHub App updraft-bot is not installed on octo/widgets. Install it there' });
+    expect(getPublication(s.db, s.runId)!.nextAttemptAt).toBeNull();
+  });
+
+  it('retries when GitHub could not be reached for a token', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s);
+    const r = await publishRun(
+      deps(s, new FakePublishApi(), {
+        runGit: git.runGit,
+        workerKind: 'app',
+        token: async () => {
+          throw new GitHubError('POST /app/installations/11/access_tokens: network error: fetch failed', 0);
+        },
+      }),
+      s.runId,
+    );
+    expect(r).toMatchObject({ status: 'failed', retryable: true });
+    expect(git.calls.some((c) => c.args[0] === 'push')).toBe(false);
+  });
+
+  it('says which permission is missing when a push changes workflow files', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s, {
+      failPushWith: new GitError(
+        'git push failed',
+        ['push'],
+        1,
+        ' ! [remote rejected] abc -> updraft/issue-7 (refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission)\n',
+      ),
+    });
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false });
+    if (r.status === 'failed') expect(r.error).toMatch(/"Workflows" repository permission/);
   });
 });

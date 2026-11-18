@@ -26,6 +26,7 @@ import {
 import { getJob, getRun, MAX_START_FAILURES } from '../db/queue.js';
 import { jobBranchName } from '../git/worktree.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
+import { GitHubAppError } from '../github/app-auth.js';
 import type { UpdraftPaths } from '../paths.js';
 import { revisionOf, type Job, type Run } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -39,7 +40,8 @@ const MAX_REASON = 300;
 /** What commenting needs, for permission errors and `updraft doctor`. */
 export const COMMENT_SCOPES_HINT =
   'Commenting needs read access to the repository and a token with the classic "repo" scope ("public_repo" is enough ' +
-  'for a public repository), or a fine-grained token with Issues set to read and write';
+  'for a public repository), or a fine-grained token with Issues set to read and write. With a GitHub App (github.app) ' +
+  'instead, the App needs the Issues repository permission set to read and write (docs/github-app.md)';
 
 export interface FailureCommentDeps {
   db: Db;
@@ -219,6 +221,8 @@ function eligibility(deps: FailureCommentDeps, runId: string): { ok: true; e: El
 function classify(err: unknown, repoFullName: string, issueNumber: number): { error: string; retryable: boolean; retryAfter: number | null } {
   if (err instanceof TransientError) return { error: err.message, retryable: true, retryAfter: null };
   if (!(err instanceof GitHubError)) return { error: message(err), retryable: false, retryAfter: null };
+  // A GitHub App problem that waiting does not fix; its message already says what to change.
+  if (err instanceof GitHubAppError) return { error: err.message, retryable: false, retryAfter: null };
   if (err.status === 0 || err.status >= 500 || err.isRateLimit) {
     return { error: `GitHub is unavailable for now: ${err.message}`, retryable: true, retryAfter: err.retryAfterSeconds };
   }

@@ -7,7 +7,10 @@ import { silentLogger } from '../util/log.js';
 import { WorkerLockedError, type DaemonDeps } from '../worker/daemon.js';
 import { LogOnlyExecutor } from '../worker/executor.js';
 import { PrepareOnlyExecutor } from '../worker/prepare-only.js';
+import { GitHubAppError } from '../github/app-auth.js';
+import { createUserCredentials } from '../github/credentials.js';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
+import { describeError } from './errors.js';
 import { fakeApi, fakeContext } from './fakes.js';
 import { startCommand, type StartDeps } from './start.js';
 
@@ -108,5 +111,51 @@ describe('updraft start', () => {
     await expect(startCommand(s.ctx, s.deps)).rejects.toBeInstanceOf(WorkerLockedError);
     expect(s.closed).toHaveLength(1);
     expect(s.uninstall).toHaveBeenCalledOnce();
+  });
+});
+
+describe('updraft start with a GitHub App (github.app)', () => {
+  function writeAppConfig(path: string) {
+    const cfg = upsertRepoWorkflow(seedConfig('me'), { id: 1, fullName: 'o/r' }, buildWorkflow({ label: 'go', action: 'implement-issue', pool: 'general' })).config;
+    writeFileSync(path, stringify({ ...cfg, github: { app: { appId: 12345, privateKeyPath: 'app.pem' } } }));
+  }
+
+  it("creates the API with the worker's credentials, built from the config", async () => {
+    let ran = false;
+    const s = setup(async () => {
+      ran = true;
+    });
+    writeAppConfig(s.ctx.paths.configFile);
+    const credentials = createUserCredentials(async () => 'tok');
+    const asked: unknown[] = [];
+    s.ctx.createCredentials = (config) => {
+      asked.push(config?.github);
+      return credentials;
+    };
+    const given: unknown[] = [];
+    s.ctx.createApi = async (opts) => {
+      given.push(opts?.credentials);
+      return s.api;
+    };
+    expect(await startCommand(s.ctx, s.deps)).toBe(0);
+    expect(ran).toBe(true);
+    expect(asked).toEqual([{ app: { appId: 12345, privateKeyPath: 'app.pem' } }]);
+    expect(given).toEqual([credentials]);
+  });
+
+  it('does not start the worker when the key cannot be used', async () => {
+    let ran = false;
+    const s = setup(async () => {
+      ran = true;
+    });
+    writeAppConfig(s.ctx.paths.configFile);
+    s.ctx.createCredentials = () => {
+      throw new GitHubAppError('the GitHub App private key /cfg/app.pem does not exist. Set github.app.privateKeyPath', 'key');
+    };
+    await expect(startCommand(s.ctx, s.deps)).rejects.toThrow(/private key .* does not exist/);
+    expect(ran).toBe(false);
+    expect(s.closed).toHaveLength(1);
+    // The message is the App's own, not advice about gh.
+    expect(describeError(new GitHubAppError('the GitHub App private key /cfg/app.pem does not exist', 'key')).message).toBe('the GitHub App private key /cfg/app.pem does not exist');
   });
 });
