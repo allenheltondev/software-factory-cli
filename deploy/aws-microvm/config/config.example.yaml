@@ -1,0 +1,59 @@
+# Updraft config for jobs in Lambda MicroVMs. Copy to config.yaml (same directory), edit, and
+# run `./deploy.sh config`; it is uploaded to s3://<bucket>/config/ together with every other
+# file in this directory (prompts included) and read by each microVM when it starts. Changing
+# repositories, labels or prompts needs no image build and no stack deployment.
+#
+# Inside the microVM this file is $UPDRAFT_HOME/config.yaml in a directory created for the
+# run. Paths are relative to it. Two of them are fixed by the runner:
+#   ./github-app.pem   the App's private key, written there from Secrets Manager
+#   ./clones/...       does not exist at start; `updraft run-event` clones into it
+version: 1
+
+execution:
+  mode: live
+
+dispatch:
+  # GitHub logins who may start work by applying the trigger label. The launcher does not
+  # check this; `updraft run-event` does, against the GitHub API.
+  allowedActors: [your-github-login]
+
+github:
+  app:
+    appId: 1234567                     # the App's ID (or client ID)
+    privateKeyPath: ./github-app.pem   # leave as is
+    commitAsApp: true                  # commits are authored by <app-slug>[bot]
+
+agents:
+  claude:
+    maxConcurrent: 1
+    # Full-auto (bypassPermissions) is the default; the microVM is the isolation boundary.
+    # Do not set `container:` here.
+    # args: [--model, sonnet, --max-turns, "80"]
+  codex: { enabled: false }
+  kiro: { enabled: false }
+
+pools:
+  general:
+    agents: [claude]
+
+actions:
+  implement-issue:
+    prompt: ./prompts/implement-issue.md   # copy from examples/prompts/ in the Updraft repository
+    output: local-branch
+    timeoutMinutes: 60
+    # verify:
+    #   - npm ci
+    #   - npm test
+
+repositories:
+  your-org/your-repo:
+    id: 123456789                      # gh api repos/your-org/your-repo --jq .id
+    checkoutPath: ./clones/your-repo   # leave under ./clones/
+    publish: draft-pr
+    workflows:
+      - id: implement
+        trigger:
+          event: issue.labeled
+          label: ready
+        action: implement-issue
+        pool: general

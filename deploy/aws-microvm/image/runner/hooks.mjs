@@ -1,0 +1,183 @@
+// HTTP handling of the Lambda MicroVMs lifecycle hooks. Lambda sends a POST to
+// /aws/lambda-microvms/runtime/v1/<hook-name> on the configured hook port and reads the HTTP
+// status: 200 means the hook completed.
+//
+// Hooks handled here:
+//   /ready      image build: the process is up and can be snapshotted
+//   /validate   image build: answered in case the hook is enabled; nothing to validate
+//   /run        a microVM started from the snapshot: start the job, answer at once
+//   /suspend    not expected for a job (see README); logged
+//   /resume     not expected for a job; logged
+//   /terminate  the microVM is going away: stop the job and let it report
+
+export const HOOK_BASE_PATH = '/aws/lambda-microvms/runtime/v1';
+export const PAYLOAD_VERSION = 1;
+
+const MAX_BODY_BYTES = 64 * 1024; // the run hook payload is at most 16 KB
+const DELIVERY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+const EVENT_NAME_PATTERN = /^[a-z_]{1,64}$/;
+const MICROVM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
+
+/**
+ * Validates the body of the /run hook: `{ microvmId, runHookPayload }`, where runHookPayload
+ * is the JSON string the launcher passed to RunMicrovm. Throws an Error naming the problem.
+ *
+ * @param {unknown} body the parsed request body
+ */
+export function parseRunRequest(body) {
+  if (body === null || typeof body !== 'object') throw new Error('the /run body is not a JSON object');
+  const { microvmId, runHookPayload } = body;
+  if (typeof microvmId !== 'string' || !MICROVM_ID_PATTERN.test(microvmId)) {
+    throw new Error('the /run body has no usable microvmId');
+  }
+  if (typeof runHookPayload !== 'string' || runHookPayload === '') {
+    throw new Error('the /run body has no runHookPayload');
+  }
+  let payload;
+  try {
+    payload = JSON.parse(runHookPayload);
+  } catch {
+    throw new Error('runHookPayload is not JSON');
+  }
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('runHookPayload is not a JSON object');
+  }
+  if (payload.version !== PAYLOAD_VERSION) {
+    throw new Error(`runHookPayload version ${JSON.stringify(payload.version)} is not ${PAYLOAD_VERSION}; rebuild the image or redeploy the launcher`);
+  }
+  const text = (name, pattern) => {
+    const value = payload[name];
+    if (typeof value !== 'string' || value === '' || (pattern && !pattern.test(value))) {
+      throw new Error(`runHookPayload.${name} is missing or malformed`);
+    }
+    return value;
+  };
+  const seconds = (name, min) => {
+    const value = payload[name];
+    if (!Number.isInteger(value) || value < min) throw new Error(`runHookPayload.${name} is missing or malformed`);
+    return value;
+  };
+  const secrets = payload.secrets;
+  if (secrets === null || typeof secrets !== 'object') throw new Error('runHookPayload.secrets is missing');
+  for (const name of ['githubAppPrivateKey', 'agentEnv']) {
+    if (typeof secrets[name] !== 'string' || secrets[name] === '') {
+      throw new Error(`runHookPayload.secrets.${name} is missing`);
+    }
+  }
+  if (payload.dedupeTable !== undefined && (typeof payload.dedupeTable !== 'string' || !/^[A-Za-z0-9_.-]{3,255}$/.test(payload.dedupeTable))) {
+    throw new Error('runHookPayload.dedupeTable is malformed');
+  }
+  const launchedAt = text('launchedAt');
+  if (Number.isNaN(Date.parse(launchedAt))) throw new Error('runHookPayload.launchedAt is not a date');
+  return {
+    microvmId,
+    payload: {
+      ...(payload.dedupeTable === undefined ? {} : { dedupeTable: payload.dedupeTable }),
+      version: PAYLOAD_VERSION,
+      deliveryId: text('deliveryId', DELIVERY_ID_PATTERN),
+      eventName: text('eventName', EVENT_NAME_PATTERN),
+      region: text('region', /^[a-z0-9-]{1,32}$/),
+      bucket: text('bucket'),
+      eventKey: text('eventKey'),
+      resultKeyPrefix: text('resultKeyPrefix'),
+      configPrefix: text('configPrefix'),
+      secrets: { githubAppPrivateKey: secrets.githubAppPrivateKey, agentEnv: secrets.agentEnv },
+      maximumDurationSeconds: seconds('maximumDurationSeconds', 1),
+      watchdogReserveSeconds: seconds('watchdogReserveSeconds', 0),
+      launchedAt,
+    },
+  };
+}
+
+/**
+ * Creates the request listener for the hook port.
+ *
+ * @param {object} handlers
+ * @param {(request: ReturnType<typeof parseRunRequest>) => void} handlers.startJob called once,
+ *   for the first valid /run; must return quickly (the job runs on its own)
+ * @param {() => Promise<void>} handlers.stopJob called on /terminate; resolves when the job
+ *   has stopped and reported, or a bounded wait is over
+ * @param {(message: string) => void} handlers.log
+ */
+export function createHookHandler({ startJob, stopJob, log }) {
+  let started = false;
+
+  const answer = (res, status, body) => {
+    const text = JSON.stringify(body);
+    res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
+    res.end(text);
+  };
+
+  return async function onRequest(req, res) {
+    try {
+      const path = (req.url ?? '').split('?')[0];
+      if (!path.startsWith(`${HOOK_BASE_PATH}/`)) return answer(res, 404, { error: 'not a lifecycle hook' });
+      if (req.method !== 'POST') return answer(res, 405, { error: 'hooks are POST requests' });
+      const hook = path.slice(HOOK_BASE_PATH.length + 1);
+
+      switch (hook) {
+        case 'ready':
+        case 'validate':
+          req.resume();
+          return answer(res, 200, { status: 'ok' });
+
+        case 'run': {
+          const raw = await readBody(req);
+          let request;
+          try {
+            request = parseRunRequest(JSON.parse(raw.toString('utf8') || 'null'));
+          } catch (error) {
+            // A non-200 answer makes Lambda terminate the microVM, which is what should
+            // happen to one that cannot know what to do. The reason is in the log.
+            log(`/run rejected: ${error.message}`);
+            return answer(res, 400, { error: error.message });
+          }
+          if (started) {
+            log(`/run called again (delivery ${request.payload.deliveryId}); ignored, a job was already started`);
+            return answer(res, 200, { status: 'already started' });
+          }
+          started = true;
+          startJob(request);
+          return answer(res, 200, { status: 'started' });
+        }
+
+        case 'suspend':
+        case 'resume':
+          req.resume();
+          log(`/${hook} called: a job microVM is not meant to be suspended; check the idle policy the launcher sets`);
+          return answer(res, 200, { status: 'ok' });
+
+        case 'terminate':
+          req.resume();
+          await stopJob();
+          return answer(res, 200, { status: 'ok' });
+
+        default:
+          req.resume();
+          return answer(res, 404, { error: 'unknown hook' });
+      }
+    } catch (error) {
+      log(`hook request failed: ${error?.message ?? error}`);
+      if (!res.headersSent) answer(res, 500, { error: 'hook failed' });
+      else res.end();
+    }
+  };
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}

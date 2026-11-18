@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Updraft on AWS Lambda MicroVMs: a GitHub App webhook starts one microVM per job.
+  This stack holds everything except the MicroVM image itself, which deploy.sh
+  creates with the AWS CLI (see README.md).
+
+Parameters:
+  ImageName:
+    Type: String
+    Default: updraft-job
+    AllowedPattern: '^[a-zA-Z0-9-_]{1,64}$'
+    Description: >-
+      Name of the MicroVM image that deploy.sh creates. The launcher runs
+      arn:<partition>:lambda:<region>:<account>:microvm-image:<ImageName>.
+  ImageVersion:
+    Type: String
+    Default: ''
+    Description: MicroVM image version to run. Empty runs the latest active version.
+  MaximumDurationSeconds:
+    Type: Number
+    Default: 7200
+    MinValue: 600
+    MaxValue: 28800
+    Description: >-
+      Hard lifetime of a job's microVM. The default covers a 60 minute agent run,
+      verification, clone and dependency installation, with room to spare.
+  WatchdogReserveSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+    Description: >-
+      The runner stops the job this long before MaximumDurationSeconds, so that the
+      result and the logs are written before Lambda terminates the microVM.
+  IdlePolicyMode:
+    Type: String
+    Default: explicit
+    AllowedValues: [explicit, omit]
+    Description: >-
+      explicit: send an idle policy that allows the microVM to be idle for its whole
+      lifetime. omit: send no idle policy. See "Idle policy" in README.md.
+  EgressNetworkConnectorArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of a VPC egress network connector for the microVMs. Empty uses the
+      Lambda-provided internet egress connector.
+  IngressNetworkConnectorArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Override for the ingress connector. Empty uses the Lambda-provided NO_INGRESS
+      connector. Only set this for debugging (for example SHELL_INGRESS).
+  TriggerLabels:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional comma-separated label names. When set, the launcher starts a microVM
+      only for these labels. Must include every trigger label in the Updraft config.
+  DedupeWindowSeconds:
+    Type: Number
+    Default: 7200
+    MinValue: 0
+    MaxValue: 86400
+    Description: >-
+      A redelivery of a delivery that already started a microVM is ignored for this
+      long, unless that microVM reported a failure (then it can be redelivered at
+      once). Set it to about MaximumDurationSeconds. 0 turns deduplication off.
+  WebhookSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of an existing Secrets Manager secret holding the GitHub App's webhook
+      secret. Empty creates one with a generated value.
+  GitHubAppPrivateKeySecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of an existing secret holding the GitHub App's private key (PEM). Empty
+      creates an empty secret for you to fill.
+  AgentEnvSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of an existing secret holding the agent's API key (a bare ANTHROPIC_API_KEY
+      value, or a JSON object of environment variables). Empty creates an empty secret.
+  EventRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    Description: Days after which stored webhook bodies (events/) are deleted.
+  ResultRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: Days after which job results (results/) are deleted.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Retention of the launcher's and the microVMs' CloudWatch log groups.
+  WebhookRateLimit:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Steady-state requests per second the HTTP API passes to the launcher.
+  WebhookBurstLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Burst of requests the HTTP API passes to the launcher.
+
+Conditions:
+  CreateWebhookSecret: !Equals [!Ref WebhookSecretArn, '']
+  CreateGitHubAppPrivateKeySecret: !Equals [!Ref GitHubAppPrivateKeySecretArn, '']
+  CreateAgentEnvSecret: !Equals [!Ref AgentEnvSecretArn, '']
+  UseInternetEgress: !Equals [!Ref EgressNetworkConnectorArn, '']
+  UseNoIngress: !Equals [!Ref IngressNetworkConnectorArn, '']
+
+Resources:
+  # ---------------------------------------------------------------- storage
+  JobBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-events
+            Status: Enabled
+            Prefix: events/
+            ExpirationInDays: !Ref EventRetentionDays
+          - Id: expire-results
+            Status: Enabled
+            Prefix: results/
+            ExpirationInDays: !Ref ResultRetentionDays
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  JobBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref JobBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt JobBucket.Arn
+              - !Sub '${JobBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # One item per delivery that started a microVM, expiring after DedupeWindowSeconds.
+  DeliveryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: deliveryId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: deliveryId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # ---------------------------------------------------------------- secrets
+  # No secret value is in this template. The webhook secret is generated by Secrets
+  # Manager; the other two are created empty and filled with `aws secretsmanager
+  # put-secret-value` (README.md, step 3).
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateWebhookSecret
+    Properties:
+      Description: !Sub 'Webhook secret of the GitHub App behind ${AWS::StackName}'
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  GitHubAppPrivateKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateGitHubAppPrivateKeySecret
+    Properties:
+      Description: !Sub 'Private key (PEM) of the GitHub App behind ${AWS::StackName}'
+
+  AgentEnvSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateAgentEnvSecret
+    Properties:
+      Description: !Sub 'Agent API key (or JSON object of agent environment variables) for ${AWS::StackName}'
+
+  # ---------------------------------------------------------------- logs
+  LauncherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Lambda's default log group for a MicroVM image: build logs and, with one stream per
+  # microVM id, runtime logs. Created here so that it has a retention period.
+  MicrovmLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda-microvms/${ImageName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------- roles
+  # Assumed by Lambda while it builds the MicroVM image: read the build context, write
+  # build logs.
+  MicrovmBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadBuildContext
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${JobBucket.Arn}/image/*'
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  # The group itself, and (the attribute ends in ":*") its log streams.
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/${ImageName}'
+                  - !GetAtt MicrovmLogGroup.Arn
+
+  # Assumed by Lambda for a running microVM. Every process in the microVM, the agent
+  # included, must be assumed able to use this role (README.md, "Security model"), so it
+  # holds only what a job needs.
+  MicrovmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: job
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadEventAndConfig
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub '${JobBucket.Arn}/events/*'
+                  - !Sub '${JobBucket.Arn}/config/*'
+              - Sid: ListConfig
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt JobBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: 'config/*'
+              - Sid: WriteResult
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${JobBucket.Arn}/results/*'
+              - Sid: ReadJobSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !If [CreateGitHubAppPrivateKeySecret, !Ref GitHubAppPrivateKeySecret, !Ref GitHubAppPrivateKeySecretArn]
+                  - !If [CreateAgentEnvSecret, !Ref AgentEnvSecret, !Ref AgentEnvSecretArn]
+              # Lets a job that did not end well remove its deduplication record, so
+              # that the delivery can be redelivered as a retry.
+              - Sid: ReleaseDelivery
+                Effect: Allow
+                Action: dynamodb:DeleteItem
+                Resource: !GetAtt DeliveryTable.Arn
+              # MicroVM actions are authorised against the image ARN (the documentation's
+              # operator policy does the same), so this allows terminating any microVM of
+              # this image, not only the caller's own.
+              - Sid: TerminateOwnMicrovm
+                Effect: Allow
+                Action: lambda:TerminateMicrovm
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}'
+              - Sid: WriteRuntimeLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  # The group itself, and (the attribute ends in ":*") its log streams.
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/${ImageName}'
+                  - !GetAtt MicrovmLogGroup.Arn
+
+  # ---------------------------------------------------------------- endpoint and launcher
+  WebhookApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: !Sub 'GitHub App webhook for ${AWS::StackName}'
+      DefaultRouteSettings:
+        ThrottlingRateLimit: !Ref WebhookRateLimit
+        ThrottlingBurstLimit: !Ref WebhookBurstLimit
+
+  LauncherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Verifies a GitHub webhook and starts one Lambda MicroVM per job
+      CodeUri: launcher/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      MemorySize: 256
+      # GitHub waits 10 seconds for a webhook response.
+      Timeout: 10
+      LoggingConfig:
+        LogGroup: !Ref LauncherLogGroup
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Path: /webhook
+            Method: POST
+            PayloadFormatVersion: '2.0'
+      Environment:
+        Variables:
+          IMAGE_ARN: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}'
+          IMAGE_VERSION: !Ref ImageVersion
+          EXECUTION_ROLE_ARN: !GetAtt MicrovmExecutionRole.Arn
+          INGRESS_CONNECTOR_ARN: !If
+            - UseNoIngress
+            - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:NO_INGRESS'
+            - !Ref IngressNetworkConnectorArn
+          EGRESS_CONNECTOR_ARN: !If
+            - UseInternetEgress
+            - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS'
+            - !Ref EgressNetworkConnectorArn
+          MICROVM_LOG_GROUP: !Ref MicrovmLogGroup
+          BUCKET: !Ref JobBucket
+          WEBHOOK_SECRET_ARN: !If [CreateWebhookSecret, !Ref WebhookSecret, !Ref WebhookSecretArn]
+          GITHUB_APP_KEY_SECRET_ARN: !If [CreateGitHubAppPrivateKeySecret, !Ref GitHubAppPrivateKeySecret, !Ref GitHubAppPrivateKeySecretArn]
+          AGENT_ENV_SECRET_ARN: !If [CreateAgentEnvSecret, !Ref AgentEnvSecret, !Ref AgentEnvSecretArn]
+          MAX_DURATION_SECONDS: !Ref MaximumDurationSeconds
+          WATCHDOG_RESERVE_SECONDS: !Ref WatchdogReserveSeconds
+          IDLE_POLICY_MODE: !Ref IdlePolicyMode
+          TRIGGER_LABELS: !Ref TriggerLabels
+          DEDUPE_TABLE: !Ref DeliveryTable
+          DEDUPE_WINDOW_SECONDS: !Ref DedupeWindowSeconds
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: StoreWebhookBody
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${JobBucket.Arn}/events/*'
+            - Sid: ReadWebhookSecret
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !If [CreateWebhookSecret, !Ref WebhookSecret, !Ref WebhookSecretArn]
+            - Sid: RecordDelivery
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt DeliveryTable.Arn
+            - Sid: RunJobMicrovm
+              Effect: Allow
+              Action: lambda:RunMicrovm
+              Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}'
+            # RunMicrovm is given the execution role; passing a role to a service needs
+            # iam:PassRole on exactly that role.
+            - Sid: PassExecutionRole
+              Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt MicrovmExecutionRole.Arn
+
+Outputs:
+  WebhookUrl:
+    Description: Payload URL for the GitHub App's webhook
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/webhook'
+  BucketName:
+    Description: Bucket for config/, events/, results/ and the image build context (image/)
+    Value: !Ref JobBucket
+  ImageName:
+    Description: Name of the MicroVM image the launcher runs
+    Value: !Ref ImageName
+  ImageArn:
+    Description: ARN the launcher passes to RunMicrovm
+    Value: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ImageName}'
+  BuildRoleArn:
+    Description: Role Lambda assumes while building the MicroVM image
+    Value: !GetAtt MicrovmBuildRole.Arn
+  ExecutionRoleArn:
+    Description: Role of a running job microVM
+    Value: !GetAtt MicrovmExecutionRole.Arn
+  WebhookSecretArn:
+    Description: Secret holding the webhook secret
+    Value: !If [CreateWebhookSecret, !Ref WebhookSecret, !Ref WebhookSecretArn]
+  GitHubAppPrivateKeySecretArn:
+    Description: Secret holding the GitHub App private key
+    Value: !If [CreateGitHubAppPrivateKeySecret, !Ref GitHubAppPrivateKeySecret, !Ref GitHubAppPrivateKeySecretArn]
+  AgentEnvSecretArn:
+    Description: Secret holding the agent API key or environment
+    Value: !If [CreateAgentEnvSecret, !Ref AgentEnvSecret, !Ref AgentEnvSecretArn]
+  DeliveryTableName:
+    Description: Table of deliveries that started a microVM (deduplication)
+    Value: !Ref DeliveryTable
+  LauncherLogGroup:
+    Description: Log group of the launcher function
+    Value: !Ref LauncherLogGroup
+  MicrovmLogGroup:
+    Description: Log group of image builds and of the job microVMs (one stream per microVM id)
+    Value: !Ref MicrovmLogGroup
