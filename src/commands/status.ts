@@ -1,3 +1,4 @@
+import { describeRouting } from '../tier-routing.js';
 import { existsSync } from 'node:fs';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import type { FailureComment } from '../db/failure-comments.js';
@@ -243,6 +244,8 @@ export function renderStatus(v: StatusView): string {
     lines.push(
       `  ${run.id}  ${job.repoFullName}#${job.issueNumber}${revisionNote(job)}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}${canceling}`,
     );
+    const routed = describeRouting(job.envelope?.routing);
+    if (routed) lines.push(`    routing: ${routed}`);
   }
 
   lines.push('', 'Recent jobs:');
