@@ -13,8 +13,17 @@ wrapper sets PATH, starts node.exe with the installed package's dist\cli.js dire
 npm .cmd shim), and redirects stdout/stderr to launcher.out.log / launcher.err.log in the
 per-user log directory. The worker also writes its own log there.
 
-Task settings: restart on failure, ignore overlapping launches, no execution time limit,
-start when available (a missed logon trigger runs as soon as possible).
+The wrapper supervises the worker: after any exit other than a clean one (code 0), it starts
+the worker again, waiting 5s after the first quick failure and doubling up to 5 min. Task
+Scheduler's own "restart on failure" does not restart a task whose action exits non-zero, so
+it cannot be relied on for that. If the wrapper itself is ended (Stop-ScheduledTask, its
+console closing), the task's repeating trigger starts it again within RepeatIntervalMinutes,
+and the new wrapper waits on the worker the old one started when that is still running.
+
+Triggers: at logon, repeating every RepeatIntervalMinutes for as long as you are logged on;
+unless -NoStart, also from now on at the same interval, so this session is covered without
+logging off. Task settings: restart on failure, ignore overlapping launches (a repeat while
+the wrapper runs does nothing), no execution time limit, start when available.
 
 Compatible with Windows PowerShell 5.1 and PowerShell 7. Run it from a normal (not
 elevated) PowerShell window as the user who should run the worker.
@@ -48,8 +57,19 @@ How many times Task Scheduler restarts a failed run. Default: 999 (the maximum).
 .PARAMETER RestartIntervalMinutes
 Delay between restarts. Default: 1 (the minimum).
 
+.PARAMETER RepeatIntervalMinutes
+How often the task's triggers repeat, starting the wrapper again if it is not running.
+Default: 5.
+
+.PARAMETER MinBackoffSeconds
+The wrapper's delay before restarting a worker that exited after a short run. Default: 5.
+
+.PARAMETER MaxBackoffSeconds
+The longest delay between restarts after repeated quick failures. Default: 300.
+
 .PARAMETER NoStart
-Register without starting the task now.
+Register without starting the task now. The task then first runs at your next logon (and
+repeats from there); this session gets no repeating trigger.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File .\register-task.ps1
@@ -68,6 +88,9 @@ param(
     [string]$UpdraftHome = $env:UPDRAFT_HOME,
     [ValidateRange(1, 999)][int]$RestartCount = 999,
     [ValidateRange(1, 44640)][int]$RestartIntervalMinutes = 1,
+    [ValidateRange(1, 1440)][int]$RepeatIntervalMinutes = 5,
+    [ValidateRange(1, 3600)][int]$MinBackoffSeconds = 5,
+    [ValidateRange(1, 86400)][int]$MaxBackoffSeconds = 300,
     [switch]$NoStart
 )
 
@@ -190,12 +213,21 @@ $wrapper = @"
 `$pathPrepend = @($pathLiterals)
 `$updraftHome = $updraftHomeLiteral
 `$pidFilePath = $(ConvertTo-PsLiteral $pidFilePath)
+`$minBackoffSeconds = $MinBackoffSeconds
+`$maxBackoffSeconds = $MaxBackoffSeconds
+# A run at least this long counts as healthy: the next restart starts from the minimum delay again.
+`$stableRunSeconds = 600
 
-trap {
+`$wrapperLog = Join-Path `$logDir 'launcher.wrapper.log'
+function Write-WrapperLog([string]`$Message) {
     try {
         New-Item -ItemType Directory -Force -Path `$logDir | Out-Null
-        Add-Content -LiteralPath (Join-Path `$logDir 'launcher.wrapper.log') -Value ('{0} {1}' -f (Get-Date -Format o), `$_)
+        Add-Content -LiteralPath `$wrapperLog -Value ('{0} {1}' -f (Get-Date -Format o), `$Message)
     } catch { }
+}
+
+trap {
+    Write-WrapperLog ('wrapper error: {0}' -f `$_)
     exit 1
 }
 
@@ -203,33 +235,89 @@ trap {
 if (`$updraftHome) { `$env:UPDRAFT_HOME = `$updraftHome }
 New-Item -ItemType Directory -Force -Path `$logDir | Out-Null
 
-`$out = Join-Path `$logDir 'launcher.out.log'
-`$err = Join-Path `$logDir 'launcher.err.log'
-foreach (`$f in @(`$out, `$err)) {
-    if (Test-Path -LiteralPath `$f) { Move-Item -LiteralPath `$f -Destination "`$f.prev" -Force }
+# The worker an earlier wrapper of this task started, if it is still running: same PID, start
+# time and executable as recorded. A wrapper can end while its worker keeps running
+# (Stop-ScheduledTask, or the wrapper's console closing), and starting a second worker then would
+# only fail on the worker lock. This wrapper waits on that worker instead.
+function Get-RecordedWorker {
+    if (-not (Test-Path -LiteralPath `$pidFilePath -PathType Leaf)) { return `$null }
+    try {
+        `$record = [System.IO.File]::ReadAllText(`$pidFilePath) | ConvertFrom-Json
+        `$p = Get-Process -Id ([int]`$record.pid) -ErrorAction Stop
+        `$sameStart = [Math]::Abs(`$p.StartTime.ToUniversalTime().Ticks - [long]`$record.startTimeUtcTicks) -lt [TimeSpan]::TicksPerSecond
+        `$sameExe = `$p.Path -and (`$p.Path -ieq [string]`$record.node)
+        if (`$sameStart -and `$sameExe) { return `$p }
+    } catch { }
+    return `$null
 }
 
-# Start-Process joins arguments with spaces, so quote each one.
-`$argList = @(`$cli, 'start', '--config', `$config) | ForEach-Object { '"' + `$_ + '"' }
-`$proc = Start-Process -FilePath `$node -ArgumentList `$argList -WorkingDirectory `$workDir ``
-    -NoNewWindow -PassThru -RedirectStandardOutput `$out -RedirectStandardError `$err
-`$null = `$proc.Handle  # keep the handle so ExitCode is available after exit
-
-# Record exactly which process this wrapper started, so unregister-task.ps1 can stop it
-# without touching a manually started worker that uses the same CLI and config.
-`$pidFile = `$pidFilePath
-try {
-    `$record = New-Object PSObject -Property @{
-        pid = `$proc.Id
-        startTimeUtcTicks = `$proc.StartTime.ToUniversalTime().Ticks
-        node = `$proc.Path
+# Rotate launcher.out.log / launcher.err.log to .prev. A file another process still holds open
+# cannot be moved; this launch then writes to time-stamped files rather than failing to start.
+function Get-LaunchLogs {
+    `$out = Join-Path `$logDir 'launcher.out.log'
+    `$err = Join-Path `$logDir 'launcher.err.log'
+    try {
+        foreach (`$f in @(`$out, `$err)) {
+            if (Test-Path -LiteralPath `$f) { Move-Item -LiteralPath `$f -Destination "`$f.prev" -Force }
+        }
+        return @(`$out, `$err)
+    } catch {
+        `$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        Write-WrapperLog ('could not rotate the launcher logs ({0}); this launch writes launcher.out.{1}.log and launcher.err.{1}.log' -f `$_, `$stamp)
+        return @((Join-Path `$logDir "launcher.out.`$stamp.log"), (Join-Path `$logDir "launcher.err.`$stamp.log"))
     }
-    [System.IO.File]::WriteAllText(`$pidFile, (`$record | ConvertTo-Json -Compress))
-    `$proc.WaitForExit()
-} finally {
-    Remove-Item -LiteralPath `$pidFile -Force -ErrorAction SilentlyContinue
 }
-exit `$proc.ExitCode
+
+# Supervise the worker. Task Scheduler's "restart on failure" does not restart a task whose action
+# exits non-zero, so the wrapper restarts the worker itself after any exit except a clean one
+# (code 0: the worker was asked to stop), waiting longer after each quick failure. The task's
+# repeating trigger starts the wrapper again if the wrapper itself is ended.
+`$backoff = `$minBackoffSeconds
+while (`$true) {
+    `$proc = Get-RecordedWorker
+    `$adopted = `$null -ne `$proc
+    if (`$adopted) {
+        Write-WrapperLog ('worker process {0} from an earlier launch is still running; waiting on it' -f `$proc.Id)
+    } else {
+        `$logs = Get-LaunchLogs
+        # Start-Process joins arguments with spaces, so quote each one. -WindowStyle Hidden (not
+        # -NoNewWindow) gives node a console of its own, so a console control event that reaches
+        # this wrapper's console (Ctrl+C, close) does not end the worker.
+        `$argList = @(`$cli, 'start', '--config', `$config) | ForEach-Object { '"' + `$_ + '"' }
+        `$proc = Start-Process -FilePath `$node -ArgumentList `$argList -WorkingDirectory `$workDir ``
+            -WindowStyle Hidden -PassThru -RedirectStandardOutput `$logs[0] -RedirectStandardError `$logs[1]
+        `$null = `$proc.Handle  # keep the handle so ExitCode is available after exit
+
+        # Record exactly which process this wrapper started, so unregister-task.ps1 can stop it
+        # without touching a manually started worker that uses the same CLI and config. Path can
+        # still be empty right after the start; the file started is `$node in that case.
+        `$exe = `$proc.Path
+        if (-not `$exe) { `$exe = [System.IO.Path]::GetFullPath(`$node) }
+        `$record = New-Object PSObject -Property @{
+            pid = `$proc.Id
+            startTimeUtcTicks = `$proc.StartTime.ToUniversalTime().Ticks
+            node = `$exe
+        }
+        [System.IO.File]::WriteAllText(`$pidFilePath, (`$record | ConvertTo-Json -Compress))
+    }
+
+    `$started = Get-Date
+    `$proc.WaitForExit()
+    `$code = `$null
+    if (-not `$adopted) { try { `$code = `$proc.ExitCode } catch { } }
+    Remove-Item -LiteralPath `$pidFilePath -Force -ErrorAction SilentlyContinue
+    if (`$code -eq 0) {
+        Write-WrapperLog 'worker exited cleanly (code 0); not restarting it'
+        exit 0
+    }
+
+    `$ran = [int]((Get-Date) - `$started).TotalSeconds
+    if (`$ran -ge `$stableRunSeconds) { `$backoff = `$minBackoffSeconds }
+    `$codeText = if (`$null -eq `$code) { 'unknown (not started by this wrapper)' } else { '{0} (0x{0:X8})' -f `$code }
+    Write-WrapperLog ('worker exited with code {0} after {1}s; restarting it in {2}s' -f `$codeText, `$ran, `$backoff)
+    Start-Sleep -Seconds `$backoff
+    `$backoff = [Math]::Min(`$backoff * 2, `$maxBackoffSeconds)
+}
 "@
 
 # --- Task definition ---------------------------------------------------------------------
@@ -238,7 +326,20 @@ $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powe
 $taskArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$wrapperPath`""
 
 $action = New-ScheduledTaskAction -Execute $powershellExe -Argument $taskArgs -WorkingDirectory $WorkingDirectory
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+# Repeat with no end (an empty Duration). New-ScheduledTaskTrigger -AtLogOn has no repetition
+# parameters, so the pattern is copied from a -Once trigger built with one.
+$repeatInterval = New-TimeSpan -Minutes $RepeatIntervalMinutes
+$repeating = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $repeatInterval
+$repeating.Repetition.Duration = ''
+# Never end a running wrapper because a repetition period ended.
+$repeating.Repetition.StopAtDurationEnd = $false
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+$logonTrigger.Repetition = $repeating.Repetition
+$trigger = @($logonTrigger)
+if (-not $NoStart) {
+    # Covers this session too: the logon trigger's repetition only begins at the next logon.
+    $trigger += $repeating
+}
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
     -RestartCount $RestartCount `

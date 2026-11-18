@@ -20,7 +20,7 @@ import type { GitHubApi } from '../github/api.js';
 import type { UpdraftPaths } from '../paths.js';
 import { createFailureCommenter } from '../publish/failure-comment.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job } from '../types.js';
-import { silentLogger } from '../util/log.js';
+import { silentLogger, type Logger } from '../util/log.js';
 import { runDaemon, WorkerLockedError, type DaemonDeps } from './daemon.js';
 import { canceledByUser, StartFailedError, type ExecutionResult, type Executor } from './executor.js';
 import { acquireWorkerLock, readWorkerLock, WORKER_STALE_MS } from './lock.js';
@@ -494,6 +494,63 @@ describe('runDaemon', () => {
     });
     await runDaemon(deps);
     expect(events).toEqual([`sweep (left-over run interrupted, publish draft-pr since ${new Date(T0).toISOString()})`, 'poll']);
+  });
+
+  it('logs an info-level "worker alive" line once per status interval, with polls and failures since the last one', async () => {
+    const db = openDatabase(':memory:');
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const recording: Logger = {
+      debug: () => {},
+      info: (msg, fields) => lines.push({ msg, fields }),
+      warn: () => {},
+      error: () => {},
+      child: () => recording,
+    };
+    // Every read of the clock moves it 10 minutes, so polls come back to back and an hour of
+    // worker time passes in a few of them.
+    let t = Date.parse('2026-01-01T00:00:00Z');
+    let calls = 0;
+    const deps = baseDeps(db, {
+      log: recording,
+      now: () => (t += 10 * 60_000),
+      timing: { statusLogMs: 60 * 60_000 },
+      poll: async () => {
+        calls++;
+        if (calls % 2 === 0) throw new Error('rate limited');
+      },
+    });
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(lines.filter((l) => l.msg === 'worker alive').length).toBeGreaterThanOrEqual(2));
+    deps.controller.abort();
+    await done;
+    const alive = lines.filter((l) => l.msg === 'worker alive');
+    const first = alive[0]!.fields!;
+    expect(first.inFlight).toBe(0);
+    expect(first.polls as number).toBeGreaterThan(0);
+    expect(first.pollFailures as number).toBeLessThanOrEqual(first.polls as number);
+    // Counters restart after each line, and uptime keeps growing.
+    const total = alive.reduce((n, l) => n + (l.fields!.polls as number), 0);
+    expect(total).toBeLessThanOrEqual(calls);
+    expect(alive[1]!.fields!.uptimeMinutes as number).toBeGreaterThan(first.uptimeMinutes as number);
+  });
+
+  it('logs no "worker alive" line before the status interval has passed', async () => {
+    const db = openDatabase(':memory:');
+    const msgs: string[] = [];
+    const recording: Logger = {
+      debug: () => {},
+      info: (msg) => msgs.push(msg),
+      warn: () => {},
+      error: () => {},
+      child: () => recording,
+    };
+    let polls = 0;
+    const deps = baseDeps(db, { log: recording, poll: async () => void polls++ });
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(polls).toBeGreaterThanOrEqual(1));
+    deps.controller.abort();
+    await done;
+    expect(msgs).not.toContain('worker alive');
   });
 
   it('records poll failures and keeps running', async () => {

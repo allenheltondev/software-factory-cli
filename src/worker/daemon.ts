@@ -53,7 +53,16 @@ export { WorkerLockedError } from './lock.js';
  */
 export const CANCEL_CHECK_MS = 2_000;
 
+/**
+ * How often the worker logs an info-level "worker alive" line. Polls are logged at debug only,
+ * so without this a worker that stopped silently (killed, crashed before its handlers ran)
+ * leaves no way to tell from the log when it was last running.
+ */
+export const STATUS_LOG_MS = 60 * 60_000;
+
 export interface DaemonTiming {
+  /** Interval of the info-level "worker alive" line. Default 1h. */
+  statusLogMs?: number;
   /** Lock heartbeat and run-lease refresh interval. Default 15s. */
   heartbeatMs?: number;
   /** How often to look for user cancel requests on in-flight runs. Default 2s. */
@@ -419,15 +428,33 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     if (settingsSynced && deps.publisher && !signal.aborted && !lockLost) await deps.publisher.sweepUnpublished(signal);
 
     let nextPollAt = now();
+    const statusLogMs = deps.timing?.statusLogMs ?? STATUS_LOG_MS;
+    const startedAt = now();
+    let lastStatusAt = startedAt;
+    let polls = 0;
+    let pollFailures = 0;
     while (!signal.aborted && !lockLost) {
       if (now() >= nextPollAt) {
+        polls++;
         try {
           await deps.poll();
         } catch (err) {
+          pollFailures++;
           log.error('poll failed', { error: message(err) });
           safeRecordError('poll', message(err));
         }
         nextPollAt = now() + pollMs;
+        if (now() - lastStatusAt >= statusLogMs) {
+          log.info('worker alive', {
+            uptimeMinutes: Math.round((now() - startedAt) / 60_000),
+            polls,
+            pollFailures,
+            inFlight: inFlight.size,
+          });
+          lastStatusAt = now();
+          polls = 0;
+          pollFailures = 0;
+        }
         deferred.clear();
         if (deps.publisher && !signal.aborted && !lockLost) await deps.publisher.retryDue(signal);
         if (deps.failureCommenter && !signal.aborted && !lockLost) await deps.failureCommenter.retryDue(signal);

@@ -25,7 +25,8 @@ Every launcher:
 
 The worker holds a lock in the state database, so a second `updraft start` against the same
 state exits with code 3 instead of polling twice. Launchers treat that as a failure and retry
-on their restart interval, so a launcher-started worker takes over once a terminal-started one
+(the Windows wrapper with its own backoff, the others on their restart interval), so a
+launcher-started worker takes over once a terminal-started one
 stops or its lock goes stale. After a restart the worker resumes from the saved checkpoints;
 already-queued jobs are not duplicated.
 
@@ -146,20 +147,49 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\register-task.ps
 ```
 
 Add `-WhatIf` to see the resolved paths without registering anything, and `-NoStart` to
-register without starting now.
+register without starting now (the task then first runs at your next logon).
 
 What it creates:
 
-- A task (default name `Updraft`) triggered at logon of your account, with an
-  interactive logon type, so no password is stored and the worker uses your credential
-  context (gh token, Git Credential Manager).
-- Settings: restart on failure (999 times, every minute), `MultipleInstances = IgnoreNew`,
-  no execution time limit (`PT0S`), start when available, keep running on battery.
-- A generated wrapper, `%LOCALAPPDATA%\updraft\launcher\<TaskName>.ps1`. Task
-  Scheduler cannot set environment variables or capture output, so the task runs
-  `powershell.exe -WindowStyle Hidden -File <wrapper>`; the wrapper sets PATH, starts
-  `node.exe` with the installed `dist\cli.js`, redirects its output to `launcher.*.log` and
-  exits with the worker's exit code so a failure triggers the restart policy.
+- A task (default name `Updraft`) for your account, with an interactive logon type, so no
+  password is stored and the worker uses your credential context (gh token, Git Credential
+  Manager). Its triggers are at logon, repeating every 5 minutes for as long as you are logged
+  on, and (unless `-NoStart`) from registration on at the same interval, so the current
+  session is covered without logging off. Change the interval with `-RepeatIntervalMinutes`.
+- Settings: `MultipleInstances = IgnoreNew` (a repeat while the wrapper runs does nothing), no
+  execution time limit (`PT0S`), start when available, keep running on battery, and restart
+  on failure.
+- A generated wrapper, `%LOCALAPPDATA%\updraft\launcher\<TaskName>.ps1`. Task Scheduler cannot
+  set environment variables or capture output, so the task runs
+  `powershell.exe -WindowStyle Hidden -File <wrapper>`. The wrapper sets PATH, starts
+  `node.exe` with the installed `dist\cli.js` in a hidden console of its own, and redirects
+  its output to `launcher.out.log` / `launcher.err.log` (the previous launch's go to `.prev`).
+
+**How the worker is kept running.** Task Scheduler's "restart on failure" does not restart a
+task whose action exits with a non-zero code. It covers a task that fails to launch, so it
+can't be relied on after a crash. Instead:
+
+- **The wrapper supervises the worker.** After any exit other than a clean one (code 0), it
+  starts the worker again, waiting 5s after the first quick failure and doubling up to 5 min
+  (`-MinBackoffSeconds`, `-MaxBackoffSeconds`). A run of 10 minutes or more resets the delay.
+  Exit code 3 (another worker holds the lock) is retried the same way, so the task takes over
+  once a worker you started by hand stops. Each restart is a line in `launcher.wrapper.log`.
+- **The repeating trigger restarts the wrapper.** It covers a wrapper that was ended, for
+  example by `Stop-ScheduledTask`, a closed console window, or a clean exit. If the worker
+  that wrapper started is still running (PID, start time and executable all match
+  `launcher\<TaskName>.worker.json`), the new wrapper waits on it instead of starting a
+  second copy.
+- **Console events can't reach the worker.** Because the worker has its own hidden console, a
+  Ctrl+C or close event that reaches the wrapper's console ends only the wrapper.
+- **A locked log can't block a launch.** If `launcher.*.log` is still held open by a running
+  process and can't be rotated, that launch writes `launcher.out.<time>.log` and
+  `launcher.err.<time>.log` instead of failing to start.
+
+`LastTaskResult` reports the last instance Task Scheduler started or refused. While the
+wrapper is running, a repeat that `IgnoreNew` turned away shows as `0x800710E0` ("The operator
+or administrator has refused the request"); that is normal. `0x41301` means it is running.
+The worker's own log (`updraft.log`) has an info-level `worker alive` line every hour, so you
+can tell from it when a worker was last running.
 
 Manage it with:
 
@@ -177,16 +207,32 @@ stops a process only when all three match, so a `updraft start` you run by hand 
 stopped, even with the same CLI and config. Re-running `register-task.ps1` does the same for
 the worker the previous registration started, so the new task doesn't hit the worker lock.
 
-`Stop-ScheduledTask` on its own ends the wrapper but can leave that `node.exe` worker running.
-To stop the worker without unregistering, re-run `register-task.ps1 -NoStart`.
+`Stop-ScheduledTask` on its own is not a way to stop the worker: it ends the wrapper but
+leaves the `node.exe` worker running, and the next repeat starts a wrapper that adopts it. To
+stop the worker:
+
+- **Until your next logon:** re-run `register-task.ps1 -NoStart`. It stops the worker and
+  registers the task with only its logon trigger.
+- **Until you turn it back on:** re-run `register-task.ps1 -NoStart`, then run
+  `Disable-ScheduledTask -TaskName Updraft`, in that order. Registering again re-enables the
+  task. Turn it back on with `Enable-ScheduledTask` and `Start-ScheduledTask`, or by re-running
+  `register-task.ps1`.
+- **For good:** run `unregister-task.ps1`.
 
 Notes:
 
-- A console window can flash briefly at logon. If Windows Terminal is set as the default
-  terminal application and a window stays open, closing it stops the worker; set the default
-  terminal to Windows Console Host or leave the window minimized.
-- Test the restart policy once: start the task, end the `node.exe` process in Task Manager,
-  and check that it comes back within a minute.
+- A console window can flash briefly when the wrapper starts. If Windows Terminal is set as
+  the default terminal application and a window stays open, closing it ends the wrapper, but
+  not the worker: the next repeat starts a wrapper that adopts it. To avoid the window, set
+  the default terminal to Windows Console Host.
+- Test the supervision once:
+  - start the task, end the `node.exe` process in Task Manager, and check that a new one
+    appears within a few seconds (`launcher.wrapper.log` says why);
+  - then run `Stop-ScheduledTask` and check that within `-RepeatIntervalMinutes` a wrapper is
+    running again and the same `node.exe` is still the only worker.
+- Run setup and `register-task.ps1` from a normal PowerShell window. A terminal inside an MSIX
+  packaged app has its `AppData` writes redirected to the package's private storage, so the
+  wrapper and config it writes can be invisible to Task Scheduler (#32).
 - Use one execution environment for the worker, checkouts and agents. To run the Linux setup
   inside WSL2 instead, keep the repos, binaries and credentials inside WSL and use the
   systemd launcher there (enable systemd in `/etc/wsl.conf`).

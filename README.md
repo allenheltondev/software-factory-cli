@@ -247,7 +247,7 @@ default and should stay off until you have read what its checks do and do not co
 
 | Platform | Launcher |
 | --- | --- |
-| Windows | `windows/register-task.ps1` registers a Task Scheduler task at logon for your account (no stored password), with restart on failure, no time limit and no overlapping runs. `unregister-task.ps1` removes it |
+| Windows | `windows/register-task.ps1` registers a Task Scheduler task at logon for your account (no stored password), repeating every 5 minutes, with no time limit and no overlapping runs. Its wrapper restarts the worker after a crash, with backoff. `unregister-task.ps1` removes it |
 | macOS | `macos/install-launchagent.sh` installs a per-user LaunchAgent from `updraft.plist.template` (`--uninstall` removes it) |
 | Linux (systemd) | `linux/install-systemd-user.sh` installs a `systemd --user` service; `loginctl enable-linger` keeps it running without a login session |
 | Other hosts | Run `updraft start --config <path>` in the foreground under your existing supervisor |

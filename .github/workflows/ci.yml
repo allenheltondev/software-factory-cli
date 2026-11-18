@@ -67,6 +67,7 @@ jobs:
                 '<RestartOnFailure>',
                 '<StartWhenAvailable>true</StartWhenAvailable>',
                 '<LogonTrigger>',
+                '<Interval>PT5M</Interval>',
                 '<LogonType>InteractiveToken</LogonType>')) {
               if (-not $xml.Contains($expected)) { throw "task XML is missing $expected`n$xml" }
             }
