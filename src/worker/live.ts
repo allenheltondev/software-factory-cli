@@ -980,8 +980,16 @@ export class LiveExecutor implements Executor {
     if (review && outcome === 'succeeded') {
       const parsed = readReviewVerdict(adapter, rawOutput);
       if (parsed.ok) {
-        reviewResult = { headSha: prepared.baseSha, baseSha: reviewedBase?.baseSha ?? null, verdict: parsed.verdict, findings: parsed.findings };
+        reviewResult = {
+          headSha: prepared.baseSha,
+          baseSha: reviewedBase?.baseSha ?? null,
+          verdict: parsed.verdict,
+          findings: parsed.findings,
+          findingsCount: parsed.findingsCount,
+        };
         await log([`review verdict for ${prepared.baseSha}: ${parsed.verdict}`]);
+        // Telemetry only: a missing or malformed count says so here and changes nothing else.
+        if (parsed.findingsCount === null) await log([`review findings count: none (${parsed.findingsCountProblem}); the verdict is unaffected`]);
       } else {
         outcome = 'failed';
         error = `no verdict: ${parsed.problem}`;

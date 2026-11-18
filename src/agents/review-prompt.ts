@@ -6,7 +6,7 @@
 // by an account that is not an allowed actor is in it.
 import type { ReviewRunRequest } from '../types.js';
 import { fence, issueSection, type IssueContext } from './prompt.js';
-import { VERDICT_TOKEN, verdictLine } from './verdict.js';
+import { findingsLine, VERDICT_TOKEN, verdictLine } from './verdict.js';
 
 export interface ReviewTarget {
   /** The commit under review; the worktree has it checked out. */
@@ -71,7 +71,10 @@ export function renderReviewPrompt(reviewPrompt: string, issue: IssueContext, re
     '# How to answer',
     '',
     'Write your findings, with file and line references, and keep blockers (what must change before this can be merged) ' +
-      'apart from suggestions (what would be nice). Then end your final message with exactly one line, with nothing after it: ' +
+      'apart from suggestions (what would be nice). After them, on a line of its own, write how many findings you reported ' +
+      `(blockers and suggestions together) as a whole number, for example \`${findingsLine(3)}\`, or \`${findingsLine(0)}\` when there are none. ` +
+      'This count is only recorded for statistics; it does not affect the verdict. ' +
+      'Then end your final message with exactly one line, with nothing after it: ' +
       `either \`${verdictLine('ready-to-merge')}\` when there are no blockers, or \`${verdictLine('changes-requested')}\` when there are. ` +
       `Write that line once and only once. A message without it, with both, or with any other value after \`${VERDICT_TOKEN}:\` ` +
       'counts as a failed review, never as an approval.',

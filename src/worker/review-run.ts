@@ -7,12 +7,14 @@
 // - in a container the clone's git directory is mounted read-only (container.ts, gitMounts);
 // - the action's verify commands are not run (they ran for the code run that produced the head);
 // - the result is the verdict parsed from the agent's final message. No verdict, no success.
+//   The findings count (UPDRAFT-FINDINGS) is read from the findings after that, and is telemetry:
+//   whatever it is, the verdict stands as parsed.
 import { appendFile } from 'node:fs/promises';
 import type { AgentAdapter } from '../agents/adapters/registry.js';
-import { parseVerdict, type ParsedVerdict } from '../agents/verdict.js';
+import { parseVerdict, readFindingsCount } from '../agents/verdict.js';
 import { fetchBranch, remoteDefaultBranch, runGit, type GitOptions } from '../git/git.js';
 import { discardWorktree, withCheckoutLock } from '../git/worktree.js';
-import type { ReviewRunRequest } from '../types.js';
+import type { ReviewRunRequest, ReviewVerdict } from '../types.js';
 
 /** Findings kept from a reviewer's final message (the run log has all of it). */
 export const MAX_FINDINGS = 30_000;
@@ -54,10 +56,20 @@ export function reviewBase(o: {
 }
 
 /**
+ * What a reviewer run's final message says. `findingsCount` is the reviewer's UPDRAFT-FINDINGS
+ * count, or null with `findingsCountProblem` saying why; it has no bearing on `verdict`.
+ */
+export type ReviewReading =
+  | { ok: true; verdict: ReviewVerdict; findings: string; findingsCount: number | null; findingsCountProblem: string | null }
+  | { ok: false; problem: string };
+
+/**
  * The verdict of a reviewer run, read from the adapter's final message: the agent's own last
  * message where the adapter can isolate it (structured output), else the whole plain output.
+ * The verdict is decided by parseVerdict alone; the findings count is read from its findings
+ * afterwards, and its line is left out of the findings that are kept.
  */
-export function readReviewVerdict(adapter: AgentAdapter, rawOutput: string): ParsedVerdict {
+export function readReviewVerdict(adapter: AgentAdapter, rawOutput: string): ReviewReading {
   let final: string | null | undefined;
   try {
     final = adapter.finalMessage ? adapter.finalMessage(rawOutput) : undefined;
@@ -67,8 +79,9 @@ export function readReviewVerdict(adapter: AgentAdapter, rawOutput: string): Par
   if (final === null) return { ok: false, problem: 'the reviewer ended without a final message' };
   const parsed = parseVerdict(final ?? rawOutput);
   if (!parsed.ok) return parsed;
-  const findings = parsed.findings.length > MAX_FINDINGS ? `${parsed.findings.slice(0, MAX_FINDINGS - 1)}…` : parsed.findings;
-  return { ...parsed, findings };
+  const counted = readFindingsCount(parsed.findings);
+  const findings = counted.findings.length > MAX_FINDINGS ? `${counted.findings.slice(0, MAX_FINDINGS - 1)}…` : counted.findings;
+  return { ok: true, verdict: parsed.verdict, findings, findingsCount: counted.count, findingsCountProblem: counted.problem };
 }
 
 /** Remove a reviewer run's worktree and branch, and say so in run.log. Never throws. */

@@ -77,6 +77,16 @@ describe('commander wiring', () => {
     expect(codes).toEqual([0, 1, 0, 0, 0]);
   });
 
+  it('parses stats with its 30-day default, --since, --repo and --json', async () => {
+    const stats = vi.fn(async (_ctx: unknown, _o: { json?: boolean; since?: string; repo?: string }) => 0);
+    const { parse, codes } = setup({ stats });
+    await parse('stats');
+    await parse('stats', '--json', '--since', 'all', '--repo', 'octo/widgets');
+    expect(stats.mock.calls[0]?.[1]).toEqual({ since: '30d' });
+    expect(stats.mock.calls[1]?.[1]).toEqual({ json: true, since: 'all', repo: 'octo/widgets' });
+    expect(codes).toEqual([0, 0]);
+  });
+
   it('parses clean with and without --dry-run', async () => {
     const clean = vi.fn(async (_ctx: unknown, _o: { dryRun?: boolean }) => 0);
     const { parse, codes } = setup({ clean });

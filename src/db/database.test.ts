@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { buildHistory, metricRows } from '../../test/factory-history.js';
 import { SCHEMA_VERSION, migrate, openDatabase, transaction, type Db } from './database.js';
 
 describe('openDatabase', () => {
@@ -309,5 +310,97 @@ describe('migration v12', () => {
     for (const table of ['failure_comments', 'pruned_events', 'revisions', 'pr_reviews']) {
       expect(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
     }
+  });
+});
+
+describe('migration v13', () => {
+  const END = Date.parse('2026-11-18T12:00:00.000Z');
+
+  it('adds the metric_events rollup and pr_reviews.findings_count, and backfills the rollup from a v12 database', () => {
+    const db = openDatabase(':memory:', { migrateTo: 12 });
+    db.prepare(
+      `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
+       VALUES ('job_1', 1, 'o/r', 'wf', 'e1', 1, 'implement-issue', 'general', ?, 'succeeded', 1, '2026-01-01T00:00:00.000Z', '2026-01-01T00:30:00.000Z'),
+              ('job_2', 1, 'o/r', 'wf', 'pr-review:5:sha_a', 1, 'implement-issue', 'reviewers', ?, 'succeeded', 1, '2026-01-01T01:00:00.000Z', '2026-01-01T01:10:00.000Z'),
+              ('job_3', 1, 'o/r', 'wf', 'e3', 2, 'implement-issue', 'general', 'not json', 'queued', 0, 't', 't')`,
+    ).run(
+      JSON.stringify({ type: 'issue.labeled', createdAt: '2025-12-31T23:00:00.000Z' }),
+      JSON.stringify({ type: 'pull_request.review', review: { pullRequest: { number: 5 } } }),
+    );
+    db.prepare(
+      // run_1 recorded an agent pid, the evidence its agent launched; run_2 has none, so its agent
+      // run time and queue wait are unknown rather than measured from its execution start.
+      `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, pid, lease_expires_at, started_at, execution_started_at, ended_at, outcome, summary)
+       VALUES ('run_1', 'job_1', 1, 'general', 'claude', 'w', 4242, 't', 't', '2026-01-01T00:05:00.000Z', '2026-01-01T00:30:00.000Z', 'succeeded', ?),
+              ('run_2', 'job_2', 1, 'reviewers', 'codex', 'w', NULL, 't', 't', '2026-01-01T01:02:00.000Z', '2026-01-01T01:10:00.000Z', 'succeeded', 'not json')`,
+    ).run(JSON.stringify({ verification: { passed: true } }));
+    db.prepare(
+      `INSERT INTO publications (run_id, job_id, repo_id, repo_full_name, issue_number, mode, state, branch, head_sha, pushed_at, pr_number, pr_url, attempts, created_at, updated_at, published_at)
+       VALUES ('run_1', 'job_1', 1, 'o/r', 1, 'pr', 'published', 'b1', 'sha_a', 't', 5, 'u5', 1, 't', 't', '2026-01-01T00:40:00.000Z')`,
+    ).run();
+    const watch = db.prepare(
+      `INSERT INTO revision_prs (repo_id, pr_number, pr_url, source_run_id, original_event_id, workflow_id, issue_number, issue_title, issue_url, label, labels,
+                                 action, pool, branch, state, created_at, updated_at, merge_state, merge_sha, merge_reason, merged_at, limit_reached_at, author_agent)
+       VALUES (1, ?, 'u', ?, 'e', 'wf', 1, 'a title that must not be copied', 'u', 'l', '[]', 'implement-issue', 'general', 'b', 'open', ?, ?, ?, ?, ?, ?, ?, 'claude')`,
+    );
+    watch.run(5, 'run_1', '2026-01-01T00:41:00.000Z', '2026-01-02T00:00:00.000Z', 'merged', 'sha_a', null, '2026-01-02T00:00:00.000Z', null);
+    watch.run(6, 'run_gone', '2026-01-03T00:00:00.000Z', '2026-01-04T00:00:00.000Z', 'blocked', 'sha_x', 'it is still a draft', null, '2026-01-03T12:00:00.000Z');
+    db.prepare(
+      `INSERT INTO pr_reviews (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, head_sha, agent, verdict, findings, state, created_at, updated_at)
+       VALUES ('run_2', 'job_2', 1, 'o/r', 1, 5, 'sha_a', 'codex', 'ready-to-merge', 'findings text', 'published', '2026-01-01T01:10:00.000Z', 't')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO review_requests (repo_id, review_id, pr_number, reviewer, trigger_kind, state, created_at)
+       VALUES (1, 'PRR_1', 6, 'someone', 'changes_requested', 'over-limit', '2026-01-03T12:00:00.000Z')`,
+    ).run();
+
+    migrate(db);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+    expect(db.prepare('SELECT findings_count FROM pr_reviews').all()).toEqual([{ findings_count: null }]);
+    const rows = db
+      .prepare(
+        'SELECT kind, subject_id, at, repo_full_name, job_kind, pr_number, agent, outcome, reason, start_at, wait_ms, findings, backfilled FROM metric_events ORDER BY kind, subject_id',
+      )
+      .all();
+    const none = { start_at: null, wait_ms: null, findings: null, backfilled: 1, repo_full_name: 'o/r' };
+    expect(rows).toEqual([
+      { ...none, kind: 'change_request', subject_id: '1:PRR_1', at: '2026-01-03T12:00:00.000Z', job_kind: null, pr_number: 6, agent: null, outcome: 'over-limit', reason: 'changes_requested' },
+      { ...none, kind: 'job.finished', subject_id: 'job_1:1:0:succeeded', at: '2026-01-01T00:30:00.000Z', job_kind: 'implement', pr_number: null, agent: 'claude', outcome: 'succeeded', reason: null, start_at: '2026-01-01T00:00:00.000Z' },
+      { ...none, kind: 'job.finished', subject_id: 'job_2:1:0:succeeded', at: '2026-01-01T01:10:00.000Z', job_kind: 'review', pr_number: 5, agent: 'codex', outcome: 'succeeded', reason: null, start_at: '2026-01-01T01:00:00.000Z' },
+      { ...none, kind: 'pr.limit_reached', subject_id: '1#6', at: '2026-01-03T12:00:00.000Z', job_kind: null, pr_number: 6, agent: 'claude', outcome: 'limit-reached', reason: null },
+      { ...none, kind: 'pr.merge_blocked', subject_id: '1#6@sha_x', at: '2026-01-04T00:00:00.000Z', job_kind: null, pr_number: 6, agent: 'claude', outcome: 'blocked', reason: 'draft' },
+      { ...none, kind: 'pr.merged', subject_id: '1#5', at: '2026-01-02T00:00:00.000Z', job_kind: null, pr_number: 5, agent: 'claude', outcome: 'merged', reason: null, start_at: '2026-01-01T00:40:00.000Z' },
+      { ...none, kind: 'pr.opened', subject_id: '1#5', at: '2026-01-01T00:40:00.000Z', job_kind: 'implement', pr_number: 5, agent: 'claude', outcome: 'pr', reason: null, start_at: '2025-12-31T23:00:00.000Z' },
+      // Watched, but its publication is gone: counted at the time watching started, with no lead time.
+      { ...none, kind: 'pr.opened', subject_id: '1#6', at: '2026-01-03T00:00:00.000Z', job_kind: 'implement', pr_number: 6, agent: null, outcome: null, reason: 'approximate' },
+      // A review from before the count existed has none.
+      { ...none, kind: 'review.verdict', subject_id: 'run_2', at: '2026-01-01T01:10:00.000Z', job_kind: 'review', pr_number: 5, agent: 'codex', outcome: 'ready-to-merge', reason: null },
+      { ...none, kind: 'run.ended', subject_id: 'run_1', at: '2026-01-01T00:30:00.000Z', job_kind: 'implement', pr_number: null, agent: 'claude', outcome: 'succeeded', reason: 'verify-passed', start_at: '2026-01-01T00:05:00.000Z', wait_ms: 300_000 },
+      // A summary that is not JSON is read as no verify result, without failing the migration.
+      { ...none, kind: 'run.ended', subject_id: 'run_2', at: '2026-01-01T01:10:00.000Z', job_kind: 'review', pr_number: 5, agent: 'codex', outcome: 'succeeded', reason: null, start_at: null, wait_ms: null },
+    ]);
+    // Nothing of the text in the rows it was built from.
+    expect(JSON.stringify(db.prepare('SELECT * FROM metric_events').all())).not.toMatch(/title|findings text|someone/);
+    // The idempotency key holds.
+    expect(() => db.prepare("INSERT INTO metric_events (kind, subject_id, at, repo_id, recorded_at) VALUES ('run.ended', 'run_1', 't', 1, 't')").run()).toThrow(/UNIQUE/i);
+  });
+
+  it('carries a live history through a downgrade and the migration again, short only of what the rows no longer hold', () => {
+    const h = buildHistory(END);
+    const live = metricRows(h.db);
+    h.db.exec(
+      'DROP TABLE metric_events; ALTER TABLE pr_reviews DROP COLUMN findings_count; ALTER TABLE runs DROP COLUMN agent_started_at; ' +
+        'ALTER TABLE jobs DROP COLUMN retries; PRAGMA user_version = 12;',
+    );
+    migrate(h.db);
+    // The findings counts lived only in the dropped column, a retried job's earlier failure only in
+    // the rollup, and its retry count only in jobs.retries (part of its job.finished key); everything
+    // else comes back as it was recorded. Agent starts come back from the recorded pids.
+    const strip = (rows: typeof live) =>
+      rows.map((r) => ({ ...r, findings: null, subject_id: r.kind === 'job.finished' ? String(r.subject_id).replace(/:\d+:(\w+)$/, ':$1') : r.subject_id }));
+    const retriedFailure = (r: (typeof live)[number]) =>
+      r.kind === 'job.finished' && r.outcome === 'failed' && live.some((x) => x.kind === 'job.finished' && x.job_id === r.job_id && x.subject_id !== r.subject_id);
+    expect(live.filter(retriedFailure)).toHaveLength(1);
+    expect(strip(metricRows(h.db))).toEqual(strip(live.filter((r) => !retriedFailure(r))));
   });
 });
