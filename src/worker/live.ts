@@ -28,6 +28,7 @@ import {
   type AgentAdapter,
   type AgentInvocation,
 } from '../agents/adapters/registry.js';
+import { agentProfile, describeProfile, effectiveArgs } from '../agents/profile.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { renderPrompt, renderRevisionPrompt, type IssueContext } from '../agents/prompt.js';
 import { renderReviewPrompt } from '../agents/review-prompt.js';
@@ -597,6 +598,7 @@ export class LiveExecutor implements Executor {
         '',
         `pool: ${run.pool}`,
         `agent: ${run.agent}${adapterName ? ` (adapter ${adapterName})` : ' (no longer configured)'}`,
+        ...(agentCfg && adapterName ? [describeProfile(run.agent, adapterName, agentProfile(adapterName, agentCfg))] : []),
         `action: ${job.action}${action ? ` (output ${action.output}, timeout ${timeoutMinutes} min)` : ' (no longer configured)'}`,
         `prompt: ${promptSource ?? '(none configured)'}`,
         `run log: ${logPath}`,
@@ -752,7 +754,7 @@ export class LiveExecutor implements Executor {
         promptFile,
         worktree: prepared.worktreePath,
         runDir,
-        extraArgs: agentCfg.args ?? [],
+        extraArgs: effectiveArgs(adapterName, agentCfg),
         platform: process.platform,
       });
     } catch (err) {
