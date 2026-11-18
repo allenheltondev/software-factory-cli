@@ -95,7 +95,7 @@ describe('createGitHubApi', () => {
     expect(calls[0]!.headers).toMatchObject({
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'software-factory-cli',
+      'User-Agent': 'updraft',
       Authorization: 'Bearer t0k',
     });
   });
@@ -110,7 +110,7 @@ describe('createGitHubApi', () => {
             event: 'labeled',
             created_at: '2026-01-01T00:00:00Z',
             actor: { login: 'allen' },
-            label: { name: 'factory:ready', color: 'fff' },
+            label: { name: 'updraft:ready', color: 'fff' },
             issue: { number: 7, title: 'T', html_url: 'https://github.com/o/r/issues/7' },
           },
           { id: 98, event: 'closed', created_at: '2026-01-01T00:00:00Z', actor: null, issue: { number: 8, title: 'P', html_url: 'u', pull_request: {} } },
@@ -128,7 +128,7 @@ describe('createGitHubApi', () => {
       event: 'labeled',
       createdAt: '2026-01-01T00:00:00Z',
       actor: 'allen',
-      label: 'factory:ready',
+      label: 'updraft:ready',
       issue: { number: 7, title: 'T', htmlUrl: 'https://github.com/o/r/issues/7', isPullRequest: false },
     });
     expect(p1.events[1]).toMatchObject({ actor: null, label: null, issue: { isPullRequest: true } });
@@ -219,7 +219,7 @@ describe('createGitHubApi', () => {
   it('getIssue does not follow transfer redirects and maps labels/PR flag', async () => {
     const { fn, calls } = fakeFetch((url) => {
       if (url.pathname.endsWith('/9')) return new Response(null, { status: 301, headers: { location: 'https://api.github.com/repositories/2/issues/1' } });
-      return json({ number: 5, title: 'x', body: 'do it', html_url: 'h', state: 'open', labels: [{ name: 'art' }, 'factory:ready'] });
+      return json({ number: 5, title: 'x', body: 'do it', html_url: 'h', state: 'open', labels: [{ name: 'art' }, 'updraft:ready'] });
     });
     const api = await createGitHubApi({ token: 't', fetch: fn });
     const repo = { id: 1, fullName: 'o/r' };
@@ -229,7 +229,7 @@ describe('createGitHubApi', () => {
       body: 'do it',
       htmlUrl: 'h',
       state: 'open',
-      labels: ['art', 'factory:ready'],
+      labels: ['art', 'updraft:ready'],
       isPullRequest: false,
     });
     expect(calls[0]!.redirect).toBe('manual');
@@ -248,7 +248,7 @@ describe('createGitHubApi: publication writes', () => {
     draft: true,
     merged_at: null,
     body: 'b',
-    head: { ref: 'factory/issue-7-job_x', repo: { id: 42 } },
+    head: { ref: 'updraft/issue-7-job_x', repo: { id: 42 } },
     base: { ref: 'main' },
     ...extra,
   });
@@ -256,17 +256,17 @@ describe('createGitHubApi: publication writes', () => {
   it('opens a PR with POST on the stable-ID route and maps the response', async () => {
     const { fn, calls } = fakeFetch(() => json(rawPull(5), { status: 201 }));
     const api = await createGitHubApi({ token: 't', fetch: fn });
-    const pr = await api.createPullRequest({ id: 42, fullName: 'o/r' }, { title: 'T', head: 'factory/issue-7-job_x', base: 'main', body: 'B', draft: true });
+    const pr = await api.createPullRequest({ id: 42, fullName: 'o/r' }, { title: 'T', head: 'updraft/issue-7-job_x', base: 'main', body: 'B', draft: true });
     expect(calls[0]).toMatchObject({ method: 'POST', url: 'https://api.github.com/repositories/42/pulls' });
     expect(calls[0]!.headers).toMatchObject({ Authorization: 'Bearer t', 'Content-Type': 'application/json' });
-    expect(JSON.parse(calls[0]!.body!)).toEqual({ title: 'T', head: 'factory/issue-7-job_x', base: 'main', body: 'B', draft: true });
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ title: 'T', head: 'updraft/issue-7-job_x', base: 'main', body: 'B', draft: true });
     expect(pr).toEqual({
       number: 5,
       htmlUrl: 'https://github.com/o/r/pull/5',
       state: 'open',
       draft: true,
       merged: false,
-      headRef: 'factory/issue-7-job_x',
+      headRef: 'updraft/issue-7-job_x',
       headRepoId: 42,
       baseRef: 'main',
       body: 'b',
@@ -326,74 +326,230 @@ describe('createGitHubApi: publication writes', () => {
   });
 });
 
-describe('createGitHubApi: pull requests and reviews (read-only)', () => {
-  const sha = 'f'.repeat(40);
+describe('createGitHubApi: issue body edits (GraphQL)', () => {
+  const repo = { id: 42, fullName: 'o/r' };
+  const answer = (issue: unknown, databaseId: number | null = 42) => json({ data: { repository: { databaseId, issue } } });
 
-  it('gets one PR with its head SHA on the stable-ID route', async () => {
-    const { fn, calls } = fakeFetch(() =>
-      json({
-        number: 5,
-        html_url: 'https://github.com/o/r/pull/5',
-        state: 'closed',
-        draft: false,
-        merged_at: '2026-01-01T00:00:00Z',
-        body: null,
-        head: { ref: 'factory/issue-7-job_x', sha, repo: { id: 42 } },
-        base: { ref: 'main' },
-      }),
-    );
+  it('asks GraphQL for the last edit of the issue, with the query variables kept out of the query text', async () => {
+    const { fn, calls } = fakeFetch(() => answer({ lastEditedAt: '2026-01-02T03:04:05Z', editor: { login: 'mallory' } }));
     const api = await createGitHubApi({ token: 't', fetch: fn });
-    const pr = await api.getPullRequest({ id: 42, fullName: 'o/r' }, 5);
-    expect(calls[0]).toMatchObject({ method: 'GET', url: 'https://api.github.com/repositories/42/pulls/5' });
-    expect(pr).toEqual({
-      number: 5,
-      htmlUrl: 'https://github.com/o/r/pull/5',
-      state: 'closed',
-      draft: false,
-      merged: true,
-      headRef: 'factory/issue-7-job_x',
-      headRepoId: 42,
-      baseRef: 'main',
-      body: '',
-      headSha: sha,
-    });
+    expect(await api.getIssueBodyEdit(repo, 7)).toEqual({ lastEditedAt: '2026-01-02T03:04:05Z', editor: 'mallory' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe('POST');
+    expect(new URL(calls[0]!.url).pathname).toBe('/graphql');
+    expect(calls[0]!.headers['Authorization']).toBe('Bearer t');
+    const sent = JSON.parse(calls[0]!.body!) as { query: string; variables: unknown };
+    expect(sent.variables).toEqual({ owner: 'o', name: 'r', number: 7 });
+    expect(sent.query).toMatch(/repository\(owner: \$owner, name: \$name\)/);
+    expect(sent.query).toMatch(/databaseId[\s\S]*issue\(number: \$number\)[\s\S]*lastEditedAt[\s\S]*editor \{ login \}/);
   });
 
-  it('lists every page of reviews and maps them', async () => {
-    const raw = (id: number, extra: Record<string, unknown> = {}) => ({
-      id,
-      user: { login: 'allen' },
-      state: 'COMMENTED',
-      body: `review ${id}`,
-      commit_id: sha,
-      submitted_at: '2026-11-17T17:25:19Z',
-      html_url: `https://github.com/o/r/pull/5#pullrequestreview-${id}`,
-      ...extra,
+  it('maps a never-edited body and a deleted editor account to nulls', async () => {
+    const never = await createGitHubApi({ token: 't', fetch: fakeFetch(() => answer({ lastEditedAt: null, editor: null })).fn });
+    expect(await never.getIssueBodyEdit(repo, 7)).toEqual({ lastEditedAt: null, editor: null });
+    const ghost = await createGitHubApi({
+      token: 't',
+      fetch: fakeFetch(() => answer({ lastEditedAt: '2026-01-02T03:04:05Z', editor: null })).fn,
     });
-    const { fn, calls } = fakeFetch((url) => {
-      if (url.searchParams.get('page') === '2') {
-        return json([raw(2, { user: null, body: null, commit_id: null, submitted_at: null, state: 'PENDING' })]);
-      }
-      return json([raw(1)], {
-        headers: { link: '<https://api.github.com/repositories/42/pulls/5/reviews?per_page=100&page=2>; rel="next"' },
-      });
+    expect(await ghost.getIssueBodyEdit(repo, 7)).toEqual({ lastEditedAt: '2026-01-02T03:04:05Z', editor: null });
+  });
+
+  it('refuses an answer about a different repository that now has the name', async () => {
+    const { fn } = fakeFetch(() => answer({ lastEditedAt: null, editor: null }, 999));
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const err = (await api.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(err).toBeInstanceOf(GitHubError);
+    expect(err.status).toBe(502);
+    expect(err.message).toMatch(/"o\/r" now names repository 999, not 42/);
+  });
+
+  it('reports a missing issue as 404, and nothing else as "gone"', async () => {
+    const missingIssue = fakeFetch(() =>
+      json({
+        data: { repository: { databaseId: 42, issue: null } },
+        errors: [{ type: 'NOT_FOUND', path: ['repository', 'issue'], message: 'Could not resolve to an Issue with the number of 7.' }],
+      }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: missingIssue.fn });
+    expect(((await api.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError).status).toBe(404);
+
+    const nullIssue = await createGitHubApi({ token: 't', fetch: fakeFetch(() => answer(null)).fn });
+    expect(((await nullIssue.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError).status).toBe(404);
+
+    // The repository not resolving by name says nothing about the issue: REST reaches it by ID.
+    const missingRepo = fakeFetch(() =>
+      json({
+        data: { repository: null },
+        errors: [{ type: 'NOT_FOUND', path: ['repository'], message: "Could not resolve to a Repository with the name 'o/r'." }],
+      }),
+    );
+    const api2 = await createGitHubApi({ token: 't', fetch: missingRepo.fn });
+    const e2 = (await api2.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(e2.status).toBe(502);
+    expect(e2.message).toMatch(/edit history of o\/r#7\) failed: Could not resolve to a Repository/);
+
+    for (const body of [{}, { data: null }, { data: { repository: null } }]) {
+      const odd = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json(body)).fn });
+      expect(((await odd.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError).status).toBe(502);
+    }
+  });
+
+  it('turns GraphQL errors sent with 200 into GitHubErrors, even next to usable-looking data', async () => {
+    const partial = fakeFetch(() =>
+      json({
+        data: { repository: { databaseId: 42, issue: { lastEditedAt: null, editor: null } } },
+        errors: [{ type: 'FORBIDDEN', path: ['repository', 'issue', 'editor'], message: 'Resource not accessible by personal access token' }],
+      }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: partial.fn });
+    const err = (await api.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(err).toBeInstanceOf(GitHubError);
+    expect(err.status).toBe(502);
+    expect(err.message).toMatch(/Resource not accessible/);
+
+    const limited = fakeFetch(() =>
+      json({ errors: [{ type: 'RATE_LIMITED', message: 'API rate limit exceeded' }] }, { headers: { 'retry-after': '30' } }),
+    );
+    const api2 = await createGitHubApi({ token: 't', fetch: limited.fn });
+    const e2 = (await api2.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(e2.isRateLimit).toBe(true);
+    expect(e2.retryAfterSeconds).toBe(30);
+  });
+
+  it('keeps the HTTP error mapping (401, 5xx, network)', async () => {
+    const unauthorized = await createGitHubApi({
+      token: 't',
+      fetch: fakeFetch(() => json({ message: 'Bad credentials' }, { status: 401 })).fn,
+    });
+    const e1 = (await unauthorized.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError;
+    expect(e1.status).toBe(401);
+    expect(e1.message).toMatch(/^POST \/graphql failed: 401 Bad credentials/);
+
+    const down = (async () => {
+      throw new Error('ECONNRESET');
+    }) as unknown as typeof fetch;
+    const api = await createGitHubApi({ token: 't', fetch: down });
+    expect(((await api.getIssueBodyEdit(repo, 7).catch((e: unknown) => e)) as GitHubError).status).toBe(0);
+  });
+});
+
+describe('createGitHubApi: the revision loop', () => {
+  const repo = { id: 42, fullName: 'o/r' };
+
+  it('lists pull requests by update time with a conditional page 1', async () => {
+    const { fn, calls } = fakeFetch((_url, call) => {
+      if (call.headers['If-None-Match'] === 'W/"p1"') return new Response(null, { status: 304 });
+      return json(
+        [
+          { number: 9, state: 'open', merged_at: null, updated_at: '2026-11-18T10:00:00Z' },
+          { number: 8, state: 'closed', merged_at: '2026-11-17T09:00:00Z', updated_at: '2026-11-17T09:00:00Z' },
+          { number: 7, state: 'closed', merged_at: null, updated_at: '2026-11-16T09:00:00Z' },
+        ],
+        { headers: { etag: 'W/"p1"', link: `<https://api.github.com/repositories/42/pulls?page=2>; rel="next"` } },
+      );
     });
     const api = await createGitHubApi({ token: 't', fetch: fn });
-    const reviews = await api.listPullRequestReviews({ id: 42, fullName: 'o/r' }, 5);
-    expect(new URL(calls[0]!.url).pathname).toBe('/repositories/42/pulls/5/reviews');
-    expect(calls.map((c) => c.method)).toEqual(['GET', 'GET']);
-    expect(reviews).toEqual([
-      {
-        id: 1,
-        user: 'allen',
-        state: 'COMMENTED',
-        body: 'review 1',
-        commitId: sha,
-        submittedAt: '2026-11-17T17:25:19Z',
-        htmlUrl: 'https://github.com/o/r/pull/5#pullrequestreview-1',
-      },
-      { id: 2, user: null, state: 'PENDING', body: '', commitId: null, submittedAt: null, htmlUrl: 'https://github.com/o/r/pull/5#pullrequestreview-2' },
-    ]);
+    const page = await api.listPullRequestUpdates(repo, { page: 1 });
+    expect(page).toEqual({
+      pulls: [
+        { number: 9, state: 'open', merged: false, updatedAt: '2026-11-18T10:00:00Z' },
+        { number: 8, state: 'closed', merged: true, updatedAt: '2026-11-17T09:00:00Z' },
+        { number: 7, state: 'closed', merged: false, updatedAt: '2026-11-16T09:00:00Z' },
+      ],
+      nextPage: 2,
+      etag: 'W/"p1"',
+      notModified: false,
+    });
+    const url = new URL(calls[0]!.url);
+    expect(url.pathname).toBe('/repositories/42/pulls');
+    expect(Object.fromEntries(url.searchParams)).toEqual({ state: 'all', sort: 'updated', direction: 'desc', per_page: '100', page: '1' });
+    expect(calls[0]!.method).toBe('GET');
+
+    expect(await api.listPullRequestUpdates(repo, { page: 1, etag: 'W/"p1"' })).toEqual({ pulls: [], nextPage: null, etag: 'W/"p1"', notModified: true });
+  });
+
+  const reviewNode = {
+    id: 'PRR_kwDO1',
+    state: 'CHANGES_REQUESTED',
+    submittedAt: '2026-11-18T10:00:00Z',
+    body: 'Rename it.',
+    url: 'https://github.com/o/r/pull/9#pullrequestreview-1',
+    author: { login: 'allen' },
+    lastEditedAt: null,
+    editor: null,
+    comments: {
+      totalCount: 3,
+      nodes: [
+        { path: 'src/a.ts', line: 4, diffHunk: '@@ -1 +1 @@', body: 'here', author: { login: 'allen' }, lastEditedAt: '2026-11-18T10:01:00Z', editor: { login: 'mallory' } },
+        { path: 'src/b.ts', line: null, diffHunk: null, body: null, author: null, lastEditedAt: null, editor: null },
+        null,
+      ],
+    },
+  };
+  const answer = (pullRequest: unknown, databaseId: number | null = 42) => json({ data: { repository: { databaseId, pullRequest } } });
+
+  it('reads a pull request with its reviews, their comments and who edited each, in one GraphQL request', async () => {
+    const { fn, calls } = fakeFetch(() =>
+      answer({ number: 9, state: 'OPEN', updatedAt: '2026-11-18T10:02:00Z', headRefName: 'updraft/issue-7-job_1', headRefOid: 'abc123', reviews: { nodes: [reviewNode, null] } }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    expect(await api.getPullRequestReviews(repo, 9)).toEqual({
+      number: 9,
+      state: 'open',
+      merged: false,
+      updatedAt: '2026-11-18T10:02:00Z',
+      headRef: 'updraft/issue-7-job_1',
+      headSha: 'abc123',
+      reviews: [
+        {
+          id: 'PRR_kwDO1',
+          state: 'CHANGES_REQUESTED',
+          author: 'allen',
+          submittedAt: '2026-11-18T10:00:00Z',
+          body: 'Rename it.',
+          url: 'https://github.com/o/r/pull/9#pullrequestreview-1',
+          lastEditedAt: null,
+          editor: null,
+          comments: [
+            { author: 'allen', body: 'here', path: 'src/a.ts', line: 4, diffHunk: '@@ -1 +1 @@', lastEditedAt: '2026-11-18T10:01:00Z', editor: 'mallory' },
+            { author: null, body: '', path: 'src/b.ts', line: null, diffHunk: '', lastEditedAt: null, editor: null },
+          ],
+          commentCount: 3,
+        },
+      ],
+    });
+    expect(calls).toHaveLength(1);
+    expect(new URL(calls[0]!.url).pathname).toBe('/graphql');
+    const sent = JSON.parse(calls[0]!.body!) as { query: string; variables: unknown };
+    expect(sent.variables).toEqual({ owner: 'o', name: 'r', number: 9 });
+    expect(sent.query).toMatch(/databaseId[\s\S]*pullRequest\(number: \$number\)[\s\S]*reviews\(last: 50\)[\s\S]*lastEditedAt[\s\S]*comments\(first: 100\)[\s\S]*diffHunk/);
+  });
+
+  it('maps merged and closed, refuses another repository under the same name, and reports only a missing pull request as 404', async () => {
+    const merged = await createGitHubApi({ token: 't', fetch: fakeFetch(() => answer({ number: 9, state: 'MERGED', updatedAt: 'u', headRefName: 'b', headRefOid: 's', reviews: null })).fn });
+    expect(await merged.getPullRequestReviews(repo, 9)).toMatchObject({ state: 'closed', merged: true, reviews: [] });
+    const closed = await createGitHubApi({ token: 't', fetch: fakeFetch(() => answer({ number: 9, state: 'CLOSED', updatedAt: 'u', headRefName: 'b', headRefOid: 's', reviews: { nodes: [] } })).fn });
+    expect(await closed.getPullRequestReviews(repo, 9)).toMatchObject({ state: 'closed', merged: false });
+
+    const other = await createGitHubApi({ token: 't', fetch: fakeFetch(() => answer({ number: 9, state: 'OPEN', updatedAt: 'u', headRefName: 'b', headRefOid: 's', reviews: null }, 999)).fn });
+    expect(((await other.getPullRequestReviews(repo, 9).catch((e: unknown) => e)) as GitHubError).status).toBe(502);
+
+    const missing = await createGitHubApi({
+      token: 't',
+      fetch: fakeFetch(() =>
+        json({ data: { repository: { databaseId: 42, pullRequest: null } }, errors: [{ type: 'NOT_FOUND', path: ['repository', 'pullRequest'], message: 'Could not resolve to a PullRequest' }] }),
+      ).fn,
+    });
+    expect(((await missing.getPullRequestReviews(repo, 9).catch((e: unknown) => e)) as GitHubError).status).toBe(404);
+
+    // A field the schema does not have fails the whole query: loud, and never "no reviews".
+    const badField = await createGitHubApi({
+      token: 't',
+      fetch: fakeFetch(() => json({ errors: [{ type: 'undefinedField', path: ['query', 'repository', 'pullRequest', 'reviews'], message: "Field 'x' doesn't exist on type 'PullRequestReview'" }] })).fn,
+    });
+    const err = (await badField.getPullRequestReviews(repo, 9).catch((e: unknown) => e)) as GitHubError;
+    expect(err.status).toBe(502);
+    expect(err.message).toMatch(/reviews of o\/r#9\) failed: Field 'x' doesn't exist/);
   });
 });
 

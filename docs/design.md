@@ -1,23 +1,52 @@
-# Software factory CLI design
+# Updraft CLI design
 
-**Status** Draft for implementation  
+**Status** Original design. The CLI parts are implemented; see the note below.  
 **Pilot repository** `allenheltondev/kids-and-dragons`  
 **Scope** A local CLI for GitHub-triggered work and a ChatGPT task for PR review.  
 **Platforms** Windows, macOS, and Linux. Windows is the first pilot environment.
 
+> **Implementation status.** This is the design the CLI was built from, kept for its
+> reasoning. It is not updated as the tool changes. Current behavior is documented in the
+> [README](../README.md), [worktrees.md](worktrees.md),
+> [live-execution.md](live-execution.md), the agent pages
+> ([Claude Code](agents/claude.md), [Codex](agents/codex.md), [Kiro](agents/kiro.md)),
+> [publication.md](publication.md), [security.md](security.md) and
+> [background-operation.md](background-operation.md).
+>
+> Implemented: repository discovery and configuration (§2), the background launchers (§2),
+> issue-event polling, the durable queue and its persistence (§3), routing, per-job branches
+> and worktrees, live execution through the Claude Code, Codex and Kiro adapters (§4),
+> and opt-in publication of a job branch as a pull request (§7). Build steps 1 and 2 of §6
+> are done.
+>
+> Not implemented: PR revision polling (§3, "PR revisions") and anything else the CLI would
+> need to host or consume reviews. The ChatGPT review task (§5) is separate from the CLI.
+>
+> Where the text below differs from the tool:
+>
+> - The default trigger label is `ready`, not `updraft:ready`.
+> - The example config omits the required `repositories.<OWNER/REPO>.id` and the
+>   `execution`, `dispatch` and per-repository checkout and publication settings added
+>   since. Use [examples/config.yaml](../examples/config.yaml) instead.
+> - The command table in §2 lists the first commands only. The README has the current set.
+> - §4 calls for an explicit tool-permission profile and a limited environment per runner.
+>   What shipped: each adapter runs its agent in full-auto by default, as the user running
+>   the worker, with the worker's environment minus `GH_TOKEN` and `GITHUB_TOKEN`. A narrower
+>   profile is set per agent in `agents.<name>.args`. There is no sandbox.
+
 ## 1. User workflow
 
 1. Install the TypeScript CLI as an npm package and sign in to GitHub with `gh`.
-2. Run `factory configure`. Search and select repositories available to the active GitHub account. Choose which actions run in each repo, the labels that trigger them, and the eligible agents.
-3. Start the worker in a terminal with `factory start`. Use the operating system's background runner to start the same command at login. On a Linux host without systemd, run it under the process supervisor the host already uses.
-4. Add the configured dispatch label to an issue. The factory queues an implementation job, selects an eligible agent and gives it an isolated checkout.
+2. Run `updraft configure`. Search and select repositories available to the active GitHub account. Choose which actions run in each repo, the labels that trigger them, and the eligible agents.
+3. Start the worker in a terminal with `updraft start`. Use the operating system's background runner to start the same command at login. On a Linux host without systemd, run it under the process supervisor the host already uses.
+4. Add the configured dispatch label to an issue. Updraft queues an implementation job, selects an eligible agent and gives it an isolated checkout.
 5. Open the resulting PR. The ChatGPT task reviews it on open and after new commits. The review identifies the exact revision, reports blockers, and follows up on previous findings. A person can hand feedback back to the implementer and push a revision.
 
-`factory` and the example label `factory:ready` are working names. The CLI is reusable across repos. The pilot can start before the public package name or npm publishing process is settled.
+`updraft:ready` is an example label. The CLI is reusable across repos. (This design was written when the project was called software-factory-cli and its command `factory`; it is published as `@allenheltondev/updraft`.)
 
 ## 2. Configuration and discovery
 
-`factory configure` uses the active `gh` account and paginates `GET /user/repos`. The searchable multi-select includes repositories the account owns, collaborates on, or can access through an organization. It preselects watched repos. `factory add OWNER/REPO` handles scripted setup and accessible public repos outside the picker. Verify repository access when saving a selection, and use the repository's stable GitHub ID for persisted state. Fetch each selected repository's GitHub labels for the issue-trigger and routing pickers.
+`updraft configure` uses the active `gh` account and paginates `GET /user/repos`. The searchable multi-select includes repositories the account owns, collaborates on, or can access through an organization. It preselects watched repos. `updraft add OWNER/REPO` handles scripted setup and accessible public repos outside the picker. Verify repository access when saving a selection, and use the repository's stable GitHub ID for persisted state. Fetch each selected repository's GitHub labels for the issue-trigger and routing pickers.
 
 Save a versioned local config. Validate referenced actions, pools, agents, limits, and repo checkout settings before writing. Show which repos and actions were added or removed. Start new subscriptions at the current state with an explicit backfill option. The startup command is non-interactive and uses the saved config. The pilot can use a 60-second poll interval, adjustable globally. Apply config changes when the worker restarts.
 
@@ -25,25 +54,25 @@ Useful commands for the first release:
 
 | Command | Behavior |
 | --- | --- |
-| `factory configure` | Select repos, triggers, actions and pools interactively |
-| `factory add OWNER/REPO` | Add a repo by name |
-| `factory start` | Poll GitHub and execute jobs |
-| `factory status` | Show watched repos, agent availability, queue state and recent errors |
-| `factory doctor` | Check paths, Git and GitHub access, enabled agent commands, and authentication in the current environment |
-| `factory retry JOB_ID` | Requeue a failed or interrupted job deliberately |
+| `updraft configure` | Select repos, triggers, actions and pools interactively |
+| `updraft add OWNER/REPO` | Add a repo by name |
+| `updraft start` | Poll GitHub and execute jobs |
+| `updraft status` | Show watched repos, agent availability, queue state and recent errors |
+| `updraft doctor` | Check paths, Git and GitHub access, enabled agent commands, and authentication in the current environment |
+| `updraft retry JOB_ID` | Requeue a failed or interrupted job deliberately |
 
 ### Background operation
 
-Publish one npm package with the same `factory` commands and YAML schema across platforms. Installing the package makes the CLI available to the user. Background startup is configured separately so users can choose when it starts. Ship example launcher definitions that invoke `factory start`.
+Publish one npm package with the same `updraft` commands and YAML schema across platforms. Installing the package makes the CLI available to the user. Background startup is configured separately so users can choose when it starts. Ship example launcher definitions that invoke `updraft start`.
 
 | Environment | Background runner |
 | --- | --- |
 | Windows | Task Scheduler task at login, under the developer's account. Use fully qualified executable paths, restart on failure, ignore overlapping launches, and remove the default runtime limit. |
 | macOS | A per-user `launchd` LaunchAgent with explicit program arguments and log paths. |
 | Linux with systemd | A `systemd --user` service with restart on failure. Enable lingering if the machine needs to run jobs before login or after logout. |
-| Other Linux hosts | Run `factory start` in the foreground under the host's existing process supervisor. |
+| Other Linux hosts | Run `updraft start` in the foreground under the host's existing process supervisor. |
 
-Launchers specify the executable, config path, working directory, and environment they need. Test `factory doctor` under the same account and environment as the launcher, since a background process may get a different PATH and credential context from a terminal. Keep config, queue and logs in per-user locations resolved for the host OS, with a config path override. The worker resumes polling from saved checkpoints after sleep or restart.
+Launchers specify the executable, config path, working directory, and environment they need. Test `updraft doctor` under the same account and environment as the launcher, since a background process may get a different PATH and credential context from a terminal. Keep config, queue and logs in per-user locations resolved for the host OS, with a config path override. The worker resumes polling from saved checkpoints after sleep or restart.
 
 On Windows, use one execution environment for the worker, checkout and agents. Prefer the native Windows setup for Windows-hosted repos. WSL2 can run the Linux setup when repos and tooling already live there or a runner needs Linux-native tools. In that case, keep the relevant binaries, credentials and worktrees inside WSL.
 
@@ -79,7 +108,7 @@ repositories:
     workflows:
       - trigger:
           event: issue.labeled
-          label: "factory:ready"
+          label: "updraft:ready"
         action: implement-issue
         pool:
           rules:
@@ -122,9 +151,9 @@ Create a dedicated Kids and Dragons review chat and configure a GitHub event-tri
 
 **Pilot status** GitHub repository read access was confirmed. Two task creation attempts returned a webhook connector validation error. The task is pending setup from the signed-in ChatGPT session. Validate both paths with a test PR: receive the initial review, push a fix, and receive a second review tied to the new SHA. Confirm whether the second run has access to the previous findings.
 
-The initial review destination is the dedicated ChatGPT chat. To close the loop automatically later, the factory will need a review result it can read reliably, with PR number, head SHA and blocker status. Options include an authorized GitHub review output or a local Codex reviewer with structured output. Define that handoff before letting the factory send findings back to an implementation agent. Keep merges a human decision in the pilot.
+The initial review destination is the dedicated ChatGPT chat. To close the loop automatically later, Updraft will need a review result it can read reliably, with PR number, head SHA and blocker status. Options include an authorized GitHub review output or a local Codex reviewer with structured output. Define that handoff before letting Updraft send findings back to an implementation agent. Keep merges a human decision in the pilot.
 
-**Decided (#13):** the result is a GitHub PR review carrying a hidden `factory-review v1` block with the reviewed head SHA and `blockers: yes|no`, trusted only from logins in `review.reviewers` and only when the block's head matches the review's `commit_id`. The blocker status lives in the block because reviews posted from the PR author's own account are always `COMMENTED`. `factory reviews` reads it; findings are not yet sent to agents. See [review-result.md](review-result.md).
+**Decided (#13):** a result from an outside reviewer is a GitHub PR review carrying a hidden `updraft-review-result v1` block with the reviewed head SHA and `blockers: yes|no`, trusted only from logins in `review.reviewers` and only when the block's head matches the review's `commit_id`. The blocker status lives in the block because reviews posted from the PR author's own account are always `COMMENTED`. `updraft reviews` reads it; it acts on nothing. Updraft's own reviewer and fix cycle were built separately ([review-loop.md](review-loop.md)). See [review-result.md](review-result.md).
 
 ## 6. First build and acceptance
 
@@ -151,8 +180,8 @@ The initial review destination is the dedicated ChatGPT chat. To close the loop 
 | Decision | Proposed pilot behavior |
 | --- | --- |
 | Who can dispatch work? | Use an explicit GitHub actor allowlist for the pilot, starting with Allen. Check the actor on the label event. Expand to collaborators or planned bot accounts only if needed. |
-| What counts as done? | Leave a local branch and summarize changes and checks. **Decided (#12):** publication is opt-in per repository (`publish: none`, the default, `draft-pr` or `pr`), applies in live mode to `local-branch` actions, and only to runs that succeeded and left commits. The CLI's worker pushes the job branch (create-only: it never moves an existing branch) and opens the PR as the user's own `gh` account, then comments on the issue; the agent gets no GitHub token. Each step is idempotent by run id. `pr` exists for private repos whose plan refuses draft PRs; the CLI never falls back to it on its own. Merging stays a human decision. |
-| Where does feedback go? | Deliver reviews in ChatGPT and hand findings back to the implementer manually. **Decided (#13):** machine-readable results live in GitHub PR reviews as a `factory-review v1` block from a trusted reviewer ([review-result.md](review-result.md)). Findings still go back by hand until the fix cycle is built on it. |
+| What counts as done? | Leave a local branch and summarize changes and checks. **Decided (#12):** publication is opt-in per repository (`publish: none`, the default, `draft-pr` or `pr`), applies in live mode to `local-branch` actions, and only to runs that succeeded and left commits. The CLI's worker pushes the job branch (create-only: it never moves an existing branch; the opt-in revision loop, [revisions.md](revisions.md), later fast-forwards that one branch) and opens the PR as the user's own `gh` account, then comments on the issue; the agent gets no GitHub token. Each step is idempotent by run id. `pr` exists for private repos whose plan refuses draft PRs; the CLI never falls back to it on its own. Merging stays a human decision. |
+| Where does feedback go? | Deliver reviews in ChatGPT and hand findings back to the implementer manually. Decide where machine-readable reviews should live before automating fix-and-review cycles. |
 | What can agents execute? | Configure the commands, credentials and tool permissions needed by each action before running it unattended. Validate Kiro headless auth and each adapter's exit behavior under the worker account. |
 
 The first coding step can begin with repo selection, event ingestion and a log-only worker. The trigger label, authorized dispatchers and publication behavior need to be settled before enabling live implementation runs. ChatGPT webhook activation is an integration dependency for the review phase.

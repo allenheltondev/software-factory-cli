@@ -13,7 +13,7 @@ import {
   upsertRepoWorkflow,
 } from './config-edit.js';
 
-const wf = buildWorkflow({ label: 'factory:ready', action: 'implement-issue', pool: 'general' });
+const wf = buildWorkflow({ label: 'updraft:ready', action: 'implement-issue', pool: 'general' });
 
 describe('seedConfig', () => {
   it('has the documented defaults and validates once a repo is added', () => {
@@ -64,7 +64,7 @@ describe('upsertRepoWorkflow', () => {
 
   it('replaces a workflow with the same id and appends a different one', () => {
     const one = upsertRepoWorkflow(base, { id: 7, fullName: 'o/r' }, wf).config;
-    const changed = buildWorkflow({ label: 'factory:ready', action: 'implement-issue', pool: 'other' });
+    const changed = buildWorkflow({ label: 'updraft:ready', action: 'implement-issue', pool: 'other' });
     const two = upsertRepoWorkflow(one, { id: 7, fullName: 'o/r' }, changed);
     expect(two.replaced).toBe(true);
     expect(two.config.repositories?.['o/r']?.workflows).toEqual([changed]);
@@ -105,7 +105,7 @@ describe('applyRepoSelections', () => {
     expect(lines).toContain('+ repo o/c (id 3)');
     expect(lines).toContain('- repo o/b (id 2)');
     expect(lines).toContain('~ repo o/a → o/a-renamed (id 1)');
-    expect(lines.some((l) => l.startsWith('+ workflow o/c [implement-issue:factory:ready]'))).toBe(true);
+    expect(lines.some((l) => l.startsWith('+ workflow o/c [implement-issue:updraft:ready]'))).toBe(true);
   });
 });
 
@@ -122,7 +122,7 @@ describe('diffConfigs', () => {
     expect(diffConfigs(null, c).other[0]).toMatch(/new config/);
 
     const changed = upsertRepoWorkflow(setEnabledAgents(c, ['claude']), { id: 1, fullName: 'o/a' }, buildWorkflow({
-      label: 'factory:ready',
+      label: 'updraft:ready',
       action: 'implement-issue',
       pool: 'general',
       routes: [{ hasLabel: 'art', use: 'general' }],

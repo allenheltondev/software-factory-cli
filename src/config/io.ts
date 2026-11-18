@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { parse, stringify } from 'yaml';
-import type { FactoryConfig, FactoryConfigInput } from './schema.js';
+import type { UpdraftConfig, UpdraftConfigInput } from './schema.js';
 import { formatIssues, validateConfig, type ConfigIssue } from './validate.js';
 import { updateYamlText } from './yaml-update.js';
 
@@ -16,7 +16,7 @@ export class ConfigError extends Error {
 }
 
 export interface LoadedConfig {
-  config: FactoryConfig;
+  config: UpdraftConfig;
   path: string;
   warnings: ConfigIssue[];
 }
@@ -37,7 +37,7 @@ export function readRawConfig(path: string): unknown {
 
 export function loadConfig(path: string): LoadedConfig {
   if (!existsSync(path)) {
-    throw new ConfigError(`No config at ${path}. Run "factory configure" or pass --config.`);
+    throw new ConfigError(`No config at ${path}. Run "updraft configure" or pass --config.`);
   }
   const result = validateConfig(readRawConfig(path));
   if (!result.ok) throw new ConfigError(`Invalid config ${path}`, result.errors);
@@ -50,7 +50,7 @@ export function loadConfig(path: string): LoadedConfig {
  * already exists, only the nodes that changed are edited, so hand-written
  * comments, key order and formatting elsewhere are kept.
  */
-export function saveConfig(path: string, input: FactoryConfigInput): LoadedConfig {
+export function saveConfig(path: string, input: UpdraftConfigInput): LoadedConfig {
   const result = validateConfig(input);
   if (!result.ok) throw new ConfigError('Refusing to save invalid config', result.errors);
   const existing = existsSync(path) ? readFileSync(path, 'utf8') : null;

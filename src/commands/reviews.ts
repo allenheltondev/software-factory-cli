@@ -1,8 +1,10 @@
-// `factory reviews`: read-only view of the machine-readable review result (docs/review-result.md)
-// for each PR the factory published. Reads the state DB and GitHub; writes nothing anywhere.
+// `updraft reviews`: read-only view of the machine-readable review result (docs/review-result.md)
+// for each PR Updraft published. Reads the state DB and GitHub; writes nothing anywhere: the
+// database is opened read-only, so it is neither migrated nor switched to WAL by looking at it.
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../config/io.js';
-import { listRecentPublications } from '../db/publications.js';
+import { PUBLICATIONS_SCHEMA_VERSION, SCHEMA_VERSION, schemaVersion } from '../db/database.js';
+import { listPublishedPulls } from '../db/publications.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import { currentReviewResult, type CurrentReviewResult } from '../review/result.js';
 import type { Publication } from '../types.js';
@@ -17,8 +19,6 @@ export interface ReviewsOptions {
 }
 
 export const DEFAULT_REVIEWS_LIMIT = 20;
-/** How many publications to scan for published PRs. */
-const PUBLICATION_SCAN = 1000;
 
 export interface PullReviewView {
   runId: string;
@@ -41,30 +41,18 @@ export interface ReviewsView {
   omitted: number;
 }
 
-/** Published runs with a PR, newest first, one entry per PR. */
-export function publishedPulls(publications: readonly Publication[]): Array<Publication & { prNumber: number }> {
-  const seen = new Set<string>();
-  const out: Array<Publication & { prNumber: number }> = [];
-  for (const p of publications) {
-    if (p.state !== 'published' || p.prNumber === null) continue;
-    const key = `${p.repoId}#${p.prNumber}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(p as Publication & { prNumber: number });
-  }
-  return out;
-}
-
-/** Fetch each PR and its reviews and choose the current review result. GET requests only. */
+/**
+ * Fetch each PR and its reviews and choose the current review result. GET requests only.
+ * `pulls` is the set to check (already limited); `total` is how many published PRs there are.
+ */
 export async function collectReviews(o: {
   api: GitHubApi;
-  publications: readonly Publication[];
+  pulls: ReadonlyArray<Publication & { prNumber: number }>;
+  total: number;
   reviewers: string[];
-  limit: number;
 }): Promise<ReviewsView> {
-  const all = publishedPulls(o.publications);
   const pulls: PullReviewView[] = [];
-  for (const p of all.slice(0, o.limit)) {
+  for (const p of o.pulls) {
     const repo = { id: p.repoId, fullName: p.repoFullName };
     const view: PullReviewView = {
       runId: p.runId,
@@ -88,7 +76,7 @@ export async function collectReviews(o: {
     }
     pulls.push(view);
   }
-  return { reviewers: o.reviewers, pulls, omitted: Math.max(0, all.length - o.limit) };
+  return { reviewers: o.reviewers, pulls, omitted: Math.max(0, o.total - o.pulls.length) };
 }
 
 const short = (sha: string) => sha.slice(0, 12);
@@ -156,20 +144,36 @@ export async function reviewsCommand(ctx: CommandContext, opts: ReviewsOptions =
   const { config } = loadConfig(ctx.paths.configFile);
   const reviewers = config.review.reviewers;
 
-  // Don't create state as a side effect of looking at it.
-  let publications: Publication[] = [];
+  // Looking at the state must not change it: no database is created, and an existing one is
+  // opened read-only, so it is not migrated (or switched to WAL) by this command.
+  let published: ReturnType<typeof listPublishedPulls> = { pulls: [], total: 0 };
   if (existsSync(ctx.paths.dbFile)) {
-    const db = ctx.openDb(ctx.paths.dbFile);
+    const db = ctx.openDbReadOnly(ctx.paths.dbFile);
     try {
-      publications = listRecentPublications(db, PUBLICATION_SCAN);
+      const version = schemaVersion(db);
+      if (version > SCHEMA_VERSION) {
+        throw new CliError(`The state database at ${ctx.paths.dbFile} is at schema v${version}, newer than this CLI supports (v${SCHEMA_VERSION}). Upgrade Updraft to read it.`);
+      }
+      if (version < PUBLICATIONS_SCHEMA_VERSION) {
+        throw new CliError(
+          `The state database at ${ctx.paths.dbFile} is at schema v${version}, from before publications were recorded (v${PUBLICATIONS_SCHEMA_VERSION}), ` +
+            'so there are no published PRs to read. "updraft reviews" never changes the database; run "updraft status" once to upgrade it, then try again.',
+        );
+      }
+      published = listPublishedPulls(db, limit);
     } finally {
       db.close();
     }
   }
 
-  const view: ReviewsView = publishedPulls(publications).length
-    ? await collectReviews({ api: await ctx.createApi({ log: createLogger({ stream: null }) }), publications, reviewers, limit })
-    : { reviewers, pulls: [], omitted: 0 };
+  let view: ReviewsView = { reviewers, pulls: [], omitted: 0 };
+  if (published.pulls.length) {
+    // As the worker would: the gh account, or the GitHub App of github.app, so a private
+    // repository that only the App can read is readable here too.
+    const log = createLogger({ stream: null });
+    const credentials = ctx.createCredentials(config, { log });
+    view = await collectReviews({ api: await ctx.createApi({ log, credentials }), pulls: published.pulls, total: published.total, reviewers });
+  }
 
   if (opts.json) println(ctx.out, JSON.stringify(view, null, 2));
   else println(ctx.out, renderReviews(view));

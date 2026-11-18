@@ -4,12 +4,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
+import { ReviewLoopApiStubs } from '../../test/review-loop-api-stubs.js';
 import { publishCommand } from '../commands/publish.js';
 import { fakeContext } from '../commands/fakes.js';
-import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getPublication } from '../db/publications.js';
-import { getJob } from '../db/queue.js';
+import { getPublishSetting, syncPublishSettings } from '../db/publish-settings.js';
+import { getJob, getRun } from '../db/queue.js';
 import { GitError, runGit, type GitOptions } from '../git/git.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree } from '../git/worktree.js';
 import {
@@ -19,9 +21,10 @@ import {
   type GitHubIssueComment,
   type GitHubPullRequest,
 } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import { GitHubAppError } from '../github/app-auth.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { RepoRef, RunOutcome } from '../types.js';
-import { silentLogger } from '../util/log.js';
+import { createLogger, silentLogger } from '../util/log.js';
 import { summarizeRun } from '../worker/run-summary.js';
 import {
   createPublisher,
@@ -42,7 +45,7 @@ const TOKEN = 'ghp_SECRETtoken0123456789';
 const T0 = Date.parse('2026-11-17T12:00:00.000Z');
 
 /** GitHub's side of publication, in memory. Optionally checks that a PR's head is on the bare remote. */
-class FakePublishApi implements GitHubApi {
+class FakePublishApi extends ReviewLoopApiStubs implements GitHubApi {
   pulls: Array<GitHubPullRequest & { title: string }> = [];
   comments: GitHubIssueComment[] = [];
   readonly calls: string[] = [];
@@ -53,7 +56,9 @@ class FakePublishApi implements GitHubApi {
   loseNextPullResponse = false;
   private nextId = 1;
 
-  constructor(private readonly remoteHas?: (branch: string) => boolean) {}
+  constructor(private readonly remoteHas?: (branch: string) => boolean) {
+    super();
+  }
 
   private maybeFail(name: keyof FakePublishApi['failNext']): void {
     const err = this.failNext[name];
@@ -65,6 +70,9 @@ class FakePublishApi implements GitHubApi {
 
   async getViewer() {
     return { login: 'allen', id: 1 };
+  }
+  async getWorkerIdentity() {
+    return { kind: 'user' as const, login: 'allen', id: 1 };
   }
   async listUserRepos(): Promise<never[]> {
     return [];
@@ -83,6 +91,15 @@ class FakePublishApi implements GitHubApi {
   }
   async listEventsForIssue(): Promise<never[]> {
     return [];
+  }
+  async getIssueBodyEdit(): Promise<never> {
+    throw new Error('not used');
+  }
+  async listPullRequestUpdates(): Promise<never> {
+    throw new Error('not used');
+  }
+  async getPullRequestReviews(): Promise<never> {
+    throw new Error('not used');
   }
 
   async listPullRequestsForHead(repo: RepoRef, opts: { headOwner: string; head: string }) {
@@ -142,14 +159,6 @@ class FakePublishApi implements GitHubApi {
     return c;
   }
 
-  // Publication never reads reviews; these exist only to satisfy the interface.
-  async getPullRequest(): Promise<never> {
-    throw new Error('not used');
-  }
-  async listPullRequestReviews(): Promise<never> {
-    throw new Error('not used');
-  }
-
   get creates(): string[] {
     return this.calls.filter((c) => c.startsWith('create'));
   }
@@ -162,7 +171,7 @@ afterEach(() => {
   for (const f of fixtures.splice(0)) f.cleanup();
 });
 
-function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over: Partial<FactoryConfigInput> = {}): FactoryConfig {
+function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over: Partial<UpdraftConfigInput> = {}): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     execution: { mode: 'live' },
@@ -177,7 +186,7 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over:
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
-        workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
         ...repoOver,
       },
     },
@@ -185,8 +194,8 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over:
   });
 }
 
-function makePaths(root: string): FactoryPaths {
-  const dataDir = join(root, 'factory state');
+function makePaths(root: string): UpdraftPaths {
+  const dataDir = join(root, 'updraft state');
   const logDir = join(dataDir, 'logs');
   return {
     configFile: join(root, 'cfg', 'config.yaml'),
@@ -201,7 +210,7 @@ function makePaths(root: string): FactoryPaths {
 interface Scenario {
   f: GitFixture;
   db: Db;
-  paths: FactoryPaths;
+  paths: UpdraftPaths;
   runId: string;
   jobId: string;
   branch: string;
@@ -244,7 +253,7 @@ async function scenario(o: { commits?: number; outcome?: RunOutcome; db?: Db; f?
   const runId = `run_${jobId}`;
   const logPath = join(paths.runsDir, runId, 'run.log');
   mkdirSync(join(paths.runsDir, runId), { recursive: true });
-  writeFileSync(logPath, 'software-factory run\n');
+  writeFileSync(logPath, 'updraft run\n');
   const at = new Date(T0).toISOString();
   db.prepare(
     `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, lease_expires_at, started_at,
@@ -284,7 +293,7 @@ function recordingGit(o: { fakePushUrl?: string; realUrl?: string; failPushWith?
   };
 }
 
-function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config?: FactoryConfig } = {}): PublishDeps {
+function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config?: UpdraftConfig } = {}): PublishDeps {
   return {
     db: s.db,
     config: makeConfig(s.f),
@@ -298,6 +307,21 @@ function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config
 }
 
 describe('publishRun', { timeout: 60_000 }, () => {
+  it('refuses to publish a branch that moved after the run ended: its result and verification are about another commit', async () => {
+    const s = await scenario();
+    // Someone (or a leftover process) commits on the job branch after the run was recorded.
+    const worktree = getRun(s.db, s.runId)!.checkoutPath!;
+    writeFileSync(join(worktree, 'late.txt'), 'added after the run\n');
+    s.f.git(worktree, 'add', '.');
+    s.f.git(worktree, 'commit', '--quiet', '-m', 'late change');
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    const r = await publishRun(deps(s, api), s.runId);
+
+    expect(r).toMatchObject({ status: 'failed', retryable: false, error: expect.stringMatching(new RegExp(`not at ${s.localSha.slice(0, 12)} where run ${s.runId} ended`)) });
+    expect(remoteSha(s)).toBeNull();
+    expect(api.pulls).toEqual([]);
+  });
+
   it('pushes the job branch, opens a draft PR and comments on the issue', async () => {
     const s = await scenario();
     const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
@@ -455,7 +479,7 @@ describe('publishRun', { timeout: 60_000 }, () => {
     if (r.status === 'failed') {
       expect(r.error).toMatch(/refused a draft PR/);
       expect(r.error).toContain(`repositories.${FULL}.publish: pr`);
-      expect(r.error).toContain(`factory publish ${s.runId}`);
+      expect(r.error).toContain(`updraft publish ${s.runId}`);
     }
     expect(api.pulls).toEqual([]);
 
@@ -756,7 +780,199 @@ describe('createPublisher', { timeout: 60_000 }, () => {
   });
 });
 
-describe('factory publish', { timeout: 60_000 }, () => {
+describe('startup sweep', { timeout: 60_000 }, () => {
+  /** Record the publish setting as the CLI would on loading `config` at `at`. */
+  const observe = (db: Db, config: UpdraftConfig, at: number) => syncPublishSettings(db, config, () => at);
+  const capture = () => {
+    const lines: string[] = [];
+    const stream = { write: (c: string) => (lines.push(c), true) } as unknown as NodeJS.WritableStream;
+    return { log: createLogger({ stream, level: 'debug' }), text: () => lines.join('') };
+  };
+
+  it('publishes a succeeded run left without a publication (crash gap) when it ended after publish was enabled', async () => {
+    const s = await scenario(); // ended at T0
+    const config = makeConfig(s.f);
+    observe(s.db, config, T0 - 60_000);
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    const out = capture();
+    await createPublisher(deps(s, api, { config, log: out.log })).sweepUnpublished();
+
+    expect(getPublication(s.db, s.runId)).toMatchObject({ state: 'published', mode: 'draft-pr', attempts: 1 });
+    expect(remoteSha(s)).toBe(s.localSha);
+    expect(api.pulls).toHaveLength(1);
+    expect(api.comments).toHaveLength(1);
+    expect(readFileSync(s.logPath, 'utf8')).toContain('publication: attempt 1 (draft-pr, startup sweep)');
+    expect(out.text()).toMatch(new RegExp(`startup sweep: publishing a succeeded run that has no publication record .*runId=${s.runId}`));
+    expect(out.text()).toMatch(/INFO {2}published .*source=startup sweep/);
+
+    // Running it again changes nothing: the run has a publication record now.
+    await createPublisher(deps(s, api, { config })).sweepUnpublished();
+    expect(api.creates).toHaveLength(2);
+  });
+
+  it('a run that ended at the enable time counts; one that ended before it is never published by surprise', async () => {
+    const before = await scenario(); // ended at T0
+    const config = makeConfig(before.f);
+    observe(before.db, config, T0 + 1);
+    const api = new FakePublishApi();
+    await createPublisher(deps(before, api, { config })).sweepUnpublished();
+    expect(getPublication(before.db, before.runId)).toBeNull();
+    expect(remoteSha(before)).toBeNull();
+    expect(api.calls).toEqual([]);
+
+    const atEnable = await scenario();
+    observe(atEnable.db, makeConfig(atEnable.f, { publish: 'none' }), T0 - 1);
+    observe(atEnable.db, makeConfig(atEnable.f), T0);
+    await createPublisher(deps(atEnable, new FakePublishApi(), { config: makeConfig(atEnable.f) })).sweepUnpublished();
+    expect(getPublication(atEnable.db, atEnable.runId)?.state).toBe('published');
+  });
+
+  it('turning publish off and on again resets enabled_at, so runs from before the new enable are skipped', async () => {
+    const s = await scenario(); // ended at T0
+    const on = makeConfig(s.f);
+    const off = makeConfig(s.f, { publish: 'none' });
+    observe(s.db, on, T0 - 60_000);
+    expect(getPublishSetting(s.db, REPO_ID)).toMatchObject({ mode: 'draft-pr', enabledAt: new Date(T0 - 60_000).toISOString() });
+    observe(s.db, off, T0 - 30_000);
+    expect(getPublishSetting(s.db, REPO_ID)).toMatchObject({ mode: 'none', enabledAt: null });
+    observe(s.db, on, T0 + 30_000);
+    expect(getPublishSetting(s.db, REPO_ID)).toMatchObject({ mode: 'draft-pr', enabledAt: new Date(T0 + 30_000).toISOString() });
+
+    const api = new FakePublishApi();
+    await createPublisher(deps(s, api, { config: on })).sweepUnpublished();
+    expect(getPublication(s.db, s.runId)).toBeNull();
+    expect(api.calls).toEqual([]);
+  });
+
+  it('switching between draft-pr and pr keeps enabled_at, and the run is published in the current mode', async () => {
+    const s = await scenario(); // ended at T0
+    observe(s.db, makeConfig(s.f), T0 - 60_000);
+    const pr = makeConfig(s.f, { publish: 'pr' });
+    expect(observe(s.db, pr, T0 + 30_000)).toEqual([
+      { repoId: REPO_ID, repoFullName: FULL, from: 'draft-pr', to: 'pr', enabledAt: new Date(T0 - 60_000).toISOString() },
+    ]);
+    expect(getPublishSetting(s.db, REPO_ID)).toMatchObject({ mode: 'pr', enabledAt: new Date(T0 - 60_000).toISOString() });
+    observe(s.db, makeConfig(s.f), T0 + 40_000);
+    observe(s.db, pr, T0 + 50_000);
+    expect(getPublishSetting(s.db, REPO_ID)?.enabledAt).toBe(new Date(T0 - 60_000).toISOString());
+
+    const api = new FakePublishApi();
+    await createPublisher(deps(s, api, { config: pr })).sweepUnpublished();
+    expect(getPublication(s.db, s.runId)).toMatchObject({ state: 'published', mode: 'pr' });
+    expect(api.pulls[0]!.draft).toBe(false);
+  });
+
+  it('skips runs that are not eligible: failed, no commits, publish off now, not live, not a local-branch action', async () => {
+    const failed = await scenario({ outcome: 'failed' });
+    const { f, db } = failed;
+    const noCommits = await scenario({ f, db, commits: 0 });
+    const ok = await scenario({ f, db });
+    const config = makeConfig(f);
+    observe(db, config, T0 - 60_000);
+    const api = new FakePublishApi();
+
+    // Publish is off in the config the worker runs with, even though the record still says on.
+    await createPublisher(deps(ok, api, { config: makeConfig(f, { publish: 'none' }) })).sweepUnpublished();
+    await createPublisher(deps(ok, api, { config: makeConfig(f, {}, { execution: { mode: 'prepare-only' } }) })).sweepUnpublished();
+    await createPublisher(
+      deps(ok, api, { config: makeConfig(f, {}, { actions: { 'implement-issue': { prompt: './prompt.md', output: 'log' } } }) }),
+    ).sweepUnpublished();
+    expect(api.calls).toEqual([]);
+    for (const s of [failed, noCommits, ok]) expect(getPublication(db, s.runId)).toBeNull();
+
+    // Once the record says off too, nothing is a candidate any more.
+    observe(db, makeConfig(f, { publish: 'none' }), T0 + 1);
+    await createPublisher(deps(ok, api, { config })).sweepUnpublished();
+    expect(api.calls).toEqual([]);
+
+    // Back on, enabled after these runs ended: still nothing. Only the eligible run, once it counts.
+    observe(db, config, T0 + 2);
+    await createPublisher(deps(ok, api, { config })).sweepUnpublished();
+    expect(api.calls).toEqual([]);
+    db.prepare('UPDATE publish_settings SET enabled_at = ?').run(new Date(T0 - 1).toISOString());
+    await createPublisher(deps(ok, api, { config })).sweepUnpublished();
+    expect(getPublication(db, ok.runId)?.state).toBe('published');
+    // The failed and the zero-commit run get no publication record at all (not even "skipped").
+    expect(getPublication(db, failed.runId)).toBeNull();
+    expect(getPublication(db, noCommits.runId)).toBeNull();
+    expect(api.pulls).toHaveLength(1);
+  });
+
+  it('leaves published runs and failed publications to the existing retry logic', async () => {
+    const done = await scenario();
+    const { f, db } = done;
+    const refused = await scenario({ f, db });
+    const later = await scenario({ f, db });
+    const config = makeConfig(f);
+    observe(db, config, T0 - 60_000);
+    const api = new FakePublishApi();
+    expect((await publishRun(deps(done, api, { config }), done.runId)).status).toBe('published');
+    api.failNext.createPullRequest = new GitHubError('POST pulls failed: 403 Resource not accessible', 403);
+    expect((await publishRun(deps(refused, api, { config }), refused.runId)).status).toBe('failed');
+    api.failNext.createPullRequest = new GitHubError('POST pulls failed: 503', 503);
+    expect((await publishRun(deps(later, api, { config }), later.runId)).status).toBe('failed');
+    const before = api.calls.length;
+
+    await createPublisher(deps(done, api, { config })).sweepUnpublished();
+    expect(api.calls.length).toBe(before);
+    expect(getPublication(db, done.runId)).toMatchObject({ state: 'published', attempts: 1 });
+    expect(getPublication(db, refused.runId)).toMatchObject({ state: 'failed', retryable: false, attempts: 1 });
+    expect(getPublication(db, later.runId)).toMatchObject({ state: 'failed', retryable: true, attempts: 1 });
+  });
+
+  it('publishes at most the limit, oldest first', async () => {
+    const newer = await scenario();
+    const { f, db } = newer;
+    const older = await scenario({ f, db });
+    db.prepare('UPDATE runs SET ended_at = ? WHERE id = ?').run(new Date(T0 - 1_000).toISOString(), older.runId);
+    const config = makeConfig(f);
+    observe(db, config, T0 - 60_000);
+    const out = capture();
+    await createPublisher(deps(newer, new FakePublishApi(), { config, log: out.log })).sweepUnpublished(undefined, { limit: 1 });
+    expect(getPublication(db, older.runId)?.state).toBe('published');
+    expect(getPublication(db, newer.runId)).toBeNull();
+    expect(out.text()).toMatch(/startup sweep: limit reached.*unchecked=1/);
+  });
+
+  it('does not publish a stranded run whose branch moved before the restart: that commit is not the run\'s', async () => {
+    const s = await scenario(); // ended at T0
+    const config = makeConfig(s.f);
+    observe(s.db, config, T0 - 60_000);
+    // Committed on the job branch after the run succeeded and before the worker came back.
+    const worktree = getRun(s.db, s.runId)!.checkoutPath!;
+    writeFileSync(join(worktree, 'late.txt'), 'added after the run\n');
+    s.f.git(worktree, 'add', '.');
+    s.f.git(worktree, 'commit', '--quiet', '-m', 'late change');
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    await createPublisher(deps(s, api, { config })).sweepUnpublished();
+
+    expect(remoteSha(s)).toBeNull();
+    expect(api.pulls).toEqual([]);
+    expect(getPublication(s.db, s.runId)).toMatchObject({ state: 'failed', retryable: false, error: expect.stringMatching(/where run .* ended/) });
+  });
+
+  it('leaves a run that does not record the commit it ended on to "updraft publish"', async () => {
+    const s = await scenario(); // ended at T0
+    const config = makeConfig(s.f);
+    observe(s.db, config, T0 - 60_000);
+    // A run recorded by a version that did not store the head commit: nothing to hold the push to.
+    const summary = { ...getRun(s.db, s.runId)!.summary! };
+    delete summary.headSha;
+    s.db.prepare('UPDATE runs SET summary = ? WHERE id = ?').run(JSON.stringify(summary), s.runId);
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    const out = capture();
+    await createPublisher(deps(s, api, { config, log: out.log })).sweepUnpublished();
+
+    expect(getPublication(s.db, s.runId)).toBeNull();
+    expect(remoteSha(s)).toBeNull();
+    expect(api.calls).toEqual([]);
+    expect(out.text()).toMatch(/does not record the commit it ended on/);
+    // Asked for by a person, it is still published.
+    expect((await publishRun(deps(s, api, { config }), s.runId)).status).toBe('published');
+  });
+});
+
+describe('updraft publish', { timeout: 60_000 }, () => {
   it('publishes a succeeded run through the same idempotent path, then reports it as already published', async () => {
     const f = createGitFixture(FULL);
     fixtures.push(f);
@@ -795,6 +1011,10 @@ describe('factory publish', { timeout: 60_000 }, () => {
     const s = await scenario({ f, db, outcome: 'failed' });
     db.close();
     await expect(publishCommand(ctx, s.runId, { fileExists: () => true, token: async () => TOKEN })).rejects.toThrow(/only succeeded runs are published/);
+    // Loading the config also recorded when publish was turned on, for the worker's startup sweep.
+    const after = openDatabase(ctx.paths.dbFile);
+    dbs.push(after);
+    expect(getPublishSetting(after, REPO_ID)).toMatchObject({ mode: 'draft-pr', enabledAt: new Date(ctx.now()).toISOString() });
   });
 });
 
@@ -841,14 +1061,147 @@ describe('helpers', () => {
         filesChanged: 1,
         diffStat: '1 file changed',
         untracked: 0,
-        lastOutput: ['done ```` tricky', '<!-- factory-run: run_other -->'],
+        lastOutput: ['done ```` tricky', '<!-- updraft-run: run_other -->'],
         notes: [],
       },
     });
     expect(body.startsWith('Closes #3\n')).toBe(true);
     // The final message is inside a fence longer than any backtick run in it.
     expect(body).toContain('`````text\ndone ```` tricky');
-    expect(body.match(/<!-- factory-run: run_x -->/g)).toHaveLength(1);
+    expect(body.match(/<!-- updraft-run: run_x -->/g)).toHaveLength(1);
     expect(body.indexOf('closes #9')).toBeGreaterThan(body.indexOf('```text'));
+  });
+});
+
+describe('publishRun as a GitHub App (github.app)', { timeout: 60_000 }, () => {
+  const APP_TOKEN = 'ghs_16C7e42F292c6912E7710c838347Ae178B4a';
+  const HTTPS = `https://github.com/${FULL}.git`;
+  const SSH = `git@github.com:${FULL}.git`;
+
+  /** Real git; the clone's remote reports an SSH push URL, and the HTTPS URL is served by the fixture's bare remote. */
+  function sshRemoteGit(s: Scenario, o: { failPushWith?: GitError } = {}): { runGit: RunGit; calls: GitCall[] } {
+    const calls: GitCall[] = [];
+    return {
+      calls,
+      runGit: async (args, opts: GitOptions) => {
+        calls.push({ args: [...args], env: opts.env });
+        if (args[0] === 'remote' && args[1] === 'get-url') return { stdout: `${SSH}\n`, stderr: '' };
+        if (o.failPushWith && args[0] === 'push') throw o.failPushWith;
+        return runGit(args.map((a) => (a === HTTPS ? s.f.remoteDir : a)), opts);
+      },
+    };
+  }
+
+  it('pushes over HTTPS with a token for that repository, in the environment and never in argv, even for an SSH remote', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s);
+    const asked: string[] = [];
+    const api = new FakePublishApi();
+    const r = await publishRun(
+      deps(s, api, {
+        runGit: git.runGit,
+        workerKind: 'app',
+        token: async (repoFullName) => {
+          asked.push(repoFullName);
+          return APP_TOKEN;
+        },
+      }),
+      s.runId,
+    );
+    expect(r.status).toBe('published');
+    expect(remoteSha(s)).toBe(s.localSha);
+    // One token, asked for the repository being pushed to.
+    expect(asked).toEqual([FULL]);
+
+    const push = git.calls.find((c) => c.args[0] === 'push')!;
+    expect(push.args).toContain(HTTPS);
+    // Nothing goes to the SSH URL: that would push as the person, with their key.
+    for (const c of git.calls) {
+      expect(c.args).not.toContain(SSH);
+      expect(c.args.join(' ')).not.toContain(APP_TOKEN);
+    }
+    for (const c of git.calls.filter((x) => ['push', 'ls-remote'].includes(x.args[0]!))) {
+      const header = Object.entries(c.env ?? {}).find(([, v]) => typeof v === 'string' && v.startsWith('AUTHORIZATION: basic '));
+      expect(header).toBeDefined();
+      const idx = header![0].replace('GIT_CONFIG_VALUE_', '');
+      expect(c.env![`GIT_CONFIG_KEY_${idx}`]).toBe('http.https://github.com/.extraheader');
+      expect(Buffer.from(header![1]!.slice('AUTHORIZATION: basic '.length), 'base64').toString()).toBe(`x-access-token:${APP_TOKEN}`);
+    }
+    const log = readFileSync(s.logPath, 'utf8');
+    expect(log).toContain(`to origin (${HTTPS})`);
+    expect(log).not.toContain(APP_TOKEN);
+    expect(api.pulls).toHaveLength(1);
+  });
+
+  it('still pushes with git\'s own credentials for an SSH remote when no App is configured', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s, { failPushWith: new GitError('git push failed', ['push'], 128, 'ssh: connect to host github.com port 22: Connection timed out\n') });
+    let asked = 0;
+    // ls-remote of the SSH URL would touch the network; the base branch is configured, so the push is the first network command.
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: async (args, opts) => (args[0] === 'ls-remote' ? { stdout: '', stderr: '' } : git.runGit(args, opts)), token: async () => (asked++, TOKEN) }), s.runId);
+    expect(r.status).toBe('failed');
+    expect(asked).toBe(0);
+    expect(git.calls.find((c) => c.args[0] === 'push')!.args).toContain(SSH);
+  });
+
+  it('redacts an installation token, a JWT and a private key from errors and run.log even when it did not hold them', async () => {
+    const s = await scenario();
+    const other = 'ghs_anotherInstallationToken0123456789';
+    const jwt = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3MDAwMDAwMDAsImlzcyI6MTIzNDV9.c2lnbmF0dXJlLXNpZ25hdHVyZQ';
+    const git = sshRemoteGit(s, {
+      failPushWith: new GitError('git push failed', ['push'], 128, `remote: denied ${other} ${jwt} -----BEGIN RSA PRIVATE KEY-----\nMIIEsecret\n-----END RSA PRIVATE KEY-----\nfatal: Authentication failed for ${APP_TOKEN}\n`),
+    });
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r.status).toBe('failed');
+    const recorded = [
+      r.status === 'failed' ? r.error : '',
+      getPublication(s.db, s.runId)!.error ?? '',
+      readFileSync(s.logPath, 'utf8'),
+      (s.db.prepare('SELECT message FROM errors').all() as { message: string }[]).map((e) => e.message).join('\n'),
+    ].join('\n');
+    for (const secret of [APP_TOKEN, other, jwt, 'MIIEsecret']) expect(recorded).not.toContain(secret);
+    expect(redactSecret(`x ${other} y`, null)).toBe('x *** y');
+  });
+
+  it('stops retrying, with the App\'s own advice, for a GitHub App problem', async () => {
+    const s = await scenario();
+    const api = new FakePublishApi();
+    api.failNext.createPullRequest = new GitHubAppError('the GitHub App updraft-bot is not installed on octo/widgets. Install it there', 'not-installed');
+    const git = sshRemoteGit(s);
+    const r = await publishRun(deps(s, api, { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false, error: 'the GitHub App updraft-bot is not installed on octo/widgets. Install it there' });
+    expect(getPublication(s.db, s.runId)!.nextAttemptAt).toBeNull();
+  });
+
+  it('retries when GitHub could not be reached for a token', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s);
+    const r = await publishRun(
+      deps(s, new FakePublishApi(), {
+        runGit: git.runGit,
+        workerKind: 'app',
+        token: async () => {
+          throw new GitHubError('POST /app/installations/11/access_tokens: network error: fetch failed', 0);
+        },
+      }),
+      s.runId,
+    );
+    expect(r).toMatchObject({ status: 'failed', retryable: true });
+    expect(git.calls.some((c) => c.args[0] === 'push')).toBe(false);
+  });
+
+  it('says which permission is missing when a push changes workflow files', async () => {
+    const s = await scenario();
+    const git = sshRemoteGit(s, {
+      failPushWith: new GitError(
+        'git push failed',
+        ['push'],
+        1,
+        ' ! [remote rejected] abc -> updraft/issue-7 (refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission)\n',
+      ),
+    });
+    const r = await publishRun(deps(s, new FakePublishApi(), { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false });
+    if (r.status === 'failed') expect(r.error).toMatch(/"Workflows" repository permission/);
   });
 });

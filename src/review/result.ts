@@ -1,14 +1,17 @@
 // Machine-readable review results (issue #13). A reviewer posts a GitHub PR review whose body
 // carries one hidden block:
 //
-//   <!-- factory-review v1
+//   <!-- updraft-review-result v1
 //   head: <40-hex SHA the review covers>
 //   blockers: yes | no
 //   -->
 //
+// The name is not "updraft-review": that is the marker Updraft's own reviewer puts on the reviews
+// it posts (src/publish/review.ts), and those must not read as a malformed block.
+//
 // Everything here is pure: no GitHub calls, no state. See docs/review-result.md for the format,
 // the trust rules and how the current result for a PR is chosen.
-import type { GitHubPullRequestReview } from '../github/api.js';
+import type { PullRequestReviewSummary } from '../github/api.js';
 
 /** Findings text longer than this is cut (and flagged) before it is exposed. */
 export const MAX_FINDINGS_CHARS = 20_000;
@@ -25,18 +28,18 @@ export interface ReviewBlock {
 }
 
 export type ParsedReview =
-  /** No factory-review block in the body: an ordinary review. */
+  /** No updraft-review-result block in the body: an ordinary review. */
   | { kind: 'none' }
   /** A block is there but cannot be used. */
   | { kind: 'invalid'; reason: string }
   | ({ kind: 'block' } & ReviewBlock);
 
-// Any HTML comment whose text starts with "factory-review" (in any case) is treated as an attempt
+// Any HTML comment whose text starts with "updraft-review-result" (in any case) is treated as an attempt
 // at a block, so a near miss is reported as invalid instead of being ignored.
 const COMMENT = /<!--([\s\S]*?)-->/g;
-const MARKER = /^\s*factory-review(?![A-Za-z0-9_-])/i;
-const UNTERMINATED = /<!--\s*factory-review(?![A-Za-z0-9_-])/i;
-const HEADER = /^factory-review[ \t]+(\S+)$/;
+const MARKER = /^\s*updraft-review-result(?![A-Za-z0-9_-])/i;
+const UNTERMINATED = /<!--\s*updraft-review-result(?![A-Za-z0-9_-])/i;
+const HEADER = /^updraft-review-result[ \t]+(\S+)$/;
 const KEY_VALUE = /^([A-Za-z0-9_-]+)[ \t]*:[ \t]*(.*?)$/;
 const SHA = /^[0-9a-f]{40}$/i;
 
@@ -56,9 +59,9 @@ function parseBlockText(inner: string): { head: string; blockers: boolean } | { 
     .map((l) => l.trim())
     .filter((l) => l !== '');
   const header = HEADER.exec(lines[0] ?? '');
-  if (!header) return { reason: 'the block must start with "factory-review v1"' };
+  if (!header) return { reason: 'the block must start with "updraft-review-result v1"' };
   if (header[1] !== REVIEW_BLOCK_VERSION) {
-    return { reason: `unsupported block version "${header[1]}" (expected "factory-review ${REVIEW_BLOCK_VERSION}")` };
+    return { reason: `unsupported block version "${header[1]}" (expected "updraft-review-result ${REVIEW_BLOCK_VERSION}")` };
   }
   const values = new Map<string, string>();
   for (const line of lines.slice(1)) {
@@ -79,7 +82,7 @@ function parseBlockText(inner: string): { head: string; blockers: boolean } | { 
 }
 
 /**
- * Find and parse the factory-review block in a review body. Lenient about whitespace, line
+ * Find and parse the updraft-review-result block in a review body. Lenient about whitespace, line
  * endings and the case of keys and values; strict about the version tag, the SHA (40 hex) and
  * `blockers` (yes/no). Unknown keys are ignored. More than one block makes the review invalid.
  */
@@ -92,9 +95,9 @@ export function parseReviewBlock(body: string): ParsedReview {
   // A block opened but never closed: the rest of the body would be hidden on GitHub, and the
   // reviewer's intent is unclear.
   const outside = text.replace(COMMENT, '');
-  if (UNTERMINATED.test(outside)) return { kind: 'invalid', reason: 'the factory-review block is not closed with "-->"' };
+  if (UNTERMINATED.test(outside)) return { kind: 'invalid', reason: 'the updraft-review-result block is not closed with "-->"' };
   if (blocks.length === 0) return { kind: 'none' };
-  if (blocks.length > 1) return { kind: 'invalid', reason: `found ${blocks.length} factory-review blocks; a review must carry exactly one` };
+  if (blocks.length > 1) return { kind: 'invalid', reason: `found ${blocks.length} updraft-review-result blocks; a review must carry exactly one` };
   const block = blocks[0]!;
   const parsed = parseBlockText(block.inner);
   if ('reason' in parsed) return { kind: 'invalid', reason: parsed.reason };
@@ -142,7 +145,7 @@ export interface CurrentReviewOptions {
   reviewers: readonly string[];
 }
 
-function newestFirst(a: GitHubPullRequestReview, b: GitHubPullRequestReview): number {
+function newestFirst(a: PullRequestReviewSummary, b: PullRequestReviewSummary): number {
   return Date.parse(b.submittedAt ?? '') - Date.parse(a.submittedAt ?? '') || b.id - a.id;
 }
 
@@ -153,7 +156,7 @@ function newestFirst(a: GitHubPullRequestReview, b: GitHubPullRequestReview): nu
  * Reviews of older heads are history; the newest of them is reported as the latest reviewed SHA.
  * `ignored` lists, newest first, reviews that carried a block but did not count.
  */
-export function currentReviewResult(reviews: readonly GitHubPullRequestReview[], opts: CurrentReviewOptions): CurrentReviewResult {
+export function currentReviewResult(reviews: readonly PullRequestReviewSummary[], opts: CurrentReviewOptions): CurrentReviewResult {
   const headSha = opts.headSha.toLowerCase();
   const trusted = new Set(opts.reviewers.map((r) => r.toLowerCase()));
   const ignored: IgnoredReview[] = [];
@@ -185,7 +188,7 @@ export function currentReviewResult(reviews: readonly GitHubPullRequestReview[],
       continue;
     }
     if (parsed.kind === 'invalid') {
-      ignore(`invalid factory-review block: ${parsed.reason}`);
+      ignore(`invalid updraft-review-result block: ${parsed.reason}`);
       continue;
     }
     const commit = r.commitId?.toLowerCase() ?? null;

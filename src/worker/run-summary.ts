@@ -4,6 +4,7 @@
 import { open } from 'node:fs/promises';
 import { runGit } from '../git/git.js';
 import type { RunSummary } from '../types.js';
+import { verificationLines, verificationNotes } from './verify.js';
 
 const MAX_COMMITS = 20;
 const MAX_STAT_LINES = 60;
@@ -13,7 +14,6 @@ const TAIL_LINES = 20;
 const MAX_LINE = 300;
 
 // CSI/OSC escape sequences and other control characters (except tab).
-// eslint-disable-next-line no-control-regex
 const ANSI = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[\u0000-\u0008\u000b-\u001f\u007f]/g;
 
 /** The last non-empty lines of a file from byte `from` on, without control sequences. */
@@ -91,12 +91,63 @@ export function cleanSummaryLines(lines: readonly string[]): string[] {
   return [...head, `… (${clean.length - head.length - 1} more lines in run.log)`, clean[clean.length - 1]!];
 }
 
+/**
+ * Entries of `git status --porcelain` in a worktree (modified, staged and untracked files; ignored
+ * files don't count), or null when git can't tell. Paths with a line break are quoted by git, so
+ * one line is one entry.
+ */
+export async function countUncommitted(worktree: string, git?: string, untrustedWorktree = false): Promise<number | null> {
+  try {
+    // In a worktree a contained agent wrote, host git must not look inside submodules: status
+    // would run a nested `git status` in each populated one, under that repository's own config
+    // (see SummaryInput.untrustedWorktree). What is inside them is then not counted here;
+    // hasSubmodules says whether that leaves anything unknown.
+    const args = untrustedWorktree ? ['status', '--porcelain', '--ignore-submodules=dirty'] : ['status', '--porcelain'];
+    const { stdout } = await runGit(args, { cwd: worktree, git, signal: AbortSignal.timeout(GIT_TIMEOUT_MS) });
+    return stdout.split('\n').filter((l) => l.trim() !== '').length;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does the index of `worktree` record any submodule? Read from the index alone (`ls-files`), so
+ * nothing inside a submodule is opened. Null when git cannot tell.
+ */
+export async function hasSubmodules(worktree: string, git?: string): Promise<boolean | null> {
+  try {
+    const { stdout } = await runGit(['ls-files', '--stage', '-z'], { cwd: worktree, git, signal: AbortSignal.timeout(GIT_TIMEOUT_MS) });
+    // "<mode> <object> <stage>\t<path>"; mode 160000 is a gitlink.
+    return stdout.split('\0').some((entry) => entry.startsWith('160000 '));
+  } catch {
+    return null;
+  }
+}
+
+/** The commit checked out in `worktree`, or null when git cannot tell. */
+export async function headCommit(worktree: string, git?: string): Promise<string | null> {
+  try {
+    const { stdout } = await runGit(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], { cwd: worktree, git, signal: AbortSignal.timeout(GIT_TIMEOUT_MS) });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 export interface SummaryInput {
   worktree: string;
   branch: string;
   baseSha: string;
   lastOutput: string[];
   git?: string;
+  /**
+   * The worktree was written by a contained agent, and this summary runs git on the host. Git
+   * then must not look inside submodules: `git diff` against the working tree runs `git status`
+   * in each populated submodule, under that nested repository's own config (core.fsmonitor and
+   * filters are commands), which the agent controls. A changed submodule commit still counts;
+   * uncommitted changes inside a submodule do not.
+   */
+  untrustedWorktree?: boolean;
 }
 
 export interface SummaryDetail {
@@ -117,16 +168,19 @@ export async function summarizeRun(input: SummaryInput): Promise<SummaryDetail> 
     }
   };
   const range = `${input.baseSha}..HEAD`;
+  const diff = input.untrustedWorktree ? ['diff', '--ignore-submodules=dirty'] : ['diff'];
   const count = await git(['rev-list', '--count', range], 'commits');
   const log = await git(['log', `--max-count=${MAX_COMMITS}`, '--format=%h %s', range], 'commit list');
-  const stat = await git(['diff', '--stat=200', input.baseSha], 'diff --stat');
-  const names = await git(['diff', '--name-only', '-z', input.baseSha], 'changed files');
+  const stat = await git([...diff, '--stat=200', input.baseSha], 'diff --stat');
+  const names = await git([...diff, '--name-only', '-z', input.baseSha], 'changed files');
   const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z'], 'untracked files');
+  const head = (await git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], 'head commit'))?.trim();
 
   const statLines = (stat ?? '').split('\n').filter((l) => l.trim() !== '');
   const summary: RunSummary = {
     branch: input.branch,
     baseSha: input.baseSha,
+    ...(head ? { headSha: head } : {}),
     worktree: input.worktree,
     commits: (log ?? '').split('\n').map((l) => l.trim()).filter(Boolean),
     commitCount: Number((count ?? '0').trim()) || 0,
@@ -154,6 +208,13 @@ export function renderSummary(d: SummaryDetail): string[] {
     `untracked files: ${s.untracked}`,
     'last agent output:',
     ...(s.lastOutput.length ? s.lastOutput.map((l) => `  | ${l}`) : ['  (none)']),
+    ...(s.verification
+      ? [
+          `verification: ${s.verification.passed ? 'passed' : 'did not pass'}`,
+          ...verificationLines(s.verification).map((l) => `  ${l}`),
+          ...verificationNotes(s.verification).map((n) => `note: ${n}`),
+        ]
+      : []),
     ...s.notes.map((n) => `note: ${n}`),
   ];
   return lines;

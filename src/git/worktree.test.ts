@@ -25,7 +25,7 @@ function fixture(fullName?: string, defaultBranch?: string): GitFixture {
 
 function request(f: GitFixture, over: Partial<PrepareRequest> & { jobId?: string; issue?: number } = {}): PrepareRequest {
   const job = { id: over.jobId ?? 'job_aaa', issueNumber: over.issue ?? 7, repoId: 42 };
-  const paths = { dataDir: join(f.root, 'factory data') };
+  const paths = { dataDir: join(f.root, 'updraft data') };
   return {
     checkoutPath: f.clone,
     repoFullName: 'octo/widgets',
@@ -144,8 +144,8 @@ describe('job naming', () => {
   it('derives the branch and worktree from the job ID, suffixing later attempts', () => {
     const job = { id: 'job_123', issueNumber: 9, repoId: 77 };
     const paths = { dataDir: join('data dir') };
-    expect(jobBranchName(job, 1)).toBe('factory/issue-9-job_123');
-    expect(jobBranchName(job, 2)).toBe('factory/issue-9-job_123-2');
+    expect(jobBranchName(job, 1)).toBe('updraft/issue-9-job_123');
+    expect(jobBranchName(job, 2)).toBe('updraft/issue-9-job_123-2');
     expect(jobWorktreePath(paths, job, 1)).toBe(join('data dir', 'worktrees', '77', 'job_123'));
     expect(jobWorktreePath(paths, job, 3)).toBe(join('data dir', 'worktrees', '77', 'job_123-3'));
     expect(isInside(worktreesRoot(paths), jobWorktreePath(paths, job, 1))).toBe(true);
@@ -163,10 +163,10 @@ describe('prepareJobWorktree', { timeout: 60_000 }, () => {
     const req = request(f);
     const prepared = await prepareJobWorktree(req);
 
-    expect(prepared).toMatchObject({ remote: 'origin', baseBranch: 'main', baseSha: sha, branch: 'factory/issue-7-job_aaa' });
+    expect(prepared).toMatchObject({ remote: 'origin', baseBranch: 'main', baseSha: sha, branch: 'updraft/issue-7-job_aaa' });
     expect(prepared.worktreePath).toBe(req.worktreePath);
     expect(readFileSync(join(req.worktreePath, 'later.txt'), 'utf8').trim()).toBe('later'); // autocrlf may apply
-    expect(f.git(req.worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('factory/issue-7-job_aaa');
+    expect(f.git(req.worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('updraft/issue-7-job_aaa');
     expect(f.git(req.worktreePath, 'rev-parse', 'HEAD')).toBe(sha);
     // The user's clone keeps its own checkout untouched.
     expect(f.git(f.clone, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main');
@@ -203,7 +203,7 @@ describe('prepareJobWorktree', { timeout: 60_000 }, () => {
     const f = fixture();
     const req = request(f);
     f.git(f.clone, 'branch', req.branch);
-    await expect(prepareJobWorktree(req)).rejects.toThrow(/branch factory\/issue-7-job_aaa already exists.*refusing to reuse it/);
+    await expect(prepareJobWorktree(req)).rejects.toThrow(/branch updraft\/issue-7-job_aaa already exists.*refusing to reuse it/);
     expect(existsSync(req.worktreePath)).toBe(false);
 
     const other = request(f, { jobId: 'job_bbb' });

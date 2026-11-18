@@ -1,15 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import type { GitHubPullRequestReview } from '../github/api.js';
+import type { PullRequestReviewSummary } from '../github/api.js';
 import { currentReviewResult, MAX_FINDINGS_CHARS, parseReviewBlock } from './result.js';
 
 const SHA_A = 'a'.repeat(40);
 const SHA_B = '0123456789abcdef0123456789abcdef01234567';
 const SHA_C = 'c'.repeat(40);
 
-const block = (head: string, blockers: string, extra = '') => `<!-- factory-review v1\nhead: ${head}\nblockers: ${blockers}\n${extra}-->`;
+const block = (head: string, blockers: string, extra = '') => `<!-- updraft-review-result v1\nhead: ${head}\nblockers: ${blockers}\n${extra}-->`;
 
 let nextId = 1;
-function review(over: Partial<GitHubPullRequestReview> & { head?: string; blockers?: string } = {}): GitHubPullRequestReview {
+function review(over: Partial<PullRequestReviewSummary> & { head?: string; blockers?: string } = {}): PullRequestReviewSummary {
   const { head = SHA_A, blockers = 'no', ...rest } = over;
   const id = rest.id ?? nextId++;
   return {
@@ -35,26 +35,33 @@ describe('parseReviewBlock', () => {
   it('returns none for an ordinary review and for unrelated HTML comments', () => {
     expect(parseReviewBlock('')).toEqual({ kind: 'none' });
     expect(parseReviewBlock('LGTM <!-- factory-run: run_1 --> <!-- some note -->')).toEqual({ kind: 'none' });
-    expect(parseReviewBlock('<!-- factory-reviewer v1 -->')).toEqual({ kind: 'none' });
+    expect(parseReviewBlock('<!-- updraft-review-resulter v1 -->')).toEqual({ kind: 'none' });
   });
 
   it('accepts CRLF, extra whitespace, a one-line header, upper-case keys and values, and ignores unknown keys', () => {
-    const body = `Findings\r\n\r\n<!--   factory-review   v1\r\n\r\n  HEAD :   ${SHA_B.toUpperCase()}  \r\nBlockers:YES\r\nsummary: two nits\r\n-->\r\n`;
+    const body = `Findings\r\n\r\n<!--   updraft-review-result   v1\r\n\r\n  HEAD :   ${SHA_B.toUpperCase()}  \r\nBlockers:YES\r\nsummary: two nits\r\n-->\r\n`;
     expect(parseReviewBlock(body)).toEqual({ kind: 'block', head: SHA_B, blockers: true, findings: 'Findings', findingsTruncated: false });
-    expect(parseReviewBlock(`<!--\nfactory-review v1\nhead: ${SHA_B}\nblockers: no -->`)).toMatchObject({ kind: 'block', blockers: false });
+    expect(parseReviewBlock(`<!--\nupdraft-review-result v1\nhead: ${SHA_B}\nblockers: no -->`)).toMatchObject({ kind: 'block', blockers: false });
   });
 
   it('is strict about the version tag', () => {
-    expect(parseReviewBlock(`<!-- factory-review v2\nhead: ${SHA_B}\nblockers: no\n-->`)).toEqual({
+    expect(parseReviewBlock(`<!-- updraft-review-result v2\nhead: ${SHA_B}\nblockers: no\n-->`)).toEqual({
       kind: 'invalid',
-      reason: 'unsupported block version "v2" (expected "factory-review v1")',
+      reason: 'unsupported block version "v2" (expected "updraft-review-result v1")',
     });
-    expect(parseReviewBlock(`<!-- factory-review V1\nhead: ${SHA_B}\nblockers: no\n-->`)).toMatchObject({ kind: 'invalid' });
-    expect(parseReviewBlock(`<!-- factory-review\nhead: ${SHA_B}\nblockers: no\n-->`)).toMatchObject({
+    expect(parseReviewBlock(`<!-- updraft-review-result V1\nhead: ${SHA_B}\nblockers: no\n-->`)).toMatchObject({ kind: 'invalid' });
+    expect(parseReviewBlock(`<!-- updraft-review-result\nhead: ${SHA_B}\nblockers: no\n-->`)).toMatchObject({
       kind: 'invalid',
-      reason: expect.stringContaining('must start with "factory-review v1"'),
+      reason: expect.stringContaining('must start with "updraft-review-result v1"'),
     });
-    expect(parseReviewBlock(`<!-- Factory-Review v1\nhead: ${SHA_B}\nblockers: no\n-->`)).toMatchObject({ kind: 'invalid' });
+    expect(parseReviewBlock(`<!-- Updraft-Review-Result v1\nhead: ${SHA_B}\nblockers: no\n-->`)).toMatchObject({ kind: 'invalid' });
+  });
+
+  it('does not mistake the marker of Updraft\'s own reviewer, or the old block name, for a block', () => {
+    // src/publish/review.ts puts this on the reviews Updraft posts; it is an ordinary review here.
+    expect(parseReviewBlock('Looks good.\n\n<!-- updraft-review: run_0mabc123 -->')).toEqual({ kind: 'none' });
+    // The name from before the rename is not read (the rename was a clean break).
+    expect(parseReviewBlock(`<!-- factory-review v1\nhead: ${SHA_B}\nblockers: no\n-->`)).toEqual({ kind: 'none' });
   });
 
   it('is strict about the SHA and blockers', () => {
@@ -64,8 +71,8 @@ describe('parseReviewBlock', () => {
     for (const b of ['maybe', 'true', '0', '']) {
       expect(parseReviewBlock(block(SHA_B, b))).toMatchObject({ kind: 'invalid', reason: expect.stringMatching(/blockers/) });
     }
-    expect(parseReviewBlock(`<!-- factory-review v1\nblockers: no\n-->`)).toMatchObject({ kind: 'invalid', reason: 'missing "head"' });
-    expect(parseReviewBlock(`<!-- factory-review v1\nhead: ${SHA_B}\n-->`)).toMatchObject({ kind: 'invalid', reason: 'missing "blockers"' });
+    expect(parseReviewBlock(`<!-- updraft-review-result v1\nblockers: no\n-->`)).toMatchObject({ kind: 'invalid', reason: 'missing "head"' });
+    expect(parseReviewBlock(`<!-- updraft-review-result v1\nhead: ${SHA_B}\n-->`)).toMatchObject({ kind: 'invalid', reason: 'missing "blockers"' });
     expect(parseReviewBlock(block(SHA_B, 'no', `head: ${SHA_A}\n`))).toMatchObject({ kind: 'invalid', reason: '"head" appears more than once' });
     expect(parseReviewBlock(block(SHA_B, 'no', 'this is prose\n'))).toMatchObject({ kind: 'invalid', reason: expect.stringContaining('malformed line') });
   });
@@ -73,10 +80,10 @@ describe('parseReviewBlock', () => {
   it('rejects several blocks in one review, and an unterminated block', () => {
     expect(parseReviewBlock(`${block(SHA_B, 'no')}\n${block(SHA_B, 'no')}`)).toEqual({
       kind: 'invalid',
-      reason: 'found 2 factory-review blocks; a review must carry exactly one',
+      reason: 'found 2 updraft-review-result blocks; a review must carry exactly one',
     });
-    expect(parseReviewBlock(`${block(SHA_B, 'no')}\n<!-- factory-review v2 -->`)).toMatchObject({ kind: 'invalid' });
-    expect(parseReviewBlock(`text\n<!-- factory-review v1\nhead: ${SHA_B}\nblockers: no\n`)).toMatchObject({
+    expect(parseReviewBlock(`${block(SHA_B, 'no')}\n<!-- updraft-review-result v2 -->`)).toMatchObject({ kind: 'invalid' });
+    expect(parseReviewBlock(`text\n<!-- updraft-review-result v1\nhead: ${SHA_B}\nblockers: no\n`)).toMatchObject({
       kind: 'invalid',
       reason: expect.stringContaining('not closed'),
     });
@@ -157,7 +164,7 @@ describe('currentReviewResult', () => {
     const two = review({ body: `${block(SHA_A, 'no')}${block(SHA_A, 'no')}` });
     const result = currentReviewResult([plain, two], opts);
     expect(result.status).toBe('not-reviewed');
-    expect(result.ignored).toEqual([expect.objectContaining({ reviewId: two.id, reason: expect.stringContaining('invalid factory-review block: found 2') })]);
+    expect(result.ignored).toEqual([expect.objectContaining({ reviewId: two.id, reason: expect.stringContaining('invalid updraft-review-result block: found 2') })]);
   });
 
   it('ignores pending and dismissed reviews', () => {

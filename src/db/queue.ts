@@ -1,10 +1,20 @@
 // OWNER: queue/worker workstream. Claim-side persistence: atomic claims, runs,
 // leases, retry, and status queries.
 import { join } from 'node:path';
-import type { FactoryConfig } from '../config/schema.js';
+import { DEFAULT_MAX_REVISIONS, reviewSettings, type UpdraftConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
-import type { Job, JobStatus, Publication, Run, RunOutcome, RunSummary } from '../types.js';
+import { reviewOf, type Job, type JobStatus, type Publication, type Revision, type Run, type RunContainer, type RunOutcome, type RunSummary } from '../types.js';
+import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
 import { listRecentPublications } from './publications.js';
+import { listRecentLoopPrs, listRecentPrReviews, prStage, type LoopPr, type PrReview, type PrStageInfo } from './pr-reviews.js';
+import {
+  issuesAwaitingRevisionPush,
+  listLimitedRevisionPrs,
+  listRecentReviewRequests,
+  listRecentRevisions,
+  type ReviewRequest,
+  type RevisionPr,
+} from './revisions.js';
 import { newId, nowIso } from '../util/ids.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
 
@@ -33,6 +43,9 @@ export function holdsWorkerLock(db: Db, workerId: string): boolean {
  * Counted in jobs.start_failures; the count resets when the user retries the job.
  */
 export const MAX_START_FAILURES = 3;
+
+/** Reason recorded on a job (and its run) canceled with `updraft cancel`. */
+export const CANCELED_BY_USER = 'canceled by user';
 
 const JOB_STATUSES: readonly JobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'interrupted', 'canceled'];
 const RETRYABLE: readonly JobStatus[] = ['failed', 'interrupted', 'canceled'];
@@ -73,7 +86,7 @@ function startFailedAgents(db: Db, jobId: string, startFailures: number): Set<st
 }
 
 function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void {
-  const reason = `${problem}; fix the config, restart the worker and run "factory retry ${row.id}"`;
+  const reason = `${problem}; fix the config, restart the worker and run "updraft retry ${row.id}"`;
   db.prepare("UPDATE jobs SET status = 'failed', status_reason = ?, updated_at = ? WHERE id = ?").run(reason, at, row.id);
   recordError(db, { scope: 'queue', repoFullName: row.repo_full_name, jobId: row.id, message: reason, at });
 }
@@ -86,11 +99,13 @@ function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void 
  */
 function pickAgent(
   db: Db,
-  config: FactoryConfig,
+  config: UpdraftConfig,
   job: JobRow,
   poolName: string,
   poolAgents: readonly string[],
   load: Map<string, number>,
+  /** Never picked, whatever its capacity (the author of the code a reviewer job reviews). */
+  exclude: string | null = null,
 ): string | null {
   const n = poolAgents.length;
   if (n === 0) return null;
@@ -103,7 +118,7 @@ function pickAgent(
     const index = (start + k) % n;
     const name = poolAgents[index]!;
     const agent = ownEntry(config.agents, name);
-    if (agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) capable.push({ name, index });
+    if (name !== exclude && agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) capable.push({ name, index });
   }
   if (capable.length === 0) return null;
   const failed = startFailedAgents(db, job.id, job.start_failures);
@@ -115,14 +130,46 @@ function pickAgent(
 }
 
 /**
+ * A reviewer job (repositories.<repo>.review) must not be run by the agent that wrote the code
+ * under review while the pool has another enabled agent: that agent is excluded from the pick,
+ * and the job waits for one of the others to have capacity. When the pool has no other enabled
+ * agent, the author reviews its own work only if the repository says so
+ * (review: { allowSameAgent: true }); otherwise the job cannot be routed (`problem`).
+ */
+function reviewerExclusion(config: UpdraftConfig, row: JobRow, poolAgents: readonly string[]): { exclude: string | null; problem?: string } {
+  if (!row.event_id.startsWith('pr-review:')) return { exclude: null };
+  let author: string | null;
+  try {
+    author = reviewOf(rowToJob(row))?.authorAgent ?? null;
+  } catch {
+    author = null;
+  }
+  if (!author) return { exclude: null };
+  const others = poolAgents.filter((a) => a !== author && ownEntry(config.agents, a)?.enabled);
+  if (others.length > 0) return { exclude: author };
+  const repo = Object.values(config.repositories).find((r) => r.id === row.repo_id);
+  if (repo && reviewSettings(repo).allowSameAgent) return { exclude: null };
+  return {
+    exclude: author,
+    problem:
+      `pool "${row.pool}" has no enabled agent other than "${author}", which wrote the code under review; add another agent to the review pool, ` +
+      'or set review: { allowSameAgent: true } for the repository',
+  };
+}
+
+/**
  * Atomically pick the oldest claimable queued job and start a run for it on an
  * eligible agent with capacity, honoring the global limit, per-agent limits
  * (across pools and repos), round-robin order per pool, and at most one running
- * job per (repo, issue). Returns null when nothing can start now.
+ * job per (repo, issue). A revision job belongs to the issue of the PR it revises, so it also
+ * waits for that issue's other jobs, and for an earlier revision whose push has not settled.
+ * A reviewer job is the same, and is never given to the agent that wrote the code it reviews
+ * while another agent can take it (reviewerExclusion).
+ * Returns null when nothing can start now.
  *
  * A queued job whose pool or action is no longer in the config is marked
  * `failed` with a reason and an error row (never silently dropped); the user can
- * `factory retry` it after fixing the config. Jobs in `excludeJobIds` are skipped.
+ * `updraft retry` it after fixing the config. Jobs in `excludeJobIds` are skipped.
  *
  * With `lockWorkerId`, the claim first checks, inside the same transaction, that this
  * worker still holds the single-worker lock, and throws WorkerLockLostError otherwise.
@@ -133,7 +180,7 @@ function pickAgent(
  */
 export function claimNextJob(
   db: Db,
-  config: FactoryConfig,
+  config: UpdraftConfig,
   opts: {
     workerId: string;
     /** Host the claiming worker runs on (os.hostname()). */
@@ -164,6 +211,9 @@ export function claimNextJob(
           .all() as { repo_id: number; issue_number: number }[]
       ).map((r) => issueKey(r.repo_id, r.issue_number)),
     );
+    // A revision starts from the PR branch's remote head: it must not start while the previous
+    // revision's commits are still on their way there.
+    for (const r of issuesAwaitingRevisionPush(db, clock)) busyIssues.add(issueKey(r.repoId, r.issueNumber));
     const queued = db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, rowid").all() as unknown as JobRow[];
     const nowMs = clock();
     const at = new Date(nowMs).toISOString();
@@ -182,7 +232,12 @@ export function claimNextJob(
         continue;
       }
 
-      const agent = pickAgent(db, config, row, row.pool, pool.agents, load);
+      const reviewer = reviewerExclusion(config, row, pool.agents);
+      if (reviewer.problem) {
+        failUnroutable(db, row, reviewer.problem, at);
+        continue;
+      }
+      const agent = pickAgent(db, config, row, row.pool, pool.agents, load, reviewer.exclude);
       if (!agent) continue; // this pool is saturated; later jobs in other pools may still start
 
       const runId = newId('run');
@@ -205,6 +260,9 @@ export function claimNextJob(
         outcome: null,
         error: null,
         summary: null,
+        cancel_requested_at: null,
+        container_runtime: null,
+        container_name: null,
       };
       db.prepare(
         `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, hostname, pid, lease_expires_at, started_at)
@@ -246,6 +304,8 @@ export interface RunProcessInfo {
   /** OS start time of `pid` (see processStartTime); recorded once known, right after the pid. */
   pidStartTime?: string | null;
   checkoutPath?: string | null;
+  /** The container about to be started for the run (see Run.container); recorded before it starts. */
+  container?: RunContainer | null;
 }
 
 /** Record the agent subprocess and/or checkout for a running run (used by live adapters and reconcile). */
@@ -257,6 +317,12 @@ export function setRunProcess(db: Db, runId: string, info: RunProcessInfo): void
   }
   if (info.checkoutPath !== undefined)
     db.prepare('UPDATE runs SET checkout_path = ? WHERE id = ?').run(info.checkoutPath, runId);
+  if (info.container !== undefined)
+    db.prepare('UPDATE runs SET container_runtime = ?, container_name = ? WHERE id = ?').run(
+      info.container?.runtime ?? null,
+      info.container?.name ?? null,
+      runId,
+    );
 }
 
 /** Store the post-run summary of a live agent run. */
@@ -266,16 +332,17 @@ export function setRunSummary(db: Db, runId: string, summary: RunSummary): void 
 
 /**
  * Mark a claimed run as executing, immediately before the worker hands it to the executor.
- * Atomic with the lock check: succeeds only while the run is open, not yet started, and
- * `workerId` still holds the worker lock. Returns the timestamp, or null if the worker must
- * not start it (the lock changed hands, and the new holder may already have requeued it).
+ * Atomic with the lock check: succeeds only while the run is open, not yet started, not
+ * canceled by the user, and `workerId` still holds the worker lock. Returns the timestamp, or
+ * null if the worker must not start it (the user canceled it, or the lock changed hands and the
+ * new holder may already have requeued it).
  */
 export function markExecutionStarted(db: Db, runId: string, opts: { workerId: string; now?: () => number }): string | null {
   const at = nowIso(opts.now ?? Date.now);
   const res = db
     .prepare(
       `UPDATE runs SET execution_started_at = ?
-       WHERE id = ? AND ended_at IS NULL AND execution_started_at IS NULL
+       WHERE id = ? AND ended_at IS NULL AND execution_started_at IS NULL AND cancel_requested_at IS NULL
          AND EXISTS (SELECT 1 FROM worker_lock WHERE id = 1 AND worker_id = ?)`,
     )
     .run(at, runId, opts.workerId);
@@ -296,30 +363,58 @@ export function listOpenRuns(db: Db): Run[] {
   return (db.prepare('SELECT * FROM runs WHERE ended_at IS NULL ORDER BY started_at').all() as unknown as RunRow[]).map(rowToRun);
 }
 
+/** How finishRun closed a run. `outcome` is null when the run ended as canceled by the user. */
+export interface FinishedRun {
+  outcome: RunOutcome | null;
+  canceledByUser: boolean;
+}
+
 /**
  * Close a run and move its job to the matching terminal state (or back to queued for start_failed).
  *
  * - succeeded / failed / interrupted: job gets the same status (checkout and log are kept).
  * - start_failed: the slot is released and the job requeued so another eligible agent is
  *   tried; after MAX_START_FAILURES consecutive start failures the job is marked failed.
+ * - the user asked to cancel the run (`updraft cancel` set cancel_requested_at): whatever
+ *   `result.outcome` says, the run closes with no outcome and the job is 'canceled'. The request
+ *   and this close are both transactions, so exactly one wins: a request recorded before the run
+ *   closed is always honored (never requeued, never published), and one that arrives after sees a
+ *   job that is no longer running.
  *
- * Idempotent: closing an already-closed run is a no-op. Only a job still `running` is moved.
+ * Idempotent: closing an already-closed run is a no-op and returns null. Only a job still
+ * `running` is moved.
  */
 export function finishRun(
   db: Db,
   runId: string,
   result: { outcome: RunOutcome; error?: string | null; now?: () => number },
-): void {
+): FinishedRun | null {
   const at = nowIso(result.now ?? Date.now);
-  transaction(db, () => {
+  return transaction(db, () => {
     const run = getRunRow(db, runId);
     if (!run) throw new Error(`run ${runId} not found`);
-    if (run.ended_at !== null) return;
+    if (run.ended_at !== null) return null;
     const error = result.error ?? null;
+
+    if (run.cancel_requested_at !== null) {
+      // An executor that was stopped reports 'interrupted'; anything else means the agent had
+      // already exited when the request was noticed, which is worth keeping on the run.
+      const detail =
+        result.outcome === 'interrupted' ? '' : ` (the run had already ended: ${result.outcome}${error ? `, ${error}` : ''})`;
+      db.prepare('UPDATE runs SET ended_at = ?, outcome = NULL, error = ? WHERE id = ?').run(at, `${CANCELED_BY_USER}${detail}`, runId);
+      db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ? AND status = 'running'").run(
+        CANCELED_BY_USER,
+        at,
+        run.job_id,
+      );
+      return { outcome: null, canceledByUser: true };
+    }
+
     db.prepare('UPDATE runs SET ended_at = ?, outcome = ?, error = ? WHERE id = ?').run(at, result.outcome, error, runId);
+    const finished: FinishedRun = { outcome: result.outcome, canceledByUser: false };
 
     const job = getJobRow(db, run.job_id);
-    if (!job || job.status !== 'running') return;
+    if (!job || job.status !== 'running') return finished;
 
     let status: JobStatus;
     let reason: string | null;
@@ -365,6 +460,7 @@ export function finishRun(
         at,
       });
     }
+    return finished;
   });
 }
 
@@ -374,6 +470,12 @@ function closeClaim(db: Db, runId: string, jobStatus: 'canceled' | 'queued', rea
     const run = getRunRow(db, runId);
     if (!run) throw new Error(`run ${runId} not found`);
     if (run.ended_at !== null) return;
+    // A user cancel recorded while the run was claimed wins over requeueing it, and over the
+    // pre-start check's own reason: the job must not come back on its own.
+    if (run.cancel_requested_at !== null) {
+      jobStatus = 'canceled';
+      reason = CANCELED_BY_USER;
+    }
     // outcome stays NULL: the agent never started, so this is not an agent failure.
     db.prepare('UPDATE runs SET ended_at = ?, error = ? WHERE id = ?').run(
       at,
@@ -424,6 +526,71 @@ export function retryJob(db: Db, jobId: string, now?: () => number): Job {
   });
 }
 
+export type CancelRequest =
+  /** The job was queued; it is canceled now. */
+  | { kind: 'canceled'; job: Job }
+  /** The job is running under a live worker; the request is recorded on `run` for the worker to act on. */
+  | { kind: 'requested'; job: Job; run: Run; alreadyRequested: boolean }
+  /** The job is 'running' but no live worker owns its run, so nobody would act on a request. Nothing changed. */
+  | { kind: 'stale'; job: Job; run: Run | null }
+  /** The job already reached a terminal state. Nothing changed. */
+  | { kind: 'terminal'; job: Job }
+  | { kind: 'not-found' };
+
+/**
+ * `updraft cancel`: cancel a queued job directly, or record a cancel request on the open run of
+ * a running one. One transaction, so it serializes with the worker closing the run (finishRun,
+ * closeClaim), a lock takeover and `updraft retry`: the job is judged by the state it has when
+ * this commits, and the request lands on the run that is open at that moment and no other.
+ *
+ * A request is only recorded while the worker that claimed the run holds a fresh lock. Otherwise
+ * the run is a leftover that the next worker's reconcile closes, and a recorded request would
+ * only claim something that is not going to happen.
+ */
+export function requestJobCancel(db: Db, jobId: string, now?: () => number): CancelRequest {
+  const clock = now ?? Date.now;
+  const at = nowIso(clock);
+  return transaction(db, (): CancelRequest => {
+    const row = getJobRow(db, jobId);
+    if (!row) return { kind: 'not-found' };
+    if (row.status === 'queued') {
+      db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ?").run(CANCELED_BY_USER, at, jobId);
+      return { kind: 'canceled', job: rowToJob(getJobRow(db, jobId)!) };
+    }
+    const job = rowToJob(row);
+    if (row.status !== 'running') return { kind: 'terminal', job };
+
+    const runRow = db
+      .prepare('SELECT * FROM runs WHERE job_id = ? AND ended_at IS NULL ORDER BY attempt DESC LIMIT 1')
+      .get(jobId) as RunRow | undefined;
+    if (!runRow) return { kind: 'stale', job, run: null };
+    const lock = db.prepare('SELECT worker_id, heartbeat_at FROM worker_lock WHERE id = 1').get() as
+      | { worker_id: string; heartbeat_at: string }
+      | undefined;
+    const owned = lock !== undefined && lock.worker_id === runRow.worker_id && clock() - Date.parse(lock.heartbeat_at) <= WORKER_STALE_MS;
+    if (!owned) return { kind: 'stale', job, run: rowToRun(runRow) };
+
+    const alreadyRequested = runRow.cancel_requested_at !== null;
+    if (!alreadyRequested) db.prepare('UPDATE runs SET cancel_requested_at = ? WHERE id = ?').run(at, runRow.id);
+    return { kind: 'requested', job, run: rowToRun(getRunRow(db, runRow.id)!), alreadyRequested };
+  });
+}
+
+/** Open runs the user asked to cancel; the worker aborts the ones it is executing. */
+export function listCancelRequestedRuns(db: Db): string[] {
+  return (
+    db.prepare('SELECT id FROM runs WHERE ended_at IS NULL AND cancel_requested_at IS NOT NULL').all() as { id: string }[]
+  ).map((r) => r.id);
+}
+
+/** The newest run of a job (by attempt), or null if it never had one. */
+export function latestRunOfJob(db: Db, jobId: string): Run | null {
+  const row = db.prepare('SELECT * FROM runs WHERE job_id = ? ORDER BY attempt DESC, started_at DESC LIMIT 1').get(jobId) as
+    | RunRow
+    | undefined;
+  return row ? rowToRun(row) : null;
+}
+
 export interface AgentLoad {
   agent: string;
   enabled: boolean;
@@ -443,9 +610,21 @@ export interface StatusSnapshot {
   checkpoints: Array<{ repoId: number; fullName: string; lastEventId: number | null; updatedAt: string }>;
   /** Recent publications (pushed branches and PRs), newest first. */
   publications?: Publication[];
+  /** Recent failure comments (posted, pending or not posted), newest first. */
+  failureComments?: FailureComment[];
+  /** Recent revision pushes and replies (repositories.<repo>.revise), newest first. */
+  revisions?: Revision[];
+  /** Recent change requests on watched PRs and what was decided about each, newest first. */
+  reviewRequests?: ReviewRequest[];
+  /** PRs that reached maxRevisions, newest first. */
+  limitedPullRequests?: RevisionPr[];
+  /** Watched PRs with their stage in the review loop (repositories.<repo>.review), most recently changed first. */
+  pullRequests?: Array<{ pr: LoopPr; stage: PrStageInfo }>;
+  /** Recent reviewer verdicts and their posting, newest first. */
+  reviews?: PrReview[];
 }
 
-export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => number): StatusSnapshot {
+export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => number): StatusSnapshot {
   const nowMs = (now ?? Date.now)();
 
   const lock = db.prepare('SELECT * FROM worker_lock WHERE id = 1').get() as
@@ -515,5 +694,27 @@ export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => num
 
   const publications = listRecentPublications(db, 10);
 
-  return { worker, counts, agents, activeRuns, recentJobs, recentAgentRuns, recentErrors, checkpoints, publications };
+  const failureComments = listRecentFailureComments(db, 10);
+
+  return {
+    worker,
+    counts,
+    agents,
+    activeRuns,
+    recentJobs,
+    recentAgentRuns,
+    recentErrors,
+    checkpoints,
+    publications,
+    failureComments,
+    revisions: listRecentRevisions(db, 10),
+    reviewRequests: listRecentReviewRequests(db, 10),
+    limitedPullRequests: listLimitedRevisionPrs(db, 10),
+    // Only where the review loop is configured: without it a watched PR has no stage to speak of.
+    pullRequests: listRecentLoopPrs(db, 20).flatMap((pr) => {
+      const repo = Object.values(config.repositories).find((r) => r.id === pr.repoId);
+      return repo && reviewSettings(repo).enabled ? [{ pr, stage: prStage(db, pr, repo.maxRevisions ?? DEFAULT_MAX_REVISIONS) }] : [];
+    }),
+    reviews: listRecentPrReviews(db, 10),
+  };
 }

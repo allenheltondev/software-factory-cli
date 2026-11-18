@@ -33,6 +33,84 @@ describe('validateConfig', () => {
     expect(validateConfig(cfg).ok).toBe(false);
   });
 
+  it('accepts verify commands as strings or argv arrays and rejects malformed ones', () => {
+    const live = () => {
+      const cfg = example();
+      cfg.execution = { mode: 'live' };
+      for (const repo of Object.values(cfg.repositories) as Array<{ checkoutPath?: string }>) repo.checkoutPath ??= './clone';
+      return cfg;
+    };
+    const restore = [registerAdapter(fakeAdapter({ name: 'claude' })), registerAdapter(fakeAdapter({ name: 'kiro' })), registerAdapter(fakeAdapter({ name: 'codex' }))];
+    try {
+      const cfg = live();
+      const action = Object.keys(cfg.actions).find((a) => (cfg.actions[a].output ?? 'local-branch') === 'local-branch')!;
+      cfg.actions[action].verify = ['npm ci', ['node', '--test', 'a file.js']];
+      cfg.actions[action].verifyTimeoutMinutes = 20;
+      const ok = validateConfig(cfg);
+      expect(ok.ok).toBe(true);
+      expect(ok.warnings.filter((w) => w.path.includes('verify'))).toEqual([]);
+
+      for (const bad of ['npm test', [], [''], ['   '], ['npm ci\nnpm test'], [[]], [['', 'x']], [42], [['node', 1]]]) {
+        const c = live();
+        c.actions[action].verify = bad;
+        const r = validateConfig(c);
+        expect(r.ok, JSON.stringify(bad)).toBe(false);
+        if (!r.ok) expect(r.errors.every((e) => e.path.startsWith(`actions.${action}.verify`)), JSON.stringify(r.errors)).toBe(true);
+      }
+      const c = live();
+      c.actions[action].verify = ['npm test'];
+      c.actions[action].verifyTimeoutMinutes = 0;
+      expect(validateConfig(c).ok).toBe(false);
+    } finally {
+      for (const r of restore.reverse()) r();
+    }
+  });
+
+  it('warns when verify is set where it does nothing', () => {
+    const cfg = example();
+    const action = Object.keys(cfg.actions)[0]!;
+    cfg.actions[action].verify = ['npm test'];
+    const logOnly = validateConfig(cfg);
+    expect(logOnly.ok).toBe(true);
+    expect(logOnly.warnings).toContainEqual({ path: `actions.${action}.verify`, message: expect.stringMatching(/only applies in live mode; in log-only mode/) });
+
+    const restore = [registerAdapter(fakeAdapter({ name: 'claude' })), registerAdapter(fakeAdapter({ name: 'kiro' })), registerAdapter(fakeAdapter({ name: 'codex' }))];
+    try {
+      cfg.execution = { mode: 'live' };
+      for (const repo of Object.values(cfg.repositories) as Array<{ checkoutPath?: string }>) repo.checkoutPath ??= './clone';
+      cfg.actions[action].output = 'log';
+      const live = validateConfig(cfg);
+      expect(live.warnings).toContainEqual({ path: `actions.${action}.verify`, message: expect.stringMatching(/only applies to actions with output local-branch/) });
+
+      delete cfg.actions[action].verify;
+      cfg.actions[action].verifyTimeoutMinutes = 5;
+      expect(validateConfig(cfg).warnings).toContainEqual({ path: `actions.${action}.verifyTimeoutMinutes`, message: 'has no effect without verify' });
+    } finally {
+      for (const r of restore.reverse()) r();
+    }
+  });
+
+  it('defaults commentOnFailure to off and warns when it is set outside live mode', () => {
+    const repo = 'allenheltondev/kids-and-dragons';
+    const plain = validateConfig(example());
+    expect(plain.ok && plain.config.repositories[repo]?.commentOnFailure).toBeUndefined();
+
+    const cfg = example();
+    cfg.repositories[repo].commentOnFailure = true;
+    const r = validateConfig(cfg);
+    expect(r.ok).toBe(true);
+    expect(r.warnings).toContainEqual({
+      path: `repositories.${repo}.commentOnFailure`,
+      message: 'only applies in live mode; in log-only mode no comment is posted when a run fails',
+    });
+
+    cfg.repositories[repo].commentOnFailure = false;
+    expect(validateConfig(cfg).warnings.some((w) => w.path.endsWith('.commentOnFailure'))).toBe(false);
+
+    cfg.repositories[repo].commentOnFailure = 'yes';
+    expect(validateConfig(cfg).ok).toBe(false);
+  });
+
   it('rejects dangling references', () => {
     const cfg = example();
     cfg.pools.general.agents.push('nobody');
@@ -84,7 +162,7 @@ describe('validateConfig', () => {
     expect(r.ok).toBe(missing.length === 0);
     if (r.ok) return;
     expect(r.errors).toEqual(
-      missing.map((a) => ({ path: `agents.${a}`, message: expect.stringMatching(new RegExp(`live execution is not implemented for adapter "${a}" in this release`)) })),
+      missing.map((a) => ({ path: `agents.${a}`, message: expect.stringMatching(new RegExp(`live execution is not implemented for adapter "${a}"`)) })),
     );
   });
 
@@ -184,8 +262,8 @@ describe('validateConfig', () => {
 describe('selectPool', () => {
   const selector = { rules: [{ hasLabel: 'art', use: 'art' }], default: 'general' };
   it('first matching rule wins, case-insensitively', () => {
-    expect(selectPool(selector, ['factory:ready', 'Art'])).toBe('art');
-    expect(selectPool(selector, ['factory:ready'])).toBe('general');
+    expect(selectPool(selector, ['updraft:ready', 'Art'])).toBe('art');
+    expect(selectPool(selector, ['updraft:ready'])).toBe('general');
     expect(selectPool('general', ['art'])).toBe('general');
   });
 });

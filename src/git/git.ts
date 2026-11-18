@@ -149,7 +149,7 @@ export async function listRemotes(opts: GitOptions): Promise<Remote[]> {
 export type RemoteSelection = { ok: true; remote: Remote; reason: string } | { ok: false; error: string };
 
 /**
- * The one rule the worker and `factory doctor` use to decide which remote of a clone is the
+ * The one rule the worker and `updraft doctor` use to decide which remote of a clone is the
  * configured repository.
  *
  * - With `explicit` (repositories.<repo>.remote), use exactly that remote. Its OWNER/NAME must

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentExit, InvocationRequest } from './adapter.js';
-import { kiroAdapter, lastOutputLine } from './kiro.js';
+import { kiroAdapter, kiroArgsChooseHarness, kiroSupportsV3, lastOutputLine } from './kiro.js';
 import { getAdapter, implementedAdapters } from './registry.js';
 
 function request(o: Partial<InvocationRequest> = {}): InvocationRequest {
@@ -48,7 +48,7 @@ describe('kiro adapter: invocation', () => {
   });
 
   it('appends config args last', () => {
-    expect(args(['--model', 'claude-sonnet-4', '--agent', 'factory'])).toEqual([...DEFAULT_ARGS, '--model', 'claude-sonnet-4', '--agent', 'factory']);
+    expect(args(['--model', 'claude-sonnet-4', '--agent', 'updraft'])).toEqual([...DEFAULT_ARGS, '--model', 'claude-sonnet-4', '--agent', 'updraft']);
   });
 
   it('a trust flag in the config args replaces the full-auto default', () => {
@@ -66,6 +66,26 @@ describe('kiro adapter: invocation', () => {
   it('does not repeat --no-interactive, and passes an --output-format through', () => {
     expect(args(['--no-interactive'])).toEqual(['chat', '--v3', '--trust-all-tools', '--no-interactive']);
     expect(args(['--output-format', 'stream-json'])).toEqual([...DEFAULT_ARGS, '--output-format', 'stream-json']);
+  });
+});
+
+describe('kiro adapter: version baseline', () => {
+  it('3.0.0 is the baseline the adapter is written against; an unreadable version is unknown', () => {
+    expect(kiroSupportsV3('2.9.9')).toBe('no');
+    expect(kiroSupportsV3('1.20.0-beta.1')).toBe('no');
+    expect(kiroSupportsV3('3.0.0')).toBe('yes');
+    expect(kiroSupportsV3('3.0.0-beta.1')).toBe('yes');
+    expect(kiroSupportsV3('10.2.0')).toBe('yes');
+    expect(kiroSupportsV3('nightly')).toBe('unknown');
+    expect(kiroSupportsV3(null)).toBe('unknown');
+  });
+
+  it('the harness flags that replace --v3 are the ones buildInvocation reads', () => {
+    for (const a of [['--v2'], ['--v3'], ['--agent-engine', 'v2'], ['--agent-engine=v3']]) {
+      expect(kiroArgsChooseHarness(a)).toBe(true);
+      expect(args(a).filter((x) => x === '--v3').length).toBe(a[0] === '--v3' ? 1 : 0);
+    }
+    expect(kiroArgsChooseHarness(['--model', 'x'])).toBe(false);
   });
 });
 
@@ -88,8 +108,8 @@ describe('kiro adapter: results', () => {
       outcome: 'failed',
       error: 'kiro-cli exited with code 3 (an MCP server required by --require-mcp-startup did not start)',
     });
-    expect(kiroAdapter.interpretExit!(exit('agent "factory" not found\n', 4)).error).toBe(
-      'kiro-cli exited with code 4 (the agent the run named (--agent or chat.defaultAgent) is not available): agent "factory" not found',
+    expect(kiroAdapter.interpretExit!(exit('agent "updraft" not found\n', 4)).error).toBe(
+      'kiro-cli exited with code 4 (the agent the run named (--agent or chat.defaultAgent) is not available): agent "updraft" not found',
     );
   });
 

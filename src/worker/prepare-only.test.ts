@@ -3,11 +3,11 @@ import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
-import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { claimNextJob, getJob, setRunProcess, type Claim } from '../db/queue.js';
 import { isInside, worktreesRoot } from '../git/worktree.js';
-import { resolvePaths, type FactoryPaths } from '../paths.js';
+import { resolvePaths, type UpdraftPaths } from '../paths.js';
 import { silentLogger } from '../util/log.js';
 import { runDaemon } from './daemon.js';
 import { LogOnlyExecutor, type ExecutionContext } from './executor.js';
@@ -21,11 +21,11 @@ afterEach(() => {
   for (const f of fixtures.splice(0)) f.cleanup();
 });
 
-function setup(repoOver: Record<string, unknown> = {}, over: Partial<FactoryConfigInput> = {}) {
+function setup(repoOver: Record<string, unknown> = {}, over: Partial<UpdraftConfigInput> = {}) {
   const f = createGitFixture('octo/widgets');
   fixtures.push(f);
-  const paths: FactoryPaths = resolvePaths({ env: { FACTORY_HOME: join(f.root, 'factory home') } });
-  const config: FactoryConfig = configSchema.parse({
+  const paths: UpdraftPaths = resolvePaths({ env: { UPDRAFT_HOME: join(f.root, 'updraft home') } });
+  const config: UpdraftConfig = configSchema.parse({
     version: 1,
     maxConcurrent: 4,
     execution: { mode: 'prepare-only' },
@@ -40,7 +40,7 @@ function setup(repoOver: Record<string, unknown> = {}, over: Partial<FactoryConf
         checkoutPath: relative(paths.configDir, f.clone),
         // The fixture's remote is a local path, so it has to be named explicitly.
         remote: 'origin',
-        workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
         ...repoOver,
       },
     },
@@ -51,13 +51,13 @@ function setup(repoOver: Record<string, unknown> = {}, over: Partial<FactoryConf
   return { f, paths, config, db };
 }
 
-function claim(db: Db, config: FactoryConfig, paths: FactoryPaths): Claim {
+function claim(db: Db, config: UpdraftConfig, paths: UpdraftPaths): Claim {
   const c = claimNextJob(db, config, { workerId: 'wrk_test', hostname: 'test-host', leaseSeconds: 60, runsDir: paths.runsDir });
   if (!c) throw new Error('nothing to claim');
   return c;
 }
 
-function context(db: Db, config: FactoryConfig, paths: FactoryPaths, runId: string, signal = new AbortController().signal) {
+function context(db: Db, config: UpdraftConfig, paths: UpdraftPaths, runId: string, signal = new AbortController().signal) {
   const recorded: Array<{ pid?: number | null; checkoutPath?: string | null }> = [];
   const ctx: ExecutionContext = {
     config,
@@ -112,7 +112,7 @@ describe('PrepareOnlyExecutor', { timeout: 60_000 }, () => {
     expect(a.log_path).not.toBe(b.log_path);
     for (const [i, run] of runs.entries()) {
       const issue = 11 + i;
-      const branch = `factory/issue-${issue}-${ids[i]}`;
+      const branch = `updraft/issue-${issue}-${ids[i]}`;
       expect(run.checkout_path).toBe(join(worktreesRoot(paths), '42', ids[i]!));
       expect(isInside(worktreesRoot(paths), run.checkout_path)).toBe(true);
       expect(f.git(run.checkout_path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(branch);
@@ -132,7 +132,7 @@ describe('PrepareOnlyExecutor', { timeout: 60_000 }, () => {
   it('fails (keeping run.log) when the branch already exists, and records no checkout', async () => {
     const { f, paths, config, db } = setup();
     const jobId = insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 5 });
-    f.git(f.clone, 'branch', `factory/issue-5-${jobId}`);
+    f.git(f.clone, 'branch', `updraft/issue-5-${jobId}`);
     const c = claim(db, config, paths);
     const { ctx, recorded } = context(db, config, paths, c.run.id);
     const result = await new PrepareOnlyExecutor().execute(c, ctx);
@@ -141,7 +141,7 @@ describe('PrepareOnlyExecutor', { timeout: 60_000 }, () => {
     expect(recorded).toEqual([]);
     const log = readFileSync(c.run.logPath!, 'utf8');
     expect(log).toContain('checkout: none (preparation failed)');
-    expect(log).toMatch(/error: could not prepare the worktree: branch factory\/issue-5-job_\w+ already exists/);
+    expect(log).toMatch(/error: could not prepare the worktree: branch updraft\/issue-5-job_\w+ already exists/);
   });
 
   it('records a worktree left by a failed git worktree add, so the failed run keeps it', async () => {
@@ -170,7 +170,7 @@ describe('PrepareOnlyExecutor', { timeout: 60_000 }, () => {
     const second = { ...c, run: { ...c.run, attempt: 2 } };
     expect(await new PrepareOnlyExecutor().execute(second, ctx)).toEqual({ outcome: 'succeeded' });
     const checkout = join(worktreesRoot(paths), '42', `${c.job.id}-2`);
-    expect(f.git(checkout, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(`factory/issue-6-${c.job.id}-2`);
+    expect(f.git(checkout, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(`updraft/issue-6-${c.job.id}-2`);
   });
 
   it('creates no checkout for an action whose output is log', async () => {
