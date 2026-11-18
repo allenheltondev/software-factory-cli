@@ -68,17 +68,20 @@ RUN set -eu; . /opt/updraft/build.env; \
 RUN set -eu; . /opt/updraft/build.env; \
     PM="$(command -v dnf || command -v microdnf)"; \
     missing=""; \
-    for pkg in ${SYSTEM_PACKAGES:-}; do \
+    for pkg in ${SYSTEM_PACKAGES:-} ${BROWSER_PACKAGES:-}; do \
       if ! "$PM" install -y "$pkg"; then missing="$missing $pkg"; fi; \
     done; \
     "$PM" clean all; \
     if [ -n "$missing" ]; then \
-      echo "these SYSTEM_PACKAGES could not be installed:$missing (edit image/build.env)" >&2; exit 1; \
+      echo "these SYSTEM_PACKAGES or BROWSER_PACKAGES could not be installed:$missing (edit image/build.env)" >&2; exit 1; \
     fi; \
     if [ -n "${PYTHON_COMMAND:-}" ]; then \
       PY="$(command -v "$PYTHON_COMMAND")" || { echo "PYTHON_COMMAND $PYTHON_COMMAND is not installed" >&2; exit 1; }; \
       ln -sf "$PY" /usr/local/bin/python3; ln -sf "$PY" /usr/local/bin/python; \
       python3 --version; python3 -m pip --version; \
+    fi; \
+    if [ -n "${UV_VERSION:-}" ]; then \
+      python3 -m pip install --no-cache-dir "uv==${UV_VERSION}"; uv --version; \
     fi
 
 # Toolchain for the repositories the agents work on (TOOL_PACKAGES in build.env), on PATH for
@@ -87,6 +90,19 @@ RUN set -eu; . /opt/updraft/build.env; \
     if [ -n "${TOOL_PACKAGES:-}" ]; then npm install -g --no-fund --no-audit ${TOOL_PACKAGES}; fi; \
     npm cache clean --force >/dev/null 2>&1 || true; \
     if command -v tsc >/dev/null 2>&1; then tsc --version; fi
+
+# A headless browser (PLAYWRIGHT_VERSION and PLAYWRIGHT_BROWSERS in build.env), in a directory
+# every job shares. It is writable by the job user so that a project pinned to another
+# Playwright version can add its own browser build next to this one.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN set -eu; . /opt/updraft/build.env; \
+    mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"; \
+    if [ -n "${PLAYWRIGHT_VERSION:-}" ]; then \
+      npm install -g --no-fund --no-audit "playwright@${PLAYWRIGHT_VERSION}"; \
+      playwright install ${PLAYWRIGHT_BROWSERS:-chromium}; \
+      npm cache clean --force >/dev/null 2>&1 || true; \
+    fi; \
+    chmod -R a+rwX "$PLAYWRIGHT_BROWSERS_PATH"
 
 # The runner and its AWS SDK clients.
 COPY runner/ /opt/updraft/runner/

@@ -18,7 +18,8 @@
 #                     (default: arn:aws:lambda:<region>:aws:microvm-image:al2023-1)
 #   BASE_IMAGE_VERSION  pin a base image version                     (default: latest)
 #   NODE_VERSION, UPDRAFT_SPEC, AGENT_PACKAGES, TOOL_PACKAGES,
-#   SYSTEM_PACKAGES, PYTHON_COMMAND                              override image/build.env
+#   SYSTEM_PACKAGES, PYTHON_COMMAND, UV_VERSION, BROWSER_PACKAGES,
+#   PLAYWRIGHT_VERSION, PLAYWRIGHT_BROWSERS                      override image/build.env
 #   UPDRAFT_TARBALL   path of an `npm pack` tarball to install instead of UPDRAFT_SPEC
 #   BUILD_TIMEOUT_SECONDS  how long to wait for the image build      (default: 2400)
 #   SAM_PARAMETER_OVERRIDES  extra template parameters, e.g.
@@ -122,6 +123,10 @@ build_image() {
     [ -z "${TOOL_PACKAGES+set}" ] || printf 'TOOL_PACKAGES="%s"\n' "$TOOL_PACKAGES"
     [ -z "${SYSTEM_PACKAGES+set}" ] || printf 'SYSTEM_PACKAGES="%s"\n' "$SYSTEM_PACKAGES"
     [ -z "${PYTHON_COMMAND+set}" ] || printf 'PYTHON_COMMAND="%s"\n' "$PYTHON_COMMAND"
+    [ -z "${UV_VERSION+set}" ] || printf 'UV_VERSION="%s"\n' "$UV_VERSION"
+    [ -z "${BROWSER_PACKAGES+set}" ] || printf 'BROWSER_PACKAGES="%s"\n' "$BROWSER_PACKAGES"
+    [ -z "${PLAYWRIGHT_VERSION+set}" ] || printf 'PLAYWRIGHT_VERSION="%s"\n' "$PLAYWRIGHT_VERSION"
+    [ -z "${PLAYWRIGHT_BROWSERS+set}" ] || printf 'PLAYWRIGHT_BROWSERS="%s"\n' "$PLAYWRIGHT_BROWSERS"
   } >> "$stage/context/build.env"
 
   local stamp key uri

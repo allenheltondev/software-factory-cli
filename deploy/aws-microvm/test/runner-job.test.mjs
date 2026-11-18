@@ -107,6 +107,7 @@ function fakeDeps(mode, overrides = {}) {
       UPDRAFT_RUN_REQUEST: '{"should":"not leak"}',
       UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH: '/somewhere/else.pem',
       GH_TOKEN: 'ghs_runner',
+      PLAYWRIGHT_BROWSERS_PATH: '/opt/ms-playwright',
     },
     log: (message) => logs.push(message),
     logStream: { write: (chunk) => output.push(String(chunk)) },
@@ -201,6 +202,8 @@ describe('runJob', () => {
     expect(env.HOME).toBe(deps.jobUser.home);
     expect(env.USER).toBe('updraft');
     expect(env.PATH).toBe(process.env.PATH);
+    // The one image setting a job needs besides PATH: where the headless browser was installed.
+    expect(env.PLAYWRIGHT_BROWSERS_PATH).toBe('/opt/ms-playwright');
     for (const name of Object.keys(env)) {
       expect(name, name).not.toMatch(/^AWS_/);
     }

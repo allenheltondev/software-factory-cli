@@ -147,7 +147,7 @@ export function watchdogBudgetMs(payload, nowMs) {
  * @param {string[]} deps.updraftCommand the Updraft executable (and leading arguments)
  * @param {{ uid?: number, gid?: number, home: string, name: string }} deps.jobUser
  * @param {Record<string, string | undefined>} deps.baseEnv the runner's environment; only
- *   PATH, LANG and TZ are copied from it
+ *   PATH, LANG, TZ and PLAYWRIGHT_BROWSERS_PATH are copied from it
  * @param {(message: string) => void} deps.log
  * @param {NodeJS.WritableStream} deps.logStream where the job's stdout and stderr are copied
  * @param {(listener: () => void) => void} [deps.onStop] registers a listener for "the microVM
@@ -327,6 +327,9 @@ function jobEnvironment(payload, stateDir, agentEnv, deps) {
     ...agentEnv,
   };
   if (baseEnv.TZ) env.TZ = baseEnv.TZ;
+  // Where the image keeps its headless browser; without it Playwright looks in the job
+  // user's empty cache and reports the browser as not installed.
+  if (baseEnv.PLAYWRIGHT_BROWSERS_PATH) env.PLAYWRIGHT_BROWSERS_PATH = baseEnv.PLAYWRIGHT_BROWSERS_PATH;
   // Deliberately absent: AWS_* (the runner's credentials and region), anything naming the
   // key file, and the run request. See "Security model" in the README for what this does
   // and does not achieve.

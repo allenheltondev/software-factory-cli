@@ -383,7 +383,11 @@ that would leave only a `stateReason`.
 input. `image/build.env` holds `NODE_VERSION` (Node.js 24 by default), `UPDRAFT_SPEC`,
 `AGENT_PACKAGES`, `TOOL_PACKAGES` (global npm tools for the repositories, TypeScript by default),
 `SYSTEM_PACKAGES` (system packages: Python 3.12 with pip, a C/C++ toolchain, make and a few
-small tools by default) and `PYTHON_COMMAND` (what `python` and `python3` mean on PATH);
+small tools by default), `PYTHON_COMMAND` (what `python` and `python3` mean on PATH),
+`UV_VERSION` (uv, installed with pip), and `PLAYWRIGHT_VERSION`, `PLAYWRIGHT_BROWSERS` and
+`BROWSER_PACKAGES` (a headless Chromium in `/opt/ms-playwright` and the libraries it needs;
+a project pinned to another Playwright version adds its own build with
+`npx playwright install chromium` in the job);
 `deploy.sh` appends overrides from its environment to the copy in the build context.
 
 **4 GB baseline memory by default.** The documented sizes give 8 GB of disk up to a 2 GB
