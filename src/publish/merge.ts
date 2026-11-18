@@ -112,6 +112,16 @@ async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: 
     if (run?.outcome !== 'succeeded' || run.summary?.verification?.passed !== true) {
       return block(`there is no record that the verify commands passed in run ${runId}, which pushed ${short(sha)}`);
     }
+    // A pass counts for this commit only if the commands tested exactly it.
+    const v = run.summary.verification;
+    if (v.sha !== sha) {
+      return block(`the verify commands of run ${runId} ran on ${v.sha ? short(v.sha) : 'an unrecorded commit'}, not on ${short(sha)}, the commit to merge`);
+    }
+    if (v.exact !== true) {
+      return block(
+        `the verify commands of run ${runId} passed, but not on exactly ${short(sha)}: the worktree held uncommitted files, or its commit changed, while they ran`,
+      );
+    }
   }
   const wf = cfg.workflows.find((w) => workflowId(w) === pr.workflowId);
   if (!wf) return block(`workflow "${pr.workflowId}" no longer exists in the config, so nobody's change requests could be honoured`);
@@ -148,6 +158,8 @@ async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: 
   // 4. Checks.
   const checks = await api.getCommitChecks(repo, sha);
   if (checks.failing.length) return block(`${checks.failing.length} check(s) of ${short(sha)} did not pass: ${names(checks.failing)}`);
+  // Checked after failing (a failure seen is a failure) and before anything is read as green.
+  if (!checks.complete) return block(`the checks of ${short(sha)} could not all be read (${checks.total} seen), so it is unknown whether they passed`);
   if (checks.pending.length) return { action: 'wait', reason: `${checks.pending.length} check(s) of ${short(sha)} are pending: ${names(checks.pending)}` };
   if (live.mergeable === null) return { action: 'wait', reason: 'GitHub has not finished working out whether it can be merged' };
   return { action: 'merge' };

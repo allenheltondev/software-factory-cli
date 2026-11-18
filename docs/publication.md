@@ -21,7 +21,9 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
    The push only ever creates the branch: it carries `--force-with-lease=<ref>:` with an empty
    expected value, so Git refuses it if the branch exists by the time it runs, and it never
    moves an existing branch, not even by a fast-forward. It never pushes the base branch and
-   refuses any branch other than the run's job branch. The remote must have exactly one push
+   refuses any branch other than the run's job branch. It pushes the commit the run ended on:
+   if the branch has moved since, the push is refused, because the run's summary and
+   verification describe a different commit. The remote must have exactly one push
    URL, and it must point at the configured repository (`git push` sends to every `pushurl`
    a remote has, so a remote with several is refused). The check and the push then both name that URL directly, from a
    throwaway repository that borrows the clone's objects but none of its configuration, with

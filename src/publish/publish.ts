@@ -599,6 +599,15 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       await assertValidBranchName(branch, local);
       const sha = (await run1(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`], local).catch(() => null))?.stdout.trim();
       if (!sha) throw new PublishRefusal(`the job branch ${branch} no longer exists in ${checkoutPath}`);
+      // Publish the commit the run ended on, or nothing: the run's summary and verification are
+      // about that commit, and a retry long after must not attach them to whatever is there now.
+      const ended = run.summary.headSha;
+      if (ended && sha !== ended) {
+        throw new PublishRefusal(
+          `the job branch ${branch} is at ${sha.slice(0, 12)}, not at ${ended.slice(0, 12)} where run ${runId} ended; ` +
+            'the branch was changed after the run, so its result and verification do not describe this commit. Nothing was pushed',
+        );
+      }
       const count = Number((await run1(['rev-list', '--count', `${run.summary.baseSha}..${sha}`], local)).stdout.trim()) || 0;
       return { remote: remoteName, pushUrl: pushUrlRaw, net: netOpts, localSha: sha, commitCount: count };
     });

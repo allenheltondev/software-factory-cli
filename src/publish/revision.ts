@@ -341,6 +341,14 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       await assertValidBranchName(prBranch, local);
       const sha = (await run1(['rev-parse', '--verify', '--quiet', `refs/heads/${localBranch}^{commit}`], local).catch(() => null))?.stdout.trim();
       if (!sha) throw new PublishRefusal(`the revision branch ${localBranch} no longer exists in ${checkoutPath}`);
+      // As for a first publication: push the commit the run ended on, or nothing.
+      const ended = run.summary?.headSha;
+      if (ended && sha !== ended) {
+        throw new PublishRefusal(
+          `the revision branch ${localBranch} is at ${sha.slice(0, 12)}, not at ${ended.slice(0, 12)} where run ${runId} ended; ` +
+            'the branch was changed after the run, so its result and verification do not describe this commit. Nothing was pushed',
+        );
+      }
       const count = Number((await run1(['rev-list', '--count', `${baseSha}..${sha}`], local)).stdout.trim()) || 0;
       // Exit 1: not an ancestor. Anything else is a real failure and is thrown.
       const isAncestor = await run1(['merge-base', '--is-ancestor', baseSha, sha], local).then(

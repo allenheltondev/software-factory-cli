@@ -181,6 +181,8 @@ describe('gitMounts', () => {
       [`${COMMON}/logs`]: 'rw',
       [`${COMMON}/reftable`]: 'rw',
       [`${COMMON}/lfs`]: 'rw',
+      // objects/info/alternates decides which host directories later containers get mounted.
+      [`${COMMON}/objects/info`]: 'ro',
       [ADMIN]: 'rw',
       [`${ADMIN}/commondir`]: 'ro',
       [`${ADMIN}/gitdir`]: 'ro',
@@ -400,6 +402,8 @@ describe.runIf(canBindMount)('the worktree mounts, applied as bind mounts in a p
         `try commondirrm rm -f ${q(join(admin, 'commondir'))}`,
         `try wtconfig write ${q(join(admin, 'config.worktree'))} '[core]'`,
         `try otherworktree mkdir ${q(join(common, 'worktrees', 'forged'))}`,
+        // Would have a host path of the agent's choosing mounted into the next container.
+        `try alternates write ${q(join(common, 'objects', 'info', 'alternates'))} /etc`,
       ].join('\n'),
       env,
     );
@@ -418,6 +422,7 @@ describe.runIf(canBindMount)('the worktree mounts, applied as bind mounts in a p
       gitconfig: expect.not.stringMatching(/^0$/),
       attributes: expect.not.stringMatching(/^0$/),
       mainhead: expect.not.stringMatching(/^0$/),
+      alternates: expect.not.stringMatching(/^0$/),
       pointer: expect.not.stringMatching(/^0$/),
       pointermv: expect.not.stringMatching(/^0$/),
       pointerrm: expect.not.stringMatching(/^0$/),

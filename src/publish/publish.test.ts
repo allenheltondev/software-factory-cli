@@ -10,7 +10,7 @@ import { fakeContext } from '../commands/fakes.js';
 import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getPublication } from '../db/publications.js';
-import { getJob } from '../db/queue.js';
+import { getJob, getRun } from '../db/queue.js';
 import { GitError, runGit, type GitOptions } from '../git/git.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree } from '../git/worktree.js';
 import {
@@ -306,6 +306,21 @@ function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config
 }
 
 describe('publishRun', { timeout: 60_000 }, () => {
+  it('refuses to publish a branch that moved after the run ended: its result and verification are about another commit', async () => {
+    const s = await scenario();
+    // Someone (or a leftover process) commits on the job branch after the run was recorded.
+    const worktree = getRun(s.db, s.runId)!.checkoutPath!;
+    writeFileSync(join(worktree, 'late.txt'), 'added after the run\n');
+    s.f.git(worktree, 'add', '.');
+    s.f.git(worktree, 'commit', '--quiet', '-m', 'late change');
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    const r = await publishRun(deps(s, api), s.runId);
+
+    expect(r).toMatchObject({ status: 'failed', retryable: false, error: expect.stringMatching(new RegExp(`not at ${s.localSha.slice(0, 12)} where run ${s.runId} ended`)) });
+    expect(remoteSha(s)).toBeNull();
+    expect(api.pulls).toEqual([]);
+  });
+
   it('pushes the job branch, opens a draft PR and comments on the issue', async () => {
     const s = await scenario();
     const api = new FakePublishApi((b) => remoteSha(s, b) !== null);

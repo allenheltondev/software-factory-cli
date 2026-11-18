@@ -129,6 +129,9 @@ inside it. In particular these stay read-only:
 - `info/attributes` and `info/exclude`;
 - `packed-refs`, and the main worktree's own `HEAD` and index;
 - other worktrees' administrative directories;
+- `objects/info`, inside the otherwise writable object store. Its `alternates` file names other
+  object stores by host path, and the worker mounts whatever it lists into containers; an agent
+  that could write it would have host directories of its choosing mounted into the next one;
 - the worktree's `.git` pointer file, and `commondir` in its administrative directory. Either
   could otherwise be rewritten to point at a directory the agent made, whose `config` host Git
   would then obey when it runs in the worktree;
@@ -152,7 +155,9 @@ commit still counts in the summary; uncommitted changes inside a submodule do no
 An action's `verify` commands ([Verification](verification.md)) execute code the agent wrote,
 so for a containerized agent the worker runs them in containers too, one per command, named
 `updraft-<run id>-verify-<n>`, from the same image with the same mounts, user, `network` and
-`args`. A string command runs through `/bin/sh -c` inside the container. They get none of the
+`args`. The mount list is the one worked out before the agent started; it is not read again
+from the clone, whose object store the agent could write to in the meantime. A string command
+runs through `/bin/sh -c` inside the container. They get none of the
 variables named in `container.env`: those are the agent's credentials, and checking its work
 does not need them. The image therefore needs whatever the commands use (the test runner, the
 package manager and network access to its registry if a command installs dependencies).

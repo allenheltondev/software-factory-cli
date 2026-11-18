@@ -64,14 +64,13 @@ import {
   stopContainer,
   trackContainer,
   untrackContainer,
-  worktreeMounts,
   type ContainedInvocation,
 } from './container.js';
 import { APP_KEY_PATH_ENV } from '../github/app-auth.js';
 import { commitIdentityEnv, type CommitIdentity } from '../github/credentials.js';
 import { processStartTime, taskkillPath } from './process.js';
 import { discardReviewWorktree, readReviewVerdict, reviewBase, type ReviewRunState } from './review-run.js';
-import { cleanSummaryLines, countUncommitted, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
+import { cleanSummaryLines, countUncommitted, headCommit, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 import { displayVerifyCommand, verifyInvocation, type VerifyInvocation } from './verify.js';
 
 const isWindows = process.platform === 'win32';
@@ -402,6 +401,8 @@ async function runVerification(o: {
   const deadline = o.now() + Math.round(o.timeoutMinutes * 60_000);
   const results: VerificationCommandResult[] = [];
   let failure: VerificationRun['failure'] = null;
+  // The commit these commands are about to test, and whether the tree is exactly that commit.
+  const sha = await headCommit(o.cwd, o.git);
   const uncommittedBefore = await countUncommitted(o.cwd, o.git);
   await o.log(['', `---- verification (run by the worker: ${o.commands.length} command(s), ${o.timeoutMinutes} min in total) ----`]);
 
@@ -499,7 +500,9 @@ async function runVerification(o: {
 
   const uncommittedAfter = await countUncommitted(o.cwd, o.git);
   await o.log([`---- end of verification: ${failure ? (failure.outcome === 'interrupted' ? 'interrupted' : 'failed') : 'passed'} ----`]);
-  return { summary: { passed: failure === null, commands: results, uncommittedBefore, uncommittedAfter }, failure };
+  // Exact only if nothing but the commit was there to test, and the commands did not move HEAD.
+  const exact = sha !== null && uncommittedBefore === 0 && (await headCommit(o.cwd, o.git)) === sha;
+  return { summary: { passed: failure === null, commands: results, uncommittedBefore, uncommittedAfter, sha, exact }, failure };
 }
 
 /** Byte size of a file, 0 if it doesn't exist. */
@@ -916,6 +919,7 @@ export class LiveExecutor implements Executor {
         ...(box && agentCfg.container
           ? {
               contain: (command: VerifyCommand, index: number) => {
+                const verifyMounts = box.mounts.filter((m) => m.path !== promptFile);
                 // Inside the container it is always a POSIX shell, whatever the host is.
                 const inner = verifyInvocation(command, 'linux');
                 const name = containerName(run.id, `verify-${index + 1}`);
@@ -924,7 +928,9 @@ export class LiveExecutor implements Executor {
                   {
                     image: agentCfg.container!.image,
                     name,
-                    mounts: worktreeMounts(prepared.worktreePath),
+                    // The plan made before the agent started, not a new one: the object store it
+                    // would be read from has been the agent's to write since.
+                    mounts: verifyMounts,
                     workdir: prepared.worktreePath,
                     user: hostUser(),
                     network: agentCfg.container!.network,

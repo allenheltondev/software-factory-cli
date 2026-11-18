@@ -216,8 +216,11 @@ Updraft merges only when all of these hold, evaluated again after every poll unt
 settles one way or the other:
 
 1. the newest verdict is `ready-to-merge` and is for the PR's current head commit;
-2. the code run that pushed that commit passed the action's `verify` commands, or the action
-   has none. A commit someone else pushed was never verified by the worker, so with `verify`
+2. the code run that pushed that commit passed the action's `verify` commands on exactly that
+   commit, or the action has none. The worker records which commit the commands started on,
+   and the pass counts only when that is the commit to merge, the worktree held no uncommitted
+   or untracked files when they started, and the checked-out commit had not changed when they
+   ended. A commit someone else pushed was never verified by the worker, so with `verify`
    configured it is not merged;
 3. on GitHub the PR is open, not a draft, still at that commit, and its base is the branch it
    was opened against;
@@ -225,7 +228,8 @@ settles one way or the other:
 5. no allowed actor has a "Request changes" review outstanding (a later approval or a
    dismissal clears it);
 6. no commit status or check run of that commit is failing, and none is pending. A commit with
-   no checks at all passes.
+   no checks at all passes. Every page of both listings is read; if either cannot be read to
+   its end, it is unknown whether the checks passed and the PR is not merged.
 
 Pending checks, and mergeability GitHub is still computing, are waited for up to
 `autoMergeWaitMinutes` (default 60).

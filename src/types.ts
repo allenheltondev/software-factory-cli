@@ -222,6 +222,12 @@ export interface RunContainer {
 export interface RunSummary {
   branch: string;
   baseSha: string;
+  /**
+   * The commit the job branch was at when the run ended, read by the worker. Publication pushes
+   * exactly this commit and refuses if the branch has moved since: a later retry must not publish,
+   * under this run's verification, a commit the run never produced. Absent in older summaries.
+   */
+  headSha?: string;
   worktree: string;
   /** Commits on the job branch since the base commit, newest first ("<short sha> <subject>"), capped. */
   commits: string[];
@@ -277,6 +283,15 @@ export interface VerificationSummary {
    */
   uncommittedBefore: number | null;
   uncommittedAfter: number | null;
+  /** The commit checked out when the first command started; null when git could not tell. Absent in older summaries. */
+  sha?: string | null;
+  /**
+   * True only when the commands tested exactly `sha`: the worktree had no uncommitted or untracked
+   * files when they started, and HEAD was still `sha` when they ended. Otherwise a pass says
+   * nothing certain about the commit that gets published (a test can pass because of a fix that
+   * was never committed). Absent in older summaries, which is read as false.
+   */
+  exact?: boolean;
 }
 
 export type PublicationState = 'publishing' | 'published' | 'failed' | 'skipped';

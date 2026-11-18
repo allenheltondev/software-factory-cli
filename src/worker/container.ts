@@ -24,7 +24,7 @@
 // - A deterministic name, so a timeout, a shutdown or a later worker's reconcile can stop the
 //   container itself. Killing the runtime client does not reliably stop the container.
 import { execFile, spawnSync } from 'node:child_process';
-import { closeSync, existsSync, openSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import { posix } from 'node:path';
 
 // POSIX path rules throughout, whatever the host: a containerized agent is only supported on
@@ -183,6 +183,12 @@ export function readWorktreeLayout(worktree: string): WorktreeGitLayout {
 
 /** Directories of the common git dir a commit writes to. Everything else in it stays read-only. */
 const WRITABLE_COMMON = ['objects', 'refs', 'logs', 'reftable', 'lfs'] as const;
+/**
+ * Inside the writable `objects/`: `info/alternates` names other object stores by host path, and
+ * the worker mounts whatever it lists into later containers. A commit never writes `objects/info`,
+ * so it stays read-only and an agent cannot use it to have host paths of its choosing mounted.
+ */
+const PINNED_OBJECTS = 'info';
 /** Files in the worktree's admin dir that decide which config and hooks host git uses there. */
 const PINNED_ADMIN = ['commondir', 'gitdir', 'config.worktree'] as const;
 
@@ -193,6 +199,7 @@ const PINNED_ADMIN = ['commondir', 'gitdir', 'config.worktree'] as const;
  * That keeps the agent away from everything host git executes or obeys the next time the worker
  * (or the user) runs git in the clone: `hooks/`, `config`, `info/attributes`, `info/exclude`,
  * `packed-refs`, the main worktree's `HEAD` and `index`, and other worktrees' admin directories.
+ * Within the writable object store, `objects/info` stays read-only (see PINNED_OBJECTS).
  * The worktree's own `.git` pointer and its admin `commondir` are pinned read-only too: either
  * could otherwise be repointed at a directory the agent controls, whose `config` host git would
  * then obey when it runs in the worktree (the run summary does). `config.worktree` is pinned
@@ -221,6 +228,7 @@ export function gitMounts(
     ro(layout.pointer),
     ro(layout.commonDir),
     ...(readOnlyGit ? [] : WRITABLE_COMMON.map((d) => join(layout.commonDir, d)).filter(exists).map(rw)),
+    ...(readOnlyGit ? [] : [join(layout.commonDir, 'objects', PINNED_OBJECTS)].filter(exists).map(ro)),
     rw(layout.adminDir),
     ...PINNED_ADMIN.map((f) => join(layout.adminDir, f)).filter(exists).map(ro),
     // Object stores the clone borrows from (git clone --reference/--shared): readable, never writable.
@@ -246,8 +254,9 @@ function readAlternates(commonDir: string): string[] {
 
 /**
  * Mounts for an agent in `worktree` (see {@link gitMounts}), read from the worktree as the worker
- * just created it. Call it before the agent runs: afterwards the worktree's contents are the
- * agent's. Creates an empty `config.worktree` in the worktree's admin dir when there is none, so
+ * just created it. Call it once, before the agent runs, and reuse the result for anything that
+ * runs in the worktree afterwards (the verify commands): by then the worktree's contents and the
+ * clone's object store are the agent's, and a plan read from them would be the agent's too. Creates an empty `config.worktree` in the worktree's admin dir when there is none, so
  * that it can be pinned read-only (a bind mount needs an existing file).
  */
 export function worktreeMounts(worktree: string, opts: { readOnlyGit?: boolean } = {}): ContainerMount[] {
@@ -258,6 +267,15 @@ export function worktreeMounts(worktree: string, opts: { readOnlyGit?: boolean }
       closeSync(openSync(perWorktreeConfig, 'a'));
     } catch (err) {
       throw new ContainerSetupError(`cannot create ${perWorktreeConfig}: ${(err as Error).message}`, { cause: err });
+    }
+  }
+  // objects/info exists in every repository git made; make sure, so that it can be pinned.
+  const objectsInfo = join(layout.commonDir, 'objects', PINNED_OBJECTS);
+  if (existsSync(join(layout.commonDir, 'objects')) && !existsSync(objectsInfo)) {
+    try {
+      mkdirSync(objectsInfo);
+    } catch (err) {
+      throw new ContainerSetupError(`cannot create ${objectsInfo}: ${(err as Error).message}`, { cause: err });
     }
   }
   return gitMounts(worktree, layout, existsSync, readAlternates(layout.commonDir), opts.readOnlyGit === true);

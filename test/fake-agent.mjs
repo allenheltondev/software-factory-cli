@@ -72,6 +72,16 @@ switch (mode) {
     process.exit(0);
     break;
   }
+  case 'uncommitted': {
+    // Succeeds like 'success', but forgets to commit one of its files.
+    writeFileSync('FAKE_AGENT.md', `# Done\n\n${prompt.split('\n')[0]}\n`);
+    git('add', 'FAKE_AGENT.md');
+    git('commit', '--quiet', '-m', 'fake agent: implement the issue');
+    writeFileSync('forgot-to-commit.txt', 'the tests may pass because of this file\n');
+    say('fake agent: all done');
+    process.exit(0);
+    break;
+  }
   case 'fail': {
     writeFileSync('partial.txt', 'half-finished work\n');
     writeFileSync('README.md', '# widgets\n\nedited by the fake agent\n');

@@ -198,6 +198,11 @@ export interface CommitChecks {
   failing: string[];
   /** Names of statuses in state pending and of check runs that have not completed. */
   pending: string[];
+  /**
+   * False when a listing could not be read to its end. `failing` and `pending` are then only
+   * what was seen, and the commit must not be treated as passing.
+   */
+  complete: boolean;
 }
 
 export interface MergePullRequestInput {

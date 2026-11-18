@@ -48,6 +48,8 @@ interface Options {
   workflow?: Record<string, unknown>;
   /** Verification result recorded on the run that published the PR. */
   verified?: boolean;
+  /** Overrides for what the verification record says it tested. */
+  verifiedAs?: { sha?: string | null; exact?: boolean; uncommittedBefore?: number };
 }
 
 function summary(over: Partial<RunSummary> = {}): RunSummary {
@@ -88,7 +90,11 @@ function setup(o: Options = {}) {
   const jobId = insertQueuedJob(db, { repoId: REPO_ID, fullName: FULL, issue: ISSUE });
   const branch = `updraft/issue-${ISSUE}-${jobId}`;
   db.prepare("UPDATE jobs SET status = 'succeeded', attempts = 1 WHERE id = ?").run(jobId);
-  const verification = o.verified === undefined ? {} : { verification: { passed: o.verified, commands: [], uncommittedBefore: 0, uncommittedAfter: 0 } };
+  // By default the commands tested exactly the published commit; `verifiedAs` overrides that record.
+  const verification =
+    o.verified === undefined
+      ? {}
+      : { verification: { passed: o.verified, commands: [], uncommittedBefore: 0, uncommittedAfter: 0, sha: H1, exact: true, ...o.verifiedAs } };
   db.prepare(
     `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at, ended_at, outcome, summary)
      VALUES ('run_original', ?, 1, 'general', 'claude', 'wrk_0', ?, ?, ?, 'succeeded', ?)`,
@@ -533,7 +539,7 @@ describe('auto-merge', () => {
 
   it('is blocked by a failing check, records why, comments once and never tries again for that head', async () => {
     const s = await ready();
-    s.gh.checks = { total: 2, failing: ['ci / test'], pending: [] };
+    s.gh.checks = { total: 2, failing: ['ci / test'], pending: [], complete: true };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([]);
     expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: `1 check(s) of ${H1.slice(0, 12)} did not pass: ci / test` });
@@ -545,7 +551,7 @@ describe('auto-merge', () => {
     expect(s.stage()).toMatchObject({ stage: 'ready-to-merge', detail: expect.stringMatching(/not merged by Updraft: 1 check/) });
 
     // The check is fixed later: still a person's call for this head.
-    s.gh.checks = { total: 2, failing: [], pending: [] };
+    s.gh.checks = { total: 2, failing: [], pending: [], complete: true };
     s.gh.calls.length = 0;
     await s.mergeStep();
     await s.mergeStep();
@@ -554,22 +560,30 @@ describe('auto-merge', () => {
     expect(s.gh.merges).toEqual([]);
   });
 
+  it('does not merge when the checks could not all be read, even though none seen failed', async () => {
+    const s = await ready();
+    s.gh.checks = { total: 100, failing: [], pending: [], complete: false };
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+    expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/could not all be read \(100 seen\)/) });
+  });
+
   it('waits for pending checks and merges when they pass', async () => {
     const s = await ready();
-    s.gh.checks = { total: 1, failing: [], pending: ['ci / build'] };
+    s.gh.checks = { total: 1, failing: [], pending: ['ci / build'], complete: true };
     await s.mergeStep();
     expect(s.pr()).toMatchObject({ mergeState: 'waiting', mergeReason: expect.stringMatching(/1 check\(s\) .* are pending: ci \/ build/) });
     expect(s.stage().stage).toBe('merging');
     expect(s.gh.writes).toEqual([]);
     s.tick(5 * 60_000);
-    s.gh.checks = { total: 1, failing: [], pending: [] };
+    s.gh.checks = { total: 1, failing: [], pending: [], complete: true };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
   });
 
   it('gives up on checks that stay pending past autoMergeWaitMinutes', async () => {
     const s = await ready({ repo: { autoMergeWaitMinutes: 30 } });
-    s.gh.checks = { total: 1, failing: [], pending: ['ci / build'] };
+    s.gh.checks = { total: 1, failing: [], pending: ['ci / build'], complete: true };
     await s.mergeStep();
     s.tick(29 * 60_000);
     await s.mergeStep();
@@ -653,6 +667,23 @@ describe('auto-merge', () => {
     // Decided locally, before anything was asked of GitHub about the merge.
     expect(s.gh.calls).toEqual([`listIssueComments #${PR}`]);
 
+    // A pass that was not a test of exactly the commit to merge does not count.
+    const dirty = await ready({ action: { verify: ['npm test'] }, verified: true, verifiedAs: { exact: false, uncommittedBefore: 2 } });
+    await dirty.mergeStep();
+    expect(dirty.gh.merges).toEqual([]);
+    expect(dirty.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/passed, but not on exactly 111111111111: the worktree held uncommitted files/) });
+
+    const otherCommit = await ready({ action: { verify: ['npm test'] }, verified: true, verifiedAs: { sha: H2 } });
+    await otherCommit.mergeStep();
+    expect(otherCommit.gh.merges).toEqual([]);
+    expect(otherCommit.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/ran on 222222222222, not on 111111111111, the commit to merge/) });
+
+    // A record from before the commit was stored says nothing about which commit was tested.
+    const old = await ready({ action: { verify: ['npm test'] }, verified: true, verifiedAs: { sha: undefined, exact: undefined } });
+    await old.mergeStep();
+    expect(old.gh.merges).toEqual([]);
+    expect(old.pr().mergeReason).toMatch(/ran on an unrecorded commit/);
+
     const unrecorded = await ready({ action: { verify: ['npm test'] } });
     await unrecorded.mergeStep();
     expect(unrecorded.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/no record that the verify commands passed in run run_original/) });
@@ -673,7 +704,7 @@ describe('auto-merge', () => {
 
   it('posts the comment about a blocked merge once even when posting it fails at first', async () => {
     const s = await ready();
-    s.gh.checks = { total: 1, failing: ['lint'], pending: [] };
+    s.gh.checks = { total: 1, failing: ['lint'], pending: [], complete: true };
     s.gh.failNext.createIssueComment = new GitHubError('POST failed: 503', 503);
     await s.mergeStep();
     expect(s.gh.writes).toEqual([]);
@@ -705,14 +736,14 @@ describe('auto-merge', () => {
 
   it('starts over for a new head: a new review, a new merge decision', async () => {
     const s = await ready();
-    s.gh.checks = { total: 1, failing: ['lint'], pending: [] };
+    s.gh.checks = { total: 1, failing: ['lint'], pending: [], complete: true };
     await s.mergeStep();
     expect(s.pr().mergeState).toBe('blocked');
     // A person pushes a fix; it is reviewed and found ready.
     s.push(H2);
     observeHead(s.db, REPO_ID, PR, H2, new Date(s.tick()).toISOString());
     expect(s.stage().stage).toBe('awaiting-review');
-    s.gh.checks = { total: 1, failing: [], pending: [] };
+    s.gh.checks = { total: 1, failing: [], pending: [], complete: true };
     await s.round('ready-to-merge');
     await s.mergeStep();
     expect(s.gh.merges).toEqual([{ sha: H2, method: 'squash' }]);

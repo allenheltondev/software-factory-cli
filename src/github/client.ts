@@ -485,6 +485,12 @@ interface RequestOptions {
   etag?: string | null;
   /** 'manual' surfaces 3xx as GitHubError(status) instead of following it. */
   redirect?: 'follow' | 'manual';
+  /**
+   * OWNER/REPO this request is about, for requests that do not name it in their path or GraphQL
+   * variables (a mutation addressed by node id). An installation token belongs to one
+   * installation, so without this a GitHub App has no way to pick one.
+   */
+  repo?: string;
 }
 
 interface RawResponse<T> {
@@ -521,7 +527,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
 
   async function request<T>(pathOrUrl: string, ro: RequestOptions = {}): Promise<RawResponse<T>> {
     const url = buildUrl(pathOrUrl, ro.query);
-    const about = repoOfRequest(url.startsWith(baseUrl) ? url.slice(baseUrl.length) : new URL(url).pathname, ro.body, repoNames);
+    const about = ro.repo ?? repoOfRequest(url.startsWith(baseUrl) ? url.slice(baseUrl.length) : new URL(url).pathname, ro.body, repoNames);
     let token = await credentials.token(about);
     const headers: Record<string, string> = {
       Accept: 'application/vnd.github+json',
@@ -857,6 +863,8 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       const res = await request<GraphQLResponse<{ markPullRequestReadyForReview?: { pullRequest?: { isDraft?: boolean } | null } | null }>>('/graphql', {
         method: 'POST',
         body: { query: MARK_READY_MUTATION, variables: { id: nodeId } },
+        // The mutation names only a node id; say which repository it is for.
+        repo: repo.fullName,
       });
       const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
       if (errors.length) {
@@ -871,19 +879,46 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       const failing: string[] = [];
       const pending: string[] = [];
       let total = 0;
-      const status = await request<{ statuses?: Array<{ context?: string; state?: string }> }>(`${repoPath(repo)}/commits/${encodeURIComponent(sha)}/status`, {
-        query: { per_page: 100 },
-      });
-      for (const s of status.data?.statuses ?? []) {
-        total++;
-        const name = s.context ?? '(status)';
-        if (s.state === 'pending') pending.push(name);
-        else if (s.state !== 'success') failing.push(name);
+      // Both listings are paginated. Every page is read, and a listing that could not be read to
+      // its end (more pages than this client follows, or fewer entries than GitHub counted) makes
+      // the result incomplete: a failing or pending entry may be among those not seen.
+      let complete = true;
+      const seenStatuses = new Set<string>();
+      let statusCount: number | null = null;
+      let next: string | undefined = buildUrl(`${repoPath(repo)}/commits/${encodeURIComponent(sha)}/status`, { per_page: 100 });
+      for (let i = 0; next; i++) {
+        if (i >= MAX_LIST_PAGES) {
+          complete = false;
+          break;
+        }
+        const res: RawResponse<{ total_count?: number; statuses?: Array<{ context?: string; state?: string }> }> = await request(next);
+        if (typeof res.data?.total_count === 'number') statusCount = res.data.total_count;
+        for (const s of res.data?.statuses ?? []) {
+          const name = s.context ?? '(status)';
+          // The combined status lists the newest status of each context; a context repeated
+          // across pages is still one check.
+          if (seenStatuses.has(name)) continue;
+          seenStatuses.add(name);
+          total++;
+          if (s.state === 'pending') pending.push(name);
+          else if (s.state !== 'success') failing.push(name);
+        }
+        next = parseLinkHeader(res.headers.get('link'))['next'];
       }
-      let next: string | undefined = buildUrl(`${repoPath(repo)}/commits/${encodeURIComponent(sha)}/check-runs`, { per_page: 100 });
-      for (let i = 0; next && i < MAX_LIST_PAGES; i++) {
-        const res: RawResponse<{ check_runs?: Array<{ name?: string; status?: string; conclusion?: string | null }> }> = await request(next);
+      if (statusCount !== null && seenStatuses.size < statusCount) complete = false;
+
+      let runCount: number | null = null;
+      let runsSeen = 0;
+      next = buildUrl(`${repoPath(repo)}/commits/${encodeURIComponent(sha)}/check-runs`, { per_page: 100 });
+      for (let i = 0; next; i++) {
+        if (i >= MAX_LIST_PAGES) {
+          complete = false;
+          break;
+        }
+        const res: RawResponse<{ total_count?: number; check_runs?: Array<{ name?: string; status?: string; conclusion?: string | null }> }> = await request(next);
+        if (typeof res.data?.total_count === 'number') runCount = res.data.total_count;
         for (const c of res.data?.check_runs ?? []) {
+          runsSeen++;
           total++;
           const name = c.name ?? '(check run)';
           if (c.status !== 'completed') pending.push(name);
@@ -891,7 +926,8 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         }
         next = parseLinkHeader(res.headers.get('link'))['next'];
       }
-      return { total, failing, pending };
+      if (runCount !== null && runsSeen < runCount) complete = false;
+      return { total, failing, pending, complete };
     },
 
     async mergePullRequest(repo, pullNumber, input) {

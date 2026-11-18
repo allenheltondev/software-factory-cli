@@ -1,5 +1,6 @@
 // Live execution acceptance, with the fake adapter (test/fake-adapter.ts) driving a Node
 // script in place of a real agent CLI. Real git, real processes, paths with spaces.
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, relative } from 'node:path';
@@ -914,6 +915,21 @@ describe('LiveExecutor verification (actions.<name>.verify)', { timeout: 120_000
     const c = claim(db, config, paths);
     const first = await new LiveExecutor().execute(c, context(db, config, paths, c.run.id));
     expect(first.summary?.verification).toMatchObject({ passed: true, uncommittedBefore: 0, uncommittedAfter: 1 });
+    // The tree was clean when the commands started, so they tested exactly the commit the run ended on.
+    const worktree = first.summary!.worktree;
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktree, encoding: 'utf8' }).stdout.trim();
+    expect(first.summary).toMatchObject({ headSha: head, verification: { sha: head, exact: true } });
+
+    // A second attempt whose agent leaves a file uncommitted: the commands pass, but not as a test of the commit.
+    const { paths: p2, config: c2, db: db2 } = setup();
+    c2.agents['claude']!.args = ['--mode', 'uncommitted'];
+    setVerify(c2, [exits(0)]);
+    insertQueuedJob(db2, { repoId: 42, fullName: 'octo/widgets', issue: 27 });
+    const second = claim(db2, c2, p2);
+    const dirty = await new LiveExecutor().execute(second, context(db2, c2, p2, second.run.id));
+    expect(dirty).toMatchObject({ outcome: 'succeeded' });
+    expect(dirty.summary?.verification).toMatchObject({ passed: true, exact: false });
+    expect(dirty.summary?.verification?.uncommittedBefore).toBeGreaterThan(0);
     const body = renderPrBody({
       runId: c.run.id,
       issueNumber: 26,

@@ -136,6 +136,22 @@ npm test: passed in 42s
 ```
 ````
 
+## Which commit was tested
+
+The worker records the commit that was checked out when the first command started, and whether
+the result is a test of exactly that commit: the worktree had no uncommitted or untracked files
+at that moment, and the same commit was still checked out when the last command ended. A pass
+with uncommitted files present is still a pass for the run, and the PR says so in a note, but
+it is not counted as verification of the commit: a test can pass because of a fix that was
+never committed. [Auto-merge](review-loop.md) requires an exact pass on the commit it merges.
+
+Ignored files (build output, `node_modules`) are not part of this check. They are not in the
+commit either, so a command that depends on one can still pass here and fail in CI on a fresh
+checkout; the PR's own CI checks are the guard for that.
+
+Publication pushes the commit the run ended on. If the job branch is at any other commit when
+the push is attempted (for example on a retry after someone committed to it), nothing is pushed.
+
 ## Uncommitted files
 
 Verification runs in the worktree as the agent left it, and the worker never commits anything

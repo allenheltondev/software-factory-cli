@@ -76,7 +76,7 @@ describe('createGitHubApi: the review loop', () => {
       fakeFetch((url) => (url.pathname.endsWith('/status') ? json({ state: 'pending', total_count: statuses.length, statuses }) : json({ total_count: runs.length, check_runs: runs })));
     const none = answer([], []);
     const api = await createGitHubApi({ token: 't', fetch: none.fn });
-    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 0, failing: [], pending: [] });
+    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 0, failing: [], pending: [], complete: true });
     expect(none.calls.map((c) => c.url)).toEqual([
       `https://api.github.com/repositories/42/commits/${SHA}/status?per_page=100`,
       `https://api.github.com/repositories/42/commits/${SHA}/check-runs?per_page=100`,
@@ -105,7 +105,65 @@ describe('createGitHubApi: the review loop', () => {
       total: 13,
       failing: ['ci/red', 'ci/err', 'test', 'e2e', 'slow', 'gate'],
       pending: ['ci/wait', 'deploy', 'later'],
+      complete: true,
     });
+  });
+
+  it('reads every page of statuses and check runs, so a failure on a later page is seen', async () => {
+    const base = `https://api.github.com/repositories/42/commits/${SHA}`;
+    const link = (url: string) => ({ headers: { link: `<${url}>; rel="next"` } });
+    const { fn, calls } = fakeFetch((url) => {
+      const page = url.searchParams.get('page') ?? '1';
+      if (url.pathname.endsWith('/status')) {
+        return page === '1'
+          ? json({ state: 'success', total_count: 2, statuses: [{ context: 'ci/ok', state: 'success' }] }, link(`${base}/status?per_page=100&page=2`))
+          : json({ state: 'success', total_count: 2, statuses: [{ context: 'ci/late-red', state: 'failure' }] });
+      }
+      return page === '1'
+        ? json({ total_count: 2, check_runs: [{ name: 'build', status: 'completed', conclusion: 'success' }] }, link(`${base}/check-runs?per_page=100&page=2`))
+        : json({ total_count: 2, check_runs: [{ name: 'late', status: 'in_progress', conclusion: null }] });
+    });
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 4, failing: ['ci/late-red'], pending: ['late'], complete: true });
+    expect(calls.map((c) => new URL(c.url).pathname.split('/').pop() + new URL(c.url).search)).toEqual([
+      'status?per_page=100',
+      'status?per_page=100&page=2',
+      'check-runs?per_page=100',
+      'check-runs?per_page=100&page=2',
+    ]);
+  });
+
+  it('reports a listing it could not read to the end as incomplete, never as passing', async () => {
+    // GitHub counts more statuses than it returned and offers no further page.
+    const short = fakeFetch((url) =>
+      url.pathname.endsWith('/status') ? json({ total_count: 3, statuses: [{ context: 'ci/ok', state: 'success' }] }) : json({ total_count: 0, check_runs: [] }),
+    );
+    expect(await (await createGitHubApi({ token: 't', fetch: short.fn })).getCommitChecks(repo, SHA)).toEqual({ total: 1, failing: [], pending: [], complete: false });
+
+    const fewerRuns = fakeFetch((url) =>
+      url.pathname.endsWith('/status') ? json({ total_count: 0, statuses: [] }) : json({ total_count: 5, check_runs: [{ name: 'build', status: 'completed', conclusion: 'success' }] }),
+    );
+    expect(await (await createGitHubApi({ token: 't', fetch: fewerRuns.fn })).getCommitChecks(repo, SHA)).toMatchObject({ complete: false });
+  });
+
+  it('asks for a token for the repository when marking a pull request ready, though the mutation names only a node id', async () => {
+    const asked: Array<string | null> = [];
+    const { fn } = fakeFetch(() => json({ data: { markPullRequestReadyForReview: { pullRequest: { isDraft: false } } } }));
+    const api = await createGitHubApi({
+      fetch: fn,
+      // Like a GitHub App: a token exists only for a repository.
+      credentials: {
+        kind: 'app',
+        token: async (repoFullName) => {
+          asked.push(repoFullName);
+          if (!repoFullName) throw new GitHubError('this request is not about one repository', 403);
+          return 'installation-token';
+        },
+        reject: () => undefined,
+      },
+    });
+    await api.markPullRequestReady(repo, 'PR_x');
+    expect(asked).toEqual(['o/r']);
   });
 
   it('merges with the head pinned, and reports a refusal with its status', async () => {

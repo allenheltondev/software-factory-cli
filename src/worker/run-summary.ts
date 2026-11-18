@@ -105,6 +105,16 @@ export async function countUncommitted(worktree: string, git?: string): Promise<
   }
 }
 
+/** The commit checked out in `worktree`, or null when git cannot tell. */
+export async function headCommit(worktree: string, git?: string): Promise<string | null> {
+  try {
+    const { stdout } = await runGit(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], { cwd: worktree, git, signal: AbortSignal.timeout(GIT_TIMEOUT_MS) });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 export interface SummaryInput {
   worktree: string;
   branch: string;
@@ -145,11 +155,13 @@ export async function summarizeRun(input: SummaryInput): Promise<SummaryDetail> 
   const stat = await git([...diff, '--stat=200', input.baseSha], 'diff --stat');
   const names = await git([...diff, '--name-only', '-z', input.baseSha], 'changed files');
   const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z'], 'untracked files');
+  const head = (await git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], 'head commit'))?.trim();
 
   const statLines = (stat ?? '').split('\n').filter((l) => l.trim() !== '');
   const summary: RunSummary = {
     branch: input.branch,
     baseSha: input.baseSha,
+    ...(head ? { headSha: head } : {}),
     worktree: input.worktree,
     commits: (log ?? '').split('\n').map((l) => l.trim()).filter(Boolean),
     commitCount: Number((count ?? '0').trim()) || 0,
