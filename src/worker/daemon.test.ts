@@ -462,6 +462,30 @@ describe('runDaemon', () => {
     ]);
   });
 
+  it('announces the assignment only for claims that pass the dispatch check, and never blocks the agent', async () => {
+    const db = openDatabase(':memory:');
+    const announced: { job: string; run: string; agent: string }[] = [];
+    const assignmentCommenter = {
+      announce: async (job: Job, run: { id: string; agent: string }) => {
+        announced.push({ job: job.id, run: run.id, agent: run.agent });
+        throw new Error('GitHub is down'); // a misbehaving commenter must not matter
+      },
+    };
+    const executor: Executor = { name: 'fake', execute: async () => ({ outcome: 'succeeded' }) };
+    const deps = baseDeps(db, {
+      executor,
+      assignmentCommenter: assignmentCommenter as never,
+      checkDispatchable: async (job) => (job.issueNumber === 2 ? { ok: false, reason: 'issue was closed' } : { ok: true }),
+    });
+    const [accepted, rejected] = [1, 2].map((issue) => insertJob(db, { issue }));
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect([accepted, rejected].map((j) => getJob(db, j!)?.status)).toEqual(['succeeded', 'canceled']));
+    deps.controller.abort();
+    await done;
+    expect(announced).toHaveLength(1);
+    expect(announced[0]).toMatchObject({ job: accepted, agent: getRun(db, announced[0]!.run)!.agent });
+  });
+
   it('at start, records the publish settings and sweeps unpublished runs once, after reconcile and before the first poll', async () => {
     const db = openDatabase(':memory:');
     const workflows = [{ trigger: { event: 'issue.labeled' as const, label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }];

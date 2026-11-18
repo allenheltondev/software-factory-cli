@@ -21,6 +21,7 @@ import {
 } from '../db/queue.js';
 import { syncPublishSettings } from '../db/publish-settings.js';
 import type { UpdraftPaths } from '../paths.js';
+import type { AssignmentCommenter } from '../publish/assignment-comment.js';
 import type { FailureCommenter } from '../publish/failure-comment.js';
 import type { Publisher } from '../publish/publish.js';
 import type { IssueSnapshot, Job } from '../types.js';
@@ -104,6 +105,11 @@ export interface DaemonDeps {
    * transient failures. Never changes a run's outcome. Absent: nothing is posted.
    */
   failureCommenter?: FailureCommenter;
+  /**
+   * Assignment comment: announced on the issue once a live implementation run passed its final
+   * dispatch check, just before the agent starts. Not awaited; never changes a run. Absent: none.
+   */
+  assignmentCommenter?: AssignmentCommenter;
   /** Identity overrides, mainly for tests. */
   workerId?: string;
   hostname?: string;
@@ -332,6 +338,12 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         releaseClaim(db, run.id, lockLost ? 'worker lost its lock' : 'run was closed before it started', now);
         if (lockLost) return;
         continue;
+      }
+      // Not awaited: delivery never delays or changes the run. announce() never throws.
+      if (deps.assignmentCommenter) {
+        deps.assignmentCommenter
+          .announce(job, run, signal)
+          .catch((err: unknown) => log.error('assignment comment crashed', { runId: run.id, error: message(err) }));
       }
       launch({ job, run: { ...run, executionStartedAt } }, check.issue);
     }
