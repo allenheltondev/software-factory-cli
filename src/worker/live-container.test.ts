@@ -7,7 +7,7 @@ import { hostname } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FAKE_AGENT, fakeAdapter } from '../../test/fake-adapter.js';
-import { installFakeRuntime, type FakeRuntime } from '../../test/fake-runtime.js';
+import { installFakeRuntime } from '../../test/fake-runtime.js';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { registerAdapter } from '../agents/adapters/registry.js';

@@ -334,7 +334,7 @@ async function runAgent(o: {
     clearTimeout(giveUpTimer);
     o.stop.removeEventListener('abort', onStop);
   }
-  if (killing) await Promise.race([killing, idle(containerBudget + o.killGraceMs + EXIT_WAIT_MS)]);
+  if (killing) await Promise.race([killing as Promise<void>, idle(containerBudget + o.killGraceMs + EXIT_WAIT_MS)]);
   if (result === null) {
     // Still no exit event. Report it as killed rather than hang the worker.
     running.delete(child);
@@ -435,7 +435,10 @@ async function runVerification(o: {
         stop: o.stop,
         killGraceMs: o.killGraceMs,
         ...(held ? { stopContainer: () => stopContainer(held.runtime, held.name, o.killGraceMs, o.env) } : {}),
-        onSpawn: (pid) => o.onSpawn(pid, (done) => (identity = done)),
+        onSpawn: (pid) =>
+          o.onSpawn(pid, (done) => {
+            identity = done;
+          }),
       });
     } catch (err) {
       if (held) {

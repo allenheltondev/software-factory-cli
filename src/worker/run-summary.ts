@@ -14,7 +14,6 @@ const TAIL_LINES = 20;
 const MAX_LINE = 300;
 
 // CSI/OSC escape sequences and other control characters (except tab).
-// eslint-disable-next-line no-control-regex
 const ANSI = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[\u0000-\u0008\u000b-\u001f\u007f]/g;
 
 /** The last non-empty lines of a file from byte `from` on, without control sequences. */

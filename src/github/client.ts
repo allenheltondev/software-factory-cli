@@ -39,7 +39,6 @@ import {
   type GitHubIssueBodyEdit,
   type GitHubIssueComment,
   type GitHubIssueEvent,
-  type GitHubLabel,
   type GitHubPullRequest,
   type GitHubRepo,
   type IssueEventsPage,
@@ -101,12 +100,14 @@ export async function resolveGitHubToken(
       throw new Error(
         'No GitHub token found: GH_TOKEN and GITHUB_TOKEN are unset and the GitHub CLI (gh) is not on PATH. ' +
           'Install gh from https://cli.github.com and run `gh auth login`, or set GH_TOKEN.',
+        { cause: err },
       );
     }
     const detail = e.stderr?.trim() || e.message;
     throw new Error(
       `No GitHub token found: \`gh auth token\` failed (${detail}). ` +
         'Run `gh auth login` for github.com under this user account, or set GH_TOKEN.',
+      { cause: err },
     );
   }
   const token = out.trim();

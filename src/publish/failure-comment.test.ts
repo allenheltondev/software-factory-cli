@@ -643,7 +643,7 @@ describe('failure comment idempotency and retries', () => {
       newer = postFailureComment(s.deps, s.runId);
     };
     const stale = await postFailureComment(s.deps, s.runId);
-    await newer;
+    await (newer as Promise<unknown> | null);
     expect(stale.status).toBe('busy');
     expect(s.api.creates).toHaveLength(1);
     expect(s.api.comments).toHaveLength(1);

@@ -281,6 +281,7 @@ clean break: nothing reads the old names. To move an existing install:
 ```sh
 npm ci
 npm run typecheck   # tsc --noEmit
+npm run lint        # eslint: type-aware correctness rules, no formatting rules
 npm test            # vitest
 npm run build       # compile to dist/
 node scripts/pack-smoke.mjs   # npm pack, install into a temp prefix, run version/validate/status

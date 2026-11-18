@@ -27,6 +27,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepack": "npm run build",
@@ -39,8 +40,11 @@
     "zod": "^4.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^24.10.0",
+    "eslint": "^10.15.0",
     "typescript": "^5.9.0",
+    "typescript-eslint": "^8.73.0",
     "vitest": "^4.0.0"
   }
 }
