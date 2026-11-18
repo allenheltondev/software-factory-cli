@@ -6,9 +6,14 @@ what came of it, what review caught and how much back-and-forth it took.
 ```sh
 updraft stats                        # the last 30 days, all repositories
 updraft stats --since 12h            # h, d or w, as for "updraft clean --older-than"
+updraft stats --since today          # since midnight, in this machine's local time zone
 updraft stats --since all --repo octo/widgets
 updraft stats --json                 # the same, machine-readable
 ```
+
+`--since today` starts the window at the most recent local midnight (an event exactly at midnight
+is included; one a moment earlier is not). It works with `--repo` and `--json`; the JSON
+`window.since` is that midnight as a UTC timestamp and `window.label` is `"today"`.
 
 It is read-only and local. It opens the state database read-only (it never creates, migrates or
 writes it), makes no network request and sends nothing anywhere. A database from before stats

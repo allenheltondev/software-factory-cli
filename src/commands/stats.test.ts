@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { buildHistory } from '../../test/factory-history.js';
+import { buildHistory, History } from '../../test/factory-history.js';
 import { openDatabase, openDatabaseReadOnly, SCHEMA_VERSION, schemaVersion } from '../db/database.js';
 import { EXIT } from './errors.js';
 import { fakeContext } from './fakes.js';
@@ -99,6 +99,34 @@ describe('statsCommand', () => {
     expect(r.overall.review.findings).toMatchObject({ total: 5, withCount: 2, average: 2.5 });
     expect(r.byRepo).toHaveLength(1);
     expect(r.byRepo[0]).toMatchObject({ repo: 'octo/widgets', repoId: 42 });
+  });
+
+  it('--since today starts at local midnight: includes an event at midnight, not one just before', async () => {
+    const midnight = new Date(2026, 10, 18).getTime(); // local midnight
+    const ctx = fakeContext();
+    ctx.now = () => midnight + 5 * 3_600_000;
+    const db = openDatabase(ctx.paths.dbFile);
+    const h = new History(midnight - 1, db);
+    h.queueIssue({ repoId: 42, fullName: 'octo/widgets', issue: 1 });
+    h.run(); // finishes 1 ms before midnight
+    h.advance(1);
+    h.queueIssue({ repoId: 42, fullName: 'octo/widgets', issue: 2 });
+    h.run(); // finishes exactly at midnight
+    db.close();
+    ctx.openDbReadOnly = (file) => openDatabaseReadOnly(file);
+
+    await statsCommand(ctx, { json: true, since: 'today', repo: 'octo/widgets' });
+    const r = JSON.parse(ctx.out.text);
+    expect(r.window).toMatchObject({ label: 'today', since: new Date(midnight).toISOString() });
+    expect(r.repo).toBe('octo/widgets');
+    expect(r.overall.work.finished.total.total).toBe(1);
+
+    const text = fakeContext();
+    text.now = ctx.now;
+    text.openDbReadOnly = ctx.openDbReadOnly;
+    text.paths = ctx.paths;
+    await statsCommand(text, { since: ' Today ' });
+    expect(text.out.text).toContain('Updraft stats for today (since ');
   });
 
   it('opens the database read-only and refuses one from before stats, without upgrading it', async () => {

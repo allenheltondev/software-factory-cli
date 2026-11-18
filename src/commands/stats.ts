@@ -19,7 +19,7 @@ import { CliError, EXIT } from './errors.js';
 
 export interface StatsOptions {
   json?: boolean;
-  /** Window: a number and a unit (h, d, w), or "all". */
+  /** Window: a number and a unit (h, d, w), "today" (since local midnight), or "all". */
   since?: string;
   /** Only this repository (OWNER/REPO). */
   repo?: string;
@@ -156,7 +156,8 @@ const when = (iso: string) => `${iso.slice(0, 16).replace('T', ' ')} UTC`;
 
 export function renderStats(report: StatsReport): string {
   const w = report.window;
-  const span = w.since === null ? 'all recorded history' : `the last ${w.label} (since ${when(w.since)})`;
+  const span =
+    w.since === null ? 'all recorded history' : w.label === 'today' ? `today (since ${when(w.since)})` : `the last ${w.label} (since ${when(w.since)})`;
   const lines = [`Updraft stats for ${span}, ${report.repo ? report.repo : 'all repositories'}`];
   if (!report.database) {
     lines.push('No state database yet: nothing has been recorded. Run "updraft start" to begin.');
@@ -190,12 +191,23 @@ export function renderStats(report: StatsReport): string {
 // Command
 // ---------------------------------------------------------------------------
 
+/** Local midnight (the CLI host's time zone) at the start of the day containing `now`, in epoch ms. */
+export function startOfToday(now: number): number {
+  const d = new Date(now);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
 export async function statsCommand(ctx: CommandContext, opts: StatsOptions = {}): Promise<number> {
   const label = (opts.since ?? DEFAULT_STATS_SINCE).trim();
-  const back = parseSince(label);
   const repo = parseRepo(opts.repo);
   const now = ctx.now();
-  const window = { since: back === null ? null : now - back, now, label: back === null ? 'all' : label, repo };
+  let window: { since: number | null; now: number; label: string; repo: string | null };
+  if (label.toLowerCase() === 'today') {
+    window = { since: startOfToday(now), now, label: 'today', repo };
+  } else {
+    const back = parseSince(label);
+    window = { since: back === null ? null : now - back, now, label: back === null ? 'all' : label, repo };
+  }
 
   // Looking must not change anything: no database is created, an existing one is opened read-only.
   let report: StatsReport;
