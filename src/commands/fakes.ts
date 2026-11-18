@@ -95,7 +95,7 @@ export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] }
 }
 
 export function tempHome(): string {
-  return mkdtempSync(join(tmpdir(), 'factory-cmd-'));
+  return mkdtempSync(join(tmpdir(), 'updraft-cmd-'));
 }
 
 /** A discovery report for one agent; usable (found, runnable, signed in, supported) by default. */
@@ -148,7 +148,7 @@ export function fakeContext(
   } = {},
 ): CommandContext & { out: MemoryOutput; err: MemoryOutput } {
   const home = o.home ?? tempHome();
-  const env = { ...o.env, FACTORY_HOME: home };
+  const env = { ...o.env, UPDRAFT_HOME: home };
   return {
     paths: resolvePaths({ env }),
     env,
@@ -175,7 +175,7 @@ export function fakeContext(
 }
 
 /** A hand-edited config with comments, blank lines and mixed styles, shared by save round-trip tests. */
-export const COMMENTED_CONFIG = `# Factory config, edited by hand
+export const COMMENTED_CONFIG = `# Updraft config, edited by hand
 version: 1
 
 # Poll every two minutes; rate limits are tight.
@@ -213,7 +213,7 @@ repositories:
     workflows:
       - trigger:
           event: issue.labeled
-          label: factory:ready
+          label: updraft:ready
         action: implement-issue
         pool: general # default pool
       # Old experiment, to be removed

@@ -1,6 +1,6 @@
-// OWNER: queue/worker workstream. The long-running worker behind `factory start`.
+// OWNER: queue/worker workstream. The long-running worker behind `updraft start`.
 import { hostname as osHostname } from 'node:os';
-import type { FactoryConfig } from '../config/schema.js';
+import type { UpdraftConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
 import {
   CANCELED_BY_USER,
@@ -19,7 +19,7 @@ import {
   type Claim,
   type FinishedRun,
 } from '../db/queue.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { FailureCommenter } from '../publish/failure-comment.js';
 import type { Publisher } from '../publish/publish.js';
 import type { IssueSnapshot, Job } from '../types.js';
@@ -46,7 +46,7 @@ import { reconcileInterruptedRuns } from './reconcile.js';
 export { WorkerLockedError } from './lock.js';
 
 /**
- * How often the worker looks for `factory cancel` requests on the runs it is executing. The
+ * How often the worker looks for `updraft cancel` requests on the runs it is executing. The
  * heartbeat (15s) is too slow for someone watching an agent do the wrong thing, and the check is
  * one indexed query on the local database, skipped while nothing is running.
  */
@@ -67,10 +67,10 @@ export interface DaemonTiming {
 
 export interface DaemonDeps {
   db: Db;
-  config: FactoryConfig;
-  paths: FactoryPaths;
+  config: UpdraftConfig;
+  paths: UpdraftPaths;
   log: Logger;
-  /** One poll cycle (wired to poller.pollOnce by `factory start`). */
+  /** One poll cycle (wired to poller.pollOnce by `updraft start`). */
   poll: () => Promise<unknown>;
   /** Final pre-start check (wired to poller.checkJobDispatchable). `issue` is passed to the executor. */
   checkDispatchable: (job: Job) => Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }>;
@@ -151,7 +151,7 @@ interface InFlight {
 }
 
 /**
- * The long-running worker behind `factory start`:
+ * The long-running worker behind `updraft start`:
  * acquire the single-worker lock, reconcile interrupted runs from a previous
  * process, then loop: poll every pollIntervalSeconds, claim and execute jobs
  * with the configured executor, heartbeat leases, and exit cleanly on abort.
@@ -345,7 +345,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   };
 
   /**
-   * `factory cancel` runs in another process and can only record its request in the database.
+   * `updraft cancel` runs in another process and can only record its request in the database.
    * Abort the controller of each requested run: the executor stops the agent's process tree
    * exactly as it does on shutdown, and finishRun then closes the run as canceled. On its own
    * timer for the same reason as the heartbeat: the loop may be awaiting GitHub.

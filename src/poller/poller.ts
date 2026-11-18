@@ -20,7 +20,7 @@
 //      application was superseded or the issue was edited since by someone not allowed to
 //      dispatch. That includes jobs queued in this same cycle, so an edit made between the
 //      label and the poll that ingested it is caught here (and again before the agent starts).
-import { allowedActorsFor, workflowId, type FactoryConfig, type RepositoryConfig, type WorkflowConfig } from '../config/schema.js';
+import { allowedActorsFor, workflowId, type UpdraftConfig, type RepositoryConfig, type WorkflowConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
 import { cancelQueuedJob, commitPollBatch, getCheckpoint, listQueuedJobs, type Checkpoint, type NewJob } from '../db/ingest.js';
 import {
@@ -57,7 +57,7 @@ export interface RepoBackoffState {
 export interface PollerDeps {
   db: Db;
   api: GitHubApi;
-  config: FactoryConfig;
+  config: UpdraftConfig;
   log: Logger;
   now?: () => number;
   /**
@@ -123,14 +123,14 @@ function cachedIssueLookup(api: GitHubApi): IssueLookup {
   };
 }
 
-function findRepo(config: FactoryConfig, repoId: number): { fullName: string; cfg: RepositoryConfig } | null {
+function findRepo(config: UpdraftConfig, repoId: number): { fullName: string; cfg: RepositoryConfig } | null {
   for (const [fullName, cfg] of Object.entries(config.repositories)) {
     if (cfg.id === repoId) return { fullName, cfg };
   }
   return null;
 }
 
-function actorAllowed(config: FactoryConfig, wf: WorkflowConfig, actor: string | null): boolean {
+function actorAllowed(config: UpdraftConfig, wf: WorkflowConfig, actor: string | null): boolean {
   if (!actor) return false;
   return allowedActorsFor(config, wf).some((a) => a.toLowerCase() === actor.toLowerCase());
 }
@@ -509,7 +509,7 @@ type IssueBodyEditLookup = (repo: RepoRef, issueNumber: number) => Promise<GitHu
  * Returns a cancel reason, or the issue's events and the application's position in them.
  */
 async function triggerApplication(
-  config: FactoryConfig,
+  config: UpdraftConfig,
   wf: WorkflowConfig,
   job: Job,
   repo: RepoRef,
@@ -552,7 +552,7 @@ async function triggerApplication(
  * Returns a cancel reason, or null when the text is approved.
  */
 async function issueEditProblem(
-  config: FactoryConfig,
+  config: UpdraftConfig,
   wf: WorkflowConfig,
   job: Job,
   repo: RepoRef,
@@ -586,7 +586,7 @@ async function issueEditProblem(
 }
 
 async function evaluateJob(
-  config: FactoryConfig,
+  config: UpdraftConfig,
   job: Job,
   getIssue: IssueLookup,
   getEvents: IssueEventsLookup,

@@ -169,7 +169,7 @@ function resultError(r: ResultMessage): string | null {
   }
 }
 
-/** One line describing the result, for the end of the run summary (and `factory status`). */
+/** One line describing the result, for the end of the run summary (and `updraft status`). */
 function statusLine(r: ResultMessage): string {
   const parts = [`claude: ${r.subtype}${r.subtype === 'success' && r.is_error ? ' (is_error)' : ''}${turns(r)}`];
   const c = cost(r);

@@ -1,46 +1,46 @@
 # Background operation
 
-`factory start` is a long-running foreground process. Installing the npm package does not
+`updraft start` is a long-running foreground process. Installing the npm package does not
 start it; you choose when and how it runs in the background. The package ships example
 launchers under `examples/launchers/` (inside the installed package at
-`$(npm root -g)/software-factory-cli/examples/launchers`).
+`$(npm root -g)/@allenheltondev/updraft/examples/launchers`).
 
 | Environment | Launcher | Files |
 | --- | --- | --- |
 | Windows | Task Scheduler task at logon, under your account | `windows/register-task.ps1`, `windows/unregister-task.ps1` |
-| macOS | Per-user `launchd` LaunchAgent | `macos/software-factory.plist.template`, `macos/install-launchagent.sh` |
-| Linux with systemd | `systemd --user` service | `linux/software-factory.service.template`, `linux/install-systemd-user.sh` |
+| macOS | Per-user `launchd` LaunchAgent | `macos/updraft.plist.template`, `macos/install-launchagent.sh` |
+| Linux with systemd | `systemd --user` service | `linux/updraft.service.template`, `linux/install-systemd-user.sh` |
 | Other Linux hosts | Your existing process supervisor | see [below](#other-hosts) |
 
 Every launcher:
 
 - runs `node <installed package>/dist/cli.js start --config <absolute path>` directly, not
-  npm's `factory` shim, with fully qualified paths;
+  npm's `updraft` shim, with fully qualified paths;
 - sets the working directory (default: the config file's directory);
 - sets `PATH` to include the directories of `node`, `git`, `gh` and any agent CLIs
   (`codex`, `claude`, `kiro-cli`) found when you install it, because a background process does
   not get your terminal's PATH. Add more with `-ExtraPath` / `--extra-path`;
-- passes `FACTORY_HOME` through if you use it;
+- passes `UPDRAFT_HOME` through if you use it;
 - restarts the worker after a crash, and only ever runs one copy.
 
-The worker holds a lock in the state database, so a second `factory start` against the same
+The worker holds a lock in the state database, so a second `updraft start` against the same
 state exits with code 3 instead of polling twice. Launchers treat that as a failure and retry
 on their restart interval, so a launcher-started worker takes over once a terminal-started one
 stops or its lock goes stale. After a restart the worker resumes from the saved checkpoints;
 already-queued jobs are not duplicated.
 
 Re-run the install script after upgrading Node.js to a new install location or moving the
-package. Upgrading the package in place (`npm install -g software-factory-cli`) keeps the same
+package. Upgrading the package in place (`npm install -g @allenheltondev/updraft`) keeps the same
 `cli.js` path; restart the launcher to pick up the new version.
 
 ## Check the environment first
 
 A background process can see a different PATH and credential context than your terminal.
-Before relying on a launcher, run `factory doctor` with the same config and, where possible,
+Before relying on a launcher, run `updraft doctor` with the same config and, where possible,
 the same environment the launcher uses:
 
 ```sh
-factory doctor --config "/path/to/config.yaml"
+updraft doctor --config "/path/to/config.yaml"
 ```
 
 `gh` must be signed in for the same user account (`gh auth status`). If `gh` stores its token
@@ -57,9 +57,9 @@ Some agent CLIs read their credentials from the environment. Kiro's headless mod
 own environment on to the agent, minus `GH_TOKEN` and `GITHUB_TOKEN`, so the key has to be in
 the environment the **launcher** gives the worker. Setting it in your terminal isn't enough.
 
-Don't put it in the factory config, and in particular not in `agents.kiro.env`. The config is a
-plain-text file that is easy to copy, share or commit. (`factory doctor` would accept a key
-there, since it checks each agent with its `agents.<name>.env` as a live run does; `factory
+Don't put it in Updraft config, and in particular not in `agents.kiro.env`. The config is a
+plain-text file that is easy to copy, share or commit. (`updraft doctor` would accept a key
+there, since it checks each agent with its `agents.<name>.env` as a live run does; `updraft
 agents` would still report Kiro as signed out.) Kiro calls API keys "long-lived credentials"; keep them in a file or store only
 your account can read, and rotate them as your policy requires
 ([authentication](https://kiro.dev/docs/getting-started/authentication/)).
@@ -78,41 +78,41 @@ Remove-Variable key
 
 Then sign out and back in. That restarts the logon task with the new environment; a task
 restarted any other way may still have the old one. Check from a new PowerShell window with
-`factory doctor`. Kiro supports the CLI on Windows 11 only, and `factory doctor` reports
+`updraft doctor`. Kiro supports the CLI on Windows 11 only, and `updraft doctor` reports
 earlier Windows builds as unsupported.
 
 **macOS (LaunchAgent).** launchd has no environment-file option, so add the key to the
 installed plist's `EnvironmentVariables` and reload it:
 
 ```sh
-plist="$HOME/Library/LaunchAgents/local.software-factory.plist"
+plist="$HOME/Library/LaunchAgents/local.updraft.plist"
 printf 'KIRO_API_KEY: '; stty -echo; IFS= read -r key; stty echo; echo
 plutil -replace EnvironmentVariables.KIRO_API_KEY -string "$key" "$plist"; unset key
 chmod 600 "$plist"
 plutil -lint "$plist"
-launchctl bootout "gui/$(id -u)/local.software-factory"
+launchctl bootout "gui/$(id -u)/local.updraft"
 launchctl bootstrap "gui/$(id -u)" "$plist"
 ```
 
 `~/Library` is private to your account by default, and `chmod 600` keeps the plist that way.
 `plutil` gets the key as an argument for the moment it runs. Re-running
 `install-launchagent.sh` rewrites the plist without the key, so add it again afterwards. Use
-your own label in place of `local.software-factory` if you passed `--label`.
+your own label in place of `local.updraft` if you passed `--label`.
 
 **Linux (systemd --user).** The unit reads an optional environment file,
-`~/.config/software-factory/worker.env` by default (`$FACTORY_HOME/worker.env` with
-`FACTORY_HOME`, or the path given to `install-systemd-user.sh --env-file`). A missing file is
+`~/.config/updraft/worker.env` by default (`$UPDRAFT_HOME/worker.env` with
+`UPDRAFT_HOME`, or the path given to `install-systemd-user.sh --env-file`). A missing file is
 ignored. Create it readable only by you:
 
 ```sh
-envfile="${XDG_CONFIG_HOME:-$HOME/.config}/software-factory/worker.env"
+envfile="${XDG_CONFIG_HOME:-$HOME/.config}/updraft/worker.env"
 mkdir -p "$(dirname "$envfile")"
 install -m 600 /dev/null "$envfile"
 printf 'KIRO_API_KEY: '; stty -echo; IFS= read -r key; stty echo; echo
 printf 'KIRO_API_KEY=%s\n' "$key" > "$envfile"; unset key
 # Once, with the options you installed with, if the unit predates its EnvironmentFile line:
-bash "$(npm root -g)/software-factory-cli/examples/launchers/linux/install-systemd-user.sh"
-systemctl --user restart software-factory
+bash "$(npm root -g)/@allenheltondev/updraft/examples/launchers/linux/install-systemd-user.sh"
+systemctl --user restart updraft
 ```
 
 The file uses systemd's `KEY=value` format, one variable per line
@@ -120,17 +120,17 @@ The file uses systemd's `KEY=value` format, one variable per line
 The install script prints the file's path and warns if other users can read it.
 
 **Other hosts.** Give the variable to the worker through your supervisor's own secret or
-environment mechanism, not the factory config.
+environment mechanism, not Updraft config.
 
 ## Logs
 
 | Platform | Worker log | Launcher stdout/stderr |
 | --- | --- | --- |
-| Windows | `%LOCALAPPDATA%\software-factory\logs\factory.log` | `launcher.out.log`, `launcher.err.log` in the same directory (previous run kept as `*.prev`) |
-| macOS | `~/Library/Logs/software-factory/factory.log` | `~/Library/Logs/software-factory/launchd.out.log`, `launchd.err.log` |
-| Linux | `~/.local/state/software-factory/logs/factory.log` | `journalctl --user -u software-factory` |
+| Windows | `%LOCALAPPDATA%\updraft\logs\updraft.log` | `launcher.out.log`, `launcher.err.log` in the same directory (previous run kept as `*.prev`) |
+| macOS | `~/Library/Logs/updraft/updraft.log` | `~/Library/Logs/updraft/launchd.out.log`, `launchd.err.log` |
+| Linux | `~/.local/state/updraft/logs/updraft.log` | `journalctl --user -u updraft` |
 
-With `FACTORY_HOME` set, the worker log is `$FACTORY_HOME/logs/factory.log` (and the Windows
+With `UPDRAFT_HOME` set, the worker log is `$UPDRAFT_HOME/logs/updraft.log` (and the Windows
 launcher logs go there too).
 
 ## Windows (Task Scheduler)
@@ -138,11 +138,11 @@ launcher logs go there too).
 Run from a normal, non-elevated PowerShell window as the user who should run the worker:
 
 ```powershell
-$launchers = Join-Path (npm root -g) 'software-factory-cli\examples\launchers\windows'
+$launchers = Join-Path (npm root -g) '@allenheltondev\updraft\examples\launchers\windows'
 powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\register-task.ps1"
 # or with options:
 powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\register-task.ps1" `
-  -ConfigPath "D:\My Configs\factory.yaml" -TaskName "SoftwareFactory" -ExtraPath "C:\Tools\bin"
+  -ConfigPath "D:\My Configs\updraft.yaml" -TaskName "Updraft" -ExtraPath "C:\Tools\bin"
 ```
 
 Add `-WhatIf` to see the resolved paths without registering anything, and `-NoStart` to
@@ -150,12 +150,12 @@ register without starting now.
 
 What it creates:
 
-- A task (default name `SoftwareFactory`) triggered at logon of your account, with an
+- A task (default name `Updraft`) triggered at logon of your account, with an
   interactive logon type, so no password is stored and the worker uses your credential
   context (gh token, Git Credential Manager).
 - Settings: restart on failure (999 times, every minute), `MultipleInstances = IgnoreNew`,
   no execution time limit (`PT0S`), start when available, keep running on battery.
-- A generated wrapper, `%LOCALAPPDATA%\software-factory\launcher\<TaskName>.ps1`. Task
+- A generated wrapper, `%LOCALAPPDATA%\updraft\launcher\<TaskName>.ps1`. Task
   Scheduler cannot set environment variables or capture output, so the task runs
   `powershell.exe -WindowStyle Hidden -File <wrapper>`; the wrapper sets PATH, starts
   `node.exe` with the installed `dist\cli.js`, redirects its output to `launcher.*.log` and
@@ -164,16 +164,16 @@ What it creates:
 Manage it with:
 
 ```powershell
-Get-ScheduledTaskInfo -TaskName SoftwareFactory   # LastTaskResult, NextRunTime
-Start-ScheduledTask   -TaskName SoftwareFactory
-Stop-ScheduledTask    -TaskName SoftwareFactory
+Get-ScheduledTaskInfo -TaskName Updraft   # LastTaskResult, NextRunTime
+Start-ScheduledTask   -TaskName Updraft
+Stop-ScheduledTask    -TaskName Updraft
 powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\unregister-task.ps1"
 ```
 
 `unregister-task.ps1` stops and removes the task, stops a leftover worker process started by
 the wrapper, and deletes the wrapper. Config, state and logs are kept. The wrapper records the
 worker's PID, start time and executable in `launcher\<TaskName>.worker.json`, and unregister
-stops a process only when all three match, so a `factory start` you run by hand is never
+stops a process only when all three match, so a `updraft start` you run by hand is never
 stopped, even with the same CLI and config. Re-running `register-task.ps1` does the same for
 the worker the previous registration started, so the new task doesn't hit the worker lock.
 
@@ -194,14 +194,14 @@ Notes:
 ## macOS (LaunchAgent)
 
 ```sh
-launchers="$(npm root -g)/software-factory-cli/examples/launchers/macos"
+launchers="$(npm root -g)/@allenheltondev/updraft/examples/launchers/macos"
 bash "$launchers/install-launchagent.sh"
 # or with options:
-bash "$launchers/install-launchagent.sh" --config "$HOME/My Configs/factory.yaml" --extra-path /opt/tools/bin
+bash "$launchers/install-launchagent.sh" --config "$HOME/My Configs/updraft.yaml" --extra-path /opt/tools/bin
 ```
 
-The script fills `software-factory.plist.template` (XML-escaping every value), writes
-`~/Library/LaunchAgents/local.software-factory.plist`, checks it with `plutil -lint`, and
+The script fills `updraft.plist.template` (XML-escaping every value), writes
+`~/Library/LaunchAgents/local.updraft.plist`, checks it with `plutil -lint`, and
 loads it with `launchctl bootstrap gui/$(id -u)`. Use `--print` to see the rendered plist
 without installing, `--no-start` to install without loading, and `--label` to change the
 label.
@@ -209,11 +209,11 @@ label.
 The agent has explicit `ProgramArguments` (node, cli.js, `start`, `--config`, path),
 `RunAtLoad`, `KeepAlive` with `SuccessfulExit = false` (restart after a crash or non-zero
 exit, 30-second throttle), a `PATH` in `EnvironmentVariables`, and stdout/stderr under
-`~/Library/Logs/software-factory/`.
+`~/Library/Logs/updraft/`.
 
 ```sh
-launchctl print gui/$(id -u)/local.software-factory    # state, pid, last exit code
-launchctl kickstart -k gui/$(id -u)/local.software-factory   # restart
+launchctl print gui/$(id -u)/local.updraft    # state, pid, last exit code
+launchctl kickstart -k gui/$(id -u)/local.updraft   # restart
 bash "$launchers/install-launchagent.sh" --uninstall
 ```
 
@@ -223,14 +223,14 @@ block background access until node is granted access in System Settings > Privac
 ## Linux (systemd --user)
 
 ```sh
-launchers="$(npm root -g)/software-factory-cli/examples/launchers/linux"
+launchers="$(npm root -g)/@allenheltondev/updraft/examples/launchers/linux"
 bash "$launchers/install-systemd-user.sh"
 # or with options:
-bash "$launchers/install-systemd-user.sh" --config "$HOME/My Configs/factory.yaml" --name software-factory
+bash "$launchers/install-systemd-user.sh" --config "$HOME/My Configs/updraft.yaml" --name updraft
 ```
 
-The script fills `software-factory.service.template` (quoting paths and escaping `%`, `$`,
-`"` and `\` for systemd), writes `~/.config/systemd/user/software-factory.service`, runs
+The script fills `updraft.service.template` (quoting paths and escaping `%`, `$`,
+`"` and `\` for systemd), writes `~/.config/systemd/user/updraft.service`, runs
 `daemon-reload`, then enables and starts it. Use `--print` to see the unit without
 installing and `--no-start` to enable without starting.
 
@@ -240,8 +240,8 @@ The unit uses `Restart=on-failure` with `RestartSec=30`, an explicit
 worker receives SIGTERM and can stop gracefully before anything left over is killed.
 
 ```sh
-systemctl --user status software-factory
-journalctl --user -u software-factory -f
+systemctl --user status updraft
+journalctl --user -u updraft -f
 bash "$launchers/install-systemd-user.sh" --uninstall
 ```
 
@@ -263,8 +263,8 @@ On a Linux host without systemd (or in a container), run the worker in the foreg
 the supervisor the host already uses, with the same explicit arguments:
 
 ```sh
-/usr/local/bin/node /usr/local/lib/node_modules/software-factory-cli/dist/cli.js \
-  start --config "/home/me/.config/software-factory/config.yaml"
+/usr/local/bin/node /usr/local/lib/node_modules/@allenheltondev/updraft/dist/cli.js \
+  start --config "/home/me/.config/updraft/config.yaml"
 ```
 
 The supervisor should run it as your user, set the working directory and `PATH`, restart it on
@@ -272,9 +272,9 @@ non-zero exit, send SIGTERM to stop it, and capture stdout/stderr. For example, 
 supervisord:
 
 ```ini
-[program:software-factory]
-command=/usr/local/bin/node /usr/local/lib/node_modules/software-factory-cli/dist/cli.js start --config "/home/me/.config/software-factory/config.yaml"
-directory=/home/me/.config/software-factory
+[program:updraft]
+command=/usr/local/bin/node /usr/local/lib/node_modules/@allenheltondev/updraft/dist/cli.js start --config "/home/me/.config/updraft/config.yaml"
+directory=/home/me/.config/updraft
 user=me
 environment=PATH="/usr/local/bin:/usr/bin:/bin",HOME="/home/me"
 autorestart=unexpected

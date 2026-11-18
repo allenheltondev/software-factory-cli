@@ -95,7 +95,7 @@ describe('createGitHubApi', () => {
     expect(calls[0]!.headers).toMatchObject({
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'software-factory-cli',
+      'User-Agent': 'updraft',
       Authorization: 'Bearer t0k',
     });
   });
@@ -110,7 +110,7 @@ describe('createGitHubApi', () => {
             event: 'labeled',
             created_at: '2026-01-01T00:00:00Z',
             actor: { login: 'allen' },
-            label: { name: 'factory:ready', color: 'fff' },
+            label: { name: 'updraft:ready', color: 'fff' },
             issue: { number: 7, title: 'T', html_url: 'https://github.com/o/r/issues/7' },
           },
           { id: 98, event: 'closed', created_at: '2026-01-01T00:00:00Z', actor: null, issue: { number: 8, title: 'P', html_url: 'u', pull_request: {} } },
@@ -128,7 +128,7 @@ describe('createGitHubApi', () => {
       event: 'labeled',
       createdAt: '2026-01-01T00:00:00Z',
       actor: 'allen',
-      label: 'factory:ready',
+      label: 'updraft:ready',
       issue: { number: 7, title: 'T', htmlUrl: 'https://github.com/o/r/issues/7', isPullRequest: false },
     });
     expect(p1.events[1]).toMatchObject({ actor: null, label: null, issue: { isPullRequest: true } });
@@ -219,7 +219,7 @@ describe('createGitHubApi', () => {
   it('getIssue does not follow transfer redirects and maps labels/PR flag', async () => {
     const { fn, calls } = fakeFetch((url) => {
       if (url.pathname.endsWith('/9')) return new Response(null, { status: 301, headers: { location: 'https://api.github.com/repositories/2/issues/1' } });
-      return json({ number: 5, title: 'x', body: 'do it', html_url: 'h', state: 'open', labels: [{ name: 'art' }, 'factory:ready'] });
+      return json({ number: 5, title: 'x', body: 'do it', html_url: 'h', state: 'open', labels: [{ name: 'art' }, 'updraft:ready'] });
     });
     const api = await createGitHubApi({ token: 't', fetch: fn });
     const repo = { id: 1, fullName: 'o/r' };
@@ -229,7 +229,7 @@ describe('createGitHubApi', () => {
       body: 'do it',
       htmlUrl: 'h',
       state: 'open',
-      labels: ['art', 'factory:ready'],
+      labels: ['art', 'updraft:ready'],
       isPullRequest: false,
     });
     expect(calls[0]!.redirect).toBe('manual');
@@ -248,7 +248,7 @@ describe('createGitHubApi: publication writes', () => {
     draft: true,
     merged_at: null,
     body: 'b',
-    head: { ref: 'factory/issue-7-job_x', repo: { id: 42 } },
+    head: { ref: 'updraft/issue-7-job_x', repo: { id: 42 } },
     base: { ref: 'main' },
     ...extra,
   });
@@ -256,17 +256,17 @@ describe('createGitHubApi: publication writes', () => {
   it('opens a PR with POST on the stable-ID route and maps the response', async () => {
     const { fn, calls } = fakeFetch(() => json(rawPull(5), { status: 201 }));
     const api = await createGitHubApi({ token: 't', fetch: fn });
-    const pr = await api.createPullRequest({ id: 42, fullName: 'o/r' }, { title: 'T', head: 'factory/issue-7-job_x', base: 'main', body: 'B', draft: true });
+    const pr = await api.createPullRequest({ id: 42, fullName: 'o/r' }, { title: 'T', head: 'updraft/issue-7-job_x', base: 'main', body: 'B', draft: true });
     expect(calls[0]).toMatchObject({ method: 'POST', url: 'https://api.github.com/repositories/42/pulls' });
     expect(calls[0]!.headers).toMatchObject({ Authorization: 'Bearer t', 'Content-Type': 'application/json' });
-    expect(JSON.parse(calls[0]!.body!)).toEqual({ title: 'T', head: 'factory/issue-7-job_x', base: 'main', body: 'B', draft: true });
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ title: 'T', head: 'updraft/issue-7-job_x', base: 'main', body: 'B', draft: true });
     expect(pr).toEqual({
       number: 5,
       htmlUrl: 'https://github.com/o/r/pull/5',
       state: 'open',
       draft: true,
       merged: false,
-      headRef: 'factory/issue-7-job_x',
+      headRef: 'updraft/issue-7-job_x',
       headRepoId: 42,
       baseRef: 'main',
       body: 'b',

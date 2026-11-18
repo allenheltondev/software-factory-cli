@@ -115,7 +115,7 @@ export function mergeEnv(base: NodeJS.ProcessEnv, ...layers: Array<Record<string
 
 /**
  * The environment an agent's CLI is looked up and checked in: the worker's, minus the GitHub
- * tokens it withholds, plus agents.<name>.env. `factory doctor` uses the same rule, so it checks
+ * tokens it withholds, plus agents.<name>.env. `updraft doctor` uses the same rule, so it checks
  * what a live run will see.
  */
 export function agentLookupEnv(base: NodeJS.ProcessEnv, agent: Pick<AgentConfig, 'env'>): NodeJS.ProcessEnv {
@@ -519,7 +519,7 @@ export class LiveExecutor implements Executor {
     await writeFile(
       logPath,
       [
-        `software-factory run ${run.id}`,
+        `updraft run ${run.id}`,
         `written: ${new Date(ctx.now()).toISOString()}`,
         'mode: live. The routed agent runs in the job worktree.',
         '',

@@ -3,19 +3,19 @@
 // execution.mode in createExecutor.
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { agentAdapter, type FactoryConfig, type RepositoryConfig } from '../config/schema.js';
+import { agentAdapter, type UpdraftConfig, type RepositoryConfig } from '../config/schema.js';
 import { CANCELED_BY_USER, ownEntry, type Claim, type RunProcessInfo } from '../db/queue.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { IssueSnapshot, Job, RunOutcome, RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
 
 export interface ExecutionContext {
-  config: FactoryConfig;
-  paths: FactoryPaths;
+  config: UpdraftConfig;
+  paths: UpdraftPaths;
   log: Logger;
   /**
    * Aborted when the worker is shutting down and the run did not finish in time, or when the
-   * user canceled the run (`factory cancel`; see canceledByUser). Either way a live adapter
+   * user canceled the run (`updraft cancel`; see canceledByUser). Either way a live adapter
    * should stop its agent and resolve with outcome 'interrupted'; the daemon records a user
    * cancel as canceled.
    */
@@ -37,7 +37,7 @@ export interface ExecutionContext {
 }
 
 /**
- * True if the run was stopped by `factory cancel` rather than by the worker shutting down: the
+ * True if the run was stopped by `updraft cancel` rather than by the worker shutting down: the
  * daemon aborts `signal` with CANCELED_BY_USER as the reason.
  */
 export function canceledByUser(signal: AbortSignal): boolean {
@@ -47,7 +47,7 @@ export function canceledByUser(signal: AbortSignal): boolean {
 export interface ExecutionResult {
   outcome: RunOutcome;
   error?: string | null;
-  /** What a live agent run left behind; stored for `factory status`. */
+  /** What a live agent run left behind; stored for `updraft status`. */
   summary?: RunSummary | null;
 }
 
@@ -71,7 +71,7 @@ export interface Executor {
 
 /** The repo's config entry, matched by stable ID first, then by name. */
 export function findRepoConfig(
-  config: FactoryConfig,
+  config: UpdraftConfig,
   job: Pick<Job, 'repoId' | 'repoFullName'>,
 ): { fullName: string; repo: RepositoryConfig } | null {
   for (const [fullName, repo] of Object.entries(config.repositories)) {
@@ -82,7 +82,7 @@ export function findRepoConfig(
 }
 
 /** Resolve an action's prompt file against the config file's directory. */
-export function resolvePromptPath(config: FactoryConfig, paths: FactoryPaths, action: string): string | null {
+export function resolvePromptPath(config: UpdraftConfig, paths: UpdraftPaths, action: string): string | null {
   const prompt = ownEntry(config.actions, action)?.prompt;
   return prompt ? resolve(paths.configDir, prompt) : null;
 }
@@ -114,7 +114,7 @@ export class LogOnlyExecutor implements Executor {
     const env = job.envelope;
 
     const lines = [
-      `software-factory run ${run.id}`,
+      `updraft run ${run.id}`,
       `written: ${new Date(ctx.now()).toISOString()}`,
       `mode: log-only. No agent process was started and no checkout was created.`,
       '',

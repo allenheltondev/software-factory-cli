@@ -82,7 +82,7 @@ export type BeginResult =
 /**
  * Take the publication of a run: create its row, or reopen a failed or skipped one, in state
  * 'publishing' with a lease. Refuses one that is already published, or being published by
- * another process whose lease has not expired (the worker and `factory publish` share this).
+ * another process whose lease has not expired (the worker and `updraft publish` share this).
  */
 export function beginPublication(db: Db, b: BeginPublication): BeginResult {
   const clock = b.now ?? Date.now;
@@ -224,7 +224,7 @@ export function listDuePublications(db: Db, opts: { maxAttempts: number; now?: (
   ).map((r) => r.run_id);
 }
 
-/** Newest first, for `factory status`. */
+/** Newest first, for `updraft status`. */
 export function listRecentPublications(db: Db, limit = 10): Publication[] {
   return (
     db.prepare('SELECT * FROM publications ORDER BY updated_at DESC, rowid DESC LIMIT ?').all(limit) as unknown as PublicationRow[]

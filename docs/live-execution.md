@@ -12,7 +12,7 @@ on its own page:
 
 ## Requirements
 
-`factory validate` accepts `execution.mode: live` only when:
+`updraft validate` accepts `execution.mode: live` only when:
 
 - at least one agent is enabled, and every enabled agent uses an adapter that can run agents
   (`claude`, `codex` and `kiro` all can);
@@ -21,9 +21,9 @@ on its own page:
 - every such action that a workflow uses has a `prompt`.
 
 Live mode starts agents only for actions with `output: local-branch`. Runs of an action with
-`output: log` are only logged, and `factory validate` warns about them.
+`output: log` are only logged, and `updraft validate` warns about them.
 
-In live mode, `factory doctor` reports a missing, broken or signed-out agent CLI as a failure
+In live mode, `updraft doctor` reports a missing, broken or signed-out agent CLI as a failure
 rather than a warning.
 
 ## Run lifecycle
@@ -33,7 +33,7 @@ For each `local-branch` job the worker does the following:
 1. It renders the action's prompt file plus the issue's title, body, labels and URL into
    `prompt.md` in the run's log directory. The issue text is fenced and labelled as untrusted
    input. The adapter hands the file to the agent on stdin or by path, never in a command line.
-2. It finds the agent CLI (`agents.<name>.command`, else the same lookup as `factory agents`).
+2. It finds the agent CLI (`agents.<name>.command`, else the same lookup as `updraft agents`).
    If it can't, or the process can't be spawned, the run is `start_failed` and the job is
    requeued for the next eligible agent (up to three start failures in a row).
 3. It prepares the branch and worktree as described in
@@ -49,7 +49,7 @@ For each `local-branch` job the worker does the following:
    their worktree for inspection.
    If the action has `verify` commands and the agent succeeded, the worker then runs them in
    the worktree; a failing command fails the run (see [Verification](verification.md)).
-6. It appends a summary to `run.log` and stores it for `factory status`: commits on the job
+6. It appends a summary to `run.log` and stores it for `updraft status`: commits on the job
    branch since the base commit, files changed (`git diff --stat` against the base, committed
    or not), untracked files, and the agent's final message (or its last output lines).
 
@@ -60,7 +60,7 @@ stops whatever it started. Pressing Ctrl-C in a terminal therefore doesn't reach
 directly: the worker forwards its own shutdown (SIGINT or SIGTERM) to the agent's group as
 SIGTERM, then SIGKILL after five seconds, and records the run `interrupted`. On Windows the
 worker stops the agent's tree with `taskkill /t /f`. If the worker itself is killed, the
-agent keeps running; the next `factory start` on the same host stops it, but only after
+agent keeps running; the next `updraft start` on the same host stops it, but only after
 checking that the recorded pid still belongs to the same process (same start time), so a pid
 the OS has since reused is never signalled. A run with no recorded start time (one recorded
 by a version of the CLI that did not store it) is not signalled either.

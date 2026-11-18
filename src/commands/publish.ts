@@ -16,7 +16,7 @@ export interface PublishCommandDeps {
 const defaultDeps: PublishCommandDeps = { fileExists: existsSync, token: (env) => resolveGitHubToken(env) };
 
 /**
- * `factory publish RUN_ID`: publish a succeeded live run now, or finish a publication that failed
+ * `updraft publish RUN_ID`: publish a succeeded live run now, or finish a publication that failed
  * part-way. Takes the same idempotent path as the worker, so it never opens a second PR or comment.
  */
 export async function publishCommand(ctx: CommandContext, runId: string, deps: PublishCommandDeps = defaultDeps): Promise<number> {

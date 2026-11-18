@@ -32,12 +32,12 @@ actions:
 3. If every command exits 0, the run is `succeeded` and publication proceeds as configured.
    Otherwise the run is `failed` with an error such as `verification failed: "npm test" exited 1`,
    and the worktree is kept for inspection, exactly as for a failed agent run. The job is not
-   retried on its own; fix the cause and use `factory retry`.
+   retried on its own; fix the cause and use `updraft retry`.
 4. If the worker is stopped (Ctrl-C, SIGTERM) while a command runs, the command's process tree
    is stopped and the run is `interrupted`.
 
 Verification applies in `live` mode to actions with `output: local-branch`. Set anywhere else,
-`factory validate` warns and nothing is run. `factory validate` rejects an empty list, empty or
+`updraft validate` warns and nothing is run. `updraft validate` rejects an empty list, empty or
 multi-line commands, and an empty argv array.
 
 ## How a command is run
@@ -111,7 +111,7 @@ exit: code 0 after 42s
 ---- end of verification: passed ----
 ```
 
-The run summary (in `run.log`, `factory status` and `factory status --json` as
+The run summary (in `run.log`, `updraft status` and `updraft status --json` as
 `summary.verification`) lists each command with its result and duration:
 
 ```text
@@ -146,7 +146,7 @@ files such as `node_modules` do not count) before the first command and after th
 - **The commands can leave files behind.** `npm ci` may rewrite a lockfile, a build may write
   output that is not ignored. These changes stay uncommitted and are not in the PR. The summary
   says `uncommitted changes in the worktree went from 0 to 2 during verification`, and
-  `factory clean` does not remove a worktree with uncommitted changes (git refuses), so it stays
+  `updraft clean` does not remove a worktree with uncommitted changes (git refuses), so it stays
   until you deal with it. If this happens on every run, add the paths to `.gitignore` or use
   commands that do not write to tracked files (`npm ci` rather than `npm install`).
 - **The agent can leave files uncommitted.** The commands then test a tree that contains them,

@@ -34,7 +34,7 @@ const everything = () => true;
 
 const base: ContainerRunOptions = {
   image: 'my-org/claude-runner:latest',
-  name: 'factory-run_abc',
+  name: 'updraft-run_abc',
   mounts: gitMounts(WT, LAYOUT, everything),
   workdir: WT,
   user: '1000:1000',
@@ -48,22 +48,22 @@ const valuesOf = (args: string[], flag: string) => args.flatMap((a, i) => (a ===
 
 describe('containerName', () => {
   it('is derived from the run id alone, so a later worker can name the container without having started it', () => {
-    expect(containerName('run_0mabc123deadbeef')).toBe('factory-run_0mabc123deadbeef');
-    expect(containerName('run_1', 'verify')).toBe('factory-run_1-verify');
+    expect(containerName('run_0mabc123deadbeef')).toBe('updraft-run_0mabc123deadbeef');
+    expect(containerName('run_1', 'verify')).toBe('updraft-run_1-verify');
   });
 
   it('only ever contains characters a runtime accepts in a name', () => {
-    expect(containerName('run/../x y;rm')).toBe('factory-run-..-x-y-rm');
+    expect(containerName('run/../x y;rm')).toBe('updraft-run-..-x-y-rm');
   });
 });
 
 describe('buildContainerRunArgs', () => {
   it('runs the command in a named, removable container, as the given user, in the worktree', () => {
     const args = buildContainerRunArgs(AGENT, base);
-    expect(args.slice(0, 7)).toEqual(['run', '--rm', '-i', '--name', 'factory-run_abc', '--pull', 'never']);
+    expect(args.slice(0, 7)).toEqual(['run', '--rm', '-i', '--name', 'updraft-run_abc', '--pull', 'never']);
     expect(valuesOf(args, '--user')).toEqual(['1000:1000']);
     expect(valuesOf(args, '--workdir')).toEqual([WT]);
-    expect(valuesOf(args, '--label')).toEqual(['software-factory.run=run_abc']);
+    expect(valuesOf(args, '--label')).toEqual(['updraft.run=run_abc']);
     // No terminal: output must be exactly what the agent wrote.
     expect(args).not.toContain('-t');
     expect(args).not.toContain('-it');
@@ -133,7 +133,7 @@ describe('buildContainerRunArgs', () => {
   });
 
   it('leaves user, workdir and label out when not given (a check that only runs `--version`)', () => {
-    const args = buildContainerRunArgs({ file: 'claude', args: ['--version'] }, { image: 'img', name: 'factory-doctor-1', mounts: [] });
+    const args = buildContainerRunArgs({ file: 'claude', args: ['--version'] }, { image: 'img', name: 'updraft-doctor-1', mounts: [] });
     for (const flag of ['--user', '--workdir', '--label', '--mount', '--network']) expect(args).not.toContain(flag);
     expect(args.slice(-3)).toEqual(['img', 'claude', '--version']);
   });
@@ -209,7 +209,7 @@ describe.skipIf(process.platform === 'win32')('worktreeMounts (real git worktree
     fixtures.push(f);
     const wt = join(f.root, 'job worktrees', 'job 1');
     mkdirSync(join(f.root, 'job worktrees'));
-    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'factory/issue-1', wt, 'HEAD');
+    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-1', wt, 'HEAD');
     return { f, wt, common: join(f.clone, '.git') };
   }
 
@@ -261,7 +261,7 @@ describe('containInvocation', () => {
     const f = createGitFixture('octo/widgets');
     fixtures.push(f);
     const wt = join(f.root, 'wt');
-    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'factory/issue-2', wt, 'HEAD');
+    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-2', wt, 'HEAD');
     const promptFile = join(f.root, 'runs', 'run_1', 'prompt.md');
     const container = containerSchema.parse({ image: 'runner:1', env: ['ANTHROPIC_API_KEY'], network: 'bridge', args: ['--memory', '4g'] });
     const stdin = containInvocation({
@@ -274,7 +274,7 @@ describe('containInvocation', () => {
       agentEnv: { GIT_AUTHOR_NAME: 'Agent' },
       user: '501:20',
     });
-    expect(stdin.name).toBe('factory-run_1');
+    expect(stdin.name).toBe('updraft-run_1');
     expect(stdin.invocation).toMatchObject({ file: '/usr/bin/docker', promptVia: 'stdin', env: { ADAPTER_VAR: 'a' } });
     const args = stdin.invocation.args;
     expect(args.slice(args.indexOf('runner:1'))).toEqual(['runner:1', 'claude', '-p']);
@@ -342,7 +342,7 @@ describe.runIf(canBindMount)('the worktree mounts, applied as bind mounts in a p
     fixtures.push(f);
     const wt = join(f.root, 'job worktrees', 'job 1');
     mkdirSync(join(f.root, 'job worktrees'));
-    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'factory/issue-1', wt, 'HEAD');
+    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-1', wt, 'HEAD');
     const common = join(f.clone, '.git');
     const admin = readWorktreeLayout(wt).adminDir;
     const emptyConfig = join(f.root, 'agent gitconfig');
@@ -364,7 +364,7 @@ describe.runIf(canBindMount)('the worktree mounts, applied as bind mounts in a p
         'try add git add -A',
         'try commit git commit -q -m "agent commit"',
         'try branch git checkout -q -b side',
-        'try back git checkout -q factory/issue-1',
+        'try back git checkout -q updraft/issue-1',
         'echo wip >> README.md',
         'try stash git stash',
         'try pop git stash pop',
@@ -411,7 +411,7 @@ describe.runIf(canBindMount)('the worktree mounts, applied as bind mounts in a p
       otherworktree: expect.not.stringMatching(/^0$/),
     });
     // The host sees the agent's commits on the job branch, and the clone itself is untouched.
-    expect(f.git(f.clone, 'log', '--format=%s', '-2', 'factory/issue-1')).toBe('second\nagent commit');
+    expect(f.git(f.clone, 'log', '--format=%s', '-2', 'updraft/issue-1')).toBe('second\nagent commit');
     expect(f.git(f.clone, 'status', '--porcelain')).toBe('');
     expect(existsSync(join(common, 'hooks', 'post-checkout'))).toBe(false);
     expect(readFileSync(join(wt, '.git'), 'utf8')).toBe(`gitdir: ${admin}\n`);

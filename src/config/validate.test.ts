@@ -262,8 +262,8 @@ describe('validateConfig', () => {
 describe('selectPool', () => {
   const selector = { rules: [{ hasLabel: 'art', use: 'art' }], default: 'general' };
   it('first matching rule wins, case-insensitively', () => {
-    expect(selectPool(selector, ['factory:ready', 'Art'])).toBe('art');
-    expect(selectPool(selector, ['factory:ready'])).toBe('general');
+    expect(selectPool(selector, ['updraft:ready', 'Art'])).toBe('art');
+    expect(selectPool(selector, ['updraft:ready'])).toBe('general');
     expect(selectPool('general', ['art'])).toBe('general');
   });
 });

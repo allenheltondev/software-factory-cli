@@ -2,7 +2,7 @@
 //
 // A containerized run replaces `<agent cli> <args>` with
 //
-//   <runtime> run --rm -i --name factory-<run id> ... <image> <agent cli> <args>
+//   <runtime> run --rm -i --name updraft-<run id> ... <image> <agent cli> <args>
 //
 // and nothing else about the run changes: the runtime client is the process the executor spawns,
 // records and waits for, its stdin is the prompt and its stdout/stderr are run.log. Adapters never
@@ -32,9 +32,9 @@ import type { AgentConfig, ContainerConfig } from '../config/schema.js';
 import { which } from '../util/which.js';
 
 /** HOME inside the container: a tmpfs any uid can write. Not a path a host mount would use. */
-export const CONTAINER_HOME = '/factory-home';
-/** Label on every container the worker starts: `docker ps --filter label=software-factory.run`. */
-export const RUN_LABEL = 'software-factory.run';
+export const CONTAINER_HOME = '/updraft-home';
+/** Label on every container the worker starts: `docker ps --filter label=updraft.run`. */
+export const RUN_LABEL = 'updraft.run';
 
 /** Exit code of `docker run` / `podman run` when the runtime itself failed and the command never ran. */
 export const CONTAINER_RUN_FAILED = 125;
@@ -73,10 +73,10 @@ export interface ContainerRunOptions {
   extraArgs?: readonly string[];
 }
 
-/** The container of a run: `factory-<run id>`, restricted to what a container name may contain. */
+/** The container of a run: `updraft-<run id>`, restricted to what a container name may contain. */
 export function containerName(runId: string, suffix?: string): string {
   const clean = (s: string) => s.replace(/[^A-Za-z0-9_.-]/g, '-');
-  return `factory-${clean(runId)}${suffix ? `-${clean(suffix)}` : ''}`;
+  return `updraft-${clean(runId)}${suffix ? `-${clean(suffix)}` : ''}`;
 }
 
 export class ContainerSetupError extends Error {

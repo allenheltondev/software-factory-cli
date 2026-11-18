@@ -1,5 +1,5 @@
-# Example factory config. `factory configure` writes one like this to your
-# per-user config location; `factory validate --config <file>` checks it.
+# Example updraft config. `updraft configure` writes one like this to your
+# per-user config location; `updraft validate --config <file>` checks it.
 version: 1
 pollIntervalSeconds: 60
 maxConcurrent: 2
@@ -51,7 +51,7 @@ actions:
 
 repositories:
   allenheltondev/kids-and-dragons:
-    id: 1 # replaced with the real GitHub repository ID by `factory add` / `configure`
+    id: 1 # replaced with the real GitHub repository ID by `updraft add` / `configure`
     # Local clone that per-job worktrees branch from (relative to this file); required in prepare-only and live mode.
     # checkoutPath: ../clones/kids-and-dragons
     # baseBranch: main # defaults to the remote's default branch

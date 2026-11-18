@@ -11,11 +11,11 @@ import { installFakeRuntime, type FakeRuntime } from '../../test/fake-runtime.js
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { registerAdapter } from '../agents/adapters/registry.js';
-import { configSchema, type FactoryConfig } from '../config/schema.js';
+import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { claimNextJob, getJob, getRun, markExecutionStarted, setRunProcess, type Claim } from '../db/queue.js';
 import { worktreesRoot } from '../git/worktree.js';
-import { resolvePaths, type FactoryPaths } from '../paths.js';
+import { resolvePaths, type UpdraftPaths } from '../paths.js';
 import { silentLogger } from '../util/log.js';
 import { CONTAINER_HOME } from './container.js';
 import { runDaemon } from './daemon.js';
@@ -57,12 +57,12 @@ function setup(o: { timeoutMinutes?: number; args?: string[]; container?: Record
   const f = createGitFixture('octo/widgets');
   fixtures.push(f);
   const runtime = installFakeRuntime(join(f.root, 'runtime bin'));
-  const paths: FactoryPaths = resolvePaths({ env: { FACTORY_HOME: join(f.root, 'factory home') } });
+  const paths: UpdraftPaths = resolvePaths({ env: { UPDRAFT_HOME: join(f.root, 'updraft home') } });
   mkdirSync(join(paths.configDir, 'prompts'), { recursive: true });
   writeFileSync(join(paths.configDir, 'prompts', 'implement.md'), 'Implement the issue below. Commit your work.\n');
   const emptyGitConfig = join(f.root, 'agent gitconfig');
   writeFileSync(emptyGitConfig, '');
-  const config: FactoryConfig = configSchema.parse({
+  const config: UpdraftConfig = configSchema.parse({
     version: 1,
     maxConcurrent: 4,
     execution: { mode: 'live' },
@@ -92,7 +92,7 @@ function setup(o: { timeoutMinutes?: number; args?: string[]; container?: Record
         id: 42,
         checkoutPath: relative(paths.configDir, f.clone),
         remote: 'origin',
-        workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
       },
     },
   });
@@ -101,14 +101,14 @@ function setup(o: { timeoutMinutes?: number; args?: string[]; container?: Record
   return { f, paths, config, db, runtime };
 }
 
-function claim(db: Db, config: FactoryConfig, paths: FactoryPaths, workerId = 'wrk_test'): Claim {
+function claim(db: Db, config: UpdraftConfig, paths: UpdraftPaths, workerId = 'wrk_test'): Claim {
   insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
   const c = claimNextJob(db, config, { workerId, hostname: hostname(), leaseSeconds: 60, runsDir: paths.runsDir });
   if (!c) throw new Error('nothing to claim');
   return c;
 }
 
-function context(db: Db, config: FactoryConfig, paths: FactoryPaths, runId: string, o: { stopping?: AbortSignal } = {}): ExecutionContext {
+function context(db: Db, config: UpdraftConfig, paths: UpdraftPaths, runId: string, o: { stopping?: AbortSignal } = {}): ExecutionContext {
   return {
     config,
     paths,
@@ -152,7 +152,7 @@ describe.skipIf(process.platform === 'win32')('LiveExecutor with agents.<name>.c
     expect(f.git(worktree, 'log', '-1', '--format=%s %an')).toBe('fake agent: implement the issue Fake Agent');
     expect(f.git(f.clone, 'status', '--porcelain')).toBe('');
 
-    const name = `factory-${c.run.id}`;
+    const name = `updraft-${c.run.id}`;
     const [started] = runtime.callsOf('run');
     expect(started!.started).toBe(name);
     const argv = started!.argv;
@@ -271,7 +271,7 @@ describe.skipIf(process.platform === 'win32')('LiveExecutor with agents.<name>.c
     const c = claim(db, config, paths);
     const running = new LiveExecutor({ env: workerEnv(), killGraceMs: 500 }).execute(c, context(db, config, paths, c.run.id));
     const pids = await readPids(pidsFile);
-    const name = `factory-${c.run.id}`;
+    const name = `updraft-${c.run.id}`;
     // The agent is not in the client's process group, as a real container's processes are not.
     expect(runtime.containerPid(name)).toBe(pids.agent);
     expect(getRun(db, c.run.id)?.pid).not.toBe(pids.agent);
@@ -296,7 +296,7 @@ describe.skipIf(process.platform === 'win32')('LiveExecutor with agents.<name>.c
     const result = await running;
     expect(result).toMatchObject({ outcome: 'interrupted', error: expect.stringMatching(/worker stopped before the run finished/) });
     await expectDead(pids.agent, pids.child);
-    expect(runtime.callsOf('stop').map((x) => x.argv)).toEqual([['stop', '-t', '2', `factory-${c.run.id}`]]);
+    expect(runtime.callsOf('stop').map((x) => x.argv)).toEqual([['stop', '-t', '2', `updraft-${c.run.id}`]]);
   });
 
   it('stops the container when the started client cannot be recorded', async () => {
@@ -314,7 +314,7 @@ describe.skipIf(process.platform === 'win32')('LiveExecutor with agents.<name>.c
     };
     const result = await new LiveExecutor({ env: workerEnv(), killGraceMs: 500 }).execute(c, ctx);
     expect(result.outcome).toBe('failed');
-    expect(runtime.containerPid(`factory-${c.run.id}`)).toBeNull();
+    expect(runtime.containerPid(`updraft-${c.run.id}`)).toBeNull();
     // The agent may or may not have got as far as writing its pids; either way nothing is left.
     if (existsSync(pidsFile)) await expectDead(...Object.values(await readPids(pidsFile)));
   });
@@ -333,7 +333,7 @@ describe.skipIf(process.platform === 'win32')('worker crash during a containeriz
     const orphaned = new LiveExecutor({ env: workerEnv() }).execute(c, context(s.db, s.config, s.paths, c.run.id));
     const pids = await readPids(pidsFile);
     await vi.waitFor(() => expect(getRun(s.db, c.run.id)?.pidStartTime).toBeTruthy(), { timeout: 30_000, interval: 50 });
-    return { ...s, c, host, pids, orphaned, name: `factory-${c.run.id}` };
+    return { ...s, c, host, pids, orphaned, name: `updraft-${c.run.id}` };
   }
 
   it('the restarted worker removes the container by its recorded name and runtime, and marks the run interrupted', async () => {
@@ -404,16 +404,16 @@ describe.skipIf(process.platform === 'win32')('removeContainer (fake runtime)', 
     const f = createGitFixture('octo/widgets');
     fixtures.push(f);
     const runtime = installFakeRuntime(join(f.root, 'bin'));
-    expect(await removeContainer(runtime.path, 'factory-run_gone')).toEqual({ removed: false, note: '' });
+    expect(await removeContainer(runtime.path, 'updraft-run_gone')).toEqual({ removed: false, note: '' });
     expect(runtime.callsOf('rm')).toEqual([]);
 
     runtime.stopDaemon();
-    const r = await removeContainer(runtime.path, 'factory-run_x');
+    const r = await removeContainer(runtime.path, 'updraft-run_x');
     expect(r.removed).toBe(false);
-    expect(r.note).toMatch(/could not check for leftover container factory-run_x .*Cannot connect to the Docker daemon.*remove it with "docker rm -f factory-run_x"/);
+    expect(r.note).toMatch(/could not check for leftover container updraft-run_x .*Cannot connect to the Docker daemon.*remove it with "docker rm -f updraft-run_x"/);
 
-    const missing = await removeContainer(join(f.root, 'no such runtime'), 'factory-run_y');
-    expect(missing).toMatchObject({ removed: false, note: expect.stringMatching(/could not check for leftover container factory-run_y/) });
+    const missing = await removeContainer(join(f.root, 'no such runtime'), 'updraft-run_y');
+    expect(missing).toMatchObject({ removed: false, note: expect.stringMatching(/could not check for leftover container updraft-run_y/) });
   });
 });
 
@@ -422,7 +422,7 @@ describe.skipIf(process.platform === 'win32')('run summary of a worktree a conta
     const f = createGitFixture('octo/widgets');
     fixtures.push(f);
     const wt = join(f.root, 'wt');
-    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'factory/issue-3', wt, 'HEAD');
+    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-3', wt, 'HEAD');
     const baseSha = f.git(wt, 'rev-parse', 'HEAD');
     // What an agent could leave: a nested repository staged as a submodule, whose config names a
     // command (core.fsmonitor) that git runs on `git status` in it.
@@ -440,13 +440,13 @@ describe.skipIf(process.platform === 'win32')('run summary of a worktree a conta
     f.git(sub, 'config', 'core.fsmonitor', `'${hook}'`);
     writeFileSync(join(sub, 'file'), 'two\n');
 
-    const contained = await summarizeRun({ worktree: wt, branch: 'factory/issue-3', baseSha, lastOutput: [], untrustedWorktree: true });
+    const contained = await summarizeRun({ worktree: wt, branch: 'updraft/issue-3', baseSha, lastOutput: [], untrustedWorktree: true });
     expect(existsSync(marker)).toBe(false);
     // The submodule's commit still counts as a change.
     expect(contained.summary).toMatchObject({ commitCount: 1, filesChanged: 1, notes: [] });
 
     // The same summary without the flag is what the flag is for: host git runs the nested config's command.
-    await summarizeRun({ worktree: wt, branch: 'factory/issue-3', baseSha, lastOutput: [] });
+    await summarizeRun({ worktree: wt, branch: 'updraft/issue-3', baseSha, lastOutput: [] });
     expect(existsSync(marker)).toBe(true);
   });
 });
@@ -464,8 +464,8 @@ describe.skipIf(process.platform === 'win32')('verify commands of a containerize
 
     const [agent, first, second] = runtime.callsOf('run');
     const worktree = join(worktreesRoot(paths), '42', c.job.id);
-    expect(first!.started).toBe(`factory-${c.run.id}-verify-1`);
-    expect(second!.started).toBe(`factory-${c.run.id}-verify-2`);
+    expect(first!.started).toBe(`updraft-${c.run.id}-verify-1`);
+    expect(second!.started).toBe(`updraft-${c.run.id}-verify-2`);
     expect(first!.argv.slice(first!.argv.indexOf('runner:test'))).toEqual(['runner:test', process.execPath, '-e', 'process.exit(0)']);
     // A string command goes to the shell inside the container.
     expect(second!.argv.slice(second!.argv.indexOf('runner:test'))).toEqual(['runner:test', '/bin/sh', '-c', 'exit 3']);
@@ -479,6 +479,6 @@ describe.skipIf(process.platform === 'win32')('verify commands of a containerize
     }
     // Nothing is left behind, and the last container recorded for the run is the last one started.
     for (const name of [agent!.started!, first!.started!, second!.started!]) expect(runtime.containerPid(name)).toBeNull();
-    expect(getRun(db, c.run.id)?.container?.name).toBe(`factory-${c.run.id}-verify-2`);
+    expect(getRun(db, c.run.id)?.container?.name).toBe(`updraft-${c.run.id}-verify-2`);
   });
 });

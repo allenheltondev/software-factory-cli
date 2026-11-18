@@ -2,7 +2,7 @@ import { defaultDiscoveryProbes, discoverAgents, type AgentReport, type Discover
 import { openDatabase, type Db } from '../db/database.js';
 import type { GitHubApi } from '../github/api.js';
 import { createGitHubApi } from '../github/client.js';
-import { resolvePaths, type FactoryPaths } from '../paths.js';
+import { resolvePaths, type UpdraftPaths } from '../paths.js';
 import type { Logger } from '../util/log.js';
 import { createClackPrompter, type Prompter } from './prompter.js';
 
@@ -12,7 +12,7 @@ export interface Output {
 
 /** Everything a command needs from the outside world, injected so commands are unit-testable. */
 export interface CommandContext {
-  paths: FactoryPaths;
+  paths: UpdraftPaths;
   env: NodeJS.ProcessEnv;
   /** Command output (stdout). */
   out: Output;

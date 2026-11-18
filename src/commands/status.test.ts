@@ -31,7 +31,7 @@ const job = (over: Partial<Job> = {}): Job =>
     id: 'job_1',
     repoId: 1,
     repoFullName: 'o/a',
-    workflowId: 'implement-issue:factory:ready',
+    workflowId: 'implement-issue:updraft:ready',
     eventId: '100',
     issueNumber: 12,
     action: 'implement-issue',
@@ -106,7 +106,7 @@ describe('renderStatus', () => {
       repoFullName: 'o/a',
       issueNumber: 12,
       mode: 'draft-pr' as const,
-      branch: 'factory/issue-12-job_1',
+      branch: 'updraft/issue-12-job_1',
       baseBranch: 'main',
       headSha: 'abc',
       pushedAt: 't',
@@ -156,7 +156,7 @@ describe('renderStatus', () => {
     expect(text).toContain('Publications:');
     expect(text).toMatch(/run_bad  failed .*o\/a#12/);
     expect(text).toContain(
-      'publication failed (attempt 1; branch pushed): GitHub is unavailable for now: 502 — worker retries at t10, or run "factory publish run_bad"',
+      'publication failed (attempt 1; branch pushed): GitHub is unavailable for now: 502 — worker retries at t10, or run "updraft publish run_bad"',
     );
     expect(renderPublication({ ...publications[1]!, state: 'skipped', error: 'no commits' })).toBe('not published: no commits');
   });
@@ -246,7 +246,7 @@ describe('renderStatus', () => {
   });
 });
 
-describe('factory status', () => {
+describe('updraft status', () => {
   it('works with no config and no state DB, without creating the DB', async () => {
     snapshotMock.current = emptySnapshot();
     const ctx = fakeContext();

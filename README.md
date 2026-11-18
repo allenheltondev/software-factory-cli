@@ -1,12 +1,12 @@
-# software-factory-cli
+# Updraft
 
-`factory` watches GitHub repositories you choose and turns labeled issues into queued jobs
+`updraft` watches GitHub repositories you choose and turns labeled issues into queued jobs
 for coding agents (Codex, Claude Code, Kiro). It runs on your machine, uses your `gh`
 sign-in, and keeps its queue in a local SQLite database.
 
 ## Status
 
-Pilot. `factory` polls GitHub issue events for the repositories you configure and queues a
+Pilot. `updraft` polls GitHub issue events for the repositories you configure and queues a
 job when an allowed user applies a trigger label to an open issue. Each job is routed to an
 agent pool and, in `live` mode, the chosen agent (Claude Code, Codex or Kiro) runs in a
 branch and Git worktree created for that job. Publication is opt-in per repository: the
@@ -23,45 +23,45 @@ on live mode. Commands and config keys may still change. The original design is 
 Requires Node.js 22.13 or later, Git, and the [GitHub CLI](https://cli.github.com/).
 
 ```sh
-npm install -g software-factory-cli
+npm install -g @allenheltondev/updraft
 gh auth login
-factory doctor
+updraft doctor
 ```
 
 ## Quick start
 
-1. `factory configure` - pick repositories, the trigger label, actions and pools. It writes
-   your per-user config. For scripts, use `factory add OWNER/REPO` instead.
+1. `updraft configure` - pick repositories, the trigger label, actions and pools. It writes
+   your per-user config. For scripts, use `updraft add OWNER/REPO` instead.
 2. Check `dispatch.allowedActors` in the config: only these GitHub logins can dispatch work.
-   A new config lists the account `gh` is signed in as. Then run `factory validate`.
-3. `factory start` - polls GitHub and processes the queue until you stop it (Ctrl+C).
-4. Add the `ready` label to an open issue. Within one poll interval, `factory status`
+   A new config lists the account `gh` is signed in as. Then run `updraft validate`.
+3. `updraft start` - polls GitHub and processes the queue until you stop it (Ctrl+C).
+4. Add the `ready` label to an open issue. Within one poll interval, `updraft status`
    shows the queued job and, in log-only mode, its run.
 
 A new config is in `log-only` mode, which starts no agent. To have agents work on issues,
 set a `checkoutPath` for each repository and `execution.mode: live`, then run
-`factory validate` and `factory doctor`; see [Live execution](#live-execution). To run the
+`updraft validate` and `updraft doctor`; see [Live execution](#live-execution). To run the
 worker in the background at login, see [Background operation](#background-operation).
 
 ## Commands
 
-All commands accept `--config <path>` (or `FACTORY_CONFIG`) to use a config file other than
+All commands accept `--config <path>` (or `UPDRAFT_CONFIG`) to use a config file other than
 the per-user default.
 
 | Command | Behavior |
 | --- | --- |
-| `factory configure` | Interactively select repos, trigger labels, actions and pools (needs a terminal) |
-| `factory add OWNER/REPO` | Add or update a repo workflow non-interactively. Options: `--label` (default `ready`), `--action` (default `implement-issue`), `--pool` (default `general`), `--route LABEL=POOL` (repeatable), `--backfill-since DATE`, `--workflow-id ID` |
-| `factory validate` | Check the config without network access; exit 1 if invalid |
-| `factory start` | Run the worker: poll GitHub and process the queue (non-interactive). Exits with code 3 if another worker holds the lock |
-| `factory status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
-| `factory doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access, labels and each enabled agent in the current environment, the way a live run starts it (its `command` and `env`) |
-| `factory agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
-| `factory retry JOB_ID` | Requeue a failed, interrupted or canceled job |
-| `factory publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [docs/publication.md](docs/publication.md) |
-| `factory logs RUN_ID\|JOB_ID [--follow] [--path]` | Print a run's `run.log`; for a job, the log of its latest run (named on stderr). `--follow` keeps printing until the run has finished; `--path` prints only the file path. Needs neither network nor a running worker |
-| `factory cancel JOB_ID` | Cancel a queued job, or ask the running worker to stop a running one: the agent's process tree is stopped within a few seconds, the job ends `canceled`, its worktree and branch are kept, and nothing is published. See [Canceling a job](docs/operations.md#canceling-a-job) |
-| `factory clean [--dry-run] [--older-than AGE]` | Remove job worktrees of succeeded runs and runs whose agent never started. Keeps the worktrees of failed, interrupted and user-canceled runs, and all branches. With `--older-than` (e.g. `30d`, `12h`, `2w`) also prunes old jobs, runs, logs and errors. See [Per-job worktrees](docs/worktrees.md) and [Retention](docs/operations.md#retention) |
+| `updraft configure` | Interactively select repos, trigger labels, actions and pools (needs a terminal) |
+| `updraft add OWNER/REPO` | Add or update a repo workflow non-interactively. Options: `--label` (default `ready`), `--action` (default `implement-issue`), `--pool` (default `general`), `--route LABEL=POOL` (repeatable), `--backfill-since DATE`, `--workflow-id ID` |
+| `updraft validate` | Check the config without network access; exit 1 if invalid |
+| `updraft start` | Run the worker: poll GitHub and process the queue (non-interactive). Exits with code 3 if another worker holds the lock |
+| `updraft status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
+| `updraft doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access, labels and each enabled agent in the current environment, the way a live run starts it (its `command` and `env`) |
+| `updraft agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
+| `updraft retry JOB_ID` | Requeue a failed, interrupted or canceled job |
+| `updraft publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [docs/publication.md](docs/publication.md) |
+| `updraft logs RUN_ID\|JOB_ID [--follow] [--path]` | Print a run's `run.log`; for a job, the log of its latest run (named on stderr). `--follow` keeps printing until the run has finished; `--path` prints only the file path. Needs neither network nor a running worker |
+| `updraft cancel JOB_ID` | Cancel a queued job, or ask the running worker to stop a running one: the agent's process tree is stopped within a few seconds, the job ends `canceled`, its worktree and branch are kept, and nothing is published. See [Canceling a job](docs/operations.md#canceling-a-job) |
+| `updraft clean [--dry-run] [--older-than AGE]` | Remove job worktrees of succeeded runs and runs whose agent never started. Keeps the worktrees of failed, interrupted and user-canceled runs, and all branches. With `--older-than` (e.g. `30d`, `12h`, `2w`) also prunes old jobs, runs, logs and errors. See [Per-job worktrees](docs/worktrees.md) and [Retention](docs/operations.md#retention) |
 
 ## Configuration
 
@@ -143,10 +143,10 @@ Config changes take effect when the worker restarts.
 ## Per-job worktrees
 
 In `prepare-only` and `live` mode, each job whose action has `output: local-branch` gets a
-new branch `factory/issue-<n>-<jobId>`, created at the freshly fetched base branch, and a
+new branch `updraft/issue-<n>-<jobId>`, created at the freshly fetched base branch, and a
 worktree for it under `<state dir>/worktrees`. Your clone's own checkout is not touched, and
 an existing branch is never reused. Worktrees of failed and interrupted runs are kept for
-inspection; `factory clean` removes the others and keeps every branch, since the branch is
+inspection; `updraft clean` removes the others and keeps every branch, since the branch is
 the job's output. Details, including how the remote is chosen:
 [docs/worktrees.md](docs/worktrees.md).
 
@@ -166,12 +166,12 @@ In `live` mode the worker runs the routed agent for each job whose action has
   killed and the run fails. Stopping the worker stops its agents and records their runs as
   `interrupted`.
 - A summary of the commits, changed files and the agent's final message is appended to
-  `run.log` and shown by `factory status`.
+  `run.log` and shown by `updraft status`.
 
 Every agent runs in **full-auto mode by default**: it edits files and runs commands without
 asking, as your user. That is not a sandbox. `agents.<name>.args` narrows it.
 
-The full lifecycle, the requirements `factory validate` checks and how agents are stopped are
+The full lifecycle, the requirements `updraft validate` checks and how agents are stopped are
 in [docs/live-execution.md](docs/live-execution.md). Prerequisites, the exact command line,
 the permission profile and platform notes for each agent:
 
@@ -192,7 +192,7 @@ branch. The worker does this after the agent has exited, as your `gh` account:
 
 Each step is recorded and checks GitHub before writing, so a retry never opens a second PR
 or comment. Transient failures are retried by the worker; others wait for
-`factory publish RUN_ID`. Merging stays a human decision: the worker never merges, approves
+`updraft publish RUN_ID`. Merging stays a human decision: the worker never merges, approves
 or marks a PR ready for review.
 
 Details, including authentication, retries and failure handling:
@@ -200,18 +200,18 @@ Details, including authentication, retries and failure handling:
 
 ## Background operation
 
-`factory start` runs in the foreground. To start it at login, use the launchers shipped in
+`updraft start` runs in the foreground. To start it at login, use the launchers shipped in
 `examples/launchers/` (also inside the installed package):
 
 | Platform | Launcher |
 | --- | --- |
 | Windows | `windows/register-task.ps1` registers a Task Scheduler task at logon for your account (no stored password), with restart on failure, no time limit and no overlapping runs. `unregister-task.ps1` removes it |
-| macOS | `macos/install-launchagent.sh` installs a per-user LaunchAgent from `software-factory.plist.template` (`--uninstall` removes it) |
+| macOS | `macos/install-launchagent.sh` installs a per-user LaunchAgent from `updraft.plist.template` (`--uninstall` removes it) |
 | Linux (systemd) | `linux/install-systemd-user.sh` installs a `systemd --user` service; `loginctl enable-linger` keeps it running without a login session |
-| Other hosts | Run `factory start --config <path>` in the foreground under your existing supervisor |
+| Other hosts | Run `updraft start --config <path>` in the foreground under your existing supervisor |
 
 Each launcher runs `node <package>/dist/cli.js start --config <path>` with absolute paths, a
-working directory and an explicit `PATH`. Run `factory doctor` under the same account and
+working directory and an explicit `PATH`. Run `updraft doctor` under the same account and
 environment before relying on it. Details, log locations and troubleshooting:
 [docs/background-operation.md](docs/background-operation.md).
 
@@ -247,17 +247,34 @@ The key points; [docs/security.md](docs/security.md) has the full statement of e
 
 | | Windows | macOS | Linux |
 | --- | --- | --- | --- |
-| Config | `%APPDATA%\software-factory\config.yaml` | `~/Library/Application Support/software-factory/config.yaml` | `$XDG_CONFIG_HOME/software-factory/config.yaml` (default `~/.config`) |
-| State (`state.db`, `worktrees/`) | `%LOCALAPPDATA%\software-factory\` | `~/Library/Application Support/software-factory/` | `$XDG_STATE_HOME/software-factory/` (default `~/.local/state`) |
-| Logs (`factory.log`, `runs/`) | `%LOCALAPPDATA%\software-factory\logs\` | `~/Library/Logs/software-factory/` | `$XDG_STATE_HOME/software-factory/logs/` |
+| Config | `%APPDATA%\updraft\config.yaml` | `~/Library/Application Support/updraft/config.yaml` | `$XDG_CONFIG_HOME/updraft/config.yaml` (default `~/.config`) |
+| State (`state.db`, `worktrees/`) | `%LOCALAPPDATA%\updraft\` | `~/Library/Application Support/updraft/` | `$XDG_STATE_HOME/updraft/` (default `~/.local/state`) |
+| Logs (`updraft.log`, `runs/`) | `%LOCALAPPDATA%\updraft\logs\` | `~/Library/Logs/updraft/` | `$XDG_STATE_HOME/updraft/logs/` |
 
 Overrides:
 
-- `FACTORY_HOME=<dir>` puts config (`<dir>/config.yaml`), state (`<dir>/state.db`) and logs
+- `UPDRAFT_HOME=<dir>` puts config (`<dir>/config.yaml`), state (`<dir>/state.db`) and logs
   (`<dir>/logs/`) under one directory.
-- `--config <path>` or `FACTORY_CONFIG=<path>` changes only the config file; `--config` wins.
+- `--config <path>` or `UPDRAFT_CONFIG=<path>` changes only the config file; `--config` wins.
   Relative paths in the config (such as prompt files) resolve against the config file's
   directory.
+
+## Upgrading from software-factory-cli
+
+Updraft was first called `software-factory-cli`, with the command `factory`. The rename is a
+clean break: nothing reads the old names. To move an existing install:
+
+1. Stop the worker and remove its launcher using the old package's scripts (the Task Scheduler
+   task, LaunchAgent or systemd unit), then `npm uninstall -g software-factory-cli` and
+   `npm install -g @allenheltondev/updraft`.
+2. Rename the `software-factory` config and state directories to `updraft` (see
+   [Files and locations](#files-and-locations)). The worker log is now `updraft.log`.
+3. Replace `FACTORY_HOME` and `FACTORY_CONFIG` with `UPDRAFT_HOME` and `UPDRAFT_CONFIG`
+   wherever you set them, and install the launcher again from the new package.
+4. Let queued and running jobs finish before you switch, or re-apply the label afterwards.
+   Job branches are now `updraft/issue-<n>-<jobId>` and the hidden markers in PRs and comments
+   are `updraft-run`, so a job started under the old name is not matched: publishing it again
+   would not find its `factory/issue-...` branch or its existing PR.
 
 ## Development
 

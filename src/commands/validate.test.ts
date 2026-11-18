@@ -11,7 +11,7 @@ function validConfig() {
   return upsertRepoWorkflow(seedConfig('me'), { id: 5, fullName: 'o/r' }, buildWorkflow({ label: 'go', action: 'implement-issue', pool: 'general' })).config;
 }
 
-describe('factory validate', () => {
+describe('updraft validate', () => {
   it('exits 1 when the config is missing', async () => {
     const ctx = fakeContext();
     expect(await validateCommand(ctx)).toBe(EXIT.FAILURE);

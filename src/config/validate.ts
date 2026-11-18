@@ -9,7 +9,7 @@ import {
   publishMode,
   repoNeedsCheckout,
   workflowId,
-  type FactoryConfig,
+  type UpdraftConfig,
 } from './schema.js';
 
 export interface ConfigIssue {
@@ -18,7 +18,7 @@ export interface ConfigIssue {
 }
 
 export type ValidationResult =
-  | { ok: true; config: FactoryConfig; warnings: ConfigIssue[] }
+  | { ok: true; config: UpdraftConfig; warnings: ConfigIssue[] }
   | { ok: false; errors: ConfigIssue[]; warnings: ConfigIssue[] };
 
 function zodIssues(err: z.ZodError): ConfigIssue[] {

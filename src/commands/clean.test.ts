@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
-import { configSchema, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { beginPublication, finishPublication } from '../db/publications.js';
 import { cancelClaim, claimNextJob, finishRun, getJob, getRun, markExecutionStarted, setRunProcess } from '../db/queue.js';
@@ -38,7 +38,7 @@ describe('cleanVerdict', () => {
     const ended = '2026-11-17T00:00:00Z';
     // Canceled or released before start: nothing ran in the checkout.
     expect(cleanVerdict({ outcome: null, endedAt: ended, executionStartedAt: null })).toEqual({ remove: true, why: 'closed before start' });
-    // `factory cancel` on a running job closes the run with no outcome too.
+    // `updraft cancel` on a running job closes the run with no outcome too.
     expect(cleanVerdict({ outcome: null, endedAt: ended, executionStartedAt: ended })).toEqual({
       remove: false,
       why: 'canceled after the agent started; kept for inspection',
@@ -60,14 +60,14 @@ describe('parseAge', () => {
 });
 
 // Real git is slow to spawn on Windows runners.
-describe('factory clean', { timeout: 60_000 }, () => {
+describe('updraft clean', { timeout: 60_000 }, () => {
   async function setup() {
     const f = createGitFixture('octo/widgets');
     fixtures.push(f);
-    const ctx = fakeContext({ home: join(f.root, 'factory home') });
+    const ctx = fakeContext({ home: join(f.root, 'updraft home') });
     ctx.openDb = (file) => openDatabase(file);
     const { paths } = ctx;
-    const input: FactoryConfigInput = {
+    const input: UpdraftConfigInput = {
       version: 1,
       maxConcurrent: 8,
       execution: { mode: 'prepare-only' },
@@ -80,7 +80,7 @@ describe('factory clean', { timeout: 60_000 }, () => {
           id: 42,
           checkoutPath: f.clone,
           remote: 'origin',
-          workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+          workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
         },
       },
     };
@@ -109,7 +109,7 @@ describe('factory clean', { timeout: 60_000 }, () => {
         finishRun(db, c.run.id, { outcome: close });
       }
       const r = getRun(db, c.run.id)!;
-      return { runId: r.id, jobId: c.job.id, checkout: r.checkoutPath!, logDir: dirname(r.logPath!), branch: `factory/issue-${issue}-${c.job.id}` };
+      return { runId: r.id, jobId: c.job.id, checkout: r.checkoutPath!, logDir: dirname(r.logPath!), branch: `updraft/issue-${issue}-${c.job.id}` };
     };
     return { f, ctx, db, run };
   }
@@ -123,7 +123,7 @@ describe('factory clean', { timeout: 60_000 }, () => {
     const open = await run(5, 'open');
     const vanished = await run(6, 'succeeded');
     rmSync(vanished.checkout, { recursive: true, force: true });
-    // A path factory did not create (here, the user's own clone) is never removed.
+    // A path updraft did not create (here, the user's own clone) is never removed.
     const outside = await run(7, 'succeeded');
     setRunProcess(db, outside.runId, { checkoutPath: f.clone });
 
@@ -151,9 +151,9 @@ describe('factory clean', { timeout: 60_000 }, () => {
     expect(getRun(db, outside.runId)?.checkoutPath).toBe(f.clone);
 
     const listed = f.git(f.clone, 'worktree', 'list', '--porcelain');
-    expect(listed).not.toContain(`factory/issue-1-`);
-    expect(listed).not.toContain(`factory/issue-6-`);
-    expect(listed).toContain(`factory/issue-3-`);
+    expect(listed).not.toContain(`updraft/issue-1-`);
+    expect(listed).not.toContain(`updraft/issue-6-`);
+    expect(listed).toContain(`updraft/issue-3-`);
     // Branches are kept, including those of removed worktrees.
     for (const r of [succeeded, canceled, failed, vanished]) expect(f.git(f.clone, 'branch', '--list', r.branch)).toContain(r.branch);
 
@@ -275,7 +275,7 @@ describe('factory clean', { timeout: 60_000 }, () => {
     expect(ctx.out.text).toContain(`Pruned job ${dirty.jobId} `);
     expect(ctx.out.text).toMatch(/pruned 1 job\(s\) .* and 0 old error row\(s\), kept 2 old job\(s\)\./);
     expect(existsSync(dirty.checkout)).toBe(false);
-    expect(f.git(f.clone, 'worktree', 'list', '--porcelain')).not.toContain('factory/issue-3-');
+    expect(f.git(f.clone, 'worktree', 'list', '--porcelain')).not.toContain('updraft/issue-3-');
   });
 
   it('--older-than rejects a bad age before removing anything', async () => {

@@ -54,7 +54,7 @@ export interface DiscoveryProbes {
    */
   cwd?: string;
   homedir: string;
-  /** The Node binary running factory, used when a shim says plain `node` and none is on PATH. */
+  /** The Node binary running updraft, used when a shim says plain `node` and none is on PATH. */
   execPath: string;
   /** Is this a regular file (and executable on POSIX)? */
   isExecutable(path: string): boolean;
@@ -627,7 +627,7 @@ function pick(a: AuthResult, notes: string[]): Pick<AgentReport, 'signedIn' | 'a
   return { signedIn: a.signedIn, auth: a.auth };
 }
 
-/** Report for an agent name factory has no adapter for. */
+/** Report for an agent name updraft has no adapter for. */
 function unknownAdapter(name: string): AgentReport {
   return {
     adapter: name as AdapterName,

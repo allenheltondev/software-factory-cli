@@ -1,16 +1,16 @@
 #!/bin/bash
-# Installs (or removes) a `systemd --user` service that runs `factory start`.
+# Installs (or removes) a `systemd --user` service that runs `updraft start`.
 #
 #   bash install-systemd-user.sh [options]
 #
 # Options:
 #   --config PATH        Config file (default: per-user config location, see README)
-#   --name NAME          unit name without .service (default: software-factory)
+#   --name NAME          unit name without .service (default: updraft)
 #   --node PATH          node binary (default: `command -v node`)
-#   --cli PATH           installed dist/cli.js (default: $(npm root -g)/software-factory-cli/dist/cli.js)
+#   --cli PATH           installed dist/cli.js (default: $(npm root -g)/@allenheltondev/updraft/dist/cli.js)
 #   --workdir DIR        working directory (default: the config file's directory)
 #   --extra-path DIR     extra directory for the service's PATH (repeatable)
-#   --factory-home DIR   set FACTORY_HOME for the service (default: current $FACTORY_HOME)
+#   --updraft-home DIR   set UPDRAFT_HOME for the service (default: current $UPDRAFT_HOME)
 #   --env-file PATH      optional KEY=value file for secrets such as KIRO_API_KEY
 #                        (default: worker.env in the per-user config directory)
 #   --no-start           install and enable, but do not start now
@@ -19,17 +19,17 @@
 #
 # Lingering (run before login / after logout) is a separate, one-time step:
 #   loginctl enable-linger "$USER"
-# Hosts without systemd: run `factory start --config <path>` in the foreground under the
+# Hosts without systemd: run `updraft start --config <path>` in the foreground under the
 # host's existing supervisor instead (see docs/background-operation.md).
 set -euo pipefail
 
-APP_DIR=software-factory
-PACKAGE=software-factory-cli
+APP_DIR=updraft
+PACKAGE=@allenheltondev/updraft
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 
-name=software-factory
+name=updraft
 config= node= cli= workdir= env_file= mode=install start=1
-factory_home=${FACTORY_HOME:-}
+updraft_home=${UPDRAFT_HOME:-}
 extra_path=()
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do
     --cli) cli=${2:?--cli needs a value}; shift 2 ;;
     --workdir) workdir=${2:?--workdir needs a value}; shift 2 ;;
     --extra-path) extra_path+=("${2:?--extra-path needs a value}"); shift 2 ;;
-    --factory-home) factory_home=${2:?--factory-home needs a value}; shift 2 ;;
+    --updraft-home) updraft_home=${2:?--updraft-home needs a value}; shift 2 ;;
     --env-file) env_file=${2:?--env-file needs a value}; shift 2 ;;
     --no-start) start=0; shift ;;
     --print) mode=print; shift ;;
@@ -84,10 +84,10 @@ q_env() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; 
 q_raw() { printf '%s' "$1" | sed -e 's/%/%%/g'; }
 
 # --- Per-user locations (mirrors src/paths.ts) ---------------------------------------------
-if [ -n "$factory_home" ]; then
-  factory_home=$(abspath "$factory_home")
-  default_config="$factory_home/config.yaml"
-  log_hint="$factory_home/logs"
+if [ -n "$updraft_home" ]; then
+  updraft_home=$(abspath "$updraft_home")
+  default_config="$updraft_home/config.yaml"
+  log_hint="$updraft_home/logs"
 else
   default_config="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_DIR/config.yaml"
   log_hint="${XDG_STATE_HOME:-$HOME/.local/state}/$APP_DIR/logs"
@@ -96,7 +96,7 @@ fi
 env_file=$(abspath "${env_file:-$(dirname "$default_config")/worker.env}")
 
 config=$(abspath "${config:-$default_config}")
-[ -f "$config" ] || warn "config file not found: $config (run 'factory configure' or pass --config)"
+[ -f "$config" ] || warn "config file not found: $config (run 'updraft configure' or pass --config)"
 workdir=$(abspath "${workdir:-$(dirname "$config")}")
 
 # --- node and the installed cli.js ---------------------------------------------------------
@@ -134,12 +134,12 @@ done
 for d in ${extra_path[@]+"${extra_path[@]}"}; do add_path "$(abspath "$d")"; done
 for d in /usr/local/bin /usr/bin /bin; do add_path "$d"; done
 
-for v in "$node" "$cli" "$config" "$workdir" "$path_value" "$factory_home" "$env_file"; do
+for v in "$node" "$cli" "$config" "$workdir" "$path_value" "$updraft_home" "$env_file"; do
   case $v in *$'\n'*) die "paths must not contain newlines" ;; esac
 done
 
 # --- Render ---------------------------------------------------------------------------------
-template="$SCRIPT_DIR/software-factory.service.template"
+template="$SCRIPT_DIR/updraft.service.template"
 [ -f "$template" ] || die "template not found: $template"
 
 render() {
@@ -148,7 +148,7 @@ render() {
   SF_CONFIG=$(q_exec "$config") \
   SF_WORKDIR=$(q_raw "$workdir") \
   SF_PATH=$(q_env "$path_value") \
-  SF_FACTORY_HOME=$(q_env "$factory_home") \
+  SF_UPDRAFT_HOME=$(q_env "$updraft_home") \
   SF_ENV_FILE=$(q_raw "$env_file") \
   awk '
     # Literal (non-regex, no & or \ processing) replacement.
@@ -158,7 +158,7 @@ render() {
       return out s
     }
     /^#__EXTRA_ENV__$/ {
-      if (ENVIRON["SF_FACTORY_HOME"] != "") print "Environment=\"FACTORY_HOME=" ENVIRON["SF_FACTORY_HOME"] "\""
+      if (ENVIRON["SF_UPDRAFT_HOME"] != "") print "Environment=\"UPDRAFT_HOME=" ENVIRON["SF_UPDRAFT_HOME"] "\""
       next
     }
     {
@@ -176,7 +176,7 @@ render() {
 
 if [ "$mode" = print ]; then render; exit 0; fi
 
-command -v systemctl >/dev/null 2>&1 || die "systemctl not found; run 'factory start' under your host's supervisor instead"
+command -v systemctl >/dev/null 2>&1 || die "systemctl not found; run 'updraft start' under your host's supervisor instead"
 
 mkdir -p "$unit_dir"
 render > "$unit_file.tmp.$$"

@@ -1,4 +1,4 @@
-// Retention (`factory clean --older-than`): delete old terminal jobs with everything that hangs
+// Retention (`updraft clean --older-than`): delete old terminal jobs with everything that hangs
 // off them, and old error rows. Nothing here runs on its own; the worker never prunes.
 import { transaction, type Db } from './database.js';
 import { TERMINAL_JOB_STATUSES, type JobStatus } from '../types.js';

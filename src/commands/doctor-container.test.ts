@@ -1,4 +1,4 @@
-// `factory doctor`, `factory agents` and `factory validate` for a containerized agent
+// `updraft doctor`, `updraft agents` and `updraft validate` for a containerized agent
 // (agents.<name>.container): the runtime, the image and the CLI inside the image are checked,
 // not a CLI on the host.
 import { writeFileSync } from 'node:fs';
@@ -56,7 +56,7 @@ describe('containerAgentChecks', () => {
     await containerAgentChecks('claude', 'claude', claude({ args: ['--memory', '4g'] }), '/cfg', probes, 'fail');
     const run = calls[2]!;
     expect(run.slice(0, 5)).toEqual(['/usr/bin/docker', 'run', '--rm', '-i', '--name']);
-    expect(run[5]).toMatch(/^factory-doctor-\d+-claude$/);
+    expect(run[5]).toMatch(/^updraft-doctor-\d+-claude$/);
     expect(run.slice(-5)).toEqual(['--memory', '4g', 'my-org/claude-runner:latest', 'claude', '--version']);
     expect(run[run.indexOf('--user') + 1]).toBe('1000:1000');
     expect(run[run.indexOf('--network') + 1]).toBe('none');
@@ -129,18 +129,18 @@ describe('containerAgentChecks', () => {
 });
 
 function configWithContainer(home: string) {
-  const paths = resolvePaths({ env: { FACTORY_HOME: home } });
+  const paths = resolvePaths({ env: { UPDRAFT_HOME: home } });
   const cfg = upsertRepoWorkflow(
     seedConfig('allen'),
     { id: 10, fullName: 'o/r' },
-    buildWorkflow({ label: 'factory:ready', action: 'implement-issue', pool: 'general', routes: [] }),
+    buildWorkflow({ label: 'updraft:ready', action: 'implement-issue', pool: 'general', routes: [] }),
   ).config;
   cfg.agents = { ...cfg.agents, claude: { maxConcurrent: 1, container: { image: 'runner:1', env: ['ANTHROPIC_API_KEY'] } } };
   writeFileSync(paths.configFile, stringify(cfg));
   return paths;
 }
 
-describe('factory doctor with a containerized agent', () => {
+describe('updraft doctor with a containerized agent', () => {
   it('checks the runtime, image and in-image CLI for that agent and host discovery for the others', async () => {
     const paths = configWithContainer(tempHome());
     const discovered: string[] = [];
@@ -162,7 +162,7 @@ describe('factory doctor with a containerized agent', () => {
       },
       checkWritable: () => {},
       checkDb: () => {},
-      createApi: async () => fakeApi({ login: 'allen', repos: [fakeRepo('o/r', 10)], labels: { 'o/r': ['factory:ready'] } }),
+      createApi: async () => fakeApi({ login: 'allen', repos: [fakeRepo('o/r', 10)], labels: { 'o/r': ['updraft:ready'] } }),
       fileExists: () => true,
     };
     const r = await runDoctor(paths, probes);
@@ -179,7 +179,7 @@ describe('factory doctor with a containerized agent', () => {
   });
 });
 
-describe('factory agents with a containerized agent in the config', () => {
+describe('updraft agents with a containerized agent in the config', () => {
   it('lists it after the host CLIs, and counts it as usable', async () => {
     const home = tempHome();
     configWithContainer(home);

@@ -12,20 +12,20 @@ launchers' account, not just your terminal):
 - Kiro CLI 3.0.0 or later (`kiro-cli --version`) on a platform Kiro supports. Kiro lists
   "macOS, Windows 11 (PowerShell), or Linux (glibc 2.34+ or musl variant)" for the CLI
   ([installation](https://kiro.dev/docs/getting-started/installation/)) and doesn't document
-  which CPU architectures the CLI supports. `factory agents` shows the platform check, and in
-  live mode `factory doctor` fails on an OS outside that list, such as Windows 10 or a Linux
+  which CPU architectures the CLI supports. `updraft agents` shows the platform check, and in
+  live mode `updraft doctor` fails on an OS outside that list, such as Windows 10 or a Linux
   with an older glibc. Elsewhere the CPU shows as "not documented" rather than supported.
 - `KIRO_API_KEY` in the worker's environment. "Headless mode requires an API key set as the
   `KIRO_API_KEY` environment variable" ([headless mode](https://kiro.dev/docs/cli/headless/)).
   API keys are available on Kiro Pro, Pro+, Pro Max and Power subscriptions and are created
   at app.kiro.dev ([authentication](https://kiro.dev/docs/getting-started/authentication/)).
-  `factory agents` and `factory doctor` check that the variable is set, but can't tell
-  whether the key works without sending a prompt (`factory agents --deep` does).
+  `updraft agents` and `updraft doctor` check that the variable is set, but can't tell
+  whether the key works without sending a prompt (`updraft agents --deep` does).
   [Agent credentials](../background-operation.md#agent-credentials) shows how to give it to
   each launcher.
 - **Don't put the key in `agents.kiro.env`** or anywhere else in the config file. The config
-  is plain text that is easy to copy, share or commit. (`factory doctor` checks each agent
-  with its `agents.<name>.env`, as a live run does, but `factory agents` looks only at the
+  is plain text that is easy to copy, share or commit. (`updraft doctor` checks each agent
+  with its `agents.<name>.env`, as a live run does, but `updraft agents` looks only at the
   worker's own environment.)
 - A `checkoutPath` for the repository and a `prompt` for the action (see
   [Requirements](../live-execution.md#requirements)).

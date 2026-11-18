@@ -1,4 +1,4 @@
-// `factory logs`: print a run's run.log, optionally following it while the run is in progress.
+// `updraft logs`: print a run's run.log, optionally following it while the run is in progress.
 // Reads only the state database and the log file: no network, and no worker needed.
 import { existsSync } from 'node:fs';
 import { open } from 'node:fs/promises';
@@ -31,7 +31,7 @@ const isMissing = (err: unknown) => (err as NodeJS.ErrnoException | null)?.code 
 /**
  * Print the file from byte `from` to its current end and return the new offset. The file is
  * opened for each call rather than held open, so following a log never stands in the way of the
- * worker (or `factory clean`) on Windows. Bytes go through `decoder`, which keeps a multi-byte
+ * worker (or `updraft clean`) on Windows. Bytes go through `decoder`, which keeps a multi-byte
  * character that is split across two reads intact.
  */
 async function printFrom(path: string, from: number, decoder: StringDecoder, out: Output): Promise<number> {
@@ -83,7 +83,7 @@ export async function logsCommand(ctx: CommandContext, id: string, opts: LogsOpt
       const job = getJob(db, id);
       if (!job) {
         throw new CliError(
-          `No run or job with id ${id}. "factory status" lists recent ones; old ones may have been pruned by "factory clean --older-than".`,
+          `No run or job with id ${id}. "updraft status" lists recent ones; old ones may have been pruned by "updraft clean --older-than".`,
         );
       }
       run = latestRunOfJob(db, job.id);
@@ -132,7 +132,7 @@ export async function logsCommand(ctx: CommandContext, id: string, opts: LogsOpt
       println(
         ctx.err,
         `Run ${run.id} is still marked in progress, but no worker is running, so nothing more will be written. ` +
-          'The next "factory start" closes it.',
+          'The next "updraft start" closes it.',
       );
     }
     return EXIT.OK;

@@ -1,10 +1,10 @@
-// `factory clean`: remove job worktrees that are no longer needed. Branches are kept.
+// `updraft clean`: remove job worktrees that are no longer needed. Branches are kept.
 // With --older-than it also prunes old state: terminal jobs with their runs, publications and
 // run logs, and old error rows.
 import { existsSync, rmdirSync, rmSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { loadConfig } from '../config/io.js';
-import type { FactoryConfig } from '../config/schema.js';
+import type { UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
 import { countOldErrors, listPrunableJobs, pruneErrors, pruneJob, type PrunableJob } from '../db/prune.js';
 import { setRunProcess } from '../db/queue.js';
@@ -40,7 +40,7 @@ interface CheckoutRow {
 export type CleanVerdict = { remove: true; why: string } | { remove: false; why: string };
 
 /**
- * Which worktrees `factory clean` removes. Succeeded runs, runs closed before their agent
+ * Which worktrees `updraft clean` removes. Succeeded runs, runs closed before their agent
  * started (canceled/released), and start failures (the agent never ran in the checkout)
  * are removed. Failed and interrupted runs are kept for inspection, and so is a run the user
  * canceled after its agent started (closed with no outcome, like a run canceled before start,
@@ -67,7 +67,7 @@ export function cleanVerdict(run: {
   }
 }
 
-function sourceCheckout(config: FactoryConfig | null, configDir: string, repoId: number): string | null {
+function sourceCheckout(config: UpdraftConfig | null, configDir: string, repoId: number): string | null {
   if (!config) return null;
   for (const repo of Object.values(config.repositories)) {
     if (repo.id === repoId && repo.checkoutPath) return resolve(configDir, repo.checkoutPath);
@@ -92,8 +92,8 @@ export function parseAge(text: string): number {
 interface CleanEnv {
   ctx: CommandContext;
   db: Db;
-  config: FactoryConfig | null;
-  /** Only worktrees under here were created by factory. */
+  config: UpdraftConfig | null;
+  /** Only worktrees under here were created by updraft. */
   root: string;
   git?: string;
   /** --dry-run only: runs whose worktree the worktree pass reported it would remove. */
@@ -127,7 +127,7 @@ async function removeCheckout(env: CleanEnv, run: { runId: string; repoId: numbe
 }
 
 /**
- * A run's log directory, if factory created it: `<runsDir>/<runId>/`. A log path recorded
+ * A run's log directory, if updraft created it: `<runsDir>/<runId>/`. A log path recorded
  * anywhere else is not ours to delete.
  */
 function runLogDir(runsDir: string, run: { id: string; logPath: string | null }): string | null {
@@ -150,7 +150,7 @@ interface PruneTotals {
  *
  * A pruned job's rows are the only record of where its worktrees are, so a worktree is never
  * left behind silently: a clean one is removed (its commits stay on the job branch, which is
- * kept), and a job with a worktree that has uncommitted or untracked changes, or one factory did
+ * kept), and a job with a worktree that has uncommitted or untracked changes, or one updraft did
  * not create, is kept whole and reported.
  */
 async function pruneOneJob(env: CleanEnv, job: PrunableJob, cutoff: string, dryRun: boolean, totals: PruneTotals): Promise<void> {
@@ -168,7 +168,7 @@ async function pruneOneJob(env: CleanEnv, job: PrunableJob, cutoff: string, dryR
   );
   for (const r of checkouts) {
     if (!isInside(env.root, r.checkoutPath)) {
-      return keep(`its checkout ${r.checkoutPath} is not under ${env.root}, so factory did not create it`);
+      return keep(`its checkout ${r.checkoutPath} is not under ${env.root}, so updraft did not create it`);
     }
     if (!existsSync(r.checkoutPath)) continue;
     let changes: string;
@@ -249,7 +249,7 @@ export async function cleanCommand(ctx: CommandContext, opts: CleanOptions = {})
     return EXIT.OK;
   }
   // The config is only needed to prune worktrees whose directory is already gone.
-  let config: FactoryConfig | null = null;
+  let config: UpdraftConfig | null = null;
   try {
     config = loadConfig(paths.configFile).config;
   } catch {
@@ -285,7 +285,7 @@ export async function cleanCommand(ctx: CommandContext, opts: CleanOptions = {})
       }
       if (!isInside(root, path)) {
         kept++;
-        println(ctx.out, `Kept ${path} (${label}): not under ${root}, so factory did not create it`);
+        println(ctx.out, `Kept ${path} (${label}): not under ${root}, so updraft did not create it`);
         continue;
       }
       if (opts.dryRun) {

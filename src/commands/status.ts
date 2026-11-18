@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { configSchema, type FactoryConfig } from '../config/schema.js';
+import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import type { FailureComment } from '../db/failure-comments.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
 import type { JobStatus, Publication } from '../types.js';
@@ -29,7 +29,7 @@ export interface StatusView {
 
 const JOB_STATUSES: JobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'interrupted', 'canceled'];
 
-export function emptyConfig(): FactoryConfig {
+export function emptyConfig(): UpdraftConfig {
   return configSchema.parse({ version: 1, agents: {}, pools: {}, actions: {} });
 }
 
@@ -37,7 +37,7 @@ export function buildStatusView(o: {
   configPath: string;
   configState: StatusView['configState'];
   configMessage: string | null;
-  config: FactoryConfig | null;
+  config: UpdraftConfig | null;
   dbFile: string;
   dbExists: boolean;
   snapshot: StatusSnapshot;
@@ -85,7 +85,7 @@ export function renderPublication(p: Publication): string {
       const done = [p.pushedAt ? 'branch pushed' : null, pr].filter(Boolean).join(', ');
       return (
         `publication failed (attempt ${p.attempts}${done ? `; ${done}` : ''}): ${oneLine(p.error ?? 'unknown error', 140)}` +
-        ` — ${next}run "factory publish ${p.runId}"`
+        ` — ${next}run "updraft publish ${p.runId}"`
       );
     }
   }
@@ -114,8 +114,8 @@ export function renderStatus(v: StatusView): string {
     v.configState === 'ok'
       ? ''
       : v.configState === 'missing'
-        ? ' (not found; run "factory configure" or "factory add")'
-        : ` (invalid: ${oneLine(v.configMessage ?? 'see "factory validate"')})`;
+        ? ' (not found; run "updraft configure" or "updraft add")'
+        : ` (invalid: ${oneLine(v.configMessage ?? 'see "updraft validate"')})`;
   lines.push(`Config: ${v.configPath}${configNote}`);
   lines.push(`State:  ${v.dbFile}${v.dbExists ? '' : ' (not created yet)'}`);
 
@@ -228,7 +228,7 @@ export function renderStatus(v: StatusView): string {
 
 export async function statusCommand(ctx: CommandContext, opts: { json?: boolean }): Promise<number> {
   const check = checkConfig(ctx.paths.configFile);
-  let config: FactoryConfig | null = null;
+  let config: UpdraftConfig | null = null;
   let configState: StatusView['configState'] = 'missing';
   let configMessage: string | null = null;
   if (check.state === 'ok') {

@@ -46,15 +46,15 @@ export const defaultStartDeps: StartDeps = {
   onShutdownSignal: installSignalHandlers,
 };
 
-/** `factory start`: non-interactive worker. Never prompts. */
+/** `updraft start`: non-interactive worker. Never prompts. */
 export async function startCommand(ctx: CommandContext, deps: StartDeps = defaultStartDeps): Promise<number> {
   const { paths } = ctx;
   const { config, warnings } = loadConfig(paths.configFile);
   // The logger only calls write(); ctx.err is process.stderr outside tests.
-  const log = deps.createLogger({ stream: ctx.err as NodeJS.WritableStream, file: join(paths.logDir, 'factory.log') });
+  const log = deps.createLogger({ stream: ctx.err as NodeJS.WritableStream, file: join(paths.logDir, 'updraft.log') });
   for (const w of warnings) log.warn(`config: ${w.path}: ${w.message}`);
   const repoCount = Object.keys(config.repositories).length;
-  if (repoCount === 0) log.warn('no repositories configured; add one with "factory add OWNER/REPO"');
+  if (repoCount === 0) log.warn('no repositories configured; add one with "updraft add OWNER/REPO"');
 
   const controller = new AbortController();
   const uninstall = deps.onShutdownSignal((signal) => {

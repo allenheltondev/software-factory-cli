@@ -32,7 +32,7 @@ export interface ReconcileResult {
  *   outcome and put the job back to 'queued'. No agent touched anything, so no human is needed.
  * - Started: if its recorded agent pid is alive on this host, terminate it (best effort),
  *   then mark the run and its job 'interrupted'. The run's checkout and log are kept. The
- *   job is NOT requeued; the user decides with `factory retry`.
+ *   job is NOT requeued; the user decides with `updraft retry`.
  *
  * A pid is only signalled when the run was claimed on this host (runs.hostname), whichever
  * earlier worker claimed it, and the process's OS start time still matches the one recorded

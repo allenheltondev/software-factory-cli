@@ -38,13 +38,13 @@ function setup() {
   return { ctx, db, jobId, claim, startWorker };
 }
 
-describe('factory cancel', () => {
+describe('updraft cancel', () => {
   it('cancels a queued job directly, with or without a worker', async () => {
     const { ctx, db, jobId } = setup();
     expect(await cancelCommand(ctx, jobId)).toBe(EXIT.OK);
     expect(getJob(db, jobId)).toMatchObject({ status: 'canceled', statusReason: CANCELED_BY_USER });
     expect(ctx.out.text).toContain(`Canceled ${jobId} (octo/widgets#7, wf); it was queued and will not run.`);
-    expect(ctx.out.text).toContain(`"factory retry ${jobId}" queues it again.`);
+    expect(ctx.out.text).toContain(`"updraft retry ${jobId}" queues it again.`);
   });
 
   it('records a request for a running job and leaves stopping it to the worker', async () => {
@@ -71,7 +71,7 @@ describe('factory cancel', () => {
     ctx.now = () => later;
     await expect(cancelCommand(ctx, jobId)).rejects.toMatchObject({
       exitCode: EXIT.FAILURE,
-      message: expect.stringMatching(new RegExp(`job ${jobId} is marked running \\(run ${run.id}\\), but no worker is running.*next "factory start"`)),
+      message: expect.stringMatching(new RegExp(`job ${jobId} is marked running \\(run ${run.id}\\), but no worker is running.*next "updraft start"`)),
     });
     expect(getRun(db, run.id)?.cancelRequestedAt).toBeNull();
     expect(getJob(db, jobId)?.status).toBe('running');
@@ -87,8 +87,8 @@ describe('factory cancel', () => {
       exitCode: EXIT.FAILURE,
       message: `job ${jobId} is already succeeded; only queued or running jobs can be canceled`,
     });
-    await expect(cancelCommand(ctx, 'job_nope')).rejects.toThrow('job job_nope not found; "factory status" lists job ids.');
-    await expect(cancelCommand(ctx, run.id)).rejects.toThrow(`${run.id} is a run, not a job; cancel its job with "factory cancel ${jobId}".`);
+    await expect(cancelCommand(ctx, 'job_nope')).rejects.toThrow('job job_nope not found; "updraft status" lists job ids.');
+    await expect(cancelCommand(ctx, run.id)).rejects.toThrow(`${run.id} is a run, not a job; cancel its job with "updraft cancel ${jobId}".`);
 
     const empty = fakeContext();
     homes.push(empty.paths.dataDir);

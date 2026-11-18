@@ -3,11 +3,11 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import type { AgentReport } from '../agents/discovery.js';
-import { agentAdapter, publishMode, type FactoryConfig } from '../config/schema.js';
+import { agentAdapter, publishMode, type UpdraftConfig } from '../config/schema.js';
 import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
 import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import { labelEquals } from '../routing.js';
 import { agentLookupEnv } from '../worker/live.js';
 import { pathEntries, which } from '../util/which.js';
@@ -113,7 +113,7 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Promise<DoctorReport> {
+export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Promise<DoctorReport> {
   const checks: CheckResult[] = [];
   const add = (status: CheckStatus, name: string, detail: string) => checks.push({ status, name, detail });
 
@@ -126,8 +126,8 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
 
   // Config
   const cfg = checkConfig(paths.configFile, probes.fileExists);
-  let config: FactoryConfig | null = null;
-  if (cfg.state === 'missing') add('fail', 'config', `not found at ${paths.configFile}; run "factory configure"`);
+  let config: UpdraftConfig | null = null;
+  if (cfg.state === 'missing') add('fail', 'config', `not found at ${paths.configFile}; run "updraft configure"`);
   else if (cfg.state === 'unreadable') add('fail', 'config', cfg.message);
   else if (cfg.state === 'invalid') {
     add('fail', 'config', `invalid: ${paths.configFile}`);
@@ -206,7 +206,7 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
       try {
         const gr = await api.getRepo(fullName);
         if (gr.id !== repo.id) {
-          add('fail', name, `ID mismatch: config has ${repo.id}, GitHub has ${gr.id}; re-run "factory add ${fullName}"`);
+          add('fail', name, `ID mismatch: config has ${repo.id}, GitHub has ${gr.id}; re-run "updraft add ${fullName}"`);
           continue;
         }
         if (gr.fullName.toLowerCase() !== fullName.toLowerCase()) {
@@ -259,7 +259,7 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
   // Local clones that per-job worktrees are created from.
   if (config) checks.push(...(await checkRepoCheckouts(config, paths, probes)));
 
-  // Agents: the same discovery as "factory agents", for each enabled agent as a live run starts it:
+  // Agents: the same discovery as "updraft agents", for each enabled agent as a live run starts it:
   // its agents.<name>.command, in this process's environment minus the GitHub tokens plus its
   // agents.<name>.env. Running doctor under the background launcher shows what the worker will see.
   // A containerized agent's CLI is in its image, so the runtime, the image and the CLI inside it
@@ -284,7 +284,7 @@ export async function runDoctor(paths: FactoryPaths, probes: DoctorProbes): Prom
   }
 
   const overrides: Record<string, string> = {};
-  for (const k of ['FACTORY_HOME', 'FACTORY_CONFIG']) {
+  for (const k of ['UPDRAFT_HOME', 'UPDRAFT_CONFIG']) {
     const v = probes.env[k];
     if (v) overrides[k] = v;
   }
@@ -348,7 +348,7 @@ export function defaultDoctorProbes(ctx: CommandContext): DoctorProbes {
       }),
     checkWritable: (dir) => {
       mkdirSync(dir, { recursive: true });
-      const probe = join(dir, `.factory-doctor-${process.pid}.tmp`);
+      const probe = join(dir, `.updraft-doctor-${process.pid}.tmp`);
       writeFileSync(probe, 'ok');
       rmSync(probe, { force: true });
     },

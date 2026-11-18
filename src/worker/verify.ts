@@ -1,5 +1,5 @@
 // The worker-run verification step (actions.<name>.verify): how a configured command becomes a
-// process to spawn, and how its result reads in run.log, `factory status` and the PR body.
+// process to spawn, and how its result reads in run.log, `updraft status` and the PR body.
 // The commands are run by the live executor (live.ts), with the agent's process handling.
 //
 // A string command needs a shell (`npm test` is a shell-resolved shim plus arguments, and people
@@ -91,7 +91,7 @@ export function verificationNotes(v: VerificationSummary): string[] {
   if (after !== before) {
     notes.push(
       `uncommitted changes in the worktree went from ${before} to ${after} during verification; ` +
-        'they are not committed or published, and factory clean keeps a worktree that has them',
+        'they are not committed or published, and updraft clean keeps a worktree that has them',
     );
   }
   return notes;

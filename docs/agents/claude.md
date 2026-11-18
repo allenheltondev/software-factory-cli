@@ -11,11 +11,11 @@ launchers' account, not just your terminal):
 
 - Claude Code installed and signed in: `claude auth status` reports `loggedIn: true` (a
   claude.ai login, or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the environment).
-  `factory agents` and `factory doctor` run the same check.
+  `updraft agents` and `updraft doctor` run the same check.
 - On Linux and macOS, a non-root user: Claude Code refuses the default full-auto profile as
   root or under `sudo`.
 - Only agents with a live adapter enabled (`claude`, `codex` or `kiro`), a
-  `checkoutPath` for the repository and a `prompt` for the action. `factory validate` checks
+  `checkoutPath` for the repository and a `prompt` for the action. `updraft validate` checks
   all three.
 
 ## Invocation

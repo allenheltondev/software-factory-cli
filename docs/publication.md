@@ -17,7 +17,7 @@ The worker publishes, never the agent, as the active `gh`
 account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
 
 1. **Push** the job branch to the repo's remote in `checkoutPath` (the same remote the
-   worktree was fetched from): `git push <remote> <sha>:refs/heads/factory/issue-<n>-<jobId>`.
+   worktree was fetched from): `git push <remote> <sha>:refs/heads/updraft/issue-<n>-<jobId>`.
    The push only ever creates the branch: it carries `--force-with-lease=<ref>:` with an empty
    expected value, so Git refuses it if the branch exists by the time it runs, and it never
    moves an existing branch, not even by a fast-forward. It never pushes the base branch and
@@ -32,7 +32,7 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
 2. **Open a PR** from the job branch into the base branch (draft for `draft-pr`), titled with
    the issue title. The body says `Closes #<n>`, lists the commits and the diffstat, quotes the
    agent's final message (capped, in a code block so mentions and closing keywords in it stay
-   inert), and carries the run id and a hidden `<!-- factory-run: <runId> -->` marker.
+   inert), and carries the run id and a hidden `<!-- updraft-run: <runId> -->` marker.
 3. **Comment on the issue** with a link to the PR and a short summary, with the same marker.
 
 Merging stays a human decision: the worker never merges, approves or marks a PR ready for
@@ -65,15 +65,15 @@ GitHub again nor change the recorded state.
 
 Network errors, GitHub 5xx responses and rate limits are retried by the worker
 on its own after each poll, with backoff, up to five attempts. Other failures wait for you:
-`factory status` shows the error, and `factory publish RUN_ID` retries through the same path.
-`factory publish` also publishes a succeeded run the worker did not publish, for example one
+`updraft status` shows the error, and `updraft publish RUN_ID` retries through the same path.
+`updraft publish` also publishes a succeeded run the worker did not publish, for example one
 from before you turned `publish` on. Permission errors say what is needed: push access to the
 repository and a token with the classic `repo` scope, or a fine-grained token with Contents,
 Pull requests and Issues set to read and write (`gh auth refresh -h github.com -s repo`).
 GitHub refuses draft PRs for private repositories on some plans; publication then fails with
 a message to set `publish: pr`. It never falls back on its own.
 
-`factory status` shows each run's PR link or publication error, and `factory doctor` checks
+`updraft status` shows each run's PR link or publication error, and `updraft doctor` checks
 that the active account has push access to every repository with `publish` set.
 
 What publication does and does not protect against is covered under

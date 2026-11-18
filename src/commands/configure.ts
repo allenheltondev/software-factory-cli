@@ -1,6 +1,6 @@
 import { saveConfig } from '../config/io.js';
 import { writeStarterPrompts } from '../config/prompts.js';
-import { workflowId, type FactoryConfigInput } from '../config/schema.js';
+import { workflowId, type UpdraftConfigInput } from '../config/schema.js';
 import { formatIssues, validateConfig } from '../config/validate.js';
 import type { GitHubApi, GitHubLabel, GitHubRepo } from '../github/api.js';
 import { labelEquals } from '../routing.js';
@@ -74,7 +74,7 @@ interface Session {
   p: Prompter;
   api: GitHubApi;
   /** Working copy; new pools/actions created during prompts are added here. */
-  config: FactoryConfigInput;
+  config: UpdraftConfigInput;
   /** Agent names that are enabled and usable on this machine (from discovery). */
   usable: Set<string>;
   /** Discovery hint per agent name, for pickers. */
@@ -143,7 +143,7 @@ async function pickLabel(
     ).trim();
   }
   if (!labels.some((l) => labelEquals(l.name, name))) {
-    s.p.warn(`Label "${name}" does not exist on ${repoName}. Create it on GitHub before dispatching (factory never creates labels).`);
+    s.p.warn(`Label "${name}" does not exist on ${repoName}. Create it on GitHub before dispatching (updraft never creates labels).`);
   }
   return name;
 }
@@ -269,14 +269,14 @@ async function promptBackfill(p: Prompter, repo: GitHubRepo): Promise<string | u
 export async function configureCommand(ctx: CommandContext): Promise<number> {
   if (!ctx.isTTY) {
     throw new CliError(
-      '"factory configure" is interactive and needs a terminal. For scripted setup use "factory add OWNER/REPO".',
+      '"updraft configure" is interactive and needs a terminal. For scripted setup use "updraft add OWNER/REPO".',
       EXIT.USAGE,
     );
   }
   const configPath = ctx.paths.configFile;
   const existing = loadEditableConfig(configPath);
   const p = ctx.prompter();
-  p.intro('factory configure');
+  p.intro('updraft configure');
 
   const api = await p.spin('Connecting to GitHub', () => ctx.createApi());
   const viewer = await api.getViewer();
@@ -291,7 +291,7 @@ export async function configureCommand(ctx: CommandContext): Promise<number> {
   const reports = await p.spin('Looking for coding agents', () => ctx.discoverAgents());
   const agentChoices = buildAgentChoices(s.config.agents, reports, Boolean(existing));
   s.agentHints = agentChoices.hints;
-  if (!agentChoices.usable.size) p.warn('No usable coding agent found on this machine. Run "factory agents" for details.');
+  if (!agentChoices.usable.size) p.warn('No usable coding agent found on this machine. Run "updraft agents" for details.');
   const enabled = await p.multiselect<string>({
     message: 'Enabled agents',
     options: agentChoices.options,

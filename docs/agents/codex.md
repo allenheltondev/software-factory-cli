@@ -11,7 +11,7 @@ launchers' account, not just your terminal):
 
 - Codex installed and signed in: `codex login status` exits 0 (a ChatGPT login or a stored
   API key), or `CODEX_API_KEY` is set in the worker's environment, which `codex exec`
-  accepts. `factory agents` and `factory doctor` run the same check.
+  accepts. `updraft agents` and `updraft doctor` run the same check.
 - Only agents with a live adapter enabled, a `checkoutPath` for the repository and a `prompt`
   for the action (see [Requirements](../live-execution.md#requirements)).
 

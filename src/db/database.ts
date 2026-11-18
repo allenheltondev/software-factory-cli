@@ -218,12 +218,12 @@ const MIGRATIONS: Record<number, Migration> = {
     CREATE INDEX failure_comments_by_state ON failure_comments (state, next_attempt_at);
   `,
   8: `
-    -- Set by "factory cancel" on a run that is claimed or executing. The CLI is not the worker
+    -- Set by "updraft cancel" on a run that is claimed or executing. The CLI is not the worker
     -- process, so it only records the request; the worker stops the run and closes it with no
     -- outcome and its job 'canceled'. It is on the run, not the job, so a request can never
-    -- carry over to a later attempt after "factory retry".
+    -- carry over to a later attempt after "updraft retry".
     ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT;
-    -- Dedupe keys of jobs deleted by "factory clean --older-than". The poller re-reads the
+    -- Dedupe keys of jobs deleted by "updraft clean --older-than". The poller re-reads the
     -- newest events of a repository on every scan (for a quiet repository, indefinitely), and
     -- only the jobs unique key stops such an event from being enqueued again. A deleted job
     -- leaves its key here, and commitPollBatch refuses any event listed.

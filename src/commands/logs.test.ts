@@ -56,7 +56,7 @@ function scripted(steps: Array<() => void>) {
   return { sleep, polls: () => polls };
 }
 
-describe('factory logs', () => {
+describe('updraft logs', () => {
   it('prints the log of a run, and for a job the log of its latest run, saying which', async () => {
     const { ctx, db, jobId, start, startWorker, write } = setup();
     startWorker();
@@ -91,7 +91,7 @@ describe('factory logs', () => {
   it('explains an unknown id, a job without runs, a missing log and a missing database', async () => {
     const { ctx, db, jobId, start, startWorker, write } = setup();
     startWorker();
-    await expect(logsCommand(ctx, 'run_nope')).rejects.toThrow(/No run or job with id run_nope\. "factory status" lists recent ones/);
+    await expect(logsCommand(ctx, 'run_nope')).rejects.toThrow(/No run or job with id run_nope\. "updraft status" lists recent ones/);
     await expect(logsCommand(ctx, jobId)).rejects.toThrow(`job ${jobId} is queued and has no runs yet, so there is no log.`);
 
     const c = start();

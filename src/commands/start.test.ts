@@ -38,7 +38,7 @@ function writeConfig(path: string, mode: 'log-only' | 'prepare-only' = 'log-only
   writeFileSync(path, stringify(cfg));
 }
 
-describe('factory start', () => {
+describe('updraft start', () => {
   it('fails with a ConfigError when there is no config', async () => {
     const s = setup(async () => {});
     await expect(startCommand(s.ctx, s.deps)).rejects.toBeInstanceOf(ConfigError);
@@ -59,7 +59,7 @@ describe('factory start', () => {
     expect(Object.keys(seen!.config.repositories)).toEqual(['o/r']);
     expect(s.deps.pollOnce).toHaveBeenCalledWith(expect.objectContaining({ api: s.api, config: seen!.config }));
     expect(s.deps.checkJobDispatchable).toHaveBeenCalledWith({ api: s.api, config: seen!.config }, { id: 'job_1' });
-    expect(s.deps.createLogger).toHaveBeenCalledWith(expect.objectContaining({ file: expect.stringMatching(/factory\.log$/) }));
+    expect(s.deps.createLogger).toHaveBeenCalledWith(expect.objectContaining({ file: expect.stringMatching(/updraft\.log$/) }));
     expect(s.closed).toEqual([s.ctx.paths.dbFile]);
     expect(s.uninstall).toHaveBeenCalledOnce();
   });

@@ -56,7 +56,7 @@ export async function containerAgentChecks(
 
   const cli = containerLaunch(adapter, agent).file;
   const user = probes.user ?? hostUser();
-  const name = `factory-doctor-${process.pid}-${agentName}`;
+  const name = `updraft-doctor-${process.pid}-${agentName}`;
   const version = await probes
     .run(runtime, buildContainerRunArgs({ file: cli, args: ['--version'] }, { image: container.image, name, mounts: [], user, network: 'none', extraArgs: container.args }))
     .catch((err: unknown) => ({ code: null, stdout: '', stderr: String(err) }));

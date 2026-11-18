@@ -15,7 +15,7 @@ const passed: VerificationSummary = {
 };
 
 const summary: RunSummary = {
-  branch: 'factory/issue-7-job_x',
+  branch: 'updraft/issue-7-job_x',
   baseSha: 'abc1234abc1234',
   worktree: '/w',
   commits: ['abc1234 add the widget'],

@@ -210,8 +210,8 @@ export const configSchema = z.strictObject({
   repositories: z.record(repoFullName, repositorySchema).default({}),
 });
 
-export type FactoryConfig = z.output<typeof configSchema>;
-export type FactoryConfigInput = z.input<typeof configSchema>;
+export type UpdraftConfig = z.output<typeof configSchema>;
+export type UpdraftConfigInput = z.input<typeof configSchema>;
 export type AgentConfig = z.output<typeof agentSchema>;
 export type ContainerConfig = z.output<typeof containerSchema>;
 export type PoolConfig = z.output<typeof poolSchema>;
@@ -231,7 +231,7 @@ export function agentAdapter(agentName: string, agent: AgentConfig): string {
 }
 
 /** True if any of the repo's workflows runs an action whose output is a local branch (needs a checkout). */
-export function repoNeedsCheckout(config: Pick<FactoryConfig, 'actions'>, repo: Pick<RepositoryConfig, 'workflows'>): boolean {
+export function repoNeedsCheckout(config: Pick<UpdraftConfig, 'actions'>, repo: Pick<RepositoryConfig, 'workflows'>): boolean {
   return repo.workflows.some(
     (wf) => Object.hasOwn(config.actions, wf.action) && config.actions[wf.action]!.output === 'local-branch',
   );
@@ -242,6 +242,6 @@ export function publishMode(repo: Pick<RepositoryConfig, 'publish'>): PublishMod
   return repo.publish ?? 'none';
 }
 
-export function allowedActorsFor(config: FactoryConfig, wf: WorkflowConfig): string[] {
+export function allowedActorsFor(config: UpdraftConfig, wf: WorkflowConfig): string[] {
   return wf.allowedActors ?? config.dispatch.allowedActors;
 }

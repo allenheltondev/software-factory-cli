@@ -3,7 +3,7 @@
 // account, and comments on the issue. Merging stays a human decision: nothing here merges,
 // approves or marks a PR ready.
 //
-// Every step is idempotent, keyed by the run id, so a retry (automatic or `factory publish`)
+// Every step is idempotent, keyed by the run id, so a retry (automatic or `updraft publish`)
 // never creates a duplicate:
 // - push: the remote branch is checked first. Absent: a create-only push, which Git refuses if
 //   the branch appeared meanwhile. Same SHA: already pushed. Different SHA (before or during the
@@ -32,7 +32,7 @@ import {
   recordPublicationProgress,
 } from '../db/publications.js';
 import { recordError, type Db } from '../db/database.js';
-import { publishMode, type FactoryConfig } from '../config/schema.js';
+import { publishMode, type UpdraftConfig } from '../config/schema.js';
 import {
   assertValidBranchName,
   GitError,
@@ -48,7 +48,7 @@ import {
 } from '../git/git.js';
 import { jobBranchName, withCheckoutLock } from '../git/worktree.js';
 import { GitHubError, type GitHubApi, type GitHubPullRequest } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { Job, Publication, Run, RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
@@ -79,8 +79,8 @@ export type RunGit = (args: readonly string[], opts: GitOptions) => Promise<GitO
 
 export interface PublishDeps {
   db: Db;
-  config: FactoryConfig;
-  paths: FactoryPaths;
+  config: UpdraftConfig;
+  paths: UpdraftPaths;
   api: GitHubApi;
   log: Logger;
   /** The active gh account's token (GH_TOKEN / GITHUB_TOKEN, else `gh auth token`). Read only for https remotes. */
@@ -105,7 +105,7 @@ export type PublishResult =
 
 /** Hidden marker on the PR body and the issue comment; finds them again on a retry. */
 export function publicationMarker(runId: string): string {
-  return `<!-- factory-run: ${runId} -->`;
+  return `<!-- updraft-run: ${runId} -->`;
 }
 
 /** Raised for conditions a retry alone cannot fix. */
@@ -214,7 +214,7 @@ function classifyGitHub(err: GitHubError, repoFullName: string, runId: string): 
       error:
         `GitHub refused a draft PR for ${repoFullName} (${err.message}). Draft PRs are not available for private ` +
         `repositories on some plans. Set repositories.${repoFullName}.publish: pr to open ready-for-review PRs ` +
-        `instead, then run "factory publish ${runId}".`,
+        `instead, then run "updraft publish ${runId}".`,
       retryable: false,
       retryAfter: null,
     };
@@ -287,7 +287,7 @@ export function renderPrBody(o: {
   const body = [
     `Closes #${o.issueNumber}`,
     '',
-    `Opened by software-factory from run \`${o.runId}\` (agent ${inline(o.agent)})${o.mode === 'draft-pr' ? ' as a draft' : ''}. ` +
+    `Opened by updraft from run \`${o.runId}\` (agent ${inline(o.agent)})${o.mode === 'draft-pr' ? ' as a draft' : ''}. ` +
       'Review it before merging; merging is up to a person.',
     '',
     `**Commits** (${o.commitCount})`,
@@ -433,7 +433,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
   };
 
   await runLog([`attempt ${pub.attempts} (${mode}) at ${new Date(now()).toISOString()}`]);
-  const hooksDir = mkdtempSync(join(tmpdir(), 'factory-publish-nohooks-'));
+  const hooksDir = mkdtempSync(join(tmpdir(), 'updraft-publish-nohooks-'));
   try {
     const run1 = deps.runGit ?? defaultRunGit;
     const signal = opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(NETWORK_TIMEOUT_MS)]) : AbortSignal.timeout(NETWORK_TIMEOUT_MS);
@@ -521,7 +521,7 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       new PublishRefusal(
         `${remoteRef} on ${remote} is at ${sha.slice(0, 12)}, but the job branch is at ${localSha.slice(0, 12)}; ` +
           'refusing to overwrite it. Inspect the remote branch; delete it there if it should be replaced, then run ' +
-          `"factory publish ${runId}"`,
+          `"updraft publish ${runId}"`,
       );
     hold();
     const remoteSha = await readRemoteSha();
@@ -644,8 +644,8 @@ export async function publishRun(deps: PublishDeps, runId: string, opts: { signa
       return { status: 'busy', reason: new PublicationSupersededError(runId, fence.attempt).message };
     }
     const hint = nextAttemptAt
-      ? `the worker retries at ${nextAttemptAt}; "factory publish ${runId}" retries now`
-      : `fix the cause, then run "factory publish ${runId}"`;
+      ? `the worker retries at ${nextAttemptAt}; "updraft publish ${runId}" retries now`
+      : `fix the cause, then run "updraft publish ${runId}"`;
     await runLog([`failed: ${error}`, hint]);
     log.warn('publication failed', { error, retryable, attempts });
     try {
@@ -698,6 +698,6 @@ export function createPublisher(deps: PublishDeps): Publisher {
 }
 
 /** True when any repository opts in to publication and the mode runs agents. */
-export function publicationEnabled(config: FactoryConfig): boolean {
+export function publicationEnabled(config: UpdraftConfig): boolean {
   return config.execution.mode === 'live' && Object.values(config.repositories).some((r) => publishMode(r) !== 'none');
 }

@@ -12,7 +12,7 @@
 import { appendFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
-import type { FactoryConfig } from '../config/schema.js';
+import type { UpdraftConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
 import {
   beginFailureComment,
@@ -26,7 +26,7 @@ import {
 import { getJob, getRun, MAX_START_FAILURES } from '../db/queue.js';
 import { jobBranchName } from '../git/worktree.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { Job, Run } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
@@ -36,15 +36,15 @@ const BASE_BACKOFF_SECONDS = 60;
 const MAX_BACKOFF_SECONDS = 60 * 60;
 const MAX_REASON = 300;
 
-/** What commenting needs, for permission errors and `factory doctor`. */
+/** What commenting needs, for permission errors and `updraft doctor`. */
 export const COMMENT_SCOPES_HINT =
   'Commenting needs read access to the repository and a token with the classic "repo" scope ("public_repo" is enough ' +
   'for a public repository), or a fine-grained token with Issues set to read and write';
 
 export interface FailureCommentDeps {
   db: Db;
-  config: FactoryConfig;
-  paths: FactoryPaths;
+  config: UpdraftConfig;
+  paths: UpdraftPaths;
   api: GitHubApi;
   log: Logger;
   now?: () => number;
@@ -60,7 +60,7 @@ export type FailureCommentResult =
 
 /** Hidden marker on the failure comment; finds it again on a retry. Distinct from publication's. */
 export function failureCommentMarker(runId: string): string {
-  return `<!-- factory-run-failed: ${runId} -->`;
+  return `<!-- updraft-run-failed: ${runId} -->`;
 }
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -95,7 +95,7 @@ const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&
  * worker's description, optionally followed by ": " and detail that may quote the agent's output
  * (adapters append what the agent printed) or name local files (git and filesystem errors). Only
  * the description is kept, local paths in it are replaced, and it is capped. The full error stays
- * in `factory status` and the run log.
+ * in `updraft status` and the run log.
  */
 export function publicFailureReason(error: string | null, localPaths: ReadonlyArray<string | null | undefined> = []): string {
   const full = error ?? '';
@@ -138,7 +138,7 @@ export function renderFailureComment(o: {
     ? o.reason
     : `no agent could start after ${o.startFailures ?? MAX_START_FAILURES} consecutive attempts; the last one, on ${o.agent}: ${o.reason}`;
   return [
-    'A software-factory run for this issue failed, so no pull request was opened for it.',
+    'An Updraft run for this issue failed, so no pull request was opened for it.',
     '',
     `- Run: ${code(o.runId)} (attempt ${o.attempt} of job ${code(o.jobId)})`,
     `- Agent: ${code(o.agent)}${o.agentStarted ? '' : ' (the last one tried)'}`,
@@ -149,9 +149,9 @@ export function renderFailureComment(o: {
     '',
     fenced(reason),
     '',
-    "The agent's output is not posted here; the full error and the run log are on the machine running the worker (`factory status`).",
+    "The agent's output is not posted here; the full error and the run log are on the machine running the worker (`updraft status`).",
     '',
-    `To try again, run ${code(`factory retry ${o.jobId}`)} on that machine, or remove the ${code(o.triggerLabel)} label from this issue and apply it again.`,
+    `To try again, run ${code(`updraft retry ${o.jobId}`)} on that machine, or remove the ${code(o.triggerLabel)} label from this issue and apply it again.`,
     '',
     failureCommentMarker(o.runId),
   ].join('\n');
@@ -409,6 +409,6 @@ export function createFailureCommenter(deps: FailureCommentDeps): FailureComment
 }
 
 /** True when any repository opts in to failure comments and the mode runs agents. */
-export function failureCommentsEnabled(config: FactoryConfig): boolean {
+export function failureCommentsEnabled(config: UpdraftConfig): boolean {
   return config.execution.mode === 'live' && Object.values(config.repositories).some((r) => r.commentOnFailure === true);
 }

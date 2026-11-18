@@ -62,11 +62,11 @@ export function buildProgram(opts: ProgramOptions): Command {
 
   const program = new Command();
   program
-    .name('factory')
+    .name('updraft')
     .description('Watch GitHub repos and dispatch labeled issues to coding agents')
     .version(opts.version)
-    .option('-c, --config <path>', 'config file (default: per-user config location; env FACTORY_CONFIG)')
-    .showHelpAfterError('(run "factory --help" for usage)');
+    .option('-c, --config <path>', 'config file (default: per-user config location; env UPDRAFT_CONFIG)')
+    .showHelpAfterError('(run "updraft --help" for usage)');
 
   /** Run a handler with the global options, mapping errors to friendly messages and exit codes. */
   const exec = async (fn: (ctx: CommandContext) => Promise<number>): Promise<void> => {
@@ -129,19 +129,19 @@ export function buildProgram(opts: ProgramOptions): Command {
   program
     .command('retry')
     .description('Requeue a failed, interrupted or canceled job')
-    .argument('<jobId>', 'job id (see "factory status")')
+    .argument('<jobId>', 'job id (see "updraft status")')
     .action((jobId: string) => exec((ctx) => handlers.retry(ctx, jobId)));
 
   program
     .command('cancel')
     .description('Cancel a queued job, or ask the running worker to stop a running one (its worktree is kept)')
-    .argument('<jobId>', 'job id (see "factory status")')
+    .argument('<jobId>', 'job id (see "updraft status")')
     .action((jobId: string) => exec((ctx) => handlers.cancel(ctx, jobId)));
 
   program
     .command('logs')
     .description("Print a run's log (run.log); for a job id, the log of its latest run")
-    .argument('<id>', 'run id or job id (see "factory status")')
+    .argument('<id>', 'run id or job id (see "updraft status")')
     .option('-f, --follow', 'keep printing as the log grows; exits when the run has finished')
     .option('--path', 'print only the path of the log file')
     .action((id: string, o: LogsOptions) => exec((ctx) => handlers.logs(ctx, id, o)));
@@ -149,7 +149,7 @@ export function buildProgram(opts: ProgramOptions): Command {
   program
     .command('publish')
     .description('Push the branch of a succeeded live run and open its PR, or finish a failed publication (never duplicates)')
-    .argument('<runId>', 'run id (see "factory status")')
+    .argument('<runId>', 'run id (see "updraft status")')
     .action((runId: string) => exec((ctx) => handlers.publish(ctx, runId)));
 
   program

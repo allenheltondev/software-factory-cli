@@ -1,7 +1,7 @@
 // OWNER: queue/worker workstream. Claim-side persistence: atomic claims, runs,
 // leases, retry, and status queries.
 import { join } from 'node:path';
-import type { FactoryConfig } from '../config/schema.js';
+import type { UpdraftConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
 import type { Job, JobStatus, Publication, Run, RunContainer, RunOutcome, RunSummary } from '../types.js';
 import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
@@ -35,7 +35,7 @@ export function holdsWorkerLock(db: Db, workerId: string): boolean {
  */
 export const MAX_START_FAILURES = 3;
 
-/** Reason recorded on a job (and its run) canceled with `factory cancel`. */
+/** Reason recorded on a job (and its run) canceled with `updraft cancel`. */
 export const CANCELED_BY_USER = 'canceled by user';
 
 const JOB_STATUSES: readonly JobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'interrupted', 'canceled'];
@@ -77,7 +77,7 @@ function startFailedAgents(db: Db, jobId: string, startFailures: number): Set<st
 }
 
 function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void {
-  const reason = `${problem}; fix the config, restart the worker and run "factory retry ${row.id}"`;
+  const reason = `${problem}; fix the config, restart the worker and run "updraft retry ${row.id}"`;
   db.prepare("UPDATE jobs SET status = 'failed', status_reason = ?, updated_at = ? WHERE id = ?").run(reason, at, row.id);
   recordError(db, { scope: 'queue', repoFullName: row.repo_full_name, jobId: row.id, message: reason, at });
 }
@@ -90,7 +90,7 @@ function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void 
  */
 function pickAgent(
   db: Db,
-  config: FactoryConfig,
+  config: UpdraftConfig,
   job: JobRow,
   poolName: string,
   poolAgents: readonly string[],
@@ -126,7 +126,7 @@ function pickAgent(
  *
  * A queued job whose pool or action is no longer in the config is marked
  * `failed` with a reason and an error row (never silently dropped); the user can
- * `factory retry` it after fixing the config. Jobs in `excludeJobIds` are skipped.
+ * `updraft retry` it after fixing the config. Jobs in `excludeJobIds` are skipped.
  *
  * With `lockWorkerId`, the claim first checks, inside the same transaction, that this
  * worker still holds the single-worker lock, and throws WorkerLockLostError otherwise.
@@ -137,7 +137,7 @@ function pickAgent(
  */
 export function claimNextJob(
   db: Db,
-  config: FactoryConfig,
+  config: UpdraftConfig,
   opts: {
     workerId: string;
     /** Host the claiming worker runs on (os.hostname()). */
@@ -324,7 +324,7 @@ export interface FinishedRun {
  * - succeeded / failed / interrupted: job gets the same status (checkout and log are kept).
  * - start_failed: the slot is released and the job requeued so another eligible agent is
  *   tried; after MAX_START_FAILURES consecutive start failures the job is marked failed.
- * - the user asked to cancel the run (`factory cancel` set cancel_requested_at): whatever
+ * - the user asked to cancel the run (`updraft cancel` set cancel_requested_at): whatever
  *   `result.outcome` says, the run closes with no outcome and the job is 'canceled'. The request
  *   and this close are both transactions, so exactly one wins: a request recorded before the run
  *   closed is always honored (never requeued, never published), and one that arrives after sees a
@@ -487,9 +487,9 @@ export type CancelRequest =
   | { kind: 'not-found' };
 
 /**
- * `factory cancel`: cancel a queued job directly, or record a cancel request on the open run of
+ * `updraft cancel`: cancel a queued job directly, or record a cancel request on the open run of
  * a running one. One transaction, so it serializes with the worker closing the run (finishRun,
- * closeClaim), a lock takeover and `factory retry`: the job is judged by the state it has when
+ * closeClaim), a lock takeover and `updraft retry`: the job is judged by the state it has when
  * this commits, and the request lands on the run that is open at that moment and no other.
  *
  * A request is only recorded while the worker that claimed the run holds a fresh lock. Otherwise
@@ -563,7 +563,7 @@ export interface StatusSnapshot {
   failureComments?: FailureComment[];
 }
 
-export function getStatusSnapshot(db: Db, config: FactoryConfig, now?: () => number): StatusSnapshot {
+export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => number): StatusSnapshot {
   const nowMs = (now ?? Date.now)();
 
   const lock = db.prepare('SELECT * FROM worker_lock WHERE id = 1').get() as

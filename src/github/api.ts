@@ -1,7 +1,7 @@
 import type { RepoRef } from '../types.js';
 
 /**
- * The GitHub surface the factory needs. `client.ts` implements it over the REST
+ * The GitHub surface Updraft needs. `client.ts` implements it over the REST
  * API using the active `gh` account's token; tests use in-memory fakes.
  */
 

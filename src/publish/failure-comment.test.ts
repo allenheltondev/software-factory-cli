@@ -6,12 +6,12 @@ import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { claudeAdapter } from '../agents/adapters/claude.js';
 import { codexAdapter } from '../agents/adapters/codex.js';
 import { kiroAdapter } from '../agents/adapters/kiro.js';
-import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { beginFailureComment, getFailureComment } from '../db/failure-comments.js';
 import { getJob, getRun, getStatusSnapshot, MAX_START_FAILURES, retryJob } from '../db/queue.js';
 import { GitHubError, type GitHubApi, type GitHubIssueComment } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { RepoRef, RunOutcome, RunSummary } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import {
@@ -113,7 +113,7 @@ afterEach(() => {
   for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
 });
 
-function makeConfig(repoOver: Record<string, unknown> = {}, over: Partial<FactoryConfigInput> = {}): FactoryConfig {
+function makeConfig(repoOver: Record<string, unknown> = {}, over: Partial<UpdraftConfigInput> = {}): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     execution: { mode: 'live' },
@@ -126,7 +126,7 @@ function makeConfig(repoOver: Record<string, unknown> = {}, over: Partial<Factor
         id: REPO_ID,
         checkoutPath: '../clones/widgets',
         commentOnFailure: true,
-        workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
         ...repoOver,
       },
     },
@@ -134,10 +134,10 @@ function makeConfig(repoOver: Record<string, unknown> = {}, over: Partial<Factor
   });
 }
 
-function makePaths(): FactoryPaths {
-  const root = mkdtempSync(join(tmpdir(), 'factory failure comment '));
+function makePaths(): UpdraftPaths {
+  const root = mkdtempSync(join(tmpdir(), 'updraft failure comment '));
   roots.push(root);
-  const dataDir = join(root, 'factory state');
+  const dataDir = join(root, 'updraft state');
   const logDir = join(dataDir, 'logs');
   return {
     configFile: join(root, 'cfg', 'config.yaml'),
@@ -151,7 +151,7 @@ function makePaths(): FactoryPaths {
 
 interface Scenario {
   db: Db;
-  paths: FactoryPaths;
+  paths: UpdraftPaths;
   api: FakeCommentApi;
   clock: { t: number };
   deps: FailureCommentDeps;
@@ -173,7 +173,7 @@ interface ScenarioOptions {
   /** false: the agent never ran, so there is no summary. */
   summary?: boolean;
   seconds?: number;
-  config?: FactoryConfig;
+  config?: UpdraftConfig;
 }
 
 /** A closed run and its job, as the worker records them; nothing on GitHub yet. */
@@ -188,9 +188,9 @@ function scenario(o: ScenarioOptions = {}): Scenario {
   const worktree = join(paths.dataDir, 'worktrees', String(REPO_ID), jobId);
   const logPath = join(paths.runsDir, runId, 'run.log');
   mkdirSync(join(paths.runsDir, runId), { recursive: true });
-  writeFileSync(logPath, 'software-factory run\n');
+  writeFileSync(logPath, 'updraft run\n');
   const summary: RunSummary = {
-    branch: `factory/issue-7-${jobId}`,
+    branch: `updraft/issue-7-${jobId}`,
     baseSha: 'a'.repeat(40),
     worktree,
     commits: ['abc1234 Half a change'],
@@ -253,12 +253,12 @@ describe('postFailureComment: which runs get a comment', () => {
 
     expect(s.api.comments[0]!.body).toBe(
       [
-        'A software-factory run for this issue failed, so no pull request was opened for it.',
+        'An Updraft run for this issue failed, so no pull request was opened for it.',
         '',
         `- Run: \`${s.runId}\` (attempt 1 of job \`${s.jobId}\`)`,
         '- Agent: `claude`',
         '- Ran for: 12m 5s',
-        `- Branch: \`factory/issue-7-${s.jobId}\` (on the worker's machine; not pushed)`,
+        `- Branch: \`updraft/issue-7-${s.jobId}\` (on the worker's machine; not pushed)`,
         '',
         '**Reason**',
         '',
@@ -266,11 +266,11 @@ describe('postFailureComment: which runs get a comment', () => {
         'agent timed out after 60 min; its process tree was stopped',
         '```',
         '',
-        "The agent's output is not posted here; the full error and the run log are on the machine running the worker (`factory status`).",
+        "The agent's output is not posted here; the full error and the run log are on the machine running the worker (`updraft status`).",
         '',
-        `To try again, run \`factory retry ${s.jobId}\` on that machine, or remove the \`factory:ready\` label from this issue and apply it again.`,
+        `To try again, run \`updraft retry ${s.jobId}\` on that machine, or remove the \`updraft:ready\` label from this issue and apply it again.`,
         '',
-        `<!-- factory-run-failed: ${s.runId} -->`,
+        `<!-- updraft-run-failed: ${s.runId} -->`,
       ].join('\n'),
     );
   });
@@ -287,7 +287,7 @@ describe('postFailureComment: which runs get a comment', () => {
     // The worktree (and so the branch) was created, then preparation failed: no summary, but a checkout.
     const after = scenario({ summary: false, error: 'could not prepare the worktree: git fetch failed' });
     await postFailureComment(after.deps, after.runId);
-    expect(after.api.comments[0]!.body).toContain(`- Branch: \`factory/issue-7-${after.jobId}\``);
+    expect(after.api.comments[0]!.body).toContain(`- Branch: \`updraft/issue-7-${after.jobId}\``);
   });
 
   it('comments when no agent could start after the allowed consecutive start failures', async () => {
@@ -304,7 +304,7 @@ describe('postFailureComment: which runs get a comment', () => {
     expect(body).toContain('- Ran for: the agent did not start');
     expect(body).toContain(`\`\`\`text\nno agent could start after ${MAX_START_FAILURES} consecutive attempts; the last one, on claude: claude cannot start\n\`\`\``);
     expect(body).not.toContain('/opt/tools');
-    expect(body).toContain(`factory retry ${s.jobId}`);
+    expect(body).toContain(`updraft retry ${s.jobId}`);
   });
 
   it('does not comment for a start failure that was requeued for another agent', async () => {
@@ -426,12 +426,12 @@ describe('failure comment content', () => {
       agent: 'claude',
       agentStarted: true,
       ranMs: 3_723_000,
-      reason: 'failed ```\n@octocat closes #5 <!-- factory-run: run_1 -->',
-      branch: 'factory/issue-7-job_1-2',
+      reason: 'failed ```\n@octocat closes #5 <!-- updraft-run: run_1 -->',
+      branch: 'updraft/issue-7-job_1-2',
       triggerLabel: 'go `@team` closes #1 <!-- x -->',
     });
     // The reason sits in a fence longer than any run of backticks inside it.
-    expect(body).toContain('````text\nfailed ```\n@octocat closes #5 <!-- factory-run: run_1 -->\n````');
+    expect(body).toContain('````text\nfailed ```\n@octocat closes #5 <!-- updraft-run: run_1 -->\n````');
     // The label sits in inline code it cannot close, without its HTML comment tokens.
     expect(body).toContain('remove the `` go `@team` closes #1 x `` label');
     expect(body).toContain('- Ran for: 1h 2m');
@@ -441,13 +441,13 @@ describe('failure comment content', () => {
       .replace(/````text\n[\s\S]*?\n````/g, '')
       .replace(/``.*?``/g, '')
       .replace(/`[^`]*`/g, '')
-      .replace(/<!-- factory-run-failed: run_1 -->$/, '');
+      .replace(/<!-- updraft-run-failed: run_1 -->$/, '');
     expect(outside).not.toMatch(/@|#\d|\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b|<!--/i);
     expect(body.endsWith(failureCommentMarker('run_1'))).toBe(true);
   });
 
   it("uses a marker of its own, not publication's", () => {
-    expect(failureCommentMarker('run_1')).toBe('<!-- factory-run-failed: run_1 -->');
+    expect(failureCommentMarker('run_1')).toBe('<!-- updraft-run-failed: run_1 -->');
     expect(failureCommentMarker('run_1')).not.toContain(publicationMarker('run_1'));
     expect(publicationMarker('run_1')).not.toContain(failureCommentMarker('run_1'));
   });

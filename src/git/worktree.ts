@@ -3,7 +3,7 @@
 import { existsSync, realpathSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import {
   addWorktree,
   listWorktreePaths,
@@ -19,20 +19,20 @@ import {
 } from './git.js';
 
 /** Root for all job worktrees: <dataDir>/worktrees/<repoId>/<jobId>[-<attempt>]. */
-export function worktreesRoot(paths: Pick<FactoryPaths, 'dataDir'>): string {
+export function worktreesRoot(paths: Pick<UpdraftPaths, 'dataDir'>): string {
   return join(paths.dataDir, 'worktrees');
 }
 
 /**
- * Branch for a job: factory/issue-<n>-<jobId>. Later attempts (after `factory retry`)
+ * Branch for a job: updraft/issue-<n>-<jobId>. Later attempts (after `updraft retry`)
  * get a -<attempt> suffix so the earlier attempt's branch and worktree stay inspectable.
  */
 export function jobBranchName(job: { id: string; issueNumber: number }, attempt: number): string {
-  return `factory/issue-${job.issueNumber}-${job.id}${attempt > 1 ? `-${attempt}` : ''}`;
+  return `updraft/issue-${job.issueNumber}-${job.id}${attempt > 1 ? `-${attempt}` : ''}`;
 }
 
 export function jobWorktreePath(
-  paths: Pick<FactoryPaths, 'dataDir'>,
+  paths: Pick<UpdraftPaths, 'dataDir'>,
   job: { id: string; repoId: number },
   attempt: number,
 ): string {
@@ -180,7 +180,7 @@ export function prepareJobWorktree(req: PrepareRequest): Promise<PreparedWorktre
       await addWorktree(worktreePath, branch, baseSha, opts);
     } catch (err) {
       // Git can create the branch and worktree and still exit non-zero. Keep what it made
-      // (failed runs stay inspectable; factory clean leaves them alone) and say so.
+      // (failed runs stay inspectable; updraft clean leaves them alone) and say so.
       if (await worktreeWasCreated(worktreePath, opts)) {
         req.onCheckout?.(worktreePath);
         const detail = err instanceof Error ? err.message : String(err);

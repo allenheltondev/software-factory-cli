@@ -2,7 +2,7 @@ import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveConfigRelative } from './io.js';
-import type { FactoryConfigInput } from './schema.js';
+import type { UpdraftConfigInput } from './schema.js';
 
 /** Prompts shipped in the package (examples/prompts), resolved from src/config or dist/config. */
 const PACKAGED_PROMPTS_DIR = fileURLToPath(new URL('../../examples/prompts/', import.meta.url));
@@ -11,7 +11,7 @@ const PACKAGED_PROMPTS_DIR = fileURLToPath(new URL('../../examples/prompts/', im
  * For each action whose prompt file is missing next to the config, copy the packaged
  * prompt with the same file name if one exists. Never overwrites. Returns written paths.
  */
-export function writeStarterPrompts(configFile: string, config: FactoryConfigInput, packagedDir = PACKAGED_PROMPTS_DIR): string[] {
+export function writeStarterPrompts(configFile: string, config: UpdraftConfigInput, packagedDir = PACKAGED_PROMPTS_DIR): string[] {
   const written: string[] = [];
   for (const action of Object.values(config.actions)) {
     if (!action.prompt) continue;

@@ -201,7 +201,7 @@ export function listDueFailureComments(db: Db, opts: { maxAttempts: number; now?
   ).map((r) => r.run_id);
 }
 
-/** Newest first, for `factory status`. */
+/** Newest first, for `updraft status`. */
 export function listRecentFailureComments(db: Db, limit = 10): FailureComment[] {
   return (
     db.prepare('SELECT * FROM failure_comments ORDER BY updated_at DESC, rowid DESC LIMIT ?').all(limit) as unknown as FailureCommentRow[]

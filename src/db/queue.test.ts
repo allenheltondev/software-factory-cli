@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope } from '../types.js';
 import { openDatabase, type Db } from './database.js';
 import {
@@ -25,9 +25,9 @@ import { acquireWorkerLock, WORKER_STALE_MS } from '../worker/lock.js';
 
 const T0 = Date.parse('2026-11-17T10:00:00.000Z');
 const now = () => T0;
-const RUNS_DIR = join('C:', 'factory state', 'runs');
+const RUNS_DIR = join('C:', 'updraft state', 'runs');
 
-function makeConfig(over: Partial<FactoryConfigInput> = {}): FactoryConfig {
+function makeConfig(over: Partial<UpdraftConfigInput> = {}): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     maxConcurrent: 5,
@@ -57,18 +57,18 @@ function insertJob(
     eventId: o.eventId ?? String(seq),
     url: `https://github.com/owner/repo/issues/${issue}`,
     actor: 'allen',
-    label: 'factory:ready',
-    labelsAtEnqueue: ['factory:ready'],
+    label: 'updraft:ready',
+    labelsAtEnqueue: ['updraft:ready'],
     createdAt,
   };
   db.prepare(
     `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
-     VALUES (?, ?, 'owner/repo', 'implement-issue:factory:ready', ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
+     VALUES (?, ?, 'owner/repo', 'implement-issue:updraft:ready', ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
   ).run(id, repoId, envelope.eventId, issue, o.action ?? 'implement-issue', o.pool ?? 'general', JSON.stringify(envelope), createdAt, createdAt);
   return id;
 }
 
-const claim = (db: Db, config: FactoryConfig): Claim | null =>
+const claim = (db: Db, config: UpdraftConfig): Claim | null =>
   claimNextJob(db, config, { workerId: 'wrk_test', hostname: 'host-a', leaseSeconds: 60, runsDir: RUNS_DIR, now });
 
 describe('claimNextJob', () => {
@@ -158,7 +158,7 @@ describe('claimNextJob', () => {
   });
 
   it('alternates round-robin and keeps the rotation across a reopened database', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'factory queue '));
+    const dir = mkdtempSync(join(tmpdir(), 'updraft queue '));
     tmpDirs.push(dir);
     const file = join(dir, 'state dir', 'state.db');
     const config = makeConfig();
@@ -389,7 +389,7 @@ describe('getStatusSnapshot', () => {
   });
 });
 
-describe('requestJobCancel (factory cancel)', () => {
+describe('requestJobCancel (updraft cancel)', () => {
   /** A database whose worker lock is held, freshly, by the worker that claims in these tests. */
   function withWorker(workerId = 'wrk_test') {
     const db = openDatabase(':memory:');

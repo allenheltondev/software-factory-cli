@@ -2,7 +2,7 @@
 // there. No agent runs. The live executor (live.ts) prepares the worktree the same way.
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { agentAdapter, type FactoryConfig } from '../config/schema.js';
+import { agentAdapter, type UpdraftConfig } from '../config/schema.js';
 import { ownEntry, type Claim } from '../db/queue.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree, type PreparedWorktree } from '../git/worktree.js';
 import {
@@ -79,7 +79,7 @@ export class PrepareOnlyExecutor implements Executor {
     const promptPath = resolvePromptPath(ctx.config, ctx.paths, job.action);
     const env = job.envelope;
     const lines = [
-      `software-factory run ${run.id}`,
+      `updraft run ${run.id}`,
       `written: ${new Date(ctx.now()).toISOString()}`,
       'mode: prepare-only. A branch and worktree are prepared for the job; no agent process was started.',
       '',
@@ -123,7 +123,7 @@ export class PrepareOnlyExecutor implements Executor {
 }
 
 /** The executor for config.execution.mode. */
-export function createExecutor(config: Pick<FactoryConfig, 'execution'>): Executor {
+export function createExecutor(config: Pick<UpdraftConfig, 'execution'>): Executor {
   switch (config.execution.mode) {
     case 'prepare-only':
       return new PrepareOnlyExecutor();

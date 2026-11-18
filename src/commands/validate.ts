@@ -1,13 +1,13 @@
 import { existsSync } from 'node:fs';
 import { ConfigError, configExists, readRawConfig, resolveConfigRelative } from '../config/io.js';
-import type { FactoryConfig } from '../config/schema.js';
+import type { UpdraftConfig } from '../config/schema.js';
 import { validateConfig, type ConfigIssue } from '../config/validate.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 
 /** Warn about action prompt files that don't exist (resolved against the config file's directory). */
 export function promptFileWarnings(
-  config: FactoryConfig,
+  config: UpdraftConfig,
   configFile: string,
   fileExists: (p: string) => boolean = existsSync,
 ): ConfigIssue[] {
@@ -24,7 +24,7 @@ export type ConfigCheck =
   | { state: 'missing'; path: string }
   | { state: 'unreadable'; path: string; message: string }
   | { state: 'invalid'; path: string; errors: ConfigIssue[]; warnings: ConfigIssue[] }
-  | { state: 'ok'; path: string; config: FactoryConfig; warnings: ConfigIssue[] };
+  | { state: 'ok'; path: string; config: UpdraftConfig; warnings: ConfigIssue[] };
 
 /** Load and validate without network access. Prompt-file checks are folded into warnings. */
 export function checkConfig(path: string, fileExists: (p: string) => boolean = existsSync): ConfigCheck {
@@ -49,7 +49,7 @@ export async function validateCommand(ctx: CommandContext): Promise<number> {
   const check = checkConfig(ctx.paths.configFile);
   switch (check.state) {
     case 'missing':
-      println(ctx.err, `✗ No config at ${check.path}. Run "factory configure" or pass --config.`);
+      println(ctx.err, `✗ No config at ${check.path}. Run "updraft configure" or pass --config.`);
       return EXIT.FAILURE;
     case 'unreadable':
       println(ctx.err, `✗ ${check.message}`);

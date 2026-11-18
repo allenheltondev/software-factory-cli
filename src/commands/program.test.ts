@@ -27,7 +27,7 @@ function setup(handlers: Partial<Handlers> = {}) {
     c.exitOverride();
     c.configureOutput({ writeOut: () => {}, writeErr: () => {} });
   }
-  const parse = (...args: string[]) => program.parseAsync(['node', 'factory', ...args]);
+  const parse = (...args: string[]) => program.parseAsync(['node', 'updraft', ...args]);
   return { ctx, globals, codes, parse };
 }
 
@@ -47,7 +47,7 @@ describe('commander wiring', () => {
     expect(codes).toEqual([0]);
   });
 
-  it('passes --config (before or after the subcommand) to the context factory', async () => {
+  it('passes --config (before or after the subcommand) to the context updraft', async () => {
     const validate = vi.fn(async () => 0);
     const { parse, globals } = setup({ validate });
     await parse('-c', 'a.yaml', 'validate');

@@ -90,7 +90,7 @@ export function commitPollBatch(
   const at = nowIso(batch.now);
   // Ignore only duplicates of the dedupe key. Plain INSERT OR IGNORE would also swallow
   // NOT NULL / CHECK / primary-key violations and silently drop a job.
-  // The dedupe key of a job that `factory clean --older-than` deleted lives on in pruned_events;
+  // The dedupe key of a job that `updraft clean --older-than` deleted lives on in pruned_events;
   // an event listed there already had its job and is never enqueued again.
   const insert = db.prepare(
     `INSERT INTO jobs

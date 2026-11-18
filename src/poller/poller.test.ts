@@ -1,6 +1,6 @@
 // In-memory GitHubApi fake, then the poller tests.
 import { describe, expect, it } from 'vitest';
-import { configSchema, workflowId, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, workflowId, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getCheckpoint, listQueuedJobs } from '../db/ingest.js';
 import { pruneJob } from '../db/prune.js';
@@ -242,9 +242,9 @@ class FakeGitHub implements GitHubApi {
 
 const REPO = 101;
 const OTHER = 202;
-const READY = 'factory:ready';
+const READY = 'updraft:ready';
 
-function makeConfig(overrides: Partial<FactoryConfigInput> = {}, repoExtra: Record<string, unknown> = {}): FactoryConfig {
+function makeConfig(overrides: Partial<UpdraftConfigInput> = {}, repoExtra: Record<string, unknown> = {}): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     dispatch: { allowedActors: ['allen'] },
@@ -268,7 +268,7 @@ function makeConfig(overrides: Partial<FactoryConfigInput> = {}, repoExtra: Reco
   });
 }
 
-function setup(config: FactoryConfig = makeConfig()) {
+function setup(config: UpdraftConfig = makeConfig()) {
   const gh = new FakeGitHub();
   for (const [name, repo] of Object.entries(config.repositories)) gh.addRepo(repo.id, name);
   const db = openDatabase(':memory:');
@@ -428,7 +428,7 @@ describe('pollOnce: dispatch and routing', () => {
     const { gh, db, deps } = setup();
     gh.createIssue(REPO, 1);
     await init(deps);
-    gh.label(REPO, 1, 'Factory:Ready');
+    gh.label(REPO, 1, 'Updraft:Ready');
     await pollOnce(deps);
     expect(listQueuedJobs(db)).toHaveLength(1);
   });
@@ -605,7 +605,7 @@ describe('pollOnce: queued job re-check', () => {
     expect(s.jobsCanceled).toBe(1);
     const [job] = allJobs(db);
     expect(job!.status).toBe('canceled');
-    expect(job!.status_reason).toMatch(/no longer carries trigger label "factory:ready"/);
+    expect(job!.status_reason).toMatch(/no longer carries trigger label "updraft:ready"/);
   });
 
   it('cancels a queued job when the issue closes', async () => {
@@ -636,7 +636,7 @@ describe('pollOnce: queued job re-check', () => {
       [1, 'canceled'],
       [2, 'running'],
     ]);
-    expect(allJobs(db)[0]!.status_reason).toMatch(/workflow "implement-issue:factory:ready" no longer exists/);
+    expect(allJobs(db)[0]!.status_reason).toMatch(/workflow "implement-issue:updraft:ready" no longer exists/);
   });
 
   it('does not cancel when the re-check hits a transient API error', async () => {
@@ -1239,7 +1239,7 @@ describe('issue edits after the trigger label (live mode)', () => {
 });
 
 describe('retention: a pruned job is never enqueued again', () => {
-  it('keeps refusing an event the poller still rescans after "factory clean --older-than" deleted its job', async () => {
+  it('keeps refusing an event the poller still rescans after "updraft clean --older-than" deleted its job', async () => {
     const { gh, db, deps, advance } = setup();
     gh.createIssue(REPO, 1);
     await init(deps);

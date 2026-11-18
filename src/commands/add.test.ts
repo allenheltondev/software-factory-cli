@@ -10,7 +10,7 @@ import { COMMENTED_CONFIG, fakeApi, fakeContext, fakeRepo } from './fakes.js';
 
 const readYaml = (p: string) => parse(readFileSync(p, 'utf8'));
 
-describe('factory add', () => {
+describe('updraft add', () => {
   it('creates a config with defaults when none exists', async () => {
     const api = fakeApi({ login: 'allen', repos: [fakeRepo('o/r', 99)], labels: { 'o/r': ['ready'] } });
     const ctx = fakeContext({ api });
@@ -86,7 +86,7 @@ describe('factory add', () => {
   });
 
   it('keeps comments and formatting of a hand-edited config when adding a repo', async () => {
-    const ctx = fakeContext({ api: fakeApi({ repos: [fakeRepo('o/new', 2)], labels: { 'o/new': ['factory:ready'] } }) });
+    const ctx = fakeContext({ api: fakeApi({ repos: [fakeRepo('o/new', 2)], labels: { 'o/new': ['updraft:ready'] } }) });
     mkdirSync(dirname(ctx.paths.configFile), { recursive: true });
     writeFileSync(ctx.paths.configFile, COMMENTED_CONFIG);
 
@@ -118,11 +118,11 @@ describe('factory add', () => {
   });
 
   it('keeps comments inside a repo renamed on GitHub and renames its key in place', async () => {
-    const ctx = fakeContext({ api: fakeApi({ repos: [fakeRepo('new-owner/app', 1)], labels: { 'new-owner/app': ['factory:ready'] } }) });
+    const ctx = fakeContext({ api: fakeApi({ repos: [fakeRepo('new-owner/app', 1)], labels: { 'new-owner/app': ['updraft:ready'] } }) });
     mkdirSync(dirname(ctx.paths.configFile), { recursive: true });
     writeFileSync(ctx.paths.configFile, COMMENTED_CONFIG);
 
-    expect(await addCommand(ctx, 'new-owner/app', { label: 'factory:ready' })).toBe(EXIT.OK);
+    expect(await addCommand(ctx, 'new-owner/app', { label: 'updraft:ready' })).toBe(EXIT.OK);
     expect(ctx.out.text).toContain('moved from o/app');
     const text = readFileSync(ctx.paths.configFile, 'utf8');
     expect(text).toBe(COMMENTED_CONFIG.replace('  # The main app\n  o/app:\n', '  # The main app\n  new-owner/app:\n'));

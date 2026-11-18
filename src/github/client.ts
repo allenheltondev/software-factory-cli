@@ -61,7 +61,7 @@ export interface CreateGitHubApiOptions {
 /** No GitHub request (headers and body) may take longer than this; a hung one fails as a network error. */
 export const REQUEST_TIMEOUT_MS = 60_000;
 
-export const USER_AGENT = 'software-factory-cli';
+export const USER_AGENT = 'updraft';
 export const API_VERSION = '2022-11-28';
 const DEFAULT_BASE_URL = 'https://api.github.com';
 /** Safety stop for internally paginated lists (100 per page). */

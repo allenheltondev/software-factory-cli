@@ -20,7 +20,7 @@ account is the strongest setup this project offers.
 > records the exact `run`, `stop`, `rm` and `inspect` calls) and by applying its mount list as
 > real bind mounts in a Linux mount namespace; the Docker 29 client accepts the generated `run`
 > arguments. As of this writing it has **not** been run
-> against a real Docker or Podman daemon. Before relying on it, run `factory doctor`, dispatch
+> against a real Docker or Podman daemon. Before relying on it, run `updraft doctor`, dispatch
 > one throwaway issue, and read the `command:` and `mount` lines in that run's `run.log`.
 
 ## Run the agent in a container
@@ -30,10 +30,10 @@ agents:
   claude:
     maxConcurrent: 1
     env:                                   # non-secret settings, set inside the container
-      GIT_AUTHOR_NAME: Factory Agent
-      GIT_AUTHOR_EMAIL: factory-agent@example.com
-      GIT_COMMITTER_NAME: Factory Agent
-      GIT_COMMITTER_EMAIL: factory-agent@example.com
+      GIT_AUTHOR_NAME: Updraft Agent
+      GIT_AUTHOR_EMAIL: updraft-agent@example.com
+      GIT_COMMITTER_NAME: Updraft Agent
+      GIT_COMMITTER_EMAIL: updraft-agent@example.com
     container:
       image: my-org/claude-runner:latest   # required
       runtime: docker                      # docker (default), podman, or a path
@@ -62,10 +62,10 @@ With `container` set, two other keys change meaning:
 run, and the worker wraps it. A containerized run starts:
 
 ```
-<runtime> run --rm -i --name factory-<run id> --pull never
-  --label software-factory.run=<run id>
+<runtime> run --rm -i --name updraft-<run id> --pull never
+  --label updraft.run=<run id>
   --user <uid>:<gid> --cap-drop ALL --security-opt no-new-privileges
-  --tmpfs /factory-home:rw,exec,mode=1777 -e HOME=/factory-home
+  --tmpfs /updraft-home:rw,exec,mode=1777 -e HOME=/updraft-home
   --mount type=bind,source=<path>,target=<path>[,readonly]   (one per mount, below)
   --workdir <job worktree>
   [--network <network>]
@@ -98,7 +98,7 @@ directory, not the SSH agent socket, not the runtime's own socket.
 **User.** The container runs as the worker's own `uid:gid`, so files the agent creates in the
 worktree are owned by you, and Claude Code (which refuses its full-auto mode as root) is not
 root. That uid usually has no home directory in the image, so `HOME` is set to
-`/factory-home`, an in-memory filesystem any uid can write. It is empty at the start of every
+`/updraft-home`, an in-memory filesystem any uid can write. It is empty at the start of every
 run and gone at the end: nothing an agent stores under `~` survives, including logins. All
 capabilities are dropped and `no-new-privileges` is set, so `sudo` inside the image does not
 work.
@@ -151,7 +151,7 @@ commit still counts in the summary; uncommitted changes inside a submodule do no
 
 An action's `verify` commands ([Verification](verification.md)) execute code the agent wrote,
 so for a containerized agent the worker runs them in containers too, one per command, named
-`factory-<run id>-verify-<n>`, from the same image with the same mounts, user, `network` and
+`updraft-<run id>-verify-<n>`, from the same image with the same mounts, user, `network` and
 `args`. A string command runs through `/bin/sh -c` inside the container. They get none of the
 variables named in `container.env`: those are the agent's credentials, and checking its work
 does not need them. The image therefore needs whatever the commands use (the test runner, the
@@ -170,20 +170,20 @@ name:
   container;
 - if the worker is killed outright, the container keeps running. The runtime's path and the
   container's name were recorded with the run before the container started, so the next
-  `factory start` on the same host removes it (`rm -f`) and marks the run `interrupted`. As
+  `updraft start` on the same host removes it (`rm -f`) and marks the run `interrupted`. As
   with recorded pids, a run claimed on a different host is left alone.
 
-`docker ps --filter label=software-factory.run` lists the worker's containers.
+`docker ps --filter label=updraft.run` lists the worker's containers.
 
 ### Checking the setup
 
-- `factory validate` checks the shape of `container` without touching the runtime.
-- `factory doctor` checks, for each enabled containerized agent: the runtime is installed and
+- `updraft validate` checks the shape of `container` without touching the runtime.
+- `updraft doctor` checks, for each enabled containerized agent: the runtime is installed and
   answers `info`; the image is present locally; and `<agent cli> --version` runs in the image
   as your uid, with the same scratch home and `container.args`, no mounts and no network. It
   warns about a variable named in `container.env` that is not set where doctor runs. It does
   not check that the agent is signed in.
-- `factory agents` lists the same checks after the host CLIs.
+- `updraft agents` lists the same checks after the host CLIs.
 
 In live mode a failed check is a failure; otherwise a warning.
 
@@ -229,11 +229,11 @@ Notes:
 ### Platforms
 
 - **Linux and macOS.** Same-path mounts work. With Docker Desktop on macOS, the worktree
-  directory (under the factory's data directory) and the clone must be inside a path Docker
+  directory (under Updraft's data directory) and the clone must be inside a path Docker
   Desktop shares with its VM.
 - **Windows.** `container` is a validation error on native Windows: a Windows path cannot
   exist inside a Linux container, so the worktree's Git pointer would not resolve. Run the
-  worker inside WSL2, with the clone and the factory's data directory on the WSL filesystem.
+  worker inside WSL2, with the clone and Updraft's data directory on the WSL filesystem.
 - **Rootless Podman.** `--user <uid>:<gid>` then refers to an id inside the user namespace,
   which does not own the worktree. Add `--userns=keep-id` to `container.args`. Untested.
 - **Rootless Docker** maps your uid to root inside the container, so running as your uid does
@@ -273,7 +273,7 @@ With the default settings, an agent that has been talked into misbehaving cannot
   later checkouts in that clone contain), and fill the disk.
   It cannot rewrite `packed-refs`. The worker fetches the base branch from the remote before
   each job and publishes only the job branch, but if you work in that clone yourself, check
-  what you are on before you trust it. A clone dedicated to the factory avoids the question.
+  what you are on before you trust it. A clone dedicated to Updraft avoids the question.
 - **The worktree's contents.** Everything in the worktree after a run is the agent's. Running
   it on the host runs the agent's code as you: tests, package manager scripts, a build, an
   editor that executes workspace settings. Review the diff (or the PR) first, or run it in a
@@ -301,7 +301,7 @@ With the default settings, an agent that has been talked into misbehaving cannot
 A separate OS account is a boundary your operating system already enforces. Run the worker,
 and therefore every agent, as a user that has nothing worth stealing:
 
-1. **Create the account**, for example `factory`, as an ordinary user without `sudo`, and not
+1. **Create the account**, for example `updraft`, as an ordinary user without `sudo`, and not
    in the `docker` group unless it needs it. Make sure your own home directory is not readable
    by it (`chmod 750 ~` or stricter).
 2. **Give it its own GitHub identity, scoped to the watched repositories.** Log in as that
@@ -321,8 +321,8 @@ and therefore every agent, as a user that has nothing worth stealing:
    [Agent credentials](background-operation.md#agent-credentials)), or the agent CLI's own
    login done as that user. Use a key you can cap and revoke.
 5. **Install the launcher for that user** (see
-   [Background operation](background-operation.md)), so the worker starts as `factory`, not
-   as you. Run `factory doctor` as that user.
+   [Background operation](background-operation.md)), so the worker starts as `updraft`, not
+   as you. Run `updraft doctor` as that user.
 
 What this gives you: the agent cannot read your SSH keys, your `gh` login, your cloud
 credentials, your browser profile or your other repositories, because the account cannot.

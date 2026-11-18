@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import {
   CANCELED_BY_USER,
@@ -17,7 +17,7 @@ import {
   WorkerLockLostError,
 } from '../db/queue.js';
 import type { GitHubApi } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import { createFailureCommenter } from '../publish/failure-comment.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job } from '../types.js';
 import { silentLogger } from '../util/log.js';
@@ -28,7 +28,7 @@ import type { ProcessControl } from './process.js';
 
 const T0 = Date.parse('2026-11-17T10:00:00.000Z');
 
-function makeConfig(over: Partial<FactoryConfigInput> = {}): FactoryConfig {
+function makeConfig(over: Partial<UpdraftConfigInput> = {}): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     maxConcurrent: 2,
@@ -54,13 +54,13 @@ function insertJob(db: Db, o: { issue?: number; pool?: string } = {}): string {
     eventId: String(1000 + seq),
     url: `https://github.com/owner/repo/issues/${issue}`,
     actor: 'allen',
-    label: 'factory:ready',
-    labelsAtEnqueue: ['factory:ready'],
+    label: 'updraft:ready',
+    labelsAtEnqueue: ['updraft:ready'],
     createdAt,
   };
   db.prepare(
     `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
-     VALUES (?, 1, 'owner/repo', 'implement-issue:factory:ready', ?, ?, 'implement-issue', ?, ?, 'queued', 0, ?, ?)`,
+     VALUES (?, 1, 'owner/repo', 'implement-issue:updraft:ready', ?, ?, 'implement-issue', ?, ?, 'queued', 0, ?, ?)`,
   ).run(id, envelope.eventId, issue, o.pool ?? 'general', JSON.stringify(envelope), createdAt, createdAt);
   return id;
 }
@@ -70,8 +70,8 @@ afterEach(() => {
   for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-function makePaths(): FactoryPaths {
-  const root = mkdtempSync(join(tmpdir(), 'factory daemon '));
+function makePaths(): UpdraftPaths {
+  const root = mkdtempSync(join(tmpdir(), 'updraft daemon '));
   tmpDirs.push(root);
   const configDir = join(root, 'my config');
   const logDir = join(root, 'state and logs', 'logs');
@@ -238,7 +238,7 @@ describe('runDaemon', () => {
         terminated.push(pid);
       },
     };
-    const issue = { title: 'T', body: 'B', labels: ['factory:ready'], url: 'u' };
+    const issue = { title: 'T', body: 'B', labels: ['updraft:ready'], url: 'u' };
     const deps = baseDeps(db, {
       executor,
       processControl,
@@ -275,7 +275,7 @@ describe('runDaemon', () => {
       executor: { name: 'spy', execute },
       checkDispatchable: async (job) => {
         checked.push(job);
-        return { ok: false, reason: 'issue no longer has the factory:ready label' };
+        return { ok: false, reason: 'issue no longer has the updraft:ready label' };
       },
     });
     const id = insertJob(db);
@@ -286,7 +286,7 @@ describe('runDaemon', () => {
 
     expect(execute).not.toHaveBeenCalled();
     expect(checked.map((j) => j.id)).toEqual([id]);
-    expect(getJob(db, id)?.statusReason).toBe('issue no longer has the factory:ready label');
+    expect(getJob(db, id)?.statusReason).toBe('issue no longer has the updraft:ready label');
     const run = db.prepare('SELECT outcome, ended_at FROM runs WHERE job_id = ?').get(id) as { outcome: string | null; ended_at: string | null };
     expect(run.outcome).toBeNull();
     expect(run.ended_at).not.toBeNull();
@@ -395,7 +395,7 @@ describe('runDaemon', () => {
         'owner/repo': {
           id: 1,
           commentOnFailure: true,
-          workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+          workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
         },
       },
     });
@@ -448,12 +448,12 @@ describe('runDaemon', () => {
     const failed = comments.find((c) => c.issue === 1)!.body;
     expect(failed).toContain('agent exited with code 1');
     expect(failed).not.toContain('SECRET');
-    expect(failed).toContain(`factory retry ${failing}`);
+    expect(failed).toContain(`updraft retry ${failing}`);
     const startRuns = db.prepare('SELECT id FROM runs WHERE job_id = ? ORDER BY attempt').all(unstartable!) as { id: string }[];
     expect(startRuns).toHaveLength(MAX_START_FAILURES);
     const noStart = comments.find((c) => c.issue === 2)!.body;
     expect(noStart).toContain(`no agent could start after ${MAX_START_FAILURES} consecutive attempts`);
-    expect(noStart).toContain(`<!-- factory-run-failed: ${startRuns.at(-1)!.id} -->`);
+    expect(noStart).toContain(`<!-- updraft-run-failed: ${startRuns.at(-1)!.id} -->`);
     expect(db.prepare("SELECT run_id, state FROM failure_comments ORDER BY issue_number").all()).toEqual([
       { run_id: (db.prepare('SELECT id FROM runs WHERE job_id = ?').get(failing!) as { id: string }).id, state: 'posted' },
       { run_id: startRuns.at(-1)!.id, state: 'posted' },
@@ -667,7 +667,7 @@ describe('runDaemon: lock ownership', () => {
   });
 });
 
-describe('runDaemon: factory cancel', () => {
+describe('runDaemon: updraft cancel', () => {
   const noPublisher = () => {
     const published: string[] = [];
     return {

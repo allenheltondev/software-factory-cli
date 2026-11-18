@@ -6,7 +6,7 @@ import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { publishCommand } from '../commands/publish.js';
 import { fakeContext } from '../commands/fakes.js';
-import { configSchema, type FactoryConfig, type FactoryConfigInput } from '../config/schema.js';
+import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getPublication } from '../db/publications.js';
 import { getJob } from '../db/queue.js';
@@ -19,7 +19,7 @@ import {
   type GitHubIssueComment,
   type GitHubPullRequest,
 } from '../github/api.js';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import type { RepoRef, RunOutcome } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { summarizeRun } from '../worker/run-summary.js';
@@ -157,7 +157,7 @@ afterEach(() => {
   for (const f of fixtures.splice(0)) f.cleanup();
 });
 
-function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over: Partial<FactoryConfigInput> = {}): FactoryConfig {
+function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over: Partial<UpdraftConfigInput> = {}): UpdraftConfig {
   return configSchema.parse({
     version: 1,
     execution: { mode: 'live' },
@@ -172,7 +172,7 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over:
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
-        workflows: [{ trigger: { event: 'issue.labeled', label: 'factory:ready' }, action: 'implement-issue', pool: 'general' }],
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
         ...repoOver,
       },
     },
@@ -180,8 +180,8 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over:
   });
 }
 
-function makePaths(root: string): FactoryPaths {
-  const dataDir = join(root, 'factory state');
+function makePaths(root: string): UpdraftPaths {
+  const dataDir = join(root, 'updraft state');
   const logDir = join(dataDir, 'logs');
   return {
     configFile: join(root, 'cfg', 'config.yaml'),
@@ -196,7 +196,7 @@ function makePaths(root: string): FactoryPaths {
 interface Scenario {
   f: GitFixture;
   db: Db;
-  paths: FactoryPaths;
+  paths: UpdraftPaths;
   runId: string;
   jobId: string;
   branch: string;
@@ -239,7 +239,7 @@ async function scenario(o: { commits?: number; outcome?: RunOutcome; db?: Db; f?
   const runId = `run_${jobId}`;
   const logPath = join(paths.runsDir, runId, 'run.log');
   mkdirSync(join(paths.runsDir, runId), { recursive: true });
-  writeFileSync(logPath, 'software-factory run\n');
+  writeFileSync(logPath, 'updraft run\n');
   const at = new Date(T0).toISOString();
   db.prepare(
     `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, lease_expires_at, started_at,
@@ -279,7 +279,7 @@ function recordingGit(o: { fakePushUrl?: string; realUrl?: string; failPushWith?
   };
 }
 
-function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config?: FactoryConfig } = {}): PublishDeps {
+function deps(s: Scenario, api: GitHubApi, over: Partial<PublishDeps> & { config?: UpdraftConfig } = {}): PublishDeps {
   return {
     db: s.db,
     config: makeConfig(s.f),
@@ -450,7 +450,7 @@ describe('publishRun', { timeout: 60_000 }, () => {
     if (r.status === 'failed') {
       expect(r.error).toMatch(/refused a draft PR/);
       expect(r.error).toContain(`repositories.${FULL}.publish: pr`);
-      expect(r.error).toContain(`factory publish ${s.runId}`);
+      expect(r.error).toContain(`updraft publish ${s.runId}`);
     }
     expect(api.pulls).toEqual([]);
 
@@ -751,7 +751,7 @@ describe('createPublisher', { timeout: 60_000 }, () => {
   });
 });
 
-describe('factory publish', { timeout: 60_000 }, () => {
+describe('updraft publish', { timeout: 60_000 }, () => {
   it('publishes a succeeded run through the same idempotent path, then reports it as already published', async () => {
     const f = createGitFixture(FULL);
     fixtures.push(f);
@@ -836,14 +836,14 @@ describe('helpers', () => {
         filesChanged: 1,
         diffStat: '1 file changed',
         untracked: 0,
-        lastOutput: ['done ```` tricky', '<!-- factory-run: run_other -->'],
+        lastOutput: ['done ```` tricky', '<!-- updraft-run: run_other -->'],
         notes: [],
       },
     });
     expect(body.startsWith('Closes #3\n')).toBe(true);
     // The final message is inside a fence longer than any backtick run in it.
     expect(body).toContain('`````text\ndone ```` tricky');
-    expect(body.match(/<!-- factory-run: run_x -->/g)).toHaveLength(1);
+    expect(body.match(/<!-- updraft-run: run_x -->/g)).toHaveLength(1);
     expect(body.indexOf('closes #9')).toBeGreaterThan(body.indexOf('```text'));
   });
 });

@@ -1,11 +1,15 @@
 {
-  "name": "software-factory-cli",
+  "name": "@allenheltondev/updraft",
   "version": "0.1.0",
   "description": "CLI that watches your GitHub repos and dispatches labeled issues to coding agents",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allenheltondev/software-factory-cli.git"
+  },
   "type": "module",
   "bin": {
-    "factory": "dist/cli.js"
+    "updraft": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -14,6 +18,9 @@
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=22.13"
   },

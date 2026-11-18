@@ -20,7 +20,7 @@ What the worker and the agents it starts can do, and which guards exist. The
   title and of the body counts, so an allowed actor who edits an issue approves the text they
   saved. Edits made before the label was applied are part of what was approved: read the
   issue before you label it. The poller applies the same check to queued jobs on every cycle,
-  so `factory status` shows the cancellation early. Body edits are read through GitHub's
+  so `updraft status` shows the cancellation early. Body edits are read through GitHub's
   GraphQL API (title changes come from the issue's events); if that information cannot be
   read, the job stays queued and is retried, and no agent is started. The check does not run
   in `log-only` or `prepare-only` mode, where no agent runs.

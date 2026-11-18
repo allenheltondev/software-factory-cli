@@ -94,7 +94,7 @@ export function renderContainerAgents(reports: ContainerAgentReport[]): string {
   return lines.join('\n');
 }
 
-/** `factory agents [--json] [--deep]`: exit 0 when at least one agent is usable. */
+/** `updraft agents [--json] [--deep]`: exit 0 when at least one agent is usable. */
 export async function agentsCommand(
   ctx: CommandContext,
   opts: AgentsOptions = {},

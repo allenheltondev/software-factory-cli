@@ -52,12 +52,12 @@ jobs:
             Write-Host "parsed $($f.Name)"
           }
           $cfgDir = Join-Path $env:RUNNER_TEMP 'launcher cfg dir'
-          $home2 = Join-Path $env:RUNNER_TEMP 'launcher factory home'
+          $home2 = Join-Path $env:RUNNER_TEMP 'launcher updraft home'
           New-Item -ItemType Directory -Force $cfgDir | Out-Null
           Copy-Item examples\config.yaml (Join-Path $cfgDir 'config.yaml')
-          $task = "SoftwareFactory CI $env:GITHUB_RUN_ID-${{ matrix.node }}"
+          $task = "Updraft CI $env:GITHUB_RUN_ID-${{ matrix.node }}"
           .\examples\launchers\windows\register-task.ps1 -TaskName $task -NoStart `
-            -ConfigPath (Join-Path $cfgDir 'config.yaml') -CliPath (Join-Path $PWD 'dist\cli.js') -FactoryHome $home2
+            -ConfigPath (Join-Path $cfgDir 'config.yaml') -CliPath (Join-Path $PWD 'dist\cli.js') -UpdraftHome $home2
           try {
             $xml = Export-ScheduledTask -TaskName $task
             foreach ($expected in @(
@@ -71,19 +71,19 @@ jobs:
             }
             Write-Host 'task definition ok'
           } finally {
-            .\examples\launchers\windows\unregister-task.ps1 -TaskName $task -FactoryHome $home2
+            .\examples\launchers\windows\unregister-task.ps1 -TaskName $task -UpdraftHome $home2
           }
 
       - name: Launchers (macOS LaunchAgent)
         if: runner.os == 'macOS'
         run: |
           bash -n examples/launchers/macos/install-launchagent.sh
-          plutil -lint examples/launchers/macos/software-factory.plist.template
+          plutil -lint examples/launchers/macos/updraft.plist.template
           out="$RUNNER_TEMP/launcher out dir"
           mkdir -p "$out"
-          bash examples/launchers/macos/install-launchagent.sh --print --label ci.software-factory \
+          bash examples/launchers/macos/install-launchagent.sh --print --label ci.updraft \
             --cli "$PWD/dist/cli.js" --config "$RUNNER_TEMP/launcher cfg dir/config.yaml" \
-            --factory-home "$RUNNER_TEMP/launcher factory home" > "$out/ci.plist"
+            --updraft-home "$RUNNER_TEMP/launcher updraft home" > "$out/ci.plist"
           plutil -lint "$out/ci.plist"
           plutil -p "$out/ci.plist"
 
@@ -96,6 +96,6 @@ jobs:
           cp examples/config.yaml "$cfg/config.yaml"
           bash examples/launchers/linux/install-systemd-user.sh --print \
             --cli "$PWD/dist/cli.js" --config "$cfg/config.yaml" \
-            --factory-home "$RUNNER_TEMP/launcher factory home" > "$RUNNER_TEMP/unit/software-factory.service"
-          cat "$RUNNER_TEMP/unit/software-factory.service"
-          systemd-analyze verify "$RUNNER_TEMP/unit/software-factory.service"
+            --updraft-home "$RUNNER_TEMP/launcher updraft home" > "$RUNNER_TEMP/unit/updraft.service"
+          cat "$RUNNER_TEMP/unit/updraft.service"
+          systemd-analyze verify "$RUNNER_TEMP/unit/updraft.service"
