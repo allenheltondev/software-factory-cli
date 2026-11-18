@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { claudeAdapter } from './adapters/claude.js';
 import { codexAdapter } from './adapters/codex.js';
-import { kiroAdapter } from './adapters/kiro.js';
+import { kiroAdapter, kiroArgsChooseHarness } from './adapters/kiro.js';
 import { agentProfile, describeProfile, effectiveArgs } from './profile.js';
 import { validateConfig } from '../config/validate.js';
 
@@ -76,5 +76,54 @@ describe('config validation', () => {
     const r = validateConfig(base({ 'claude-fast': { adapter: 'claude', model: 'haiku', args: ['--model', 'opus'] }, 'claude-deep': { adapter: 'claude' } }));
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.errors[0]!.path).toBe('agents.claude-fast');
+  });
+});
+
+describe('adapter invocations with model and effort', () => {
+  const agent = { model: 'my vendor/model 1', effort: 'high' };
+  const build = (adapter: typeof claudeAdapter, adapterName: string, a: { model?: string; effort?: string; args?: string[] }) =>
+    adapter.buildInvocation({ launch, promptFile: 'p.md', worktree: 'w', runDir: 'r', extraArgs: effectiveArgs(adapterName, a), platform: 'linux' });
+
+  it('claude: model and effort follow the adapter defaults, after the config args', () => {
+    const i = build(claudeAdapter, 'claude', { ...agent, args: ['--max-turns', '3'] });
+    expect(i.args.slice(-6)).toEqual(['--max-turns', '3', '--model', 'my vendor/model 1', '--effort', 'high']);
+    expect(i.args).toContain('--permission-mode');
+    expect(i.promptVia).toBe('stdin');
+  });
+
+  it('claude: a legacy args-only entry produces the same invocation as before', () => {
+    const args = ['--model', 'opus', '--effort', 'low'];
+    expect(build(claudeAdapter, 'claude', { args }).args).toEqual(claudeAdapter.buildInvocation({ launch, promptFile: 'p.md', worktree: 'w', runDir: 'r', extraArgs: args, platform: 'linux' }).args);
+  });
+
+  it('codex: model is an exec option and effort is a -c override, both as single arguments', () => {
+    const { args } = build(codexAdapter, 'codex', agent);
+    const exec = args.indexOf('exec');
+    expect(exec).toBeGreaterThanOrEqual(0);
+    expect(args[args.indexOf('--model') + 1]).toBe('my vendor/model 1');
+    const c = args.indexOf('-c');
+    expect(args[c + 1]).toBe('model_reasoning_effort="high"');
+    expect(args.filter((a) => a === '--model')).toHaveLength(1);
+  });
+
+  it('codex: an effort value with quotes stays one escaped TOML string', () => {
+    const { args } = build(codexAdapter, 'codex', { effort: 'hi"gh' });
+    expect(args).toContain('model_reasoning_effort="hi\\"gh"');
+  });
+
+  it('kiro: model and effort come last, after the defaults, and keep the harness default', () => {
+    const { args } = build(kiroAdapter, 'kiro', agent);
+    expect(args.slice(0, 4)).toEqual(['chat', '--no-interactive', '--v3', '--trust-all-tools']);
+    expect(args.slice(-4)).toEqual(['--model', 'my vendor/model 1', '--effort', 'high']);
+    expect(kiroArgsChooseHarness(effectiveArgs('kiro', agent))).toBe(false);
+  });
+
+  it('kiro: model and effort do not disturb a harness or trust choice made in args', () => {
+    const extra = effectiveArgs('kiro', { ...agent, args: ['--v2', '--trust-tools=read_file'] });
+    expect(kiroArgsChooseHarness(extra)).toBe(true);
+    const { args } = build(kiroAdapter, 'kiro', { ...agent, args: ['--v2', '--trust-tools=read_file'] });
+    expect(args).not.toContain('--v3');
+    expect(args).not.toContain('--trust-all-tools');
+    expect(args.slice(-4)).toEqual(['--model', 'my vendor/model 1', '--effort', 'high']);
   });
 });

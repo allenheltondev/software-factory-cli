@@ -1,6 +1,6 @@
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { stringify } from 'yaml';
+import { parse, stringify } from 'yaml';
 import { resolvePaths } from '../paths.js';
 import { buildWorkflow, seedConfig, upsertRepoWorkflow } from './config-edit.js';
 import type { AdapterName } from '../config/schema.js';
@@ -395,5 +395,49 @@ describe('updraft doctor', () => {
     const ok = setup();
     const ctx2 = fakeContext({ home: ok.home });
     expect(await doctorCommand(ctx2, {}, ok.probes)).toBe(0);
+  });
+});
+
+describe('runDoctor profile capability check', () => {
+  function withKiroProfile(extra: Record<string, unknown>) {
+    const s = setup();
+    const cfg = parse(readFileSync(s.paths.configFile, 'utf8'));
+    cfg.agents.kiro = { ...cfg.agents.kiro, ...extra };
+    writeFileSync(s.paths.configFile, stringify(cfg));
+    return s;
+  }
+  const helpRun = (help: string, seen: string[][] = []): DoctorProbes['run'] => async (file, args) => {
+    seen.push([file, ...args]);
+    return args.includes('--help') ? { code: 0, stdout: help, stderr: '' } : { code: 0, stdout: file.endsWith('git') ? 'git version 2.50.0\n' : '', stderr: '' };
+  };
+
+  it('reports the profile and passes when the CLI help advertises the options', async () => {
+    const { paths, probes } = withKiroProfile({ model: 'm 1', effort: 'high' });
+    const seen: string[][] = [];
+    const r = await runDoctor(paths, { ...probes, run: helpRun('--model <M>\n--effort <L>\n', seen) });
+    expect(status(r.checks, /agent kiro profile: .*model "m 1".*effort "high"/)).toBe('ok');
+    expect(r.checks.some((c) => /does not advertise/.test(c.detail))).toBe(false);
+    expect(seen.filter((c) => c.includes('--help')).every((c) => c.includes('chat'))).toBe(true);
+  });
+
+  it('fails in live mode, with a remedy, when the CLI does not advertise --effort', async () => {
+    const { paths, probes } = withKiroProfile({ effort: 'high' });
+    const r = await runDoctor(paths, { ...probes, run: helpRun('--model <M>\n') });
+    const c = r.checks.find((x) => /does not advertise --effort/.test(x.detail));
+    expect(c?.name).toBe('agent kiro');
+    expect(c?.detail).toMatch(/remove effort/);
+    expect(c?.status).not.toBe('ok');
+  });
+
+  it('warns that it is unverified when help cannot be read', async () => {
+    const { paths, probes } = withKiroProfile({ model: 'x' });
+    const r = await runDoctor(paths, { ...probes, run: async () => ({ code: 1, stdout: '', stderr: '' }) });
+    expect(status(r.checks, /agent kiro: could not read Kiro CLI's help text.*unverified/)).toBe('warn');
+  });
+
+  it('shows the profile line for CLI-default profiles too', async () => {
+    const { paths, probes } = setup();
+    const r = await runDoctor(paths, probes);
+    expect(status(r.checks, /agent kiro profile: .*model CLI default/)).toBe('ok');
   });
 });

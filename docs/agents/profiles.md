@@ -28,10 +28,26 @@ prefix work the same on Windows, macOS and Linux. The same setting in both a fie
 (duplicate or contradictory), repeated differing flags, and values that are empty, start with `-`
 or contain line breaks are config errors.
 
+## Where the flags come from
+
+- claude: `--model` and `--effort` are listed by `claude --help`.
+- codex: `--model` / `-m` are listed by `codex --help`. Effort has no flag of its own, so it is the
+  `-c model_reasoning_effort=...` config override.
+- kiro: `--model <MODEL>` and `--effort <LEVEL>` are documented for `kiro-cli chat`
+  (https://kiro.dev/docs/reference/cli-commands/; documented levels: low, medium, high, xhigh, max).
+  Older Kiro CLI releases may lack `--effort`; the capability check below reports that.
+
 ## What is and is not checked
 
-- Updraft keeps no list of model or effort names. They differ by CLI version and plan, and the CLI
-  itself rejects what it does not know; that failure shows in the run's log. Use the CLI's own
+- **Option support** is checked against the installed CLI. `updraft doctor` and `updraft agents`
+  read the CLI's own help text (`--help`, or `chat --help` for Kiro) and report when it does not
+  advertise an option a profile uses (`--model`, `--effort`, or `--config` for Codex effort).
+  Doctor fails the agent in live mode, because the run would fail at launch. When the help cannot
+  be read, the result is "unverified", shown as a warning and never as a pass. This runs no model
+  and sends no prompt, so it uses no quota.
+
+- **Values** are not checked. Updraft keeps no list of model or effort names. They differ by CLI
+  version and plan, and the CLI itself rejects what it does not know; that failure shows in the run's log. Use the CLI's own
   discovery (for example `kiro-cli chat --list-models`, or `/model` in Claude Code and Codex).
 - Updraft never calls a model API and holds no API keys. Nothing is probed silently; the only
   command that sends a prompt is `updraft agents --deep`, which warns first.
