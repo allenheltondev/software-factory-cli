@@ -2,7 +2,7 @@
 // (test/fake-runtime.mjs): real git, real processes, no real container. The fake models what the
 // stop logic depends on: killing the client leaves the "container" running, and only a stop or
 // removal by name ends it.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -164,7 +164,8 @@ describe.skipIf(process.platform === 'win32')('LiveExecutor with agents.<name>.c
 
     // Mounts: the worktree, and the clone's git directory read-only except what a commit writes.
     const mounts = Object.fromEntries(valuesOf(argv, '--mount').map((m) => [/source=([^,]*)/.exec(m)![1]!, m.endsWith(',readonly') ? 'ro' : 'rw']));
-    const common = join(f.clone, '.git');
+    // Git records the clone's git directory by its real path (macOS temp dirs sit behind a symlink).
+    const common = realpathSync(join(f.clone, '.git'));
     expect(mounts).toMatchObject({
       [worktree]: 'rw',
       [join(worktree, '.git')]: 'ro',

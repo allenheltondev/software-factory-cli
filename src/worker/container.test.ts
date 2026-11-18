@@ -1,7 +1,7 @@
 // The container boundary's pure parts: the runtime argv and the mount list. The executor's use
 // of them, against a fake runtime, is in live-container.test.ts.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
@@ -225,7 +225,7 @@ describe.skipIf(process.platform === 'win32')('worktreeMounts (real git worktree
     const wt = join(f.root, 'job worktrees', 'job 1');
     mkdirSync(join(f.root, 'job worktrees'));
     f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-1', wt, 'HEAD');
-    return { f, wt, common: join(f.clone, '.git') };
+    return { f, wt, common: realpathSync(join(f.clone, '.git')) };
   }
 
   it('reads the admin and common directories from the pointer files git wrote', () => {
@@ -358,7 +358,8 @@ describe.runIf(canBindMount)('the worktree mounts, applied as bind mounts in a p
     const wt = join(f.root, 'job worktrees', 'job 1');
     mkdirSync(join(f.root, 'job worktrees'));
     f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-1', wt, 'HEAD');
-    const common = join(f.clone, '.git');
+    // Git records the clone's git directory by its real path (macOS temp dirs sit behind a symlink).
+    const common = realpathSync(join(f.clone, '.git'));
     const admin = readWorktreeLayout(wt).adminDir;
     const emptyConfig = join(f.root, 'agent gitconfig');
     writeFileSync(emptyConfig, '');
