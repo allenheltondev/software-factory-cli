@@ -232,18 +232,42 @@ async function codexAuth(ctx: AuthContext): Promise<AuthResult> {
 }
 
 /**
- * Kiro: "Headless mode requires an API key set as the KIRO_API_KEY environment variable"
- * (https://kiro.dev/docs/cli/headless/). `kiro-cli whoami` reports interactive login sessions,
- * which headless runs can't rely on, so presence of the env var is the check. We can't validate
- * the key without a prompt (see --deep). The check reads the worker's own environment, not
- * agents.<name>.env: the key belongs in the launcher's environment, not the config file. An
- * active browser login takes precedence over the key when both exist
- * (https://kiro.dev/docs/getting-started/authentication/).
+ * Kiro: two ways to be signed in for headless runs.
+ *
+ * - `KIRO_API_KEY` in the environment. Kiro's docs say "Headless mode requires an API key set as
+ *   the KIRO_API_KEY environment variable" (https://kiro.dev/docs/cli/headless/). We can't
+ *   validate the key without a prompt (see --deep). The check reads the worker's own
+ *   environment, not agents.<name>.env: the key belongs in the launcher's environment, not the
+ *   config file.
+ * - A login session (`kiro-cli login`: a Builder ID or IAM Identity Center browser sign-in).
+ *   Despite the docs, headless `chat --no-interactive` works with one: verified with
+ *   kiro-cli 3.5.0 signed in through IAM Identity Center, no key set. `kiro-cli whoami` exits 0
+ *   and prints "Logged in with ..." for such a session, which is the check. An active login
+ *   takes precedence over the key when both exist
+ *   (https://kiro.dev/docs/getting-started/authentication/).
+ *
+ * With the key set, the CLI is not run for auth. Without it and without a runnable CLI, there is
+ * nothing to ask, so it is "no" as before.
  */
 async function kiroAuth(ctx: AuthContext): Promise<AuthResult> {
-  return ctx.probes.env.KIRO_API_KEY
-    ? { signedIn: 'yes', auth: 'KIRO_API_KEY is set' }
-    : { signedIn: 'no', auth: 'KIRO_API_KEY is not set; headless Kiro requires it' };
+  if (ctx.probes.env.KIRO_API_KEY) return { signedIn: 'yes', auth: 'KIRO_API_KEY is set' };
+  const notSignedIn = 'not logged in; run "kiro-cli login" or set KIRO_API_KEY';
+  if (!ctx.launch) return { signedIn: 'no', auth: notSignedIn };
+  const r = await runLaunch(ctx, ['whoami'], AUTH_TIMEOUT_MS);
+  const out = `${r.stdout}\n${r.stderr}`;
+  const loggedIn = out.split(/\r?\n/).map((l) => l.trim()).find((l) => /^logged in\b/i.test(l));
+  if (r.code === 0 && loggedIn) {
+    return {
+      signedIn: 'yes',
+      auth: loggedIn,
+      notes: ['signed in with a kiro-cli login session, which expires: runs fail until "kiro-cli login" again. KIRO_API_KEY does not'],
+    };
+  }
+  if (r.code !== null && /not logged in|log ?in required|please log ?in|kiro-cli login/i.test(out)) {
+    return { signedIn: 'no', auth: notSignedIn };
+  }
+  const why = r.timedOut ? `timed out after ${AUTH_TIMEOUT_MS / 1000}s` : failureDetail(r) || r.error || `exit ${r.code}`;
+  return { signedIn: 'unknown', auth: null, notes: [`"kiro-cli whoami" gave no status (${why}); set KIRO_API_KEY or run "kiro-cli login"`] };
 }
 
 export const AGENT_SPECS: Record<AdapterName, AgentSpec> = {
@@ -329,7 +353,8 @@ function getEnv(env: NodeJS.ProcessEnv, name: string, platform: NodeJS.Platform)
 /**
  * Common install locations that may be missing from a background launcher's PATH:
  * npm's global prefix, ~/.local/bin (Claude Code's native installer on every OS, Kiro's Linux
- * installer), Homebrew, and WinGet's Links directory.
+ * installer), Homebrew, WinGet's Links directory, and %LOCALAPPDATA%\Kiro-Cli (where Kiro's
+ * Windows installer puts kiro-cli.exe, seen with 3.5.0).
  */
 export function commonInstallDirs(probes: Pick<DiscoveryProbes, 'platform' | 'env' | 'homedir' | 'execPath'>): string[] {
   const { platform, env, homedir: home } = probes;
@@ -346,6 +371,7 @@ export function commonInstallDirs(probes: Pick<DiscoveryProbes, 'platform' | 'en
     dirs.push(p.join(home, '.local', 'bin'));
     const localAppData = getEnv(env, 'LOCALAPPDATA', platform) ?? p.join(home, 'AppData', 'Local');
     dirs.push(p.join(localAppData, 'Microsoft', 'WinGet', 'Links'));
+    dirs.push(p.join(localAppData, 'Kiro-Cli'));
   } else {
     if (npmPrefix) dirs.push(p.join(npmPrefix, 'bin'));
     // Default prefix is the Node install root (bin/node -> ../), plus the common user prefix.

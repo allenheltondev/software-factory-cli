@@ -802,8 +802,8 @@ describe('startup sweep', { timeout: 60_000 }, () => {
     expect(api.pulls).toHaveLength(1);
     expect(api.comments).toHaveLength(1);
     expect(readFileSync(s.logPath, 'utf8')).toContain('publication: attempt 1 (draft-pr, startup sweep)');
-    expect(out.text()).toMatch(new RegExp(`startup sweep: publishing a succeeded run that has no publication record .*runId=${s.runId}`));
-    expect(out.text()).toMatch(/INFO {2}published .*source=startup sweep/);
+    expect(out.text()).toMatch(new RegExp(`\\[run:${s.runId}\\] +startup sweep: publishing a succeeded run that has no publication record`));
+    expect(out.text()).toMatch(/INFO +\[run:[^\]]+\] +published .*source="startup sweep"/);
 
     // Running it again changes nothing: the run has a publication record now.
     await createPublisher(deps(s, api, { config })).sweepUnpublished();

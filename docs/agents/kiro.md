@@ -19,14 +19,28 @@ launchers' account, not just your terminal):
   which CPU architectures the CLI supports. `updraft agents` shows the platform check, and in
   live mode `updraft doctor` fails on an OS outside that list, such as Windows 10 or a Linux
   with an older glibc. Elsewhere the CPU shows as "not documented" rather than supported.
-- `KIRO_API_KEY` in the worker's environment. "Headless mode requires an API key set as the
-  `KIRO_API_KEY` environment variable" ([headless mode](https://kiro.dev/docs/cli/headless/)).
-  API keys are available on Kiro Pro, Pro+, Pro Max and Power subscriptions and are created
-  at app.kiro.dev ([authentication](https://kiro.dev/docs/getting-started/authentication/)).
-  `updraft agents` and `updraft doctor` check that the variable is set, but can't tell
-  whether the key works without sending a prompt (`updraft agents --deep` does).
-  [Agent credentials](../background-operation.md#agent-credentials) shows how to give it to
-  each launcher.
+- A way to sign in that works without a person present, one of:
+  - **`KIRO_API_KEY` in the worker's environment.** Kiro's docs say "Headless mode requires an
+    API key set as the `KIRO_API_KEY` environment variable"
+    ([headless mode](https://kiro.dev/docs/cli/headless/)). API keys are available on Kiro
+    Pro, Pro+, Pro Max and Power subscriptions and are created at app.kiro.dev
+    ([authentication](https://kiro.dev/docs/getting-started/authentication/)).
+    [Agent credentials](../background-operation.md#agent-credentials) shows how to give it to
+    each launcher. A key doesn't expire on its own, so it suits a background worker best.
+  - **A `kiro-cli login` session** (Builder ID or IAM Identity Center), under the account the
+    worker runs as. Despite the docs, headless runs work with one: verified with kiro-cli
+    3.5.0 signed in through IAM Identity Center, with no key set. The session expires on
+    Kiro's or your organization's schedule. After that, runs fail until someone runs
+    `kiro-cli login` again, so check `updraft doctor` if Kiro runs start failing.
+
+  With the key set, `updraft agents` and `updraft doctor` report Kiro as signed in without
+  running it. Without it, they ask `kiro-cli whoami`, which prints "Logged in with ..." for a
+  session. Neither check can tell whether the key or session is accepted without sending a
+  prompt (`updraft agents --deep` does).
+- On Windows, Kiro's installer puts `kiro-cli.exe` in `%LOCALAPPDATA%\Kiro-Cli` and adds that
+  folder to your user `PATH`. A terminal or worker started before the install doesn't see it
+  until it is restarted. `updraft agents` also looks in that folder and says so, or you can
+  set `agents.kiro.command` to the full path.
 - **Don't put the key in `agents.kiro.env`** or anywhere else in the config file. The config
   is plain text that is easy to copy, share or commit. (`updraft doctor` checks each agent
   with its `agents.<name>.env`, as a live run does, but `updraft agents` looks only at the
