@@ -28,6 +28,13 @@ gh auth login
 updraft doctor
 ```
 
+To try it without installing, run a pinned version once, for example
+`npx @allenheltondev/updraft@<version> agents` (the package's only command is `updraft`). The
+background worker needs the global install: the launchers point at the global package, npx's
+cache folder can change or be cleared, and an unpinned npx can run a newer CLI that upgrades
+the state database past what the worker supports. `updraft start` warns when it runs from
+the npx cache.
+
 ## Quick start
 
 1. `updraft configure` - pick repositories, the trigger label, actions and pools. It writes

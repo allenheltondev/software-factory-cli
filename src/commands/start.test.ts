@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { stringify } from 'yaml';
 import { ConfigError } from '../config/io.js';
 import type { Job } from '../types.js';
-import { silentLogger } from '../util/log.js';
+import { createLogger, silentLogger } from '../util/log.js';
 import { WorkerLockedError, type DaemonDeps } from '../worker/daemon.js';
 import { LogOnlyExecutor } from '../worker/executor.js';
 import { PrepareOnlyExecutor } from '../worker/prepare-only.js';
@@ -111,6 +111,22 @@ describe('updraft start', () => {
     await expect(startCommand(s.ctx, s.deps)).rejects.toBeInstanceOf(WorkerLockedError);
     expect(s.closed).toHaveLength(1);
     expect(s.uninstall).toHaveBeenCalledOnce();
+  });
+
+  it('warns, without stopping, when the CLI runs from the npx cache', async () => {
+    for (const [cliFile, warned] of [
+      ['C:\\Users\\jane\\AppData\\Local\\npm-cache\\_npx\\abc\\node_modules\\@allenheltondev\\updraft\\dist\\commands\\start.js', true],
+      ['/usr/local/lib/node_modules/@allenheltondev/updraft/dist/commands/start.js', false],
+    ] as const) {
+      const ran = vi.fn(async () => {});
+      const s = setup(ran);
+      const lines: string[] = [];
+      s.deps.createLogger = () => createLogger({ stream: { write: (l: string) => lines.push(l) } as never });
+      writeConfig(s.ctx.paths.configFile);
+      expect(await startCommand(s.ctx, { ...s.deps, cliFile })).toBe(0);
+      expect(ran).toHaveBeenCalledOnce();
+      expect(lines.some((l) => /npx cache.*npm install -g @allenheltondev\/updraft/.test(l))).toBe(warned);
+    }
   });
 });
 

@@ -1,3 +1,4 @@
+import { kiroV3Problem } from '../agents/adapters/kiro.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { agentAdapter } from '../config/schema.js';
 import { agentLookupEnv } from '../worker/live.js';
@@ -49,6 +50,8 @@ export function renderAgents(reports: AgentReport[], deep = false): string {
     row('platform', triText(r.platform.supported, r.platform.detail));
     if (deep) row('prompt', r.deep ? triText(r.deep.ok ? 'ok' : 'failed', r.deep.detail) : 'skipped');
     for (const n of r.notes) row('note', n);
+    const kiro = r.kiroV3 ? kiroV3Problem(r.version, r.kiroV3) : null;
+    if (kiro) row('note', kiro);
   }
   const usable = reports.filter((r) => r.usable).length;
   lines.push('', `${usable} of ${reports.length} agent(s) usable here.`);

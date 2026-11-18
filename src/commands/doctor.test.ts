@@ -312,6 +312,61 @@ describe('runDoctor', () => {
     expect(agentChecks(undefined, 'warn')).toEqual([{ status: 'warn', detail: 'unknown adapter; not checked' }]);
   });
 
+  it('agentChecks: a Kiro CLI older than 3.0 is a warning, even in live mode, unless the args pick a harness', () => {
+    const older =
+      'Kiro CLI 2.4.1 is older than 3.0.0, the release Updraft is written against. Updraft starts Kiro with --v3; earlier releases that have the V3 harness may work but are not verified. If live runs fail to start, upgrade Kiro CLI or add --v2 to agents.kiro.args';
+    const old = fakeAgentReport('kiro', { version: '2.4.1', kiroV3: 'no' });
+    // Older than the baseline is unverified, not known broken (--v3 shipped before 3.0): never a failure.
+    expect(agentChecks(old, 'fail', { name: 'kiro' })).toContainEqual({ status: 'warn', detail: older });
+    expect(agentChecks(old, 'fail', { name: 'kiro' }).map((c) => c.status)).not.toContain('fail');
+    expect(agentChecks(old, 'warn', { name: 'kiro', args: [] })).toContainEqual({ status: 'warn', detail: older });
+    // --v2 (or --v3 / --agent-engine, as the adapter reads them) means the adapter adds no --v3.
+    for (const args of [['--v2'], ['--agent-engine=v2'], ['--v3']]) {
+      expect(agentChecks(old, 'fail', { name: 'kiro', args }).map((c) => c.status)).toEqual(['ok', 'ok']);
+    }
+    expect(agentChecks(fakeAgentReport('kiro', { version: '3.0.0', kiroV3: 'yes' }), 'fail', { name: 'kiro' }).map((c) => c.status)).toEqual(['ok', 'ok']);
+    // An unreadable version is a warning, never a failure.
+    const unknown = agentChecks(fakeAgentReport('kiro', { version: 'nightly', kiroV3: 'unknown' }), 'fail', { name: 'kiro' });
+    expect(unknown).toEqual([
+      { status: 'ok', detail: 'kiro-cli nightly: /usr/bin/kiro-cli' },
+      { status: 'warn', detail: 'could not read a Kiro CLI version from "nightly", so it is unknown whether it is 3.0.0 or later. Updraft starts Kiro with --v3. If live runs fail to start, upgrade Kiro CLI or add --v2 to agents.kiro.args' },
+      { status: 'ok', detail: 'signed in: test' },
+    ]);
+  });
+
+  it('checks the Kiro version against each agent\'s configured args in live mode', async () => {
+    const restore = (['codex', 'claude', 'kiro'] as const).map((name) => registerAdapter(fakeAdapter({ name })));
+    try {
+      const run = async (args?: string[]) => {
+        const home = tempHome();
+        const paths = resolvePaths({ env: { UPDRAFT_HOME: home } });
+        const cfg = upsertRepoWorkflow(
+          seedConfig('allen'),
+          { id: 10, fullName: 'o/r' },
+          buildWorkflow({ label: 'updraft:ready', action: 'implement-issue', pool: 'general', routes: [] }),
+        ).config;
+        cfg.execution = { mode: 'live' };
+        cfg.repositories!['o/r']!.checkoutPath = 'clones/r';
+        cfg.agents = { ...cfg.agents, kiro: { ...cfg.agents!.kiro!, ...(args ? { args } : {}) } };
+        writeFileSync(paths.configFile, stringify(cfg));
+        const { probes } = setup();
+        return runDoctor(paths, {
+          ...probes,
+          discoverAgent: async (adapter) =>
+            fakeAgentReport(adapter as AdapterName, adapter === 'kiro' ? { version: '2.4.1', kiroV3: 'no' } : {}),
+        });
+      };
+      const old = await run();
+      // A warning that names this agent's own args key, and doctor still passes.
+      expect(status(old.checks, /^agent kiro: Kiro CLI 2\.4\.1 is older than 3\.0\.0.*add --v2 to agents\.kiro\.args$/)).toBe('warn');
+      expect(old.checks.filter((c) => c.name === 'agent kiro').map((c) => c.status)).not.toContain('fail');
+      const v2 = await run(['--v2']);
+      expect(v2.checks.filter((c) => c.name === 'agent kiro').map((c) => c.status)).toEqual(['ok', 'ok']);
+    } finally {
+      for (const r of restore) r();
+    }
+  });
+
   it('reports state dir and DB failures', async () => {
     const { paths, probes } = setup();
     const r = await runDoctor(paths, {

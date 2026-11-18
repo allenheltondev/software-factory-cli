@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
+import { kiroArgsChooseHarness, kiroV3Problem } from '../agents/adapters/kiro.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { agentAdapter, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviewSettings, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
@@ -29,8 +30,15 @@ export function agentProblemSeverity(mode: string): CheckStatus {
   return mode === 'live' ? 'fail' : 'warn';
 }
 
-/** Doctor checks for one enabled agent's discovery report. */
-export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array<Omit<CheckResult, 'name'>> {
+/**
+ * Doctor checks for one enabled agent's discovery report. `agent` is its config entry, for checks
+ * that depend on agents.<name>.args (Kiro's version: see {@link kiroV3Problem}).
+ */
+export function agentChecks(
+  r: AgentReport | undefined,
+  sev: CheckStatus,
+  agent: { name: string; args?: readonly string[] } = { name: '<name>' },
+): Array<Omit<CheckResult, 'name'>> {
   if (!r) return [{ status: sev, detail: 'unknown adapter; not checked' }];
   const out: Array<Omit<CheckResult, 'name'>> = [];
   const notes = r.notes.length ? ` (${r.notes.join('; ')})` : '';
@@ -42,6 +50,12 @@ export function agentChecks(r: AgentReport | undefined, sev: CheckStatus): Array
   } else {
     out.push({ status: 'ok', detail: `${r.command} ${r.version ?? '(unknown version)'}: ${r.path}` });
     if (!r.onPath) out.push({ status: 'warn', detail: `${r.command} is not on this PATH; the worker may not find it${notes}` });
+    // The adapter adds --v3 unless the args pick a harness themselves. An older Kiro CLI may well
+    // have it (V3 shipped before 3.0), so this is a warning in every mode, never a failure: the
+    // version is unverified, not known to be broken.
+    if (r.kiroV3 && r.kiroV3 !== 'yes' && !kiroArgsChooseHarness(agent.args ?? [])) {
+      out.push({ status: 'warn', detail: kiroV3Problem(r.version, r.kiroV3, `agents.${agent.name}.args`)! });
+    }
   }
   if (r.signedIn === 'yes') out.push({ status: 'ok', detail: `signed in: ${r.auth ?? 'yes'}` });
   else if (r.signedIn === 'no') out.push({ status: sev, detail: `not signed in: ${r.auth ?? 'no'}` });
@@ -382,7 +396,7 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
           return containerAgentChecks(agentName, adapter, agent, paths.configDir, { platform: probes.platform, env, which: probes.which, run: probes.run }, sev);
         }
         const report = await probes.discoverAgent(adapter, { env, ...(agent.command ? { command: agent.command } : {}), baseDir: paths.configDir });
-        return agentChecks(report, sev);
+        return agentChecks(report, sev, { name: agentName, args: agent.args });
       }),
     );
     enabled.forEach(([agentName], i) => {

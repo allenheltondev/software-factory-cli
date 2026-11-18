@@ -9,7 +9,11 @@ How the worker runs the Kiro CLI for a job in `live` mode. The parts common to e
 Under the account and environment the worker runs as (the background
 launchers' account, not just your terminal):
 
-- Kiro CLI 3.0.0 or later (`kiro-cli --version`) on a platform Kiro supports. Kiro lists
+- Kiro CLI 3.0.0 or later is recommended (`kiro-cli --version`): Updraft starts Kiro with
+  `--v3`, and 3.0.0 is the release it is written against. Some earlier releases have the V3
+  harness too and may work, but are not verified. `updraft agents` notes an older CLI and
+  `updraft doctor` warns about it (never a failure), unless the agent's `args` pick a harness
+  themselves, such as `--v2`. It must also run on a platform Kiro supports. Kiro lists
   "macOS, Windows 11 (PowerShell), or Linux (glibc 2.34+ or musl variant)" for the CLI
   ([installation](https://kiro.dev/docs/getting-started/installation/)) and doesn't document
   which CPU architectures the CLI supports. `updraft agents` shows the platform check, and in
