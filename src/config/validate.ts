@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import { agentProfile } from '../agents/profile.js';
 import { getAdapter } from '../agents/adapters/registry.js';
 import {
   KNOWN_ADAPTERS,
@@ -60,6 +61,9 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
           `live execution is not implemented for adapter "${adapter}", so live mode cannot run this agent; ` +
           'use execution.mode prepare-only, or disable the agent',
       });
+    }
+    for (const problem of agentProfile(adapter, agent).problems) {
+      errors.push({ path: `agents.${agentName}`, message: problem });
     }
     if (agent.container) {
       const base = `agents.${agentName}.container`;

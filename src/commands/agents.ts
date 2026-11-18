@@ -1,3 +1,4 @@
+import { agentProfile } from '../agents/profile.js';
 import { kiroV3Problem } from '../agents/adapters/kiro.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { agentAdapter } from '../config/schema.js';
@@ -108,11 +109,58 @@ export async function agentsCommand(
   }
   const reports = await ctx.discoverAgents({ deep: Boolean(opts.deep) });
   const containers = await containerAgentReports(ctx, probes);
+  const profiles = profileReports(ctx);
   if (opts.json) {
-    println(ctx.out, JSON.stringify({ platform: process.platform, arch: process.arch, agents: reports, ...(containers.length ? { containers } : {}) }, null, 2));
+    println(ctx.out, JSON.stringify({ platform: process.platform, arch: process.arch, agents: reports, ...(containers.length ? { containers } : {}), ...(profiles.length ? { profiles } : {}) }, null, 2));
   } else {
     println(ctx.out, renderAgents(reports, opts.deep));
     if (containers.length) println(ctx.out, renderContainerAgents(containers));
+    if (profiles.length) println(ctx.out, renderProfiles(profiles));
   }
   return reports.some((r) => r.usable) || containers.some((c) => c.usable) ? EXIT.OK : EXIT.FAILURE;
+}
+
+/** A configured agent entry (profile) and the model/effort it asks its CLI for. Read from the config; nothing is probed. */
+export interface ProfileReport {
+  agent: string;
+  adapter: string;
+  enabled: boolean;
+  model: string | null;
+  modelSource: string;
+  effort: string | null;
+  effortSource: string;
+  /** Always the configured value: none of the CLIs reports which model a run resolved. */
+  note: string;
+  problems: string[];
+}
+
+/** The config's agent entries with their model/effort, empty when there is no valid config. */
+export function profileReports(ctx: CommandContext): ProfileReport[] {
+  const cfg = checkConfig(ctx.paths.configFile);
+  if (cfg.state !== 'ok') return [];
+  return Object.entries(cfg.config.agents).map(([name, agent]) => {
+    const adapter = agentAdapter(name, agent);
+    const p = agentProfile(adapter, agent);
+    return {
+      agent: name,
+      adapter,
+      enabled: agent.enabled,
+      model: p.model.value,
+      modelSource: p.model.source,
+      effort: p.effort.value,
+      effortSource: p.effort.source,
+      note: 'configured values; the CLI decides the model it actually uses unless one is set here',
+      problems: p.problems,
+    };
+  });
+}
+
+export function renderProfiles(reports: ProfileReport[]): string {
+  const lines = ['', 'Agent profiles in the config (configured model/effort; not verified against the CLI):'];
+  for (const r of reports) {
+    const show = (v: string | null, src: string) => (v === null ? 'CLI default' : `${v} (${src})`);
+    lines.push(`  ${r.agent} (adapter ${r.adapter}${r.enabled ? '' : ', disabled'}): model ${show(r.model, r.modelSource)}, effort ${show(r.effort, r.effortSource)}`);
+    for (const p of r.problems) lines.push(`    ! ${p}`);
+  }
+  return lines.join('\n');
 }

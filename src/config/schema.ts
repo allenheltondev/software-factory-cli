@@ -73,6 +73,13 @@ export const agentSchema = z.strictObject({
   command: z.string().min(1).optional(),
   /** Live mode: extra arguments for the agent CLI; the adapter places them where its CLI accepts options. */
   args: z.array(z.string()).optional(),
+  /**
+   * Live mode: model for the agent CLI, passed as the adapter's own option (--model). Optional
+   * shorthand for putting it in `args`; setting it in both is rejected. Not checked against a list.
+   */
+  model: z.string().optional(),
+  /** Live mode: reasoning effort, mapped to the adapter's own option (see docs/agents/profiles.md). */
+  effort: z.string().optional(),
   /** Live mode: environment variables set for the agent process, on top of the worker's environment. */
   env: z.record(envName, z.string()).optional(),
   /** Live mode: run this agent in a container. `env` above is then set inside the container. */

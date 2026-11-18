@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { kiroArgsChooseHarness, kiroV3Problem } from '../agents/adapters/kiro.js';
+import { agentProfile, describeProfile } from '../agents/profile.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { agentAdapter, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviewPoolFor, reviewSettings, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
@@ -399,8 +400,13 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
         return agentChecks(report, sev, { name: agentName, args: agent.args });
       }),
     );
-    enabled.forEach(([agentName], i) => {
+    enabled.forEach(([agentName, agent], i) => {
       for (const c of results[i]!) add(c.status, `agent ${agentName}`, c.detail);
+      const adapter = agentAdapter(agentName, agent);
+      const profile = agentProfile(adapter, agent);
+      if (profile.model.value !== null || profile.effort.value !== null) {
+        add('ok', `agent ${agentName} profile`, describeProfile(agentName, adapter, profile));
+      }
     });
   }
 
