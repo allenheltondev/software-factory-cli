@@ -1,6 +1,11 @@
 import type { AgentReport } from '../agents/discovery.js';
+import { agentAdapter } from '../config/schema.js';
+import { agentLookupEnv } from '../worker/live.js';
 import { println, type CommandContext } from './context.js';
+import { defaultDoctorProbes, type CheckResult, type DoctorProbes } from './doctor.js';
+import { containerAgentChecks } from './doctor-container.js';
 import { EXIT } from './errors.js';
+import { checkConfig } from './validate.js';
 
 export interface AgentsOptions {
   json?: boolean;
@@ -50,13 +55,61 @@ export function renderAgents(reports: AgentReport[], deep = false): string {
   return lines.join('\n');
 }
 
+/** A configured agent that runs in a container: checked in its image, not on this host. */
+export interface ContainerAgentReport {
+  agent: string;
+  adapter: string;
+  image: string;
+  runtime: string;
+  /** No check failed: the runtime answers, the image is present and the CLI runs in it. */
+  usable: boolean;
+  checks: Array<Omit<CheckResult, 'name'>>;
+}
+
+/**
+ * The config's enabled containerized agents (agents.<name>.container), checked the way doctor
+ * checks them. Empty when there is no valid config or none is containerized: discovery above is
+ * about this host's CLIs and needs no config.
+ */
+export async function containerAgentReports(ctx: CommandContext, probes: Pick<DoctorProbes, 'platform' | 'env' | 'which' | 'run'>): Promise<ContainerAgentReport[]> {
+  const cfg = checkConfig(ctx.paths.configFile);
+  if (cfg.state !== 'ok') return [];
+  const contained = Object.entries(cfg.config.agents).filter(([, a]) => a.enabled && a.container);
+  return Promise.all(
+    contained.map(async ([name, agent]) => {
+      const adapter = agentAdapter(name, agent);
+      const checks = await containerAgentChecks(name, adapter, agent, ctx.paths.configDir, { ...probes, env: agentLookupEnv(probes.env, agent) }, 'fail');
+      return { agent: name, adapter, image: agent.container!.image, runtime: agent.container!.runtime, usable: !checks.some((c) => c.status === 'fail'), checks };
+    }),
+  );
+}
+
+export function renderContainerAgents(reports: ContainerAgentReport[]): string {
+  const symbol = { ok: '✓', warn: '!', fail: '✗' } as const;
+  const lines = ['', 'Containerized agents in the config (checked in their image, not on this host):'];
+  for (const r of reports) {
+    lines.push(`${r.usable ? '✓' : '✗'} ${r.agent} (adapter ${r.adapter}, image ${r.image}): ${r.usable ? 'ready' : 'not ready'}`);
+    for (const c of r.checks) lines.push(`    ${symbol[c.status]} ${c.detail}`);
+  }
+  return lines.join('\n');
+}
+
 /** `factory agents [--json] [--deep]`: exit 0 when at least one agent is usable. */
-export async function agentsCommand(ctx: CommandContext, opts: AgentsOptions = {}): Promise<number> {
+export async function agentsCommand(
+  ctx: CommandContext,
+  opts: AgentsOptions = {},
+  probes: Pick<DoctorProbes, 'platform' | 'env' | 'which' | 'run'> = defaultDoctorProbes(ctx),
+): Promise<number> {
   if (opts.deep) {
     println(ctx.err, 'warning: --deep sends one short prompt to each usable agent. This uses tokens or plan quota.');
   }
   const reports = await ctx.discoverAgents({ deep: Boolean(opts.deep) });
-  if (opts.json) println(ctx.out, JSON.stringify({ platform: process.platform, arch: process.arch, agents: reports }, null, 2));
-  else println(ctx.out, renderAgents(reports, opts.deep));
-  return reports.some((r) => r.usable) ? EXIT.OK : EXIT.FAILURE;
+  const containers = await containerAgentReports(ctx, probes);
+  if (opts.json) {
+    println(ctx.out, JSON.stringify({ platform: process.platform, arch: process.arch, agents: reports, ...(containers.length ? { containers } : {}) }, null, 2));
+  } else {
+    println(ctx.out, renderAgents(reports, opts.deep));
+    if (containers.length) println(ctx.out, renderContainerAgents(containers));
+  }
+  return reports.some((r) => r.usable) || containers.some((c) => c.usable) ? EXIT.OK : EXIT.FAILURE;
 }

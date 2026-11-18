@@ -3,7 +3,7 @@
 import { join } from 'node:path';
 import type { FactoryConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
-import type { Job, JobStatus, Publication, Run, RunOutcome, RunSummary } from '../types.js';
+import type { Job, JobStatus, Publication, Run, RunContainer, RunOutcome, RunSummary } from '../types.js';
 import { listRecentPublications } from './publications.js';
 import { newId, nowIso } from '../util/ids.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
@@ -205,6 +205,8 @@ export function claimNextJob(
         outcome: null,
         error: null,
         summary: null,
+        container_runtime: null,
+        container_name: null,
       };
       db.prepare(
         `INSERT INTO runs (id, job_id, attempt, pool, agent, checkout_path, log_path, worker_id, hostname, pid, lease_expires_at, started_at)
@@ -246,6 +248,8 @@ export interface RunProcessInfo {
   /** OS start time of `pid` (see processStartTime); recorded once known, right after the pid. */
   pidStartTime?: string | null;
   checkoutPath?: string | null;
+  /** The container about to be started for the run (see Run.container); recorded before it starts. */
+  container?: RunContainer | null;
 }
 
 /** Record the agent subprocess and/or checkout for a running run (used by live adapters and reconcile). */
@@ -257,6 +261,12 @@ export function setRunProcess(db: Db, runId: string, info: RunProcessInfo): void
   }
   if (info.checkoutPath !== undefined)
     db.prepare('UPDATE runs SET checkout_path = ? WHERE id = ?').run(info.checkoutPath, runId);
+  if (info.container !== undefined)
+    db.prepare('UPDATE runs SET container_runtime = ?, container_name = ? WHERE id = ?').run(
+      info.container?.runtime ?? null,
+      info.container?.name ?? null,
+      runId,
+    );
 }
 
 /** Store the post-run summary of a live agent run. */

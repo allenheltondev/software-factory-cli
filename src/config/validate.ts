@@ -25,11 +25,16 @@ function zodIssues(err: z.ZodError): ConfigIssue[] {
   return err.issues.map((i) => ({ path: i.path.map(String).join('.') || '(root)', message: i.message }));
 }
 
+/** The worker's own GitHub credentials, which a live run never passes on (WITHHELD_ENV in src/worker/live.ts). */
+const WITHHELD_FROM_AGENTS = ['GH_TOKEN', 'GITHUB_TOKEN'];
+
 /**
  * Parse and cross-check a config object: referenced actions, pools, agents,
  * limits and actor allowlists. Pure; does not touch the filesystem or network.
+ * `platform` is the one the worker runs on (injectable for tests).
  */
-export function validateConfig(raw: unknown): ValidationResult {
+export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform } = {}): ValidationResult {
+  const platform = opts.platform ?? process.platform;
   const parsed = configSchema.safeParse(raw);
   if (!parsed.success) return { ok: false, errors: zodIssues(parsed.error), warnings: [] };
   const config = parsed.data;
@@ -51,6 +56,27 @@ export function validateConfig(raw: unknown): ValidationResult {
           `live execution is not implemented for adapter "${adapter}" in this release, so live mode cannot run this agent yet; ` +
           'use execution.mode prepare-only, or disable the agent',
       });
+    }
+    if (agent.container) {
+      const base = `agents.${agentName}.container`;
+      if (platform === 'win32') {
+        // The container sees the worktree and the git directory at their host paths, and a
+        // Windows path can't exist inside a Linux container. Refuse rather than half-isolate.
+        errors.push({
+          path: base,
+          message:
+            'containerized agents are not supported on native Windows yet; run the worker inside WSL2 with the clone on the WSL filesystem, or remove container',
+        });
+      }
+      for (const v of agent.container.env.filter((n) => WITHHELD_FROM_AGENTS.includes(n.toUpperCase()))) {
+        warnings.push({
+          path: `${base}.env`,
+          message: `${v} is withheld from every agent, so it will not reach the container; to hand the agent a GitHub token on purpose, set agents.${agentName}.env.${v}`,
+        });
+      }
+      if (config.execution.mode !== 'live') {
+        warnings.push({ path: base, message: `only applies in live mode; in ${config.execution.mode} mode no agent is started` });
+      }
     }
     if (agent.maxConcurrent > config.maxConcurrent) {
       warnings.push({

@@ -32,6 +32,31 @@ const name = z
 
 const repoFullName = z.string().regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, 'expected OWNER/REPO');
 
+/** An environment variable name (agents.<name>.env keys, agents.<name>.container.env entries). */
+const envName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'an environment variable name');
+
+/**
+ * Live mode: run the agent in a container instead of on the host (docs/isolation.md,
+ * src/worker/container.ts). Only the job worktree and the parts of the clone's git directory a
+ * commit needs are mounted.
+ */
+export const containerSchema = z.strictObject({
+  /** Image to run. It must contain the agent CLI, git and the repository's toolchain. The worker never pulls it explicitly. */
+  image: z.string().regex(/^[^-\s][^\s]*$/, 'an image reference, e.g. my-org/claude-runner:latest'),
+  /** Runtime client: "docker" (default) or "podman", looked up on PATH; or a path (relative to the config file's directory). */
+  runtime: z.string().regex(/^[^-\s]/, 'docker, podman, or a path to the runtime client').default('docker'),
+  /**
+   * Names of variables to pass from the worker's environment into the container (for example the
+   * agent's API key). Passed by name, never as a value on the command line. Nothing else of the
+   * worker's environment reaches the container.
+   */
+  env: z.array(envName).default([]),
+  /** Passed as --network (for example "none", "bridge" or a user-defined network). Default: the runtime's default network. */
+  network: z.string().regex(/^[^-\s][^\s]*$/, 'a network name or mode').optional(),
+  /** Extra arguments for `<runtime> run`, placed before the image. They can widen what the container reaches. */
+  args: z.array(z.string()).optional(),
+});
+
 export const agentSchema = z.strictObject({
   /** Which adapter runs this agent; defaults to the agent's key. */
   adapter: z.enum(KNOWN_ADAPTERS).optional(),
@@ -39,13 +64,16 @@ export const agentSchema = z.strictObject({
   maxConcurrent: z.number().int().min(1).max(32).default(1),
   /**
    * Live mode: the agent CLI to run instead of the one discovery finds (an absolute path, or a
-   * name looked up on PATH). Windows npm `.cmd` shims are resolved to their target.
+   * name looked up on PATH). Windows npm `.cmd` shims are resolved to their target. With
+   * `container`, it is a name or path inside the image and is used as written.
    */
   command: z.string().min(1).optional(),
   /** Live mode: extra arguments for the agent CLI; the adapter places them where its CLI accepts options. */
   args: z.array(z.string()).optional(),
   /** Live mode: environment variables set for the agent process, on top of the worker's environment. */
-  env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'an environment variable name'), z.string()).optional(),
+  env: z.record(envName, z.string()).optional(),
+  /** Live mode: run this agent in a container. `env` above is then set inside the container. */
+  container: containerSchema.optional(),
 });
 
 export const poolSchema = z.strictObject({
@@ -159,6 +187,7 @@ export const configSchema = z.strictObject({
 export type FactoryConfig = z.output<typeof configSchema>;
 export type FactoryConfigInput = z.input<typeof configSchema>;
 export type AgentConfig = z.output<typeof agentSchema>;
+export type ContainerConfig = z.output<typeof containerSchema>;
 export type PoolConfig = z.output<typeof poolSchema>;
 export type ActionConfig = z.output<typeof actionSchema>;
 export type WorkflowConfig = z.output<typeof workflowSchema>;

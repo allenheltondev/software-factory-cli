@@ -93,6 +93,18 @@ export interface Run {
   error: string | null;
   /** What a live agent run left behind; null for log-only and prepare-only runs. */
   summary: RunSummary | null;
+  /**
+   * The container a containerized live run started (agents.<name>.container): the runtime client
+   * and the container's name, so a later worker on the same host can remove it. Null when the
+   * agent ran on the host.
+   */
+  container: RunContainer | null;
+}
+
+export interface RunContainer {
+  /** Absolute path of the runtime client (docker, podman) that started the container. */
+  runtime: string;
+  name: string;
 }
 
 /** Recorded after a live agent run, in run.log and the state DB (`factory status`). */
