@@ -1,9 +1,38 @@
 # Software factory CLI design
 
-**Status** Draft for implementation  
+**Status** Original design. The CLI parts are implemented; see the note below.  
 **Pilot repository** `allenheltondev/kids-and-dragons`  
 **Scope** A local CLI for GitHub-triggered work and a ChatGPT task for PR review.  
 **Platforms** Windows, macOS, and Linux. Windows is the first pilot environment.
+
+> **Implementation status.** This is the design the CLI was built from, kept for its
+> reasoning. It is not updated as the tool changes. Current behavior is documented in the
+> [README](../README.md), [worktrees.md](worktrees.md),
+> [live-execution.md](live-execution.md), the agent pages
+> ([Claude Code](agents/claude.md), [Codex](agents/codex.md), [Kiro](agents/kiro.md)),
+> [publication.md](publication.md), [security.md](security.md) and
+> [background-operation.md](background-operation.md).
+>
+> Implemented: repository discovery and configuration (§2), the background launchers (§2),
+> issue-event polling, the durable queue and its persistence (§3), routing, per-job branches
+> and worktrees, live execution through the Claude Code, Codex and Kiro adapters (§4),
+> and opt-in publication of a job branch as a pull request (§7). Build steps 1 and 2 of §6
+> are done.
+>
+> Not implemented: PR revision polling (§3, "PR revisions") and anything else the CLI would
+> need to host or consume reviews. The ChatGPT review task (§5) is separate from the CLI.
+>
+> Where the text below differs from the tool:
+>
+> - The default trigger label is `ready`, not `factory:ready`.
+> - The example config omits the required `repositories.<OWNER/REPO>.id` and the
+>   `execution`, `dispatch` and per-repository checkout and publication settings added
+>   since. Use [examples/config.yaml](../examples/config.yaml) instead.
+> - The command table in §2 lists the first commands only. The README has the current set.
+> - §4 calls for an explicit tool-permission profile and a limited environment per runner.
+>   What shipped: each adapter runs its agent in full-auto by default, as the user running
+>   the worker, with the worker's environment minus `GH_TOKEN` and `GITHUB_TOKEN`. A narrower
+>   profile is set per agent in `agents.<name>.args`. There is no sandbox.
 
 ## 1. User workflow
 

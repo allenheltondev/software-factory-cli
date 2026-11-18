@@ -52,7 +52,8 @@ lingering enabled, the service may run without a desktop keyring; see
 ## Agent credentials
 
 Some agent CLIs read their credentials from the environment. Kiro's headless mode requires
-`KIRO_API_KEY` ([headless mode](https://kiro.dev/docs/cli/headless/)). The worker passes its
+`KIRO_API_KEY` ([headless mode](https://kiro.dev/docs/cli/headless/); see also
+[Live mode with Kiro](agents/kiro.md#prerequisites)). The worker passes its
 own environment on to the agent, minus `GH_TOKEN` and `GITHUB_TOKEN`, so the key has to be in
 the environment the **launcher** gives the worker. Setting it in your terminal isn't enough.
 
