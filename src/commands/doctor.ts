@@ -4,7 +4,7 @@ import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { kiroArgsChooseHarness, kiroV3Problem } from '../agents/adapters/kiro.js';
 import type { AgentReport } from '../agents/discovery.js';
-import { agentAdapter, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviewSettings, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
+import { agentAdapter, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviewPoolFor, reviewSettings, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
 import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
@@ -97,7 +97,7 @@ export function loopChecks(config: UpdraftConfig, fullName: string, repo: Reposi
       for (const wf of repo.workflows) {
         const pools = typeof wf.pool === 'string' ? [wf.pool] : [...wf.pool.rules.map((r) => r.use), wf.pool.default];
         for (const p of new Set(pools)) {
-          const reviewPool = wf.reviewPool ?? p;
+          const reviewPool = reviewPoolFor(repo, wf, p);
           const reviewers = enabledIn(reviewPool);
           const alone = enabledIn(p).find((author) => reviewers.every((r) => r === author));
           const where = `review: workflow ${workflowId(wf)}, code from pool ${p}, reviewers from pool ${reviewPool}`;

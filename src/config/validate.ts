@@ -9,6 +9,7 @@ import {
   publishMode,
   reviseActive,
   reviewActive,
+  reviewPoolFor,
   reviewSettings,
   repoNeedsCheckout,
   workflowId,
@@ -191,6 +192,13 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       }
     }
 
+    if (review.pool !== null) {
+      if (!Object.hasOwn(config.pools, review.pool)) errors.push({ path: `repositories.${repoName}.review.pool`, message: `unknown pool "${review.pool}"` });
+      else if (repo.workflows.every((wf) => wf.reviewPool !== undefined)) {
+        warnings.push({ path: `repositories.${repoName}.review.pool`, message: 'has no effect: every workflow of this repository sets its own reviewPool' });
+      }
+    }
+
     const wfIds = new Set<string>();
     repo.workflows.forEach((wf, i) => {
       const base = `repositories.${repoName}.workflows.${i}`;
@@ -198,28 +206,28 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       if (wfIds.has(id)) errors.push({ path: `${base}.id`, message: `duplicate workflow id "${id}"; set a unique id` });
       wfIds.add(id);
 
-      if (!config.actions[wf.action]) errors.push({ path: `${base}.action`, message: `unknown action "${wf.action}"` });
+      if (!Object.hasOwn(config.actions, wf.action)) errors.push({ path: `${base}.action`, message: `unknown action "${wf.action}"` });
 
       const pools = typeof wf.pool === 'string' ? [wf.pool] : [...wf.pool.rules.map((r) => r.use), wf.pool.default];
       for (const p of pools) {
-        if (!config.pools[p]) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
+        if (!Object.hasOwn(config.pools, p)) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
       }
       if (wf.reviewPool !== undefined) {
-        if (!config.pools[wf.reviewPool]) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
+        if (!Object.hasOwn(config.pools, wf.reviewPool)) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
         if (!review.enabled) warnings.push({ path: `${base}.reviewPool`, message: `has no effect without repositories.${repoName}.review` });
       }
       // The reviewer must be able to be a different agent than the one that wrote the code. For
       // each pool the job can be routed to: is there a coding agent that would leave the review
-      // pool (reviewPool, else that same pool) with nobody else enabled?
+      // pool (reviewPool, else review.pool, else that same pool) with nobody else enabled?
       if (reviewActive(config, repo) && !review.allowSameAgent) {
         const enabledIn = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
         for (const p of new Set(pools)) {
-          const reviewPool = wf.reviewPool ?? p;
+          const reviewPool = reviewPoolFor(repo, wf, p);
           const reviewers = enabledIn(reviewPool);
           const alone = enabledIn(p).find((author) => reviewers.every((r) => r === author));
           if (alone !== undefined && reviewers.length > 0) {
             errors.push({
-              path: wf.reviewPool !== undefined ? `${base}.reviewPool` : `${base}.pool`,
+              path: wf.reviewPool !== undefined ? `${base}.reviewPool` : review.pool !== null ? `repositories.${repoName}.review.pool` : `${base}.pool`,
               message:
                 `review needs a reviewer other than the agent that wrote the code, but "${alone}" is the only enabled agent in pool "${reviewPool}" ` +
                 `and also writes code in pool "${p}"; add another agent, set reviewPool to a pool with a different agent, or set ` +

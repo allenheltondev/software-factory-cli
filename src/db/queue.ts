@@ -1,12 +1,12 @@
 // OWNER: queue/worker workstream. Claim-side persistence: atomic claims, runs,
 // leases, retry, and status queries.
 import { join } from 'node:path';
-import { DEFAULT_MAX_REVISIONS, reviewSettings, type UpdraftConfig } from '../config/schema.js';
+import { DEFAULT_MAX_REVISIONS, reviewPoolFor, reviewSettings, workflowId, type UpdraftConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
 import { reviewOf, type Job, type JobStatus, type Publication, type Revision, type Run, type RunContainer, type RunOutcome, type RunSummary } from '../types.js';
 import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
 import { listRecentPublications } from './publications.js';
-import { listRecentLoopPrs, listRecentPrReviews, prStage, type LoopPr, type PrReview, type PrStageInfo } from './pr-reviews.js';
+import { getLoopPr, listRecentLoopPrs, listRecentPrReviews, prStage, type LoopPr, type PrReview, type PrStageInfo } from './pr-reviews.js';
 import {
   issuesAwaitingRevisionPush,
   listLimitedRevisionPrs,
@@ -92,8 +92,22 @@ function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void 
 }
 
 /**
- * Pick an agent for a job in `poolName` using the pool's persisted round-robin
- * cursor: walk the pool from next_index and take the first enabled agent with
+ * The pool_cursors key of a job's round-robin rotation. Reviewer jobs rotate on a cursor of their
+ * own, so who reviews takes turns among the reviewers whatever coding jobs the same pool runs in
+ * between (with one shared cursor, a pool that both codes and reviews would hand each review to
+ * whichever agent follows the author). Pool names cannot contain ":", so the keys never collide.
+ */
+export function cursorKey(row: Pick<JobRow, 'pool' | 'event_id'>): string {
+  return isReviewJobRow(row) ? `review:${row.pool}` : row.pool;
+}
+
+function isReviewJobRow(row: Pick<JobRow, 'event_id'>): boolean {
+  return row.event_id.startsWith('pr-review:');
+}
+
+/**
+ * Pick an agent for a job from `poolAgents` using the persisted round-robin cursor `cursor`
+ * (cursorKey): walk the pool from next_index and take the first enabled agent with
  * capacity, preferring agents that have not just failed to start this job.
  * Advances the cursor past the chosen agent. Returns null if none has capacity.
  */
@@ -101,7 +115,7 @@ function pickAgent(
   db: Db,
   config: UpdraftConfig,
   job: JobRow,
-  poolName: string,
+  cursor: string,
   poolAgents: readonly string[],
   load: Map<string, number>,
   /** Never picked, whatever its capacity (the author of the code a reviewer job reviews). */
@@ -109,7 +123,7 @@ function pickAgent(
 ): string | null {
   const n = poolAgents.length;
   if (n === 0) return null;
-  const cursorRow = db.prepare('SELECT next_index FROM pool_cursors WHERE pool = ?').get(poolName) as
+  const cursorRow = db.prepare('SELECT next_index FROM pool_cursors WHERE pool = ?').get(cursor) as
     | { next_index: number }
     | undefined;
   const start = (((cursorRow?.next_index ?? 0) % n) + n) % n;
@@ -125,8 +139,30 @@ function pickAgent(
   const choice = capable.find((c) => !failed.has(c.name)) ?? capable[0]!;
   db.prepare(
     'INSERT INTO pool_cursors (pool, next_index) VALUES (?, ?) ON CONFLICT (pool) DO UPDATE SET next_index = excluded.next_index',
-  ).run(poolName, (choice.index + 1) % n);
+  ).run(cursor, (choice.index + 1) % n);
   return choice.name;
+}
+
+/**
+ * The pool a reviewer job is routed to under the current config (reviewPoolFor). A job records
+ * the pool it was queued for, but the config may have changed since: a workflow's reviewPool
+ * replaced by the repository's review.pool, or the old pool removed. A head is reviewed once, so
+ * scheduling never queues a second job for it; the route is settled here, when the job (queued
+ * earlier or retried) is claimed. Falls back to the recorded pool when the repository, the job's
+ * review request or its pull request cannot be found.
+ */
+function currentReviewPool(db: Db, config: UpdraftConfig, row: JobRow): string {
+  const repo = Object.values(config.repositories).find((r) => r.id === row.repo_id);
+  if (!repo) return row.pool;
+  let prNumber: number | undefined;
+  try {
+    prNumber = reviewOf(rowToJob(row))?.pullRequest.number;
+  } catch {
+    return row.pool;
+  }
+  if (prNumber === undefined) return row.pool;
+  const wf = repo.workflows.find((w) => workflowId(w) === row.workflow_id);
+  return reviewPoolFor(repo, wf, getLoopPr(db, row.repo_id, prNumber)?.pool ?? row.pool);
 }
 
 /**
@@ -137,7 +173,7 @@ function pickAgent(
  * (review: { allowSameAgent: true }); otherwise the job cannot be routed (`problem`).
  */
 function reviewerExclusion(config: UpdraftConfig, row: JobRow, poolAgents: readonly string[]): { exclude: string | null; problem?: string } {
-  if (!row.event_id.startsWith('pr-review:')) return { exclude: null };
+  if (!isReviewJobRow(row)) return { exclude: null };
   let author: string | null;
   try {
     author = reviewOf(rowToJob(row))?.authorAgent ?? null;
@@ -218,9 +254,18 @@ export function claimNextJob(
     const nowMs = clock();
     const at = new Date(nowMs).toISOString();
 
-    for (const row of queued) {
-      if (opts.excludeJobIds?.has(row.id)) continue;
-      if (busyIssues.has(issueKey(row.repo_id, row.issue_number))) continue;
+    for (const queuedRow of queued) {
+      if (opts.excludeJobIds?.has(queuedRow.id)) continue;
+      if (busyIssues.has(issueKey(queuedRow.repo_id, queuedRow.issue_number))) continue;
+
+      let row = queuedRow;
+      if (isReviewJobRow(row)) {
+        const route = currentReviewPool(db, config, row);
+        if (route !== row.pool) {
+          db.prepare('UPDATE jobs SET pool = ?, updated_at = ? WHERE id = ?').run(route, at, row.id);
+          row = { ...row, pool: route, updated_at: at };
+        }
+      }
 
       const pool = ownEntry(config.pools, row.pool);
       if (!pool) {
@@ -237,7 +282,7 @@ export function claimNextJob(
         failUnroutable(db, row, reviewer.problem, at);
         continue;
       }
-      const agent = pickAgent(db, config, row, row.pool, pool.agents, load, reviewer.exclude);
+      const agent = pickAgent(db, config, row, cursorKey(row), pool.agents, load, reviewer.exclude);
       if (!agent) continue; // this pool is saturated; later jobs in other pools may still start
 
       const runId = newId('run');

@@ -13,7 +13,7 @@ import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../co
 import { openDatabase, type Db } from '../db/database.js';
 import { getLoopPr, getPrReview, observeHead, prStage, reviewEventId, scheduleAllReviews } from '../db/pr-reviews.js';
 import { pruneJob } from '../db/prune.js';
-import { claimNextJob, finishRun, getJob, getStatusSnapshot } from '../db/queue.js';
+import { claimNextJob, finishRun, getJob, getStatusSnapshot, retryJob } from '../db/queue.js';
 import { getReviewRequest } from '../db/revisions.js';
 import { GitHubError } from '../github/api.js';
 import { resolvePaths, type UpdraftPaths } from '../paths.js';
@@ -45,6 +45,7 @@ interface Options {
   repo?: Record<string, unknown>;
   action?: Record<string, unknown>;
   pools?: UpdraftConfigInput['pools'];
+  agents?: UpdraftConfigInput['agents'];
   workflow?: Record<string, unknown>;
   /** Verification result recorded on the run that published the PR. */
   verified?: boolean;
@@ -63,7 +64,7 @@ function setup(o: Options = {}) {
   const config: UpdraftConfig = configSchema.parse({
     version: 1,
     execution: { mode: 'live' },
-    agents: { claude: {}, codex: {} },
+    agents: o.agents ?? { claude: {}, codex: {} },
     pools: o.pools ?? { general: { agents: ['claude'] }, reviewers: { agents: ['codex'] } },
     actions: { 'implement-issue': { prompt: './p.md', revisePrompt: './r.md', reviewPrompt: './v.md', ...o.action } },
     dispatch: { allowedActors: ['allen'] },
@@ -202,8 +203,8 @@ describe('reviewer jobs', () => {
   it('never gives the review to the agent that wrote the code while another agent can take it', () => {
     const s = setup({ workflow: { reviewPool: undefined }, pools: { general: { agents: ['claude', 'codex'] } } });
     s.schedule();
-    // The pool's round-robin cursor points at the author.
-    s.db.prepare("INSERT INTO pool_cursors (pool, next_index) VALUES ('general', 0)").run();
+    // The round-robin cursor of the pool's reviewer jobs points at the author.
+    s.db.prepare("INSERT INTO pool_cursors (pool, next_index) VALUES ('review:general', 0)").run();
     const claim = claimNextJob(s.db, s.config, { workerId: 'w', hostname: 'h', leaseSeconds: 60, runsDir: s.paths.runsDir, now: s.now });
     expect(claim?.run.agent).toBe('codex');
 
@@ -215,6 +216,64 @@ describe('reviewer jobs', () => {
     const [job] = busy.schedule();
     expect(claimNextJob(busy.db, busy.config, { workerId: 'w', hostname: 'h', leaseSeconds: 60, runsDir: busy.paths.runsDir, now: busy.now })).toBeNull();
     expect(getJob(busy.db, job!.id)?.status).toBe('queued');
+  });
+
+  it("routes to the repository's review.pool when the workflow names no reviewPool", () => {
+    expect(setup({ workflow: { reviewPool: undefined }, repo: { review: { pool: 'reviewers' } } }).schedule()[0]).toMatchObject({ pool: 'reviewers' });
+    const both = setup({ pools: { general: { agents: ['claude'] }, reviewers: { agents: ['codex'] }, others: { agents: ['codex'] } }, repo: { review: { pool: 'others' } } });
+    expect(both.schedule()[0]).toMatchObject({ pool: 'reviewers' });
+  });
+
+  it('routes a review queued under an old reviewPool to the current route when it is claimed, and again when retried', () => {
+    // Queued under the workflow's reviewPool "old"...
+    const s = setup({ pools: { general: { agents: ['claude'] }, old: { agents: ['codex'] }, reviewers: { agents: ['codex'] } }, workflow: { reviewPool: 'old' } });
+    const [job] = s.schedule();
+    expect(job).toMatchObject({ pool: 'old' });
+    // ...then the config moves to a repository-wide review.pool and drops "old".
+    const repo = s.config.repositories[FULL]!;
+    const moved: UpdraftConfig = {
+      ...s.config,
+      pools: { general: s.config.pools.general!, reviewers: s.config.pools.reviewers! },
+      repositories: { [FULL]: { ...repo, review: { pool: 'reviewers', allowSameAgent: false }, workflows: repo.workflows.map((w) => ({ ...w, reviewPool: undefined })) } },
+    };
+    // The head already has its job, so scheduling queues nothing new.
+    expect(scheduleAllReviews(s.db, moved, s.now)).toEqual([]);
+    const claimOpts = { workerId: 'w', hostname: 'h', leaseSeconds: 60, runsDir: s.paths.runsDir, now: s.now };
+    const claim = claimNextJob(s.db, moved, claimOpts);
+    expect(claim).toMatchObject({ job: { id: job!.id, pool: 'reviewers' }, run: { pool: 'reviewers', agent: 'codex' } });
+    expect(getJob(s.db, job!.id)).toMatchObject({ status: 'running', pool: 'reviewers' });
+
+    // A retry of a job recorded under a pool that is gone is rerouted the same way.
+    finishRun(s.db, claim!.run.id, { outcome: 'failed', error: 'boom', now: s.now });
+    s.db.prepare("UPDATE jobs SET status = 'failed', pool = 'old' WHERE id = ?").run(job!.id);
+    retryJob(s.db, job!.id, s.now);
+    expect(claimNextJob(s.db, moved, claimOpts)).toMatchObject({ job: { id: job!.id, pool: 'reviewers' }, run: { agent: 'codex' } });
+  });
+
+  it('takes reviewers in turn, skipping the author, on a rotation of their own', () => {
+    // One pool both writes and reviews code. Claude wrote the PR.
+    const s = setup({ workflow: { reviewPool: undefined }, agents: { claude: {}, codex: {}, kiro: {} }, pools: { general: { agents: ['claude', 'codex', 'kiro'] } } });
+    const claim = () => claimNextJob(s.db, s.config, { workerId: 'w', hostname: 'h', leaseSeconds: 60, runsDir: s.paths.runsDir, now: s.now })!;
+    const done = (runId: string) => {
+      expect(finishRun(s.db, runId, { outcome: 'succeeded', now: s.now })).not.toBeNull();
+    };
+    const reviewers: string[] = [];
+    const coders: string[] = [];
+    for (const [i, head] of [H1, H2, H3, '4'.repeat(40)].entries()) {
+      if (i > 0) expect(observeHead(s.db, REPO_ID, PR, head, new Date(s.tick()).toISOString())).toBe(true);
+      // A coding job on another issue claims first and moves the pool's coding cursor.
+      insertQueuedJob(s.db, { repoId: REPO_ID, fullName: FULL, issue: 200 + i });
+      const coding = claim();
+      coders.push(coding.run.agent);
+      done(coding.run.id);
+      const [job] = s.schedule();
+      const review = claim();
+      expect(review.job.id).toBe(job!.id);
+      reviewers.push(review.run.agent);
+      done(review.run.id);
+    }
+    expect(coders).toEqual(['claude', 'codex', 'kiro', 'claude']);
+    expect(reviewers).toEqual(['codex', 'kiro', 'codex', 'kiro']);
   });
 
   it('fails the job rather than let the only agent review its own code, unless allowSameAgent says so', () => {

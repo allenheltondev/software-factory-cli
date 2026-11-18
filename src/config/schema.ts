@@ -157,7 +157,10 @@ export const workflowSchema = z.strictObject({
   pool: poolSelectorSchema,
   /** Overrides dispatch.allowedActors for this workflow. */
   allowedActors: z.array(z.string().min(1)).optional(),
-  /** With repositories.<repo>.review: the pool reviewer runs are routed to. Default: the pool the job itself was routed to. */
+  /**
+   * With repositories.<repo>.review: the pool reviewer runs are routed to. Default:
+   * repositories.<repo>.review.pool, else the pool the job itself was routed to.
+   */
   reviewPool: name.optional(),
 });
 
@@ -212,6 +215,12 @@ export const repositorySchema = z.strictObject({
     .union([
       z.boolean(),
       z.strictObject({
+        /**
+         * The pool reviewer runs are routed to, for every workflow of this repository that sets no
+         * reviewPool of its own. One agent in it fixes the reviewer; several are taken in turn.
+         * Default: the pool the job itself was routed to.
+         */
+        pool: name.optional(),
         /** Let the agent that wrote the code also review it when the review pool has no other enabled agent. Default false. */
         allowSameAgent: z.boolean().default(false),
       }),
@@ -335,10 +344,18 @@ export function reviseActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pic
 }
 
 /** repositories.<repo>.review as settings: off unless set to true or to an options object. */
-export function reviewSettings(repo: Pick<RepositoryConfig, 'review'>): { enabled: boolean; allowSameAgent: boolean } {
-  if (repo.review === undefined || repo.review === false) return { enabled: false, allowSameAgent: false };
-  if (repo.review === true) return { enabled: true, allowSameAgent: false };
-  return { enabled: true, allowSameAgent: repo.review.allowSameAgent };
+export function reviewSettings(repo: Pick<RepositoryConfig, 'review'>): { enabled: boolean; allowSameAgent: boolean; pool: string | null } {
+  if (repo.review === undefined || repo.review === false) return { enabled: false, allowSameAgent: false, pool: null };
+  if (repo.review === true) return { enabled: true, allowSameAgent: false, pool: null };
+  return { enabled: true, allowSameAgent: repo.review.allowSameAgent, pool: repo.review.pool ?? null };
+}
+
+/**
+ * The pool a reviewer job is routed to: the workflow's reviewPool, else the repository's
+ * review.pool, else `codePool`, the pool the job that wrote the code was routed to.
+ */
+export function reviewPoolFor(repo: Pick<RepositoryConfig, 'review'>, wf: Pick<WorkflowConfig, 'reviewPool'> | undefined, codePool: string): string {
+  return wf?.reviewPool ?? reviewSettings(repo).pool ?? codePool;
 }
 
 /** True when reviewer runs happen for this repository: live mode, publication on, review on. */
