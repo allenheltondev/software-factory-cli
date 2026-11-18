@@ -113,6 +113,37 @@ export interface RunSummary {
   lastOutput: string[];
   /** Parts of the summary that could not be computed. */
   notes: string[];
+  /** Result of the action's verify commands; absent when none ran (and in summaries from before they existed). */
+  verification?: VerificationSummary;
+}
+
+/**
+ * passed/failed: the command exited 0 / non-zero (or could not be started, or was killed by a
+ * signal). timed_out/interrupted: the worker stopped it at the step's time limit / on shutdown.
+ * not_run: an earlier command did not pass.
+ */
+export type VerificationStatus = 'passed' | 'failed' | 'timed_out' | 'interrupted' | 'not_run';
+
+export interface VerificationCommandResult {
+  /** The command as configured (an argv command joined for display). */
+  command: string;
+  status: VerificationStatus;
+  exitCode: number | null;
+  seconds: number;
+}
+
+/** What the worker's verification step (actions.<name>.verify) did after the agent succeeded. */
+export interface VerificationSummary {
+  passed: boolean;
+  commands: VerificationCommandResult[];
+  /**
+   * Entries of `git status --porcelain` in the worktree before the first command and after the
+   * last one that ran; null when git could not tell. Uncommitted changes are never published, so
+   * a non-zero `before` means the commands saw files the commits don't contain, and a higher
+   * `after` means the commands themselves changed the worktree.
+   */
+  uncommittedBefore: number | null;
+  uncommittedAfter: number | null;
 }
 
 export type PublicationState = 'publishing' | 'published' | 'failed' | 'skipped';

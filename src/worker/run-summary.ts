@@ -4,6 +4,7 @@
 import { open } from 'node:fs/promises';
 import { runGit } from '../git/git.js';
 import type { RunSummary } from '../types.js';
+import { verificationLines, verificationNotes } from './verify.js';
 
 const MAX_COMMITS = 20;
 const MAX_STAT_LINES = 60;
@@ -91,6 +92,20 @@ export function cleanSummaryLines(lines: readonly string[]): string[] {
   return [...head, `… (${clean.length - head.length - 1} more lines in run.log)`, clean[clean.length - 1]!];
 }
 
+/**
+ * Entries of `git status --porcelain` in a worktree (modified, staged and untracked files; ignored
+ * files don't count), or null when git can't tell. Paths with a line break are quoted by git, so
+ * one line is one entry.
+ */
+export async function countUncommitted(worktree: string, git?: string): Promise<number | null> {
+  try {
+    const { stdout } = await runGit(['status', '--porcelain'], { cwd: worktree, git, signal: AbortSignal.timeout(GIT_TIMEOUT_MS) });
+    return stdout.split('\n').filter((l) => l.trim() !== '').length;
+  } catch {
+    return null;
+  }
+}
+
 export interface SummaryInput {
   worktree: string;
   branch: string;
@@ -154,6 +169,13 @@ export function renderSummary(d: SummaryDetail): string[] {
     `untracked files: ${s.untracked}`,
     'last agent output:',
     ...(s.lastOutput.length ? s.lastOutput.map((l) => `  | ${l}`) : ['  (none)']),
+    ...(s.verification
+      ? [
+          `verification: ${s.verification.passed ? 'passed' : 'did not pass'}`,
+          ...verificationLines(s.verification).map((l) => `  ${l}`),
+          ...verificationNotes(s.verification).map((n) => `note: ${n}`),
+        ]
+      : []),
     ...s.notes.map((n) => `note: ${n}`),
   ];
   return lines;

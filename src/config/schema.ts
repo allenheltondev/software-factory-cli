@@ -53,16 +53,37 @@ export const poolSchema = z.strictObject({
   strategy: z.enum(['round-robin']).default('round-robin'),
 });
 
+// A line break ends the command for cmd.exe and starts a second one for sh, so one entry would
+// mean different things per OS; NUL can't be passed to a process at all.
+const verifyShellCommand = z
+  .string()
+  .refine((c) => c.trim() !== '', 'a verify command must not be empty')
+  .refine((c) => !/[\r\n\0]/.test(c), 'a verify command must be a single line; use one list entry per command');
+const verifyArgvCommand = z
+  .array(z.string().refine((a) => !a.includes('\0'), 'an argument must not contain a NUL character'))
+  .min(1, 'an argv verify command needs at least the executable')
+  .refine((argv) => (argv[0] ?? '').trim() !== '', 'the executable (first element) must not be empty');
+
 export const actionSchema = z.strictObject({
   /** Prompt file, relative to the config file's directory. */
   prompt: z.string().min(1).optional(),
   output: z.enum(['local-branch', 'log']).default('local-branch'),
   /** Live mode: stop the agent (and fail the run) after this many minutes. Default 60. */
   timeoutMinutes: z.number().positive().max(24 * 60).optional(),
+  /**
+   * Live mode, local-branch actions only: commands the worker runs in the job worktree after the
+   * agent succeeded, in order; the first that fails fails the run. A string runs through the
+   * platform shell, an array is an executable and its arguments, run without one.
+   */
+  verify: z.array(z.union([verifyShellCommand, verifyArgvCommand])).min(1).optional(),
+  /** Time limit for all verify commands together, in minutes. Default 15. */
+  verifyTimeoutMinutes: z.number().positive().max(24 * 60).optional(),
 });
 
 /** Agent run time limit when an action sets no timeoutMinutes. */
 export const DEFAULT_TIMEOUT_MINUTES = 60;
+/** Time limit for an action's verify commands when it sets no verifyTimeoutMinutes. */
+export const DEFAULT_VERIFY_TIMEOUT_MINUTES = 15;
 
 export const poolRuleSchema = z.strictObject({
   hasLabel: z.string().min(1),
@@ -161,6 +182,8 @@ export type FactoryConfigInput = z.input<typeof configSchema>;
 export type AgentConfig = z.output<typeof agentSchema>;
 export type PoolConfig = z.output<typeof poolSchema>;
 export type ActionConfig = z.output<typeof actionSchema>;
+/** One actions.<name>.verify entry: a shell command line, or an argv array run without a shell. */
+export type VerifyCommand = NonNullable<ActionConfig['verify']>[number];
 export type WorkflowConfig = z.output<typeof workflowSchema>;
 export type RepositoryConfig = z.output<typeof repositorySchema>;
 export type PoolSelector = z.output<typeof poolSelectorSchema>;

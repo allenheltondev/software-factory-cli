@@ -52,6 +52,7 @@ import type { FactoryPaths } from '../paths.js';
 import type { Job, Publication, Run, RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
+import { verificationLines, verificationNotes } from '../worker/verify.js';
 
 /** How long a publication may hold its lease before another process may take it over. */
 export const PUBLISH_LEASE_SECONDS = 10 * 60;
@@ -295,6 +296,15 @@ export function renderPrBody(o: {
     '',
     `**Changes:** ${inline(s.diffStat)}`,
     '',
+    ...(s.verification
+      ? [
+          `**Verification** (${s.verification.passed ? 'passed' : 'did not pass'}; commands run by the worker after the agent finished)`,
+          '',
+          fenced(cap(verificationLines(s.verification).join('\n') || '(no commands)', 4_000)),
+          '',
+          ...verificationNotes(s.verification).flatMap((n) => [`Note: ${inline(n)}.`, '']),
+        ]
+      : []),
     "**The agent's final message**",
     '',
     fenced(finalMessage),
