@@ -63,6 +63,13 @@ RUN set -eu; . /opt/updraft/build.env; \
     if [ -n "${AGENT_PACKAGES}" ]; then npm install -g --no-fund --no-audit ${AGENT_PACKAGES}; fi; \
     npm cache clean --force >/dev/null 2>&1 || true
 
+# Toolchain for the repositories the agents work on (TOOL_PACKAGES in build.env), on PATH for
+# the agent and for the verify commands alike.
+RUN set -eu; . /opt/updraft/build.env; \
+    if [ -n "${TOOL_PACKAGES:-}" ]; then npm install -g --no-fund --no-audit ${TOOL_PACKAGES}; fi; \
+    npm cache clean --force >/dev/null 2>&1 || true; \
+    if command -v tsc >/dev/null 2>&1; then tsc --version; fi
+
 # The runner and its AWS SDK clients.
 COPY runner/ /opt/updraft/runner/
 RUN set -eu; cd /opt/updraft/runner; npm ci --omit=dev --no-fund --no-audit; npm cache clean --force >/dev/null 2>&1 || true
