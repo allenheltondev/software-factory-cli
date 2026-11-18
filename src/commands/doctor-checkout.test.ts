@@ -58,7 +58,7 @@ function fixture(): GitFixture {
 describe('doctor: repo checkouts', { timeout: 60_000 }, () => {
   it('checks each checkoutPath exists, is a git repo, and has the configured remote', async () => {
     const f = fixture();
-    const configDir = join(f.root, 'factory home');
+    const configDir = join(f.root, 'updraft home');
     const plain = join(f.root, 'plain dir');
     mkdirSync(plain);
     const cfg = config('prepare-only', {

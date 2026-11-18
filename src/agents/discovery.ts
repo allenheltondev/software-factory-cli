@@ -55,7 +55,7 @@ export interface DiscoveryProbes {
    */
   cwd?: string;
   homedir: string;
-  /** The Node binary running factory, used when a shim says plain `node` and none is on PATH. */
+  /** The Node binary running updraft, used when a shim says plain `node` and none is on PATH. */
   execPath: string;
   /** Is this a regular file (and executable on POSIX)? */
   isExecutable(path: string): boolean;
@@ -102,8 +102,8 @@ export interface AgentReport {
   /** True when `command` came from agents.<name>.command rather than the adapter's default. */
   configuredCommand?: boolean;
   /**
-   * Kiro only, when it ran: whether this Kiro CLI is 3.0.0 or later, which the `--v3` the adapter
-   * adds by default needs; 'unknown' when the version could not be read. Not in `notes`, because
+   * Kiro only, when it ran: whether this Kiro CLI is at the 3.0.0 baseline the adapter is written
+   * against ('no': older, unverified); 'unknown' when the version could not be read. Not in `notes`, because
    * agents.<name>.args can pick another harness (doctor checks it with the args).
    */
   kiroV3?: Tri;
@@ -635,7 +635,7 @@ function pick(a: AuthResult, notes: string[]): Pick<AgentReport, 'signedIn' | 'a
   return { signedIn: a.signedIn, auth: a.auth };
 }
 
-/** Report for an agent name factory has no adapter for. */
+/** Report for an agent name updraft has no adapter for. */
 function unknownAdapter(name: string): AgentReport {
   return {
     adapter: name as AdapterName,

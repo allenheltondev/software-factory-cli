@@ -1,71 +1,74 @@
-# software-factory-cli
+# Updraft
 
-`factory` watches GitHub repositories you choose and turns labeled issues into queued jobs
+`updraft` watches GitHub repositories you choose and turns labeled issues into queued jobs
 for coding agents (Codex, Claude Code, Kiro). It runs on your machine, uses your `gh`
 sign-in, and keeps its queue in a local SQLite database.
 
 ## Status
 
-Pilot. This release covers repository discovery, config validation, issue-event polling, a
-durable queue and a **log-only** worker: jobs are claimed, routed to a pool and agent, and
-recorded, but no agent is started and no code is changed. The opt-in **prepare-only** mode
-also creates a branch and Git worktree per job (still without an agent). The **live** mode
-runs the routed agent in that worktree; this release ships the Claude Code, Codex and Kiro
-adapters (see [Live mode with Claude Code](#live-mode-with-claude-code),
-[Live mode with Codex](#live-mode-with-codex) and [Live mode with Kiro](#live-mode-with-kiro)).
-See [docs/design.md](docs/design.md).
+Pilot. `updraft` polls GitHub issue events for the repositories you configure and queues a
+job when an allowed user applies a trigger label to an open issue. Each job is routed to an
+agent pool and, in `live` mode, the chosen agent (Claude Code, Codex or Kiro) runs in a
+branch and Git worktree created for that job. Publication is opt-in per repository: the
+worker can push the job branch and open a pull request. The default mode, `log-only`, records
+what would run and starts no agent.
 
-Publication is opt-in per repository: with `publish: draft-pr` (or `pr`), a live run that
-succeeded and left commits gets its branch pushed and a PR opened as your `gh` account. See
-[Publication](#publication).
+It is built for one person running it on their own machine. Agents run as your user, in
+full-auto mode by default and without a sandbox; read [Security](#security) before turning
+on live mode. Commands and config keys may still change. The original design is in
+[docs/design.md](docs/design.md).
 
 ## Install
 
 Requires Node.js 22.13 or later, Git, and the [GitHub CLI](https://cli.github.com/).
 
 ```sh
-npm install -g software-factory-cli
+npm install -g @allenheltondev/updraft
 gh auth login
-factory doctor
+updraft doctor
 ```
 
 To try it without installing, run a pinned version once, for example
-`npx software-factory-cli@<version> agents` (the package's only command is `factory`). The
+`npx @allenheltondev/updraft@<version> agents` (the package's only command is `updraft`). The
 background worker needs the global install: the launchers point at the global package, npx's
 cache folder can change or be cleared, and an unpinned npx can run a newer CLI that upgrades
-the state database past what the worker supports. `factory start` warns when it runs from
+the state database past what the worker supports. `updraft start` warns when it runs from
 the npx cache.
 
 ## Quick start
 
-1. `factory configure` - pick repositories, the trigger label, actions and pools. It writes
-   your per-user config. For scripts, use `factory add OWNER/REPO` instead.
-2. Add your GitHub login to `dispatch.allowedActors` in the config (only these users can
-   dispatch work), then run `factory validate`.
-3. `factory start` - polls GitHub and processes the queue until you stop it (Ctrl+C).
-4. Add the `ready` label to an open issue. Within one poll interval, `factory status`
+1. `updraft configure` - pick repositories, the trigger label, actions and pools. It writes
+   your per-user config. For scripts, use `updraft add OWNER/REPO` instead.
+2. Check `dispatch.allowedActors` in the config: only these GitHub logins can dispatch work.
+   A new config lists the account `gh` is signed in as. Then run `updraft validate`.
+3. `updraft start` - polls GitHub and processes the queue until you stop it (Ctrl+C).
+4. Add the `ready` label to an open issue. Within one poll interval, `updraft status`
    shows the queued job and, in log-only mode, its run.
 
-To run the worker in the background at login, see
-[Background operation](#background-operation).
+A new config is in `log-only` mode, which starts no agent. To have agents work on issues,
+set a `checkoutPath` for each repository and `execution.mode: live`, then run
+`updraft validate` and `updraft doctor`; see [Live execution](#live-execution). To run the
+worker in the background at login, see [Background operation](#background-operation).
 
 ## Commands
 
-All commands accept `--config <path>` (or `FACTORY_CONFIG`) to use a config file other than
+All commands accept `--config <path>` (or `UPDRAFT_CONFIG`) to use a config file other than
 the per-user default.
 
 | Command | Behavior |
 | --- | --- |
-| `factory configure` | Interactively select repos, trigger labels, actions and pools (needs a terminal) |
-| `factory add OWNER/REPO` | Add or update a repo workflow non-interactively. Options: `--label` (default `ready`), `--action` (default `implement-issue`), `--pool` (default `general`), `--route LABEL=POOL` (repeatable), `--backfill-since DATE`, `--workflow-id ID` |
-| `factory validate` | Check the config without network access; exit 1 if invalid |
-| `factory start` | Run the worker: poll GitHub and process the queue (non-interactive). Exits with code 3 if another worker holds the lock |
-| `factory status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
-| `factory doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access, labels and each enabled agent in the current environment, the way a live run starts it (its `command` and `env`) |
-| `factory agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
-| `factory retry JOB_ID` | Requeue a failed, interrupted or canceled job |
-| `factory publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [Publication](#publication) |
-| `factory clean [--dry-run]` | Remove job worktrees of succeeded or canceled runs. Keeps failed and interrupted runs' worktrees, and all branches. See [Per-job worktrees](#per-job-worktrees) |
+| `updraft configure` | Interactively select repos, trigger labels, actions and pools (needs a terminal) |
+| `updraft add OWNER/REPO` | Add or update a repo workflow non-interactively. Options: `--label` (default `ready`), `--action` (default `implement-issue`), `--pool` (default `general`), `--route LABEL=POOL` (repeatable), `--backfill-since DATE`, `--workflow-id ID` |
+| `updraft validate` | Check the config without network access; exit 1 if invalid |
+| `updraft start` | Run the worker: poll GitHub and process the queue (non-interactive). Exits with code 3 if another worker holds the lock |
+| `updraft status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
+| `updraft doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access (with `github.app`: the App's key, its installation on each repository and the permissions it grants), labels and each enabled agent in the current environment, the way a live run starts it (its `command` and `env`) |
+| `updraft agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
+| `updraft retry JOB_ID` | Requeue a failed, interrupted or canceled job |
+| `updraft publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [docs/publication.md](docs/publication.md) |
+| `updraft logs RUN_ID\|JOB_ID [--follow] [--path]` | Print a run's `run.log`; for a job, the log of its latest run (named on stderr). `--follow` keeps printing until the run has finished; `--path` prints only the file path. Needs neither network nor a running worker |
+| `updraft cancel JOB_ID` | Cancel a queued job, or ask the running worker to stop a running one: the agent's process tree is stopped within a few seconds, the job ends `canceled`, its worktree and branch are kept, and nothing is published. See [Canceling a job](docs/operations.md#canceling-a-job) |
+| `updraft clean [--dry-run] [--older-than AGE]` | Remove job worktrees of succeeded runs and runs whose agent never started. Keeps the worktrees of failed, interrupted and user-canceled runs, and all branches. With `--older-than` (e.g. `30d`, `12h`, `2w`) also prunes old jobs, runs, logs and errors. See [Per-job worktrees](docs/worktrees.md) and [Retention](docs/operations.md#retention) |
 
 ## Configuration
 
@@ -108,29 +111,50 @@ repositories:
 | `version` | required | Config schema version; must be `1` |
 | `pollIntervalSeconds` | `60` | GitHub poll interval, 10-3600 |
 | `maxConcurrent` | `2` | Global cap on simultaneous runs, 1-64 |
-| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree (see [Live execution](#live-execution)); it is rejected unless every enabled agent's adapter is implemented, which in this release means `claude`, `codex` or `kiro` |
+| `execution.mode` | `log-only` | `log-only` writes run.log only. `prepare-only` also creates the job's branch and worktree; no agent runs in either. `live` also runs the routed agent in the worktree; it needs at least one enabled agent. See [docs/live-execution.md](docs/live-execution.md) |
 | `dispatch.allowedActors` | `[]` | GitHub logins allowed to dispatch work by applying a trigger label. Empty means nobody |
+| `github.app.appId` | none | Act on GitHub as a GitHub App installation (`<app-slug>[bot]`) instead of your `gh` account: polling, pushes, PRs and comments. The App's ID or client ID. Needs `privateKeyPath`. See [docs/github-app.md](docs/github-app.md) |
+| `github.app.privateKeyPath` | none | Path of the App's PEM private key file, relative to the config file's directory. The key itself is never in the config. `UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH` in the worker's environment names another file |
+| `github.app.installationId` | looked up per repository | Use this installation for every repository. Leave it out when repositories are under different owners |
+| `github.app.commitAsApp` | `false` | Live mode: agents commit as the App's bot (through `GIT_AUTHOR_*` and `GIT_COMMITTER_*` in the agent's environment) instead of the local Git identity. Commits are never rewritten afterwards |
 | `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
 | `agents.<name>.maxConcurrent` | `1` | Per-agent cap across all pools and repos, 1-32 |
-| `agents.<name>.command` | found by discovery | Live mode: the agent CLI to run. An absolute path, a path relative to the config file's directory, or a name looked up on `PATH`. Windows npm `.cmd` shims are resolved to the real executable or Node entry point |
+| `agents.<name>.command` | found by discovery | Live mode: the agent CLI to run. An absolute path, a path relative to the config file's directory, or a name looked up on `PATH`. Windows npm `.cmd` shims are resolved to the real executable or Node entry point. With `container`, a name or path inside the image, used as written |
 | `agents.<name>.args` | none | Live mode: extra arguments for the agent CLI; the adapter places them where its CLI takes options |
-| `agents.<name>.env` | none | Live mode: environment variables for the agent process, on top of the worker's. Not for secrets such as `KIRO_API_KEY`; see [Agent credentials](docs/background-operation.md#agent-credentials) |
+| `agents.<name>.env` | none | Live mode: environment variables for the agent process, on top of the worker's. Not for secrets such as `KIRO_API_KEY`; see [Agent credentials](docs/background-operation.md#agent-credentials). With `container`, set inside the container |
+| `agents.<name>.container.image` | none | Live mode: run this agent, and the action's `verify` commands, in a container from this image instead of on the host (see [Isolating agents](docs/isolation.md)). The image must contain the agent CLI, `git` and the repository's toolchain, and must already be present locally; a run never pulls. Not supported on native Windows (use WSL2) |
+| `agents.<name>.container.runtime` | `docker` | `docker` or `podman` looked up on `PATH`, or a path relative to the config file's directory |
+| `agents.<name>.container.env` | `[]` | Names of variables to pass from the worker's environment into the agent's container, such as its API key. Names only, never values. Nothing else of the worker's environment reaches the container |
+| `agents.<name>.container.network` | the runtime's default | Passed as `--network`, for example `none`, `bridge` or a network you created |
+| `agents.<name>.container.args` | none | Extra arguments for `<runtime> run`, such as `["--memory", "4g"]`. They can widen what the container reaches |
 | `pools.<name>.agents` | required | Agent names in the pool (at least one) |
 | `pools.<name>.strategy` | `round-robin` | Rotates among agents with free capacity |
 | `actions.<name>.prompt` | none | Prompt file, relative to the config file's directory |
+| `actions.<name>.revisePrompt` | none | Prompt file for revision runs, relative to the config file's directory. Required in live mode for every action used by a repository with `revise` on. See [Revisions](docs/revisions.md) |
+| `actions.<name>.reviewPrompt` | none | Prompt file for reviewer runs, relative to the config file's directory. Required in live mode for every action used by a repository with `review` on. See [The review loop](docs/review-loop.md) |
 | `actions.<name>.output` | `local-branch` | `local-branch` or `log`. Live mode starts agents only for `local-branch` actions |
 | `actions.<name>.timeoutMinutes` | `60` | Live mode: stop the agent and fail the run after this long |
+| `actions.<name>.verify` | none | Live mode, `local-branch` actions: commands the worker runs in the job worktree after the agent succeeded, in order; the first that fails fails the run, so it is not published. A string runs through the shell (`sh -c`, or `cmd.exe /d /s /c` on Windows); an array is an executable and its arguments, run without a shell. Set in another mode or on a `log` action, it is a validation warning and does nothing. See [Verification](docs/verification.md) |
+| `actions.<name>.verifyTimeoutMinutes` | `15` | Time limit for all of the action's verify commands together; at the limit the running command's process tree is killed and the run fails |
 | `repositories.<OWNER/REPO>.id` | required | Stable GitHub repository ID (filled in by `configure` / `add`) |
 | `repositories.<OWNER/REPO>.baseBranch` | remote's default branch | Branch that per-job branches start from (fetched first) |
 | `repositories.<OWNER/REPO>.checkoutPath` | none | Local clone of the repo that per-job worktrees are created from, relative to the config file's directory. Required in `prepare-only` and `live` mode when a workflow's action has `output: local-branch` |
 | `repositories.<OWNER/REPO>.remote` | a github.com remote | Remote of `checkoutPath` to fetch from. Without it, only a remote whose URL is on `github.com` with path `OWNER/REPO` qualifies (`origin` preferred). Set it for an SSH host alias such as `git@github-work:OWNER/REPO`; any host is then accepted, but `OWNER/REPO` must still match |
-| `repositories.<OWNER/REPO>.publish` | `none` | Live mode, `local-branch` actions: `draft-pr` pushes the job branch of a succeeded run that left commits and opens a draft PR; `pr` opens a ready-for-review PR instead (for private repos where your plan has no draft PRs). Set in another mode, it is a validation warning and does nothing. See [Publication](#publication) |
+| `repositories.<OWNER/REPO>.publish` | `none` | Live mode, `local-branch` actions: `draft-pr` pushes the job branch of a succeeded run that left commits and opens a draft PR; `pr` opens a ready-for-review PR instead (for private repos where your plan has no draft PRs). Set in another mode, it is a validation warning and does nothing. See [docs/publication.md](docs/publication.md) |
+| `repositories.<OWNER/REPO>.commentOnFailure` | `false` | Live mode: when a run leaves its job failed (agent error, timeout, failed verification, worktree preparation failure, or no agent could start), the worker comments once on the issue with the run id, agent, duration, reason and how to retry. Never includes agent output or local paths. Set in another mode, it is a validation warning and does nothing. See [Failure comments](docs/failure-comments.md) |
+| `repositories.<OWNER/REPO>.revise` | `false` | Live mode, together with `publish`: when an allowed actor requests changes on a PR the worker opened, run the agent on that PR's branch with the review, verify, push the new commits to the PR as a fast-forward and reply there. Set in another mode or without `publish`, it is a validation warning and does nothing. See [Revisions](docs/revisions.md) |
+| `repositories.<OWNER/REPO>.maxRevisions` | `3` | With `revise`: how many revision jobs one PR gets. Further change requests are recorded and shown in `updraft status` but not acted on, and one comment on the PR says so |
+| `repositories.<OWNER/REPO>.review` | `false` | Live mode, together with `publish`: a second agent reviews every head commit of a PR the worker opened and its verdict is posted as a comment review. "Changes requested" queues a revision when `revise` is on; "ready to merge" marks a draft ready for review. `true`, or `{ allowSameAgent: true }` to let the agent that wrote the code review it when the pool has no other. Set in another mode or without `publish`, it is a validation warning and does nothing. See [The review loop](docs/review-loop.md) |
+| `repositories.<OWNER/REPO>.autoMerge` | off | With `review`: `squash`, `merge` or `rebase`. Updraft merges a PR whose current head its reviewer found ready, once the head's checks passed and nothing else stands in the way, with the reviewed commit pinned. The issue and the code are untrusted and could talk a reviewer into approving: read [Auto-merge](docs/review-loop.md#auto-merge) before setting it |
+| `repositories.<OWNER/REPO>.autoMergeWaitMinutes` | `60` | With `autoMerge`: how long to wait for pending checks before giving up and leaving the PR for a person |
+| `repositories.<OWNER/REPO>.autoMergeRequiredChecks` | none | With `autoMerge`: names of the commit statuses or check runs (for example `test`) that must each report success on the commit. Without it, any one successful check is enough. A skipped or neutral check never counts as a success |
 | `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
 | `workflows[].action` | required | Action name |
 | `workflows[].pool` | required | A pool name, or `{ rules: [{ hasLabel, use }], default }`. The first matching rule wins; routing uses the issue's labels when the job is queued |
+| `workflows[].reviewPool` | the job's pool | With `review`: the pool reviewer runs are routed to. The agent that wrote the code is never picked while the pool has another enabled agent; a configuration where it is the only one is invalid unless `review.allowSameAgent` is set |
 | `workflows[].allowedActors` | `dispatch.allowedActors` | Per-workflow override of the allowlist |
 
 Names of agents, pools, actions and workflow IDs use letters, digits, `.`, `_` and `-`.
@@ -138,450 +162,176 @@ Config changes take effect when the worker restarts.
 
 ## Per-job worktrees
 
-In `prepare-only` and `live` mode, each job whose action has `output: local-branch` gets:
-
-- a fetch of the base branch (`baseBranch`, else the remote's default branch) from the
-  repo's remote in `checkoutPath`: the one named by `remote`, else a remote whose URL is on
-  `github.com` with path `OWNER/REPO` (`origin` if several are). A same-named repo on another
-  host is never picked on its own;
-- a new branch `factory/issue-<n>-<jobId>` at the fetched commit. A retried job's later
-  attempts add `-<attempt>`. An existing branch is never reused; the run fails instead;
-- a worktree at `<state dir>/worktrees/<repoId>/<jobId>[-<attempt>]`, recorded as the run's
-  checkout, and `run.log` describing it.
-
-Your clone's own checkout is not touched. Git operations on one clone are serialized, so
-concurrent jobs in one repo do not race. `factory doctor` checks that each `checkoutPath`
-exists and is a Git repository, and shows which remote it selected (by the same rule) and
-why; its repository check confirms the repo ID behind the configured name.
-
-Worktrees of failed and interrupted runs are kept for inspection. `factory clean` removes
-worktrees of succeeded runs, runs closed before they started (canceled), and runs whose agent
-never started. It only touches worktrees under `<state dir>/worktrees`, skips any with
-uncommitted changes, and keeps every branch, since the branch is the job's output. Delete
-branches with `git branch -D` when you no longer need them.
+In `prepare-only` and `live` mode, each job whose action has `output: local-branch` gets a
+new branch `updraft/issue-<n>-<jobId>`, created at the freshly fetched base branch, and a
+worktree for it under `<state dir>/worktrees`. Your clone's own checkout is not touched, and
+an existing branch is never reused. Worktrees of failed and interrupted runs are kept for
+inspection; `updraft clean` removes the others and keeps every branch, since the branch is
+the job's output. Details, including how the remote is chosen:
+[docs/worktrees.md](docs/worktrees.md).
 
 ## Live execution
 
-In `live` mode the worker runs the routed agent for each `local-branch` job:
+In `live` mode the worker runs the routed agent for each job whose action has
+`output: local-branch`:
 
-1. It renders the action's prompt file plus the issue's title, body, labels and URL into
-   `prompt.md` in the run's log directory. The issue text is fenced and labelled as untrusted
-   input. The adapter hands the file to the agent on stdin or by path, never in a command line.
-2. It finds the agent CLI (`agents.<name>.command`, else the same lookup as `factory agents`).
-   If it can't, or the process can't be spawned, the run is `start_failed` and the job is
-   requeued for the next eligible agent (up to three start failures in a row).
-3. It prepares the branch and worktree as above. A failure there fails the run.
-4. It spawns the agent directly (no shell) in the worktree, records its pid and the OS start
-   time of that process, and writes its stdout and stderr to `run.log`. `GH_TOKEN` and
-   `GITHUB_TOKEN` are not passed to the agent unless `agents.<name>.env` sets them. If the
-   worker can't record the pid, it stops the agent at once and fails the run (it is not a
-   start failure, so no other agent is tried).
-5. The adapter decides the outcome from the exit code and, where the CLI reports one, its
-   machine-readable result (exit code 0 alone means `succeeded` otherwise). At
-   `timeoutMinutes` the agent's process tree is killed and the run fails. Failed runs keep
-   their worktree for inspection.
-6. It appends a summary to `run.log` and stores it for `factory status`: commits on the job
-   branch since the base commit, files changed (`git diff --stat` against the base, committed
-   or not), untracked files, and the agent's final message (or its last output lines).
+- It writes the action's prompt and the issue's title, body, labels and URL to a prompt file.
+  The issue text is fenced and labelled as untrusted input, and reaches the agent on stdin or
+  by path, never in a command line.
+- It starts the agent CLI directly (no shell) in the job's worktree, with the worker's
+  environment minus `GH_TOKEN` and `GITHUB_TOKEN`, and writes its output to `run.log`. If the
+  CLI can't be found or started, the job is requeued for the next eligible agent.
+- The agent's exit code and, where its CLI reports one, its machine-readable result decide
+  whether the run `succeeded` or `failed`. At `timeoutMinutes` the agent's process tree is
+  killed and the run fails. Stopping the worker stops its agents and records their runs as
+  `interrupted`.
+- A summary of the commits, changed files and the agent's final message is appended to
+  `run.log` and shown by `updraft status`.
 
-On macOS and Linux each agent runs in its own process group, so a timeout or shutdown also
-stops whatever it started. Pressing Ctrl-C in a terminal therefore doesn't reach the agent
-directly: the worker forwards its own shutdown (SIGINT or SIGTERM) to the agent's group as
-SIGTERM, then SIGKILL after five seconds, and records the run `interrupted`. On Windows the
-worker stops the agent's tree with `taskkill /t /f`. If the worker itself is killed, the
-agent keeps running; the next `factory start` on the same host stops it, but only after
-checking that the recorded pid still belongs to the same process (same start time), so a pid
-the OS has since reused is never signalled. Runs recorded before this release have no start
-time and are not signalled.
+Every agent runs in **full-auto mode by default**: it edits files and runs commands without
+asking, as your user. That is not a sandbox. `agents.<name>.args` narrows it.
 
-In live mode, `factory doctor` reports a missing, broken or signed-out agent CLI as a failure
-rather than a warning.
+The full lifecycle, the requirements `updraft validate` checks and how agents are stopped are
+in [docs/live-execution.md](docs/live-execution.md). Prerequisites, the exact command line,
+the permission profile and platform notes for each agent:
 
-### Live mode with Claude Code
+- [docs/agents/claude.md](docs/agents/claude.md) for Claude Code
+- [docs/agents/codex.md](docs/agents/codex.md) for Codex
+- [docs/agents/kiro.md](docs/agents/kiro.md) for Kiro
 
-Prerequisites, under the account and environment the worker runs as (the background
-launchers' account, not just your terminal):
+## Publication
 
-- Claude Code installed and signed in: `claude auth status` reports `loggedIn: true` (a
-  claude.ai login, or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the environment).
-  `factory agents` and `factory doctor` run the same check.
-- On Linux and macOS, a non-root user: Claude Code refuses the default full-auto profile as
-  root or under `sudo`.
-- Only agents with a live adapter enabled (`claude`, `codex` or `kiro`), a
-  `checkoutPath` for the repository and a `prompt` for the action. `factory validate` checks
-  all three.
+Off by default. With `repositories.<OWNER/REPO>.publish` set to `draft-pr` or `pr`, the
+worker publishes a live run that **succeeded and left at least one commit** on the job
+branch. The worker does this after the agent has exited, as your `gh` account:
 
-Each job runs, in its worktree, with the prompt file on stdin:
+- it pushes the job branch to the repository's remote. The push only ever creates the branch;
+  it never moves an existing branch (unless `revise` is on, see below) and never pushes the
+  base branch;
+- it opens a PR from the job branch into the base branch (a draft for `draft-pr`);
+- it comments on the issue with a link to the PR.
 
-```
-claude -p --output-format stream-json --verbose --permission-mode bypassPermissions <agents.claude.args>
-```
+Each step is recorded and checks GitHub before writing, so a retry never opens a second PR
+or comment. Transient failures are retried by the worker; others wait for
+`updraft publish RUN_ID`. Merging stays a human decision: publication never merges, approves
+or marks a PR ready for review (the opt-in review loop below can do the last, and with
+`autoMerge` the first).
 
-- `-p` is Claude Code's [headless mode](https://code.claude.com/docs/en/headless); with no
-  prompt argument it reads the prompt from stdin.
-- `stream-json` writes one JSON event per line to `run.log` as the run goes, so a run that
-  times out still leaves a transcript. The last event is the run's result.
-- The run is `succeeded` only when Claude Code exits 0 with a `success` result. An error
-  result (`is_error`, such as a sign-in failure), the turn limit (`error_max_turns`), the
-  spending limit (`error_max_budget_usd`) or an error during execution fails the run with
-  that reason, and so does exiting 0 without a result the worker can read. The worker looks
-  for the result in the last 16 MiB of output, past anything printed on stderr after it.
-  The summary shows Claude's final message, then a line with the result, turns, estimated
-  cost, any permission denials and the session id. To look at a run afterwards, run
-  `claude --resume <session id>` in its worktree.
+Details, including authentication, retries and failure handling:
+[docs/publication.md](docs/publication.md).
 
-**Default permission profile: full auto.** `--permission-mode bypassPermissions` (the same as
-`--dangerously-skip-permissions`) lets Claude edit files and run any command inside the job's
-worktree without asking, as decided for the pilot. It is not a sandbox: commands run as your
-user, can reach the network and can read or write outside the worktree. Anthropic recommends
-this mode only in isolated environments; see
-[permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode).
+To have the PRs and comments authored by a bot instead of you (so that you can approve them,
+and with short-lived credentials limited to the watched repositories), configure a GitHub
+App: [docs/github-app.md](docs/github-app.md).
 
-To narrow it, set a permission mode in `agents.claude.args`; any `--permission-mode` or
-`--dangerously-skip-permissions` there replaces the default. Config arguments go last, after
-the adapter's own:
+With `revise: true` as well, a "Request changes" review by an allowed actor on such a PR
+queues a revision: the agent runs on the PR's branch with the review, and the worker pushes
+the new commits as a fast-forward and replies on the PR. See
+[docs/revisions.md](docs/revisions.md).
 
-```yaml
-agents:
-  claude:
-    args:
-      - --permission-mode
-      - acceptEdits        # edits files without asking; other commands need an allow rule
-      - --max-turns
-      - "60"               # stop a run after 60 agentic turns (fails as error_max_turns)
-      - --allowedTools     # variadic: keep it last
-      - "Bash(npm test *)"
-      - "Bash(git add *)"
-      - "Bash(git commit *)"
-```
-
-In a `-p` run anything that would prompt is denied (and listed as a permission denial in the
-summary), so with a narrower profile allow every command the action needs, including
-`git add`/`git commit`. `--max-budget-usd` caps estimated spend the same way. Other flags
-from the [CLI reference](https://code.claude.com/docs/en/cli-reference), such as `--model`,
-pass through unchanged. Leave `--output-format` alone: `json` also works, but with `text`
-the adapter can't read a result and goes by the exit code alone.
-
-Without `--bare`, Claude Code loads the worktree's `CLAUDE.md`, `.claude/settings.json`
-(including hooks) and `.mcp.json` as it would interactively, and `-p` skips the workspace trust
-dialog. Point live mode only at repositories whose checked-in Claude settings you trust.
-
-**Windows:** Claude Code's native Windows setup has no built-in command sandbox; commands run
-unsandboxed ([sandboxing](https://code.claude.com/docs/en/sandboxing)). When an action needs
-sandboxed command execution, run the worker and Claude Code inside WSL2, where the sandbox is
-available, or inside another isolation boundary such as a VM or container.
-
-### Live mode with Codex
-
-Prerequisites, under the account and environment the worker runs as:
-
-- Codex installed and signed in: `codex login status` exits 0 (a ChatGPT login or a stored
-  API key), or `CODEX_API_KEY` is set in the worker's environment, which `codex exec`
-  accepts. `factory agents` and `factory doctor` run the same check.
-- Only agents with a live adapter enabled, a `checkoutPath` and a `prompt`, as for Claude Code.
-
-Each job runs, in its worktree, with the prompt file on stdin (no prompt argument):
-
-```
-codex exec --json --dangerously-bypass-approvals-and-sandbox <agents.codex.args>
-```
-
-- `codex exec` is Codex's [non-interactive mode](https://developers.openai.com/codex/noninteractive);
-  with no prompt argument it reads the prompt from stdin.
-- `--json` makes stdout a stream of JSON events, one per line, written to `run.log` as the run
-  goes: `thread.started`, `item.*` (commands, file changes, messages), then `turn.completed`
-  or `turn.failed`.
-- The run is `succeeded` only when Codex exits 0 after `turn.completed`. A `turn.failed`
-  event fails the run with its message (for example a usage limit), and so does a non-zero
-  exit (Codex exits 1 when the turn fails or is interrupted, or a fatal error was reported)
-  or exiting 0 without a turn result the worker can read. `error` events alone don't decide
-  anything, since Codex also reports errors it is about to retry that way. The summary shows
-  Codex's final message, then a line with the turn result, token usage and the thread id. To
-  look at a run afterwards, run `codex resume <thread id>` in its worktree.
-
-**Default permission profile: full auto.** `--dangerously-bypass-approvals-and-sandbox`
-(alias `--yolo`) runs every command without approval and without Codex's sandbox, the
-equivalent of Claude Code's `bypassPermissions`. It is not a sandbox: commands run as your
-user, can reach the network and can read or write outside the worktree, including
-environment variables such as `CODEX_API_KEY`. OpenAI recommends it only inside an isolated
-runner; see [agent approvals and security](https://developers.openai.com/codex/agent-approvals-security).
-
-The sandboxed mode OpenAI suggests for automation, `--sandbox workspace-write`, keeps `.git`
-read-only, and for a worktree also the Git directory its `.git` file points to. In a job
-worktree Codex can then edit files but cannot commit them: the run summary lists the
-uncommitted changes, and the branch has no new commits. Network access is off in that mode
-unless enabled with `-c sandbox_workspace_write.network_access=true`.
-
-To change the profile, set it in `agents.codex.args`. Any of `--sandbox`/`-s`,
-`--ask-for-approval`/`-a`, `--full-auto`, `--approve-for-me`, `--yolo`,
-`--dangerously-bypass-approvals-and-sandbox`, or `-c sandbox_mode=...` /
-`-c approval_policy=...` there replaces the default. Settings in `~/.codex/config.toml` or a
-`--profile` do not; put them in `args`. Config arguments go last, after the adapter's own,
-except `--ask-for-approval`/`-a`, which `codex exec` only accepts before the subcommand, so
-the adapter moves it there:
-
-```yaml
-agents:
-  codex:
-    args:
-      - --sandbox
-      - workspace-write    # sandboxed edits; Codex can't commit (see above)
-      - --model
-      - gpt-5-codex
-```
-
-`codex exec` never stops to ask: with a narrower profile, anything that would need approval
-is refused. `--full-auto` is still accepted by older releases (it is
-`--sandbox workspace-write` with on-request approvals), but current docs say it is no longer
-supported; use `--sandbox workspace-write` instead. Other flags from the
-[CLI reference](https://developers.openai.com/codex/cli/reference), such as `--model` or
-`-c key=value`, pass through unchanged. Leave `--json` and the prompt alone.
-
-Codex reads the worktree's `AGENTS.md` files. Project `.codex/config.toml` settings and
-project MCP servers load only for projects you have marked trusted, and the adapter doesn't
-pass `--trust`. Point live mode only at repositories whose checked-in instructions you trust.
-
-**Windows:** Codex has a native Windows sandbox for its sandboxed modes
-([Windows sandbox](https://developers.openai.com/codex/windows/windows-sandbox)): the newer
-`mxc` mode needs recent Windows 11 builds; the `elevated` mode needs a one-time
-administrator-approved setup (`codex sandbox setup --elevated`) and uses separate
-lower-privilege sandbox users and firewall rules; the `unelevated` fallback has weaker network
-isolation. The default full-auto profile bypasses it, so none of that applies unless you
-choose `--sandbox` in `args`. If you do, set the sandbox up under the worker's account and try
-a run interactively first: the worker can't answer a setup prompt, and how `codex exec`
-behaves when setup is missing is not documented. WSL2 uses the Linux sandbox instead.
-
-**macOS and Linux:** the sandboxed modes use Seatbelt on macOS and bubblewrap on Linux and
-WSL2; the docs ask you to install `bwrap` first, and WSL1 is not supported
-([sandboxing](https://developers.openai.com/codex/sandboxing)). The default profile uses
-neither.
-
-### Live mode with Kiro
-
-Prerequisites, under the account and environment the worker runs as (the background
-launchers' account, not just your terminal):
-
-- Kiro CLI 3.0.0 or later (`kiro-cli --version`), because factory starts Kiro with `--v3`.
-  `factory agents` notes an older CLI, and `factory doctor` flags it (a failure in live mode)
-  unless the agent's `args` pick a harness themselves, such as `--v2`. It must also run on a
-  platform Kiro supports. Kiro lists
-  "macOS, Windows 11 (PowerShell), or Linux (glibc 2.34+ or musl variant)" for the CLI
-  ([installation](https://kiro.dev/docs/getting-started/installation/)) and doesn't document
-  which CPU architectures the CLI supports. `factory agents` shows the platform check, and in
-  live mode `factory doctor` fails on an OS outside that list, such as Windows 10 or a Linux
-  with an older glibc. Elsewhere the CPU shows as "not documented" rather than supported.
-- `KIRO_API_KEY` in the worker's environment. "Headless mode requires an API key set as the
-  `KIRO_API_KEY` environment variable" ([headless mode](https://kiro.dev/docs/cli/headless/)).
-  API keys are available on Kiro Pro, Pro+, Pro Max and Power subscriptions and are created
-  at app.kiro.dev ([authentication](https://kiro.dev/docs/getting-started/authentication/)).
-  `factory agents` and `factory doctor` check that the variable is set, but can't tell
-  whether the key works without sending a prompt (`factory agents --deep` does).
-  [Agent credentials](docs/background-operation.md#agent-credentials) shows how to give it to
-  each launcher.
-- **Don't put the key in `agents.kiro.env`** or anywhere else in the config file. The config
-  is plain text that is easy to copy, share or commit. (`factory doctor` checks each agent
-  with its `agents.<name>.env`, as a live run does, but `factory agents` looks only at the
-  worker's own environment.)
-- A `checkoutPath` for the repository and a `prompt` for the action, as for Claude Code.
-
-Each job runs, in its worktree, with the prompt file on stdin:
-
-```
-kiro-cli chat --no-interactive --v3 --trust-all-tools <agents.kiro.args>
-```
-
-- `chat --no-interactive` is Kiro's [headless mode](https://kiro.dev/docs/cli/headless/).
-  With no prompt argument it reads the whole instruction from stdin. Don't add a positional
-  argument in `agents.kiro.args`: Kiro would use it as the prompt and ignore stdin.
-- `--v3` pins the agent harness, as Kiro recommends for scripts, so a change in Kiro's
-  defaults doesn't change how jobs run ([agent harness](https://kiro.dev/docs/cli/agent-harness/)).
-  `--v2`, `--v3` or `--agent-engine` in `agents.kiro.args` replaces it.
-- The run's outcome is Kiro's exit code ([exit codes](https://kiro.dev/docs/reference/exit-codes/)):
-  0 is `succeeded`. Anything else fails the run, with what the code means (1 is a general
-  failure such as an authentication error or invalid arguments, 3 a required MCP server that
-  didn't start, 4 an agent named by `--agent` that isn't available) and the last line Kiro
-  printed. The summary shows Kiro's last output lines.
-- Kiro also has `--output-format stream-json` (JSON Lines on stdout), but its docs don't yet
-  describe the record format, so the adapter doesn't ask for it or read it. If you add it to
-  `agents.kiro.args`, `run.log` keeps the event stream, the exit code still decides the
-  outcome, and the summary shows the last JSON lines.
-
-**Default permission profile: full auto.** `--trust-all-tools` lets Kiro use any tool
-without asking, inside the job's worktree. As with Claude Code, that is not a sandbox: commands
-run as your user and can reach the network and files outside the worktree. To narrow it, set
-`--trust-tools` in `agents.kiro.args`. Any `--trust-tools` or `--trust-all-tools` there
-replaces the default:
-
-```yaml
-agents:
-  kiro:
-    args:
-      - --trust-tools=read_file,grep_search   # comma-separated tool ids; others are denied
-      - --model
-      - <model id>                            # see: kiro-cli chat --list-models
-```
-
-A headless run can't ask for approval, so a tool that isn't trusted is denied, sub-agents'
-tool calls included. With a narrower profile, trust every tool the action needs, including
-the one that runs `git add` and `git commit` (tool ids are in Kiro's
-[built-in tools](https://kiro.dev/docs/tools/)). `--trust-tools` can't approve hook
-confirmations; only `--trust-all-tools` does. On V3, `--sandbox` makes the run fail rather
-than run commands without Kiro's
-[local command sandbox](https://kiro.dev/docs/sandbox/).
-Other flags from the [CLI reference](https://kiro.dev/docs/reference/cli-commands/), such as
-`--model`, `--agent` and `--effort`, pass through unchanged after the adapter's own.
-
-Kiro may load project configuration checked into the repository (for example agents, hooks
-and MCP servers under `.kiro/`). Point live mode only at repositories whose
-checked-in Kiro settings you trust.
-
-**Windows:** Kiro supports the CLI on Windows 11 only. The worker starts `kiro-cli` directly,
-without PowerShell. Live runs on Windows have been tested only against a stand-in CLI, not a
-real Kiro install.
-
-**Claude Code and Kiro together:** with both in a pool, such as the default
-`general: { agents: [claude, kiro] }`, the queue hands consecutive jobs to them in turn
-(round-robin). Each still needs its own prerequisites above.
-
-## Files and locations
-
-| | Windows | macOS | Linux |
-| --- | --- | --- | --- |
-| Config | `%APPDATA%\software-factory\config.yaml` | `~/Library/Application Support/software-factory/config.yaml` | `$XDG_CONFIG_HOME/software-factory/config.yaml` (default `~/.config`) |
-| State (`state.db`, `worktrees/`) | `%LOCALAPPDATA%\software-factory\` | `~/Library/Application Support/software-factory/` | `$XDG_STATE_HOME/software-factory/` (default `~/.local/state`) |
-| Logs (`factory.log`, `runs/`) | `%LOCALAPPDATA%\software-factory\logs\` | `~/Library/Logs/software-factory/` | `$XDG_STATE_HOME/software-factory/logs/` |
-
-Overrides:
-
-- `FACTORY_HOME=<dir>` puts config (`<dir>/config.yaml`), state (`<dir>/state.db`) and logs
-  (`<dir>/logs/`) under one directory.
-- `--config <path>` or `FACTORY_CONFIG=<path>` changes only the config file; `--config` wins.
-  Relative paths in the config (such as prompt files) resolve against the config file's
-  directory.
+With `review: true`, the loop closes without a person in it: a second agent (never the one
+that wrote the code, unless you allow that) reviews every head of such a PR in a throwaway
+worktree and ends with a verdict. "Changes requested" queues a revision, up to `maxRevisions`
+rounds; "ready to merge" marks the draft ready for review, and there it stops. GitHub does
+not let an account approve its own PR, so the verdict is recorded by Updraft and posted as a
+comment review. Merging is still up to a person unless `autoMerge` is set, which is off by
+default and should stay off until you have read what its checks do and do not cover. See
+[docs/review-loop.md](docs/review-loop.md).
 
 ## Background operation
 
-`factory start` runs in the foreground. To start it at login, use the launchers shipped in
+`updraft start` runs in the foreground. To start it at login, use the launchers shipped in
 `examples/launchers/` (also inside the installed package):
 
 | Platform | Launcher |
 | --- | --- |
 | Windows | `windows/register-task.ps1` registers a Task Scheduler task at logon for your account (no stored password), with restart on failure, no time limit and no overlapping runs. `unregister-task.ps1` removes it |
-| macOS | `macos/install-launchagent.sh` installs a per-user LaunchAgent from `software-factory.plist.template` (`--uninstall` removes it) |
+| macOS | `macos/install-launchagent.sh` installs a per-user LaunchAgent from `updraft.plist.template` (`--uninstall` removes it) |
 | Linux (systemd) | `linux/install-systemd-user.sh` installs a `systemd --user` service; `loginctl enable-linger` keeps it running without a login session |
-| Other hosts | Run `factory start --config <path>` in the foreground under your existing supervisor |
+| Other hosts | Run `updraft start --config <path>` in the foreground under your existing supervisor |
 
 Each launcher runs `node <package>/dist/cli.js start --config <path>` with absolute paths, a
-working directory and an explicit `PATH`. Run `factory doctor` under the same account and
+working directory and an explicit `PATH`. Run `updraft doctor` under the same account and
 environment before relying on it. Details, log locations and troubleshooting:
 [docs/background-operation.md](docs/background-operation.md).
 
-## Publication
-
-Off by default. Set `repositories.<OWNER/REPO>.publish` to `draft-pr` or `pr` to have the
-worker publish a live run's work. It applies only in `live` mode, to actions with
-`output: local-branch`, and only to runs that **succeeded and left at least one commit** on
-the job branch. Failed runs keep their local worktree as before; a run with no commits is
-recorded as "not published". The worker publishes, never the agent, as the active `gh`
-account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
-
-1. **Push** the job branch to the repo's remote in `checkoutPath` (the same remote the
-   worktree was fetched from): `git push <remote> <sha>:refs/heads/factory/issue-<n>-<jobId>`.
-   The push only ever creates the branch: it carries `--force-with-lease=<ref>:` with an empty
-   expected value, so Git refuses it if the branch exists by the time it runs, and it never
-   moves an existing branch, not even by a fast-forward. It never pushes the base branch and
-   refuses any branch other than the run's job branch. The remote must have exactly one push URL, and it must point at the
-   configured repository (`git push` sends to every `pushurl` a remote has, so a remote with
-   several is refused). The check and the push then both name that URL directly, from a
-   throwaway repository that borrows the clone's objects but none of its configuration, with
-   global and system Git config switched off, so a remote, `insteadOf` rule or hook changed
-   after the check can't send the push elsewhere. If the branch already exists at that URL at
-   the same commit, the push is skipped; at a different commit, before or during the push,
-   publication fails and the remote branch is left alone.
-2. **Open a PR** from the job branch into the base branch (draft for `draft-pr`), titled with
-   the issue title. The body says `Closes #<n>`, lists the commits and the diffstat, quotes the
-   agent's final message (capped, in a code block so mentions and closing keywords in it stay
-   inert), and carries the run id and a hidden `<!-- factory-run: <runId> -->` marker.
-3. **Comment on the issue** with a link to the PR and a short summary, with the same marker.
-
-Merging stays a human decision: the worker never merges, approves or marks a PR ready for
-review.
-
-**Authentication.** API calls use the token. For an `https://github.com/...` remote, the push
-uses the same token, handed to that one `git` process as an `Authorization` header scoped to
-`https://github.com/` through `GIT_CONFIG_*` environment variables, so it is not in the command
-line, the remote URL, a file or the logs. For SSH remotes (including host aliases) the push uses
-your SSH key and `~/.ssh/config`; because Git config files are ignored for the push, a
-`core.sshCommand` there does not apply (set `GIT_SSH_COMMAND` in the worker's environment
-instead). Git hooks and tracing are turned off for these commands.
-
-**Idempotent retries.** Each step is recorded as it completes (in the state DB, separately
-from the run, so publication never changes a run's outcome), and each step checks GitHub
-before writing: the remote branch before pushing, any PR for the head branch in any state
-(open, closed or merged) before opening one, and an issue comment with the run's marker before
-commenting. A retry resumes where the last attempt stopped and never creates a duplicate.
-Only one attempt owns a publication at a time. Right before each push, PR and comment it
-confirms it still owns the publication and renews its lease, so a slow lookup can't lead to
-a late write. Every GitHub request gives up after 60 seconds, an attempt stops after 8
-minutes (and is retried later), and an attempt that lost its lease can neither write to
-GitHub again nor change the recorded state.
-
-**Failures.** Network errors, GitHub 5xx responses and rate limits are retried by the worker
-on its own after each poll, with backoff, up to five attempts. Other failures wait for you:
-`factory status` shows the error, and `factory publish RUN_ID` retries through the same path.
-`factory publish` also publishes a succeeded run the worker did not publish, for example one
-from before you turned `publish` on. Permission errors say what is needed: push access to the
-repository and a token with the classic `repo` scope, or a fine-grained token with Contents,
-Pull requests and Issues set to read and write (`gh auth refresh -h github.com -s repo`).
-GitHub refuses draft PRs for private repositories on some plans; publication then fails with
-a message to set `publish: pr`. It never falls back on its own.
-
-`factory status` shows each run's PR link or publication error, and `factory doctor` checks
-that the active account has push access to every repository with `publish` set.
-
 ## Security
 
+The key points; [docs/security.md](docs/security.md) has the full statement of each.
+
 - Only GitHub logins in `dispatch.allowedActors` (or a workflow's `allowedActors`) can
-  dispatch work. The check uses the actor on the label event; with an empty list, no events
-  are queued. In live mode the worker checks again right before it starts an agent: the label
-  application that queued the job must still be the latest one for that label on the issue,
-  and its actor must still be allowed. If the label was removed and put back since, the old
-  job is canceled; a reapplication by an allowed actor has queued its own job.
-- Issue titles, bodies and labels are untrusted input. In live mode they reach the agent
-  only through a prompt file (on stdin or by path), never a command line, fenced and
-  labelled as untrusted; the default prompt
-  ([examples/prompts/implement-issue.md](examples/prompts/implement-issue.md)) also tells
-  agents not to follow instructions in them.
-- Without `publish`, the worker only reads from GitHub and never pushes. In `prepare-only`
-  and `live` mode it fetches into your clone and creates branches and worktrees; Git hooks
-  configured for the clone (such as `post-checkout`) run as they would for any
-  `git worktree add`. With `publish` set for a repository, the worker also writes to GitHub
-  as your `gh` account: it creates job branches (never moving an existing one, never the
-  base branch), opens PRs and comments on issues (see [Publication](#publication)). It never merges.
-- Publication is done by the worker after the agent has exited; the agent itself is not given
-  `GH_TOKEN`/`GITHUB_TOKEN`. That is a guard against accidental use, not isolation: the agent
-  runs as your user, so it can still reach whatever that user can, including `gh auth token`,
-  Git credential helpers (such as the one `gh auth setup-git` installs) and SSH keys, and so
-  could push or call the API itself. Only an isolation boundary such as a separate account,
-  VM or container would prevent that.
-- In live mode the agent runs as your user, in the job's worktree, with the worker's
-  environment minus `GH_TOKEN`/`GITHUB_TOKEN`. That is not a sandbox: what the agent may do
-  is up to the agent CLI's own permission settings. Claude Code runs in full-auto mode by
-  default (see [Live mode with Claude Code](#live-mode-with-claude-code)), and so do Codex
-  (see [Live mode with Codex](#live-mode-with-codex)) and Kiro
-  (see [Live mode with Kiro](#live-mode-with-kiro)); the allowlist of actors who can dispatch
-  work is the guard on who can start such a run.
-- Agent credentials such as `KIRO_API_KEY` belong in the worker's environment, set by its
-  launcher, not in the config file
-  (see [Agent credentials](docs/background-operation.md#agent-credentials)).
-- GitHub access uses `GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`. The CLI
-  does not store tokens.
+  dispatch work, and with an empty list no events are queued. In live mode the check is
+  repeated right before an agent starts.
+- Applying the label approves the issue text as it is then. In live mode a job is canceled
+  if the title or body was edited afterwards by someone who is not an allowed actor;
+  re-apply the label to dispatch the edited issue.
+- Issue titles, bodies and labels are untrusted input. They reach the agent only through a
+  prompt file, fenced and labelled as untrusted, never a command line.
+- In live mode the agent runs as your user, in full-auto mode by default. That is not a
+  sandbox: it can run any command, reach the network and read or write outside the worktree.
+  The allowlist of actors is the guard on who can start such a run.
+- The agent is not given `GH_TOKEN`/`GITHUB_TOKEN`. That is a guard against accidental use,
+  not isolation: it can still reach whatever your user can, including `gh auth token`, Git
+  credential helpers and SSH keys. Only an isolation boundary such as a separate account, VM
+  or container would prevent that.
+- `agents.<name>.container` puts that boundary in place: the agent and the verify commands run
+  in containers that see only the job's worktree and what a commit needs. See
+  [Isolating agents](docs/isolation.md) for what that does and does not protect against.
+- Without `publish`, the worker only reads from GitHub and never pushes. With `publish`, it
+  creates job branches, opens PRs and comments on issues as your `gh` account. It never
+  merges, unless you set `autoMerge`.
+- `autoMerge` (off by default, needs `review`) lets Updraft merge a PR that its own reviewing
+  agent found ready. That agent read untrusted issue text and untrusted code, either of which
+  can be written to talk it into approving. The checks before the merge are listed, with what
+  they do not cover, in [docs/review-loop.md](docs/review-loop.md#auto-merge).
+- Agent credentials such as `KIRO_API_KEY` belong in the worker's environment, not in the
+  config file. The CLI does not store tokens.
+- With `github.app`, the worker acts as a GitHub App installation instead of your account,
+  with one-hour tokens limited to the repositories the App is installed on. The App's private
+  key stays in a file only you can read, never in the config; an agent running as your user
+  can still read that file unless it runs in a container or the worker has its own OS
+  account. The bot cannot dispatch work unless you list it in `allowedActors`. See
+  [docs/github-app.md](docs/github-app.md#security).
+
+## Files and locations
+
+| | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| Config | `%APPDATA%\updraft\config.yaml` | `~/Library/Application Support/updraft/config.yaml` | `$XDG_CONFIG_HOME/updraft/config.yaml` (default `~/.config`) |
+| State (`state.db`, `worktrees/`) | `%LOCALAPPDATA%\updraft\` | `~/Library/Application Support/updraft/` | `$XDG_STATE_HOME/updraft/` (default `~/.local/state`) |
+| Logs (`updraft.log`, `runs/`) | `%LOCALAPPDATA%\updraft\logs\` | `~/Library/Logs/updraft/` | `$XDG_STATE_HOME/updraft/logs/` |
+
+Overrides:
+
+- `UPDRAFT_HOME=<dir>` puts config (`<dir>/config.yaml`), state (`<dir>/state.db`) and logs
+  (`<dir>/logs/`) under one directory.
+- `--config <path>` or `UPDRAFT_CONFIG=<path>` changes only the config file; `--config` wins.
+  Relative paths in the config (such as prompt files) resolve against the config file's
+  directory.
+
+## Upgrading from software-factory-cli
+
+Updraft was first called `software-factory-cli`, with the command `factory`. The rename is a
+clean break: nothing reads the old names. To move an existing install:
+
+1. Stop the worker and remove its launcher using the old package's scripts (the Task Scheduler
+   task, LaunchAgent or systemd unit), then `npm uninstall -g software-factory-cli` and
+   `npm install -g @allenheltondev/updraft`.
+2. Rename the `software-factory` config and state directories to `updraft` (see
+   [Files and locations](#files-and-locations)). The worker log is now `updraft.log`.
+3. Replace `FACTORY_HOME` and `FACTORY_CONFIG` with `UPDRAFT_HOME` and `UPDRAFT_CONFIG`
+   wherever you set them, and install the launcher again from the new package.
+4. Let queued and running jobs finish before you switch, or re-apply the label afterwards.
+   Job branches are now `updraft/issue-<n>-<jobId>` and the hidden markers in PRs and comments
+   are `updraft-run`, so a job started under the old name is not matched: publishing it again
+   would not find its `factory/issue-...` branch or its existing PR.
 
 ## Development
 
 ```sh
 npm ci
 npm run typecheck   # tsc --noEmit
+npm run lint        # eslint: type-aware correctness rules, no formatting rules
 npm test            # vitest
 npm run build       # compile to dist/
 node scripts/pack-smoke.mjs   # npm pack, install into a temp prefix, run version/validate/status

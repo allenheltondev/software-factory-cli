@@ -1,9 +1,9 @@
 // Per-job branches and worktrees (design §4). The user's clone (checkoutPath) is only
 // the source: each job gets its own branch and a worktree under the per-user data dir.
-import { existsSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import type { FactoryPaths } from '../paths.js';
+import type { UpdraftPaths } from '../paths.js';
 import {
   addWorktree,
   listWorktreePaths,
@@ -15,24 +15,30 @@ import {
   localBranchExists,
   selectRepoRemote,
   remoteDefaultBranch,
+  runGit,
   type GitOptions,
 } from './git.js';
 
 /** Root for all job worktrees: <dataDir>/worktrees/<repoId>/<jobId>[-<attempt>]. */
-export function worktreesRoot(paths: Pick<FactoryPaths, 'dataDir'>): string {
+export function worktreesRoot(paths: Pick<UpdraftPaths, 'dataDir'>): string {
   return join(paths.dataDir, 'worktrees');
 }
 
 /**
- * Branch for a job: factory/issue-<n>-<jobId>. Later attempts (after `factory retry`)
+ * Branch for a job: updraft/issue-<n>-<jobId>. Later attempts (after `updraft retry`)
  * get a -<attempt> suffix so the earlier attempt's branch and worktree stay inspectable.
  */
 export function jobBranchName(job: { id: string; issueNumber: number }, attempt: number): string {
-  return `factory/issue-${job.issueNumber}-${job.id}${attempt > 1 ? `-${attempt}` : ''}`;
+  return `updraft/issue-${job.issueNumber}-${job.id}${attempt > 1 ? `-${attempt}` : ''}`;
+}
+
+/** Is `branch` shaped like a job branch? Publication and revisions push to nothing else. */
+export function isJobBranchName(branch: string): boolean {
+  return /^updraft\/issue-\d+-job_[A-Za-z0-9]+(-\d+)?$/.test(branch);
 }
 
 export function jobWorktreePath(
-  paths: Pick<FactoryPaths, 'dataDir'>,
+  paths: Pick<UpdraftPaths, 'dataDir'>,
   job: { id: string; repoId: number },
   attempt: number,
 ): string {
@@ -77,6 +83,47 @@ export function withCheckoutLock<T>(checkoutPath: string, fn: () => Promise<T>):
   return result;
 }
 
+/** `sha` as a full commit id when the clone has that commit, else null. */
+async function tryCommit(sha: string, opts: GitOptions): Promise<string | null> {
+  try {
+    return (await runGit(['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], opts)).stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remove a throwaway worktree and its branch, whatever state they are in (uncommitted changes,
+ * new commits): a reviewer run's worktree, of which nothing is kept. Serialized per clone like
+ * every other operation on it. Returns notes about anything that could not be removed.
+ */
+export function discardWorktree(o: { checkoutPath: string; worktreePath: string; branch: string; git?: string }): Promise<string[]> {
+  return withCheckoutLock(o.checkoutPath, async () => {
+    const opts: GitOptions = { cwd: o.checkoutPath, git: o.git };
+    const notes: string[] = [];
+    const attempt = async (what: string, args: string[]) => {
+      try {
+        await runGit(args, opts);
+      } catch (err) {
+        notes.push(`${what}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+    await attempt(`could not remove the worktree ${o.worktreePath}`, ['worktree', 'remove', '--force', o.worktreePath]);
+    if (existsSync(o.worktreePath)) {
+      // Git refuses when the directory is in a state it does not understand; nothing in it is kept.
+      try {
+        rmSync(o.worktreePath, { recursive: true, force: true });
+        notes.length = 0;
+      } catch (err) {
+        notes.push(`could not delete ${o.worktreePath}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      await attempt('could not prune worktree records', ['worktree', 'prune']);
+    }
+    if (await localBranchExists(o.branch, opts)) await attempt(`could not delete the branch ${o.branch}`, ['branch', '-D', o.branch]);
+    return notes;
+  });
+}
+
 export class PrepareError extends Error {
   constructor(message: string) {
     super(message);
@@ -93,6 +140,11 @@ export interface PrepareRequest {
   remote?: string | undefined;
   /** Configured base branch; defaults to the remote's default branch. */
   baseBranch?: string | undefined;
+  /**
+   * Start the worktree at exactly this commit instead of the fetched head of `baseBranch` (a
+   * reviewer run reviews one commit). The branch is still fetched; the commit must then be in the clone.
+   */
+  atSha?: string | undefined;
   branch: string;
   worktreePath: string;
   git?: string;
@@ -167,7 +219,13 @@ export function prepareJobWorktree(req: PrepareRequest): Promise<PreparedWorktre
     const baseBranch = req.baseBranch ?? (await remoteDefaultBranch(remote.name, net));
     await assertValidBranchName(baseBranch, opts);
     await assertValidBranchName(branch, opts);
-    const baseSha = await fetchBranch(remote.name, baseBranch, net);
+    let baseSha = await fetchBranch(remote.name, baseBranch, net);
+    if (req.atSha !== undefined && req.atSha !== baseSha) {
+      if (!/^[0-9a-f]{40,64}$/.test(req.atSha) || (await tryCommit(req.atSha, opts)) !== req.atSha) {
+        throw new PrepareError(`commit ${req.atSha} is not in ${checkoutPath} after fetching ${baseBranch} (now at ${baseSha}); the branch was rewritten`);
+      }
+      baseSha = req.atSha;
+    }
 
     if (await localBranchExists(branch, opts)) {
       throw new PrepareError(`branch ${branch} already exists in ${checkoutPath}; refusing to reuse it`);
@@ -180,7 +238,7 @@ export function prepareJobWorktree(req: PrepareRequest): Promise<PreparedWorktre
       await addWorktree(worktreePath, branch, baseSha, opts);
     } catch (err) {
       // Git can create the branch and worktree and still exit non-zero. Keep what it made
-      // (failed runs stay inspectable; factory clean leaves them alone) and say so.
+      // (failed runs stay inspectable; updraft clean leaves them alone) and say so.
       if (await worktreeWasCreated(worktreePath, opts)) {
         req.onCheckout?.(worktreePath);
         const detail = err instanceof Error ? err.message : String(err);

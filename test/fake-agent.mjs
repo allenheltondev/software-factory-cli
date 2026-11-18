@@ -14,6 +14,12 @@
 //   stubborn  like hang, but both processes ignore SIGTERM and SIGINT (POSIX escalation to SIGKILL)
 //   orphan    start a child process, write both pids to --pids-file, and exit 0 leaving the child
 //   env       print selected environment variables; exit 0
+//   review    act as a reviewer: write REVIEW_NOTES.md and try to commit it (none of which may
+//             ever be published), print findings, and end with a verdict line; exit 0.
+//             --verdict <v> picks it: ready-to-merge, changes-requested, or one of the broken
+//             ones (none, both, twice, garbage, trailing). Without it the verdict is
+//             changes-requested on a first review and ready-to-merge once the prompt carries an
+//             earlier review.
 import { execFileSync, spawn } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 
@@ -66,6 +72,16 @@ switch (mode) {
     process.exit(0);
     break;
   }
+  case 'uncommitted': {
+    // Succeeds like 'success', but forgets to commit one of its files.
+    writeFileSync('FAKE_AGENT.md', `# Done\n\n${prompt.split('\n')[0]}\n`);
+    git('add', 'FAKE_AGENT.md');
+    git('commit', '--quiet', '-m', 'fake agent: implement the issue');
+    writeFileSync('forgot-to-commit.txt', 'the tests may pass because of this file\n');
+    say('fake agent: all done');
+    process.exit(0);
+    break;
+  }
   case 'fail': {
     writeFileSync('partial.txt', 'half-finished work\n');
     writeFileSync('README.md', '# widgets\n\nedited by the fake agent\n');
@@ -86,6 +102,46 @@ switch (mode) {
       process.exit(0);
     });
     break;
+  case 'review': {
+    writeFileSync('REVIEW_NOTES.md', 'notes the reviewer should not have left\n');
+    try {
+      git('add', 'REVIEW_NOTES.md');
+      git('commit', '--quiet', '-m', 'fake reviewer: must be discarded');
+      say(`fake reviewer: committed ${git('rev-parse', '--short', 'HEAD')}`);
+    } catch {
+      say('fake reviewer: could not commit');
+    }
+    const verdict = opt('--verdict') ?? (prompt.includes('# Earlier automated reviews') ? 'ready-to-merge' : 'changes-requested');
+    say('fake reviewer: findings');
+    say('Blockers:');
+    say('- widget.txt:1 @octocat says this closes #1; it needs a second line');
+    say('Suggestions:');
+    say('- none');
+    const line = (v) => say(`UPDRAFT-VERDICT: ${v}`);
+    switch (verdict) {
+      case 'none':
+        break;
+      case 'both':
+        line('ready-to-merge');
+        line('changes-requested');
+        break;
+      case 'twice':
+        line('ready-to-merge');
+        line('ready-to-merge');
+        break;
+      case 'garbage':
+        line('looks good to me');
+        break;
+      case 'trailing':
+        line('ready-to-merge');
+        say('but please also rename the file');
+        break;
+      default:
+        line(verdict);
+    }
+    process.exit(0);
+    break;
+  }
   case 'env':
     for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'FAKE_ADAPTER_ENV', 'FAKE_CONFIG_ENV']) say(`env ${k}=${process.env[k] ?? '(unset)'}`);
     process.exit(0);

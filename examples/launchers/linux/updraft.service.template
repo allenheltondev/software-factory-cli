@@ -1,4 +1,4 @@
-# systemd --user unit for `factory start`.
+# systemd --user unit for `updraft start`.
 #
 # install-systemd-user.sh fills the __PLACEHOLDERS__ (with systemd quoting and % escaping)
 # and writes ~/.config/systemd/user/<name>.service. To fill it by hand, use absolute paths,
@@ -8,7 +8,7 @@
 # logout, enable lingering once:  loginctl enable-linger "$USER"
 
 [Unit]
-Description=software-factory worker (factory start)
+Description=updraft worker (updraft start)
 
 [Service]
 Type=simple

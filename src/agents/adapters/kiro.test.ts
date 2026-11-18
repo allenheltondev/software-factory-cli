@@ -48,7 +48,7 @@ describe('kiro adapter: invocation', () => {
   });
 
   it('appends config args last', () => {
-    expect(args(['--model', 'claude-sonnet-4', '--agent', 'factory'])).toEqual([...DEFAULT_ARGS, '--model', 'claude-sonnet-4', '--agent', 'factory']);
+    expect(args(['--model', 'claude-sonnet-4', '--agent', 'updraft'])).toEqual([...DEFAULT_ARGS, '--model', 'claude-sonnet-4', '--agent', 'updraft']);
   });
 
   it('a trust flag in the config args replaces the full-auto default', () => {
@@ -69,8 +69,8 @@ describe('kiro adapter: invocation', () => {
   });
 });
 
-describe('kiro adapter: version requirement', () => {
-  it('--v3 needs Kiro CLI 3.0.0; an unreadable version is unknown', () => {
+describe('kiro adapter: version baseline', () => {
+  it('3.0.0 is the baseline the adapter is written against; an unreadable version is unknown', () => {
     expect(kiroSupportsV3('2.9.9')).toBe('no');
     expect(kiroSupportsV3('1.20.0-beta.1')).toBe('no');
     expect(kiroSupportsV3('3.0.0')).toBe('yes');
@@ -108,8 +108,8 @@ describe('kiro adapter: results', () => {
       outcome: 'failed',
       error: 'kiro-cli exited with code 3 (an MCP server required by --require-mcp-startup did not start)',
     });
-    expect(kiroAdapter.interpretExit!(exit('agent "factory" not found\n', 4)).error).toBe(
-      'kiro-cli exited with code 4 (the agent the run named (--agent or chat.defaultAgent) is not available): agent "factory" not found',
+    expect(kiroAdapter.interpretExit!(exit('agent "updraft" not found\n', 4)).error).toBe(
+      'kiro-cli exited with code 4 (the agent the run named (--agent or chat.defaultAgent) is not available): agent "updraft" not found',
     );
   });
 

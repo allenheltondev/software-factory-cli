@@ -23,7 +23,7 @@ describe('agentStatus / agentHint', () => {
   });
 });
 
-describe('factory agents', () => {
+describe('updraft agents', () => {
   it('renders path, shim launch target, version, sign-in, platform and notes', async () => {
     const ctx = fakeContext({ agents: [windowsClaude, missingAgentReport('kiro')] });
     expect(await agentsCommand(ctx)).toBe(EXIT.OK);
@@ -49,10 +49,10 @@ describe('factory agents', () => {
     const ctx = fakeContext({ agents: [fakeAgentReport('kiro', { version: '2.4.1', kiroV3: 'no' })] });
     expect(await agentsCommand(ctx)).toBe(EXIT.OK);
     expect(ctx.out.text).toContain(
-      'note      Kiro CLI 2.4.1 is older than 3.0.0: factory starts Kiro with --v3, which needs Kiro CLI 3.0.0 or later, so live runs fail. Upgrade Kiro CLI, or add --v2 to agents.<name>.args',
+      'note      Kiro CLI 2.4.1 is older than 3.0.0, the release Updraft is written against. Updraft starts Kiro with --v3; earlier releases that have the V3 harness may work but are not verified. If live runs fail to start, upgrade Kiro CLI or add --v2 to agents.<name>.args',
     );
     expect(renderAgents([fakeAgentReport('kiro', { version: 'nightly', kiroV3: 'unknown' })])).toContain(
-      'note      could not read a Kiro CLI version from "nightly"; factory starts Kiro with --v3, which needs Kiro CLI 3.0.0 or later',
+      'note      could not read a Kiro CLI version from "nightly", so it is unknown whether it is 3.0.0 or later. Updraft starts Kiro with --v3. If live runs fail to start, upgrade Kiro CLI or add --v2 to agents.<name>.args',
     );
     expect(renderAgents([fakeAgentReport('kiro', { version: '3.0.0', kiroV3: 'yes' })])).not.toContain('note');
   });

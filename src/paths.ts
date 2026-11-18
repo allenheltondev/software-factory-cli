@@ -1,9 +1,9 @@
 import { homedir as osHomedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
-export const APP_DIR = 'software-factory';
+export const APP_DIR = 'updraft';
 
-export interface FactoryPaths {
+export interface UpdraftPaths {
   configFile: string;
   /** Directory holding config.yaml; relative paths in the config resolve against it. */
   configDir: string;
@@ -16,7 +16,7 @@ export interface FactoryPaths {
 }
 
 export interface ResolvePathsOptions {
-  /** Explicit --config path. Wins over FACTORY_CONFIG. */
+  /** Explicit --config path. Wins over UPDRAFT_CONFIG. */
   configPath?: string;
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
@@ -26,10 +26,10 @@ export interface ResolvePathsOptions {
 /**
  * Per-user locations for the host OS.
  *
- * - FACTORY_HOME puts config, data and logs under one directory.
- * - FACTORY_CONFIG / --config override only the config file location.
+ * - UPDRAFT_HOME puts config, data and logs under one directory.
+ * - UPDRAFT_CONFIG / --config override only the config file location.
  */
-export function resolvePaths(opts: ResolvePathsOptions = {}): FactoryPaths {
+export function resolvePaths(opts: ResolvePathsOptions = {}): UpdraftPaths {
   const env = opts.env ?? process.env;
   const platform = opts.platform ?? process.platform;
   const home = opts.homedir ?? osHomedir();
@@ -38,8 +38,8 @@ export function resolvePaths(opts: ResolvePathsOptions = {}): FactoryPaths {
   let dataDir: string;
   let logDir: string;
 
-  if (env.FACTORY_HOME) {
-    const root = resolve(env.FACTORY_HOME);
+  if (env.UPDRAFT_HOME) {
+    const root = resolve(env.UPDRAFT_HOME);
     configDir = root;
     dataDir = root;
     logDir = join(root, 'logs');
@@ -61,7 +61,7 @@ export function resolvePaths(opts: ResolvePathsOptions = {}): FactoryPaths {
     logDir = join(xdgState, APP_DIR, 'logs');
   }
 
-  const explicit = opts.configPath ?? env.FACTORY_CONFIG;
+  const explicit = opts.configPath ?? env.UPDRAFT_CONFIG;
   const configFile = explicit ? resolve(explicit) : join(configDir, 'config.yaml');
   if (explicit) configDir = dirname(configFile);
 

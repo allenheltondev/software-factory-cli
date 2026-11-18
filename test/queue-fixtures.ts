@@ -1,4 +1,4 @@
-// Queue rows for tests that drive the worker or `factory clean` against a real DB.
+// Queue rows for tests that drive the worker or `updraft clean` against a real DB.
 import type { Db } from '../src/db/database.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope } from '../src/types.js';
 
@@ -20,8 +20,8 @@ export function insertQueuedJob(
     eventId: String(5000 + seq),
     url,
     actor: 'allen',
-    label: 'factory:ready',
-    labelsAtEnqueue: ['factory:ready'],
+    label: 'updraft:ready',
+    labelsAtEnqueue: ['updraft:ready'],
     createdAt,
   };
   db.prepare(

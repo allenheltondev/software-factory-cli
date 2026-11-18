@@ -1,22 +1,27 @@
-// OWNER: queue/worker workstream. The long-running worker behind `factory start`.
+// OWNER: queue/worker workstream. The long-running worker behind `updraft start`.
 import { hostname as osHostname } from 'node:os';
-import type { FactoryConfig } from '../config/schema.js';
+import type { UpdraftConfig } from '../config/schema.js';
 import { recordError, type Db } from '../db/database.js';
 import {
+  CANCELED_BY_USER,
   cancelClaim,
   claimNextJob,
   finishRun,
   getRun,
   heartbeatRun,
   holdsWorkerLock,
+  listCancelRequestedRuns,
   markExecutionStarted,
   releaseClaim,
   setRunProcess,
   setRunSummary,
   WorkerLockLostError,
   type Claim,
+  type FinishedRun,
 } from '../db/queue.js';
-import type { FactoryPaths } from '../paths.js';
+import { syncPublishSettings } from '../db/publish-settings.js';
+import type { UpdraftPaths } from '../paths.js';
+import type { FailureCommenter } from '../publish/failure-comment.js';
 import type { Publisher } from '../publish/publish.js';
 import type { IssueSnapshot, Job } from '../types.js';
 import { newId } from '../util/ids.js';
@@ -35,14 +40,24 @@ import {
   heartbeatWorkerLock,
   releaseWorkerLock,
 } from './lock.js';
+import { defaultContainerControl, type ContainerControl } from './container.js';
 import { defaultProcessControl, terminateIfSameProcess, type ProcessControl } from './process.js';
 import { reconcileInterruptedRuns } from './reconcile.js';
 
 export { WorkerLockedError } from './lock.js';
 
+/**
+ * How often the worker looks for `updraft cancel` requests on the runs it is executing. The
+ * heartbeat (15s) is too slow for someone watching an agent do the wrong thing, and the check is
+ * one indexed query on the local database, skipped while nothing is running.
+ */
+export const CANCEL_CHECK_MS = 2_000;
+
 export interface DaemonTiming {
   /** Lock heartbeat and run-lease refresh interval. Default 15s. */
   heartbeatMs?: number;
+  /** How often to look for user cancel requests on in-flight runs. Default 2s. */
+  cancelCheckMs?: number;
   /** Run lease length. Default 2x the stale-lock threshold (90s). */
   leaseSeconds?: number;
   /** On abort, how long to wait for in-flight runs to finish on their own. Default 20s. */
@@ -53,10 +68,10 @@ export interface DaemonTiming {
 
 export interface DaemonDeps {
   db: Db;
-  config: FactoryConfig;
-  paths: FactoryPaths;
+  config: UpdraftConfig;
+  paths: UpdraftPaths;
   log: Logger;
-  /** One poll cycle (wired to poller.pollOnce by `factory start`). */
+  /** One poll cycle (wired to poller.pollOnce by `updraft start`). */
   poll: () => Promise<unknown>;
   /** Final pre-start check (wired to poller.checkJobDispatchable). `issue` is passed to the executor. */
   checkDispatchable: (job: Job) => Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }>;
@@ -67,11 +82,19 @@ export interface DaemonDeps {
   executor?: Executor;
   /** Process liveness/termination; injectable for tests. */
   processControl?: ProcessControl;
+  /** Removal of a containerized run's container; injectable for tests. */
+  containers?: ContainerControl;
   /**
    * Publication (repositories.<repo>.publish): called after a succeeded run is recorded, and after
    * each poll to retry transient failures. Never changes a run's outcome. Absent: nothing is published.
    */
   publisher?: Publisher;
+  /**
+   * Failure comments (repositories.<repo>.commentOnFailure): called after a failed or start_failed
+   * run is recorded (it decides whether the job ended failed), and after each poll to retry
+   * transient failures. Never changes a run's outcome. Absent: nothing is posted.
+   */
+  failureCommenter?: FailureCommenter;
   /** Identity overrides, mainly for tests. */
   workerId?: string;
   hostname?: string;
@@ -129,7 +152,7 @@ interface InFlight {
 }
 
 /**
- * The long-running worker behind `factory start`:
+ * The long-running worker behind `updraft start`:
  * acquire the single-worker lock, reconcile interrupted runs from a previous
  * process, then loop: poll every pollIntervalSeconds, claim and execute jobs
  * with the configured executor, heartbeat leases, and exit cleanly on abort.
@@ -142,8 +165,10 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const hostname = deps.hostname ?? osHostname();
   const pid = deps.pid ?? process.pid;
   const processControl = deps.processControl ?? defaultProcessControl;
+  const containers = deps.containers ?? defaultContainerControl;
   const executor = deps.executor ?? new LogOnlyExecutor();
   const heartbeatMs = deps.timing?.heartbeatMs ?? WORKER_HEARTBEAT_MS;
+  const cancelCheckMs = deps.timing?.cancelCheckMs ?? CANCEL_CHECK_MS;
   const leaseSeconds = deps.timing?.leaseSeconds ?? Math.ceil((2 * WORKER_STALE_MS) / 1000);
   const shutdownTimeoutMs = deps.timing?.shutdownTimeoutMs ?? 20_000;
   const interruptGraceMs = deps.timing?.interruptGraceMs ?? 5_000;
@@ -210,17 +235,26 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
           runLog.error('could not record run summary', { error: message(err) });
         }
       }
-      let recorded = false;
+      // What was recorded can differ from what the executor reported: a run the user canceled
+      // closes as canceled even if its agent finished first, and a run another worker already
+      // reconciled is left as that worker recorded it.
+      let finished: FinishedRun | null = null;
       try {
-        finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });
-        recorded = true;
-        runLog.info('run finished', { outcome: result.outcome, ...(result.error ? { error: result.error } : {}) });
+        finished = finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });
+        if (finished?.canceledByUser) runLog.info('run canceled by user', { executorOutcome: result.outcome });
+        else runLog.info('run finished', { outcome: result.outcome, ...(result.error ? { error: result.error } : {}) });
       } catch (err) {
         runLog.error('could not record run result', { error: message(err) });
       }
       // The run is closed (its slot is free); publishing it is a separate step with its own record.
-      if (recorded && result.outcome === 'succeeded' && deps.publisher) {
+      if (finished?.outcome === 'succeeded' && deps.publisher) {
         await deps.publisher.afterRun(run.id, controller.signal);
+      }
+      // Not for interrupted runs: the worker is stopping, and whoever stops it is there to retry.
+      // Decided by what was recorded: a run the user canceled is closed as canceled whatever the
+      // executor reported, and must not be announced as a failure.
+      if (finished && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.failureCommenter) {
+        await deps.failureCommenter.afterRun(run.id, controller.signal);
       }
     })().finally(() => {
       inFlight.delete(run.id);
@@ -281,9 +315,11 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       // that takes over treats the run as started (interrupted), not as safe to requeue.
       const executionStartedAt = markExecutionStarted(db, run.id, { workerId, now });
       if (!executionStartedAt) {
-        // The lock changed hands after the check above; the new holder may already have
-        // requeued this run, in which case releaseClaim is a no-op.
+        // Either the user canceled the job while it was being checked (releaseClaim then cancels
+        // it instead of requeueing), or the lock changed hands after the check above; the new
+        // holder may already have requeued this run, in which case releaseClaim is a no-op.
         if (!holdsWorkerLock(db, workerId)) markLockLost();
+        if (getRun(db, run.id)?.cancelRequestedAt) log.info('job canceled by user before start', { jobId: job.id, runId: run.id });
         releaseClaim(db, run.id, lockLost ? 'worker lost its lock' : 'run was closed before it started', now);
         if (lockLost) return;
         continue;
@@ -309,6 +345,26 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     }
   };
 
+  /**
+   * `updraft cancel` runs in another process and can only record its request in the database.
+   * Abort the controller of each requested run: the executor stops the agent's process tree
+   * exactly as it does on shutdown, and finishRun then closes the run as canceled. On its own
+   * timer for the same reason as the heartbeat: the loop may be awaiting GitHub.
+   */
+  const checkCancelRequests = () => {
+    if (lockLost || inFlight.size === 0) return;
+    try {
+      for (const runId of listCancelRequestedRuns(db)) {
+        const f = inFlight.get(runId);
+        if (!f || f.controller.signal.aborted) continue;
+        log.info('cancel requested by user; stopping run', { runId, jobId: f.claim.job.id });
+        f.controller.abort(CANCELED_BY_USER);
+      }
+    } catch (err) {
+      log.error('could not check for cancel requests', { error: message(err) });
+    }
+  };
+
   const shutdown = async () => {
     if (inFlight.size === 0) return;
     log.info('waiting for in-flight runs', { count: inFlight.size, timeoutMs: shutdownTimeoutMs });
@@ -323,8 +379,13 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       // still verify the start time so a pid the OS reused is never killed.
       const current = getRun(db, runId);
       let note = '';
+      if (current?.container) {
+        // Before the client: stopping the runtime client alone can leave the container running.
+        note = (await containers.remove(current.container.runtime, current.container.name).catch(() => ({ note: '' }))).note;
+      }
       if (current?.pid != null) {
-        note = (await terminateIfSameProcess(processControl, current.pid, current.pidStartTime).catch(() => ({ note: '' }))).note;
+        const pidNote = (await terminateIfSameProcess(processControl, current.pid, current.pidStartTime).catch(() => ({ note: '' }))).note;
+        note = [note, pidNote].filter(Boolean).join('; ');
       }
       try {
         finishRun(db, runId, {
@@ -340,8 +401,22 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   };
 
   const heartbeatTimer = setInterval(heartbeat, heartbeatMs);
+  const cancelTimer = setInterval(checkCancelRequests, cancelCheckMs);
   try {
-    await reconcileInterruptedRuns(db, { hostname, processControl, log, now });
+    await reconcileInterruptedRuns(db, { hostname, processControl, containers, log, now });
+
+    // Record when publish was turned on or off per repository (the config has no history), then
+    // publish succeeded runs a previous worker stopped before publishing, if they ended since.
+    let settingsSynced = false;
+    try {
+      for (const c of syncPublishSettings(db, config, now)) {
+        log.info('publish setting changed', { repo: c.repoFullName, from: c.from, to: c.to, enabledAt: c.enabledAt });
+      }
+      settingsSynced = true;
+    } catch (err) {
+      log.error('could not record publish settings; skipping the startup publication sweep', { error: message(err) });
+    }
+    if (settingsSynced && deps.publisher && !signal.aborted && !lockLost) await deps.publisher.sweepUnpublished(signal);
 
     let nextPollAt = now();
     while (!signal.aborted && !lockLost) {
@@ -355,6 +430,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         nextPollAt = now() + pollMs;
         deferred.clear();
         if (deps.publisher && !signal.aborted && !lockLost) await deps.publisher.retryDue(signal);
+        if (deps.failureCommenter && !signal.aborted && !lockLost) await deps.failureCommenter.retryDue(signal);
       }
       if (signal.aborted) break;
 
@@ -365,6 +441,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     }
   } finally {
     log.info('worker stopping', { inFlight: inFlight.size });
+    clearInterval(cancelTimer);
     await shutdown();
     clearInterval(heartbeatTimer);
     releaseWorkerLock(db, workerId);

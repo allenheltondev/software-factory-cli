@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
     environment: 'node',
+    setupFiles: ['test/setup-env.ts'],
     // node:sqlite is a builtin; keep vitest from trying to bundle it.
     server: { deps: { external: [/^node:/] } },
   },

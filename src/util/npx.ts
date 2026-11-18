@@ -10,7 +10,7 @@ export function isInNpxCache(file: string): boolean {
   return i > 0 && parts.indexOf('node_modules', i + 1) > i;
 }
 
-/** What `factory start` logs when {@link isInNpxCache} is true. It never blocks startup. */
+/** What `updraft start` logs when {@link isInNpxCache} is true. It never blocks startup. */
 export const NPX_START_WARNING =
-  'factory is running from the npx cache; for background use, install it globally with "npm install -g software-factory-cli". ' +
+  'updraft is running from the npx cache; for background use, install it globally with "npm install -g @allenheltondev/updraft". ' +
   'npx can clear or change its cache folder, and an unpinned npx can run a newer CLI that upgrades the state database past what this worker supports';

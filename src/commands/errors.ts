@@ -1,5 +1,6 @@
 import { ConfigError } from '../config/io.js';
 import { GitHubError } from '../github/api.js';
+import { GitHubAppError } from '../github/app-auth.js';
 import { WorkerLockedError } from '../worker/daemon.js';
 
 export const EXIT = {
@@ -32,6 +33,8 @@ export class CancelledError extends Error {
 }
 
 export function describeGitHubError(err: GitHubError): string {
+  // GitHub App problems (github.app) carry their own instructions; the `gh` advice below is wrong for them.
+  if (err instanceof GitHubAppError) return err.message;
   if (err.isRateLimit) {
     const wait = err.retryAfterSeconds !== null ? ` Try again in ${err.retryAfterSeconds}s.` : '';
     return `GitHub rate limit reached.${wait}`;
@@ -55,7 +58,7 @@ export function describeError(err: unknown): { message: string; exitCode: number
   if (err instanceof ConfigError) return { message: err.message, exitCode: EXIT.FAILURE };
   if (err instanceof GitHubError) return { message: describeGitHubError(err), exitCode: EXIT.FAILURE };
   if (err instanceof WorkerLockedError) {
-    return { message: `${err.message}. Stop it first, or check "factory status".`, exitCode: EXIT.LOCKED };
+    return { message: `${err.message}. Stop it first, or check "updraft status".`, exitCode: EXIT.LOCKED };
   }
   if (err instanceof Error) return { message: err.message, exitCode: EXIT.FAILURE };
   return { message: String(err), exitCode: EXIT.FAILURE };

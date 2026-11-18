@@ -12,8 +12,8 @@ function newJob(eventId: string, workflowId = 'wf', issueNumber = 1): NewJob {
     eventId,
     url: 'u',
     actor: 'allen',
-    label: 'factory:ready',
-    labelsAtEnqueue: ['factory:ready'],
+    label: 'updraft:ready',
+    labelsAtEnqueue: ['updraft:ready'],
     createdAt: '2026-01-01T00:00:00Z',
   };
   return { repoId: 7, repoFullName: 'o/r', workflowId, eventId, issueNumber, action: 'a', pool: 'general', envelope };
@@ -71,7 +71,7 @@ describe('ingest persistence', () => {
       now: () => Date.parse('2026-01-01T00:00:00Z'),
     });
     expect(listQueuedJobs(db).map((j) => j.eventId)).toEqual(['1', '2', '3']);
-    expect(listQueuedJobs(db)[0]!.envelope.labelsAtEnqueue).toEqual(['factory:ready']);
+    expect(listQueuedJobs(db)[0]!.envelope.labelsAtEnqueue).toEqual(['updraft:ready']);
 
     db.prepare("UPDATE jobs SET status = 'running' WHERE id = ?").run(jobs[1]!.id);
     expect(cancelQueuedJob(db, jobs[0]!.id, 'issue #1 is closed')).toBe(true);

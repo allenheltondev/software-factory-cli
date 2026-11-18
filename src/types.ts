@@ -18,10 +18,16 @@ export interface RepoRef {
  */
 export interface EventEnvelope {
   schemaVersion: typeof ENVELOPE_SCHEMA_VERSION;
-  type: 'issue.labeled';
+  /**
+   * issue.labeled: a trigger label was applied to an issue. pull_request.changes_requested: a
+   * review asked for changes on a PR Updraft published; `revision` then says which and with what text.
+   * pull_request.review: Updraft's own reviewer run of one head commit of such a PR
+   * (repositories.<repo>.review); `review` then says which commit and with what context.
+   */
+  type: 'issue.labeled' | 'pull_request.changes_requested' | 'pull_request.review';
   repo: RepoRef;
   issue: { number: number; title: string; url: string };
-  /** GitHub issue-event ID (stringified). For PR revisions this would be the head SHA. */
+  /** GitHub issue-event ID (stringified). For a revision: "review:<review id>". For a reviewer run: "pr-review:<pr>:<head sha>". */
   eventId: string;
   /** Link to the event's subject (the issue URL). */
   url: string;
@@ -30,6 +36,101 @@ export interface EventEnvelope {
   /** Labels on the issue when the job was enqueued (used for routing). */
   labelsAtEnqueue: string[];
   createdAt: string;
+  /** Present exactly when `type` is pull_request.changes_requested. */
+  revision?: RevisionRequest;
+  /** Present exactly when `type` is pull_request.review. */
+  review?: ReviewRunRequest;
+}
+
+/**
+ * What made a review count as a change request (see reviewTrigger in src/poller/review-trigger.ts).
+ * changes_requested: a submitted review with state CHANGES_REQUESTED by an allowed actor.
+ * updraft_review: a changes-requested verdict of Updraft's own reviewer run, taken from the
+ * worker's database when the verdict is recorded (never read back from GitHub).
+ */
+export type RevisionTriggerKind = 'changes_requested' | 'updraft_review';
+
+/** One inline comment of the triggering review, as it read when the review was ingested. Untrusted text. */
+export interface ReviewCommentSnapshot {
+  path: string;
+  /** Line in the file the comment is attached to; null for a file-level or outdated comment. */
+  line: number | null;
+  body: string;
+  /** The diff hunk GitHub shows above the comment (capped); '' when there is none. */
+  diffHunk: string;
+}
+
+/**
+ * The triggering review as it read when it was ingested. A revision run uses this snapshot and
+ * never re-reads the review, so an edit made after ingestion cannot reach the agent.
+ */
+export interface ReviewSnapshot {
+  /** GitHub's node id of the review; the dedupe key. */
+  id: string;
+  url: string;
+  author: string;
+  submittedAt: string;
+  body: string;
+  comments: ReviewCommentSnapshot[];
+  /** Inline comments left out: beyond the cap, or not written by an allowed actor. */
+  omittedComments: number;
+}
+
+/** The revision a pull_request.changes_requested job carries out. */
+export interface RevisionRequest {
+  trigger: RevisionTriggerKind;
+  /** `branch` is the PR's head: the job branch Updraft pushed when it opened the PR. */
+  pullRequest: { number: number; url: string; branch: string };
+  /** The run whose publication opened the PR. */
+  sourceRunId: string;
+  /** Event id of the label application that queued the original job; the issue text is vouched for against it. */
+  originalEventId: string;
+  review: ReviewSnapshot;
+  /**
+   * updraft_review only: the head commit the verdict was for. The revision is dropped as stale
+   * unless the pull request is still at this commit when it starts.
+   */
+  reviewedSha?: string;
+}
+
+/** What Updraft's reviewer concluded about one head commit. Anything else is not a verdict. */
+export type ReviewVerdict = 'ready-to-merge' | 'changes-requested';
+export const REVIEW_VERDICTS: readonly ReviewVerdict[] = ['ready-to-merge', 'changes-requested'];
+
+/** An earlier Updraft review of the same pull request, as given to a later reviewer run. Untrusted text. */
+export interface PriorReviewSnapshot {
+  headSha: string;
+  verdict: ReviewVerdict;
+  agent: string;
+  findings: string;
+}
+
+/** The reviewer run a pull_request.review job carries out. */
+export interface ReviewRunRequest {
+  /** `branch` is the PR's head branch, `baseBranch` the branch it was opened against (null when unknown). */
+  pullRequest: { number: number; url: string; branch: string; baseBranch: string | null };
+  /** The commit to review. The verdict is bound to it. */
+  headSha: string;
+  /** Agent of the pull request's latest code run when the job was queued; never picked as the reviewer while another agent can be. */
+  authorAgent: string | null;
+  /** The run whose publication opened the PR. */
+  sourceRunId: string;
+  /** Event id of the label application that queued the original job; the issue text is vouched for against it. */
+  originalEventId: string;
+  /** Findings of earlier Updraft reviews of this PR, oldest first, as recorded when this job was queued. */
+  priorReviews: PriorReviewSnapshot[];
+  /** Change requests by allowed actors that queued a revision of this PR, oldest first, as snapshotted when each was ingested. */
+  changeRequests: ReviewSnapshot[];
+}
+
+/** The reviewer run a job carries out, or null for any other job. */
+export function reviewOf(job: { envelope?: EventEnvelope }): ReviewRunRequest | null {
+  return job.envelope?.type === 'pull_request.review' ? (job.envelope.review ?? null) : null;
+}
+
+/** The revision a job carries out, or null for an issue job. */
+export function revisionOf(job: { envelope?: EventEnvelope }): RevisionRequest | null {
+  return job.envelope?.type === 'pull_request.changes_requested' ? (job.envelope.revision ?? null) : null;
 }
 
 /** The issue as fetched by the worker's pre-start check, handed to the executor. Untrusted text. */
@@ -38,6 +139,11 @@ export interface IssueSnapshot {
   body: string;
   labels: string[];
   url: string;
+  /**
+   * Revision jobs only: why the body must not be given to the agent (the issue changed since an
+   * allowed actor approved it). `body` is '' then.
+   */
+  withheld?: string;
 }
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'canceled';
@@ -93,12 +199,35 @@ export interface Run {
   error: string | null;
   /** What a live agent run left behind; null for log-only and prepare-only runs. */
   summary: RunSummary | null;
+  /**
+   * When the user asked to cancel this run (`updraft cancel`). A run closed with this set has no
+   * outcome and its job is 'canceled', whatever the executor reported.
+   */
+  cancelRequestedAt: string | null;
+  /**
+   * The container a containerized live run started (agents.<name>.container): the runtime client
+   * and the container's name, so a later worker on the same host can remove it. Null when the
+   * agent ran on the host.
+   */
+  container: RunContainer | null;
 }
 
-/** Recorded after a live agent run, in run.log and the state DB (`factory status`). */
+export interface RunContainer {
+  /** Absolute path of the runtime client (docker, podman) that started the container. */
+  runtime: string;
+  name: string;
+}
+
+/** Recorded after a live agent run, in run.log and the state DB (`updraft status`). */
 export interface RunSummary {
   branch: string;
   baseSha: string;
+  /**
+   * The commit the job branch was at when the run ended, read by the worker. Publication pushes
+   * exactly this commit and refuses if the branch has moved since: a later retry must not publish,
+   * under this run's verification, a commit the run never produced. Absent in older summaries.
+   */
+  headSha?: string;
   worktree: string;
   /** Commits on the job branch since the base commit, newest first ("<short sha> <subject>"), capped. */
   commits: string[];
@@ -113,9 +242,100 @@ export interface RunSummary {
   lastOutput: string[];
   /** Parts of the summary that could not be computed. */
   notes: string[];
+  /** Result of the action's verify commands; absent when none ran (and in summaries from before they existed). */
+  verification?: VerificationSummary;
+  /** A reviewer run only: the commit it reviewed and what it concluded. Absent when no verdict could be read. */
+  review?: ReviewResult;
+}
+
+/** The parsed result of a reviewer run. `findings` is the reviewer's text before the verdict line: untrusted. */
+export interface ReviewResult {
+  headSha: string;
+  baseSha: string | null;
+  verdict: ReviewVerdict;
+  findings: string;
+}
+
+/**
+ * passed/failed: the command exited 0 / non-zero (or could not be started, or was killed by a
+ * signal). timed_out/interrupted: the worker stopped it at the step's time limit / on shutdown.
+ * not_run: an earlier command did not pass.
+ */
+export type VerificationStatus = 'passed' | 'failed' | 'timed_out' | 'interrupted' | 'not_run';
+
+export interface VerificationCommandResult {
+  /** The command as configured (an argv command joined for display). */
+  command: string;
+  status: VerificationStatus;
+  exitCode: number | null;
+  seconds: number;
+}
+
+/** What the worker's verification step (actions.<name>.verify) did after the agent succeeded. */
+export interface VerificationSummary {
+  passed: boolean;
+  commands: VerificationCommandResult[];
+  /**
+   * Entries of `git status --porcelain` in the worktree before the first command and after the
+   * last one that ran; null when git could not tell. Uncommitted changes are never published, so
+   * a non-zero `before` means the commands saw files the commits don't contain, and a higher
+   * `after` means the commands themselves changed the worktree.
+   */
+  uncommittedBefore: number | null;
+  uncommittedAfter: number | null;
+  /** The commit checked out when the first command started; null when git could not tell. Absent in older summaries. */
+  sha?: string | null;
+  /**
+   * True only when the commands tested exactly `sha`: the worktree had no uncommitted or untracked
+   * files when they started, and HEAD was still `sha` when they ended. Otherwise a pass says
+   * nothing certain about the commit that gets published (a test can pass because of a fix that
+   * was never committed). Absent in older summaries, which is read as false.
+   */
+  exact?: boolean;
+  /**
+   * Set for a containerized run whose tree has submodules: the worker does not run git inside
+   * them on the host, so uncommitted files there were not counted and `exact` is false.
+   */
+  submodulesNotInspected?: boolean;
 }
 
 export type PublicationState = 'publishing' | 'published' | 'failed' | 'skipped';
+
+/**
+ * The push and reply of one revision run (src/publish/revision.ts). published: the PR branch was
+ * fast-forwarded and the reply posted. skipped: nothing was pushed (no commits, or the PR was
+ * closed). failed: see `error`; `moved` says the PR branch was no longer where the run started.
+ */
+export interface Revision {
+  runId: string;
+  jobId: string;
+  repoId: number;
+  repoFullName: string;
+  issueNumber: number;
+  prNumber: number;
+  reviewId: string;
+  trigger: RevisionTriggerKind;
+  state: PublicationState;
+  /** The PR's own branch on the remote. */
+  branch: string;
+  /** The remote head of `branch` the run started from; the push only fast-forwards from exactly this. */
+  baseSha: string | null;
+  /** The commit pushed (or found already on the remote at this SHA). */
+  headSha: string | null;
+  pushedAt: string | null;
+  /** True when the push was refused because the PR branch had moved. Never retried automatically. */
+  moved: boolean;
+  commentId: number | null;
+  commentUrl: string | null;
+  error: string | null;
+  retryable: boolean;
+  attempts: number;
+  leaseExpiresAt: string | null;
+  nextAttemptAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  publishedAt: string | null;
+}
 
 /** Publication of a succeeded live run: job branch pushed, PR opened, issue commented. */
 export interface Publication {
