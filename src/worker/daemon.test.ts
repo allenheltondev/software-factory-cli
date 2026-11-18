@@ -178,7 +178,7 @@ describe('runDaemon', () => {
     expect(run.outcome).toBe('succeeded');
     expect(run.log_path).toBe(join(deps.paths.runsDir, run.id, 'run.log'));
     const text = readFileSync(run.log_path, 'utf8');
-    expect(text).toContain('Live execution is disabled');
+    expect(text).toContain('mode: log-only. No agent process was started');
     expect(text).toContain(`prompt: ${join(deps.paths.configDir, 'prompts', 'implement issue.md')}\n`);
     expect(text).toContain('agent: claude (adapter claude)');
     expect(text).toContain('pool: general');
