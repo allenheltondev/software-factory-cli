@@ -34,6 +34,14 @@ describe('safeMarkdown', () => {
     expect(out).toContain('me@example.com');
   });
 
+  it.each(['a `@bob', 'x`@bob'])('breaks mentions after an unclosed backtick: %s', (s) => {
+    expect(safeMarkdown(s, 1_000)).toContain('@\u200Bbob');
+  });
+
+  it('leaves mentions inside closed code spans alone', () => {
+    expect(safeMarkdown('see `@bob` here', 1_000)).toContain('`@bob`');
+  });
+
   it.each(['a|@bob', 'a=@bob', 'a/@bob', '-@bob', '| x |@bob|'])('breaks mentions after punctuation: %s', (s) => {
     const out = safeMarkdown(s, 1_000);
     expect(out).toContain(`@${Z}bob`);
