@@ -47,6 +47,8 @@ For each `local-branch` job the worker does the following:
    machine-readable result (exit code 0 alone means `succeeded` otherwise). At
    `timeoutMinutes` the agent's process tree is killed and the run fails. Failed runs keep
    their worktree for inspection.
+   If the action has `verify` commands and the agent succeeded, the worker then runs them in
+   the worktree; a failing command fails the run (see [Verification](verification.md)).
 6. It appends a summary to `run.log` and stores it for `factory status`: commits on the job
    branch since the base commit, files changed (`git diff --stat` against the base, committed
    or not), untracked files, and the agent's final message (or its last output lines).
