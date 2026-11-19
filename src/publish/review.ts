@@ -410,7 +410,8 @@ export function createReviewLoopPublisher(deps: PublishDeps, inner?: Publisher):
   };
   const schedule = () => {
     try {
-      for (const job of scheduleAllReviews(deps.db, deps.config, deps.now)) {
+      const only = deps.scope ? (pr: { repoId: number; prNumber: number }) => deps.scope!.pr(pr.repoId, pr.prNumber) : undefined;
+      for (const job of scheduleAllReviews(deps.db, deps.config, deps.now, only)) {
         deps.log.info('reviewer job queued', { job: job.id, repo: job.repoFullName, pr: job.envelope.review?.pullRequest.number, head: job.envelope.review?.headSha, pool: job.pool });
       }
     } catch (err) {
@@ -436,7 +437,7 @@ export function createReviewLoopPublisher(deps: PublishDeps, inner?: Publisher):
       await inner?.retryDue(signal);
       let due: string[] = [];
       try {
-        due = listDuePrReviews(deps.db, { now: deps.now });
+        due = listDuePrReviews(deps.db, { now: deps.now }).filter((id) => deps.scope?.run(id) ?? true);
       } catch (err) {
         deps.log.error('could not list reviews to retry', { error: message(err) });
       }

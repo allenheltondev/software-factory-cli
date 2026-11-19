@@ -60,7 +60,11 @@ the per-user default.
 | `updraft configure` | Interactively select repos, trigger labels, actions and pools (needs a terminal) |
 | `updraft add OWNER/REPO` | Add or update a repo workflow non-interactively. Options: `--label` (default `ready`), `--action` (default `implement-issue`), `--pool` (default `general`), `--route LABEL=POOL` (repeatable), `--backfill-since DATE`, `--workflow-id ID` |
 | `updraft validate` | Check the config without network access; exit 1 if invalid |
+| `updraft validate --json` | The same, as one JSON object: errors, warnings, and the validated config with its defaults filled in (values of `agents.<name>.env` replaced by `(set)`) |
 | `updraft start` | Run the worker: poll GitHub and process the queue (non-interactive). Exits with code 3 if another worker holds the lock |
+| `updraft run-event --event-file FILE [--event-name NAME] [--delivery-id ID] [--deadline-minutes N] [--json]` | Handle one GitHub webhook event to the end, then exit: apply the worker's dispatch rules to it, create the clone if it is missing, run the job, verify and publish, and run the review loop (reviewer, revision, auto-merge) where it is configured. Handles `issues.labeled`, `pull_request_review` (submitted, edited, dismissed) and `pull_request` (synchronize, closed, reopened). No polling; for a machine started per event, with an empty state directory or a copy of a shared state database. Exits 0 when there was nothing to do or the job succeeded, 4 when the work waits for a usage-limit cooldown (deliver the event again later). See [docs/run-event.md](docs/run-event.md) |
+| `updraft state merge --changed FILE --into FILE [--base FILE] [--json]` | Apply what one finished run changed in its copy of the state database to the latest shared copy: a three-way merge by key against the snapshot the run started from (`--base`), with a rule per table. `--into` is replaced only when the merge succeeded, as one self-contained file; exits 5 and changes nothing when it is newer than this CLI. See [docs/shared-state.md](docs/shared-state.md) |
+| `updraft state info --db FILE [--json]` | Schema version, rows per table, jobs by status and open runs of a state database file. Read-only |
 | `updraft status [--json]` | Worker state, watched repos and checkpoints, agents, queue counts, active runs, recent jobs and errors. Works offline |
 | `updraft doctor [--json]` | Check Node, config, state, Git, `gh`, GitHub access (with `github.app`: the App's key, its installation on each repository and the permissions it grants), labels and each enabled agent in the current environment, the way a live run starts it (its `command` and `env`) |
 | `updraft agents [--json] [--deep]` | List Claude Code, Codex and Kiro on this machine: path, version, sign-in status and platform support. `--deep` sends one short prompt to each usable agent (uses tokens) |
@@ -259,6 +263,14 @@ Each launcher runs `node <package>/dist/cli.js start --config <path>` with absol
 working directory and an explicit `PATH`. Run `updraft doctor` under the same account and
 environment before relying on it. Details, log locations and troubleshooting:
 [docs/background-operation.md](docs/background-operation.md).
+
+## Running jobs in AWS Lambda MicroVMs
+
+[deploy/aws-microvm/](deploy/aws-microvm/README.md) is a reference deployment without a
+long-lived worker: a GitHub App webhook reaches a small Lambda function, which starts one AWS
+Lambda MicroVM per labelled issue; the microVM runs `updraft run-event`, opens the pull
+request and terminates itself. It was written from the service's documentation and has not
+yet been run on AWS; its README lists what is tested and what is not.
 
 ## Security
 

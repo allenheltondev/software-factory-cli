@@ -592,7 +592,14 @@ export function openDatabase(file: string, opts: { migrateTo?: number } = {}): D
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA synchronous = NORMAL;');
-  migrate(db, opts.migrateTo);
+  try {
+    migrate(db, opts.migrateTo);
+  } catch (err) {
+    // A refused database (newer schema, failed migration) must not stay open: on Windows an
+    // open handle keeps the file, and its directory, from being moved or removed.
+    db.close();
+    throw err;
+  }
   return db;
 }
 
@@ -606,6 +613,21 @@ export function openDatabaseReadOnly(file: string): Db {
   const db = new DatabaseSync(file, { readOnly: true });
   db.exec('PRAGMA busy_timeout = 5000;');
   return db;
+}
+
+/**
+ * Fold a database's write-ahead log into its main file, so that the one file is all of it. No
+ * migration and no change to what the database holds. For `updraft state merge`.
+ */
+export function foldWriteAheadLog(file: string): void {
+  const { DatabaseSync } = loadSqlite();
+  const db = new DatabaseSync(file);
+  try {
+    db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+  } finally {
+    db.close();
+  }
 }
 
 /** The schema version a state database is at (PRAGMA user_version). */

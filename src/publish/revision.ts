@@ -40,8 +40,9 @@ import {
 } from '../db/revisions.js';
 import { assertValidBranchName, GitError, redactRemoteUrl, remoteDefaultBranch, runGit as defaultRunGit, type GitOptions } from '../git/git.js';
 import { isJobBranchName, jobBranchName, withCheckoutLock } from '../git/worktree.js';
-import { GitHubError, type GitHubIssueComment } from '../github/api.js';
-import { revisionOf, type Job, type Revision, type RevisionRequest, type Run, type RunSummary } from '../types.js';
+import { GitHubError, type GitHubApi, type GitHubIssueComment } from '../github/api.js';
+import { isWorkerLogin } from '../github/credentials.js';
+import { revisionOf, type Job, type RepoRef, type Revision, type RevisionRequest, type Run, type RunSummary } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
 import { safeMarkdown } from './markdown.js';
@@ -85,6 +86,67 @@ export function revisionMarker(runId: string): string {
   return `<!-- updraft-revision: ${runId} -->`;
 }
 
+// ---------------------------------------------------------------------------
+// One revision per review, across machines (PublishDeps.claimReviews)
+// ---------------------------------------------------------------------------
+//
+// The long-running worker acts on a review once because its one database records the review by
+// its id. Single-event runs each have a copy of the state, and two of them can meet the same
+// review without either having seen the other's record (the machine the review's delivery
+// started, and the last look of the run that opened the pull request). Their state databases
+// cannot settle that before the merge; the pull request can, because both read and write it:
+//
+// - before it pushes, a revision posts its comment on the pull request, carrying the review's id
+//   and the commits it is about to move the branch between (the "claim"); after the push the
+//   same comment becomes the reply;
+// - a revision whose claim another one has already made good on (the claimed head is in the
+//   history this run started from, or is where the branch now is) pushes nothing and ends
+//   `skipped` with a reason that begins "superseded: ";
+// - the push itself is the fast-forward from the exact commit the run started from, as always.
+//   Of two runs that started from the same head only one push is accepted; the other finds the
+//   branch at the head the first one claimed, and ends the same way.
+// A claim is posted before its push, so a run that fetches a branch holding another's revision
+// can always see that claim; and a run that cannot see it has not built on it, so its lease fails.
+
+/** The words a revision's `error` (and a canceled job's reason) begins with when another run handled the review. */
+export const SUPERSEDED_PREFIX = 'superseded: ';
+
+/** Hidden marker on a revision's comment: which review it answers, and from which commit to which it moves the branch. */
+export function revisionClaimMarker(reviewId: string, baseSha: string, headSha: string): string {
+  return `<!-- updraft-revision-of: ${reviewId} ${baseSha}..${headSha} -->`;
+}
+
+const CLAIM = /<!-- updraft-revision-of: (\S+) ([0-9a-f]{40,64})\.\.([0-9a-f]{40,64}) -->/;
+const RUN_MARKER = /<!-- updraft-revision: (\S+) -->/;
+
+export interface RevisionClaim {
+  reviewId: string;
+  /** The branch head the revision started from, and the commit it pushes (equal when it has nothing to push). */
+  baseSha: string;
+  headSha: string;
+  /** The run that made it. */
+  runId: string | null;
+  commentId: number;
+  url: string;
+}
+
+/**
+ * The claims on a pull request for one review: comments by the worker's own identity that carry
+ * the marker. Anybody can write a comment that looks like one, so the author is checked: a
+ * comment by someone else is not a claim.
+ */
+export async function findRevisionClaims(api: Pick<GitHubApi, 'listIssueComments' | 'getWorkerIdentity'>, repo: RepoRef, prNumber: number, reviewId: string): Promise<RevisionClaim[]> {
+  const marked = (await api.listIssueComments(repo, prNumber)).flatMap((c) => {
+    const m = CLAIM.exec(c.body);
+    return m && m[1] === reviewId ? [{ c, m }] : [];
+  });
+  if (!marked.length) return [];
+  const identity = await api.getWorkerIdentity();
+  return marked
+    .filter(({ c }) => isWorkerLogin(identity, c.user))
+    .map(({ c, m }) => ({ reviewId, baseSha: m[2]!, headSha: m[3]!, runId: RUN_MARKER.exec(c.body)?.[1] ?? null, commentId: c.id, url: c.htmlUrl }));
+}
+
 /** Hidden marker on the one comment that says a PR reached maxRevisions. */
 export const REVISION_LIMIT_MARKER = '<!-- updraft-revision-limit -->';
 
@@ -98,6 +160,14 @@ class NotPushed extends PublishRefusal {
   ) {
     super(message);
     this.name = 'NotPushed';
+  }
+}
+
+/** Another run has answered the review (claimReviews): this one pushes nothing and says nothing. Not a failure. */
+class Superseded extends Error {
+  constructor(readonly claim: RevisionClaim) {
+    super(`another run answered the review first (${claim.url})`);
+    this.name = 'Superseded';
   }
 }
 
@@ -121,6 +191,29 @@ export function renderRevisionReply(o: { runId: string; agent: string; review: R
       `From run ${code(o.runId)} (agent ${inline(o.agent)}). Review it before merging; merging is up to a person.`,
       '',
       ...renderRunResult(o.summary, o.commitCount),
+    ],
+    revisionMarker(o.runId),
+  );
+}
+
+/** With claimReviews: what a revision posts just before its push, and then replaces with the reply (or with why it pushed nothing). */
+export function renderRevisionClaim(o: { runId: string; review: RevisionRequest['review']; commitCount: number }): string {
+  return withMarker(
+    [
+      `Updraft is pushing ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`,
+      '',
+      `From run ${code(o.runId)}. This comment is replaced by the result as soon as the push is done.`,
+    ],
+    revisionMarker(o.runId),
+  );
+}
+
+/** With claimReviews: what is left of a claim whose push another run's got ahead of. One line, and no longer a claim. */
+export function renderSupersededNote(o: { runId: string; review: RevisionRequest['review']; otherUrl: string }): string {
+  return withMarker(
+    [
+      `Another Updraft run pushed for the changes requested by ${code(o.review.author)} in ${o.review.url} first (${o.otherUrl}). ` +
+        `Run ${code(o.runId)} pushed nothing, and nothing on this pull request's branch was changed by it.`,
     ],
     revisionMarker(o.runId),
   );
@@ -296,8 +389,26 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     if (!finishRevision(deps.db, runId, fence.attempt, { ...r, now })) throw new RevisionSupersededError(runId, fence.attempt);
     return getRevision(deps.db, runId)!;
   };
-  /** The PR comment of this run: recorded, found by its marker, or new. */
-  const comment = async (body: () => string): Promise<void> => {
+  const claiming = deps.claimReviews === true;
+  /**
+   * The PR comment of this run: recorded, found by its marker, or new.
+   *
+   * With claimReviews the run has one comment that changes: first the claim, then the reply (or
+   * why nothing was pushed). `claim` names the commit the comment says the branch is moved to;
+   * the marker for it is what other runs read (findRevisionClaims).
+   */
+  const comment = async (body: () => string, claim?: { headSha: string }): Promise<void> => {
+    if (claiming) {
+      hold();
+      const marker = revisionMarker(runId);
+      const text = claim ? `${body()}\n${revisionClaimMarker(request.review.id, baseSha, claim.headSha)}` : body();
+      const id = rev.commentId ?? (await deps.api.listIssueComments(repoRef, prNumber)).find((c) => c.body.includes(marker))?.id ?? null;
+      hold(); // the lookup may have outlived the lease
+      const written = id !== null ? await deps.api.updateIssueComment(repoRef, id, text) : await deps.api.createIssueComment(repoRef, prNumber, text);
+      hold({ commentId: written.id, commentUrl: written.htmlUrl });
+      await runLog([`${id !== null ? 'updated the comment' : 'commented'} on pull request #${prNumber}: ${written.htmlUrl}`]);
+      return;
+    }
     if (rev.commentId) return;
     hold();
     const marker = revisionMarker(runId);
@@ -364,9 +475,28 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     const protectedBranches = new Set([watched.baseBranch, repo.baseBranch, await remoteDefaultBranch(pushUrl, net)].filter((b): b is string => Boolean(b)));
     if (protectedBranches.has(prBranch)) throw new PublishRefusal(`${prBranch} is the base or default branch of ${repoFullName}; refusing to push to it`);
 
+    /**
+     * With claimReviews: the claim of another run for this review that has been made good on, as
+     * far as this run can tell: its head is where the branch is (`remoteSha`), or is in the
+     * history this run started from. A claim whose push never came is nobody's.
+     */
+    const answeredElsewhere = async (remoteSha: string | null): Promise<RevisionClaim | null> => {
+      if (!claiming) return null;
+      hold();
+      for (const c of await findRevisionClaims(deps.api, repoRef, prNumber, request.review.id)) {
+        if (c.runId === runId) continue;
+        if (c.headSha === remoteSha || c.headSha === baseSha) return c;
+        // Exit 1: not an ancestor; 128: a commit this clone never fetched, so not in the run's history either.
+        if (await run1(['merge-base', '--is-ancestor', c.headSha, baseSha], local).then(() => true, () => false)) return c;
+      }
+      return null;
+    };
+
     if (localSha === baseSha) {
-      // 3a. Nothing to push; the reviewer is still owed an answer.
-      await comment(() => renderNoChangeReply({ runId, agent: run.agent, review: request.review, summary: run.summary }));
+      // 3a. Nothing to push; the reviewer is still owed an answer (one, from whichever run gets there first).
+      const first = await answeredElsewhere(null);
+      if (first) throw new Superseded(first);
+      await comment(() => renderNoChangeReply({ runId, agent: run.agent, review: request.review, summary: run.summary }), { headSha: baseSha });
       const reason = `the agent made no commits on top of ${short(baseSha)}; nothing was pushed`;
       const done = finish({ state: 'skipped', error: reason });
       await runLog([`skipped: ${reason}`]);
@@ -404,11 +534,15 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       );
     hold();
     const remoteSha = await readRemoteSha();
+    const first = await answeredElsewhere(remoteSha);
+    if (first) throw new Superseded(first);
     if (remoteSha === localSha) {
       await runLog([`${remoteRef} is already on ${remote} at ${short(localSha)}`]);
     } else if (remoteSha !== baseSha) {
       throw movedTo(remoteSha);
     } else {
+      // Said on the pull request before it is done, so that no run can build on this push without being able to see whose it is.
+      if (claiming) await comment(() => renderRevisionClaim({ runId, review: request.review, commitCount }), { headSha: localSha });
       await runLog([`pushing ${short(baseSha)}..${short(localSha)} (${commitCount} commit(s)) to ${prBranch} on ${remote} (${redactRemoteUrl(pushUrl)})`]);
       hold();
       try {
@@ -428,20 +562,37 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
         } else if (after === undefined || after === baseSha) {
           throw classifyGit(err, 'push', remote, repoFullName);
         } else {
-          throw movedTo(after);
+          // The branch moved under the lease. To the head another run claimed for this review: that is the answer.
+          const won = await answeredElsewhere(after);
+          throw won ? new Superseded(won) : movedTo(after);
         }
       }
     }
     if (rev.headSha !== localSha || !rev.pushedAt) hold({ headSha: localSha, pushedAt: rev.pushedAt ?? new Date(now()).toISOString() });
 
     // 4. The reply: recorded, found by marker, or new.
-    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount }));
+    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount }), { headSha: localSha });
 
     const done = finish({ state: 'published' });
     log.info('revision pushed', { pr: prNumber, from: baseSha, to: localSha });
     return { status: 'published', revision: done, already: false };
   } catch (caught) {
     let err = caught;
+    if (err instanceof Superseded) {
+      // Not a failure and not news for the pull request: the review has its revision. What this
+      // run announced, if it got that far, is taken back; a failure to do so is retried like any.
+      const { claim } = err;
+      const reason = `${SUPERSEDED_PREFIX}another run answered this review first (${claim.url}${claim.runId ? `, run ${claim.runId}` : ''}, ${short(claim.baseSha)}..${short(claim.headSha)}); nothing was pushed`;
+      try {
+        if (rev.commentId) await comment(() => renderSupersededNote({ runId, review: request.review, otherUrl: claim.url }));
+        const done = finish({ state: 'skipped', error: reason });
+        await runLog([`skipped: ${reason}`]);
+        log.info('revision not pushed', { reason });
+        return { status: 'skipped', reason, revision: done };
+      } catch (noteErr) {
+        err = noteErr;
+      }
+    }
     if (err instanceof NotPushed) {
       // Say so on the PR. If that fails for now, the whole attempt is retried: the branch check
       // above refuses again, and the comment gets another try.
@@ -476,6 +627,15 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       log.warn('revision attempt superseded', { attempt: fence.attempt, error });
       return { status: 'busy', reason: new RevisionSupersededError(runId, fence.attempt).message };
     }
+    if (claiming && rev.commentId && nextAttemptAt === null && !(caught instanceof NotPushed)) {
+      // The push was announced and is not going to happen: the announcement must not stand.
+      try {
+        const reason = 'the push did not go through, and the worker will not try it again by itself';
+        await deps.api.updateIssueComment(repoRef, rev.commentId, renderNotPushedNotice({ runId, review: request.review, reason, localBranch: run.summary.branch }));
+      } catch (noteErr) {
+        log.warn('could not take back the announcement of a push that failed', { error: message(noteErr) });
+      }
+    }
     const moved = caught instanceof NotPushed && caught.moved;
     const hint = nextAttemptAt
       ? `the worker retries at ${nextAttemptAt}; "updraft publish ${runId}" retries now`
@@ -504,10 +664,10 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
  * worker calls this (after a poll), and it looks for the marker before posting, so a PR gets one
  * comment however often this runs. Never throws.
  */
-export async function postLimitNotices(deps: Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now'>, signal?: AbortSignal): Promise<void> {
+export async function postLimitNotices(deps: Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'scope'>, signal?: AbortSignal): Promise<void> {
   let pending: RevisionPr[];
   try {
-    pending = listPendingLimitNotices(deps.db, REVISION_MAX_AUTO_ATTEMPTS);
+    pending = listPendingLimitNotices(deps.db, REVISION_MAX_AUTO_ATTEMPTS).filter((pr) => deps.scope?.pr(pr.repoId, pr.prNumber) ?? true);
   } catch (err) {
     deps.log.error('could not list pull requests that reached maxRevisions', { error: message(err) });
     return;
@@ -574,7 +734,7 @@ export function createRevisionPublisher(deps: PublishDeps, inner?: Publisher): P
       await inner?.retryDue(signal);
       let due: string[];
       try {
-        due = listDueRevisions(deps.db, { now: deps.now });
+        due = listDueRevisions(deps.db, { now: deps.now }).filter((id) => deps.scope?.run(id) ?? true);
       } catch (err) {
         deps.log.error('could not list revisions to retry', { error: message(err) });
         return;

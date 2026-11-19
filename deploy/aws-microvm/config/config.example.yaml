@@ -1,0 +1,94 @@
+# Updraft config for jobs in Lambda MicroVMs. Copy to config.yaml (same directory), edit, and
+# run `./deploy.sh config`; it is uploaded to s3://<bucket>/config/ together with every other
+# file in this directory (prompts included) and read by each microVM when it starts. Changing
+# repositories, labels or prompts needs no image build and no stack deployment.
+#
+# Inside the microVM this file is $UPDRAFT_HOME/config.yaml in a directory created for the
+# run. Paths are relative to it. Three of them are fixed by the runner:
+#   ./github-app.pem   the App's private key, written there from Secrets Manager
+#   ./clones/...       does not exist at start; `updraft run-event` clones into it
+#   ./state.db         the shared state database, downloaded from S3 before the job and
+#                      merged back after it (do not name a config file state.db)
+version: 1
+
+execution:
+  mode: live
+
+dispatch:
+  # GitHub logins who may start work by applying the trigger label. The launcher does not
+  # check this; `updraft run-event` does, against the GitHub API.
+  allowedActors: [your-github-login]
+
+github:
+  app:
+    appId: 1234567                     # the App's ID (or client ID)
+    privateKeyPath: ./github-app.pem   # leave as is
+    commitAsApp: true                  # commits are authored by <app-slug>[bot]
+
+# Every enabled agent runs in the image's sandbox runtime (README, "Security model"). With
+# AgentIsolation=enforced (the default) the runner refuses to start a job unless each enabled
+# agent has exactly this container block: image microvm, runtime /opt/updraft/bin/updraft-sandbox,
+# no `args`, and `network` unset, host or none. Inside it the agent and every verify command see
+# the system, the worktree and the clone's git directory, and not the App key, the state
+# database or the rest of the job's directory. `env` names the variables passed in, here the
+# agent's key from the agent-environment secret. Do not configure `triage`: it starts an agent
+# CLI outside any container, and an enforced job refuses it.
+agents:
+  claude:
+    maxConcurrent: 1
+    # Full-auto (bypassPermissions) is the default.
+    # args: [--model, sonnet, --max-turns, "80"]
+    container:
+      image: microvm
+      runtime: /opt/updraft/bin/updraft-sandbox
+      env: [ANTHROPIC_API_KEY]
+  codex: { enabled: false }
+  kiro: { enabled: false }
+  # For the review loop, a second agent that reviews what the first wrote. It needs its CLI
+  # in the image (AGENT_PACKAGES="@anthropic-ai/claude-code @openai/codex" ./deploy.sh image)
+  # and its key in the agent-environment secret:
+  #   {"ANTHROPIC_API_KEY": "...", "CODEX_API_KEY": "..."}
+  # codex:
+  #   maxConcurrent: 1
+  #   container:
+  #     image: microvm
+  #     runtime: /opt/updraft/bin/updraft-sandbox
+  #     env: [CODEX_API_KEY]
+
+pools:
+  general:
+    agents: [claude]
+  # reviewers:
+  #   agents: [codex]
+
+actions:
+  implement-issue:
+    prompt: ./prompts/implement-issue.md   # copy from examples/prompts/ in the Updraft repository
+    output: local-branch
+    timeoutMinutes: 60
+    # revisePrompt: ./prompts/revise-pr.md   # needed with `revise`
+    # reviewPrompt: ./prompts/review-pr.md   # needed with `review`
+    # verify:
+    #   - npm ci
+    #   - npm test
+
+repositories:
+  your-org/your-repo:
+    id: 123456789                      # gh api repos/your-org/your-repo --jq .id
+    checkoutPath: ./clones/your-repo   # leave under ./clones/
+    publish: draft-pr
+    # The review loop. Before turning it on, read "The review loop" in the README: it needs
+    # AcceptedEvents=issues,pull_request_review,pull_request on the stack, two more webhook
+    # subscriptions on the App, a second agent, and a MaximumDurationSeconds that fits
+    # every round of one run.
+    # revise: true
+    # review: true
+    # maxRevisions: 2
+    workflows:
+      - id: implement
+        trigger:
+          event: issue.labeled
+          label: ready
+        action: implement-issue
+        pool: general
+        # reviewPool: reviewers

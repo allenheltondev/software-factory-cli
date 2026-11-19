@@ -116,7 +116,7 @@ export function backoffSeconds(failures: number, retryAfterSeconds: number | nul
 }
 
 /** Deleted (410), transferred (301) or no longer readable (404). */
-function isGone(err: unknown): boolean {
+export function isGone(err: unknown): boolean {
   return err instanceof GitHubError && [301, 404, 410].includes(err.status);
 }
 
@@ -141,7 +141,7 @@ function cachedIssueLookup(api: GitHubApi): IssueLookup {
   };
 }
 
-function findRepo(config: UpdraftConfig, repoId: number): { fullName: string; cfg: RepositoryConfig } | null {
+export function findRepo(config: UpdraftConfig, repoId: number): { fullName: string; cfg: RepositoryConfig } | null {
   for (const [fullName, cfg] of Object.entries(config.repositories)) {
     if (cfg.id === repoId) return { fullName, cfg };
   }
@@ -452,13 +452,23 @@ function maxCreatedAt(events: GitHubIssueEvent[]): string | null {
   return best;
 }
 
-async function buildJobs(
-  deps: PollerDeps,
+/** Why a label event that matches a workflow queued no job. */
+export type IngestSkipReason = 'actor-not-allowed' | 'label-removed' | 'issue-gone' | 'pull-request' | 'issue-closed' | 'label-missing';
+
+/**
+ * The ingestion rules: which of `events` (oldest first, with every later event of the same scan
+ * after them) queue a job, checked against each issue's current state. The poller's only way to
+ * queue an issue job, and `updraft run-event`'s too (src/poller/webhook.ts). `onSkip` hears why a
+ * matching event queued nothing.
+ */
+export async function buildJobs(
+  deps: Pick<PollerDeps, 'config' | 'db' | 'log' | 'configDir' | 'now' | 'triage'>,
   repo: RepoRef,
   cfg: RepositoryConfig,
   events: GitHubIssueEvent[],
   getIssue: IssueLookup,
   log: Logger,
+  onSkip?: (reason: IngestSkipReason, message: string) => void,
 ): Promise<NewJob[]> {
   const jobs: NewJob[] = [];
   for (let i = 0; i < events.length; i++) {
@@ -477,12 +487,16 @@ async function buildJobs(
     for (const wf of workflows) {
       const wfId = workflowId(wf);
       const ctx = { issue: issueNumber, workflow: wfId, event: ev.id, actor: ev.actor };
+      const skip = (reason: IngestSkipReason, message: string) => {
+        log.info(message, ctx);
+        onSkip?.(reason, message);
+      };
       if (!actorAllowed(deps.config, wf, ev.actor)) {
-        log.info('ignoring trigger label applied by an actor not in the allowlist', ctx);
+        skip('actor-not-allowed', 'ignoring trigger label applied by an actor not in the allowlist');
         continue;
       }
       if (removedLater) {
-        log.info('ignoring trigger label that was removed later in the same batch', ctx);
+        skip('label-removed', 'ignoring trigger label that was removed later in the same batch');
         continue;
       }
       let issue: GitHubIssue;
@@ -490,18 +504,21 @@ async function buildJobs(
         issue = await getIssue(repo, issueNumber);
       } catch (err) {
         if (isGone(err)) {
-          log.info('skipping event: issue was deleted, transferred or is no longer accessible', ctx);
+          skip('issue-gone', 'skipping event: issue was deleted, transferred or is no longer accessible');
           continue;
         }
         throw err;
       }
-      if (issue.isPullRequest) continue;
+      if (issue.isPullRequest) {
+        onSkip?.('pull-request', 'skipping event: it is on a pull request');
+        continue;
+      }
       if (issue.state !== 'open') {
-        log.info('skipping event: issue is closed', ctx);
+        skip('issue-closed', 'skipping event: issue is closed');
         continue;
       }
       if (!issue.labels.some((l) => labelEquals(l, wf.trigger.label))) {
-        log.info('skipping event: issue no longer carries the trigger label', ctx);
+        skip('label-missing', 'skipping event: issue no longer carries the trigger label');
         continue;
       }
       const routeDeps = { poolAvailable: (p: string) => (deps.config.pools[p]?.agents ?? []).some((a) => deps.config.agents[a]?.enabled) };

@@ -284,6 +284,7 @@ interface RawReview {
   author: RawActor | null;
   lastEditedAt: string | null;
   editor: RawActor | null;
+  commit?: { oid: string } | null;
   comments: { totalCount: number; nodes: Array<RawReviewComment | null> | null } | null;
 }
 interface RawPullRequestReviews {
@@ -323,6 +324,7 @@ const PULL_REQUEST_REVIEWS_QUERY = `query($owner: String!, $name: String!, $numb
           author { login }
           lastEditedAt
           editor { login }
+          commit { oid }
           comments(first: ${REVIEW_COMMENTS_PER_READ}) {
             totalCount
             nodes {
@@ -352,6 +354,7 @@ function mapReview(r: RawReview): GitHubReview {
     url: r.url,
     lastEditedAt: r.lastEditedAt ?? null,
     editor: r.editor?.login ?? null,
+    commitSha: r.commit?.oid ?? null,
     comments: comments.map((c) => ({
       author: c.author?.login ?? null,
       body: c.body ?? '',
@@ -424,8 +427,10 @@ interface RawPullRequestDetails {
   merged?: boolean;
   merged_at?: string | null;
   draft?: boolean;
-  head: { ref: string; sha: string };
+  head: { ref: string; sha: string; repo?: { id: number } | null };
   base: { ref: string };
+  user?: { login: string } | null;
+  body?: string | null;
   mergeable?: boolean | null;
   mergeable_state?: string;
 }
@@ -478,7 +483,7 @@ function mapEvent(r: RawIssueEvent): GitHubIssueEvent {
 
 interface RequestOptions {
   /** GET unless set. Writes are used only by the publication, revision and review steps. */
-  method?: 'GET' | 'POST' | 'PUT';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH';
   /** JSON request body (POST). */
   body?: unknown;
   query?: Record<string, string | number>;
@@ -827,6 +832,14 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       return mapComment(res.data!);
     },
 
+    async updateIssueComment(repo, commentId, body) {
+      const res = await request<RawComment>(`${repoPath(repo)}/issues/comments/${commentId}`, {
+        method: 'PATCH',
+        body: { body },
+      });
+      return mapComment(res.data!);
+    },
+
     async getPullRequest(repo, pullNumber): Promise<PullRequestDetails> {
       const r = (await request<RawPullRequestDetails>(`${repoPath(repo)}/pulls/${pullNumber}`)).data!;
       return {
@@ -841,6 +854,9 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         baseRef: r.base.ref,
         mergeable: typeof r.mergeable === 'boolean' ? r.mergeable : null,
         mergeableState: r.mergeable_state ?? 'unknown',
+        author: r.user?.login ?? null,
+        body: r.body ?? '',
+        headRepoId: r.head.repo?.id ?? null,
       };
     },
 

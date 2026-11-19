@@ -40,12 +40,12 @@ import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
 import { cap, fenced, type PublishDeps } from './publish.js';
 
-type MergeDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now'>;
+type MergeDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'scope'>;
 
 /** Merge requests sent for one head before an unknown result (network error, 5xx) is given up on. */
 export const MAX_MERGE_ATTEMPTS = 3;
 /** Attempts to post the comment that says why a PR was not merged. */
-const MAX_NOTICE_ATTEMPTS = 5;
+export const MAX_NOTICE_ATTEMPTS = 5;
 const MAX_NAMES = 8;
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -252,7 +252,7 @@ export async function evaluateAutoMerges(deps: MergeDeps, signal?: AbortSignal):
     if (!autoMergeMethod(deps.config, cfg)) continue;
     let candidates: LoopPr[];
     try {
-      candidates = listMergeCandidates(deps.db, cfg.id);
+      candidates = listMergeCandidates(deps.db, cfg.id).filter((pr) => deps.scope?.pr(pr.repoId, pr.prNumber) ?? true);
     } catch (err) {
       deps.log.error('could not list pull requests to merge', { repo: fullName, error: message(err) });
       continue;
@@ -272,7 +272,7 @@ export async function evaluateAutoMerges(deps: MergeDeps, signal?: AbortSignal):
 export async function postMergeNotices(deps: MergeDeps, signal?: AbortSignal): Promise<void> {
   let pending: LoopPr[];
   try {
-    pending = listPendingMergeNotices(deps.db, MAX_NOTICE_ATTEMPTS);
+    pending = listPendingMergeNotices(deps.db, MAX_NOTICE_ATTEMPTS).filter((pr) => deps.scope?.pr(pr.repoId, pr.prNumber) ?? true);
   } catch (err) {
     deps.log.error('could not list pull requests whose merge was blocked', { error: message(err) });
     return;

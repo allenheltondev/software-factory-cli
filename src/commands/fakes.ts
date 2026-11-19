@@ -108,6 +108,9 @@ export function fakeApi(data: FakeApiData = {}): GitHubApi & { calls: string[] }
     async createIssueComment() {
       throw new Error('not used');
     },
+    async updateIssueComment() {
+      throw new Error('not used');
+    },
     async getPullRequest(repo, n) {
       calls.push(`getPullRequest ${repo.fullName}#${n}`);
       const pr = data.pulls?.[`${repo.fullName}#${n}`];

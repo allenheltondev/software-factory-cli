@@ -315,6 +315,31 @@ build and run tests), and the whole git directory of the clone is read-only, inc
 fails inside the container, while `git diff`, `git log` and `git show` work. The worktree is
 deleted after the run in any case, and nothing of a reviewer run is ever pushed.
 
+### A runtime that is not Docker
+
+`container.runtime` may be any program that answers the part of the docker command line
+Updraft uses: `run` with the options above, `image inspect`, `container inspect`, `stop`,
+`rm -f` and `info`. The AWS MicroVM deployment ships one,
+[`deploy/aws-microvm/image/sandbox/updraft-sandbox.mjs`](../deploy/aws-microvm/image/sandbox/updraft-sandbox.mjs).
+It needs no daemon. It builds each "container" with bubblewrap on the machine it runs on: new
+mount, PID, IPC, UTS and user namespaces, and a root file system made from an allowlist (the
+system directories read-only, a filtered `/etc`, and exactly the binds Updraft passes). Its
+only "image" is the machine itself, under one fixed name (`microvm`). It refuses any option
+it cannot honour instead of ignoring it.
+
+Compared with a container runtime it gives less:
+
+- **The host's software.** The agent runs the host's own tools and libraries, read-only,
+  instead of an image's.
+- **The network.** It is shared with the host unless `network: none` is set.
+- **No resource limits.** There are none at all.
+- **The kernel.** It relies on unprivileged user namespaces, so a kernel that does not allow
+  them cannot run it, and a kernel exploit defeats it.
+
+The deployment uses it together with a packet filter and a per-job self-test; see "Security
+model" in [its README](../deploy/aws-microvm/README.md#security-model). It is written for
+that machine. Elsewhere, a real container runtime is the better choice.
+
 ## Run the worker under a dedicated account
 
 A separate OS account is a boundary your operating system already enforces. Run the worker,

@@ -1,0 +1,175 @@
+# MicroVM image for one Updraft job per microVM.
+#
+# Lambda runs this Dockerfile on its managed MicroVM base image, starts the ENTRYPOINT, calls
+# the /ready hook and snapshots disk and memory. Every microVM starts from that snapshot, so
+# nothing here may create per-run state: no secrets, no ids, no clones. All of that happens
+# after the /run hook (runner/job.mjs).
+#
+# The container base image is the one Lambda publishes for MicroVMs; it carries the
+# snapshot-compatible OpenSSL that git and curl link against.
+FROM public.ecr.aws/lambda/microvms:al2023-minimal
+
+COPY build.env /opt/updraft/build.env
+
+# System packages. The minimal Amazon Linux 2023 images ship microdnf or dnf depending on the
+# variant; use whichever is there. curl is only installed when no curl is present (the
+# `curl` and `curl-minimal` packages conflict on Amazon Linux 2023).
+RUN set -eu; \
+    PM="$(command -v dnf || command -v microdnf)"; \
+    "$PM" install -y git tar xz gzip shadow-utils ca-certificates findutils; \
+    command -v curl >/dev/null 2>&1 || "$PM" install -y curl-minimal; \
+    "$PM" clean all
+
+# Node.js from nodejs.org, pinned in build.env, for the microVM's CPU architecture. The
+# checksum file comes from the same origin, so it guards against a damaged download, not
+# against a compromised origin.
+RUN set -eu; . /opt/updraft/build.env; \
+    case "$(uname -m)" in \
+      aarch64|arm64) NODE_ARCH=arm64 ;; \
+      x86_64) NODE_ARCH=x64 ;; \
+      *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    FILE="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"; \
+    cd /tmp; \
+    curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/${FILE}"; \
+    curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt"; \
+    grep " ${FILE}\$" SHASUMS256.txt | sha256sum -c -; \
+    tar -xJf "${FILE}" -C /usr/local --strip-components=1 --no-same-owner; \
+    rm -f "${FILE}" SHASUMS256.txt; \
+    node --version; npm --version
+
+# Updraft: a local `npm pack` tarball in vendor/ wins (for builds that are not on npm yet),
+# otherwise the pinned npm spec. The build fails if the installed version has no `run-event`
+# command, because the image would be useless, and (unless REQUIRE_STATE_COMMANDS is 0 in
+# build.env) if it has no `state merge`, because every job would then run but none could
+# save what it learned to the shared state database.
+COPY vendor/ /opt/updraft/vendor/
+RUN set -eu; . /opt/updraft/build.env; \
+    set -- /opt/updraft/vendor/*.tgz; \
+    if [ -e "$1" ]; then \
+      if [ "$#" -ne 1 ]; then echo "vendor/ must contain at most one .tgz" >&2; exit 1; fi; \
+      echo "installing Updraft from $1"; \
+      npm install -g --no-fund --no-audit "$1"; \
+    else \
+      echo "installing Updraft from npm: ${UPDRAFT_SPEC}"; \
+      npm install -g --no-fund --no-audit "${UPDRAFT_SPEC}"; \
+    fi; \
+    updraft --version; \
+    if ! updraft --help | grep -q 'run-event'; then \
+      echo "this Updraft has no run-event command; use a newer UPDRAFT_SPEC or a tarball in vendor/" >&2; \
+      exit 1; \
+    fi; \
+    if [ "${REQUIRE_STATE_COMMANDS:-1}" != "0" ] && ! updraft state --help 2>/dev/null | grep -q 'merge'; then \
+      echo "this Updraft has no 'state merge' command, which the shared state database needs; use a newer UPDRAFT_SPEC or a tarball in vendor/, or set REQUIRE_STATE_COMMANDS=0 in build.env and deploy the stack with SharedState=disabled" >&2; \
+      exit 1; \
+    fi; \
+    if [ "${REQUIRE_STATE_COMMANDS:-1}" != "0" ] && ! { updraft state merge --help 2>/dev/null | grep -q -- '--live' && updraft state --help 2>/dev/null | grep -q 'copy'; }; then \
+      echo "this Updraft has no 'state merge --live' or no 'state copy', which checkpoints of the shared state and keeping an unsaved database need; use a newer UPDRAFT_SPEC or a tarball in vendor/ (or REQUIRE_STATE_COMMANDS=0 with SharedState=disabled)" >&2; \
+      exit 1; \
+    fi
+
+# Agent CLIs (word splitting of the list is intended). The review loop needs two different
+# agents, one to write and one to review: list both packages in AGENT_PACKAGES.
+RUN set -eu; . /opt/updraft/build.env; \
+    if [ -n "${AGENT_PACKAGES}" ]; then npm install -g --no-fund --no-audit ${AGENT_PACKAGES}; fi; \
+    npm cache clean --force >/dev/null 2>&1 || true
+
+# System packages for the repositories (SYSTEM_PACKAGES in build.env). Installed one at a time
+# so that a build with several unknown names reports all of them at once.
+RUN set -eu; . /opt/updraft/build.env; \
+    PM="$(command -v dnf || command -v microdnf)"; \
+    missing=""; \
+    for pkg in ${SYSTEM_PACKAGES:-} ${BROWSER_PACKAGES:-}; do \
+      if ! "$PM" install -y "$pkg"; then missing="$missing $pkg"; fi; \
+    done; \
+    "$PM" clean all; \
+    if [ -n "$missing" ]; then \
+      echo "these SYSTEM_PACKAGES or BROWSER_PACKAGES could not be installed:$missing (edit image/build.env)" >&2; exit 1; \
+    fi; \
+    if [ -n "${PYTHON_COMMAND:-}" ]; then \
+      PY="$(command -v "$PYTHON_COMMAND")" || { echo "PYTHON_COMMAND $PYTHON_COMMAND is not installed" >&2; exit 1; }; \
+      ln -sf "$PY" /usr/local/bin/python3; ln -sf "$PY" /usr/local/bin/python; \
+      python3 --version; python3 -m pip --version; \
+    fi; \
+    if [ -n "${UV_VERSION:-}" ]; then \
+      python3 -m pip install --no-cache-dir "uv==${UV_VERSION}"; uv --version; \
+    fi
+
+# Toolchain for the repositories the agents work on (TOOL_PACKAGES in build.env), on PATH for
+# the agent and for the verify commands alike.
+RUN set -eu; . /opt/updraft/build.env; \
+    if [ -n "${TOOL_PACKAGES:-}" ]; then npm install -g --no-fund --no-audit ${TOOL_PACKAGES}; fi; \
+    npm cache clean --force >/dev/null 2>&1 || true; \
+    if command -v tsc >/dev/null 2>&1; then tsc --version; fi
+
+# A headless browser (PLAYWRIGHT_VERSION and PLAYWRIGHT_BROWSERS in build.env), in a directory
+# every job shares. It is writable by the job user so that a project pinned to another
+# Playwright version can add its own browser build next to this one.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN set -eu; . /opt/updraft/build.env; \
+    mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"; \
+    if [ -n "${PLAYWRIGHT_VERSION:-}" ]; then \
+      npm install -g --no-fund --no-audit "playwright@${PLAYWRIGHT_VERSION}"; \
+      playwright install ${PLAYWRIGHT_BROWSERS:-chromium}; \
+      npm cache clean --force >/dev/null 2>&1 || true; \
+    fi; \
+    chmod -R a+rwX "$PLAYWRIGHT_BROWSERS_PATH"
+
+# The sandbox runtime agents and verify commands run in when AgentIsolation is enforced
+# (sandbox/updraft-sandbox.mjs; README, "Security model"). Updraft starts it as the runtime
+# client of agents.<name>.container. Everything here is root's and not writable by anyone
+# else: the runner refuses to start a job if the runtime could have been replaced. The config
+# file shows the sandbox the browser Playwright installed, which lies outside /usr.
+COPY sandbox/ /opt/updraft/sandbox/
+RUN set -eu; . /opt/updraft/build.env; \
+    PM="$(command -v dnf || command -v microdnf)"; \
+    missing=""; \
+    for pkg in ${ISOLATION_PACKAGES:-}; do \
+      if ! "$PM" install -y "$pkg"; then missing="$missing $pkg"; fi; \
+    done; \
+    "$PM" clean all; \
+    if [ -n "$missing" ]; then \
+      echo "these ISOLATION_PACKAGES could not be installed:$missing (edit image/build.env; empty only with AgentIsolation=disabled)" >&2; exit 1; \
+    fi; \
+    mkdir -p /opt/updraft/bin; \
+    printf '#!/bin/sh\nexec /usr/local/bin/node /opt/updraft/sandbox/updraft-sandbox.mjs "$@"\n' > /opt/updraft/bin/updraft-sandbox; \
+    chown -R root:root /opt/updraft/sandbox /opt/updraft/bin; \
+    chmod 0755 /opt/updraft/bin /opt/updraft/bin/updraft-sandbox /opt/updraft/sandbox; \
+    chmod 0644 /opt/updraft/sandbox/updraft-sandbox.mjs; \
+    printf '{"readOnlyBinds":["%s"],"env":{"PLAYWRIGHT_BROWSERS_PATH":"%s"}}\n' "$PLAYWRIGHT_BROWSERS_PATH" "$PLAYWRIGHT_BROWSERS_PATH" > /etc/updraft-sandbox.json; \
+    chmod 0644 /etc/updraft-sandbox.json; \
+    if [ -n "${ISOLATION_PACKAGES:-}" ]; then \
+      bwrap --version; nft --version; \
+      if ! updraft validate --help | grep -q -- '--json'; then \
+        echo "this Updraft has no 'validate --json', which the runner needs to check that every agent runs in the sandbox; use a newer UPDRAFT_SPEC or a tarball in vendor/ (or ISOLATION_PACKAGES=\"\" with AgentIsolation=disabled)" >&2; exit 1; \
+      fi; \
+    fi
+
+# The runner and its AWS SDK clients.
+COPY runner/ /opt/updraft/runner/
+RUN set -eu; cd /opt/updraft/runner; npm ci --omit=dev --no-fund --no-audit; npm cache clean --force >/dev/null 2>&1 || true
+
+# The job user. The runner (root) starts `updraft run-event` and `updraft state merge` as
+# this user; Updraft starts the agent as the same user. /var/lib/updraft-jobs stays root's:
+# the runner makes one directory per job in it for the job user, and keeps its own copy of
+# the shared state database (the merge base) in one the job user cannot enter. Claude Code refuses its full-auto mode as root. The Git identity is
+# a fallback for agents that commit without `github.app.commitAsApp: true`.
+RUN set -eu; \
+    useradd --create-home --uid 1000 --user-group --shell /bin/sh updraft; \
+    mkdir -p /var/lib/updraft-jobs; chmod 0755 /var/lib/updraft-jobs; \
+    git config --system user.name "Updraft Agent"; \
+    git config --system user.email "updraft-agent@users.noreply.invalid"; \
+    git config --system init.defaultBranch main
+
+ENV UPDRAFT_JOB_USER=updraft \
+    UPDRAFT_JOB_UID=1000 \
+    UPDRAFT_JOB_GID=1000 \
+    UPDRAFT_JOB_HOME=/home/updraft \
+    UPDRAFT_STATE_ROOT=/var/lib/updraft-jobs \
+    HOOK_PORT=9000 \
+    NODE_ENV=production
+
+# Lifecycle hooks only. Nothing listens for application traffic: jobs run with NO_INGRESS.
+EXPOSE 9000
+
+ENTRYPOINT ["node", "/opt/updraft/runner/server.mjs"]

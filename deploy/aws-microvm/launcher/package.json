@@ -1,0 +1,17 @@
+{
+  "name": "updraft-microvm-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Webhook launcher for Updraft jobs in AWS Lambda MicroVMs",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1171.0",
+    "@aws-sdk/client-lambda-microvms": "^3.1171.0",
+    "@aws-sdk/client-s3": "^3.1171.0",
+    "@aws-sdk/client-secrets-manager": "^3.1171.0"
+  }
+}

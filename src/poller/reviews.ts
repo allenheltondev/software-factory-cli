@@ -94,6 +94,7 @@ function snapshotReview(review: GitHubReview, decision: Extract<ReturnType<typeo
       diffHunk: capStart(c.diffHunk, MAX_DIFF_HUNK),
     })),
     omittedComments: decision.omittedComments + (decision.comments.length - kept.length),
+    ...(review.commitSha ? { headSha: review.commitSha } : {}),
   };
 }
 
@@ -106,14 +107,34 @@ function snapshotReview(review: GitHubReview, decision: Extract<ReturnType<typeo
  * a head someone else pushed gets its reviewer run. That costs no further request: the PR's
  * reviews are read whenever the PR changed, and a push changes it.
  */
-export async function pollRepoReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: RepositoryConfig, log: Logger): Promise<ReviewPollResult | null> {
+export async function pollRepoReviews(
+  deps: ReviewPollDeps,
+  repo: RepoRef,
+  cfg: RepositoryConfig,
+  log: Logger,
+  /**
+   * `only`: one pull request, for `updraft run-event` (a webhook said it changed). It is read
+   * directly instead of being looked for in the listing, the repository's other watched pull
+   * requests are left to their own events, and the listing checkpoint is not touched.
+   */
+  opts: {
+    only?: number;
+    /**
+     * Called for a pull request after its reviews were read from the API and before any of them
+     * is decided. `updraft run-event --shared-state` uses it to learn, as late as it can, which
+     * reviews another machine has on record. The worker has one database and passes nothing.
+     */
+    beforeIngest?: (prNumber: number) => void;
+  } = {},
+): Promise<ReviewPollResult | null> {
   const revising = reviseActive(deps.config, cfg);
   const reviewing = reviewActive(deps.config, cfg);
   if (!revising && !reviewing) return null;
   const { db, api } = deps;
+  const { only } = opts;
   const result: ReviewPollResult = { pullRequestsRead: 0, revisionsQueued: 0, reviewsQueued: 0, jobsCanceled: 0 };
   const scheduleReviewJobs = () => {
-    for (const job of scheduleReviews(db, deps.config, repo.fullName, cfg, deps.now)) {
+    for (const job of scheduleReviews(db, deps.config, repo.fullName, cfg, deps.now, only === undefined ? undefined : (pr) => pr.prNumber === only)) {
       result.reviewsQueued++;
       log.info('reviewer job queued', { job: job.id, pr: job.envelope.review?.pullRequest.number, head: job.envelope.review?.headSha, pool: job.pool });
     }
@@ -123,7 +144,11 @@ export async function pollRepoReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: 
   if (added) log.info('watching pull requests', { added });
   // From local state, so also after a restart: heads the worker pushed itself need no read.
   scheduleReviewJobs();
-  const watched = new Map(listOpenRevisionPrs(db, repo.id).map((w) => [w.prNumber, w]));
+  const watched = new Map(
+    listOpenRevisionPrs(db, repo.id)
+      .filter((w) => only === undefined || w.prNumber === only)
+      .map((w) => [w.prNumber, w]),
+  );
   if (watched.size === 0) return result;
 
   const cp = getReviewCheckpoint(db, repo.id);
@@ -134,7 +159,7 @@ export async function pollRepoReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: 
   let page = 1;
   // False when the page budget ran out first: a watched PR that was not listed may have changed.
   let complete = false;
-  for (let fetched = 0; fetched < MAX_PULL_PAGES; fetched++) {
+  for (let fetched = 0; only === undefined && fetched < MAX_PULL_PAGES; fetched++) {
     const res = await api.listPullRequestUpdates(repo, { page, perPage: PULLS_PER_PAGE, etag: page === 1 ? etag : null });
     complete = true;
     // Sorted by update time, so any change to any PR changes page 1 and its ETag.
@@ -187,14 +212,17 @@ export async function pollRepoReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: 
     if (reviewing && pr.headRef === w.branch && observeHead(db, repo.id, w.prNumber, pr.headSha, readAt)) {
       log.info('pull request head changed', { pr: w.prNumber, head: pr.headSha });
     }
-    if (revising) result.revisionsQueued += ingestReviews(deps, repo, cfg, w, pr, log);
+    if (revising) {
+      opts.beforeIngest?.(w.prNumber);
+      result.revisionsQueued += ingestReviews(deps, repo, cfg, w, pr, log);
+    }
     // The listed time, not the read's: a review that landed between the two is then read again.
     markRevisionPrSeen(db, repo.id, w.prNumber, seen?.updatedAt ?? pr.updatedAt, deps.now);
   }
 
   // Heads read just now.
   scheduleReviewJobs();
-  saveReviewCheckpoint(db, repo.id, { etag, lastUpdatedAt: newest }, deps.now);
+  if (only === undefined) saveReviewCheckpoint(db, repo.id, { etag, lastUpdatedAt: newest }, deps.now);
   return result;
 }
 

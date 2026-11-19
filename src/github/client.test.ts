@@ -296,6 +296,14 @@ describe('createGitHubApi: publication writes', () => {
     expect(c).toEqual({ id: 4, htmlUrl: 'h4', body: 'hi', user: 'allen' });
   });
 
+  it('replaces the body of a comment', async () => {
+    const { fn, calls } = fakeFetch(() => json({ id: 4, html_url: 'h4', body: 'new', user: { login: 'allen' } }));
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    expect(await api.updateIssueComment({ id: 42, fullName: 'o/r' }, 4, 'new')).toEqual({ id: 4, htmlUrl: 'h4', body: 'new', user: 'allen' });
+    expect(calls[0]).toMatchObject({ method: 'PATCH', url: 'https://api.github.com/repositories/42/issues/comments/4' });
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ body: 'new' });
+  });
+
   it('keeps the error mapping for writes, including validation details and rate limits', async () => {
     const draft = fakeFetch(() =>
       json({ message: 'Validation Failed', errors: [{ message: 'Draft pull requests are not supported in this repository.' }] }, { status: 422 }),
@@ -477,6 +485,7 @@ describe('createGitHubApi: the revision loop', () => {
     author: { login: 'allen' },
     lastEditedAt: null,
     editor: null,
+    commit: { oid: 'def456' },
     comments: {
       totalCount: 3,
       nodes: [
@@ -515,6 +524,8 @@ describe('createGitHubApi: the revision loop', () => {
             { author: null, body: '', path: 'src/b.ts', line: null, diffHunk: '', lastEditedAt: null, editor: null },
           ],
           commentCount: 3,
+          // The commit the review was submitted against.
+          commitSha: 'def456',
         },
       ],
     });
@@ -522,7 +533,7 @@ describe('createGitHubApi: the revision loop', () => {
     expect(new URL(calls[0]!.url).pathname).toBe('/graphql');
     const sent = JSON.parse(calls[0]!.body!) as { query: string; variables: unknown };
     expect(sent.variables).toEqual({ owner: 'o', name: 'r', number: 9 });
-    expect(sent.query).toMatch(/databaseId[\s\S]*pullRequest\(number: \$number\)[\s\S]*reviews\(last: 50\)[\s\S]*lastEditedAt[\s\S]*comments\(first: 100\)[\s\S]*diffHunk/);
+    expect(sent.query).toMatch(/databaseId[\s\S]*pullRequest\(number: \$number\)[\s\S]*reviews\(last: 50\)[\s\S]*lastEditedAt[\s\S]*commit \{ oid \}[\s\S]*comments\(first: 100\)[\s\S]*diffHunk/);
   });
 
   it('maps merged and closed, refuses another repository under the same name, and reports only a missing pull request as 404', async () => {

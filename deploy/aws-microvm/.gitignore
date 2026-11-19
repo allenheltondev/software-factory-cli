@@ -1,0 +1,13 @@
+# SAM build output and local dependency installs
+.aws-sam/
+node_modules/
+
+# Your deployment's Updraft config and prompts (uploaded to S3 by deploy.sh, not committed)
+config/*
+!config/config.example.yaml
+
+# `npm pack` tarballs placed in image/vendor/ for testing unpublished builds
+image/vendor/*.tgz
+
+# A copy of the fleet's state database from `deploy.sh state pull` (issue titles, review text)
+updraft-state/

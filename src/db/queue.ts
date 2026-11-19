@@ -74,8 +74,10 @@ function getRunRow(db: Db, runId: string): RunRow | undefined {
   return db.prepare('SELECT * FROM runs WHERE id = ?').get(runId) as RunRow | undefined;
 }
 
-function runningByAgent(db: Db): Map<string, number> {
-  const rows = db.prepare('SELECT agent, count(*) AS n FROM runs WHERE ended_at IS NULL GROUP BY agent').all() as {
+function runningByAgent(db: Db, ownedBy: string | null = null): Map<string, number> {
+  const rows = db
+    .prepare('SELECT agent, count(*) AS n FROM runs WHERE ended_at IS NULL AND (? IS NULL OR worker_id = ?) GROUP BY agent')
+    .all(ownedBy, ownedBy) as {
     agent: string;
     n: number;
   }[];
@@ -245,17 +247,24 @@ export function claimNextJob(
     now?: () => number;
     excludeJobIds?: ReadonlySet<string>;
     lockWorkerId?: string;
+    /**
+     * Count only this worker's own open runs towards the limits and the one-job-per-issue rule.
+     * For a single-event run on a state database shared between machines (drain.ts): open runs
+     * of other workers in it are another machine's, or were, and this process cannot tell which.
+     */
+    ownRunsOnly?: boolean;
   },
 ): Claim | null {
   const clock = opts.now ?? Date.now;
+  const ownedBy = opts.ownRunsOnly ? opts.workerId : null;
   return transaction(db, () => {
     if (opts.lockWorkerId !== undefined && !holdsWorkerLock(db, opts.lockWorkerId)) {
       throw new WorkerLockLostError(opts.lockWorkerId);
     }
-    const open = (db.prepare('SELECT count(*) AS n FROM runs WHERE ended_at IS NULL').get() as { n: number }).n;
+    const open = (db.prepare('SELECT count(*) AS n FROM runs WHERE ended_at IS NULL AND (? IS NULL OR worker_id = ?)').get(ownedBy, ownedBy) as { n: number }).n;
     if (open >= config.maxConcurrent) return null;
 
-    const load = runningByAgent(db);
+    const load = runningByAgent(db, ownedBy);
     const cooldowns = config.capacity ? activeCooldowns(db, clock()) : [];
     const blocked = config.capacity ? (name: string) => capacityBlock(config, name, cooldowns, load) : null;
     const busyIssues = new Set(
@@ -263,9 +272,9 @@ export function claimNextJob(
         db
           .prepare(
             `SELECT DISTINCT repo_id, issue_number FROM jobs
-             WHERE status = 'running' OR id IN (SELECT job_id FROM runs WHERE ended_at IS NULL)`,
+             WHERE (? IS NULL AND status = 'running') OR id IN (SELECT job_id FROM runs WHERE ended_at IS NULL AND (? IS NULL OR worker_id = ?))`,
           )
-          .all() as { repo_id: number; issue_number: number }[]
+          .all(ownedBy, ownedBy, ownedBy) as { repo_id: number; issue_number: number }[]
       ).map((r) => issueKey(r.repo_id, r.issue_number)),
     );
     // A revision starts from the PR branch's remote head: it must not start while the previous

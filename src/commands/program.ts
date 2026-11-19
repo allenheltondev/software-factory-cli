@@ -13,7 +13,9 @@ import { logsCommand, type LogsOptions } from './logs.js';
 import { publishCommand } from './publish.js';
 import { retryCommand } from './retry.js';
 import { reviewsCommand, type ReviewsOptions } from './reviews.js';
+import { runEventCommand, type RunEventOptions } from './run-event.js';
 import { startCommand } from './start.js';
+import { stateCopyCommand, stateInfoCommand, stateMergeCommand, type StateMergeOptions } from './state.js';
 import { statsCommand, type StatsOptions } from './stats.js';
 import { statusCommand } from './status.js';
 import { validateCommand } from './validate.js';
@@ -21,8 +23,12 @@ import { validateCommand } from './validate.js';
 export interface Handlers {
   configure(ctx: CommandContext): Promise<number>;
   add(ctx: CommandContext, repo: string, opts: AddOptions): Promise<number>;
-  validate(ctx: CommandContext): Promise<number>;
+  validate(ctx: CommandContext, opts?: { json?: boolean }): Promise<number>;
   start(ctx: CommandContext): Promise<number>;
+  runEvent(ctx: CommandContext, opts: RunEventOptions): Promise<number>;
+  stateMerge(ctx: CommandContext, opts: StateMergeOptions): Promise<number>;
+  stateInfo(ctx: CommandContext, opts: { db: string; json?: boolean }): Promise<number>;
+  stateCopy(ctx: CommandContext, opts: { db: string; out: string; json?: boolean }): Promise<number>;
   status(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   doctor(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   retry(ctx: CommandContext, jobId: string): Promise<number>;
@@ -40,6 +46,10 @@ export const defaultHandlers: Handlers = {
   add: addCommand,
   validate: validateCommand,
   start: (ctx) => startCommand(ctx),
+  runEvent: (ctx, opts) => runEventCommand(ctx, opts),
+  stateMerge: (ctx, opts) => stateMergeCommand(ctx, opts),
+  stateInfo: (ctx, opts) => stateInfoCommand(ctx, opts),
+  stateCopy: (ctx, opts) => stateCopyCommand(ctx, opts),
   status: statusCommand,
   doctor: (ctx, opts) => doctorCommand(ctx, opts),
   retry: (ctx, jobId) => retryCommand(ctx, jobId),
@@ -108,12 +118,49 @@ export function buildProgram(opts: ProgramOptions): Command {
   program
     .command('validate')
     .description('Check the config without network access (exit 1 if invalid)')
-    .action(() => exec((ctx) => handlers.validate(ctx)));
+    .addOption(new Option('--json', 'print one JSON object on stdout: errors, warnings and the validated config with its defaults filled in'))
+    .action((o: { json?: boolean }) => exec((ctx) => handlers.validate(ctx, o)));
 
   program
     .command('start')
     .description('Run the worker: poll GitHub and process the queue (non-interactive)')
     .action(() => exec((ctx) => handlers.start(ctx)));
+
+  program
+    .command('run-event')
+    .description('Handle one GitHub webhook event to the end, then exit: run its job, verify, publish (no polling; see docs/run-event.md)')
+    .requiredOption('--event-file <path>', 'file holding the webhook payload (the JSON body GitHub POSTs)')
+    .option('--event-name <name>', 'the X-GitHub-Event header of the delivery', 'issues')
+    .option('--delivery-id <id>', 'the X-GitHub-Delivery header, for the logs and the summary')
+    .option('--deadline-minutes <n>', 'stop everything, a running agent included, after this many minutes')
+    .option('--worker-git-credentials', "fetch with the worker's GitHub credentials even into a clone run-event did not create")
+    .option('--shared-state <file>', 'a copy of the shared state database kept fresher than the one this run started from; read before the last look, never written')
+    .addOption(new Option('--json', 'print one JSON summary object on stdout'))
+    .action((o: RunEventOptions) => exec((ctx) => handlers.runEvent(ctx, o)));
+
+  const state = program.command('state').description('Work with a state database as a file shared between runs (see docs/shared-state.md)');
+  state
+    .command('merge')
+    .description('Apply what one finished run changed in its copy of the state database to the latest shared copy (a three-way merge by key)')
+    .requiredOption('--changed <file>', 'the state database the run used')
+    .requiredOption('--into <file>', 'the latest shared copy; created when it does not exist')
+    .option('--base <file>', 'the snapshot the run started from (omit when it started from nothing)')
+    .option('--live', 'the run is still going: read --changed consistently while it is written to, and leave unfinished work as it is (a checkpoint)')
+    .addOption(new Option('--json', 'print one JSON object on stdout: per-table counts, schema version, and whether anything changed'))
+    .action((o: StateMergeOptions) => exec((ctx) => handlers.stateMerge(ctx, o)));
+  state
+    .command('info')
+    .description('Show the schema version and row counts of a state database file (read-only)')
+    .requiredOption('--db <file>', 'the state database file')
+    .addOption(new Option('--json', 'machine-readable output'))
+    .action((o: { db: string; json?: boolean }) => exec((ctx) => handlers.stateInfo(ctx, o)));
+  state
+    .command('copy')
+    .description('Write a consistent single-file copy of a state database, read through SQLite (safe while a run is writing to it)')
+    .requiredOption('--db <file>', 'the state database to copy')
+    .requiredOption('--out <file>', 'the file to write; it must not exist')
+    .addOption(new Option('--json', 'machine-readable output'))
+    .action((o: { db: string; out: string; json?: boolean }) => exec((ctx) => handlers.stateCopy(ctx, o)));
 
   program
     .command('status')

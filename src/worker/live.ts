@@ -102,6 +102,14 @@ export interface LiveExecutorOptions {
    * the local git identity, as git is configured.
    */
   commitIdentity?: (repoFullName: string) => Promise<CommitIdentity | null>;
+  /**
+   * How the fetch that prepares a run's worktree authenticates, for a machine that has no git
+   * credentials of its own (`updraft run-event`; src/git/clone.ts). The environment is given to
+   * the worker's own ls-remote and fetch and to nothing else: never to the agent. `redact`
+   * removes the credential from an error before it is logged. Absent or null: the machine's own
+   * git credentials, as always.
+   */
+  networkGit?: (o: { repoFullName: string; checkoutPath: string }) => Promise<{ env: NodeJS.ProcessEnv; redact: (text: string) => string } | null>;
 }
 
 function defaultLocate(adapter: string, agent: AgentConfig, opts: { env: NodeJS.ProcessEnv; configDir: string }): LocatedLaunch {
@@ -703,6 +711,14 @@ export class LiveExecutor implements Executor {
     const worktreePath = jobWorktreePath(ctx.paths, job, run.attempt);
     let prepared: PreparedWorktree;
     let checkout: string | null = null;
+    let networkGit: Awaited<ReturnType<NonNullable<LiveExecutorOptions['networkGit']>>> = null;
+    if (this.opts.networkGit) {
+      try {
+        networkGit = await this.opts.networkGit({ repoFullName: found.fullName, checkoutPath: checkoutSource });
+      } catch (err) {
+        return fail('failed', `could not get the worker's GitHub credentials for the fetch: ${message(err)}`);
+      }
+    }
     try {
       prepared = await prepareJobWorktree({
         checkoutPath: checkoutSource,
@@ -716,6 +732,7 @@ export class LiveExecutor implements Executor {
         branch,
         worktreePath,
         git: this.opts.git,
+        networkEnv: networkGit?.env,
         signal: ctx.workerStopping ? AbortSignal.any([ctx.signal, ctx.workerStopping]) : ctx.signal,
         onCheckout: (path) => {
           checkout = path;
@@ -728,7 +745,7 @@ export class LiveExecutor implements Executor {
         `source clone: ${checkoutSource}`,
         checkout ? `checkout: ${checkout} (left by the failed preparation; kept for inspection)` : 'checkout: none (preparation failed)',
       ]);
-      return fail(stopping() ? 'interrupted' : 'failed', `could not prepare the worktree: ${message(err)}`);
+      return fail(stopping() ? 'interrupted' : 'failed', `could not prepare the worktree: ${networkGit ? networkGit.redact(message(err)) : message(err)}`);
     }
     if (stopping()) {
       await log([`checkout: ${prepared.worktreePath}`]);

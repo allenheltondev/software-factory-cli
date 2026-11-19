@@ -32,6 +32,19 @@ function setup(handlers: Partial<Handlers> = {}) {
 }
 
 describe('commander wiring', () => {
+  it('parses state merge and state info, and passes their exit codes on', async () => {
+    const stateMerge = vi.fn(async () => 5);
+    const stateInfo = vi.fn(async () => 0);
+    const { parse, codes } = setup({ stateMerge, stateInfo });
+    await parse('state', 'merge', '--changed', 'run.db', '--into', 'shared.db', '--base', 'snapshot.db', '--json');
+    expect(stateMerge).toHaveBeenCalledWith(expect.anything(), { changed: 'run.db', into: 'shared.db', base: 'snapshot.db', json: true });
+    await parse('state', 'merge', '--changed', 'run.db', '--into', 'shared.db');
+    expect(stateMerge).toHaveBeenLastCalledWith(expect.anything(), { changed: 'run.db', into: 'shared.db' });
+    await parse('state', 'info', '--db', 'shared.db', '--json');
+    expect(stateInfo).toHaveBeenCalledWith(expect.anything(), { db: 'shared.db', json: true });
+    expect(codes).toEqual([5, 5, 0]);
+  });
+
   it('parses add with defaults and repeatable routes', async () => {
     const add = vi.fn(async () => 0);
     const { parse, codes } = setup({ add });

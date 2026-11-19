@@ -112,6 +112,25 @@ export interface PublishDeps {
   /** Base environment for git; defaults to the worker's. */
   env?: NodeJS.ProcessEnv;
   now?: () => number;
+  /**
+   * Single-event runs on a state database shared between machines (src/worker/scope.ts): what a
+   * publisher does on its own after a poll (retries, reviewer jobs, auto-merge, notices) is
+   * limited to these runs and pull requests. Absent: everything in the database, as for the worker.
+   */
+  scope?: PublishScope;
+  /**
+   * Single-event runs again: another machine may be revising for the same review, from a state
+   * database this one cannot see. With this set, a revision announces its push on the pull
+   * request before making it, and gives way to one that got there first (src/publish/revision.ts,
+   * "One revision per review"). Absent: the worker's own database is the only one, and says.
+   */
+  claimReviews?: boolean;
+}
+
+/** Which runs and pull requests a publisher may act on by itself (PublishDeps.scope). */
+export interface PublishScope {
+  run(runId: string): boolean;
+  pr(repoId: number, prNumber: number): boolean;
 }
 
 export type PublishResult =
@@ -801,7 +820,7 @@ export function createPublisher(deps: PublishDeps): Publisher {
     async retryDue(signal) {
       let due: string[];
       try {
-        due = listDuePublications(deps.db, { maxAttempts: MAX_AUTO_ATTEMPTS, now: deps.now });
+        due = listDuePublications(deps.db, { maxAttempts: MAX_AUTO_ATTEMPTS, now: deps.now }).filter((id) => deps.scope?.run(id) ?? true);
       } catch (err) {
         deps.log.error('could not list publications to retry', { error: message(err) });
         return;

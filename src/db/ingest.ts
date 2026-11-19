@@ -23,6 +23,11 @@ export interface Checkpoint {
 }
 
 export interface NewJob {
+  /**
+   * The job's id when the caller must be able to derive it again elsewhere (`updraft run-event`
+   * derives it from the event, see src/poller/webhook.ts); a new random id otherwise.
+   */
+  id?: string;
   repoId: number;
   repoFullName: string;
   workflowId: string;
@@ -128,7 +133,7 @@ export function commitPollBatch(
   return transaction(db, () => {
     const inserted: Job[] = [];
     for (const j of batch.jobs) {
-      const id = newId('job');
+      const id = j.id ?? newId('job');
       const res = insert.run(
         id,
         j.repoId,
