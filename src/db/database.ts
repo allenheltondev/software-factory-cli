@@ -25,7 +25,10 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
+
+/** The schema version that added dependency_waits (docs/dependencies.md). */
+export const DEPENDENCIES_SCHEMA_VERSION = 17;
 
 /** The schema version that added the metric_events rollup (`updraft stats`). */
 export const METRICS_SCHEMA_VERSION = 13;
@@ -557,6 +560,54 @@ const MIGRATIONS: Record<number, Migration> = {
     ALTER TABLE metric_events ADD COLUMN hops           INTEGER;  -- escalations the job had had when the fact happened
     ALTER TABLE metric_events ADD COLUMN retries        INTEGER;  -- "updraft retry" count of the job at that time
     ALTER TABLE metric_events ADD COLUMN head_sha       TEXT;     -- review.verdict, revision.pushed: the PR head commit
+  `,
+  17: `
+    -- Waits on a pull request in another repository (repositories.<repo>.dependencies,
+    -- docs/dependencies.md). One row per run that declared one with an UPDRAFT-WAITING-ON line;
+    -- that run's job stays 'succeeded' and nothing of the run is published. The worker checks the
+    -- pull request every checkIntervalMinutes and, once it is merged, queues a follow-up job of the
+    -- same workflow on the same issue (event_id "dep:<run_id>"). Kept apart from runs, like
+    -- publications, so it never changes a run's outcome. 'waiting' is the only state that is not final.
+    -- IF NOT EXISTS: a database taken back to an older user_version by hand keeps its waits.
+    CREATE TABLE IF NOT EXISTS dependency_waits (
+      run_id                TEXT    PRIMARY KEY REFERENCES runs (id),
+      job_id                TEXT    NOT NULL,
+      repo_id               INTEGER NOT NULL,
+      repo_full_name        TEXT    NOT NULL,
+      issue_number          INTEGER NOT NULL,
+      workflow_id           TEXT    NOT NULL,
+      original_event_id     TEXT    NOT NULL,   -- label application the issue text is vouched for against
+      waits                 INTEGER NOT NULL,   -- waits in this chain, this one included
+      dep_repo              TEXT    NOT NULL,   -- OWNER/REPO as allowed by the config
+      dep_repo_id           INTEGER,            -- its GitHub id, once read
+      dep_number            INTEGER NOT NULL,
+      dep_url               TEXT    NOT NULL,
+      dep_title             TEXT,               -- as last read; untrusted text, never posted
+      note                  TEXT    NOT NULL,   -- the run's final message before the line, capped; untrusted, never posted
+      state                 TEXT    NOT NULL CHECK (state IN ('waiting','resumed','closed','canceled','expired')),
+      reason                TEXT,               -- why the wait ended, in the worker's words
+      checks                INTEGER NOT NULL DEFAULT 0,
+      failures              INTEGER NOT NULL DEFAULT 0,   -- consecutive checks that could not read GitHub
+      last_error            TEXT,
+      last_checked_at       TEXT,
+      next_check_at         TEXT    NOT NULL,
+      merged_at             TEXT,
+      merge_commit_sha      TEXT,
+      resume_job_id         TEXT,               -- the follow-up job, when state = 'resumed'
+      wait_comment_id       INTEGER,            -- "waiting on OWNER/REPO#N" on the issue
+      wait_comment_url      TEXT,
+      wait_comment_attempts INTEGER NOT NULL DEFAULT 0,
+      wait_comment_error    TEXT,
+      end_comment_id        INTEGER,            -- "stopped waiting" on the issue (closed unmerged, expired)
+      end_comment_url       TEXT,
+      end_comment_attempts  INTEGER NOT NULL DEFAULT 0,
+      end_comment_error     TEXT,
+      created_at            TEXT    NOT NULL,
+      updated_at            TEXT    NOT NULL,
+      ended_at              TEXT
+    );
+    CREATE INDEX IF NOT EXISTS dependency_waits_by_state ON dependency_waits (state, next_check_at);
+    CREATE INDEX IF NOT EXISTS dependency_waits_by_job ON dependency_waits (job_id);
   `,
 };
 

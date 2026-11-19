@@ -426,6 +426,8 @@ interface RawPullRequestDetails {
   state: string;
   merged?: boolean;
   merged_at?: string | null;
+  merge_commit_sha?: string | null;
+  title?: string | null;
   draft?: boolean;
   head: { ref: string; sha: string; repo?: { id: number } | null };
   base: { ref: string };
@@ -857,6 +859,9 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         author: r.user?.login ?? null,
         body: r.body ?? '',
         headRepoId: r.head.repo?.id ?? null,
+        title: r.title ?? '',
+        mergedAt: r.merged_at ?? null,
+        mergeCommitSha: r.merged === true || r.merged_at != null ? (r.merge_commit_sha ?? null) : null,
       };
     },
 

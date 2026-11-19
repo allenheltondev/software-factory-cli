@@ -28,6 +28,7 @@ import {
 } from './capacity.js';
 import { noteCooldown, noteJobDeferred, noteJobEscalated, noteJobFinished, noteJobRetried, noteRunEnded, noteRunSelected } from './metrics.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
+import { insertDependencyWait, listStatusWaits, type DeclaredDependency, type DependencyWait } from './dependency-waits.js';
 
 export interface Claim {
   job: Job;
@@ -457,6 +458,8 @@ export function listOpenRuns(db: Db): Run[] {
 export interface FinishedRun {
   outcome: RunOutcome | null;
   canceledByUser: boolean;
+  /** Set when the run's declared wait was recorded with it (docs/dependencies.md). */
+  dependency?: DeclaredDependency;
 }
 
 /**
@@ -492,7 +495,18 @@ export type FailureHandling =
 export function finishRun(
   db: Db,
   runId: string,
-  result: { outcome: RunOutcome; error?: string | null; now?: () => number; handling?: FailureHandling },
+  result: {
+    outcome: RunOutcome;
+    error?: string | null;
+    now?: () => number;
+    handling?: FailureHandling;
+    /**
+     * A wait the run declared (docs/dependencies.md), recorded in this same transaction when the
+     * run closes as succeeded and leaves its job succeeded; ignored otherwise. `firstCheckAt` is
+     * when the pull request is first looked at.
+     */
+    dependency?: DeclaredDependency & { firstCheckAt: string };
+  },
 ): FinishedRun | null {
   const at = nowIso(result.now ?? Date.now);
   return transaction(db, () => {
@@ -530,6 +544,11 @@ export function finishRun(
       case 'succeeded':
         status = 'succeeded';
         reason = null;
+        if (result.dependency) {
+          const { firstCheckAt, ...dependency } = result.dependency;
+          insertDependencyWait(db, { runId, agent: run.agent, job, dependency, firstCheckAt, at });
+          finished.dependency = dependency;
+        }
         break;
       case 'failed':
         status = 'failed';
@@ -777,6 +796,8 @@ export interface StatusSnapshot {
   cooldowns?: Cooldown[];
   /** Recent cooldowns, deferrals and escalations by job and run, oldest first. */
   policyEvents?: PolicyEvent[];
+  /** Waits on pull requests in other repositories: every one still waiting, then the latest ended ones (docs/dependencies.md). */
+  dependencyWaits?: DependencyWait[];
 }
 
 export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => number): StatusSnapshot {
@@ -873,7 +894,17 @@ export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => num
     reviews: listRecentPrReviews(db, 10),
     // Only where capacity or escalation policy is in use (or has ever acted); otherwise absent.
     ...policySnapshot(db, config, nowMs),
+    ...dependencySnapshot(db),
   };
+}
+
+function dependencySnapshot(db: Db): Pick<StatusSnapshot, 'dependencyWaits'> {
+  try {
+    const waits = listStatusWaits(db, 10);
+    return waits.length ? { dependencyWaits: waits } : {};
+  } catch {
+    return {}; // a database from before the table existed (status reads without migrating)
+  }
 }
 
 function policySnapshot(db: Db, config: UpdraftConfig, nowMs: number): Pick<StatusSnapshot, 'cooldowns' | 'policyEvents'> {

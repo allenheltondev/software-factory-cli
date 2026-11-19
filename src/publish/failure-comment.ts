@@ -177,6 +177,48 @@ export function renderFailureComment(o: {
   ].join('\n');
 }
 
+/** Hidden marker on the comment that says a wait on another repository ended without a follow-up. */
+export function dependencyEndedMarker(runId: string): string {
+  return `<!-- updraft-wait-ended: ${runId} -->`;
+}
+
+/**
+ * The failure comment of a wait on another repository's pull request (docs/dependencies.md) that
+ * ended without its issue being continued: the pull request was closed without being merged, could
+ * not be read, or was still open after dependencies.maxWaitDays. Same rules as the run failure
+ * comment: only what the worker itself knows, no agent output, no pull request title.
+ */
+export function renderDependencyEndedComment(o: {
+  runId: string;
+  jobId: string;
+  /** OWNER/REPO#N, validated against the config when the wait was recorded. */
+  dependency: string;
+  url: string;
+  state: 'closed' | 'expired';
+  /** The worker's own words. */
+  reason: string;
+  waitingSince: string;
+  triggerLabel: string;
+}): string {
+  return [
+    `Updraft stopped waiting on ${o.dependency}, so it will not continue this issue on its own.`,
+    '',
+    `- Waited on: ${o.url}`,
+    `- Waiting since: ${o.waitingSince}`,
+    `- Waiting run: ${code(o.runId)} (job ${code(o.jobId)}); nothing from it was published`,
+    '',
+    '**Reason**',
+    '',
+    fenced(cap(o.reason, MAX_REASON)),
+    '',
+    o.state === 'expired'
+      ? `To try again once that pull request is merged, remove the ${code(o.triggerLabel)} label from this issue and apply it again.`
+      : `To try again, remove the ${code(o.triggerLabel)} label from this issue and apply it again; the next run can find another way, or wait on another pull request.`,
+    '',
+    dependencyEndedMarker(o.runId),
+  ].join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // Eligibility
 // ---------------------------------------------------------------------------

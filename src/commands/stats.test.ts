@@ -93,7 +93,7 @@ describe('statsCommand', () => {
     const r = JSON.parse(ctx.out.text);
     expect(Object.keys(r)).toEqual(['version', 'generatedAt', 'window', 'repo', 'database', 'facts', 'overall', 'byRepo']);
     expect(r).toMatchObject({ version: 1, repo: 'octo/widgets', database: true, window: { label: 'all', since: null, until: '2026-11-18T12:00:00.000Z' } });
-    expect(Object.keys(r.overall)).toEqual(['work', 'time', 'outcomes', 'review', 'backAndForth', 'routing', 'pressure']);
+    expect(Object.keys(r.overall)).toEqual(['work', 'time', 'outcomes', 'review', 'backAndForth', 'routing', 'pressure', 'dependencies']);
     expect(Object.keys(r.overall.time)).toEqual(['agentRun', 'queueWait', 'labelToPr', 'prToMerge']);
     expect(r.overall.time.agentRun.byKind.implement).toEqual({ count: 5, total: 5, averageMs: expect.any(Number), medianMs: expect.any(Number), p90Ms: expect.any(Number) });
     expect(r.overall.review.findings).toMatchObject({ total: 5, withCount: 2, average: 2.5 });

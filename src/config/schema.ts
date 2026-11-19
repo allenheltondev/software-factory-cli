@@ -321,6 +321,21 @@ export const repositorySchema = z.strictObject({
    * the commit before it is merged. Not set: any one successful check is enough.
    */
   autoMergeRequiredChecks: z.array(z.string().min(1)).min(1).optional(),
+  /**
+   * Live mode: let a run wait on a pull request in another repository (docs/dependencies.md). The
+   * agent names it with an UPDRAFT-WAITING-ON line; the worker publishes nothing for that run,
+   * watches the pull request, and runs the issue again once it is merged.
+   */
+  dependencies: z
+    .strictObject({
+      /** OWNER/REPO of every repository whose pull requests may be waited on. Nothing else counts. */
+      repositories: z.array(repoFullName).min(1),
+      /** How often a waited-on pull request is checked, in minutes. Default 5. */
+      checkIntervalMinutes: z.number().min(1).max(24 * 60).optional(),
+      /** How long the worker waits before it gives up, in days. Default 30. */
+      maxWaitDays: z.number().positive().max(365).optional(),
+    })
+    .optional(),
   workflows: z.array(workflowSchema).min(1),
 });
 
@@ -448,6 +463,34 @@ export function publishMode(repo: Pick<RepositoryConfig, 'publish'>): PublishMod
 
 /** Revision jobs one PR gets when repositories.<repo>.maxRevisions is not set. */
 export const DEFAULT_MAX_REVISIONS = 3;
+
+/** How often a waited-on pull request is checked when dependencies.checkIntervalMinutes is not set. */
+export const DEFAULT_DEPENDENCY_CHECK_MINUTES = 5;
+/** How long a wait lasts when dependencies.maxWaitDays is not set. */
+export const DEFAULT_DEPENDENCY_MAX_WAIT_DAYS = 30;
+
+/**
+ * repositories.<repo>.dependencies as settings, or null when waits are off for the repository
+ * (not set, or not live mode). `allows` matches OWNER/REPO case-insensitively.
+ */
+export function dependencySettings(
+  config: Pick<UpdraftConfig, 'execution'>,
+  repo: Pick<RepositoryConfig, 'dependencies'>,
+): { repositories: string[]; checkIntervalMs: number; maxWaitMs: number; allows(fullName: string): string | null } | null {
+  const d = repo.dependencies;
+  if (config.execution.mode !== 'live' || !d) return null;
+  return {
+    repositories: [...d.repositories],
+    checkIntervalMs: (d.checkIntervalMinutes ?? DEFAULT_DEPENDENCY_CHECK_MINUTES) * 60_000,
+    maxWaitMs: (d.maxWaitDays ?? DEFAULT_DEPENDENCY_MAX_WAIT_DAYS) * 24 * 60 * 60_000,
+    allows: (fullName) => d.repositories.find((r) => r.toLowerCase() === fullName.toLowerCase()) ?? null,
+  };
+}
+
+/** True when any repository lets runs wait on another repository's pull request, in live mode. */
+export function dependenciesEnabled(config: Pick<UpdraftConfig, 'execution' | 'repositories'>): boolean {
+  return Object.values(config.repositories).some((r) => dependencySettings(config, r) !== null);
+}
 
 /** True when the revision loop runs for this repository: live mode, publication on, revise on. */
 export function reviseActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'revise'>): boolean {

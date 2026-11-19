@@ -345,6 +345,47 @@ describe('runDaemon', () => {
     expect(retries).toBeGreaterThanOrEqual(1);
   });
 
+  it('records a declared wait with its run, publishes nothing for it, tells the watcher, and checks waits after each poll', async () => {
+    const db = openDatabase(':memory:');
+    const config = makeConfig({
+      execution: { mode: 'live' },
+      repositories: {
+        'owner/repo': {
+          id: 1,
+          dependencies: { repositories: ['owner/lib'], checkIntervalMinutes: 10 },
+          workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
+        },
+      },
+    });
+    const executor: Executor = {
+      name: 'waits',
+      execute: async (c): Promise<ExecutionResult> =>
+        c.job.issueNumber === 1 ? { outcome: 'succeeded', dependency: { repo: 'owner/lib', number: 12, note: 'needs the hook' } } : { outcome: 'succeeded' },
+    };
+    const published: string[] = [];
+    const told: string[] = [];
+    let checks = 0;
+    const publisher = { afterRun: async (runId: string) => void published.push(runId), retryDue: async () => {}, sweepUnpublished: async () => {} };
+    const dependencyWatcher = { afterRun: async (runId: string) => void told.push(runId), checkDue: async () => void checks++ };
+    const deps = baseDeps(db, { config, executor, publisher, dependencyWatcher, now: () => T0 });
+    const waiting = insertJob(db, { issue: 1 });
+    const plain = insertJob(db, { issue: 2 });
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(told).toHaveLength(1));
+    await vi.waitFor(() => expect(published).toHaveLength(1));
+    deps.controller.abort();
+    await done;
+    const runOf = (job: string) => (db.prepare('SELECT id FROM runs WHERE job_id = ?').get(job) as { id: string }).id;
+    expect(told).toEqual([runOf(waiting)]);
+    expect(published).toEqual([runOf(plain)]);
+    expect(getJob(db, waiting)?.status).toBe('succeeded');
+    const wait = db.prepare('SELECT * FROM dependency_waits').all() as Array<Record<string, unknown>>;
+    expect(wait).toEqual([
+      expect.objectContaining({ run_id: runOf(waiting), job_id: waiting, dep_repo: 'owner/lib', dep_number: 12, state: 'waiting', waits: 1, note: 'needs the hook', next_check_at: new Date(T0 + 10 * 60_000).toISOString() }),
+    ]);
+    expect(checks).toBeGreaterThanOrEqual(1);
+  });
+
   it('hands failed and start_failed runs to the failure commenter, after recording them, and retries after each poll', async () => {
     const db = openDatabase(':memory:');
     const outcomes: Record<number, ExecutionResult> = {

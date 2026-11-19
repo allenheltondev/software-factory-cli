@@ -2,6 +2,7 @@ import { describeRouting } from '../tier-routing.js';
 import { existsSync } from 'node:fs';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import type { FailureComment } from '../db/failure-comments.js';
+import { dependencyRef, type DependencyWait } from '../db/dependency-waits.js';
 import type { PrReview, PrStage } from '../db/pr-reviews.js';
 import { syncPublishSettings } from '../db/publish-settings.js';
 import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
@@ -189,6 +190,33 @@ export function renderReview(r: PrReview): string {
   }
 }
 
+/** One line: where a wait on another repository's pull request stands (docs/dependencies.md). */
+export function renderDependencyWait(w: DependencyWait): string {
+  const on = `on ${dependencyRef(w)}`;
+  switch (w.state) {
+    case 'waiting': {
+      const checked = w.lastCheckedAt ? `last checked ${w.lastCheckedAt}` : 'not checked yet';
+      const trouble = w.failures ? `; ${w.failures} check(s) in a row could not read GitHub: ${oneLine(w.lastError ?? 'unknown error', 100)}` : '';
+      return `waiting ${on} since ${w.createdAt}; ${checked}, next check ${w.nextCheckAt}${trouble}`;
+    }
+    case 'resumed':
+      return `resumed: ${dependencyRef(w)} merged${w.mergedAt ? ` ${w.mergedAt}` : ''}; follow-up job ${w.resumeJobId ?? '(pruned)'}`;
+    default:
+      return `${w.state} ${on} at ${w.endedAt ?? w.updatedAt}: ${oneLine(w.reason ?? 'no reason recorded', 140)}`;
+  }
+}
+
+/** Where a wait's issue comments stand, or null when there is nothing to say. */
+function waitCommentNote(w: DependencyWait): string | null {
+  const parts: string[] = [];
+  if (w.waitComment.url) parts.push(`waiting comment ${w.waitComment.url}`);
+  else if (w.waitComment.error) parts.push(`waiting comment not posted: ${oneLine(w.waitComment.error, 100)}`);
+  if (w.endComment.url) parts.push(`failure comment ${w.endComment.url}`);
+  else if (w.endComment.error) parts.push(`failure comment not posted: ${oneLine(w.endComment.error, 100)}`);
+  else if (w.state === 'closed' || w.state === 'expired') parts.push('failure comment not posted yet');
+  return parts.length ? parts.join('; ') : null;
+}
+
 export function renderStatus(v: StatusView): string {
   const s = v.snapshot;
   const lines: string[] = [];
@@ -231,7 +259,12 @@ export function renderStatus(v: StatusView): string {
     );
   }
 
-  lines.push('', `Queue: ${JOB_STATUSES.map((st) => `${st} ${s.counts[st] ?? 0}`).join(', ')}`);
+  const waits = s.dependencyWaits ?? [];
+  const waiting = waits.filter((w) => w.state === 'waiting');
+  lines.push(
+    '',
+    `Queue: ${JOB_STATUSES.map((st) => `${st} ${s.counts[st] ?? 0}`).join(', ')}${waiting.length ? `; ${waiting.length} succeeded job(s) waiting on another pull request` : ''}`,
+  );
 
   lines.push('', `Active runs (${s.activeRuns.length}):`);
   if (!s.activeRuns.length) lines.push('  (none)');
@@ -250,8 +283,15 @@ export function renderStatus(v: StatusView): string {
 
   lines.push('', 'Recent jobs:');
   if (!s.recentJobs.length) lines.push('  (none)');
+  const waitByJob = new Map<string, DependencyWait>();
+  for (const w of waits) if (!waitByJob.has(w.jobId)) waitByJob.set(w.jobId, w);
   for (const j of s.recentJobs) {
-    const reason = j.statusReason ? ` — ${oneLine(j.statusReason, 100)}` : '';
+    const wait = j.status === 'succeeded' ? waitByJob.get(j.id) : undefined;
+    const reason = wait?.state === 'waiting'
+      ? ` — waiting on ${dependencyRef(wait)}`
+      : j.statusReason
+        ? ` — ${oneLine(j.statusReason, 100)}`
+        : '';
     lines.push(
       `  ${j.id}  ${j.status.padEnd(11)}  ${j.repoFullName}#${j.issueNumber}${revisionNote(j)}  ${j.workflowId}  updated ${j.updatedAt}${reason}`,
     );
@@ -288,6 +328,8 @@ export function renderStatus(v: StatusView): string {
       if (revision) lines.push(`    ${renderRevision(revision)}`);
       const failureComment = failureCommentByRun.get(run.id);
       if (failureComment) lines.push(`    ${renderFailureComment(failureComment)}`);
+      const wait = waits.find((w) => w.runId === run.id);
+      if (wait) lines.push(`    ${renderDependencyWait(wait)} (nothing from this run is published)`);
     }
   }
 
@@ -340,6 +382,16 @@ export function renderStatus(v: StatusView): string {
     for (const pr of s.limitedPullRequests ?? []) {
       const comment = pr.limitCommentUrl ?? (pr.limitCommentError ? `not posted yet: ${oneLine(pr.limitCommentError, 100)}` : 'not posted yet');
       lines.push(`  ${repoName.get(pr.repoId) ?? `repository ${pr.repoId}`} PR #${pr.prNumber} reached maxRevisions at ${pr.limitReachedAt}; comment: ${comment}`);
+    }
+  }
+
+  if (waits.length) {
+    lines.push('', 'Waiting on other repositories:');
+    for (const w of waits) {
+      lines.push(`  ${w.jobId}  ${w.state.padEnd(8)}  ${w.repoFullName}#${w.issueNumber}  ${w.workflowId}  run ${w.runId}`);
+      lines.push(`    ${renderDependencyWait(w)}`);
+      const comments = waitCommentNote(w);
+      if (comments) lines.push(`    ${comments}`);
     }
   }
 

@@ -89,6 +89,19 @@ export interface StatsSection {
   routing: RoutingStats;
   /** Subscription usage pressure from local signals only. */
   pressure: PressureStats;
+  /** Waits on pull requests in other repositories (docs/dependencies.md). */
+  dependencies: DependencyStats;
+}
+
+export interface DependencyStats {
+  /** Waits that began in the window. */
+  started: number;
+  /** Waits that ended in the window, by how they ended. */
+  ended: { resumed: number; closed: number; canceled: number; expired: number };
+  /** How long the waits that resumed in the window had waited for their pull request to merge. */
+  waitToMerge: Distribution;
+  /** Waiting right now (not windowed). */
+  waitingNow: number;
 }
 
 /** A rate with the sample behind it: `low` is the bound of a 95% Wilson interval. */
@@ -222,7 +235,8 @@ function normalize(e: Partial<EventRow>): EventRow {
 interface QueueRow {
   repo_id: number;
   repo_full_name: string;
-  status: 'queued' | 'running';
+  /** waiting: a wait on another repository's pull request (dependency_waits), not a job. */
+  status: 'queued' | 'running' | 'waiting';
   job_kind: string | null;
 }
 
@@ -615,7 +629,28 @@ function section(windowed: readonly EventRow[], all: readonly EventRow[], queue:
     },
     routing: routingSection(windowed, all, jobs, opened),
     pressure: pressureSection(windowed, runs),
+    dependencies: dependencySection(windowed, queue),
   };
+}
+
+function dependencySection(windowed: readonly EventRow[], queue: readonly QueueRow[]): DependencyStats {
+  const ended = windowed.filter((e) => e.kind === 'dependency.ended');
+  const count = (outcome: string) => ended.filter((e) => e.outcome === outcome).length;
+  return {
+    started: windowed.filter((e) => e.kind === 'dependency.waiting').length,
+    ended: { resumed: count('resumed'), closed: count('closed'), canceled: count('canceled'), expired: count('expired') },
+    waitToMerge: distribution(ended.filter((e) => e.outcome === 'resumed' && e.wait_ms !== null).map((e) => e.wait_ms!)),
+    waitingNow: queue.filter((q) => q.status === 'waiting').length,
+  };
+}
+
+/** Waits still waiting, as queue rows; none in a database from before dependency_waits existed. */
+function waitingRows(db: Db): QueueRow[] {
+  try {
+    return db.prepare("SELECT repo_id, repo_full_name, 'waiting' AS status, 'implement' AS job_kind FROM dependency_waits WHERE state = 'waiting'").all() as unknown as QueueRow[];
+  } catch {
+    return [];
+  }
 }
 
 const QUEUE_SQL = `
@@ -644,7 +679,7 @@ export function computeStats(db: Db | null, o: { since: number | null; now: numb
   if (!db) return { ...base, database: false, facts: { total: 0, backfilled: 0 }, overall: emptySection(), byRepo: [] };
 
   let events = (db.prepare('SELECT * FROM metric_events ORDER BY at, id').all() as unknown as Partial<EventRow>[]).map(normalize);
-  let queue = db.prepare(QUEUE_SQL).all() as unknown as QueueRow[];
+  let queue = [...(db.prepare(QUEUE_SQL).all() as unknown as QueueRow[]), ...waitingRows(db)];
 
   // Every name each repository was seen under, and the newest one to show.
   const names = new Map<number, { shown: string; at: string; all: Set<string> }>();

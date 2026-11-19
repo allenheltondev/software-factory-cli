@@ -39,6 +39,11 @@ No comment for:
 - a single start failure that was requeued for another agent;
 - a job that failed without a run, because its pool or action was removed from the config.
 
+A wait on another repository's pull request that ends without its issue being continued (the
+pull request was closed unmerged, can't be read, or outlasted `maxWaitDays`) gets a failure
+comment of its own. It's posted whatever `commentOnFailure` says, because `dependencies` turns it
+on. See [dependencies.md](dependencies.md#comments).
+
 If you retry the job and a later attempt succeeds and is published, the publication comment
 follows on the issue. The failure comment is left as it is: the worker never edits or deletes it.
 A later attempt that fails again gets a comment of its own.

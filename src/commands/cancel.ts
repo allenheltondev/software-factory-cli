@@ -1,6 +1,7 @@
 // `updraft cancel`: stop a job that is queued or running.
 import { existsSync } from 'node:fs';
 import { getRun, requestJobCancel } from '../db/queue.js';
+import { dependencyRef, endDependencyWait, waitOfJob } from '../db/dependency-waits.js';
 import { println, type CommandContext } from './context.js';
 import { CliError, EXIT } from './errors.js';
 
@@ -49,8 +50,16 @@ export async function cancelCommand(
             '(or queues it again if its agent had not started yet); cancel it then if it is queued. ' +
             'An interrupted job does not run again unless you "updraft retry" it.',
         );
-      case 'terminal':
+      case 'terminal': {
+        // A succeeded job may still be waiting on another repository's pull request (docs/dependencies.md).
+        const wait = waitOfJob(db, job.id);
+        if (wait?.state === 'waiting' && endDependencyWait(db, wait.runId, { state: 'canceled', reason: 'canceled by user', now: ctx.now })) {
+          println(ctx.out, `Stopped waiting on ${dependencyRef(wait)} for ${what}; the issue will not be run again when it merges.`);
+          println(ctx.out, 'Re-apply the trigger label to the issue to run it again.');
+          break;
+        }
         throw new CliError(`job ${job.id} is already ${job.status}; only queued or running jobs can be canceled`);
+      }
     }
     return EXIT.OK;
   } finally {

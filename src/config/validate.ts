@@ -166,6 +166,13 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       warnings.push({ path: `repositories.${repoName}.maxRevisions`, message: 'has no effect without revise' });
     }
 
+    if (repo.dependencies && config.execution.mode !== 'live') {
+      warnings.push({
+        path: `repositories.${repoName}.dependencies`,
+        message: `only applies in live mode; in ${config.execution.mode} mode no agent runs, so none can wait on a pull request`,
+      });
+    }
+
     const review = reviewSettings(repo);
     if (review.enabled) {
       if (config.execution.mode !== 'live') {
