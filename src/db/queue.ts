@@ -26,7 +26,7 @@ import {
   type Cooldown,
   type PolicyEvent,
 } from './capacity.js';
-import { noteJobFinished, noteRunEnded } from './metrics.js';
+import { noteCooldown, noteJobDeferred, noteJobEscalated, noteJobFinished, noteJobRetried, noteRunEnded, noteRunSelected } from './metrics.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
 
 export interface Claim {
@@ -367,6 +367,7 @@ export function claimNextJob(
       db.prepare(
         "UPDATE jobs SET status = 'running', status_reason = NULL, attempts = attempts + 1, updated_at = ? WHERE id = ?",
       ).run(at, row.id);
+      noteRunSelected(db, config, row, runRow);
       return { job: rowToJob(getJobRow(db, row.id)!), run: rowToRun(runRow) };
     }
     return null;
@@ -538,6 +539,7 @@ export function finishRun(
           const nowMs = (result.now ?? Date.now)();
           if (h.kind === 'usage-limit') {
             setCooldown(db, { ...h.cooldown, reason: h.detail, jobId: job.id, runId, nowMs });
+            noteCooldown(db, { runId, job, scope: h.cooldown.scope, name: h.cooldown.name, waitMs: h.cooldown.untilMs - nowMs, stated: h.cooldown.stated, at });
             recordPolicyEvent(db, {
               kind: 'cooldown',
               jobId: job.id,
@@ -550,12 +552,14 @@ export function finishRun(
               recordPolicyEvent(db, { kind: 'exhausted', jobId: job.id, runId, detail: reason, now: result.now });
             } else {
               db.prepare('UPDATE jobs SET deferrals = deferrals + 1 WHERE id = ?').run(job.id);
+              noteJobDeferred(db, job, { deferrals: job.deferrals + 1, agent: run.agent, at });
               status = 'queued';
               reason = `waiting: ${run.agent} hit a usage limit; ${h.cooldown.scope} "${h.cooldown.name}" cools down until ${new Date(h.cooldown.untilMs).toISOString()}`;
               recordPolicyEvent(db, { kind: 'deferred', jobId: job.id, runId, detail: `requeued after a usage limit on ${run.agent} (deferral ${job.deferrals + 1} of ${h.maxDeferrals})`, now: result.now });
             }
           } else {
             db.prepare('UPDATE jobs SET pool = ?, escalation_hops = escalation_hops + 1 WHERE id = ?').run(h.pool, job.id);
+            noteJobEscalated(db, job, { hops: job.escalation_hops + 1, fromTier: h.fromTier, toTier: h.toTier, source: h.source, agent: run.agent, pool: h.pool, at });
             status = 'queued';
             reason = `escalated ${h.fromTier} -> ${h.toTier} (pool ${h.pool}): ${h.reason}`;
             recordPolicyEvent(db, { kind: 'escalated', jobId: job.id, runId, detail: `${h.source}: ${reason}`, now: result.now });
@@ -667,6 +671,7 @@ export function retryJob(db: Db, jobId: string, now?: () => number): Job {
     db.prepare(
       "UPDATE jobs SET status = 'queued', status_reason = ?, start_failures = 0, retries = retries + 1, updated_at = ? WHERE id = ?",
     ).run(`retried by user (was ${row.status})`, at, jobId);
+    noteJobRetried(db, { ...row, retries: (db.prepare('SELECT retries FROM jobs WHERE id = ?').get(jobId) as { retries: number }).retries }, at);
     return rowToJob(getJobRow(db, jobId)!);
   });
 }

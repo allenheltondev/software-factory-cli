@@ -95,7 +95,101 @@ The text output shows all of this for the window, then one line per repository. 
 narrows everything, including the queue, to one repository (any case; a renamed repository is
 matched by any name it was recorded under). `--json` has the full breakdown for each repository.
 
+## Model tiers
+
+With tier routing, escalation or several agent profiles configured, `updraft stats` also shows
+whether each choice pays off. The same blocks (`routing` and `pressure`) are in every section of
+`--json`, so `--repo` and the per-repository breakdown narrow them too. Nothing here leaves the
+machine, and none of it changes how jobs are routed: it only measures.
+
+### What is recorded
+
+Schema v16 adds nullable columns to `metric_events` and six more kinds of fact, each written in
+the transaction of the decision it describes and keyed so a restart records it once:
+
+| Fact | Key | Holds |
+| --- | --- | --- |
+| `route.decided` | job id | tier, risk, selection source, reason code, classifier or triage confidence |
+| `run.selected` | run id | profile (agent), pool, adapter, model, effort, resolved and requested tier, risk, selection source, confidence, escalations and retries so far |
+| `job.retried` | job id and retry count | the retry (`updraft retry`) |
+| `job.escalated` | job id and hop count | tier left and reached, the policy that decided (a fixed code), profile that failed |
+| `job.deferred` | job id and deferral count | a job requeued to wait out a usage limit |
+| `capacity.cooldown` | run id | capacity group or profile, cooldown length, whether the CLI stated the retry-after |
+
+Failed verification (`run.ended` with `verify-failed`), reviewer findings and changes requested
+(`review.verdict`, now with the PR head commit it judged), revisions (`revision.pushed`, also
+with its head commit) and job start and end were already facts. They are attributed to a route
+through the run and job ids.
+
+- **Selection source** is one of `override` (a tier label), `local-rule` (the heuristic
+  classifier), `cli-triage` (an answer from the triage CLI, fresh or cached), `fallback` (triage
+  was asked and unavailable, so the local tier stands), `legacy-label` (a `pool.rules` match)
+  or `default`.
+- **Model and effort are configured, not observed.** They are the values the profile asks its
+  CLI for (`model`/`effort`, or `--model` in `args`). A profile that sets neither is recorded
+  with `model_source = unknown`: the CLI picks its own default and Updraft cannot tell which.
+  `observed` is reserved for a CLI that reports the model it used; none does today, so it is
+  never written. Treat a model name as the request, not as proof of what ran.
+- **Resolved tier** is the tier of the pool the run was claimed from. After an escalation that
+  is the new tier; the tier the router first asked for stays in `requested_tier`.
+- **Not stored:** prompts, issue or review text, triage explanations, account names or emails,
+  credential paths, session tokens, CLI output. Model and effort values that do not look like a
+  plain identifier (for example a path) are dropped.
+- **Older databases.** Migration 16 only adds columns. Existing rows keep `NULL`, and a run from
+  before this version is reported under the tier `unknown`, with its profile taken from the run
+  record. Selections are never backfilled. `updraft stats` still reads a database that has not
+  been upgraded (it never migrates one).
+
+### What is reported
+
+For implement jobs, by tier, by profile and by model (`routing.byTier`, `byProfile`, `byModel`):
+
+- `jobs` that finished in the window and `success`: succeeded of succeeded plus failed, with the
+  count, sample size, rate and a 95% Wilson interval (`low`, `high`). Canceled and interrupted
+  jobs are not counted either way.
+- `smallSample`: true below `routing.minSample` (20) jobs. Do not compare groups that are small.
+- `reviewReady`: of the PRs opened in the window that Updraft's reviewer has reviewed, how many
+  have a latest verdict of ready-to-merge. `changesRequested` counts the changes-requested
+  verdicts and `revisions` the revision pushes on those PRs.
+- `labelToPr` (time to a finished PR), `queueWait`, `retries` and `verificationFailures` (runs of
+  the group whose verify commands failed).
+- `escalatedOut`: jobs moved up after a run of this group. `escalatedIn`: jobs that finished here
+  after at least one escalation.
+
+**Attribution after an escalation.** A job's outcome belongs to the run that ended it, so a job
+that failed on `routine` and succeeded on `complex` is a `complex` success flagged in
+`escalatedIn`. The failed run counts against `routine` through `verificationFailures` and
+`escalatedOut`. A group's success rate therefore describes work that reached it, not work that
+started there: compare `escalatedIn` with `jobs` before reading a cheap tier's rate as better.
+
+`routing.decisions` counts the routing decisions made in the window by source and tier, and
+`triageFallbacks` how many fell back. `pressure` reports the local signals of subscription
+usage: cooldowns started by a recognized usage-limit exit (count, total time, per group or
+profile), jobs deferred, and runs whose agent could not start. It does not know your plan's quota
+and reports no token, credit or dollar figure: `tokenUsage.reported` is `false` because the CLIs
+Updraft drives give no trustworthy number.
+
+### Evaluating a model choice
+
+1. Let a route collect a meaningful sample before judging it: at least `minSample` jobs per group
+   and, better, several dozen. Read the interval, not the point rate: 9 of 10 is 90% but its
+   range runs from about 57% to 98%.
+2. Compare like with like. Use `--since` to hold the window and the configuration steady, and
+   change one thing at a time (a model, an effort, a tier mapping). Different mixes of issues
+   make a cheaper tier look better or worse than it is.
+3. Judge the outcome through to review, not just completion: success rate, then `reviewReady`,
+   then revisions per PR, `verificationFailures` and time to PR, and count the escalations a
+   cheap tier needed.
+4. Weigh pressure: a profile that often hits a usage limit costs queue time elsewhere.
+5. Keep the high-risk policy. Risk-based routing and `tiers.highRisk` hold whatever the
+   history says; a cheaper average is never a reason to route high-risk work to a cheaper pool.
+
+Nothing here recommends a model automatically. The facts are kept per run so a later comparison
+tool can read them without a new migration.
+
 ## What it does not measure
+
+- **Model use before schema v16.** Runs from before it have no selection facts.
 
 - **History that was pruned before the upgrade.** The backfill can only read rows that are still
   there. After the upgrade nothing is lost to pruning.
