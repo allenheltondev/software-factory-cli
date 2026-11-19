@@ -37,6 +37,10 @@ export interface WebhookResponse {
   body: { ok: boolean; disposition: string };
 }
 
+/**
+ * A write that fails (a throttled table, a Lambda timeout mid-sweep) answers 500, so GitHub shows
+ * the delivery as failed and it can be redelivered; every write here is safe to repeat.
+ */
 export function createWebhookHandler({
   store,
   github,
@@ -50,7 +54,7 @@ export function createWebhookHandler({
   now?: () => number;
   log?: (message: string) => void;
 }) {
-  return async function handle(req: WebhookRequest): Promise<WebhookResponse> {
+  async function handle(req: WebhookRequest): Promise<WebhookResponse> {
     const header = (name: string) => {
       const key = Object.keys(req.headers).find((k) => k.toLowerCase() === name);
       return key ? req.headers[key] : undefined;
@@ -103,5 +107,14 @@ export function createWebhookHandler({
     if (result === 'uninstalled') return done('already_uninstalled');
     if (result === 'no_tenant') return done('no_tenant');
     return done(suspended ? 'tenant_suspended' : 'tenant_active');
+  }
+
+  return async function safely(req: WebhookRequest): Promise<WebhookResponse> {
+    try {
+      return await handle(req);
+    } catch (err) {
+      log(JSON.stringify({ error: String(err) }));
+      return { status: 500, body: { ok: false, disposition: 'error' } };
+    }
   };
 }

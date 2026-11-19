@@ -149,6 +149,20 @@ describe('webhook', () => {
     });
   });
 
+  it('answers 500 when a write fails, so GitHub shows a delivery to redeliver, and the redelivery finishes it', async () => {
+    const { store, deliver } = await setup();
+    const markUninstalled = store.markUninstalled.bind(store);
+    let calls = 0;
+    store.markUninstalled = async (id, deadline) => {
+      if (++calls === 1) throw new Error('throttled');
+      return markUninstalled(id, deadline);
+    };
+    const first = await deliver('installation', { action: 'deleted', installation: { id: 55 } });
+    expect(first).toEqual({ status: 500, body: { ok: false, disposition: 'error' } });
+    const again = await deliver('installation', { action: 'deleted', installation: { id: 55 } });
+    expect(again.body.disposition).toBe('tenant_uninstalled');
+  });
+
   it('creates nothing for an installation that was never onboarded', async () => {
     const { lifecycle, store } = await setup();
     expect((await lifecycle('created', 66)).body.disposition).toBe('ignored');

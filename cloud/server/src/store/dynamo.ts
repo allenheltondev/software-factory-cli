@@ -19,6 +19,40 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
   const tenantKey = (id: number) => ({ pk: `TENANT#${id}`, sk: 'META' });
   const memberKey = (id: number, sub: string) => ({ pk: `TENANT#${id}`, sk: `MEMBER#${sub}` });
 
+  /**
+   * Gives everything in a tenant's partition (members now; config and jobs later) the table TTL.
+   * Idempotent (rows that already have this TTL are skipped), so it is simply run again until it
+   * completes. Throws on the first failed write.
+   */
+  async function sweepPartition(id: number, ttl: number): Promise<void> {
+    let ExclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const page = await client.send(
+        new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}` },
+          ProjectionExpression: 'pk, sk, #ttl',
+          ExpressionAttributeNames: { '#ttl': 'ttl' },
+          ExclusiveStartKey,
+        }),
+      );
+      for (const item of page.Items ?? []) {
+        if (item.sk === 'META' || item.ttl === ttl) continue;
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: { pk: item.pk, sk: item.sk },
+            UpdateExpression: 'SET #ttl = :ttl',
+            ExpressionAttributeNames: { '#ttl': 'ttl' },
+            ExpressionAttributeValues: { ':ttl': ttl },
+          }),
+        );
+      }
+      ExclusiveStartKey = page.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+  }
+
   const toTenant = (item: Record<string, unknown>): Tenant => {
     const t: Tenant = {
       installationId: Number(item.installationId),
@@ -161,17 +195,39 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         if (!(err instanceof ConditionalCheckFailedException)) throw err;
         // The tenant exists already: keep it as it is.
       }
-      await client.send(
-        new PutCommand({
-          TableName: T,
-          Item: {
-            ...memberKey(member.installationId, member.sub),
-            ...member,
-            GSI1PK: `USER#${member.sub}`,
-            GSI1SK: `TENANT#${member.installationId}`,
-          },
-        }),
-      );
+      // The member only while the tenant is not uninstalled, in one transaction with that check: a
+      // member can never slip in after an uninstall has started giving the partition its TTL.
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                ConditionCheck: {
+                  TableName: T,
+                  Key: tenantKey(tenant.installationId),
+                  ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+                  ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
+                },
+              },
+              {
+                Put: {
+                  TableName: T,
+                  Item: {
+                    ...memberKey(member.installationId, member.sub),
+                    ...member,
+                    GSI1PK: `USER#${member.sub}`,
+                    GSI1SK: `TENANT#${member.installationId}`,
+                  },
+                },
+              },
+            ],
+          }),
+        );
+        return 'added';
+      } catch (err) {
+        if (err instanceof TransactionCanceledException && err.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed') return 'uninstalled';
+        throw err;
+      }
     },
 
     async putOffer(offer: InstallationOffer) {
@@ -200,7 +256,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async markUninstalled(id, deleteAfter) {
-      const ttl = Math.ceil(deleteAfter / 1000);
+      let result: 'marked' | 'already' = 'marked';
+      let deadline = deleteAfter;
       try {
         // Final, and only once: a repeated delete keeps the original deadline.
         await client.send(
@@ -210,40 +267,20 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             UpdateExpression: 'SET #status = :disabled, disabledReason = :uninstalled, deleteAfter = :deleteAfter, #ttl = :ttl',
             ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
             ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
-            ExpressionAttributeValues: { ':disabled': 'disabled', ':uninstalled': 'uninstalled', ':deleteAfter': deleteAfter, ':ttl': ttl },
+            ExpressionAttributeValues: { ':disabled': 'disabled', ':uninstalled': 'uninstalled', ':deleteAfter': deleteAfter, ':ttl': Math.ceil(deleteAfter / 1000) },
           }),
         );
       } catch (err) {
         if (!(err instanceof ConditionalCheckFailedException)) throw err;
-        return (await this.getTenant(id)) ? 'already' : 'no_tenant';
+        const tenant = await this.getTenant(id);
+        if (!tenant) return 'no_tenant';
+        // Uninstalled before: finish (or redo) the sweep with the deadline stored then, so a sweep
+        // a failure or timeout cut short is completed by the next delivery of the event.
+        result = 'already';
+        deadline = tenant.deleteAfter ?? deleteAfter;
       }
-      // Everything else in the partition (members now; config and jobs later) expires with it.
-      let ExclusiveStartKey: Record<string, unknown> | undefined;
-      do {
-        const page = await client.send(
-          new QueryCommand({
-            TableName: T,
-            KeyConditionExpression: 'pk = :pk',
-            ExpressionAttributeValues: { ':pk': `TENANT#${id}` },
-            ProjectionExpression: 'pk, sk',
-            ExclusiveStartKey,
-          }),
-        );
-        for (const item of page.Items ?? []) {
-          if (item.sk === 'META') continue;
-          await client.send(
-            new UpdateCommand({
-              TableName: T,
-              Key: { pk: item.pk, sk: item.sk },
-              UpdateExpression: 'SET #ttl = :ttl',
-              ExpressionAttributeNames: { '#ttl': 'ttl' },
-              ExpressionAttributeValues: { ':ttl': ttl },
-            }),
-          );
-        }
-        ExclusiveStartKey = page.LastEvaluatedKey;
-      } while (ExclusiveStartKey);
-      return 'marked';
+      await sweepPartition(id, Math.ceil(deadline / 1000));
+      return result;
     },
 
     async setSuspended(id, suspended) {

@@ -95,11 +95,15 @@ export interface Store {
   getOffer(sub: string): Promise<InstallationOffer | null>;
 
   getTenant(installationId: number): Promise<Tenant | null>;
-  /** Creates the tenant if it is new (keeping an existing one as it is) and adds or updates the member. */
-  putTenantWithMember(tenant: Tenant, member: Member): Promise<void>;
+  /**
+   * Creates the tenant if it is new (keeping an existing one as it is) and adds or updates the
+   * member, atomically with a check that the tenant is not uninstalled (`uninstalled`: nothing added).
+   */
+  putTenantWithMember(tenant: Tenant, member: Member): Promise<'added' | 'uninstalled'>;
   /**
    * Uninstalled: final. Sets the deadline and the TTL of every item in the tenant's partition.
-   * `already`: it was uninstalled before, and keeps its original deadline.
+   * `already`: it was uninstalled before and keeps its original deadline; the partition sweep runs
+   * again with that deadline, so one cut short by a failure completes on the next delivery.
    */
   markUninstalled(installationId: number, deleteAfter: number): Promise<'marked' | 'already' | 'no_tenant'>;
   /** Suspended or active again, unless the tenant was uninstalled (one conditional write). */
@@ -162,16 +166,19 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async putTenantWithMember(tenant, member) {
       if (!tenants.has(tenant.installationId)) tenants.set(tenant.installationId, { ...tenant });
+      if (tenants.get(tenant.installationId)?.disabledReason === 'uninstalled') return 'uninstalled';
       members.set(memberKey(member.installationId, member.sub), { ...member });
+      return 'added';
     },
     async markUninstalled(id, deleteAfter) {
       const t = tenants.get(id);
       if (!t) return 'no_tenant';
-      if (t.disabledReason === 'uninstalled') return 'already';
-      const ttl = Math.ceil(deleteAfter / 1000);
-      tenants.set(id, { ...t, status: 'disabled', disabledReason: 'uninstalled', deleteAfter, ttl });
-      for (const [k, m] of members) if (m.installationId === id) members.set(k, { ...m, ttl });
-      return 'marked';
+      const already = t.disabledReason === 'uninstalled';
+      const deadline = already ? (t.deleteAfter ?? deleteAfter) : deleteAfter;
+      const ttl = Math.ceil(deadline / 1000);
+      if (!already) tenants.set(id, { ...t, status: 'disabled', disabledReason: 'uninstalled', deleteAfter, ttl });
+      for (const [k, m] of members) if (m.installationId === id && m.ttl !== ttl) members.set(k, { ...m, ttl });
+      return already ? 'already' : 'marked';
     },
     async setSuspended(id, suspended) {
       const t = tenants.get(id);

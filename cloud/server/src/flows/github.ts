@@ -180,7 +180,7 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
       throw new FlowError('tenant_disabled', 409, 'This installation was removed from GitHub; install the App again');
     }
     const at = new Date(now()).toISOString();
-    await store.putTenantWithMember(
+    const result = await store.putTenantWithMember(
       {
         installationId: installation.installationId,
         accountId: installation.accountId,
@@ -193,6 +193,8 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
       },
       { installationId: installation.installationId, sub: caller.sub, role: 'owner', githubUserId: user.id, githubLogin: user.login, addedAt: at },
     );
+    // Uninstalled between the check above and the write.
+    if (result === 'uninstalled') throw new FlowError('tenant_disabled', 409, 'This installation was removed from GitHub; install the App again');
   }
 
   const offered = (i: GitHubInstallation): OfferedInstallation => ({
@@ -336,17 +338,22 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
     /**
      * Connects an installation from the caller's current offer: authority was checked with a fresh
      * GitHub token when the offer was made, at most OFFER_TTL_MS ago, for the identity still linked.
+     * The installation itself is read again now: GitHub may have removed or suspended it since.
      */
     async connect(caller: Caller, installationId: number): Promise<{ installationId: number; accountLogin: string }> {
-      await settings();
+      const s = await settings();
       const [offer, link] = await Promise.all([store.getOffer(caller.sub), store.getLink(caller.sub)]);
       if (!offer || offer.expiresAt < now() || !link || link.githubUserId !== offer.githubUserId) {
         throw new FlowError('offer_expired', 409, 'Find your installations again: link GitHub from the dashboard');
       }
       const installation = offer.installations.find((i) => i.installationId === installationId);
       if (!installation) throw new FlowError('not_authorized', 403, 'That installation was not offered to you');
-      await addOwner(caller, { id: offer.githubUserId, login: offer.githubLogin }, installation);
-      return { installationId, accountLogin: installation.accountLogin };
+      const current = await github.getInstallation(appJwt(s.appId, s.privateKey, now()), installationId);
+      if (!current) throw new FlowError('installation_not_found', 404, 'The Updraft App is no longer installed there');
+      // The same installation id is the same account; anything else is not what was offered.
+      if (current.account.id !== installation.accountId) throw new FlowError('not_authorized', 403, 'That installation was not offered to you');
+      await addOwner(caller, { id: offer.githubUserId, login: offer.githubLogin }, offered(current));
+      return { installationId, accountLogin: current.account.login };
     },
 
     async unlink(caller: Caller): Promise<void> {

@@ -420,6 +420,27 @@ describe('GitHub flows', () => {
       expect(again.kind === 'linked' && again.installations).toEqual([expect.objectContaining({ installationId: 55, connected: true })]);
     });
 
+    it('refuses an installation GitHub removed after offering it, creating no tenant (the review\'s case)', async () => {
+      await linkedWithInstallations();
+      gh.installations.delete(55); // uninstalled on GitHub; no tenant existed, so the webhook found nothing
+      await expect(flows.connect(PAT, 55)).rejects.toMatchObject({ code: 'installation_not_found', status: 404 });
+      expect(await store.getTenant(55)).toBeNull();
+    });
+
+    it('connects with the installation\'s current suspension, not the offer\'s', async () => {
+      await linkedWithInstallations();
+      gh.installations.set(55, { ...acme, suspendedAt: '2026-11-19T00:00:00Z' });
+      await flows.connect(PAT, 55);
+      expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'suspended' });
+    });
+
+    it('refuses an installation id that now belongs to another account', async () => {
+      await linkedWithInstallations();
+      gh.installations.set(55, { ...acme, account: { id: 999, login: 'someone-else', type: 'Organization' } });
+      await expect(flows.connect(PAT, 55)).rejects.toMatchObject({ code: 'not_authorized' });
+      expect(await store.getTenant(55)).toBeNull();
+    });
+
     it('refuses to connect an installation that was uninstalled', async () => {
       await linkedWithInstallations();
       await flows.connect(PAT, 55);
