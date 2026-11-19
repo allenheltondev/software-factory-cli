@@ -18,7 +18,7 @@ export interface RepoRef {
  */
 /** How a job's pool was chosen (see docs/tier-routing.md). Decided at enqueue, then fixed for the job. */
 export interface RoutingDecision {
-  rule: 'default' | 'legacy-label' | 'override-label' | 'heuristic';
+  rule: 'default' | 'legacy-label' | 'override-label' | 'heuristic' | 'triage';
   pool: string;
   /** Set when tier routing is on. */
   tier?: 'routine' | 'standard' | 'complex' | 'high-risk';
@@ -29,6 +29,25 @@ export interface RoutingDecision {
   detail?: string;
   /** Set when no eligible pool exists: the job is not run and needs a human. */
   hold?: string;
+  /** Heuristic rule only: the local classifier's confidence was below tiers.minConfidence. */
+  uncertain?: boolean;
+  /** Set when CLI triage was consulted (docs/triage.md). Holds no issue text. */
+  triage?: TriageNote;
+}
+
+/** What CLI triage contributed to a routing decision, kept on the job for status and logs. */
+export interface TriageNote {
+  /** cli: a triage run just answered; cache: an earlier answer was reused; fallback: no usable answer, local routing stands. */
+  origin: 'cli' | 'cache' | 'fallback';
+  agent: string;
+  /** The agent's validated verdict; absent for a fallback. */
+  complexity?: 'routine' | 'standard' | 'complex';
+  risk?: 'low' | 'medium' | 'high';
+  confidence?: number;
+  /** The agent's short explanation (clipped, untrusted text), or the reason for the fallback. */
+  reason: string;
+  /** Why a verdict was not followed in full (a policy floor was higher). */
+  conflict?: string;
 }
 
 export interface EventEnvelope {

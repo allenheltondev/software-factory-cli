@@ -259,6 +259,49 @@ describe('validateConfig', () => {
   });
 });
 
+describe('validateConfig: tiers.triage', () => {
+  const base = (triage: unknown, agents: Record<string, unknown> = { worker: { adapter: 'claude' }, 'claude-triage': { adapter: 'claude', model: 'haiku' } }) => ({
+    version: 1,
+    dispatch: { allowedActors: ['allen'] },
+    agents,
+    pools: { p: { agents: ['worker'] } },
+    actions: { a: { output: 'log' } },
+    repositories: {
+      'o/r': {
+        id: 1,
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'go' }, action: 'a', pool: 'p', tiers: { pools: { routine: 'p', standard: 'p', complex: 'p' }, triage } }],
+      },
+    },
+  });
+
+  it('is off unless configured, and accepts a named triage profile', () => {
+    const r = validateConfig(base({ agent: 'claude-triage' }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.repositories['o/r']!.workflows[0]!.tiers!.triage).toMatchObject({ agent: 'claude-triage', enabled: true, onLowConfidence: true, timeoutSeconds: 120, maxRetries: 1 });
+    const none = validateConfig(base(undefined));
+    expect(none.ok && none.config.repositories['o/r']!.workflows[0]!.tiers!.triage).toBeUndefined();
+  });
+
+  it('rejects an unknown agent, a container agent and unsafe args, and an opt-out skips the checks', () => {
+    expect(validateConfig(base({ agent: 'missing' }))).toMatchObject({ ok: false, errors: [{ message: expect.stringMatching(/unknown agent/) }] });
+    expect(validateConfig(base({ agent: 'c' }, { worker: { adapter: 'claude' }, c: { adapter: 'claude', container: { image: 'img' } } }))).toMatchObject({ ok: false });
+    expect(validateConfig(base({ agent: 'c' }, { worker: { adapter: 'claude' }, c: { adapter: 'claude', args: ['--permission-mode', 'bypassPermissions'] } }))).toMatchObject({
+      ok: false,
+      errors: [{ message: expect.stringMatching(/permission-mode/) }],
+    });
+    expect(validateConfig(base({ agent: 'missing', enabled: false })).ok).toBe(true);
+  });
+
+  it('rejects unknown keys (no api key setting exists) and warns that kiro cannot guarantee no tools', () => {
+    expect(validateConfig(base({ agent: 'claude-triage', apiKey: 'x' })).ok).toBe(false);
+    const kiro = validateConfig(base({ agent: 'k' }, { worker: { adapter: 'claude' }, k: { adapter: 'kiro' } }));
+    expect(kiro.ok && kiro.warnings.some((w) => /cannot guarantee/.test(w.message))).toBe(true);
+    const claude = validateConfig(base({ agent: 'claude-triage' }));
+    expect(claude.ok && claude.warnings.some((w) => /cannot guarantee/.test(w.message))).toBe(false);
+  });
+});
+
 describe('selectPool', () => {
   const selector = { rules: [{ hasLabel: 'art', use: 'art' }], default: 'general' };
   it('first matching rule wins, case-insensitively', () => {

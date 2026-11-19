@@ -77,6 +77,23 @@ export interface AgentExit {
 /** How much of the agent's raw output {@link AgentExit.output} and {@link AgentAdapter.summarizeOutput} see. */
 export const RAW_OUTPUT_BYTES = 16 * 1024 * 1024;
 
+/** What a triage launch (src/triage) asks of an adapter: the CLI, and the profile args the user configured. */
+export interface TriageInvocationRequest {
+  launch: LaunchSpec;
+  /** agents.<name>.args (and model/effort) from the config. Settings that widen access are refused. */
+  extraArgs: readonly string[];
+  platform: NodeJS.Platform;
+}
+
+/** How tightly a triage launch is confined; see docs/triage.md. */
+export type TriageIsolation =
+  /** The CLI is started with its tools turned off. */
+  | 'no-tools'
+  /** Tools exist but the CLI's own sandbox or approval policy blocks writes and commands. */
+  | 'read-only'
+  /** The adapter withholds trust for tools, but cannot promise the CLI has no read-only tool. */
+  | 'best-effort';
+
 export interface AgentVerdict {
   outcome: 'succeeded' | 'failed';
   /** Why the run failed, for the job's status reason. */
@@ -103,6 +120,15 @@ export interface AgentAdapter {
    * output is plain text, and the whole of it is the message.
    */
   finalMessage?(output: string): string | null | undefined;
+  /**
+   * Opt-in triage (src/triage): the invocation for one read-only classification run, the prompt
+   * on stdin, in the same output mode as {@link buildInvocation} so {@link finalMessage} reads
+   * the answer. Never grants write access; throws an Error (shown as the fallback reason) when
+   * the configured args would. Absent: this adapter cannot triage.
+   */
+  buildTriageInvocation?(req: TriageInvocationRequest): AgentInvocation;
+  /** How tightly {@link buildTriageInvocation} confines the run. */
+  readonly triageIsolation?: TriageIsolation;
 }
 
 export function defaultVerdict(exit: AgentExit): AgentVerdict {

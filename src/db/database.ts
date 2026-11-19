@@ -25,7 +25,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 /** The schema version that added the metric_events rollup (`updraft stats`). */
 export const METRICS_SCHEMA_VERSION = 13;
@@ -486,6 +486,31 @@ const MIGRATIONS: Record<number, Migration> = {
     `);
     backfillMetrics(db);
   },
+  14: `
+    -- CLI-powered triage of ambiguous issues (docs/triage.md, src/triage). cache_key is a hash of
+    -- the issue identity, its content revision, the triage agent and the policy version, so a
+    -- restart or a repeated poll finds the earlier answer instead of spending subscription
+    -- capacity again. A failed attempt is kept too (outcome 'failed', until expires_at) so a
+    -- broken CLI is not retried on every poll. No issue text is stored: only the validated
+    -- verdict (complexity, risk, confidence, a short explanation) or the failure reason.
+    CREATE TABLE triage_cache (
+      cache_key  TEXT PRIMARY KEY,
+      outcome    TEXT NOT NULL CHECK (outcome IN ('ok','failed')),
+      result     TEXT,               -- JSON verdict when outcome = 'ok'
+      reason     TEXT,               -- why it failed, when outcome = 'failed'
+      agent      TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT                -- NULL: never expires (policy version change invalidates)
+    ) WITHOUT ROWID;
+
+    -- One row per triage CLI launch, for the per-hour frequency limit.
+    CREATE TABLE triage_runs (
+      id       INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent    TEXT NOT NULL,
+      started_at TEXT NOT NULL
+    );
+    CREATE INDEX triage_runs_by_time ON triage_runs (started_at);
+  `,
 };
 
 /**

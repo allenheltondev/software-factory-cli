@@ -1,5 +1,5 @@
 import type { z } from 'zod';
-import { agentProfile } from '../agents/profile.js';
+import { agentProfile, effectiveArgs } from '../agents/profile.js';
 import { getAdapter } from '../agents/adapters/registry.js';
 import {
   KNOWN_ADAPTERS,
@@ -236,6 +236,28 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
           errors.push({ path: `${base}.tiers.highRisk`, message: 'high-risk work requires independent review: review.allowSameAgent must be false' });
         }
         if (!t.highRisk) warnings.push({ path: `${base}.tiers.highRisk`, message: 'no high-risk pool: high-risk issues will be held for a human' });
+        if (t.triage?.enabled) {
+          const tp = `${base}.tiers.triage.agent`;
+          const triageAgent = config.agents[t.triage.agent];
+          if (!triageAgent) errors.push({ path: tp, message: `unknown agent "${t.triage.agent}"` });
+          else {
+            const adapterName = agentAdapter(t.triage.agent, triageAgent);
+            const adapter = getAdapter(adapterName);
+            if (!triageAgent.enabled) errors.push({ path: tp, message: `agent "${t.triage.agent}" is disabled` });
+            if (triageAgent.container) errors.push({ path: tp, message: 'triage runs the agent CLI on the host; an agent with a container cannot be used' });
+            if (!adapter?.buildTriageInvocation) errors.push({ path: tp, message: `the ${adapterName} adapter cannot run triage` });
+            else {
+              try {
+                adapter.buildTriageInvocation({ launch: { file: 'agent', args: [] }, extraArgs: effectiveArgs(adapterName, triageAgent), platform: 'linux' });
+              } catch (err) {
+                errors.push({ path: tp, message: (err as Error).message });
+              }
+              if (adapter.triageIsolation === 'best-effort') {
+                warnings.push({ path: tp, message: `the ${adapterName} adapter cannot guarantee a read-only, no-tools triage run (see docs/triage.md)` });
+              }
+            }
+          }
+        }
       }
       if (wf.reviewPool !== undefined) {
         if (!Object.hasOwn(config.pools, wf.reviewPool)) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });

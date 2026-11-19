@@ -149,6 +149,31 @@ export const poolSelectorSchema = z.union([
 ]);
 
 /**
+ * Opt-in triage by an installed, signed-in coding CLI (docs/triage.md). It never calls a model
+ * API: it launches the named agent (agents.<name>, any adapter that can run read-only) once for
+ * an ambiguous issue, which uses that agent's own subscription.
+ */
+export const triageSchema = z.strictObject({
+  /** The agent profile that classifies (agents.<name>): pick a cheap model, e.g. a `claude-triage` entry with `model`. */
+  agent: name,
+  /** Per-workflow opt-out without deleting the block. Default true (the block itself is the opt-in). */
+  enabled: z.boolean().default(true),
+  /** Triage when the local heuristics are below tiers.minConfidence. Default true. Set false for label-requested triage only. */
+  onLowConfidence: z.boolean().default(true),
+  /** An issue label that asks for triage explicitly. Default `triage:requested`. */
+  requestLabel: z.string().min(1).default('triage:requested'),
+  /** Kill the triage CLI after this many seconds. Default 120. */
+  timeoutSeconds: z.number().int().min(5).max(900).default(120),
+  /** Treat more output than this as malformed. Default 65536 bytes. */
+  maxOutputBytes: z.number().int().min(1024).max(1048576).default(65536),
+  /** Extra launches after an unreadable reply (not after a timeout or a CLI failure). Default 1, at most 2. */
+  maxRetries: z.number().int().min(0).max(2).default(1),
+  /** Triage launches allowed per hour across all repositories. Default 20. */
+  maxPerHour: z.number().int().min(1).max(1000).default(20),
+  /** After a failed triage of an issue revision, wait this long before launching again. Default 60. */
+  failureCooldownMinutes: z.number().int().min(1).max(1440).default(60),
+});
+/**
  * Opt-in tier routing (docs/tier-routing.md). Absent: routing is exactly `pool` as before.
  * `pool` is still required and is used for non-tiered paths such as legacy `rules`.
  */
@@ -167,6 +192,8 @@ export const tierSchema = z.strictObject({
     .optional(),
   /** Below this confidence the heuristic choice becomes standard. Default 0.6. */
   minConfidence: z.number().min(0).max(1).optional(),
+  /** Opt-in CLI triage of ambiguous issues (docs/triage.md). Absent: no triage, ever. */
+  triage: triageSchema.optional(),
 });
 
 export const triggerSchema = z.strictObject({
@@ -344,6 +371,7 @@ export type VerifyCommand = NonNullable<ActionConfig['verify']>[number];
 export type WorkflowConfig = z.output<typeof workflowSchema>;
 export type RepositoryConfig = z.output<typeof repositorySchema>;
 export type TierConfig = z.output<typeof tierSchema>;
+export type TriageConfig = z.output<typeof triageSchema>;
 export type PoolSelector = z.output<typeof poolSelectorSchema>;
 
 export function workflowId(wf: Pick<WorkflowConfig, 'id' | 'action' | 'trigger'>): string {

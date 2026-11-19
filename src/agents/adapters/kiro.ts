@@ -57,7 +57,7 @@
  * so a key belongs in the worker's runtime environment, not in agents.<name>.env (see
  * docs/agents/kiro.md).
  */
-import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
+import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest, TriageInvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';
 import { failureLine } from '../failure-line.js';
 import { hasOption } from './claude.js';
@@ -135,6 +135,23 @@ export const kiroAdapter: AgentAdapter = {
     if (!TRUST_FLAGS.some((f) => hasOption(extra, f))) args.push('--trust-all-tools');
     args.push(...extra);
     // kiro-cli logs to stderr while it answers on stdout; keep them apart (see the header).
+    return { file: req.launch.file, args, promptVia: 'stdin', separateStderr: true };
+  },
+
+  triageIsolation: 'best-effort',
+
+  /**
+   * Triage: `chat --no-interactive --v3 --trust-tools=` (an empty list trusts no tool). A headless
+   * run cannot answer an approval prompt, so a tool that needs approval is denied. Kiro does not
+   * document whether read-only tools run without approval, so this is not a no-tools guarantee;
+   * the run starts in an empty directory. A trust flag in agents.<name>.args is refused.
+   */
+  buildTriageInvocation(req: TriageInvocationRequest): AgentInvocation {
+    const bad = TRUST_FLAGS.find((f) => hasOption(req.extraArgs, f));
+    if (bad) throw new Error(`agents.<name>.args sets ${bad}, which would give a triage run tools`);
+    const args = [...req.launch.args, 'chat', NO_INTERACTIVE];
+    if (!kiroArgsChooseHarness(req.extraArgs)) args.push('--v3');
+    args.push('--trust-tools=', ...req.extraArgs);
     return { file: req.launch.file, args, promptVia: 'stdin', separateStderr: true };
   },
 

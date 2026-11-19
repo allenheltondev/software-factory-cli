@@ -6,6 +6,7 @@ import { openDatabase, type Db } from '../db/database.js';
 import { getCheckpoint, listQueuedJobs } from '../db/ingest.js';
 import { pruneJob } from '../db/prune.js';
 import { retryJob } from '../db/queue.js';
+import type { TriageOutcome } from '../triage/triage.js';
 import { silentLogger } from '../util/log.js';
 import { EVENTS_PER_PAGE, OVERLAP_MS, backoffSeconds, checkJobDispatchable, pollOnce, type PollerDeps } from './poller.js';
 import {
@@ -482,6 +483,86 @@ describe('pollOnce: tier routing', () => {
     const [job] = listQueuedJobs(db);
     expect(job!.pool).toBe('general');
     expect(job!.envelope.routing).toBeUndefined();
+  });
+});
+
+describe('pollOnce: CLI triage', () => {
+  const GOOD = { complexity: 'routine', risk: 'low', confidence: 0.9, explanation: 'Only wording.' } as const;
+  const triaged = (triage: Record<string, unknown> = { agent: 'a' }) =>
+    makeConfig(
+      {
+        agents: { a: {}, b: {}, c: {}, d: {} },
+        pools: { fast: { agents: ['a'] }, mid: { agents: ['b'] }, deep: { agents: ['c'] }, safe: { agents: ['d'] } },
+      },
+      {
+        publish: 'pr',
+        review: true,
+        workflows: [
+          {
+            trigger: { event: 'issue.labeled', label: READY },
+            action: 'implement-issue',
+            pool: 'mid',
+            tiers: { pools: { routine: 'fast', standard: 'mid', complex: 'deep' }, highRisk: { pool: 'safe' }, triage },
+          },
+        ],
+      },
+    );
+
+  async function run(config: UpdraftConfig, issue: { labels?: string[]; title?: string; body?: string }, outcome: TriageOutcome | 'throw' = { ok: true, origin: 'cli', agent: 'a', verdict: GOOD }) {
+    const { gh, db, deps } = setup(config);
+    const calls: Array<{ title: string; labels: readonly string[]; repo: string }> = [];
+    deps.triage = async (_cfg, req) => {
+      calls.push({ title: req.title, labels: req.labels, repo: req.repo });
+      if (outcome === 'throw') throw new Error('boom');
+      return outcome;
+    };
+    gh.createIssue(REPO, 1, issue);
+    await init(deps);
+    gh.label(REPO, 1, READY);
+    await pollOnce(deps);
+    const [row] = db.prepare('SELECT pool, envelope FROM jobs').all() as unknown as Array<{ pool: string; envelope: string }>;
+    return { calls, pool: row?.pool, routing: row ? JSON.parse(row.envelope).routing : undefined };
+  }
+
+  it('triages an ambiguous issue and records the origin on the job', async () => {
+    const r = await run(triaged(), { title: 'Tidy the page' });
+    expect(r.calls).toHaveLength(1);
+    expect(r.pool).toBe('fast');
+    expect(r.routing).toMatchObject({ rule: 'triage', tier: 'routine', triage: { origin: 'cli', agent: 'a' } });
+  });
+
+  it('does not triage confident heuristics, labels, legacy rules or high-risk issues', async () => {
+    for (const issue of [{ title: 'Fix typo in README' }, { title: 'Concurrency migration' }, { title: 'Tidy', labels: ['tier:complex'] }, { title: 'Rotate the password' }]) {
+      expect((await run(triaged(), issue)).calls, issue.title).toHaveLength(0);
+    }
+  });
+
+  it('is off by default, can be opted out per workflow, and can be label-only', async () => {
+    expect((await run(makeConfig(), { title: 'Tidy the page' })).calls).toHaveLength(0);
+    expect((await run(triaged({ agent: 'a', enabled: false }), { title: 'Tidy the page' })).calls).toHaveLength(0);
+    const labelOnly = triaged({ agent: 'a', onLowConfidence: false });
+    expect((await run(labelOnly, { title: 'Tidy the page' })).calls).toHaveLength(0);
+    expect((await run(labelOnly, { title: 'Tidy the page', labels: ['triage:requested'] })).calls).toHaveLength(1);
+  });
+
+  it('an explicit request still cannot override a tier label', async () => {
+    const r = await run(triaged(), { title: 'Tidy the page', labels: ['triage:requested', 'tier:complex'] });
+    expect(r.calls).toHaveLength(0);
+    expect(r.routing).toMatchObject({ rule: 'override-label', tier: 'complex' });
+  });
+
+  it('falls back to standard with the reason when triage fails or throws', async () => {
+    const failed = await run(triaged(), { title: 'Tidy the page' }, { ok: false, agent: 'a', reason: 'claude CLI not found' });
+    expect(failed.pool).toBe('mid');
+    expect(failed.routing).toMatchObject({ rule: 'heuristic', tier: 'standard', triage: { origin: 'fallback', reason: 'claude CLI not found' } });
+    const thrown = await run(triaged(), { title: 'Tidy the page' }, 'throw');
+    expect(thrown.routing).toMatchObject({ tier: 'standard', triage: { origin: 'fallback', reason: expect.stringMatching(/boom/) } });
+  });
+
+  it('a triage verdict cannot lower the high-risk floor from local signals', async () => {
+    const r = await run(triaged({ agent: 'a', requestLabel: 'ask' }), { title: 'Update auth flow', labels: ['ask'] });
+    expect(r.routing).toMatchObject({ tier: 'high-risk', pool: 'safe' });
+    expect(r.routing.triage).toBeUndefined();
   });
 });
 
