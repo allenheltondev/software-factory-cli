@@ -109,7 +109,27 @@ Parameters:
     MinValue: 1
     Description: >-
       Days an overwritten version of the shared state database stays recoverable
-      (bucket versioning, noncurrent version expiry under state/).
+      (bucket versioning, noncurrent version expiry under state/), and days a database
+      that could not be saved is kept under state/unsaved/.
+  StateCheckpointSeconds:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    MaxValue: 3600
+    Description: >-
+      While a job runs, what it has recorded so far is merged into the shared state
+      database whenever it changed, at most this often, so that a pull request the job
+      opened is known to other microVMs before the job ends. 0: only at the end.
+  StatePendingWaitSeconds:
+    Type: Number
+    Default: 180
+    MinValue: 0
+    MaxValue: 1800
+    Description: >-
+      A pull request event for a pull request that Updraft opened, and that the shared
+      state does not know yet, waits inside its microVM for the state to change and runs
+      again, for at most this long in all. After that the job fails and the delivery can
+      be redelivered. 0: fail at once.
   DedupeWindowSeconds:
     Type: Number
     Default: 14400
@@ -216,6 +236,12 @@ Resources:
             Prefix: state/
             NoncurrentVersionExpiration:
               NoncurrentDays: !Ref StateVersionRetentionDays
+          # A run's database that could not be merged into the shared one (deploy.sh state
+          # recover merges it later). Kept as long as an overwritten state version.
+          - Id: expire-unsaved-state
+            Status: Enabled
+            Prefix: state/unsaved/
+            ExpirationInDays: !Ref StateVersionRetentionDays
           # `deploy.sh config` replaces and deletes config objects; keep what it replaced
           # for a month, then drop it and the delete markers left behind.
           - Id: expire-old-config-versions
@@ -371,7 +397,10 @@ Resources:
                     s3:prefix:
                       - 'config/*'
                       - !If [UseSharedState, 'state/*', 'config/*']
-              # The shared state database: read the current version, write a new one.
+              # The shared state database: read the current version, write a new one. The
+              # same statement covers state/unsaved/<delivery>.db, where the runner keeps a
+              # run's database that it could not merge (a plain PutObject; nothing reads it
+              # back inside a microVM).
               # Deliberately absent: s3:DeleteObject, s3:GetObjectVersion and
               # s3:DeleteObjectVersion, so that nothing in a microVM can read or remove the
               # versions kept for recovery. Writing to a versioned bucket needs no more
@@ -476,6 +505,8 @@ Resources:
           IGNORED_SENDERS: !Ref IgnoredSenders
           PR_COALESCE_SECONDS: !Ref PullRequestCoalesceSeconds
           STATE_KEY: !If [UseSharedState, state/state.db, '']
+          STATE_CHECKPOINT_SECONDS: !Ref StateCheckpointSeconds
+          STATE_PENDING_WAIT_SECONDS: !Ref StatePendingWaitSeconds
           DEDUPE_TABLE: !Ref DeliveryTable
           DEDUPE_WINDOW_SECONDS: !Ref DedupeWindowSeconds
       Policies:

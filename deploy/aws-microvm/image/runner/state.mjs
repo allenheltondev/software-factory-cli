@@ -7,6 +7,13 @@
 // into it, and write it back with an S3 conditional write that succeeds only if nobody else
 // wrote in between. On a conflict it starts again from the newer object.
 //
+// While the job runs, the same loop runs as a checkpoint (createCheckpointer) whenever the
+// run's database has changed: `updraft state merge --live`, which reads the database
+// consistently while the run writes to it and settles nothing. That is how a pull request the
+// run opened is on record in the shared database minutes later, not at the end of the run.
+// And when the final sync fails, the run's database is kept under its own key (saveUnsaved),
+// so that what only this microVM knew is not gone with it.
+//
 // The runner is root and holds the AWS credentials. The Updraft CLI runs as the job user,
 // with an environment built from nothing, and never gets them. Everything that talks to AWS
 // or starts a process comes in through `deps` (see ../../test/runner-state.test.mjs).
@@ -21,6 +28,17 @@ export const STATE_DB_FILE = 'state.db';
 
 /** How often the download, merge, upload loop runs before it gives up. */
 export const STATE_SYNC_MAX_ATTEMPTS = 4;
+/** A checkpoint is worth less than the final sync: fewer attempts, and little time. */
+export const CHECKPOINT_MAX_ATTEMPTS = 2;
+export const CHECKPOINT_BUDGET_MS = 45 * 1000;
+/** Seconds between checkpoints when the payload does not say (stateCheckpointSeconds). */
+export const DEFAULT_CHECKPOINT_SECONDS = 20;
+/** How often the checkpointer looks at the run's database files. */
+export const CHECKPOINT_POLL_MS = 2000;
+/** The most time the copy and upload of an unsaved database may take. */
+export const UNSAVED_UPLOAD_MS = 45 * 1000;
+/** How often the shared object's ETag is asked for while a run waits for newer state. */
+export const STATE_CHANGE_POLL_MS = 5000;
 /** The most time state sync may take after a job, when the microVM has that long left. */
 export const STATE_SYNC_MAX_MS = 5 * 60 * 1000;
 /** Time kept after state sync for the logs, the result document and TerminateMicrovm. */
@@ -47,9 +65,32 @@ const MAX_REPORT_JSON_BYTES = 16 * 1024;
  * need not exist (it is created). It leaves --into as one self-contained SQLite file and
  * prints one JSON object. Exit 0 on success; any other exit means --into must not be
  * uploaded (one of them says that --into has a newer schema than this CLI).
+ *
+ * --live is for a run that is still going (a checkpoint): --changed is read through SQLite in
+ * one read transaction while the run writes to it, its -wal and -shm files are left alone,
+ * and nothing the run has in flight is marked as ended. The final merge of the same run,
+ * against the same --base, brings every row to its final state and adds nothing twice.
  */
-export function stateMergeInvocation({ changed, into, base }) {
-  return ['state', 'merge', '--changed', changed, '--into', into, ...(base ? ['--base', base] : []), '--json'];
+export function stateMergeInvocation({ changed, into, base, live }) {
+  return ['state', 'merge', '--changed', changed, '--into', into, ...(base ? ['--base', base] : []), ...(live ? ['--live'] : []), '--json'];
+}
+
+/**
+ * THE ONE PLACE that knows how `updraft state copy` is invoked:
+ *
+ *   updraft state copy --db <file> --out <file that does not exist> --json
+ *
+ * A consistent copy of a state database in one file (no -wal beside it), read through
+ * SQLite, with every row under the id it has. Exit 0 on success.
+ */
+export function stateCopyInvocation({ db, out }) {
+  return ['state', 'copy', '--db', db, '--out', out, '--json'];
+}
+
+/** Where a run's database is kept when the final sync fails: next to the shared one, by delivery. */
+export function unsavedKeys(stateKey, deliveryId) {
+  const prefix = stateKey.includes('/') ? stateKey.slice(0, stateKey.lastIndexOf('/') + 1) : '';
+  return { key: `${prefix}unsaved/${deliveryId}.db`, baseKey: `${prefix}unsaved/${deliveryId}.base.db` };
 }
 
 /**
@@ -176,6 +217,10 @@ export function stateSyncBudgetMs(payload, nowMs, { terminating = false } = {}) 
  *   resolves `{ written: false }` when S3 refused the precondition (412, 409, 404); rejects on anything else
  * @param {(register: () => void) => void} [context.onHurry] called with a function that cuts
  *   the remaining budget to TERMINATING_SYNC_MS (the microVM is being terminated)
+ * @param {boolean} [context.live] a checkpoint of a run that is still going: merge with
+ *   --live, and report in the log as a checkpoint (a checkpoint that fails loses nothing)
+ * @param {number} [context.maxAttempts] overrides the number of attempts
+ * @param {AbortSignal} [context.signal] stops it early (a checkpoint, when the job has ended)
  */
 export async function syncState(context, deps) {
   const report = {
@@ -204,6 +249,9 @@ export async function syncState(context, deps) {
     timer = setTimeout(() => controller.abort(), hurriedMs);
   });
   const aborted = new Promise((resolve) => controller.signal.addEventListener('abort', () => resolve('aborted'), { once: true }));
+  const stopEarly = () => controller.abort();
+  if (context.signal?.aborted) stopEarly();
+  context.signal?.addEventListener('abort', stopEarly, { once: true });
   const setReason = (code, message) => {
     report.notSavedCode = code;
     report.notSavedReason = message;
@@ -216,13 +264,17 @@ export async function syncState(context, deps) {
 
   const workDirs = [];
   try {
-    if (context.budgetMs <= 0) {
+    if (context.signal?.aborted) {
+      setReason('stopped', 'stopped before it began');
+    } else if (context.budgetMs <= 0) {
       setReason('no-time', 'no time left before the microVM reaches its maximum duration');
     } else {
       // The race is what guarantees an end: a dependency that ignores the abort signal cannot
       // keep the runner from reporting and terminating the microVM.
       const outcome = await Promise.race([syncLoop(context, deps, report, controller.signal, workDirs, fail), aborted]);
-      if (outcome === 'aborted') {
+      if (outcome === 'aborted' && context.signal?.aborted) {
+        setReason('stopped', `stopped after ${Math.round((Date.now() - started) / 1000)} s (attempt ${report.attempts}): the job ended, and the final sync follows`);
+      } else if (outcome === 'aborted') {
         setReason('timed-out', `state sync was stopped after ${Math.round((Date.now() - started) / 1000)} s (attempt ${report.attempts}); the shared database was left as it was unless an upload already under way completed`);
       }
     }
@@ -231,10 +283,17 @@ export async function syncState(context, deps) {
     else setReason('error', `state sync failed: ${error?.message ?? error}`);
   } finally {
     clearTimeout(timer);
+    context.signal?.removeEventListener('abort', stopEarly);
     controller.abort();
     for (const dir of workDirs) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
   report.durationMs = Date.now() - started;
+  if (context.live) {
+    // A checkpoint that did not happen loses nothing: the next one, or the final sync, carries it.
+    if (report.saved) deps.log(`checkpoint: shared state saved while the job runs (${report.uploadedBytes} bytes, attempt ${report.attempts})`);
+    else if (report.notSavedReason && report.notSavedCode !== 'no-run-database' && report.notSavedCode !== 'stopped') deps.log(`checkpoint skipped (${report.notSavedCode}): ${report.notSavedReason}`);
+    return report;
+  }
   if (report.notSavedReason) deps.log(`STATE NOT SAVED (${report.notSavedCode}): ${report.notSavedReason}`);
   else if (report.saved) deps.log(`shared state saved: ${report.uploadedBytes} bytes, schema version ${report.schemaVersion}, attempt ${report.attempts}`);
   else deps.log('shared state unchanged by this run; nothing uploaded');
@@ -253,7 +312,7 @@ async function syncLoop(context, deps, report, signal, workDirs, fail) {
   }
 
   let lastProblem = '';
-  for (let attempt = 1; attempt <= (deps.stateSyncMaxAttempts ?? STATE_SYNC_MAX_ATTEMPTS); attempt += 1) {
+  for (let attempt = 1; attempt <= (context.maxAttempts ?? deps.stateSyncMaxAttempts ?? STATE_SYNC_MAX_ATTEMPTS); attempt += 1) {
     if (signal.aborted) return undefined;
     report.attempts = attempt;
 
@@ -285,7 +344,7 @@ async function syncLoop(context, deps, report, signal, workDirs, fail) {
     await handOver(workDir, [latest ? into : undefined, base], deps.jobUser);
 
     // 3. The merge, as the job user.
-    const merge = await runTool(stateMergeInvocation({ changed, into, base }), stateDir, deps, signal);
+    const merge = await runTool(stateMergeInvocation({ changed, into, base, live: context.live === true }), stateDir, deps, signal);
     if (signal.aborted) return undefined;
     const mergeReport = parseJsonOutput(merge.stdout);
     if (merge.exitCode !== 0) {
@@ -479,4 +538,164 @@ function pause(deps, attempt, signal) {
       resolve();
     }, { once: true });
   });
+}
+
+/** What the run's database files look like from outside: enough to tell that it was written to. */
+async function fingerprint(stateDir) {
+  const parts = [];
+  for (const name of [STATE_DB_FILE, `${STATE_DB_FILE}-wal`]) {
+    const stat = await fs.lstat(path.join(stateDir, name)).catch(() => undefined);
+    parts.push(stat ? `${stat.size}:${stat.mtimeMs}` : '-');
+  }
+  return parts[0] === '-' ? null : parts.join('|');
+}
+
+/**
+ * Checkpoints the run's database into the shared one while the job runs: whenever the
+ * database (or its write-ahead log) has changed since the last checkpoint, at most every
+ * `intervalMs`, one at a time, each with a small budget. Nothing here can delay or fail the
+ * job: it only reads the job's files, a failed checkpoint is a log line, and `stop()` (called
+ * when the job has ended, before the final sync) aborts one that is under way and waits for
+ * it to let go.
+ *
+ * @param {object} context bucket, key, stateDir and baseFile as for syncState
+ * @param {number} context.intervalMs the least time between two checkpoints
+ * @param {number} [context.intervalSeconds] the setting it comes from, for the result document
+ * @param {() => number} context.timeLeftMs how long the microVM can still spend on a checkpoint
+ * @returns {{ start: () => void, stop: () => Promise<object> }} `stop` resolves with what the
+ *   result document says about the checkpoints
+ */
+export function createCheckpointer(context, deps) {
+  const summary = { intervalSeconds: context.intervalSeconds ?? Math.round(context.intervalMs / 1000), attempted: 0, saved: 0, unchanged: 0, failed: 0, lastSavedAt: null, lastEtag: null, lastProblem: null };
+  const pollMs = deps.checkpointPollMs ?? Math.min(CHECKPOINT_POLL_MS, context.intervalMs);
+  const controller = new AbortController();
+  let timer;
+  let running;
+  let lastStartedAt = Date.now();
+  let lastPrint = null;
+
+  const tick = async () => {
+    if (running || controller.signal.aborted || Date.now() - lastStartedAt < context.intervalMs) return;
+    const print = await fingerprint(context.stateDir);
+    if (print === null || print === lastPrint || controller.signal.aborted) return;
+    const budgetMs = Math.min(deps.checkpointBudgetMs ?? CHECKPOINT_BUDGET_MS, context.timeLeftMs());
+    if (budgetMs <= 0) return;
+    lastStartedAt = Date.now();
+    summary.attempted += 1;
+    running = syncState({ bucket: context.bucket, key: context.key, stateDir: context.stateDir, baseFile: context.baseFile, budgetMs, live: true, maxAttempts: deps.checkpointMaxAttempts ?? CHECKPOINT_MAX_ATTEMPTS, signal: controller.signal }, deps)
+      .then((report) => {
+        if (report.saved) {
+          summary.saved += 1;
+          summary.lastSavedAt = new Date().toISOString();
+          summary.lastEtag = report.etag;
+          lastPrint = print;
+        } else if (report.notSavedReason === null) {
+          summary.unchanged += 1;
+          lastPrint = print;
+        } else if (report.notSavedCode !== 'stopped') {
+          // Tried again at the next interval: the fingerprint is not remembered.
+          summary.failed += 1;
+          summary.lastProblem = `${report.notSavedCode}: ${report.notSavedReason}`;
+        }
+      })
+      .catch((error) => {
+        summary.failed += 1;
+        summary.lastProblem = `error: ${error?.message ?? error}`;
+      })
+      .finally(() => {
+        running = undefined;
+      });
+  };
+
+  return {
+    start() {
+      timer = setInterval(() => void tick().catch(() => {}), pollMs);
+      timer.unref?.();
+    },
+    async stop() {
+      clearInterval(timer);
+      controller.abort();
+      await running;
+      return summary;
+    },
+  };
+}
+
+/**
+ * Keeps the run's database when the final sync could not save it: a consistent single-file
+ * copy (made by `updraft state copy`, as the job user) at `unsavedKeys().key`, and the
+ * snapshot the run started from next to it, so that `deploy.sh state recover` can merge
+ * exactly what this run changed. Plain writes to keys nothing else uses: this cannot fail
+ * for the reason the sync did. Never throws; the returned object goes into the result document.
+ */
+export async function saveUnsaved({ bucket, stateKey, deliveryId, stateDir, baseFile, budgetMs }, deps) {
+  const keys = unsavedKeys(stateKey, deliveryId);
+  const report = { saved: false, key: null, baseKey: null, bytes: null, error: null };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(0, budgetMs));
+  const aborted = new Promise((resolve) => controller.signal.addEventListener('abort', () => resolve('aborted'), { once: true }));
+  let workDir;
+  const work = async () => {
+    workDir = await fs.mkdtemp(path.join(deps.stateRoot, 'unsaved-'));
+    await fs.chmod(workDir, 0o700);
+    await handOver(workDir, [], deps.jobUser);
+    const out = path.join(workDir, 'unsaved.db');
+    const copy = await runTool(stateCopyInvocation({ db: path.join(stateDir, STATE_DB_FILE), out }), stateDir, deps, controller.signal);
+    if (controller.signal.aborted) return;
+    if (copy.exitCode !== 0) throw new Error(`updraft state copy ${copy.signal ? `was killed by ${copy.signal}` : `exited ${copy.exitCode}`}${copy.stderrTail.trim() ? `: ${oneLine(copy.stderrTail)}` : ''}`);
+    const body = await readCandidate(out);
+    if (!sqliteHeader(body).valid) throw new Error('the copy is not a SQLite database');
+    await deps.s3Put(bucket, keys.key, body, 'application/vnd.sqlite3');
+    report.saved = true;
+    report.key = keys.key;
+    report.bytes = body.length;
+    if (baseFile) {
+      await deps.s3Put(bucket, keys.baseKey, await fs.readFile(baseFile), 'application/vnd.sqlite3');
+      report.baseKey = keys.baseKey;
+    }
+  };
+  try {
+    if (budgetMs <= 0) throw new Error('no time left to keep the unsaved database');
+    const outcome = await Promise.race([work(), aborted]);
+    if (outcome === 'aborted' && !report.baseKey) report.error = report.saved ? 'stopped before the snapshot the run started from was kept as well' : 'stopped before the unsaved database was kept: out of time';
+  } catch (error) {
+    report.error = error?.message ?? String(error);
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+    if (workDir) await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+  if (report.saved) deps.log(`UNSAVED STATE KEPT at s3://${bucket}/${report.key}${report.baseKey ? ` (base: ${report.baseKey})` : ''}; merge it with ./deploy.sh state recover ${deliveryId}`);
+  else deps.log(`UNSAVED STATE LOST: could not keep the run's database: ${report.error}`);
+  return report;
+}
+
+/**
+ * Waits until the shared object's ETag is no longer `etag` (somebody saved newer state), for
+ * at most `timeoutMs`. Resolves true when it changed; false on a timeout, an abort, or a
+ * runner that cannot ask (no deps.s3Etag).
+ */
+export async function waitForStateChange({ bucket, key, etag, timeoutMs, signal }, deps) {
+  if (!deps.s3Etag) return false;
+  const pollMs = deps.stateChangePollMs ?? STATE_CHANGE_POLL_MS;
+  const until = Date.now() + timeoutMs;
+  while (!signal?.aborted && Date.now() < until) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(done, Math.min(pollMs, Math.max(0, until - Date.now())));
+      function done() {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', done);
+        resolve();
+      }
+      signal?.addEventListener('abort', done, { once: true });
+    });
+    if (signal?.aborted) return false;
+    try {
+      const current = await deps.s3Etag(bucket, key);
+      if (current !== undefined && current !== etag) return true;
+    } catch (error) {
+      deps.log(`could not ask for the shared state's ETag: ${error?.message ?? error}`);
+    }
+  }
+  return false;
 }

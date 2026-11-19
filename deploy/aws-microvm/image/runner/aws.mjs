@@ -47,6 +47,11 @@ export function createAwsDeps(region) {
         throw error;
       }
     },
+    /** The object's ETag, or undefined when there is none. A list request, for the same reason as above. */
+    async s3Etag(bucket, key) {
+      const page = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: key, MaxKeys: 10 }));
+      return (page.Contents ?? []).find((item) => item.Key === key)?.ETag;
+    },
     /**
      * A conditional write (PutObject's IfMatch / IfNoneMatch, the If-Match and If-None-Match
      * headers). S3 answers 412 Precondition Failed when the object is no longer the one named

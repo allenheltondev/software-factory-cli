@@ -13,7 +13,9 @@
 export const SUPPORTED = Object.freeze({
   issues: Object.freeze(['labeled']),
   pull_request_review: Object.freeze(['submitted', 'edited', 'dismissed']),
-  pull_request: Object.freeze(['synchronize', 'closed', 'reopened']),
+  // Not `reopened`: a closed pull request is no longer watched, for good, so run-event would
+  // start, find that out and exit. An action that is not listed starts no microVM.
+  pull_request: Object.freeze(['synchronize', 'closed']),
 });
 
 export const DEFAULT_ACCEPTED_EVENTS = Object.freeze(['issues']);

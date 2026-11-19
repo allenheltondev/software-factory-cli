@@ -36,7 +36,7 @@ Launcher Lambda function  (launcher/, Node.js 22)
         |  1. verify the HMAC over the raw body (secret from Secrets Manager); else 401
         |  2. keep only accepted events (AcceptedEvents): issues.labeled (optionally: only some
         |     labels); pull_request_review.submitted/edited/dismissed and
-        |     pull_request.synchronize/closed/reopened on Updraft's own branches;
+        |     pull_request.synchronize/closed on Updraft's own branches;
         |     else 200, nothing started
         |  3. record the delivery id (DynamoDB, conditional put); already there: 200, nothing started
         |  4. pull request events: take a lease of a few seconds on the pull request (same
@@ -64,6 +64,12 @@ Lambda MicroVM  (image/, one per launch, restored from the image snapshot)
         |  everything against the GitHub API, clones, runs the agent (full-auto) and the
         |  verify commands, opens the PR; with review/revise configured also runs the
         |  reviewer, the revisions and the wait for CI, all in this one run
+        |
+        |  meanwhile, runner: a checkpoint whenever the run's database changed, at most every
+        |    StateCheckpointSeconds: the state sync below with `state merge --live`
+        |  exit code 6 (the event's pull request is Updraft's, the snapshot does not know it
+        |    yet): wait for the state object's ETag to change, download it, run the event
+        |    again; at most StatePendingWaitSeconds in all, then the job has failed
         v
    runner: state sync, whatever the job's outcome, at most 4 times:
         |    latest database  <- s3://BUCKET/state/state.db  (GET, ETag)
@@ -72,10 +78,13 @@ Lambda MicroVM  (image/, one per launch, restored from the image snapshot)
         |    changed: false -> done.  Else updraft state info on the result, then
         |    PUT s3://BUCKET/state/state.db  If-Match: <ETag>   (If-None-Match: * if there was none)
         |    412 or 409: somebody else wrote first -> again with the newer object
+        |  not saved: updraft state copy -> s3://BUCKET/state/unsaved/<delivery>.db (+ .base.db),
+        |    the result says state_not_saved, the delivery record is removed
         v
    runner: updraft.log, run.log -> s3://BUCKET/results/<delivery>/<microvm-id>/
            result               -> s3://BUCKET/results/<delivery>/<microvm-id>.json
-           job did not end well: remove the delivery record, so it can be redelivered
+           job did not end well (or its state was not saved): remove the delivery record, so it
+           can be redelivered
            TerminateMicrovm(own id)          (a watchdog stops a job that runs too long)
 ```
 
@@ -84,7 +93,7 @@ Files:
 | Path | What it is |
 | --- | --- |
 | `template.yaml` | SAM template: HTTP API, launcher function, bucket (versioned), delivery table, secrets, IAM roles, log groups |
-| `deploy.sh` | Deploys the stack, uploads the config, creates or updates the MicroVM image and waits for the build; `state info` and `state pull` for the shared state |
+| `deploy.sh` | Deploys the stack, uploads the config, creates or updates the MicroVM image and waits for the build; `state info`, `state pull`, `state unsaved` and `state recover` for the shared state |
 | `launcher/` | The launcher function. `lib/` is the logic (tested); `index.mjs` wires the AWS SDK to it |
 | `image/Dockerfile`, `image/build.env` | The MicroVM image: git, Node.js, Updraft, agent CLIs, toolchain, the runner |
 | `image/runner/` | Hook server (`server.mjs`, `hooks.mjs`), the job (`run-job.mjs`, `job.mjs`), the shared state (`state.mjs`), AWS calls (`aws.mjs`) |
@@ -222,7 +231,9 @@ Pass them through `SAM_PARAMETER_OVERRIDES="Key=Value ..."`.
 | `IgnoredSenders` | empty | Comma-separated logins whose pull request events start nothing. Set it to the App's own `<app-slug>[bot]` |
 | `PullRequestCoalesceSeconds` | `20` | Events for a pull request within this long of one that started a microVM start none (0 to 300; `0` launches for every event). See [Coalescing pull request events](#coalescing-pull-request-events) |
 | `SharedState` | `enabled` | `disabled`: every job starts from an empty state database and saves nothing, as before this existed |
-| `StateVersionRetentionDays` | `30` | How long a replaced version of the shared state database stays recoverable |
+| `StateVersionRetentionDays` | `30` | How long a replaced version of the shared state database stays recoverable, and how long a database that could not be saved is kept under `state/unsaved/` |
+| `StateCheckpointSeconds` | `20` | While a job runs, what it recorded so far is merged into the shared state whenever its database changed, at most this often (0 to 3600; `0`: only at the end). See [Checkpoints](#checkpoints) |
+| `StatePendingWaitSeconds` | `180` | How long, in all, a job for a pull request that the shared state does not know yet waits inside its microVM for that state to arrive (0 to 1800; `0`: it fails at once). See [A pull request the state does not know yet](#a-pull-request-the-state-does-not-know-yet) |
 | `IdlePolicyMode` | `explicit` | See [Idle policy](#idle-policy) |
 | `EgressNetworkConnectorArn` | empty | A VPC egress network connector. Empty uses the Lambda-provided internet egress connector |
 | `IngressNetworkConnectorArn` | empty | Empty uses the Lambda-provided `NO_INGRESS` connector. Set it only for debugging, for example to the `SHELL_INGRESS` connector |
@@ -308,7 +319,8 @@ it:
    remembers that there was one. It keeps a second, pristine copy in a directory only root
    can enter: the merge base. No object is the normal first run; the job then starts from an
    empty database.
-2. **The job runs** on its copy, as the job user. Nothing is written to S3 while it runs.
+2. **The job runs** on its copy, as the job user. While it runs, the runner saves
+   [checkpoints](#checkpoints) of it.
 3. **After the job**, whatever its outcome (succeeded, failed, stopped by the watchdog;
    only a job that never started is skipped), the runner loops, at most four times:
    - download the latest object and its ETag into a scratch directory;
@@ -339,14 +351,120 @@ makes two microVMs that finish at the same moment safe: neither can overwrite th
 upload without having merged it first. The upload is a single `PutObject` of the whole file,
 so readers never see half of one.
 
-**When state is not saved.** The runner never uploads when the merge exits non-zero, when
-the merge says the shared database has a newer schema than the Updraft in the image, when
-the merged file fails a check, when four attempts all lost the race, or when its time is up.
-None of that changes the job's outcome: a job that succeeded stays `succeeded`, and its
-delivery record is kept as for any success. It is loud instead: the result document's
-`state.sync.notSavedReason` and `notSavedCode` say why, and the log has a line starting with
-`STATE NOT SAVED`. What is lost is that run's entries in the shared history, not anything it
-did on GitHub; [Concurrency model](#concurrency-model) says what that can lead to.
+### Checkpoints
+
+A run opens its pull request minutes after it starts and may then work for hours: a reviewer
+run, revisions, a wait for CI. Saved only at the end, the pull request would be unknown to
+every other microVM for all that time, and a person's review of it would reach a microVM that
+has never heard of the pull request. So while `run-event` runs, the runner (root) looks at the
+run's `state.db` and `state.db-wal` every two seconds (their size and modification time, read
+with `lstat`; it never opens them), and when they changed since the last checkpoint, and at
+least `StateCheckpointSeconds` (20) have passed since the last one started, it runs the state
+sync of step 3 with one difference: `updraft state merge --live`.
+
+- `--live` reads the run's database through SQLite, in one read transaction, so the merge sees
+  one consistent state of it while the run keeps writing; it leaves the database's `-wal` and
+  `-shm` files alone; and it marks nothing as ended. Work in flight (an open run, a running
+  job, a review being posted) is carried as it is.
+- The merge still runs as the job user, with an environment built from nothing: no AWS
+  credentials, no agent keys. Download and conditional upload are the runner's, as in step 3.
+- A checkpoint has a small budget (2 attempts, 45 seconds, never more than the microVM has
+  left). Checkpoints never overlap: the next one is not started while one runs. A checkpoint
+  that fails, hangs or loses the race twice is a log line (`checkpoint skipped ...`) and is
+  tried again at the next interval. Nothing a checkpoint does can delay or fail the job: it
+  only reads the job's files.
+- When the job ends, the runner stops the checkpointer first (a checkpoint under way is
+  aborted and waited for), and only then starts the final sync. The final sync merges against
+  the same pristine copy as every checkpoint did; `updraft state merge` then finds the run's
+  own earlier rows in the shared database, brings each to its final state, and adds nothing
+  twice (Updraft's `docs/shared-state.md`, "Checkpoints").
+- `StateCheckpointSeconds=0` turns checkpoints off.
+
+What the runner did is in the result document: `state.checkpoints` has `attempted`, `saved`,
+`unchanged` (the merge found nothing new), `failed`, `lastSavedAt` and `lastProblem`.
+
+Each checkpoint that saves is a download and an upload of the whole database, and a new
+version of the object. A run's database changes at least every 15 seconds while an agent
+runs (the run's lease is renewed), so expect one checkpoint per interval per running job.
+See [Cost and quotas](#cost-and-quotas).
+
+### A pull request the state does not know yet
+
+Between the moment a run opens its pull request and its first checkpoint after that, a
+`pull_request_review` or `pull_request` delivery for it can start a microVM whose snapshot
+has no record of the pull request. `run-event` does not answer "not ours" from the snapshot
+alone: it asks the GitHub API whether the pull request is open, was opened by the App, is on a
+job branch of the repository and carries Updraft's marker. If so, it exits with code 6
+(outcome `state-pending`) and does nothing. The runner then:
+
+1. asks S3 for the state object's ETag every 5 seconds (a list request);
+2. when it differs from the snapshot's, removes the run's database, downloads the object again
+   (a new pristine copy too) and runs `updraft run-event` again, in the same microVM;
+3. repeats this while `run-event` exits 6: at most 6 runs, at most `StatePendingWaitSeconds`
+   (180) of waiting in all, and never past the point where the watchdog would leave the next
+   run less than four minutes.
+
+If the pull request is still unknown after that, the job has **failed**: the result says
+`outcome: "failed"`, `exitCode: 6`, `state.pending: { tries, waitedMs, resolved: false }`
+and what to do; the delivery record is removed. Nothing redelivers by itself: redeliver that
+delivery from the App's *Recent Deliveries* once the state has arrived. If it never will (the
+run that opened the pull request died without saving anything), redeliver the pull request's
+**`issues`** delivery instead: `run-event` then restores the publication from GitHub
+([When state is not saved](#when-state-is-not-saved)).
+
+A pull request that is not Updraft's ends as before: exit 0, `pull-request-not-watched`, at
+the cost of one read of the pull request.
+
+### When state is not saved
+
+The runner never uploads when the merge exits non-zero, when the merge says the shared
+database has a newer schema than the Updraft in the image, when the merged file fails a
+check, when four attempts all lost the race, or when its time is up. Checkpoints make it
+unlikely that this loses much: everything up to the last checkpoint is in the shared database
+already. What the run recorded after that exists only in the microVM, which is about to be
+terminated. If that includes the pull request it opened, every later review of it would find
+the pull request unknown. So a final sync that fails after the job ran is a failure of its
+own, whatever the job's outcome:
+
+- **The result says so.** `outcome` is `state_not_saved`; `jobOutcome` keeps what the job
+  itself ended as (`succeeded`, `failed`, `timed_out`, ...). `state.sync.notSavedReason` and
+  `notSavedCode` say why, `error` repeats it, and the log has a line starting with
+  `STATE NOT SAVED`. (A run that left no database, or changed nothing, is not this case.)
+- **The delivery record is removed**, also after a job that succeeded, so that the delivery
+  can be redelivered.
+- **The run's database is kept.** The runner has `updraft state copy` (as the job user) write
+  a consistent single-file copy of it and uploads that to
+  `s3://<bucket>/state/unsaved/<delivery id>.db`, and the pristine copy the run started from to
+  `state/unsaved/<delivery id>.base.db`, with plain `PutObject`s: no merge and no condition, so
+  this does not fail for the reason the sync did. `state.unsaved` in the result has the keys,
+  or the error when this failed too (`UNSAVED STATE LOST` in the log). The objects expire
+  after `StateVersionRetentionDays`.
+
+Nothing depends on those objects: no job reads them, and the next job's sync is the same
+whether they exist or not. Two ways lead back to a complete shared state, and they can be
+combined in either order:
+
+```sh
+./deploy.sh state unsaved                    # what is there
+./deploy.sh state recover <delivery id>      # merge it into state/state.db
+```
+
+`state recover` downloads the unsaved database and its base, and loops as the runner does:
+download the current shared database and its ETag, `updraft state merge --changed <unsaved>
+--base <base> --into <shared>` locally, upload with `--if-match <ETag>` (`--if-none-match '*'`
+when there is none), start over on a 412 or 409. It needs an `updraft` on this machine of the
+version the image runs (`UPDRAFT_BIN` names another command) and an AWS CLI whose
+`s3api put-object` has `--if-match`. Merging the same database twice adds nothing.
+
+**Or redeliver the `issues` delivery.** `run-event` finds the event's pull request on GitHub,
+finds no record of it in the state database, and restores the publication from the GitHub
+API without running an agent: outcome `nothing-to-do`, reason `already-handled`,
+`stateRestored: true`, exit 0. Reviews of the pull request are acted on again from then on.
+The restored rows are marked as reconstructed, and if `state recover` later brings the
+original rows, those replace them. A restore needs `revise` or `review` to be on for the
+repository, and the pull request to be open, opened by the App, and still carrying the marker
+and the agent line in its body; otherwise the redelivery ends with exit 1 and
+`reason: "state-not-restorable"`, and `state recover` is the way.
 
 **Recovering an earlier version.** The bucket has versioning turned on, so every upload of
 `state/state.db` keeps the object it replaced as a noncurrent version, for
@@ -463,7 +581,8 @@ further microVMs are started by what people do to the pull request afterwards. T
 recorded in the state database, and a microVM that starts from an empty one knows none.
 
 **Which events start a microVM.** `pull_request_review` with action `submitted`, `edited` or
-`dismissed`, and `pull_request` with action `synchronize`, `closed` or `reopened`, and of
+`dismissed`, and `pull_request` with action `synchronize` or `closed` (not `reopened`: a closed
+pull request is no longer watched, for good, so no microVM is started for a reopen), and of
 those only the ones that can lead to work:
 
 - the pull request's head branch starts with `updraft/` (`PullRequestBranchPrefix`). Updraft
@@ -503,7 +622,10 @@ several run at the same time. In plain terms, this is what they share and what f
 **What a microVM has to itself.** Its disk, its clone, its agent processes, and its copy of
 the state database as it was in S3 when the microVM started.
 
-**What they share.** GitHub, and the one object `state/state.db`.
+**What they share.** GitHub, and the one object `state/state.db`. A microVM writes to it at
+the end of its job and, while the job runs, in [checkpoints](#checkpoints): so a microVM that
+starts later sees what the earlier ones have recorded **so far**, their unfinished work
+included.
 
 **What two microVMs running at the same time cannot do to each other:**
 
@@ -512,6 +634,16 @@ the state database as it was in S3 when the microVM started.
   in the shared database, in either order.
 - *Corrupt the shared database.* An upload replaces the whole object at once, after the
   merged file was opened and checked; a microVM that dies mid-way has uploaded nothing.
+- *Take over each other's unfinished work.* A checkpoint shows a run's work in flight: a
+  queued reviewer job, a review posting that is due for a retry, a merge that waits for
+  checks. `run-event` records, with that work, a **hold** that names the run and expires some
+  time after its deadline; another run leaves held work alone (it does not start the queued
+  job, make the retry, or wait for and make the merge) until the holder has released it or the
+  hold has expired. A pull request that is held is still **watched**: a new review of it is
+  acted on by the run that received it. Open runs of other microVMs are, as before, neither
+  closed nor counted towards `maxConcurrent` or an agent's limit.
+- *Record a run as ended while it runs.* A checkpoint settles nothing; only a run's final
+  sync (or `state recover`) marks what that run left unfinished as interrupted.
 - *Open two pull requests for one event, or move a branch backwards.* That is GitHub's doing
   and Updraft's, not this deployment's: the branch name is derived from the event, a push
   only creates a branch or fast-forwards it from the exact commit the run started from, and
@@ -519,9 +651,10 @@ the state database as it was in S3 when the microVM started.
 
 **What they can do, and you should expect:**
 
-- *Not see each other.* A microVM never reads the shared database again after it started.
-  A capacity cooldown that one run records reaches only microVMs that start after that run
-  has ended and saved. Two runs that start within the same minutes can both hit the same
+- *Not see each other's latest.* A microVM never reads the shared database again after it
+  started (the one exception: a job that waits for a pull request's state downloads a newer
+  snapshot before it runs again). A capacity cooldown that one run records reaches only
+  microVMs that start after the checkpoint that saved it. Two runs that start within the same minutes can both hit the same
   rate-limited agent, both spend the same triage budget, and both pick the same agent from a
   rotating pool. Limits that Updraft enforces by counting in its database (`maxConcurrent`,
   the hourly triage limit, cooldowns) are therefore exact only from one run to a later one,
@@ -531,17 +664,30 @@ the state database as it was in S3 when the microVM started.
   revision; one push wins. The launcher's coalescing covers events that arrive within
   seconds of each other, not a review that arrives while an earlier microVM is still
   revising. The cost is an agent run, and possibly a second comment on the pull request.
+- *Handle one review in two places.* A review that is submitted while the run that opened the
+  pull request is still going is handled by the microVM its delivery started (the pull request
+  is on record after the first checkpoint) **and** is seen by the first run, which reads its
+  pull requests once more before it ends and does not have the second microVM's record of the
+  review. Usually the second microVM has pushed its revision by then and the first run's
+  revision finds the review answered or its push refused; the cost is as above. The last look
+  exists for the review that arrives before any checkpoint has the pull request and whose own
+  microVM gave up waiting: without it that review would be handled by nobody.
 - *Disagree about one row.* When two runs changed the same row (the same pull request's
   stage, the same cursor), `updraft state merge` decides which value stands. That is the
   CLI's rule, not this deployment's.
 
-**What losing a run's state does.** A microVM that dies before it saved, or whose save was
-refused, leaves GitHub changed and the shared database not. Later runs then decide without
-that history: a pull request that was opened but never recorded is not revised or reviewed
-on later events; a review that was handled but not recorded can be handled again; a cooldown
-is forgotten; the run is missing from `updraft stats`. Nothing repairs this by itself. The
-result document says when it happened (`state.sync.saved: false` with a reason); a microVM
-that died without a result object lost its state too.
+**What losing a run's state does.** A microVM whose final save was refused, or that died,
+leaves GitHub changed and the shared database behind by whatever the run recorded after its
+last checkpoint (everything, if it never made one). Later runs then decide without that
+history: a review that was handled but not recorded can be handled again; a cooldown is
+forgotten; the run is missing from `updraft stats`, or is in the shared database as still
+running, with its hold in force until it expires. A pull request that was opened but not
+recorded is the case that matters: events about it end `state-pending` and fail, loudly,
+until it is on record. The result document says when a save failed (`outcome:
+"state_not_saved"`), the run's database is then under `state/unsaved/`, and
+[When state is not saved](#when-state-is-not-saved) has the two ways back. A microVM that
+died without a result object kept nothing: redeliver its `issues` delivery (after
+`DedupeWindowSeconds`, when its record has expired) to restore the publication.
 
 **What does not run at all.** There is no poller. A microVM acts on the event that started
 it and on what it finds on GitHub for that issue or pull request, then ends. Work that the
@@ -584,15 +730,18 @@ delivery id to a DynamoDB table with a conditional put; the item expires after
 `DedupeWindowSeconds`. A redelivery that finds an unexpired item gets
 `200 {"duplicate": true, ...}` and starts nothing. The item is removed again when the launch
 fails (the launcher does it) and when the job does not end cleanly (the runner does it: any
-outcome other than `run-event` exiting 0 with a summary). Whether the shared state could be
-saved plays no part in this: a failure to save state neither keeps nor removes the record.
-So:
+outcome other than `run-event` exiting 0 with a summary **and** its state saved). `run-event`
+exits 0 only when everything of the event went well, the reviewer runs and revisions of the
+same run included. A final state sync that fails removes the record too
+([When state is not saved](#when-state-is-not-saved)): the redelivery is what restores a
+publication whose state was lost. So:
 
 | First attempt | A redelivery |
 | --- | --- |
 | Still running | Ignored. Without this, both microVMs would run the agent |
 | Ended with exit 0 (published, nothing to do, canceled, superseded) | Ignored until the window has passed; after that it starts a microVM that finds the work done |
-| Failed, timed out, deferred with a non-zero exit, or the runner could not start it | Starts a new microVM at once: redelivering is the retry |
+| Failed (the event's job, or a reviewer run or revision that followed from it), timed out, deferred with a non-zero exit, still waiting for a pull request's state (exit 6), or the runner could not start it | Starts a new microVM at once: redelivering is the retry |
+| Ended, and its state could not be saved (`state_not_saved`) | Starts a new microVM at once. For an `issues` delivery whose pull request exists, it restores the publication without running an agent |
 | Launch failed (delivery shows `500`) | Starts a new microVM at once |
 | Coalesced into another delivery (`202` with `"coalesced": true`) | Starts a new microVM once the few seconds of the lease are over: nothing was recorded for it |
 | MicroVM died without reporting (no result object) | Ignored until the window has passed, because nothing removed the item. Delete it from the table (`DeliveryTableName` output) to retry sooner |
@@ -686,7 +835,11 @@ What can go wrong, either way:
 | Delivery shows `429` or `503` | HTTP API throttling (`WebhookRateLimit`) |
 | `202`, but no result object | The microVM's log stream in `/aws/lambda-microvms/<image-name>`. `aws lambda-microvms get-microvm --microvm-identifier <id>` shows `state` and `stateReason`. A microVM whose `/run` hook fails or times out is terminated without ever running |
 | Result has `outcome: runner_error` | `error` says which step failed: reading the event or config from S3, a secret that is empty or not a PEM key, no `config.yaml`, a shared state object that is not a SQLite database (restore an earlier version, see [Shared state](#shared-state)), Updraft not startable |
-| Result has `state.sync.saved: false` with a `notSavedReason` | The job ran, but what it changed in the state database was not saved; the log has a `STATE NOT SAVED` line. `notSavedCode` is `merge-failed` (`updraft state merge` exited non-zero; its last output is in the reason), `newer-schema` (the image's Updraft is older than the shared database; rebuild the image), `merged-database-unreadable` or `merged-database-refused` (the merged file failed a check), `attempts-exhausted` (four attempts each lost to another microVM), `timed-out` or `no-time` (the microVM was at its end; raise `WatchdogReserveSeconds` or `MaximumDurationSeconds`), `shared-database-unreadable` (the object in S3 is damaged; restore a version), `no-run-database`, `merge-report-missing`. [Concurrency model](#concurrency-model) says what the missing history means |
+| Result has `outcome: state_not_saved` (`state.sync.saved: false` with a `notSavedReason`) | The job ran (`jobOutcome` says how it went), but what it changed in the state database since its last checkpoint was not saved; the log has a `STATE NOT SAVED` line. The run's database is in `state.unsaved.key`; [When state is not saved](#when-state-is-not-saved) says how to merge it or restore from GitHub. `notSavedCode` is `merge-failed` (`updraft state merge` exited non-zero; its last output is in the reason), `newer-schema` (the image's Updraft is older than the shared database; rebuild the image), `merged-database-unreadable` or `merged-database-refused` (the merged file failed a check), `attempts-exhausted` (four attempts each lost to another microVM), `timed-out` or `no-time` (the microVM was at its end; raise `WatchdogReserveSeconds` or `MaximumDurationSeconds`), `shared-database-unreadable` (the object in S3 is damaged; restore a version), `no-run-database`, `merge-report-missing`. [Concurrency model](#concurrency-model) says what the missing history means |
+| Result has `outcome: failed`, `exitCode: 6`, `updraftOutcome: state-pending` | A pull request event arrived before the state of the run that opened the pull request did, and it did not arrive within `StatePendingWaitSeconds` (`state.pending`). Redeliver the delivery once that run has saved state (its first checkpoint is enough); if that run is gone, redeliver the pull request's `issues` delivery first. See [A pull request the state does not know yet](#a-pull-request-the-state-does-not-know-yet) |
+| Result has `updraftOutcome: failed` although the pull request was opened | A job that followed from the event in the same run failed: a reviewer run, a revision. `summary.followOnJobs` lists them, `summary.loop` says where the pull request stands, and `summary.message` names the job that failed |
+| Result has `updraftOutcome: error`, `summary.reason: state-not-restorable` | A redelivered `issues` event found its pull request on GitHub, no record of it in the shared state, and could not restore it from the API (the message says which fact is missing). Merge the original run's database with `./deploy.sh state recover`, or close the pull request and apply the label again |
+| Log has `checkpoint skipped` lines | A checkpoint could not save (the reason follows). The job is not affected and the final sync saves everything; many of them in every job mean the database is too large or too contended for the checkpoint budget: raise `StateCheckpointSeconds` |
 | Result has `state.snapshot.found: false` on a deployment that has run jobs | The object is gone or the role cannot list `state/`. `./deploy.sh state info` shows what is there |
 | Result has `outcome: failed` | `error` explains the exit code; `summary` is Updraft's own JSON summary (`outcome`, `reason`, `message`, `verification`, `publicationError`, ...), `stderrTail` its last output. `updraft.log` and the run log are in S3 next to the result (`logs`), the same output is in the microVM's log stream |
 | Result has `updraftOutcome: error` and a message about an event not found | GitHub's events API had not listed the label event yet. Redeliver the webhook |
@@ -700,14 +853,17 @@ The result document:
 ```json
 {
   "deliveryId": "...", "eventName": "issues", "microvmId": "mvm-...",
-  "outcome": "succeeded | failed | timed_out | terminated | runner_error",
+  "outcome": "succeeded | failed | timed_out | terminated | runner_error | state_not_saved",
+  "jobOutcome": "the same without state_not_saved: how the job itself ended",
   "exitCode": 0, "signal": null,
   "summary": { "...": "the JSON object updraft run-event printed, or null" },
   "summaryMissing": false,
-  "updraftOutcome": "summary.outcome: nothing-to-do | succeeded | canceled | superseded | failed | publish-failed | not-started | error | any newer one",
+  "updraftOutcome": "summary.outcome: nothing-to-do | succeeded | canceled | superseded | failed | publish-failed | not-started | deferred | state-pending | error | any newer one",
   "state": {
     "key": "state/state.db",
     "snapshot": { "found": true, "bytes": 1048576, "etag": "\"...\"", "schemaVersion": 12 },
+    "checkpoints": { "intervalSeconds": 20, "attempted": 14, "saved": 12, "unchanged": 2, "failed": 0, "lastSavedAt": "...", "lastEtag": "\"...\"", "lastProblem": null },
+    "pending": null,
     "sync": {
       "attempted": true, "saved": true, "changed": true,
       "attempts": 1, "conflicts": 0,
@@ -715,7 +871,8 @@ The result document:
       "info": { "...": "the JSON object updraft state info printed for the merged file" },
       "uploadedBytes": 1052672, "schemaVersion": 12, "etag": "\"...\"",
       "notSavedReason": null, "notSavedCode": null, "durationMs": 840
-    }
+    },
+    "unsaved": null
   },
   "logs": ["results/<delivery>/<microvm-id>/updraft.log", "results/<delivery>/<microvm-id>/run.log"],
   "error": null,
@@ -724,14 +881,23 @@ The result document:
 }
 ```
 
-`outcome` is the runner's view and follows the exit code: `succeeded` is exit 0, which
+`state.checkpoints` is null when none was due; `state.pending` is `{ "tries", "waitedMs",
+"resolved" }` when `run-event` exited 6 at least once; `state.unsaved` is `{ "saved", "key",
+"baseKey", "bytes", "error" }` when the final sync failed. With a `pending` retry,
+`state.snapshot` describes the snapshot of the last try.
+
+`outcome` is the runner's view and follows the exit code (and, for `state_not_saved`, the
+final state sync): `succeeded` is exit 0, which
 `run-event` also uses for "nothing to do", "canceled by the pre-start check" and "another run
-published first"; read `updraftOutcome` for which. The runner never interprets
+published first"; read `updraftOutcome` for which. Exit 0 covers the whole run: a reviewer run
+or a revision that failed after the pull request was opened is exit 1. The runner never interprets
 `updraftOutcome`: an outcome it has not heard of is handled by its exit code like any other.
 `failed` is any other exit code: 1 for a failed, unpublished, interrupted, deferred or
 never-started job and for command errors (config, GitHub, event not matched), 2 for an
 unusable event file or deadline, 3 for a held worker lock (not expected here: the state
-directory is new, only its database has a past). `run.log` is the file the summary's
+directory is new, only its database has a past), 4 for work deferred behind a cooldown, 5 for
+a state database newer than the image's Updraft, 6 for a pull request whose state has not
+arrived (after the runner's own retries). `run.log` is the file the summary's
 `logPath` names, uploaded only if it lies inside the job's state directory; logs over 20 MB
 are cut to their last 20 MB.
 
@@ -1047,6 +1213,9 @@ delivery table, read the webhook secret, call
 `image/*` and write build logs. The execution role is listed above; the shared state added
 `s3:GetObject` and `s3:PutObject` on `state/*` and the right to list that prefix, and nothing
 else (no delete, no version actions; a versioned bucket needs none for an ordinary write).
+Checkpoints, the wait for newer state and the unsaved copies under `state/unsaved/` use those
+same permissions and widened nothing: the ETag is asked for with the list request, and
+`state/unsaved/<delivery>.db` is a `PutObject` under `state/*`.
 The bucket blocks public access, refuses non-TLS requests, keeps replaced versions for a
 while and expires `events/` and `results/`.
 
@@ -1093,9 +1262,17 @@ What the documentation says about what is billed and limited:
   and storage for every version of it kept: one per job that changed something, each the
   whole file, for `StateVersionRetentionDays`. At 5 MB and 100 jobs a day that is about
   15 GB kept; lower the parameter if the database grows.
+- Checkpoints multiply that: while a job runs, up to one list, one download and one upload of
+  the database every `StateCheckpointSeconds`, each upload another kept version. A one-hour
+  job at the default 20 seconds is up to 180 versions; at 5 MB that is about 900 MB per job
+  kept for `StateVersionRetentionDays`. If that is too much, raise `StateCheckpointSeconds`
+  (60 keeps a pull request unknown to other microVMs for at most a minute or so after it is
+  opened, which `StatePendingWaitSeconds` covers) or lower the retention. A job that waits
+  for a pull request's state costs one list request every 5 seconds while it waits.
 - A pull request event that starts a microVM for nothing (the review loop off for that
-  repository, a pull request Updraft does not know) costs the seconds until `run-event` has
-  said so, plus up to `PullRequestCoalesceSeconds` of waiting.
+  repository, a pull request that is not Updraft's) costs the seconds until `run-event` has
+  said so (for the latter, one read of the pull request from the API), plus up to
+  `PullRequestCoalesceSeconds` of waiting.
 - CloudTrail records `RunMicrovm` and `TerminateMicrovm` as data events, which are not logged
   unless enabled.
 
@@ -1242,7 +1419,8 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
     result, `--into` created when missing, `--changed` read in place. That was checked by
     reading both sides, not by running the real commands from the runner: the runner's
     tests use a stand-in. No field of `state info`'s output is read. The Dockerfile's
-    check greps `updraft state --help` for `merge`.
+    check greps `updraft state --help` for `merge` and `copy`, and `updraft state merge
+    --help` for `--live`.
 26. **The schema version in the file header.** The runner reads the snapshot's schema
     version as SQLite's `user_version` (4 bytes at offset 60 of the file), which is where
     Updraft keeps it at the time of writing (`src/db/database.ts`). If that changes, the
@@ -1277,6 +1455,52 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
     and runs headless with `CODEX_API_KEY` is taken from [docs/agents/codex.md](../../docs/agents/codex.md);
     what Kiro needs is taken from [docs/agents/kiro.md](../../docs/agents/kiro.md). Neither
     was installed or run here.
+33. **Checkpoints against a real run.** `updraft state merge --live` is tested in the Updraft
+    repository against a database that another connection is writing to (an open, uncommitted
+    transaction included), and `state.mjs` was run once by hand against the real CLI that
+    way. It was never run against a real `run-event` with an agent at work in a microVM.
+    Assumed: that reading a write-ahead-log database through a second, read-only SQLite
+    connection as the same OS user works on the image's file system as it does on a
+    developer machine (it needs the `-shm` file to be shared memory both processes can map);
+    and that a read transaction held for the length of a merge only delays the run's own
+    WAL checkpoint, never its writes.
+34. **How the runner notices a change.** It compares the size and modification time of
+    `state.db` and `state.db-wal`. A write that changes neither would be missed until the
+    next one; SQLite appends to the log on every commit, so none is expected. The run's
+    lease heartbeat (every 15 seconds while an agent runs) changes the files, so a job
+    checkpoints about once per interval for as long as it runs; the cost estimate in
+    [Cost and quotas](#cost-and-quotas) assumes exactly that and was not measured.
+35. **The ETag from a list request.** The wait for newer state compares the `ETag` that
+    `ListObjectsV2` reports with the one `GetObject` returned for the snapshot. That both are
+    the same quoted string for an object written with a single `PutObject` (no multipart
+    upload, SSE-S3) is assumed. If they differed, the wait would end at once, the job would
+    run again on an unchanged snapshot, and after 6 such runs fail as it would have anyway.
+36. **The pending retry inside one microVM.** That running `updraft run-event` a second time
+    in the same state directory is sound: the first run exits 6 before it creates a clone or
+    a worktree, the runner replaces `state.db` (and removes `-wal` and `-shm`) with the new
+    snapshot and gives it to the job user, and logs append. Tested with a stand-in for the
+    CLI; `run-event`'s own exit 6 path is tested in the Updraft repository.
+37. **Unsaved state and `deploy.sh state recover`.** That `updraft state copy` (SQLite's
+    `VACUUM INTO` on a read-only connection) keeps every row's id is tested in the Updraft
+    repository; the upload was tested with stand-ins. `deploy.sh state unsaved` and `state
+    recover` were checked with `bash -n` only: that `aws s3api get-object ... --query ETag
+    --output text` prints the ETag with its quotes, that `aws s3api put-object` accepts
+    `--if-match` and `--if-none-match` (recent AWS CLI v2 only), and that a refused
+    precondition shows as `PreconditionFailed` or `(412)` in its error text, are from memory.
+    That a lifecycle rule with `Prefix: state/unsaved/` and `ExpirationInDays` may coexist
+    with the `state/` rule that only expires noncurrent versions was not deployed.
+38. **Holds between microVMs.** That a second microVM leaves a first one's unfinished work
+    alone is tested in the Updraft repository with two state directories and a checkpoint
+    merged by hand between them (a merge waiting for checks), not with two microVMs. A hold
+    expires 15 minutes after the holder's `--deadline-minutes`; the runner's final sync or
+    `state recover` releases it earlier. A microVM that died after a checkpoint therefore
+    blocks its own queued follow-on work from being picked up by a later delivery for up to
+    `MaximumDurationSeconds` plus 15 minutes.
+39. **Restoring a publication from GitHub.** Tested against an in-memory GitHub. Assumed of
+    the real API: that `GET /repos/{owner}/{repo}/pulls/{n}` returns `user.login` as
+    `<app-slug>[bot]` for a pull request the App opened, `head.repo.id`, and the body exactly
+    as publication wrote it (the marker comment and the "Opened by updraft from run ... (agent
+    ...)" line survive unless a person edits them).
 
 ## Tests
 
@@ -1311,14 +1535,21 @@ the suite:
   that hangs, S3 calls that never answer, no budget, and the shortened budget on
   termination; the environment of the merge (no `AWS_*`, no agent key). Through `runJob`:
   the snapshot in the job's directory and the pristine base outside it, the result
-  document's `state`, sync after a failed job and after the watchdog, a successful job that
-  stays successful when state is not saved (and keeps its delivery record), no sync when the
-  job never started, an unreadable snapshot, config objects named like the database, and the
-  wait for `notBefore`.
+  document's `state`, sync after a failed job and after the watchdog, a job whose state is
+  not saved (`state_not_saved` with the job's own outcome beside it, the delivery record
+  released, the database and its base kept under `state/unsaved/`, and the case where that
+  fails too), no sync when the job never started, an unreadable snapshot, config objects
+  named like the database, and the wait for `notBefore`. Checkpoints: a job that writes its
+  database in steps has its first row in S3 while it is still running, every merge before
+  the last is `--live` against the same base, a checkpoint that hangs or fails costs the job
+  nothing, and `stateCheckpointSeconds: 0` takes none. The pending retry: exit 6, the object
+  changes, a second run on the new snapshot succeeds; the state never arrives and the job
+  fails after the wait, with the record released; a wait of 0; and a shared object that keeps
+  changing without ever having the pull request (6 runs, then failed).
 
 Not covered by tests: `launcher/index.mjs` (which holds the DynamoDB condition expression),
 `image/runner/aws.mjs` (which holds the real conditional write and how its refusal is
-recognised), `run-job.mjs` and `server.mjs` (thin wiring that needs the AWS SDK, which the
+recognised, and `s3Etag`), `deploy.sh state unsaved` and `state recover`, `run-job.mjs` and `server.mjs` (thin wiring that needs the AWS SDK, which the
 repository does not depend on; each was started by hand with the SDK installed, without AWS,
 and the two state functions of `aws.mjs` against a local stand-in for S3, as said under
 [What is not verified](#what-is-not-verified)), switching to the job user and every file

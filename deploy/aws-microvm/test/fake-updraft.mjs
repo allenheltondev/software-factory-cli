@@ -3,13 +3,16 @@
 //   run-event     FAKE_UPDRAFT_MODE picks the behaviour; FAKE_UPDRAFT_RECORD names a file that
 //                 receives what the process was given; FAKE_UPDRAFT_STATE_ROWS (a JSON array
 //                 of strings) are "rows" the run adds to $UPDRAFT_HOME/state.db.
-//   state merge   a deterministic three-way merge of fake-state-db.mjs files
+//   state merge   a deterministic three-way merge of fake-state-db.mjs files (--live is
+//                 recorded and otherwise the same merge)
 //   state info    schema version and row count of such a file
+//   state copy    a copy of such a file
 //
 // The state commands get an environment built from nothing, so the test cannot steer them
 // through variables. They read $UPDRAFT_HOME/fake-state-control.json instead (a test puts it
 // there as a config object): { "record": <file to append one JSON line per call to>,
-// "merge": ok | fail | newer-schema | hang | garbage | tiny | no-json | wal, "info": ok | fail }.
+// "merge": ok | fail | newer-schema | hang | garbage | tiny | no-json | wal, "info": ok | fail,
+// "copy": ok | fail, "failFinalMerge": true (a merge without --live fails; checkpoints work) }.
 import fs from 'node:fs';
 import path from 'node:path';
 import { decodeStateDb, encodeStateDb } from './fake-state-db.mjs';
@@ -39,8 +42,9 @@ if (args[0] === 'state') {
     const changed = read(option('--changed'));
     const base = read(option('--base'));
     const into = read(intoFile);
-    record({ changedRows: changed?.rows, baseRows: base?.rows ?? null, intoRows: into?.rows ?? null, intoExisted: into !== undefined });
-    switch (control.merge ?? 'ok') {
+    const live = args.includes('--live');
+    record({ live, changedRows: changed?.rows, baseRows: base?.rows ?? null, intoRows: into?.rows ?? null, intoExisted: into !== undefined });
+    switch (control.failFinalMerge && !live ? 'fail' : (control.merge ?? 'ok')) {
       case 'fail':
         console.error('fake-updraft: database disk image is malformed');
         process.exit(1);
@@ -87,6 +91,14 @@ if (args[0] === 'state') {
       console.error(`fake-updraft: ${error.message}`);
       process.exit(1);
     }
+  } else if (args[1] === 'copy') {
+    record({});
+    if (control.copy === 'fail') {
+      console.error('fake-updraft: database disk image is malformed');
+      process.exit(1);
+    }
+    fs.writeFileSync(option('--out'), fs.readFileSync(option('--db')), { flag: 'wx' });
+    console.log(JSON.stringify({ ok: true, out: option('--out') }));
   } else {
     console.error(`fake-updraft: unknown state command ${args[1]}`);
     process.exit(64);
@@ -136,7 +148,45 @@ const writeLogs = () => {
 console.error('fake-updraft: starting');
 console.log('progress line that is not the summary');
 
+/** Adds a row to the run's database the way SQLite would: readers see the old file or the new one. */
+const addRow = (row) => {
+  const file = path.join(home, 'state.db');
+  const rows = fs.existsSync(file) ? decodeStateDb(fs.readFileSync(file)).rows : [];
+  fs.writeFileSync(`${file}.tmp`, encodeStateDb([...rows, row], SCHEMA_VERSION));
+  fs.renameSync(`${file}.tmp`, file);
+};
+
 switch (mode) {
+  case 'slow-state': {
+    // A run that records things as it goes: one row now, one later, then it ends.
+    const rows = JSON.parse(process.env.FAKE_UPDRAFT_SLOW_ROWS ?? '[]');
+    const pauseMs = Number(process.env.FAKE_UPDRAFT_SLOW_MS ?? 400);
+    const logPath = writeLogs();
+    const step = () => {
+      if (rows.length === 0) {
+        console.log(JSON.stringify({ outcome: 'succeeded', logPath, exitCode: 0 }));
+        return;
+      }
+      addRow(rows.shift());
+      setTimeout(step, pauseMs);
+    };
+    step();
+    break;
+  }
+  case 'state-pending': {
+    // A pull request event: its pull request is known once the shared state has the row "pr-known".
+    const file = path.join(home, 'state.db');
+    const known = fs.existsSync(file) && decodeStateDb(fs.readFileSync(file)).rows.includes('pr-known');
+    if (process.env.FAKE_UPDRAFT_TRIES) fs.appendFileSync(process.env.FAKE_UPDRAFT_TRIES, `${known ? 'known' : 'pending'}\n`);
+    if (known) {
+      addRow('revision-1');
+      console.log(JSON.stringify({ outcome: 'succeeded', logPath: writeLogs(), exitCode: 0 }));
+    } else {
+      console.log(JSON.stringify({ outcome: 'state-pending', reason: 'state-pending', exitCode: 6 }));
+      process.exitCode = 6;
+    }
+    break;
+  }
   case 'success':
     console.log(JSON.stringify({ outcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logPath: writeLogs(), exitCode: 0 }));
     break;

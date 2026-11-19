@@ -49,6 +49,12 @@ export function loadConfig(env) {
   if (stateKey !== '' && (!STATE_KEY_PATTERN.test(stateKey) || stateKey.length > 200)) {
     throw new Error('STATE_KEY is not a usable object key');
   }
+  const optional = (name, fallback, max) => (env[name] === undefined || env[name] === '' ? fallback : integer(name, 0, max));
+  // While a job runs, its state is checkpointed into the shared database at most this often
+  // (0: only at the end). And a job whose pull request the shared state does not know yet
+  // waits this long, in all, for the state to arrive before it gives up (0: not at all).
+  const stateCheckpointSeconds = optional('STATE_CHECKPOINT_SECONDS', 20, 3600);
+  const statePendingWaitSeconds = optional('STATE_PENDING_WAIT_SECONDS', 180, 1800);
   const list = (value) =>
     (value ?? '')
       .split(',')
@@ -88,6 +94,8 @@ export function loadConfig(env) {
     coalesceSeconds,
     // Key of the shared Updraft state database; empty turns state sync off in the runner.
     stateKey,
+    stateCheckpointSeconds,
+    statePendingWaitSeconds,
   };
 }
 
@@ -109,7 +117,7 @@ export function buildRunHookPayload(config, { deliveryId, eventName, launchedAt,
   const dedupe = config.dedupeWindowSeconds > 0 ? { dedupeTable: config.dedupeTable } : {};
   return {
     ...dedupe,
-    ...(config.stateKey ? { stateKey: config.stateKey } : {}),
+    ...(config.stateKey ? { stateKey: config.stateKey, stateCheckpointSeconds: config.stateCheckpointSeconds, statePendingWaitSeconds: config.statePendingWaitSeconds } : {}),
     // Set for a pull request event that holds a coalescing lease: the runner starts the job
     // no earlier, so that it sees every event the launcher coalesced into this one.
     ...(notBefore ? { notBefore } : {}),

@@ -3,11 +3,23 @@
 // shared database, report the outcome to S3, terminate the microVM. Everything that talks to AWS or the
 // operating system's process table comes in through `deps`, so this file is tested with
 // stand-ins (see ../../test/runner-job.test.mjs).
+/* global AbortController */
 import { spawn as nodeSpawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { STATE_DB_FILE, downloadState, stateSyncBudgetMs, syncState } from './state.mjs';
+import {
+  DEFAULT_CHECKPOINT_SECONDS,
+  REPORT_RESERVE_MS,
+  STATE_DB_FILE,
+  UNSAVED_UPLOAD_MS,
+  createCheckpointer,
+  downloadState,
+  saveUnsaved,
+  stateSyncBudgetMs,
+  syncState,
+  waitForStateChange,
+} from './state.mjs';
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
 const KEY_FILE = 'github-app.pem';
@@ -22,6 +34,17 @@ const MAX_CONFIG_BYTES = 5 * 1024 * 1024;
 const MAX_STDOUT_LINE_BYTES = 1024 * 1024;
 const STDERR_TAIL_BYTES = 8 * 1024;
 const MAX_LOG_BYTES = 20 * 1024 * 1024;
+
+/**
+ * run-event's exit code for "this pull request is Updraft's, and the state database I was
+ * given does not know it yet" (docs/run-event.md, exit code 6). Nothing was done; the same
+ * event is to be run again on a newer snapshot.
+ */
+export const STATE_PENDING_EXIT = 6;
+/** Seconds a job waits, in all, for newer state when the payload does not say (statePendingWaitSeconds). */
+export const DEFAULT_STATE_PENDING_WAIT_SECONDS = 180;
+/** However often the shared state changes in that time, run-event is not started more often than this. */
+export const MAX_STATE_PENDING_TRIES = 6;
 
 // Names an agent-environment secret may not set: they would change how the job process itself
 // runs, or hand it credentials this design keeps away from it.
@@ -48,6 +71,10 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * run went is taken from the exit code, so an outcome this file has never heard of (a job
  * deferred by a capacity cooldown, say) is handled like any other: exit 0 keeps the
  * delivery record, any other exit releases it so that a redelivery is the retry.
+ *
+ * Exit 0 means that everything of the event went well, the jobs that followed from it in the
+ * same run included (a reviewer run that failed is exit 1). One exit code is acted on here:
+ * STATE_PENDING_EXIT, after which the job is run again on a newer snapshot (runJob).
  */
 export function updraftInvocation({ eventFile, eventName, deliveryId, deadlineMinutes }) {
   return [
@@ -71,6 +98,12 @@ export function describeExitCode(code) {
       return 'updraft exited 2: the event file is missing or not JSON, or --deadline-minutes was rejected';
     case 3:
       return "updraft exited 3: the state directory's worker lock is held";
+    case 4:
+      return 'updraft exited 4: work of the event waits for a usage-limit cooldown and is still queued in the shared state; redeliver the event after summary.deferredUntil';
+    case 5:
+      return 'updraft exited 5: the shared state database was written by a newer Updraft than the one in this image; rebuild the image';
+    case STATE_PENDING_EXIT:
+      return 'updraft exited 6: the event is about a pull request Updraft opened, and the shared state does not know it yet (the run that opened it has not saved its state, or never could); see state.pending. Redeliver this event once that state is saved; if it never is, redeliver the issue event of the pull request, which restores it';
     default:
       return `updraft exited with code ${code}`;
   }
@@ -185,7 +218,11 @@ export async function runJob(request, deps) {
     deliveryId: payload.deliveryId,
     eventName: payload.eventName,
     microvmId,
+    // succeeded | failed | timed_out | terminated | runner_error, or state_not_saved: the job
+    // ran and what it changed in the shared state could not be saved (jobOutcome says how
+    // the job itself went, state.sync why, state.unsaved where its database was kept).
     outcome: 'runner_error',
+    jobOutcome: null,
     exitCode: null,
     signal: null,
     summary: null,
@@ -195,7 +232,9 @@ export async function runJob(request, deps) {
     updraftOutcome: null,
     // The shared state database: what the run started from and whether its changes were
     // saved. null when the launcher sent no stateKey (state sync is off).
-    state: payload.stateKey ? { key: payload.stateKey, snapshot: null, sync: notAttempted() } : null,
+    // checkpoints: the saves made while the job ran. pending: the waits for newer state
+    // after run-event exited STATE_PENDING_EXIT. unsaved: set when the final sync failed.
+    state: payload.stateKey ? { key: payload.stateKey, snapshot: null, checkpoints: null, pending: null, sync: notAttempted(), unsaved: null } : null,
     logs: [],
     error: null,
     stderrTail: '',
@@ -243,11 +282,70 @@ export async function runJob(request, deps) {
     log(`running updraft run-event for delivery ${payload.deliveryId}; its deadline is ${deadline} min, the watchdog fires in ${Math.round(budgetMs / 1000)} s`);
 
     stateDirForLogs = stateDir;
-    const run = await runUpdraft(payload, stateDir, budgetMs, deadline, deps, (stop) => {
-      stopChild = stop;
-      if (stopRequested) stop();
-    });
-    if (state) stateToSync = { stateDir, baseFile: state.baseFile };
+    let current = state;
+    let budget = budgetMs;
+    let deadlineNow = deadline;
+    let run;
+    const pending = { tries: 0, waitedMs: 0, resolved: null };
+    const pendingWaitMs = (payload.statePendingWaitSeconds ?? DEFAULT_STATE_PENDING_WAIT_SECONDS) * 1000;
+    const checkpointMs = (payload.stateCheckpointSeconds ?? DEFAULT_CHECKPOINT_SECONDS) * 1000;
+    const checkpoints = [];
+    for (;;) {
+      // Checkpoints: what the run records (the pull request it opened, above all) reaches the
+      // shared database while it runs, not only at its end. Stopped before anything else
+      // touches the run's database or the shared one.
+      const checkpointer =
+        current !== undefined && checkpointMs > 0
+          ? createCheckpointer(
+              { bucket: payload.bucket, key: payload.stateKey, stateDir, baseFile: current.baseFile, intervalMs: deps.checkpointIntervalMs ?? checkpointMs, intervalSeconds: checkpointMs / 1000, timeLeftMs: () => stateSyncBudgetMs(payload, now()) },
+              deps,
+            )
+          : undefined;
+      checkpointer?.start();
+      try {
+        run = await runUpdraft(payload, stateDir, budget, deadlineNow, deps, (stop) => {
+          stopChild = stop;
+          if (stopRequested) stop();
+        });
+      } finally {
+        const made = await checkpointer?.stop();
+        if (made) checkpoints.push(made);
+      }
+      if (current) stateToSync = { stateDir, baseFile: current.baseFile };
+      if (run.exitCode !== STATE_PENDING_EXIT) {
+        if (pending.tries > 0) pending.resolved = true;
+        break;
+      }
+      // The pull request of this event is Updraft's, and the snapshot this run started from
+      // does not know it: the run that opened it has not saved its state yet. Wait for the
+      // shared object to change, take a fresh snapshot, and run the same event again, a
+      // bounded number of times; after that the job has failed, and says why.
+      pending.tries += 1;
+      pending.resolved = false;
+      if (!current || stopRequested || run.timedOut || pending.tries >= MAX_STATE_PENDING_TRIES) break;
+      const waitStarted = now();
+      const mayWaitMs = Math.min(pendingWaitMs - pending.waitedMs, watchdogBudgetMs(payload, now()) - DEADLINE_MARGIN_MS - 60_000);
+      if (mayWaitMs <= 0) break;
+      log(`the shared state does not know this event's pull request yet; waiting up to ${Math.round(mayWaitMs / 1000)} s for it to change (try ${pending.tries})`);
+      const waiting = new AbortController();
+      stopWaiting = () => waiting.abort();
+      const changed = await waitForStateChange({ bucket: payload.bucket, key: payload.stateKey, etag: current.snapshot.etag ?? undefined, timeoutMs: mayWaitMs, signal: waiting.signal }, deps);
+      stopWaiting = () => {};
+      pending.waitedMs += Math.max(0, now() - waitStarted);
+      if (!changed || stopRequested) break;
+      budget = watchdogBudgetMs(payload, now());
+      deadlineNow = deps.deadlineMinutes ?? deadlineMinutes(budget);
+      if (budget <= 0 || deadlineNow < 1) break;
+      // The database of the try that found nothing is replaced by the newer snapshot.
+      stateToSync = undefined;
+      current = await refreshState(payload, stateDir, current, deps);
+      result.state.snapshot = current.snapshot;
+      log(`running updraft run-event again on the newer shared state (try ${pending.tries + 1})`);
+    }
+    if (result.state) {
+      result.state.checkpoints = checkpoints.length ? summarizeCheckpoints(checkpoints) : null;
+      result.state.pending = pending.tries > 0 ? pending : null;
+    }
     result.exitCode = run.exitCode;
     result.signal = run.signal;
     result.stderrTail = run.stderrTail;
@@ -266,6 +364,9 @@ export async function runJob(request, deps) {
     } else {
       result.outcome = 'failed';
       result.error = run.signal ? `updraft was killed by ${run.signal}` : describeExitCode(run.exitCode);
+      if (run.exitCode === STATE_PENDING_EXIT && pending.tries > 0) {
+        result.error += ` (tried ${pending.tries} time(s), waited ${Math.round(pending.waitedMs / 1000)} s for newer state)`;
+      }
     }
   } catch (error) {
     result.outcome = stopRequested ? 'terminated' : 'runner_error';
@@ -274,8 +375,8 @@ export async function runJob(request, deps) {
   }
 
   // Save what the run changed in the shared state, whatever the job's outcome: a failed run
-  // also recorded things later runs need (a capacity cooldown, a review it has seen). This
-  // never changes the job's outcome; a failure is reported in result.state.sync and the log.
+  // also recorded things later runs need (a capacity cooldown, a review it has seen).
+  result.jobOutcome = result.outcome;
   if (stateToSync && result.state) {
     const budgetMs = deps.stateSyncBudgetMs ?? stateSyncBudgetMs(payload, now(), { terminating: stopRequested });
     result.state.sync = await syncState(
@@ -292,6 +393,24 @@ export async function runJob(request, deps) {
       deps,
     );
     hurrySync = () => {};
+    // The job ran and its state is not in the shared database. With a pull request opened,
+    // that state exists nowhere else: every later event about the pull request would find it
+    // unknown. So this is a failure of its own, whatever the job's outcome was: the delivery
+    // record is released below (a redelivery restores the publication from GitHub), and the
+    // run's database is kept under its own key for `deploy.sh state recover`.
+    const sync = result.state.sync;
+    if (sync.notSavedReason && sync.notSavedCode !== 'no-run-database') {
+      result.outcome = 'state_not_saved';
+      const lost = `the job ended "${result.jobOutcome}", and what it changed in the shared state was NOT saved (${sync.notSavedCode}): ${sync.notSavedReason}`;
+      result.error = result.error ? `${lost}; the job: ${result.error}` : lost;
+      const hardEnd = Date.parse(payload.launchedAt) + payload.maximumDurationSeconds * 1000;
+      // Lambda gives a terminating microVM a minute in all: keep this short then.
+      const unsavedBudgetMs = deps.unsavedUploadMs ?? Math.min(stopRequested ? 20_000 : UNSAVED_UPLOAD_MS, hardEnd - REPORT_RESERVE_MS / 2 - now());
+      result.state.unsaved = await saveUnsaved(
+        { bucket: payload.bucket, stateKey: payload.stateKey, deliveryId: payload.deliveryId, stateDir: stateToSync.stateDir, baseFile: stateToSync.baseFile, budgetMs: unsavedBudgetMs },
+        deps,
+      );
+    }
   }
 
   const finishedAt = now();
@@ -312,8 +431,9 @@ export async function runJob(request, deps) {
     log(`could not write the result to S3: ${error?.message ?? error}`);
   }
   // The launcher refuses a redelivery while its record of this delivery exists. Keep the
-  // record after a clean exit (a redelivery would find the work done), remove it otherwise:
-  // redelivering the webhook is how a failed run is retried.
+  // record after a clean exit whose state was saved (a redelivery would find the work done),
+  // remove it otherwise: redelivering the webhook is how a failed run is retried, and how a
+  // publication whose state was lost is put back on record.
   if (payload.dedupeTable && deps.releaseDelivery && !(result.outcome === 'succeeded' && !result.summaryMissing)) {
     try {
       await retry(() => deps.releaseDelivery(payload.dedupeTable, payload.deliveryId), deps);
@@ -400,6 +520,33 @@ async function prepare(payload, deps) {
 
   if (jobUser.uid !== undefined && jobUser.gid !== undefined) await chownTree(stateDir, jobUser.uid, jobUser.gid);
   return { stateDir, state };
+}
+
+/**
+ * A fresh snapshot for another try of the same event: the run's database (and its
+ * write-ahead log) is removed, the shared object is downloaded again, and the new file is
+ * given to the job user. The job's processes are gone by now; even so, the file is created
+ * exclusively, so nothing left behind can make root write through a link.
+ */
+async function refreshState(payload, stateDir, previous, deps) {
+  const fresh = await retry(async () => {
+    for (const name of [STATE_DB_FILE, `${STATE_DB_FILE}-wal`, `${STATE_DB_FILE}-shm`]) await fs.rm(path.join(stateDir, name), { force: true });
+    return downloadState({ bucket: payload.bucket, key: payload.stateKey, stateDir }, deps);
+  }, deps);
+  if (previous.baseDir) await fs.rm(previous.baseDir, { recursive: true, force: true }).catch(() => {});
+  const { uid, gid } = deps.jobUser;
+  if (fresh.snapshot.found && uid !== undefined && gid !== undefined) await fs.lchown(path.join(stateDir, STATE_DB_FILE), uid, gid);
+  return fresh;
+}
+
+/** The checkpoints of every try of the job, as one entry of the result document. */
+function summarizeCheckpoints(all) {
+  const total = { intervalSeconds: all[0].intervalSeconds, attempted: 0, saved: 0, unchanged: 0, failed: 0, lastSavedAt: null, lastEtag: null, lastProblem: null };
+  for (const one of all) {
+    for (const name of ['attempted', 'saved', 'unchanged', 'failed']) total[name] += one[name];
+    for (const name of ['lastSavedAt', 'lastEtag', 'lastProblem']) total[name] = one[name] ?? total[name];
+  }
+  return total;
 }
 
 async function chownTree(target, uid, gid) {

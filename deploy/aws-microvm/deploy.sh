@@ -9,6 +9,9 @@
 #   ./deploy.sh state info        what the shared state database in S3 is: size, date, versions
 #   ./deploy.sh state pull [dir]  download it (and the config) into dir, laid out as an Updraft
 #                                 home, for `UPDRAFT_HOME=dir updraft status` (default: ./updraft-state)
+#   ./deploy.sh state unsaved     list the databases of jobs whose state could not be saved
+#   ./deploy.sh state recover <delivery id>
+#                                 merge such a database into the shared one (needs `updraft` here)
 #
 # Settings come from the environment; nothing is hard-coded:
 #
@@ -29,6 +32,7 @@
 #   SAM_PARAMETER_OVERRIDES  extra template parameters, e.g.
 #                     "MaximumDurationSeconds=5400 TriggerLabels=ready"
 #   STATE_KEY         key of the shared state database             (default: state/state.db)
+#   UPDRAFT_BIN       the updraft command `state recover` merges with  (default: updraft)
 #
 # The MicroVM image is created with the AWS CLI rather than by the template; README.md
 # ("Why the image is not in the template") explains why.
@@ -270,6 +274,78 @@ state_pull() {
 NOTE
 }
 
+# Where the runner keeps the database of a job whose final state sync failed.
+unsaved_prefix() {
+  case "$STATE_KEY" in */*) echo "${STATE_KEY%/*}/unsaved" ;; *) echo "unsaved" ;; esac
+}
+
+state_unsaved() {
+  state_location
+  local prefix
+  prefix="$(unsaved_prefix)"
+  say "s3://$STATE_BUCKET/$prefix/"
+  aws s3 ls "s3://$STATE_BUCKET/$prefix/" || echo "    none: no job has failed to save its state (or they have expired)"
+}
+
+# Merges what one job changed, and could not save, into the shared database: the same
+# three-way merge and the same conditional write the runner uses, from this machine. Safe to
+# repeat: merging the same database twice adds nothing.
+state_recover() {
+  state_location
+  local delivery="${1:-}" updraft="${UPDRAFT_BIN:-updraft}"
+  [ -n "$delivery" ] || die "usage: ./deploy.sh state recover <delivery id>   (./deploy.sh state unsaved lists them)"
+  case "$delivery" in *[!A-Za-z0-9-]*) die "not a delivery id: $delivery" ;; esac
+  need "$updraft"
+  "$updraft" state merge --help 2>/dev/null | grep -q -- '--base' \
+    || die "$updraft has no 'state merge' command; install the Updraft version the image uses, or set UPDRAFT_BIN"
+  local prefix work out etag attempt
+  prefix="$(unsaved_prefix)"
+  work="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" EXIT
+  say "downloading s3://$STATE_BUCKET/$prefix/$delivery.db"
+  aws s3 cp "s3://$STATE_BUCKET/$prefix/$delivery.db" "$work/unsaved.db" --only-show-errors \
+    || die "no unsaved database for delivery $delivery (./deploy.sh state unsaved lists them)"
+  # The snapshot that job started from makes this an exact three-way merge. Without it every
+  # row of the database counts as that job's, which is right only for a job that started
+  # from nothing.
+  local base=()
+  if aws s3 cp "s3://$STATE_BUCKET/$prefix/$delivery.base.db" "$work/base.db" --only-show-errors 2>/dev/null; then
+    base=(--base "$work/base.db")
+  else
+    say "no $delivery.base.db: the job started from nothing (or its snapshot was not kept); merging without a base"
+  fi
+  for attempt in 1 2 3 4 5; do
+    rm -f "$work/shared.db" "$work/shared.db-wal" "$work/shared.db-shm"
+    # No object yet is a first write (If-None-Match: *). An object this identity cannot read
+    # ends there too, and the condition refuses the write: nothing is overwritten blindly.
+    if ! etag="$(aws s3api get-object --bucket "$STATE_BUCKET" --key "$STATE_KEY" "$work/shared.db" --query ETag --output text 2>/dev/null)"; then
+      etag=""
+      rm -f "$work/shared.db"
+    fi
+    out="$("$updraft" state merge --changed "$work/unsaved.db" --into "$work/shared.db" ${base[@]+"${base[@]}"} --json)" \
+      || die "updraft state merge failed; nothing was uploaded: $out"
+    case "$out" in
+      *'"changed":false'*)
+        say "nothing to recover: the shared database already has everything of delivery $delivery"
+        return 0
+        ;;
+    esac
+    local condition=(--if-none-match '*')
+    [ -z "$etag" ] || condition=(--if-match "$etag")
+    if aws s3api put-object --bucket "$STATE_BUCKET" --key "$STATE_KEY" --body "$work/shared.db" \
+        --content-type application/vnd.sqlite3 "${condition[@]}" >/dev/null 2>"$work/put.err"; then
+      say "merged delivery $delivery into s3://$STATE_BUCKET/$STATE_KEY"
+      echo "    $out"
+      echo "    the unsaved copy stays under $prefix/ until it expires; recovering it again changes nothing"
+      return 0
+    fi
+    grep -qE 'PreconditionFailed|ConditionalRequestConflict|\(412\)|\(409\)' "$work/put.err" || { cat "$work/put.err" >&2; die "the upload failed; the shared database is unchanged"; }
+    say "a job wrote the shared database first; merging again into the newer one (attempt $attempt)"
+  done
+  die "gave up after 5 attempts that each lost to another write; the shared database has none of delivery $delivery's changes from this run of the command. Try again"
+}
+
 case "${1:-all}" in
   all)
     deploy_stack
@@ -284,9 +360,11 @@ case "${1:-all}" in
     case "${2:-}" in
       info) state_info ;;
       pull) state_pull "${3:-}" ;;
-      *) die "usage: ./deploy.sh state info | ./deploy.sh state pull [dir]" ;;
+      unsaved) state_unsaved ;;
+      recover) state_recover "${3:-}" ;;
+      *) die "usage: ./deploy.sh state info | state pull [dir] | state unsaved | state recover <delivery id>" ;;
     esac
     ;;
-  -h|--help|help) sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command: $1 (try --help)" ;;
 esac

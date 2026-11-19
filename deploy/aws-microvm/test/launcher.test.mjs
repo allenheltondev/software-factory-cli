@@ -576,7 +576,7 @@ describe('decideEvent: pull request events', () => {
         pullRequest: { repository: 'octo/repo', number: 34 },
       });
     }
-    for (const action of ['synchronize', 'closed', 'reopened']) {
+    for (const action of ['synchronize', 'closed']) {
       expect(decideEvent('pull_request', pushed({ action }), options)).toMatchObject({ launch: true, reason: `pull_request.${action}`, pullRequest: { number: 34 } });
     }
     // issues still work as before, without a pull request to coalesce on.
@@ -586,6 +586,8 @@ describe('decideEvent: pull request events', () => {
   it('ignores other actions and payloads that lack what a job needs', () => {
     for (const [event, payload] of [
       ['pull_request', pushed({ action: 'opened' })],
+      // Closing is final in Updraft: run-event does nothing for a reopen, so no microVM starts for one.
+      ['pull_request', pushed({ action: 'reopened' })],
       ['pull_request', pushed({ action: 'labeled' })],
       ['pull_request', pushed({ action: 'edited' })],
       ['pull_request_review', reviewed({ action: 'created' })],
@@ -672,7 +674,14 @@ describe('parseAcceptedEvents and the launcher settings for the loop', () => {
     expect(off).not.toHaveProperty('stateKey');
     expect(off).not.toHaveProperty('notBefore');
     expect(parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify(off) }).payload).not.toHaveProperty('stateKey');
-    for (const bad of [{ stateKey: '../x' }, { stateKey: 7 }, { notBefore: 'soon' }, { notBefore: 5 }]) {
+    // The settings of state sync travel with the key, with their defaults.
+    expect(on).toMatchObject({ stateCheckpointSeconds: 20, statePendingWaitSeconds: 180 });
+    expect(off).not.toHaveProperty('stateCheckpointSeconds');
+    const tuned = JSON.parse(buildRunMicrovmInput(loadConfig({ ...env, STATE_KEY: 'state/state.db', STATE_CHECKPOINT_SECONDS: '0', STATE_PENDING_WAIT_SECONDS: '600' }), args).runHookPayload);
+    expect(parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify(tuned) }).payload).toMatchObject({ stateCheckpointSeconds: 0, statePendingWaitSeconds: 600 });
+    expect(() => loadConfig({ ...env, STATE_CHECKPOINT_SECONDS: '-1' })).toThrow('STATE_CHECKPOINT_SECONDS');
+    expect(() => loadConfig({ ...env, STATE_PENDING_WAIT_SECONDS: '1801' })).toThrow('STATE_PENDING_WAIT_SECONDS');
+    for (const bad of [{ stateKey: '../x' }, { stateKey: 7 }, { notBefore: 'soon' }, { notBefore: 5 }, { stateCheckpointSeconds: 1.5 }, { statePendingWaitSeconds: -1 }, { statePendingWaitSeconds: '60' }]) {
       expect(() => parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify({ ...on, ...bad }) }), JSON.stringify(bad)).toThrow('runHookPayload');
     }
   });

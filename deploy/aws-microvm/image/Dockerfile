@@ -62,6 +62,10 @@ RUN set -eu; . /opt/updraft/build.env; \
     if [ "${REQUIRE_STATE_COMMANDS:-1}" != "0" ] && ! updraft state --help 2>/dev/null | grep -q 'merge'; then \
       echo "this Updraft has no 'state merge' command, which the shared state database needs; use a newer UPDRAFT_SPEC or a tarball in vendor/, or set REQUIRE_STATE_COMMANDS=0 in build.env and deploy the stack with SharedState=disabled" >&2; \
       exit 1; \
+    fi; \
+    if [ "${REQUIRE_STATE_COMMANDS:-1}" != "0" ] && ! { updraft state merge --help 2>/dev/null | grep -q -- '--live' && updraft state --help 2>/dev/null | grep -q 'copy'; }; then \
+      echo "this Updraft has no 'state merge --live' or no 'state copy', which checkpoints of the shared state and keeping an unsaved database need; use a newer UPDRAFT_SPEC or a tarball in vendor/ (or REQUIRE_STATE_COMMANDS=0 with SharedState=disabled)" >&2; \
+      exit 1; \
     fi
 
 # Agent CLIs (word splitting of the list is intended). The review loop needs two different

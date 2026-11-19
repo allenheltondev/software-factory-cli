@@ -76,6 +76,14 @@ export function parseRunRequest(body) {
   if (payload.notBefore !== undefined && (typeof payload.notBefore !== 'string' || Number.isNaN(Date.parse(payload.notBefore)))) {
     throw new Error('runHookPayload.notBefore is not a date');
   }
+  // Optional settings of state sync; absent means the runner's defaults.
+  const optionalSeconds = (name, max) => {
+    const value = payload[name];
+    if (value === undefined) return {};
+    if (!Number.isInteger(value) || value < 0 || value > max) throw new Error(`runHookPayload.${name} is malformed`);
+    return { [name]: value };
+  };
+  const stateSettings = { ...optionalSeconds('stateCheckpointSeconds', 3600), ...optionalSeconds('statePendingWaitSeconds', 1800) };
   const launchedAt = text('launchedAt');
   if (Number.isNaN(Date.parse(launchedAt))) throw new Error('runHookPayload.launchedAt is not a date');
   return {
@@ -84,6 +92,7 @@ export function parseRunRequest(body) {
       ...(payload.dedupeTable === undefined ? {} : { dedupeTable: payload.dedupeTable }),
       ...(payload.stateKey === undefined ? {} : { stateKey: payload.stateKey }),
       ...(payload.notBefore === undefined ? {} : { notBefore: payload.notBefore }),
+      ...stateSettings,
       version: PAYLOAD_VERSION,
       deliveryId: text('deliveryId', DELIVERY_ID_PATTERN),
       eventName: text('eventName', EVENT_NAME_PATTERN),

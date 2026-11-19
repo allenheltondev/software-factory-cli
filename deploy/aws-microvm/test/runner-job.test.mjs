@@ -427,6 +427,9 @@ describe('describeExitCode', () => {
     expect(describeExitCode(1)).toContain('see summary.outcome');
     expect(describeExitCode(2)).toContain('event file');
     expect(describeExitCode(3)).toContain('worker lock');
+    expect(describeExitCode(4)).toContain('cooldown');
+    expect(describeExitCode(5)).toContain('newer Updraft');
+    expect(describeExitCode(6)).toContain('does not know it yet');
     expect(describeExitCode(64)).toBe('updraft exited with code 64');
   });
 });

@@ -1,3 +1,4 @@
+/* global AbortController */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,10 +15,13 @@ import {
   readMergeReport,
   refuseUpload,
   sqliteHeader,
+  stateCopyInvocation,
   stateInfoInvocation,
   stateMergeInvocation,
   stateSyncBudgetMs,
   syncState,
+  unsavedKeys,
+  waitForStateChange,
 } from '../image/runner/state.mjs';
 import { decodeStateDb, encodeStateDb } from './fake-state-db.mjs';
 
@@ -386,6 +390,30 @@ describe('state helpers', () => {
     ]);
     expect(stateMergeInvocation({ changed: '/s/state.db', into: '/m/into.db' })).toEqual(['state', 'merge', '--changed', '/s/state.db', '--into', '/m/into.db', '--json']);
     expect(stateInfoInvocation({ db: '/m/into.db' })).toEqual(['state', 'info', '--db', '/m/into.db', '--json']);
+    // A checkpoint is the same merge with --live; the copy of an unsaved database has its own command.
+    expect(stateMergeInvocation({ changed: '/s/state.db', into: '/m/into.db', base: '/m/base.db', live: true })).toEqual([
+      'state', 'merge', '--changed', '/s/state.db', '--into', '/m/into.db', '--base', '/m/base.db', '--live', '--json',
+    ]);
+    expect(stateCopyInvocation({ db: '/s/state.db', out: '/u/unsaved.db' })).toEqual(['state', 'copy', '--db', '/s/state.db', '--out', '/u/unsaved.db', '--json']);
+  });
+
+  it('keeps an unsaved database next to the shared one, by delivery', () => {
+    expect(unsavedKeys('state/state.db', 'd-1')).toEqual({ key: 'state/unsaved/d-1.db', baseKey: 'state/unsaved/d-1.base.db' });
+    expect(unsavedKeys('state.db', 'd-1')).toEqual({ key: 'unsaved/d-1.db', baseKey: 'unsaved/d-1.base.db' });
+  });
+
+  it('waits for the shared object to change, and gives up on time', async () => {
+    let etag = '"a"';
+    const deps = { s3Etag: async () => etag, stateChangePollMs: 10, log: () => {} };
+    setTimeout(() => (etag = '"b"'), 60);
+    expect(await waitForStateChange({ bucket: BUCKET, key: KEY, etag: '"a"', timeoutMs: 5000 }, deps)).toBe(true);
+    expect(await waitForStateChange({ bucket: BUCKET, key: KEY, etag: '"b"', timeoutMs: 80 }, deps)).toBe(false);
+    // No object yet counts as "unchanged" for a run that started from nothing; a runner that cannot ask does not wait.
+    expect(await waitForStateChange({ bucket: BUCKET, key: KEY, etag: undefined, timeoutMs: 60 }, { ...deps, s3Etag: async () => undefined })).toBe(false);
+    expect(await waitForStateChange({ bucket: BUCKET, key: KEY, etag: '"a"', timeoutMs: 5000 }, { log: () => {} })).toBe(false);
+    const stopped = new AbortController();
+    setTimeout(() => stopped.abort(), 30);
+    expect(await waitForStateChange({ bucket: BUCKET, key: KEY, etag: '"b"', timeoutMs: 5000, signal: stopped.signal }, deps)).toBe(false);
   });
 
   it('treats only an explicit changed: false as "nothing to upload"', () => {
@@ -583,24 +611,201 @@ describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
     expect(names(calls)).toContain('releaseDelivery');
   });
 
-  it('keeps a successful job successful when state cannot be saved, loudly, and keeps the delivery record', async () => {
+  it('reports "state_not_saved" when the job succeeded and its state could not be saved, releases the delivery, and keeps the database', async () => {
     for (const control of [{ merge: 'fail' }, { merge: 'newer-schema' }]) {
       const s3 = memoryS3(encodeStateDb(['old']));
       const { deps, calls, logs, document } = jobSetup('success', { s3, control });
       const result = await runJob(request({ dedupeTable: 'deliveries' }), deps);
-      expect(result.outcome).toBe('succeeded');
+      // Loud, and its own status: the job's outcome is kept next to it.
+      expect(result.outcome).toBe('state_not_saved');
+      expect(result.jobOutcome).toBe('succeeded');
       expect(result.exitCode).toBe(0);
-      expect(result.error).toBeNull();
+      expect(result.error).toContain('NOT saved');
       expect(result.state.sync).toMatchObject({ attempted: true, saved: false });
       expect(result.state.sync.notSavedCode).toBe(control.merge === 'fail' ? 'merge-failed' : 'newer-schema');
       expect(document().state.sync.notSavedReason).toEqual(expect.any(String));
+      expect(document()).toMatchObject({ outcome: 'state_not_saved', jobOutcome: 'succeeded' });
       expect(logs.some((line) => line.startsWith('STATE NOT SAVED'))).toBe(true);
       expect(logs.find((line) => line.startsWith('RESULT '))).toContain('notSavedReason');
       expect(names(calls)).not.toContain('s3PutIf');
-      expect(names(calls)).not.toContain('releaseDelivery');
+      expect(s3.versions).toHaveLength(1);
+
+      // The run's database, as one file, and the snapshot it started from: under their own
+      // keys, with plain writes, before the result is written.
+      const puts = calls.filter(([name]) => name === 's3Put');
+      const unsaved = puts.find(([, , key]) => key === 'state/unsaved/delivery-1.db');
+      const base = puts.find(([, , key]) => key === 'state/unsaved/delivery-1.base.db');
+      expect(decodeStateDb(unsaved[3]).rows).toEqual(['job-a', 'old']);
+      expect(decodeStateDb(base[3]).rows).toEqual(['old']);
+      expect(result.state.unsaved).toEqual({ saved: true, key: 'state/unsaved/delivery-1.db', baseKey: 'state/unsaved/delivery-1.base.db', bytes: 4096, error: null });
+      expect(puts.indexOf(unsaved)).toBeLessThan(puts.findIndex(([, , key]) => key.endsWith('.json')));
+      expect(logs.some((line) => line.startsWith('UNSAVED STATE KEPT') && line.includes('state recover delivery-1'))).toBe(true);
+      // The copy was made by the CLI, as the job user's command, without AWS credentials.
+      const copy = stateCalls().find((call) => call.command === 'copy');
+      expect(copy.args.slice(0, 4)).toEqual(['state', 'copy', '--db', path.join(copy.env.UPDRAFT_HOME, 'state.db')]);
+      expect(Object.keys(copy.env).filter((name) => name.startsWith('AWS_'))).toEqual([]);
+
+      // A redelivery is possible: it is what puts the publication back on record.
+      expect(calls).toContainEqual(['releaseDelivery', 'deliveries', 'delivery-1']);
       expect(names(calls).at(-1)).toBe('terminate');
+      fs.rmSync(stateRecord, { force: true });
+    }
+  });
+
+  it('says so when the unsaved database cannot be kept either, and still reports and terminates', async () => {
+    const s3 = memoryS3(encodeStateDb(['old']));
+    const { deps, calls, logs } = jobSetup('fail', { s3, control: { merge: 'fail', copy: 'fail' } });
+    const result = await runJob(request({ dedupeTable: 'deliveries' }), deps);
+    expect(result).toMatchObject({ outcome: 'state_not_saved', jobOutcome: 'failed', exitCode: 1 });
+    expect(result.error).toContain('the job: updraft exited 1');
+    expect(result.state.unsaved).toMatchObject({ saved: false, key: null });
+    expect(result.state.unsaved.error).toContain('updraft state copy exited 1');
+    expect(logs.some((line) => line.startsWith('UNSAVED STATE LOST'))).toBe(true);
+    expect(names(calls)).toContain('releaseDelivery');
+    expect(names(calls).at(-1)).toBe('terminate');
+  });
+
+  it('does not call a run that left no database, or changed nothing, a loss', async () => {
+    const s3 = memoryS3(encodeStateDb(['old']));
+    const { deps, calls } = jobSetup('success', { s3, rows: null });
+    const result = await runJob(request({ dedupeTable: 'deliveries' }), deps);
+    expect(result).toMatchObject({ outcome: 'succeeded', jobOutcome: 'succeeded', state: { sync: { saved: false, changed: false, notSavedReason: null }, unsaved: null } });
+    expect(names(calls)).not.toContain('releaseDelivery');
+  });
+
+  it('checkpoints the state while the job runs, with --live, and the final sync adds the rest', async () => {
+    const s3 = memoryS3(encodeStateDb(['old']));
+    const { deps, calls } = jobSetup('slow-state', {
+      s3,
+      rows: null,
+      secrets: { [ENV_ARN]: JSON.stringify({ FAKE_UPDRAFT_MODE: 'slow-state', FAKE_UPDRAFT_SLOW_ROWS: JSON.stringify(['pr-opened', 'review-1', 'review-2']), FAKE_UPDRAFT_SLOW_MS: '500' }) },
+      deps: { checkpointIntervalMs: 150, checkpointPollMs: 30 },
+    });
+    const seen = [];
+    const putIf = deps.s3PutIf;
+    deps.s3PutIf = async (...args) => {
+      const put = await putIf(...args);
+      seen.push(s3.rows());
+      return put;
+    };
+    const result = await runJob(request({ stateCheckpointSeconds: 20 }), deps);
+
+    expect(result.outcome).toBe('succeeded');
+    // The pull request was in the shared database while the job was still running.
+    expect(seen[0]).toEqual(['old', 'pr-opened']);
+    expect(result.state.checkpoints).toMatchObject({ intervalSeconds: 20, failed: 0, lastProblem: null });
+    expect(result.state.checkpoints.saved).toBeGreaterThanOrEqual(1);
+    expect(result.state.checkpoints.lastEtag).toEqual(expect.any(String));
+    expect(s3.rows()).toEqual(['old', 'pr-opened', 'review-1', 'review-2']);
+    // Every merge while the job ran was a live one against the snapshot the job started
+    // from; exactly one merge was not live, and it came last.
+    const all = merges();
+    expect(all.at(-1).live).toBe(false);
+    expect(all.slice(0, -1).every((merge) => merge.live)).toBe(true);
+    expect(all.every((merge) => JSON.stringify(merge.baseRows) === JSON.stringify(['old']))).toBe(true);
+    expect(all[0].args).toContain('--live');
+    expect(Object.keys(all[0].env).filter((name) => name.startsWith('AWS_') || name.includes('ANTHROPIC'))).toEqual([]);
+    expect(names(calls).at(-1)).toBe('terminate');
+  });
+
+  it('lets a checkpoint that fails or hangs cost the job nothing', async () => {
+    for (const control of [{ merge: 'hang' }, { merge: 'fail' }]) {
+      const s3 = memoryS3(encodeStateDb(['old']));
+      const { deps } = jobSetup('slow-state', {
+        s3,
+        rows: null,
+        control,
+        secrets: { [ENV_ARN]: JSON.stringify({ FAKE_UPDRAFT_MODE: 'slow-state', FAKE_UPDRAFT_SLOW_ROWS: JSON.stringify(['a', 'b']), FAKE_UPDRAFT_SLOW_MS: '400' }) },
+        deps: { checkpointIntervalMs: 100, checkpointPollMs: 30, stateSyncBudgetMs: 1500 },
+      });
+      const started = Date.now();
+      const result = await runJob(request(), deps);
+      // The job itself is as it would have been; the hanging checkpoint was stopped when the job ended.
+      expect(result).toMatchObject({ jobOutcome: 'succeeded', exitCode: 0, summary: { outcome: 'succeeded' } });
+      expect(result.state.checkpoints.saved).toBe(0);
+      expect(Date.now() - started).toBeLessThan(8000);
       expect(s3.versions).toHaveLength(1);
       fs.rmSync(stateRecord, { force: true });
+    }
+  });
+
+  it('takes no checkpoints when the setting is 0', async () => {
+    const s3 = memoryS3(encodeStateDb(['old']));
+    const { deps } = jobSetup('slow-state', {
+      s3,
+      rows: null,
+      secrets: { [ENV_ARN]: JSON.stringify({ FAKE_UPDRAFT_MODE: 'slow-state', FAKE_UPDRAFT_SLOW_ROWS: JSON.stringify(['a', 'b']), FAKE_UPDRAFT_SLOW_MS: '300' }) },
+      deps: { checkpointPollMs: 20 },
+    });
+    const result = await runJob(request({ stateCheckpointSeconds: 0 }), deps);
+    expect(result.state.checkpoints).toBeNull();
+    expect(merges()).toHaveLength(1);
+    expect(s3.rows()).toEqual(['a', 'b', 'old']);
+  });
+
+  /** A pull request event whose pull request the shared state does not know yet (fake-updraft's state-pending mode). */
+  function pendingSetup(s3, deps = {}) {
+    const tries = path.join(root, 'tries.txt');
+    const setup = jobSetup('state-pending', {
+      s3,
+      rows: null,
+      secrets: { [ENV_ARN]: JSON.stringify({ FAKE_UPDRAFT_MODE: 'state-pending', FAKE_UPDRAFT_TRIES: tries }) },
+      deps: { s3Etag: async () => (await s3.s3GetIfExists(BUCKET, KEY))?.etag, stateChangePollMs: 20, ...deps },
+    });
+    return { ...setup, tries: () => fs.readFileSync(tries, 'utf8').trim().split('\n') };
+  }
+
+  it('runs the event again on a fresh snapshot once the shared state has changed, and succeeds', async () => {
+    const s3 = memoryS3(encodeStateDb(['old']));
+    const { deps, calls, tries } = pendingSetup(s3);
+    // The microVM that opened the pull request saves its state a moment later.
+    setTimeout(() => s3.put(encodeStateDb(['old', 'pr-known'])), 150);
+    const result = await runJob(request({ eventName: 'pull_request_review', dedupeTable: 'deliveries', statePendingWaitSeconds: 30 }), deps);
+
+    expect(tries()).toEqual(['pending', 'known']);
+    expect(result).toMatchObject({ outcome: 'succeeded', exitCode: 0, updraftOutcome: 'succeeded', state: { pending: { tries: 1, resolved: true }, sync: { saved: true } } });
+    // The second try started from the newer object, and its merge is against that as the base.
+    expect(result.state.snapshot).toMatchObject({ found: true, bytes: 4096 });
+    expect(merges().at(-1).baseRows).toEqual(['old', 'pr-known']);
+    expect(s3.rows()).toEqual(['old', 'pr-known', 'revision-1']);
+    expect(names(calls)).not.toContain('releaseDelivery');
+  });
+
+  it('fails the job, with the reason, when the state never arrives in the time it is given', async () => {
+    const s3 = memoryS3(encodeStateDb(['old']));
+    const { deps, calls, tries, document } = pendingSetup(s3);
+    const started = Date.now();
+    const result = await runJob(request({ eventName: 'pull_request_review', dedupeTable: 'deliveries', statePendingWaitSeconds: 1 }), deps);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(900);
+    expect(tries()).toEqual(['pending']);
+    expect(result).toMatchObject({ outcome: 'failed', jobOutcome: 'failed', exitCode: 6, updraftOutcome: 'state-pending', state: { pending: { tries: 1, resolved: false } } });
+    expect(result.error).toContain('updraft exited 6');
+    expect(result.error).toContain('tried 1 time(s)');
+    expect(document().error).toContain('does not know it yet');
+    // Released: a redelivery can try again.
+    expect(calls).toContainEqual(['releaseDelivery', 'deliveries', 'delivery-1']);
+    expect(s3.versions).toHaveLength(1);
+  });
+
+  it('does not wait at all when the wait is set to 0, and stops trying after a bounded number of changes', async () => {
+    const s3 = memoryS3(encodeStateDb(['old']));
+    const none = pendingSetup(s3);
+    const result = await runJob(request({ eventName: 'pull_request', statePendingWaitSeconds: 0 }), none.deps);
+    expect(none.tries()).toEqual(['pending']);
+    expect(result).toMatchObject({ outcome: 'failed', exitCode: 6, state: { pending: { tries: 1, waitedMs: 0, resolved: false } } });
+
+    // The shared state keeps changing (other jobs' checkpoints) and never has the pull request.
+    fs.rmSync(path.join(root, 'tries.txt'));
+    const busy = memoryS3(encodeStateDb(['old']));
+    let version = 0;
+    const churn = setInterval(() => busy.put(encodeStateDb(['old', `other-${(version += 1)}`])), 15);
+    try {
+      const many = pendingSetup(busy);
+      const stuck = await runJob(request({ eventName: 'pull_request', statePendingWaitSeconds: 600 }), many.deps);
+      expect(many.tries()).toEqual(Array.from({ length: 6 }, () => 'pending'));
+      expect(stuck).toMatchObject({ outcome: 'failed', exitCode: 6, state: { pending: { tries: 6, resolved: false } } });
+    } finally {
+      clearInterval(churn);
     }
   });
 
@@ -632,8 +837,10 @@ describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
     const started = Date.now();
     const result = await runJob(request(), deps);
     expect(Date.now() - started).toBeLessThan(8000);
-    expect(result.outcome).toBe('succeeded');
+    expect(result).toMatchObject({ outcome: 'state_not_saved', jobOutcome: 'succeeded' });
     expect(result.state.sync).toMatchObject({ saved: false, notSavedCode: 'timed-out' });
+    // What the hanging merge could not save is kept under its own key; then the report, then the end.
+    expect(result.state.unsaved).toMatchObject({ saved: true, key: 'state/unsaved/delivery-1.db' });
     expect(names(calls).slice(-2)).toEqual(['s3Put', 'terminate']);
   });
 
