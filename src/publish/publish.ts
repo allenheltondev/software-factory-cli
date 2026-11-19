@@ -62,6 +62,8 @@ import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { verificationLines, verificationNotes } from '../worker/verify.js';
 import { safeMarkdown } from './markdown.js';
+import { code } from './failure-comment.js';
+import { detailLines, runDetails, type RunDetails } from './run-details.js';
 
 /** How long a publication may hold its lease before another process may take it over. */
 export const PUBLISH_LEASE_SECONDS = 10 * 60;
@@ -397,12 +399,13 @@ export function renderPrBody(o: {
   return `${cap(body, MAX_BODY - marker.length - 2)}\n\n${marker}`;
 }
 
-export function renderIssueComment(o: { runId: string; pr: GitHubPullRequest; commitCount: number; summary: RunSummary }): string {
+export function renderIssueComment(o: { runId: string; pr: GitHubPullRequest; commitCount: number; summary: RunSummary; details?: RunDetails }): string {
   const kind = o.pr.draft ? 'Draft PR' : 'PR';
   return [
     `${kind} #${o.pr.number} has the changes for this issue: ${o.pr.htmlUrl}`,
     '',
     `From run \`${o.runId}\`: ${o.commitCount} commit(s), ${inline(o.summary.diffStat)}. Merging is up to a person.`,
+    ...(o.details ? ['', `- **Worker** ${code(o.details.worker)}`, ...detailLines(o.details)] : []),
     '',
     publicationMarker(o.runId),
   ].join('\n');
@@ -739,7 +742,7 @@ export async function publishRun(
       let comment = found;
       if (!comment) {
         hold(); // the lookup may have outlived the lease
-        comment = await deps.api.createIssueComment(repoRef, job.issueNumber, renderIssueComment({ runId, pr, commitCount, summary: run.summary }));
+        comment = await deps.api.createIssueComment(repoRef, job.issueNumber, renderIssueComment({ runId, pr, commitCount, summary: run.summary, details: runDetails(deps.db, job, run) }));
       }
       progress({ commentId: comment.id, commentUrl: comment.htmlUrl });
       await runLog([found ? `issue comment already there: ${comment.htmlUrl}` : `commented on issue #${job.issueNumber}: ${comment.htmlUrl}`]);

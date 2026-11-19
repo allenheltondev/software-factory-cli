@@ -32,6 +32,7 @@ import { reviewOf, revisionOf, type Job, type Run } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { cap, fenced, MAX_AUTO_ATTEMPTS, PUBLISH_ATTEMPT_SECONDS, PUBLISH_LEASE_SECONDS } from './publish.js';
+import { detailLines, runDetails, type RunDetails } from './run-details.js';
 
 const BASE_BACKOFF_SECONDS = 60;
 const MAX_BACKOFF_SECONDS = 60 * 60;
@@ -128,6 +129,8 @@ export function renderFailureComment(o: {
   jobId: string;
   attempt: number;
   agent: string;
+  /** Model and complexity of the run (see run-details.ts). */
+  details?: RunDetails;
   /** False when the job failed because no agent could start. */
   agentStarted: boolean;
   /** Consecutive start failures, when that is why the job failed. */
@@ -154,6 +157,7 @@ export function renderFailureComment(o: {
     '',
     `- Run: ${code(o.runId)} (attempt ${o.attempt} of job ${code(o.jobId)})`,
     `- Agent: ${code(o.agent)}${o.agentStarted ? '' : ' (the last one tried)'}`,
+    ...(o.details ? detailLines(o.details, false, true) : []),
     `- Ran for: ${o.agentStarted && o.ranMs !== null ? duration(o.ranMs) : 'the agent did not start'}`,
     ...(o.branch && !o.review ? [`- Branch: ${code(o.branch)} (on the worker's machine; not pushed)`] : []),
     '',
@@ -340,6 +344,7 @@ export async function postFailureComment(deps: FailureCommentDeps, runId: string
         jobId: job.id,
         attempt: run.attempt,
         agent: run.agent,
+        details: runDetails(deps.db, job, run),
         agentStarted,
         startFailures: job.startFailures,
         ranMs: run.endedAt ? Date.parse(run.endedAt) - Date.parse(started) : null,

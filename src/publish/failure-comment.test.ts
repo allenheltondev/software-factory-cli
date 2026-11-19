@@ -275,6 +275,8 @@ describe('postFailureComment: which runs get a comment', () => {
         '',
         `- Run: \`${s.runId}\` (attempt 1 of job \`${s.jobId}\`)`,
         '- Agent: `claude`',
+        '- Model: `Unknown`',
+        '- Complexity: `Not classified`',
         '- Ran for: 12m 5s',
         `- Branch: \`updraft/issue-7-${s.jobId}\` (on the worker's machine; not pushed)`,
         '',
