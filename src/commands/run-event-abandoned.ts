@@ -10,7 +10,7 @@
 // database would have settled it (settleUnfinished), so the normal rules apply to it again.
 import type { Db } from '../db/database.js';
 import { holdKey, listHolds } from '../db/holds.js';
-import { settleUnfinished, STEP_TABLES } from '../db/merge.js';
+import { settleUnfinished, STEP_TABLES, UNFINISHED_PUSH_NOTE } from '../db/merge.js';
 import { getPublication } from '../db/publications.js';
 import { getJob, latestRunOfJob, retryJob } from '../db/queue.js';
 
@@ -63,10 +63,12 @@ export function requeueAbandonedJob(db: Db, jobId: string, reason: string, now: 
 }
 
 /**
- * A job of this event whose agent finished but whose publication never did: a checkpoint carried
- * the job as `succeeded` with its publication `publishing` (pushed or not, no pull request yet),
- * and the run's machine vanished before the rest of its database was saved. The caller has
- * established that no live hold covers the job.
+ * A job of this event whose agent finished but whose publication never did: the job is
+ * `succeeded` and its publication has no pull request and is either still `publishing` (a
+ * checkpoint carried it, and the machine vanished before the rest of its database was saved) or
+ * `failed` only because a final merge closed it unfinished (UNFINISHED_PUSH_NOTE; the runner
+ * merged what was there before the machine went). A publication GitHub or Updraft refused is not
+ * this, and stays as it is. The caller has established that no live hold covers the job.
  */
 export interface StalledPublication {
   jobId: string;
@@ -76,12 +78,17 @@ export interface StalledPublication {
   endedSha: string | null;
 }
 
+/** The publication rows findStalledPublication takes; one parameter, UNFINISHED_PUSH_NOTE. */
+const STALLED = "(state = 'publishing' OR (state = 'failed' AND retryable = 0 AND instr(coalesce(error, ''), ?) > 0))";
+
 export function findStalledPublication(db: Db, jobId: string): StalledPublication | null {
   if (getJob(db, jobId)?.status !== 'succeeded') return null;
   const run = latestRunOfJob(db, jobId);
   if (!run || run.outcome !== 'succeeded') return null;
   const pub = getPublication(db, run.id);
-  if (!pub || pub.state !== 'publishing' || pub.prNumber !== null) return null;
+  if (!pub || pub.prNumber !== null) return null;
+  const unfinished = pub.state === 'publishing' || (pub.state === 'failed' && !pub.retryable && (pub.error ?? '').includes(UNFINISHED_PUSH_NOTE));
+  if (!unfinished) return null;
   return { jobId, runId: run.id, branch: pub.branch, endedSha: run.summary?.headSha ?? null };
 }
 
@@ -96,8 +103,8 @@ export function resumeStalledPublication(db: Db, runId: string, reason: string, 
   db.prepare(
     `UPDATE publications SET state = 'failed', retryable = 1, next_attempt_at = coalesce(lease_expires_at, updated_at), lease_expires_at = NULL,
             error = ?, updated_at = ?
-     WHERE run_id = ? AND state = 'publishing'`,
-  ).run(reason, at, runId);
+     WHERE run_id = ? AND ${STALLED}`,
+  ).run(reason, at, runId, UNFINISHED_PUSH_NOTE);
 }
 
 /**
@@ -109,7 +116,7 @@ export function failStalledPublication(db: Db, s: StalledPublication, reason: st
   const at = new Date(now()).toISOString();
   db.prepare(
     `UPDATE publications SET state = 'failed', retryable = 0, next_attempt_at = NULL, lease_expires_at = NULL, error = ?, updated_at = ?
-     WHERE run_id = ? AND state = 'publishing'`,
-  ).run(reason, at, s.runId);
+     WHERE run_id = ? AND ${STALLED}`,
+  ).run(reason, at, s.runId, UNFINISHED_PUSH_NOTE);
   db.prepare("UPDATE jobs SET status = 'failed', status_reason = ?, updated_at = ? WHERE id = ? AND status = 'succeeded'").run(reason, at, s.jobId);
 }

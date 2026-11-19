@@ -709,6 +709,13 @@ export const STEP_TABLES: readonly string[] = LEASED_TABLES.map((t) => t.table);
  * The final merge of a run applies it to the rows it wrote; `updraft run-event` applies it to the
  * job of its own event when the run that had it is gone (docs/run-event.md, "An abandoned run").
  */
+/**
+ * What the error of a push or publication says when a merge closed it because the process doing
+ * it was gone: not refused, only never finished. A redelivery looks for it (run-event-abandoned.ts):
+ * the commits may have reached GitHub after all.
+ */
+export const UNFINISHED_PUSH_NOTE = 'not retried: the commits exist only on the machine that made them';
+
 export function settleUnfinished(into: Db, rows: UnfinishedRows, now: () => number = Date.now): MergeResult['unfinished'] {
   const unfinished = { runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 0, holdsReleased: 0 };
   const at = new Date(now()).toISOString();
@@ -749,10 +756,10 @@ export function settleUnfinished(into: Db, rows: UnfinishedRows, now: () => numb
         : into
             .prepare(
               `UPDATE ${t.table} SET state = 'failed', retryable = 0, lease_expires_at = NULL, next_attempt_at = NULL,
-                      error = coalesce(error, ?) || '; not retried: the commits exist only on the machine that made them', updated_at = ?
+                      error = coalesce(error, ?) || '; ' || ?, updated_at = ?
                WHERE run_id = ? AND (state = ? OR (state = 'failed' AND retryable = 1))`,
             )
-            .run(note, at, runId, t.busy);
+            .run(note, UNFINISHED_PUSH_NOTE, at, runId, t.busy);
       unfinished.stepsClosed += Number(res.changes);
     }
   }

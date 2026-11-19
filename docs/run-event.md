@@ -662,7 +662,11 @@ run the job: the race of two runs of one event, with the outcome described under
 
 **A run that vanished between its push and its pull request.** A checkpoint can also carry
 the job as `succeeded` with its publication under way (`publishing`, no pull request): the
-agent finished, the machine went before the pull request was opened. Once no live hold
+agent finished, the machine went before the pull request was opened. If the runner's final
+merge ran before the machine went, it closed that publication as unfinished instead
+(`failed`, not retryable, its error ending "not retried: the commits exist only on the
+machine that made them"), and the same holds for it. A publication that GitHub or Updraft
+refused has no such note and is left as it is. Once no live hold
 covers the job, a redelivery asks GitHub for the job's branch and compares it with the
 commit the run ended on (its summary's `headSha`):
 

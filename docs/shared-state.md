@@ -195,6 +195,10 @@ the rows **this merge wrote**, and only those:
   `queued`. The next delivery of the event runs it.
 - A publication or revision push that was mid-step, or scheduled for a retry, becomes `failed`
   and is not retried: the commits to push existed only in the clone of the machine that is gone.
+  Its error ends "not retried: the commits exist only on the machine that made them". For a
+  publication, a redelivery of the event checks whether they reached GitHub after all and, if
+  the branch is at exactly the commit the run ended on, opens the pull request from it
+  ([run-event.md](run-event.md#an-abandoned-run)).
 - A review posting or failure comment that was mid-step becomes `failed` and due for a retry:
   both are made from the database alone, so a later run of the same event can still make them.
 

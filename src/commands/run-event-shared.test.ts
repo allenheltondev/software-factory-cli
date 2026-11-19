@@ -1009,7 +1009,12 @@ describe('updraft run-event: a run that checkpointed and then vanished', { timeo
   });
 });
 
-describe('updraft run-event: a run that vanished between its push and its pull request', { timeout: 180_000 }, () => {
+// Twice: the shared state has what a checkpoint carried (the publication still `publishing`), or
+// what the runner's final merge of that database made of it (closed as unfinished, `failed`).
+describe.each([
+  { saved: 'a checkpoint', final: false },
+  { saved: 'the final merge', final: true },
+])('updraft run-event: a run that vanished between its push and its pull request, saved by $saved', { timeout: 180_000 }, ({ final }) => {
   const HOURS = 3_600_000;
   /**
    * A machine whose agent finished and whose push landed, checkpointed while it was publishing,
@@ -1030,14 +1035,16 @@ describe('updraft run-event: a run that vanished between its push and its pull r
       ).run();
       return (db.prepare('SELECT run_id FROM publications').get() as { run_id: string }).run_id;
     });
-    mergeState({ changed: lost.state, into: w.shared, live: true });
+    mergeState({ changed: lost.state, into: w.shared, ...(final ? {} : { live: true }) });
     // GitHub never saw the pull request.
     w.gh.pull = null;
     w.gh.pulls = [];
     rmSync(w.received, { force: true });
     withDb(w.shared, (db) => {
       expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded' });
-      expect(db.prepare('SELECT state, pr_number FROM publications').get()).toEqual({ state: 'publishing', pr_number: null });
+      expect(db.prepare('SELECT state, retryable, pr_number FROM publications').get()).toEqual(
+        final ? { state: 'failed', retryable: 0, pr_number: null } : { state: 'publishing', retryable: 0, pr_number: null },
+      );
     });
     return { w, runId, ended };
   }
@@ -1107,6 +1114,28 @@ describe('updraft run-event: a run that vanished between its push and its pull r
       expect(getJob(db, JOB_ID)).toMatchObject({ status: 'failed' });
       expect(db.prepare('SELECT state, retryable FROM publications').get()).toEqual({ state: 'failed', retryable: 0 });
     });
+  });
+});
+
+describe('updraft run-event: a publication that was refused', { timeout: 180_000 }, () => {
+  it('is not taken for one a vanished run left unfinished: a redelivery changes nothing', async () => {
+    const w = world();
+    const first = vm(w, 'vm first');
+    expect((await first.run({ deliveryId: 'd-first' })).code).toBe(0);
+    withDb(first.state, (db) =>
+      db.prepare("UPDATE publications SET state = 'failed', retryable = 0, pr_number = NULL, pr_url = NULL, published_at = NULL, error = 'GitHub refused the pull request: 422'").run(),
+    );
+    mergeState({ changed: first.state, into: w.shared });
+    w.gh.pull = null;
+    w.gh.pulls = [];
+    rmSync(w.received, { force: true });
+    const late = vm(w, 'vm late', { now: () => Date.now() + 7 * 3_600_000 });
+    late.download();
+    const r = await late.run({ deliveryId: 'd-late' });
+    expect(r.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery', abandonedRun: null, exitCode: 0 });
+    expect(existsSync(w.received)).toBe(false);
+    expect(w.gh.pull).toBeNull();
+    expect(withDb(late.state, (db) => db.prepare('SELECT state, retryable, error FROM publications').get())).toEqual({ state: 'failed', retryable: 0, error: 'GitHub refused the pull request: 422' });
   });
 });
 
