@@ -11,6 +11,13 @@
   "bin": {
     "updraft": "dist/cli.js"
   },
+  "exports": {
+    "./config": {
+      "types": "./dist/config/public.d.ts",
+      "default": "./dist/config/public.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist",
     "docs",
