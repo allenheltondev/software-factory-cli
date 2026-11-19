@@ -129,8 +129,8 @@ const noHostLookup = () => {
 };
 
 async function readPids(file: string): Promise<{ agent: number; child: number }> {
-  await vi.waitFor(() => expect(existsSync(file)).toBe(true), { timeout: 30_000, interval: 50 });
-  const pids = JSON.parse(readFileSync(file, 'utf8')) as { agent: number; child: number };
+  // The file appears before its content does: wait until it parses, not just until it exists.
+  const pids = await vi.waitFor(() => JSON.parse(readFileSync(file, 'utf8')) as { agent: number; child: number }, { timeout: 30_000, interval: 50 });
   strays.push(pids.agent, pids.child);
   return pids;
 }
