@@ -146,7 +146,10 @@ describe('TABLE_RULES', () => {
   });
 });
 
-describe('mergeState', () => {
+// Every test here opens, copies and rewrites several SQLite files. That takes about a second in
+// all on Linux, and more than ten times that on a loaded Windows CI runner, so the default 5 s
+// per test is too tight there.
+describe('mergeState', { timeout: 60_000 }, () => {
   it('gives the same shared copy whichever of two runs from one snapshot is merged first, when they changed different things', () => {
     const snap = snapshot();
     const a = copy(snap, 'a.db');
@@ -563,7 +566,7 @@ function insertOldJob(db: Db): string {
   return 'job_old';
 }
 
-describe('updraft state merge / info', () => {
+describe('updraft state merge / info', { timeout: 60_000 }, () => {
   const ctx = () => {
     const out = new MemoryOutput();
     const err = new MemoryOutput();
@@ -636,7 +639,7 @@ describe('updraft state merge / info', () => {
   });
 });
 
-describe('mergeState, live: a checkpoint of a run that is still going', () => {
+describe('mergeState, live: a checkpoint of a run that is still going', { timeout: 60_000 }, () => {
   /** A run in `file`, left exactly where a checkpoint would find it: one job done and mid-publication, one running, a hold, an error. */
   function runUnderWay(db: Db) {
     const done = finishedJob(db, 70, { worker: 'wa', at: T0 + 1000 });
@@ -751,7 +754,7 @@ describe('mergeState, live: a checkpoint of a run that is still going', () => {
   });
 });
 
-describe('mergeState, live: a run that has not opened its database yet', () => {
+describe('mergeState, live: a run that has not opened its database yet', { timeout: 60_000 }, () => {
   it('copies an older database aside through SQLite and migrates the copy, leaving the file and its sidecars alone', () => {
     const d = dir();
     const a = join(d, 'state.db');
@@ -770,7 +773,7 @@ describe('mergeState, live: a run that has not opened its database yet', () => {
   });
 });
 
-describe('copyState / updraft state copy', () => {
+describe('copyState / updraft state copy', { timeout: 60_000 }, () => {
   it('writes one self-contained file with every row under its id, while the database is open elsewhere', async () => {
     const d = dir();
     const file = join(d, 'state.db');
