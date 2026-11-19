@@ -4,23 +4,24 @@
  *   /login            LoginForm
  *   /signup           SignUpForm (also the confirm step, below)
  *   /signup/confirm   SignUpForm started at the confirm step, for an account
- *                     sign-in found unconfirmed (email and, in memory only,
- *                     the password arrive via router state)
+ *                     sign-in found unconfirmed. The email arrives via router
+ *                     state; the password never does (router state lands in
+ *                     window.history.state), only via heldPassword.ts, in memory
  *   /forgot-password  ForgotPasswordForm
  */
 
-import type { ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router';
 import { Alert } from '@readysetcloud/ui';
 import { ForgotPasswordForm, LoginForm, SignUpForm, useAuth } from '@readysetcloud/ui/auth';
 import { useAppConfig } from '../config/ConfigContext';
+import { forgetHeldPassword, holdPassword, takeHeldPassword } from './heldPassword';
 
 export const APP_NAME = 'Updraft';
 
 interface FlowState {
   from?: string;
   email?: string;
-  password?: string;
   startAtReset?: boolean;
 }
 
@@ -30,7 +31,6 @@ function flowState(state: unknown): FlowState {
   const out: FlowState = {};
   if (typeof record.from === 'string') out.from = record.from;
   if (typeof record.email === 'string') out.email = record.email;
-  if (typeof record.password === 'string') out.password = record.password;
   if (record.startAtReset === true) out.startAtReset = true;
   return out;
 }
@@ -114,9 +114,10 @@ export function LoginPage() {
           forgetReturnPath();
           void navigate(safeReturnPath(from), { replace: true });
         }}
-        onNeedsConfirmation={(email, password) =>
-          navigate('/signup/confirm', { state: { email, password, from } })
-        }
+        onNeedsConfirmation={(email, password) => {
+          holdPassword(email, password);
+          void navigate('/signup/confirm', { state: { email, from } });
+        }}
         onPasswordResetRequired={(email) =>
           navigate('/forgot-password', { state: { email, startAtReset: true, from } })
         }
@@ -141,8 +142,11 @@ export function LoginPage() {
 export function SignUpPage() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { email, password } = flowState(location.state);
+  const { email } = flowState(location.state);
   const from = useReturnPath();
+  // Read once on mount, then gone from module memory; dropped from this screen when it unmounts.
+  const [password] = useState(() => takeHeldPassword(email));
+  useEffect(() => forgetHeldPassword, []);
   return (
     <AuthPage>
       <SignUpForm

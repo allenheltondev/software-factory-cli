@@ -42,6 +42,7 @@ browser ── https://updraft.readysetcloud.io ──> CloudFront (one distribu
 | `server/` | The API: Hono. `src/lambda.ts` is the Lambda entry, `src/local.ts` the local dev server; `scripts/bundle.mjs` bundles to `server/dist/` |
 | `infra/` | `template.yaml` (SAM) and `samconfig.toml` |
 | `scripts/smoke.mjs` | Anonymous post-deploy checks |
+| `scripts/spa-release.mjs` | Records each SPA release and prunes assets of releases replaced long ago |
 | `Makefile` | Dev, checks and deploy targets, shared by local runs and CI |
 
 ## Local development
@@ -77,7 +78,10 @@ Both workflows call `.github/workflows/cloud-deploy-env.yaml`, which runs these 
 
 1. lint, typecheck and test;
 2. `make deploy-backend`: bundle the API, then `sam deploy`;
-3. `make deploy-frontend`: build the SPA, then write `auth-config.json` from the stack outputs. Next it syncs to S3; hashed assets are cached as immutable, while `index.html` and `auth-config.json` are uploaded with `no-cache`. Finally it invalidates CloudFront.
+3. `make deploy-frontend`: build the SPA and write `auth-config.json` from the stack outputs, then release in this order:
+   - Upload the new hashed files under `assets/` (immutable cache). **Nothing is deleted**, so an `index.html` still in flight or cached at an edge keeps finding the files it names.
+   - Upload `auth-config.json`, then `index.html` last (both `no-cache`), which switches the release. Invalidate CloudFront.
+   - `scripts/spa-release.mjs` records the release (`_releases/<time>.json` lists its assets) and prunes the assets of releases replaced more than `ASSET_RETENTION_DAYS` (default 7) ago. The window counts from when a release was replaced, not from when its files were uploaded.
 4. `scripts/smoke.mjs` against the deployed URL.
 
 There is no `sam build`. `ApiFunction`'s `CodeUri` is the bundled `server/dist`, which `sam deploy` zips and uploads itself.

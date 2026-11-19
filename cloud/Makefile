@@ -10,6 +10,8 @@ STACK_NAME ?= updraft-cloud
 # surprise region. The stack must be in us-east-1 for the CloudFront certificate.
 DEPLOY_REGION ?=
 REGION_ARG = $(if $(DEPLOY_REGION),--region $(DEPLOY_REGION),)
+# How long a replaced SPA release's hashed assets stay in the bucket (deploy-frontend).
+ASSET_RETENTION_DAYS ?= 7
 SAM_DEPLOY_ARGS ?= --stack-name $(STACK_NAME) $(REGION_ARG) \
 	--template-file template.yaml \
 	--resolve-s3 \
@@ -88,8 +90,11 @@ smoke:
 # deploy
 #
 #   deploy-backend   bundle the API (server/dist) -> sam deploy the whole stack
-#   deploy-frontend  build the SPA -> write /auth-config.json from the stack's outputs -> s3 sync
-#                    -> CloudFront invalidation
+#   deploy-frontend  build the SPA -> write /auth-config.json from the stack's outputs -> upload
+#                    the new hashed assets (nothing deleted) -> switch index.html last ->
+#                    CloudFront invalidation -> scripts/spa-release.mjs records the release and
+#                    prunes assets of releases replaced more than ASSET_RETENTION_DAYS ago, so an
+#                    index.html still in flight or cached never points at deleted files
 #   deploy           both, in that order
 #
 # There is no `sam build`: the template's ApiFunction points at the bundled server/dist, which
@@ -141,15 +146,19 @@ deploy-frontend:
 	npm run build --workspace=app; \
 	printf '{"region":"%s","userPoolId":"%s","clientId":"%s"}\n' "$$REGION" "$$POOL_ID" "$$CLIENT_ID" > app/dist/auth-config.json; \
 	echo "deploy-frontend: publishing to s3://$$APP_BUCKET"; \
-	aws s3 sync app/dist "s3://$$APP_BUCKET" --delete $(REGION_ARG) \
-		--exclude index.html --exclude auth-config.json \
+	aws s3 sync app/dist/assets "s3://$$APP_BUCKET/assets" $(REGION_ARG) \
 		--cache-control 'public, max-age=31536000, immutable'; \
-	aws s3 cp app/dist/index.html "s3://$$APP_BUCKET/index.html" $(REGION_ARG) \
-		--cache-control 'no-cache' --content-type 'text/html; charset=utf-8'; \
+	aws s3 sync app/dist "s3://$$APP_BUCKET" $(REGION_ARG) \
+		--exclude 'assets/*' --exclude index.html --exclude auth-config.json \
+		--cache-control 'public, max-age=300'; \
 	aws s3 cp app/dist/auth-config.json "s3://$$APP_BUCKET/auth-config.json" $(REGION_ARG) \
 		--cache-control 'no-cache' --content-type 'application/json'; \
+	aws s3 cp app/dist/index.html "s3://$$APP_BUCKET/index.html" $(REGION_ARG) \
+		--cache-control 'no-cache' --content-type 'text/html; charset=utf-8'; \
 	echo "deploy-frontend: invalidating $$DIST_ID"; \
 	aws cloudfront create-invalidation --distribution-id "$$DIST_ID" --paths '/*' >/dev/null; \
+	node scripts/spa-release.mjs --bucket "$$APP_BUCKET" --dist app/dist \
+		--retention-days $(ASSET_RETENTION_DAYS) $(REGION_ARG); \
 	echo; \
 	echo "Deployed: $$APP_URL"
 
