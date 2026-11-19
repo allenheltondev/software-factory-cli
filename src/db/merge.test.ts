@@ -7,13 +7,14 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { MemoryOutput } from '../commands/fakes.js';
-import { stateInfoCommand, stateMergeCommand } from '../commands/state.js';
+import { stateCopyCommand, stateInfoCommand, stateMergeCommand } from '../commands/state.js';
 import type { CommandContext } from '../commands/context.js';
 import { configSchema } from '../config/schema.js';
 import { setCooldown } from './capacity.js';
 import { openDatabase, openDatabaseReadOnly, recordError, SCHEMA_VERSION, schemaVersion, type Db } from './database.js';
 import { commitPollBatch } from './ingest.js';
-import { listTables, mergeState, SchemaTooNewError, stateInfo, TABLE_RULES } from './merge.js';
+import { listHolds, putHold, releaseHolds } from './holds.js';
+import { copyState, listTables, mergeState, MergeInputError, SchemaTooNewError, stateInfo, TABLE_RULES } from './merge.js';
 import { pruneJob } from './prune.js';
 import { beginPublication } from './publications.js';
 import { claimNextJob, finishRun, getJob, retryJob } from './queue.js';
@@ -632,5 +633,173 @@ describe('updraft state merge / info', () => {
     const missing = ctx();
     expect(await stateInfoCommand(missing.ctx, { db: join(dir(), 'nope.db'), json: true })).toBe(2);
     expect(JSON.parse(missing.out.text)).toMatchObject({ exists: false });
+  });
+});
+
+describe('mergeState, live: a checkpoint of a run that is still going', () => {
+  /** A run in `file`, left exactly where a checkpoint would find it: one job done and mid-publication, one running, a hold, an error. */
+  function runUnderWay(db: Db) {
+    const done = finishedJob(db, 70, { worker: 'wa', at: T0 + 1000 });
+    beginPublication(db, { runId: done.runId, jobId: done.jobId, repoId: 1, repoFullName: 'o/r', issueNumber: 70, mode: 'draft-pr', branch: 'updraft/issue-70-x', leaseSeconds: 60, now: () => T0 + 2000 });
+    const running = insertQueuedJob(db, { repoId: 1, fullName: 'o/r', issue: 71 });
+    const c = claimNextJob(db, config, claimOpts('wa', T0 + 3000))!;
+    started(db, c.run.id, T0 + 3000);
+    recordError(db, { scope: 'worker', message: 'before the checkpoint', at: new Date(T0 + 3000).toISOString() });
+    putHold(db, { job: running }, { holder: 'wa', delivery: 'd-1', until: new Date(T0 + 3_600_000).toISOString() });
+    acquireWorkerLock(db, { workerId: 'wa', pid: 1, hostname: 'vm' }, { now: () => T0, isPidAlive: () => true });
+    return { done, running, runningRun: c.run.id };
+  }
+
+  it('reads one consistent state while the run writes, settles nothing, and leaves the run\'s files alone', () => {
+    const snap = snapshot();
+    const a = copy(snap, 'state.db');
+    const shared = copy(snap, 'shared.db');
+    const db = openDatabase(a);
+    try {
+      const own = runUnderWay(db);
+      // The run is in the middle of a write that it has not committed.
+      db.exec('BEGIN IMMEDIATE');
+      recordError(db, { scope: 'worker', message: 'not committed yet', at: new Date(T0 + 4000).toISOString() });
+
+      const r = mergeState({ changed: a, base: snap, into: shared, live: true, now: () => T0 + 5000 });
+      expect(r).toMatchObject({ changed: true, unfinished: { runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 0, holdsReleased: 0 } });
+      // The run's write-ahead log is part of its database: still there, and the run can go on.
+      expect(existsSync(`${a}-wal`)).toBe(true);
+      db.exec('COMMIT');
+
+      read(shared, (x) => {
+        // In flight, and recorded as that.
+        expect(getJob(x, own.running)).toMatchObject({ status: 'running' });
+        expect(x.prepare('SELECT ended_at, outcome FROM runs WHERE id = ?').get(own.runningRun)).toEqual({ ended_at: null, outcome: null });
+        expect(x.prepare('SELECT state FROM publications WHERE run_id = ?').get(own.done.runId)).toEqual({ state: 'publishing' });
+        expect(listHolds(x)).toMatchObject([{ holder: 'wa', releasedAt: null }]);
+        expect(x.prepare('SELECT count(*) AS n FROM worker_lock').get()).toEqual({ n: 0 });
+        expect(x.prepare("SELECT message FROM errors WHERE scope = 'worker'").all()).toEqual([{ message: 'before the checkpoint' }]);
+      });
+      // A second checkpoint with nothing new changes nothing; with the committed row, it adds that row once.
+      expect(mergeState({ changed: a, base: snap, into: shared, live: true, now: () => T0 + 6000 }).totals).toMatchObject({ inserted: 0, updated: 0, appended: 1 });
+      expect(mergeState({ changed: a, base: snap, into: shared, live: true, now: () => T0 + 7000 })).toMatchObject({ changed: false });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('followed by the final merge against the same base, gives what the final merge alone gives, and nothing twice', () => {
+    const snap = snapshot();
+    const a = copy(snap, 'state.db');
+    const shared = copy(snap, 'shared.db');
+    const other = copy(snap, 'other.db');
+    edit(other, (x) => finishedJob(x, 90, { worker: 'wb', at: T0 + 5500 }));
+    const db = openDatabase(a);
+    let own: ReturnType<typeof runUnderWay>;
+    try {
+      own = runUnderWay(db);
+      mergeState({ changed: a, base: snap, into: shared, live: true, now: () => T0 + 5000 });
+      // Another machine's upload lands between the checkpoint and the end of the run.
+      mergeState({ changed: other, base: snap, into: shared, now: () => T0 + 5600 });
+      // The run goes on to its end.
+      finishRun(db, own.runningRun, { outcome: 'succeeded', now: () => T0 + 8000 });
+      recordError(db, { scope: 'worker', message: 'after the checkpoint', at: new Date(T0 + 8000).toISOString() });
+      setCooldown(db, { scope: 'agent', name: 'claude', untilMs: T0 + 900_000, reason: 'usage limit', stated: true, nowMs: T0 + 8000 });
+      releaseHolds(db, 'wa', new Date(T0 + 9000).toISOString());
+    } finally {
+      db.close();
+    }
+    const at = () => T0 + 60_000;
+    const final = mergeState({ changed: a, base: snap, into: shared, now: at });
+    // The publication never finished: that is settled now, once, by the final merge.
+    expect(final).toMatchObject({ changed: true, unfinished: { runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 1, holdsReleased: 0 } });
+    read(shared, (x) => {
+      expect(getJob(x, own.running)).toMatchObject({ status: 'succeeded' });
+      expect(x.prepare('SELECT outcome FROM runs WHERE id = ?').get(own.runningRun)).toEqual({ outcome: 'succeeded' });
+      expect(x.prepare('SELECT state, retryable FROM publications WHERE run_id = ?').get(own.done.runId)).toEqual({ state: 'failed', retryable: 0 });
+      expect(listHolds(x)).toMatchObject([{ holder: 'wa', releasedAt: new Date(T0 + 9000).toISOString() }]);
+      expect(x.prepare("SELECT message, count(*) AS n FROM errors WHERE scope = 'worker' GROUP BY message ORDER BY message").all()).toEqual([
+        { message: 'after the checkpoint', n: 1 },
+        { message: 'before the checkpoint', n: 1 },
+      ]);
+      expect(x.prepare('SELECT count(*) AS n FROM metric_events').get()).toEqual(read(a, (y) => y.prepare('SELECT count(*) + 3 AS n FROM metric_events').get()));
+    });
+
+    // The same end state as a run that was never checkpointed.
+    const plain = copy(snap, 'plain.db');
+    mergeState({ changed: other, base: snap, into: plain, now: () => T0 + 5600 });
+    mergeState({ changed: a, base: snap, into: plain, now: at });
+    expect(dump(shared)).toEqual(dump(plain));
+
+    // And merging the run once more adds nothing.
+    const before = dump(shared);
+    mergeState({ changed: a, base: snap, into: shared, now: at });
+    expect(dump(shared)).toEqual(before);
+  });
+
+  it('lets the final merge settle what a checkpoint carried and the run never got to finish', () => {
+    const snap = snapshot();
+    const a = copy(snap, 'state.db');
+    const shared = copy(snap, 'shared.db');
+    const own = edit(a, (db) => runUnderWay(db));
+    mergeState({ changed: a, base: snap, into: shared, live: true, now: () => T0 + 5000 });
+    expect(read(shared, (x) => getJob(x, own.running)?.status)).toBe('running');
+
+    // The run was killed right after: its database is exactly what the checkpoint read.
+    const r = mergeState({ changed: a, base: snap, into: shared, now: () => T0 + 60_000 });
+    expect(r).toMatchObject({ changed: true, totals: { inserted: 0, updated: 0, appended: 0 }, unfinished: { runsInterrupted: 1, stepsClosed: 1, holdsReleased: 1 } });
+    read(shared, (x) => {
+      expect(getJob(x, own.running)).toMatchObject({ status: 'interrupted' });
+      expect(listHolds(x)[0]?.releasedAt).toBe(new Date(T0 + 60_000).toISOString());
+    });
+  });
+});
+
+describe('mergeState, live: a run that has not opened its database yet', () => {
+  it('copies an older database aside through SQLite and migrates the copy, leaving the file and its sidecars alone', () => {
+    const d = dir();
+    const a = join(d, 'state.db');
+    // The snapshot as downloaded, still at an older schema, and held open by something.
+    const old = openDatabase(a, { migrateTo: 12 });
+    try {
+      insertOldJob(old);
+      const shared = join(dir(), 'shared.db');
+      const r = mergeState({ changed: a, into: shared, live: true });
+      expect(r).toMatchObject({ created: true, changed: true, tables: { jobs: { inserted: 1 } } });
+      expect(schemaVersion(old)).toBe(12);
+      expect(read(shared, (x) => getJob(x, 'job_old')?.status)).toBe('canceled');
+    } finally {
+      old.close();
+    }
+  });
+});
+
+describe('copyState / updraft state copy', () => {
+  it('writes one self-contained file with every row under its id, while the database is open elsewhere', async () => {
+    const d = dir();
+    const file = join(d, 'state.db');
+    const db = openDatabase(file);
+    try {
+      const { jobId } = finishedJob(db, 80, { worker: 'wa', at: T0 });
+      recordError(db, { scope: 'poll', message: 'one', at: new Date(T0).toISOString() });
+      db.prepare('DELETE FROM errors').run();
+      recordError(db, { scope: 'poll', message: 'two', at: new Date(T0).toISOString() });
+      // Committed, and still only in the write-ahead log.
+      expect(existsSync(`${file}-wal`)).toBe(true);
+
+      const out = join(d, 'copy.db');
+      expect(copyState(file, out)).toMatchObject({ schemaVersion: SCHEMA_VERSION });
+      expect(existsSync(`${out}-wal`)).toBe(false);
+      read(out, (x) => {
+        expect(getJob(x, jobId)?.status).toBe('succeeded');
+        expect(x.prepare('SELECT id, message FROM errors').all()).toEqual(db.prepare('SELECT id, message FROM errors').all());
+      });
+      // Never over a file that is there.
+      expect(() => copyState(file, out)).toThrow(MergeInputError);
+
+      const c = { out: new MemoryOutput(), err: new MemoryOutput() };
+      const again = join(d, 'copy2.db');
+      expect(await stateCopyCommand({ ...c, now: () => T0 } as unknown as CommandContext, { db: file, out: again, json: true })).toBe(0);
+      expect(JSON.parse(c.out.text)).toMatchObject({ ok: true, out: again, schemaVersion: SCHEMA_VERSION, exitCode: 0 });
+      expect(await stateCopyCommand({ ...c, now: () => T0 } as unknown as CommandContext, { db: join(d, 'missing.db'), out: join(d, 'x.db') })).toBe(2);
+    } finally {
+      db.close();
+    }
   });
 });

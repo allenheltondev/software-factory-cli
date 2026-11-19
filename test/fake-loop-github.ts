@@ -45,6 +45,9 @@ export class FakeLoopGitHub {
   /** Refuse a review's commit_id as GitHub does for a commit that is not in the PR. */
   refuseCommitId = false;
   updatedAt = '2026-11-18T12:00:00Z';
+  /** The body the pull request was opened with (it carries the run's marker), and who opened it. */
+  pullBody = '';
+  pullAuthor: string | null = null;
   private version = 0;
   private nextId = 1;
 
@@ -107,6 +110,8 @@ export class FakeLoopGitHub {
   async createPullRequest(_repo: RepoRef, input: CreatePullRequestInput): Promise<GitHubPullRequest> {
     this.writes.push(`open ${input.draft ? 'draft ' : ''}PR ${input.head} -> ${input.base}`);
     this.pull = { number: this.nextPullNumber, state: 'open', merged: false, draft: input.draft, headRef: input.head, baseRef: input.base, mergeable: true, mergeableState: 'clean' };
+    this.pullBody = input.body;
+    this.pullAuthor = this.login;
     this.touch();
     return { number: this.pull.number, htmlUrl: `https://github.com/${this.fullName}/pull/${this.pull.number}`, state: 'open', draft: input.draft, merged: false, headRef: input.head, headRepoId: 42, baseRef: input.base, body: input.body };
   }
@@ -139,11 +144,12 @@ export class FakeLoopGitHub {
     const p = this.need();
     return { number: p.number, state: p.state, merged: p.merged, updatedAt: this.updatedAt, headRef: p.headRef, headSha: this.headSha(), reviews: this.humanReviews };
   }
-  async getPullRequest(): Promise<PullRequestDetails> {
+  async getPullRequest(_repo?: RepoRef, pullNumber?: number): Promise<PullRequestDetails> {
     this.calls.push('getPullRequest');
     this.maybeFail('getPullRequest');
     const p = this.need();
-    return { number: p.number, nodeId: `PR_node_${p.number}`, htmlUrl: `https://github.com/${this.fullName}/pull/${p.number}`, state: p.state, merged: p.merged, draft: p.draft, headRef: p.headRef, headSha: this.headSha(), baseRef: p.baseRef, mergeable: p.mergeable, mergeableState: p.mergeableState };
+    if (pullNumber !== undefined && pullNumber !== p.number) throw new GitHubError('pull request not found', 404);
+    return { number: p.number, nodeId: `PR_node_${p.number}`, htmlUrl: `https://github.com/${this.fullName}/pull/${p.number}`, state: p.state, merged: p.merged, draft: p.draft, headRef: p.headRef, headSha: this.headSha(), baseRef: p.baseRef, mergeable: p.mergeable, mergeableState: p.mergeableState, author: this.pullAuthor, body: this.pullBody, headRepoId: 42 };
   }
   async listPullRequestReviews(): Promise<PullRequestReviewSummary[]> {
     this.calls.push('listPullRequestReviews');

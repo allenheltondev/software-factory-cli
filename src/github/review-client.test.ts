@@ -32,11 +32,15 @@ describe('createGitHubApi: the review loop', () => {
     const raw = { number: 5, node_id: 'PR_x', html_url: 'https://github.com/o/r/pull/5', state: 'open', merged: false, draft: true, head: { ref: 'b', sha: SHA }, base: { ref: 'main' }, mergeable: null, mergeable_state: 'unknown' };
     const { fn, calls } = fakeFetch(() => json(raw));
     const api = await createGitHubApi({ token: 't', fetch: fn });
-    expect(await api.getPullRequest(repo, 5)).toEqual({ number: 5, nodeId: 'PR_x', htmlUrl: 'https://github.com/o/r/pull/5', state: 'open', merged: false, draft: true, headRef: 'b', headSha: SHA, baseRef: 'main', mergeable: null, mergeableState: 'unknown' });
+    expect(await api.getPullRequest(repo, 5)).toEqual({ number: 5, nodeId: 'PR_x', htmlUrl: 'https://github.com/o/r/pull/5', state: 'open', merged: false, draft: true, headRef: 'b', headSha: SHA, baseRef: 'main', mergeable: null, mergeableState: 'unknown', author: null, body: '', headRepoId: null });
     expect(calls[0]).toMatchObject({ method: 'GET', url: 'https://api.github.com/repositories/42/pulls/5' });
 
     const merged = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json({ ...raw, state: 'closed', merged: true, draft: false, mergeable: true, mergeable_state: 'clean' })).fn });
     expect(await merged.getPullRequest(repo, 5)).toMatchObject({ state: 'closed', merged: true, draft: false, mergeable: true });
+
+    // Who opened it, its body and the repository of its head: what tells one of Updraft's own pull requests from any other.
+    const own = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json({ ...raw, user: { login: 'updraft[bot]' }, body: 'Closes #1', head: { ref: 'b', sha: SHA, repo: { id: 42 } } })).fn });
+    expect(await own.getPullRequest(repo, 5)).toMatchObject({ author: 'updraft[bot]', body: 'Closes #1', headRepoId: 42 });
   });
 
   it('lists reviews and only ever submits a COMMENT review', async () => {

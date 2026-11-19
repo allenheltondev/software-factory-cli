@@ -15,7 +15,7 @@ import { retryCommand } from './retry.js';
 import { reviewsCommand, type ReviewsOptions } from './reviews.js';
 import { runEventCommand, type RunEventOptions } from './run-event.js';
 import { startCommand } from './start.js';
-import { stateInfoCommand, stateMergeCommand, type StateMergeOptions } from './state.js';
+import { stateCopyCommand, stateInfoCommand, stateMergeCommand, type StateMergeOptions } from './state.js';
 import { statsCommand, type StatsOptions } from './stats.js';
 import { statusCommand } from './status.js';
 import { validateCommand } from './validate.js';
@@ -28,6 +28,7 @@ export interface Handlers {
   runEvent(ctx: CommandContext, opts: RunEventOptions): Promise<number>;
   stateMerge(ctx: CommandContext, opts: StateMergeOptions): Promise<number>;
   stateInfo(ctx: CommandContext, opts: { db: string; json?: boolean }): Promise<number>;
+  stateCopy(ctx: CommandContext, opts: { db: string; out: string; json?: boolean }): Promise<number>;
   status(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   doctor(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   retry(ctx: CommandContext, jobId: string): Promise<number>;
@@ -48,6 +49,7 @@ export const defaultHandlers: Handlers = {
   runEvent: (ctx, opts) => runEventCommand(ctx, opts),
   stateMerge: (ctx, opts) => stateMergeCommand(ctx, opts),
   stateInfo: (ctx, opts) => stateInfoCommand(ctx, opts),
+  stateCopy: (ctx, opts) => stateCopyCommand(ctx, opts),
   status: statusCommand,
   doctor: (ctx, opts) => doctorCommand(ctx, opts),
   retry: (ctx, jobId) => retryCommand(ctx, jobId),
@@ -141,6 +143,7 @@ export function buildProgram(opts: ProgramOptions): Command {
     .requiredOption('--changed <file>', 'the state database the run used')
     .requiredOption('--into <file>', 'the latest shared copy; created when it does not exist')
     .option('--base <file>', 'the snapshot the run started from (omit when it started from nothing)')
+    .option('--live', 'the run is still going: read --changed consistently while it is written to, and leave unfinished work as it is (a checkpoint)')
     .addOption(new Option('--json', 'print one JSON object on stdout: per-table counts, schema version, and whether anything changed'))
     .action((o: StateMergeOptions) => exec((ctx) => handlers.stateMerge(ctx, o)));
   state
@@ -149,6 +152,13 @@ export function buildProgram(opts: ProgramOptions): Command {
     .requiredOption('--db <file>', 'the state database file')
     .addOption(new Option('--json', 'machine-readable output'))
     .action((o: { db: string; json?: boolean }) => exec((ctx) => handlers.stateInfo(ctx, o)));
+  state
+    .command('copy')
+    .description('Write a consistent single-file copy of a state database, read through SQLite (safe while a run is writing to it)')
+    .requiredOption('--db <file>', 'the state database to copy')
+    .requiredOption('--out <file>', 'the file to write; it must not exist')
+    .addOption(new Option('--json', 'machine-readable output'))
+    .action((o: { db: string; out: string; json?: boolean }) => exec((ctx) => handlers.stateCopy(ctx, o)));
 
   program
     .command('status')

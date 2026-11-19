@@ -2,7 +2,7 @@
 // between machines (docs/shared-state.md). Neither needs the config, GitHub or a worker.
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { mergeState, MergeInputError, SchemaTooNewError, stateInfo, type MergeResult, type StateInfo, type TableCounts } from '../db/merge.js';
+import { copyState, mergeState, MergeInputError, SchemaTooNewError, stateInfo, type MergeResult, type StateInfo, type TableCounts } from '../db/merge.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 
@@ -13,6 +13,8 @@ export interface StateMergeOptions {
   into: string;
   /** The snapshot the run started from; omitted when it started from nothing. */
   base?: string;
+  /** `--changed` is the database of a run that is still going: merge a consistent reading of it and settle nothing. */
+  live?: boolean;
   json?: boolean;
 }
 
@@ -43,7 +45,7 @@ function describeCounts(c: TableCounts): string {
 export async function stateMergeCommand(ctx: CommandContext, opts: StateMergeOptions): Promise<number> {
   let summary: StateMergeSummary;
   try {
-    const result = mergeState({ changed: opts.changed, into: opts.into, ...(opts.base !== undefined ? { base: opts.base } : {}), now: ctx.now });
+    const result = mergeState({ changed: opts.changed, into: opts.into, ...(opts.base !== undefined ? { base: opts.base } : {}), ...(opts.live ? { live: true } : {}), now: ctx.now });
     summary = { ok: true, exitCode: EXIT.OK, ...result };
   } catch (err) {
     const reason = err instanceof SchemaTooNewError ? 'schema-too-new' : err instanceof MergeInputError ? 'bad-input' : 'failed';
@@ -67,15 +69,34 @@ export async function stateMergeCommand(ctx: CommandContext, opts: StateMergeOpt
         if (line) println(ctx.out, `  ${table}: ${line}`);
       }
       const u = summary.unfinished;
-      if (u.runsInterrupted + u.runsReleased + u.jobsInterrupted + u.stepsClosed > 0) {
+      if (u.runsInterrupted + u.runsReleased + u.jobsInterrupted + u.stepsClosed + u.holdsReleased > 0) {
         println(
           ctx.out,
-          `  unfinished work closed: ${u.runsInterrupted} run(s) interrupted, ${u.runsReleased} claim(s) released, ${u.jobsInterrupted} job(s) interrupted, ${u.stepsClosed} step(s) towards GitHub`,
+          `  unfinished work closed: ${u.runsInterrupted} run(s) interrupted, ${u.runsReleased} claim(s) released, ${u.jobsInterrupted} job(s) interrupted, ${u.stepsClosed} step(s) towards GitHub, ${u.holdsReleased} hold(s) released`,
         );
       }
     }
   }
   return EXIT.OK;
+}
+
+/**
+ * `updraft state copy`: a consistent single-file copy of a state database, read through SQLite,
+ * so it is safe while a run is writing to `--db`. Exit 0: copied. 2: `--db` is missing or
+ * unreadable, or `--out` exists. 1: anything else. `--db` is never changed.
+ */
+export async function stateCopyCommand(ctx: CommandContext, opts: { db: string; out: string; json?: boolean }): Promise<number> {
+  try {
+    const copied = copyState(opts.db, opts.out);
+    if (opts.json) println(ctx.out, JSON.stringify({ ok: true, out: resolve(opts.out), ...copied, exitCode: EXIT.OK }));
+    else println(ctx.out, `Copied ${resolve(opts.db)} to ${resolve(opts.out)} (${copied.bytes} bytes, schema v${copied.schemaVersion}).`);
+    return EXIT.OK;
+  } catch (err) {
+    const exitCode = err instanceof MergeInputError ? EXIT.USAGE : EXIT.FAILURE;
+    if (opts.json) println(ctx.out, JSON.stringify({ ok: false, error: message(err), exitCode }));
+    println(ctx.err, `error: ${message(err)}`);
+    return exitCode;
+  }
 }
 
 /** `updraft state info`: schema version and row counts of a state database file. Read-only. */

@@ -2,21 +2,26 @@
 // docs/run-event.md is the contract; this file is the wiring.
 //
 //   payload file -> decideWebhook (the poller's ingestion rules, from the API)
-//                -> "already in this state database?" (shared between runs: docs/shared-state.md)
-//                -> "already handled?" (GitHub, for runs that could not see each other's state)
+//                -> "already in this state database?" (shared between runs: docs/shared-state.md);
+//                   a pull request that is not, and that GitHub says is ours: "state pending"
+//                -> "already handled?" (GitHub, for runs that could not see each other's state);
+//                   handled, and nothing of it on record: the publication is restored
 //                -> the clone, created if missing
 //                -> the queue, with a job id derived from the event; or, for a pull request
 //                   event, the review poller (reviews.ts) for that pull request
+//                -> a hold on the event's work, for the runs that see this one's checkpoints
 //                -> drainQueue (runDaemon until the event's work is done: pre-start check, live
 //                   executor, verification, publication, the review loop, auto-merge, failure
 //                   comment), scoped to the event (src/worker/scope.ts)
-//                -> one summary, one exit code
+//                -> the last look at the event's pull requests, and what it queues
+//                -> one summary, one exit code, for everything the run did for the event
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../config/io.js';
-import { autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, type UpdraftConfig } from '../config/schema.js';
+import { autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
 import { getFailureComment } from '../db/failure-comments.js';
+import { putHold, releaseHolds } from '../db/holds.js';
 import { cancelQueuedJob, commitPollBatch } from '../db/ingest.js';
 import { getLoopPr, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
 import { getPublication } from '../db/publications.js';
@@ -39,13 +44,15 @@ import { createRevisionPublisher, revisionsEnabled } from '../publish/revision.j
 import { reviewOf, revisionOf, type RepoRef, type VerificationSummary } from '../types.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import type { DaemonDeps } from '../worker/daemon.js';
-import { drainQueue, type DrainEnd, type DrainOptions } from '../worker/drain.js';
+import { drainQueue, type DrainEnd, type DrainOptions, type DrainResult } from '../worker/drain.js';
 import { findRepoConfig } from '../worker/executor.js';
 import type { LiveExecutorOptions } from '../worker/live.js';
 import { createExecutor } from '../worker/prepare-only.js';
-import { createEventScope, nothingPending, pendingWork, type EventScope } from '../worker/scope.js';
+import { newId } from '../util/ids.js';
+import { createEventScope, foreignWork, nothingPending, pendingWork, withoutForeignWork, type GuardedScope } from '../worker/scope.js';
 import { println, type CommandContext } from './context.js';
 import { CliError, describeError, EXIT } from './errors.js';
+import { readOwnPullRequest, restorePublication } from './run-event-restore.js';
 import { installSignalHandlers } from './start.js';
 
 export interface RunEventOptions {
@@ -109,6 +116,23 @@ export interface RunEventJobSummary {
   logPath: string | null;
 }
 
+/** A job the event's work queued while this run was going: a reviewer run, a revision. */
+export interface RunEventFollowOnJob extends RunEventJobSummary {
+  kind: 'review' | 'revision' | 'other';
+  /** As the top-level `outcome`, for this job alone. */
+  outcome: string;
+}
+
+/** The look at the event's pull requests that a run takes before it ends (docs/run-event.md, "The last look"). */
+export interface RunEventFinalLook {
+  /** How often the pull requests were read from the API after the work had run out. */
+  looks: number;
+  /** Jobs those reads queued (a person's change request, a head someone pushed), which this run then ran. */
+  queued: number;
+  /** Why a look failed; null when none did. A failed look changes nothing else about the run. */
+  error: string | null;
+}
+
 /** Where the review loop left a pull request of the event (repositories.<repo>.review, revise, autoMerge). */
 export interface RunEventLoopSummary {
   pullRequest: number;
@@ -146,10 +170,14 @@ export interface RunEventSummary extends Omit<RunEventJobSummary, 'jobId' | 'wor
   resumed: boolean;
   /**
    * - nothing-to-do: no job was queued (`reason` says why).
-   * - succeeded: the job ran and, where publish is on, its result was published (or there was nothing to publish).
+   * - succeeded: the job ran and, where publish is on, its result was published (or there was nothing to publish),
+   *   and so did every job that followed from it in this run (reviewer runs, revisions).
    * - canceled: the job was queued and the pre-start check canceled it before any agent started.
-   * - failed: the agent run failed, could not start, or was interrupted.
-   * - publish-failed: the run succeeded and its publication did not.
+   * - failed: an agent run of the event's job, or of a job that followed from it, failed, could not start, or was interrupted.
+   * - publish-failed: a run succeeded and its publication, revision push or review posting did not.
+   * - state-pending: a pull request event for a pull request Updraft opened that this state
+   *   database does not know yet; nothing was done, and the event is to be run again with a
+   *   newer copy of the state database.
    * - superseded: the run succeeded, but another run of the same event published first; this
    *   run's commits were not pushed and nothing on GitHub was changed by it.
    * - not-started: the job was still queued when the drain ended.
@@ -158,13 +186,19 @@ export interface RunEventSummary extends Omit<RunEventJobSummary, 'jobId' | 'wor
    *   continues it (`deferredUntil`).
    * - error: the command itself failed (configuration, GitHub, the event file).
    */
-  outcome: 'nothing-to-do' | 'succeeded' | 'canceled' | 'superseded' | 'failed' | 'publish-failed' | 'not-started' | 'deferred' | 'error';
+  outcome: 'nothing-to-do' | 'succeeded' | 'canceled' | 'superseded' | 'failed' | 'publish-failed' | 'not-started' | 'deferred' | 'state-pending' | 'error';
   /**
    * Why nothing was done (or nothing was published), as a code: a NothingToDoReason,
    * "already-handled", "duplicate-delivery", "pull-request-not-watched", "pull-request-closed",
-   * "no-new-work", "canceled-before-start", "published-by-another-run" or "cooldown".
+   * "no-new-work", "canceled-before-start", "published-by-another-run", "cooldown", "state-pending"
+   * or (with outcome `error`) "state-not-restorable".
    */
   reason: string | null;
+  /**
+   * True when this run put a publication back on record from the GitHub API: the event's pull
+   * request exists, and the state database had nothing of the run that opened it.
+   */
+  stateRestored: boolean;
   /** With outcome `deferred`: when the cooldown ends (ISO time). Null otherwise. */
   deferredUntil: string | null;
   /** The review loop's result for the event's pull request; null when the event has none, or the loop is off. */
@@ -178,6 +212,10 @@ export interface RunEventSummary extends Omit<RunEventJobSummary, 'jobId' | 'wor
   drain: DrainEnd | null;
   /** Every job of the event, when there is more than one; the top-level fields describe the first. */
   jobs?: RunEventJobSummary[];
+  /** The jobs that followed from the event's in this run, when there are any. They count towards `outcome`. */
+  followOnJobs?: RunEventFollowOnJob[];
+  /** Null when no last look was due: the run has no open pull request, or neither revise nor review is on. */
+  finalLook: RunEventFinalLook | null;
   exitCode: number;
 }
 
@@ -225,6 +263,8 @@ function parseDeadline(value: string | undefined): number | undefined {
 
 /** What already exists on GitHub for a job of this event: the reason a second run stops. */
 interface ExistingWork {
+  /** The attempt the branch belongs to (jobBranchName). */
+  attempt: number;
   branch: string;
   sha: string | null;
   prNumber: number | null;
@@ -238,6 +278,21 @@ interface ExistingWork {
  * deleted), and so does the branch alone (a run that pushed and has not opened its PR yet, or
  * never will). Read with the same credentials and remote the run itself would fetch with.
  */
+const branchNames = (job: { id: string; issueNumber: number }) => Array.from({ length: MAX_START_FAILURES }, (_, i) => jobBranchName(job, i + 1));
+
+/** The pull request half of findExistingWork: the API alone, no clone. */
+async function findExistingPullRequest(o: { api: GitHubApi; repo: RepoRef; job: { id: string; issueNumber: number } }): Promise<ExistingWork | null> {
+  const owner = o.repo.fullName.split('/')[0]!;
+  for (const [i, branch] of branchNames(o.job).entries()) {
+    const pulls = (await o.api.listPullRequestsForHead(o.repo, { headOwner: owner, head: branch })).filter(
+      (p) => p.headRef === branch && (p.headRepoId === null || p.headRepoId === o.repo.id),
+    );
+    const pr = pulls.find((p) => p.state === 'open') ?? pulls[0];
+    if (pr) return { attempt: i + 1, branch, sha: null, prNumber: pr.number, prUrl: pr.htmlUrl };
+  }
+  return null;
+}
+
 async function findExistingWork(o: {
   api: GitHubApi;
   repo: RepoRef;
@@ -246,20 +301,14 @@ async function findExistingWork(o: {
   remote: string;
   net: GitOptions;
 }): Promise<ExistingWork | null> {
-  const names = Array.from({ length: MAX_START_FAILURES }, (_, i) => jobBranchName(o.job, i + 1));
-  const owner = o.repo.fullName.split('/')[0]!;
-  for (const branch of names) {
-    const pulls = (await o.api.listPullRequestsForHead(o.repo, { headOwner: owner, head: branch })).filter(
-      (p) => p.headRef === branch && (p.headRepoId === null || p.headRepoId === o.repo.id),
-    );
-    const pr = pulls.find((p) => p.state === 'open') ?? pulls[0];
-    if (pr) return { branch, sha: null, prNumber: pr.number, prUrl: pr.htmlUrl };
-  }
+  const names = branchNames(o.job);
+  const pr = await findExistingPullRequest(o);
+  if (pr) return pr;
   const listed = (await withCheckoutLock(o.checkoutPath, () => runGit(['ls-remote', o.remote, ...names.map((n) => `refs/heads/${n}`)], o.net))).stdout;
   for (const line of listed.split(/\r?\n/)) {
     const [sha, ref] = line.trim().split(/\s+/);
     const branch = names.find((n) => ref === `refs/heads/${n}`);
-    if (sha && branch) return { branch, sha, prNumber: null, prUrl: null };
+    if (sha && branch) return { attempt: names.indexOf(branch) + 1, branch, sha, prNumber: null, prUrl: null };
   }
   return null;
 }
@@ -336,7 +385,7 @@ function summarizeJob(db: Db, config: UpdraftConfig, jobId: string): RunEventJob
   };
 }
 
-type JobOutcome = Exclude<RunEventSummary['outcome'], 'nothing-to-do' | 'error'>;
+type JobOutcome = Exclude<RunEventSummary['outcome'], 'nothing-to-do' | 'error' | 'state-pending'>;
 
 function jobOutcome(j: RunEventJobSummary): JobOutcome {
   switch (j.status) {
@@ -426,6 +475,7 @@ export async function runEventCommand(ctx: CommandContext, opts: RunEventOptions
     resumed: false,
     outcome: 'error',
     reason: null,
+    stateRestored: false,
     deferredUntil: null,
     loop: null,
     message: '',
@@ -434,6 +484,7 @@ export async function runEventCommand(ctx: CommandContext, opts: RunEventOptions
     status: null,
     ...NO_JOB,
     drain: null,
+    finalLook: null,
     exitCode: EXIT.FAILURE,
   };
   try {
@@ -458,6 +509,14 @@ export async function runEventCommand(ctx: CommandContext, opts: RunEventOptions
 
 /** How long the end of the command waits for an assignment comment that is still being delivered. */
 const ANNOUNCE_WAIT_MS = 10_000;
+
+/** How often a run looks at its pull requests once more after its work ran out: each look after the first needs the one before to have queued something. */
+const MAX_FINAL_LOOKS = 3;
+/** With less of the deadline left than this, no further look is taken. */
+const FINAL_LOOK_MIN_MS = 30_000;
+/** How long a hold outlasts the run's deadline (the caller's merge of the state follows the run), and how long it lasts without one. */
+const HOLD_GRACE_MS = 15 * 60_000;
+const HOLD_WITHOUT_DEADLINE_MS = 6 * 3_600_000;
 
 function loopMessage(l: RunEventLoopSummary): string {
   return `pull request #${l.pullRequest} is ${l.stage} after ${l.rounds} revision round(s) (${l.detail})`;
@@ -496,6 +555,9 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
   });
   let db: Db | undefined;
   const announcements = new Set<Promise<void>>();
+  /** This run, to the other runs that share the state database (src/db/holds.ts). */
+  const holder = newId('wrk');
+  let holding = false;
   try {
     const credentials: GitHubCredentials = ctx.createCredentials(config, { log: log.child({ component: 'github' }) });
     const api = await ctx.createApi({ log: log.child({ component: 'github' }), credentials });
@@ -543,28 +605,96 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     // 2. What the state database already holds for the event. Everything from here on is
     // limited to the event's own jobs and pull requests (scope): the rest of the database
     // belongs to other events, whose machines may still be working.
-    let scope: EventScope | undefined;
+    let scope: GuardedScope | undefined;
+    /** A scope for this event that leaves alone what other runs hold (checkpoints make their work in flight visible here). */
+    const newScope = (openDb: Db): GuardedScope => withoutForeignWork(createEventScope(openDb), foreignWork(openDb, holder, ctx.now()));
+    const loopsOn = reviseActive(config, repoCfg) || reviewActive(config, repoCfg);
+    const publishing = publishMode(repoCfg) !== 'none';
     const issueJobs = decision.dispatch === true ? decision.jobs : [];
     /** Event jobs the state database already has. */
     let known: Array<{ id: string; status: string; issueNumber: number }> = [];
+
+    /**
+     * The pull request GitHub has for a job of the event is not on record: put its publication
+     * back from what the API establishes (run-event-restore.ts). False when there is nothing to
+     * restore: the pull request is closed or gone, it is on record after all, or neither loop is
+     * on for the repository. Throws when a fact it needs cannot be established: better a loud
+     * failure than a pull request nothing will ever act on.
+     */
+    const restore = async (openDb: () => Db, job: { id: string; issueNumber: number }, existing: ExistingWork, ensureJob: () => void): Promise<boolean> => {
+      // The rows are what the revision and review loops read; without either, nothing misses them.
+      if (existing.prNumber === null || !publishing || !loopsOn) return false;
+      if (hadState) {
+        syncRevisionPrs(stateDb(), repo.id);
+        if (getRevisionPr(stateDb(), repo.id, existing.prNumber)) return false; // on record: nothing was lost
+      }
+      const answer = await readOwnPullRequest(api, repo, existing.prNumber);
+      if (answer.kind === 'gone' || answer.kind === 'closed') return false;
+      let missing: string | null = null;
+      if (answer.kind === 'not-ours') missing = answer.why;
+      else if (answer.own.pr.headRef !== existing.branch) missing = `its head branch is ${answer.own.pr.headRef}, not ${existing.branch}`;
+      else if (answer.own.agent === null || !Object.hasOwn(config.agents, answer.own.agent)) missing = 'the agent of the run that opened it cannot be read from its body, or is no longer configured';
+      if (missing !== null || answer.kind !== 'ours' || answer.own.agent === null) {
+        summary.reason = 'state-not-restorable';
+        throw new CliError(
+          `pull request #${existing.prNumber} (${existing.prUrl}) exists for this event, the state database has no record of it, and it cannot be restored from GitHub: ${missing}. ` +
+            'Nothing will act on reviews of it until it is on record. Merge the original run\'s state database if it was kept (docs/shared-state.md, "Recovery"), ' +
+            'or close the pull request and apply the label again',
+        );
+      }
+      ensureJob();
+      try {
+        restorePublication(openDb(), { repo, jobId: job.id, attempt: existing.attempt, own: { ...answer.own, agent: answer.own.agent }, mode: publishMode(repoCfg) === 'pr' ? 'pr' : 'draft-pr', deliveryId: opts.deliveryId ?? null, now: ctx.now });
+      } catch (err) {
+        summary.reason = 'state-not-restorable';
+        throw new CliError(`pull request #${existing.prNumber} exists for this event, but its publication cannot be put back on record: ${errText(err)}`);
+      }
+      summary.stateRestored = true;
+      Object.assign(summary, summarizeJob(openDb(), config, job.id));
+      summary.loop = summarizeLoop(openDb(), config, repo.id, existing.prNumber);
+      log.warn('restored a publication the state database had lost', { job: job.id, pr: existing.prNumber, run: answer.own.runId });
+      return true;
+    };
+    const restoredMessage = (e: ExistingWork) => `${describeExisting(e)}; the state database had no record of it, and its publication was restored from the GitHub API, so reviews of it are acted on again`;
+
     if (decision.dispatch === 'poll-reviews') {
       const n = decision.pullRequest;
-      const notWatched = () =>
-        nothing('pull-request-not-watched', `pull request #${n} of ${repo.fullName} is not one Updraft opened, as far as this state database knows; nothing acts on it`);
+      // Not on record. Before this is "not ours", GitHub is asked: the run that opened a pull
+      // request uploads its state long after the pull request exists, and an event that arrives
+      // in between must not be answered "nothing to do" and forgotten.
+      const notOnRecord = async (): Promise<number> => {
+        const answer = await readOwnPullRequest(api, repo, n);
+        if (answer.kind !== 'ours') {
+          const why = answer.kind === 'not-ours' ? `GitHub says ${answer.why}` : answer.kind === 'closed' ? 'it is closed or merged' : 'GitHub has no such pull request';
+          return nothing('pull-request-not-watched', `pull request #${n} of ${repo.fullName} is not one Updraft opened, as far as this state database knows, and ${why}; nothing acts on it`);
+        }
+        summary.outcome = 'state-pending';
+        summary.reason = 'state-pending';
+        summary.prNumber = answer.own.pr.number;
+        summary.prUrl = answer.own.pr.htmlUrl;
+        summary.message =
+          `pull request #${n} of ${repo.fullName} was opened by Updraft (run ${answer.own.runId}), but this state database does not know it yet: ` +
+          'the run that opened it has not saved its state. Nothing was done. Run this event again with a newer copy of the state database; ' +
+          'if the state never arrives, deliver the issue event of that pull request again, which restores it';
+        log.warn('the pull request is ours, and the state database does not know it yet', { pr: n, run: answer.own.runId });
+        return EXIT.STATE_PENDING;
+      };
       // Without state there is no record of any pull request Updraft opened.
-      if (!hadState) return notWatched();
+      if (!hadState) return notOnRecord();
       const openDb = stateDb();
       syncRevisionPrs(openDb, repo.id);
       const watched = getRevisionPr(openDb, repo.id, n);
-      if (!watched) return notWatched();
+      if (!watched) return notOnRecord();
       if (watched.state !== 'open') return nothing('pull-request-closed', `pull request #${n} of ${repo.fullName} was closed or merged; it is no longer watched`);
-      scope = createEventScope(openDb);
+      scope = newScope(openDb);
       scope.addPr(repo.id, n);
       log.info('event matched', { repo: repo.fullName, pr: n, action: decision.event.action });
       // The review poller, for this pull request: the API says what its reviews and its head
       // are, and the loop's own rules decide what that queues or cancels.
       const polled = await pollRepoReviews({ db: openDb, api, config }, repo, repoCfg, log.child({ component: 'reviews', repo: repo.fullName }), { only: n });
       summary.dispatched = (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0) > 0;
+      // What it queued is this run's own, also on a pull request another run still holds.
+      if (summary.dispatched) scope.engage();
       summary.loop = summarizeLoop(openDb, config, repo.id, n);
       if (nothingPending(pendingWork(openDb, config, scope))) {
         if (getRevisionPr(openDb, repo.id, n)?.state !== 'open') {
@@ -572,6 +702,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
         }
         return nothing('no-new-work', `nothing on pull request #${n} of ${repo.fullName} asks for work: no new change request by an allowed actor, and no head commit without a review`);
       }
+      scope.engage();
       summary.resumed = !summary.dispatched;
     } else {
       log.info('event matched', { repo: repo.fullName, issue: decision.event.issue, event: decision.event.eventId, jobs: issueJobs.map((j) => j.id) });
@@ -584,16 +715,29 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       }
       if (known.length) {
         const openDb = stateDb();
-        scope = createEventScope(openDb);
+        scope = newScope(openDb);
         for (const j of known) scope.addJob(j.id);
         const mine = scope;
         // A published head whose reviewer job was never queued is work that is left, too.
         if (reviewsEnabled(config)) scheduleAllReviews(openDb, config, undefined, (pr) => mine.pr(pr.repoId, pr.prNumber));
         const left = !nothingPending(pendingWork(openDb, config, scope));
         if (known.length === issueJobs.length && !left) {
+          // A job that got as far as an agent and has no publication on record: a checkpoint
+          // carried it while its run was going, and that run's end was never saved. If GitHub
+          // has its pull request, the publication is restored; another run's live work is left.
+          const published = openDb.prepare("SELECT 1 AS x FROM publications WHERE job_id = ? AND state IN ('published', 'skipped')");
+          for (const k of known) {
+            if (!publishing || !['running', 'interrupted', 'succeeded'].includes(k.status) || mine.heldByAnother(k.id) || published.get(k.id)) continue;
+            const existing = await findExistingPullRequest({ api, repo, job: k });
+            if (existing && (await restore(() => openDb, k, existing, () => {}))) return nothing('already-handled', restoredMessage(existing));
+          }
           const pr = scope.prs()[0];
           if (pr) summary.loop = summarizeLoop(openDb, config, pr.repoId, pr.prNumber);
-          return nothing('duplicate-delivery', `this state database already has the job for this event, and nothing of it is left to do (${known.map((j) => `${j.id}: ${j.status}`).join(', ')})`);
+          const held = known.some((j) => mine.heldByAnother(j.id));
+          return nothing(
+            'duplicate-delivery',
+            `this state database already has the job for this event, and ${held ? 'another run that is still going is working on it' : 'nothing of it is left to do'} (${known.map((j) => `${j.id}: ${j.status}`).join(', ')})`,
+          );
         }
         summary.resumed = left;
       }
@@ -624,7 +768,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       // 4. Was this event already handled by a run whose state this one has not seen? Only
       // GitHub can say. Asked for the jobs that have not started: new ones, and ones an earlier
       // run left queued. An event that was leaves no state behind.
-      const unstarted = [...fresh.map((j) => ({ id: j.id, issueNumber: j.issueNumber })), ...known.filter((k) => k.status === 'queued')];
+      const unstarted = [...fresh.map((j) => ({ id: j.id, issueNumber: j.issueNumber })), ...known.filter((k) => k.status === 'queued' && (scope?.job(k.id) ?? true))];
       for (const job of unstarted) {
         let existing: ExistingWork | null;
         try {
@@ -633,6 +777,16 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
           throw new CliError(`could not check whether the event was already handled: ${net ? net.redact(errText(err)) : errText(err)}`);
         }
         if (!existing) continue;
+        // The pull request is there and the state database has nothing of it: the run that opened
+        // it never saved its state. Put the publication back, so that reviews are acted on again.
+        const newJob = fresh.find((j) => j.id === job.id);
+        const queueIt = () => {
+          if (newJob) commitPollBatch(stateDb(), { repoId: repo.id, fullName: repo.fullName, lastEventId: decision.applied.id, lastEventCreatedAt: decision.applied.createdAt, etag: null, jobs: [newJob], now: ctx.now });
+        };
+        if (await restore(stateDb, job, existing, queueIt)) {
+          for (const k of known) if (k.status === 'queued' && k.id !== job.id) cancelQueuedJob(stateDb(), k.id, describeExisting(existing));
+          return nothing('already-handled', restoredMessage(existing));
+        }
         // A queued job in the state database for work that is on GitHub already must not run later either.
         for (const k of known) if (k.status === 'queued') cancelQueuedJob(stateDb(), k.id, describeExisting(existing));
         return nothing('already-handled', describeExisting(existing));
@@ -640,7 +794,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     }
 
     const openDb = stateDb();
-    scope ??= createEventScope(openDb);
+    scope ??= newScope(openDb);
     if (decision.dispatch === true) {
       // 5. Queue it, under ids any other run of this event would derive too.
       const inserted = fresh.length
@@ -669,6 +823,16 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       decision.dispatch === true
         ? issueJobs.map((j) => j.id).filter((id) => getJob(openDb, id) !== null)
         : pendingWork(openDb, config, scope).queued.map((j) => j.id);
+    // Jobs that had reached an end before this run did anything: whatever else is in scope when
+    // the run ends is work that followed from the event in this run (a reviewer run, a revision).
+    const settledBefore = new Set((openDb.prepare("SELECT id FROM jobs WHERE status IN ('succeeded', 'failed', 'interrupted', 'canceled')").all() as Array<{ id: string }>).map((r) => r.id));
+    // Tell the other runs that share this database what this one is working on: a checkpoint
+    // shows them its rows while they are still in flight.
+    const holdUntil = new Date(ctx.now() + (deadlineMs ?? HOLD_WITHOUT_DEADLINE_MS) + HOLD_GRACE_MS).toISOString();
+    const hold = { holder, delivery: opts.deliveryId ?? null, until: holdUntil };
+    if (decision.dispatch === true) for (const id of eventJobIds) putHold(openDb, { job: id }, hold);
+    else putHold(openDb, { pr: { repoId: repo.id, prNumber: decision.pullRequest } }, hold);
+    holding = true;
 
     // 6. Drain: the worker of `updraft start`, wired as it is there, until the event's work is done.
     const eventScope = scope;
@@ -696,27 +860,66 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       },
     };
     const appAuth = credentials.app;
-    const drained = await drainQueue(
-      {
-        db: openDb,
-        config,
-        paths,
-        log: log.child({ component: 'worker' }),
-        checkDispatchable: (job) => checkJobDispatchable({ api, config }, job),
-        signal: controller.signal,
-        executor: createExecutor(config, {
-          ...deps.executor,
-          ...(appAuth && config.github?.app?.commitAsApp ? { commitIdentity: (repoFullName: string) => appCommitIdentity(appAuth, repoFullName) } : {}),
-          networkGit,
-        }),
-        ...(publisher ? { publisher } : {}),
-        assignmentCommenter,
-        ...(failureCommentsEnabled(config)
-          ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }), scope: eventScope }) }
-          : {}),
-      },
-      { ...deps.drain, scope: eventScope, ...(deadlineMs !== undefined ? { deadlineMs } : {}), ...(deps.runDaemon ? { runDaemon: deps.runDaemon } : {}) },
-    );
+    const startedAt = Date.now();
+    const drain = (timeLeftMs: number | undefined): Promise<DrainResult> =>
+      drainQueue(
+        {
+          db: openDb,
+          config,
+          paths,
+          log: log.child({ component: 'worker' }),
+          checkDispatchable: (job) => checkJobDispatchable({ api, config }, job),
+          signal: controller.signal,
+          executor: createExecutor(config, {
+            ...deps.executor,
+            ...(appAuth && config.github?.app?.commitAsApp ? { commitIdentity: (repoFullName: string) => appCommitIdentity(appAuth, repoFullName) } : {}),
+            networkGit,
+          }),
+          ...(publisher ? { publisher } : {}),
+          assignmentCommenter,
+          ...(failureCommentsEnabled(config)
+            ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }), scope: eventScope }) }
+            : {}),
+        },
+        { ...deps.drain, scope: eventScope, ...(timeLeftMs !== undefined ? { deadlineMs: timeLeftMs } : {}), ...(deps.runDaemon ? { runDaemon: deps.runDaemon } : {}) },
+      );
+    let drained = await drain(deadlineMs);
+
+    // 6b. The last look. A person's review that was submitted while the agents of this run were
+    // at work was delivered to a machine that could not know the pull request yet; this run can,
+    // so before it ends it reads its open pull requests once more, with the review poller, and
+    // runs what that queues. A further look needs the one before to have queued something, so
+    // this ends by itself; the deadline bounds it like everything else.
+    if (loopsOn) {
+      const look: RunEventFinalLook = { looks: 0, queued: 0, error: null };
+      for (let i = 0; i < MAX_FINAL_LOOKS; i++) {
+        if (drained.ended === 'deadline' || drained.ended === 'stopped' || controller.signal.aborted) break;
+        const timeLeftMs = deadlineMs === undefined ? undefined : deadlineMs - (Date.now() - startedAt);
+        if (timeLeftMs !== undefined && timeLeftMs < FINAL_LOOK_MIN_MS) break;
+        syncRevisionPrs(openDb, repo.id);
+        const open = eventScope.prs().filter((p) => p.repoId === repo.id && getRevisionPr(openDb, p.repoId, p.prNumber)?.state === 'open' && getLoopPr(openDb, p.repoId, p.prNumber)?.mergeState !== 'merged');
+        if (!open.length) break;
+        summary.finalLook = look;
+        let queued = 0;
+        try {
+          for (const p of open) {
+            const polled = await pollRepoReviews({ db: openDb, api, config }, repo, repoCfg, log.child({ component: 'reviews', repo: repo.fullName }), { only: p.prNumber });
+            queued += (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0);
+          }
+        } catch (err) {
+          look.error = redactGitHubSecrets(errText(err));
+          log.warn('the last look at the pull request failed; a review submitted during this run is left to its own delivery', { error: look.error });
+          break;
+        }
+        look.looks++;
+        look.queued += queued;
+        // Queued behind a cooldown: it stays queued, as the rest does.
+        if (queued === 0 || drained.ended === 'deferred') break;
+        log.info('the last look found new work on the pull request; running it', { queued });
+        eventScope.engage();
+        drained = await drain(timeLeftMs);
+      }
+    }
     summary.drain = drained.ended;
     if (announcements.size) {
       let timer: NodeJS.Timeout | undefined;
@@ -728,6 +931,17 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     const deferred = drained.ended === 'deferred';
     const jobs = eventJobIds.map((id) => summarizeJob(openDb, config, id));
     const outcomes = jobs.map((j) => (deferred && j.status === 'queued' ? 'deferred' : jobOutcome(j)));
+    // What followed from the event in this run counts as much as the event's own job: a reviewer
+    // run that failed, a revision that was not pushed. (A follow-on job that was canceled is not
+    // a failure: its pull request was closed, or its review withdrawn.)
+    const followOn: RunEventFollowOnJob[] = (openDb.prepare('SELECT id FROM jobs ORDER BY created_at, rowid').all() as Array<{ id: string }>)
+      .filter((r) => !settledBefore.has(r.id) && !eventJobIds.includes(r.id) && eventScope.job(r.id))
+      .map((r) => {
+        const j = summarizeJob(openDb, config, r.id);
+        const job = getJob(openDb, r.id);
+        const kind = job && reviewOf(job) ? 'review' : job && revisionOf(job) ? 'revision' : 'other';
+        return { ...j, kind, outcome: deferred && j.status === 'queued' ? 'deferred' : jobOutcome(j) };
+      });
     // A publication that never pushed, while GitHub has a branch or PR for the event: two runs of
     // the event raced, and the other one's create-only push won.
     for (const [i, j] of jobs.entries()) {
@@ -740,7 +954,8 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       j.error = describeExisting(other);
       if (other.prUrl) Object.assign(j, { prNumber: other.prNumber, prUrl: other.prUrl });
     }
-    let worst: JobOutcome = OUTCOME_RANK.find((o) => outcomes.includes(o)) ?? 'succeeded';
+    const counted = [...outcomes, ...followOn.map((j) => j.outcome as JobOutcome).filter((o) => o !== 'canceled')];
+    let worst: JobOutcome = OUTCOME_RANK.find((o) => counted.includes(o)) ?? 'succeeded';
     // The event's own job is done, and what follows it (a reviewer run, a revision) is what waits.
     if (deferred && (worst === 'succeeded' || worst === 'superseded' || worst === 'canceled')) worst = 'deferred';
     const first = jobs[0];
@@ -749,6 +964,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     summary.loop = loopPr ? summarizeLoop(openDb, config, loopPr.repoId, loopPr.prNumber) : null;
     summary.outcome = worst;
     const parts = jobs.map((j, i) => jobMessage(j, outcomes[i]!));
+    for (const j of followOn) if (j.outcome !== 'succeeded' && j.outcome !== 'canceled') parts.push(`${j.kind === 'other' ? 'follow-on' : j.kind} ${jobMessage(j, j.outcome as JobOutcome)}`);
     if (summary.loop && (reviewsEnabled(config) || revisionsEnabled(config))) parts.push(loopMessage(summary.loop));
     summary.message = parts.join('; ') || 'nothing was left to run';
     if (drained.ended === 'deadline' || drained.ended === 'stopped') {
@@ -762,11 +978,18 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       summary.message += ` (a usage-limit cooldown holds the rest back${summary.deferredUntil ? ` until ${summary.deferredUntil}` : ''}; it stays queued, and delivering the event again after that continues it)`;
     }
     if (jobs.length > 1) summary.jobs = jobs;
+    if (followOn.length) summary.followOnJobs = followOn;
     log.info('event handled', { outcome: worst, drain: drained.ended, jobs: jobs.map((j) => j.jobId), ...(summary.loop ? { pr: summary.loop.pullRequest, stage: summary.loop.stage } : {}) });
     if (worst === 'deferred') return EXIT.DEFERRED;
     return worst === 'succeeded' || worst === 'canceled' || worst === 'superseded' ? EXIT.OK : EXIT.FAILURE;
   } finally {
     uninstall();
+    try {
+      // The run is over: what it held is free for the next run, whatever became of it.
+      if (holding && db) releaseHolds(db, holder, new Date(ctx.now()).toISOString());
+    } catch {
+      // the merge of this database releases what the run could not
+    }
     try {
       db?.close();
     } catch {

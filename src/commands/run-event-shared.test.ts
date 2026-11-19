@@ -521,20 +521,23 @@ describe('updraft run-event: pull request events', { timeout: 180_000 }, () => {
     const r = await v.run({ eventName: 'pull_request' });
     expect(r.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'pull-request-closed', exitCode: 0 });
     expect(withDb(v.state, (db) => getLoopPr(db, REPO_ID, PR)?.state)).toBe('closed');
-    // With revise alone, the pull request is first put on record by the first event about it.
-    expect(v.upload().tables.revision_prs).toMatchObject({ inserted: 1 });
+    // The run that opened it put it on record (its last look); this run closed it.
+    expect(v.upload().tables.revision_prs).toMatchObject({ inserted: 0, updated: 1 });
     expect(withDb(w.shared, (db) => getLoopPr(db, REPO_ID, PR)?.state)).toBe('closed');
 
+    // Reopened on GitHub: closing was final. Whatever event arrives for it next, the state
+    // database decides, and GitHub is not asked. `reopened` itself is not an action run-event handles.
     w.gh.pull!.state = 'open';
     const calls = w.gh.calls.length;
-    const re = event(w, 'vm reopened', 'reopened', { repo: { revise: true } });
+    const re = event(w, 'vm reopened', 'synchronize', { repo: { revise: true } });
     expect((await re.run({ eventName: 'pull_request' })).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'pull-request-closed' });
-    // Decided from the state database: GitHub was not asked.
+    const unhandled = event(w, 'vm reopened action', 'reopened', { repo: { revise: true } });
+    expect((await unhandled.run({ eventName: 'pull_request' })).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'unsupported-action', exitCode: 0 });
     expect(w.gh.calls.slice(calls)).toEqual([]);
     expect(existsSync(w.received)).toBe(false);
   });
 
-  it('does nothing for a pull request Updraft does not watch, without asking GitHub or starting an agent', async () => {
+  it('does nothing for a pull request Updraft does not watch: one read of it from the API, no agent', async () => {
     const w = await published({ revise: true });
     const calls = w.gh.calls.length;
     for (const [eventName, action] of [
@@ -543,7 +546,6 @@ describe('updraft run-event: pull request events', { timeout: 180_000 }, () => {
       ['pull_request_review', 'dismissed'],
       ['pull_request', 'synchronize'],
       ['pull_request', 'closed'],
-      ['pull_request', 'reopened'],
     ] as const) {
       const v = vm(w, `vm ${eventName} ${action}`, { payload: pullRequestEvent(action, 555), repo: { revise: true } });
       v.download();
@@ -553,10 +555,312 @@ describe('updraft run-event: pull request events', { timeout: 180_000 }, () => {
       expect(v.upload().totals).toMatchObject({ updated: 0, appended: 0, conflicts: 0 });
     }
     // A machine with no state at all knows of no pull request, and creates no state for the question.
-    const empty = vm(w, 'vm empty', { payload: pullRequestEvent('submitted'), repo: { revise: true } });
+    const empty = vm(w, 'vm empty', { payload: pullRequestEvent('submitted', 555), repo: { revise: true } });
     expect((await empty.run({ eventName: 'pull_request_review' })).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'pull-request-not-watched' });
     expect(existsSync(empty.state)).toBe(false);
-    expect(w.gh.calls.slice(calls)).toEqual([]);
+    // GitHub was asked one thing each time: whether the pull request is one of Updraft's after all.
+    expect(w.gh.calls.slice(calls)).toEqual(Array.from({ length: 6 }, () => 'getPullRequest'));
+
+    // One that somebody else opened on a branch that looks like a job branch, or that lost the
+    // run's marker, is not Updraft's either; a closed one of Updraft's is not waited for.
+    const other = async (name: string, change: () => void) => {
+      change();
+      const v = vm(w, name, { payload: pullRequestEvent('submitted'), repo: { revise: true } });
+      const r = await v.run({ eventName: 'pull_request_review' });
+      expect(r.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'pull-request-not-watched', exitCode: 0 });
+      return r.summary.message;
+    };
+    const body = w.gh.pullBody;
+    expect(await other('vm not the worker', () => (w.gh.pullAuthor = 'mallory'))).toContain('opened by mallory');
+    w.gh.pullAuthor = w.gh.login;
+    expect(await other('vm no marker', () => (w.gh.pullBody = 'Closes #7'))).toContain('marker');
+    w.gh.pullBody = body;
+    expect(await other('vm closed', () => (w.gh.pull!.state = 'closed'))).toContain('closed or merged');
     expect(existsSync(w.received)).toBe(false);
+  });
+});
+
+describe('updraft run-event: review findings', { timeout: 180_000 }, () => {
+  it('finding 1: a reviewer job the drain created and that failed makes the run fail', async () => {
+    const w = world();
+    const v = vm(w, 'vm one', { repo: LOOP, reviewerArgs: ['--mode', 'fail'] });
+    const r = await v.run();
+    expect(jobsOf(v.state)).toEqual([
+      ['issue.labeled', 'succeeded'],
+      ['pull_request.review', 'failed'],
+    ]);
+    expect(r.summary.loop).toMatchObject({ stage: 'needs-human' });
+    // The event's own job is still described as it went; the outcome is the worst of everything in scope.
+    expect(r.summary).toMatchObject({ status: 'succeeded', publication: 'published', prNumber: PR, outcome: 'failed', exitCode: 1 });
+    expect(r.code).toBe(1);
+    expect(r.summary.followOnJobs).toHaveLength(1);
+    expect(r.summary.followOnJobs![0]).toMatchObject({ status: 'failed', agent: 'codex', kind: 'review', outcome: 'failed' });
+    expect(r.summary.message).toContain('failed');
+  });
+
+  it('finding 2: a pull request event for an Updraft pull request that the state database does not know yet is not swallowed', async () => {
+    const w = world();
+    // The issue machine has opened the pull request and has not uploaded anything yet.
+    const first = vm(w, 'vm publish', { repo: { revise: true } });
+    expect((await first.run()).code).toBe(0);
+    w.gh.humanReview('allen', 'CHANGES_REQUESTED', 'Please add a second line.');
+
+    const second = vm(w, 'vm review', { payload: pullRequestEvent('submitted'), repo: { revise: true } });
+    second.download();
+    const r = await second.run({ eventName: 'pull_request_review' });
+    expect(r.summary).toMatchObject({ outcome: 'state-pending', reason: 'state-pending', dispatched: false, exitCode: 6 });
+    expect(r.code).toBe(6);
+    expect(r.summary.message).toContain('again');
+    // Nothing was created for the question, and nothing was written anywhere.
+    expect(existsSync(second.state)).toBe(false);
+    const writes = w.gh.writes.length;
+
+    // The caller tries again once the shared database has changed: the same event, a new snapshot.
+    first.upload();
+    rmSync(w.received);
+    const retry = vm(w, 'vm review retry', { payload: pullRequestEvent('submitted'), repo: { revise: true } });
+    retry.download();
+    const done = await retry.run({ eventName: 'pull_request_review' });
+    expect(done.summary).toMatchObject({ outcome: 'succeeded', dispatched: true, agent: 'claude', exitCode: 0, loop: { rounds: 1 } });
+    expect(w.gh.writes.length).toBeGreaterThan(writes);
+  });
+
+  it('finding 2: the run that opened the pull request looks at it once more before it ends, and handles a review submitted meanwhile', async () => {
+    const w = world();
+    // A person requests changes the moment the pull request exists, long before this run uploads anything.
+    const open = w.gh.createPullRequest.bind(w.gh);
+    w.gh.createPullRequest = async (...args) => {
+      const pr = await open(...args);
+      w.gh.humanReview('allen', 'CHANGES_REQUESTED', 'Please add a second line.');
+      return pr;
+    };
+    const v = vm(w, 'vm one', { repo: { revise: true } });
+    const head0 = () => remoteHead(w.f, BRANCH);
+    const r = await v.run();
+    expect(r.code).toBe(0);
+    // The event's own job, then the revision the last look queued; a second look found nothing more.
+    expect(jobsOf(v.state)).toEqual([
+      ['issue.labeled', 'succeeded'],
+      ['pull_request.changes_requested', 'succeeded'],
+    ]);
+    expect(r.summary).toMatchObject({ outcome: 'succeeded', drain: 'idle', finalLook: { looks: 2, queued: 1, error: null }, loop: { rounds: 1 } });
+    expect(r.summary.followOnJobs).toMatchObject([{ kind: 'revision', status: 'succeeded', outcome: 'succeeded', publication: 'published' }]);
+    expect(w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'rev-list', '--count', `main..${head0()}`)).toBe('2');
+    // The review is on record, so its own delivery finds nothing left to do.
+    v.upload();
+    const late = vm(w, 'vm review', { payload: pullRequestEvent('submitted'), repo: { revise: true } });
+    late.download();
+    expect((await late.run({ eventName: 'pull_request_review' })).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'no-new-work', exitCode: 0 });
+
+    // A look that fails does not fail the run: the review still has its own delivery.
+    const w2 = world();
+    const v2 = vm(w2, 'vm one', { repo: { revise: true } });
+    w2.gh.getPullRequestReviews = async () => {
+      throw new Error('GitHub is down');
+    };
+    const failed = await v2.run();
+    expect(failed.summary).toMatchObject({ outcome: 'succeeded', exitCode: 0, finalLook: { looks: 0, queued: 0, error: 'GitHub is down' } });
+  });
+
+  it("finding 2: a checkpoint shows another machine the pull request as watched, and that machine leaves the first run's unfinished work alone", async () => {
+    const w = world();
+    const v1 = vm(w, 'vm one', { repo: LOOP, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] });
+    let asked = 0;
+    let second: Awaited<ReturnType<ReturnType<typeof vm>['run']>> | undefined;
+    let hookError: unknown;
+    w.gh.getCommitChecks = async (_repo, sha) => {
+      w.gh.calls.push(`getCommitChecks ${sha}`);
+      if (++asked === 2) hookError = await inHook().catch((err: unknown) => err);
+      return asked < 3 ? { total: 1, failing: [], pending: ['ci / build'], succeeded: [], complete: true } : { total: 1, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
+    };
+    const inHook = async () => {
+      {
+        // The first run is waiting for checks before it merges. Its database is checkpointed
+        // into the shared one, and a `synchronize` delivery starts a second machine from that.
+        const checkpoint = mergeState({ changed: v1.state, into: w.shared, live: true });
+        expect(checkpoint.unfinished).toMatchObject({ runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 0, holdsReleased: 0 });
+        expect(withDb(w.shared, (db) => getLoopPr(db, REPO_ID, PR))).toMatchObject({ state: 'open', mergeState: 'waiting' });
+        const v2 = vm(w, 'vm two', { payload: pullRequestEvent('synchronize'), repo: LOOP, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] });
+        v2.download();
+        const writes = w.gh.writes.length;
+        second = await v2.run({ eventName: 'pull_request' });
+        // Nothing of its own to do, and the merge that is waiting is the first run's: it did not wait for it, or make it.
+        expect(w.gh.writes).toHaveLength(writes);
+        v2.upload();
+      }
+    };
+    const r = await v1.run();
+    expect(hookError).toBeUndefined();
+    expect(second?.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'no-new-work', exitCode: 0, loop: { pullRequest: PR, merged: false } });
+    expect(r.code).toBe(0);
+    expect(r.summary).toMatchObject({ outcome: 'succeeded', loop: { stage: 'merged', merged: true } });
+    expect(w.gh.merges).toHaveLength(1);
+
+    // The final merge of the first run, on top of its own checkpoint and the second machine's upload.
+    expect(v1.upload()).toMatchObject({ changed: true, unfinished: { runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 0, holdsReleased: 0 } });
+    expect(jobsOf(w.shared)).toEqual([
+      ['issue.labeled', 'succeeded'],
+      ['pull_request.review', 'succeeded'],
+    ]);
+    withDb(w.shared, (db) => {
+      expect(getLoopPr(db, REPO_ID, PR)).toMatchObject({ mergeState: 'merged' });
+      expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 2 });
+      expect(db.prepare('SELECT count(*) AS n FROM runs WHERE ended_at IS NULL').get()).toEqual({ n: 0 });
+      expect(db.prepare("SELECT count(*) AS n, count(DISTINCT kind || subject_id) AS d FROM metric_events").get()).toMatchObject(db.prepare('SELECT count(*) AS n, count(*) AS d FROM metric_events').get() as object);
+      // The hold the checkpoint carried is released.
+      expect((db.prepare("SELECT value FROM meta WHERE key LIKE 'run-event:hold:%'").all() as Array<{ value: string }>).map((m) => (JSON.parse(m.value) as { releasedAt: string | null }).releasedAt !== null)).toEqual([true]);
+    });
+    expect(v1.upload()).toMatchObject({ changed: false });
+  });
+
+  /** The issue machine opened the pull request and its state never reached the shared database. */
+  async function lostState(repo: Record<string, unknown>) {
+    const w = world();
+    const first = vm(w, 'vm lost', { repo });
+    const r = await first.run();
+    expect(r.code).toBe(0);
+    rmSync(w.received, { force: true });
+    return { w, first, runId: r.summary.runId! };
+  }
+
+  it('finding 3: a redelivery restores a publication whose state was lost, without running the agent, and reviews are acted on again', async () => {
+    const { w, first, runId } = await lostState({ revise: true });
+    const writes = w.gh.writes.length;
+    const again = vm(w, 'vm redelivered', { repo: { revise: true } });
+    again.download();
+    const r = await again.run({ deliveryId: 'd-again' });
+    expect(r.code).toBe(0);
+    expect(r.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'already-handled', stateRestored: true, dispatched: false, exitCode: 0, jobId: JOB_ID, runId, status: 'succeeded', publication: 'published', prNumber: PR });
+    expect(r.summary.message).toContain('restored from the GitHub API');
+    expect(existsSync(w.received)).toBe(false);
+    expect(w.gh.writes).toHaveLength(writes);
+    // What is on record, and that it says where it came from.
+    withDb(again.state, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded' });
+      expect(getJob(db, JOB_ID)?.statusReason).toMatch(/^reconstructed: /);
+      expect(db.prepare('SELECT id, agent, worker_id, outcome, summary FROM runs').all()).toEqual([{ id: runId, agent: 'claude', worker_id: 'reconstructed', outcome: 'succeeded', summary: null }]);
+      expect(db.prepare('SELECT run_id, state, pr_number, branch, base_branch, head_sha FROM publications').all()).toEqual([{ run_id: runId, state: 'published', pr_number: PR, branch: BRANCH, base_branch: 'main', head_sha: null }]);
+      expect(db.prepare("SELECT error FROM publications").get()).toMatchObject({ error: expect.stringMatching(/^reconstructed: .*d-again/) });
+      expect(db.prepare('SELECT state, source_run_id, author_agent, created_at FROM revision_prs').all()).toEqual([{ state: 'open', source_run_id: runId, author_agent: 'claude', created_at: '1970-01-01T00:00:00.000Z' }]);
+    });
+    again.upload();
+
+    // Delivered once more: on record now, settled from the database.
+    const third = vm(w, 'vm third', { repo: { revise: true } });
+    third.download();
+    expect((await third.run()).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery', stateRestored: false });
+
+    // A review of the pull request is acted on, from the restored rows.
+    w.gh.humanReview('allen', 'CHANGES_REQUESTED', 'Please add a second line.');
+    const review = vm(w, 'vm review', { payload: pullRequestEvent('submitted'), repo: { revise: true } });
+    review.download();
+    const revised = await review.run({ eventName: 'pull_request_review' });
+    expect(revised.summary).toMatchObject({ outcome: 'succeeded', dispatched: true, agent: 'claude', exitCode: 0, loop: { rounds: 1 } });
+    review.upload();
+
+    // The original run's database turns up after all (recovered from where the runner kept it).
+    // Its rows are the recorded ones: they replace the reconstructed ones, and nothing is there twice.
+    mergeState({ changed: first.state, into: w.shared });
+    withDb(w.shared, (db) => {
+      expect(jobsOf(w.shared)).toEqual([
+        ['issue.labeled', 'succeeded'],
+        ['pull_request.changes_requested', 'succeeded'],
+      ]);
+      expect(getJob(db, JOB_ID)?.statusReason ?? '').not.toMatch(/^reconstructed/);
+      expect(db.prepare('SELECT worker_id != ? AS recorded, summary IS NOT NULL AS summarized FROM runs WHERE id = ?').get('reconstructed', runId)).toEqual({ recorded: 1, summarized: 1 });
+      expect(db.prepare('SELECT count(*) AS n FROM runs').get()).toEqual({ n: 2 });
+      expect(db.prepare('SELECT error, head_sha IS NOT NULL AS pushed FROM publications WHERE run_id = ?').get(runId)).toEqual({ error: null, pushed: 1 });
+      expect(db.prepare('SELECT count(*) AS n FROM publications').get()).toEqual({ n: 1 });
+      // The pull request's row is the one that knows more: the revision round a later run recorded.
+      expect(db.prepare('SELECT count(*) AS n FROM revision_prs').get()).toEqual({ n: 1 });
+      expect(getLoopPr(db, REPO_ID, PR)).toMatchObject({ state: 'open', sourceRunId: runId });
+      expect(getLoopPr(db, REPO_ID, PR)?.seenUpdatedAt).not.toBeNull();
+    });
+  });
+
+  it('finding 3: a job that a checkpoint carried, and whose end was never saved, is left to its run while that holds it and restored once it does not', async () => {
+    const w = world();
+    const first = vm(w, 'vm lost', { repo: { revise: true } });
+    // A checkpoint while the publication is under way: the run has ended, the pull request is not recorded yet.
+    const open = w.gh.createPullRequest.bind(w.gh);
+    w.gh.createPullRequest = async (...args) => {
+      mergeState({ changed: first.state, into: w.shared, live: true });
+      return open(...args);
+    };
+    const r = await first.run();
+    expect(r.code).toBe(0);
+    rmSync(w.received, { force: true });
+    // The machine is gone after that; its final merge never happened.
+    expect(withDb(w.shared, (db) => db.prepare('SELECT state, pr_number FROM publications').all())).toEqual([{ state: 'publishing', pr_number: null }]);
+
+    // Delivered again while the first run's hold is in force: its work, not ours.
+    const early = vm(w, 'vm early', { repo: { revise: true } });
+    early.download();
+    const held = await early.run();
+    expect(held.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery', stateRestored: false, exitCode: 0 });
+    expect(held.summary.message).toContain('another run that is still going');
+
+    // Delivered again after the hold has expired: GitHub has the pull request, so the publication is completed.
+    const late = vm(w, 'vm late', { repo: { revise: true }, now: () => Date.now() + 7 * 3_600_000 });
+    late.download();
+    const restored = await late.run();
+    expect(restored.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'already-handled', stateRestored: true, exitCode: 0, runId: r.summary.runId, prNumber: PR, publication: 'published' });
+    withDb(late.state, (db) => {
+      // The run is the recorded one; only the publication had to be completed from the API.
+      expect(db.prepare('SELECT worker_id != ? AS recorded, summary IS NOT NULL AS summarized FROM runs').all('reconstructed')).toEqual([{ recorded: 1, summarized: 1 }]);
+      expect(db.prepare('SELECT state, pr_number FROM publications').all()).toEqual([{ state: 'published', pr_number: PR }]);
+      expect(getLoopPr(db, REPO_ID, PR)).toMatchObject({ state: 'open' });
+    });
+    expect(existsSync(w.received)).toBe(false);
+  });
+
+  it('finding 3: reconstructed rows never replace the recorded ones, whichever reaches the shared database first', async () => {
+    const { w, first, runId } = await lostState({ revise: true });
+    const again = vm(w, 'vm redelivered', { repo: { revise: true } });
+    expect((await again.run()).summary).toMatchObject({ reason: 'already-handled', stateRestored: true });
+    // The recorded state first, then the machine that reconstructed (it started from nothing, so no base).
+    first.upload();
+    const recorded = withDb(w.shared, (db) => ({
+      job: db.prepare('SELECT * FROM jobs WHERE id = ?').get(JOB_ID),
+      run: db.prepare('SELECT * FROM runs WHERE id = ?').get(runId),
+      publication: db.prepare('SELECT * FROM publications WHERE run_id = ?').get(runId),
+      pr: db.prepare('SELECT * FROM revision_prs').all(),
+    }));
+    const merged = again.upload();
+    expect(merged.tables.runs).toMatchObject({ inserted: 0, updated: 0, conflicts: 1 });
+    expect(merged.tables.publications).toMatchObject({ inserted: 0, updated: 0, conflicts: 1 });
+    expect(merged.tables.jobs).toMatchObject({ inserted: 0, updated: 0, conflicts: 1 });
+    expect(merged.tables.revision_prs).toMatchObject({ inserted: 0, updated: 0, conflicts: 1 });
+    withDb(w.shared, (db) => {
+      expect(db.prepare('SELECT * FROM jobs WHERE id = ?').get(JOB_ID)).toEqual(recorded.job);
+      expect(db.prepare('SELECT * FROM runs WHERE id = ?').get(runId)).toEqual(recorded.run);
+      expect(db.prepare('SELECT * FROM publications WHERE run_id = ?').get(runId)).toEqual(recorded.publication);
+      expect(db.prepare('SELECT * FROM revision_prs').all()).toEqual(recorded.pr);
+    });
+  });
+
+  it('finding 3: fails loudly when the pull request is there and what a restore needs cannot be established', async () => {
+    for (const [name, change, said] of [
+      ['no marker', (w: World) => (w.gh.pullBody = 'Closes #7'), 'marker'],
+      ['another author', (w: World) => (w.gh.pullAuthor = 'mallory'), 'opened by mallory'],
+      ['no agent', (w: World) => (w.gh.pullBody = w.gh.pullBody.replace(/\(agent [^)]*\)/, '')), 'agent'],
+    ] as const) {
+      const { w } = await lostState({ revise: true });
+      change(w);
+      const again = vm(w, `vm ${name}`, { repo: { revise: true } });
+      const r = await again.run();
+      expect(r.code, name).toBe(1);
+      expect(r.summary).toMatchObject({ outcome: 'error', reason: 'state-not-restorable', stateRestored: false, exitCode: 1 });
+      expect(r.summary.message).toContain(said);
+      expect(r.summary.message).toContain('cannot be restored');
+      expect(existsSync(w.received)).toBe(false);
+      // Nothing was invented.
+      if (existsSync(again.state)) expect(withDb(again.state, (db) => db.prepare('SELECT count(*) AS n FROM publications').get())).toEqual({ n: 0 });
+    }
+    // A pull request that was merged or closed meanwhile needs no rows: as before.
+    const { w } = await lostState({ revise: true });
+    w.gh.pull!.state = 'closed';
+    w.gh.pulls[0]!.state = 'closed';
+    expect((await vm(w, 'vm closed', { repo: { revise: true } }).run()).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'already-handled', stateRestored: false, exitCode: 0 });
   });
 });

@@ -13,6 +13,7 @@
 import { autoMergeMethod, reviseActive, type UpdraftConfig } from '../config/schema.js';
 import { activeCooldowns } from '../db/capacity.js';
 import type { Db } from '../db/database.js';
+import { activeForeignHolds, holdSubject } from '../db/holds.js';
 import { listMergeCandidates, listPendingMergeNotices, type LoopPr } from '../db/pr-reviews.js';
 import { getJob, getRun } from '../db/queue.js';
 import { listPendingLimitNotices, REVISION_MAX_AUTO_ATTEMPTS } from '../db/revisions.js';
@@ -140,4 +141,75 @@ export function pendingWork(db: Db, config: UpdraftConfig, scope: EventScope | n
 /** True when nothing in `p` is left that a worker would act on. */
 export function nothingPending(p: PendingWork): boolean {
   return p.queued.length === 0 && p.nextRetryAt === null && p.merges.length === 0 && p.notices === 0;
+}
+
+// ---------------------------------------------------------------------------
+// Work another run holds (src/db/holds.ts)
+// ---------------------------------------------------------------------------
+
+/** What was in the database when this run started and is held by another run that is still going. */
+export interface ForeignWork {
+  /** Unfinished jobs (queued or running) of the other runs. */
+  jobs: ReadonlySet<string>;
+  /** Their runs that are open, or have a step towards GitHub that is not final. */
+  runs: ReadonlySet<string>;
+  /** Their pull requests, as `<repo id>#<number>`. */
+  prs: ReadonlySet<string>;
+  /** True for any job a live hold covers, finished or not: its run may still be publishing what it made. */
+  covers(jobId: string): boolean;
+}
+
+/**
+ * The work in `db` that live holds of other runs cover: a held job, a held pull request (or the
+ * pull request a held job opened), and the reviewer and revision jobs of such a pull request.
+ * Taken once, when a run starts: what this run queues later is its own, whatever it is for.
+ */
+export function foreignWork(db: Db, holder: string, nowMs: number): ForeignWork {
+  const holds = activeForeignHolds(db, holder, nowMs);
+  const jobs = new Set<string>();
+  const runs = new Set<string>();
+  const prs = new Set<string>();
+  if (!holds.length) return { jobs, runs, prs, covers: () => false };
+  const theirs = createEventScope(db);
+  for (const h of holds) {
+    const subject = holdSubject(h.key);
+    if (!subject) continue;
+    if ('job' in subject) theirs.addJob(subject.job);
+    else theirs.addPr(subject.pr.repoId, subject.pr.prNumber);
+  }
+  for (const r of db.prepare("SELECT id FROM jobs WHERE status IN ('queued', 'running')").all() as Array<{ id: string }>) if (theirs.job(r.id)) jobs.add(r.id);
+  const candidates = new Set((db.prepare('SELECT id FROM runs WHERE ended_at IS NULL').all() as Array<{ id: string }>).map((r) => r.id));
+  for (const table of RETRY_TABLES) {
+    for (const r of db.prepare(`SELECT run_id FROM ${table} WHERE state NOT IN ('published', 'skipped', 'posted')`).all() as Array<{ run_id: string }>) candidates.add(r.run_id);
+  }
+  for (const id of candidates) if (theirs.run(id)) runs.add(id);
+  for (const p of theirs.prs()) prs.add(prKey(p.repoId, p.prNumber));
+  return { jobs, runs, prs, covers: (jobId) => theirs.job(jobId) };
+}
+
+export interface GuardedScope extends EventScope {
+  /**
+   * This run has work of its own for the pull requests in scope (it queued a job for one): from
+   * here on their merge step and notices are its to take, like the holder's.
+   */
+  engage(): void;
+  /** True when a run that is still going holds this job (ForeignWork.covers). */
+  heldByAnother(jobId: string): boolean;
+}
+
+/**
+ * `scope` without the work other runs hold: their unfinished jobs are never claimed, their
+ * retries never taken, and their pull requests' merge is left to them until this run has work of
+ * its own there (`engage`).
+ */
+export function withoutForeignWork(scope: EventScope, foreign: ForeignWork): GuardedScope {
+  let engaged = false;
+  return {
+    ...scope,
+    job: (id) => !foreign.jobs.has(id) && scope.job(id),
+    run: (id) => !foreign.runs.has(id) && scope.run(id),
+    pr: (repoId, prNumber) => (engaged || !foreign.prs.has(prKey(repoId, prNumber))) && scope.pr(repoId, prNumber),
+    engage: () => void (engaged = true),
+    heldByAnother: (jobId) => foreign.covers(jobId),
+  };
 }

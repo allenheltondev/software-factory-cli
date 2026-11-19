@@ -11,12 +11,19 @@
 // Nothing is written to the caller's `into` until the whole merge has succeeded: the work happens
 // on a copy next to it, which replaces it in one rename. The result is one self-contained file
 // (checkpointed, rollback-journal mode, no -wal or -shm beside it).
+//
+// `live` is the same merge for a run that has NOT finished (a checkpoint): `changed` is read in
+// one read transaction while the run keeps writing to it, and nothing unfinished is settled.
+// The final merge of the same run, against the same `base`, then finds its own earlier rows in
+// `into` and brings each to its final state under the rule of its table.
 import { copyFileSync, existsSync, mkdtempSync, renameSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { foldWriteAheadLog, openDatabase, openDatabaseReadOnly, recordError, SCHEMA_VERSION, schemaVersion, transaction, type Db } from './database.js';
+import { HOLD_PREFIX, releasedHoldValue } from './holds.js';
 import { noteJobFinished } from './metrics.js';
 import { finishRun, releaseClaim } from './queue.js';
+import { isReconstructedText, RECONSTRUCTED_WORKER } from './reconstructed.js';
 
 type Value = null | number | bigint | string | Uint8Array;
 type Row = Record<string, Value>;
@@ -64,11 +71,21 @@ const maxOf = (a: Value | undefined, b: Value | undefined): Value => {
 
 const TERMINAL = new Set(['succeeded', 'failed', 'interrupted', 'canceled']);
 
-/** A finished job is never put back by a run that left it unfinished; otherwise the later change wins. Counters never go down. */
+/**
+ * A finished job is never put back by a run that left it unfinished; otherwise the later change
+ * wins. Counters never go down. A reconstructed row (reconstructed.ts) never replaces a finished
+ * job that a run recorded.
+ */
 const jobConflict: Resolve = (c) => {
   const mineDone = TERMINAL.has(text(c.mine.status));
   const theirsDone = TERMINAL.has(text(c.theirs.status));
-  const winner = mineDone !== theirsDone ? (mineDone ? c.mine : c.theirs) : text(c.mine.updated_at) >= text(c.theirs.updated_at) ? c.mine : c.theirs;
+  const mineRebuilt = isReconstructedText(c.mine.status_reason);
+  const theirsRebuilt = isReconstructedText(c.theirs.status_reason);
+  let winner = mineDone !== theirsDone ? (mineDone ? c.mine : c.theirs) : text(c.mine.updated_at) >= text(c.theirs.updated_at) ? c.mine : c.theirs;
+  if (mineRebuilt !== theirsRebuilt) {
+    const recorded = mineRebuilt ? c.theirs : c.mine;
+    if (TERMINAL.has(text(recorded.status))) winner = recorded;
+  }
   const merged: Row = { ...winner };
   for (const counter of ['attempts', 'retries', 'deferrals', 'escalation_hops']) {
     if (counter in merged) merged[counter] = maxOf(c.mine[counter], c.theirs[counter]);
@@ -106,6 +123,12 @@ const reviewCheckpointConflict: Resolve = (c) => {
 };
 
 const RUN_FACT = 'keyed by the run id, which only one run ever writes: this run\'s row wins';
+const REBUILT_LOSES = '. A reconstructed row never replaces a recorded one';
+/** This run's row wins, unless it is a reconstructed row and the shared copy has the recorded one. */
+const recordedOverRebuilt =
+  (rebuilt: (r: Row) => boolean): Resolve =>
+  (c) =>
+    rebuilt(c.mine) && !rebuilt(c.theirs) ? null : c.mine;
 
 /**
  * How each table of the state database is merged, in the order they are merged (a row's parent
@@ -119,10 +142,10 @@ export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
     rule:
       'a finished job beats an unfinished one, otherwise the later updated_at wins (this run on a tie); attempts, retries, deferrals and ' +
       'escalation_hops take the larger value. A job the shared copy pruned is not brought back. A job whose dedupe key (repository, workflow, ' +
-      'event) the shared copy already has under another id is folded into that job',
+      'event) the shared copy already has under another id is folded into that job. A reconstructed row never replaces a finished job a run recorded',
   },
-  runs: { kind: 'keyed', conflict: mine, parent: { column: 'job_id', table: 'jobs' }, rule: RUN_FACT },
-  publications: { kind: 'keyed', conflict: mine, parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT },
+  runs: { kind: 'keyed', conflict: recordedOverRebuilt((r) => r.worker_id === RECONSTRUCTED_WORKER), parent: { column: 'job_id', table: 'jobs' }, rule: RUN_FACT + REBUILT_LOSES },
+  publications: { kind: 'keyed', conflict: recordedOverRebuilt((r) => isReconstructedText(r.error)), parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT + REBUILT_LOSES },
   failure_comments: { kind: 'keyed', conflict: mine, parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT },
   revisions: { kind: 'keyed', conflict: mine, parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT },
   pr_reviews: { kind: 'keyed', conflict: mine, parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT },
@@ -206,6 +229,8 @@ export interface MergeResult {
     jobsInterrupted: number;
     /** Publications, revision pushes, review postings and failure comments that were mid-step. */
     stepsClosed: number;
+    /** Holds of the run (holds.ts) that it did not release itself. */
+    holdsReleased: number;
   };
   /** Jobs of this run folded into the job the shared copy already had for the same event: this run's id to the kept id. */
   jobsFolded: Record<string, string>;
@@ -285,7 +310,7 @@ function versionOf(file: string): number {
  * Open a source database (`changed` or `base`) for reading at this CLI's schema version. One that
  * is older is copied aside and the copy migrated: the caller's file is never written.
  */
-function openSource(file: string, role: string, scratch: () => string): Db {
+function openSource(file: string, role: string, scratch: () => string, live = false): Db {
   if (!existsSync(file)) throw new MergeInputError(`${role} ${file} does not exist`);
   let version: number;
   try {
@@ -296,6 +321,11 @@ function openSource(file: string, role: string, scratch: () => string): Db {
   if (version > SCHEMA_VERSION) throw new SchemaTooNewError(file, version);
   if (version === SCHEMA_VERSION) return openDatabaseReadOnly(file);
   const copy = join(scratch(), `${role.replace(/[^a-z]/gi, '')}.db`);
+  if (live) {
+    // Another process may be writing (or migrating) the file right now: never copy it raw.
+    copyState(file, copy);
+    return openDatabase(copy);
+  }
   copyFileSync(file, copy);
   // Commits a killed process left in the write-ahead log belong to the database.
   if (existsSync(`${file}-wal`)) copyFileSync(`${file}-wal`, `${copy}-wal`);
@@ -309,7 +339,42 @@ export interface MergeOptions {
   into: string;
   /** The snapshot the run started from. Omit when it started from nothing. */
   base?: string;
+  /**
+   * `changed` belongs to a run that is still going (a checkpoint). It is read in one read
+   * transaction, through SQLite, so that what is merged is one consistent state of it; its
+   * files are left exactly as they are; and nothing the run has in flight is settled: open runs,
+   * running jobs and steps towards GitHub are carried as they are.
+   */
+  live?: boolean;
   now?: () => number;
+}
+
+/**
+ * A consistent copy of a state database in one file, made through SQLite (VACUUM INTO), so it is
+ * safe while another process writes to `file`: the copy is the database as of one moment, with
+ * every row under the id it has, and no -wal or -shm beside it. `out` must not exist.
+ */
+export function copyState(file: string, out: string): { bytes: number; schemaVersion: number } {
+  const from = resolve(file);
+  const to = resolve(out);
+  if (!existsSync(from)) throw new MergeInputError(`--db ${from} does not exist`);
+  if (existsSync(to)) throw new MergeInputError(`--out ${to} exists already; the copy is never written over a file`);
+  let db: Db;
+  try {
+    db = openDatabaseReadOnly(from);
+  } catch (err) {
+    throw new MergeInputError(`--db ${from} is not a readable state database: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    const version = schemaVersion(db);
+    db.prepare('VACUUM INTO ?').run(to);
+    return { bytes: statSync(to).size, schemaVersion: version };
+  } catch (err) {
+    removeQuietly(to);
+    throw err;
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -328,7 +393,8 @@ export function mergeState(opts: MergeOptions): MergeResult {
   let migratedFrom: number | null = null;
   // Reading a database in write-ahead-log mode leaves empty -wal and -shm files beside it. The
   // caller hands over single files and gets single files back: whatever was not there is removed.
-  const callerFiles = [changedFile, intoFile, ...(baseFile ? [baseFile] : [])];
+  // Not those of a database a run is still using: they are part of it, whenever they appeared.
+  const callerFiles = [...(opts.live ? [] : [changedFile]), intoFile, ...(baseFile ? [baseFile] : [])];
   const preexisting = new Set(callerFiles.flatMap(sidecars).filter((f) => existsSync(f)));
   const tidy = () => {
     for (const f of callerFiles.flatMap(sidecars)) if (!preexisting.has(f)) removeQuietly(f);
@@ -361,7 +427,7 @@ export function mergeState(opts: MergeOptions): MergeResult {
     }
   };
   try {
-    const changed = openSource(changedFile, '--changed', scratch);
+    const changed = openSource(changedFile, '--changed', scratch, opts.live === true);
     open.push(changed);
     const base = baseFile ? openSource(baseFile, '--base', scratch) : null;
     if (base) open.push(base);
@@ -376,7 +442,7 @@ export function mergeState(opts: MergeOptions): MergeResult {
     const into = openDatabase(work);
     open.push(into);
 
-    const result = mergeInto({ changed, base, into, now });
+    const result = mergeInto({ changed, base, into, now, ...(opts.live ? { live: true } : {}) });
     result.created = created;
     result.migratedFrom = migratedFrom;
 
@@ -411,7 +477,24 @@ export function mergeState(opts: MergeOptions): MergeResult {
  * The merge itself, on open databases: `changed` and `base` are read, `into` is written. Exported
  * for tests; mergeState is what makes it safe for the caller's file.
  */
-export function mergeInto(dbs: { changed: Db; base: Db | null; into: Db; now?: () => number }): MergeResult {
+export function mergeInto(dbs: { changed: Db; base: Db | null; into: Db; now?: () => number; live?: boolean }): MergeResult {
+  const { changed } = dbs;
+  if (!dbs.live) return mergeRows(dbs);
+  // One read transaction for everything read from a database that is being written to: in
+  // write-ahead-log mode that is one consistent state of it, however long the merge takes.
+  changed.exec('BEGIN');
+  try {
+    return mergeRows(dbs);
+  } finally {
+    try {
+      changed.exec('ROLLBACK');
+    } catch {
+      // the transaction ended with the error that brought us here
+    }
+  }
+}
+
+function mergeRows(dbs: { changed: Db; base: Db | null; into: Db; now?: () => number; live?: boolean }): MergeResult {
   const { changed, base, into } = dbs;
   const now = dbs.now ?? Date.now;
   const tables = listTables(changed);
@@ -428,6 +511,7 @@ export function mergeInto(dbs: { changed: Db; base: Db | null; into: Db; now?: (
   const carriedRuns = new Set<string>();
   const carriedJobs = new Set<string>();
   const carriedSteps = new Map<string, Set<string>>();
+  const carriedHolds = new Set<string>();
 
   transaction(into, () => {
     for (const [table, rule] of Object.entries(TABLE_RULES)) {
@@ -477,6 +561,7 @@ export function mergeInto(dbs: { changed: Db; base: Db | null; into: Db; now?: (
       const noteCarried = (row: Row) => {
         if (table === 'jobs') carriedJobs.add(text(row.id));
         if (table === 'runs') carriedRuns.add(text(row.id));
+        if (table === 'meta' && text(row.key).startsWith(HOLD_PREFIX)) carriedHolds.add(text(row.key));
         if (LEASED_TABLES.some((t) => t.table === table)) {
           let set = carriedSteps.get(table);
           if (!set) carriedSteps.set(table, (set = new Set()));
@@ -528,7 +613,12 @@ export function mergeInto(dbs: { changed: Db; base: Db | null; into: Db; now?: (
           noteCarried(row);
           continue;
         }
-        if (sameRow(existing, row, info.columns)) continue; // already there
+        if (sameRow(existing, row, info.columns)) {
+          // Already there (an earlier merge of this run, a checkpoint for one). Still this
+          // run's row: what it shows as unfinished is settled below like any other.
+          noteCarried(row);
+          continue;
+        }
         if (before && sameRow(existing, before, info.columns)) {
           store(row, existing); // only this run changed it
           continue;
@@ -543,8 +633,17 @@ export function mergeInto(dbs: { changed: Db; base: Db | null; into: Db; now?: (
   // What the run left unfinished. It has ended, so nothing of it is running any more; the shared
   // copy must not say otherwise, or the work would look taken for ever. Only rows this merge
   // wrote: another run's unfinished work in the shared copy is that run's to settle.
-  const unfinished = { runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 0 };
+  //
+  // Not for a checkpoint (`live`): that run is still going, and its rows say so truthfully. They
+  // are carried as they are; its final merge settles whatever it then leaves.
+  const unfinished = { runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 0, holdsReleased: 0 };
   const at = new Date(now()).toISOString();
+  if (dbs.live) {
+    carriedRuns.clear();
+    carriedJobs.clear();
+    carriedSteps.clear();
+    carriedHolds.clear();
+  }
   const openRun = into.prepare('SELECT execution_started_at, pid, container_name FROM runs WHERE id = ? AND ended_at IS NULL');
   for (const runId of carriedRuns) {
     const run = openRun.get(runId) as { execution_started_at: string | null; pid: number | null; container_name: string | null } | undefined;
@@ -590,9 +689,17 @@ export function mergeInto(dbs: { changed: Db; base: Db | null; into: Db; now?: (
     }
   }
 
+  for (const key of carriedHolds) {
+    const row = into.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined;
+    const released = row ? releasedHoldValue(key, row.value, at) : null;
+    if (released === null) continue;
+    into.prepare('UPDATE meta SET value = ? WHERE key = ?').run(released, key);
+    unfinished.holdsReleased++;
+  }
+
   const totals = zero();
   for (const c of Object.values(counts)) for (const k of Object.keys(totals) as Array<keyof TableCounts>) totals[k] += c[k];
-  const settled = unfinished.runsInterrupted + unfinished.runsReleased + unfinished.jobsInterrupted + unfinished.stepsClosed;
+  const settled = unfinished.runsInterrupted + unfinished.runsReleased + unfinished.jobsInterrupted + unfinished.stepsClosed + unfinished.holdsReleased;
   return {
     changed: totals.inserted + totals.updated + totals.appended + settled > 0,
     schemaVersion: schemaVersion(into),

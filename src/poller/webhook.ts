@@ -116,12 +116,14 @@ type Handler = (deps: WebhookDeps, payload: Payload, event: WebhookEventInfo) =>
 /**
  * What is recognised: event name (the X-GitHub-Event header) to action to handler. Everything
  * else is "nothing to do". The pull request events drive the revision and review loops: a
- * person's review (submitted, edited or dismissed), a push to the branch, a close or a reopen.
+ * person's review (submitted, edited or dismissed), a push to the branch, a close. A reopen is
+ * not among them: a closed pull request is no longer watched, for good, so there is nothing a
+ * `pull_request.reopened` delivery could set off.
  */
 const HANDLERS: Readonly<Record<string, Readonly<Record<string, Handler>>>> = {
   issues: { labeled: issueLabeled },
   pull_request_review: { submitted: pullRequestChanged, edited: pullRequestChanged, dismissed: pullRequestChanged },
-  pull_request: { synchronize: pullRequestChanged, closed: pullRequestChanged, reopened: pullRequestChanged },
+  pull_request: { synchronize: pullRequestChanged, closed: pullRequestChanged },
 };
 
 /** Event names and actions `decideWebhook` acts on, for messages and docs. */

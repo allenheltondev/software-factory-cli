@@ -96,7 +96,7 @@ describe('eventJobId', () => {
 });
 
 describe('decideWebhook', () => {
-  it('handles issues.labeled, a review of a pull request, and a push, close or reopen of one; nothing else', () => {
+  it('handles issues.labeled, a review of a pull request, and a push or close of one; nothing else', () => {
     expect(supportedWebhookEvents()).toEqual([
       'issues.labeled',
       'pull_request_review.submitted',
@@ -104,7 +104,6 @@ describe('decideWebhook', () => {
       'pull_request_review.dismissed',
       'pull_request.synchronize',
       'pull_request.closed',
-      'pull_request.reopened',
     ]);
   });
 
@@ -136,7 +135,6 @@ describe('decideWebhook', () => {
       ['pull_request_review', 'dismissed'],
       ['pull_request', 'synchronize'],
       ['pull_request', 'closed'],
-      ['pull_request', 'reopened'],
     ] as const) {
       const decision = await decideWebhook(d, { eventName, payload: pr({ action }) });
       expect(decision).toEqual({
@@ -152,6 +150,8 @@ describe('decideWebhook', () => {
       return decision.dispatch === false ? decision.reason : 'dispatched';
     };
     expect(await reasonOf('pull_request', pr({ action: 'opened' }))).toBe('unsupported-action');
+    // Closing is final: a reopened pull request is not watched again, so the action is not handled at all.
+    expect(await reasonOf('pull_request', pr({ action: 'reopened' }))).toBe('unsupported-action');
     expect(await reasonOf('pull_request_review', pr({ pull_request: {} }))).toBe('malformed-payload');
     expect(await reasonOf('pull_request_review', pr({ repository: { id: 7 } }))).toBe('repository-not-configured');
     // Neither loop is on for the repository: there is nothing a pull request event could set off.

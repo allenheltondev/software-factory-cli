@@ -173,6 +173,12 @@ export interface PullRequestDetails {
   mergeable: boolean | null;
   /** GitHub's own word for it: clean, dirty, blocked, behind, unstable, draft, unknown... For messages only. */
   mergeableState: string;
+  /** Login of the account that opened it, as REST reports it (`<app-slug>[bot]` for an App); null when unknown. */
+  author?: string | null;
+  /** Markdown body; '' when it has none. */
+  body?: string;
+  /** Stable ID of the head's repository; null when that repository was deleted. */
+  headRepoId?: number | null;
 }
 
 /** A submitted review as REST lists it (no editors, no inline comments). */
