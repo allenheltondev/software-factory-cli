@@ -9,7 +9,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CONTAINER_HOME, buildContainerRunArgs, removeContainer, runRuntime, stopContainer } from '../../../src/worker/container.ts';
 import { EXIT_NOT_FOUND, EXIT_RUNTIME_FAILED, IMAGE_NAME, imageId, processStart } from '../image/sandbox/updraft-sandbox.mjs';
-import { installRuntime, sandboxAvailability } from './sandbox-host.mjs';
+import { installRuntime, networkNamespaceAvailability, sandboxAvailability } from './sandbox-host.mjs';
 
 const availability = sandboxAvailability();
 const SECRET = 'TOP-SECRET-0f3a9c';
@@ -282,7 +282,8 @@ describe.skipIf(!availability.usable)(`updraft-sandbox, started for real${availa
     expect(result.stdout).not.toContain(path.basename(root));
   });
 
-  it('--network none takes the network away; without it the caller\'s loopback is reachable', () => {
+  const network = networkNamespaceAvailability();
+  it.skipIf(!network.usable)(`--network none takes the network away; without it the caller's loopback is reachable${network.usable ? '' : ` (SKIPPED: ${network.reason})`}`, () => {
     const isolated = sh('cat /proc/net/dev | grep -c -v -E "lo:|Inter|face"', { network: 'none' });
     expect(isolated.stdout.trim()).toBe('0');
   });

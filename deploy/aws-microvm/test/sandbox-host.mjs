@@ -58,3 +58,18 @@ export function sandboxAvailability() {
   }
   return (cached = { usable: true });
 }
+
+let cachedNet;
+/**
+ * { usable, reason }: can bwrap also give a sandbox its own, empty network namespace here? Some
+ * hosts allow user namespaces and refuse network namespaces (Operation not permitted).
+ */
+export function networkNamespaceAvailability() {
+  if (cachedNet) return cachedNet;
+  const base = sandboxAvailability();
+  if (!base.usable) return (cachedNet = base);
+  const probe = spawnSync('bwrap', ['--unshare-user', '--unshare-net', '--ro-bind', '/', '/', 'true'], { encoding: 'utf8', timeout: 30_000 });
+  if (probe.status === 0) return (cachedNet = { usable: true });
+  const said = (probe.stderr ?? '').trim().split('\n').pop() ?? '';
+  return (cachedNet = { usable: false, reason: `bwrap cannot create a network namespace here (${said || 'refused'})` });
+}
