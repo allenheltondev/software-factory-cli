@@ -1,25 +1,30 @@
 import type { AgentKeyMeta, Store } from '../store/store.js';
-import { AGENT_KEY_ENV } from './config.js';
+// Not from config.ts: that pulls in the CLI's whole validator, which nothing here needs.
+import { AGENT_KEY_ENV } from './agents.js';
 
 /**
- * A tenant's agent API keys (bring your own, #64): one Secrets Manager secret per tenant,
- * `updraft/tenants/<installationId>/agent-env`, a JSON object of the variables the job passes to
- * its agents (`ANTHROPIC_API_KEY`, `CODEX_API_KEY`). The job broker (PR 3) reads it for that
- * tenant's jobs only.
+ * A tenant's agent API keys (bring your own, #64). Each key is its own Secrets Manager secret,
+ * `updraft/tenants/<installationId>/agent-keys/<NAME>`, whose value is the key itself. The job
+ * broker (PR 3) reads a tenant's keys for that tenant's jobs only.
+ *
+ * One secret per key, not one JSON secret per tenant: writing a key never reads or rewrites
+ * another, so two keys set at the same moment both survive.
  *
  * Write-only: nothing here, or anywhere in the API, returns a value. What can be read is that a
  * key is set, when, and by whom (AgentKeyMeta in the table).
  */
 
 export const AGENT_KEY_NAMES = Object.values(AGENT_KEY_ENV) as string[];
-export const agentEnvSecretName = (installationId: number) => `updraft/tenants/${installationId}/agent-env`;
+/** Every key secret of a tenant starts with this (the uninstall cleanup deletes them by name). */
+export const agentKeySecretPrefix = (installationId: number) => `updraft/tenants/${installationId}/agent-keys/`;
+export const agentKeySecretName = (installationId: number, name: string) => `${agentKeySecretPrefix(installationId)}${name}`;
 
 /** The Secrets Manager calls this needs, so tests need no AWS. */
 export interface SecretsPort {
-  /** The secret's current value, or undefined when the secret does not exist yet. */
-  get(name: string): Promise<string | undefined>;
   /** Writes a new value, creating the secret (with these tags) when it does not exist. */
   put(name: string, value: string, tags: Record<string, string>): Promise<void>;
+  /** Deletes the secret at once (no recovery window); nothing when it does not exist. */
+  remove(name: string): Promise<void>;
 }
 
 /** Shapes of the keys we know, to catch a value pasted into the wrong name. Not a validity check. */
@@ -43,20 +48,15 @@ export async function setAgentKey(
   if (!tenant) return { ok: false, message: `there is no tenant for installation ${installationId}` };
   if (tenant.disabledReason === 'uninstalled') return { ok: false, message: `installation ${installationId} was uninstalled` };
 
-  const secretName = agentEnvSecretName(installationId);
-  const current = await deps.secrets.get(secretName);
-  let env: Record<string, string> = {};
-  if (current) {
-    try {
-      const parsed = JSON.parse(current) as unknown;
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) env = parsed as Record<string, string>;
-    } catch {
-      // An unreadable secret is replaced by one holding just this key.
-    }
-  }
-  env[name] = value;
-  await deps.secrets.put(secretName, JSON.stringify(env), { installationId: String(installationId), app: 'updraft-cloud' });
+  const secretName = agentKeySecretName(installationId, name);
+  await deps.secrets.put(secretName, value, { installationId: String(installationId), app: 'updraft-cloud' });
   const meta: AgentKeyMeta = { name, updatedAt: new Date((deps.now ?? Date.now)()).toISOString(), updatedBy };
-  await deps.store.putAgentKeyMeta(installationId, meta);
+  // Guarded: refused once the tenant is uninstalled, so no key row escapes the uninstall sweep.
+  // The secret written in that race is removed again (and the uninstall cleanup deletes every
+  // key secret of the tenant at the deadline in any case).
+  if ((await deps.store.putAgentKeyMeta(installationId, meta)) !== 'stored') {
+    await deps.secrets.remove(secretName).catch(() => {});
+    return { ok: false, message: `installation ${installationId} was uninstalled` };
+  }
   return { ok: true, meta };
 }

@@ -31,7 +31,7 @@ export interface PublishDeps {
 export type PublishResult =
   | { ok: true; version: number; sha256: string; warnings: ConfigIssue[] }
   | { ok: false; reason: 'invalid'; errors: ConfigIssue[] }
-  | { ok: false; reason: 'no_tenant' | 'uninstalled' | 'not_activated'; message: string };
+  | { ok: false; reason: 'no_tenant' | 'uninstalled' | 'superseded' | 'not_activated'; message: string };
 
 export async function publishTenantConfig(
   input: { installationId: number; submission: TenantSubmission; platform: PlatformSettings; repositoryIds: ReadonlyMap<string, number>; publishedBy: string },
@@ -57,6 +57,10 @@ export async function publishTenantConfig(
   await deps.store.markConfigReady(id, version);
 
   const activated = await deps.store.activateConfig(id, version);
+  if (activated === 'superseded') {
+    // A later publish finished first; activation only moves forward, so that one stays active.
+    return { ok: false, reason: 'superseded', message: `version ${version} was stored, but a newer version was activated meanwhile and stays active` };
+  }
   if (activated !== 'activated') {
     return { ok: false, reason: 'not_activated', message: `version ${version} was stored but not activated (${activated}); the previous version stays active` };
   }

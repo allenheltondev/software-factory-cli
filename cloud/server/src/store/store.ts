@@ -148,14 +148,30 @@ export interface Store {
   /** The bundle is fully uploaded. */
   markConfigReady(installationId: number, version: number): Promise<void>;
   /**
-   * Makes a ready version the one jobs start with, in one transaction with the checks. The
-   * previous active version stays active on any refusal.
+   * Makes a ready version the one jobs start with, in one transaction with the checks. Only ever
+   * forward: `superseded` when a newer version is active already (a slow publish finishing after
+   * a later one). The previous active version stays active on any refusal.
    */
-  activateConfig(installationId: number, version: number): Promise<'activated' | 'not_ready' | 'uninstalled' | 'no_tenant'>;
+  activateConfig(installationId: number, version: number): Promise<'activated' | 'superseded' | 'not_ready' | 'uninstalled' | 'no_tenant'>;
   listConfigVersions(installationId: number): Promise<ConfigVersion[]>;
 
-  putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<void>;
+  /** Refused (`uninstalled`) once the tenant is uninstalled or gone, so no row escapes the sweep. */
+  putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<'stored' | 'uninstalled'>;
   listAgentKeyMeta(installationId: number): Promise<AgentKeyMeta[]>;
+
+  /**
+   * Uninstalled tenants whose deadline has passed and whose data outside the table (the S3 prefix,
+   * the key secrets) is not deleted yet. markUninstalled records them, without a TTL, so they
+   * outlive the tenant's own rows.
+   */
+  listDueCleanups(now: number): Promise<CleanupEntry[]>;
+  /** The tenant's data outside the table is gone: forget the entry. */
+  completeCleanup(entry: CleanupEntry): Promise<void>;
+}
+
+export interface CleanupEntry {
+  installationId: number;
+  deleteAfter: number;
 }
 
 /** In-memory Store for tests and local dev without AWS. `ttl` is recorded as DynamoDB would hold it. */
@@ -167,6 +183,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const tenants = new Map<number, Tenant & { ttl?: number }>();
   const members = new Map<string, Member & { ttl?: number }>();
   const configs = new Map<string, ConfigVersion>();
+  const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
   const memberKey = (id: number, sub: string) => `${id}/${sub}`;
   const strip = <T extends { ttl?: number }>(item: T): Omit<T, 'ttl'> => {
@@ -233,6 +250,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
           createdAt: new Date(0).toISOString(),
           createdBy: 'github:installation.deleted',
         });
+        cleanups.set(id, { installationId: id, deleteAfter });
         return 'tombstone';
       }
       const already = t.disabledReason === 'uninstalled';
@@ -240,6 +258,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const ttl = Math.ceil(deadline / 1000);
       if (!already) tenants.set(id, { ...t, status: 'disabled', disabledReason: 'uninstalled', deleteAfter, ttl });
       for (const [k, m] of members) if (m.installationId === id && m.ttl !== ttl) members.set(k, { ...m, ttl });
+      cleanups.set(id, { installationId: id, deleteAfter: deadline });
       return already ? 'already' : 'marked';
     },
     async setSuspended(id, suspended) {
@@ -276,6 +295,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       if (!t) return 'no_tenant';
       if (t.disabledReason === 'uninstalled') return 'uninstalled';
       if (configs.get(`${id}/${version}`)?.status !== 'ready') return 'not_ready';
+      if (t.activeConfigVersion !== undefined && t.activeConfigVersion >= version) return 'superseded';
       tenants.set(id, { ...t, activeConfigVersion: version });
       return 'activated';
     },
@@ -283,7 +303,16 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       return [...configs.values()].filter((c) => c.installationId === id).sort((a, b) => a.version - b.version).map((c) => ({ ...c }));
     },
     async putAgentKeyMeta(id, meta) {
+      const t = tenants.get(id);
+      if (!t || t.disabledReason === 'uninstalled') return 'uninstalled';
       keys.set(`${id}/${meta.name}`, { ...meta });
+      return 'stored';
+    },
+    async listDueCleanups(now) {
+      return [...cleanups.values()].filter((c) => c.deleteAfter <= now).map((c) => ({ ...c }));
+    },
+    async completeCleanup(entry) {
+      if (cleanups.get(entry.installationId)?.deleteAfter === entry.deleteAfter) cleanups.delete(entry.installationId);
     },
     async listAgentKeyMeta(id) {
       return [...keys.entries()].filter(([k]) => k.startsWith(`${id}/`)).map(([, v]) => ({ ...v })).sort((a, b) => a.name.localeCompare(b.name));

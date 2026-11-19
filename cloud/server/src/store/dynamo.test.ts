@@ -24,6 +24,12 @@ function fakeTable() {
     if (!expr) return true;
     if (expr === 'attribute_not_exists(pk)') return !item;
     if (expr === 'attribute_exists(pk)') return Boolean(item);
+    if (
+      expr ===
+      'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND (attribute_not_exists(activeConfigVersion) OR activeConfigVersion < :v)'
+    ) {
+      return Boolean(item) && item!.disabledReason !== values[':uninstalled'] && (item!.activeConfigVersion === undefined || (item!.activeConfigVersion as number) < (values[':v'] as number));
+    }
     if (expr === '#status = :ready') return item?.status === values[':ready'];
     if (expr === 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)') {
       return Boolean(item) && (item!.disabledReason === undefined || item!.disabledReason !== values[':uninstalled']);
@@ -84,8 +90,9 @@ function fakeTable() {
           }
           const pk = values?.[':pk'];
           const prefix = String(input.KeyConditionExpression).includes('begins_with(sk, :prefix)') ? String(values?.[':prefix']) : '';
+          const until = String(input.KeyConditionExpression).includes('sk <= :until') ? String(values?.[':until']) : null;
           let found = [...items.values()]
-            .filter((i) => i.pk === pk && String(i.sk).startsWith(prefix) && visible(key(i), input))
+            .filter((i) => i.pk === pk && String(i.sk).startsWith(prefix) && (until === null || String(i.sk) <= until) && visible(key(i), input))
             .sort((a, b) => String(a.sk).localeCompare(String(b.sk)));
           if (input.ScanIndexForward === false) found.reverse();
           if (typeof input.Limit === 'number') found = found.slice(0, input.Limit);
@@ -305,5 +312,47 @@ describe('dynamo store: config versions and agent keys', () => {
       { name: 'ANTHROPIC_API_KEY', updatedAt: 't1', updatedBy: 'admin' },
       { name: 'CODEX_API_KEY', updatedAt: 't2', updatedBy: 'admin' },
     ]);
+  });
+});
+
+describe('dynamo store: review fixes on #78', () => {
+  const meta = { sha256: 'abc', files: ['config.yaml'], publishedBy: 'admin', publishedAt: 't' };
+
+  it('never activates an older version after a newer one (superseded)', async () => {
+    const { store } = await seeded();
+    const v1 = (await store.createConfigVersion(55, meta)) as number;
+    const v2 = (await store.createConfigVersion(55, meta)) as number;
+    await store.markConfigReady(55, v2);
+    expect(await store.activateConfig(55, v2)).toBe('activated');
+    await store.markConfigReady(55, v1);
+    expect(await store.activateConfig(55, v1)).toBe('superseded');
+    expect((await store.getTenant(55))?.activeConfigVersion).toBe(v2);
+    expect(await store.activateConfig(55, v2)).toBe('superseded');
+  });
+
+  it('refuses key metadata once the tenant is uninstalled', async () => {
+    const { store, table } = await seeded();
+    expect(await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'a' })).toBe('stored');
+    await store.markUninstalled(55, DEADLINE);
+    expect(table.items.get('TENANT#55|KEY#ANTHROPIC_API_KEY')?.ttl).toBe(TTL);
+    expect(await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'a' })).toBe('uninstalled');
+    expect(table.items.has('TENANT#55|KEY#CODEX_API_KEY')).toBe(false);
+    expect(await store.putAgentKeyMeta(77, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'a' })).toBe('uninstalled');
+  });
+
+  it('records a cleanup entry for every uninstall (marked, repeated, tombstone), without a TTL, due at the deadline', async () => {
+    const { store, table } = await seeded();
+    await store.markUninstalled(55, DEADLINE);
+    await store.markUninstalled(55, DEADLINE + 5000); // repeated: the first deadline
+    await store.markUninstalled(66, DEADLINE + 10_000, { id: 1, login: 'x', type: 'User' }); // tombstone
+    const entries = [...table.items.values()].filter((i) => i.pk === 'CLEANUP');
+    expect(entries.map((e) => [e.installationId, e.deleteAfter, e.ttl])).toEqual([
+      [55, DEADLINE, undefined],
+      [66, DEADLINE + 10_000, undefined],
+    ]);
+    expect(await store.listDueCleanups(DEADLINE - 1)).toEqual([]);
+    expect(await store.listDueCleanups(DEADLINE)).toEqual([{ installationId: 55, deleteAfter: DEADLINE }]);
+    await store.completeCleanup({ installationId: 55, deleteAfter: DEADLINE });
+    expect(await store.listDueCleanups(DEADLINE + 10_000)).toEqual([{ installationId: 66, deleteAfter: DEADLINE + 10_000 }]);
   });
 });

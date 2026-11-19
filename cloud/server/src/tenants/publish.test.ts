@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createMemoryStore, type Tenant } from '../store/store.js';
-import { agentEnvSecretName, setAgentKey, type SecretsPort } from './agent-keys.js';
+import { agentKeySecretName, setAgentKey, type SecretsPort } from './agent-keys.js';
 import type { TenantSubmission } from './config.js';
 import { configPrefix, publishTenantConfig } from './publish.js';
 
@@ -87,6 +87,19 @@ describe('publishTenantConfig', () => {
     expect(await store.activateConfig(55, 2)).toBe('not_ready');
   });
 
+  it('never moves the active version back: a slow publish that finishes after a later one is superseded', async () => {
+    const { store, putObject, publish } = await setup();
+    // Version 1's upload stalls; version 2 publishes and activates; then version 1 finishes.
+    let release!: () => void;
+    putObject.mockImplementationOnce(() => new Promise<void>((r) => (release = r)));
+    const slow = publish(submission('ready'));
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    expect(await publish(submission('go'))).toMatchObject({ ok: true, version: 2 });
+    release();
+    expect(await slow).toMatchObject({ ok: false, reason: 'superseded' });
+    expect((await store.getTenant(55))?.activeConfigVersion).toBe(2);
+  });
+
   it('refuses an unknown or uninstalled tenant', async () => {
     const { store, publish } = await setup();
     await store.markUninstalled(55, NOW + 1000);
@@ -100,14 +113,18 @@ describe('publishTenantConfig', () => {
 });
 
 describe('setAgentKey', () => {
+  /** Secrets Manager with one secret per name; each operation yields, as a network call would. */
   function secrets() {
     const values = new Map<string, string>();
     const tags = new Map<string, Record<string, string>>();
     const port: SecretsPort = {
-      get: async (name) => values.get(name),
-      put: async (name, value, t) => {
+      async put(name, value, t) {
+        await new Promise((r) => setTimeout(r, 1));
         values.set(name, value);
         if (!tags.has(name)) tags.set(name, t);
+      },
+      async remove(name) {
+        values.delete(name);
       },
     };
     return { port, values, tags };
@@ -115,16 +132,33 @@ describe('setAgentKey', () => {
   const ANTHROPIC = `sk-ant-api03-${'a'.repeat(40)}`;
   const OPENAI = `sk-proj-${'b'.repeat(40)}`;
 
-  it('writes the key into the tenant\'s own secret, keeping the other key, and records only that it is set', async () => {
+  it('keeps each key in its own secret, so two keys set at once both survive (the review\x27s race)', async () => {
     const { store } = await setup();
     const s = secrets();
-    expect(await setAgentKey({ installationId: 55, name: 'ANTHROPIC_API_KEY', value: ANTHROPIC, updatedBy: 'admin' }, { secrets: s.port, store, now: () => NOW })).toMatchObject({ ok: true });
-    await setAgentKey({ installationId: 55, name: 'CODEX_API_KEY', value: OPENAI, updatedBy: 'admin' }, { secrets: s.port, store, now: () => NOW });
-    expect(JSON.parse(s.values.get(agentEnvSecretName(55))!)).toEqual({ ANTHROPIC_API_KEY: ANTHROPIC, CODEX_API_KEY: OPENAI });
-    expect(s.tags.get(agentEnvSecretName(55))).toEqual({ installationId: '55', app: 'updraft-cloud' });
+    const set = (name: string, value: string) => setAgentKey({ installationId: 55, name, value, updatedBy: 'admin' }, { secrets: s.port, store, now: () => NOW });
+    const results = await Promise.all([set('ANTHROPIC_API_KEY', ANTHROPIC), set('CODEX_API_KEY', OPENAI)]);
+    expect(results.every((r) => r.ok)).toBe(true);
+    expect(s.values.get(agentKeySecretName(55, 'ANTHROPIC_API_KEY'))).toBe(ANTHROPIC);
+    expect(s.values.get(agentKeySecretName(55, 'CODEX_API_KEY'))).toBe(OPENAI);
+    expect(s.tags.get(agentKeySecretName(55, 'CODEX_API_KEY'))).toEqual({ installationId: '55', app: 'updraft-cloud' });
     const meta = await store.listAgentKeyMeta(55);
     expect(meta.map((m) => m.name)).toEqual(['ANTHROPIC_API_KEY', 'CODEX_API_KEY']);
     expect(JSON.stringify(meta)).not.toContain('sk-');
+  });
+
+  it('refuses a key set that races an uninstall, and removes the secret it wrote', async () => {
+    const { store } = await setup();
+    const s = secrets();
+    // The tenant is read as active, then the uninstall lands before the metadata write.
+    const put = s.port.put;
+    s.port.put = async (...args) => {
+      await put(...args);
+      await store.markUninstalled(55, NOW + 1000);
+    };
+    const r = await setAgentKey({ installationId: 55, name: 'ANTHROPIC_API_KEY', value: ANTHROPIC, updatedBy: 'admin' }, { secrets: s.port, store });
+    expect(r).toMatchObject({ ok: false, message: expect.stringMatching(/uninstalled/) });
+    expect(s.values.size).toBe(0);
+    expect(await store.listAgentKeyMeta(55)).toEqual([]);
   });
 
   it('refuses an unknown name, a value of the wrong shape (without repeating it), and a missing tenant', async () => {

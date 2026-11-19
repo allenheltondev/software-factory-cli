@@ -26,9 +26,9 @@ import { validateConfig } from '../../../../src/config/public.js';
  * here is one the job accepts.
  */
 
-/** Agents the job image ships, and the variable each one's API key is passed in as. */
-export const AGENT_KEY_ENV = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY' } as const;
-export type CloudAgent = keyof typeof AGENT_KEY_ENV;
+import { AGENT_KEY_ENV, type CloudAgent } from './agents.js';
+
+export { AGENT_KEY_ENV, type CloudAgent };
 
 /** The #63 sandbox runtime every agent and verify command runs in. */
 export const SANDBOX_CONTAINER = { image: 'microvm', runtime: '/opt/updraft/bin/updraft-sandbox' } as const;

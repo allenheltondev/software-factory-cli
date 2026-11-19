@@ -276,6 +276,46 @@ Resources:
             Auth:
               Authorizer: NONE
 
+  # The uninstall retention deadline for what DynamoDB TTL cannot reach (tenants/cleanup.ts):
+  # once a day, the S3 prefix and agent key secrets of every uninstalled tenant past its deadline.
+  # A tenant that fails is retried the next day (its cleanup entry stays).
+  CleanupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../server/dist
+      Handler: cleanup.handler
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UpdraftTable
+          TENANT_BUCKET: !Ref TenantBucket
+          NODE_OPTIONS: --enable-source-maps
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UpdraftTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt TenantBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix: tenants/*
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub ${TenantBucket.Arn}/tenants/*
+            - Effect: Allow
+              Action: secretsmanager:DeleteSecret
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/tenants/*
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            Description: Delete uninstalled tenants' S3 data and key secrets past their deadline
+            ScheduleExpression: cron(23 4 * * ? *)
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+
   # ---------------------------------------------------------------------------
   # Tenant data (#68): everything a tenant's jobs read and write, under tenants/<installationId>/
   #   config/<version>/   immutable config bundles (server/src/tenants/publish.ts)

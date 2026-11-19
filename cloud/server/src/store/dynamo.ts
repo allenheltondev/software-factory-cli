@@ -8,7 +8,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import type { AgentKeyMeta, ConfigVersion, GitHubLink, InstallationOffer, Member, OAuthState, Store, Tenant } from './store.js';
+import type { AgentKeyMeta, CleanupEntry, ConfigVersion, GitHubLink, InstallationOffer, Member, OAuthState, Store, Tenant } from './store.js';
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
@@ -20,6 +20,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
   const memberKey = (id: number, sub: string) => ({ pk: `TENANT#${id}`, sk: `MEMBER#${sub}` });
   // Zero-padded, so the sort key orders versions numerically.
   const configKey = (id: number, version: number) => ({ pk: `TENANT#${id}`, sk: `CONFIG#${String(version).padStart(10, '0')}` });
+  // Uninstalled tenants whose data outside the table must be deleted at the deadline. One
+  // partition, ordered by deadline, and no TTL: these must outlive the tenant's own rows.
+  const cleanupKey = (entry: CleanupEntry) => ({ pk: 'CLEANUP', sk: `${String(entry.deleteAfter).padStart(15, '0')}#${entry.installationId}` });
+  async function recordCleanup(entry: CleanupEntry): Promise<void> {
+    await client.send(new PutCommand({ TableName: T, Item: { ...cleanupKey(entry), ...entry } }));
+  }
 
   /**
    * Gives everything in a tenant's partition (members now; config and jobs later) the table TTL.
@@ -286,6 +292,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             }),
           );
           await sweepPartition(id, ttl);
+          await recordCleanup({ installationId: id, deleteAfter });
           return 'marked';
         } catch (err) {
           if (!(err instanceof ConditionalCheckFailedException)) throw err;
@@ -296,6 +303,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           // failure or timeout cut short completes on the next delivery.
           const stored = typeof existing.deleteAfter === 'number' ? existing.deleteAfter : deleteAfter;
           await sweepPartition(id, Math.ceil(stored / 1000));
+          await recordCleanup({ installationId: id, deleteAfter: stored });
           return 'already';
         }
         if (existing) continue; // created or changed since the update was refused: try again
@@ -319,6 +327,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
               ConditionExpression: 'attribute_not_exists(pk)',
             }),
           );
+          await recordCleanup({ installationId: id, deleteAfter });
           return 'tombstone';
         } catch (err) {
           if (!(err instanceof ConditionalCheckFailedException)) throw err;
@@ -451,7 +460,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   TableName: T,
                   Key: tenantKey(id),
                   UpdateExpression: 'SET activeConfigVersion = :v',
-                  ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+                  // Only ever forward: a slow publish finishing after a later one must not move it back.
+                  ConditionExpression:
+                    'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND (attribute_not_exists(activeConfigVersion) OR activeConfigVersion < :v)',
                   ExpressionAttributeValues: { ':v': version, ':uninstalled': 'uninstalled' },
                 },
               },
@@ -462,8 +473,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       } catch (err) {
         if (!(err instanceof TransactionCanceledException)) throw err;
         const [config, tenant] = err.CancellationReasons ?? [];
-        if (tenant?.Code === 'ConditionalCheckFailed') return (await getTenantItem(id, true)) ? 'uninstalled' : 'no_tenant';
         if (config?.Code === 'ConditionalCheckFailed') return 'not_ready';
+        if (tenant?.Code === 'ConditionalCheckFailed') {
+          const item = await getTenantItem(id, true);
+          if (!item) return 'no_tenant';
+          return item.disabledReason === 'uninstalled' ? 'uninstalled' : 'superseded';
+        }
         throw err;
       }
     },
@@ -497,7 +512,51 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async putAgentKeyMeta(id, meta: AgentKeyMeta) {
-      await client.send(new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: `KEY#${meta.name}`, ...meta } }));
+      // With the uninstall check in the same transaction: no key row is written after the sweep.
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                ConditionCheck: {
+                  TableName: T,
+                  Key: tenantKey(id),
+                  ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+                  ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
+                },
+              },
+              { Put: { TableName: T, Item: { pk: `TENANT#${id}`, sk: `KEY#${meta.name}`, ...meta } } },
+            ],
+          }),
+        );
+        return 'stored';
+      } catch (err) {
+        if (err instanceof TransactionCanceledException && err.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed') return 'uninstalled';
+        throw err;
+      }
+    },
+
+    async listDueCleanups(now) {
+      const out: CleanupEntry[] = [];
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk AND sk <= :until',
+            ExpressionAttributeValues: { ':pk': 'CLEANUP', ':until': `${String(now).padStart(15, '0')}#~` },
+            ConsistentRead: true,
+            ExclusiveStartKey,
+          }),
+        );
+        for (const i of page.Items ?? []) out.push({ installationId: Number(i.installationId), deleteAfter: Number(i.deleteAfter) });
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return out;
+    },
+
+    async completeCleanup(entry) {
+      await client.send(new DeleteCommand({ TableName: T, Key: cleanupKey(entry) }));
     },
 
     async listAgentKeyMeta(id) {
