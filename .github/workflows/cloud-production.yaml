@@ -1,0 +1,28 @@
+name: Deploy Updraft Cloud to Production
+
+# updraft.readysetcloud.io. Runs when main changes anything Updraft Cloud is built from.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cloud/**'
+      - '.github/workflows/cloud-*.yaml'
+  workflow_dispatch:
+
+concurrency:
+  group: updraft-cloud-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  production:
+    uses: ./.github/workflows/cloud-deploy-env.yaml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      environment: Production
+      domain: updraft.readysetcloud.io
+    secrets: inherit

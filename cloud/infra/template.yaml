@@ -1,0 +1,424 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Updraft Cloud -- the hosted Updraft at updraft.readysetcloud.io. One origin: the SPA on S3 at /
+  and the API at /api/*, both through one CloudFront distribution. The API is an API Gateway REST
+  API with a Cognito authorizer on the shared Ready, Set, Cloud user pool (this stack adds its own
+  app client to that pool).
+
+Parameters:
+  AuthUserPoolId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /readysetcloud/auth/user-pool-id
+    Description: >
+      SSM parameter holding the shared Ready, Set, Cloud user pool id (rsc-core). People sign in
+      with their existing RSC account.
+  AuthUserPoolArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /readysetcloud/auth/user-pool-arn
+    Description: SSM parameter holding the same pool's ARN, for the API's Cognito authorizer.
+
+  ApiStageName:
+    Type: String
+    Default: prod
+    AllowedPattern: '^[a-zA-Z0-9_]+$'
+    Description: The API Gateway stage. CloudFront's api origin adds it as OriginPath.
+  ApiRateLimit:
+    Type: Number
+    Default: 50
+    Description: Steady-state requests per second for the whole stage (API Gateway throttling).
+  ApiBurstLimit:
+    Type: Number
+    Default: 100
+    Description: Burst capacity for the whole stage.
+
+  AppDomainName:
+    Type: String
+    Default: ''
+    Description: >
+      Optional hostname for the app, e.g. updraft.readysetcloud.io. With AppHostedZoneId, the stack
+      issues an ACM certificate for it (DNS validated in that zone), adds it to the distribution and
+      points A/AAAA alias records at the distribution. Empty (every non-production deploy) serves
+      on the *.cloudfront.net domain only. CloudFront certificates must be in us-east-1, as this
+      stack is.
+  AppHostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route 53 hosted zone that holds AppDomainName's parent domain.
+
+Conditions:
+  DeployCustomDomain: !And
+    - !Not [!Equals [!Ref AppDomainName, '']]
+    - !Not [!Equals [!Ref AppHostedZoneId, '']]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    Tracing: Active
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Data: one table, generic keys and two overloaded GSIs so tenants, members, config versions,
+  # deliveries and jobs (#67-#71) fit without a table replacement. Retained on stack delete.
+  # ---------------------------------------------------------------------------
+  UpdraftTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ---------------------------------------------------------------------------
+  # Auth: this app's own client in the shared pool. The SPA signs in with
+  # @readysetcloud/ui/auth, which calls cognito-idp directly (USER_PASSWORD_AUTH), so the client
+  # has no secret and no hosted UI. The pool's shared client lacks USER_PASSWORD_AUTH.
+  # ---------------------------------------------------------------------------
+  AuthClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-app
+      UserPoolId: !Ref AuthUserPoolId
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      # An ID token lives an hour; the SPA refreshes it silently (getFreshIdToken) for as long as
+      # the refresh token lasts.
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ---------------------------------------------------------------------------
+  # The API: API Gateway REST (regional; CloudFront is the only edge) with the Cognito authorizer
+  # as the default on every route. The authorizer verifies the ID token's signature, issuer and
+  # expiry; it accepts any client in the shared pool, so ApiFunction also checks `aud` against
+  # AuthClient. Routes live under /api because CloudFront forwards /api/* paths unchanged.
+  # ---------------------------------------------------------------------------
+  UpdraftApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref ApiStageName
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: true
+      # Same origin as the SPA: no CORS configuration on purpose.
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !Ref AuthUserPoolArn
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: !Ref ApiRateLimit
+          ThrottlingBurstLimit: !Ref ApiBurstLimit
+          MetricsEnabled: true
+      # No access or execution logging yet: both need the account-level API Gateway CloudWatch
+      # role (AWS::ApiGateway::Account), which this stack does not own. Metrics need no role.
+      GatewayResponses:
+        # The authorizer's own refusals, as JSON in the same shape the API answers with.
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseTemplates:
+            application/json: '{"error":"unauthorized"}'
+        ACCESS_DENIED:
+          StatusCode: 403
+          ResponseTemplates:
+            application/json: '{"error":"forbidden"}'
+        THROTTLED:
+          StatusCode: 429
+          ResponseTemplates:
+            application/json: '{"error":"throttled"}'
+        DEFAULT_4XX:
+          ResponseTemplates:
+            application/json: '{"error":"bad_request"}'
+        DEFAULT_5XX:
+          ResponseTemplates:
+            application/json: '{"error":"internal_error"}'
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Bundled by `npm run build --workspace=server` (server/scripts/bundle.mjs). `sam deploy`
+      # zips this directory itself, so there is no `sam build` step.
+      CodeUri: ../server/dist
+      Handler: index.handler
+      MemorySize: 512
+      # CloudFront waits at most 30s for the origin by default; long work belongs elsewhere.
+      Timeout: 29
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UpdraftTable
+          USER_POOL_ID: !Ref AuthUserPoolId
+          USER_POOL_CLIENT_ID: !Ref AuthClient
+          NODE_OPTIONS: --enable-source-maps
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UpdraftTable
+      Events:
+        Health:
+          Type: Api
+          Properties:
+            RestApiId: !Ref UpdraftApi
+            Path: /api/health
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        V1:
+          Type: Api
+          Properties:
+            RestApiId: !Ref UpdraftApi
+            Path: /api/v1/{proxy+}
+            Method: ANY
+
+  ApiFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ApiFunction}
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # Hosting: a private S3 bucket and one CloudFront distribution with two origins, so the browser
+  # sees a single origin for the app and the API (no CORS, relative /api/v1 paths).
+  # ---------------------------------------------------------------------------
+  AppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  AppOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-app-oac
+        Description: Signs CloudFront's reads of the SPA bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  AppBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AppBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${AppBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${AppDistribution}
+
+  # SPA fallback as a viewer-request rewrite on the default behavior only. Distribution-wide
+  # CustomErrorResponses would also turn the API's own 401/403/404s into a 200 carrying
+  # index.html; a function is per-behavior, so /api/* is left untouched.
+  SpaRouterFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub ${AWS::StackName}-spa-router
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrite extensionless paths to /index.html for client-side routing
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          var last = uri.substring(uri.lastIndexOf('/') + 1);
+          if (last.indexOf('.') === -1) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+
+  # The custom domain (Production). CloudFormation writes the DNS validation record itself and
+  # waits for the certificate before the distribution uses it.
+  AppCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: DeployCustomDomain
+    Properties:
+      DomainName: !Ref AppDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref AppDomainName
+          HostedZoneId: !Ref AppHostedZoneId
+
+  # A and AAAA: the distribution serves IPv6. Z2FDTNDATAQYW2 is CloudFront's fixed hosted zone id
+  # for alias targets.
+  AppDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: DeployCustomDomain
+    Properties:
+      HostedZoneId: !Ref AppHostedZoneId
+      Name: !Ref AppDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt AppDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  AppDnsRecordIpv6:
+    Type: AWS::Route53::RecordSet
+    Condition: DeployCustomDomain
+    Properties:
+      HostedZoneId: !Ref AppHostedZoneId
+      Name: !Ref AppDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt AppDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  AppDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub Updraft Cloud (${AWS::StackName}) -- SPA + API
+        HttpVersion: http2and3
+        Aliases: !If [DeployCustomDomain, [!Ref AppDomainName], !Ref AWS::NoValue]
+        ViewerCertificate: !If
+          - DeployCustomDomain
+          - AcmCertificateArn: !Ref AppCertificate
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: spa
+            DomainName: !GetAtt AppBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt AppOriginAccessControl.Id
+            # Required-but-empty when OAC is in use.
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: api
+            # The regional execute-api host; OriginPath adds the stage, so the viewer's
+            # /api/v1/me reaches the stage as /api/v1/me.
+            DomainName: !Sub ${UpdraftApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+            OriginPath: !Sub /${ApiStageName}
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: spa
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed CachingOptimized. Vite emits content-hashed asset names; index.html and
+          # auth-config.json are uploaded no-cache and invalidated by `make deploy-frontend`.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # Managed SecurityHeadersPolicy (HSTS, nosniff, frame options, ...).
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRouterFunction.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            # Managed CachingDisabled.
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # Managed AllViewerExceptHostHeader: forwards every viewer header (Authorization,
+            # X-Hub-Signature-256), cookie and query string, but lets CloudFront set Host to the
+            # execute-api domain, which API Gateway requires.
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        # No CustomErrorResponses on purpose -- see SpaRouterFunction above.
+
+Outputs:
+  AppUrl:
+    Description: >
+      The deployment's one public URL -- SPA at /, API at /api. The custom domain when one is
+      configured, the CloudFront domain otherwise.
+    Value: !If
+      - DeployCustomDomain
+      - !Sub https://${AppDomainName}
+      - !Sub https://${AppDistribution.DomainName}
+  AppBucket:
+    Description: S3 bucket the built SPA is synced into (private; read only via CloudFront OAC)
+    Value: !Ref AppBucket
+  AppDistributionId:
+    Description: CloudFront distribution id (for `aws cloudfront create-invalidation`)
+    Value: !Ref AppDistribution
+  AppDistributionDomainName:
+    Description: The distribution's *.cloudfront.net domain (Staging's AppUrl)
+    Value: !GetAtt AppDistribution.DomainName
+  ApiUrl:
+    Description: The API stage's own execute-api URL (CloudFront's api origin); browsers use AppUrl/api
+    Value: !Sub https://${UpdraftApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStageName}
+  UserPoolId:
+    Description: The shared Ready, Set, Cloud user pool
+    Value: !Ref AuthUserPoolId
+  UserPoolClientId:
+    Description: This stack's app client on that pool; `make deploy-frontend` publishes it in /auth-config.json
+    Value: !Ref AuthClient
+  TableName:
+    Description: The Updraft Cloud table
+    Value: !Ref UpdraftTable

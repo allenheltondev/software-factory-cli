@@ -5,7 +5,8 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**', '.claude/**'] },
+  // cloud/ is its own npm project with its own lint config (cloud/eslint.config.js).
+  { ignores: ['dist/**', 'node_modules/**', '.claude/**', 'cloud/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
