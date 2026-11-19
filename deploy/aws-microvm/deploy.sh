@@ -28,7 +28,7 @@
 #   NODE_VERSION, UPDRAFT_SPEC, AGENT_PACKAGES, TOOL_PACKAGES,
 #   SYSTEM_PACKAGES, PYTHON_COMMAND, UV_VERSION, BROWSER_PACKAGES,
 #   PLAYWRIGHT_VERSION, PLAYWRIGHT_BROWSERS,
-#   REQUIRE_STATE_COMMANDS                                       override image/build.env
+#   REQUIRE_STATE_COMMANDS, ISOLATION_PACKAGES                   override image/build.env
 #   UPDRAFT_TARBALL   path of an `npm pack` tarball to install instead of UPDRAFT_SPEC
 #   BUILD_TIMEOUT_SECONDS  how long to wait for the image build      (default: 2400)
 #   SAM_PARAMETER_OVERRIDES  extra template parameters, e.g.
@@ -139,6 +139,7 @@ build_image() {
     [ -z "${PLAYWRIGHT_VERSION+set}" ] || printf 'PLAYWRIGHT_VERSION="%s"\n' "$PLAYWRIGHT_VERSION"
     [ -z "${PLAYWRIGHT_BROWSERS+set}" ] || printf 'PLAYWRIGHT_BROWSERS="%s"\n' "$PLAYWRIGHT_BROWSERS"
     [ -z "${REQUIRE_STATE_COMMANDS:-}" ] || printf 'REQUIRE_STATE_COMMANDS="%s"\n' "$REQUIRE_STATE_COMMANDS"
+    [ -z "${ISOLATION_PACKAGES+set}" ] || printf 'ISOLATION_PACKAGES="%s"\n' "$ISOLATION_PACKAGES"
   } >> "$stage/context/build.env"
 
   local stamp key uri

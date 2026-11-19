@@ -64,7 +64,14 @@ export function loadConfig(env) {
   if (idlePolicyMode !== 'explicit' && idlePolicyMode !== 'omit') {
     throw new Error('IDLE_POLICY_MODE must be "explicit" or "omit"');
   }
+  // enforced: the runner starts a job only when agents are provably kept away from the App
+  // key, the state database and the execution role. disabled: as before that existed.
+  const agentIsolation = (env.AGENT_ISOLATION ?? 'enforced').trim() || 'enforced';
+  if (agentIsolation !== 'enforced' && agentIsolation !== 'disabled') {
+    throw new Error('AGENT_ISOLATION must be "enforced" or "disabled"');
+  }
   return {
+    agentIsolation,
     region: need('AWS_REGION'),
     imageArn: need('IMAGE_ARN'),
     imageVersion: (env.IMAGE_VERSION ?? '').trim(),
@@ -121,6 +128,9 @@ export function buildRunHookPayload(config, { deliveryId, eventName, launchedAt,
     // Set for a pull request event that holds a coalescing lease: the runner starts the job
     // no earlier, so that it sees every event the launcher coalesced into this one.
     ...(notBefore ? { notBefore } : {}),
+    // Whether the runner must prove, before the job, that agents cannot reach the App key,
+    // the state database or the execution role (README, "Security model").
+    agentIsolation: config.agentIsolation,
     version: PAYLOAD_VERSION,
     deliveryId,
     eventName,

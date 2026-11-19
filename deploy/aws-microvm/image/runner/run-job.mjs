@@ -3,6 +3,7 @@
 import os from 'node:os';
 import { createAwsDeps } from './aws.mjs';
 import { parseRunRequest } from './hooks.mjs';
+import { SANDBOX_IMAGE, SANDBOX_RUNTIME, createNftFilter, credentialEndpoints } from './isolation.mjs';
 import { runJob } from './job.mjs';
 
 const log = (message) => console.log(`[runner] ${message}`);
@@ -40,8 +41,29 @@ async function main() {
     jobUser = { home: info.homedir, name: info.username };
   }
 
+  // What AgentIsolation=enforced needs (isolation.mjs): the sandbox runtime Updraft starts
+  // agents through, and a packet filter between every user but root and the addresses that
+  // hand out this process's AWS credentials. A problem here is reported by runJob, as a job
+  // that was not started.
+  const hookPort = Number(process.env.HOOK_PORT ?? 9000);
+  let isolation;
+  try {
+    const endpoints = credentialEndpoints(process.env);
+    isolation = {
+      runtime: process.env.UPDRAFT_SANDBOX_RUNTIME ?? SANDBOX_RUNTIME,
+      image: SANDBOX_IMAGE,
+      nodePath: process.execPath,
+      endpoints,
+      hookPort,
+      filter: createNftFilter({ endpoints, hookPort }),
+    };
+  } catch (error) {
+    isolation = { setupProblem: error?.message ?? String(error) };
+  }
+
   const result = await runJob(request, {
     ...createAwsDeps(request.payload.region),
+    isolation,
     stateRoot: process.env.UPDRAFT_STATE_ROOT ?? '/var/lib/updraft-jobs',
     updraftCommand: [process.env.UPDRAFT_COMMAND ?? 'updraft'],
     jobUser,

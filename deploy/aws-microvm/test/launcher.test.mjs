@@ -192,6 +192,23 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...env, IDLE_POLICY_MODE: 'never' })).toThrow('IDLE_POLICY_MODE');
   });
 
+  it('enforces agent isolation unless told otherwise, and passes the choice to the runner', () => {
+    expect(loadConfig(env).agentIsolation).toBe('enforced');
+    expect(loadConfig({ ...env, AGENT_ISOLATION: '' }).agentIsolation).toBe('enforced');
+    expect(loadConfig({ ...env, AGENT_ISOLATION: 'disabled' }).agentIsolation).toBe('disabled');
+    expect(() => loadConfig({ ...env, AGENT_ISOLATION: 'off' })).toThrow('AGENT_ISOLATION');
+    const args = { deliveryId: 'd-1', eventName: 'issues', launchedAt: '2026-01-02T03:04:05.000Z' };
+    for (const mode of ['enforced', 'disabled']) {
+      const payload = JSON.parse(buildRunMicrovmInput(loadConfig({ ...env, AGENT_ISOLATION: mode }), args).runHookPayload);
+      expect(payload.agentIsolation).toBe(mode);
+      expect(parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify(payload) }).payload.agentIsolation).toBe(mode);
+      // A payload without the setting (an older launcher) is accepted; the runner then enforces.
+      delete payload.agentIsolation;
+      expect(parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify(payload) }).payload).not.toHaveProperty('agentIsolation');
+      expect(() => parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify({ ...payload, agentIsolation: 'maybe' }) })).toThrow('agentIsolation');
+    }
+  });
+
   it('parses the label list', () => {
     expect(loadConfig({ ...env, TRIGGER_LABELS: ' ready, agent ,,' }).triggerLabels).toEqual(['ready', 'agent']);
     expect(loadConfig(env).triggerLabels).toEqual([]);
@@ -214,6 +231,7 @@ describe('buildRunMicrovmInput', () => {
       runHookPayload: expect.any(String),
     });
     expect(JSON.parse(input.runHookPayload)).toEqual({
+      agentIsolation: 'enforced',
       version: 1,
       deliveryId: 'd-1',
       eventName: 'issues',
@@ -288,7 +306,7 @@ describe('handleWebhook', () => {
     const payload = JSON.parse(input.runHookPayload);
     for (const reference of Object.values(payload.secrets)) expect(reference).toMatch(/^arn:aws:secretsmanager:/);
     expect(Object.keys(payload).sort()).toEqual(
-      ['bucket', 'configPrefix', 'deliveryId', 'eventKey', 'eventName', 'launchedAt', 'maximumDurationSeconds', 'region', 'resultKeyPrefix', 'secrets', 'version', 'watchdogReserveSeconds'],
+      ['agentIsolation', 'bucket', 'configPrefix', 'deliveryId', 'eventKey', 'eventName', 'launchedAt', 'maximumDurationSeconds', 'region', 'resultKeyPrefix', 'secrets', 'version', 'watchdogReserveSeconds'],
     );
     // The webhook secret's ARN is the launcher's business, not the microVM's.
     expect(serialized).not.toContain(env.WEBHOOK_SECRET_ARN);

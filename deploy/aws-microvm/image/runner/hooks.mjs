@@ -84,6 +84,10 @@ export function parseRunRequest(body) {
     return { [name]: value };
   };
   const stateSettings = { ...optionalSeconds('stateCheckpointSeconds', 3600), ...optionalSeconds('statePendingWaitSeconds', 1800) };
+  // Optional: absent (a launcher older than the setting) means enforced, in the runner.
+  if (payload.agentIsolation !== undefined && payload.agentIsolation !== 'enforced' && payload.agentIsolation !== 'disabled') {
+    throw new Error('runHookPayload.agentIsolation is malformed');
+  }
   const launchedAt = text('launchedAt');
   if (Number.isNaN(Date.parse(launchedAt))) throw new Error('runHookPayload.launchedAt is not a date');
   return {
@@ -93,6 +97,7 @@ export function parseRunRequest(body) {
       ...(payload.stateKey === undefined ? {} : { stateKey: payload.stateKey }),
       ...(payload.notBefore === undefined ? {} : { notBefore: payload.notBefore }),
       ...stateSettings,
+      ...(payload.agentIsolation === undefined ? {} : { agentIsolation: payload.agentIsolation }),
       version: PAYLOAD_VERSION,
       deliveryId: text('deliveryId', DELIVERY_ID_PATTERN),
       eventName: text('eventName', EVENT_NAME_PATTERN),

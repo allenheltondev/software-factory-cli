@@ -7,6 +7,9 @@
 //                 recorded and otherwise the same merge)
 //   state info    schema version and row count of such a file
 //   state copy    a copy of such a file
+//   validate      with --json: prints $UPDRAFT_HOME/fake-validate.json when there is one (a
+//                 test writes the report it wants the runner to see), else a valid report
+//                 whose config has one agent contained by the sandbox runtime
 //
 // The state commands get an environment built from nothing, so the test cannot steer them
 // through variables. They read $UPDRAFT_HOME/fake-state-control.json instead (a test puts it
@@ -23,6 +26,24 @@ const option = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : u
 const home = process.env.UPDRAFT_HOME ?? '';
 /** The schema version this "CLI" supports; a database with a higher one is refused. */
 const SCHEMA_VERSION = 3;
+
+if (args[0] === 'validate') {
+  let report;
+  try {
+    report = JSON.parse(fs.readFileSync(path.join(home, 'fake-validate.json'), 'utf8'));
+  } catch {
+    report = {
+      ok: true,
+      path: path.join(home, 'config.yaml'),
+      state: 'ok',
+      errors: [],
+      warnings: [],
+      config: { agents: { claude: { enabled: true, container: { image: 'microvm', runtime: '/opt/updraft/bin/updraft-sandbox', env: ['ANTHROPIC_API_KEY'] } } } },
+    };
+  }
+  console.log(JSON.stringify(report));
+  process.exit(report.ok ? 0 : 1);
+}
 
 if (args[0] === 'state') {
   let control = {};

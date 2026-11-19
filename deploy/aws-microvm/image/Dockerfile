@@ -115,6 +115,36 @@ RUN set -eu; . /opt/updraft/build.env; \
     fi; \
     chmod -R a+rwX "$PLAYWRIGHT_BROWSERS_PATH"
 
+# The sandbox runtime agents and verify commands run in when AgentIsolation is enforced
+# (sandbox/updraft-sandbox.mjs; README, "Security model"). Updraft starts it as the runtime
+# client of agents.<name>.container. Everything here is root's and not writable by anyone
+# else: the runner refuses to start a job if the runtime could have been replaced. The config
+# file shows the sandbox the browser Playwright installed, which lies outside /usr.
+COPY sandbox/ /opt/updraft/sandbox/
+RUN set -eu; . /opt/updraft/build.env; \
+    PM="$(command -v dnf || command -v microdnf)"; \
+    missing=""; \
+    for pkg in ${ISOLATION_PACKAGES:-}; do \
+      if ! "$PM" install -y "$pkg"; then missing="$missing $pkg"; fi; \
+    done; \
+    "$PM" clean all; \
+    if [ -n "$missing" ]; then \
+      echo "these ISOLATION_PACKAGES could not be installed:$missing (edit image/build.env; empty only with AgentIsolation=disabled)" >&2; exit 1; \
+    fi; \
+    mkdir -p /opt/updraft/bin; \
+    printf '#!/bin/sh\nexec /usr/local/bin/node /opt/updraft/sandbox/updraft-sandbox.mjs "$@"\n' > /opt/updraft/bin/updraft-sandbox; \
+    chown -R root:root /opt/updraft/sandbox /opt/updraft/bin; \
+    chmod 0755 /opt/updraft/bin /opt/updraft/bin/updraft-sandbox /opt/updraft/sandbox; \
+    chmod 0644 /opt/updraft/sandbox/updraft-sandbox.mjs; \
+    printf '{"readOnlyBinds":["%s"],"env":{"PLAYWRIGHT_BROWSERS_PATH":"%s"}}\n' "$PLAYWRIGHT_BROWSERS_PATH" "$PLAYWRIGHT_BROWSERS_PATH" > /etc/updraft-sandbox.json; \
+    chmod 0644 /etc/updraft-sandbox.json; \
+    if [ -n "${ISOLATION_PACKAGES:-}" ]; then \
+      bwrap --version; nft --version; \
+      if ! updraft validate --help | grep -q -- '--json'; then \
+        echo "this Updraft has no 'validate --json', which the runner needs to check that every agent runs in the sandbox; use a newer UPDRAFT_SPEC or a tarball in vendor/ (or ISOLATION_PACKAGES=\"\" with AgentIsolation=disabled)" >&2; exit 1; \
+      fi; \
+    fi
+
 # The runner and its AWS SDK clients.
 COPY runner/ /opt/updraft/runner/
 RUN set -eu; cd /opt/updraft/runner; npm ci --omit=dev --no-fund --no-audit; npm cache clean --force >/dev/null 2>&1 || true

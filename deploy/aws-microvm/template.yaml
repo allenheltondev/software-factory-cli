@@ -44,6 +44,17 @@ Parameters:
     Description: >-
       explicit: send an idle policy that allows the microVM to be idle for its whole
       lifetime. omit: send no idle policy. See "Idle policy" in README.md.
+  AgentIsolation:
+    Type: String
+    Default: enforced
+    AllowedValues: [enforced, disabled]
+    Description: >-
+      enforced: a job starts only after the runner has proven, in that microVM, that agents
+      and verify commands run in the sandbox runtime, cannot read the GitHub App key or the
+      state database, and cannot reach the execution role's credentials. Every enabled agent
+      in the config must use container: { image: microvm, runtime: /opt/updraft/bin/updraft-sandbox }.
+      disabled: agents run as the job user next to the key and the state, as before this
+      setting existed. See "Security model" in README.md.
   EgressNetworkConnectorArn:
     Type: String
     Default: ''
@@ -499,6 +510,7 @@ Resources:
           MAX_DURATION_SECONDS: !Ref MaximumDurationSeconds
           WATCHDOG_RESERVE_SECONDS: !Ref WatchdogReserveSeconds
           IDLE_POLICY_MODE: !Ref IdlePolicyMode
+          AGENT_ISOLATION: !Ref AgentIsolation
           TRIGGER_LABELS: !Ref TriggerLabels
           ACCEPTED_EVENTS: !Ref AcceptedEvents
           PR_BRANCH_PREFIX: !Ref PullRequestBranchPrefix

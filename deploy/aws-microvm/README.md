@@ -9,7 +9,7 @@ each microVM starts from the latest copy and merges what it changed back, so coo
 triage cache, rotation, `updraft stats` and the review loop work across microVMs.
 
 > **Status: written from the documentation, not yet run on AWS.** The launcher's logic and the
-> runner's logic are covered by tests that need no AWS (127 of them, part of `npm test`). The
+> runner's logic are covered by tests that need no AWS (208 of them, part of `npm test`). The
 > SAM template, `deploy.sh`, the Dockerfile and every call to AWS have never been executed
 > against the real services. [What is not verified](#what-is-not-verified) lists each
 > assumption in one place. Expect to fix things on the first deployment.
@@ -57,13 +57,22 @@ Lambda MicroVM  (image/, one per launch, restored from the image snapshot)
         |  state database   <- s3://BUCKET/state/state.db  (GET; its ETag is remembered;
         |                      a pristine copy is kept where only root can read it)
         |  all written to a fresh directory, owner-only, owned by the job user
+        |  AgentIsolation=enforced: a packet filter keeps every user but root from the
+        |    execution role's credentials; `updraft validate --json` must show every agent
+        |    in the sandbox runtime; a probe in the sandbox must not reach the key, the state
+        |    or the credentials. Otherwise the job is not started
         v
    updraft run-event --event-file ... --event-name <event> --delivery-id ... --json
                      --deadline-minutes <n>
         |  as user "updraft" (not root), on the state database it was given; re-checks
-        |  everything against the GitHub API, clones, runs the agent (full-auto) and the
-        |  verify commands, opens the PR; with review/revise configured also runs the
-        |  reviewer, the revisions and the wait for CI, all in this one run
+        |  everything against the GitHub API, clones, opens the PR; with review/revise
+        |  configured also runs the reviewer, the revisions and the wait for CI, all in
+        |  this one run
+        |
+        |  agents and verify commands: started by Updraft through
+        |    /opt/updraft/bin/updraft-sandbox (bubblewrap), which shows them the system,
+        |    the worktree and the clone's git directory, and not the key, the state
+        |    database or the rest of the job's directory
         |
         |  meanwhile, runner: a checkpoint whenever the run's database changed, at most every
         |    StateCheckpointSeconds: the state sync below with `state merge --live`
@@ -146,7 +155,10 @@ hard-coded.
 
    Everything in `config/` (except `*.example.*`) is uploaded to `s3://<bucket>/config/`.
    `config/` is ignored by Git, apart from the example. See
-   [Config and prompts](#config-and-prompts).
+   [Config and prompts](#config-and-prompts). Keep the `container` block the example gives
+   each agent, and give one to every agent you enable: with `AgentIsolation=enforced` a job
+   whose config has an agent without it is not started ([Security model](#security-model)).
+   `updraft validate --json` on your copy shows what the runner will check.
 
 3. **Store the secrets.** The stack created three secrets; their ARNs are stack outputs.
 
@@ -235,6 +247,7 @@ Pass them through `SAM_PARAMETER_OVERRIDES="Key=Value ..."`.
 | `StateVersionRetentionDays` | `30` | How long a replaced version of the shared state database stays recoverable, and how long a database that could not be saved is kept under `state/unsaved/` |
 | `StateCheckpointSeconds` | `20` | While a job runs, what it recorded so far is merged into the shared state whenever its database changed, at most this often (0 to 3600; `0`: only at the end). See [Checkpoints](#checkpoints) |
 | `StatePendingWaitSeconds` | `180` | How long, in all, a job for a pull request that the shared state does not know yet waits inside its microVM for that state to arrive (0 to 1800; `0`: it fails at once). See [A pull request the state does not know yet](#a-pull-request-the-state-does-not-know-yet) |
+| `AgentIsolation` | `enforced` | `enforced`: a job starts only after the runner has shown, in that microVM, that agents and verify commands run in the sandbox runtime and cannot reach the App key, the state database or the execution role. Every enabled agent in the config needs the sandbox `container` block. `disabled`: agents run next to all three, as before this setting existed. See [Security model](#security-model) |
 | `IdlePolicyMode` | `explicit` | See [Idle policy](#idle-policy) |
 | `EgressNetworkConnectorArn` | empty | A VPC egress network connector. Empty uses the Lambda-provided internet egress connector |
 | `IngressNetworkConnectorArn` | empty | Empty uses the Lambda-provided `NO_INGRESS` connector. Set it only for debugging, for example to the `SHELL_INGRESS` connector |
@@ -874,6 +887,7 @@ What can go wrong, either way:
 | Delivery shows `500` | The launcher's log group (`LauncherLogGroup` output). Each line is JSON with the `deliveryId`. Typical causes: the image does not exist or has no active version (`ResourceNotFoundException`), the account's MicroVM memory quota is used up (`ServiceQuotaExceededException`), a missing permission, a rejected parameter (`ValidationException`, see [Idle policy](#idle-policy)) |
 | Delivery shows `429` or `503` | HTTP API throttling (`WebhookRateLimit`) |
 | `202`, but no result object | The microVM's log stream in `/aws/lambda-microvms/<image-name>`. `aws lambda-microvms get-microvm --microvm-identifier <id>` shows `state` and `stateReason`. A microVM whose `/run` hook fails or times out is terminated without ever running |
+| Result has `errorCode: isolation-not-enforced` | The job was not started because the boundary around agents could not be shown to hold. `isolation.failedStep` is `setup`, `packet filter`, `config` or `self-test`, and `isolation.problems` lists each reason: an agent without the sandbox `container` block or with `triage` configured (fix the config), `nft` or `bwrap` missing or refused by the kernel (see "What is not verified"), a file of the state directory readable inside the sandbox, or a credential address that answered. The delivery record is released, so a redelivery tries again once it is fixed. `AgentIsolation=disabled` skips all of this, see [Security model](#security-model) |
 | Result has `outcome: runner_error` | `error` says which step failed: reading the event or config from S3, a secret that is empty or not a PEM key, no `config.yaml`, a shared state object that is not a SQLite database (restore an earlier version, see [Shared state](#shared-state)), Updraft not startable |
 | Result has `outcome: state_not_saved` (`state.sync.saved: false` with a `notSavedReason`) | The job ran (`jobOutcome` says how it went), but what it changed in the state database since its last checkpoint was not saved; the log has a `STATE NOT SAVED` line. The run's database is kept as the backup `state.unsaved.manifestKey` names (when `state.unsaved.complete` is true); [When state is not saved](#when-state-is-not-saved) says how to merge it or restore from GitHub. `notSavedCode` is `merge-failed` (`updraft state merge` exited non-zero; its last output is in the reason), `newer-schema` (the image's Updraft is older than the shared database; rebuild the image), `merged-database-unreadable` or `merged-database-refused` (the merged file failed a check), `attempts-exhausted` (four attempts each lost to another microVM), `timed-out` or `no-time` (the microVM was at its end; raise `WatchdogReserveSeconds` or `MaximumDurationSeconds`), `shared-database-unreadable` (the object in S3 is damaged; restore a version), `no-run-database`, `merge-report-missing`. [Concurrency model](#concurrency-model) says what the missing history means |
 | Result has `outcome: failed`, `exitCode: 6`, `updraftOutcome: state-pending` | A pull request event arrived before the state of the run that opened the pull request did, and it did not arrive within `StatePendingWaitSeconds` (`state.pending`). Redeliver the delivery once that run has saved state (its first checkpoint is enough); if that run is gone, redeliver the pull request's `issues` delivery first. See [A pull request the state does not know yet](#a-pull-request-the-state-does-not-know-yet) |
@@ -1197,62 +1211,116 @@ The webhook body is treated as a hint about which issue or pull request to look 
 text: the delivery id, the event name, S3 keys, two secret ARNs and time limits. With
 `NO_INGRESS` there is no endpoint to connect to; only Lambda calls the hooks.
 
-**What an agent inside the microVM can reach.** Be clear about this one. Agents run in
-full-auto mode on issue text, and the microVM is the only boundary around them:
+**Who is trusted inside the microVM.** The runner (root, holds the execution role) and
+`updraft run-event` (the job user, holds the GitHub App key and the state database) are
+trusted. The agent CLIs and the repository's verify commands are not: they act on issue text
+and run code from a branch. With `AgentIsolation=enforced`, the default, the two are kept
+apart, and a job does not start unless that has been shown in the same microVM.
 
-- *The network.* Egress is the public internet (or what your VPC connector allows).
-- *The agents' API keys.* All of them are in the environment of `run-event` and of every
-  agent it starts: with two agents configured, each agent can read the other's key.
-- *The GitHub App's private key.* Updraft runs as the job user and reads the key file, and it
-  starts the agent as the same user, so the agent can read the file. Updraft does not put the
-  key or its path in the agent's environment, and the runner starts Updraft with an
-  environment built from nothing (no `AWS_*`, no run request). That prevents accidents; it
-  does not stop an agent that goes looking.
-- *The state database on its disk.* The job's copy is `$UPDRAFT_HOME/state.db`, owned by the
-  job user, and the agent runs as that user. It can read all of it: the titles of issues
-  from every configured repository, the text of reviews as Updraft snapshotted them, run
-  history, pull request numbers. And it can write to it: what the agent changes in that file
-  is, to the merge, what the run changed, and is uploaded to the shared database. Reviewer
-  verdicts, the record of which reviews were handled and which pull requests are Updraft's
-  all live there.
-- *The execution role.* The documentation describes the microVM's AWS credentials as provided
-  through IMDSv2 and says nothing about restricting which process may ask for them (no hop
-  limit, no per-user rule). Assume any process in the microVM can obtain the role's
-  credentials. With them it can read the two secrets again, read `config/` and `events/` of
-  this deployment (including other deliveries' webhook bodies), read and replace
-  `state/state.db` (the current object; not its earlier versions, which it can neither read
-  nor delete), write objects under `results/`, delete items from the delivery table (which
-  only makes a redelivery possible again, or ends a coalescing lease early), and terminate
-  microVMs of this image, its own and other jobs'. It cannot write the config, read the
-  webhook secret, start microVMs or touch anything else in the account.
+**How agents are kept apart (`AgentIsolation=enforced`).** Three parts, all in the image:
 
-The runner keeps what it can out of the job user's hands: `updraft state merge` and
+- *A sandbox for every agent and verify command.* The config gives every enabled agent
+  `container: { image: microvm, runtime: /opt/updraft/bin/updraft-sandbox, env: [<its key>] }`.
+  Updraft's container mode ([docs/isolation.md](../../docs/isolation.md)) then starts the
+  agent, each verify command and each reviewer through that runtime with its usual mount
+  plan. The runtime (`image/sandbox/updraft-sandbox.mjs`) speaks the part of the docker
+  command line Updraft uses and builds each sandbox with bubblewrap. It gets new mount, PID,
+  IPC, UTS and user namespaces, no capabilities, `no_new_privs` and a new session. Its root
+  file system is built from an allowlist: read-only `/usr` and the other system
+  directories, a filtered `/etc` without `shadow`, `sudoers` or SSH keys, the browser
+  directory, a new `/proc` and `/dev`, an empty `/tmp`, and exactly the worktree and
+  git-directory binds Updraft asks for. The job's state directory is not in it. Inside, the
+  App key, `state.db`, the config, the event and the run logs do not exist, and the
+  directories above the worktree are empty stand-ins. The command gets only the variables
+  named in `env` (plus `HOME`, `PATH` and `LANG`), only its three standard streams, and no
+  view of processes outside the sandbox, so it can neither see nor signal `run-event`. A
+  verify command gets none of the agent's variables. Each agent gets its own key, not the
+  other agents'.
+- *A packet filter for the execution role.* Before anything of the job exists, the runner
+  installs an nftables table that rejects traffic from every user but root to the instance
+  metadata service (`169.254.169.254`, `fd00:ec2::254`), to the container-credential
+  addresses (`169.254.170.2`, `169.254.170.23`, `fd00:ec2::23`), to any credential address
+  the runner's own environment names, and to the lifecycle hook port on loopback. The match
+  is on the socket owner's real uid, so it holds inside the sandbox's user namespace too.
+  The runner's own SDK calls run as root and are not affected. `run-event` needs no AWS
+  credentials.
+- *A check before every job.* After the state directory is filled and before `run-event`
+  starts, the runner checks four things and starts nothing if any of them fails:
+  1. it asks `updraft validate --json` (as the job user) what the config means, and refuses
+     a config in which an enabled agent has no such container block, a different runtime or
+     image, `container.args`, an unknown `network`, or a `triage` block (triage starts an
+     agent CLI outside any container);
+  2. it runs a probe through the sandbox runtime with the same arguments Updraft uses for an
+     agent, bound into a directory inside the state directory as a worktree is. The probe
+     tries to read and open for writing the key, the state database, the config and the
+     event, list the state directory, create a file there, see and signal the runner,
+     receive an inherited file descriptor and inherited variables, and connect to every
+     blocked address;
+  3. it runs the same connection attempts as the plain job user, and tries to read the
+     runner's environment from `/proc`;
+  4. it checks that the packet filter is still in place.
+
+  The probe only reports, and the runner judges from that report and from what it sees
+  outside. A failure is a `runner_error` with `errorCode: isolation-not-enforced` and the
+  reasons in `isolation.problems`. The log says `ISOLATION NOT ENFORCED: the job was NOT
+  started`, and the delivery record is released. A passed check is
+  `isolation.enforced: true` in the result.
+
+**What an agent can still reach with isolation enforced.**
+
+- *The network.* Egress is the public internet (or what your VPC connector allows), and the
+  sandbox shares the microVM's network, loopback and abstract Unix sockets included. An agent
+  can send anything it can see (the repository, its own API key) anywhere. Nothing in the
+  image listens on loopback except the hook port, which is blocked for non-root.
+- *Its own API key*, and nothing else of the agent-environment secret. Scope and cap the key.
+- *The worktree and the clone's objects and refs.* As [docs/isolation.md](../../docs/isolation.md)
+  says under "What it does not protect against": the agent writes its branch and can write
+  other loose refs and objects in the job's clone. The clone exists only for this job, and
+  `run-event` publishes only the job branch. Updraft keeps the clone's hooks and Git config
+  out of the agent's reach, so Git run by `run-event` afterwards obeys nothing the agent
+  wrote.
+- *The kernel.* bubblewrap uses unprivileged user namespaces. A kernel exploit from inside
+  the sandbox defeats it; the microVM is then the remaining boundary, as it was before.
+- *What `run-event` decides from what the agent produced.* A reviewer's verdict is the text
+  the reviewer agent printed. An agent cannot write the state database, but a reviewer agent
+  that is talked into it can still say "ready to merge". Keep `autoMerge` off unless branch
+  protection requires a person's approval.
+
+**With `AgentIsolation=disabled`.** The runner skips the filter, the config check and the
+probe, writes `isolation.mode: disabled` and a warning into every result, and logs a
+`WARNING` line. Agents then run as the job user, next to everything `run-event` has:
+
+- they can read the GitHub App's private key, and with it act as the App on every repository
+  the App is installed on until the key is revoked;
+- they can read and write `$UPDRAFT_HOME/state.db`. What an agent writes there is, to the
+  merge, what the run changed, and it is uploaded for later jobs: reviewer verdicts, which
+  reviews were handled, which pull requests are Updraft's;
+- they can get the execution role's credentials from the metadata service. With them a
+  process can read the two secrets, read `config/` and `events/` (other deliveries' webhook
+  bodies too), read and replace `state/state.db` (not its earlier versions), write under
+  `results/` and `state/unsaved/`, delete delivery records, and terminate microVMs of this
+  image. It cannot write the config, read the webhook secret, start microVMs or touch
+  anything else in the account;
+- every agent sees every agent's key, because they are all in the job user's environment.
+
+Use `disabled` only for an image that cannot run the sandbox (see "What is not verified"),
+and then keep `autoMerge` off, install the App on the job repositories only, protect base
+branches, and rotate the key if a run looks wrong.
+
+**What the runner keeps from the job user in either mode.** `updraft state merge` and
 `updraft state info` run as the job user with an environment built from nothing, without AWS
-credentials and without the agents' keys; the merge base is a copy only root can read; root
+credentials and without the agents' keys. The merge base is a copy only root can read. Root
 fills each scratch directory before handing it over, reads the merged file without following
 links, and uploads only bytes that are a SQLite database of plausible size. Before the merge
-it kills what is left of the job's process group. That makes the merge honest about the file
-it was given. It does not make the file honest.
-
-So an agent that is talked into it by an issue's text can obtain the App's private key, and
-with it act as the App on every repository the App is installed on until the key is revoked;
-and it can alter the shared state that later runs decide from. What limits that today: only
-`allowedActors` can start a job at all; install the App on the job repositories only and
-grant only the permissions above; protect the base branches on GitHub, so that the App's
-Contents permission cannot push to them directly; rotate the key if a run looks wrong; keep
-`autoMerge` off, because with it a "ready to merge" verdict in the state database, which an
-agent can write, becomes a merge (branch protection that requires a person's approval is
-what stops that, where it is on). A corrupted shared database is recoverable from its earlier
-versions. Two changes would close most of the gap, and neither is built (see below): a
-firewall rule in the microVM that keeps the job user away from the metadata endpoint, and
-giving the job a short-lived installation token, minted outside the agent's reach, instead of
-the key. Neither would keep the agent from the state database on its disk; that needs a
-separate OS user for the agent.
+it kills what is left of the job's process group. With isolation enforced, the database
+`run-event` used was not writable by any agent, so what is merged is what Updraft recorded.
 
 **Roles.** The launcher's role can put objects under `events/`, put and delete items in the
 delivery table, read the webhook secret, call
 `lambda:RunMicrovm` on the one image and pass the one execution role. The build role can read
-`image/*` and write build logs. The execution role is listed above; the shared state added
+`image/*` and write build logs. What the execution role can do is listed under
+`AgentIsolation=disabled` above; with isolation enforced only the runner (root) can use it.
+The shared state added
 `s3:GetObject` and `s3:PutObject` on `state/*` and the right to list that prefix, and nothing
 else (no delete, no version actions; a versioned bucket needs none for an ordinary write).
 Checkpoints, the wait for newer state and the unsaved copies under `state/unsaved/` use those
@@ -1262,7 +1330,8 @@ The bucket blocks public access, refuses non-TLS requests, keeps replaced versio
 while and expires `events/` and `results/`.
 
 **Who can read the shared state.** Anyone with `s3:GetObject` on the bucket's `state/`
-prefix: the execution role (so, in effect, every job and every agent), and whoever your
+prefix: the execution role (so every job's runner, and with `AgentIsolation=disabled` every
+agent), and whoever your
 account's IAM policies give read access to the bucket, `deploy.sh state pull` included. With
 `s3:GetObjectVersion` also every version of the last `StateVersionRetentionDays` days, which
 still holds rows that Updraft pruned since. The object is encrypted at rest with S3-managed
@@ -1338,9 +1407,13 @@ What the documentation says about what is billed and limited:
 - **Automatic retry.** A failed launch is a 500 in the App's delivery list and a failed job
   is a result object; nobody redelivers either automatically. A microVM that dies without
   reporting keeps its delivery record until the window has passed.
-- **Keeping the App key, the execution role and the state database away from the agent**
-  (metadata-endpoint firewall for the job user; installation token instead of the key; a
-  separate OS user for the agent). Until then `autoMerge` should stay off.
+- **A short-lived installation token instead of the App key.** With isolation enforced the
+  key is out of the agents' reach, but `run-event` still holds it for the whole job. Minting
+  a token in the runner and giving `run-event` only that would limit what a compromise of
+  Updraft itself could do.
+- **An egress allowlist for agents.** The sandbox shares the microVM's network. A proxy that
+  only lets agents reach their model API and package registries would need a separate
+  network namespace with a route to it.
 - **Kiro in the image.** Described under [The review loop](#the-review-loop), not built or
   tried.
 - **Cleanup of old image versions**, alarms (a `STATE NOT SAVED` log line would be the first
@@ -1572,6 +1645,39 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
     to reach a microVM at all, and the hold lasts `--deadline-minutes` plus 15 minutes: a
     redelivery before that ends `duplicate-delivery`, as before.
 
+42. **The sandbox runtime in a MicroVM.** It has run for real only on this repository's
+    Linux test hosts, with bubblewrap from the distribution and unprivileged user namespaces
+    allowed. Not known: whether the MicroVM's guest kernel allows unprivileged user
+    namespaces (`user.max_user_namespaces`, and no distribution switch that turns them off),
+    and whether Amazon Linux 2023 packages bubblewrap under the name `bubblewrap`. If either
+    fails, the self-test fails and every enforced job is refused with the reason. The image
+    build fails if the package does not exist.
+43. **The packet filter in a MicroVM.** Assumed: that the guest kernel has nf_tables with the
+    `inet` family, the output hook and `meta skuid`; that the runner, as root, may load a
+    table; and that `nftables` is the package's name. The runner reads the table back after
+    installing it. The self-test checks from inside and outside the sandbox that the
+    credential addresses do not answer the job user. On a test host an address that answers
+    is caught (a local listener stood in for it); the rule itself has not been loaded
+    anywhere.
+44. **Where a MicroVM's credentials come from.** The MicroVMs documentation names IAM
+    credentials through IMDSv2 and no other address. The filter also blocks the ECS and EKS
+    container-credential addresses and whatever `AWS_CONTAINER_CREDENTIALS_FULL_URI`,
+    `AWS_EC2_METADATA_SERVICE_ENDPOINT` or `AWS_LAMBDA_RUNTIME_API` name in the runner's
+    environment. If credentials are also delivered another way (a file, a socket), the
+    filter does not cover it, and the self-test does not look for it.
+45. **Agent CLIs inside the sandbox.** The sandbox shows `/usr` (Node.js and the npm global
+    packages live in `/usr/local`), a filtered `/etc` and an empty in-memory home. Not tried:
+    Claude Code, Codex or Kiro under it. A CLI that wants a writable path outside the home,
+    the worktree and `/tmp`, or a file in `/etc` that is filtered out, fails inside the
+    sandbox. The run then fails with the CLI's own error.
+46. **A headless browser inside the sandbox.** `/etc/updraft-sandbox.json` shows
+    `PLAYWRIGHT_BROWSERS_PATH` to the sandbox. Playwright starts Chromium with Chromium's own
+    sandbox off unless told otherwise. A test that turns it on needs nested user namespaces,
+    which bubblewrap allows unless the kernel does not. Not tried.
+47. **`updraft validate --json` in the image.** The runner needs an Updraft that has it; the
+    published 0.1.0 does not. Without it every enforced job is refused at the config step,
+    and the message says so.
+
 ## Tests
 
 `npm test` at the repository root runs `deploy/aws-microvm/test/*.test.mjs` with the rest of
@@ -1588,6 +1694,36 @@ the suite:
   launch, table unreachable), and coalescing by pull request (a burst, the lease's last
   second, other pull requests, redelivery, a failed launch, table unreachable, off).
 - `runner-hooks.test.mjs`: hook routing over a real HTTP server.
+- `sandbox-args.test.mjs`: the sandbox runtime's translation, on every OS. The docker command
+  lines are built with Updraft's own `buildContainerRunArgs` and `gitMounts`, so a change to
+  them breaks the test. Every flag Updraft can emit is understood. What cannot be honoured
+  is refused with exit 125. The bwrap command line is built from the allowlist, `/etc` is
+  filtered, and the config file is validated.
+- `sandbox-exec.test.mjs` (Linux with bubblewrap and unprivileged user namespaces; skipped
+  with the reason otherwise): the runtime started for real. Covered: streams and exit codes;
+  a secret next to the bound worktree that cannot be read, written or listed; read-only binds
+  that stay read-only; processes outside that cannot be seen or signalled; only the named
+  variables and none of the caller's file descriptors arriving; no capabilities;
+  `--network none`; `stop`, `rm -f` and `container inspect` from another process; dying with
+  the client; forwarded SIGTERM; a config file others can write being refused; and running
+  as an unprivileged user.
+- `sandbox-updraft.test.mjs` (same hosts): Updraft's real container mode drives the runtime.
+  The worktree is laid out as in the microVM, under the job's Updraft home next to a key and a
+  state database. An agent commits inside the sandbox and reports that the key, the state
+  database and the config do not exist for it and that it got its API key and nothing else.
+  A verify command in its own sandbox checks the same, and the run succeeds.
+- `runner-isolation.test.mjs`: the packet filter's ruleset and its read-back (with a stand-in
+  `nft`); the credential addresses; the config check; the judging of probe reports; the probe
+  started with exactly Updraft's arguments; and the example config passing Updraft's
+  validation and the agent check. On POSIX hosts the self-test fails against a "runtime"
+  that runs the command on the host (the key, the state and the job directory all within
+  reach) and when the filter is missing. Where the sandbox can run, it passes against the
+  real runtime and fails when that runtime is configured to show the state directory, when a
+  credential address answers (a local listener stands in for one the filter did not block),
+  or when the runtime cannot start. `runJob` with isolation enforced starts nothing without
+  the runtime, without the filter, with an uncontained agent or when the self-test reaches
+  the key, and releases the delivery each time. It runs the job once the self-test passed,
+  and with `disabled` as before, with the warning.
 - `deploy-state.test.mjs` (POSIX hosts with `bash`): `deploy.sh state unsaved` and `state
   recover` run for real against a stand-in `aws` on `PATH` (`fake-aws.mjs`: a directory for
   the bucket, ETags, the two write conditions) and a stand-in `updraft` that records how the

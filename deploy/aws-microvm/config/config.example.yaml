@@ -25,12 +25,23 @@ github:
     privateKeyPath: ./github-app.pem   # leave as is
     commitAsApp: true                  # commits are authored by <app-slug>[bot]
 
+# Every enabled agent runs in the image's sandbox runtime (README, "Security model"). With
+# AgentIsolation=enforced (the default) the runner refuses to start a job unless each enabled
+# agent has exactly this container block: image microvm, runtime /opt/updraft/bin/updraft-sandbox,
+# no `args`, and `network` unset, host or none. Inside it the agent and every verify command see
+# the system, the worktree and the clone's git directory, and not the App key, the state
+# database or the rest of the job's directory. `env` names the variables passed in, here the
+# agent's key from the agent-environment secret. Do not configure `triage`: it starts an agent
+# CLI outside any container, and an enforced job refuses it.
 agents:
   claude:
     maxConcurrent: 1
-    # Full-auto (bypassPermissions) is the default; the microVM is the isolation boundary.
-    # Do not set `container:` here.
+    # Full-auto (bypassPermissions) is the default.
     # args: [--model, sonnet, --max-turns, "80"]
+    container:
+      image: microvm
+      runtime: /opt/updraft/bin/updraft-sandbox
+      env: [ANTHROPIC_API_KEY]
   codex: { enabled: false }
   kiro: { enabled: false }
   # For the review loop, a second agent that reviews what the first wrote. It needs its CLI
@@ -39,6 +50,10 @@ agents:
   #   {"ANTHROPIC_API_KEY": "...", "CODEX_API_KEY": "..."}
   # codex:
   #   maxConcurrent: 1
+  #   container:
+  #     image: microvm
+  #     runtime: /opt/updraft/bin/updraft-sandbox
+  #     env: [CODEX_API_KEY]
 
 pools:
   general:

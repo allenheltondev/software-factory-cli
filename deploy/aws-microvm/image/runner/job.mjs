@@ -1,4 +1,5 @@
 // One job: prepare a fresh state directory (with the shared state database, see state.mjs),
+// make sure agents cannot reach it (isolation.mjs; unless AgentIsolation is disabled),
 // run `updraft run-event` as the unprivileged job user, merge what it changed back into the
 // shared database, report the outcome to S3, terminate the microVM. Everything that talks to AWS or the
 // operating system's process table comes in through `deps`, so this file is tested with
@@ -8,6 +9,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { IsolationError, beginIsolation, isolationMode, verifyIsolation } from './isolation.mjs';
 import {
   DEFAULT_CHECKPOINT_SECONDS,
   REPORT_RESERVE_MS,
@@ -207,6 +209,8 @@ export function watchdogBudgetMs(payload, nowMs) {
  * @param {number} [deps.killGraceMs] SIGTERM to SIGKILL
  * @param {number} [deps.retryDelayMs]
  * @param {typeof nodeSpawn} [deps.spawn]
+ * @param {object} [deps.isolation] the sandbox runtime and the packet filter (isolation.mjs,
+ *   run-job.mjs); required unless the payload says agentIsolation: "disabled"
  * @returns {Promise<object>} the result document that was written to S3
  */
 export async function runJob(request, deps) {
@@ -236,7 +240,13 @@ export async function runJob(request, deps) {
     // after run-event exited STATE_PENDING_EXIT. unsaved: set when the final sync failed.
     state: payload.stateKey ? { key: payload.stateKey, snapshot: null, checkpoints: null, pending: null, sync: notAttempted(), unsaved: null } : null,
     logs: [],
+    // Whether agents and verify commands were kept away from the App key, the state database
+    // and the execution role (isolation.mjs). mode: enforced | disabled. enforced is true only
+    // once the per-job self-test has passed; with mode disabled, warning says what that gives up.
+    isolation: { mode: isolationMode(payload), enforced: false, warning: null, checks: null, problems: [] },
     error: null,
+    // Set for a runner error with a cause of its own: isolation-not-enforced.
+    errorCode: null,
     stderrTail: '',
     startedAt: new Date(startedAt).toISOString(),
     finishedAt: null,
@@ -260,8 +270,19 @@ export async function runJob(request, deps) {
   // database worth merging.
   let stateToSync;
   try {
+    // First of all, before a secret is fetched or a job process exists: the packet filter
+    // that keeps every user but root from the execution role's credentials.
+    result.isolation = await beginIsolation(payload, deps);
     const { stateDir, state } = await prepare(payload, deps);
     if (result.state && state) result.state.snapshot = state.snapshot;
+    // Nothing is started unless the boundary around agents is proven in this microVM: the
+    // config contains every agent, and a probe in the sandbox cannot reach the key, the state
+    // or the credentials. Throws IsolationError; the job then never starts.
+    await verifyIsolation(
+      result.isolation,
+      { stateDir, protectedFiles: [KEY_FILE, STATE_DB_FILE, CONFIG_FILE, EVENT_FILE].map((name) => path.join(stateDir, name)) },
+      deps,
+    );
     // A pull request event that other deliveries were coalesced into: start only when the
     // launcher has stopped coalescing, so that this run sees all of them on GitHub.
     const waitMs = Math.min(MAX_NOT_BEFORE_WAIT_MS, payload.notBefore ? Date.parse(payload.notBefore) - now() : 0);
@@ -371,6 +392,13 @@ export async function runJob(request, deps) {
   } catch (error) {
     result.outcome = stopRequested ? 'terminated' : 'runner_error';
     result.error = error instanceof Error ? error.message : String(error);
+    if (error instanceof IsolationError) {
+      // A failure of its own kind: nothing was started, and nothing may be until it is fixed.
+      result.outcome = 'runner_error';
+      result.errorCode = 'isolation-not-enforced';
+      result.isolation = { ...result.isolation, enforced: false, failedStep: error.step, problems: error.problems };
+      log(`ISOLATION NOT ENFORCED: the job was NOT started. ${error.step}: ${error.problems.join('; ')}`);
+    }
     log(`job could not run: ${result.error}`);
   }
 
@@ -573,6 +601,8 @@ function jobEnvironment(payload, stateDir, agentEnv, deps) {
   // Where the image keeps its headless browser; without it Playwright looks in the job
   // user's empty cache and reports the browser as not installed.
   if (baseEnv.PLAYWRIGHT_BROWSERS_PATH) env.PLAYWRIGHT_BROWSERS_PATH = baseEnv.PLAYWRIGHT_BROWSERS_PATH;
+  // Settings of the sandbox runtime client that Updraft starts (tests point it at a config).
+  Object.assign(env, deps.isolation?.runtimeEnv);
   // Deliberately absent: AWS_* (the runner's credentials and region), anything naming the
   // key file, and the run request. See "Security model" in the README for what this does
   // and does not achieve.

@@ -47,6 +47,9 @@ function request(overrides = {}) {
       maximumDurationSeconds: 7200,
       watchdogReserveSeconds: 300,
       launchedAt: new Date(START).toISOString(),
+      // These suites are about the job and its state as they were before isolation existed;
+      // runner-isolation.test.mjs covers `enforced`, which is what an absent value means.
+      agentIsolation: 'disabled',
       ...overrides,
     },
   };
