@@ -78,12 +78,62 @@ It is off unless configured. Without `github.app`, nothing described here applie
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `github.app.appId` | required | The App's ID (a number) or client ID (a string such as `Iv23li...`) |
-| `github.app.privateKeyPath` | required | Path of the PEM private key file, relative to the config file's directory. The key itself is never in the config. `UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH` in the worker's environment names another file (also relative to the config file's directory) and wins |
+| `github.app.privateKeyPath` | one of the two | Path of the PEM private key file, relative to the config file's directory. The key itself is never in the config. `UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH` in the worker's environment names another file (also relative to the config file's directory) and wins |
+| `github.app.tokenFile` | one of the two | Instead of the key: path of a [token file](#a-token-file-instead-of-the-key), relative to the config file's directory. `UPDRAFT_GITHUB_APP_TOKEN_FILE` in the worker's environment names another file and wins over both settings |
 | `github.app.installationId` | looked up per repository | Use this installation for every repository. Leave it out when repositories are under different owners: each owner has its own installation, and the worker finds the right one per repository |
 | `github.app.commitAsApp` | `false` | Live mode: agents commit as the bot. See [Commit authorship](#commit-authorship) |
 
 The private key is read each time the worker signs in to GitHub (for a new token, at least
 once an hour), so a replaced key file is picked up without a restart.
+
+### A token file instead of the key
+
+Whoever holds the private key can mint a token for *every* installation of the App. A worker
+that should reach only some repositories, such as one job on a shared machine (Updraft Cloud
+runs each job like this), can be given installation tokens instead. Something else holds the
+key, mints a token with only the repositories and permissions the job needs, and writes it to a
+file the worker reads:
+
+```json
+{
+  "app": { "id": 123456, "slug": "updraft", "name": "Updraft" },
+  "installationId": 55,
+  "token": "ghs_...",
+  "expiresAt": "2026-11-19T21:00:00Z",
+  "permissions": { "contents": "write", "issues": "write", "pull_requests": "write" },
+  "repositories": ["acme/web"],
+  "bot": { "id": 98765, "login": "updraft[bot]" }
+}
+```
+
+`app`, `installationId`, `token` and `expiresAt` are required. `token` may contain only letters,
+digits, `_`, `.` and `-`; anything else, such as a line break, is refused before it reaches a
+request header. `name`, `permissions`, `repositories` and `bot` are optional:
+- **`permissions`:** without it the permissions are unknown, not empty. `updraft doctor` then says
+  it can't check them, instead of reporting each one as missing.
+- **`repositories`:** with it, the worker asks for a token only for those repositories and says
+  so for any other.
+- **`bot`:** without it, the bot user is looked up once with the token, for `commitAsApp`.
+
+The file must be for the configured App, and the worker checks that on every read. That way a
+refresh that wrote another App's or another installation's token can't switch who the worker acts as:
+- **A numeric `github.app.appId`,** quoted or not, must equal `app.id`.
+- **A client ID** in `github.app.appId` must equal `app.clientId`, which the file must then state.
+- **`github.app.installationId`,** when set, must equal `installationId`.
+
+How the worker uses the file:
+- **It reads the file again for every token it needs,** so the writer replaces the token before
+  it expires, and the worker picks up the new one with no restart. Installation tokens last an
+  hour.
+- **When a token is about to expire,** with under ten minutes left, it's still used, with one
+  warning in the log.
+- **An expired token stops the request.** The error says the file was not replaced.
+- **A token GitHub rejected** isn't used again until the file holds another.
+
+Set `github.app.tokenFile` instead of `privateKeyPath`, or set `UPDRAFT_GITHUB_APP_TOKEN_FILE`.
+`updraft validate` and `updraft doctor` read the file, and doctor also reports how long the
+token has left. Like the key path, the variable is never passed to an agent. Keep the file
+readable only by the worker's user (mode 600) and outside every clone.
 
 ## What changes
 

@@ -106,4 +106,20 @@ describe('updraft validate --json', () => {
     expect(report.ok).toBe(false);
     expect(report.errors.map((e) => e.path)).toContain('github.app.privateKeyPath');
   });
+
+  it('checks a github.app token file instead of a key', async () => {
+    const missing = fakeContext();
+    writeFileSync(missing.paths.configFile, stringify({ ...validConfig(), github: { app: { appId: 1, tokenFile: './app-token.json' } } }));
+    expect(await validateCommand(missing, { json: true })).toBe(EXIT.FAILURE);
+    const report = JSON.parse(missing.out.text) as { ok: boolean; errors: Array<{ path: string; message: string }> };
+    expect(report.errors).toEqual([expect.objectContaining({ path: 'github.app.tokenFile', message: expect.stringMatching(/does not exist/) })]);
+
+    const present = fakeContext();
+    writeFileSync(present.paths.configFile, stringify({ ...validConfig(), github: { app: { appId: 1, tokenFile: './app-token.json' } } }));
+    writeFileSync(
+      join(present.paths.configDir, 'app-token.json'),
+      JSON.stringify({ app: { id: 1, slug: 'updraft' }, installationId: 5, token: 'ghs_x', expiresAt: '2099-01-01T00:00:00Z' }),
+    );
+    expect(await validateCommand(present)).toBe(EXIT.OK);
+  });
 });

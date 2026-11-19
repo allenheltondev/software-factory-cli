@@ -1196,9 +1196,16 @@ describe('LiveExecutor: committing as the GitHub App (github.app.commitAsApp)', 
     expect(getRun(db, c.run.id)!.checkoutPath).toBeNull();
   });
 
-  it("keeps the App's key path, like the GitHub tokens, out of the agent's environment", () => {
+  it("keeps the App's key path and token file, like the GitHub tokens, out of the agent's environment", () => {
     const env = agentLookupEnv(
-      { PATH: '/bin', GH_TOKEN: 'a', GITHUB_TOKEN: 'b', UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH: '/secrets/app.pem', KIRO_API_KEY: 'k' },
+      {
+        PATH: '/bin',
+        GH_TOKEN: 'a',
+        GITHUB_TOKEN: 'b',
+        UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH: '/secrets/app.pem',
+        UPDRAFT_GITHUB_APP_TOKEN_FILE: '/secrets/app-token.json',
+        KIRO_API_KEY: 'k',
+      },
       { env: { EXTRA: '1' } },
     );
     expect(env).toEqual({ PATH: '/bin', KIRO_API_KEY: 'k', EXTRA: '1' });

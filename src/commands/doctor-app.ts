@@ -4,18 +4,29 @@
 // check in doctor.ts, which asks who the worker is.
 import { statSync } from 'node:fs';
 import { publishMode, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
-import { APP_DOC, APP_KEY_PATH_ENV, loadAppPrivateKey, missingAppPermissions, requiredAppPermissions, type AppAuth } from '../github/app-auth.js';
-import { appPrivateKeyPath, type GitHubAppConfig } from '../github/credentials.js';
+import { APP_DOC, APP_KEY_PATH_ENV, APP_TOKEN_FILE_ENV, loadAppPrivateKey, missingAppPermissions, requiredAppPermissions, type AppAuth } from '../github/app-auth.js';
+import { appPrivateKeyPath, appTokenFilePath, type GitHubAppConfig } from '../github/credentials.js';
+import { loadTokenFile } from '../github/token-file-auth.js';
 import type { CheckResult, CheckStatus } from './doctor.js';
 
 type Check = Omit<CheckResult, 'name'>;
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-/** Why the configured private key cannot be used, or null. Offline: reads and parses the file. */
+/** The config field a credential problem is about: the token file when one is used, else the key. */
+export function appCredentialField(app: GitHubAppConfig, o: { configDir: string; env: NodeJS.ProcessEnv }): string {
+  return appTokenFilePath(app, o) ? 'github.app.tokenFile' : 'github.app.privateKeyPath';
+}
+
+/**
+ * Why the App's configured credential cannot be used, or null. Offline: reads and parses the token
+ * file when one is used (token-file-auth.ts), else the private key.
+ */
 export function appKeyProblem(app: GitHubAppConfig, o: { configDir: string; env: NodeJS.ProcessEnv }): string | null {
   try {
-    loadAppPrivateKey(appPrivateKeyPath(app, o));
+    const tokenFile = appTokenFilePath(app, o);
+    if (tokenFile) loadTokenFile(tokenFile);
+    else loadAppPrivateKey(appPrivateKeyPath(app, o));
     return null;
   } catch (err) {
     return message(err);
@@ -40,6 +51,8 @@ export function appKeyChecks(
   app: GitHubAppConfig,
   o: { configDir: string; env: NodeJS.ProcessEnv; platform: NodeJS.Platform; fileMode?: (path: string) => number | null },
 ): { ok: boolean; checks: Check[] } {
+  const tokenFile = appTokenFilePath(app, o);
+  if (tokenFile) return tokenFileChecks(tokenFile, app, o);
   const path = appPrivateKeyPath(app, o);
   const from = o.env[APP_KEY_PATH_ENV]?.trim() ? ` (from ${APP_KEY_PATH_ENV})` : '';
   const problem = appKeyProblem(app, o);
@@ -53,6 +66,45 @@ export function appKeyChecks(
         detail:
           `${path} has mode ${mode.toString(8).padStart(3, '0')}, so other users on this machine can read the App's private key ` +
           `(anyone holding it can act as the App); run: chmod 600 ${path}`,
+      });
+    }
+  }
+  return { ok: true, checks };
+}
+
+/**
+ * The token file instead of a key: that it reads, is for the configured App, still has a token
+ * that has not expired, and on POSIX that only its owner can read it.
+ */
+function tokenFileChecks(
+  path: string,
+  app: GitHubAppConfig,
+  o: { env: NodeJS.ProcessEnv; platform: NodeJS.Platform; fileMode?: (path: string) => number | null; now?: () => number },
+): { ok: boolean; checks: Check[] } {
+  const from = o.env[APP_TOKEN_FILE_ENV]?.trim() ? ` (from ${APP_TOKEN_FILE_ENV})` : '';
+  let file;
+  try {
+    file = loadTokenFile(path);
+  } catch (err) {
+    return { ok: false, checks: [{ status: 'fail', detail: message(err) }] };
+  }
+  if (typeof app.appId === 'number' && file.app.id !== app.appId) {
+    return { ok: false, checks: [{ status: 'fail', detail: `${path} is for App ${file.app.id}, but github.app.appId is ${app.appId}` }] };
+  }
+  const left = file.expiresAt - (o.now ?? Date.now)();
+  if (left <= 0) {
+    return { ok: false, checks: [{ status: 'fail', detail: `the token in ${path} expired at ${new Date(file.expiresAt).toISOString()}; whoever writes the file has not replaced it` }] };
+  }
+  const covers = file.repositories ? `, for ${file.repositories.join(', ')}` : '';
+  const checks: Check[] = [
+    { status: 'ok', detail: `token file loads: ${path}${from} (App ${file.app.slug}, installation ${file.installationId}${covers}, ${Math.round(left / 60000)} min left)` },
+  ];
+  if (o.platform !== 'win32') {
+    const mode = (o.fileMode ?? fileMode)(path);
+    if (mode !== null && (mode & 0o077) !== 0) {
+      checks.push({
+        status: 'warn',
+        detail: `${path} has mode ${mode.toString(8).padStart(3, '0')}, so other users on this machine can read the installation token; run: chmod 600 ${path}`,
       });
     }
   }
@@ -104,6 +156,16 @@ export async function appRepoChecks(
   let selection: string | null;
   try {
     const token = await auth.installationToken(fullName);
+    if (token.permissionsUnknown) {
+      return [
+        {
+          status: 'warn',
+          detail:
+            `GitHub App installation ${installationId}: the token file states no permissions, so whether they cover this ` +
+            "repository's settings is not checked; add \"permissions\" to the file to have them checked",
+        },
+      ];
+    }
     granted = token.permissions;
     selection = token.repositorySelection;
   } catch (err) {

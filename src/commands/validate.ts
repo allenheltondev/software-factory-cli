@@ -3,7 +3,7 @@ import { ConfigError, configExists, readRawConfig, resolveConfigRelative } from 
 import type { UpdraftConfig } from '../config/schema.js';
 import { validateConfig, type ConfigIssue } from '../config/validate.js';
 import { legacyNotice, println, type CommandContext } from './context.js';
-import { appKeyProblem } from './doctor-app.js';
+import { appCredentialField, appKeyProblem } from './doctor-app.js';
 import { EXIT } from './errors.js';
 
 /** Warn about action prompt files that don't exist (resolved against the config file's directory). */
@@ -88,7 +88,7 @@ export function validateJson(ctx: Pick<CommandContext, 'paths' | 'env'>): Valida
       const app = check.config.github?.app;
       const keyProblem = app ? appKeyProblem(app, { configDir: ctx.paths.configDir, env: ctx.env }) : null;
       if (keyProblem) {
-        return { ...base, ok: false, state: 'invalid', errors: [{ path: 'github.app.privateKeyPath', message: keyProblem }], warnings: check.warnings, config: null };
+        return { ...base, ok: false, state: 'invalid', errors: [{ path: appCredentialField(app!, { configDir: ctx.paths.configDir, env: ctx.env }), message: keyProblem }], warnings: check.warnings, config: null };
       }
       return { ...base, ok: true, errors: [], warnings: check.warnings, config: withoutEnvValues(check.config) };
     }
@@ -116,12 +116,12 @@ export async function validateCommand(ctx: CommandContext, opts: { json?: boolea
       for (const w of check.warnings) println(ctx.err, `  ! ${w.path}: ${w.message}`);
       return EXIT.FAILURE;
     case 'ok': {
-      // github.app: the key is a file outside the config, so it is checked here (offline), not by the schema.
+      // github.app: the key (or token file) is a file outside the config, so it is checked here (offline), not by the schema.
       const app = check.config.github?.app;
       const keyProblem = app ? appKeyProblem(app, { configDir: ctx.paths.configDir, env: ctx.env }) : null;
       if (keyProblem) {
         println(ctx.err, `✗ Invalid config ${check.path}`);
-        println(ctx.err, `  ✗ github.app.privateKeyPath: ${keyProblem}`);
+        println(ctx.err, `  ✗ ${appCredentialField(app!, { configDir: ctx.paths.configDir, env: ctx.env })}: ${keyProblem}`);
         for (const w of check.warnings) println(ctx.err, `  ! ${w.path}: ${w.message}`);
         return EXIT.FAILURE;
       }

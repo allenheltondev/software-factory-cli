@@ -63,7 +63,7 @@
 import { execFile } from 'node:child_process';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
-import { appRequestProblem } from './app-auth.js';
+import { appRequestProblem, redactGitHubSecrets } from './app-auth.js';
 import { appIdentity, createUserCredentials, repoOfRequest, userIdentity, type GitHubCredentials } from './credentials.js';
 import {
   GitHubError,
@@ -506,10 +506,18 @@ interface RawResponse<T> {
   headers: Headers;
 }
 
-function networkError(method: string, display: string, err: unknown, timeoutMs: number): GitHubError {
+/**
+ * A request that never got a response. Its message is kept for diagnosis, but a fetch error can
+ * repeat a header value (Node's header validation does), so the token this request sent is cut
+ * out of it, every piece of it, and then anything else shaped like a credential.
+ */
+function networkError(method: string, display: string, err: unknown, timeoutMs: number, sent?: string): GitHubError {
   const e = err as Error;
-  const why = e?.name === 'TimeoutError' ? `timed out after ${Math.round(timeoutMs / 1000)}s` : (e?.message ?? String(err));
-  return new GitHubError(`${method} ${display}: network error: ${why}`, 0);
+  let why = e?.name === 'TimeoutError' ? `timed out after ${Math.round(timeoutMs / 1000)}s` : (e?.message ?? String(err));
+  if (sent) {
+    for (const piece of [sent, ...sent.split(/\s+/)]) if (piece.length >= 4) why = why.split(piece).join('***');
+  }
+  return new GitHubError(`${method} ${display}: network error: ${redactGitHubSecrets(why)}`, 0);
 }
 
 export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promise<GitHubApi> {
@@ -555,7 +563,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     try {
       res = await doFetch(url, init);
     } catch (err) {
-      throw networkError(method, display, err, timeoutMs);
+      throw networkError(method, display, err, timeoutMs, token);
     }
     if (res.status === 401 && credentials.kind === 'app') {
       // An installation token can stop working before it expires (the installation was changed,
@@ -567,7 +575,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       try {
         res = await doFetch(url, init);
       } catch (err) {
-        throw networkError(method, display, err, timeoutMs);
+        throw networkError(method, display, err, timeoutMs, token);
       }
     }
     log?.debug('github request', { method, url: display, status: res.status });
