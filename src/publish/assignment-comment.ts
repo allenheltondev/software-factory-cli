@@ -17,6 +17,7 @@ import { GitHubAppError } from '../github/app-auth.js';
 import type { Job, Run } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { code } from './failure-comment.js';
+import { detailLines, runDetails, type RunDetails } from './run-details.js';
 
 /** Writes tried per assignment (the first plus retries of transient failures). */
 export const ASSIGNMENT_MAX_ATTEMPTS = 4;
@@ -46,10 +47,12 @@ export function assignmentCommentMarker(runId: string): string {
   return `<!-- updraft-run-assigned: ${runId} -->`;
 }
 
-export function renderAssignmentComment(o: { agent: string; jobId: string; runId: string; pool: string }): string {
+export function renderAssignmentComment(o: { details: RunDetails; jobId: string; runId: string; pool: string }): string {
   return [
-    `Updraft assigned **${o.agent.replace(/[^\w.-]/g, '')}** to work on this issue.`,
+    'Updraft assigned a worker to this issue.',
     '',
+    `- **Worker** ${code(o.details.worker)}`,
+    ...detailLines(o.details, true),
     `- **Job ID** ${code(o.jobId)}`,
     `- **Run ID** ${code(o.runId)}`,
     `- **Pool** ${code(o.pool)}`,
@@ -104,7 +107,7 @@ export function createAssignmentCommenter(deps: AssignmentCommentDeps): Assignme
             const created = await deps.api.createIssueComment(
               repoRef,
               job.issueNumber,
-              renderAssignmentComment({ agent: run.agent, jobId: job.id, runId: run.id, pool: run.pool }),
+              renderAssignmentComment({ details: runDetails(deps.db, job, run), jobId: job.id, runId: run.id, pool: run.pool }),
             );
             log.info('assignment comment posted', { comment: created.htmlUrl });
             return;

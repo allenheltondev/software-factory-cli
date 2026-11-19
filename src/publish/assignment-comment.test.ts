@@ -68,8 +68,11 @@ describe('assignment comment', () => {
     const { api, commenter } = setup();
     await commenter.announce(job(), run('run_1', 'codex'));
     expect(api.comments).toHaveLength(1);
-    expect(api.comments[0]!.body).toBe(renderAssignmentComment({ agent: 'codex', jobId: 'job_1', runId: 'run_1', pool: 'general' }));
-    expect(api.comments[0]!.body).toContain('Updraft assigned **codex** to work on this issue.');
+    expect(api.comments[0]!.body).toBe(renderAssignmentComment({ details: { worker: 'codex', model: 'Unknown', modelKind: null, complexity: 'Not classified' }, jobId: 'job_1', runId: 'run_1', pool: 'general' }));
+    expect(api.comments[0]!.body).toContain('Updraft assigned a worker to this issue.');
+    expect(api.comments[0]!.body).toContain('- **Worker** `codex`');
+    expect(api.comments[0]!.body).toContain('- **Model** `Unknown`');
+    expect(api.comments[0]!.body).toContain('- **Complexity** `Not classified`');
     expect(api.comments[0]!.body).toContain('`job_1`');
     expect(api.comments[0]!.body).toContain('`run_1`');
     expect(api.comments[0]!.body).toContain('`general`');
@@ -108,7 +111,7 @@ describe('assignment comment', () => {
     await commenter.announce(job(), run('run_1', 'codex'));
     await commenter.announce(job(), run('run_2', 'claude'));
     expect(api.comments).toHaveLength(2);
-    expect(api.comments[1]!.body).toContain('**claude**');
+    expect(api.comments[1]!.body).toContain('- **Worker** `claude`');
     expect(api.comments[1]!.body).toContain('`run_2`');
   });
 
