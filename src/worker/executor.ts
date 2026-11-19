@@ -1,6 +1,7 @@
 // OWNER: queue/worker workstream. Execution seam: the daemon hands each claim to an
 // Executor: log-only (here), prepare-only (prepare-only.ts) or live (live.ts), chosen by
 // execution.mode in createExecutor.
+import type { DeclaredDependency } from '../db/dependency-waits.js';
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { agentAdapter, type UpdraftConfig, type RepositoryConfig } from '../config/schema.js';
@@ -59,6 +60,12 @@ export interface ExecutionResult {
    * Unvalidated; the daemon's policy validates and decides (src/escalation/escalation.ts).
    */
   escalationRequest?: string;
+  /**
+   * Live executor, succeeded runs only: the pull request the run declared it waits on, already
+   * validated against repositories.<repo>.dependencies (docs/dependencies.md). The daemon records
+   * the wait with the run; nothing of the run is published.
+   */
+  dependency?: DeclaredDependency;
 }
 
 /**

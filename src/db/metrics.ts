@@ -315,9 +315,22 @@ export type RoutingMetricKind =
   /** A job was requeued to wait out a usage limit. subject: "<job id>:<deferrals after>". */
   | 'job.deferred'
   /** A job was moved to a more capable tier. subject: "<job id>:<hops after>". */
-  | 'job.escalated';
+  | 'job.escalated'
+  /** A run declared a wait on another repository's pull request (docs/dependencies.md). subject: run id. */
+  | 'dependency.waiting'
+  /** That wait ended; outcome resumed | closed | canceled | expired, start_at when it began. subject: run id. */
+  | 'dependency.ended';
 
-export const ROUTING_METRIC_KINDS: readonly RoutingMetricKind[] = ['route.decided', 'run.selected', 'job.retried', 'capacity.cooldown', 'job.deferred', 'job.escalated'];
+export const ROUTING_METRIC_KINDS: readonly RoutingMetricKind[] = [
+  'route.decided',
+  'run.selected',
+  'job.retried',
+  'capacity.cooldown',
+  'job.deferred',
+  'job.escalated',
+  'dependency.waiting',
+  'dependency.ended',
+];
 
 export type Tier = 'routine' | 'standard' | 'complex' | 'high-risk';
 export type RouteSource = 'override' | 'local-rule' | 'cli-triage' | 'fallback' | 'legacy-label' | 'default';
@@ -549,6 +562,30 @@ export function noteCooldown(
     outcome: c.scope,
     reason: c.stated ? 'stated' : 'default',
     waitMs: Math.max(0, Math.round(c.waitMs)),
+  });
+}
+
+/** A run started waiting on a pull request in another repository. No repository name or PR number: ids and codes only. */
+export function noteDependencyWaiting(db: Db, w: { runId: string; jobId: string; repoId: number; repoFullName: string; agent: string; at: string }): void {
+  insertRouting(db, { kind: 'dependency.waiting', subject: w.runId, at: w.at, repoId: w.repoId, repoFullName: w.repoFullName, jobId: w.jobId, agent: w.agent, jobKind: 'implement' });
+}
+
+/** A wait ended: resumed (the pull request merged), closed (closed unmerged or unreadable), canceled or expired. */
+export function noteDependencyEnded(
+  db: Db,
+  w: { runId: string; jobId: string; repoId: number; repoFullName: string; outcome: 'resumed' | 'closed' | 'canceled' | 'expired'; startAt: string; at: string },
+): void {
+  insertRouting(db, {
+    kind: 'dependency.ended',
+    subject: w.runId,
+    at: w.at,
+    repoId: w.repoId,
+    repoFullName: w.repoFullName,
+    jobId: w.jobId,
+    jobKind: 'implement',
+    outcome: w.outcome,
+    startAt: w.startAt,
+    waitMs: Math.max(0, Date.parse(w.at) - Date.parse(w.startAt)) || 0,
   });
 }
 

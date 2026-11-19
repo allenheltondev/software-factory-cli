@@ -78,6 +78,18 @@ describe('updraft cancel', () => {
     expect(ctx.out.text).toBe('');
   });
 
+  it('stops a succeeded job from waiting on another pull request (docs/dependencies.md), once', async () => {
+    const { ctx, db, jobId, claim, startWorker } = setup();
+    startWorker();
+    const { run } = claim();
+    finishRun(db, run.id, { outcome: 'succeeded', now: ctx.now, dependency: { repo: 'octo/lib', number: 12, note: '', firstCheckAt: new Date(ctx.now()).toISOString() } });
+    expect(await cancelCommand(ctx, jobId)).toBe(EXIT.OK);
+    expect(ctx.out.text).toContain(`Stopped waiting on octo/lib#12 for ${jobId} (octo/widgets#7, wf)`);
+    expect(db.prepare('SELECT state, reason FROM dependency_waits WHERE run_id = ?').get(run.id)).toEqual({ state: 'canceled', reason: CANCELED_BY_USER });
+    expect(getJob(db, jobId)?.status).toBe('succeeded');
+    await expect(cancelCommand(ctx, jobId)).rejects.toThrow(`job ${jobId} is already succeeded`);
+  });
+
   it('fails clearly for a finished job, an unknown id, a run id and a missing database', async () => {
     const { ctx, jobId, claim, startWorker, db } = setup();
     startWorker();

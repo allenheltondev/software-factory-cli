@@ -157,6 +157,7 @@ repositories:
 | `repositories.<OWNER/REPO>.autoMerge` | off | With `review`: `squash`, `merge` or `rebase`. Updraft merges a PR whose current head its reviewer found ready, once the head's checks passed and nothing else stands in the way, with the reviewed commit pinned. The issue and the code are untrusted and could talk a reviewer into approving: read [Auto-merge](docs/review-loop.md#auto-merge) before setting it |
 | `repositories.<OWNER/REPO>.autoMergeWaitMinutes` | `60` | With `autoMerge`: how long to wait for pending checks before giving up and leaving the PR for a person |
 | `repositories.<OWNER/REPO>.autoMergeRequiredChecks` | none | With `autoMerge`: names of the commit statuses or check runs (for example `test`) that must each report success on the commit. Without it, any one successful check is enough. A skipped or neutral check never counts as a success |
+| `repositories.<OWNER/REPO>.dependencies` | off | Live mode: `{ repositories: [OWNER/REPO, ...], checkIntervalMinutes: 5, maxWaitDays: 30 }`. A run that finds its issue needs a pull request in one of those repositories first ends with an `UPDRAFT-WAITING-ON: OWNER/REPO#N` line; the worker publishes nothing for it, comments on the issue, checks the pull request every `checkIntervalMinutes`, and runs the issue again once it is merged (or comments and stops waiting if it is closed unmerged or outlasts `maxWaitDays`). Pull requests in other repositories are never waited on. See [Waiting on another repository](docs/dependencies.md) |
 | `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll. "First poll" means whenever `state.db` has no checkpoint for the repository, including with a new or deleted `state.db`, which then has no record of jobs already run. Remove it once the first poll has run |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
@@ -245,6 +246,12 @@ not let an account approve its own PR, so the verdict is recorded by Updraft and
 comment review. Merging is still up to a person unless `autoMerge` is set, which is off by
 default and should stay off until you have read what its checks do and do not cover. See
 [docs/review-loop.md](docs/review-loop.md).
+
+When the right fix needs a change in another repository first, set `dependencies` to the
+repositories whose pull requests may be waited on. The run opens the pull request there and ends
+with `UPDRAFT-WAITING-ON: OWNER/REPO#N`. The worker publishes nothing for that run, shows the job
+as waiting in `updraft status`, and once that pull request merges, it runs the issue again with
+the merge noted in the prompt. See [docs/dependencies.md](docs/dependencies.md).
 
 ## Background operation
 

@@ -31,9 +31,12 @@ import {
 import { agentProfile, describeProfile, effectiveArgs } from '../agents/profile.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { renderPrompt, renderRevisionPrompt, type IssueContext } from '../agents/prompt.js';
+import { dependencyMergedSection, dependencyProtocolSection, MAX_DEPENDENCY_WAITS, readDependency } from '../agents/dependency.js';
+import type { DeclaredDependency } from '../db/dependency-waits.js';
 import { renderReviewPrompt } from '../agents/review-prompt.js';
 import {
   agentAdapter,
+  dependencySettings,
   DEFAULT_TIMEOUT_MINUTES,
   DEFAULT_VERIFY_TIMEOUT_MINUTES,
   type AdapterName,
@@ -42,7 +45,7 @@ import {
 } from '../config/schema.js';
 import { ownEntry, type Claim } from '../db/queue.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree, type PreparedWorktree } from '../git/worktree.js';
-import { reviewOf, revisionOf, type ReviewResult, type RunOutcome, type RunSummary, type VerificationCommandResult, type VerificationSummary } from '../types.js';
+import { resumeOf, reviewOf, revisionOf, type ReviewResult, type RunOutcome, type RunSummary, type VerificationCommandResult, type VerificationSummary } from '../types.js';
 import {
   canceledByUser,
   findRepoConfig,
@@ -578,6 +581,11 @@ export class LiveExecutor implements Executor {
     const promptSource = resolvePromptPath(ctx.config, ctx.paths, job.action, promptKey);
     const env = job.envelope;
     const timeoutMinutes = action?.timeoutMinutes ?? DEFAULT_TIMEOUT_MINUTES;
+    // An implementation run of a repository with dependencies may wait on another repository's
+    // pull request (docs/dependencies.md); a follow-up run is told what it waited on.
+    const resume = resumeOf(job);
+    const dependencies = !review && !revision && env.type === 'issue.labeled' && found ? dependencySettings(ctx.config, found.repo) : null;
+    const waitsLeft = MAX_DEPENDENCY_WAITS - (resume?.waits ?? 0);
 
     await writeFile(
       logPath,
@@ -603,7 +611,15 @@ export class LiveExecutor implements Executor {
                 `pull request: #${review.request.pullRequest.number} ${review.request.pullRequest.url}`,
                 `code written by agent: ${review.request.authorAgent ?? '(unknown)'}; this run reviews it and publishes nothing`,
               ]
-            : [`trigger: ${env.type} label "${env.label}" by ${env.actor ?? '(unknown actor)'} at ${env.createdAt}`]),
+            : [
+                `trigger: ${env.type} label "${env.label}" by ${env.actor ?? '(unknown actor)'} at ${env.createdAt}`,
+                ...(resume
+                  ? [
+                      `continues: job ${resume.waitingJobId} (run ${resume.waitingRunId}), which waited on ${resume.pullRequest.repo}#${resume.pullRequest.number}; ` +
+                        `merged ${resume.pullRequest.mergedAt ?? '(time unknown)'}`,
+                    ]
+                  : []),
+              ]),
         '',
         `pool: ${run.pool}`,
         `agent: ${run.agent}${adapterName ? ` (adapter ${adapterName})` : ' (no longer configured)'}`,
@@ -671,7 +687,10 @@ export class LiveExecutor implements Executor {
         ? reviewPrompt(review, { baseBranch: review.request.pullRequest.baseBranch, baseSha: null })
         : revision
           ? renderRevisionPrompt(actionPrompt, issue, revision)
-          : renderPrompt(actionPrompt, issue),
+          : renderPrompt(actionPrompt, issue, [
+              ...(resume ? dependencyMergedSection(resume) : []),
+              ...(dependencies ? dependencyProtocolSection(dependencies.repositories, { waitsLeft }) : []),
+            ]),
       'utf8',
     );
     if (ctx.issue?.withheld) await log([`issue body: withheld from the agent (${ctx.issue.withheld})`]);
@@ -906,7 +925,7 @@ export class LiveExecutor implements Executor {
     // 6. Outcome.
     // Read before the stderr is appended: with separateStderr this is the agent's stdout alone.
     const outputTail = await tailLines(logPath, outputStart);
-    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || review ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || review || dependencies ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
     const stderrText = await moveStderr();
     // What exit interpretation and summaries see: stdout, then stderr (an error is often only there).
     const rawOutput = stderrText.trim() ? (agentOutput ? `${agentOutput.replace(/\r?\n$/, '')}\n${stderrText}` : stderrText) : agentOutput;
@@ -955,6 +974,23 @@ export class LiveExecutor implements Executor {
       ...(agentRun.leftovers ? ['note: processes the agent left running in its process group were stopped'] : []),
     ]);
 
+    // 6a. A declared wait (docs/dependencies.md): read from the agent's own final message, and only
+    // honored for a pull request the config allows. A valid one means nothing of this run is
+    // published, so there is nothing for the verify commands to check.
+    let dependency: DeclaredDependency | undefined;
+    if (dependencies && outcome === 'succeeded') {
+      const declared = readDependency(adapter, agentOutput || outputTail.join('\n'), dependencies, waitsLeft);
+      if (declared.ok) {
+        dependency = declared.dependency;
+        await log([
+          `waiting on: ${declared.dependency.repo}#${declared.dependency.number} (UPDRAFT-WAITING-ON); nothing from this run is published, ` +
+            'and the issue runs again once that pull request is merged',
+        ]);
+      } else if (declared.problem) {
+        await log([`waiting on: none (${declared.problem}); the run ends as it would without the line`]);
+      }
+    }
+
     // 6b. Verification: the worker's own check of what a successful agent left, before the run
     // counts as succeeded (and so before anything can be published). The commands run code the
     // agent wrote, so they get the worker's environment without the GitHub tokens, like the agent;
@@ -964,7 +1000,9 @@ export class LiveExecutor implements Executor {
     // those are the agent's credentials, and checking its work does not need them.
     let verification: VerificationSummary | undefined;
     // Not for a reviewer run: the commands ran for the code run that produced the commit under review.
-    if (outcome === 'succeeded' && action.verify?.length && !review) {
+    if (outcome === 'succeeded' && action.verify?.length && !review && dependency) {
+      await log(['verification: skipped (the run is waiting on another pull request; nothing from it is published)']);
+    } else if (outcome === 'succeeded' && action.verify?.length && !review) {
       const verified = await runVerification({
         commands: action.verify,
         ...(box && agentCfg.container
@@ -1080,6 +1118,7 @@ export class LiveExecutor implements Executor {
       summary,
       ...(cliFailureOutput && outcome === 'failed' ? { cliOutput: cliFailureOutput.slice(-RAW_OUTPUT_BYTES) } : {}),
       ...(escalationRequest ? { escalationRequest } : {}),
+      ...(dependency && outcome === 'succeeded' ? { dependency } : {}),
     };
   }
 }
