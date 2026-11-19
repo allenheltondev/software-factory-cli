@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@readysetcloud/ui": "^0.7.8",
+    "@readysetcloud/ui": "^0.7.9",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-router": "^8.4.0"

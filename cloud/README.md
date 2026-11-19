@@ -166,9 +166,13 @@ The manifest sets everything #67 describes:
 
 ## Not verified yet
 
-Staging and Production deploy and pass the anonymous smoke checks, and `updraft.readysetcloud.io` serves. Still unconfirmed:
+Staging and Production deploy and pass the anonymous smoke checks. Signing in at `updraft.readysetcloud.io` works end to end through the Cognito authorizer.
 
-- A signed-in request through the Cognito authorizer (`Authorization: Bearer <ID token>`). It is the same header form rsc-core's own clients send to its Cognito-authorized API.
-- The GitHub flows against real GitHub, which needs a registered App: user authorization with PKCE, "request user authorization during installation" returning `state` to the callback, and the Members permission letting a user token read its own org membership.
+Still unconfirmed: the GitHub flows against real GitHub, which need a registered App. That covers:
+- user authorization with PKCE;
+- "request user authorization during installation" returning `state` to the callback;
+- the Members permission letting a user token read its own org membership.
 
-API Gateway access and execution logging are off for now. Both need the account-level API Gateway CloudWatch role, which this stack does not own.
+Deliberately off:
+- **API Gateway access and execution logging.** Both need the account-level API Gateway CloudWatch role, which this stack does not own.
+- **Point-in-time recovery on `UpdraftTable`.** This is a decision, not a gap.
