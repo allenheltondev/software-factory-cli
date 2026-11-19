@@ -31,6 +31,14 @@ Parameters:
     Type: Number
     Default: 100
     Description: Burst capacity for the whole stage.
+  WebhookRateLimit:
+    Type: Number
+    Default: 20
+    Description: Steady-state requests per second for the GitHub webhook route alone.
+  WebhookBurstLimit:
+    Type: Number
+    Default: 40
+    Description: Burst capacity for the GitHub webhook route alone.
 
   AppDomainName:
     Type: String
@@ -165,6 +173,12 @@ Resources:
           ThrottlingRateLimit: !Ref ApiRateLimit
           ThrottlingBurstLimit: !Ref ApiBurstLimit
           MetricsEnabled: true
+        # The webhook route's own limit (API Gateway escapes "/" in a resource path as "~1").
+        - ResourcePath: '/~1api~1webhooks~1github'
+          HttpMethod: POST
+          ThrottlingRateLimit: !Ref WebhookRateLimit
+          ThrottlingBurstLimit: !Ref WebhookBurstLimit
+          MetricsEnabled: true
       # No access or execution logging yet: both need the account-level API Gateway CloudWatch
       # role (AWS::ApiGateway::Account), which this stack does not own. Metrics need no role.
       GatewayResponses:
@@ -207,6 +221,13 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
+        # The GitHub App's settings (github/settings.ts), written by scripts/register-github-app.mjs.
+        - SSMParameterReadPolicy:
+            ParameterName: updraft/app/*
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
       Events:
         Health:
           Type: Api
@@ -222,6 +243,39 @@ Resources:
             RestApiId: !Ref UpdraftApi
             Path: /api/v1/{proxy+}
             Method: ANY
+
+  # The GitHub webhook (flows/webhook.ts). No authorizer: the HMAC over the raw body, keyed with the
+  # App's webhook secret, is the authentication. Its own function, so its own concurrency and
+  # throttling (WebhookRateLimit on the route); #68 turns it into the multi-tenant launcher.
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../server/dist
+      Handler: webhook.handler
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UpdraftTable
+          NODE_OPTIONS: --enable-source-maps
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UpdraftTable
+        - SSMParameterReadPolicy:
+            ParameterName: updraft/app/*
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
+      Events:
+        GitHub:
+          Type: Api
+          Properties:
+            RestApiId: !Ref UpdraftApi
+            Path: /api/webhooks/github
+            Method: POST
+            Auth:
+              Authorizer: NONE
 
   # ---------------------------------------------------------------------------
   # Hosting: a private S3 bucket and one CloudFront distribution with two origins, so the browser

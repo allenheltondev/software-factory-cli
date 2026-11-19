@@ -56,6 +56,15 @@ const checks = [
     const r = await get('/api/v1/me', { authorization: 'Bearer not-a-real-token' });
     return r.status === 401 && !r.text.includes('id="root"');
   }],
+  ['the GitHub webhook refuses an unsigned delivery (401, or 503 before the App exists)', async () => {
+    const res = await fetch(`${base}/api/webhooks/github`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-github-event': 'ping', 'x-hub-signature-256': 'sha256=' + '0'.repeat(64) },
+      body: '{"zen":"smoke"}',
+    });
+    const body = json(await res.text());
+    return (res.status === 401 && body?.disposition === 'bad_signature') || (res.status === 503 && body?.disposition === 'not_configured');
+  }],
 ];
 
 // A fresh distribution or invalidation can take a minute to settle; retry the whole set a few times.

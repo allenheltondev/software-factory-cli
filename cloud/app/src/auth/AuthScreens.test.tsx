@@ -4,6 +4,7 @@ import { BrowserRouter } from 'react-router';
 import { configureAuth } from '@readysetcloud/ui/auth';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../App';
+import { fakeApi } from '../test/fakeApi';
 import { HOLD_MS, holdPassword, takeHeldPassword } from './heldPassword';
 
 const PASSWORD = 'Synthetic-Passw0rd-123';
@@ -41,7 +42,7 @@ describe('unconfirmed-account sign-in', () => {
 
     render(
       <BrowserRouter>
-        <App api={{ me: vi.fn() }} />
+        <App api={fakeApi()} />
       </BrowserRouter>,
     );
 
