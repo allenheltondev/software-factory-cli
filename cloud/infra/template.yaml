@@ -505,9 +505,11 @@ Resources:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
+                # The group and its streams. Spelled out rather than !GetAtt MicrovmLogGroup.Arn,
+                # which needs logs:DescribeLogGroups, and the deploy role does not have it.
                 Resource:
-                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/${AWS::StackName}-job
-                  - !GetAtt MicrovmLogGroup.Arn
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}:*
 
   # ---------------------------------------------------------------------------
   # Hosting: a private S3 bucket and one CloudFront distribution with two origins, so the browser
