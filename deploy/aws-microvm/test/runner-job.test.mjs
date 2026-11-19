@@ -256,8 +256,9 @@ describe.runIf(onLinuxLikeHost)('runJob', () => {
   });
 
   it('stops a run that outlives the watchdog, keeps what it reported, and terminates', async () => {
-    // 7200 s maximum, 300 s reserve, and 6899.5 s already gone: half a second is left.
-    const { deps, calls, logs } = fakeDeps('hang', { deps: { now: () => START + 6_899_500, deadlineMinutes: 1 } });
+    // 7200 s maximum, 300 s reserve, and 6898 s already gone: two seconds are left, enough for
+    // the stand-in to start and install its SIGTERM handler on a slow CI runner.
+    const { deps, calls, logs } = fakeDeps('hang', { deps: { now: () => START + 6_898_000, deadlineMinutes: 1 } });
     const result = await runJob(request(), deps);
     expect(result.outcome).toBe('timed_out');
     expect(result.error).toContain('watchdog');
@@ -290,7 +291,7 @@ describe.runIf(onLinuxLikeHost)('runJob', () => {
     const running = runJob(request(), harness.deps);
     // Wait until the stand-in is up, then deliver what the /terminate hook delivers.
     await expect.poll(() => fs.existsSync(recordFile), { timeout: 10_000 }).toBe(true);
-    await expect.poll(() => harness.output.join('').includes('fake-updraft: starting'), { timeout: 10_000 }).toBe(true);
+    await expect.poll(() => harness.output.join('').includes('fake-updraft: waiting for SIGTERM'), { timeout: 10_000 }).toBe(true);
     harness.stop();
     const result = await running;
     expect(result.outcome).toBe('terminated');

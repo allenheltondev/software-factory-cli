@@ -231,12 +231,14 @@ switch (mode) {
   case 'silent':
     break;
   case 'hang':
-    // Stops when asked to.
+    // Stops when asked to. Says so only once the handler is in place, so that a test can
+    // wait for it before it sends the signal.
     process.on('SIGTERM', () => {
       console.error('fake-updraft: interrupted');
       console.log(JSON.stringify(interrupted));
       process.exit(1);
     });
+    console.error('fake-updraft: waiting for SIGTERM');
     setInterval(() => {}, 1000);
     break;
   case 'hang-ignoring-sigterm':
