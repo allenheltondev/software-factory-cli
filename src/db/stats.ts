@@ -85,6 +85,71 @@ export interface StatsSection {
     /** PRs that reached maxRevisions in the window. */
     limitReached: number;
   };
+  /** Model-tier measurement (docs/stats.md, "Model tiers"). */
+  routing: RoutingStats;
+  /** Subscription usage pressure from local signals only. */
+  pressure: PressureStats;
+}
+
+/** A rate with the sample behind it: `low` is the bound of a 95% Wilson interval. */
+export interface Rate {
+  /** Successes. */
+  count: number;
+  /** Sample size. */
+  of: number;
+  rate: number | null;
+  low: number | null;
+  high: number | null;
+}
+
+/** What one tier, profile or model did over the implement jobs attributed to it. */
+export interface RouteGroupStats {
+  /** Jobs that finished in the window and are attributed to this group (the group of the run that ended them). */
+  jobs: number;
+  /** Fewer than MIN_SAMPLE jobs: the numbers are anecdotes, not a comparison. */
+  smallSample: boolean;
+  success: Rate;
+  /** Jobs attributed here after at least one escalation, and how many of them succeeded. */
+  escalatedIn: { jobs: number; succeeded: number };
+  /** Jobs moved to a more capable tier after a run in this group. */
+  escalatedOut: number;
+  retries: number;
+  /** Runs of this group whose verify commands failed. */
+  verificationFailures: number;
+  /** PRs opened in the window by jobs attributed here, and what review made of them. */
+  prsOpened: number;
+  reviewed: number;
+  reviewReady: Rate;
+  changesRequested: number;
+  revisions: { average: number | null; total: number };
+  labelToPr: CoveredDistribution;
+  queueWait: Distribution;
+  /** Of these runs' selections, how the model and effort are known. */
+  modelSources: Record<string, number>;
+}
+
+export interface RoutingStats {
+  /** Below this many jobs a group is flagged `smallSample`. */
+  minSample: number;
+  /** Routing decisions made in the window, by how the pool was chosen and by tier. */
+  decisions: { total: number; bySource: Record<string, number>; byTier: Record<string, number>; triageFallbacks: number };
+  /** Runs selected in the window; those from before selections were recorded are not counted (they are "unknown" in the groups). */
+  selections: number;
+  byTier: Record<string, RouteGroupStats>;
+  byProfile: Record<string, RouteGroupStats>;
+  /** Keyed "<adapter>/<model or cli-default>[ effort <effort>]". The model is the one configured, not one the CLI reported. */
+  byModel: Record<string, RouteGroupStats & { adapter: string | null; model: string | null; effort: string | null; modelSource: 'configured' | 'observed' | 'unknown' }>;
+}
+
+export interface PressureStats {
+  /** Cooldowns started by a recognized CLI usage-limit exit. */
+  cooldowns: { count: number; totalMs: number; byName: Record<string, { count: number; totalMs: number; stated: number }> };
+  /** Jobs requeued to wait out a usage limit. */
+  deferrals: { count: number; byAgent: Record<string, number> };
+  /** Runs whose agent could not be started, by profile. */
+  unavailable: { startFailedRuns: number; byAgent: Record<string, number> };
+  /** Token and credit usage are not recorded: the supported CLIs give no trustworthy figure. */
+  tokenUsage: { reported: false };
 }
 
 export interface StatsReport {
@@ -103,6 +168,7 @@ export interface StatsReport {
 }
 
 interface EventRow {
+  id: number;
   kind: string;
   subject_id: string;
   at: string;
@@ -119,6 +185,38 @@ interface EventRow {
   wait_ms: number | null;
   findings: number | null;
   backfilled: number;
+  // Added by migration 16; NULL on every fact recorded before it.
+  tier: string | null;
+  requested_tier: string | null;
+  risk: string | null;
+  adapter: string | null;
+  model: string | null;
+  effort: string | null;
+  model_source: string | null;
+  route_source: string | null;
+  confidence: number | null;
+  hops: number | null;
+  retries: number | null;
+  head_sha: string | null;
+}
+
+/** A row of a database not yet at schema v16 lacks the routing columns: they read as unknown (null). */
+function normalize(e: Partial<EventRow>): EventRow {
+  return {
+    tier: null,
+    requested_tier: null,
+    risk: null,
+    adapter: null,
+    model: null,
+    effort: null,
+    model_source: null,
+    route_source: null,
+    confidence: null,
+    hops: null,
+    retries: null,
+    head_sha: null,
+    ...e,
+  } as EventRow;
 }
 
 interface QueueRow {
@@ -184,6 +282,193 @@ function groupBy<T>(rows: readonly T[], key: (r: T) => string): Map<string, T[]>
 
 function byKey<T, V>(rows: readonly T[], key: (r: T) => string, f: (rows: T[]) => V): Record<string, V> {
   return Object.fromEntries([...groupBy(rows, key)].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, f(v)]));
+}
+
+/** Below this many jobs a route group is flagged as a small sample. */
+export const MIN_SAMPLE = 20;
+
+/** 95% Wilson score interval for `count` successes in `n` trials. */
+export function rate(count: number, n: number): Rate {
+  if (n === 0) return { count, of: n, rate: null, low: null, high: null };
+  const z = 1.96;
+  const p = count / n;
+  const d = 1 + (z * z) / n;
+  const centre = (p + (z * z) / (2 * n)) / d;
+  const half = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / d;
+  return { count, of: n, rate: p, low: Math.max(0, centre - half), high: Math.min(1, centre + half) };
+}
+
+const UNKNOWN = 'unknown';
+
+function modelLabel(s: EventRow | undefined): string {
+  if (!s || !s.adapter) return UNKNOWN;
+  return `${s.adapter}/${s.model ?? 'cli-default'}${s.effort ? ` effort ${s.effort}` : ''}`;
+}
+
+/**
+ * Tier, profile and model views over implement jobs. A job's outcome belongs to the run that
+ * ended it (its newest run.selected), so a job escalated from routine to complex counts for
+ * complex, flagged `escalatedIn`, and its earlier failed runs count for routine (verification
+ * failures, escalatedOut). Runs and jobs from before selections were recorded are "unknown".
+ */
+function routingSection(windowed: readonly EventRow[], all: readonly EventRow[], jobs: readonly EventRow[], prsOpenedRows: readonly EventRow[]): RoutingStats {
+  const of = (rows: readonly EventRow[], kind: string) => rows.filter((e) => e.kind === kind);
+  const selections = of(all, 'run.selected');
+  const selByRun = new Map(selections.map((s) => [s.subject_id, s]));
+  const selsOfJob = groupBy(selections, (s) => s.job_id ?? '');
+  /** The job's newest selection at or before `at`. */
+  const selAt = (jobId: string | null, than: EventRow | null): EventRow | undefined => {
+    const list = jobId ? selsOfJob.get(jobId) : undefined;
+    if (!list) return undefined;
+    let best: EventRow | undefined;
+    for (const s of list) if (than === null || s.at < than.at || (s.at === than.at && s.id < than.id)) best = s; // list is in (at, id) order
+    return best;
+  };
+  const implementJobs = jobs.filter((j) => j.job_kind === 'implement');
+  const jobKindOf = new Map<string, string | null>(all.filter((e) => e.job_id && e.job_kind).map((e) => [e.job_id!, e.job_kind]));
+  const isImplement = (jobId: string | null) => jobKindOf.get(jobId ?? '') === 'implement';
+
+  const runs = of(windowed, 'run.ended').filter((r) => isImplement(r.job_id));
+  const escalations = of(windowed, 'job.escalated');
+  const retried = of(windowed, 'job.retried');
+  const opened = prsOpenedRows.filter((o) => isImplement(o.job_id));
+  const verdictsOf = groupBy(of(all, 'review.verdict'), prKey);
+  const revisionsOf = groupBy(of(all, 'revision.pushed'), prKey);
+
+  const dims = {
+    tier: (s: EventRow | undefined) => s?.tier ?? UNKNOWN,
+    profile: (s: EventRow | undefined, fallback: string | null) => s?.agent ?? fallback ?? UNKNOWN,
+    model: (s: EventRow | undefined) => modelLabel(s),
+  };
+  type Dim = 'tier' | 'profile' | 'model';
+  const keyOf = (dim: Dim, s: EventRow | undefined, fallbackAgent: string | null) =>
+    dim === 'tier' ? dims.tier(s) : dim === 'profile' ? dims.profile(s, fallbackAgent) : dims.model(s);
+
+  function view(dim: Dim): Map<string, RouteGroupStats & { sample?: EventRow }> {
+    const keys = new Map<string, { jobs: EventRow[]; runs: EventRow[]; sample?: EventRow }>();
+    const slot = (k: string, s?: EventRow) => {
+      let g = keys.get(k);
+      if (!g) keys.set(k, (g = { jobs: [], runs: [], sample: s }));
+      else if (s && !g.sample) g.sample = s;
+      return g;
+    };
+    const jobKey = new Map<string, string>();
+    for (const j of implementJobs) {
+      const s = selAt(j.job_id, null);
+      const k = keyOf(dim, s, j.agent);
+      slot(k, s).jobs.push(j);
+      jobKey.set(j.job_id ?? '', k);
+    }
+    for (const r of runs) {
+      const s = selByRun.get(r.subject_id);
+      slot(keyOf(dim, s, r.agent), s).runs.push(r);
+    }
+    const outs = new Map<string, number>();
+    for (const e of escalations) {
+      if (!isImplement(e.job_id)) continue;
+      const k = keyOf(dim, selAt(e.job_id, e), e.agent);
+      outs.set(k, (outs.get(k) ?? 0) + 1);
+      slot(k);
+    }
+    const retriesBy = new Map<string, number>();
+    for (const e of retried) {
+      if (!isImplement(e.job_id)) continue;
+      const k = keyOf(dim, selAt(e.job_id, e), null);
+      retriesBy.set(k, (retriesBy.get(k) ?? 0) + 1);
+      slot(k);
+    }
+    const openedBy = new Map<string, EventRow[]>();
+    for (const o of opened) {
+      const k = jobKey.get(o.job_id ?? '') ?? keyOf(dim, selAt(o.job_id, o), o.agent);
+      const list = openedBy.get(k);
+      if (list) list.push(o);
+      else openedBy.set(k, [o]);
+      slot(k);
+    }
+
+    const out = new Map<string, RouteGroupStats & { sample?: EventRow }>();
+    for (const [k, g] of keys) {
+      const done = g.jobs.filter((j) => j.outcome === 'succeeded').length;
+      const failed = g.jobs.filter((j) => j.outcome === 'failed').length;
+      const escalatedJobs = g.jobs.filter((j) => (selAt(j.job_id, null)?.hops ?? 0) > 0);
+      const prs = openedBy.get(k) ?? [];
+      const prVerdicts = prs.map((p) => verdictsOf.get(prKey(p)) ?? []);
+      const reviewedPrs = prVerdicts.filter((v) => v.length > 0);
+      const latestReady = reviewedPrs.filter((v) => v.reduce((a, b) => (b.at >= a.at ? b : a)).outcome === 'ready-to-merge').length;
+      const revs = prs.map((p) => revisionsOf.get(prKey(p))?.length ?? 0);
+      const modelSource: Record<string, number> = {};
+      for (const j of g.jobs) {
+        const m = selAt(j.job_id, null)?.model_source ?? UNKNOWN;
+        modelSource[m] = (modelSource[m] ?? 0) + 1;
+      }
+      out.set(k, {
+        jobs: g.jobs.length,
+        smallSample: g.jobs.length < MIN_SAMPLE,
+        success: rate(done, done + failed),
+        escalatedIn: { jobs: escalatedJobs.length, succeeded: escalatedJobs.filter((j) => j.outcome === 'succeeded').length },
+        escalatedOut: outs.get(k) ?? 0,
+        retries: retriesBy.get(k) ?? 0,
+        verificationFailures: g.runs.filter((r) => r.reason === 'verify-failed').length,
+        prsOpened: prs.length,
+        reviewed: reviewedPrs.length,
+        reviewReady: rate(latestReady, reviewedPrs.length),
+        changesRequested: prVerdicts.flat().filter((v) => v.outcome === 'changes-requested').length,
+        revisions: { average: revs.length ? revs.reduce((a, b) => a + b, 0) / revs.length : null, total: revs.reduce((a, b) => a + b, 0) },
+        labelToPr: covered(prs.map((p) => ms(p.start_at, p.at))),
+        queueWait: distribution(g.runs.filter((r) => r.wait_ms !== null).map((r) => r.wait_ms!)),
+        modelSources: modelSource,
+        sample: g.sample,
+      });
+    }
+    return out;
+  }
+
+  const plain = (m: Map<string, RouteGroupStats & { sample?: EventRow }>): Record<string, RouteGroupStats> =>
+    Object.fromEntries([...m].sort(([a], [b]) => a.localeCompare(b)).map(([k, { sample: _s, ...v }]) => [k, v]));
+  const models = view('model');
+  const decided = of(windowed, 'route.decided');
+  const count = (rows: readonly EventRow[], f: (r: EventRow) => string) => Object.fromEntries([...groupBy(rows, f)].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, v.length]));
+
+  return {
+    minSample: MIN_SAMPLE,
+    decisions: {
+      total: decided.length,
+      bySource: count(decided, (d) => d.route_source ?? UNKNOWN),
+      byTier: count(decided, (d) => d.tier ?? UNKNOWN),
+      triageFallbacks: decided.filter((d) => d.route_source === 'fallback').length,
+    },
+    selections: of(windowed, 'run.selected').length,
+    byTier: plain(view('tier')),
+    byProfile: plain(view('profile')),
+    byModel: Object.fromEntries(
+      [...models]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, { sample, ...v }]) => [
+          k,
+          { ...v, adapter: sample?.adapter ?? null, model: sample?.model ?? null, effort: sample?.effort ?? null, modelSource: (sample?.model_source as 'configured' | 'observed') ?? 'unknown' },
+        ]),
+    ),
+  };
+}
+
+function pressureSection(windowed: readonly EventRow[], runs: readonly EventRow[]): PressureStats {
+  const cooldowns = windowed.filter((e) => e.kind === 'capacity.cooldown');
+  const deferred = windowed.filter((e) => e.kind === 'job.deferred');
+  const startFailed = runs.filter((r) => r.outcome === 'start_failed');
+  return {
+    cooldowns: {
+      count: cooldowns.length,
+      totalMs: cooldowns.reduce((a, c) => a + (c.wait_ms ?? 0), 0),
+      byName: byKey(cooldowns, (c) => c.agent ?? UNKNOWN, (rows) => ({
+        count: rows.length,
+        totalMs: rows.reduce((a, c) => a + (c.wait_ms ?? 0), 0),
+        stated: rows.filter((c) => c.reason === 'stated').length,
+      })),
+    },
+    deferrals: { count: deferred.length, byAgent: byKey(deferred, (d) => agentOf(d.agent), (rows) => rows.length) },
+    unavailable: { startFailedRuns: startFailed.length, byAgent: byKey(startFailed, (r) => agentOf(r.agent), (rows) => rows.length) },
+    tokenUsage: { reported: false },
+  };
 }
 
 /**
@@ -328,6 +613,8 @@ function section(windowed: readonly EventRow[], all: readonly EventRow[], queue:
       reviewsPerPr: { average: avg(reviews), max: max(reviews) },
       limitReached: new Set(of(windowed, 'pr.limit_reached').map(prKey)).size,
     },
+    routing: routingSection(windowed, all, jobs, opened),
+    pressure: pressureSection(windowed, runs),
   };
 }
 
@@ -356,7 +643,7 @@ export function computeStats(db: Db | null, o: { since: number | null; now: numb
   } as const;
   if (!db) return { ...base, database: false, facts: { total: 0, backfilled: 0 }, overall: emptySection(), byRepo: [] };
 
-  let events = db.prepare('SELECT * FROM metric_events ORDER BY at, id').all() as unknown as EventRow[];
+  let events = (db.prepare('SELECT * FROM metric_events ORDER BY at, id').all() as unknown as Partial<EventRow>[]).map(normalize);
   let queue = db.prepare(QUEUE_SQL).all() as unknown as QueueRow[];
 
   // Every name each repository was seen under, and the newest one to show.

@@ -3,7 +3,7 @@
 import { rowToJob, transaction, type Db, type JobRow } from './database.js';
 import type { EventEnvelope, Job } from '../types.js';
 import { newId, nowIso } from '../util/ids.js';
-import { noteJobFinished } from './metrics.js';
+import { noteJobFinished, noteRouteDecided } from './metrics.js';
 
 export interface Checkpoint {
   repoId: number;
@@ -146,6 +146,7 @@ export function commitPollBatch(
         j.eventId,
       );
       if (Number(res.changes) > 0) {
+        noteRouteDecided(db, { id, repoId: j.repoId, repoFullName: j.repoFullName, envelope: JSON.stringify(j.envelope), at });
         inserted.push({
           id,
           repoId: j.repoId,

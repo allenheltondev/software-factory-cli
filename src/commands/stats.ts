@@ -10,6 +10,8 @@ import {
   type CoveredDistribution,
   type Distribution,
   type KindCounts,
+  type Rate,
+  type RouteGroupStats,
   type StatsReport,
   type StatsSection,
 } from '../db/stats.js';
@@ -149,6 +151,59 @@ function renderSection(s: StatsSection): string[] {
     ['reviews per PR', `avg ${avg(bf.reviewsPerPr.average)}, max ${num(bf.reviewsPerPr.max)}`],
     ['reached maxRevisions', String(bf.limitReached)],
   ]));
+  lines.push(...renderRouting(s));
+  return lines;
+}
+
+const rateCell = (r: Rate) => (r.rate === null ? '-' : `${r.count}/${r.of} ${pct(r.rate)} (${pct(r.low)}-${pct(r.high)})`);
+
+function routeTable(title: string, groups: Record<string, RouteGroupStats>): string[] {
+  const keys = Object.keys(groups);
+  if (!keys.length) return [];
+  const rows = [['', 'jobs', 'success (95%)', 'review-ready (95%)', 'vfail', 'retry', 'esc in/out', 'rev/PR', 'to PR', 'wait']];
+  for (const k of keys) {
+    const g = groups[k]!;
+    rows.push([
+      g.smallSample ? `${k} *` : k,
+      String(g.jobs),
+      rateCell(g.success),
+      rateCell(g.reviewReady),
+      String(g.verificationFailures),
+      String(g.retries),
+      `${g.escalatedIn.jobs}/${g.escalatedOut}`,
+      avg(g.revisions.average),
+      formatDuration(g.labelToPr.medianMs),
+      formatDuration(g.queueWait.medianMs),
+    ]);
+  }
+  return ['', title, ...table(rows)];
+}
+
+function renderRouting(s: StatsSection): string[] {
+  const { routing, pressure } = s;
+  const lines: string[] = [];
+  const d = routing.decisions;
+  if (d.total || routing.selections || Object.keys(routing.byTier).length) {
+    lines.push('', 'Model tiers (implement jobs; model and effort are as configured, not reported by the CLI)');
+    if (d.total) {
+      const src = Object.entries(d.bySource).map(([k, n]) => `${k} ${n}`).join(', ');
+      lines.push(...pairs([['routing decisions', `${d.total}: ${src}${d.triageFallbacks ? `; ${d.triageFallbacks} fell back after triage was unavailable` : ''}`]]));
+    }
+    lines.push(...routeTable('By tier (a job counts for the tier of the run that ended it)', routing.byTier));
+    lines.push(...routeTable('By profile', routing.byProfile));
+    lines.push(...routeTable('By model (configured)', routing.byModel));
+    lines.push(`  * fewer than ${routing.minSample} jobs: too few to compare. vfail: failed verification; esc in/out: escalated into / out of; to PR, wait: medians.`);
+    lines.push('  "unknown" is work from before selections were recorded.');
+  }
+  const c = pressure.cooldowns;
+  if (c.count || pressure.deferrals.count || pressure.unavailable.startFailedRuns) {
+    const names = Object.entries(c.byName).map(([n, v]) => `${n} ${v.count}x ${formatDuration(v.totalMs)}`).join(', ');
+    lines.push('', 'Subscription usage pressure (local signals; token and credit use is not recorded)', ...pairs([
+      ['usage-limit cooldowns', `${c.count}, ${formatDuration(c.totalMs)} in all${names ? `: ${names}` : ''}`],
+      ['jobs deferred', String(pressure.deferrals.count)],
+      ['runs that could not start', String(pressure.unavailable.startFailedRuns)],
+    ]));
+  }
   return lines;
 }
 
