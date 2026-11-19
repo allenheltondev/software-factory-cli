@@ -8,7 +8,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import type { GitHubLink, InstallationOffer, Member, OAuthState, Store, Tenant } from './store.js';
+import type { AgentKeyMeta, ConfigVersion, GitHubLink, InstallationOffer, Member, OAuthState, Store, Tenant } from './store.js';
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
@@ -18,6 +18,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
   const ghKey = (id: number) => ({ pk: `GHUSER#${id}`, sk: 'LINK' });
   const tenantKey = (id: number) => ({ pk: `TENANT#${id}`, sk: 'META' });
   const memberKey = (id: number, sub: string) => ({ pk: `TENANT#${id}`, sk: `MEMBER#${sub}` });
+  // Zero-padded, so the sort key orders versions numerically.
+  const configKey = (id: number, version: number) => ({ pk: `TENANT#${id}`, sk: `CONFIG#${String(version).padStart(10, '0')}` });
 
   /**
    * Gives everything in a tenant's partition (members now; config and jobs later) the table TTL.
@@ -73,6 +75,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     };
     if (item.disabledReason === 'suspended' || item.disabledReason === 'uninstalled') t.disabledReason = item.disabledReason;
     if (typeof item.deleteAfter === 'number') t.deleteAfter = item.deleteAfter;
+    if (typeof item.activeConfigVersion === 'number') t.activeConfigVersion = item.activeConfigVersion;
     return t;
   };
   const toMember = (item: Record<string, unknown>): Member => ({
@@ -364,6 +367,150 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         }),
       );
       return (out.Items ?? []).map(toMember);
+    },
+
+    async createConfigVersion(id, meta) {
+      // Versions only grow: the next number after the highest there is, claimed with a
+      // conditional put (a concurrent publish that took it makes this one try the next), in one
+      // transaction with a check that the tenant is not uninstalled.
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const last = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+            ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'CONFIG#' },
+            ScanIndexForward: false,
+            Limit: 1,
+            ConsistentRead: true,
+          }),
+        );
+        const version = (typeof last.Items?.[0]?.version === 'number' ? last.Items[0].version : 0) + 1;
+        try {
+          await client.send(
+            new TransactWriteCommand({
+              TransactItems: [
+                {
+                  ConditionCheck: {
+                    TableName: T,
+                    Key: tenantKey(id),
+                    ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+                    ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
+                  },
+                },
+                {
+                  Put: {
+                    TableName: T,
+                    Item: { ...configKey(id, version), ...meta, installationId: id, version, status: 'pending' },
+                    ConditionExpression: 'attribute_not_exists(pk)',
+                  },
+                },
+              ],
+            }),
+          );
+          return version;
+        } catch (err) {
+          if (!(err instanceof TransactionCanceledException)) throw err;
+          const [tenant, config] = err.CancellationReasons ?? [];
+          if (tenant?.Code === 'ConditionalCheckFailed') return (await getTenantItem(id, true)) ? 'uninstalled' : 'no_tenant';
+          if (config?.Code !== 'ConditionalCheckFailed') throw err;
+          // Taken by a concurrent publish: try the next number.
+        }
+      }
+      throw new Error(`createConfigVersion: tenant ${id} kept publishing concurrently; try again`);
+    },
+
+    async markConfigReady(id, version) {
+      await client.send(
+        new UpdateCommand({
+          TableName: T,
+          Key: configKey(id, version),
+          UpdateExpression: 'SET #status = :ready',
+          ConditionExpression: 'attribute_exists(pk)',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':ready': 'ready' },
+        }),
+      );
+    },
+
+    async activateConfig(id, version) {
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                ConditionCheck: {
+                  TableName: T,
+                  Key: configKey(id, version),
+                  ConditionExpression: '#status = :ready',
+                  ExpressionAttributeNames: { '#status': 'status' },
+                  ExpressionAttributeValues: { ':ready': 'ready' },
+                },
+              },
+              {
+                Update: {
+                  TableName: T,
+                  Key: tenantKey(id),
+                  UpdateExpression: 'SET activeConfigVersion = :v',
+                  ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+                  ExpressionAttributeValues: { ':v': version, ':uninstalled': 'uninstalled' },
+                },
+              },
+            ],
+          }),
+        );
+        return 'activated';
+      } catch (err) {
+        if (!(err instanceof TransactionCanceledException)) throw err;
+        const [config, tenant] = err.CancellationReasons ?? [];
+        if (tenant?.Code === 'ConditionalCheckFailed') return (await getTenantItem(id, true)) ? 'uninstalled' : 'no_tenant';
+        if (config?.Code === 'ConditionalCheckFailed') return 'not_ready';
+        throw err;
+      }
+    },
+
+    async listConfigVersions(id) {
+      const out: ConfigVersion[] = [];
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+            ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'CONFIG#' },
+            ExclusiveStartKey,
+          }),
+        );
+        for (const i of page.Items ?? []) {
+          out.push({
+            installationId: id,
+            version: Number(i.version),
+            status: i.status === 'ready' ? 'ready' : 'pending',
+            sha256: String(i.sha256),
+            files: Array.isArray(i.files) ? i.files.map(String) : [],
+            publishedBy: String(i.publishedBy),
+            publishedAt: String(i.publishedAt),
+          });
+        }
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return out.sort((a, b) => a.version - b.version);
+    },
+
+    async putAgentKeyMeta(id, meta: AgentKeyMeta) {
+      await client.send(new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: `KEY#${meta.name}`, ...meta } }));
+    },
+
+    async listAgentKeyMeta(id) {
+      const out = await client.send(
+        new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'KEY#' },
+        }),
+      );
+      return (out.Items ?? [])
+        .map((i) => ({ name: String(i.name), updatedAt: String(i.updatedAt), updatedBy: String(i.updatedBy) }))
+        .sort((a, b) => a.name.localeCompare(b.name));
     },
   };
 }

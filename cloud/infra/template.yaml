@@ -277,6 +277,47 @@ Resources:
               Authorizer: NONE
 
   # ---------------------------------------------------------------------------
+  # Tenant data (#68): everything a tenant's jobs read and write, under tenants/<installationId>/
+  #   config/<version>/   immutable config bundles (server/src/tenants/publish.ts)
+  #   state/, results/    the shared state database and job results (the job broker, next)
+  # Private; only the platform's roles reach it, and a job reaches only its own tenant's prefix
+  # (the broker's scoped credentials).
+  # ---------------------------------------------------------------------------
+  TenantBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Object ownership is left at S3's default for new buckets (bucket owner enforced, ACLs off).
+
+  TenantBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TenantBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt TenantBucket.Arn
+              - !Sub ${TenantBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---------------------------------------------------------------------------
   # Hosting: a private S3 bucket and one CloudFront distribution with two origins, so the browser
   # sees a single origin for the app and the API (no CORS, relative /api/v1 paths).
   # ---------------------------------------------------------------------------
@@ -470,3 +511,6 @@ Outputs:
   TableName:
     Description: The Updraft Cloud table
     Value: !Ref UpdraftTable
+  TenantBucket:
+    Description: Tenant config bundles, state and results, under tenants/<installationId>/
+    Value: !Ref TenantBucket

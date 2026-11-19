@@ -6,6 +6,9 @@ on:
   pull_request:
     paths:
       - 'cloud/**'
+      # The server bundles the CLI's config schema and agent profiles from src/.
+      - 'src/config/**'
+      - 'src/agents/**'
       - '.github/workflows/cloud-*.yaml'
 
 # One Staging stack: deploys queue instead of cancelling each other halfway through a change set.

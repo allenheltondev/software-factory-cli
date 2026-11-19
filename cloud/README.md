@@ -164,6 +164,46 @@ The manifest sets everything #67 describes:
 - **Organization permission:** Members (read). A user's token needs it to show their own org membership, which is how ownership of an org installation is checked.
 - **Events:** Issues, Pull request and Pull request review. Installation events always arrive.
 
+### Tenant config and agent keys
+
+A tenant's jobs run with that tenant's own Updraft config and agent keys (#68). Until the console can edit them (#69, #70), an admin sets them with `server/scripts/tenant-admin.ts`, using AWS credentials for the stack's account:
+
+```sh
+cd cloud
+npm run tenant-admin --workspace=server -- config publish --installation 55 --file tenant.yaml --prompts ./prompts
+npm run tenant-admin --workspace=server -- config list    --installation 55
+npm run tenant-admin --workspace=server -- key set        --installation 55 --name ANTHROPIC_API_KEY   # the key on stdin, never in argv
+npm run tenant-admin --workspace=server -- key status     --installation 55
+```
+
+**The config** is an ordinary Updraft config: `agents`, `pools`, `actions`, `repositories`, `dispatch` and `review`. Prompts are `./prompts/<name>.md`, taken from the `--prompts` directory. `server/src/tenants/config.ts` compiles it as follows.
+
+- **Tenant input the platform owns is rejected, with its path.** It's never silently overridden:
+  - `github`, `execution`, `maxConcurrent`, `pollIntervalSeconds` and `capacity`;
+  - an agent's `command`, `args`, `env`, `container`, `capacityGroup` or `maxConcurrent`;
+  - a repository's `id`, `checkoutPath`, `remote` or `dependencies`;
+  - any `tiers.triage`;
+  - agents other than `claude` and `codex`;
+  - publish modes other than `draft-pr` and `pr`;
+  - timeouts over 120 minutes (agent) or 30 minutes (verify).
+- **What the platform writes:**
+  - live mode, one job at a time;
+  - the platform App through `tokenFile` (#77), committing as its bot;
+  - each agent in the sandbox runtime with only its own key's variable;
+  - each repository's id, from what the installation can actually reach, and a checkout under `./clones/`.
+- **Validation:** the result is checked with the worker's own `validateConfig` (imported from `src/`, as Linux), so a config that publishes is one the job accepts.
+- **Publishing** (`server/src/tenants/publish.ts`):
+  1. allocate the next version as pending (versions only grow, and none is rewritten);
+  2. upload the bundle to `s3://<TenantBucket>/tenants/<id>/config/<version>/`;
+  3. mark it ready;
+  4. activate it, in one conditional write.
+
+  If anything fails, the previous version stays active. Jobs will pin the version active when they're dispatched (PR 4).
+
+**Agent keys** go into one Secrets Manager secret per tenant, `updraft/tenants/<id>/agent-env`: a JSON object of `ANTHROPIC_API_KEY` and `CODEX_API_KEY`, tagged with the installation id.
+- **Write-only:** nothing reads a value back. The table records only that a key is set, when, and by whom.
+- **Shape check:** a value that doesn't look like the named key is refused without being repeated.
+
 ## Not verified yet
 
 Staging and Production deploy and pass the anonymous smoke checks. Signing in at `updraft.readysetcloud.io` works end to end through the Cognito authorizer.

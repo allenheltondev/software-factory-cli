@@ -45,6 +45,27 @@ export interface Tenant {
   deleteAfter?: number;
   createdAt: string;
   createdBy: string;
+  /** The config version jobs start with; absent until one is published (no config, no jobs). */
+  activeConfigVersion?: number;
+}
+
+/** One published config: an immutable bundle under tenants/<id>/config/<version>/ in the tenant bucket. */
+export interface ConfigVersion {
+  installationId: number;
+  version: number;
+  /** pending: allocated, the upload may not have finished (never activated). ready: fully uploaded. */
+  status: 'pending' | 'ready';
+  sha256: string;
+  files: string[];
+  publishedBy: string;
+  publishedAt: string;
+}
+
+/** That an agent key is set (never its value, which lives only in Secrets Manager). */
+export interface AgentKeyMeta {
+  name: string;
+  updatedAt: string;
+  updatedBy: string;
 }
 
 export type MemberRole = 'owner' | 'editor';
@@ -118,6 +139,23 @@ export interface Store {
   setSuspended(installationId: number, suspended: boolean): Promise<'updated' | 'uninstalled' | 'no_tenant'>;
   getMember(installationId: number, sub: string): Promise<Member | null>;
   listMemberships(sub: string): Promise<Member[]>;
+
+  /**
+   * Allocates the next config version as `pending` (versions only ever grow). `uninstalled`: the
+   * tenant is gone or going, so nothing is allocated; `no_tenant`: there is no such tenant.
+   */
+  createConfigVersion(installationId: number, meta: Omit<ConfigVersion, 'installationId' | 'version' | 'status'>): Promise<number | 'uninstalled' | 'no_tenant'>;
+  /** The bundle is fully uploaded. */
+  markConfigReady(installationId: number, version: number): Promise<void>;
+  /**
+   * Makes a ready version the one jobs start with, in one transaction with the checks. The
+   * previous active version stays active on any refusal.
+   */
+  activateConfig(installationId: number, version: number): Promise<'activated' | 'not_ready' | 'uninstalled' | 'no_tenant'>;
+  listConfigVersions(installationId: number): Promise<ConfigVersion[]>;
+
+  putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<void>;
+  listAgentKeyMeta(installationId: number): Promise<AgentKeyMeta[]>;
 }
 
 /** In-memory Store for tests and local dev without AWS. `ttl` is recorded as DynamoDB would hold it. */
@@ -128,6 +166,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const offers = new Map<string, InstallationOffer>();
   const tenants = new Map<number, Tenant & { ttl?: number }>();
   const members = new Map<string, Member & { ttl?: number }>();
+  const configs = new Map<string, ConfigVersion>();
+  const keys = new Map<string, AgentKeyMeta>();
   const memberKey = (id: number, sub: string) => `${id}/${sub}`;
   const strip = <T extends { ttl?: number }>(item: T): Omit<T, 'ttl'> => {
     const { ttl: _ttl, ...rest } = item;
@@ -218,6 +258,35 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async listMemberships(sub) {
       return [...members.values()].filter((m) => m.sub === sub).map((m) => strip(m) as Member);
+    },
+    async createConfigVersion(id, meta) {
+      const t = tenants.get(id);
+      if (!t) return 'no_tenant';
+      if (t.disabledReason === 'uninstalled') return 'uninstalled';
+      const version = Math.max(0, ...[...configs.values()].filter((c) => c.installationId === id).map((c) => c.version)) + 1;
+      configs.set(`${id}/${version}`, { ...meta, installationId: id, version, status: 'pending' });
+      return version;
+    },
+    async markConfigReady(id, version) {
+      const c = configs.get(`${id}/${version}`);
+      if (c) configs.set(`${id}/${version}`, { ...c, status: 'ready' });
+    },
+    async activateConfig(id, version) {
+      const t = tenants.get(id);
+      if (!t) return 'no_tenant';
+      if (t.disabledReason === 'uninstalled') return 'uninstalled';
+      if (configs.get(`${id}/${version}`)?.status !== 'ready') return 'not_ready';
+      tenants.set(id, { ...t, activeConfigVersion: version });
+      return 'activated';
+    },
+    async listConfigVersions(id) {
+      return [...configs.values()].filter((c) => c.installationId === id).sort((a, b) => a.version - b.version).map((c) => ({ ...c }));
+    },
+    async putAgentKeyMeta(id, meta) {
+      keys.set(`${id}/${meta.name}`, { ...meta });
+    },
+    async listAgentKeyMeta(id) {
+      return [...keys.entries()].filter(([k]) => k.startsWith(`${id}/`)).map(([, v]) => ({ ...v })).sort((a, b) => a.name.localeCompare(b.name));
     },
     ttlOf(id) {
       return {
