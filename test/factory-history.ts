@@ -6,9 +6,9 @@ import { configSchema, type UpdraftConfig } from '../src/config/schema.js';
 import { openDatabase, type Db } from '../src/db/database.js';
 import { beginPublication, finishPublication, recordPublicationProgress } from '../src/db/publications.js';
 import { adoptOwnPushes, beginPrReview, enqueueReviewJob, finishPrReview, getLoopPr, setMergeState, startMergeFor, type MergeStep } from '../src/db/pr-reviews.js';
-import { claimNextJob, finishRun, markExecutionStarted, retryJob, setRunProcess, setRunSummary } from '../src/db/queue.js';
+import { claimNextJob, finishRun, type FailureHandling, markExecutionStarted, retryJob, setRunProcess, setRunSummary } from '../src/db/queue.js';
 import { beginRevision, enqueueRevision, finishRevision, holdRevision, revisionJob, syncRevisionPrs, getRevisionPr } from '../src/db/revisions.js';
-import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type RunOutcome, type RunSummary, type ReviewVerdict } from '../src/types.js';
+import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type RoutingDecision, type RunOutcome, type RunSummary, type ReviewVerdict } from '../src/types.js';
 
 export const MIN = 60_000;
 export const HOUR = 60 * MIN;
@@ -30,6 +30,8 @@ let seq = 0;
 export class History {
   readonly db: Db;
   t: number;
+  /** The configuration runs are claimed under. */
+  config: UpdraftConfig = historyConfig;
 
   constructor(start: number, db?: Db) {
     this.t = start;
@@ -48,7 +50,7 @@ export class History {
   }
 
   /** Queue an issue job now, for a label applied `labelAgo` ms ago. */
-  queueIssue(o: { repoId: number; fullName: string; issue: number; pool?: string; labelAgo?: number }): string {
+  queueIssue(o: { repoId: number; fullName: string; issue: number; pool?: string; labelAgo?: number; routing?: RoutingDecision }): string {
     seq++;
     const id = `job_h${String(seq).padStart(5, '0')}`;
     const url = `https://github.com/${o.fullName}/issues/${o.issue}`;
@@ -63,6 +65,7 @@ export class History {
       label: 'updraft:ready',
       labelsAtEnqueue: ['updraft:ready'],
       createdAt: this.iso(-(o.labelAgo ?? 0)),
+      ...(o.routing ? { routing: o.routing } : {}),
     };
     this.db
       .prepare(
@@ -80,10 +83,10 @@ export class History {
    * execution start but no agent start. A start_failed run has neither.
    */
   run(
-    o: { wait?: number; runMs?: number; outcome?: RunOutcome; verify?: boolean; review?: RunSummary['review']; launched?: boolean } = {},
+    o: { wait?: number; runMs?: number; outcome?: RunOutcome; verify?: boolean; review?: RunSummary['review']; launched?: boolean; handling?: FailureHandling } = {},
   ): { runId: string; jobId: string } {
     this.advance(o.wait ?? 0);
-    const c = claimNextJob(this.db, historyConfig, { workerId: WORKER, hostname: 'host', leaseSeconds: 3600, runsDir: '/runs', now: this.now });
+    const c = claimNextJob(this.db, this.config, { workerId: WORKER, hostname: 'host', leaseSeconds: 3600, runsDir: '/runs', now: this.now });
     if (!c) throw new Error('nothing to claim');
     if (o.outcome !== 'start_failed') {
       markExecutionStarted(this.db, c.run.id, { workerId: WORKER, now: this.now });
@@ -108,7 +111,7 @@ export class History {
       };
       setRunSummary(this.db, c.run.id, summary);
     }
-    finishRun(this.db, c.run.id, { outcome: o.outcome ?? 'succeeded', ...(o.outcome === 'failed' ? { error: 'agent failed' } : {}), now: this.now });
+    finishRun(this.db, c.run.id, { outcome: o.outcome ?? 'succeeded', ...(o.outcome === 'failed' ? { error: 'agent failed' } : {}), ...(o.handling ? { handling: o.handling } : {}), now: this.now });
     return { runId: c.run.id, jobId: c.job.id };
   }
 
@@ -244,11 +247,23 @@ export class History {
   }
 }
 
-/** Every row of metric_events without the columns that differ between a live record and a backfill. */
+/** Facts of the routing and selection kinds: written live only, never backfilled (src/db/metrics.ts). */
+const ROUTING_KINDS = "('route.decided', 'run.selected', 'job.retried', 'capacity.cooldown', 'job.deferred', 'job.escalated')";
+/** The columns migration 16 added; the original facts are compared without them. */
+const V16_COLUMNS = ['tier', 'requested_tier', 'risk', 'adapter', 'model', 'effort', 'model_source', 'route_source', 'confidence', 'hops', 'retries', 'head_sha'];
+
+/** Every original-kind row of metric_events without the columns that differ between a live record and a backfill. */
 export function metricRows(db: Db): Array<Record<string, unknown>> {
   return (
-    db.prepare('SELECT * FROM metric_events ORDER BY kind, subject_id').all() as Array<Record<string, unknown>>
-  ).map(({ id: _id, backfilled: _b, recorded_at: _r, ...rest }) => rest);
+    db.prepare(`SELECT * FROM metric_events WHERE kind NOT IN ${ROUTING_KINDS} ORDER BY kind, subject_id`).all() as Array<Record<string, unknown>>
+  ).map(({ id: _id, backfilled: _b, recorded_at: _r, ...rest }) => Object.fromEntries(Object.entries(rest).filter(([k]) => !V16_COLUMNS.includes(k))));
+}
+
+/** The routing and selection facts, by kind and subject. */
+export function routingRows(db: Db): Array<Record<string, unknown>> {
+  return (db.prepare(`SELECT * FROM metric_events WHERE kind IN ${ROUTING_KINDS} ORDER BY kind, subject_id`).all() as Array<Record<string, unknown>>).map(
+    ({ id: _id, backfilled: _b, recorded_at: _r, ...rest }) => rest,
+  );
 }
 
 /**

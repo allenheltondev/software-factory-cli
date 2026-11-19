@@ -25,7 +25,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 /** The schema version that added the metric_events rollup (`updraft stats`). */
 export const METRICS_SCHEMA_VERSION = 13;
@@ -540,6 +540,23 @@ const MIGRATIONS: Record<number, Migration> = {
 
     ALTER TABLE jobs ADD COLUMN escalation_hops INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE jobs ADD COLUMN deferrals INTEGER NOT NULL DEFAULT 0;
+  `,
+  16: `
+    -- Model-tier measurement (docs/stats.md). metric_events gains nullable columns for the routing
+    -- decision and the run selection; every older row keeps NULL, which "updraft stats" reports
+    -- as unknown. Codes, names, numbers and ids only: no prompt, issue text, account or path.
+    ALTER TABLE metric_events ADD COLUMN tier           TEXT;     -- resolved tier: routine | standard | complex | high-risk
+    ALTER TABLE metric_events ADD COLUMN requested_tier TEXT;     -- tier the router asked for (escalation: the tier left)
+    ALTER TABLE metric_events ADD COLUMN risk           TEXT;     -- low | medium | high
+    ALTER TABLE metric_events ADD COLUMN adapter        TEXT;
+    ALTER TABLE metric_events ADD COLUMN model          TEXT;     -- as configured for the profile; never what the CLI reports
+    ALTER TABLE metric_events ADD COLUMN effort         TEXT;
+    ALTER TABLE metric_events ADD COLUMN model_source   TEXT;     -- configured | observed | unknown
+    ALTER TABLE metric_events ADD COLUMN route_source   TEXT;     -- override | local-rule | cli-triage | fallback | legacy-label | default
+    ALTER TABLE metric_events ADD COLUMN confidence     REAL;     -- classifier or triage confidence
+    ALTER TABLE metric_events ADD COLUMN hops           INTEGER;  -- escalations the job had had when the fact happened
+    ALTER TABLE metric_events ADD COLUMN retries        INTEGER;  -- "updraft retry" count of the job at that time
+    ALTER TABLE metric_events ADD COLUMN head_sha       TEXT;     -- review.verdict, revision.pushed: the PR head commit
   `,
 };
 

@@ -13,6 +13,8 @@
 //   live writers and the backfill of migration 13 run the same SELECTs, so an upgraded install's
 //   history is computed exactly as new facts are. Migration 13 runs them against the v13 schema:
 //   a later change that makes a SELECT read a newer column must give migration 13 its own copy.
+import { agentProfile } from '../agents/profile.js';
+import { workflowId, type TierConfig, type UpdraftConfig } from '../config/schema.js';
 import { nowIso } from '../util/ids.js';
 import type { Db } from './database.js';
 
@@ -269,9 +271,16 @@ export function noteLimitReached(db: Db, repoId: number, prNumber: number): void
   note(db, 'pr.limit_reached', 'AND w.repo_id = $repo AND w.pr_number = $pr', { repo: repoId, pr: prNumber });
 }
 
-/** After the verdict of a reviewer run was first written down (its pr_reviews row). */
+/**
+ * After the verdict of a reviewer run was first written down (its pr_reviews row). The PR head
+ * commit it reviewed is stored on the fact (a column added by migration 16, written with it).
+ */
 export function noteReview(db: Db, runId: string): void {
   note(db, 'review.verdict', 'AND v.run_id = $id', { id: runId });
+  db.prepare(
+    `UPDATE metric_events SET head_sha = (SELECT head_sha FROM pr_reviews WHERE run_id = $id)
+     WHERE kind = 'review.verdict' AND subject_id = $id AND head_sha IS NULL`,
+  ).run({ id: runId });
 }
 
 /** After a change request was recorded. */
@@ -282,6 +291,301 @@ export function noteChangeRequest(db: Db, repoId: number, reviewId: string): voi
 /** After a revision's push was recorded; records something only once pushed_at is set. */
 export function noteRevisionPushed(db: Db, runId: string): void {
   note(db, 'revision.pushed', 'AND v.run_id = $id', { id: runId });
+  db.prepare(
+    `UPDATE metric_events SET head_sha = (SELECT head_sha FROM revisions WHERE run_id = $id)
+     WHERE kind = 'revision.pushed' AND subject_id = $id AND head_sha IS NULL`,
+  ).run({ id: runId });
+}
+
+// ---------------------------------------------------------------------------
+// Routing and selection facts (docs/stats.md, "Model tiers"). Written by the code that makes the
+// decision, with the same one-row-per-fact idempotency as above. They are never backfilled: a
+// database from before they existed reports those runs as unknown.
+// ---------------------------------------------------------------------------
+
+export type RoutingMetricKind =
+  /** The router chose a pool for a new job (at enqueue). subject: job id. */
+  | 'route.decided'
+  /** A run was selected for a job: the claim picked an agent profile. subject: run id. */
+  | 'run.selected'
+  /** "updraft retry" requeued a job. subject: "<job id>:<retries after>". */
+  | 'job.retried'
+  /** A usage limit started (or extended) a cooldown. subject: run id. */
+  | 'capacity.cooldown'
+  /** A job was requeued to wait out a usage limit. subject: "<job id>:<deferrals after>". */
+  | 'job.deferred'
+  /** A job was moved to a more capable tier. subject: "<job id>:<hops after>". */
+  | 'job.escalated';
+
+export const ROUTING_METRIC_KINDS: readonly RoutingMetricKind[] = ['route.decided', 'run.selected', 'job.retried', 'capacity.cooldown', 'job.deferred', 'job.escalated'];
+
+export type Tier = 'routine' | 'standard' | 'complex' | 'high-risk';
+export type RouteSource = 'override' | 'local-rule' | 'cli-triage' | 'fallback' | 'legacy-label' | 'default';
+
+interface RoutingFact {
+  kind: RoutingMetricKind;
+  subject: string;
+  at: string;
+  repoId: number;
+  repoFullName: string | null;
+  jobId: string | null;
+  jobKind?: string | null;
+  agent?: string | null;
+  pool?: string | null;
+  outcome?: string | null;
+  reason?: string | null;
+  startAt?: string | null;
+  waitMs?: number | null;
+  tier?: string | null;
+  requestedTier?: string | null;
+  risk?: string | null;
+  adapter?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  modelSource?: string | null;
+  routeSource?: string | null;
+  confidence?: number | null;
+  hops?: number | null;
+  retries?: number | null;
+}
+
+function insertRouting(db: Db, f: RoutingFact): void {
+  db.prepare(
+    `INSERT INTO metric_events (kind, subject_id, at, repo_id, repo_full_name, job_id, job_kind, agent, pool, outcome, reason, start_at, wait_ms,
+       backfilled, recorded_at, tier, requested_tier, risk, adapter, model, effort, model_source, route_source, confidence, hops, retries)
+     VALUES ($kind, $subject, $at, $repo, $name, $job, $jobKind, $agent, $pool, $outcome, $reason, $startAt, $waitMs,
+       0, $recorded, $tier, $requested, $risk, $adapter, $model, $effort, $modelSource, $routeSource, $confidence, $hops, $retries)
+     ON CONFLICT (kind, subject_id) DO NOTHING`,
+  ).run({
+    kind: f.kind,
+    subject: f.subject,
+    at: f.at,
+    repo: f.repoId,
+    name: f.repoFullName,
+    job: f.jobId,
+    jobKind: f.jobKind ?? null,
+    agent: f.agent ?? null,
+    pool: f.pool ?? null,
+    outcome: f.outcome ?? null,
+    reason: f.reason ?? null,
+    startAt: f.startAt ?? null,
+    waitMs: f.waitMs ?? null,
+    recorded: nowIso(),
+    tier: f.tier ?? null,
+    requested: f.requestedTier ?? null,
+    risk: f.risk ?? null,
+    adapter: f.adapter ?? null,
+    model: f.model ?? null,
+    effort: f.effort ?? null,
+    modelSource: f.modelSource ?? null,
+    routeSource: f.routeSource ?? null,
+    confidence: f.confidence ?? null,
+    hops: f.hops ?? null,
+    retries: f.retries ?? null,
+  });
+}
+
+interface RoutingNote {
+  rule?: string;
+  tier?: string;
+  risk?: string;
+  confidence?: number;
+  uncertain?: boolean;
+  triage?: { origin?: string };
+}
+
+/** What a job's envelope says about its kind and routing; tolerant of anything unexpected. */
+function envelopeOf(envelope: string): { kind: string | null; routing: RoutingNote | null } {
+  try {
+    const e = JSON.parse(envelope) as { type?: string; routing?: RoutingNote };
+    const kind = e.type === 'issue.labeled' ? 'implement' : e.type === 'pull_request.changes_requested' ? 'revision' : e.type === 'pull_request.review' ? 'review' : null;
+    return { kind, routing: e.routing && typeof e.routing === 'object' ? e.routing : null };
+  } catch {
+    return { kind: null, routing: null };
+  }
+}
+
+const TIERS: readonly string[] = ['routine', 'standard', 'complex', 'high-risk'];
+const RISKS: readonly string[] = ['low', 'medium', 'high'];
+const tierOrNull = (t: unknown): Tier | null => (typeof t === 'string' && TIERS.includes(t) ? (t as Tier) : null);
+
+/** How the pool of a job was chosen, as a fixed code. */
+export function routeSourceOf(r: RoutingNote | null): RouteSource | null {
+  if (!r?.rule) return null;
+  switch (r.rule) {
+    case 'override-label':
+      return 'override';
+    case 'legacy-label':
+      return 'legacy-label';
+    case 'triage':
+      return 'cli-triage';
+    case 'heuristic':
+      return r.triage?.origin === 'fallback' ? 'fallback' : 'local-rule';
+    case 'default':
+      return 'default';
+    default:
+      return null;
+  }
+}
+
+/** A fixed code for why the route is what it is; never the free-text detail. */
+function routeReasonCode(r: RoutingNote | null): string | null {
+  if (!r?.rule) return null;
+  if (r.rule === 'triage') return r.triage?.origin === 'cache' ? 'triage-cached' : 'triage-answered';
+  if (r.rule === 'heuristic') return r.triage?.origin === 'fallback' ? 'triage-unavailable' : r.uncertain ? 'low-confidence' : 'confident';
+  return r.rule;
+}
+
+/** A configured model or effort value kept only when it looks like one (no paths, no free text). */
+const safeSetting = (v: string | null | undefined): string | null => (v && v.length <= 80 && /^[A-Za-z0-9._:@+/-]+$/.test(v) && !v.startsWith('/') && !v.includes('..') ? v : null);
+
+/** The tier whose pool this is, when the configuration names one. */
+export function tierOfPool(t: TierConfig | undefined, pool: string): Tier | null {
+  if (!t) return null;
+  if (t.highRisk?.pool === pool) return 'high-risk';
+  for (const tier of ['routine', 'standard', 'complex'] as const) if (t.pools[tier] === pool) return tier;
+  return null;
+}
+
+/** After a poll batch inserted a job: the router's decision, when tier routing made one. */
+export function noteRouteDecided(db: Db, job: { id: string; repoId: number; repoFullName: string; envelope: string; at: string }): void {
+  const { kind, routing } = envelopeOf(job.envelope);
+  const tier = tierOrNull(routing?.tier);
+  if (!routing || !tier) return;
+  insertRouting(db, {
+    kind: 'route.decided',
+    subject: job.id,
+    at: job.at,
+    repoId: job.repoId,
+    repoFullName: job.repoFullName,
+    jobId: job.id,
+    jobKind: kind,
+    tier,
+    requestedTier: tier,
+    risk: RISKS.includes(routing.risk ?? '') ? routing.risk : null,
+    routeSource: routeSourceOf(routing),
+    reason: routeReasonCode(routing),
+    confidence: typeof routing.confidence === 'number' ? routing.confidence : null,
+    outcome: 'decided',
+  });
+}
+
+/**
+ * In the claim's transaction: which profile, adapter, configured model and effort a run was
+ * given, with the job's routing and how many escalations and retries it had had. The model and
+ * effort are what the profile asks its CLI for; whether the CLI honored them is not known.
+ */
+export function noteRunSelected(
+  db: Db,
+  config: UpdraftConfig,
+  job: { id: string; repo_id: number; repo_full_name: string; workflow_id: string; envelope: string; created_at: string; escalation_hops: number },
+  run: { id: string; agent: string; pool: string; started_at: string },
+): void {
+  const { kind, routing } = envelopeOf(job.envelope);
+  const agent = Object.hasOwn(config.agents, run.agent) ? config.agents[run.agent] : undefined;
+  const adapter = agent ? (agent.adapter ?? run.agent) : null;
+  const profile = agent && adapter ? agentProfile(adapter, agent) : null;
+  const model = safeSetting(profile?.model.value);
+  const effort = safeSetting(profile?.effort.value);
+  const requested = tierOrNull(routing?.tier);
+  // After an escalation the pool is no longer the one the router chose; the pool says what ran.
+  const tiers = Object.values(config.repositories)
+    .find((r) => r.id === job.repo_id)
+    ?.workflows.find((w) => workflowId(w) === job.workflow_id)?.tiers;
+  const resolved = tierOfPool(tiers, run.pool) ?? (job.escalation_hops === 0 ? requested : null);
+  insertRouting(db, {
+    kind: 'run.selected',
+    subject: run.id,
+    at: run.started_at,
+    repoId: job.repo_id,
+    repoFullName: job.repo_full_name,
+    jobId: job.id,
+    jobKind: kind,
+    agent: run.agent,
+    pool: run.pool,
+    startAt: job.created_at,
+    tier: resolved,
+    requestedTier: requested,
+    risk: RISKS.includes(routing?.risk ?? '') ? routing!.risk : null,
+    adapter: safeSetting(adapter),
+    model,
+    effort,
+    modelSource: model || effort ? 'configured' : 'unknown',
+    routeSource: routeSourceOf(routing),
+    reason: routeReasonCode(routing),
+    confidence: typeof routing?.confidence === 'number' ? routing.confidence : null,
+    hops: job.escalation_hops,
+    retries: (db.prepare('SELECT retries FROM jobs WHERE id = ?').get(job.id) as { retries: number } | undefined)?.retries ?? null,
+  });
+}
+
+/** After "updraft retry" requeued a job (`retries` is the count after the retry). */
+export function noteJobRetried(db: Db, job: { id: string; repo_id: number; repo_full_name: string; envelope: string; retries: number }, at: string): void {
+  insertRouting(db, {
+    kind: 'job.retried',
+    subject: `${job.id}:${job.retries}`,
+    at,
+    repoId: job.repo_id,
+    repoFullName: job.repo_full_name,
+    jobId: job.id,
+    jobKind: envelopeOf(job.envelope).kind,
+    retries: job.retries,
+  });
+}
+
+/** After a usage limit started a cooldown of a capacity group or profile. `waitMs` is its length. */
+export function noteCooldown(
+  db: Db,
+  c: { runId: string; job: { id: string; repo_id: number; repo_full_name: string }; scope: 'group' | 'agent'; name: string; waitMs: number; stated: boolean; at: string },
+): void {
+  insertRouting(db, {
+    kind: 'capacity.cooldown',
+    subject: c.runId,
+    at: c.at,
+    repoId: c.job.repo_id,
+    repoFullName: c.job.repo_full_name,
+    jobId: c.job.id,
+    agent: c.name,
+    outcome: c.scope,
+    reason: c.stated ? 'stated' : 'default',
+    waitMs: Math.max(0, Math.round(c.waitMs)),
+  });
+}
+
+/** After a job was requeued to wait out a usage limit (`deferrals` is the count after it). */
+export function noteJobDeferred(db: Db, job: { id: string; repo_id: number; repo_full_name: string }, d: { deferrals: number; agent: string; at: string }): void {
+  insertRouting(db, {
+    kind: 'job.deferred',
+    subject: `${job.id}:${d.deferrals}`,
+    at: d.at,
+    repoId: job.repo_id,
+    repoFullName: job.repo_full_name,
+    jobId: job.id,
+    agent: d.agent,
+    reason: 'usage-limit',
+  });
+}
+
+/** After a job was moved to a more capable tier (`hops` is the count after it). */
+export function noteJobEscalated(
+  db: Db,
+  job: { id: string; repo_id: number; repo_full_name: string },
+  e: { hops: number; fromTier: string; toTier: string; source: string; agent: string; pool: string; at: string },
+): void {
+  insertRouting(db, {
+    kind: 'job.escalated',
+    subject: `${job.id}:${e.hops}`,
+    at: e.at,
+    repoId: job.repo_id,
+    repoFullName: job.repo_full_name,
+    jobId: job.id,
+    agent: e.agent,
+    pool: e.pool,
+    tier: tierOrNull(e.toTier),
+    requestedTier: tierOrNull(e.fromTier),
+    reason: /^[a-z-]{1,30}$/.test(e.source) ? e.source : 'other',
+    hops: e.hops,
+  });
 }
 
 /**
