@@ -181,6 +181,12 @@ export interface PullRequestDetails {
   body?: string;
   /** Stable ID of the head's repository; null when that repository was deleted. */
   headRepoId?: number | null;
+  /** Its title; '' when unknown. */
+  title?: string;
+  /** When it was merged; null when it was not (or GitHub did not say). */
+  mergedAt?: string | null;
+  /** The commit the merge made on the base branch; null when not merged or unknown. */
+  mergeCommitSha?: string | null;
 }
 
 /** A submitted review as REST lists it (no editors, no inline comments). */

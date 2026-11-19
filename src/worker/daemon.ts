@@ -1,6 +1,7 @@
 // OWNER: queue/worker workstream. The long-running worker behind `updraft start`.
 import { hostname as osHostname } from 'node:os';
 import type { UpdraftConfig } from '../config/schema.js';
+import { findRepoConfig } from './executor.js';
 import { recordError, type Db } from '../db/database.js';
 import {
   CANCELED_BY_USER,
@@ -25,6 +26,8 @@ import type { UpdraftPaths } from '../paths.js';
 import type { AssignmentCommenter } from '../publish/assignment-comment.js';
 import type { FailureCommenter } from '../publish/failure-comment.js';
 import type { Publisher } from '../publish/publish.js';
+import type { DependencyWatcher } from '../poller/dependencies.js';
+import { dependencySettings } from '../config/schema.js';
 import type { IssueSnapshot, Job } from '../types.js';
 import { newId } from '../util/ids.js';
 import type { Logger } from '../util/log.js';
@@ -127,6 +130,12 @@ export interface DaemonDeps {
    * dispatch check, just before the agent starts. Not awaited; never changes a run. Absent: none.
    */
   assignmentCommenter?: AssignmentCommenter;
+  /**
+   * Waits on other repositories' pull requests (repositories.<repo>.dependencies,
+   * docs/dependencies.md): told when a run's wait was recorded, and asked after each poll to check
+   * the waits that are due. Not used with `scope` (single-event runs). Absent: no wait is checked.
+   */
+  dependencyWatcher?: DependencyWatcher;
   /** Identity overrides, mainly for tests. */
   workerId?: string;
   hostname?: string;
@@ -283,11 +292,16 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
             runLog.error('could not apply failure policy; recording the run as reported', { error: message(err) });
           }
         }
+        // A wait the run declared is recorded with it, so the run is never succeeded without it.
+        const waitSettings = result.dependency && policy.outcome === 'succeeded' ? dependencyWaitSettings(job) : null;
         finished = finishRun(db, run.id, {
           outcome: policy.outcome,
           error: policy.error ?? null,
           now,
           ...(policy.handling ? { handling: policy.handling } : {}),
+          ...(result.dependency && waitSettings
+            ? { dependency: { ...result.dependency, firstCheckAt: new Date(now() + Math.min(waitSettings.checkIntervalMs, waitSettings.maxWaitMs)).toISOString() } }
+            : {}),
         });
         policyRequeued = !!policy.handling && getJob(db, job.id)?.status === 'queued';
         if (policy.handling) runLog.info('failure policy applied', { kind: policy.handling.kind, detail: policy.error ?? undefined });
@@ -297,7 +311,11 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         runLog.error('could not record run result', { error: message(err) });
       }
       // The run is closed (its slot is free); publishing it is a separate step with its own record.
-      if (finished?.outcome === 'succeeded' && deps.publisher) {
+      // A run that waits on another pull request publishes nothing; its issue hears about the wait.
+      if (finished?.dependency) {
+        runLog.info('run waits on another pull request', { on: `${finished.dependency.repo}#${finished.dependency.number}` });
+        if (deps.dependencyWatcher) await deps.dependencyWatcher.afterRun(run.id, controller.signal);
+      } else if (finished?.outcome === 'succeeded' && deps.publisher) {
         await deps.publisher.afterRun(run.id, controller.signal);
       }
       // Not for interrupted runs: the worker is stopping, and whoever stops it is there to retry.
@@ -311,6 +329,12 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       wake.notify();
     });
     inFlight.set(run.id, { claim, controller, done });
+  };
+
+  /** The job's repository's dependency settings, as the config has them now; null when waits are off there. */
+  const dependencyWaitSettings = (job: Job) => {
+    const found = findRepoConfig(config, job);
+    return found ? dependencySettings(config, found.repo) : null;
   };
 
   /** With `scope`: the queued jobs that are not this worker's to run. */
@@ -511,6 +535,9 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         deferred.clear();
         if (deps.publisher && !signal.aborted && !lockLost) await deps.publisher.retryDue(signal);
         if (deps.failureCommenter && !signal.aborted && !lockLost) await deps.failureCommenter.retryDue(signal);
+        // Waits on other repositories' pull requests; a merge queues a follow-up job, which the
+        // claim below picks up under the same limits as any other.
+        if (deps.dependencyWatcher && !deps.scope && !signal.aborted && !lockLost) await deps.dependencyWatcher.checkDue(signal);
       }
       if (signal.aborted) break;
 

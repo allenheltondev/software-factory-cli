@@ -40,7 +40,7 @@ import { labelEquals } from '../routing.js';
 import { classifyIssue } from '../classify.js';
 import { describeRouting, routeJob, triageWanted } from '../tier-routing.js';
 import { createTriageRunner, type TriageOutcome, type TriageRunner } from '../triage/triage.js';
-import { ENVELOPE_SCHEMA_VERSION, reviewOf, revisionOf, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
+import { ENVELOPE_SCHEMA_VERSION, labelEventIdOf, reviewOf, revisionOf, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { checkReviewDispatchable, queuedReviewProblem } from './review-jobs.js';
 import { checkRevisionDispatchable, pollRepoReviews, queuedRevisionProblem } from './reviews.js';
@@ -613,7 +613,8 @@ async function triggerApplication(
     (e) => (e.event === 'labeled' || e.event === 'unlabeled') && e.label !== null && labelEquals(e.label, label),
   );
   const latest = events[index];
-  if (!latest || latest.event !== 'labeled' || String(latest.id) !== job.eventId) {
+  // A follow-up job (docs/dependencies.md) carries on the work the original label application asked for.
+  if (!latest || latest.event !== 'labeled' || String(latest.id) !== labelEventIdOf(job)) {
     return {
       problem: `the "${label}" label application that queued this job is no longer the current one (the label was removed or reapplied since)`,
     };

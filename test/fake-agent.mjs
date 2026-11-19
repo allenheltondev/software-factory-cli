@@ -14,6 +14,8 @@
 //   stubborn  like hang, but both processes ignore SIGTERM and SIGINT (POSIX escalation to SIGKILL)
 //   orphan    start a child process, write both pids to --pids-file, and exit 0 leaving the child
 //   env       print selected environment variables; exit 0
+//   wait      find that the issue needs another repository's pull request first: commit
+//             nothing, explain, and end with "UPDRAFT-WAITING-ON: <--waiting-on>"; exit 0
 //   review    act as a reviewer: write REVIEW_NOTES.md and try to commit it (none of which may
 //             ever be published), print findings, and end with a verdict line; exit 0.
 //             --verdict <v> picks it: ready-to-merge, changes-requested, or one of the broken
@@ -90,6 +92,12 @@ switch (mode) {
     writeFileSync('README.md', '# widgets\n\nedited by the fake agent\n');
     process.stderr.write('fake agent: could not finish; giving up\n');
     process.exit(3);
+    break;
+  }
+  case 'wait': {
+    say('The hook this issue needs does not exist yet; it belongs in the library.');
+    say(`UPDRAFT-WAITING-ON: ${opt('--waiting-on') ?? 'octo/lib#12'}`);
+    process.exit(0);
     break;
   }
   case 'hang':

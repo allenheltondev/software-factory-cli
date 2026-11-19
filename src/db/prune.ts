@@ -46,6 +46,16 @@ const RUN_TABLES: ReadonlyArray<{ table: string; runColumn: string; what: string
     busy: "state = 'publishing' OR (state = 'failed' AND retryable = 1)",
     touched: 'updated_at',
   },
+  // A wait on another repository's pull request (docs/dependencies.md). While it waits, its job is
+  // what the follow-up is copied from, so the job stays. The follow-up job's own dedupe key
+  // ("dep:<run id>") is a job like any other once it exists.
+  {
+    table: 'dependency_waits',
+    runColumn: 'run_id',
+    what: 'wait on another repository',
+    busy: "state = 'waiting'",
+    touched: 'updated_at',
+  },
 ];
 
 export interface PrunableRun {

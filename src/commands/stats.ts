@@ -152,6 +152,16 @@ function renderSection(s: StatsSection): string[] {
     ['reached maxRevisions', String(bf.limitReached)],
   ]));
   lines.push(...renderRouting(s));
+  const dep = s.dependencies;
+  const depEnded = dep.ended.resumed + dep.ended.closed + dep.ended.canceled + dep.ended.expired;
+  if (dep.started || depEnded || dep.waitingNow) {
+    lines.push('', 'Waiting on other repositories', ...pairs([
+      ['waits begun', String(dep.started)],
+      ['waits ended', `${depEnded}: resumed after a merge ${dep.ended.resumed}, closed unmerged ${dep.ended.closed}, canceled ${dep.ended.canceled}, expired ${dep.ended.expired}`],
+      ['wait until merged', `median ${formatDuration(dep.waitToMerge.medianMs)}, avg ${formatDuration(dep.waitToMerge.averageMs)} (${dep.waitToMerge.count} wait(s))`],
+      ['waiting now', String(dep.waitingNow)],
+    ]));
+  }
   return lines;
 }
 

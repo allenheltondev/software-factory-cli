@@ -6,6 +6,9 @@ import { appCommitIdentity } from '../github/credentials.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { createAssignmentCommenter } from '../publish/assignment-comment.js';
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
+import { createDependencyWatcher } from '../poller/dependencies.js';
+import { hasDependencyWaits } from '../db/dependency-waits.js';
+import { dependenciesEnabled } from '../config/schema.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
 import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
 import { createRevisionPublisher, revisionsEnabled } from '../publish/revision.js';
@@ -55,6 +58,15 @@ export const defaultStartDeps: StartDeps = {
 };
 
 /** `updraft start`: non-interactive worker. Never prompts. */
+/** True when waits recorded earlier are still waiting (so they end even after dependencies was turned off). */
+function leftoverWaits(db: Db): boolean {
+  try {
+    return hasDependencyWaits(db);
+  } catch {
+    return false;
+  }
+}
+
 export async function startCommand(ctx: CommandContext, deps: StartDeps = defaultStartDeps): Promise<number> {
   const { paths } = ctx;
   const { config, warnings } = loadConfig(paths.configFile);
@@ -119,6 +131,10 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
         : {}),
       ...(failureCommentsEnabled(config)
         ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }) }) }
+        : {}),
+      // Checked even after dependencies was turned off, so the waits recorded before end (canceled).
+      ...(dependenciesEnabled(config) || leftoverWaits(openDb)
+        ? { dependencyWatcher: createDependencyWatcher({ db: openDb, config, api, log: log.child({ component: 'dependencies' }) }) }
         : {}),
     });
     log.info('worker stopped');

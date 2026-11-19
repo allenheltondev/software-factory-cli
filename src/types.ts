@@ -76,6 +76,40 @@ export interface EventEnvelope {
   revision?: RevisionRequest;
   /** Present exactly when `type` is pull_request.review. */
   review?: ReviewRunRequest;
+  /**
+   * An issue.labeled job only: this job continues the issue after a pull request it waited on was
+   * merged (repositories.<repo>.dependencies, docs/dependencies.md). `eventId` is then
+   * "dep:<waiting run id>", and the issue text is vouched for against `resume.originalEventId`.
+   */
+  resume?: DependencyResume;
+}
+
+/** What a follow-up job knows about the wait it continues (docs/dependencies.md). */
+export interface DependencyResume {
+  /** Event id of the label application that queued the first job of the issue; the issue text is vouched for against it. */
+  originalEventId: string;
+  /** The run that declared the wait, and its job. */
+  waitingRunId: string;
+  waitingJobId: string;
+  /** Waits in this chain so far, the one that just ended included (1 for the first follow-up). */
+  waits: number;
+  /** The pull request that was waited on, as the worker read it when it saw the merge. `title` is untrusted text. */
+  pullRequest: { repo: string; number: number; url: string; title: string; mergedAt: string | null; mergeCommitSha: string | null };
+  /** The waiting run's final message without its UPDRAFT-WAITING-ON line, capped. Untrusted text. */
+  note: string;
+}
+
+/** The wait a follow-up job continues, or null for any other job. */
+export function resumeOf(job: { envelope?: EventEnvelope }): DependencyResume | null {
+  return job.envelope?.type === 'issue.labeled' ? (job.envelope.resume ?? null) : null;
+}
+
+/**
+ * The label application a job's issue text is vouched for against: the job's own event, or for a
+ * follow-up job (docs/dependencies.md) the one that queued the first job of the issue.
+ */
+export function labelEventIdOf(job: { eventId: string; envelope?: EventEnvelope }): string {
+  return resumeOf(job)?.originalEventId ?? job.eventId;
 }
 
 /**

@@ -37,6 +37,7 @@ import {
   recordPublicationProgress,
 } from '../db/publications.js';
 import { listUnpublishedSinceEnabled } from '../db/publish-settings.js';
+import { dependencyRef, getDependencyWait } from '../db/dependency-waits.js';
 import { recordError, type Db } from '../db/database.js';
 import { publishMode, type UpdraftConfig } from '../config/schema.js';
 import {
@@ -448,6 +449,9 @@ function eligibility(deps: PublishDeps, runId: string): { ok: true; e: Eligible 
     return { ok: false, reason: `run ${runId} ${run.outcome ? `ended ${run.outcome}` : 'has not finished'}; only succeeded runs are published` };
   }
   if (!run.summary) return { ok: false, reason: `run ${runId} has no agent summary; only live agent runs are published` };
+  // A run that waits on another repository's pull request publishes nothing (docs/dependencies.md).
+  const wait = getDependencyWait(deps.db, runId);
+  if (wait) return { ok: false, reason: `run ${runId} waits on ${dependencyRef(wait)}; a waiting run publishes nothing, its follow-up does` };
   if (!found.repo.checkoutPath) return { ok: false, reason: `repositories.${found.fullName}.checkoutPath is not set` };
   return {
     ok: true,

@@ -181,6 +181,12 @@ export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
   failure_comments: { kind: 'keyed', conflict: finishedStays(stepDone, mine), parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT + FINISHED_STAYS },
   revisions: { kind: 'keyed', conflict: finishedStays(stepDone, mine), parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT + FINISHED_STAYS },
   pr_reviews: { kind: 'keyed', conflict: finishedStays(stepDone, mine), parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT + FINISHED_STAYS },
+  dependency_waits: {
+    kind: 'keyed',
+    conflict: finishedStays((r) => text(r.state) !== 'waiting', later('updated_at')),
+    parent: { column: 'run_id', table: 'runs' },
+    rule: 'a wait that has ended (resumed, closed, canceled or expired) is never replaced by one still waiting; otherwise the later updated_at wins (this run on a tie)',
+  },
   revision_prs: {
     kind: 'keyed',
     conflict: pullRequestConflict,
@@ -215,7 +221,7 @@ export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
 };
 
 /** Columns that hold a job id, in any table: rewritten when a job was folded into another (see the jobs rule). */
-const JOB_ID_COLUMNS = ['job_id', 'revision_job_id'];
+const JOB_ID_COLUMNS = ['job_id', 'revision_job_id', 'resume_job_id'];
 
 /** Rows that record a step towards GitHub with a lease: what a run that ended mid-step leaves behind. */
 const LEASED_TABLES: ReadonlyArray<{ table: string; busy: string; retryLater: boolean }> = [

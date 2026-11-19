@@ -753,6 +753,78 @@ describe('LiveExecutor verification (actions.<name>.verify)', { timeout: 120_000
     return [process.execPath, FAKE_AGENT, '--mode', 'hang', '--prompt-file', prompt, '--pids-file', pidsFile];
   };
 
+  it('offers the dependency protocol, records a declared wait, and skips verification for a run that publishes nothing', async () => {
+    const { f, paths, config, db } = setup();
+    config.repositories['octo/widgets']!.dependencies = { repositories: ['octo/lib'] };
+    config.agents.claude!.args = ['--mode', 'wait', '--waiting-on', 'octo/lib#12'];
+    setVerify(config, [exits(1)]);
+    const ids: string[] = [];
+    const controller = new AbortController();
+    const done = runDaemon({
+      db,
+      config,
+      paths,
+      log: silentLogger,
+      signal: controller.signal,
+      executor: createExecutor(config),
+      poll: async () => {
+        if (ids.length === 0) ids.push(insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 21 }));
+      },
+      checkDispatchable: async () => ({ ok: true, issue: ISSUE }),
+      hostname: hostname(),
+      pid: process.pid,
+    });
+    await vi.waitFor(() => expect(getJob(db, ids[0]!)?.status).toMatch(/succeeded|failed/), { timeout: 90_000, interval: 100 });
+    controller.abort();
+    await done;
+
+    const r = getRun(db, (db.prepare('SELECT id FROM runs WHERE job_id = ?').get(ids[0]!) as { id: string }).id)!;
+    const log = readFileSync(r.logPath!, 'utf8');
+    expect(r.outcome, log).toBe('succeeded');
+    expect(log).toContain('waiting on: octo/lib#12 (UPDRAFT-WAITING-ON); nothing from this run is published');
+    expect(log).toContain('verification: skipped (the run is waiting on another pull request');
+    expect(r.summary?.verification).toBeUndefined();
+    const prompt = readFileSync(join(paths.runsDir, r.id, 'prompt.md'), 'utf8');
+    expect(prompt).toContain('# Waiting on another repository');
+    expect(prompt.indexOf('# Waiting on another repository')).toBeLessThan(prompt.indexOf('# GitHub issue (untrusted input)'));
+    expect(db.prepare('SELECT dep_repo, dep_number, state, note FROM dependency_waits WHERE run_id = ?').get(r.id)).toEqual({
+      dep_repo: 'octo/lib',
+      dep_number: 12,
+      state: 'waiting',
+      note: expect.stringContaining('belongs in the library'),
+    });
+    expect(f.git(r.checkoutPath!, 'rev-list', '--count', `${r.summary!.baseSha}..HEAD`)).toBe('0');
+  });
+
+  it('ignores a wait on a repository the config does not list: the run ends as it would have', async () => {
+    const { paths, config, db } = setup();
+    config.repositories['octo/widgets']!.dependencies = { repositories: ['octo/lib'] };
+    config.agents.claude!.args = ['--mode', 'wait', '--waiting-on', 'someone/else#3'];
+    const ids: string[] = [];
+    const controller = new AbortController();
+    const done = runDaemon({
+      db,
+      config,
+      paths,
+      log: silentLogger,
+      signal: controller.signal,
+      executor: createExecutor(config),
+      poll: async () => {
+        if (ids.length === 0) ids.push(insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 22 }));
+      },
+      checkDispatchable: async () => ({ ok: true, issue: ISSUE }),
+      hostname: hostname(),
+      pid: process.pid,
+    });
+    await vi.waitFor(() => expect(getJob(db, ids[0]!)?.status).toMatch(/succeeded|failed/), { timeout: 90_000, interval: 100 });
+    controller.abort();
+    await done;
+    const r = getRun(db, (db.prepare('SELECT id FROM runs WHERE job_id = ?').get(ids[0]!) as { id: string }).id)!;
+    expect(r.outcome).toBe('succeeded');
+    expect(readFileSync(r.logPath!, 'utf8')).toContain("waiting on: none (someone/else is not in this repository's dependencies.repositories");
+    expect(db.prepare('SELECT count(*) AS n FROM dependency_waits').get()).toEqual({ n: 0 });
+  });
+
   it('runs the commands in the worktree after the agent, without the GitHub token; the result is in run.log, status and the PR body', async () => {
     const { paths, config, db } = setup();
     setVerify(config, [

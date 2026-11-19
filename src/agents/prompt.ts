@@ -44,8 +44,13 @@ export function issueSection(issue: IssueContext): string[] {
   ];
 }
 
-export function renderPrompt(actionPrompt: string, issue: IssueContext): string {
-  return [actionPrompt.replace(/\r\n?/g, '\n').trimEnd(), '', '---', '', ...issueSection(issue)].join('\n');
+/**
+ * The prompt of an implementation run. `sections` (the worker's own text, each ending with a
+ * separator) go between the action's prompt and the issue: the dependency protocol and, for a
+ * follow-up run, the pull request it waited on (src/agents/dependency.ts).
+ */
+export function renderPrompt(actionPrompt: string, issue: IssueContext, sections: readonly string[] = []): string {
+  return [actionPrompt.replace(/\r\n?/g, '\n').trimEnd(), '', '---', '', ...sections, ...issueSection(issue)].join('\n');
 }
 
 /**

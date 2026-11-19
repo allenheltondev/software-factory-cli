@@ -91,6 +91,15 @@ ready-to-merge on the first head reviewed.
 pushed per PR (average, maximum, and how many PRs had 0, 1, 2 or 3 or more) and reviews per PR,
 plus how many PRs reached `maxRevisions` in the window.
 
+**Waiting on other repositories** (`dependencies`, shown only when there is something to show).
+Waits on another repository's pull request ([dependencies.md](dependencies.md)) that began in the
+window, and those that ended in it, by how they ended: `resumed` (the pull request merged and a
+follow-up was queued), `closed`, `canceled`, `expired`. *Wait until merged* is the median and
+average time from the start of a wait to the merge that resumed it, over waits resumed in the
+window. *Waiting now* isn't windowed. The facts are `dependency.waiting` and `dependency.ended`,
+keyed by the waiting run's id. They hold the issue's repository, job and agent, never the
+dependency's repository name or pull request number.
+
 The text output shows all of this for the window, then one line per repository. `--repo`
 narrows everything, including the queue, to one repository (any case; a renamed repository is
 matched by any name it was recorded under). `--json` has the full breakdown for each repository.
