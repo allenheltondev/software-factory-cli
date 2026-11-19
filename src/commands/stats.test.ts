@@ -1,5 +1,7 @@
-import { existsSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { buildHistory, History } from '../../test/factory-history.js';
 import { openDatabase, openDatabaseReadOnly, SCHEMA_VERSION, schemaVersion } from '../db/database.js';
 import { EXIT } from './errors.js';
@@ -8,14 +10,30 @@ import { formatDuration, parseSince, statsCommand } from './stats.js';
 
 const END = Date.parse('2026-11-18T12:00:00.000Z');
 
+/**
+ * The history fixture in a real state DB, built once: every migration plus the fixture is the slow
+ * part, and on a busy CI runner doing it inside the first test ran past vitest's 5 s per-test limit.
+ * A hook has its own, longer limit; each test then copies the finished file.
+ */
+let fixtureDb: string;
+beforeAll(() => {
+  fixtureDb = join(mkdtempSync(join(tmpdir(), 'updraft-stats-fixture-')), 'state.db');
+  const db = openDatabase(fixtureDb);
+  buildHistory(END, db);
+  db.close(); // checkpoints the WAL into the main file, so the file alone is the whole database
+}, 60_000);
+
 /** A context whose clock is END, with (unless `db` is false) the history fixture in a real state DB. */
 function setup(o: { db?: boolean; schema?: number } = {}) {
   const ctx = fakeContext();
   ctx.now = () => END;
   if (o.db !== false) {
-    const db = openDatabase(ctx.paths.dbFile, o.schema ? { migrateTo: o.schema } : {});
-    if (!o.schema) buildHistory(END, db);
-    db.close();
+    if (o.schema) {
+      openDatabase(ctx.paths.dbFile, { migrateTo: o.schema }).close();
+    } else {
+      mkdirSync(dirname(ctx.paths.dbFile), { recursive: true });
+      copyFileSync(fixtureDb, ctx.paths.dbFile);
+    }
   }
   const opened: string[] = [];
   // The command may only ever use the read-only opener.
