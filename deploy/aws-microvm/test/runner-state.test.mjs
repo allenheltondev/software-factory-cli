@@ -118,7 +118,12 @@ function syncSetup({ runRows, baseRows, control = {}, s3, depsOverrides = {} }) 
   return { context: { bucket: BUCKET, key: KEY, stateDir, baseFile, budgetMs: 20_000 }, deps, logs, stateDir, stateRoot };
 }
 
-describe('syncState', () => {
+// The runner only ever runs in the Linux image: it relies on POSIX file modes, signals and
+// process groups, none of which behave this way on Windows. These suites start real child
+// processes, so they are left out there; the pure helpers below still run everywhere.
+const onLinuxLikeHost = process.platform !== 'win32';
+
+describe.runIf(onLinuxLikeHost)('syncState', () => {
   it('creates the object on the first run, with If-None-Match', async () => {
     const s3 = memoryS3();
     const { context, deps, stateDir, stateRoot } = syncSetup({ runRows: ['job-a'], s3 });
@@ -518,7 +523,7 @@ function jobSetup(mode, { s3 = memoryS3(), rows = ['job-a'], control = {}, secre
 
 const names = (calls) => calls.map(([name]) => name);
 
-describe('runJob with shared state', () => {
+describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
   it('starts from nothing on the first run and creates the shared database', async () => {
     const { deps, calls, s3, document } = jobSetup('success');
     const result = await runJob(request(), deps);

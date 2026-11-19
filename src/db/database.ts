@@ -592,7 +592,14 @@ export function openDatabase(file: string, opts: { migrateTo?: number } = {}): D
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA synchronous = NORMAL;');
-  migrate(db, opts.migrateTo);
+  try {
+    migrate(db, opts.migrateTo);
+  } catch (err) {
+    // A refused database (newer schema, failed migration) must not stay open: on Windows an
+    // open handle keeps the file, and its directory, from being moved or removed.
+    db.close();
+    throw err;
+  }
   return db;
 }
 

@@ -129,7 +129,12 @@ const written = (calls) => {
   return put ? { bucket: put[1], key: put[2], document: JSON.parse(put[3]) } : undefined;
 };
 
-describe('runJob', () => {
+// The runner only ever runs in the Linux image: it relies on POSIX file modes, signals and
+// process groups, none of which behave this way on Windows. These suites start real child
+// processes, so they are left out there; the pure helpers below still run everywhere.
+const onLinuxLikeHost = process.platform !== 'win32';
+
+describe.runIf(onLinuxLikeHost)('runJob', () => {
   it('prepares a private state directory, runs updraft run-event, reports and terminates', async () => {
     const { deps, calls, output } = fakeDeps('success');
     const result = await runJob(request(), deps);
@@ -362,7 +367,7 @@ describe('runJob', () => {
   });
 });
 
-describe('runJob: logs and deduplication record', () => {
+describe.runIf(onLinuxLikeHost)('runJob: logs and deduplication record', () => {
   it('reads a log only when it really lies inside the state directory', async () => {
     const outside = path.join(root, 'outside.log');
     fs.writeFileSync(outside, 'not for upload');

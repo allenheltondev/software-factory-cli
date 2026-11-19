@@ -134,7 +134,8 @@ describe('a created clone, fetched with a network environment', () => {
     };
     const prepared = await prepareJobWorktree({ ...request, networkEnv });
     expect(prepared.baseSha).toBe(f.git(f.clone, 'rev-parse', 'origin/main'));
-    expect(readFileSync(join(prepared.worktreePath, 'README.md'), 'utf8')).toBe('# widgets\n');
+    // Git for Windows checks text out with CRLF line endings by default.
+    expect(readFileSync(join(prepared.worktreePath, 'README.md'), 'utf8').replace(/\r\n/g, '\n')).toBe('# widgets\n');
 
     // One branch, whole history, no tags; and the environment's settings were not written down.
     expect(f.git(checkoutPath, 'for-each-ref', '--format=%(refname)')).toBe(['refs/heads/updraft/issue-7-job_ev1x0', 'refs/remotes/origin/main'].join('\n'));
