@@ -112,9 +112,8 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
-      # No point-in-time recovery yet: enabling it needs dynamodb:UpdateContinuousBackups, which the
-      # deploy role does not have (same as ai-fantasy-league's table). Turn it on before #67 stores
-      # anything that matters.
+      # No point-in-time recovery, by decision (same as ai-fantasy-league's table). The deploy role
+      # has no dynamodb:UpdateContinuousBackups either.
       StreamSpecification:
         StreamViewType: NEW_AND_OLD_IMAGES
       TimeToLiveSpecification:
