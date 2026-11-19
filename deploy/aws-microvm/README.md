@@ -1235,18 +1235,14 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
     list request for the exact key first (`s3GetIfExists` in `aws.mjs`). That the
     `s3:prefix` condition with the values `config/*` and `state/*` allows a list request
     with the prefix `state/state.db` is assumed.
-25. **`updraft state merge` and `updraft state info`.** They did not exist in the commit
-    this was written against. Assumed, in `image/runner/state.mjs`: the options `--changed`,
-    `--into`, `--base`, `--db` and `--json`; that the merge prints one JSON object (the whole
-    of stdout, or its last line) with a boolean `changed`; that it exits 0 on success and
-    non-zero otherwise; that it leaves `--into` as a single file without a write-ahead log
-    holding data; that it creates `--into` when there is none; that it reads `--changed` in
-    place, in the job's state directory, write-ahead log included; that both commands run
-    with `UPDRAFT_HOME` set to the job's directory and need nothing else from the
-    environment. The exit code for "newer schema" is not known: the runner refuses to upload
-    after any non-zero exit and recognises that case by its message (`describeMergeFailure`),
-    which only affects the wording in the result. No field of `state info`'s output is
-    read. The Dockerfile's check greps `updraft state --help` for `merge`.
+25. **`updraft state merge` and `updraft state info` end to end.** The runner's use of them
+    (`image/runner/state.mjs`) matches the commands as they are in this repository
+    (`docs/shared-state.md`): the options, one JSON object with a boolean `changed`, exit 5
+    with `reason: "schema-too-new"` for a database newer than the CLI, a single-file
+    result, `--into` created when missing, `--changed` read in place. That was checked by
+    reading both sides, not by running the real commands from the runner: the runner's
+    tests use a stand-in. No field of `state info`'s output is read. The Dockerfile's
+    check greps `updraft state --help` for `merge`.
 26. **The schema version in the file header.** The runner reads the snapshot's schema
     version as SQLite's `user_version` (4 bytes at offset 60 of the file), which is where
     Updraft keeps it at the time of writing (`src/db/database.ts`). If that changes, the

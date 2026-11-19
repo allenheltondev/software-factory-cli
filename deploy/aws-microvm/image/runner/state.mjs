@@ -77,13 +77,15 @@ export function stateInfoInvocation({ db }) {
 }
 
 /**
- * Why a merge that exited non-zero did not happen, for the result document. The exact exit
- * code for "newer schema" is the CLI's to choose, so it is recognised by what the command
- * says (its JSON object's `reason`, `error` or `message`, else its stderr), not by number.
+ * Why a merge that exited non-zero did not happen, for the result document. `updraft state
+ * merge` exits 5 with `reason: "schema-too-new"` when a database is newer than the CLI; the
+ * wording of its message is matched too, in case either of those changes.
  */
 export function describeMergeFailure({ exitCode, signal, report, stderrTail }) {
-  const said = [report?.reason, report?.error, report?.message].find((value) => typeof value === 'string' && value !== '') ?? stderrTail.trim();
-  const newerSchema = /newer.{0,60}schema|schema.{0,60}newer/i.test(`${said} ${typeof report?.code === 'string' ? report.code : ''}`);
+  const said = [report?.error, report?.message, report?.reason].find((value) => typeof value === 'string' && value !== '') ?? stderrTail.trim();
+  const newerSchema = exitCode === 5
+    || report?.reason === 'schema-too-new'
+    || /newer.{0,60}schema|schema.{0,60}newer/i.test(`${said} ${typeof report?.code === 'string' ? report.code : ''}`);
   const how = signal ? `was killed by ${signal}` : `exited ${exitCode}`;
   return {
     code: newerSchema ? 'newer-schema' : 'merge-failed',
