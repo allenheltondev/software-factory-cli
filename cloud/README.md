@@ -50,7 +50,12 @@ browser ── https://updraft.readysetcloud.io ──> CloudFront (one distribu
   When the App is uninstalled, every item in the tenant's partition gets the table's `ttl`, 30 days out. DynamoDB deletes them after that, and reads treat the tenant as gone as soon as the deadline passes.
   - **Interrupted cleanup:** if a write fails partway, the webhook answers 500 so GitHub shows a delivery you can redeliver, and a redelivered delete finishes the sweep with the first deadline.
   - **No late members:** a member, or an agent key's metadata, is only ever added in a transaction that checks the tenant isn't uninstalled, so none misses the TTL.
-  - **Outside the table:** the uninstall also records a cleanup entry that has no TTL. Once a day, `CleanupFunction` (`server/src/tenants/cleanup.ts`) deletes the S3 prefix `tenants/<id>/` and the agent key secrets of every uninstalled tenant past its deadline. It forgets the entry only once both are gone, so a run that fails is finished by the next one.
+  - **Outside the table:** the uninstall also records a cleanup entry with no TTL. It's written in the same transaction that disables the tenant (or records its tombstone), so no uninstall exists without one. Once a day, `CleanupFunction` (`server/src/tenants/cleanup.ts`) cleans up every uninstalled tenant past its deadline:
+    - the S3 prefix `tenants/<id>/`;
+    - the agent key secrets;
+    - any of the tenant's rows still in the table, which covers an interrupted sweep.
+
+    It forgets the entry only once all three are gone, so a run that fails is finished by the next one.
   - **Strongly consistent sweep:** the sweep and its replay read strongly, so a member committed just before the uninstall is found.
   - **Tombstones:** a delete for an installation with no tenant yet records one already uninstalled, expiring with the same TTL. A Connect or install callback that passed its GitHub check just before the delete can't create the tenant afterwards.
 - **GitHub.** Linking and installing both leave for github.com and come back to the SPA's `/github/callback`, which posts what GitHub returned to `POST /api/v1/github/callback`.
