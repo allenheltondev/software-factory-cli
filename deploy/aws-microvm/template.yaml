@@ -19,20 +19,24 @@ Parameters:
     Description: MicroVM image version to run. Empty runs the latest active version.
   MaximumDurationSeconds:
     Type: Number
-    Default: 7200
+    Default: 14400
     MinValue: 600
     MaxValue: 28800
     Description: >-
-      Hard lifetime of a job's microVM. The default covers a 60 minute agent run,
-      verification, clone and dependency installation, with room to spare.
+      Hard lifetime of a job's microVM. One run can hold the whole review loop: the
+      agent run, verification, a reviewer run, revisions and further reviews, and a
+      wait for CI before an auto-merge. The default (4 hours) covers a 60 minute agent
+      run and two review rounds; 7200 is enough without review and revise. A job ends
+      its microVM as soon as it is done, so this only bounds a job that hangs.
   WatchdogReserveSeconds:
     Type: Number
-    Default: 300
+    Default: 600
     MinValue: 60
     MaxValue: 3600
     Description: >-
-      The runner stops the job this long before MaximumDurationSeconds, so that the
-      result and the logs are written before Lambda terminates the microVM.
+      The runner stops the job this long before MaximumDurationSeconds. In that time
+      it merges and uploads the shared state (up to 5 minutes), uploads the logs and
+      the result and asks for the microVM's termination.
   IdlePolicyMode:
     Type: String
     Default: explicit
@@ -58,15 +62,64 @@ Parameters:
     Description: >-
       Optional comma-separated label names. When set, the launcher starts a microVM
       only for these labels. Must include every trigger label in the Updraft config.
+  AcceptedEvents:
+    Type: String
+    Default: issues
+    AllowedPattern: '^(issues|pull_request_review|pull_request)(,(issues|pull_request_review|pull_request))*$'
+    Description: >-
+      Comma-separated webhook events that may start a microVM. "issues" alone runs
+      labelled issues. Add pull_request_review and pull_request when the Updraft config
+      uses review or revise: "issues,pull_request_review,pull_request".
+  PullRequestBranchPrefix:
+    Type: String
+    Default: updraft/
+    AllowedPattern: '^[A-Za-z0-9._/-]{0,64}$'
+    Description: >-
+      Pull request events start a microVM only for pull requests whose head branch
+      starts with this. Updraft's job branches are updraft/issue-<n>-<job id>. Empty
+      turns the check off.
+  IgnoredSenders:
+    Type: String
+    Default: ''
+    AllowedPattern: '^[A-Za-z0-9,\[\] _-]{0,512}$'
+    Description: >-
+      Optional comma-separated GitHub logins whose pull request events start nothing.
+      Set it to the App's own login, <app-slug>[bot]: the run that pushed a revision
+      already reviews the new head itself.
+  PullRequestCoalesceSeconds:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    MaxValue: 300
+    Description: >-
+      Events for one pull request that arrive within this many seconds of an event
+      that started a microVM start none of their own; that microVM starts its job when
+      the window has closed and sees them all. 0 launches a microVM for every event.
+  SharedState:
+    Type: String
+    Default: enabled
+    AllowedValues: [enabled, disabled]
+    Description: >-
+      enabled: every job starts from the shared Updraft state database at
+      state/state.db in the bucket and merges its changes back. disabled: every job
+      starts with an empty database, as before (no cooldowns, no review loop).
+  StateVersionRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: >-
+      Days an overwritten version of the shared state database stays recoverable
+      (bucket versioning, noncurrent version expiry under state/).
   DedupeWindowSeconds:
     Type: Number
-    Default: 7200
+    Default: 14400
     MinValue: 0
     MaxValue: 86400
     Description: >-
       A redelivery of a delivery that already started a microVM is ignored for this
       long, unless that microVM reported a failure (then it can be redelivered at
       once). Set it to about MaximumDurationSeconds. 0 turns deduplication off.
+      The same table holds the pull request coalescing leases.
   WebhookSecretArn:
     Type: String
     Default: ''
@@ -117,6 +170,7 @@ Conditions:
   CreateAgentEnvSecret: !Equals [!Ref AgentEnvSecretArn, '']
   UseInternetEgress: !Equals [!Ref EgressNetworkConnectorArn, '']
   UseNoIngress: !Equals [!Ref IngressNetworkConnectorArn, '']
+  UseSharedState: !Equals [!Ref SharedState, enabled]
 
 Resources:
   # ---------------------------------------------------------------- storage
@@ -135,16 +189,41 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      # Versioning is what keeps the previous shared state database recoverable after a
+      # job overwrites it. S3 versions a whole bucket or nothing, so the rules below also
+      # say when the old versions under every other prefix go.
+      VersioningConfiguration:
+        Status: Enabled
       LifecycleConfiguration:
         Rules:
+          # In a versioned bucket "expire" adds a delete marker; the noncurrent expiry a
+          # day later is what removes the data, and S3 then removes the lone marker.
           - Id: expire-events
             Status: Enabled
             Prefix: events/
             ExpirationInDays: !Ref EventRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
           - Id: expire-results
             Status: Enabled
             Prefix: results/
             ExpirationInDays: !Ref ResultRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+          # The current state database never expires; each version it replaced does.
+          - Id: expire-old-state-versions
+            Status: Enabled
+            Prefix: state/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref StateVersionRetentionDays
+          # `deploy.sh config` replaces and deletes config objects; keep what it replaced
+          # for a month, then drop it and the delete markers left behind.
+          - Id: expire-old-config-versions
+            Status: Enabled
+            Prefix: config/
+            ExpiredObjectDeleteMarker: true
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
           - Id: abort-incomplete-uploads
             Status: Enabled
             AbortIncompleteMultipartUpload:
@@ -168,7 +247,9 @@ Resources:
               Bool:
                 aws:SecureTransport: 'false'
 
-  # One item per delivery that started a microVM, expiring after DedupeWindowSeconds.
+  # One item per delivery that started a microVM, expiring after DedupeWindowSeconds, and
+  # one per pull request with a microVM that is starting ("pr#<owner/repo>#<number>"),
+  # expiring after PullRequestCoalesceSeconds.
   DeliveryTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -279,13 +360,31 @@ Resources:
                 Resource:
                   - !Sub '${JobBucket.Arn}/events/*'
                   - !Sub '${JobBucket.Arn}/config/*'
-              - Sid: ListConfig
+              # Listing is how the runner learns the config's file names and whether a
+              # state database exists yet, and nothing else is listable.
+              - Sid: ListConfigAndState
                 Effect: Allow
                 Action: s3:ListBucket
                 Resource: !GetAtt JobBucket.Arn
                 Condition:
                   StringLike:
-                    s3:prefix: 'config/*'
+                    s3:prefix:
+                      - 'config/*'
+                      - !If [UseSharedState, 'state/*', 'config/*']
+              # The shared state database: read the current version, write a new one.
+              # Deliberately absent: s3:DeleteObject, s3:GetObjectVersion and
+              # s3:DeleteObjectVersion, so that nothing in a microVM can read or remove the
+              # versions kept for recovery. Writing to a versioned bucket needs no more
+              # than s3:PutObject.
+              - !If
+                - UseSharedState
+                - Sid: ReadWriteState
+                  Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                  Resource: !Sub '${JobBucket.Arn}/state/*'
+                - !Ref AWS::NoValue
               - Sid: WriteResult
                 Effect: Allow
                 Action: s3:PutObject
@@ -372,6 +471,11 @@ Resources:
           WATCHDOG_RESERVE_SECONDS: !Ref WatchdogReserveSeconds
           IDLE_POLICY_MODE: !Ref IdlePolicyMode
           TRIGGER_LABELS: !Ref TriggerLabels
+          ACCEPTED_EVENTS: !Ref AcceptedEvents
+          PR_BRANCH_PREFIX: !Ref PullRequestBranchPrefix
+          IGNORED_SENDERS: !Ref IgnoredSenders
+          PR_COALESCE_SECONDS: !Ref PullRequestCoalesceSeconds
+          STATE_KEY: !If [UseSharedState, state/state.db, '']
           DEDUPE_TABLE: !Ref DeliveryTable
           DEDUPE_WINDOW_SECONDS: !Ref DedupeWindowSeconds
       Policies:
@@ -407,8 +511,11 @@ Outputs:
     Description: Payload URL for the GitHub App's webhook
     Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/webhook'
   BucketName:
-    Description: Bucket for config/, events/, results/ and the image build context (image/)
+    Description: Bucket for config/, events/, results/, state/ and the image build context (image/)
     Value: !Ref JobBucket
+  StateObject:
+    Description: The shared Updraft state database (empty when SharedState is disabled)
+    Value: !If [UseSharedState, !Sub 's3://${JobBucket}/state/state.db', '']
   ImageName:
     Description: Name of the MicroVM image the launcher runs
     Value: !Ref ImageName

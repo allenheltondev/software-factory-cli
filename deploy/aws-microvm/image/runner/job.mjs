@@ -1,16 +1,21 @@
-// One job: prepare a fresh state directory, run `updraft run-event` as the unprivileged job
-// user, report the outcome to S3, terminate the microVM. Everything that talks to AWS or the
+// One job: prepare a fresh state directory (with the shared state database, see state.mjs),
+// run `updraft run-event` as the unprivileged job user, merge what it changed back into the
+// shared database, report the outcome to S3, terminate the microVM. Everything that talks to AWS or the
 // operating system's process table comes in through `deps`, so this file is tested with
 // stand-ins (see ../../test/runner-job.test.mjs).
 import { spawn as nodeSpawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { STATE_DB_FILE, downloadState, stateSyncBudgetMs, syncState } from './state.mjs';
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
 const KEY_FILE = 'github-app.pem';
 const EVENT_FILE = 'event.json';
 const CONFIG_FILE = 'config.yaml';
+const RESERVED_FILES = new Set([KEY_FILE, EVENT_FILE, STATE_DB_FILE, `${STATE_DB_FILE}-wal`, `${STATE_DB_FILE}-shm`]);
+/** The longest the runner waits for a coalescing window to close (the launcher's limit, plus slack). */
+const MAX_NOT_BEFORE_WAIT_MS = 310 * 1000;
 
 const MAX_CONFIG_FILES = 200;
 const MAX_CONFIG_BYTES = 5 * 1024 * 1024;
@@ -30,10 +35,19 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
  *   updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>] [--json]
  *                     [--deadline-minutes <n>] [--worker-git-credentials]
  *
- * It reads the normal config ($UPDRAFT_HOME/config.yaml), creates the clone when
- * checkoutPath does not exist, and with --json prints one JSON object as its last stdout
- * line, on errors too. --deadline-minutes makes it stop everything (a running agent
- * included) and still print that summary. --worker-git-credentials is not needed here.
+ * It reads the normal config ($UPDRAFT_HOME/config.yaml), works on the state database at
+ * $UPDRAFT_HOME/state.db (the shared snapshot the runner put there, or a new one), creates
+ * the clone when checkoutPath does not exist, and with --json prints one JSON object as its
+ * last stdout line, on errors too. --deadline-minutes makes it stop everything (a running
+ * agent, a review round, a wait for CI) and still print that summary.
+ * --worker-git-credentials is not needed here.
+ *
+ * Event names passed through: issues, pull_request_review, pull_request (whatever the
+ * launcher accepted). Read from the summary: that it is a JSON object, `outcome` (copied
+ * into the result document, never interpreted) and `logPath`. Everything else about how the
+ * run went is taken from the exit code, so an outcome this file has never heard of (a job
+ * deferred by a capacity cooldown, say) is handled like any other: exit 0 keeps the
+ * delivery record, any other exit releases it so that a redelivery is the retry.
  */
 export function updraftInvocation({ eventFile, eventName, deliveryId, deadlineMinutes }) {
   return [
@@ -52,7 +66,7 @@ export function describeExitCode(code) {
     case 0:
       return null;
     case 1:
-      return 'updraft exited 1: the job failed, could not start, was interrupted or was not published, or the command itself failed (config, GitHub, event not matched); see summary.outcome and summary.message';
+      return 'updraft exited 1: the job failed, could not start, was interrupted, was deferred or was not published, or the command itself failed (config, GitHub, event not matched); see summary.outcome and summary.message';
     case 2:
       return 'updraft exited 2: the event file is missing or not JSON, or --deadline-minutes was rejected';
     case 3:
@@ -115,7 +129,7 @@ export function configRelativePath(key, prefix) {
       throw new Error(`config object ${JSON.stringify(key)} has an unusable path`);
     }
   }
-  if (segments.length === 1 && (relative === KEY_FILE || relative === EVENT_FILE)) {
+  if (segments.length === 1 && RESERVED_FILES.has(relative)) {
     throw new Error(`config object ${JSON.stringify(key)} uses a name reserved by the runner`);
   }
   return segments.join(path.sep);
@@ -138,6 +152,10 @@ export function watchdogBudgetMs(payload, nowMs) {
  * @param {(bucket: string, key: string) => Promise<Buffer>} deps.s3Get
  * @param {(bucket: string, prefix: string) => Promise<{ key: string, size: number }[]>} deps.s3List
  * @param {(bucket: string, key: string, body: string | Buffer, contentType?: string) => Promise<void>} deps.s3Put
+ * @param {Function} [deps.s3GetIfExists] the shared state database and its ETag (state.mjs);
+ *   needed when the payload has a stateKey
+ * @param {Function} [deps.s3PutIf] a conditional write of it (state.mjs)
+ * @param {number} [deps.stateSyncBudgetMs] overrides the computed budget of state sync (tests)
  * @param {(secretId: string) => Promise<string>} deps.getSecret
  * @param {(microvmId: string) => Promise<void>} deps.terminate
  * @param {(table: string, deliveryId: string) => Promise<void>} [deps.releaseDelivery] removes
@@ -173,8 +191,11 @@ export async function runJob(request, deps) {
     summary: null,
     summaryMissing: true,
     // summary.outcome, copied up: nothing-to-do | succeeded | canceled | superseded | failed |
-    // publish-failed | not-started | error
+    // publish-failed | not-started | error | whatever a newer run-event adds
     updraftOutcome: null,
+    // The shared state database: what the run started from and whether its changes were
+    // saved. null when the launcher sent no stateKey (state sync is off).
+    state: payload.stateKey ? { key: payload.stateKey, snapshot: null, sync: notAttempted() } : null,
     logs: [],
     error: null,
     stderrTail: '',
@@ -186,14 +207,35 @@ export async function runJob(request, deps) {
   // Registered first, so that a /terminate during preparation is not lost.
   let stopRequested = false;
   let stopChild = () => {};
+  let stopWaiting = () => {};
+  let hurrySync = () => {};
   deps.onStop?.(() => {
     stopRequested = true;
+    stopWaiting();
     stopChild();
+    hurrySync();
   });
 
   let stateDirForLogs;
+  // Set once `updraft run-event` has run, whatever its outcome: only then is there a
+  // database worth merging.
+  let stateToSync;
   try {
-    const stateDir = await prepare(payload, deps);
+    const { stateDir, state } = await prepare(payload, deps);
+    if (result.state && state) result.state.snapshot = state.snapshot;
+    // A pull request event that other deliveries were coalesced into: start only when the
+    // launcher has stopped coalescing, so that this run sees all of them on GitHub.
+    const waitMs = Math.min(MAX_NOT_BEFORE_WAIT_MS, payload.notBefore ? Date.parse(payload.notBefore) - now() : 0);
+    if (waitMs > 0 && !stopRequested) {
+      log(`waiting ${Math.ceil(waitMs / 1000)} s for the launcher's coalescing window to close`);
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, waitMs);
+        stopWaiting = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+    }
     if (stopRequested) throw new Error('the microVM was terminated before the job started');
     const budgetMs = watchdogBudgetMs(payload, now());
     const deadline = deps.deadlineMinutes ?? deadlineMinutes(budgetMs);
@@ -205,6 +247,7 @@ export async function runJob(request, deps) {
       stopChild = stop;
       if (stopRequested) stop();
     });
+    if (state) stateToSync = { stateDir, baseFile: state.baseFile };
     result.exitCode = run.exitCode;
     result.signal = run.signal;
     result.stderrTail = run.stderrTail;
@@ -228,6 +271,27 @@ export async function runJob(request, deps) {
     result.outcome = stopRequested ? 'terminated' : 'runner_error';
     result.error = error instanceof Error ? error.message : String(error);
     log(`job could not run: ${result.error}`);
+  }
+
+  // Save what the run changed in the shared state, whatever the job's outcome: a failed run
+  // also recorded things later runs need (a capacity cooldown, a review it has seen). This
+  // never changes the job's outcome; a failure is reported in result.state.sync and the log.
+  if (stateToSync && result.state) {
+    const budgetMs = deps.stateSyncBudgetMs ?? stateSyncBudgetMs(payload, now(), { terminating: stopRequested });
+    result.state.sync = await syncState(
+      {
+        bucket: payload.bucket,
+        key: payload.stateKey,
+        stateDir: stateToSync.stateDir,
+        baseFile: stateToSync.baseFile,
+        budgetMs,
+        onHurry: (hurry) => {
+          hurrySync = hurry;
+        },
+      },
+      deps,
+    );
+    hurrySync = () => {};
   }
 
   const finishedAt = now();
@@ -269,7 +333,29 @@ export async function runJob(request, deps) {
   return result;
 }
 
-/** Creates the state directory and fills it: event, config tree, App key. Returns its path. */
+/** result.state.sync for a job that never ran: there is nothing to merge. */
+function notAttempted() {
+  return {
+    attempted: false,
+    saved: false,
+    changed: null,
+    attempts: 0,
+    conflicts: 0,
+    merge: null,
+    info: null,
+    uploadedBytes: null,
+    schemaVersion: null,
+    etag: null,
+    notSavedReason: 'the job did not start, so there is nothing to save',
+    notSavedCode: 'job-not-started',
+    durationMs: null,
+  };
+}
+
+/**
+ * Creates the state directory and fills it: event, config tree, App key and, when the
+ * payload names one, the shared state database. Returns its path and what was downloaded.
+ */
 async function prepare(payload, deps) {
   const { jobUser } = deps;
   await fs.mkdir(deps.stateRoot, { recursive: true });
@@ -302,8 +388,18 @@ async function prepare(payload, deps) {
   }
   await fs.writeFile(path.join(stateDir, KEY_FILE), privateKey.endsWith('\n') ? privateKey : `${privateKey}\n`, { mode: 0o600 });
 
+  // Last, so that the snapshot is as fresh as it can be when the job starts.
+  let state;
+  if (payload.stateKey) {
+    if (!deps.s3GetIfExists || !deps.s3PutIf) throw new Error('the run request names a shared state database, but this runner cannot reach one');
+    state = await retry(async () => {
+      await fs.rm(path.join(stateDir, STATE_DB_FILE), { force: true });
+      return downloadState({ bucket: payload.bucket, key: payload.stateKey, stateDir }, deps);
+    }, deps);
+  }
+
   if (jobUser.uid !== undefined && jobUser.gid !== undefined) await chownTree(stateDir, jobUser.uid, jobUser.gid);
-  return stateDir;
+  return { stateDir, state };
 }
 
 async function chownTree(target, uid, gid) {
@@ -460,6 +556,9 @@ async function runUpdraft(payload, stateDir, budgetMs, deadline, deps, registerS
       clearTimeout(watchdog);
       clearTimeout(killTimer);
       if (pending !== '' && !pendingOversized) takeLine(pending);
+      // Nothing the job started may outlive it: the state database is merged next, and the
+      // microVM is about to go away.
+      signalGroup(child, 'SIGKILL');
       const { summary, problem } = parseSummary(lastLine);
       resolve({ exitCode, signal, timedOut, summary, summaryProblem: problem, stderrTail });
     });

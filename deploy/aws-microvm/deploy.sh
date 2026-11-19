@@ -6,6 +6,9 @@
 #   ./deploy.sh config     upload ./config/ to s3://<bucket>/config/
 #   ./deploy.sh image      package ./image/, create or update the MicroVM image, wait for the build
 #   ./deploy.sh status     stack outputs, image state, microVMs of the image
+#   ./deploy.sh state info        what the shared state database in S3 is: size, date, versions
+#   ./deploy.sh state pull [dir]  download it (and the config) into dir, laid out as an Updraft
+#                                 home, for `UPDRAFT_HOME=dir updraft status` (default: ./updraft-state)
 #
 # Settings come from the environment; nothing is hard-coded:
 #
@@ -19,11 +22,13 @@
 #   BASE_IMAGE_VERSION  pin a base image version                     (default: latest)
 #   NODE_VERSION, UPDRAFT_SPEC, AGENT_PACKAGES, TOOL_PACKAGES,
 #   SYSTEM_PACKAGES, PYTHON_COMMAND, UV_VERSION, BROWSER_PACKAGES,
-#   PLAYWRIGHT_VERSION, PLAYWRIGHT_BROWSERS                      override image/build.env
+#   PLAYWRIGHT_VERSION, PLAYWRIGHT_BROWSERS,
+#   REQUIRE_STATE_COMMANDS                                       override image/build.env
 #   UPDRAFT_TARBALL   path of an `npm pack` tarball to install instead of UPDRAFT_SPEC
 #   BUILD_TIMEOUT_SECONDS  how long to wait for the image build      (default: 2400)
 #   SAM_PARAMETER_OVERRIDES  extra template parameters, e.g.
 #                     "MaximumDurationSeconds=5400 TriggerLabels=ready"
+#   STATE_KEY         key of the shared state database             (default: state/state.db)
 #
 # The MicroVM image is created with the AWS CLI rather than by the template; README.md
 # ("Why the image is not in the template") explains why.
@@ -127,6 +132,7 @@ build_image() {
     [ -z "${BROWSER_PACKAGES+set}" ] || printf 'BROWSER_PACKAGES="%s"\n' "$BROWSER_PACKAGES"
     [ -z "${PLAYWRIGHT_VERSION+set}" ] || printf 'PLAYWRIGHT_VERSION="%s"\n' "$PLAYWRIGHT_VERSION"
     [ -z "${PLAYWRIGHT_BROWSERS+set}" ] || printf 'PLAYWRIGHT_BROWSERS="%s"\n' "$PLAYWRIGHT_BROWSERS"
+    [ -z "${REQUIRE_STATE_COMMANDS:-}" ] || printf 'REQUIRE_STATE_COMMANDS="%s"\n' "$REQUIRE_STATE_COMMANDS"
   } >> "$stage/context/build.env"
 
   local stamp key uri
@@ -214,6 +220,56 @@ show_status() {
     --query 'items[].[microvmId, state, startedAt]' --output table || true
 }
 
+# The bucket and key of the shared state database, in $STATE_BUCKET and $STATE_KEY.
+state_location() {
+  need aws
+  STATE_BUCKET="$(stack_output BucketName)"
+  [ -n "$STATE_BUCKET" ] && [ "$STATE_BUCKET" != "None" ] || die "stack $STACK_NAME has no BucketName output; run ./deploy.sh stack first"
+  STATE_KEY="${STATE_KEY:-state/state.db}"
+}
+
+state_info() {
+  state_location
+  say "s3://$STATE_BUCKET/$STATE_KEY"
+  if ! aws s3api head-object --bucket "$STATE_BUCKET" --key "$STATE_KEY" \
+      --query '{bytes: ContentLength, lastModified: LastModified, etag: ETag, versionId: VersionId}' --output table 2>/dev/null; then
+    echo "    no state database yet (no job has saved one), or no permission to read it"
+    return 0
+  fi
+  # Every write by a job is a new version; old ones expire after StateVersionRetentionDays.
+  local count
+  count="$(aws s3api list-object-versions --bucket "$STATE_BUCKET" --prefix "$STATE_KEY" \
+    --query "length(Versions[?Key=='$STATE_KEY'] || \`[]\`)" --output text)"
+  echo "    versions kept: $count"
+  aws s3api list-object-versions --bucket "$STATE_BUCKET" --prefix "$STATE_KEY" --max-items 10 \
+    --query "Versions[?Key=='$STATE_KEY'].[LastModified, Size, VersionId, IsLatest]" --output table || true
+}
+
+# Downloads the state database (and the config it belongs to) into a directory that Updraft
+# reads as its home. A copy for reading: nothing done to it locally is ever uploaded.
+state_pull() {
+  state_location
+  local dir="${1:-$PWD/updraft-state}"
+  mkdir -p "$dir"
+  # A write-ahead log left by an earlier look at an earlier copy must not be replayed onto
+  # the new file.
+  rm -f "$dir/state.db" "$dir/state.db-wal" "$dir/state.db-shm"
+  say "downloading s3://$STATE_BUCKET/$STATE_KEY to $dir/state.db"
+  aws s3 cp "s3://$STATE_BUCKET/$STATE_KEY" "$dir/state.db" --only-show-errors \
+    || die "no state database at s3://$STATE_BUCKET/$STATE_KEY (no job has saved one yet?)"
+  # status and stats read the config for names and settings. The App's private key is not
+  # downloaded, so nothing run against this directory can act on GitHub as the App.
+  say "downloading the config from s3://$STATE_BUCKET/config/"
+  aws s3 sync "s3://$STATE_BUCKET/config/" "$dir/" --exclude 'state.db*' --only-show-errors
+  cat <<NOTE
+==> a copy of the fleet's state as of now. Read it with:
+      UPDRAFT_HOME="$dir" updraft status
+      UPDRAFT_HOME="$dir" updraft stats
+    Changes made to this copy are NOT pushed back; run 'state pull' again for a newer one.
+    Do not run 'updraft start' or 'updraft run-event' against it.
+NOTE
+}
+
 case "${1:-all}" in
   all)
     deploy_stack
@@ -224,6 +280,13 @@ case "${1:-all}" in
   config) upload_config ;;
   image) build_image ;;
   status) show_status ;;
-  -h|--help|help) sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  state)
+    case "${2:-}" in
+      info) state_info ;;
+      pull) state_pull "${3:-}" ;;
+      *) die "usage: ./deploy.sh state info | ./deploy.sh state pull [dir]" ;;
+    esac
+    ;;
+  -h|--help|help) sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command: $1 (try --help)" ;;
 esac

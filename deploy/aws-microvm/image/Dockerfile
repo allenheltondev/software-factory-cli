@@ -40,7 +40,9 @@ RUN set -eu; . /opt/updraft/build.env; \
 
 # Updraft: a local `npm pack` tarball in vendor/ wins (for builds that are not on npm yet),
 # otherwise the pinned npm spec. The build fails if the installed version has no `run-event`
-# command, because the image would be useless.
+# command, because the image would be useless, and (unless REQUIRE_STATE_COMMANDS is 0 in
+# build.env) if it has no `state merge`, because every job would then run but none could
+# save what it learned to the shared state database.
 COPY vendor/ /opt/updraft/vendor/
 RUN set -eu; . /opt/updraft/build.env; \
     set -- /opt/updraft/vendor/*.tgz; \
@@ -56,9 +58,14 @@ RUN set -eu; . /opt/updraft/build.env; \
     if ! updraft --help | grep -q 'run-event'; then \
       echo "this Updraft has no run-event command; use a newer UPDRAFT_SPEC or a tarball in vendor/" >&2; \
       exit 1; \
+    fi; \
+    if [ "${REQUIRE_STATE_COMMANDS:-1}" != "0" ] && ! updraft state --help 2>/dev/null | grep -q 'merge'; then \
+      echo "this Updraft has no 'state merge' command, which the shared state database needs; use a newer UPDRAFT_SPEC or a tarball in vendor/, or set REQUIRE_STATE_COMMANDS=0 in build.env and deploy the stack with SharedState=disabled" >&2; \
+      exit 1; \
     fi
 
-# Agent CLIs (word splitting of the list is intended).
+# Agent CLIs (word splitting of the list is intended). The review loop needs two different
+# agents, one to write and one to review: list both packages in AGENT_PACKAGES.
 RUN set -eu; . /opt/updraft/build.env; \
     if [ -n "${AGENT_PACKAGES}" ]; then npm install -g --no-fund --no-audit ${AGENT_PACKAGES}; fi; \
     npm cache clean --force >/dev/null 2>&1 || true
@@ -108,8 +115,10 @@ RUN set -eu; . /opt/updraft/build.env; \
 COPY runner/ /opt/updraft/runner/
 RUN set -eu; cd /opt/updraft/runner; npm ci --omit=dev --no-fund --no-audit; npm cache clean --force >/dev/null 2>&1 || true
 
-# The job user. The runner (root) starts `updraft run-event` as this user; Updraft starts the
-# agent as the same user. Claude Code refuses its full-auto mode as root. The Git identity is
+# The job user. The runner (root) starts `updraft run-event` and `updraft state merge` as
+# this user; Updraft starts the agent as the same user. /var/lib/updraft-jobs stays root's:
+# the runner makes one directory per job in it for the job user, and keeps its own copy of
+# the shared state database (the merge base) in one the job user cannot enter. Claude Code refuses its full-auto mode as root. The Git identity is
 # a fallback for agents that commit without `github.app.commitAsApp: true`.
 RUN set -eu; \
     useradd --create-home --uid 1000 --user-group --shell /bin/sh updraft; \

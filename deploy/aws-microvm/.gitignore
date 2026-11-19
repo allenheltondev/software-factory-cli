@@ -8,3 +8,6 @@ config/*
 
 # `npm pack` tarballs placed in image/vendor/ for testing unpublished builds
 image/vendor/*.tgz
+
+# A copy of the fleet's state database from `deploy.sh state pull` (issue titles, review text)
+updraft-state/

@@ -2,29 +2,67 @@
 //
 // This is an optimisation, not the authority. It only drops deliveries that cannot lead to
 // work. Whether the label is a trigger, whether the actor is allowed, whether the issue was
-// edited since: all of that is decided by `updraft run-event` inside the microVM, against the
-// GitHub API and the Updraft config.
+// edited since, whether a pull request is one Updraft opened, whether a review asks for
+// changes and by whom: all of that is decided by `updraft run-event` inside the microVM,
+// against the GitHub API, the Updraft config and the shared state database.
 
-/** Events and actions that can start a job. Extend this when run-event handles more. */
-export const ACCEPTED = Object.freeze({ issues: Object.freeze(['labeled']) });
+/**
+ * Events and actions `updraft run-event` handles. Which of these events a deployment accepts
+ * is a setting (the AcceptedEvents template parameter); the default is `issues` only.
+ */
+export const SUPPORTED = Object.freeze({
+  issues: Object.freeze(['labeled']),
+  pull_request_review: Object.freeze(['submitted', 'edited', 'dismissed']),
+  pull_request: Object.freeze(['synchronize', 'closed', 'reopened']),
+});
+
+export const DEFAULT_ACCEPTED_EVENTS = Object.freeze(['issues']);
+/** Updraft's job branches are `updraft/issue-<n>-<job id>`; revisions and reviews only concern those. */
+export const DEFAULT_PR_BRANCH_PREFIX = 'updraft/';
+
+/**
+ * Parses the ACCEPTED_EVENTS setting: comma-separated event names, each one of SUPPORTED.
+ * Empty means the default. Throws for a name run-event does not handle, so that a typo is a
+ * loud misconfiguration and not a silently ignored event.
+ */
+export function parseAcceptedEvents(text) {
+  const names = String(text ?? '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name !== '');
+  if (names.length === 0) return [...DEFAULT_ACCEPTED_EVENTS];
+  for (const name of names) {
+    if (!Object.hasOwn(SUPPORTED, name)) {
+      throw new Error(`ACCEPTED_EVENTS names ${printable(name)}; the events that can start a job are ${Object.keys(SUPPORTED).join(', ')}`);
+    }
+  }
+  return [...new Set(names)];
+}
 
 /** Whether any delivery of this event can start a job; false means the body need not be read. */
-export function canLaunch(eventName) {
-  return typeof eventName === 'string' && Object.hasOwn(ACCEPTED, eventName);
+export function canLaunch(eventName, acceptedEvents = DEFAULT_ACCEPTED_EVENTS) {
+  return typeof eventName === 'string' && Object.hasOwn(SUPPORTED, eventName) && acceptedEvents.includes(eventName);
 }
 
 /**
  * @param {string | undefined} eventName the X-GitHub-Event header
  * @param {unknown} payload the parsed webhook body
- * @param {{ triggerLabels?: string[] }} [options] when triggerLabels is not empty, only these
- *   label names launch a microVM (compared case-insensitively, as GitHub treats label names)
- * @returns {{ launch: boolean, reason: string }}
+ * @param {object} [options]
+ * @param {string[]} [options.acceptedEvents] events this deployment acts on (default: issues)
+ * @param {string[]} [options.triggerLabels] when not empty, only these label names launch a
+ *   microVM for an issues event (compared case-insensitively, as GitHub treats label names)
+ * @param {string} [options.prBranchPrefix] when not empty, pull request events launch only
+ *   for pull requests whose head branch starts with it
+ * @param {string[]} [options.ignoredSenders] logins whose pull request events never launch
+ *   (the App's own `<slug>[bot]`: the run that pushed or reviewed already knows what it did)
+ * @returns {{ launch: boolean, reason: string, pullRequest?: { repository: string, number: number } }}
+ *   `pullRequest` is set for an accepted pull request event; the launcher coalesces on it
  */
 export function decideEvent(eventName, payload, options = {}) {
   if (typeof eventName !== 'string' || eventName === '') return skip('no X-GitHub-Event header');
   if (eventName === 'ping') return skip('ping');
-  if (!canLaunch(eventName)) return skip(`event ${printable(eventName)} is not handled`);
-  const actions = ACCEPTED[eventName];
+  if (!canLaunch(eventName, options.acceptedEvents ?? DEFAULT_ACCEPTED_EVENTS)) return skip(`event ${printable(eventName)} is not handled`);
+  const actions = SUPPORTED[eventName];
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
     return skip('payload is not a JSON object');
   }
@@ -33,6 +71,10 @@ export function decideEvent(eventName, payload, options = {}) {
     return skip(`action ${printable(action)} of ${eventName} is not handled`);
   }
   if (typeof payload.repository?.full_name !== 'string') return skip('payload has no repository.full_name');
+  return eventName === 'issues' ? decideIssue(eventName, action, payload, options) : decidePullRequest(eventName, action, payload, options);
+}
+
+function decideIssue(eventName, action, payload, options) {
   if (!Number.isInteger(payload.issue?.number)) return skip('payload has no issue.number');
   const label = payload.label?.name;
   if (typeof label !== 'string' || label === '') return skip('payload has no label.name');
@@ -41,6 +83,37 @@ export function decideEvent(eventName, payload, options = {}) {
     return skip('label is not in TRIGGER_LABELS');
   }
   return { launch: true, reason: `${eventName}.${action}` };
+}
+
+function decidePullRequest(eventName, action, payload, options) {
+  const number = payload.pull_request?.number;
+  if (!Number.isInteger(number)) return skip('payload has no pull_request.number');
+  // Revisions and reviews are only ever made to pull requests Updraft opened, and those are
+  // on its job branches. A pull request on any other branch cannot lead to work.
+  const prefix = options.prBranchPrefix ?? DEFAULT_PR_BRANCH_PREFIX;
+  const branch = payload.pull_request?.head?.ref;
+  if (prefix !== '' && (typeof branch !== 'string' || !branch.startsWith(prefix))) {
+    return skip('the pull request is not on an Updraft job branch');
+  }
+  const sender = payload.sender?.login;
+  const ignored = (options.ignoredSenders ?? []).map((login) => login.toLowerCase());
+  if (typeof sender === 'string' && ignored.includes(sender.toLowerCase())) {
+    return skip('the sender is in IGNORED_SENDERS');
+  }
+  if (eventName === 'pull_request_review') {
+    if (!Number.isInteger(payload.review?.id)) return skip('payload has no review.id');
+    // A "Comment" review starts nothing in Updraft (only "Request changes" does; an approval
+    // or a dismissal can cancel a pending revision). Updraft's own reviewer posts comment
+    // reviews, so this is also what keeps a run from waking a second microVM for itself.
+    if (typeof payload.review.state === 'string' && payload.review.state.toLowerCase() === 'commented') {
+      return skip('a comment review starts nothing');
+    }
+  }
+  return {
+    launch: true,
+    reason: `${eventName}.${action}`,
+    pullRequest: { repository: payload.repository.full_name.toLowerCase(), number },
+  };
 }
 
 function skip(reason) {

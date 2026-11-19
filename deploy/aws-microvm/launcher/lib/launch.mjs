@@ -1,7 +1,7 @@
 // The launcher's logic, free of the AWS SDK so it can be tested with stand-ins: configuration
 // from the environment, the RunMicrovm input, and the webhook handler itself.
 import { verifySignature } from './signature.mjs';
-import { canLaunch, decideEvent } from './filter.mjs';
+import { DEFAULT_PR_BRANCH_PREFIX, canLaunch, decideEvent, parseAcceptedEvents } from './filter.mjs';
 
 /** RunMicrovm's runHookPayload limit ("max 16 KB"; the API model says 16,384 bytes). */
 export const MAX_RUN_HOOK_PAYLOAD_BYTES = 16384;
@@ -13,6 +13,10 @@ export const PAYLOAD_VERSION = 1;
 // GitHub sends a GUID. The id becomes part of an S3 key, so accept nothing else.
 const DELIVERY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 const EVENT_NAME_PATTERN = /^[a-z_]{1,64}$/;
+// An S3 key for the shared state database: relative, no "..", nothing that needs escaping.
+const STATE_KEY_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]*(\/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$/;
+/** Longest coalescing window; the runner waits for it to close before it starts the job. */
+export const MAX_COALESCE_SECONDS = 300;
 
 /**
  * Reads the launcher's settings from environment variables (set by the SAM template).
@@ -39,6 +43,17 @@ export function loadConfig(env) {
   const dedupeWindowSeconds = env.DEDUPE_WINDOW_SECONDS === undefined || env.DEDUPE_WINDOW_SECONDS === '' ? 0 : integer('DEDUPE_WINDOW_SECONDS', 0, 86400);
   const dedupeTable = (env.DEDUPE_TABLE ?? '').trim();
   if (dedupeWindowSeconds > 0 && dedupeTable === '') throw new Error('DEDUPE_TABLE is not set but DEDUPE_WINDOW_SECONDS is');
+  const coalesceSeconds = env.PR_COALESCE_SECONDS === undefined || env.PR_COALESCE_SECONDS === '' ? 0 : integer('PR_COALESCE_SECONDS', 0, MAX_COALESCE_SECONDS);
+  if (coalesceSeconds > 0 && dedupeTable === '') throw new Error('DEDUPE_TABLE is not set but PR_COALESCE_SECONDS is');
+  const stateKey = (env.STATE_KEY ?? '').trim();
+  if (stateKey !== '' && (!STATE_KEY_PATTERN.test(stateKey) || stateKey.length > 200)) {
+    throw new Error('STATE_KEY is not a usable object key');
+  }
+  const list = (value) =>
+    (value ?? '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => item !== '');
   const idlePolicyMode = (env.IDLE_POLICY_MODE ?? 'explicit').trim() || 'explicit';
   if (idlePolicyMode !== 'explicit' && idlePolicyMode !== 'omit') {
     throw new Error('IDLE_POLICY_MODE must be "explicit" or "omit"');
@@ -63,10 +78,16 @@ export function loadConfig(env) {
     idlePolicyMode,
     dedupeTable,
     dedupeWindowSeconds,
-    triggerLabels: (env.TRIGGER_LABELS ?? '')
-      .split(',')
-      .map((label) => label.trim())
-      .filter((label) => label !== ''),
+    triggerLabels: list(env.TRIGGER_LABELS),
+    // Which webhook events may start a microVM. `issues` only unless the owner adds the
+    // pull request events the review loop needs.
+    acceptedEvents: parseAcceptedEvents(env.ACCEPTED_EVENTS),
+    // Unset means Updraft's job-branch prefix; set and empty turns the branch check off.
+    prBranchPrefix: env.PR_BRANCH_PREFIX === undefined ? DEFAULT_PR_BRANCH_PREFIX : env.PR_BRANCH_PREFIX.trim(),
+    ignoredSenders: list(env.IGNORED_SENDERS),
+    coalesceSeconds,
+    // Key of the shared Updraft state database; empty turns state sync off in the runner.
+    stateKey,
   };
 }
 
@@ -84,10 +105,14 @@ export function eventKeyFor(config, deliveryId) {
  * The run-hook payload: references and the event's identity, never a secret value. The
  * runner in the microVM fetches everything else with its execution role.
  */
-export function buildRunHookPayload(config, { deliveryId, eventName, launchedAt }) {
+export function buildRunHookPayload(config, { deliveryId, eventName, launchedAt, notBefore }) {
   const dedupe = config.dedupeWindowSeconds > 0 ? { dedupeTable: config.dedupeTable } : {};
   return {
     ...dedupe,
+    ...(config.stateKey ? { stateKey: config.stateKey } : {}),
+    // Set for a pull request event that holds a coalescing lease: the runner starts the job
+    // no earlier, so that it sees every event the launcher coalesced into this one.
+    ...(notBefore ? { notBefore } : {}),
     version: PAYLOAD_VERSION,
     deliveryId,
     eventName,
@@ -110,8 +135,8 @@ export function buildRunHookPayload(config, { deliveryId, eventName, launchedAt 
  * The RunMicrovm request. Field names are those of RunMicrovmRequest in
  * @aws-sdk/client-lambda-microvms; see the README for the documentation page behind each.
  */
-export function buildRunMicrovmInput(config, { deliveryId, eventName, launchedAt }) {
-  const runHookPayload = JSON.stringify(buildRunHookPayload(config, { deliveryId, eventName, launchedAt }));
+export function buildRunMicrovmInput(config, { deliveryId, eventName, launchedAt, notBefore }) {
+  const runHookPayload = JSON.stringify(buildRunHookPayload(config, { deliveryId, eventName, launchedAt, notBefore }));
   const size = Buffer.byteLength(runHookPayload, 'utf8');
   if (size > MAX_RUN_HOOK_PAYLOAD_BYTES) {
     throw new Error(`run hook payload is ${size} bytes; the limit is ${MAX_RUN_HOOK_PAYLOAD_BYTES}`);
@@ -151,9 +176,10 @@ export function buildRunMicrovmInput(config, { deliveryId, eventName, launchedAt
  * @param {() => Promise<string>} deps.getWebhookSecret
  * @param {(bucket: string, key: string, body: Buffer) => Promise<void>} deps.putObject
  * @param {(input: object) => Promise<{ microvmId?: string, state?: string }>} deps.runMicrovm
- * @param {(deliveryId: string, nowSeconds: number, expiresSeconds: number) => Promise<boolean>} [deps.claimDelivery]
- *   records the delivery unless an unexpired record exists; false means "already launched"
- * @param {(deliveryId: string) => Promise<void>} [deps.releaseDelivery] removes that record
+ * @param {(key: string, nowSeconds: number, expiresSeconds: number) => Promise<boolean>} [deps.claimDelivery]
+ *   records the key (a delivery id, or a pull request's coalescing lease) unless an unexpired
+ *   record exists; false means "already there"
+ * @param {(key: string) => Promise<void>} [deps.releaseDelivery] removes that record
  * @param {(entry: object) => void} deps.log
  * @param {() => Date} [deps.now]
  */
@@ -197,7 +223,7 @@ export async function handleWebhook(request, deps) {
   }
 
   // 3. Filter cheaply. Anything that cannot lead to work gets a 2xx and no microVM.
-  if (!canLaunch(eventName)) {
+  if (!canLaunch(eventName, config.acceptedEvents)) {
     // Not worth parsing a body for an event this deployment never acts on (ping included).
     const reason = eventName === 'ping' ? 'ping' : `event "${eventName}" is not handled`;
     log({ level: 'info', deliveryId, eventName, message: `ignored: ${reason}` });
@@ -236,12 +262,45 @@ export async function handleWebhook(request, deps) {
     }
   }
 
-  // 5. Store the body (it can exceed the 16 KB run-hook payload) and launch.
+  // 5. Coalesce pull request events. Several deliveries can concern one pull request within
+  //    seconds (a push followed by a review, two reviews). run-event looks at the pull
+  //    request as it is on GitHub, not at the delivery, so one microVM that starts after the
+  //    burst covers all of them, and two would each run an agent on the same branch. The
+  //    first delivery takes a lease of a few seconds on the pull request and launches; the
+  //    others get 202 and no microVM; the runner starts the job only once the lease is over.
+  //    Like deduplication this fails open: no table, no coalescing.
+  let leaseKey;
+  let notBefore;
+  if (decision.pullRequest && config.coalesceSeconds > 0 && deps.claimDelivery) {
+    const key = pullRequestLeaseKey(decision.pullRequest);
+    const nowSeconds = Math.floor(nowDate.getTime() / 1000);
+    try {
+      if (await deps.claimDelivery(key, nowSeconds, nowSeconds + config.coalesceSeconds)) {
+        leaseKey = key;
+        // The record counts as unexpired through the whole second it expires in.
+        notBefore = new Date((nowSeconds + config.coalesceSeconds + 1) * 1000).toISOString();
+      } else {
+        const reason = `coalesced: a microVM launched in the last ${config.coalesceSeconds} s for pull request #${decision.pullRequest.number} has not started its job yet and will see this event`;
+        log({ level: 'info', deliveryId, eventName, message: `ignored: ${reason}` });
+        // This delivery started nothing, so a redelivery of it must not be refused later.
+        if (claimed) {
+          await deps.releaseDelivery?.(deliveryId).catch((releaseError) => {
+            log({ level: 'warn', deliveryId, message: 'could not release the delivery record', error: describe(releaseError) });
+          });
+        }
+        return respond(202, { deliveryId, coalesced: true, ignored: reason });
+      }
+    } catch (error) {
+      log({ level: 'warn', deliveryId, eventName, message: 'coalescing unavailable; launching anyway', error: describe(error) });
+    }
+  }
+
+  // 6. Store the body (it can exceed the 16 KB run-hook payload) and launch.
   const launchedAt = nowDate.toISOString();
   const eventKey = eventKeyFor(config, deliveryId);
   try {
     await deps.putObject(config.bucket, eventKey, rawBody);
-    const input = buildRunMicrovmInput(config, { deliveryId, eventName, launchedAt });
+    const input = buildRunMicrovmInput(config, { deliveryId, eventName, launchedAt, notBefore });
     const result = await deps.runMicrovm(input);
     log({
       level: 'info',
@@ -257,14 +316,24 @@ export async function handleWebhook(request, deps) {
     // A 5xx marks the delivery as failed in the App's "Recent Deliveries", from where it can
     // be redelivered once the cause is fixed.
     log({ level: 'error', deliveryId, eventName, message: 'launch failed', error: describe(error) });
-    if (claimed) {
-      // Nothing is running, so the redelivery that retries this must not be refused.
-      await deps.releaseDelivery?.(deliveryId).catch((releaseError) => {
+    // Nothing is running, so the redelivery that retries this must not be refused, and the
+    // next event for the pull request must not be coalesced into a microVM that does not exist.
+    for (const key of [claimed ? deliveryId : undefined, leaseKey]) {
+      if (key === undefined) continue;
+      await deps.releaseDelivery?.(key).catch((releaseError) => {
         log({ level: 'warn', deliveryId, message: 'could not release the delivery record', error: describe(releaseError) });
       });
     }
     return respond(500, { deliveryId, error: 'launch failed' });
   }
+}
+
+/**
+ * The coalescing lease lives in the delivery table under a key no delivery id can have
+ * (delivery ids have no "#"), so the table needs no second key and the role no new action.
+ */
+export function pullRequestLeaseKey({ repository, number }) {
+  return `pr#${repository}#${number}`;
 }
 
 function respond(statusCode, body) {

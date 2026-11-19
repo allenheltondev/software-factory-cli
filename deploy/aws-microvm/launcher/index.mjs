@@ -57,7 +57,8 @@ export async function handler(event) {
       await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: 'application/json' }));
     },
     runMicrovm: (input) => microvms.send(new RunMicrovmCommand(input)),
-    // DynamoDB deletes expired items lazily, so "expired" is part of the condition.
+    // DynamoDB deletes expired items lazily, so "expired" is part of the condition. The key
+    // is a delivery id or a pull request's coalescing lease ("pr#<owner/repo>#<number>").
     claimDelivery: async (deliveryId, nowSeconds, expiresSeconds) => {
       try {
         await dynamodb.send(

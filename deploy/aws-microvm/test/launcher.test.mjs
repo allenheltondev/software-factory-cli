@@ -1,11 +1,12 @@
 import crypto from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { decideEvent } from '../launcher/lib/filter.mjs';
+import { canLaunch, decideEvent, parseAcceptedEvents } from '../launcher/lib/filter.mjs';
 import {
   MAX_RUN_HOOK_PAYLOAD_BYTES,
   buildRunMicrovmInput,
   handleWebhook,
   loadConfig,
+  pullRequestLeaseKey,
 } from '../launcher/lib/launch.mjs';
 import { signBody, verifySignature } from '../launcher/lib/signature.mjs';
 import { parseRunRequest } from '../image/runner/hooks.mjs';
@@ -523,5 +524,308 @@ describe('handleWebhook: deduplication on the delivery id', () => {
   it('requires a table when a window is set', () => {
     expect(() => loadConfig({ ...env, DEDUPE_WINDOW_SECONDS: '60' })).toThrow('DEDUPE_TABLE');
     expect(loadConfig({ ...env, DEDUPE_TABLE: 't', DEDUPE_WINDOW_SECONDS: '0' }).dedupeWindowSeconds).toBe(0);
+  });
+});
+
+// ------------------------------------------------------------------ pull request events
+
+const LOOP_EVENTS = ['issues', 'pull_request_review', 'pull_request'];
+const loopEnv = { ...env, ACCEPTED_EVENTS: LOOP_EVENTS.join(',') };
+
+const pullRequest = (overrides = {}) => ({
+  number: 34,
+  title: 'Add a thing',
+  head: { ref: 'updraft/issue-12-job_ev9001x3f0c1d2e4a', sha: 'a'.repeat(40) },
+  ...overrides,
+});
+const reviewed = (overrides = {}) => ({
+  action: 'submitted',
+  review: { id: 501, state: 'changes_requested', body: 'Please rename it.' },
+  pull_request: pullRequest(),
+  repository: { id: 1, full_name: 'Octo/Repo' },
+  sender: { login: 'someone' },
+  ...overrides,
+});
+const pushed = (overrides = {}) => ({
+  action: 'synchronize',
+  pull_request: pullRequest(),
+  repository: { id: 1, full_name: 'Octo/Repo' },
+  sender: { login: 'someone' },
+  ...overrides,
+});
+
+describe('decideEvent: pull request events', () => {
+  const options = { acceptedEvents: LOOP_EVENTS };
+
+  it('ignores them unless the deployment accepts them', () => {
+    expect(decideEvent('pull_request_review', reviewed()).launch).toBe(false);
+    expect(decideEvent('pull_request', pushed()).launch).toBe(false);
+    expect(decideEvent('pull_request_review', reviewed(), { acceptedEvents: ['issues', 'pull_request'] }).launch).toBe(false);
+    expect(canLaunch('pull_request')).toBe(false);
+    expect(canLaunch('pull_request', LOOP_EVENTS)).toBe(true);
+    // Accepting an event does not make an unknown one launchable.
+    expect(canLaunch('push', [...LOOP_EVENTS, 'push'])).toBe(false);
+    expect(canLaunch('constructor', LOOP_EVENTS)).toBe(false);
+  });
+
+  it('launches for the review and pull request actions run-event handles, naming the pull request', () => {
+    for (const action of ['submitted', 'edited', 'dismissed']) {
+      expect(decideEvent('pull_request_review', reviewed({ action }), options)).toEqual({
+        launch: true,
+        reason: `pull_request_review.${action}`,
+        pullRequest: { repository: 'octo/repo', number: 34 },
+      });
+    }
+    for (const action of ['synchronize', 'closed', 'reopened']) {
+      expect(decideEvent('pull_request', pushed({ action }), options)).toMatchObject({ launch: true, reason: `pull_request.${action}`, pullRequest: { number: 34 } });
+    }
+    // issues still work as before, without a pull request to coalesce on.
+    expect(decideEvent('issues', labeled(), options)).toEqual({ launch: true, reason: 'issues.labeled' });
+  });
+
+  it('ignores other actions and payloads that lack what a job needs', () => {
+    for (const [event, payload] of [
+      ['pull_request', pushed({ action: 'opened' })],
+      ['pull_request', pushed({ action: 'labeled' })],
+      ['pull_request', pushed({ action: 'edited' })],
+      ['pull_request_review', reviewed({ action: 'created' })],
+      ['pull_request_review_comment', reviewed({ action: 'created' })],
+      ['pull_request', pushed({ pull_request: undefined })],
+      ['pull_request', pushed({ pull_request: pullRequest({ number: '34' }) })],
+      ['pull_request', pushed({ repository: { id: 1 } })],
+      ['pull_request_review', reviewed({ review: undefined })],
+      ['pull_request_review', reviewed({ review: { state: 'approved' } })],
+      ['pull_request', null],
+    ]) {
+      expect(decideEvent(event, payload, options).launch, `${event}/${payload?.action}`).toBe(false);
+    }
+  });
+
+  it('launches only for pull requests on Updraft job branches', () => {
+    const other = pullRequest({ head: { ref: 'feature/by-a-person' } });
+    expect(decideEvent('pull_request', pushed({ pull_request: other }), options)).toEqual({ launch: false, reason: 'the pull request is not on an Updraft job branch' });
+    expect(decideEvent('pull_request_review', reviewed({ pull_request: other }), options).launch).toBe(false);
+    expect(decideEvent('pull_request', pushed({ pull_request: pullRequest({ head: undefined }) }), options).launch).toBe(false);
+    // Another prefix, or none at all.
+    expect(decideEvent('pull_request', pushed({ pull_request: other }), { ...options, prBranchPrefix: 'feature/' }).launch).toBe(true);
+    expect(decideEvent('pull_request', pushed({ pull_request: other }), { ...options, prBranchPrefix: '' }).launch).toBe(true);
+    expect(decideEvent('pull_request', pushed(), { ...options, prBranchPrefix: 'feature/' }).launch).toBe(false);
+  });
+
+  it('ignores comment reviews, which start nothing, and keeps the reviews that can', () => {
+    for (const state of ['commented', 'COMMENTED']) {
+      for (const action of ['submitted', 'edited']) {
+        expect(decideEvent('pull_request_review', reviewed({ action, review: { id: 1, state } }), options)).toEqual({ launch: false, reason: 'a comment review starts nothing' });
+      }
+    }
+    for (const state of ['changes_requested', 'approved', 'dismissed', undefined]) {
+      expect(decideEvent('pull_request_review', reviewed({ review: { id: 1, state } }), options).launch, String(state)).toBe(true);
+    }
+  });
+
+  it('ignores pull request events sent by the listed logins, and only those events', () => {
+    const own = { login: 'My-Updraft-App[bot]' };
+    const withIgnored = { ...options, ignoredSenders: ['my-updraft-app[bot]'] };
+    expect(decideEvent('pull_request', pushed({ sender: own }), withIgnored)).toEqual({ launch: false, reason: 'the sender is in IGNORED_SENDERS' });
+    expect(decideEvent('pull_request_review', reviewed({ sender: own }), withIgnored).launch).toBe(false);
+    expect(decideEvent('pull_request', pushed(), withIgnored).launch).toBe(true);
+    expect(decideEvent('pull_request', pushed({ sender: own }), options).launch).toBe(true);
+    expect(decideEvent('issues', labeled({ sender: own }), withIgnored).launch).toBe(true);
+  });
+});
+
+describe('parseAcceptedEvents and the launcher settings for the loop', () => {
+  it('defaults to issues only', () => {
+    expect(parseAcceptedEvents(undefined)).toEqual(['issues']);
+    expect(parseAcceptedEvents('')).toEqual(['issues']);
+    expect(parseAcceptedEvents(' , ')).toEqual(['issues']);
+    expect(loadConfig(env).acceptedEvents).toEqual(['issues']);
+  });
+
+  it('takes a comma-separated list and refuses names run-event does not handle', () => {
+    expect(parseAcceptedEvents('issues, pull_request_review,pull_request,issues')).toEqual(LOOP_EVENTS);
+    expect(parseAcceptedEvents('pull_request')).toEqual(['pull_request']);
+    expect(() => parseAcceptedEvents('issues,push')).toThrow('ACCEPTED_EVENTS');
+    expect(() => parseAcceptedEvents('constructor')).toThrow('ACCEPTED_EVENTS');
+    expect(() => loadConfig({ ...env, ACCEPTED_EVENTS: 'issue_comment' })).toThrow('ACCEPTED_EVENTS');
+    expect(loadConfig(loopEnv).acceptedEvents).toEqual(LOOP_EVENTS);
+  });
+
+  it('reads the branch prefix, the ignored senders, the coalescing window and the state key', () => {
+    const defaults = loadConfig(env);
+    expect(defaults).toMatchObject({ prBranchPrefix: 'updraft/', ignoredSenders: [], coalesceSeconds: 0, stateKey: '' });
+    const set = loadConfig({ ...loopEnv, PR_BRANCH_PREFIX: '', IGNORED_SENDERS: 'a[bot], b', PR_COALESCE_SECONDS: '20', DEDUPE_TABLE: 't', STATE_KEY: 'state/state.db' });
+    expect(set).toMatchObject({ prBranchPrefix: '', ignoredSenders: ['a[bot]', 'b'], coalesceSeconds: 20, stateKey: 'state/state.db' });
+    expect(() => loadConfig({ ...env, PR_COALESCE_SECONDS: '20' })).toThrow('DEDUPE_TABLE');
+    expect(() => loadConfig({ ...env, PR_COALESCE_SECONDS: '301', DEDUPE_TABLE: 't' })).toThrow('PR_COALESCE_SECONDS');
+    for (const key of ['/state/state.db', 'state/../config/config.yaml', 'state//x', 'state/a b', '.hidden']) {
+      expect(() => loadConfig({ ...env, STATE_KEY: key }), key).toThrow('STATE_KEY');
+    }
+  });
+
+  it('tells the runner where the shared state is, and nothing when state sync is off', () => {
+    const args = { deliveryId: 'd-1', eventName: 'issues', launchedAt: '2026-01-02T03:04:05.000Z' };
+    const on = JSON.parse(buildRunMicrovmInput(loadConfig({ ...env, STATE_KEY: 'state/state.db' }), args).runHookPayload);
+    expect(on.stateKey).toBe('state/state.db');
+    expect(parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify(on) }).payload.stateKey).toBe('state/state.db');
+    const off = JSON.parse(buildRunMicrovmInput(loadConfig(env), args).runHookPayload);
+    expect(off).not.toHaveProperty('stateKey');
+    expect(off).not.toHaveProperty('notBefore');
+    expect(parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify(off) }).payload).not.toHaveProperty('stateKey');
+    for (const bad of [{ stateKey: '../x' }, { stateKey: 7 }, { notBefore: 'soon' }, { notBefore: 5 }]) {
+      expect(() => parseRunRequest({ microvmId: 'mvm-1', runHookPayload: JSON.stringify({ ...on, ...bad }) }), JSON.stringify(bad)).toThrow('runHookPayload');
+    }
+  });
+});
+
+describe('handleWebhook: pull request events and coalescing', () => {
+  const NOW = Math.floor(Date.parse('2026-01-02T03:04:05.000Z') / 1000);
+  const coalesceEnv = { ...loopEnv, DEDUPE_TABLE: 'deliveries', DEDUPE_WINDOW_SECONDS: '14400', PR_COALESCE_SECONDS: '20' };
+
+  function withTable(overrides = {}, environment = coalesceEnv) {
+    const table = new Map();
+    const d = deps({
+      config: loadConfig(environment),
+      claimDelivery: async (key, nowSeconds, expiresSeconds) => {
+        const existing = table.get(key);
+        if (existing !== undefined && existing >= nowSeconds) return false;
+        table.set(key, expiresSeconds);
+        return true;
+      },
+      releaseDelivery: async (key) => {
+        table.delete(key);
+      },
+      ...overrides,
+    });
+    return { d, table };
+  }
+
+  it('answers 200 and launches nothing for pull request events when only issues are accepted', async () => {
+    const d = deps();
+    for (const [event, payload] of [['pull_request_review', reviewed()], ['pull_request', pushed()]]) {
+      const response = await handleWebhook(request(payload, { event }), d);
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body).ignored).toContain('is not handled');
+    }
+    expect(d.calls.run).toEqual([]);
+    expect(d.calls.put).toEqual([]);
+  });
+
+  it('launches for an accepted pull request event and passes the event name through', async () => {
+    const d = deps({ config: loadConfig(loopEnv) });
+    const response = await handleWebhook(request(reviewed(), { event: 'pull_request_review', delivery: 'review-1' }), d);
+    expect(response.statusCode).toBe(202);
+    const payload = JSON.parse(d.calls.run[0].runHookPayload);
+    expect(payload).toMatchObject({ eventName: 'pull_request_review', deliveryId: 'review-1', eventKey: 'events/review-1/event.json' });
+    // No coalescing configured: nothing to wait for.
+    expect(payload).not.toHaveProperty('notBefore');
+    // No review text in the request.
+    expect(JSON.stringify(d.calls.run[0])).not.toContain('rename');
+    expect(parseRunRequest({ microvmId: 'mvm-1', runHookPayload: d.calls.run[0].runHookPayload }).payload.eventName).toBe('pull_request_review');
+  });
+
+  it('applies the filters before anything is recorded or launched', async () => {
+    const { d, table } = withTable();
+    const comment = await handleWebhook(request(reviewed({ review: { id: 2, state: 'commented' } }), { event: 'pull_request_review' }), d);
+    expect(JSON.parse(comment.body).ignored).toBe('a comment review starts nothing');
+    const foreign = await handleWebhook(request(pushed({ pull_request: pullRequest({ head: { ref: 'main' } }) }), { event: 'pull_request' }), d);
+    expect(foreign.statusCode).toBe(200);
+    expect(table.size).toBe(0);
+    expect(d.calls.run).toEqual([]);
+  });
+
+  it('launches one microVM for a burst of events on one pull request, and tells it when to start', async () => {
+    const { d, table } = withTable();
+    const first = await handleWebhook(request(pushed(), { event: 'pull_request', delivery: 'push-1' }), d);
+    expect(first.statusCode).toBe(202);
+    expect(JSON.parse(first.body)).toMatchObject({ deliveryId: 'push-1', microvmId: expect.any(String) });
+
+    d.now = () => new Date((NOW + 3) * 1000);
+    const second = await handleWebhook(request(reviewed(), { event: 'pull_request_review', delivery: 'review-1' }), d);
+    expect(second.statusCode).toBe(202);
+    expect(JSON.parse(second.body)).toMatchObject({ deliveryId: 'review-1', coalesced: true });
+    expect(JSON.parse(second.body)).not.toHaveProperty('microvmId');
+    expect(d.calls.run).toHaveLength(1);
+    // The coalesced delivery stored no body and left no delivery record: redelivering it later works.
+    expect(d.calls.put.map((put) => put.key)).toEqual(['events/push-1/event.json']);
+    expect([...table.keys()].sort()).toEqual(['pr#octo/repo#34', 'push-1']);
+
+    // The microVM starts its job only after the lease has ended, so it sees both events.
+    const payload = JSON.parse(d.calls.run[0].runHookPayload);
+    expect(payload.notBefore).toBe(new Date((NOW + 21) * 1000).toISOString());
+    expect(table.get('pr#octo/repo#34')).toBe(NOW + 20);
+    expect(parseRunRequest({ microvmId: 'mvm-1', runHookPayload: d.calls.run[0].runHookPayload }).payload.notBefore).toBe(payload.notBefore);
+
+    // Still inside the lease at its last second; a new microVM right after.
+    d.now = () => new Date((NOW + 20) * 1000);
+    expect(JSON.parse((await handleWebhook(request(reviewed(), { event: 'pull_request_review', delivery: 'review-2' }), d)).body).coalesced).toBe(true);
+    d.now = () => new Date((NOW + 21) * 1000);
+    const later = await handleWebhook(request(reviewed(), { event: 'pull_request_review', delivery: 'review-1' }), d);
+    expect(later.statusCode).toBe(202);
+    expect(JSON.parse(later.body).microvmId).toEqual(expect.any(String));
+    expect(d.calls.run).toHaveLength(2);
+  });
+
+  it('does not coalesce across pull requests or repositories, and never coalesces issues', async () => {
+    const { d } = withTable();
+    await handleWebhook(request(pushed(), { event: 'pull_request', delivery: 'a' }), d);
+    await handleWebhook(request(pushed({ pull_request: pullRequest({ number: 35 }) }), { event: 'pull_request', delivery: 'b' }), d);
+    await handleWebhook(request(pushed({ repository: { id: 2, full_name: 'octo/other' } }), { event: 'pull_request', delivery: 'c' }), d);
+    await handleWebhook(request(labeled(), { delivery: 'd' }), d);
+    await handleWebhook(request(labeled(), { delivery: 'e' }), d);
+    expect(d.calls.run).toHaveLength(5);
+    expect(JSON.parse(d.calls.run[3].runHookPayload)).not.toHaveProperty('notBefore');
+  });
+
+  it('still refuses a redelivery of the delivery that launched', async () => {
+    const { d } = withTable();
+    await handleWebhook(request(pushed(), { event: 'pull_request', delivery: 'push-1' }), d);
+    d.now = () => new Date((NOW + 60) * 1000);
+    const again = await handleWebhook(request(pushed(), { event: 'pull_request', delivery: 'push-1' }), d);
+    expect(again.statusCode).toBe(200);
+    expect(JSON.parse(again.body).duplicate).toBe(true);
+    expect(d.calls.run).toHaveLength(1);
+  });
+
+  it('releases the lease when the launch fails, so the next event launches', async () => {
+    let fail = true;
+    const { d, table } = withTable({
+      runMicrovm: async () => {
+        if (fail) throw new Error('ServiceQuotaExceededException');
+        return { microvmId: 'mvm-2' };
+      },
+    });
+    expect((await handleWebhook(request(pushed(), { event: 'pull_request', delivery: 'push-1' }), d)).statusCode).toBe(500);
+    expect(table.size).toBe(0);
+    fail = false;
+    const next = await handleWebhook(request(reviewed(), { event: 'pull_request_review', delivery: 'review-1' }), d);
+    expect(next.statusCode).toBe(202);
+    expect(JSON.parse(next.body).microvmId).toBe('mvm-2');
+  });
+
+  it('launches anyway when the table cannot be reached, and when coalescing is off', async () => {
+    const broken = withTable({
+      claimDelivery: async () => {
+        throw new Error('ProvisionedThroughputExceededException');
+      },
+    });
+    expect((await handleWebhook(request(pushed(), { event: 'pull_request' }), broken.d)).statusCode).toBe(202);
+    expect(broken.d.calls.log.some((entry) => entry.level === 'warn' && entry.message.includes('coalescing unavailable'))).toBe(true);
+    expect(JSON.parse(broken.d.calls.run[0].runHookPayload)).not.toHaveProperty('notBefore');
+
+    const off = withTable({}, { ...coalesceEnv, PR_COALESCE_SECONDS: '0' });
+    await handleWebhook(request(pushed(), { event: 'pull_request', delivery: 'a' }), off.d);
+    await handleWebhook(request(reviewed(), { event: 'pull_request_review', delivery: 'b' }), off.d);
+    expect(off.d.calls.run).toHaveLength(2);
+    expect([...off.table.keys()].sort()).toEqual(['a', 'b']);
+  });
+
+  it('coalesces without deduplication when only the coalescing window is set', async () => {
+    const { d, table } = withTable({}, { ...coalesceEnv, DEDUPE_WINDOW_SECONDS: '0' });
+    await handleWebhook(request(pushed(), { event: 'pull_request', delivery: 'a' }), d);
+    const second = await handleWebhook(request(pushed(), { event: 'pull_request', delivery: 'b' }), d);
+    expect(JSON.parse(second.body).coalesced).toBe(true);
+    expect([...table.keys()]).toEqual(['pr#octo/repo#34']);
+    expect(pullRequestLeaseKey({ repository: 'octo/repo', number: 34 })).toBe('pr#octo/repo#34');
   });
 });

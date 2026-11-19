@@ -16,6 +16,7 @@ export const PAYLOAD_VERSION = 1;
 const MAX_BODY_BYTES = 64 * 1024; // the run hook payload is at most 16 KB
 const DELIVERY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 const EVENT_NAME_PATTERN = /^[a-z_]{1,64}$/;
+const STATE_KEY_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]*(\/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$/;
 const MICROVM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
 
 /**
@@ -67,12 +68,22 @@ export function parseRunRequest(body) {
   if (payload.dedupeTable !== undefined && (typeof payload.dedupeTable !== 'string' || !/^[A-Za-z0-9_.-]{3,255}$/.test(payload.dedupeTable))) {
     throw new Error('runHookPayload.dedupeTable is malformed');
   }
+  // Optional: the key of the shared state database (absent: the job starts from nothing and
+  // saves nothing), and the time before which the job must not start (coalesced events).
+  if (payload.stateKey !== undefined && (typeof payload.stateKey !== 'string' || !STATE_KEY_PATTERN.test(payload.stateKey) || payload.stateKey.length > 200)) {
+    throw new Error('runHookPayload.stateKey is malformed');
+  }
+  if (payload.notBefore !== undefined && (typeof payload.notBefore !== 'string' || Number.isNaN(Date.parse(payload.notBefore)))) {
+    throw new Error('runHookPayload.notBefore is not a date');
+  }
   const launchedAt = text('launchedAt');
   if (Number.isNaN(Date.parse(launchedAt))) throw new Error('runHookPayload.launchedAt is not a date');
   return {
     microvmId,
     payload: {
       ...(payload.dedupeTable === undefined ? {} : { dedupeTable: payload.dedupeTable }),
+      ...(payload.stateKey === undefined ? {} : { stateKey: payload.stateKey }),
+      ...(payload.notBefore === undefined ? {} : { notBefore: payload.notBefore }),
       version: PAYLOAD_VERSION,
       deliveryId: text('deliveryId', DELIVERY_ID_PATTERN),
       eventName: text('eventName', EVENT_NAME_PATTERN),
