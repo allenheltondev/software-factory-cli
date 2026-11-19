@@ -164,6 +164,7 @@ export function createWorkerCredentials(config: Pick<UpdraftConfig, 'github'> | 
       createTokenFileAuth({
         path: tokenFile,
         appId: app.appId,
+        ...(app.installationId !== undefined ? { installationId: app.installationId } : {}),
         ...(o.log ? { log: o.log } : {}),
         ...(o.fetch ? { fetch: o.fetch } : {}),
         ...(o.now ? { now: o.now } : {}),

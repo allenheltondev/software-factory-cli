@@ -34,7 +34,8 @@ import {
 } from './app-auth.js';
 
 export interface TokenFile {
-  app: { id: number; slug: string; name?: string };
+  /** `clientId` is needed when github.app.appId is the App's client ID rather than its number. */
+  app: { id: number; slug: string; name?: string; clientId?: string };
   installationId: number;
   token: string;
   /** Epoch milliseconds. */
@@ -47,6 +48,13 @@ export interface TokenFile {
 
 const SLUG = /^[a-z0-9][a-z0-9-]*$/i;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const CLIENT_ID = /^[A-Za-z0-9._-]+$/;
+/**
+ * What a GitHub token is made of (ghs_ installation tokens are letters, digits and underscores).
+ * Anything else, a line break above all, is refused before it can reach an Authorization header,
+ * whose validation error would otherwise repeat the value.
+ */
+const TOKEN = /^[A-Za-z0-9_.-]{1,512}$/;
 
 function fail(path: string, what: string): never {
   throw new GitHubAppError(`the GitHub App token file ${path} ${what}. See ${APP_DOC} ("A token file instead of the key").`, 'token-file');
@@ -79,11 +87,19 @@ export function loadTokenFile(path: string): TokenFile {
   if (typeof app.slug !== 'string' || !SLUG.test(app.slug)) fail(path, 'has no usable app.slug');
   if (!Number.isSafeInteger(r.installationId) || (r.installationId as number) <= 0) fail(path, 'has no installationId');
   if (typeof r.token !== 'string' || r.token.trim() === '') fail(path, 'has no token');
+  // Generic on purpose: nothing about the value is repeated.
+  if (!TOKEN.test(r.token.trim())) fail(path, 'has a token that is not a GitHub token (letters, digits, "_", "." and "-" only)');
+  if (app.clientId !== undefined && (typeof app.clientId !== 'string' || !CLIENT_ID.test(app.clientId))) fail(path, 'has an app.clientId that is not a client ID');
   const expiresAt = typeof r.expiresAt === 'string' ? Date.parse(r.expiresAt) : Number.NaN;
   if (!Number.isFinite(expiresAt)) fail(path, 'has no expiresAt (an ISO time)');
 
   const out: TokenFile = {
-    app: { id: app.id as number, slug: app.slug, ...(typeof app.name === 'string' && app.name ? { name: app.name } : {}) },
+    app: {
+      id: app.id as number,
+      slug: app.slug,
+      ...(typeof app.name === 'string' && app.name ? { name: app.name } : {}),
+      ...(typeof app.clientId === 'string' ? { clientId: app.clientId } : {}),
+    },
     installationId: r.installationId as number,
     token: r.token.trim(),
     expiresAt,
@@ -114,8 +130,13 @@ export function loadTokenFile(path: string): TokenFile {
 export interface TokenFileAuthOptions {
   /** The token file. */
   path: string;
-  /** github.app.appId: the file must be for this App when the config names it by number. */
+  /**
+   * github.app.appId: the file must be for this App. A number (or a string of digits) is compared
+   * with `app.id`; a client ID with `app.clientId`, which the file must then state.
+   */
   appId: number | string;
+  /** github.app.installationId: when set, the file must be for this installation. */
+  installationId?: number;
   /** For the bot lookup when the file has no `bot`. Defaults to https://api.github.com */
   baseUrl?: string;
   fetch?: typeof fetch;
@@ -143,11 +164,30 @@ export function createTokenFileAuth(opts: TokenFileAuthOptions): AppAuth {
   const warned = new Set<string>();
   let bot: Promise<{ id: number; login: string }> | undefined;
 
+  const numericAppId = typeof opts.appId === 'number' ? opts.appId : /^\d+$/.test(opts.appId) ? Number(opts.appId) : null;
+
+  /**
+   * The file, checked against the configured App and installation on every read: a refresh that
+   * wrote another App's or another installation's token must not switch who the worker acts as.
+   */
   function current(): TokenFile {
     const file = read(opts.path);
-    if (typeof opts.appId === 'number' && file.app.id !== opts.appId) {
+    if (numericAppId !== null) {
+      if (file.app.id !== numericAppId) {
+        throw new GitHubAppError(`the GitHub App token file ${opts.path} is for App ${file.app.id}, but github.app.appId is ${numericAppId}`, 'token-file');
+      }
+    } else if (file.app.clientId !== opts.appId) {
       throw new GitHubAppError(
-        `the GitHub App token file ${opts.path} is for App ${file.app.id}, but github.app.appId is ${opts.appId}`,
+        file.app.clientId === undefined
+          ? `github.app.appId is the client ID ${String(opts.appId)}, but the GitHub App token file ${opts.path} has no app.clientId to compare it with; ` +
+              "add it to the file, or set github.app.appId to the App's numeric ID"
+          : `the GitHub App token file ${opts.path} is for the App with client ID ${file.app.clientId}, but github.app.appId is ${String(opts.appId)}`,
+        'token-file',
+      );
+    }
+    if (opts.installationId !== undefined && file.installationId !== opts.installationId) {
+      throw new GitHubAppError(
+        `the GitHub App token file ${opts.path} is for installation ${file.installationId}, but github.app.installationId is ${opts.installationId}`,
         'token-file',
       );
     }
@@ -184,6 +224,8 @@ export function createTokenFileAuth(opts: TokenFileAuthOptions): AppAuth {
       installationId: file.installationId,
       expiresAt: file.expiresAt,
       permissions: file.permissions ?? {},
+      // Omitted is unknown, not "none": doctor then says it cannot check them instead of failing.
+      ...(file.permissions === undefined ? { permissionsUnknown: true } : {}),
       repositorySelection: file.repositories ? 'selected' : null,
     };
   }

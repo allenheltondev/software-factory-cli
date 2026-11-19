@@ -188,6 +188,20 @@ describe('createGitHubApi', () => {
     expect(e2.isRateLimit).toBe(true);
   });
 
+  it('cuts the token it sent out of a network error that repeats it', async () => {
+    const secret = 'synthetic-credential-0123456789';
+    // As Node's header validation does: the rejected value ends up in the message.
+    const echo = (async (_url: string, init?: RequestInit) => {
+      throw new TypeError(`Headers.append: "${(init?.headers as Record<string, string>).Authorization}" is an invalid header value`);
+    }) as typeof fetch;
+    const api = await createGitHubApi({ token: `${secret}\nsecond-line-9876`, fetch: echo });
+    const err = (await api.getRepo('o/r').catch((e: unknown) => e)) as GitHubError;
+    expect(err.status).toBe(0);
+    expect(err.message).toMatch(/network error: Headers\.append: "Bearer \*\*\*/);
+    expect(err.message).not.toContain(secret);
+    expect(err.message).not.toContain('second-line-9876');
+  });
+
   it('gives up on a request that hangs, as a retryable network error', async () => {
     // Never answers; only the client's deadline ends the request.
     const hang = ((_url: string, init?: RequestInit) =>

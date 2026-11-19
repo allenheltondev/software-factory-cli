@@ -238,6 +238,11 @@ export interface InstallationToken {
   expiresAt: number;
   /** What the installation grants, as GitHub listed it with the token. */
   permissions: AppPermissions;
+  /**
+   * True when nobody stated the permissions (a token file without `permissions`): `permissions`
+   * is then empty because it is unknown, not because nothing is granted.
+   */
+  permissionsUnknown?: boolean;
   repositorySelection: string | null;
 }
 

@@ -106,11 +106,20 @@ file the worker reads:
 }
 ```
 
-`app`, `installationId`, `token` and `expiresAt` are required. `name`, `permissions`,
-`repositories` and `bot` are optional:
+`app`, `installationId`, `token` and `expiresAt` are required. `token` may contain only letters,
+digits, `_`, `.` and `-`; anything else, such as a line break, is refused before it reaches a
+request header. `name`, `permissions`, `repositories` and `bot` are optional:
+- **`permissions`:** without it the permissions are unknown, not empty. `updraft doctor` then says
+  it can't check them, instead of reporting each one as missing.
 - **`repositories`:** with it, the worker asks for a token only for those repositories and says
   so for any other.
 - **`bot`:** without it, the bot user is looked up once with the token, for `commitAsApp`.
+
+The file must be for the configured App, and the worker checks that on every read. That way a
+refresh that wrote another App's or another installation's token can't switch who the worker acts as:
+- **A numeric `github.app.appId`,** quoted or not, must equal `app.id`.
+- **A client ID** in `github.app.appId` must equal `app.clientId`, which the file must then state.
+- **`github.app.installationId`,** when set, must equal `installationId`.
 
 How the worker uses the file:
 - **It reads the file again for every token it needs,** so the writer replaces the token before

@@ -13,6 +13,9 @@ import { runDoctor, type DoctorProbes } from './doctor.js';
 import { EXIT } from './errors.js';
 import { fakeAgentReport, fakeApi, fakeContext, fakeRepo, tempHome } from './fakes.js';
 import { validateCommand } from './validate.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { createTokenFileAuth } from '../github/token-file-auth.js';
 
 const PEM = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
 const FULL_ACCESS = { metadata: 'read', contents: 'write', pull_requests: 'write', issues: 'write' };
@@ -243,6 +246,21 @@ describe('updraft doctor with a GitHub App (github.app)', () => {
     const unlisted = setup({ allowedActors: ['someone-else'] });
     const r2 = await runDoctor(unlisted.paths, unlisted.probes);
     expect(r2.checks.some((c) => /allowedActors/.test(c.detail))).toBe(false);
+  });
+});
+
+describe('updraft doctor with a GitHub App token file', () => {
+  it('warns that permissions are not checked when the token file states none, instead of failing', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'updraft-doctor-token-')), 'app-token.json');
+    const file = { app: { id: 4242, slug: 'updraft' }, installationId: 55, token: 'ghs_aaaaaaaaaaaaaaaaaaaa', expiresAt: '2099-01-01T00:00:00Z' };
+    writeFileSync(path, JSON.stringify(file));
+    const repo = { publish: 'draft-pr' as const, commentOnFailure: true, revise: true };
+    const unstated = await appRepoChecks(createTokenFileAuth({ path, appId: 4242 }), { execution: { mode: 'live' }, github: undefined }, 'acme/web', repo);
+    expect(unstated).toEqual([{ status: 'warn', detail: expect.stringMatching(/states no permissions, so whether they cover .* is not checked/) }]);
+
+    writeFileSync(path, JSON.stringify({ ...file, permissions: { metadata: 'read', contents: 'write', issues: 'write', pull_requests: 'write' } }));
+    const stated = await appRepoChecks(createTokenFileAuth({ path, appId: 4242 }), { execution: { mode: 'live' }, github: undefined }, 'acme/web', repo);
+    expect(stated.map((c) => c.status)).toEqual(['ok']);
   });
 });
 

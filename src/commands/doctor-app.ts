@@ -156,6 +156,16 @@ export async function appRepoChecks(
   let selection: string | null;
   try {
     const token = await auth.installationToken(fullName);
+    if (token.permissionsUnknown) {
+      return [
+        {
+          status: 'warn',
+          detail:
+            `GitHub App installation ${installationId}: the token file states no permissions, so whether they cover this ` +
+            "repository's settings is not checked; add \"permissions\" to the file to have them checked",
+        },
+      ];
+    }
     granted = token.permissions;
     selection = token.repositorySelection;
   } catch (err) {

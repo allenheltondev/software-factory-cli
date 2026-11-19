@@ -55,6 +55,9 @@ describe('loadTokenFile', () => {
     ['no expiry', good({ expiresAt: 'soon' }), /has no expiresAt/],
     ['bad repositories', good({ repositories: ['not a repo'] }), /repositories that are not/],
     ['a bad bot', good({ bot: { login: 'x' } }), /bot that is not/],
+    ['a token with a line break', good({ token: 'ghs_aaaaaaaa\nX-Injected: ghs_bbbbbbbb' }), /token that is not a GitHub token/],
+    ['a token with a space', good({ token: 'ghs_aaaa bbbb' }), /token that is not a GitHub token/],
+    ['a bad client id', good({ app: { id: 1, slug: 'u', clientId: 'not a client id' } }), /app\.clientId that is not/],
   ])('refuses %s, without repeating the token', async (_what, body, pattern) => {
     const path = body === null ? join(root, 'missing.json') : tokenFile(body);
     const p = await problem(() => loadTokenFile(path));
@@ -117,10 +120,33 @@ describe('createTokenFileAuth', () => {
     await expect(auth.installationToken('acme/web')).resolves.toMatchObject({ token: 'ghs_cccccccccccccccccccc' });
   });
 
-  it('refuses a file for another App when the config names the App by number', async () => {
+  it('refuses a file for another App, whether the config names the App by number or quoted number', async () => {
     expect(await problem(setup(good(), { appId: 1 }).auth.installationToken('acme/web'))).toMatch(/^token-file: .*for App 4242, but github\.app\.appId is 1/);
-    // A client ID cannot be compared with the file's numeric id, so it is not.
-    await expect(setup(good(), { appId: 'Iv23liabc' }).auth.installationToken('acme/web')).resolves.toBeTruthy();
+    expect(await problem(setup(good(), { appId: '1' }).auth.installationToken('acme/web'))).toMatch(/^token-file: .*for App 4242, but github\.app\.appId is 1/);
+    await expect(setup(good(), { appId: '4242' }).auth.installationToken('acme/web')).resolves.toBeTruthy();
+  });
+
+  it('checks a client ID against the file\'s app.clientId, which the file must then state', async () => {
+    expect(await problem(setup(good(), { appId: 'Iv23liabc' }).auth.installationToken('acme/web'))).toMatch(/^token-file: .*client ID Iv23liabc.*has no app\.clientId/);
+    const other = good({ app: { id: 4242, slug: 'updraft', clientId: 'Iv23lizzz' } });
+    expect(await problem(setup(other, { appId: 'Iv23liabc' }).auth.installationToken('acme/web'))).toMatch(/^token-file: .*client ID Iv23lizzz, but github\.app\.appId is Iv23liabc/);
+    const same = good({ app: { id: 4242, slug: 'updraft', clientId: 'Iv23liabc' } });
+    await expect(setup(same, { appId: 'Iv23liabc' }).auth.installationToken('acme/web')).resolves.toBeTruthy();
+  });
+
+  it('enforces a pinned installation on every read, so a misrouted refresh cannot switch it', async () => {
+    const path = tokenFile(good());
+    const auth = createTokenFileAuth({ path, appId: 4242, installationId: 55, now: () => T0 });
+    await expect(auth.installationToken('acme/web')).resolves.toMatchObject({ installationId: 55 });
+    writeFileSync(path, JSON.stringify(good({ installationId: 99, token: 'ghs_dddddddddddddddddddd' })));
+    expect(await problem(auth.installationToken('acme/web'))).toMatch(/^token-file: .*for installation 99, but github\.app\.installationId is 55/);
+    expect(await problem(auth.app())).toMatch(/installation 99/);
+  });
+
+  it('marks permissions the file does not state as unknown, not as none', async () => {
+    await expect(setup(good({ permissions: undefined })).auth.installationToken('acme/web')).resolves.toMatchObject({ permissions: {}, permissionsUnknown: true });
+    const stated = await setup(good()).auth.installationToken('acme/web');
+    expect(stated.permissionsUnknown).toBeUndefined();
   });
 
   it('takes the bot user from the file, or looks it up once with the token', async () => {
