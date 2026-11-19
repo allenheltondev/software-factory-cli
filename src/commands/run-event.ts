@@ -52,6 +52,7 @@ import { newId } from '../util/ids.js';
 import { createEventScope, foreignWork, nothingPending, pendingWork, withoutForeignWork, type GuardedScope } from '../worker/scope.js';
 import { println, type CommandContext } from './context.js';
 import { CliError, describeError, EXIT } from './errors.js';
+import { holdEnd, requeueAbandonedJob, settleAbandonedJob, type AbandonedRunSummary } from './run-event-abandoned.js';
 import { readOwnPullRequest, restorePublication } from './run-event-restore.js';
 import { installSignalHandlers } from './start.js';
 
@@ -199,6 +200,12 @@ export interface RunEventSummary extends Omit<RunEventJobSummary, 'jobId' | 'wor
    * request exists, and the state database had nothing of the run that opened it.
    */
   stateRestored: boolean;
+  /**
+   * Set when the state database had the event's job as `running` under a run that is gone (it
+   * checkpointed and vanished; its hold has ended): that run was closed, and `resumed` says
+   * whether this run then did the job itself. Null otherwise.
+   */
+  abandonedRun: AbandonedRunSummary | null;
   /** With outcome `deferred`: when the cooldown ends (ISO time). Null otherwise. */
   deferredUntil: string | null;
   /** The review loop's result for the event's pull request; null when the event has none, or the loop is off. */
@@ -476,6 +483,7 @@ export async function runEventCommand(ctx: CommandContext, opts: RunEventOptions
     outcome: 'error',
     reason: null,
     stateRestored: false,
+    abandonedRun: null,
     deferredUntil: null,
     loop: null,
     message: '',
@@ -613,6 +621,11 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     const issueJobs = decision.dispatch === true ? decision.jobs : [];
     /** Event jobs the state database already has. */
     let known: Array<{ id: string; status: string; issueNumber: number }> = [];
+    /**
+     * Of those, the ones the database shows as `running` although no run that is still going
+     * holds them: a machine checkpointed and vanished. Settled below, once GitHub was asked.
+     */
+    let abandoned: typeof known = [];
 
     /**
      * The pull request GitHub has for a job of the event is not on record: put its publication
@@ -721,6 +734,8 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
         // A published head whose reviewer job was never queued is work that is left, too.
         if (reviewsEnabled(config)) scheduleAllReviews(openDb, config, undefined, (pr) => mine.pr(pr.repoId, pr.prNumber));
         const left = !nothingPending(pendingWork(openDb, config, scope));
+        // Never while a live hold covers the job: that run is, as far as anyone can know, at work.
+        abandoned = known.filter((k) => k.status === 'running' && !mine.heldByAnother(k.id));
         if (known.length === issueJobs.length && !left) {
           // A job that got as far as an agent and has no publication on record: a checkpoint
           // carried it while its run was going, and that run's end was never saved. If GitHub
@@ -731,13 +746,15 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
             const existing = await findExistingPullRequest({ api, repo, job: k });
             if (existing && (await restore(() => openDb, k, existing, () => {}))) return nothing('already-handled', restoredMessage(existing));
           }
-          const pr = scope.prs()[0];
-          if (pr) summary.loop = summarizeLoop(openDb, config, pr.repoId, pr.prNumber);
-          const held = known.some((j) => mine.heldByAnother(j.id));
-          return nothing(
-            'duplicate-delivery',
-            `this state database already has the job for this event, and ${held ? 'another run that is still going is working on it' : 'nothing of it is left to do'} (${known.map((j) => `${j.id}: ${j.status}`).join(', ')})`,
-          );
+          if (!abandoned.length) {
+            const pr = scope.prs()[0];
+            if (pr) summary.loop = summarizeLoop(openDb, config, pr.repoId, pr.prNumber);
+            const held = known.some((j) => mine.heldByAnother(j.id));
+            return nothing(
+              'duplicate-delivery',
+              `this state database already has the job for this event, and ${held ? 'another run that is still going is working on it' : 'nothing of it is left to do'} (${known.map((j) => `${j.id}: ${j.status}`).join(', ')})`,
+            );
+          }
         }
         summary.resumed = left;
       }
@@ -764,11 +781,69 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     const net = await networkGit();
 
     const fresh = issueJobs.filter((j) => !known.some((k) => k.id === j.id));
+    /** Jobs GitHub was just asked about: step 4 does not ask again. */
+    const asked = new Set<string>();
+    // 3b. A job of this event that a vanished run left `running` (docs/run-event.md, "An
+    // abandoned run"). GitHub first: work of that run that got there is not done twice. Then the
+    // run is closed, as the final merge of its database would have closed it, and where nothing
+    // of it exists this delivery is the retry.
+    for (const k of abandoned) {
+      const openDb = stateDb();
+      let existing: ExistingWork | null;
+      try {
+        existing = await findExistingWork({ api, repo, job: k, checkoutPath, remote: remote.name, net: { ...local, signal: controller.signal, ...(net ? { env: net.env } : {}) } });
+      } catch (err) {
+        throw new CliError(`could not check whether the event was already handled: ${net ? net.redact(errText(err)) : errText(err)}`);
+      }
+      asked.add(k.id);
+      if (existing && (await restore(() => openDb, k, existing, () => {}))) return nothing('already-handled', restoredMessage(existing));
+      const heldUntil = holdEnd(openDb, k.id);
+      const attempts = getJob(openDb, k.id)?.attempts ?? 0;
+      const closed = settleAbandonedJob(openDb, k.id, ctx.now);
+      k.status = closed.status;
+      const what = `the state database had job ${k.id} as running under a run that is gone${closed.runId ? ` (${closed.runId})` : ''}: its hold ${heldUntil ? `ended ${heldUntil}` : 'is not on record'}, so the run was closed as ${closed.settled}`;
+      const report = (resumed: boolean, detail: string) => {
+        summary.abandonedRun = { jobId: k.id, runId: closed.runId, heldUntil, settled: closed.settled, resumed, existingBranch: existing?.branch ?? null, detail };
+        log.warn('settled a run that checkpointed and vanished', { job: k.id, run: closed.runId, heldUntil, resumed, ...(existing ? { branch: existing.branch } : {}) });
+        Object.assign(summary, summarizeJob(openDb, config, k.id));
+      };
+      if (existing) {
+        // Its branch (or a pull request nothing could be restored from) is on GitHub: running the
+        // job again would leave two results. The job is `interrupted` now, which `updraft retry` takes.
+        const detail =
+          existing.prNumber !== null
+            ? `${what}; ${describeExisting(existing)}, so nothing was started`
+            : `${what}; the branch ${existing.branch} is on GitHub for this event (at ${existing.sha?.slice(0, 12)}) with no pull request, so nothing was started. ` +
+              `To run the job again: delete that branch, "updraft retry ${k.id}" on a copy of the shared state database, and deliver the event again`;
+        report(false, detail);
+        return nothing('already-handled', detail);
+      }
+      if (closed.status === 'interrupted') {
+        // The next attempt's branch must be one the checks above know (branchNames).
+        let refusal: string | null = attempts >= MAX_START_FAILURES ? `the job has had ${attempts} attempts, and a redelivery starts no more than ${MAX_START_FAILURES}` : null;
+        if (refusal === null) {
+          try {
+            requeueAbandonedJob(openDb, k.id, `requeued by a redelivery of its event${opts.deliveryId ? ` (${opts.deliveryId})` : ''}: the run that had it is gone`, ctx.now);
+          } catch (err) {
+            refusal = errText(err);
+          }
+        }
+        if (refusal !== null) {
+          const detail = `${what}; nothing was started: ${refusal}. "updraft retry ${k.id}" on a copy of the shared state database, then another delivery of the event, runs it again`;
+          report(false, detail);
+          return nothing('duplicate-delivery', detail);
+        }
+        k.status = 'queued';
+      }
+      // Queued again (requeued here, or released because the run was only ever claimed): this run does it.
+      report(k.status === 'queued', `${what}; nothing of it is on GitHub, so this delivery runs the job as its next attempt`);
+      summary.resumed = true;
+    }
     if (decision.dispatch === true) {
       // 4. Was this event already handled by a run whose state this one has not seen? Only
       // GitHub can say. Asked for the jobs that have not started: new ones, and ones an earlier
       // run left queued. An event that was leaves no state behind.
-      const unstarted = [...fresh.map((j) => ({ id: j.id, issueNumber: j.issueNumber })), ...known.filter((k) => k.status === 'queued' && (scope?.job(k.id) ?? true))];
+      const unstarted = [...fresh.map((j) => ({ id: j.id, issueNumber: j.issueNumber })), ...known.filter((k) => k.status === 'queued' && !asked.has(k.id) && (scope?.job(k.id) ?? true))];
       for (const job of unstarted) {
         let existing: ExistingWork | null;
         try {

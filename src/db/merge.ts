@@ -664,16 +664,52 @@ function mergeRows(dbs: { changed: Db; base: Db | null; into: Db; now?: () => nu
   //
   // Not for a checkpoint (`live`): that run is still going, and its rows say so truthfully. They
   // are carried as they are; its final merge settles whatever it then leaves.
+  const unfinished = dbs.live
+    ? { runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 0, holdsReleased: 0 }
+    : settleUnfinished(into, { runs: carriedRuns, jobs: carriedJobs, steps: carriedSteps, holds: carriedHolds }, now);
+
+  const totals = zero();
+  for (const c of Object.values(counts)) for (const k of Object.keys(totals) as Array<keyof TableCounts>) totals[k] += c[k];
+  const settled = unfinished.runsInterrupted + unfinished.runsReleased + unfinished.jobsInterrupted + unfinished.stepsClosed + unfinished.holdsReleased;
+  return {
+    changed: totals.inserted + totals.updated + totals.appended + settled > 0,
+    schemaVersion: schemaVersion(into),
+    created: false,
+    migratedFrom: null,
+    tables: counts,
+    totals,
+    unfinished,
+    jobsFolded: Object.fromEntries(folded),
+  };
+}
+
+/** Rows whose unfinished state is to be settled (settleUnfinished): ids of runs and jobs, run ids per step table, hold keys. */
+export interface UnfinishedRows {
+  runs: Iterable<string>;
+  jobs: Iterable<string>;
+  /** By table (publications, revisions, pr_reviews, failure_comments): the run ids of the rows. */
+  steps: ReadonlyMap<string, Iterable<string>>;
+  holds: Iterable<string>;
+}
+
+/** The tables of UnfinishedRows.steps. */
+export const STEP_TABLES: readonly string[] = LEASED_TABLES.map((t) => t.table);
+
+/**
+ * Record that the process behind `rows` is gone: an open run that had started is closed as
+ * interrupted (its job `interrupted`), one that was only claimed is released (its job back to
+ * `queued`), a job left `running` without an open run becomes `interrupted`, a step towards
+ * GitHub that was under way is closed as failed, and a hold is released. Rows that are not
+ * unfinished are left exactly as they are. docs/shared-state.md, "Work the run did not finish".
+ *
+ * The final merge of a run applies it to the rows it wrote; `updraft run-event` applies it to the
+ * job of its own event when the run that had it is gone (docs/run-event.md, "An abandoned run").
+ */
+export function settleUnfinished(into: Db, rows: UnfinishedRows, now: () => number = Date.now): MergeResult['unfinished'] {
   const unfinished = { runsInterrupted: 0, runsReleased: 0, jobsInterrupted: 0, stepsClosed: 0, holdsReleased: 0 };
   const at = new Date(now()).toISOString();
-  if (dbs.live) {
-    carriedRuns.clear();
-    carriedJobs.clear();
-    carriedSteps.clear();
-    carriedHolds.clear();
-  }
   const openRun = into.prepare('SELECT execution_started_at, pid, container_name FROM runs WHERE id = ? AND ended_at IS NULL');
-  for (const runId of carriedRuns) {
+  for (const runId of rows.runs) {
     const run = openRun.get(runId) as { execution_started_at: string | null; pid: number | null; container_name: string | null } | undefined;
     if (!run) continue;
     if (run.execution_started_at === null && run.pid === null && run.container_name === null) {
@@ -685,7 +721,7 @@ function mergeRows(dbs: { changed: Db; base: Db | null; into: Db; now?: () => nu
     }
   }
   const stranded = into.prepare("SELECT repo_full_name FROM jobs WHERE id = ? AND status = 'running' AND id NOT IN (SELECT job_id FROM runs WHERE ended_at IS NULL)");
-  for (const jobId of carriedJobs) {
+  for (const jobId of rows.jobs) {
     const job = stranded.get(jobId) as { repo_full_name: string } | undefined;
     if (!job) continue;
     const reason = 'the process that ran this job ended while it was marked running';
@@ -697,7 +733,7 @@ function mergeRows(dbs: { changed: Db; base: Db | null; into: Db; now?: () => nu
     unfinished.jobsInterrupted++;
   }
   for (const t of LEASED_TABLES) {
-    for (const runId of carriedSteps.get(t.table) ?? []) {
+    for (const runId of rows.steps.get(t.table) ?? []) {
       const note = 'the process doing this ended before it was done';
       const res = t.retryLater
         ? into
@@ -717,27 +753,14 @@ function mergeRows(dbs: { changed: Db; base: Db | null; into: Db; now?: () => nu
     }
   }
 
-  for (const key of carriedHolds) {
+  for (const key of rows.holds) {
     const row = into.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined;
     const released = row ? releasedHoldValue(key, row.value, at) : null;
     if (released === null) continue;
     into.prepare('UPDATE meta SET value = ? WHERE key = ?').run(released, key);
     unfinished.holdsReleased++;
   }
-
-  const totals = zero();
-  for (const c of Object.values(counts)) for (const k of Object.keys(totals) as Array<keyof TableCounts>) totals[k] += c[k];
-  const settled = unfinished.runsInterrupted + unfinished.runsReleased + unfinished.jobsInterrupted + unfinished.stepsClosed + unfinished.holdsReleased;
-  return {
-    changed: totals.inserted + totals.updated + totals.appended + settled > 0,
-    schemaVersion: schemaVersion(into),
-    created: false,
-    migratedFrom: null,
-    tables: counts,
-    totals,
-    unfinished,
-    jobsFolded: Object.fromEntries(folded),
-  };
+  return unfinished;
 }
 
 export interface StateInfo {

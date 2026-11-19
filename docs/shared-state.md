@@ -416,10 +416,15 @@ while they work, because a snapshot is only as new as the last upload before it 
   final merge) leaves its jobs `running` or `queued` and its hold in force until `until`. Other
   runs leave that work alone for that long. After that, a queued job is picked up by the next
   delivery of its event like any leftover; a job left `running` stays so (nothing reconciles
-  across machines) until its event is delivered again and, if GitHub has its pull request, its
-  publication is restored, or until the run's kept database is merged ([Recovery](#recovery)).
-- **`maxRevisions` can be exceeded by one** in that same race: each run counts the revisions in
-  its own snapshot.
+  across machines) until its event is delivered again. That delivery restores the
+  publication if GitHub has the pull request, and otherwise closes the vanished run and,
+  where nothing of it reached GitHub, does the job itself
+  ([run-event.md](run-event.md#an-abandoned-run)). Merging the run's kept database
+  ([Recovery](#recovery)) settles it too.
+- **`maxRevisions` can be exceeded by one** when two runs act on two different reviews of one
+  pull request at the same moment: each counts the revisions in its own snapshot. (The same
+  review seen by two runs counts once: the second run's job is canceled as superseded, which
+  still counts, or is folded into the first in the merge.)
 - **A cooldown set by one run is not seen by runs that started before it was uploaded.** They
   will try the agent, hit the same limit, and set the cooldown themselves.
 - **Rotation is approximate.** Two runs that start from the same cursor pick the same agent, and

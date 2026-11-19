@@ -16,7 +16,7 @@ import { setCooldown } from '../db/capacity.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { mergeState } from '../db/merge.js';
 import { getLoopPr } from '../db/pr-reviews.js';
-import { getJob } from '../db/queue.js';
+import { claimNextJob, getJob } from '../db/queue.js';
 import type { GitHubIssue, GitHubPullRequest } from '../github/api.js';
 import { createUserCredentials } from '../github/credentials.js';
 import { eventJobId } from '../poller/webhook.js';
@@ -109,6 +109,10 @@ interface VmOptions {
   reviewerArgs?: string[];
   capacity?: boolean;
   now?: () => number;
+  /** Replaces parts of the command's dependencies (a daemon that dies, for one). */
+  deps?: Partial<RunEventDeps>;
+  /** The first line of this machine's revise prompt: the fake agent writes it into the file it commits, so two machines make different commits. */
+  revise?: string;
 }
 
 /** One machine: its own state directory, config and event file. */
@@ -162,6 +166,7 @@ function vm(w: World, name: string, o: VmOptions = {}) {
     cloneUrl: () => w.f.remoteDir,
     eventLookup: { retries: 1, delayMs: 1 },
     drain: { tickMs: 20, stallMs: 300, mergePollMs: 20 },
+    ...o.deps,
   };
   const state = join(home, 'state.db');
   const base = join(home, 'snapshot.db');
@@ -862,5 +867,136 @@ describe('updraft run-event: review findings', { timeout: 180_000 }, () => {
     w.gh.pull!.state = 'closed';
     w.gh.pulls[0]!.state = 'closed';
     expect((await vm(w, 'vm closed', { repo: { revise: true } }).run()).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'already-handled', stateRestored: false, exitCode: 0 });
+  });
+});
+
+describe('updraft run-event: a run that checkpointed and then vanished', { timeout: 180_000 }, () => {
+  const HOURS = 3_600_000;
+  /**
+   * A machine that claimed the event's job, started its agent, checkpointed and was never heard
+   * of again: the shared state has the job `running`, its open run and the machine's hold.
+   */
+  async function vanished(repo: Record<string, unknown> = {}) {
+    const w = world();
+    const lost = vm(w, 'vm lost', {
+      repo,
+      deps: {
+        runDaemon: async (d) => {
+          const c = claimNextJob(d.db, d.config, { workerId: 'wrk_lost', hostname: 'lost-vm', leaseSeconds: 60, runsDir: join(w.f.root, 'vm lost', 'runs') })!;
+          d.db.prepare('UPDATE runs SET execution_started_at = ?, pid = 4242 WHERE id = ?').run(new Date().toISOString(), c.run.id);
+          mergeState({ changed: lost.state, into: w.shared, live: true });
+          throw new Error('the machine is gone');
+        },
+      },
+    });
+    const died = await lost.run({ deadlineMinutes: '30', deliveryId: 'd-lost' });
+    expect(died.code).toBe(1);
+    const run = withDb(w.shared, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'running', attempts: 1 });
+      return db.prepare('SELECT id, ended_at FROM runs').all() as Array<{ id: string; ended_at: string | null }>;
+    });
+    expect(run).toMatchObject([{ ended_at: null }]);
+    return { w, runId: run[0]!.id };
+  }
+  const runRow = (file: string, runId: string) => withDb(file, (db) => db.prepare('SELECT outcome, ended_at IS NOT NULL AS ended FROM runs WHERE id = ?').get(runId));
+
+  it('while its hold is live: a redelivery settles nothing and starts nothing', async () => {
+    const { w, runId } = await vanished();
+    const early = vm(w, 'vm early');
+    early.download();
+    const r = await early.run({ deliveryId: 'd-early' });
+    expect(r.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery', exitCode: 0, abandonedRun: null, resumed: false });
+    expect(r.summary.message).toContain('another run that is still going');
+    expect(withDb(early.state, (db) => getJob(db, JOB_ID))).toMatchObject({ status: 'running', attempts: 1 });
+    expect(runRow(early.state, runId)).toEqual({ outcome: null, ended: 0 });
+    expect(existsSync(w.received)).toBe(false);
+    expect(w.gh.writes).toEqual([]);
+  });
+
+  it('after its hold expired, with nothing of it on GitHub: the run is closed as interrupted and this delivery does the work, on the next attempt\'s branch', async () => {
+    const { w, runId } = await vanished();
+    // Another machine's job that is also running in the shared state: not this event's.
+    const foreign = withDb(w.shared, (db) => {
+      const id = insertQueuedJob(db, { repoId: REPO_ID, fullName: FULL, issue: 8 });
+      db.prepare("UPDATE jobs SET status = 'running', attempts = 1 WHERE id = ?").run(id);
+      db.prepare(
+        `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, hostname, pid, lease_expires_at, started_at, execution_started_at)
+         VALUES ('run_other', ?, 1, 'general', 'claude', 'wrk_other', 'another-vm', 1, '2026-11-18T10:00:00.000Z', '2026-11-18T09:59:00.000Z', '2026-11-18T09:59:01.000Z')`,
+      ).run(id);
+      return id;
+    });
+    const late = vm(w, 'vm late', { now: () => Date.now() + 7 * HOURS });
+    late.download();
+    const r = await late.run({ deliveryId: 'd-late' });
+    expect(r.code).toBe(0);
+    expect(r.summary).toMatchObject({
+      outcome: 'succeeded',
+      resumed: true,
+      dispatched: false,
+      jobId: JOB_ID,
+      status: 'succeeded',
+      publication: 'published',
+      prNumber: PR,
+      branch: `${BRANCH}-2`,
+      abandonedRun: { jobId: JOB_ID, runId, settled: 'interrupted', resumed: true, existingBranch: null },
+    });
+    expect(r.summary.abandonedRun?.heldUntil).toEqual(expect.any(String));
+    expect(r.summary.runId).not.toBe(runId);
+    expect(existsSync(w.received)).toBe(true);
+    expect(remoteHead(w.f, `${BRANCH}-2`)).not.toBe('');
+    expect(remoteHead(w.f, BRANCH)).toBe('');
+    withDb(late.state, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded', attempts: 2 });
+      // The other machine's run is not this event's: exactly as it was.
+      expect(getJob(db, foreign)).toMatchObject({ status: 'running', attempts: 1 });
+      expect(db.prepare("SELECT ended_at, outcome FROM runs WHERE id = 'run_other'").get()).toEqual({ ended_at: null, outcome: null });
+    });
+    expect(runRow(late.state, runId)).toEqual({ outcome: 'interrupted', ended: 1 });
+    // And in the shared copy after the merge: the job is no longer stuck.
+    late.upload();
+    withDb(w.shared, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded' });
+      expect(getJob(db, foreign)).toMatchObject({ status: 'running' });
+    });
+    expect(runRow(w.shared, runId)).toEqual({ outcome: 'interrupted', ended: 1 });
+
+    // The same delivery once more: nothing is left.
+    const again = vm(w, 'vm again', { now: () => Date.now() + 8 * HOURS });
+    again.download();
+    expect((await again.run()).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery', abandonedRun: null });
+  });
+
+  it('after its hold expired, with its branch pushed and no pull request: the run is closed, nothing is started, and the summary says what to do', async () => {
+    const { w, runId } = await vanished();
+    w.f.pushCommit(BRANCH, 'widget.txt', 'pushed by the run that vanished\n');
+    const late = vm(w, 'vm late', { now: () => Date.now() + 7 * HOURS });
+    late.download();
+    const r = await late.run();
+    expect(r.summary).toMatchObject({
+      outcome: 'nothing-to-do',
+      reason: 'already-handled',
+      exitCode: 0,
+      resumed: false,
+      stateRestored: false,
+      abandonedRun: { jobId: JOB_ID, runId, settled: 'interrupted', resumed: false, existingBranch: BRANCH },
+    });
+    expect(r.summary.message).toContain('updraft retry');
+    expect(existsSync(w.received)).toBe(false);
+    expect(withDb(late.state, (db) => getJob(db, JOB_ID))).toMatchObject({ status: 'interrupted', attempts: 1 });
+    expect(runRow(late.state, runId)).toEqual({ outcome: 'interrupted', ended: 1 });
+    expect(late.upload().changed).toBe(true);
+    expect(withDb(w.shared, (db) => getJob(db, JOB_ID))).toMatchObject({ status: 'interrupted' });
+  });
+
+  it('does not start another attempt once the job has used them up', async () => {
+    const { w, runId } = await vanished();
+    withDb(w.shared, (db) => db.prepare('UPDATE jobs SET attempts = 3 WHERE id = ?').run(JOB_ID));
+    const late = vm(w, 'vm late', { now: () => Date.now() + 7 * HOURS });
+    late.download();
+    const r = await late.run();
+    expect(r.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery', exitCode: 0, abandonedRun: { runId, settled: 'interrupted', resumed: false, existingBranch: null } });
+    expect(r.summary.message).toContain('updraft retry');
+    expect(existsSync(w.received)).toBe(false);
+    expect(withDb(late.state, (db) => getJob(db, JOB_ID))).toMatchObject({ status: 'interrupted' });
   });
 });

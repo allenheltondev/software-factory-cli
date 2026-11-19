@@ -355,6 +355,7 @@ has its `run.log`. Without `--json`, stdout carries one line for a person instea
   "outcome": "succeeded",
   "reason": null,
   "stateRestored": false,
+  "abandonedRun": null,
   "deferredUntil": null,
   "loop": {
     "pullRequest": 100, "url": "https://github.com/octo/widgets/pull/100",
@@ -397,6 +398,7 @@ has its `run.log`. Without `--json`, stdout carries one line for a person instea
 | `outcome` | `nothing-to-do`, `succeeded`, `canceled` (queued, then canceled by the pre-start check before any agent started), `superseded` (see [Idempotency](#idempotency)), `failed` (an agent run failed, could not start or was interrupted), `publish-failed` (a run succeeded, its publication, push or review posting did not), `not-started` (a job was still queued when the command ended), `deferred` (work of the event waits for a cooldown; see [Cooldowns](#cooldowns)), `state-pending` (see [A pull request the state database does not know](#a-pull-request-the-state-database-does-not-know)) or `error` (the command itself failed: config, GitHub, the event file, the state database). It is the worst of the event's own jobs **and** the jobs that followed from them in this run: see [What counts as success](#what-counts-as-success) |
 | `reason` | Why nothing was done, as a code; null otherwise. From the payload: `unsupported-event`, `unsupported-action`, `malformed-payload`, `pull-request`, `repository-not-configured`, `label-not-configured`, `review-loop-off`. From the API: `actor-not-allowed`, `label-removed`, `label-missing`, `issue-closed`, `issue-gone`, `pull-request`. From the state database: `duplicate-delivery` (it already has the event's job, and nothing of it is left to do), `pull-request-closed`, `no-new-work`. From the state database and then the API: `pull-request-not-watched`, `state-pending` (with the outcome of that name). Others: `already-handled`, `canceled-before-start`, `published-by-another-run`, `cooldown` (with `deferred`), `state-not-restorable` (with `error`; see [Restoring lost state](#restoring-lost-state)) |
 | `stateRestored` | True when this run put a lost publication back on record from the GitHub API (with `reason: "already-handled"`). The job fields then describe the restored job. False otherwise |
+| `abandonedRun` | Set when the state database had the event's job as `running` under a run that is gone, and this run closed it ([An abandoned run](#an-abandoned-run)): `jobId`, `runId` (the run that was left open), `heldUntil` (when its hold ended; null when none is on record), `settled` (`interrupted`, or `released` for a run that was only claimed), `resumed` (true when this run then did the job itself), `existingBranch` (the branch or pull request branch GitHub has for the event, which is why nothing was started; null otherwise) and `detail`. Null otherwise |
 | `deferredUntil` | With `deferred`: when the cooldown ends (ISO time). Null otherwise |
 | `loop` | Where the review loop left the event's pull request, from the state database; null when the event has no pull request (yet). `rounds`: revision rounds so far, of `maxRevisions`. `reviews`: reviewer verdicts recorded. `verdict`, `verdictSha`: the newest verdict (`ready-to-merge`, `changes-requested`) and the commit it is for. `headSha`: the newest head known. `stage`, `detail`: the stage `updraft status` shows (`awaiting-review`, `reviewing`, `changes-requested`, `revising`, `ready-to-merge`, `merging`, `merged`, `needs-human`, `closed`). `ready`: the draft was marked ready for review. `merged`, `mergeCommitSha`, and `notMergedReason` (why it is not merged: `autoMerge` is off, the gate that blocked it, or the stage it is in) |
 | `message` | One line saying the same to a person |
@@ -447,7 +449,7 @@ The worst of these is the outcome (`failed`, then `publish-failed`, `not-started
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Nothing to do (a restored publication included: `stateRestored`); or the event's job and every job that followed from it in this run succeeded, and what they produced was published, pushed or posted; or the job was canceled before an agent started; or another run of the same event published first. Where the pull request stands is in `loop`: one that was reviewed and not merged, or waits for a person or for checks, is still exit code 0 ([What counts as success](#what-counts-as-success)) |
+| 0 | Nothing to do (a restored publication included: `stateRestored`; and an abandoned run that was closed without being resumed: `abandonedRun`); or the event's job and every job that followed from it in this run succeeded, and what they produced was published, pushed or posted; or the job was canceled before an agent started; or another run of the same event published first, or revised for the same review first. Where the pull request stands is in `loop`: one that was reviewed and not merged, or waits for a person or for checks, is still exit code 0 ([What counts as success](#what-counts-as-success)) |
 | 1 | A job of the event, **or a reviewer or revision job that followed from it in this run**, failed, was not published, pushed or posted, or never started; or the command failed (invalid config, a mode other than `live`, GitHub unreachable, the event could not be matched, a lost publication that cannot be restored) |
 | 2 | The event file is missing or not JSON, or `--deadline-minutes` is not a positive number |
 | 3 | Another worker holds the lock of this state directory |
@@ -476,7 +478,9 @@ GitHub redelivers webhooks, and a launcher can start two machines for one delive
     with `updraft retry JOB_ID` on a copy of the shared database, upload that, and deliver the
     event again;
   - and something is left (the job is still `queued` after a deferral, or the loop was cut
-    short by a deadline or a cooldown): the run continues it, `resumed: true`.
+    short by a deadline or a cooldown): the run continues it, `resumed: true`;
+  - and the job is `running` although no run that is still going holds it: see
+    [An abandoned run](#an-abandoned-run).
 - **Then GitHub is asked**, for a job that has not started: whether its branch already has a
   pull request (in any state: a merged pull request counts, also after its branch was deleted)
   or exists on the remote. If so, there is nothing to do: `reason: "already-handled"`, exit
@@ -504,8 +508,10 @@ What remains:
   comment may appear twice, but nothing is pushed twice and nothing is merged twice or at the
   wrong commit.
 - **A run that pushed its branch and died before opening the pull request** leaves a branch
-  without a pull request. Later runs of the event see the branch and do nothing. Delete the
-  branch on GitHub and redeliver the event to run it again.
+  without a pull request. Later runs of the event see the branch and do nothing. Without
+  shared state: delete the branch on GitHub and redeliver the event to run it again. With
+  shared state the job is on record, and [An abandoned run](#an-abandoned-run) says what a
+  redelivery does and how to run the job again.
 - **Without shared state, a failed job leaves nothing that marks the event as handled**, so a
   redelivery runs it again, and each failed run posts its own failure comment where
   `commentOnFailure` is on.
@@ -555,3 +561,64 @@ state was restored. A consumer that only knows `already-handled` sees what it al
   saved), and no other run holds it, the same check and the same restore apply before the
   delivery is answered `duplicate-delivery`. A run the database has is kept as recorded and
   closed if it was left open.
+
+## An abandoned run
+
+A machine can checkpoint while its agent is at work and then disappear: no pull request, no
+branch, no final merge of its database. The shared state then has the event's job as
+`running` with an open run, for good: nothing reconciles across machines, and
+`updraft retry` does not take a running job. A redelivery of the event resolves it.
+
+**Never while the run may be alive.** A run holds its event's jobs from before it claims
+them until it ends ([shared-state.md](shared-state.md#holds)), and a checkpoint carries the
+hold with the job. While another run's hold on the job is live, a redelivery ends
+`duplicate-delivery` as it always did, and settles nothing. Only when no live hold of
+another run covers the job (it has expired: 15 minutes after that run's
+`--deadline-minutes`, six hours without one; or it was released) is the job taken to be
+abandoned.
+
+Then, for that job and nothing else in the database:
+
+1. **GitHub is asked first**, as for any job that has not started: a pull request for one of
+   the job's branches, or such a branch on the remote.
+2. **A pull request that can be restored is restored** ([above](#restoring-lost-state)):
+   `already-handled`, `stateRestored: true`.
+3. **Otherwise the abandoned run is closed**, exactly as the final merge of its database
+   would have closed it ([shared-state.md](shared-state.md#work-the-run-did-not-finish)): an
+   open run whose agent had started becomes `interrupted` and so does the job; a run that
+   was only claimed is released and the job is `queued` again; a publication of it that was
+   under way becomes `failed`; its hold is released. Runs and jobs of other events are not
+   read, let alone changed.
+4. **Where nothing of it is on GitHub, this delivery does the job.** The job is requeued
+   (as `updraft retry` requeues it, with the reason "requeued by a redelivery of its event")
+   and run in this run, as the job's next attempt: on the branch
+   `updraft/issue-<n>-<job id>-<attempt>`, through the pre-start check and everything else.
+   `resumed: true`, and the summary describes that run.
+5. **Where its branch is on GitHub without a pull request** (the run pushed and died before
+   opening it), nothing is started: running the job again would leave two results. The run
+   is closed, the job is `interrupted`, and the command ends `nothing-to-do`,
+   `already-handled`, exit code 0, with a message that says what to do: delete the branch,
+   `updraft retry JOB_ID` on a copy of the shared state database, upload it, and deliver the
+   event again. The same holds for a pull request that exists and cannot be restored
+   because it is closed or neither loop is on (without the instructions: that work is done).
+6. **Where the job has used its attempts** (three, the same number as start failures a job
+   gets, and the number of attempt branches the checks of [Idempotency](#idempotency) know),
+   or `updraft retry` would refuse it (a job held for a human), the run is closed and
+   nothing is started: `nothing-to-do`, `duplicate-delivery`, exit code 0, and the message
+   names `updraft retry`.
+
+In all of 3 to 6 the summary has **`abandonedRun`**, which says which run was closed, when
+its hold had ended, and whether this run did the job (`resumed`). The existing fields mean
+what they always meant. Merge the state as usual afterwards: the job is no longer stuck in
+the shared copy either. If the vanished run's own database turns up after all and is merged
+([shared-state.md](shared-state.md#recovery)), its run row wins over the `interrupted` one,
+as a run's own record always does.
+
+Two redeliveries that arrive together after the hold has expired both close the run and both
+run the job: the race of two runs of one event, with the outcome described under
+[Idempotency](#idempotency) (one publishes, the other ends `superseded`).
+
+Not covered: a job the checkpoint carried as `succeeded` whose publication never happened
+and left nothing on GitHub. Its agent's commits were on the machine that is gone; the
+delivery ends `duplicate-delivery`, and `updraft retry` on a copy of the shared state is the
+way to run it again.
