@@ -80,8 +80,13 @@ Both workflows call `.github/workflows/cloud-deploy-env.yaml`, which runs these 
 2. `make deploy-backend`: bundle the API, then `sam deploy`;
 3. `make deploy-frontend`: build the SPA and write `auth-config.json` from the stack outputs, then release in this order:
    - Upload the new hashed files under `assets/` (immutable cache). **Nothing is deleted**, so an `index.html` still in flight or cached at an edge keeps finding the files it names.
-   - Upload `auth-config.json`, then `index.html` last (both `no-cache`), which switches the release. Invalidate CloudFront.
-   - `scripts/spa-release.mjs` records the release (`_releases/<time>.json` lists its assets) and prunes the assets of releases replaced more than `ASSET_RETENTION_DAYS` (default 7) ago. The window counts from when a release was replaced, not from when its files were uploaded.
+   - Upload `auth-config.json`. Then record the release **before** switching anything: `scripts/spa-release.mjs record` writes `_releases/<time>.json` listing its assets. Every release that goes live has a record, even if the deploy stops right after the switch.
+   - Upload `index.html` last (both files `no-cache`), which switches the release. Invalidate CloudFront, then mark the record live (`activate`).
+   - `prune` deletes the assets of releases replaced more than `ASSET_RETENTION_DAYS` (default 7) ago. The window counts from replacement, not upload.
+     - A record never marked live counts as possibly live.
+     - A file no record mentions stays until a release recorded before the window proves it was retired.
+     - If any record can't be read, nothing is deleted.
+     - Pruning is best-effort. A failure leaves old files behind and doesn't fail the deploy, because the release is already live.
 4. `scripts/smoke.mjs` against the deployed URL.
 
 There is no `sam build`. `ApiFunction`'s `CodeUri` is the bundled `server/dist`, which `sam deploy` zips and uploads itself.

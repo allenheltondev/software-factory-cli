@@ -91,10 +91,12 @@ smoke:
 #
 #   deploy-backend   bundle the API (server/dist) -> sam deploy the whole stack
 #   deploy-frontend  build the SPA -> write /auth-config.json from the stack's outputs -> upload
-#                    the new hashed assets (nothing deleted) -> switch index.html last ->
-#                    CloudFront invalidation -> scripts/spa-release.mjs records the release and
-#                    prunes assets of releases replaced more than ASSET_RETENTION_DAYS ago, so an
-#                    index.html still in flight or cached never points at deleted files
+#                    the new hashed assets (nothing deleted) -> record the release
+#                    (scripts/spa-release.mjs record) -> switch index.html last -> CloudFront
+#                    invalidation -> mark the record live -> prune assets of releases replaced
+#                    more than ASSET_RETENTION_DAYS ago, so an index.html still in flight or
+#                    cached never points at deleted files. Pruning is best-effort: the release is
+#                    already live, and a failure only leaves old files behind
 #   deploy           both, in that order
 #
 # There is no `sam build`: the template's ApiFunction points at the bundled server/dist, which
@@ -153,12 +155,16 @@ deploy-frontend:
 		--cache-control 'public, max-age=300'; \
 	aws s3 cp app/dist/auth-config.json "s3://$$APP_BUCKET/auth-config.json" $(REGION_ARG) \
 		--cache-control 'no-cache' --content-type 'application/json'; \
+	RELEASE_KEY=$$(node scripts/spa-release.mjs record --bucket "$$APP_BUCKET" --dist app/dist $(REGION_ARG)); \
 	aws s3 cp app/dist/index.html "s3://$$APP_BUCKET/index.html" $(REGION_ARG) \
 		--cache-control 'no-cache' --content-type 'text/html; charset=utf-8'; \
 	echo "deploy-frontend: invalidating $$DIST_ID"; \
 	aws cloudfront create-invalidation --distribution-id "$$DIST_ID" --paths '/*' >/dev/null; \
-	node scripts/spa-release.mjs --bucket "$$APP_BUCKET" --dist app/dist \
-		--retention-days $(ASSET_RETENTION_DAYS) $(REGION_ARG); \
+	node scripts/spa-release.mjs activate --bucket "$$APP_BUCKET" --key "$$RELEASE_KEY" $(REGION_ARG) \
+		|| echo "deploy-frontend: WARNING could not mark $$RELEASE_KEY live; it is kept as possibly live" >&2; \
+	node scripts/spa-release.mjs prune --bucket "$$APP_BUCKET" --dist app/dist \
+		--retention-days $(ASSET_RETENTION_DAYS) $(REGION_ARG) \
+		|| echo "deploy-frontend: WARNING pruning old assets failed; the release is live and nothing was lost" >&2; \
 	echo; \
 	echo "Deployed: $$APP_URL"
 
