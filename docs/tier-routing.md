@@ -69,6 +69,14 @@ The decision is made once, when the job is enqueued, and stored in the job (so i
 restarts). It is not recomputed when the issue is edited later, nor on `updraft retry`, which requeues the same job with its stored decision. A held job cannot be retried (that would run it on an ineligible pool).
 A new decision happens when a new trigger label application creates a new job.
 
+## CLI triage (optional)
+
+For issues the heuristics are unsure about, `tiers.triage` can ask an installed, signed-in coding
+CLI to classify them, under its subscription and without any model API. It is off unless
+configured, never overrides a label or a high-risk floor, and falls back to `standard` when it
+cannot answer. See [triage.md](triage.md). Its decisions appear as rule `triage` (or `heuristic`
+with a fallback note).
+
 ## Correcting a decision
 
 Add an override label (e.g. `tier:complex`) and remove and re-apply the trigger label to queue a
@@ -78,4 +86,4 @@ new job, or cancel the held/misrouted job first. To stop using heuristics, remov
 
 `updraft status` prints `routing: tier <t>, risk <r>, rule <rule>, pool <pool>` under each job with
 a recorded decision, and the worker's `job queued` log line carries `tier`, `risk`, `rule` and
-`pool`. Rules are `legacy-label`, `override-label` and `heuristic`.
+`pool`. Rules are `legacy-label`, `override-label`, `heuristic` and `triage`.

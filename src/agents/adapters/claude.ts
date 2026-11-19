@@ -35,13 +35,16 @@
  * without a readable result fails; with `--output-format text` in the config args, the exit
  * code decides.
  */
-import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
+import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest, TriageInvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';
 import { failureLine } from '../failure-line.js';
 
 /** The flags that set Claude Code's permission profile; any of them in the config's args replaces the default. */
 const PERMISSION_FLAGS = ['--permission-mode', '--dangerously-skip-permissions'];
 const OUTPUT_FORMAT_FLAG = '--output-format';
+
+/** Flags that would give a triage run tools or a looser permission profile; refused in agents.<name>.args. */
+const TRIAGE_REFUSED_FLAGS = [...PERMISSION_FLAGS, '--allow-dangerously-skip-permissions', '--allowedTools', '--allowed-tools', '--tools', '--mcp-config', '--add-dir', '--settings'];
 
 /** Does `args` set option `name`, as `--name value` or `--name=value`? */
 export function hasOption(args: readonly string[], name: string): boolean {
@@ -206,6 +209,23 @@ export const claudeAdapter: AgentAdapter = {
     if (!hasOption(extra, OUTPUT_FORMAT_FLAG)) args.push(OUTPUT_FORMAT_FLAG, 'stream-json', '--verbose');
     if (!PERMISSION_FLAGS.some((f) => hasOption(extra, f))) args.push('--permission-mode', 'bypassPermissions');
     args.push(...extra);
+    return { file: req.launch.file, args, promptVia: 'stdin' };
+  },
+
+  triageIsolation: 'no-tools',
+
+  /**
+   * Triage: `-p --output-format stream-json --verbose --tools "" --permission-mode default
+   * `--tools ""` turns every built-in tool off (the CLI reference: an empty string disables all tools), so there
+   * is nothing to approve or write (https://code.claude.com/docs/en/cli-reference). The output mode is the one
+   * live runs use, so {@link finalMessage} reads the answer.
+   */
+  buildTriageInvocation(req: TriageInvocationRequest): AgentInvocation {
+    const bad = TRIAGE_REFUSED_FLAGS.find((f) => hasOption(req.extraArgs, f));
+    if (bad) throw new Error(`agents.<name>.args sets ${bad}, which would give a triage run tools or wider access`);
+    const args = [...req.launch.args, '-p', OUTPUT_FORMAT_FLAG, 'stream-json', '--verbose', '--tools', '', '--permission-mode', 'default', '--no-session-persistence'];
+    if (hasOption(req.extraArgs, OUTPUT_FORMAT_FLAG)) throw new Error('agents.<name>.args sets --output-format, which triage controls itself');
+    args.push(...req.extraArgs);
     return { file: req.launch.file, args, promptVia: 'stdin' };
   },
 

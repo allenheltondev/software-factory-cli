@@ -109,7 +109,7 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       config,
       paths,
       log: log.child({ component: 'worker' }),
-      poll: () => deps.pollOnce({ db: openDb, api, config, log: pollLog }),
+      poll: () => deps.pollOnce({ db: openDb, api, config, log: pollLog, configDir: paths.configDir }),
       checkDispatchable: (job) => deps.checkJobDispatchable({ api, config }, job),
       signal: controller.signal,
       executor: createExecutor(config, appAuth && config.github?.app?.commitAsApp ? { commitIdentity: (repoFullName) => appCommitIdentity(appAuth, repoFullName) } : {}),

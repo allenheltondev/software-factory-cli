@@ -355,7 +355,7 @@ describe('migration v13', () => {
     ).run();
 
     migrate(db);
-    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: SCHEMA_VERSION });
     expect(db.prepare('SELECT findings_count FROM pr_reviews').all()).toEqual([{ findings_count: null }]);
     const rows = db
       .prepare(
@@ -389,7 +389,7 @@ describe('migration v13', () => {
     const h = buildHistory(END);
     const live = metricRows(h.db);
     h.db.exec(
-      'DROP TABLE metric_events; ALTER TABLE pr_reviews DROP COLUMN findings_count; ALTER TABLE runs DROP COLUMN agent_started_at; ' +
+      'DROP TABLE triage_cache; DROP TABLE triage_runs; DROP TABLE metric_events; ALTER TABLE pr_reviews DROP COLUMN findings_count; ALTER TABLE runs DROP COLUMN agent_started_at; ' +
         'ALTER TABLE jobs DROP COLUMN retries; PRAGMA user_version = 12;',
     );
     migrate(h.db);

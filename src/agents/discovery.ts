@@ -720,6 +720,8 @@ const KILL_GRACE_MS = 1_500;
 
 export interface RunProcessOptions extends RunOptions {
   env?: NodeJS.ProcessEnv;
+  /** Written to the process's stdin, which is then closed. Absent: stdin is closed without input. */
+  input?: string;
   /** Overrides the SIGTERM-to-SIGKILL grace period (tests). */
   killGraceMs?: number;
 }
@@ -794,8 +796,13 @@ export function runProcess(file: string, args: string[], opts: RunProcessOptions
         detached: process.platform !== 'win32',
         env: opts.env,
         cwd: opts.cwd,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       });
+      if (opts.input !== undefined) {
+        // A CLI that exits without reading its prompt closes the pipe: EPIPE is not a failure of ours.
+        child.stdin?.on('error', () => undefined);
+        child.stdin?.end(opts.input);
+      }
     } catch (err) {
       resolve({ code: null, stdout: '', stderr: '', error: err instanceof Error ? err.message : String(err) });
       return;
