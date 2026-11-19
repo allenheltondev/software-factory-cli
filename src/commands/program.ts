@@ -23,7 +23,7 @@ import { validateCommand } from './validate.js';
 export interface Handlers {
   configure(ctx: CommandContext): Promise<number>;
   add(ctx: CommandContext, repo: string, opts: AddOptions): Promise<number>;
-  validate(ctx: CommandContext): Promise<number>;
+  validate(ctx: CommandContext, opts?: { json?: boolean }): Promise<number>;
   start(ctx: CommandContext): Promise<number>;
   runEvent(ctx: CommandContext, opts: RunEventOptions): Promise<number>;
   stateMerge(ctx: CommandContext, opts: StateMergeOptions): Promise<number>;
@@ -118,7 +118,8 @@ export function buildProgram(opts: ProgramOptions): Command {
   program
     .command('validate')
     .description('Check the config without network access (exit 1 if invalid)')
-    .action(() => exec((ctx) => handlers.validate(ctx)));
+    .addOption(new Option('--json', 'print one JSON object on stdout: errors, warnings and the validated config with its defaults filled in'))
+    .action((o: { json?: boolean }) => exec((ctx) => handlers.validate(ctx, o)));
 
   program
     .command('start')
