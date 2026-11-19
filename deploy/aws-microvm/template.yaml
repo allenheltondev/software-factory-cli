@@ -398,7 +398,7 @@ Resources:
                       - 'config/*'
                       - !If [UseSharedState, 'state/*', 'config/*']
               # The shared state database: read the current version, write a new one. The
-              # same statement covers state/unsaved/<delivery>.db, where the runner keeps a
+              # same statement covers state/unsaved/<delivery>/<attempt>/, where the runner keeps a
               # run's database that it could not merge (a plain PutObject; nothing reads it
               # back inside a microVM).
               # Deliberately absent: s3:DeleteObject, s3:GetObjectVersion and

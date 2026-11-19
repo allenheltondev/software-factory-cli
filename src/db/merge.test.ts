@@ -566,6 +566,82 @@ function insertOldJob(db: Db): string {
   return 'job_old';
 }
 
+describe('mergeState: work that is finished in the shared copy', { timeout: 60_000 }, () => {
+  /** A snapshot in which another machine has a succeeded run whose publication is under way (a checkpoint of it). */
+  function publishingElsewhere() {
+    const snap = join(dir(), 'snapshot.db');
+    const other = edit(snap, (db) => {
+      const done = finishedJob(db, 1, { worker: 'other', at: T0 });
+      beginPublication(db, { runId: done.runId, jobId: done.jobId, repoId: 1, repoFullName: 'o/r', issueNumber: 1, mode: 'draft-pr', branch: 'updraft/issue-1-x', leaseSeconds: 600, now: () => T0 + 2000 });
+      const jobId = insertQueuedJob(db, { repoId: 1, fullName: 'o/r', issue: 5 });
+      const c = claimNextJob(db, config, claimOpts('other', T0 + 3000))!;
+      started(db, c.run.id, T0 + 3000);
+      return { ...done, runningJob: jobId, runningRun: c.run.id };
+    });
+    // This machine's run: a job of its own, and nothing about the other machine's rows.
+    const mine = copy(snap, 'mine.db');
+    const own = edit(mine, (db) => finishedJob(db, 2, { worker: 'me', at: T0 + 5000 }));
+    // Meanwhile the other machine finished: its publication is published, its second run ended.
+    const shared = copy(snap, 'shared.db');
+    edit(shared, (db) => {
+      db.prepare("UPDATE publications SET state = 'published', pr_number = 100, pr_url = 'https://github.com/o/r/pull/100', lease_expires_at = NULL, published_at = ?, updated_at = ? WHERE run_id = ?").run(
+        new Date(T0 + 9000).toISOString(),
+        new Date(T0 + 9000).toISOString(),
+        other.runId,
+      );
+      finishRun(db, other.runningRun, { outcome: 'succeeded', now: () => T0 + 9000 });
+    });
+    return { snap, mine, shared, other, own };
+  }
+  const publicationOf = (file: string, runId: string) => read(file, (db) => db.prepare('SELECT state, pr_number FROM publications WHERE run_id = ?').get(runId));
+  const runOf = (file: string, runId: string) => read(file, (db) => db.prepare('SELECT outcome, ended_at IS NOT NULL AS ended FROM runs WHERE id = ?').get(runId));
+
+  it("never turns another run's finished publication or ended run back into an unfinished one, even when the snapshot is missing", () => {
+    const w = publishingElsewhere();
+    // No --base: every row of --changed is taken for this run's, the other machine's stale ones included.
+    const r = mergeState({ changed: w.mine, into: w.shared, now: () => T0 + 60_000 });
+    expect(publicationOf(w.shared, w.other.runId)).toEqual({ state: 'published', pr_number: 100 });
+    expect(runOf(w.shared, w.other.runningRun)).toEqual({ outcome: 'succeeded', ended: 1 });
+    read(w.shared, (db) => {
+      expect(getJob(db, w.other.runningJob)).toMatchObject({ status: 'succeeded' });
+      expect(getJob(db, w.own.jobId)).toMatchObject({ status: 'succeeded' });
+    });
+    expect(r.unfinished).toMatchObject({ runsInterrupted: 0, stepsClosed: 0, jobsInterrupted: 0 });
+  });
+
+  it('gives the same result with the true snapshot, where those rows are not looked at at all', () => {
+    const w = publishingElsewhere();
+    mergeState({ changed: w.mine, base: w.snap, into: w.shared, now: () => T0 + 60_000 });
+    expect(publicationOf(w.shared, w.other.runId)).toEqual({ state: 'published', pr_number: 100 });
+    expect(runOf(w.shared, w.other.runningRun)).toEqual({ outcome: 'succeeded', ended: 1 });
+  });
+
+  it('does not let a stale checkpoint that arrives after the final merge reopen what the run finished', () => {
+    const snap = snapshot();
+    const a = copy(snap, 'a.db');
+    const run = edit(a, (db) => {
+      const jobId = insertQueuedJob(db, { repoId: 1, fullName: 'o/r', issue: 2 });
+      const c = claimNextJob(db, config, claimOpts('wa', T0 + 1000))!;
+      started(db, c.run.id, T0 + 1000);
+      return { jobId, runId: c.run.id };
+    });
+    // A copy of the run's database while it was going: what a checkpoint that is delayed would carry.
+    const stale = copy(a, 'stale.db');
+    edit(a, (db) => {
+      finishRun(db, run.runId, { outcome: 'succeeded', now: () => T0 + 2000 });
+      beginPublication(db, { runId: run.runId, jobId: run.jobId, repoId: 1, repoFullName: 'o/r', issueNumber: 2, mode: 'draft-pr', branch: 'updraft/issue-2-x', leaseSeconds: 600, now: () => T0 + 2000 });
+      db.prepare("UPDATE publications SET state = 'published', pr_number = 7, lease_expires_at = NULL WHERE run_id = ?").run(run.runId);
+    });
+    edit(stale, (db) => beginPublication(db, { runId: run.runId, jobId: run.jobId, repoId: 1, repoFullName: 'o/r', issueNumber: 2, mode: 'draft-pr', branch: 'updraft/issue-2-x', leaseSeconds: 600, now: () => T0 + 1500 }));
+    const shared = copy(snap, 'shared.db');
+    mergeState({ changed: a, base: snap, into: shared, now: () => T0 + 60_000 });
+    mergeState({ changed: stale, base: snap, into: shared, live: true, now: () => T0 + 61_000 });
+    expect(publicationOf(shared, run.runId)).toEqual({ state: 'published', pr_number: 7 });
+    expect(runOf(shared, run.runId)).toEqual({ outcome: 'succeeded', ended: 1 });
+    read(shared, (db) => expect(getJob(db, run.jobId)).toMatchObject({ status: 'succeeded' }));
+  });
+});
+
 describe('updraft state merge / info', { timeout: 60_000 }, () => {
   const ctx = () => {
     const out = new MemoryOutput();

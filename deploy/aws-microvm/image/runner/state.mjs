@@ -19,6 +19,7 @@
 // or starts a process comes in through `deps` (see ../../test/runner-state.test.mjs).
 /* global AbortController */
 import { spawn as nodeSpawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -87,11 +88,27 @@ export function stateCopyInvocation({ db, out }) {
   return ['state', 'copy', '--db', db, '--out', out, '--json'];
 }
 
-/** Where a run's database is kept when the final sync fails: next to the shared one, by delivery. */
-export function unsavedKeys(stateKey, deliveryId) {
-  const prefix = stateKey.includes('/') ? stateKey.slice(0, stateKey.lastIndexOf('/') + 1) : '';
-  return { key: `${prefix}unsaved/${deliveryId}.db`, baseKey: `${prefix}unsaved/${deliveryId}.base.db` };
+/** The version of the manifest saveUnsaved writes (`deploy.sh state recover` reads it, and refuses another). */
+export const UNSAVED_MANIFEST_VERSION = 1;
+
+/**
+ * Where a run's database is kept when the final sync fails: next to the shared one, under
+ * the delivery and one attempt to keep it. Every attempt has keys of its own, so that the
+ * files of two attempts (a redelivery, a second microVM) can never be taken for one backup.
+ * The manifest is written last and names the other two: a backup without one is incomplete.
+ */
+export function unsavedKeys(stateKey, deliveryId, attemptId) {
+  const root = stateKey.includes('/') ? stateKey.slice(0, stateKey.lastIndexOf('/') + 1) : '';
+  const prefix = `${root}unsaved/${deliveryId}/${attemptId}/`;
+  return { prefix, key: `${prefix}changed.db`, baseKey: `${prefix}base.db`, manifestKey: `${prefix}manifest.json` };
 }
+
+/** An id for one attempt to keep an unsaved database: when, and eight random hex digits. Letters, digits and "-" only. */
+export function newAttemptId(nowMs = Date.now()) {
+  return `${new Date(nowMs).toISOString().replace(/[-:.]/g, '').toLowerCase()}-${crypto.randomBytes(4).toString('hex')}`;
+}
+
+const sha256 = (body) => crypto.createHash('sha256').update(body).digest('hex');
 
 /**
  * THE ONE PLACE that reads `updraft state merge --json`'s output. Only `changed` decides
@@ -622,19 +639,33 @@ export function createCheckpointer(context, deps) {
 }
 
 /**
- * Keeps the run's database when the final sync could not save it: a consistent single-file
- * copy (made by `updraft state copy`, as the job user) at `unsavedKeys().key`, and the
- * snapshot the run started from next to it, so that `deploy.sh state recover` can merge
- * exactly what this run changed. Plain writes to keys nothing else uses: this cannot fail
- * for the reason the sync did. Never throws; the returned object goes into the result document.
+ * Keeps the run's database when the final sync could not save it, as a backup that describes
+ * itself (README, "When state is not saved"), under keys of this attempt alone:
+ *
+ *   1. base.db       the snapshot the run started from; not written when it started from nothing
+ *   2. changed.db    a consistent single-file copy of the run's database (`updraft state copy`,
+ *                    made as the job user)
+ *   3. manifest.json last: both keys, their sizes and SHA-256 checksums, the schema version,
+ *                    the delivery, the attempt, and `startedEmpty` with `base: null` when
+ *                    there was no snapshot
+ *
+ * The base goes first because the changed database without it must never look usable: merged
+ * without its base, every row in it would count as this run's, other runs' unfinished work
+ * included. The manifest goes last because it is what says that everything before it is
+ * there; `deploy.sh state recover` merges nothing without one and checks every byte against
+ * it. Plain writes to keys nothing else uses: this cannot fail for the reason the sync did.
+ * Never throws; the returned object goes into the result document. `saved` (and `complete`)
+ * is true only once the manifest is written.
  */
 export async function saveUnsaved({ bucket, stateKey, deliveryId, stateDir, baseFile, budgetMs }, deps) {
-  const keys = unsavedKeys(stateKey, deliveryId);
-  const report = { saved: false, key: null, baseKey: null, bytes: null, error: null };
+  const attemptId = deps.unsavedAttemptId?.() ?? newAttemptId();
+  const keys = unsavedKeys(stateKey, deliveryId, attemptId);
+  const report = { saved: false, complete: false, attemptId, manifestKey: null, key: null, baseKey: null, startedEmpty: !baseFile, bytes: null, error: null };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(0, budgetMs));
   const aborted = new Promise((resolve) => controller.signal.addEventListener('abort', () => resolve('aborted'), { once: true }));
   let workDir;
+  let step = 'the copy of the run\'s database';
   const work = async () => {
     workDir = await fs.mkdtemp(path.join(deps.stateRoot, 'unsaved-'));
     await fs.chmod(workDir, 0o700);
@@ -644,29 +675,59 @@ export async function saveUnsaved({ bucket, stateKey, deliveryId, stateDir, base
     if (controller.signal.aborted) return;
     if (copy.exitCode !== 0) throw new Error(`updraft state copy ${copy.signal ? `was killed by ${copy.signal}` : `exited ${copy.exitCode}`}${copy.stderrTail.trim() ? `: ${oneLine(copy.stderrTail)}` : ''}`);
     const body = await readCandidate(out);
-    if (!sqliteHeader(body).valid) throw new Error('the copy is not a SQLite database');
+    const header = sqliteHeader(body);
+    if (!header.valid) throw new Error('the copy is not a SQLite database');
+    let base = null;
+    if (baseFile) {
+      step = 'the snapshot the run started from';
+      const baseBody = await fs.readFile(baseFile);
+      const baseHeader = sqliteHeader(baseBody);
+      if (!baseHeader.valid) throw new Error('the snapshot the run started from is not a SQLite database');
+      await deps.s3Put(bucket, keys.baseKey, baseBody, 'application/vnd.sqlite3');
+      if (controller.signal.aborted) return;
+      report.baseKey = keys.baseKey;
+      base = { key: keys.baseKey, bytes: baseBody.length, sha256: sha256(baseBody), schemaVersion: baseHeader.schemaVersion };
+    }
+    step = 'the run\'s database';
     await deps.s3Put(bucket, keys.key, body, 'application/vnd.sqlite3');
-    report.saved = true;
+    if (controller.signal.aborted) return;
     report.key = keys.key;
     report.bytes = body.length;
-    if (baseFile) {
-      await deps.s3Put(bucket, keys.baseKey, await fs.readFile(baseFile), 'application/vnd.sqlite3');
-      report.baseKey = keys.baseKey;
-    }
+    step = 'the manifest';
+    const manifest = {
+      version: UNSAVED_MANIFEST_VERSION,
+      deliveryId,
+      attemptId,
+      createdAt: new Date().toISOString(),
+      schemaVersion: header.schemaVersion,
+      startedEmpty: base === null,
+      changed: { key: keys.key, bytes: body.length, sha256: sha256(body) },
+      base,
+    };
+    await deps.s3Put(bucket, keys.manifestKey, Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`), 'application/json');
+    // Not if the time ran out meanwhile: the caller was told "not saved" by then.
+    if (controller.signal.aborted) return;
+    report.manifestKey = keys.manifestKey;
+    report.saved = true;
+    report.complete = true;
   };
   try {
     if (budgetMs <= 0) throw new Error('no time left to keep the unsaved database');
     const outcome = await Promise.race([work(), aborted]);
-    if (outcome === 'aborted' && !report.baseKey) report.error = report.saved ? 'stopped before the snapshot the run started from was kept as well' : 'stopped before the unsaved database was kept: out of time';
+    if (outcome === 'aborted' && !report.saved) report.error = `stopped at ${step}: out of time`;
   } catch (error) {
-    report.error = error?.message ?? String(error);
+    report.error = `${step} was not kept: ${error?.message ?? String(error)}`;
   } finally {
     clearTimeout(timer);
     controller.abort();
     if (workDir) await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
-  if (report.saved) deps.log(`UNSAVED STATE KEPT at s3://${bucket}/${report.key}${report.baseKey ? ` (base: ${report.baseKey})` : ''}; merge it with ./deploy.sh state recover ${deliveryId}`);
-  else deps.log(`UNSAVED STATE LOST: could not keep the run's database: ${report.error}`);
+  if (report.saved) {
+    deps.log(`UNSAVED STATE KEPT at s3://${bucket}/${keys.prefix} (manifest: ${report.manifestKey}; ${report.startedEmpty ? 'the run started from nothing' : `base: ${report.baseKey}`}); merge it with ./deploy.sh state recover ${deliveryId}`);
+  } else {
+    const partial = report.key || report.baseKey;
+    deps.log(`UNSAVED STATE LOST: could not keep the run's database: ${report.error}${partial ? `. What was written under s3://${bucket}/${keys.prefix} is an incomplete backup with no manifest; state recover will not merge it` : ''}`);
+  }
   return report;
 }
 

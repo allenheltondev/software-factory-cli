@@ -20,6 +20,9 @@ import {
   stateMergeInvocation,
   stateSyncBudgetMs,
   syncState,
+  UNSAVED_MANIFEST_VERSION,
+  newAttemptId,
+  saveUnsaved,
   unsavedKeys,
   waitForStateChange,
 } from '../image/runner/state.mjs';
@@ -397,9 +400,17 @@ describe('state helpers', () => {
     expect(stateCopyInvocation({ db: '/s/state.db', out: '/u/unsaved.db' })).toEqual(['state', 'copy', '--db', '/s/state.db', '--out', '/u/unsaved.db', '--json']);
   });
 
-  it('keeps an unsaved database next to the shared one, by delivery', () => {
-    expect(unsavedKeys('state/state.db', 'd-1')).toEqual({ key: 'state/unsaved/d-1.db', baseKey: 'state/unsaved/d-1.base.db' });
-    expect(unsavedKeys('state.db', 'd-1')).toEqual({ key: 'unsaved/d-1.db', baseKey: 'unsaved/d-1.base.db' });
+  it('keeps an unsaved database next to the shared one, by delivery and attempt, with its manifest', () => {
+    expect(unsavedKeys('state/state.db', 'd-1', 'a-1')).toEqual({
+      prefix: 'state/unsaved/d-1/a-1/',
+      key: 'state/unsaved/d-1/a-1/changed.db',
+      baseKey: 'state/unsaved/d-1/a-1/base.db',
+      manifestKey: 'state/unsaved/d-1/a-1/manifest.json',
+    });
+    expect(unsavedKeys('state.db', 'd-1', 'a-1').manifestKey).toBe('unsaved/d-1/a-1/manifest.json');
+    // Two attempts of one delivery never share a key.
+    expect(newAttemptId(START)).toMatch(/^20260102t030405000z-[0-9a-f]{8}$/);
+    expect(newAttemptId(START)).not.toBe(newAttemptId(START));
   });
 
   it('waits for the shared object to change, and gives up on time', async () => {
@@ -545,7 +556,7 @@ function jobSetup(mode, { s3 = memoryS3(), rows = ['job-a'], control = {}, secre
     retryDelayMs: 1,
     ...depsOverrides,
   };
-  const document = () => JSON.parse(calls.find(([name, , key]) => name === 's3Put' && key.endsWith('.json'))[3]);
+  const document = () => JSON.parse(calls.find(([name, , key]) => name === 's3Put' && key.endsWith('.json') && !key.endsWith('/manifest.json'))[3]);
   return { deps, calls, logs, s3, document, stop: () => stopListeners.forEach((listener) => listener()) };
 }
 
@@ -614,7 +625,7 @@ describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
   it('reports "state_not_saved" when the job succeeded and its state could not be saved, releases the delivery, and keeps the database', async () => {
     for (const control of [{ merge: 'fail' }, { merge: 'newer-schema' }]) {
       const s3 = memoryS3(encodeStateDb(['old']));
-      const { deps, calls, logs, document } = jobSetup('success', { s3, control });
+      const { deps, calls, logs, document } = jobSetup('success', { s3, control, deps: { unsavedAttemptId: () => 'attempt-1' } });
       const result = await runJob(request({ dedupeTable: 'deliveries' }), deps);
       // Loud, and its own status: the job's outcome is kept next to it.
       expect(result.outcome).toBe('state_not_saved');
@@ -630,15 +641,42 @@ describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
       expect(names(calls)).not.toContain('s3PutIf');
       expect(s3.versions).toHaveLength(1);
 
-      // The run's database, as one file, and the snapshot it started from: under their own
-      // keys, with plain writes, before the result is written.
+      // The snapshot the run started from, then the run's database as one file, then the
+      // manifest that names and describes both: under keys of this attempt, with plain writes,
+      // before the result is written.
       const puts = calls.filter(([name]) => name === 's3Put');
-      const unsaved = puts.find(([, , key]) => key === 'state/unsaved/delivery-1.db');
-      const base = puts.find(([, , key]) => key === 'state/unsaved/delivery-1.base.db');
+      const at = 'state/unsaved/delivery-1/attempt-1';
+      const order = puts.map(([, , key]) => key).filter((key) => key.startsWith('state/unsaved/'));
+      expect(order).toEqual([`${at}/base.db`, `${at}/changed.db`, `${at}/manifest.json`]);
+      const unsaved = puts.find(([, , key]) => key === `${at}/changed.db`);
+      const base = puts.find(([, , key]) => key === `${at}/base.db`);
+      const manifestPut = puts.find(([, , key]) => key === `${at}/manifest.json`);
       expect(decodeStateDb(unsaved[3]).rows).toEqual(['job-a', 'old']);
       expect(decodeStateDb(base[3]).rows).toEqual(['old']);
-      expect(result.state.unsaved).toEqual({ saved: true, key: 'state/unsaved/delivery-1.db', baseKey: 'state/unsaved/delivery-1.base.db', bytes: 4096, error: null });
-      expect(puts.indexOf(unsaved)).toBeLessThan(puts.findIndex(([, , key]) => key.endsWith('.json')));
+      const sha256 = (body) => crypto.createHash('sha256').update(body).digest('hex');
+      expect(JSON.parse(manifestPut[3])).toEqual({
+        version: UNSAVED_MANIFEST_VERSION,
+        deliveryId: 'delivery-1',
+        attemptId: 'attempt-1',
+        createdAt: expect.any(String),
+        schemaVersion: 3,
+        startedEmpty: false,
+        changed: { key: `${at}/changed.db`, bytes: 4096, sha256: sha256(unsaved[3]) },
+        base: { key: `${at}/base.db`, bytes: base[3].length, sha256: sha256(base[3]), schemaVersion: 3 },
+      });
+      expect(manifestPut[4]).toBe('application/json');
+      expect(result.state.unsaved).toEqual({
+        saved: true,
+        complete: true,
+        attemptId: 'attempt-1',
+        manifestKey: `${at}/manifest.json`,
+        key: `${at}/changed.db`,
+        baseKey: `${at}/base.db`,
+        startedEmpty: false,
+        bytes: 4096,
+        error: null,
+      });
+      expect(puts.indexOf(manifestPut)).toBeLessThan(puts.findIndex(([, , key]) => key.endsWith('.json') && !key.endsWith('/manifest.json')));
       expect(logs.some((line) => line.startsWith('UNSAVED STATE KEPT') && line.includes('state recover delivery-1'))).toBe(true);
       // The copy was made by the CLI, as the job user's command, without AWS credentials.
       const copy = stateCalls().find((call) => call.command === 'copy');
@@ -658,7 +696,7 @@ describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
     const result = await runJob(request({ dedupeTable: 'deliveries' }), deps);
     expect(result).toMatchObject({ outcome: 'state_not_saved', jobOutcome: 'failed', exitCode: 1 });
     expect(result.error).toContain('the job: updraft exited 1');
-    expect(result.state.unsaved).toMatchObject({ saved: false, key: null });
+    expect(result.state.unsaved).toMatchObject({ saved: false, complete: false, manifestKey: null, key: null });
     expect(result.state.unsaved.error).toContain('updraft state copy exited 1');
     expect(logs.some((line) => line.startsWith('UNSAVED STATE LOST'))).toBe(true);
     expect(names(calls)).toContain('releaseDelivery');
@@ -840,7 +878,8 @@ describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
     expect(result).toMatchObject({ outcome: 'state_not_saved', jobOutcome: 'succeeded' });
     expect(result.state.sync).toMatchObject({ saved: false, notSavedCode: 'timed-out' });
     // What the hanging merge could not save is kept under its own key; then the report, then the end.
-    expect(result.state.unsaved).toMatchObject({ saved: true, key: 'state/unsaved/delivery-1.db' });
+    expect(result.state.unsaved).toMatchObject({ saved: true, complete: true });
+    expect(result.state.unsaved.manifestKey).toMatch(/^state\/unsaved\/delivery-1\/[0-9a-z-]+\/manifest\.json$/);
     expect(names(calls).slice(-2)).toEqual(['s3Put', 'terminate']);
   });
 
@@ -887,5 +926,76 @@ describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
     await runJob(request({ notBefore: new Date(START - 5000).toISOString() }), quick.deps);
     expect(quick.logs.some((line) => line.includes('coalescing window'))).toBe(false);
     expect(Date.now() - start).toBeLessThan(5000);
+  });
+});
+
+describe.runIf(onLinuxLikeHost)('saveUnsaved: a backup is complete only with its manifest', () => {
+  /** saveUnsaved on a run's database, with an S3 whose PutObject fails for the keys `failing` matches. */
+  function backup({ baseRows = ['old'], failing = () => false, control = {} } = {}) {
+    const s3 = memoryS3();
+    const { context, deps, stateDir, stateRoot } = syncSetup({ runRows: ['job-a', 'old'], ...(baseRows ? { baseRows } : {}), control, s3 });
+    const puts = [];
+    const logs = [];
+    deps.log = (line) => logs.push(line);
+    deps.unsavedAttemptId = () => 'attempt-1';
+    deps.s3Put = async (bucket, key, body, contentType) => {
+      if (failing(key)) throw new Error(`AccessDenied: ${key}`);
+      puts.push({ key, body: Buffer.from(body), contentType });
+    };
+    const run = () => saveUnsaved({ bucket: BUCKET, stateKey: KEY, deliveryId: 'delivery-1', stateDir, baseFile: context.baseFile, budgetMs: 20_000 }, deps);
+    return { run, puts, logs, stateRoot };
+  }
+  const AT = 'state/unsaved/delivery-1/attempt-1';
+  const keys = (puts) => puts.map((put) => put.key);
+
+  it('writes nothing more, and no manifest, when the base cannot be uploaded', async () => {
+    const { run, puts, logs } = backup({ failing: (key) => key.endsWith('/base.db') });
+    const report = await run();
+    expect(keys(puts)).toEqual([]);
+    expect(report).toMatchObject({ saved: false, complete: false, manifestKey: null, key: null, baseKey: null, attemptId: 'attempt-1', startedEmpty: false });
+    expect(report.error).toContain('AccessDenied');
+    expect(logs.some((line) => line.startsWith('UNSAVED STATE LOST'))).toBe(true);
+    expect(logs.some((line) => line.startsWith('UNSAVED STATE KEPT'))).toBe(false);
+  });
+
+  it('is incomplete, and says so, when the changed database cannot be uploaded', async () => {
+    const { run, puts, logs } = backup({ failing: (key) => key.endsWith('/changed.db') });
+    const report = await run();
+    expect(keys(puts)).toEqual([`${AT}/base.db`]);
+    expect(report).toMatchObject({ saved: false, complete: false, manifestKey: null, key: null, baseKey: `${AT}/base.db` });
+    expect(logs.find((line) => line.startsWith('UNSAVED STATE LOST'))).toContain('incomplete');
+  });
+
+  it('is not reported as saved when only the manifest is missing', async () => {
+    const { run, puts, logs } = backup({ failing: (key) => key.endsWith('/manifest.json') });
+    const report = await run();
+    expect(keys(puts)).toEqual([`${AT}/base.db`, `${AT}/changed.db`]);
+    expect(report).toMatchObject({ saved: false, complete: false, manifestKey: null, key: `${AT}/changed.db`, baseKey: `${AT}/base.db` });
+    expect(report.error).toContain('manifest');
+    expect(logs.some((line) => line.startsWith('UNSAVED STATE KEPT'))).toBe(false);
+  });
+
+  it('says in the manifest, explicitly, that a run started from nothing', async () => {
+    const { run, puts } = backup({ baseRows: null });
+    const report = await run();
+    expect(keys(puts)).toEqual([`${AT}/changed.db`, `${AT}/manifest.json`]);
+    expect(report).toMatchObject({ saved: true, complete: true, manifestKey: `${AT}/manifest.json`, baseKey: null, startedEmpty: true });
+    const manifest = JSON.parse(puts[1].body);
+    expect(manifest).toMatchObject({ startedEmpty: true, base: null, deliveryId: 'delivery-1', attemptId: 'attempt-1' });
+    expect(manifest.changed.sha256).toBe(crypto.createHash('sha256').update(puts[0].body).digest('hex'));
+  });
+
+  it('gives every attempt keys of its own', async () => {
+    const first = backup();
+    first.puts.length = 0;
+    const s3 = memoryS3();
+    const { context, deps, stateDir } = syncSetup({ runRows: ['job-a'], baseRows: ['old'], s3 });
+    const seen = [];
+    deps.log = () => {};
+    deps.s3Put = async (bucket, key) => void seen.push(key);
+    const a = await saveUnsaved({ bucket: BUCKET, stateKey: KEY, deliveryId: 'delivery-1', stateDir, baseFile: context.baseFile, budgetMs: 20_000 }, deps);
+    const b = await saveUnsaved({ bucket: BUCKET, stateKey: KEY, deliveryId: 'delivery-1', stateDir, baseFile: context.baseFile, budgetMs: 20_000 }, deps);
+    expect(a.attemptId).not.toBe(b.attemptId);
+    expect(new Set(seen).size).toBe(6);
   });
 });

@@ -78,8 +78,9 @@ Lambda MicroVM  (image/, one per launch, restored from the image snapshot)
         |    changed: false -> done.  Else updraft state info on the result, then
         |    PUT s3://BUCKET/state/state.db  If-Match: <ETag>   (If-None-Match: * if there was none)
         |    412 or 409: somebody else wrote first -> again with the newer object
-        |  not saved: updraft state copy -> s3://BUCKET/state/unsaved/<delivery>.db (+ .base.db),
-        |    the result says state_not_saved, the delivery record is removed
+        |  not saved: s3://BUCKET/state/unsaved/<delivery>/<attempt>/ gets base.db, then changed.db
+        |    (updraft state copy), then manifest.json; the result says state_not_saved, the
+        |    delivery record is removed
         v
    runner: updraft.log, run.log -> s3://BUCKET/results/<delivery>/<microvm-id>/
            result               -> s3://BUCKET/results/<delivery>/<microvm-id>.json
@@ -432,29 +433,68 @@ own, whatever the job's outcome:
   `STATE NOT SAVED`. (A run that left no database, or changed nothing, is not this case.)
 - **The delivery record is removed**, also after a job that succeeded, so that the delivery
   can be redelivered.
-- **The run's database is kept.** The runner has `updraft state copy` (as the job user) write
-  a consistent single-file copy of it and uploads that to
-  `s3://<bucket>/state/unsaved/<delivery id>.db`, and the pristine copy the run started from to
-  `state/unsaved/<delivery id>.base.db`, with plain `PutObject`s: no merge and no condition, so
-  this does not fail for the reason the sync did. `state.unsaved` in the result has the keys,
-  or the error when this failed too (`UNSAVED STATE LOST` in the log). The objects expire
-  after `StateVersionRetentionDays`.
+- **The run's database is kept, as a backup that describes itself.** Under
+  `s3://<bucket>/state/unsaved/<delivery id>/<attempt id>/`, with plain `PutObject`s (no merge
+  and no condition, so this does not fail for the reason the sync did), in this order:
+
+  | Object | What it is |
+  | --- | --- |
+  | `base.db` | The pristine copy of the shared database the run started from. Not written when the run started from nothing |
+  | `changed.db` | A consistent single-file copy of the run's database, made by `updraft state copy` as the job user |
+  | `manifest.json` | Written last. `version`, `deliveryId`, `attemptId`, `createdAt`, `schemaVersion`, `startedEmpty`, and for `changed` and `base` their `key`, `bytes` and `sha256` (`base` also its `schemaVersion`). A run that started from nothing has `"base": null` and `"startedEmpty": true` |
+
+  The attempt id is a timestamp and eight random hex digits, new for every attempt to keep a
+  database, so the files of two attempts for one delivery (a redelivery, a second microVM)
+  are never mixed. **A backup is complete when its manifest is there, and only then.** The
+  base is uploaded first because `changed.db` must never be usable without it, and the
+  manifest last because it is what says that everything it names was written.
+  `state.unsaved` in the result has `saved` and `complete` (both true only once the manifest
+  is written), `attemptId`, `manifestKey`, `key`, `baseKey`, `startedEmpty`, `bytes`, and the
+  `error` when a step failed; the log then has `UNSAVED STATE LOST`, and says so when objects
+  without a manifest were left behind. The objects expire after `StateVersionRetentionDays`.
 
 Nothing depends on those objects: no job reads them, and the next job's sync is the same
 whether they exist or not. Two ways lead back to a complete shared state, and they can be
 combined in either order:
 
 ```sh
-./deploy.sh state unsaved                    # what is there
-./deploy.sh state recover <delivery id>      # merge it into state/state.db
+./deploy.sh state unsaved                             # complete backups, and incomplete ones
+./deploy.sh state recover <delivery id> [attempt id]  # verify one and merge it into state/state.db
 ```
 
-`state recover` downloads the unsaved database and its base, and loops as the runner does:
-download the current shared database and its ETag, `updraft state merge --changed <unsaved>
---base <base> --into <shared>` locally, upload with `--if-match <ETag>` (`--if-none-match '*'`
-when there is none), start over on a 412 or 409. It needs an `updraft` on this machine of the
-version the image runs (`UPDRAFT_BIN` names another command) and an AWS CLI whose
-`s3api put-object` has `--if-match`. Merging the same database twice adds nothing.
+`state unsaved` lists complete backups (delivery and attempt) apart from incomplete ones (an
+attempt's directory with no `manifest.json`, with the objects it does have) and from
+`<delivery id>.db` files in the layout an earlier runner wrote.
+
+`state recover` takes a complete backup and nothing else. The attempt id is only needed when
+a delivery has more than one. It
+
+1. downloads `manifest.json` first, and refuses a manifest that is not version 1, is for
+   another delivery or attempt, names a key outside its own directory, or does not say
+   whether the run started empty;
+2. downloads `changed.db`, and `base.db` when the manifest names one, and compares the size
+   and the SHA-256 of each with the manifest;
+3. loops as the runner does: download the current shared database and its ETag,
+   `updraft state merge --changed <changed> --base <base> --into <shared>` locally, upload
+   with `--if-match <ETag>` (`--if-none-match '*'` when there is none), start over on a 412
+   or 409.
+
+It merges **without `--base` only when the manifest says `startedEmpty: true`**. In every
+other case a base that is missing, cannot be downloaded or is not the file the manifest
+describes ends the command with a non-zero exit and a message, before any merge and any
+upload. There is no fallback and no flag that skips the base, on purpose: merged without the
+snapshot it started from, every row of the backup counts as that run's, so rows of other
+runs that it merely started with would be compared with what those runs have recorded since.
+(`updraft state merge` itself no longer lets such a row replace one that is finished in the
+shared database, but another run's work that is still unfinished there would be closed as
+abandoned: [shared-state.md](../../docs/shared-state.md#recovery).) When the base is gone for
+good, redeliver the event instead; an incomplete backup or one in the old layout is in the
+same position. The bucket keeps versions, so an object that was overwritten or deleted can
+usually be restored first.
+
+It needs an `updraft` on this machine of the version the image runs (`UPDRAFT_BIN` names
+another command), `node` (which `updraft` needs anyway; the manifest checks run in it) and an
+AWS CLI whose `s3api put-object` has `--if-match`. Merging the same backup twice adds nothing.
 
 **Or redeliver the `issues` delivery.** `run-event` finds the event's pull request on GitHub,
 finds no record of it in the state database, and restores the publication from the GitHub
@@ -835,7 +875,7 @@ What can go wrong, either way:
 | Delivery shows `429` or `503` | HTTP API throttling (`WebhookRateLimit`) |
 | `202`, but no result object | The microVM's log stream in `/aws/lambda-microvms/<image-name>`. `aws lambda-microvms get-microvm --microvm-identifier <id>` shows `state` and `stateReason`. A microVM whose `/run` hook fails or times out is terminated without ever running |
 | Result has `outcome: runner_error` | `error` says which step failed: reading the event or config from S3, a secret that is empty or not a PEM key, no `config.yaml`, a shared state object that is not a SQLite database (restore an earlier version, see [Shared state](#shared-state)), Updraft not startable |
-| Result has `outcome: state_not_saved` (`state.sync.saved: false` with a `notSavedReason`) | The job ran (`jobOutcome` says how it went), but what it changed in the state database since its last checkpoint was not saved; the log has a `STATE NOT SAVED` line. The run's database is in `state.unsaved.key`; [When state is not saved](#when-state-is-not-saved) says how to merge it or restore from GitHub. `notSavedCode` is `merge-failed` (`updraft state merge` exited non-zero; its last output is in the reason), `newer-schema` (the image's Updraft is older than the shared database; rebuild the image), `merged-database-unreadable` or `merged-database-refused` (the merged file failed a check), `attempts-exhausted` (four attempts each lost to another microVM), `timed-out` or `no-time` (the microVM was at its end; raise `WatchdogReserveSeconds` or `MaximumDurationSeconds`), `shared-database-unreadable` (the object in S3 is damaged; restore a version), `no-run-database`, `merge-report-missing`. [Concurrency model](#concurrency-model) says what the missing history means |
+| Result has `outcome: state_not_saved` (`state.sync.saved: false` with a `notSavedReason`) | The job ran (`jobOutcome` says how it went), but what it changed in the state database since its last checkpoint was not saved; the log has a `STATE NOT SAVED` line. The run's database is kept as the backup `state.unsaved.manifestKey` names (when `state.unsaved.complete` is true); [When state is not saved](#when-state-is-not-saved) says how to merge it or restore from GitHub. `notSavedCode` is `merge-failed` (`updraft state merge` exited non-zero; its last output is in the reason), `newer-schema` (the image's Updraft is older than the shared database; rebuild the image), `merged-database-unreadable` or `merged-database-refused` (the merged file failed a check), `attempts-exhausted` (four attempts each lost to another microVM), `timed-out` or `no-time` (the microVM was at its end; raise `WatchdogReserveSeconds` or `MaximumDurationSeconds`), `shared-database-unreadable` (the object in S3 is damaged; restore a version), `no-run-database`, `merge-report-missing`. [Concurrency model](#concurrency-model) says what the missing history means |
 | Result has `outcome: failed`, `exitCode: 6`, `updraftOutcome: state-pending` | A pull request event arrived before the state of the run that opened the pull request did, and it did not arrive within `StatePendingWaitSeconds` (`state.pending`). Redeliver the delivery once that run has saved state (its first checkpoint is enough); if that run is gone, redeliver the pull request's `issues` delivery first. See [A pull request the state does not know yet](#a-pull-request-the-state-does-not-know-yet) |
 | Result has `updraftOutcome: failed` although the pull request was opened | A job that followed from the event in the same run failed: a reviewer run, a revision. `summary.followOnJobs` lists them, `summary.loop` says where the pull request stands, and `summary.message` names the job that failed |
 | Result has `updraftOutcome: error`, `summary.reason: state-not-restorable` | A redelivered `issues` event found its pull request on GitHub, no record of it in the shared state, and could not restore it from the API (the message says which fact is missing). Merge the original run's database with `./deploy.sh state recover`, or close the pull request and apply the label again |
@@ -882,8 +922,10 @@ The result document:
 ```
 
 `state.checkpoints` is null when none was due; `state.pending` is `{ "tries", "waitedMs",
-"resolved" }` when `run-event` exited 6 at least once; `state.unsaved` is `{ "saved", "key",
-"baseKey", "bytes", "error" }` when the final sync failed. With a `pending` retry,
+"resolved" }` when `run-event` exited 6 at least once; `state.unsaved` is `{ "saved", "complete",
+"attemptId", "manifestKey", "key", "baseKey", "startedEmpty", "bytes", "error" }` when the
+final sync failed: `manifestKey` is the backup's `manifest.json`, and `saved` and `complete`
+are true only when that was written ([When state is not saved](#when-state-is-not-saved)). With a `pending` retry,
 `state.snapshot` describes the snapshot of the last try.
 
 `outcome` is the runner's view and follows the exit code (and, for `state_not_saved`, the
@@ -1215,7 +1257,7 @@ delivery table, read the webhook secret, call
 else (no delete, no version actions; a versioned bucket needs none for an ordinary write).
 Checkpoints, the wait for newer state and the unsaved copies under `state/unsaved/` use those
 same permissions and widened nothing: the ETag is asked for with the list request, and
-`state/unsaved/<delivery>.db` is a `PutObject` under `state/*`.
+each object of a backup under `state/unsaved/<delivery>/<attempt>/` is a `PutObject` under `state/*`.
 The bucket blocks public access, refuses non-TLS requests, keeps replaced versions for a
 while and expires `events/` and `results/`.
 
@@ -1482,13 +1524,21 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
     CLI; `run-event`'s own exit 6 path is tested in the Updraft repository.
 37. **Unsaved state and `deploy.sh state recover`.** That `updraft state copy` (SQLite's
     `VACUUM INTO` on a read-only connection) keeps every row's id is tested in the Updraft
-    repository; the upload was tested with stand-ins. `deploy.sh state unsaved` and `state
-    recover` were checked with `bash -n` only: that `aws s3api get-object ... --query ETag
-    --output text` prints the ETag with its quotes, that `aws s3api put-object` accepts
-    `--if-match` and `--if-none-match` (recent AWS CLI v2 only), and that a refused
-    precondition shows as `PreconditionFailed` or `(412)` in its error text, are from memory.
-    That a lifecycle rule with `Prefix: state/unsaved/` and `ExpirationInDays` may coexist
-    with the `state/` rule that only expires noncurrent versions was not deployed.
+    repository; the three uploads of a backup, their order and each one failing were tested
+    with stand-ins. `deploy.sh state unsaved` and `state recover` were run in tests against
+    a stand-in `aws` command (`test/fake-aws.mjs`) and a stand-in `updraft`, and checked with
+    `bash -n`; never against AWS. So these are from memory: that `aws s3api list-objects-v2
+    --query 'Contents[].Key' --output text` prints the keys separated by tabs (and `None`
+    for no objects, possibly once per page of a long listing, which the script filters
+    out), that `aws s3api get-object ... --query ETag --output text` prints the ETag with
+    its quotes, that `aws s3api put-object` accepts `--if-match` and `--if-none-match`
+    (recent AWS CLI v2 only), and that a refused precondition shows as `PreconditionFailed`
+    or `(412)` in its error text. That a lifecycle rule with `Prefix: state/unsaved/` and
+    `ExpirationInDays` may coexist with the `state/` rule that only expires noncurrent
+    versions, and that it covers the keys one level further down
+    (`state/unsaved/<delivery>/<attempt>/...`), was not deployed. The real merge of a real
+    backup through `state recover` was not run end to end: the script's decisions and the
+    merge are tested separately.
 38. **Holds between microVMs.** That a second microVM leaves a first one's unfinished work
     alone is tested in the Updraft repository with two state directories and a checkpoint
     merged by hand between them (a merge waiting for checks), not with two microVMs. A hold
@@ -1501,6 +1551,26 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
     `<app-slug>[bot]` for a pull request the App opened, `head.repo.id`, and the body exactly
     as publication wrote it (the marker comment and the "Opened by updraft from run ... (agent
     ...)" line survive unless a person edits them).
+40. **One revision per review across microVMs.** Tested in the Updraft repository with two
+    state directories, one in-memory GitHub and a real local Git remote, not with two
+    microVMs. Assumed of the real API: that a comment the App posts is listed by
+    `GET /repos/{owner}/{repo}/issues/{n}/comments` to every other caller as soon as the
+    `POST` has returned, with `user.login` `<app-slug>[bot]` (the guarantee rests on a
+    revision's announcement being readable before its push is); that
+    `PATCH /repos/{owner}/{repo}/issues/comments/{id}` replaces the body for the App that
+    wrote the comment, with the `Issues: write` or `Pull requests: write` permission it
+    already has; and that the GraphQL `PullRequestReview.commit { oid }` is the head the
+    review was submitted against. The runner does not pass `--shared-state` to
+    `run-event` yet (the checkpointer would have to keep a copy the job user can read but
+    not replace), so on this deployment the last look learns of another microVM's revision
+    from the pull request, not from the shared database: one extra read of the pull request
+    and its comments, and no agent run.
+41. **A run that checkpointed and vanished.** That a redelivery after the hold has expired
+    closes the vanished run and does the job is tested in the Updraft repository with a
+    daemon that dies after a checkpoint, not with a microVM that is terminated. The
+    launcher's deduplication record must have expired (or been released) for the redelivery
+    to reach a microVM at all, and the hold lasts `--deadline-minutes` plus 15 minutes: a
+    redelivery before that ends `duplicate-delivery`, as before.
 
 ## Tests
 
@@ -1518,6 +1588,15 @@ the suite:
   launch, table unreachable), and coalescing by pull request (a burst, the lease's last
   second, other pull requests, redelivery, a failed launch, table unreachable, off).
 - `runner-hooks.test.mjs`: hook routing over a real HTTP server.
+- `deploy-state.test.mjs` (POSIX hosts with `bash`): `deploy.sh state unsaved` and `state
+  recover` run for real against a stand-in `aws` on `PATH` (`fake-aws.mjs`: a directory for
+  the bucket, ETags, the two write conditions) and a stand-in `updraft` that records how the
+  merge was called. Complete and incomplete backups listed apart; a merge with `--base` only
+  after the manifest and both checksums were checked; without `--base` only for
+  `startedEmpty: true`; a refusal, with nothing merged and nothing uploaded, for a missing
+  manifest, the old layout, a missing or mismatching base or database, a manifest for
+  another delivery or with keys outside its directory; several attempts of one delivery;
+  the retry after a lost conditional write; and `bash -n`.
 - `runner-job.test.mjs`: the job, with stand-ins for AWS and `fake-updraft.mjs` in place of
   `updraft`, as a real child process: success, failure, no summary, a run that outlives the
   watchdog (stopped with SIGTERM, then SIGKILL), termination during a run, unusable secrets
@@ -1537,8 +1616,10 @@ the suite:
   the snapshot in the job's directory and the pristine base outside it, the result
   document's `state`, sync after a failed job and after the watchdog, a job whose state is
   not saved (`state_not_saved` with the job's own outcome beside it, the delivery record
-  released, the database and its base kept under `state/unsaved/`, and the case where that
-  fails too), no sync when the job never started, an unreadable snapshot, config objects
+  released, the base, the database and the manifest kept under
+  `state/unsaved/<delivery>/<attempt>/` in that order, and the case where that fails too; and
+  `saveUnsaved` with the upload of the base, of the database or of the manifest failing, each
+  reported as not saved and incomplete, and a run that started from nothing), no sync when the job never started, an unreadable snapshot, config objects
   named like the database, and the wait for `notBefore`. Checkpoints: a job that writes its
   database in steps has its first row in S3 while it is still running, every merge before
   the last is `--live` against the same base, a checkpoint that hangs or fails costs the job
@@ -1549,7 +1630,7 @@ the suite:
 
 Not covered by tests: `launcher/index.mjs` (which holds the DynamoDB condition expression),
 `image/runner/aws.mjs` (which holds the real conditional write and how its refusal is
-recognised, and `s3Etag`), `deploy.sh state unsaved` and `state recover`, `run-job.mjs` and `server.mjs` (thin wiring that needs the AWS SDK, which the
+recognised, and `s3Etag`), `deploy.sh` other than `state unsaved` and `state recover`, `run-job.mjs` and `server.mjs` (thin wiring that needs the AWS SDK, which the
 repository does not depend on; each was started by hand with the SDK installed, without AWS,
 and the two state functions of `aws.mjs` against a local stand-in for S3, as said under
 [What is not verified](#what-is-not-verified)), switching to the job user and every file

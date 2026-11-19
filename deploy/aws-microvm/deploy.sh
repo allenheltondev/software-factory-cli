@@ -9,9 +9,11 @@
 #   ./deploy.sh state info        what the shared state database in S3 is: size, date, versions
 #   ./deploy.sh state pull [dir]  download it (and the config) into dir, laid out as an Updraft
 #                                 home, for `UPDRAFT_HOME=dir updraft status` (default: ./updraft-state)
-#   ./deploy.sh state unsaved     list the databases of jobs whose state could not be saved
-#   ./deploy.sh state recover <delivery id>
-#                                 merge such a database into the shared one (needs `updraft` here)
+#   ./deploy.sh state unsaved     list the backups of jobs whose state could not be saved:
+#                                 complete ones (with a manifest) and incomplete ones
+#   ./deploy.sh state recover <delivery id> [attempt id]
+#                                 verify such a backup against its manifest and merge it into
+#                                 the shared database (needs `updraft` and `node` here)
 #
 # Settings come from the environment; nothing is hard-coded:
 #
@@ -279,43 +281,168 @@ unsaved_prefix() {
   case "$STATE_KEY" in */*) echo "${STATE_KEY%/*}/unsaved" ;; *) echo "unsaved" ;; esac
 }
 
+# Every key under the unsaved prefix, one per line (nothing when there are none).
+unsaved_keys() {
+  local out
+  out="$(aws s3api list-objects-v2 --bucket "$STATE_BUCKET" --prefix "$1" --query 'Contents[].Key' --output text)" \
+    || die "could not list s3://$STATE_BUCKET/$1"
+  printf '%s\n' "$out" | tr '\t' '\n' | grep -v -e '^None$' -e '^$' || true
+}
+
+# A backup is one attempt's directory: <prefix>/<delivery id>/<attempt id>/ holding base.db
+# (unless the job started from nothing), changed.db and, written last, manifest.json. It is
+# complete when the manifest is there. Anything else cannot be told apart from an upload that
+# stopped half-way, and `state recover` does not touch it.
 state_unsaved() {
   state_location
-  local prefix
+  local prefix keys attempts a files
   prefix="$(unsaved_prefix)"
   say "s3://$STATE_BUCKET/$prefix/"
-  aws s3 ls "s3://$STATE_BUCKET/$prefix/" || echo "    none: no job has failed to save its state (or they have expired)"
+  keys="$(unsaved_keys "$prefix/")"
+  if [ -z "$keys" ]; then
+    echo "    none: no job has failed to save its state (or the backups have expired)"
+    return 0
+  fi
+  attempts="$(printf '%s\n' "$keys" | sed -n "s|^$prefix/\([A-Za-z0-9-]\{1,\}\)/\([A-Za-z0-9-]\{1,\}\)/[^/]\{1,\}\$|\1/\2|p" | sort -u)"
+  echo "    complete (./deploy.sh state recover <delivery id> [attempt id]):"
+  for a in $attempts; do
+    if printf '%s\n' "$keys" | grep -qxF "$prefix/$a/manifest.json"; then
+      echo "      delivery ${a%%/*}  attempt ${a##*/}"
+    fi
+  done
+  echo "    incomplete (no manifest: the upload did not finish; not recoverable with this command):"
+  for a in $attempts; do
+    if ! printf '%s\n' "$keys" | grep -qxF "$prefix/$a/manifest.json"; then
+      files="$(printf '%s\n' "$keys" | sed -n "s|^$prefix/$a/||p" | tr '\n' ' ')"
+      echo "      delivery ${a%%/*}  attempt ${a##*/}  has: $files"
+    fi
+  done
+  # Written by an earlier version of the runner, which kept no manifest.
+  printf '%s\n' "$keys" | sed -n "s|^$prefix/\([^/]*\.db\)\$|      \1  (old layout, no manifest)|p"
+}
+
+# Reads and checks a backup's manifest, and checks a downloaded file against it. Kept in one
+# small Node program because the checks are on JSON, sizes and SHA-256 checksums; Node is
+# here wherever `updraft` is.
+write_manifest_tool() {
+  cat > "$1" <<'JS'
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+const [command, manifestFile, ...rest] = process.argv.slice(2);
+const fail = (message) => {
+  console.error(message);
+  process.exit(1);
+};
+let m;
+try {
+  m = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+} catch (error) {
+  fail(`the manifest is not JSON (${error.message})`);
+}
+const entry = (e, name, key) => {
+  if (e === null || typeof e !== 'object') fail(`the manifest has no "${name}" entry`);
+  if (e.key !== key) fail(`the manifest's ${name} key is ${JSON.stringify(e.key)}, not ${key}`);
+  if (!Number.isInteger(e.bytes) || e.bytes <= 0) fail(`the manifest's ${name} size is not a positive number`);
+  if (typeof e.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(e.sha256)) fail(`the manifest's ${name} checksum is not a SHA-256`);
+};
+if (command === 'read') {
+  const [delivery, attempt, dir] = rest;
+  if (m === null || typeof m !== 'object' || m.version !== 1) fail(`the manifest is version ${JSON.stringify(m?.version)}; this command reads version 1`);
+  if (m.deliveryId !== delivery) fail(`the manifest is for delivery ${JSON.stringify(m.deliveryId)}, not ${delivery}`);
+  if (m.attemptId !== attempt) fail(`the manifest is for attempt ${JSON.stringify(m.attemptId)}, not ${attempt}`);
+  if (typeof m.startedEmpty !== 'boolean') fail('the manifest does not say whether the job started from an empty state (startedEmpty)');
+  entry(m.changed, 'changed', `${dir}/changed.db`);
+  if (m.base === null) {
+    if (m.startedEmpty !== true) fail('the manifest names no base snapshot and does not say that the job started from an empty state');
+  } else {
+    if (m.startedEmpty !== false) fail('the manifest names a base snapshot and says that the job started from an empty state');
+    entry(m.base, 'base', `${dir}/base.db`);
+  }
+  console.log(m.startedEmpty ? 'empty' : 'base');
+} else if (command === 'verify') {
+  const [name, file] = rest;
+  const e = m[name];
+  const body = fs.readFileSync(file);
+  if (body.length !== e.bytes) fail(`${name}.db is ${body.length} bytes; the manifest says ${e.bytes}`);
+  const sum = crypto.createHash('sha256').update(body).digest('hex');
+  if (sum !== e.sha256) fail(`the SHA-256 of ${name}.db is ${sum}; the manifest says ${e.sha256}`);
+  if (body.subarray(0, 16).toString('latin1') !== 'SQLite format 3\0') fail(`${name}.db is not a SQLite database`);
+} else {
+  fail(`unknown command ${command}`);
+}
+JS
 }
 
 # Merges what one job changed, and could not save, into the shared database: the same
 # three-way merge and the same conditional write the runner uses, from this machine. Safe to
 # repeat: merging the same database twice adds nothing.
+#
+# Only from a complete backup, and only as its manifest says. The base snapshot is what makes
+# the merge exact: without it every row of the backup counts as that job's, and rows of other
+# runs that the job merely started with would be written over what those runs did since. So
+# the merge goes without a base only when the manifest says the job started from an empty
+# state; a base that is missing, unreadable or not the one the manifest describes ends the
+# command. There is no way to skip that.
 state_recover() {
   state_location
-  local delivery="${1:-}" updraft="${UPDRAFT_BIN:-updraft}"
-  [ -n "$delivery" ] || die "usage: ./deploy.sh state recover <delivery id>   (./deploy.sh state unsaved lists them)"
+  local delivery="${1:-}" attempt="${2:-}" updraft="${UPDRAFT_BIN:-updraft}"
+  [ -n "$delivery" ] || die "usage: ./deploy.sh state recover <delivery id> [attempt id]   (./deploy.sh state unsaved lists them)"
   case "$delivery" in *[!A-Za-z0-9-]*) die "not a delivery id: $delivery" ;; esac
-  need "$updraft"
+  case "$attempt" in *[!A-Za-z0-9-]*) die "not an attempt id: $attempt" ;; esac
+  need "$updraft"; need node
   "$updraft" state merge --help 2>/dev/null | grep -q -- '--base' \
     || die "$updraft has no 'state merge' command; install the Updraft version the image uses, or set UPDRAFT_BIN"
-  local prefix work out etag attempt
+  local prefix work out etag try keys complete dir mode
   prefix="$(unsaved_prefix)"
+  keys="$(unsaved_keys "$prefix/$delivery")"
+  complete="$(printf '%s\n' "$keys" | sed -n "s|^$prefix/$delivery/\([A-Za-z0-9-]\{1,\}\)/manifest\.json\$|\1|p" | sort)"
+  if [ -n "$attempt" ]; then
+    printf '%s\n' "$complete" | grep -qxF "$attempt" \
+      || die "delivery $delivery has no complete backup for attempt $attempt (no manifest.json under s3://$STATE_BUCKET/$prefix/$delivery/$attempt/); nothing was merged. ./deploy.sh state unsaved lists what is there"
+  elif [ -z "$complete" ]; then
+    if printf '%s\n' "$keys" | grep -q "^$prefix/$delivery/"; then
+      die "delivery $delivery has only incomplete backups (no manifest.json: the upload did not finish); nothing was merged. An incomplete backup cannot be verified, so it is never merged; deliver the event again instead (README, \"When state is not saved\")"
+    fi
+    if printf '%s\n' "$keys" | grep -qxF "$prefix/$delivery.db"; then
+      die "the backup of delivery $delivery was written by an earlier version of the runner and has no manifest, so it cannot be verified; nothing was merged (README, \"When state is not saved\")"
+    fi
+    die "no unsaved backup for delivery $delivery (./deploy.sh state unsaved lists them)"
+  elif [ "$(printf '%s\n' "$complete" | wc -l)" -gt 1 ]; then
+    die "delivery $delivery has several complete backups; name one: ./deploy.sh state recover $delivery <attempt id> (attempts: $(printf '%s' "$complete" | tr '\n' ' '))"
+  else
+    attempt="$complete"
+  fi
+  dir="$prefix/$delivery/$attempt"
   work="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$work'" EXIT
-  say "downloading s3://$STATE_BUCKET/$prefix/$delivery.db"
-  aws s3 cp "s3://$STATE_BUCKET/$prefix/$delivery.db" "$work/unsaved.db" --only-show-errors \
-    || die "no unsaved database for delivery $delivery (./deploy.sh state unsaved lists them)"
-  # The snapshot that job started from makes this an exact three-way merge. Without it every
-  # row of the database counts as that job's, which is right only for a job that started
-  # from nothing.
+  write_manifest_tool "$work/manifest-tool.mjs"
+  say "reading the manifest s3://$STATE_BUCKET/$dir/manifest.json"
+  aws s3 cp "s3://$STATE_BUCKET/$dir/manifest.json" "$work/manifest.json" --only-show-errors \
+    || die "could not download the manifest of delivery $delivery, attempt $attempt; nothing was merged"
+  mode="$(node "$work/manifest-tool.mjs" read "$work/manifest.json" "$delivery" "$attempt" "$dir")" \
+    || die "the manifest of delivery $delivery, attempt $attempt, cannot be used (see above); nothing was merged"
+  say "downloading s3://$STATE_BUCKET/$dir/changed.db"
+  aws s3 cp "s3://$STATE_BUCKET/$dir/changed.db" "$work/unsaved.db" --only-show-errors \
+    || die "the manifest names $dir/changed.db, and it could not be downloaded; nothing was merged"
+  node "$work/manifest-tool.mjs" verify "$work/manifest.json" changed "$work/unsaved.db" \
+    || die "$dir/changed.db is not the file its manifest describes (see above); nothing was merged"
   local base=()
-  if aws s3 cp "s3://$STATE_BUCKET/$prefix/$delivery.base.db" "$work/base.db" --only-show-errors 2>/dev/null; then
-    base=(--base "$work/base.db")
-  else
-    say "no $delivery.base.db: the job started from nothing (or its snapshot was not kept); merging without a base"
-  fi
-  for attempt in 1 2 3 4 5; do
+  case "$mode" in
+    empty)
+      say "the manifest says the job started from an empty state: merging without a base"
+      ;;
+    base)
+      say "downloading s3://$STATE_BUCKET/$dir/base.db"
+      aws s3 cp "s3://$STATE_BUCKET/$dir/base.db" "$work/base.db" --only-show-errors \
+        || die "the manifest names the base snapshot $dir/base.db, and it could not be downloaded. Without it the merge would take every row of the backup for that job's and could write over what other runs did since, so nothing was merged. Restore the object (the bucket keeps versions) and run this again"
+      node "$work/manifest-tool.mjs" verify "$work/manifest.json" base "$work/base.db" \
+        || die "$dir/base.db is not the snapshot its manifest describes (see above); nothing was merged. Restore the version of the object the manifest was written with and run this again"
+      base=(--base "$work/base.db")
+      ;;
+    *) die "the manifest of delivery $delivery could not be read; nothing was merged" ;;
+  esac
+  for try in 1 2 3 4 5; do
     rm -f "$work/shared.db" "$work/shared.db-wal" "$work/shared.db-shm"
     # No object yet is a first write (If-None-Match: *). An object this identity cannot read
     # ends there too, and the condition refuses the write: nothing is overwritten blindly.
@@ -335,13 +462,13 @@ state_recover() {
     [ -z "$etag" ] || condition=(--if-match "$etag")
     if aws s3api put-object --bucket "$STATE_BUCKET" --key "$STATE_KEY" --body "$work/shared.db" \
         --content-type application/vnd.sqlite3 "${condition[@]}" >/dev/null 2>"$work/put.err"; then
-      say "merged delivery $delivery into s3://$STATE_BUCKET/$STATE_KEY"
+      say "merged delivery $delivery (attempt $attempt) into s3://$STATE_BUCKET/$STATE_KEY"
       echo "    $out"
-      echo "    the unsaved copy stays under $prefix/ until it expires; recovering it again changes nothing"
+      echo "    the backup stays under $dir/ until it expires; recovering it again changes nothing"
       return 0
     fi
     grep -qE 'PreconditionFailed|ConditionalRequestConflict|\(412\)|\(409\)' "$work/put.err" || { cat "$work/put.err" >&2; die "the upload failed; the shared database is unchanged"; }
-    say "a job wrote the shared database first; merging again into the newer one (attempt $attempt)"
+    say "a job wrote the shared database first; merging again into the newer one (attempt $try)"
   done
   die "gave up after 5 attempts that each lost to another write; the shared database has none of delivery $delivery's changes from this run of the command. Try again"
 }
@@ -361,10 +488,10 @@ case "${1:-all}" in
       info) state_info ;;
       pull) state_pull "${3:-}" ;;
       unsaved) state_unsaved ;;
-      recover) state_recover "${3:-}" ;;
-      *) die "usage: ./deploy.sh state info | state pull [dir] | state unsaved | state recover <delivery id>" ;;
+      recover) state_recover "${3:-}" "${4:-}" ;;
+      *) die "usage: ./deploy.sh state info | state pull [dir] | state unsaved | state recover <delivery id> [attempt id]" ;;
     esac
     ;;
-  -h|--help|help) sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command: $1 (try --help)" ;;
 esac

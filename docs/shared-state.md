@@ -39,7 +39,7 @@ updraft state info  --db <file> [--json]
 | --- | --- |
 | `--changed <file>` | The state database the run used |
 | `--into <file>` | The latest shared copy. Created when it does not exist. Rewritten only when there is something to merge |
-| `--base <file>` | The snapshot the run started from. Omit it when the run started from nothing: every row of `--changed` is then the run's |
+| `--base <file>` | The snapshot the run started from. Omit it **only** when the run started from nothing: every row of `--changed` is then taken for the run's ([Recovery](#recovery) says what that does to a database that did not start empty) |
 | `--live` | The run is still going and is writing to `--changed`: a [checkpoint](#checkpoints). `--changed` is read in one read transaction, its files are not touched, and nothing unfinished is settled |
 | `--json` | Print one JSON object on stdout |
 
@@ -152,12 +152,12 @@ adding its rule and its row here.
 
 | Table | Key | Rule; on a conflict |
 | --- | --- | --- |
-| `jobs` | `id` | A finished job (succeeded, failed, interrupted, canceled) beats an unfinished one; between two finished or two unfinished, the later `updated_at` wins (this run's on a tie). `attempts`, `retries`, `deferrals` and `escalation_hops` take the larger value. A job whose event `--into` has a tombstone for (`pruned_events`) is not inserted. A job whose dedupe key (repository, workflow, event) `--into` already has under **another id** is folded into that job: the existing row keeps the key, the rule above decides its content, and this run's runs and records are attached to it. A [reconstructed](#reconstructed-rows) row never replaces a finished job that a run recorded |
-| `runs` | `id` | A run id is written by one run only: this run's row wins. Inserted only when its job is in `--into`. A [reconstructed](#reconstructed-rows) row never replaces a recorded one |
-| `publications` | `run_id` | As `runs`; inserted only when its run is in `--into`. A [reconstructed](#reconstructed-rows) row never replaces a recorded one |
-| `failure_comments` | `run_id` | As `publications` |
-| `revisions` | `run_id` | As `publications` |
-| `pr_reviews` | `run_id` | As `publications` |
+| `jobs` | `id` | A finished job (succeeded, failed, interrupted, canceled) beats an unfinished one, and a succeeded job a canceled one (one machine did the job, another called its copy off because the work was there already); otherwise, between two finished or two unfinished, the later `updated_at` wins (this run's on a tie). `attempts`, `retries`, `deferrals` and `escalation_hops` take the larger value. A job whose event `--into` has a tombstone for (`pruned_events`) is not inserted. A job whose dedupe key (repository, workflow, event) `--into` already has under **another id** is folded into that job: the existing row keeps the key, the rule above decides its content, and this run's runs and records are attached to it. A [reconstructed](#reconstructed-rows) row never replaces a finished job that a run recorded |
+| `runs` | `id` | A run id is written by one run only: this run's row wins. Inserted only when its job is in `--into`. A [reconstructed](#reconstructed-rows) row never replaces a recorded one, and an open run never replaces one that has ended in `--into` ([Finished stays finished](#finished-stays-finished)) |
+| `publications` | `run_id` | As `runs`; inserted only when its run is in `--into`. A [reconstructed](#reconstructed-rows) row never replaces a recorded one, and an unfinished row never replaces one that is `published` or `skipped` in `--into` |
+| `failure_comments` | `run_id` | This run's row wins; inserted only when its run is in `--into`. An unfinished row never replaces one that is `posted` or `skipped` in `--into` |
+| `revisions` | `run_id` | As `failure_comments`, for `published` and `skipped` |
+| `pr_reviews` | `run_id` | As `revisions` |
 | `revision_prs` | `repo_id, pr_number` | A merged row beats an unmerged one, and a closed row an open one. Between two open rows the later `updated_at` wins, as a whole row. (A [reconstructed](#reconstructed-rows) row carries the epoch as its `updated_at`, so every recorded row is later) |
 | `review_requests` | `repo_id, review_id` | The decision recorded first stands: `--into`'s row is kept |
 | `pruned_events` | `repo_id, workflow_id, event_id` | Tombstones are only ever added; an existing one is kept as it is |
@@ -209,6 +209,34 @@ run left them, from an earlier merge of the same database (a checkpoint): they a
 and are settled like the rest.
 
 None of this happens with `--live`: that run has not ended.
+
+`updraft run-event` applies the same settlement to one job in one case: the job of its own
+event, when the run that had it checkpointed and then vanished
+([run-event.md](run-event.md#an-abandoned-run)).
+
+### Finished stays finished
+
+A run's rows only ever move towards an end: a run ends, a publication is published. So when
+this run's version of a row is unfinished and `--into` has the same row finished, this run's
+version is older knowledge, and `--into`'s row is kept:
+
+- a run that has ended in `--into` is not replaced by an open one;
+- a publication, revision push, review posting or failure comment that is `published`,
+  `skipped` or `posted` in `--into` is not replaced by one that is still under way or
+  failed;
+- a finished job is not replaced by an unfinished one (the `jobs` rule).
+
+A row that is kept this way was not written by this merge, so it is not settled as
+unfinished work either. Two things could otherwise turn finished work back, and then close
+it as abandoned (a publication `failed`, its pull request number gone):
+
+- a checkpoint (`--live`) that arrives after the run's final merge;
+- a database merged **without the snapshot it started from**, in which rows of other runs
+  that it merely started with look like rows this run wrote.
+
+The rule covers what is finished in `--into`. It cannot help another run's work that is
+still unfinished there: without the snapshot, the merge takes those rows for this run's and
+closes them. That is why the snapshot is not optional ([Recovery](#recovery)).
 
 A job that is `queued` at the end of a run (for example behind a usage-limit cooldown) is merged
 as it is. That is the point: the next delivery of the event finds it and continues.
@@ -334,9 +362,19 @@ the run recorded after its last checkpoint.
 2. **Merge it later**, from anywhere: download the latest shared copy, `updraft state merge
    --changed <the kept file> --base <the kept snapshot> --into <latest>` (no `--live`: the run
    is over, and what it left unfinished is settled), upload with the conditional write, repeat
-   on a lost race. This is exactly the merge the run's machine would have made. Without the
-   kept snapshot, omit `--base` only if the run started from nothing; otherwise rows the run
-   never touched would be merged as if it had written them.
+   on a lost race. This is exactly the merge the run's machine would have made.
+
+   **Never merge a kept database without its snapshot unless the run started from nothing.**
+   Without `--base` every row of the file is taken for that run's: another run's job that was
+   in the snapshot, and is still `running` in the shared copy, is closed as `interrupted`;
+   its open run is closed; its hold is released. ([Finished stays finished](#finished-stays-finished)
+   protects what those runs have completed since, not what they are still doing.) A caller
+   that keeps such files should therefore keep the two together with a record of which
+   belongs to which and of whether there was a snapshot at all, store the snapshot before
+   the database, and refuse to merge when the snapshot is missing or is not the file that
+   was kept. The AWS deployment's `deploy.sh state recover` does exactly that, with a
+   manifest ([its README](../deploy/aws-microvm/README.md#when-state-is-not-saved)). When
+   the snapshot is lost, step 3 is the way.
 3. **Or deliver the event again.** For a run that opened a pull request, `updraft run-event`
    restores the publication from GitHub ([Reconstructed rows](#reconstructed-rows)), which is
    enough for reviews to be acted on. Step 2 can still follow, in either order.

@@ -124,6 +124,24 @@ const reviewCheckpointConflict: Resolve = (c) => {
 
 const RUN_FACT = 'keyed by the run id, which only one run ever writes: this run\'s row wins';
 const REBUILT_LOSES = '. A reconstructed row never replaces a recorded one';
+const FINISHED_STAYS = '. A row that is finished in the shared copy is never replaced by an unfinished one';
+
+/** States in which a step towards GitHub (publication, revision push, review posting, failure comment) is over for good. */
+const STEP_DONE = new Set(['published', 'skipped', 'posted']);
+
+/**
+ * What is finished in the shared copy stays finished. A run's rows only ever move towards an end,
+ * so an unfinished version that meets a finished one is older knowledge, whoever carries it: a
+ * checkpoint that arrives after the final merge, or a database merged without the snapshot it
+ * started from, in which another run's rows look like this run's. Without this, such a row would
+ * replace the finished one and then be settled as work the run abandoned.
+ */
+const finishedStays =
+  (done: (r: Row) => boolean, inner: Resolve): Resolve =>
+  (c) =>
+    done(c.theirs) && !done(c.mine) ? null : inner(c);
+const stepDone = (r: Row) => STEP_DONE.has(text(r.state));
+const runEnded = (r: Row) => r.ended_at !== null && r.ended_at !== undefined;
 /** This run's row wins, unless it is a reconstructed row and the shared copy has the recorded one. */
 const recordedOverRebuilt =
   (rebuilt: (r: Row) => boolean): Resolve =>
@@ -144,11 +162,21 @@ export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
       'escalation_hops take the larger value. A job the shared copy pruned is not brought back. A job whose dedupe key (repository, workflow, ' +
       'event) the shared copy already has under another id is folded into that job. A reconstructed row never replaces a finished job a run recorded',
   },
-  runs: { kind: 'keyed', conflict: recordedOverRebuilt((r) => r.worker_id === RECONSTRUCTED_WORKER), parent: { column: 'job_id', table: 'jobs' }, rule: RUN_FACT + REBUILT_LOSES },
-  publications: { kind: 'keyed', conflict: recordedOverRebuilt((r) => isReconstructedText(r.error)), parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT + REBUILT_LOSES },
-  failure_comments: { kind: 'keyed', conflict: mine, parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT },
-  revisions: { kind: 'keyed', conflict: mine, parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT },
-  pr_reviews: { kind: 'keyed', conflict: mine, parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT },
+  runs: {
+    kind: 'keyed',
+    conflict: finishedStays(runEnded, recordedOverRebuilt((r) => r.worker_id === RECONSTRUCTED_WORKER)),
+    parent: { column: 'job_id', table: 'jobs' },
+    rule: RUN_FACT + REBUILT_LOSES + '. A run that has ended in the shared copy is never replaced by an open one',
+  },
+  publications: {
+    kind: 'keyed',
+    conflict: finishedStays(stepDone, recordedOverRebuilt((r) => isReconstructedText(r.error))),
+    parent: { column: 'run_id', table: 'runs' },
+    rule: RUN_FACT + REBUILT_LOSES + FINISHED_STAYS,
+  },
+  failure_comments: { kind: 'keyed', conflict: finishedStays(stepDone, mine), parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT + FINISHED_STAYS },
+  revisions: { kind: 'keyed', conflict: finishedStays(stepDone, mine), parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT + FINISHED_STAYS },
+  pr_reviews: { kind: 'keyed', conflict: finishedStays(stepDone, mine), parent: { column: 'run_id', table: 'runs' }, rule: RUN_FACT + FINISHED_STAYS },
   revision_prs: {
     kind: 'keyed',
     conflict: pullRequestConflict,
