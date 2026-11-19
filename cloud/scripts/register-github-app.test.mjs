@@ -8,6 +8,7 @@ test('the manifest points GitHub at this deployment', () => {
   assert.deepEqual(m.callback_urls, ['https://updraft.example/github/callback']);
   assert.equal(m.redirect_url, 'http://127.0.0.1:3999/done');
   assert.equal(m.request_oauth_on_install, true);
+  assert.ok(!('setup_url' in m), 'GitHub ignores the setup URL with request_oauth_on_install');
   assert.equal(m.default_permissions.members, 'read');
   assert.equal(m.default_permissions.contents, 'write');
   assert.ok(!('administration' in m.default_permissions));

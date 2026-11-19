@@ -61,8 +61,15 @@ export interface CallbackInput {
   setupAction?: string;
 }
 
+export interface ConnectableInstallation {
+  installationId: number;
+  accountLogin: string;
+  accountType: string;
+  connected: boolean;
+}
+
 export type CallbackResult =
-  | { kind: 'linked'; githubLogin: string }
+  | { kind: 'linked'; githubLogin: string; installations: ConnectableInstallation[] }
   | { kind: 'installed'; githubLogin: string; installationId: number; accountLogin: string }
   | { kind: 'requested'; githubLogin: string };
 
@@ -106,6 +113,8 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     startInstall: () => request<{ url: string }>('/github/install', { method: 'POST' }),
     completeCallback: (input: CallbackInput) =>
       request<CallbackResult>('/github/callback', { method: 'POST', body: JSON.stringify(input) }),
+    connect: (installationId: number) =>
+      request<{ installationId: number; accountLogin: string }>(`/github/connect/${installationId}`, { method: 'POST' }),
     repositories: (installationId: number) =>
       request<{ tenant: TenantSummary; repositories: Repository[] }>(`/installations/${installationId}/repositories`),
   };

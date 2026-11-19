@@ -1,3 +1,5 @@
+import type { GitHubApi } from '../github/client.js';
+import { appJwt } from '../github/jwt.js';
 import { verifySignature } from '../github/signature.js';
 import type { LoadSettings } from '../github/settings.js';
 import type { Store } from '../store/store.js';
@@ -8,13 +10,18 @@ import type { Store } from '../store/store.js';
  * #67 handles the installation lifecycle only; issue and pull request events, which start jobs,
  * arrive with the multi-tenant launcher (#68) and are acknowledged without action until then.
  *
- *   installation.deleted     tenant disabled (uninstalled); its data is deleted after 30 days
- *   installation.suspend     tenant disabled (suspended)
- *   installation.unsuspend   tenant active again
+ *   installation.deleted     tenant uninstalled, finally: everything in its partition gets the
+ *                            table TTL for 30 days on, and reads stop at once when they pass. A
+ *                            repeated delete keeps the first deadline.
+ *   installation.suspend /   GitHub can deliver events out of order, so these do not trust their
+ *   installation.unsuspend   own order: the handler asks GitHub for the installation's state now
+ *                            (gone, suspended or active) and records that. If GitHub cannot be
+ *                            asked, the event's action is used. Neither ever overrides an
+ *                            uninstall (a conditional write).
  *   installation_repositories  nothing stored yet: repositories are read live from GitHub
  *
- * An installation that was never onboarded through /github/callback has no tenant, so its events
- * change nothing: installing the App on GitHub alone never creates a tenant.
+ * An installation that was never onboarded has no tenant, so its events change nothing: installing
+ * the App on GitHub alone never creates a tenant.
  */
 
 export const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -30,8 +37,15 @@ export interface WebhookResponse {
   body: { ok: boolean; disposition: string };
 }
 
-export function createWebhookHandler({ store, loadSettings, now = () => Date.now(), log = (m: string) => console.log(m) }: {
+export function createWebhookHandler({
+  store,
+  github,
+  loadSettings,
+  now = () => Date.now(),
+  log = (m: string) => console.log(m),
+}: {
   store: Store;
+  github: Pick<GitHubApi, 'getInstallation'>;
   loadSettings: LoadSettings;
   now?: () => number;
   log?: (message: string) => void;
@@ -64,27 +78,30 @@ export function createWebhookHandler({ store, loadSettings, now = () => Date.now
     };
 
     if (event === 'ping') return done('pong');
-    if (event !== 'installation' || !Number.isSafeInteger(installationId)) return done('ignored');
+    if (event !== 'installation' || !Number.isSafeInteger(installationId) || installationId <= 0) return done('ignored');
 
-    if (action === 'deleted') {
-      const changed = await store.updateTenantStatus(installationId, {
-        status: 'disabled',
-        disabledReason: 'uninstalled',
-        deleteAfter: now() + RETENTION_MS,
-      });
-      return done(changed ? 'tenant_uninstalled' : 'no_tenant');
+    const uninstall = async () => {
+      const result = await store.markUninstalled(installationId, now() + RETENTION_MS);
+      return done(result === 'marked' ? 'tenant_uninstalled' : result === 'already' ? 'already_uninstalled' : 'no_tenant');
+    };
+
+    if (action === 'deleted') return uninstall();
+    if (action !== 'suspend' && action !== 'unsuspend') return done('ignored');
+
+    // Only tenants matter; skip the GitHub call for installations that were never onboarded.
+    if (!(await store.getTenant(installationId))) return done('no_tenant');
+
+    let suspended = action === 'suspend';
+    try {
+      const current = await github.getInstallation(appJwt(settings.appId, settings.privateKey, now()), installationId);
+      if (!current) return uninstall();
+      suspended = current.suspendedAt !== null;
+    } catch (err) {
+      log(JSON.stringify({ delivery, event, action, installationId, warning: `could not read the installation: ${String(err)}` }));
     }
-    if (action === 'suspend') {
-      const changed = await store.updateTenantStatus(installationId, { status: 'disabled', disabledReason: 'suspended' });
-      return done(changed ? 'tenant_suspended' : 'no_tenant');
-    }
-    if (action === 'unsuspend') {
-      const tenant = await store.getTenant(installationId);
-      if (!tenant) return done('no_tenant');
-      if (tenant.disabledReason === 'uninstalled') return done('ignored');
-      await store.updateTenantStatus(installationId, { status: 'active' });
-      return done('tenant_active');
-    }
-    return done('ignored');
+    const result = await store.setSuspended(installationId, suspended);
+    if (result === 'uninstalled') return done('already_uninstalled');
+    if (result === 'no_tenant') return done('no_tenant');
+    return done(suspended ? 'tenant_suspended' : 'tenant_active');
   };
 }

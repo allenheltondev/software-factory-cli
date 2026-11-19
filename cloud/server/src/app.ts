@@ -13,6 +13,7 @@ import { FlowError, type GitHubFlows } from './flows/github.js';
  *   DELETE /api/v1/github/link                       unlink the GitHub identity
  *   POST   /api/v1/github/install                    start installing the App: { url }
  *   POST   /api/v1/github/callback                   finish either: { code, state, installationId?, setupAction? }
+ *   POST   /api/v1/github/connect/:id                connect an installation the last link offered
  *   GET    /api/v1/installations/:id/repositories    a tenant's repositories (members only)
  *
  * Everything under /api/v1 needs a caller. How one is found depends on where the app runs
@@ -69,6 +70,11 @@ export function createApp({ resolveCaller, github, logError = (err) => console.e
         ...(str(body.setupAction) ? { setupAction: str(body.setupAction) } : {}),
       };
       return c.json(await github.completeCallback(c.get('caller'), input));
+    });
+    app.post('/v1/github/connect/:id', async (c) => {
+      const id = Number(c.req.param('id'));
+      if (!Number.isSafeInteger(id) || id <= 0) return c.json({ error: 'not_found' }, 404);
+      return c.json(await github.connect(c.get('caller'), id));
     });
     app.get('/v1/installations/:id/repositories', async (c) => {
       const id = Number(c.req.param('id'));

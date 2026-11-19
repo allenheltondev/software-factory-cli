@@ -8,12 +8,13 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import type { GitHubLink, Member, OAuthState, Store, Tenant } from './store.js';
+import type { GitHubLink, InstallationOffer, Member, OAuthState, Store, Tenant } from './store.js';
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
   const T = tableName;
   const userKey = (sub: string) => ({ pk: `USER#${sub}`, sk: 'PROFILE' });
+  const offerKey = (sub: string) => ({ pk: `USER#${sub}`, sk: 'OFFER' });
   const ghKey = (id: number) => ({ pk: `GHUSER#${id}`, sk: 'LINK' });
   const tenantKey = (id: number) => ({ pk: `TENANT#${id}`, sk: 'META' });
   const memberKey = (id: number, sub: string) => ({ pk: `TENANT#${id}`, sk: `MEMBER#${sub}` });
@@ -36,6 +37,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     installationId: Number(item.installationId),
     sub: String(item.sub),
     role: item.role === 'owner' ? 'owner' : 'editor',
+    // A membership from before identities were recorded matches no identity, so it grants nothing.
+    githubUserId: typeof item.githubUserId === 'number' ? item.githubUserId : -1,
     githubLogin: String(item.githubLogin),
     addedAt: String(item.addedAt),
   });
@@ -134,6 +137,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                 UpdateExpression: 'REMOVE githubUserId, githubLogin, linkedAt',
               },
             },
+            { Delete: { TableName: T, Key: offerKey(sub) } },
           ],
         }),
       );
@@ -170,34 +174,99 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       );
     },
 
-    async updateTenantStatus(id, update) {
-      const names: Record<string, string> = { '#status': 'status' };
-      const values: Record<string, unknown> = { ':status': update.status };
-      const set = ['#status = :status'];
-      const remove: string[] = [];
-      if (update.disabledReason) {
-        set.push('disabledReason = :reason');
-        values[':reason'] = update.disabledReason;
-      } else remove.push('disabledReason');
-      if (update.deleteAfter) {
-        set.push('deleteAfter = :deleteAfter');
-        values[':deleteAfter'] = update.deleteAfter;
-      } else remove.push('deleteAfter');
+    async putOffer(offer: InstallationOffer) {
+      await client.send(
+        new PutCommand({ TableName: T, Item: { ...offerKey(offer.sub), ...offer, ttl: Math.ceil(offer.expiresAt / 1000) } }),
+      );
+    },
+
+    async getOffer(sub) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: offerKey(sub) }));
+      const i = out.Item;
+      if (!i || !Array.isArray(i.installations)) return null;
+      return {
+        sub,
+        githubUserId: Number(i.githubUserId),
+        githubLogin: String(i.githubLogin),
+        installations: (i.installations as Record<string, unknown>[]).map((o) => ({
+          installationId: Number(o.installationId),
+          accountId: Number(o.accountId),
+          accountLogin: String(o.accountLogin),
+          accountType: String(o.accountType),
+          suspended: o.suspended === true,
+        })),
+        expiresAt: Number(i.expiresAt),
+      };
+    },
+
+    async markUninstalled(id, deleteAfter) {
+      const ttl = Math.ceil(deleteAfter / 1000);
+      try {
+        // Final, and only once: a repeated delete keeps the original deadline.
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: tenantKey(id),
+            UpdateExpression: 'SET #status = :disabled, disabledReason = :uninstalled, deleteAfter = :deleteAfter, #ttl = :ttl',
+            ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+            ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
+            ExpressionAttributeValues: { ':disabled': 'disabled', ':uninstalled': 'uninstalled', ':deleteAfter': deleteAfter, ':ttl': ttl },
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return (await this.getTenant(id)) ? 'already' : 'no_tenant';
+      }
+      // Everything else in the partition (members now; config and jobs later) expires with it.
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk',
+            ExpressionAttributeValues: { ':pk': `TENANT#${id}` },
+            ProjectionExpression: 'pk, sk',
+            ExclusiveStartKey,
+          }),
+        );
+        for (const item of page.Items ?? []) {
+          if (item.sk === 'META') continue;
+          await client.send(
+            new UpdateCommand({
+              TableName: T,
+              Key: { pk: item.pk, sk: item.sk },
+              UpdateExpression: 'SET #ttl = :ttl',
+              ExpressionAttributeNames: { '#ttl': 'ttl' },
+              ExpressionAttributeValues: { ':ttl': ttl },
+            }),
+          );
+        }
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return 'marked';
+    },
+
+    async setSuspended(id, suspended) {
       try {
         await client.send(
           new UpdateCommand({
             TableName: T,
             Key: tenantKey(id),
-            UpdateExpression: `SET ${set.join(', ')}${remove.length ? ` REMOVE ${remove.join(', ')}` : ''}`,
-            ConditionExpression: 'attribute_exists(pk)',
-            ExpressionAttributeNames: names,
-            ExpressionAttributeValues: values,
+            UpdateExpression: suspended ? 'SET #status = :status, disabledReason = :suspended' : 'SET #status = :status REMOVE disabledReason',
+            // Never over an uninstall, whatever order GitHub delivers events in.
+            ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+              ':status': suspended ? 'disabled' : 'active',
+              ':uninstalled': 'uninstalled',
+              ...(suspended ? { ':suspended': 'suspended' } : {}),
+            },
           }),
         );
-        return true;
+        return 'updated';
       } catch (err) {
-        if (err instanceof ConditionalCheckFailedException) return false;
-        throw err;
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return (await this.getTenant(id)) ? 'uninstalled' : 'no_tenant';
       }
     },
 

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router';
-import { Alert, Card, CardBody, CardHeader, CardTitle, Loading } from '@readysetcloud/ui';
-import { api as defaultApi, type ApiClient, type CallbackInput, type CallbackResult } from '../api/client';
+import { Alert, Button, Card, CardBody, CardHeader, CardTitle, Loading } from '@readysetcloud/ui';
+import { api as defaultApi, type ApiClient, type CallbackInput, type CallbackResult, type ConnectableInstallation } from '../api/client';
 
 /** What GitHub put in the callback's query string. */
 export function callbackInput(search: string): CallbackInput {
@@ -20,13 +20,66 @@ export function callbackInput(search: string): CallbackInput {
 
 type View = { state: 'working' } | { state: 'done'; result: CallbackResult } | { state: 'error'; message: string };
 
+type Row = { state: 'idle' | 'busy' | 'connected' } | { state: 'error'; message: string };
+
+/**
+ * The installations of the App this GitHub account has authority over, as of the link just made.
+ * Connecting one makes it a tenant with you as owner; the offer lasts ten minutes.
+ */
+function ConnectList({ api, installations }: { api: Pick<ApiClient, 'connect'>; installations: ConnectableInstallation[] }) {
+  const [rows, setRows] = useState<Record<number, Row>>(() =>
+    Object.fromEntries(installations.map((i) => [i.installationId, { state: i.connected ? 'connected' : 'idle' } as Row])),
+  );
+  const set = (id: number, row: Row) => setRows((r) => ({ ...r, [id]: row }));
+
+  async function connect(id: number) {
+    set(id, { state: 'busy' });
+    try {
+      await api.connect(id);
+      set(id, { state: 'connected' });
+    } catch (err) {
+      set(id, { state: 'error', message: err instanceof Error ? err.message : 'Could not connect it.' });
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2" data-testid="connect-list">
+      <p className="text-sm text-muted-foreground">The Updraft App is already installed on these accounts you own. Connect the ones Updraft should manage:</p>
+      <ul className="flex flex-col divide-y divide-border">
+        {installations.map((i) => {
+          const row = rows[i.installationId] ?? { state: 'idle' };
+          return (
+            <li key={i.installationId} className="flex flex-col gap-1 py-2">
+              <div className="flex items-center justify-between gap-3">
+                <span>
+                  {i.accountLogin} <span className="text-sm text-muted-foreground">· {i.accountType === 'Organization' ? 'Organization' : 'Personal account'}</span>
+                </span>
+                {row.state === 'connected' ? (
+                  <Link className="auth-link" to={`/installations/${i.installationId}`}>
+                    Connected
+                  </Link>
+                ) : (
+                  <Button size="sm" loading={row.state === 'busy'} onClick={() => void connect(i.installationId)}>
+                    Connect
+                  </Button>
+                )}
+              </div>
+              {row.state === 'error' && <Alert variant="error">{row.message}</Alert>}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 /**
  * GitHub sends the browser here after linking (code, state) or installing the App (code, state,
  * installation_id, setup_action). The page forwards that to the API exactly once: the state is
  * single use, so a second post (React's dev double effect, a reload) would fail. The query string
  * is dropped from the address bar and history straight away, so the code does not linger there.
  */
-export function GitHubCallbackPage({ api = defaultApi }: { api?: Pick<ApiClient, 'completeCallback'> }) {
+export function GitHubCallbackPage({ api = defaultApi }: { api?: Pick<ApiClient, 'completeCallback' | 'connect'> }) {
   const location = useLocation();
   const navigate = useNavigate();
   const [input] = useState(() => callbackInput(location.search));
@@ -61,9 +114,13 @@ export function GitHubCallbackPage({ api = defaultApi }: { api?: Pick<ApiClient,
           </Alert>
         )}
         {view.state === 'done' && view.result.kind === 'linked' && (
-          <Alert variant="success" data-testid="callback-linked">
-            Linked to GitHub as @{view.result.githubLogin}. Next, install the Updraft App.
-          </Alert>
+          <>
+            <Alert variant="success" data-testid="callback-linked">
+              Linked to GitHub as @{view.result.githubLogin}.
+              {view.result.installations.length === 0 ? ' Next, install the Updraft App.' : ''}
+            </Alert>
+            {view.result.installations.length > 0 && <ConnectList api={api} installations={view.result.installations} />}
+          </>
         )}
         {view.state === 'done' && view.result.kind === 'installed' && (
           <Alert variant="success" data-testid="callback-installed">

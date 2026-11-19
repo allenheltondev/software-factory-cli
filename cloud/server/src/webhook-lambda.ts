@@ -1,5 +1,6 @@
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { createWebhookHandler } from './flows/webhook.js';
+import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
 import { createDynamoStore } from './store/dynamo.js';
 
@@ -10,6 +11,7 @@ import { createDynamoStore } from './store/dynamo.js';
 
 const handleWebhook = createWebhookHandler({
   store: createDynamoStore(process.env.TABLE_NAME ?? ''),
+  github: createGitHubApi(),
   loadSettings: createSettingsLoader(),
 });
 

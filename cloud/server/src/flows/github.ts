@@ -3,7 +3,7 @@ import type { Caller } from '../caller.js';
 import { GitHubError, type GitHubApi, type GitHubInstallation, type GitHubRepository, type GitHubUser } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { AppSettings, LoadSettings } from '../github/settings.js';
-import type { Member, OAuthKind, Store, Tenant } from '../store/store.js';
+import type { GitHubLink, Member, OAuthKind, OfferedInstallation, Store, Tenant } from '../store/store.js';
 
 /**
  * Linking a GitHub identity to a Ready, Set, Cloud user, and onboarding installations of the
@@ -12,12 +12,25 @@ import type { Member, OAuthKind, Store, Tenant } from '../store/store.js';
  * Both flows leave through GitHub and come back to the SPA's /github/callback, which posts what
  * GitHub returned to `completeCallback`. A `state` the server issued, single use, bound to the
  * caller's `sub` and valid for ten minutes, is the only thing that ties a callback to a session;
- * a callback without one is never acted on. An installation id in the query is never trusted: it
- * must be among the installations the GitHub user can access, the App must see it, and the user
- * must have authority over its account (the account itself, or an admin of the org).
+ * a callback without one is never acted on. An installation id is never trusted: it must be among
+ * the installations the GitHub user can access, the App must see it, and the user must have
+ * authority over its account (the account itself, or an active admin of the org).
+ *
+ * - Installing: GitHub's install page, with "request user authorization during installation", so
+ *   the callback carries a fresh code and the new installation's id.
+ * - Linking (a fresh PKCE authorization) also finds the installations the user already has
+ *   authority over and offers them; `connect` onboards one the user picks within ten minutes.
+ *   That is how an installation made outside Updraft, or one whose install callback expired, is
+ *   connected.
+ * - A membership records the GitHub identity whose authority earned it, and counts only while the
+ *   caller is still linked to that identity: unlinking, or relinking another account, ends access.
+ * - An uninstalled tenant is gone once its deadline passes, before DynamoDB's TTL deletes it.
  */
 
 export const STATE_TTL_MS = 10 * 60 * 1000;
+export const OFFER_TTL_MS = 10 * 60 * 1000;
+/** At most this many existing installations are checked and offered per link. */
+export const MAX_OFFERED = 50;
 
 export type FlowErrorCode =
   | 'github_app_not_configured'
@@ -28,6 +41,7 @@ export type FlowErrorCode =
   | 'github_account_mismatch'
   | 'not_linked'
   | 'installation_not_found'
+  | 'offer_expired'
   | 'not_authorized'
   | 'tenant_disabled';
 
@@ -49,8 +63,16 @@ export interface CallbackInput {
   setupAction?: string;
 }
 
+/** An existing installation the user may connect (or already has). */
+export interface ConnectableInstallation {
+  installationId: number;
+  accountLogin: string;
+  accountType: string;
+  connected: boolean;
+}
+
 export type CallbackResult =
-  | { kind: 'linked'; githubLogin: string }
+  | { kind: 'linked'; githubLogin: string; installations: ConnectableInstallation[] }
   | { kind: 'installed'; githubLogin: string; installationId: number; accountLogin: string }
   /** An org member asked an owner to install the App; nothing to onboard until they approve. */
   | { kind: 'requested'; githubLogin: string };
@@ -89,6 +111,16 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
   }
 
   const callbackUrl = (s: AppSettings) => `${s.appUrl}/github/callback`;
+  const gone = (t: Tenant) => t.deleteAfter !== undefined && t.deleteAfter <= now();
+
+  const summarize = (t: Tenant, m: Member): TenantSummary => ({
+    installationId: t.installationId,
+    accountLogin: t.accountLogin,
+    accountType: t.accountType,
+    status: t.status,
+    ...(t.disabledReason ? { disabledReason: t.disabledReason } : {}),
+    role: m.role,
+  });
 
   async function newState(caller: Caller, kind: OAuthKind, codeVerifier?: string): Promise<string> {
     const state = randomToken();
@@ -141,6 +173,36 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
     return false;
   }
 
+  /** Writes the tenant (if new) and the caller as owner, bound to the GitHub identity that proved authority. */
+  async function addOwner(caller: Caller, user: GitHubUser, installation: OfferedInstallation): Promise<void> {
+    const existing = await store.getTenant(installation.installationId);
+    if (existing?.disabledReason === 'uninstalled') {
+      throw new FlowError('tenant_disabled', 409, 'This installation was removed from GitHub; install the App again');
+    }
+    const at = new Date(now()).toISOString();
+    await store.putTenantWithMember(
+      {
+        installationId: installation.installationId,
+        accountId: installation.accountId,
+        accountLogin: installation.accountLogin,
+        accountType: installation.accountType,
+        status: installation.suspended ? 'disabled' : 'active',
+        ...(installation.suspended ? { disabledReason: 'suspended' as const } : {}),
+        createdAt: at,
+        createdBy: caller.sub,
+      },
+      { installationId: installation.installationId, sub: caller.sub, role: 'owner', githubUserId: user.id, githubLogin: user.login, addedAt: at },
+    );
+  }
+
+  const offered = (i: GitHubInstallation): OfferedInstallation => ({
+    installationId: i.id,
+    accountId: i.account.id,
+    accountLogin: i.account.login,
+    accountType: i.account.type,
+    suspended: i.suspendedAt !== null,
+  });
+
   async function onboard(caller: Caller, s: AppSettings, token: string, user: GitHubUser, installationId: number) {
     // 1. The user can access it (so it is theirs to name), 2. the App sees it (so it is ours).
     const accessible = await github.listUserInstallationIds(token);
@@ -159,32 +221,50 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
           : `Only @${installation.account.login} can connect this installation`,
       );
     }
-    const existing = await store.getTenant(installationId);
-    if (existing?.status === 'disabled' && existing.disabledReason === 'uninstalled') {
-      throw new FlowError('tenant_disabled', 409, 'This installation was removed from GitHub; install the App again');
-    }
-    const at = new Date(now()).toISOString();
-    await store.putTenantWithMember(
-      {
-        installationId,
-        accountId: installation.account.id,
-        accountLogin: installation.account.login,
-        accountType: installation.account.type,
-        status: installation.suspendedAt ? 'disabled' : 'active',
-        ...(installation.suspendedAt ? { disabledReason: 'suspended' as const } : {}),
-        createdAt: at,
-        createdBy: caller.sub,
-      },
-      { installationId, sub: caller.sub, role: 'owner', githubLogin: user.login, addedAt: at },
-    );
+    await addOwner(caller, user, offered(installation));
     return installation;
   }
 
+  /** Installations this user has authority over right now, offered to connect for OFFER_TTL_MS. */
+  async function offerExisting(caller: Caller, s: AppSettings, token: string, user: GitHubUser): Promise<ConnectableInstallation[]> {
+    const jwt = appJwt(s.appId, s.privateKey, now());
+    const eligible: OfferedInstallation[] = [];
+    for (const id of (await github.listUserInstallationIds(token)).slice(0, MAX_OFFERED)) {
+      const installation = await github.getInstallation(jwt, id);
+      if (installation && (await hasAuthority(token, user, installation))) eligible.push(offered(installation));
+    }
+    await store.putOffer({ sub: caller.sub, githubUserId: user.id, githubLogin: user.login, installations: eligible, expiresAt: now() + OFFER_TTL_MS });
+    const out: ConnectableInstallation[] = [];
+    for (const i of eligible) {
+      const member = await store.getMember(i.installationId, caller.sub);
+      const tenant = member ? await store.getTenant(i.installationId) : null;
+      out.push({
+        installationId: i.installationId,
+        accountLogin: i.accountLogin,
+        accountType: i.accountType,
+        connected: Boolean(member && tenant && !gone(tenant) && member.githubUserId === user.id),
+      });
+    }
+    return out.sort((a, b) => a.accountLogin.localeCompare(b.accountLogin));
+  }
+
+  /** The caller's memberships that still count: same GitHub identity as now linked, tenant not gone. */
+  async function liveMemberships(caller: Caller, link: GitHubLink | null): Promise<{ tenant: Tenant; member: Member }[]> {
+    if (!link) return [];
+    const out: { tenant: Tenant; member: Member }[] = [];
+    for (const member of await store.listMemberships(caller.sub)) {
+      if (member.githubUserId !== link.githubUserId) continue;
+      const tenant = await store.getTenant(member.installationId);
+      if (tenant && !gone(tenant)) out.push({ tenant, member });
+    }
+    return out;
+  }
+
   async function memberOf(caller: Caller, installationId: number): Promise<{ tenant: Tenant; member: Member }> {
-    const member = await store.getMember(installationId, caller.sub);
-    const tenant = member ? await store.getTenant(installationId) : null;
-    // The same answer for "no such tenant" and "not yours", so ids cannot be probed.
-    if (!member || !tenant) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
+    const [link, member] = await Promise.all([store.getLink(caller.sub), store.getMember(installationId, caller.sub)]);
+    const tenant = member && link && member.githubUserId === link.githubUserId ? await store.getTenant(installationId) : null;
+    // The same answer for "no such tenant", "not yours" and "no longer yours", so ids cannot be probed.
+    if (!member || !tenant || gone(tenant)) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
     return { tenant, member };
   }
 
@@ -192,20 +272,8 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
 
   return {
     async status(caller: Caller): Promise<GitHubStatus> {
-      const [s, link, memberships] = await Promise.all([loadSettings(), store.getLink(caller.sub), store.listMemberships(caller.sub)]);
-      const tenants: TenantSummary[] = [];
-      for (const m of memberships) {
-        const t = await store.getTenant(m.installationId);
-        if (!t) continue;
-        tenants.push({
-          installationId: t.installationId,
-          accountLogin: t.accountLogin,
-          accountType: t.accountType,
-          status: t.status,
-          ...(t.disabledReason ? { disabledReason: t.disabledReason } : {}),
-          role: m.role,
-        });
-      }
+      const [s, link] = await Promise.all([loadSettings(), store.getLink(caller.sub)]);
+      const tenants = (await liveMemberships(caller, link)).map(({ tenant, member }) => summarize(tenant, member));
       return {
         configured: s !== null,
         ...(s ? { appSlug: s.slug } : {}),
@@ -249,9 +317,9 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
       if (!input.code) throw new FlowError('github_exchange_failed', 400, 'GitHub returned no authorization code; start again');
 
       if (issued.kind === 'link') {
-        const { user } = await identify(s, input.code, issued.codeVerifier, callbackUrl(s));
+        const { token, user } = await identify(s, input.code, issued.codeVerifier, callbackUrl(s));
         await ensureLinked(caller, user);
-        return { kind: 'linked', githubLogin: user.login };
+        return { kind: 'linked', githubLogin: user.login, installations: await offerExisting(caller, s, token, user) };
       }
 
       const { token, user } = await identify(s, input.code);
@@ -265,6 +333,22 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
       return { kind: 'installed', githubLogin: user.login, installationId, accountLogin: installation.account.login };
     },
 
+    /**
+     * Connects an installation from the caller's current offer: authority was checked with a fresh
+     * GitHub token when the offer was made, at most OFFER_TTL_MS ago, for the identity still linked.
+     */
+    async connect(caller: Caller, installationId: number): Promise<{ installationId: number; accountLogin: string }> {
+      await settings();
+      const [offer, link] = await Promise.all([store.getOffer(caller.sub), store.getLink(caller.sub)]);
+      if (!offer || offer.expiresAt < now() || !link || link.githubUserId !== offer.githubUserId) {
+        throw new FlowError('offer_expired', 409, 'Find your installations again: link GitHub from the dashboard');
+      }
+      const installation = offer.installations.find((i) => i.installationId === installationId);
+      if (!installation) throw new FlowError('not_authorized', 403, 'That installation was not offered to you');
+      await addOwner(caller, { id: offer.githubUserId, login: offer.githubLogin }, installation);
+      return { installationId, accountLogin: installation.accountLogin };
+    },
+
     async unlink(caller: Caller): Promise<void> {
       await store.unlink(caller.sub);
     },
@@ -272,14 +356,7 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
     async repositories(caller: Caller, installationId: number): Promise<{ tenant: TenantSummary; repositories: GitHubRepository[] }> {
       const s = await settings();
       const { tenant, member } = await memberOf(caller, installationId);
-      const summary: TenantSummary = {
-        installationId,
-        accountLogin: tenant.accountLogin,
-        accountType: tenant.accountType,
-        status: tenant.status,
-        ...(tenant.disabledReason ? { disabledReason: tenant.disabledReason } : {}),
-        role: member.role,
-      };
+      const summary = summarize(tenant, member);
       if (tenant.status !== 'active') return { tenant: summary, repositories: [] };
       let cached = installationTokens.get(installationId);
       if (!cached || cached.expiresAt - now() < 5 * 60 * 1000) {

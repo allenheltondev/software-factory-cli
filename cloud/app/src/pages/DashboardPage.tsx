@@ -127,6 +127,9 @@ export function DashboardPage({ api = defaultApi, go = leave }: { api?: Dashboar
                   <Button loading={busy === 'install'} disabled={busy !== null} onClick={() => void start('install')}>
                     Install the App on GitHub
                   </Button>
+                  <Button variant="secondary" loading={busy === 'link'} disabled={busy !== null} onClick={() => void start('link')}>
+                    Connect an existing installation
+                  </Button>
                   <Button variant="ghost" loading={busy === 'unlink'} disabled={busy !== null} onClick={() => void unlink()}>
                     Unlink @{load.github.linked.githubLogin}
                   </Button>

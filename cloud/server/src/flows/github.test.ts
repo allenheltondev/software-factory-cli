@@ -116,7 +116,7 @@ describe('GitHub flows', () => {
       expect(url.searchParams.get('code_challenge')).not.toBe(verifier);
 
       gh.code('c1', PAT_GH, verifier);
-      await expect(flows.completeCallback(PAT, { code: 'c1', state })).resolves.toEqual({ kind: 'linked', githubLogin: 'pat' });
+      await expect(flows.completeCallback(PAT, { code: 'c1', state })).resolves.toEqual({ kind: 'linked', githubLogin: 'pat', installations: [] });
       expect(await store.getLink(PAT.sub)).toMatchObject({ githubUserId: 101, githubLogin: 'pat' });
     });
 
@@ -320,8 +320,112 @@ describe('GitHub flows', () => {
 
     it('lists nothing for a disabled tenant', async () => {
       await onboarded();
-      await store.updateTenantStatus(55, { status: 'disabled', disabledReason: 'suspended' });
+      await store.setSuspended(55, true);
       expect((await flows.repositories(PAT, 55)).repositories).toEqual([]);
+    });
+
+    it('ends access when the GitHub identity that earned it is unlinked', async () => {
+      await onboarded();
+      await flows.unlink(PAT);
+      await expect(flows.repositories(PAT, 55)).rejects.toMatchObject({ code: 'not_authorized', status: 403 });
+      expect((await flows.status(PAT)).tenants).toEqual([]);
+    });
+
+    it('does not carry access over to a different GitHub identity linked later', async () => {
+      await onboarded();
+      await flows.unlink(PAT);
+      const l = await startedLink(PAT);
+      gh.code('relink', SAM_GH, l.verifier); // pat's RSC account now linked to @sam
+      await flows.completeCallback(PAT, { code: 'relink', state: l.state });
+      await expect(flows.repositories(PAT, 55)).rejects.toMatchObject({ code: 'not_authorized' });
+      expect((await flows.status(PAT)).tenants).toEqual([]);
+    });
+
+    it('restores access when the same identity is linked again', async () => {
+      await onboarded();
+      await flows.unlink(PAT);
+      const l = await startedLink(PAT);
+      gh.code('again', PAT_GH, l.verifier);
+      await flows.completeCallback(PAT, { code: 'again', state: l.state });
+      expect((await flows.repositories(PAT, 55)).repositories).toHaveLength(2);
+    });
+
+    it('an uninstalled tenant shows as uninstalled until its deadline, then is gone', async () => {
+      await onboarded();
+      await store.markUninstalled(55, clock + 1000);
+      expect((await flows.status(PAT)).tenants).toEqual([
+        expect.objectContaining({ installationId: 55, status: 'disabled', disabledReason: 'uninstalled' }),
+      ]);
+      expect((await flows.repositories(PAT, 55)).repositories).toEqual([]);
+
+      clock += 1001;
+      expect((await flows.status(PAT)).tenants).toEqual([]);
+      await expect(flows.repositories(PAT, 55)).rejects.toMatchObject({ code: 'not_authorized' });
+    });
+  });
+
+  describe('connecting an existing installation', () => {
+    const acme: GitHubInstallation = { id: 55, account: { id: 900, login: 'acme', type: 'Organization' }, suspendedAt: null };
+    const other: GitHubInstallation = { id: 66, account: { id: 901, login: 'other', type: 'Organization' }, suspendedAt: null };
+
+    /** pat links; GitHub lists acme (pat is an admin) and other (pat is only a member). */
+    async function linkedWithInstallations() {
+      const l = await startedLink(PAT);
+      const token = gh.code('c1', PAT_GH, l.verifier);
+      gh.userInstallations.set(token, [55, 66, 77]); // 77: not this App's
+      gh.installations.set(55, acme);
+      gh.installations.set(66, other);
+      gh.memberships.set(`${token}/acme`, { role: 'admin', state: 'active' });
+      gh.memberships.set(`${token}/other`, { role: 'member', state: 'active' });
+      return flows.completeCallback(PAT, { code: 'c1', state: l.state });
+    }
+
+    it('linking offers only the installations the user has authority over', async () => {
+      await expect(linkedWithInstallations()).resolves.toEqual({
+        kind: 'linked',
+        githubLogin: 'pat',
+        installations: [{ installationId: 55, accountLogin: 'acme', accountType: 'Organization', connected: false }],
+      });
+    });
+
+    it('connects an offered installation as owner, bound to the linked identity', async () => {
+      await linkedWithInstallations();
+      await expect(flows.connect(PAT, 55)).resolves.toEqual({ installationId: 55, accountLogin: 'acme' });
+      expect(await store.getMember(55, PAT.sub)).toMatchObject({ role: 'owner', githubUserId: PAT_GH.id });
+      expect((await flows.repositories(PAT, 55)).repositories).toHaveLength(2);
+    });
+
+    it('refuses an installation that was not offered', async () => {
+      await linkedWithInstallations();
+      await expect(flows.connect(PAT, 66)).rejects.toMatchObject({ code: 'not_authorized', status: 403 });
+      await expect(flows.connect(PAT, 77)).rejects.toMatchObject({ code: 'not_authorized' });
+      expect(await store.getTenant(66)).toBeNull();
+    });
+
+    it('refuses an expired offer, another user\'s offer, and an offer after unlinking', async () => {
+      await linkedWithInstallations();
+      await expect(flows.connect(SAM, 55)).rejects.toMatchObject({ code: 'offer_expired' });
+      clock += 10 * 60 * 1000 + 1;
+      await expect(flows.connect(PAT, 55)).rejects.toMatchObject({ code: 'offer_expired' });
+
+      clock -= 10 * 60 * 1000 + 1;
+      await flows.unlink(PAT);
+      await expect(flows.connect(PAT, 55)).rejects.toMatchObject({ code: 'offer_expired' });
+    });
+
+    it('marks installations already connected', async () => {
+      await linkedWithInstallations();
+      await flows.connect(PAT, 55);
+      const again = await linkedWithInstallations();
+      expect(again.kind === 'linked' && again.installations).toEqual([expect.objectContaining({ installationId: 55, connected: true })]);
+    });
+
+    it('refuses to connect an installation that was uninstalled', async () => {
+      await linkedWithInstallations();
+      await flows.connect(PAT, 55);
+      await store.markUninstalled(55, clock + 1000);
+      await linkedWithInstallations();
+      await expect(flows.connect(PAT, 55)).rejects.toMatchObject({ code: 'tenant_disabled' });
     });
   });
 

@@ -12,6 +12,7 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     unlink: vi.fn().mockResolvedValue({ ok: true }),
     startInstall: vi.fn().mockResolvedValue({ url: 'https://github.com/apps/updraft/installations/new?state=s' }),
     completeCallback: vi.fn(),
+    connect: vi.fn(),
     repositories: vi.fn(),
     ...overrides,
   } as ApiClient;

@@ -70,12 +70,12 @@ describe('DashboardPage', () => {
 });
 
 describe('GitHubCallbackPage', () => {
-  function renderAt(url: string, completeCallback = vi.fn()) {
+  function renderAt(url: string, completeCallback = vi.fn(), connect = vi.fn()) {
     render(
       <StrictMode>
         <MemoryRouter initialEntries={[url]}>
           <Routes>
-            <Route path="/github/callback" element={<GitHubCallbackPage api={{ completeCallback }} />} />
+            <Route path="/github/callback" element={<GitHubCallbackPage api={{ completeCallback, connect }} />} />
           </Routes>
           <Where />
         </MemoryRouter>
@@ -114,6 +114,38 @@ describe('GitHubCallbackPage', () => {
   it('shows the server\'s refusal', async () => {
     renderAt('/github/callback?code=c&state=s', vi.fn().mockRejectedValue(new ApiError(403, 'not_authorized', 'Only an owner of acme')));
     expect(await screen.findByTestId('callback-error')).toHaveTextContent('Only an owner of acme');
+  });
+
+  it('after linking, offers existing installations and connects the one picked', async () => {
+    const connect = vi.fn().mockResolvedValue({ installationId: 55, accountLogin: 'acme' });
+    renderAt(
+      '/github/callback?code=c&state=s',
+      vi.fn().mockResolvedValue({
+        kind: 'linked',
+        githubLogin: 'pat',
+        installations: [
+          { installationId: 55, accountLogin: 'acme', accountType: 'Organization', connected: false },
+          { installationId: 56, accountLogin: 'pat', accountType: 'User', connected: true },
+        ],
+      }),
+      connect,
+    );
+    const list = await screen.findByTestId('connect-list');
+    expect(list).toHaveTextContent('acme');
+    expect(screen.getByRole('link', { name: 'Connected' })).toHaveAttribute('href', '/installations/56');
+    await userEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    expect(connect).toHaveBeenCalledWith(55);
+    await waitFor(() => expect(screen.getAllByRole('link', { name: 'Connected' })).toHaveLength(2));
+  });
+
+  it('shows why a connect was refused', async () => {
+    renderAt(
+      '/github/callback?code=c&state=s',
+      vi.fn().mockResolvedValue({ kind: 'linked', githubLogin: 'pat', installations: [{ installationId: 55, accountLogin: 'acme', accountType: 'Organization', connected: false }] }),
+      vi.fn().mockRejectedValue(new ApiError(409, 'offer_expired', 'Find your installations again')),
+    );
+    await userEvent.click(await screen.findByRole('button', { name: 'Connect' }));
+    expect(await screen.findByText('Find your installations again')).toBeInTheDocument();
   });
 
   it('explains an install request that waits for an org owner', async () => {

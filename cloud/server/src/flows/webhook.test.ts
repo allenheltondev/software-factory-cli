@@ -1,10 +1,17 @@
+import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import type { GitHubInstallation } from '../github/client.js';
 import { signBody, verifySignature } from '../github/signature.js';
 import type { AppSettings } from '../github/settings.js';
 import { createMemoryStore, type Tenant } from '../store/store.js';
 import { createWebhookHandler, RETENTION_MS } from './webhook.js';
 
-const SETTINGS = { webhookSecret: 'hook-secret' } as AppSettings;
+const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const SETTINGS = {
+  appId: '1',
+  privateKey: privateKey.export({ type: 'pkcs1', format: 'pem' }).toString(),
+  webhookSecret: 'hook-secret',
+} as AppSettings;
 const NOW = Date.UTC(2026, 10, 19);
 const tenant: Tenant = {
   installationId: 55,
@@ -15,16 +22,43 @@ const tenant: Tenant = {
   createdAt: '2026-11-19T00:00:00.000Z',
   createdBy: 'sub-pat',
 };
+const installation = (suspendedAt: string | null): GitHubInstallation => ({
+  id: 55,
+  account: { id: 900, login: 'acme', type: 'Organization' },
+  suspendedAt,
+});
 
-async function setup() {
+/** `github` says what GitHub reports for installation 55 right now: an installation, gone (null), or an error. */
+async function setup(github: { current: GitHubInstallation | null | Error } = { current: installation(null) }) {
   const store = createMemoryStore();
-  await store.putTenantWithMember(tenant, { installationId: 55, sub: 'sub-pat', role: 'owner', githubLogin: 'pat', addedAt: tenant.createdAt });
-  const handle = createWebhookHandler({ store, loadSettings: async () => SETTINGS, now: () => NOW, log: () => {} });
+  await store.putTenantWithMember(tenant, {
+    installationId: 55,
+    sub: 'sub-pat',
+    role: 'owner',
+    githubUserId: 101,
+    githubLogin: 'pat',
+    addedAt: tenant.createdAt,
+  });
+  const clock = { now: NOW };
+  const handle = createWebhookHandler({
+    store,
+    github: {
+      async getInstallation(jwt) {
+        expect(jwt.split('.')).toHaveLength(3);
+        if (github.current instanceof Error) throw github.current;
+        return github.current;
+      },
+    },
+    loadSettings: async () => SETTINGS,
+    now: () => clock.now,
+    log: () => {},
+  });
   const deliver = (event: string, payload: unknown, secret = SETTINGS.webhookSecret) => {
     const body = JSON.stringify(payload);
     return handle({ body, headers: { 'X-GitHub-Event': event, 'X-GitHub-Delivery': 'd1', 'X-Hub-Signature-256': signBody(body, secret) } });
   };
-  return { store, handle, deliver };
+  const lifecycle = (action: string, id = 55) => deliver('installation', { action, installation: { id } });
+  return { store, handle, deliver, lifecycle, clock, github };
 }
 
 describe('verifySignature', () => {
@@ -48,40 +82,78 @@ describe('webhook', () => {
   });
 
   it('answers 503 until the App is registered', async () => {
-    const store = createMemoryStore();
-    const handle = createWebhookHandler({ store, loadSettings: async () => null, log: () => {} });
+    const handle = createWebhookHandler({ store: createMemoryStore(), github: { getInstallation: async () => null }, loadSettings: async () => null, log: () => {} });
     expect((await handle({ body: '{}', headers: {} })).status).toBe(503);
   });
 
-  it('disables an uninstalled tenant and schedules its deletion', async () => {
-    const { deliver, store } = await setup();
-    const res = await deliver('installation', { action: 'deleted', installation: { id: 55 } });
-    expect(res.body.disposition).toBe('tenant_uninstalled');
-    expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'uninstalled', deleteAfter: NOW + RETENTION_MS });
+  describe('uninstall', () => {
+    it('disables the tenant and gives it and its members the table TTL', async () => {
+      const { lifecycle, store } = await setup();
+      expect((await lifecycle('deleted')).body.disposition).toBe('tenant_uninstalled');
+      expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'uninstalled', deleteAfter: NOW + RETENTION_MS });
+      const ttl = Math.ceil((NOW + RETENTION_MS) / 1000);
+      expect(store.ttlOf(55)).toEqual({ tenant: ttl, members: [ttl] });
+    });
+
+    it('keeps the first deadline when the delete is delivered again', async () => {
+      const { lifecycle, store, clock } = await setup();
+      await lifecycle('deleted');
+      clock.now = NOW + 5 * 24 * 60 * 60 * 1000;
+      expect((await lifecycle('deleted')).body.disposition).toBe('already_uninstalled');
+      expect((await store.getTenant(55))?.deleteAfter).toBe(NOW + RETENTION_MS);
+    });
+
+    it('is final: a late suspend or unsuspend does not override it, whatever GitHub says', async () => {
+      const github = { current: installation(null) as GitHubInstallation | null | Error };
+      const { lifecycle, store } = await setup(github);
+      await lifecycle('deleted');
+      for (const [action, current] of [['suspend', installation('2026-11-18T00:00:00Z')], ['unsuspend', installation(null)]] as const) {
+        github.current = current;
+        expect((await lifecycle(action)).body.disposition).toBe('already_uninstalled');
+        expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'uninstalled', deleteAfter: NOW + RETENTION_MS });
+      }
+    });
+
+    it('a suspend whose installation is already gone on GitHub uninstalls it', async () => {
+      const { lifecycle, store } = await setup({ current: null });
+      expect((await lifecycle('suspend')).body.disposition).toBe('tenant_uninstalled');
+      expect((await store.getTenant(55))?.disabledReason).toBe('uninstalled');
+    });
   });
 
-  it('suspends and unsuspends', async () => {
-    const { deliver, store } = await setup();
-    await deliver('installation', { action: 'suspend', installation: { id: 55 } });
-    expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'suspended' });
-    await deliver('installation', { action: 'unsuspend', installation: { id: 55 } });
-    const t = await store.getTenant(55);
-    expect(t?.status).toBe('active');
-    expect(t?.disabledReason).toBeUndefined();
-  });
+  describe('suspend and unsuspend follow GitHub, not delivery order', () => {
+    it('records what GitHub reports now', async () => {
+      const github = { current: installation('2026-11-19T00:00:00Z') as GitHubInstallation | null | Error };
+      const { lifecycle, store } = await setup(github);
+      expect((await lifecycle('suspend')).body.disposition).toBe('tenant_suspended');
+      expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'suspended' });
 
-  it('does not revive an uninstalled tenant on unsuspend', async () => {
-    const { deliver, store } = await setup();
-    await deliver('installation', { action: 'deleted', installation: { id: 55 } });
-    await deliver('installation', { action: 'unsuspend', installation: { id: 55 } });
-    expect((await store.getTenant(55))?.status).toBe('disabled');
+      github.current = installation(null);
+      expect((await lifecycle('unsuspend')).body.disposition).toBe('tenant_active');
+      const t = await store.getTenant(55);
+      expect(t?.status).toBe('active');
+      expect(t?.disabledReason).toBeUndefined();
+    });
+
+    it('a stale suspend delivered after the unsuspend leaves the tenant active', async () => {
+      const { lifecycle, store } = await setup({ current: installation(null) });
+      await lifecycle('unsuspend');
+      expect((await lifecycle('suspend')).body.disposition).toBe('tenant_active');
+      expect((await store.getTenant(55))?.status).toBe('active');
+    });
+
+    it('falls back to the event when GitHub cannot be asked', async () => {
+      const { lifecycle, store } = await setup({ current: new Error('GitHub is down') });
+      expect((await lifecycle('suspend')).body.disposition).toBe('tenant_suspended');
+      expect((await store.getTenant(55))?.status).toBe('disabled');
+    });
   });
 
   it('creates nothing for an installation that was never onboarded', async () => {
-    const { deliver, store } = await setup();
-    const res = await deliver('installation', { action: 'created', installation: { id: 66 } });
-    expect(res.body.disposition).toBe('ignored');
-    expect((await deliver('installation', { action: 'suspend', installation: { id: 66 } })).body.disposition).toBe('no_tenant');
+    const { lifecycle, store } = await setup();
+    expect((await lifecycle('created', 66)).body.disposition).toBe('ignored');
+    expect((await lifecycle('suspend', 66)).body.disposition).toBe('no_tenant');
+    expect((await lifecycle('deleted', 66)).body.disposition).toBe('no_tenant');
     expect(await store.getTenant(66)).toBeNull();
   });
 

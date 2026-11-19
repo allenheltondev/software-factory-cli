@@ -34,10 +34,10 @@ export function manifest({ appUrl, name, port }) {
     hook_attributes: { url: `${base}/api/webhooks/github`, active: true },
     redirect_url: `http://127.0.0.1:${port}/done`,
     callback_urls: [`${base}/github/callback`],
-    // With request_oauth_on_install GitHub sends installs to the callback URL (with a code), and
-    // uses the setup URL only for updates; both are the same SPA route.
-    setup_url: `${base}/github/callback`,
-    setup_on_update: true,
+    // GitHub sends a new installation to the callback URL with a fresh code. It disables the setup
+    // URL when request_oauth_on_install is on, so there is none: an installation that exists
+    // already (made on GitHub, or its callback expired) is connected by linking again, which
+    // offers every installation the user owns.
     request_oauth_on_install: true,
     public: true,
     default_permissions: {

@@ -44,12 +44,17 @@ browser ── https://updraft.readysetcloud.io ──> CloudFront (one distribu
   - pending GitHub sign-ins, single use with a 10-minute TTL;
   - linked GitHub identities, unique per GitHub user;
   - tenants, one per App installation;
-  - members of each tenant.
+  - members of each tenant, each recording the GitHub identity that earned the membership;
+  - a 10-minute offer of existing installations to connect.
+
+  When the App is uninstalled, every item in the tenant's partition gets the table's `ttl`, 30 days out. DynamoDB deletes them after that, and reads treat the tenant as gone as soon as the deadline passes.
 - **GitHub.** Linking and installing both leave for github.com and come back to the SPA's `/github/callback`, which posts what GitHub returned to `POST /api/v1/github/callback`.
   - **Callbacks:** a callback counts only with a `state` the server issued for this user, unused and under 10 minutes old.
   - **Installations:** an `installation_id` is never taken on trust. It must be listed by `GET /user/installations` for the GitHub user, the App must see it (`GET /app/installations/{id}`), and the user must own it: they *are* the account, or they're an active org **admin** (`GET /user/memberships/orgs/{org}`).
+  - **Existing installations:** linking also lists the installations you already own, such as one installed on GitHub directly or one whose install callback expired. You connect the ones you pick, within 10 minutes, through `POST /api/v1/github/connect/:id`.
+  - **Access follows the identity:** a membership counts only while you're linked to the GitHub identity that earned it. Unlinking, or linking a different account, ends access; linking the same account again restores it.
   - **Tokens:** user tokens are used within the request and never stored.
-  - **The webhook:** `server/src/flows/webhook.ts` handles uninstall, suspend and unsuspend. Issue and pull request events are acknowledged without action until #68.
+  - **The webhook:** `server/src/flows/webhook.ts` handles uninstall, suspend and unsuspend. Uninstall is final (a conditional write), and a repeated delete keeps the first deadline. GitHub can deliver events out of order, so for suspend and unsuspend the webhook asks GitHub for the installation's current state instead of trusting the event's order. Issue and pull request events are acknowledged without action until #68.
 
 | Path | What it is |
 | --- | --- |
@@ -150,7 +155,7 @@ node scripts/register-github-app.mjs --app-url https://updraft.readysetcloud.io 
 
 The manifest sets everything #67 describes:
 - **Webhook:** `<app-url>/api/webhooks/github`.
-- **Callback and setup URL:** `<app-url>/github/callback`, with "request user authorization during installation" on.
+- **Callback URL:** `<app-url>/github/callback`, with "request user authorization during installation" on. There's no setup URL, because GitHub disables it with that setting. Existing installations are connected by linking instead.
 - **Repository permissions:** Metadata (read); Contents, Issues and Pull requests (read and write); Checks and Commit statuses (read).
 - **Organization permission:** Members (read). A user's token needs it to show their own org membership, which is how ownership of an org installation is checked.
 - **Events:** Issues, Pull request and Pull request review. Installation events always arrive.
