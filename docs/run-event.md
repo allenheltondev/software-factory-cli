@@ -236,9 +236,12 @@ has the mechanism):
 - **Before an agent starts for a review**, the pull request is read. If it is still at the
   commit the review was submitted against, nothing has been pushed since and the job goes
   ahead. Otherwise its comments are read: when the worker's own identity has left the
-  comment of a revision for this review there, and the branch has moved on from where that
-  revision started, the job is canceled with a reason that begins `superseded: `. No agent
-  runs, nothing is posted, exit code 0 (a canceled job is not a failure).
+  comment of a revision for this review there, and the pull request is at exactly the commit
+  that revision pushed (or the revision was a reply with nothing to push), the job is
+  canceled with a reason that begins `superseded: `. No agent runs, nothing is posted, exit
+  code 0 (a canceled job is not a failure). A branch that merely moved on proves nothing:
+  the run that announced the revision may have died before pushing, and a person pushed. In
+  that case the agent runs, and the check before the push (below) decides from the history.
 - **Before a revision is pushed**, it announces the push in its comment on the pull request,
   and the push is only ever a fast-forward from the exact commit the run started from. Two
   runs that both got as far as an agent therefore end with one push: the other finds the
@@ -433,9 +436,9 @@ has its `run.log`. Without `--json`, stdout carries one line for a person instea
 | `dispatched` | True when a job was queued for the event in this run |
 | `resumed` | True when this run continued work an earlier run of the event left in the state database (a deferred job, a loop that was cut short) |
 | `outcome` | `nothing-to-do`, `succeeded`, `canceled` (queued, then canceled by the pre-start check before any agent started), `superseded` (the agent ran and nothing was pushed, because another run of the same event published first, see [Idempotency](#idempotency), or another run revised for the same review first, see [One review, one revision](#one-review-one-revision)), `failed` (an agent run failed, could not start or was interrupted), `publish-failed` (a run succeeded, its publication, push or review posting did not), `not-started` (a job was still queued when the command ended), `deferred` (work of the event waits for a cooldown; see [Cooldowns](#cooldowns)), `state-pending` (see [A pull request the state database does not know](#a-pull-request-the-state-database-does-not-know)) or `error` (the command itself failed: config, GitHub, the event file, the state database). It is the worst of the event's own jobs **and** the jobs that followed from them in this run: see [What counts as success](#what-counts-as-success) |
-| `reason` | Why nothing was done, as a code; null otherwise. From the payload: `unsupported-event`, `unsupported-action`, `malformed-payload`, `pull-request`, `repository-not-configured`, `label-not-configured`, `review-loop-off`. From the API: `actor-not-allowed`, `label-removed`, `label-missing`, `issue-closed`, `issue-gone`, `pull-request`. From the state database: `duplicate-delivery` (it already has the event's job, and nothing of it is left to do), `pull-request-closed`, `no-new-work`. From the state database and then the API: `pull-request-not-watched`, `state-pending` (with the outcome of that name). Others: `already-handled`, `canceled-before-start`, `published-by-another-run`, `cooldown` (with `deferred`), `state-not-restorable` (with `error`; see [Restoring lost state](#restoring-lost-state)) |
+| `reason` | Why nothing was done, as a code; null otherwise. From the payload: `unsupported-event`, `unsupported-action`, `malformed-payload`, `pull-request`, `repository-not-configured`, `label-not-configured`, `review-loop-off`. From the API: `actor-not-allowed`, `label-removed`, `label-missing`, `issue-closed`, `issue-gone`, `pull-request`. From the state database: `duplicate-delivery` (it already has the event's job, and nothing of it is left to do), `pull-request-closed`, `no-new-work`. From the state database and then the API: `pull-request-not-watched`, `state-pending` (with the outcome of that name). Others: `already-handled`, `canceled-before-start`, `published-by-another-run`, `cooldown` (with `deferred`), `state-not-restorable` (with `error`; see [Restoring lost state](#restoring-lost-state)), `publication-not-recoverable` (with `error`; see [An abandoned run](#an-abandoned-run)) |
 | `stateRestored` | True when this run put a lost publication back on record from the GitHub API (with `reason: "already-handled"`). The job fields then describe the restored job. False otherwise |
-| `abandonedRun` | Set when the state database had the event's job as `running` under a run that is gone, and this run closed it ([An abandoned run](#an-abandoned-run)): `jobId`, `runId` (the run that was left open), `heldUntil` (when its hold ended; null when none is on record), `settled` (`interrupted`, or `released` for a run that was only claimed), `resumed` (true when this run then did the job itself), `existingBranch` (the branch or pull request branch GitHub has for the event, which is why nothing was started; null otherwise) and `detail`. Null otherwise |
+| `abandonedRun` | Set when the state database had the event's job as `running` under a run that is gone, and this run closed it ([An abandoned run](#an-abandoned-run)): `jobId`, `runId` (the run that was left open), `heldUntil` (when its hold ended; null when none is on record), `settled` (`interrupted`, `released` for a run that was only claimed, or `publication` when its agent had finished and only its publication was left under way), `resumed` (true when this run then did the job itself), `existingBranch` (the branch or pull request branch GitHub has for the event, which is why nothing was started; null otherwise) and `detail`. Null otherwise |
 | `deferredUntil` | With `deferred`: when the cooldown ends (ISO time). Null otherwise |
 | `loop` | Where the review loop left the event's pull request, from the state database; null when the event has no pull request (yet). `rounds`: revision rounds so far, of `maxRevisions`. `reviews`: reviewer verdicts recorded. `verdict`, `verdictSha`: the newest verdict (`ready-to-merge`, `changes-requested`) and the commit it is for. `headSha`: the newest head known. `stage`, `detail`: the stage `updraft status` shows (`awaiting-review`, `reviewing`, `changes-requested`, `revising`, `ready-to-merge`, `merging`, `merged`, `needs-human`, `closed`). `ready`: the draft was marked ready for review. `merged`, `mergeCommitSha`, and `notMergedReason` (why it is not merged: `autoMerge` is off, the gate that blocked it, or the stage it is in) |
 | `message` | One line saying the same to a person |
@@ -657,7 +660,23 @@ Two redeliveries that arrive together after the hold has expired both close the 
 run the job: the race of two runs of one event, with the outcome described under
 [Idempotency](#idempotency) (one publishes, the other ends `superseded`).
 
-Not covered: a job the checkpoint carried as `succeeded` whose publication never happened
-and left nothing on GitHub. Its agent's commits were on the machine that is gone; the
-delivery ends `duplicate-delivery`, and `updraft retry` on a copy of the shared state is the
-way to run it again.
+**A run that vanished between its push and its pull request.** A checkpoint can also carry
+the job as `succeeded` with its publication under way (`publishing`, no pull request): the
+agent finished, the machine went before the pull request was opened. Once no live hold
+covers the job, a redelivery asks GitHub for the job's branch and compares it with the
+commit the run ended on (its summary's `headSha`):
+
+- **The branch is there, at exactly that commit:** it is fetched into this clone and the
+  publication is handed back to the publisher, due at once. The publisher finds the branch
+  already pushed and opens the pull request. No agent runs again, and the run stays the one
+  that did the work. `resumed: true`.
+- **No branch:** the commits died with the machine. The publication fails for good, the job
+  becomes `failed`, and it is requeued and run in this delivery as its next attempt, as in 4
+  above (and refused as in 6).
+- **Another commit is on the branch,** or the run recorded none: nothing can be vouched for.
+  The publication fails for good and the job is `failed`. The command exits 1 with
+  `reason: "publication-not-recoverable"` and a message that says what to do: delete the
+  branch, `updraft retry JOB_ID` on a copy of the shared state database, upload it, and
+  deliver the event again.
+
+In each case `abandonedRun` has `settled: "publication"`.

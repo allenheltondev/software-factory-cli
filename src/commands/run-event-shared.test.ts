@@ -1009,6 +1009,107 @@ describe('updraft run-event: a run that checkpointed and then vanished', { timeo
   });
 });
 
+describe('updraft run-event: a run that vanished between its push and its pull request', { timeout: 180_000 }, () => {
+  const HOURS = 3_600_000;
+  /**
+   * A machine whose agent finished and whose push landed, checkpointed while it was publishing,
+   * and vanished before the pull request was opened: the shared state has the job `succeeded`
+   * and its publication `publishing` with no pull request; GitHub has the branch and no PR.
+   * (Made from a run that did finish, its database turned back into that checkpoint.)
+   */
+  async function stalled() {
+    const w = world();
+    const lost = vm(w, 'vm lost');
+    const first = await lost.run({ deliveryId: 'd-lost' });
+    expect(first.code, JSON.stringify(first.summary)).toBe(0);
+    const ended = remoteHead(w.f, BRANCH);
+    const runId = withDb(lost.state, (db) => {
+      db.prepare(
+        `UPDATE publications SET state = 'publishing', pr_number = NULL, pr_url = NULL, published_at = NULL,
+                lease_expires_at = '2026-01-01T00:00:00.000Z'`,
+      ).run();
+      return (db.prepare('SELECT run_id FROM publications').get() as { run_id: string }).run_id;
+    });
+    mergeState({ changed: lost.state, into: w.shared, live: true });
+    // GitHub never saw the pull request.
+    w.gh.pull = null;
+    w.gh.pulls = [];
+    rmSync(w.received, { force: true });
+    withDb(w.shared, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded' });
+      expect(db.prepare('SELECT state, pr_number FROM publications').get()).toEqual({ state: 'publishing', pr_number: null });
+    });
+    return { w, runId, ended };
+  }
+  const late = (w: World) => {
+    const v = vm(w, 'vm late', { now: () => Date.now() + 7 * HOURS });
+    v.download();
+    return v;
+  };
+
+  it('with its branch on GitHub at the commit it ended on: opens the pull request from it, and runs no agent', async () => {
+    const { w, runId, ended } = await stalled();
+    const v = late(w);
+    const r = await v.run({ deliveryId: 'd-late' });
+    expect(r.code, JSON.stringify(r.summary)).toBe(0);
+    expect(r.summary).toMatchObject({
+      outcome: 'succeeded',
+      resumed: true,
+      runId,
+      publication: 'published',
+      prNumber: expect.any(Number),
+      abandonedRun: { jobId: JOB_ID, runId, settled: 'publication', resumed: true, existingBranch: BRANCH },
+    });
+    expect(existsSync(w.received)).toBe(false);
+    expect(remoteHead(w.f, BRANCH)).toBe(ended);
+    expect(w.gh.pull).toMatchObject({ headRef: BRANCH, state: 'open' });
+    withDb(v.state, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded', attempts: 1 });
+      expect(db.prepare('SELECT state, pr_number IS NOT NULL AS pr FROM publications').get()).toEqual({ state: 'published', pr: 1 });
+    });
+  });
+
+  it('with nothing of it on GitHub: the publication fails, and this delivery runs the job as its next attempt', async () => {
+    const { w, runId } = await stalled();
+    w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'update-ref', '-d', `refs/heads/${BRANCH}`);
+    const v = late(w);
+    const r = await v.run({ deliveryId: 'd-late' });
+    expect(r.code).toBe(0);
+    expect(r.summary).toMatchObject({
+      outcome: 'succeeded',
+      resumed: true,
+      publication: 'published',
+      branch: `${BRANCH}-2`,
+      abandonedRun: { jobId: JOB_ID, runId, settled: 'publication', resumed: true, existingBranch: null },
+    });
+    expect(r.summary.runId).not.toBe(runId);
+    expect(existsSync(w.received)).toBe(true);
+    withDb(v.state, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded', attempts: 2 });
+      expect(db.prepare('SELECT state, retryable FROM publications WHERE run_id = ?').get(runId)).toEqual({ state: 'failed', retryable: 0 });
+    });
+  });
+
+  it('with another commit on its branch: publishes nothing, fails the job so updraft retry takes it, and exits 1', async () => {
+    const { w, runId, ended } = await stalled();
+    const tree = w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'rev-parse', `${ended}^{tree}`);
+    const other = w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'commit-tree', tree, '-p', ended, '-m', 'someone else');
+    w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'update-ref', `refs/heads/${BRANCH}`, other);
+    const v = late(w);
+    const r = await v.run({ deliveryId: 'd-late' });
+    expect(r.code).toBe(1);
+    expect(r.summary).toMatchObject({ reason: 'publication-not-recoverable', abandonedRun: { runId, settled: 'publication', resumed: false, existingBranch: BRANCH } });
+    expect(r.summary.message).toContain(`updraft retry ${JOB_ID}`);
+    expect(existsSync(w.received)).toBe(false);
+    expect(remoteHead(w.f, BRANCH)).toBe(other);
+    expect(w.gh.pull).toBeNull();
+    withDb(v.state, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'failed' });
+      expect(db.prepare('SELECT state, retryable FROM publications').get()).toEqual({ state: 'failed', retryable: 0 });
+    });
+  });
+});
+
 describe('updraft run-event: one review, two machines', { timeout: 180_000 }, () => {
   const REVISE = { revise: true };
   /** A pull request on record in the shared state, a change request on it, and two machines that both start from that state. */
@@ -1067,6 +1168,23 @@ describe('updraft run-event: one review, two machines', { timeout: 180_000 }, ()
     for (const [name, order] of [['a first', [a, b]], ['b first', [b, a]]] as const) {
       expect(merged(w, [...order], name)).toMatchObject({ ...ONE_REVISION, revisions: [{ state: 'published', why: '' }] });
     }
+  });
+
+  it('a claim whose push never happened does not cancel the review, even after a person pushed', async () => {
+    const { w, b, head1, review } = await twoMachines();
+    // A machine claimed the review and died before pushing: the claim names a commit that
+    // never reached GitHub. Then a person pushed to the branch.
+    const neverPushed = 'f'.repeat(40);
+    await w.gh.createIssueComment({ id: REPO_ID, fullName: FULL }, PR, `Revising.\n\n<!-- updraft-revision-of: ${review.id} ${head1}..${neverPushed} -->`);
+    const tree = w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'rev-parse', `${head1}^{tree}`);
+    const personal = w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'commit-tree', tree, '-p', head1, '-m', 'a person pushed');
+    w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'update-ref', `refs/heads/${BRANCH}`, personal);
+
+    const rb = await b.run({ eventName: 'pull_request_review', deliveryId: 'd-b' });
+    expect(rb.summary).toMatchObject({ outcome: 'succeeded', exitCode: 0, publication: 'published' });
+    expect(existsSync(w.received)).toBe(true);
+    const head = remoteHead(w.f, BRANCH);
+    expect(parentOf(w, head)).toBe(personal);
   });
 
   it('at the same time: both run their agent, one push is accepted, and the other ends quietly as superseded', async () => {

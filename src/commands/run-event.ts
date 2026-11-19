@@ -52,7 +52,16 @@ import { newId } from '../util/ids.js';
 import { createEventScope, foreignWork, nothingPending, pendingWork, withoutForeignWork, type GuardedScope } from '../worker/scope.js';
 import { println, type CommandContext } from './context.js';
 import { CliError, describeError, EXIT } from './errors.js';
-import { holdEnd, requeueAbandonedJob, settleAbandonedJob, type AbandonedRunSummary } from './run-event-abandoned.js';
+import {
+  failStalledPublication,
+  findStalledPublication,
+  holdEnd,
+  requeueAbandonedJob,
+  resumeStalledPublication,
+  settleAbandonedJob,
+  type AbandonedRunSummary,
+  type StalledPublication,
+} from './run-event-abandoned.js';
 import { readOwnPullRequest, restorePublication } from './run-event-restore.js';
 import { adoptReviewRequests } from './run-event-shared-state.js';
 import { installSignalHandlers } from './start.js';
@@ -339,8 +348,8 @@ function describeExisting(e: ExistingWork): string {
  * The cheap half of "one revision per review" (src/publish/revision.ts): before an agent is
  * started for a review, ask the pull request whether a revision for that review is there
  * already. It is when the worker's own identity left a claim for the review on the pull request
- * and the branch is no longer at the commit that claim started from (or the claim was a reply
- * that had nothing to push). Returns the reason to cancel the job with, or null.
+ * and the branch is at the commit that claim pushed (or the claim was a reply that had nothing
+ * to push). Returns the reason to cancel the job with, or null.
  *
  * A pull request that is still at the commit the review was submitted against has had no push
  * since the review, so nothing is listed for it: one read of the pull request, usually.
@@ -358,7 +367,11 @@ async function revisionAnsweredElsewhere(api: GitHubApi, job: Job): Promise<stri
     throw err;
   }
   if (revision.review.headSha !== undefined && head === revision.review.headSha) return null;
-  const claim = (await findRevisionClaims(api, repo, n, revision.review.id)).find((c) => c.baseSha !== head || c.headSha === c.baseSha);
+  // Only what can be seen to have landed: the pull request is at the claimed commit, or the claim
+  // was a reply with nothing to push. A head that merely moved on proves nothing (the claiming
+  // run may have died before pushing, and a person pushed); the publisher's ancestry check after
+  // a fetch decides those (src/publish/revision.ts).
+  const claim = (await findRevisionClaims(api, repo, n, revision.review.id)).find((c) => c.headSha === head || c.headSha === c.baseSha);
   if (!claim) return null;
   return `${SUPERSEDED_PREFIX}another run already answered this review on pull request #${n} (${claim.url}${claim.runId ? `, run ${claim.runId}` : ''}); no agent was started`;
 }
@@ -663,6 +676,8 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
      * holds them: a machine checkpointed and vanished. Settled below, once GitHub was asked.
      */
     let abandoned: typeof known = [];
+    /** Jobs of this event whose agent finished and whose publication a vanished run left mid-step. */
+    let stalled: StalledPublication[] = [];
 
     /**
      * The pull request GitHub has for a job of the event is not on record: put its publication
@@ -773,6 +788,10 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
         const left = !nothingPending(pendingWork(openDb, config, scope));
         // Never while a live hold covers the job: that run is, as far as anyone can know, at work.
         abandoned = known.filter((k) => k.status === 'running' && !mine.heldByAnother(k.id));
+        stalled = known.flatMap((k) => {
+          const found = k.status === 'succeeded' && !mine.heldByAnother(k.id) ? findStalledPublication(openDb, k.id) : null;
+          return found ? [found] : [];
+        });
         if (known.length === issueJobs.length && !left) {
           // A job that got as far as an agent and has no publication on record: a checkpoint
           // carried it while its run was going, and that run's end was never saved. If GitHub
@@ -783,7 +802,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
             const existing = await findExistingPullRequest({ api, repo, job: k });
             if (existing && (await restore(() => openDb, k, existing, () => {}))) return nothing('already-handled', restoredMessage(existing));
           }
-          if (!abandoned.length) {
+          if (!abandoned.length && !stalled.length) {
             const pr = scope.prs()[0];
             if (pr) summary.loop = summarizeLoop(openDb, config, pr.repoId, pr.prNumber);
             const held = known.some((j) => mine.heldByAnother(j.id));
@@ -874,6 +893,76 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       }
       // Queued again (requeued here, or released because the run was only ever claimed): this run does it.
       report(k.status === 'queued', `${what}; nothing of it is on GitHub, so this delivery runs the job as its next attempt`);
+      summary.resumed = true;
+    }
+    // 3c. A job whose agent finished and whose publication a vanished run left mid-step (it was
+    // checkpointed as `succeeded`, publishing, with no pull request; docs/run-event.md, "An
+    // abandoned run"). GitHub decides: its branch at exactly the commit the run ended on is
+    // published from here; no branch means the commits died with the machine and the job runs
+    // again; any other commit there cannot be vouched for and is left to a person.
+    for (const s of stalled) {
+      const openDb = stateDb();
+      const k = known.find((j) => j.id === s.jobId)!;
+      let existing: ExistingWork | null;
+      try {
+        existing = await findExistingWork({ api, repo, job: k, checkoutPath, remote: remote.name, net: { ...local, signal: controller.signal, ...(net ? { env: net.env } : {}) } });
+      } catch (err) {
+        throw new CliError(`could not check whether the event was already handled: ${net ? net.redact(errText(err)) : errText(err)}`);
+      }
+      asked.add(k.id);
+      if (existing?.prNumber != null) {
+        // A pull request the restore above could not take as this run's: its own error said why.
+        throw new CliError(`pull request #${existing.prNumber} exists for job ${k.id}, whose publication was left mid-step; nothing was changed`);
+      }
+      const what = `the state database had job ${k.id} as succeeded with its publication left mid-step by a run that is gone (${s.runId})`;
+      const report = (resumed: boolean, detail: string) => {
+        summary.abandonedRun = { jobId: k.id, runId: s.runId, heldUntil: holdEnd(openDb, k.id), settled: 'publication', resumed, existingBranch: existing?.branch ?? null, detail };
+        log.warn('took over a publication a vanished run left mid-step', { job: k.id, run: s.runId, resumed, ...(existing ? { branch: existing.branch } : {}) });
+        Object.assign(summary, summarizeJob(openDb, config, k.id));
+      };
+      if (existing && s.endedSha && existing.branch === s.branch && existing.sha === s.endedSha) {
+        // Exactly what the run ended on: bring the branch back into this clone, and let the
+        // publisher (which publishes only from it) find it already pushed and open the PR.
+        const branchRef = `refs/heads/${s.branch}`;
+        await withCheckoutLock(checkoutPath, async () => {
+          await runGit(['fetch', '--no-tags', '--quiet', remote.name, `+${branchRef}:${branchRef}`], { ...local, signal: controller.signal, ...(net ? { env: net.env } : {}) });
+          const fetched = (await runGit(['rev-parse', '--verify', '--quiet', `${branchRef}^{commit}`], local)).stdout.trim();
+          if (fetched !== s.endedSha) throw new CliError(`fetched ${s.branch} at ${fetched.slice(0, 12)}, not at ${s.endedSha!.slice(0, 12)} where run ${s.runId} ended; nothing was published`);
+        });
+        resumeStalledPublication(openDb, s.runId, `resumed by a redelivery of its event${opts.deliveryId ? ` (${opts.deliveryId})` : ''}: the run that was publishing is gone, and its branch is on GitHub at the commit it ended on`, ctx.now);
+        report(true, `${what}; its branch ${s.branch} is on GitHub at ${s.endedSha.slice(0, 12)}, the commit the run ended on, so this delivery opens its pull request (no agent runs again)`);
+        scope?.engage();
+        summary.resumed = true;
+        continue;
+      }
+      if (existing) {
+        const detail =
+          `${what}; its branch ${existing.branch} is on GitHub at ${existing.sha?.slice(0, 12)}, ` +
+          (s.endedSha ? `not at ${s.endedSha.slice(0, 12)} where the run ended,` : 'and the run recorded no commit it ended on,') +
+          ` so nothing can be published for it. The job is now failed. To run it again: delete that branch, "updraft retry ${k.id}" on a copy of the shared state database, and deliver the event again`;
+        failStalledPublication(openDb, s, `not published: ${detail}`, ctx.now);
+        report(false, detail);
+        summary.reason = 'publication-not-recoverable';
+        throw new CliError(detail);
+      }
+      // Nothing on GitHub: the commits died with the machine. The delivery is the retry.
+      failStalledPublication(openDb, s, 'not published: the run that was publishing is gone, and its commits never reached GitHub', ctx.now);
+      const attempts = getJob(openDb, k.id)?.attempts ?? 0;
+      let refusal: string | null = attempts >= MAX_START_FAILURES ? `the job has had ${attempts} attempts, and a redelivery starts no more than ${MAX_START_FAILURES}` : null;
+      if (refusal === null) {
+        try {
+          requeueAbandonedJob(openDb, k.id, `requeued by a redelivery of its event${opts.deliveryId ? ` (${opts.deliveryId})` : ''}: the run that was publishing it is gone, and its commits never reached GitHub`, ctx.now);
+        } catch (err) {
+          refusal = errText(err);
+        }
+      }
+      if (refusal !== null) {
+        const detail = `${what}; its commits never reached GitHub and nothing was started: ${refusal}. "updraft retry ${k.id}" on a copy of the shared state database, then another delivery of the event, runs it again`;
+        report(false, detail);
+        return nothing('duplicate-delivery', detail);
+      }
+      k.status = 'queued';
+      report(true, `${what}; its commits never reached GitHub, so this delivery runs the job as its next attempt`);
       summary.resumed = true;
     }
     if (decision.dispatch === true) {
