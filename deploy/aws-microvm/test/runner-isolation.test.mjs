@@ -147,7 +147,9 @@ describe('the config check', () => {
 });
 
 describe('the example config', () => {
-  it('is valid, and is what an enforced job accepts', () => {
+  // Its agents are containerized, which validate refuses on native Windows by design: the
+  // deployment's config is for the Linux image only.
+  it.skipIf(process.platform === 'win32')('is valid, and is what an enforced job accepts', () => {
     const example = fileURLToPath(new URL('../config/config.example.yaml', import.meta.url));
     const check = checkConfig(example);
     expect(check.state).toBe('ok');

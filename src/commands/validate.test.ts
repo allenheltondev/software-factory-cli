@@ -52,7 +52,8 @@ describe('updraft validate', () => {
 });
 
 describe('updraft validate --json', () => {
-  it('prints the validated config with its defaults, and no value of agents.<name>.env', async () => {
+  // The config has a containerized agent, which validate refuses on native Windows by design.
+  it.skipIf(process.platform === 'win32')('prints the validated config with its defaults, and no value of agents.<name>.env', async () => {
     const ctx = fakeContext();
     const cfg = validConfig();
     cfg.agents = {
