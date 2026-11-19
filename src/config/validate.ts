@@ -48,6 +48,12 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
 
   for (const [agentName, agent] of Object.entries(config.agents)) {
     const adapter = agentAdapter(agentName, agent);
+    if (agent.capacityGroup !== undefined && !Object.hasOwn(config.capacity?.groups ?? {}, agent.capacityGroup)) {
+      errors.push({
+        path: `agents.${agentName}.capacityGroup`,
+        message: `unknown capacity group "${agent.capacityGroup}"; declare it under capacity.groups`,
+      });
+    }
     if (!(KNOWN_ADAPTERS as readonly string[]).includes(adapter)) {
       errors.push({
         path: `agents.${agentName}`,
@@ -234,6 +240,9 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
           });
         } else if (t.highRisk && review.allowSameAgent) {
           errors.push({ path: `${base}.tiers.highRisk`, message: 'high-risk work requires independent review: review.allowSameAgent must be false' });
+        }
+        if (t.escalation?.enabled && t.escalation.ceiling === 'high-risk' && !t.highRisk) {
+          errors.push({ path: `${base}.tiers.escalation.ceiling`, message: 'a high-risk ceiling needs tiers.highRisk (with independent review)' });
         }
         if (!t.highRisk) warnings.push({ path: `${base}.tiers.highRisk`, message: 'no high-risk pool: high-risk issues will be held for a human' });
         if (t.triage?.enabled) {

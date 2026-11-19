@@ -49,6 +49,16 @@ export interface ExecutionResult {
   error?: string | null;
   /** What a live agent run left behind; stored for `updraft status`. */
   summary?: RunSummary | null;
+  /**
+   * Live executor: the agent CLI's own output when the CLI itself exited unsuccessfully (not
+   * verification, not a timeout). Only used to recognize a usage limit (src/capacity/usage-limit.ts).
+   */
+  cliOutput?: string;
+  /**
+   * Live executor: the agent's output, set only when it contains an `updraft-escalation:` line.
+   * Unvalidated; the daemon's policy validates and decides (src/escalation/escalation.ts).
+   */
+  escalationRequest?: string;
 }
 
 /**

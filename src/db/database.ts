@@ -25,7 +25,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 /** The schema version that added the metric_events rollup (`updraft stats`). */
 export const METRICS_SCHEMA_VERSION = 13;
@@ -511,6 +511,36 @@ const MIGRATIONS: Record<number, Migration> = {
     );
     CREATE INDEX triage_runs_by_time ON triage_runs (started_at);
   `,
+  15: `
+    -- Subscription capacity and escalation (docs/capacity-and-escalation.md). A cooldown is a
+    -- bounded pause of a capacity group (or of a profile with no group) after a recognized CLI
+    -- usage-limit exit; it lives in the database so a restarted worker still honors it.
+    CREATE TABLE capacity_cooldowns (
+      scope      TEXT NOT NULL CHECK (scope IN ('group','agent')),
+      name       TEXT NOT NULL,
+      until      TEXT NOT NULL,
+      reason     TEXT NOT NULL,
+      stated     INTEGER NOT NULL DEFAULT 0,   -- 1: the CLI gave the retry-after; 0: the configured default
+      job_id     TEXT,
+      run_id     TEXT,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (scope, name)
+    ) WITHOUT ROWID;
+
+    -- Every cooldown, deferral, escalation and refusal, by job and run, so each is explainable.
+    CREATE TABLE policy_events (
+      id     INTEGER PRIMARY KEY AUTOINCREMENT,
+      at     TEXT NOT NULL,
+      kind   TEXT NOT NULL,   -- cooldown | deferred | escalated | escalation-denied | exhausted
+      job_id TEXT NOT NULL,
+      run_id TEXT,
+      detail TEXT NOT NULL
+    );
+    CREATE INDEX policy_events_by_job ON policy_events (job_id, id);
+
+    ALTER TABLE jobs ADD COLUMN escalation_hops INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN deferrals INTEGER NOT NULL DEFAULT 0;
+  `,
 };
 
 /**
@@ -637,6 +667,8 @@ export interface JobRow {
   status_reason: string | null;
   attempts: number;
   start_failures: number;
+  escalation_hops: number;
+  deferrals: number;
   created_at: string;
   updated_at: string;
 }

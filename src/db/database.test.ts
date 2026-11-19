@@ -389,7 +389,7 @@ describe('migration v13', () => {
     const h = buildHistory(END);
     const live = metricRows(h.db);
     h.db.exec(
-      'DROP TABLE triage_cache; DROP TABLE triage_runs; DROP TABLE metric_events; ALTER TABLE pr_reviews DROP COLUMN findings_count; ALTER TABLE runs DROP COLUMN agent_started_at; ' +
+      'DROP TABLE capacity_cooldowns; DROP TABLE policy_events; ALTER TABLE jobs DROP COLUMN escalation_hops; ALTER TABLE jobs DROP COLUMN deferrals; DROP TABLE triage_cache; DROP TABLE triage_runs; DROP TABLE metric_events; ALTER TABLE pr_reviews DROP COLUMN findings_count; ALTER TABLE runs DROP COLUMN agent_started_at; ' +
         'ALTER TABLE jobs DROP COLUMN retries; PRAGMA user_version = 12;',
     );
     migrate(h.db);

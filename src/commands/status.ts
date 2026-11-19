@@ -352,6 +352,18 @@ export function renderStatus(v: StatusView): string {
     }
   }
 
+  if (s.cooldowns?.length) {
+    lines.push('', 'Capacity cooldowns:');
+    for (const c of s.cooldowns) {
+      lines.push(`  ${c.scope} ${c.name}  wakes ${c.until} (${c.stated ? 'retry-after from the CLI' : 'configured default'})${c.runId ? `  run ${c.runId}` : ''}`);
+      lines.push(`    ${oneLine(c.reason, 140)}`);
+    }
+  }
+  if (s.policyEvents?.length) {
+    lines.push('', 'Recent capacity and escalation decisions:');
+    for (const e of s.policyEvents) lines.push(`  ${e.at}  ${e.kind.padEnd(17)}  job ${e.jobId}${e.runId ? `  run ${e.runId}` : ''}  ${oneLine(e.detail, 140)}`);
+  }
+
   lines.push('', 'Recent errors:');
   if (!s.recentErrors.length) lines.push('  (none)');
   for (const e of s.recentErrors) {
