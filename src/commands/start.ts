@@ -4,6 +4,7 @@ import { loadConfig } from '../config/io.js';
 import type { Db } from '../db/database.js';
 import { appCommitIdentity } from '../github/credentials.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
+import { createAssignmentCommenter } from '../publish/assignment-comment.js';
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
 import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
@@ -108,11 +109,14 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       config,
       paths,
       log: log.child({ component: 'worker' }),
-      poll: () => deps.pollOnce({ db: openDb, api, config, log: pollLog }),
+      poll: () => deps.pollOnce({ db: openDb, api, config, log: pollLog, configDir: paths.configDir }),
       checkDispatchable: (job) => deps.checkJobDispatchable({ api, config }, job),
       signal: controller.signal,
       executor: createExecutor(config, appAuth && config.github?.app?.commitAsApp ? { commitIdentity: (repoFullName) => appCommitIdentity(appAuth, repoFullName) } : {}),
       ...(publisher ? { publisher } : {}),
+      ...(config.execution.mode === 'live'
+        ? { assignmentCommenter: createAssignmentCommenter({ db: openDb, config, api, log: log.child({ component: 'assignment-comment' }) }) }
+        : {}),
       ...(failureCommentsEnabled(config)
         ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }) }) }
         : {}),

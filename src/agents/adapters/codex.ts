@@ -51,8 +51,9 @@
  * that exits 0 without a readable `turn.completed` / `turn.failed` fails. Only the documented
  * fields above are read here.
  */
-import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest } from './adapter.js';
+import type { AgentAdapter, AgentExit, AgentInvocation, AgentVerdict, InvocationRequest, TriageInvocationRequest } from './adapter.js';
 import { defaultVerdict } from './adapter.js';
+import { failureLine } from '../failure-line.js';
 
 /** Long flags that set Codex's sandbox or approval policy; any of them in the config's args replaces the default. */
 const PERMISSION_FLAGS = [
@@ -232,6 +233,22 @@ export const codexAdapter: AgentAdapter = {
     return { file: req.launch.file, args, promptVia: 'stdin' };
   },
 
+  triageIsolation: 'read-only',
+
+  /**
+   * Triage: `exec --json --sandbox read-only --skip-git-repo-check --ephemeral`. Codex has no
+   * switch that turns its tools off: the read-only sandbox blocks writes and network, but the
+   * model can still read files the sandbox can see (the triage run starts in an empty directory).
+   * Any sandbox or approval setting in agents.<name>.args is refused.
+   */
+  buildTriageInvocation(req: TriageInvocationRequest): AgentInvocation {
+    if (setsPermissions(req.extraArgs)) throw new Error('agents.<name>.args sets a sandbox or approval policy, which triage controls itself (read-only)');
+    if (jsonMode(req.extraArgs)) throw new Error('agents.<name>.args sets --json, which triage controls itself');
+    const { global, rest } = splitGlobalArgs(req.extraArgs);
+    const args = [...req.launch.args, ...global, 'exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral', ...rest];
+    return { file: req.launch.file, args, promptVia: 'stdin' };
+  },
+
   interpretExit(exit: AgentExit): AgentVerdict {
     const end = findTurnEnd(exit.output);
     if (end?.type === 'turn.failed') return { outcome: 'failed', error: `codex turn failed: ${failureMessage(end)}` };
@@ -251,7 +268,8 @@ export const codexAdapter: AgentAdapter = {
     }
     // An interrupted turn, a fatal error, or a bad flag before the run started (printed on stderr).
     const { events, text } = scan(exit.output);
-    const said = lastError(events) ?? text[0];
+    // `text` is newest first; read it oldest first so the error wins over a stdin banner or config warning.
+    const said = lastError(events) ?? (failureLine([...text].reverse().join('\n')) || undefined);
     return { outcome: 'failed', error: `${fallback.error} before finishing its turn${said ? `: ${clip(firstLine(said))}` : ''}` };
   },
 

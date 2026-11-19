@@ -25,7 +25,8 @@ Every launcher:
 
 The worker holds a lock in the state database, so a second `updraft start` against the same
 state exits with code 3 instead of polling twice. Launchers treat that as a failure and retry
-on their restart interval, so a launcher-started worker takes over once a terminal-started one
+(the Windows wrapper with its own backoff, the others on their restart interval), so a
+launcher-started worker takes over once a terminal-started one
 stops or its lock goes stale. After a restart the worker resumes from the saved checkpoints;
 already-queued jobs are not duplicated.
 
@@ -51,9 +52,9 @@ lingering enabled, the service may run without a desktop keyring; see
 
 ## Agent credentials
 
-Some agent CLIs read their credentials from the environment. Kiro's headless mode requires
-`KIRO_API_KEY` ([headless mode](https://kiro.dev/docs/cli/headless/); see also
-[Live mode with Kiro](agents/kiro.md#prerequisites)). The worker passes its
+Some agent CLIs read their credentials from the environment. Kiro's headless mode takes
+`KIRO_API_KEY` ([headless mode](https://kiro.dev/docs/cli/headless/)), or a `kiro-cli login`
+session that expires (see [Live mode with Kiro](agents/kiro.md#prerequisites)). The worker passes its
 own environment on to the agent, minus `GH_TOKEN` and `GITHUB_TOKEN`, so the key has to be in
 the environment the **launcher** gives the worker. Setting it in your terminal isn't enough.
 
@@ -100,12 +101,12 @@ launchctl bootstrap "gui/$(id -u)" "$plist"
 your own label in place of `local.updraft` if you passed `--label`.
 
 **Linux (systemd --user).** The unit reads an optional environment file,
-`~/.config/updraft/worker.env` by default (`$UPDRAFT_HOME/worker.env` with
+`~/.updraft/worker.env` by default (`$UPDRAFT_HOME/worker.env` with
 `UPDRAFT_HOME`, or the path given to `install-systemd-user.sh --env-file`). A missing file is
 ignored. Create it readable only by you:
 
 ```sh
-envfile="${XDG_CONFIG_HOME:-$HOME/.config}/updraft/worker.env"
+envfile="${UPDRAFT_HOME:-$HOME/.updraft}/worker.env"
 mkdir -p "$(dirname "$envfile")"
 install -m 600 /dev/null "$envfile"
 printf 'KIRO_API_KEY: '; stty -echo; IFS= read -r key; stty echo; echo
@@ -126,12 +127,16 @@ environment mechanism, not Updraft config.
 
 | Platform | Worker log | Launcher stdout/stderr |
 | --- | --- | --- |
-| Windows | `%LOCALAPPDATA%\updraft\logs\updraft.log` | `launcher.out.log`, `launcher.err.log` in the same directory (previous run kept as `*.prev`) |
-| macOS | `~/Library/Logs/updraft/updraft.log` | `~/Library/Logs/updraft/launchd.out.log`, `launchd.err.log` |
-| Linux | `~/.local/state/updraft/logs/updraft.log` | `journalctl --user -u updraft` |
+The worker log is `~/.updraft/logs/updraft.log` on every platform
+(`%USERPROFILE%\.updraft\logs\updraft.log` on Windows).
 
-With `UPDRAFT_HOME` set, the worker log is `$UPDRAFT_HOME/logs/updraft.log` (and the Windows
-launcher logs go there too).
+| Platform | Launcher stdout/stderr |
+| --- | --- |
+| Windows | `launcher.out.log`, `launcher.err.log` in the same directory (previous run kept as `*.prev`) |
+| macOS | `launchd.out.log`, `launchd.err.log` in the same directory |
+| Linux | `journalctl --user -u updraft` |
+
+With `UPDRAFT_HOME` set, all of these are under `$UPDRAFT_HOME/logs/` instead.
 
 ## Windows (Task Scheduler)
 
@@ -146,20 +151,54 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\register-task.ps
 ```
 
 Add `-WhatIf` to see the resolved paths without registering anything, and `-NoStart` to
-register without starting now.
+register without starting now (the task then first runs at your next logon).
 
 What it creates:
 
-- A task (default name `Updraft`) triggered at logon of your account, with an
-  interactive logon type, so no password is stored and the worker uses your credential
-  context (gh token, Git Credential Manager).
-- Settings: restart on failure (999 times, every minute), `MultipleInstances = IgnoreNew`,
-  no execution time limit (`PT0S`), start when available, keep running on battery.
-- A generated wrapper, `%LOCALAPPDATA%\updraft\launcher\<TaskName>.ps1`. Task
-  Scheduler cannot set environment variables or capture output, so the task runs
-  `powershell.exe -WindowStyle Hidden -File <wrapper>`; the wrapper sets PATH, starts
-  `node.exe` with the installed `dist\cli.js`, redirects its output to `launcher.*.log` and
-  exits with the worker's exit code so a failure triggers the restart policy.
+- A task (default name `Updraft`) for your account, with an interactive logon type, so no
+  password is stored and the worker uses your credential context (gh token, Git Credential
+  Manager). Its triggers are at logon, repeating every 5 minutes for as long as you are logged
+  on, and (unless `-NoStart`) from registration on at the same interval, so the current
+  session is covered without logging off. Change the interval with `-RepeatIntervalMinutes`.
+- Settings: `MultipleInstances = IgnoreNew` (a repeat while the wrapper runs does nothing), no
+  execution time limit (`PT0S`), start when available, keep running on battery, and restart
+  on failure.
+- A generated wrapper, `%USERPROFILE%\.updraft\launcher\<TaskName>.ps1`. Task Scheduler cannot
+  set environment variables or capture output, so the task runs
+  `powershell.exe -WindowStyle Hidden -File <wrapper>`. The wrapper sets PATH, starts
+  `node.exe` with the installed `dist\cli.js` in a hidden console of its own, and redirects
+  its output to `launcher.out.log` / `launcher.err.log` (the previous launch's go to `.prev`).
+
+**How the worker is kept running.** Task Scheduler's "restart on failure" does not restart a
+task whose action exits with a non-zero code. It covers a task that fails to launch, so it
+can't be relied on after a crash. Instead:
+
+- **The wrapper supervises the worker.** After any exit other than a clean one (code 0), it
+  starts the worker again, waiting 5s after the first quick failure and doubling up to 5 min
+  (`-MinBackoffSeconds`, `-MaxBackoffSeconds`). A run of 10 minutes or more resets the delay.
+  Exit code 3 (another worker holds the lock) is retried the same way, so the task takes over
+  once a worker you started by hand stops. Each restart is a line in `launcher.wrapper.log`.
+- **The repeating trigger restarts the wrapper.** It covers a wrapper that was ended, for
+  example by `Stop-ScheduledTask`, a closed console window, or a clean exit. If the worker
+  that wrapper started is still running, the new wrapper waits on it instead of starting a
+  second copy. The worker is found one of two ways:
+  - **By its PID record:** PID, start time and executable all match
+    `launcher\<TaskName>.worker.json`.
+  - **By its marker:** if a wrapper ended between starting the worker and writing that
+    record, the worker is found by the marker the wrapper puts on its command line,
+    `--title=updraft-task:<TaskName>` (a Node option that only sets the process title). A
+    `updraft start` you run yourself has no marker, so it is never adopted or stopped.
+- **Console events can't reach the worker.** Because the worker has its own hidden console, a
+  Ctrl+C or close event that reaches the wrapper's console ends only the wrapper.
+- **A locked log can't block a launch.** If `launcher.*.log` is still held open by a running
+  process and can't be rotated, that launch writes `launcher.out.<time>.log` and
+  `launcher.err.<time>.log` instead of failing to start.
+
+`LastTaskResult` reports the last instance Task Scheduler started or refused. While the
+wrapper is running, a repeat that `IgnoreNew` turned away shows as `0x800710E0` ("The operator
+or administrator has refused the request"); that is normal. `0x41301` means it is running.
+The worker's own log (`updraft.log`) has an info-level `worker alive` line every hour, so you
+can tell from it when a worker was last running.
 
 Manage it with:
 
@@ -170,23 +209,42 @@ Stop-ScheduledTask    -TaskName Updraft
 powershell -NoProfile -ExecutionPolicy Bypass -File "$launchers\unregister-task.ps1"
 ```
 
-`unregister-task.ps1` stops and removes the task, stops a leftover worker process started by
-the wrapper, and deletes the wrapper. Config, state and logs are kept. The wrapper records the
-worker's PID, start time and executable in `launcher\<TaskName>.worker.json`, and unregister
-stops a process only when all three match, so a `updraft start` you run by hand is never
+`unregister-task.ps1` disables and stops the task, stops the worker the wrapper started, then
+unregisters the task and deletes the wrapper. Disabling comes first so that no repeat can start
+a wrapper while it is being torn down. Config, state and logs are kept. The worker is matched
+by its PID record or by its marker (see above), so a `updraft start` you run by hand is never
 stopped, even with the same CLI and config. Re-running `register-task.ps1` does the same for
-the worker the previous registration started, so the new task doesn't hit the worker lock.
+the worker the previous registration started, so the new task doesn't hit the worker lock, and
+registers the task again, enabled.
 
-`Stop-ScheduledTask` on its own ends the wrapper but can leave that `node.exe` worker running.
-To stop the worker without unregistering, re-run `register-task.ps1 -NoStart`.
+`Stop-ScheduledTask` on its own is not a way to stop the worker: it ends the wrapper but
+leaves the `node.exe` worker running, and the next repeat starts a wrapper that adopts it. To
+stop the worker:
+
+- **Until your next logon:** re-run `register-task.ps1 -NoStart`. It stops the worker and
+  registers the task with only its logon trigger.
+- **Until you turn it back on:** re-run `register-task.ps1 -NoStart`, then run
+  `Disable-ScheduledTask -TaskName Updraft`, in that order. Registering again re-enables the
+  task. Turn it back on with `Enable-ScheduledTask` and `Start-ScheduledTask`, or by re-running
+  `register-task.ps1`.
+- **For good:** run `unregister-task.ps1`.
 
 Notes:
 
-- A console window can flash briefly at logon. If Windows Terminal is set as the default
-  terminal application and a window stays open, closing it stops the worker; set the default
-  terminal to Windows Console Host or leave the window minimized.
-- Test the restart policy once: start the task, end the `node.exe` process in Task Manager,
-  and check that it comes back within a minute.
+- A console window can flash briefly when the wrapper starts. If Windows Terminal is set as
+  the default terminal application and a window stays open, closing it ends the wrapper, but
+  not the worker: the next repeat starts a wrapper that adopts it. To avoid the window, set
+  the default terminal to Windows Console Host.
+- Test the supervision once:
+  - start the task, end the `node.exe` process in Task Manager, and check that a new one
+    appears within a few seconds (`launcher.wrapper.log` says why);
+  - then run `Stop-ScheduledTask` and check that within `-RepeatIntervalMinutes` a wrapper is
+    running again and the same `node.exe` is still the only worker.
+- Run setup and `register-task.ps1` from a normal PowerShell window. A terminal inside an MSIX
+  packaged app has its writes to new `AppData` folders redirected to the package's private
+  storage (#32). Updraft's own files are in `%USERPROFILE%\.updraft`, outside `AppData`, so
+  they are not affected, but an `-ExtraPath`, `-ConfigPath` or `UPDRAFT_HOME` under `AppData`
+  would be.
 - Use one execution environment for the worker, checkouts and agents. To run the Linux setup
   inside WSL2 instead, keep the repos, binaries and credentials inside WSL and use the
   systemd launcher there (enable systemd in `/etc/wsl.conf`).
@@ -209,7 +267,7 @@ label.
 The agent has explicit `ProgramArguments` (node, cli.js, `start`, `--config`, path),
 `RunAtLoad`, `KeepAlive` with `SuccessfulExit = false` (restart after a crash or non-zero
 exit, 30-second throttle), a `PATH` in `EnvironmentVariables`, and stdout/stderr under
-`~/Library/Logs/updraft/`.
+`~/.updraft/logs/`.
 
 ```sh
 launchctl print gui/$(id -u)/local.updraft    # state, pid, last exit code
@@ -259,12 +317,13 @@ with `systemd-run --user --wait --pipe gh auth status`; if it fails, sign in wit
 
 ## Other hosts
 
-On a Linux host without systemd (or in a container), run the worker in the foreground under
-the supervisor the host already uses, with the same explicit arguments:
+On a Linux host without systemd, run the worker in the foreground under the supervisor the
+host already uses, with the same explicit arguments (for a container, see
+[In a container](#in-a-container)):
 
 ```sh
 /usr/local/bin/node /usr/local/lib/node_modules/@allenheltondev/updraft/dist/cli.js \
-  start --config "/home/me/.config/updraft/config.yaml"
+  start --config "/home/me/.updraft/config.yaml"
 ```
 
 The supervisor should run it as your user, set the working directory and `PATH`, restart it on
@@ -273,8 +332,8 @@ supervisord:
 
 ```ini
 [program:updraft]
-command=/usr/local/bin/node /usr/local/lib/node_modules/@allenheltondev/updraft/dist/cli.js start --config "/home/me/.config/updraft/config.yaml"
-directory=/home/me/.config/updraft
+command=/usr/local/bin/node /usr/local/lib/node_modules/@allenheltondev/updraft/dist/cli.js start --config "/home/me/.updraft/config.yaml"
+directory=/home/me/.updraft
 user=me
 environment=PATH="/usr/local/bin:/usr/bin:/bin",HOME="/home/me"
 autorestart=unexpected
@@ -283,3 +342,96 @@ stopwaitsecs=60
 ```
 
 Run only one worker per state directory.
+
+## In a container
+
+The worker can run inside a Linux container: it is a Node process that needs `git`, `gh` and
+the agent CLIs, nothing more. What a container changes is where its files live and how it is
+stopped and restarted. This is about the worker itself; to run each *agent* in a container of
+its own while the worker stays on the host, see [Isolating agents](isolation.md).
+
+**Put the state on a volume.** Everything the worker keeps (`config.yaml`, prompts,
+`state.db`, `worktrees/`, `logs/`) is in one directory, `~/.updraft` by default. Inside a
+container that is the image's home directory, which is lost with the container and, on
+platforms that run containers under an arbitrary uid, may be `/` or read-only. Set
+`UPDRAFT_HOME` explicitly and mount a volume there.
+
+The worker must be able to write that directory as the user it runs as. A new named volume is
+owned by root unless the image already has the directory: on first use Docker and Podman copy
+the image's directory at the mount point, including its owner, into an empty volume. So
+create it in the image, owned by the user the container runs as:
+
+```dockerfile
+# In your image, after installing node, git, gh, updraft and the agent CLIs:
+RUN mkdir -p /data && chown 1000:1000 /data
+USER 1000:1000
+```
+
+```sh
+docker run -d --name updraft --init --restart unless-stopped --stop-timeout 60 \
+  --user 1000:1000 \
+  -e UPDRAFT_HOME=/data \
+  -e GH_TOKEN \
+  -e ANTHROPIC_API_KEY \
+  -v updraft-data:/data \
+  your-updraft-image updraft start
+```
+
+The copy only happens into an empty named volume. For a volume that already exists and is
+owned by root, fix its owner once, for example
+`docker run --rm -v updraft-data:/data alpine chown 1000:1000 /data`. For a bind mount
+(`-v /srv/updraft:/data`), make the host directory owned by that uid, since nothing is copied.
+In Kubernetes, set `securityContext.fsGroup` (and `runAsUser`) to match. Then check with
+`docker exec updraft updraft doctor`, which reports whether the state and log directories are
+writable.
+
+- **A local volume, not a network share.** `state.db` is SQLite in WAL mode, which needs a
+  filesystem with working locks and shared memory. A named volume or a bind mount of a local
+  directory works; NFS, SMB and most cloud file shares do not.
+- **One worker per volume.** The worker takes a lock in `state.db`. Do not run two replicas
+  against the same volume, and do not scale the container above one.
+- **Clones on the volume too.** In `prepare-only` and `live` mode each repository needs a
+  `checkoutPath`. Clone the repositories under `/data` (for example `/data/repos/<name>`) and
+  give `checkoutPath` relative to the config file, so the clones and their per-job worktrees
+  survive the container.
+
+**Credentials come from the environment.** There is no interactive `gh auth login` in a
+container:
+
+- GitHub: `GH_TOKEN` (which `gh` reads directly), or a [GitHub App](github-app.md) with its
+  private key on the volume, readable only by the container's user. The worker does not pass
+  `GH_TOKEN` or `GITHUB_TOKEN` on to agents.
+- Agents: each CLI's headless sign-in, such as `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`
+  for Claude Code, `CODEX_API_KEY` for Codex and `KIRO_API_KEY` for Kiro (see
+  [Claude Code](agents/claude.md), [Codex](agents/codex.md), [Kiro](agents/kiro.md)). Pass them with `-e NAME` or your platform's secret store, never in
+  the image or `config.yaml`.
+- Git: job commits need an identity. Set `user.name` and `user.email` in the image's or the
+  volume's Git config, or set `github.app.commitAsApp`.
+
+**Stopping and restarting.**
+
+- `--init` (or another init such as `tini`) as PID 1. The worker handles SIGTERM itself, but
+  agent CLIs start processes of their own, and without an init the orphans of a killed agent
+  are never reaped.
+- Give it time to stop. On SIGTERM the worker stops its agents, records their runs as
+  `interrupted` and releases its lock. `--stop-timeout 60` (or `terminationGracePeriodSeconds`
+  in Kubernetes) leaves room for that; the default 10 seconds may not.
+- After a crash or a forced kill the lock is not released. The new container's worker takes it
+  over once the old heartbeat is about 45 seconds old; until then `updraft start` exits with
+  code 3 and the restart policy tries again.
+
+**Checking it.** Run the commands in the same container, so they see the same `UPDRAFT_HOME`
+and credentials:
+
+```sh
+docker exec updraft updraft doctor
+docker exec updraft updraft status
+docker exec updraft updraft logs <JOB_ID>
+```
+
+**Agents in containers from a containerized worker** (`agents.<name>.container` set on a worker
+that itself runs in a container) is not supported. The worker mounts each job's worktree into
+the agent's container at the same absolute path, so the runtime has to see the worker's paths
+as its own, and it would need the host's container runtime socket, which gives the worker's
+container control of the host. Run the worker on the host, or in a VM, when you want agents in
+containers.

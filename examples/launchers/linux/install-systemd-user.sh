@@ -23,7 +23,7 @@
 # host's existing supervisor instead (see docs/background-operation.md).
 set -euo pipefail
 
-APP_DIR=updraft
+HOME_DIR=.updraft
 PACKAGE=@allenheltondev/updraft
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 
@@ -89,8 +89,8 @@ if [ -n "$updraft_home" ]; then
   default_config="$updraft_home/config.yaml"
   log_hint="$updraft_home/logs"
 else
-  default_config="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_DIR/config.yaml"
-  log_hint="${XDG_STATE_HOME:-$HOME/.local/state}/$APP_DIR/logs"
+  default_config="$HOME/$HOME_DIR/config.yaml"
+  log_hint="$HOME/$HOME_DIR/logs"
 fi
 # Secrets for agent CLIs (e.g. KIRO_API_KEY) live in their own file, never in config.yaml.
 env_file=$(abspath "${env_file:-$(dirname "$default_config")/worker.env}")

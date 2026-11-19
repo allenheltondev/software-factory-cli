@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { kiroArgsChooseHarness, kiroV3Problem } from '../agents/adapters/kiro.js';
+import { checkCapabilities, readHelp } from '../agents/capabilities.js';
+import { agentProfile, describeProfile } from '../agents/profile.js';
 import type { AgentReport } from '../agents/discovery.js';
-import { agentAdapter, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviewSettings, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
+import { agentAdapter, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviewPoolFor, reviewSettings, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import { COMMENT_SCOPES_HINT } from '../publish/failure-comment.js';
 import { TOKEN_SCOPES_HINT } from '../publish/publish.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
@@ -13,7 +15,7 @@ import type { UpdraftPaths } from '../paths.js';
 import { labelEquals } from '../routing.js';
 import { agentLookupEnv } from '../worker/live.js';
 import { pathEntries, which } from '../util/which.js';
-import { println, type CommandContext } from './context.js';
+import { legacyNotice, println, type CommandContext } from './context.js';
 import { appKeyChecks, appRepoChecks } from './doctor-app.js';
 import { checkRepoCheckouts } from './doctor-checkout.js';
 import { containerAgentChecks } from './doctor-container.js';
@@ -97,7 +99,7 @@ export function loopChecks(config: UpdraftConfig, fullName: string, repo: Reposi
       for (const wf of repo.workflows) {
         const pools = typeof wf.pool === 'string' ? [wf.pool] : [...wf.pool.rules.map((r) => r.use), wf.pool.default];
         for (const p of new Set(pools)) {
-          const reviewPool = wf.reviewPool ?? p;
+          const reviewPool = reviewPoolFor(repo, wf, p);
           const reviewers = enabledIn(reviewPool);
           const alone = enabledIn(p).find((author) => reviewers.every((r) => r === author));
           const where = `review: workflow ${workflowId(wf)}, code from pool ${p}, reviewers from pool ${reviewPool}`;
@@ -396,11 +398,21 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
           return containerAgentChecks(agentName, adapter, agent, paths.configDir, { platform: probes.platform, env, which: probes.which, run: probes.run }, sev);
         }
         const report = await probes.discoverAgent(adapter, { env, ...(agent.command ? { command: agent.command } : {}), baseDir: paths.configDir });
-        return agentChecks(report, sev, { name: agentName, args: agent.args });
+        const checks = agentChecks(report, sev, { name: agentName, args: agent.args });
+        // Option check from the CLI's help text only: no prompt is sent, so no quota is used.
+        const profile = agentProfile(adapter, agent);
+        if (profile.model.value !== null || profile.effort.value !== null) {
+          const cap = checkCapabilities(adapter, profile, await readHelp(adapter, report?.launch, probes.run));
+          for (const message of cap.messages) checks.push({ status: cap.state === 'unsupported' ? sev : 'warn', detail: message });
+        }
+        return checks;
       }),
     );
-    enabled.forEach(([agentName], i) => {
+    enabled.forEach(([agentName, agent], i) => {
       for (const c of results[i]!) add(c.status, `agent ${agentName}`, c.detail);
+      const adapter = agentAdapter(agentName, agent);
+      const profile = agentProfile(adapter, agent);
+      add('ok', `agent ${agentName} profile`, describeProfile(agentName, adapter, profile));
     });
   }
 
@@ -488,5 +500,6 @@ export async function doctorCommand(
 ): Promise<number> {
   const report = await runDoctor(ctx.paths, probes);
   println(ctx.out, opts.json ? JSON.stringify(report, null, 2) : renderDoctor(report));
+  if (!opts.json && !probes.fileExists(ctx.paths.configFile)) for (const line of legacyNotice(ctx)) println(ctx.err, line);
   return report.ok ? EXIT.OK : EXIT.FAILURE;
 }

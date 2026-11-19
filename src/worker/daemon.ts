@@ -7,6 +7,7 @@ import {
   cancelClaim,
   claimNextJob,
   finishRun,
+  getJob,
   getRun,
   heartbeatRun,
   holdsWorkerLock,
@@ -21,6 +22,7 @@ import {
 } from '../db/queue.js';
 import { syncPublishSettings } from '../db/publish-settings.js';
 import type { UpdraftPaths } from '../paths.js';
+import type { AssignmentCommenter } from '../publish/assignment-comment.js';
 import type { FailureCommenter } from '../publish/failure-comment.js';
 import type { Publisher } from '../publish/publish.js';
 import type { IssueSnapshot, Job } from '../types.js';
@@ -43,6 +45,7 @@ import {
 import { defaultContainerControl, type ContainerControl } from './container.js';
 import { defaultProcessControl, terminateIfSameProcess, type ProcessControl } from './process.js';
 import { reconcileInterruptedRuns } from './reconcile.js';
+import { decideFailureHandling, hasEscalation, type PolicyOutcome } from './failure-policy.js';
 
 export { WorkerLockedError } from './lock.js';
 
@@ -53,7 +56,16 @@ export { WorkerLockedError } from './lock.js';
  */
 export const CANCEL_CHECK_MS = 2_000;
 
+/**
+ * How often the worker logs an info-level "worker alive" line. Polls are logged at debug only,
+ * so without this a worker that stopped silently (killed, crashed before its handlers ran)
+ * leaves no way to tell from the log when it was last running.
+ */
+export const STATUS_LOG_MS = 60 * 60_000;
+
 export interface DaemonTiming {
+  /** Interval of the info-level "worker alive" line. Default 1h. */
+  statusLogMs?: number;
   /** Lock heartbeat and run-lease refresh interval. Default 15s. */
   heartbeatMs?: number;
   /** How often to look for user cancel requests on in-flight runs. Default 2s. */
@@ -103,6 +115,11 @@ export interface DaemonDeps {
    * transient failures. Never changes a run's outcome. Absent: nothing is posted.
    */
   failureCommenter?: FailureCommenter;
+  /**
+   * Assignment comment: announced on the issue once a live implementation run passed its final
+   * dispatch check, just before the agent starts. Not awaited; never changes a run. Absent: none.
+   */
+  assignmentCommenter?: AssignmentCommenter;
   /** Identity overrides, mainly for tests. */
   workerId?: string;
   hostname?: string;
@@ -226,7 +243,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       workerStopping: signal,
       now,
       ...(issue ? { issue } : {}),
-      recordProcess: (info) => setRunProcess(db, run.id, info),
+      recordProcess: (info) => setRunProcess(db, run.id, info, now),
     };
     runLog.info('run started', { repo: job.repoFullName, issue: job.issueNumber, pool: run.pool, logPath: run.logPath });
     const done = (async () => {
@@ -247,8 +264,26 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       // closes as canceled even if its agent finished first, and a run another worker already
       // reconciled is left as that worker recorded it.
       let finished: FinishedRun | null = null;
+      let policyRequeued = false;
       try {
-        finished = finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });
+        // Opt-in policy (usage limits, escalation): may close a clean-exit pre-edit deferral as
+        // failed and put the job back instead of failing it. A no-op without that configuration.
+        let policy: PolicyOutcome = { outcome: result.outcome, error: result.error ?? null };
+        if (config.capacity || hasEscalation(config)) {
+          try {
+            policy = decideFailureHandling(db, config, job, run, result, now());
+          } catch (err) {
+            runLog.error('could not apply failure policy; recording the run as reported', { error: message(err) });
+          }
+        }
+        finished = finishRun(db, run.id, {
+          outcome: policy.outcome,
+          error: policy.error ?? null,
+          now,
+          ...(policy.handling ? { handling: policy.handling } : {}),
+        });
+        policyRequeued = !!policy.handling && getJob(db, job.id)?.status === 'queued';
+        if (policy.handling) runLog.info('failure policy applied', { kind: policy.handling.kind, detail: policy.error ?? undefined });
         if (finished?.canceledByUser) runLog.info('run canceled by user', { executorOutcome: result.outcome });
         else runLog.info('run finished', { outcome: result.outcome, ...(result.error ? { error: result.error } : {}) });
       } catch (err) {
@@ -261,7 +296,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       // Not for interrupted runs: the worker is stopping, and whoever stops it is there to retry.
       // Decided by what was recorded: a run the user canceled is closed as canceled whatever the
       // executor reported, and must not be announced as a failure.
-      if (finished && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.failureCommenter) {
+      if (finished && !policyRequeued && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.failureCommenter) {
         await deps.failureCommenter.afterRun(run.id, controller.signal);
       }
     })().finally(() => {
@@ -331,6 +366,12 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         releaseClaim(db, run.id, lockLost ? 'worker lost its lock' : 'run was closed before it started', now);
         if (lockLost) return;
         continue;
+      }
+      // Not awaited: delivery never delays or changes the run. announce() never throws.
+      if (deps.assignmentCommenter) {
+        deps.assignmentCommenter
+          .announce(job, run, signal)
+          .catch((err: unknown) => log.error('assignment comment crashed', { runId: run.id, error: message(err) }));
       }
       launch({ job, run: { ...run, executionStartedAt } }, check.issue);
     }
@@ -427,15 +468,33 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     if (settingsSynced && deps.publisher && !signal.aborted && !lockLost) await deps.publisher.sweepUnpublished(signal);
 
     let nextPollAt = now();
+    const statusLogMs = deps.timing?.statusLogMs ?? STATUS_LOG_MS;
+    const startedAt = now();
+    let lastStatusAt = startedAt;
+    let polls = 0;
+    let pollFailures = 0;
     while (!signal.aborted && !lockLost) {
       if (now() >= nextPollAt) {
+        polls++;
         try {
           await deps.poll();
         } catch (err) {
+          pollFailures++;
           log.error('poll failed', { error: message(err) });
           safeRecordError('poll', message(err));
         }
         nextPollAt = now() + pollMs;
+        if (now() - lastStatusAt >= statusLogMs) {
+          log.info('worker alive', {
+            uptimeMinutes: Math.round((now() - startedAt) / 60_000),
+            polls,
+            pollFailures,
+            inFlight: inFlight.size,
+          });
+          lastStatusAt = now();
+          polls = 0;
+          pollFailures = 0;
+        }
         deferred.clear();
         if (deps.publisher && !signal.aborted && !lockLost) await deps.publisher.retryDue(signal);
         if (deps.failureCommenter && !signal.aborted && !lockLost) await deps.failureCommenter.retryDue(signal);

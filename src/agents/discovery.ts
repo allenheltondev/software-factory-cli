@@ -20,6 +20,7 @@ import { homedir, release, tmpdir } from 'node:os';
 import { posix, win32 } from 'node:path';
 import { KNOWN_ADAPTERS, type AdapterName } from '../config/schema.js';
 import { kiroSupportsV3 } from './adapters/kiro.js';
+import { failureLine, firstMeaningfulLine } from './failure-line.js';
 import { which } from '../util/which.js';
 
 export type Tri = 'yes' | 'no' | 'unknown';
@@ -168,6 +169,13 @@ const DEEP_PROMPT = 'Reply with the single word OK and nothing else.';
 
 const firstLine = (s: string): string => s.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? '';
 
+/**
+ * Why a probe command failed, from its output: the line that reads as the error, not merely the
+ * first one (Codex prints a stdin banner and config warnings ahead of it). stderr comes after
+ * stdout, so its lines win ties.
+ */
+const failureDetail = (r: ProcessResult): string => failureLine(`${r.stdout}\n${r.stderr}`);
+
 function runLaunch(ctx: AuthContext, args: string[], timeoutMs: number, cwd?: string): Promise<ProcessResult> {
   const l = ctx.launch!;
   return ctx.probes.run(l.file, [...l.args, ...args], { timeoutMs, cwd });
@@ -199,7 +207,7 @@ async function claudeAuth(ctx: AuthContext): Promise<AuthResult> {
       : { signedIn: 'no', auth: 'not signed in; run "claude auth login" or set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN' };
   }
   // Older Claude Code builds have no `auth status`; don't guess.
-  const why = firstLine(r.stderr || r.stdout || r.error || '');
+  const why = failureDetail(r) || (r.error ?? '');
   return { signedIn: 'unknown', auth: null, notes: [`"claude auth status" gave no status${why ? ` (${why})` : ''}; update Claude Code`] };
 }
 
@@ -212,7 +220,7 @@ async function claudeAuth(ctx: AuthContext): Promise<AuthResult> {
  */
 async function codexAuth(ctx: AuthContext): Promise<AuthResult> {
   const r = await runLaunch(ctx, ['login', 'status'], AUTH_TIMEOUT_MS);
-  const text = firstLine(r.stderr) || firstLine(r.stdout);
+  const text = firstMeaningfulLine(r.stderr) || firstMeaningfulLine(r.stdout);
   if (r.code === 0) return { signedIn: 'yes', auth: text || 'logged in' };
   if (ctx.probes.env.CODEX_API_KEY) {
     return { signedIn: 'yes', auth: 'CODEX_API_KEY (codex exec only)' };
@@ -224,18 +232,42 @@ async function codexAuth(ctx: AuthContext): Promise<AuthResult> {
 }
 
 /**
- * Kiro: "Headless mode requires an API key set as the KIRO_API_KEY environment variable"
- * (https://kiro.dev/docs/cli/headless/). `kiro-cli whoami` reports interactive login sessions,
- * which headless runs can't rely on, so presence of the env var is the check. We can't validate
- * the key without a prompt (see --deep). The check reads the worker's own environment, not
- * agents.<name>.env: the key belongs in the launcher's environment, not the config file. An
- * active browser login takes precedence over the key when both exist
- * (https://kiro.dev/docs/getting-started/authentication/).
+ * Kiro: two ways to be signed in for headless runs.
+ *
+ * - `KIRO_API_KEY` in the environment. Kiro's docs say "Headless mode requires an API key set as
+ *   the KIRO_API_KEY environment variable" (https://kiro.dev/docs/cli/headless/). We can't
+ *   validate the key without a prompt (see --deep). The check reads the worker's own
+ *   environment, not agents.<name>.env: the key belongs in the launcher's environment, not the
+ *   config file.
+ * - A login session (`kiro-cli login`: a Builder ID or IAM Identity Center browser sign-in).
+ *   Despite the docs, headless `chat --no-interactive` works with one: verified with
+ *   kiro-cli 3.5.0 signed in through IAM Identity Center, no key set. `kiro-cli whoami` exits 0
+ *   and prints "Logged in with ..." for such a session, which is the check. An active login
+ *   takes precedence over the key when both exist
+ *   (https://kiro.dev/docs/getting-started/authentication/).
+ *
+ * With the key set, the CLI is not run for auth. Without it and without a runnable CLI, there is
+ * nothing to ask, so it is "no" as before.
  */
 async function kiroAuth(ctx: AuthContext): Promise<AuthResult> {
-  return ctx.probes.env.KIRO_API_KEY
-    ? { signedIn: 'yes', auth: 'KIRO_API_KEY is set' }
-    : { signedIn: 'no', auth: 'KIRO_API_KEY is not set; headless Kiro requires it' };
+  if (ctx.probes.env.KIRO_API_KEY) return { signedIn: 'yes', auth: 'KIRO_API_KEY is set' };
+  const notSignedIn = 'not logged in; run "kiro-cli login" or set KIRO_API_KEY';
+  if (!ctx.launch) return { signedIn: 'no', auth: notSignedIn };
+  const r = await runLaunch(ctx, ['whoami'], AUTH_TIMEOUT_MS);
+  const out = `${r.stdout}\n${r.stderr}`;
+  const loggedIn = out.split(/\r?\n/).map((l) => l.trim()).find((l) => /^logged in\b/i.test(l));
+  if (r.code === 0 && loggedIn) {
+    return {
+      signedIn: 'yes',
+      auth: loggedIn,
+      notes: ['signed in with a kiro-cli login session, which expires: runs fail until "kiro-cli login" again. KIRO_API_KEY does not'],
+    };
+  }
+  if (r.code !== null && /not logged in|log ?in required|please log ?in|kiro-cli login/i.test(out)) {
+    return { signedIn: 'no', auth: notSignedIn };
+  }
+  const why = r.timedOut ? `timed out after ${AUTH_TIMEOUT_MS / 1000}s` : failureDetail(r) || r.error || `exit ${r.code}`;
+  return { signedIn: 'unknown', auth: null, notes: [`"kiro-cli whoami" gave no status (${why}); set KIRO_API_KEY or run "kiro-cli login"`] };
 }
 
 export const AGENT_SPECS: Record<AdapterName, AgentSpec> = {
@@ -321,7 +353,8 @@ function getEnv(env: NodeJS.ProcessEnv, name: string, platform: NodeJS.Platform)
 /**
  * Common install locations that may be missing from a background launcher's PATH:
  * npm's global prefix, ~/.local/bin (Claude Code's native installer on every OS, Kiro's Linux
- * installer), Homebrew, and WinGet's Links directory.
+ * installer), Homebrew, WinGet's Links directory, and %LOCALAPPDATA%\Kiro-Cli (where Kiro's
+ * Windows installer puts kiro-cli.exe, seen with 3.5.0).
  */
 export function commonInstallDirs(probes: Pick<DiscoveryProbes, 'platform' | 'env' | 'homedir' | 'execPath'>): string[] {
   const { platform, env, homedir: home } = probes;
@@ -338,6 +371,7 @@ export function commonInstallDirs(probes: Pick<DiscoveryProbes, 'platform' | 'en
     dirs.push(p.join(home, '.local', 'bin'));
     const localAppData = getEnv(env, 'LOCALAPPDATA', platform) ?? p.join(home, 'AppData', 'Local');
     dirs.push(p.join(localAppData, 'Microsoft', 'WinGet', 'Links'));
+    dirs.push(p.join(localAppData, 'Kiro-Cli'));
   } else {
     if (npmPrefix) dirs.push(p.join(npmPrefix, 'bin'));
     // Default prefix is the Node install root (bin/node -> ../), plus the common user prefix.
@@ -602,7 +636,7 @@ async function discoverOne(
       report.version = parseVersion(r.stdout) ?? parseVersion(r.stderr);
       if (spec.adapter === 'kiro') report.kiroV3 = kiroSupportsV3(report.version);
     } else {
-      const why = r.timedOut ? `timed out after ${VERSION_TIMEOUT_MS / 1000}s` : r.error ?? (firstLine(r.stderr || r.stdout) || `exit ${r.code}`);
+      const why = r.timedOut ? `timed out after ${VERSION_TIMEOUT_MS / 1000}s` : r.error ?? (failureDetail(r) || `exit ${r.code}`);
       notes.push(`"${spec.command} --version" failed: ${why}`);
     }
   }
@@ -623,7 +657,7 @@ async function discoverOne(
     report.deep =
       r.code === 0
         ? { ok: true, detail: 'headless prompt succeeded' }
-        : { ok: false, detail: r.timedOut ? `timed out after ${DEEP_TIMEOUT_MS / 1000}s` : r.error ?? (firstLine(r.stderr || r.stdout) || `exit ${r.code}`) };
+        : { ok: false, detail: r.timedOut ? `timed out after ${DEEP_TIMEOUT_MS / 1000}s` : r.error ?? (failureDetail(r) || `exit ${r.code}`) };
     if (report.deep.ok) report.signedIn = 'yes';
     else report.usable = false;
   }
@@ -686,6 +720,8 @@ const KILL_GRACE_MS = 1_500;
 
 export interface RunProcessOptions extends RunOptions {
   env?: NodeJS.ProcessEnv;
+  /** Written to the process's stdin, which is then closed. Absent: stdin is closed without input. */
+  input?: string;
   /** Overrides the SIGTERM-to-SIGKILL grace period (tests). */
   killGraceMs?: number;
 }
@@ -760,8 +796,13 @@ export function runProcess(file: string, args: string[], opts: RunProcessOptions
         detached: process.platform !== 'win32',
         env: opts.env,
         cwd: opts.cwd,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       });
+      if (opts.input !== undefined) {
+        // A CLI that exits without reading its prompt closes the pipe: EPIPE is not a failure of ours.
+        child.stdin?.on('error', () => undefined);
+        child.stdin?.end(opts.input);
+      }
     } catch (err) {
       resolve({ code: null, stdout: '', stderr: '', error: err instanceof Error ? err.message : String(err) });
       return;

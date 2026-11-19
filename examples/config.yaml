@@ -46,6 +46,7 @@ agents:
     # own; a --permission-mode here replaces the full-auto default (see docs/agents/claude.md).
     # command: /usr/local/bin/claude
     # args: [--model, sonnet, --max-turns, "60"]
+    # or, as a profile (model/effort are optional; see docs/agents/profiles.md): model: sonnet, effort: high
     # args: [--permission-mode, acceptEdits, --allowedTools, "Bash(npm test *)", "Bash(git add *)", "Bash(git commit *)"]
     # env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000" }
   kiro:
@@ -80,7 +81,10 @@ repositories:
     # maxRevisions: 3
     # With publish: have a second agent review every head of such a PR; with revise, its "changes requested" starts a revision.
     # The reviewer is never the agent that wrote the code, so a pool used for reviews needs two agents (or set workflows[].reviewPool).
+    # Reviewers are your coding agents, each review a fresh process. Route reviews to their own pool: one agent fixes the
+    # reviewer, several take turns (e.g. pools.reviewers: { agents: [codex, kiro, claude] }).
     # review: true
+    # review: { pool: reviewers }
     # With review: merge a PR the reviewer found ready, once its checks passed. Off unless set; read docs/review-loop.md first.
     # autoMerge: squash
     workflows:

@@ -124,8 +124,8 @@ One comment on the PR per revision run, found again by a hidden marker so a retr
 a second one:
 
 - after a push: the new commits, the diff stat, the verification results and the agent's
-  final message, fenced so mentions and closing keywords in it stay inert;
-- when the agent made no commits: a comment saying so, with its final message;
+  final message, as sanitized Markdown so mentions and closing keywords in it stay inert;
+- when the agent made no commits: a comment saying so, with its final message (also sanitized Markdown);
 - when the push was refused: the reason, in the worker's own words (no agent output, no local
   paths).
 

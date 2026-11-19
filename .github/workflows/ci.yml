@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Branch pushes are covered by pull_request. Running both posts two sets of the same
+  # required check names on one commit, and a cancelled or failed duplicate blocks the merge.
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -67,6 +70,7 @@ jobs:
                 '<RestartOnFailure>',
                 '<StartWhenAvailable>true</StartWhenAvailable>',
                 '<LogonTrigger>',
+                '<Interval>PT5M</Interval>',
                 '<LogonType>InteractiveToken</LogonType>')) {
               if (-not $xml.Contains($expected)) { throw "task XML is missing $expected`n$xml" }
             }

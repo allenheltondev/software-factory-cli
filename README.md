@@ -68,6 +68,7 @@ the per-user default.
 | `updraft retry JOB_ID` | Requeue a failed, interrupted or canceled job |
 | `updraft publish RUN_ID` | Push the branch of a succeeded live run and open its PR, or finish a publication that failed part-way. Never opens a second PR or comment. See [docs/publication.md](docs/publication.md) |
 | `updraft reviews [--json] [--limit N]` | For each PR Updraft published (newest first, default 20), show its head SHA and the current result from an outside reviewer: blockers yes/no, reviewer and link, or "no review for this head" / "not reviewed". Read-only: it changes neither the state database nor GitHub. See [docs/review-result.md](docs/review-result.md) |
+| `updraft stats [--json] [--since AGE] [--repo OWNER/REPO]` | How the factory is doing over a window (default `30d`; `h`, `d`, `w` or `all`), overall and per repository: work items done, agent run time and queue wait (average, median, p90) per kind and agent, lead times, PRs opened, merged and blocked from auto-merge, failed runs, reviewer verdicts and findings, change-request rounds and revisions per PR. Read-only and local: nothing leaves the machine. Based on a rollup that `clean --older-than` never prunes. See [docs/stats.md](docs/stats.md) |
 | `updraft logs RUN_ID\|JOB_ID [--follow] [--path]` | Print a run's `run.log`; for a job, the log of its latest run (named on stderr). `--follow` keeps printing until the run has finished; `--path` prints only the file path. Needs neither network nor a running worker |
 | `updraft cancel JOB_ID` | Cancel a queued job, or ask the running worker to stop a running one: the agent's process tree is stopped within a few seconds, the job ends `canceled`, its worktree and branch are kept, and nothing is published. See [Canceling a job](docs/operations.md#canceling-a-job) |
 | `updraft clean [--dry-run] [--older-than AGE]` | Remove job worktrees of succeeded runs and runs whose agent never started. Keeps the worktrees of failed, interrupted and user-canceled runs, and all branches. With `--older-than` (e.g. `30d`, `12h`, `2w`) also prunes old jobs, runs, logs and errors. See [Per-job worktrees](docs/worktrees.md) and [Retention](docs/operations.md#retention) |
@@ -146,18 +147,19 @@ repositories:
 | `repositories.<OWNER/REPO>.remote` | a github.com remote | Remote of `checkoutPath` to fetch from. Without it, only a remote whose URL is on `github.com` with path `OWNER/REPO` qualifies (`origin` preferred). Set it for an SSH host alias such as `git@github-work:OWNER/REPO`; any host is then accepted, but `OWNER/REPO` must still match |
 | `repositories.<OWNER/REPO>.publish` | `none` | Live mode, `local-branch` actions: `draft-pr` pushes the job branch of a succeeded run that left commits and opens a draft PR; `pr` opens a ready-for-review PR instead (for private repos where your plan has no draft PRs). Set in another mode, it is a validation warning and does nothing. See [docs/publication.md](docs/publication.md) |
 | `repositories.<OWNER/REPO>.commentOnFailure` | `false` | Live mode: when a run leaves its job failed (agent error, timeout, failed verification, worktree preparation failure, or no agent could start), the worker comments once on the issue with the run id, agent, duration, reason and how to retry. Never includes agent output or local paths. Set in another mode, it is a validation warning and does nothing. See [Failure comments](docs/failure-comments.md) |
+| Assignment comment (no setting) | always in live mode | When a live implementation run passes its final dispatch check, the worker comments once on the issue naming the assigned agent, job ID, run ID and pool; needs the same Issues write permission as the failure comment. Failures never affect the run. See [Assignment comments](docs/assignment-comments.md) |
 | `repositories.<OWNER/REPO>.revise` | `false` | Live mode, together with `publish`: when an allowed actor requests changes on a PR the worker opened, run the agent on that PR's branch with the review, verify, push the new commits to the PR as a fast-forward and reply there. Set in another mode or without `publish`, it is a validation warning and does nothing. See [Revisions](docs/revisions.md) |
 | `repositories.<OWNER/REPO>.maxRevisions` | `3` | With `revise`: how many revision jobs one PR gets. Further change requests are recorded and shown in `updraft status` but not acted on, and one comment on the PR says so |
-| `repositories.<OWNER/REPO>.review` | `false` | Live mode, together with `publish`: a second agent reviews every head commit of a PR the worker opened and its verdict is posted as a comment review. "Changes requested" queues a revision when `revise` is on; "ready to merge" marks a draft ready for review. `true`, or `{ allowSameAgent: true }` to let the agent that wrote the code review it when the pool has no other. Set in another mode or without `publish`, it is a validation warning and does nothing. See [The review loop](docs/review-loop.md) |
+| `repositories.<OWNER/REPO>.review` | `false` | Live mode, together with `publish`: a second agent reviews every head commit of a PR the worker opened and its verdict is posted as a comment review. "Changes requested" queues a revision when `revise` is on; "ready to merge" marks a draft ready for review. `true`, or an object: `{ pool: <name> }` routes reviews of every workflow without a `reviewPool` to that pool (one agent fixes the reviewer, several take turns), and `{ allowSameAgent: true }` lets the agent that wrote the code review it when the pool has no other. Set in another mode or without `publish`, it is a validation warning and does nothing. See [The review loop](docs/review-loop.md) |
 | `repositories.<OWNER/REPO>.autoMerge` | off | With `review`: `squash`, `merge` or `rebase`. Updraft merges a PR whose current head its reviewer found ready, once the head's checks passed and nothing else stands in the way, with the reviewed commit pinned. The issue and the code are untrusted and could talk a reviewer into approving: read [Auto-merge](docs/review-loop.md#auto-merge) before setting it |
 | `repositories.<OWNER/REPO>.autoMergeWaitMinutes` | `60` | With `autoMerge`: how long to wait for pending checks before giving up and leaving the PR for a person |
 | `repositories.<OWNER/REPO>.autoMergeRequiredChecks` | none | With `autoMerge`: names of the commit statuses or check runs (for example `test`) that must each report success on the commit. Without it, any one successful check is enough. A skipped or neutral check never counts as a success |
-| `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll |
+| `repositories.<OWNER/REPO>.backfillSince` | none | ISO timestamp. New subscriptions start at the current event; set this to enqueue matching events since then on the first poll. "First poll" means whenever `state.db` has no checkpoint for the repository, including with a new or deleted `state.db`, which then has no record of jobs already run. Remove it once the first poll has run |
 | `workflows[].id` | `ACTION:LABEL` | Stable ID used to deduplicate events. Set it to keep dedupe stable if you rename the label or action |
 | `workflows[].trigger` | required | `{ event: issue.labeled, label: <label> }` |
 | `workflows[].action` | required | Action name |
 | `workflows[].pool` | required | A pool name, or `{ rules: [{ hasLabel, use }], default }`. The first matching rule wins; routing uses the issue's labels when the job is queued |
-| `workflows[].reviewPool` | the job's pool | With `review`: the pool reviewer runs are routed to. The agent that wrote the code is never picked while the pool has another enabled agent; a configuration where it is the only one is invalid unless `review.allowSameAgent` is set |
+| `workflows[].reviewPool` | `review.pool`, else the job's pool | With `review`: the pool reviewer runs are routed to, in turn on a rotation of their own. The agent that wrote the code is never picked while the pool has another enabled agent; a configuration where it is the only one is invalid unless `review.allowSameAgent` is set |
 | `workflows[].allowedActors` | `dispatch.allowedActors` | Per-workflow override of the allowlist |
 
 Names of agents, pools, actions and workflow IDs use letters, digits, `.`, `_` and `-`.
@@ -248,10 +250,11 @@ default and should stay off until you have read what its checks do and do not co
 
 | Platform | Launcher |
 | --- | --- |
-| Windows | `windows/register-task.ps1` registers a Task Scheduler task at logon for your account (no stored password), with restart on failure, no time limit and no overlapping runs. `unregister-task.ps1` removes it |
+| Windows | `windows/register-task.ps1` registers a Task Scheduler task at logon for your account (no stored password), repeating every 5 minutes, with no time limit and no overlapping runs. Its wrapper restarts the worker after a crash, with backoff. `unregister-task.ps1` removes it |
 | macOS | `macos/install-launchagent.sh` installs a per-user LaunchAgent from `updraft.plist.template` (`--uninstall` removes it) |
 | Linux (systemd) | `linux/install-systemd-user.sh` installs a `systemd --user` service; `loginctl enable-linger` keeps it running without a login session |
 | Other hosts | Run `updraft start --config <path>` in the foreground under your existing supervisor |
+| Container | Run `updraft start` with `UPDRAFT_HOME` on a local volume; see [In a container](docs/background-operation.md#in-a-container) |
 
 Each launcher runs `node <package>/dist/cli.js start --config <path>` with absolute paths, a
 working directory and an explicit `PATH`. Run `updraft doctor` under the same account and
@@ -306,19 +309,98 @@ The key points; [docs/security.md](docs/security.md) has the full statement of e
 
 ## Files and locations
 
-| | Windows | macOS | Linux |
-| --- | --- | --- | --- |
-| Config | `%APPDATA%\updraft\config.yaml` | `~/Library/Application Support/updraft/config.yaml` | `$XDG_CONFIG_HOME/updraft/config.yaml` (default `~/.config`) |
-| State (`state.db`, `worktrees/`) | `%LOCALAPPDATA%\updraft\` | `~/Library/Application Support/updraft/` | `$XDG_STATE_HOME/updraft/` (default `~/.local/state`) |
-| Logs (`updraft.log`, `runs/`) | `%LOCALAPPDATA%\updraft\logs\` | `~/Library/Logs/updraft/` | `$XDG_STATE_HOME/updraft/logs/` |
+Everything lives in one directory, `~/.updraft`, on every OS (`%USERPROFILE%\.updraft` on
+Windows, for example `C:\Users\you\.updraft`):
+
+```text
+~/.updraft/
+  config.yaml      config
+  prompts/         starter prompts written by configure / add
+  state.db         queue, runs and checkpoints
+  worktrees/       per-job worktrees
+  logs/
+    updraft.log    worker log
+    runs/<runId>/  one run.log per run
+```
+
+On Windows it is deliberately outside `AppData`: Windows redirects new `AppData` folders that a
+packaged (MSIX) app creates into that app's private storage, so a CLI run from such an app
+(a desktop IDE or agent host) and one run from a terminal would each see their own files.
 
 Overrides:
 
-- `UPDRAFT_HOME=<dir>` puts config (`<dir>/config.yaml`), state (`<dir>/state.db`) and logs
-  (`<dir>/logs/`) under one directory.
+- `UPDRAFT_HOME=<dir>` moves the whole directory: config (`<dir>/config.yaml`), state
+  (`<dir>/state.db`) and logs (`<dir>/logs/`).
 - `--config <path>` or `UPDRAFT_CONFIG=<path>` changes only the config file; `--config` wins.
   Relative paths in the config (such as prompt files) resolve against the config file's
   directory.
+
+## Moving from the per-OS locations
+
+Earlier builds kept their files in per-OS folders:
+
+| | Config folder (`config.yaml`, `prompts/`) | State folder (`state.db`, `worktrees/`, `logs/`) |
+| --- | --- | --- |
+| Windows | `%APPDATA%\updraft` | `%LOCALAPPDATA%\updraft` |
+| macOS | `~/Library/Application Support/updraft` | the same folder; logs in `~/Library/Logs/updraft` |
+| Linux | `~/.config/updraft` | `~/.local/state/updraft` |
+
+Nothing reads those folders by default any more. When `~/.updraft` has no config and the old
+config folder does, `updraft doctor`, `configure`, `add` and every command that stops for lack
+of a config say where it is. Don't just move the files into `~/.updraft`:
+
+- `state.db` records each run's log file and worktree by absolute path, so after a move
+  `updraft logs` can't find old runs and `updraft clean` skips their worktrees.
+- Relative paths in `config.yaml`, such as `checkoutPath: ../my-clone`, resolve against the
+  config file's folder, so moving the file changes where they point.
+
+Choose one of these instead:
+
+**Keep the install where it is.** Nothing is lost. Point Updraft at the old folders, in your
+user environment and in the launcher:
+
+| | Set |
+| --- | --- |
+| Environment | `UPDRAFT_CONFIG=<config folder>/config.yaml` and `UPDRAFT_HOME=<state folder>` |
+| Windows launcher | `register-task.ps1 -ConfigPath <config folder>\config.yaml -UpdraftHome <state folder>` |
+| macOS launcher | `install-launchagent.sh --config <config folder>/config.yaml --updraft-home <state folder>` |
+| Linux launcher | `install-systemd-user.sh --config <config folder>/config.yaml --updraft-home <state folder> --env-file ~/.config/updraft/worker.env` |
+
+Config-relative paths, state and worktrees then resolve exactly as before. On macOS, logs of new
+runs go to `<state folder>/logs`; logs of earlier runs stay in `~/Library/Logs/updraft` and are
+still found. On Windows the folders stay under `AppData`, with the redirection problem
+described above for packaged apps.
+
+**Start over in `~/.updraft`.** Only the config moves. The queue, run history and stats stay
+behind:
+
+1. Let queued and running jobs finish, or cancel them. Publish any succeeded run you still
+   want (`updraft publish RUN_ID`). Optionally run `updraft clean` to remove finished
+   worktrees. Then stop the worker and remove its launcher.
+2. Copy `config.yaml` and `prompts/` into `~/.updraft`. Then make every config-relative path
+   absolute, or rewrite it relative to `~/.updraft`:
+   - `repositories.*.checkoutPath`;
+   - `actions.*.prompt`, `revisePrompt` and `reviewPrompt` (unchanged if they point into the
+     copied `prompts/`);
+   - `agents.*.command` and `agents.*.container.runtime` when they are paths;
+   - `github.app.privateKeyPath`, and move the key file if it lived in the old folder.
+
+   Then remove every `repositories.*.backfillSince` from the copied config, or move it to a
+   cutoff after the last job the old install handled. A repository with no checkpoint is
+   scanned back to its `backfillSince`, and the new `state.db` has no record of the jobs the
+   old install already queued. Label events since that date would be dispatched again and
+   open duplicate PRs.
+3. Leave `state.db`, `logs/` and `worktrees/` where they are. `~/.updraft` gets a new, empty
+   `state.db`:
+   - with no `backfillSince`, polling starts at each repository's current event, so earlier
+     label events are not queued again;
+   - `updraft logs`, `retry`, `publish`, `status` and `stats` no longer know earlier jobs;
+   - PRs opened before the switch get no further revisions or reviews.
+
+   Earlier runs' logs stay readable as files in the old state folder. Their branches are
+   untouched. Remove leftover worktrees with `git worktree remove <path>` from the clone.
+4. Run `updraft validate` and `updraft doctor`, which check each `checkoutPath` and prompt
+   file, then reinstall the launcher.
 
 ## Upgrading from software-factory-cli
 
@@ -328,8 +410,10 @@ clean break: nothing reads the old names. To move an existing install:
 1. Stop the worker and remove its launcher using the old package's scripts (the Task Scheduler
    task, LaunchAgent or systemd unit), then `npm uninstall -g software-factory-cli` and
    `npm install -g @allenheltondev/updraft`.
-2. Rename the `software-factory` config and state directories to `updraft` (see
-   [Files and locations](#files-and-locations)). The worker log is now `updraft.log`.
+2. Keep the `software-factory` config and state folders where they are, or start over in
+   `~/.updraft`, as described in [Moving from the per-OS locations](#moving-from-the-per-os-locations),
+   with `software-factory` in place of `updraft` in the folder names. Don't just move or rename
+   them, for the same reasons. The worker log is now `updraft.log`.
 3. Replace `FACTORY_HOME` and `FACTORY_CONFIG` with `UPDRAFT_HOME` and `UPDRAFT_CONFIG`
    wherever you set them, and install the launcher again from the new package.
 4. Let queued and running jobs finish before you switch, or re-apply the label afterwards.

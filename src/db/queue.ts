@@ -1,12 +1,12 @@
 // OWNER: queue/worker workstream. Claim-side persistence: atomic claims, runs,
 // leases, retry, and status queries.
 import { join } from 'node:path';
-import { DEFAULT_MAX_REVISIONS, reviewSettings, type UpdraftConfig } from '../config/schema.js';
+import { DEFAULT_MAX_REVISIONS, reviewPoolFor, reviewSettings, workflowId, type UpdraftConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
 import { reviewOf, type Job, type JobStatus, type Publication, type Revision, type Run, type RunContainer, type RunOutcome, type RunSummary } from '../types.js';
 import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
 import { listRecentPublications } from './publications.js';
-import { listRecentLoopPrs, listRecentPrReviews, prStage, type LoopPr, type PrReview, type PrStageInfo } from './pr-reviews.js';
+import { getLoopPr, listRecentLoopPrs, listRecentPrReviews, prStage, type LoopPr, type PrReview, type PrStageInfo } from './pr-reviews.js';
 import {
   issuesAwaitingRevisionPush,
   listLimitedRevisionPrs,
@@ -16,6 +16,17 @@ import {
   type RevisionPr,
 } from './revisions.js';
 import { newId, nowIso } from '../util/ids.js';
+import {
+  activeCooldowns,
+  capacityBlock,
+  listRecentPolicyEvents,
+  recordPolicyEvent,
+  setCooldown,
+  type CapacityKey,
+  type Cooldown,
+  type PolicyEvent,
+} from './capacity.js';
+import { noteJobFinished, noteRunEnded } from './metrics.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
 
 export interface Claim {
@@ -88,12 +99,27 @@ function startFailedAgents(db: Db, jobId: string, startFailures: number): Set<st
 function failUnroutable(db: Db, row: JobRow, problem: string, at: string): void {
   const reason = `${problem}; fix the config, restart the worker and run "updraft retry ${row.id}"`;
   db.prepare("UPDATE jobs SET status = 'failed', status_reason = ?, updated_at = ? WHERE id = ?").run(reason, at, row.id);
+  noteJobFinished(db, row.id);
   recordError(db, { scope: 'queue', repoFullName: row.repo_full_name, jobId: row.id, message: reason, at });
 }
 
 /**
- * Pick an agent for a job in `poolName` using the pool's persisted round-robin
- * cursor: walk the pool from next_index and take the first enabled agent with
+ * The pool_cursors key of a job's round-robin rotation. Reviewer jobs rotate on a cursor of their
+ * own, so who reviews takes turns among the reviewers whatever coding jobs the same pool runs in
+ * between (with one shared cursor, a pool that both codes and reviews would hand each review to
+ * whichever agent follows the author). Pool names cannot contain ":", so the keys never collide.
+ */
+export function cursorKey(row: Pick<JobRow, 'pool' | 'event_id'>): string {
+  return isReviewJobRow(row) ? `review:${row.pool}` : row.pool;
+}
+
+function isReviewJobRow(row: Pick<JobRow, 'event_id'>): boolean {
+  return row.event_id.startsWith('pr-review:');
+}
+
+/**
+ * Pick an agent for a job from `poolAgents` using the persisted round-robin cursor `cursor`
+ * (cursorKey): walk the pool from next_index and take the first enabled agent with
  * capacity, preferring agents that have not just failed to start this job.
  * Advances the cursor past the chosen agent. Returns null if none has capacity.
  */
@@ -101,15 +127,18 @@ function pickAgent(
   db: Db,
   config: UpdraftConfig,
   job: JobRow,
-  poolName: string,
+  cursor: string,
   poolAgents: readonly string[],
   load: Map<string, number>,
   /** Never picked, whatever its capacity (the author of the code a reviewer job reviews). */
   exclude: string | null = null,
+  /** Capacity policy (docs/capacity-and-escalation.md): why an agent cannot take the run now, or null. */
+  blocked: ((agent: string) => string | null) | null = null,
+  blockedReasons: string[] = [],
 ): string | null {
   const n = poolAgents.length;
   if (n === 0) return null;
-  const cursorRow = db.prepare('SELECT next_index FROM pool_cursors WHERE pool = ?').get(poolName) as
+  const cursorRow = db.prepare('SELECT next_index FROM pool_cursors WHERE pool = ?').get(cursor) as
     | { next_index: number }
     | undefined;
   const start = (((cursorRow?.next_index ?? 0) % n) + n) % n;
@@ -118,15 +147,41 @@ function pickAgent(
     const index = (start + k) % n;
     const name = poolAgents[index]!;
     const agent = ownEntry(config.agents, name);
-    if (name !== exclude && agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) capable.push({ name, index });
+    if (name !== exclude && agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) {
+      const why = blocked?.(name) ?? null;
+      if (why) blockedReasons.push(`${name}: ${why}`);
+      else capable.push({ name, index });
+    }
   }
   if (capable.length === 0) return null;
   const failed = startFailedAgents(db, job.id, job.start_failures);
   const choice = capable.find((c) => !failed.has(c.name)) ?? capable[0]!;
   db.prepare(
     'INSERT INTO pool_cursors (pool, next_index) VALUES (?, ?) ON CONFLICT (pool) DO UPDATE SET next_index = excluded.next_index',
-  ).run(poolName, (choice.index + 1) % n);
+  ).run(cursor, (choice.index + 1) % n);
   return choice.name;
+}
+
+/**
+ * The pool a reviewer job is routed to under the current config (reviewPoolFor). A job records
+ * the pool it was queued for, but the config may have changed since: a workflow's reviewPool
+ * replaced by the repository's review.pool, or the old pool removed. A head is reviewed once, so
+ * scheduling never queues a second job for it; the route is settled here, when the job (queued
+ * earlier or retried) is claimed. Falls back to the recorded pool when the repository, the job's
+ * review request or its pull request cannot be found.
+ */
+function currentReviewPool(db: Db, config: UpdraftConfig, row: JobRow): string {
+  const repo = Object.values(config.repositories).find((r) => r.id === row.repo_id);
+  if (!repo) return row.pool;
+  let prNumber: number | undefined;
+  try {
+    prNumber = reviewOf(rowToJob(row))?.pullRequest.number;
+  } catch {
+    return row.pool;
+  }
+  if (prNumber === undefined) return row.pool;
+  const wf = repo.workflows.find((w) => workflowId(w) === row.workflow_id);
+  return reviewPoolFor(repo, wf, getLoopPr(db, row.repo_id, prNumber)?.pool ?? row.pool);
 }
 
 /**
@@ -137,7 +192,7 @@ function pickAgent(
  * (review: { allowSameAgent: true }); otherwise the job cannot be routed (`problem`).
  */
 function reviewerExclusion(config: UpdraftConfig, row: JobRow, poolAgents: readonly string[]): { exclude: string | null; problem?: string } {
-  if (!row.event_id.startsWith('pr-review:')) return { exclude: null };
+  if (!isReviewJobRow(row)) return { exclude: null };
   let author: string | null;
   try {
     author = reviewOf(rowToJob(row))?.authorAgent ?? null;
@@ -201,6 +256,8 @@ export function claimNextJob(
     if (open >= config.maxConcurrent) return null;
 
     const load = runningByAgent(db);
+    const cooldowns = config.capacity ? activeCooldowns(db, clock()) : [];
+    const blocked = config.capacity ? (name: string) => capacityBlock(config, name, cooldowns, load) : null;
     const busyIssues = new Set(
       (
         db
@@ -218,9 +275,18 @@ export function claimNextJob(
     const nowMs = clock();
     const at = new Date(nowMs).toISOString();
 
-    for (const row of queued) {
-      if (opts.excludeJobIds?.has(row.id)) continue;
-      if (busyIssues.has(issueKey(row.repo_id, row.issue_number))) continue;
+    for (const queuedRow of queued) {
+      if (opts.excludeJobIds?.has(queuedRow.id)) continue;
+      if (busyIssues.has(issueKey(queuedRow.repo_id, queuedRow.issue_number))) continue;
+
+      let row = queuedRow;
+      if (isReviewJobRow(row)) {
+        const route = currentReviewPool(db, config, row);
+        if (route !== row.pool) {
+          db.prepare('UPDATE jobs SET pool = ?, updated_at = ? WHERE id = ?').run(route, at, row.id);
+          row = { ...row, pool: route, updated_at: at };
+        }
+      }
 
       const pool = ownEntry(config.pools, row.pool);
       if (!pool) {
@@ -237,8 +303,16 @@ export function claimNextJob(
         failUnroutable(db, row, reviewer.problem, at);
         continue;
       }
-      const agent = pickAgent(db, config, row, row.pool, pool.agents, load, reviewer.exclude);
-      if (!agent) continue; // this pool is saturated; later jobs in other pools may still start
+      const blockedReasons: string[] = [];
+      const agent = pickAgent(db, config, row, cursorKey(row), pool.agents, load, reviewer.exclude, blocked, blockedReasons);
+      if (!agent) {
+        // Saturated, or held back by capacity policy. Say so on the job (once) so `status` can explain the wait.
+        if (blockedReasons.length) {
+          const waiting = `waiting: no eligible agent in pool "${row.pool}" (${blockedReasons.join('; ')})`.slice(0, 500);
+          if (row.status_reason !== waiting) db.prepare('UPDATE jobs SET status_reason = ? WHERE id = ?').run(waiting, row.id);
+        }
+        continue; // later jobs in other pools may still start
+      }
 
       const runId = newId('run');
       const runRow: RunRow = {
@@ -309,9 +383,15 @@ export interface RunProcessInfo {
 }
 
 /** Record the agent subprocess and/or checkout for a running run (used by live adapters and reconcile). */
-export function setRunProcess(db: Db, runId: string, info: RunProcessInfo): void {
+export function setRunProcess(db: Db, runId: string, info: RunProcessInfo, now: () => number = Date.now): void {
   if (info.pid !== undefined) {
-    db.prepare('UPDATE runs SET pid = ?, pid_start_time = ? WHERE id = ?').run(info.pid, info.pidStartTime ?? null, runId);
+    // agent_started_at: the first time a pid is recorded is when the agent process was spawned.
+    db.prepare('UPDATE runs SET pid = ?, pid_start_time = ?, agent_started_at = coalesce(agent_started_at, ?) WHERE id = ?').run(
+      info.pid,
+      info.pidStartTime ?? null,
+      info.pid === null ? null : nowIso(now),
+      runId,
+    );
   } else if (info.pidStartTime !== undefined) {
     db.prepare('UPDATE runs SET pid_start_time = ? WHERE id = ?').run(info.pidStartTime, runId);
   }
@@ -384,10 +464,25 @@ export interface FinishedRun {
  * Idempotent: closing an already-closed run is a no-op and returns null. Only a job still
  * `running` is moved.
  */
+/**
+ * What the worker's policy decided to do with a failed run instead of leaving its job failed
+ * (docs/capacity-and-escalation.md). The run itself is still recorded as an ordinary failed run
+ * whose error explains why; the job goes back in the queue.
+ */
+export type FailureHandling =
+  | {
+      kind: 'usage-limit';
+      cooldown: CapacityKey & { untilMs: number; stated: boolean };
+      /** Times one job may be put back by usage limits before it fails. */
+      maxDeferrals: number;
+      detail: string;
+    }
+  | { kind: 'escalate'; fromTier: string; toTier: string; pool: string; reason: string; source: string };
+
 export function finishRun(
   db: Db,
   runId: string,
-  result: { outcome: RunOutcome; error?: string | null; now?: () => number },
+  result: { outcome: RunOutcome; error?: string | null; now?: () => number; handling?: FailureHandling },
 ): FinishedRun | null {
   const at = nowIso(result.now ?? Date.now);
   return transaction(db, () => {
@@ -407,10 +502,13 @@ export function finishRun(
         at,
         run.job_id,
       );
+      noteRunEnded(db, runId);
+      noteJobFinished(db, run.job_id);
       return { outcome: null, canceledByUser: true };
     }
 
     db.prepare('UPDATE runs SET ended_at = ?, outcome = ?, error = ? WHERE id = ?').run(at, result.outcome, error, runId);
+    noteRunEnded(db, runId);
     const finished: FinishedRun = { outcome: result.outcome, canceledByUser: false };
 
     const job = getJobRow(db, run.job_id);
@@ -426,6 +524,34 @@ export function finishRun(
       case 'failed':
         status = 'failed';
         reason = error ?? `run ${runId} on ${run.agent} failed`;
+        if (result.handling) {
+          const h = result.handling;
+          const nowMs = (result.now ?? Date.now)();
+          if (h.kind === 'usage-limit') {
+            setCooldown(db, { ...h.cooldown, reason: h.detail, jobId: job.id, runId, nowMs });
+            recordPolicyEvent(db, {
+              kind: 'cooldown',
+              jobId: job.id,
+              runId,
+              detail: `${h.cooldown.scope} "${h.cooldown.name}" cooling down until ${new Date(h.cooldown.untilMs).toISOString()} (${h.cooldown.stated ? 'retry-after stated by the CLI' : 'configured default'}): ${h.detail}`,
+              now: result.now,
+            });
+            if (job.deferrals + 1 > h.maxDeferrals) {
+              reason = `usage limit hit ${job.deferrals + 1} times (cap ${h.maxDeferrals}); not requeued: ${h.detail}`;
+              recordPolicyEvent(db, { kind: 'exhausted', jobId: job.id, runId, detail: reason, now: result.now });
+            } else {
+              db.prepare('UPDATE jobs SET deferrals = deferrals + 1 WHERE id = ?').run(job.id);
+              status = 'queued';
+              reason = `waiting: ${run.agent} hit a usage limit; ${h.cooldown.scope} "${h.cooldown.name}" cools down until ${new Date(h.cooldown.untilMs).toISOString()}`;
+              recordPolicyEvent(db, { kind: 'deferred', jobId: job.id, runId, detail: `requeued after a usage limit on ${run.agent} (deferral ${job.deferrals + 1} of ${h.maxDeferrals})`, now: result.now });
+            }
+          } else {
+            db.prepare('UPDATE jobs SET pool = ?, escalation_hops = escalation_hops + 1 WHERE id = ?').run(h.pool, job.id);
+            status = 'queued';
+            reason = `escalated ${h.fromTier} -> ${h.toTier} (pool ${h.pool}): ${h.reason}`;
+            recordPolicyEvent(db, { kind: 'escalated', jobId: job.id, runId, detail: `${h.source}: ${reason}`, now: result.now });
+          }
+        }
         break;
       case 'interrupted':
         status = 'interrupted';
@@ -451,6 +577,7 @@ export function finishRun(
       at,
       job.id,
     );
+    noteJobFinished(db, job.id);
     if (result.outcome !== 'succeeded') {
       recordError(db, {
         scope: 'worker',
@@ -488,6 +615,8 @@ function closeClaim(db: Db, runId: string, jobStatus: 'canceled' | 'queued', rea
       at,
       run.job_id,
     );
+    noteRunEnded(db, runId);
+    noteJobFinished(db, run.job_id);
   });
 }
 
@@ -519,8 +648,15 @@ export function retryJob(db: Db, jobId: string, now?: () => number): Job {
     if (!RETRYABLE.includes(row.status)) {
       throw new Error(`job ${jobId} is ${row.status}; only failed, interrupted or canceled jobs can be retried`);
     }
+    const held = (JSON.parse(row.envelope) as { routing?: { hold?: string } }).routing?.hold;
+    if (held) {
+      throw new Error(
+        `job ${jobId} was held for a human (${held}); retrying would run it on a pool that was not eligible. ` +
+          'Add a tier override label (or fix the pools) and re-apply the trigger label to queue a new job.',
+      );
+    }
     db.prepare(
-      "UPDATE jobs SET status = 'queued', status_reason = ?, start_failures = 0, updated_at = ? WHERE id = ?",
+      "UPDATE jobs SET status = 'queued', status_reason = ?, start_failures = 0, retries = retries + 1, updated_at = ? WHERE id = ?",
     ).run(`retried by user (was ${row.status})`, at, jobId);
     return rowToJob(getJobRow(db, jobId)!);
   });
@@ -555,6 +691,7 @@ export function requestJobCancel(db: Db, jobId: string, now?: () => number): Can
     if (!row) return { kind: 'not-found' };
     if (row.status === 'queued') {
       db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ?").run(CANCELED_BY_USER, at, jobId);
+      noteJobFinished(db, jobId);
       return { kind: 'canceled', job: rowToJob(getJobRow(db, jobId)!) };
     }
     const job = rowToJob(row);
@@ -622,6 +759,10 @@ export interface StatusSnapshot {
   pullRequests?: Array<{ pr: LoopPr; stage: PrStageInfo }>;
   /** Recent reviewer verdicts and their posting, newest first. */
   reviews?: PrReview[];
+  /** Capacity groups or profiles cooling down after a usage limit, with when they wake (docs/capacity-and-escalation.md). */
+  cooldowns?: Cooldown[];
+  /** Recent cooldowns, deferrals and escalations by job and run, oldest first. */
+  policyEvents?: PolicyEvent[];
 }
 
 export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => number): StatusSnapshot {
@@ -716,5 +857,23 @@ export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => num
       return repo && reviewSettings(repo).enabled ? [{ pr, stage: prStage(db, pr, repo.maxRevisions ?? DEFAULT_MAX_REVISIONS) }] : [];
     }),
     reviews: listRecentPrReviews(db, 10),
+    // Only where capacity or escalation policy is in use (or has ever acted); otherwise absent.
+    ...policySnapshot(db, config, nowMs),
   };
+}
+
+function policySnapshot(db: Db, config: UpdraftConfig, nowMs: number): Pick<StatusSnapshot, 'cooldowns' | 'policyEvents'> {
+  try {
+    return config.capacity || hasPolicyEvents(db) ? { cooldowns: activeCooldowns(db, nowMs), policyEvents: listRecentPolicyEvents(db, 10) } : {};
+  } catch {
+    return {}; // a database from before the tables existed (status reads without migrating)
+  }
+}
+
+function hasPolicyEvents(db: Db): boolean {
+  try {
+    return db.prepare('SELECT 1 FROM policy_events LIMIT 1').get() !== undefined;
+  } catch {
+    return false; // a database from before the table existed
+  }
 }

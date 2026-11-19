@@ -36,6 +36,9 @@ Write, in this order:
    when there are none.
 2. **Suggestions**, the same way. They do not affect the verdict.
 3. **Checks you ran** and their results.
+4. **How many findings** you reported (blockers and suggestions together), on a line of its own
+   as a whole number, for example `UPDRAFT-FINDINGS: 3`, or `UPDRAFT-FINDINGS: 0` when there
+   are none. It is only recorded for statistics and does not affect the verdict.
 
 Then end your message with exactly one line, on a line of its own, with nothing after it:
 

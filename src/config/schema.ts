@@ -73,10 +73,23 @@ export const agentSchema = z.strictObject({
   command: z.string().min(1).optional(),
   /** Live mode: extra arguments for the agent CLI; the adapter places them where its CLI accepts options. */
   args: z.array(z.string()).optional(),
+  /**
+   * Live mode: model for the agent CLI, passed as the adapter's own option (--model). Optional
+   * shorthand for putting it in `args`; setting it in both is rejected. Not checked against a list.
+   */
+  model: z.string().optional(),
+  /** Live mode: reasoning effort, mapped to the adapter's own option (see docs/agents/profiles.md). */
+  effort: z.string().optional(),
   /** Live mode: environment variables set for the agent process, on top of the worker's environment. */
   env: z.record(envName, z.string()).optional(),
   /** Live mode: run this agent in a container. `env` above is then set inside the container. */
   container: containerSchema.optional(),
+  /**
+   * Opt-in: the name of a `capacity.groups` entry. Profiles that run under the same signed-in CLI
+   * account name the same group and then share its concurrency budget and its cooldown after a
+   * usage limit (docs/capacity-and-escalation.md). Updraft never infers this from credentials.
+   */
+  capacityGroup: name.optional(),
 });
 
 export const poolSchema = z.strictObject({
@@ -141,6 +154,74 @@ export const poolSelectorSchema = z.union([
   }),
 ]);
 
+/**
+ * Opt-in triage by an installed, signed-in coding CLI (docs/triage.md). It never calls a model
+ * API: it launches the named agent (agents.<name>, any adapter that can run read-only) once for
+ * an ambiguous issue, which uses that agent's own subscription.
+ */
+export const triageSchema = z.strictObject({
+  /** The agent profile that classifies (agents.<name>): pick a cheap model, e.g. a `claude-triage` entry with `model`. */
+  agent: name,
+  /** Per-workflow opt-out without deleting the block. Default true (the block itself is the opt-in). */
+  enabled: z.boolean().default(true),
+  /** Triage when the local heuristics are below tiers.minConfidence. Default true. Set false for label-requested triage only. */
+  onLowConfidence: z.boolean().default(true),
+  /** An issue label that asks for triage explicitly. Default `triage:requested`. */
+  requestLabel: z.string().min(1).default('triage:requested'),
+  /** Kill the triage CLI after this many seconds. Default 120. */
+  timeoutSeconds: z.number().int().min(5).max(900).default(120),
+  /** Treat more output than this as malformed. Default 65536 bytes. */
+  maxOutputBytes: z.number().int().min(1024).max(1048576).default(65536),
+  /** Extra launches after an unreadable reply (not after a timeout or a CLI failure). Default 1, at most 2. */
+  maxRetries: z.number().int().min(0).max(2).default(1),
+  /** Triage launches allowed per hour across all repositories. Default 20. */
+  maxPerHour: z.number().int().min(1).max(1000).default(20),
+  /** After a failed triage of an issue revision, wait this long before launching again. Default 60. */
+  failureCooldownMinutes: z.number().int().min(1).max(1440).default(60),
+});
+/**
+ * Opt-in escalation of a job to a more capable tier pool. A run can only *request* it (reason,
+ * tier, evidence); this policy decides, and the ceiling, hop cap and pools here are never
+ * overridable by model output.
+ */
+export const escalationSchema = z.strictObject({
+  /** Per-workflow opt-out without deleting the block. Default true (the block itself is the opt-in). */
+  enabled: z.boolean().default(true),
+  /** Escalations one job may get in total. Default 1, at most 3. */
+  maxHops: z.number().int().min(1).max(3).default(1),
+  /** The most capable tier escalation may reach. high-risk needs tiers.highRisk. Default complex. */
+  ceiling: z.enum(['standard', 'complex', 'high-risk']).default('complex'),
+  /** Escalate one tier after a failed verification, without the agent asking. Default true. */
+  onVerificationFailure: z.boolean().default(true),
+  /** Honor an agent's `updraft-escalation:` request line. Default true. */
+  allowAgentRequests: z.boolean().default(true),
+});
+
+/**
+ * Opt-in tier routing (docs/tier-routing.md). Absent: routing is exactly `pool` as before.
+ * `pool` is still required and is used for non-tiered paths such as legacy `rules`.
+ */
+export const tierSchema = z.strictObject({
+  pools: z.strictObject({ routine: name, standard: name, complex: name }),
+  /** Pool for high-risk work. Absent: high-risk work is held for a human, never run on a weaker pool. */
+  highRisk: z.strictObject({ pool: name }).optional(),
+  /** Labels people with triage access apply to force a tier. Defaults: tier:routine, tier:standard, tier:complex, tier:high-risk. */
+  overrideLabels: z
+    .strictObject({
+      routine: z.string().min(1).optional(),
+      standard: z.string().min(1).optional(),
+      complex: z.string().min(1).optional(),
+      highRisk: z.string().min(1).optional(),
+    })
+    .optional(),
+  /** Below this confidence the heuristic choice becomes standard. Default 0.6. */
+  minConfidence: z.number().min(0).max(1).optional(),
+  /** Opt-in CLI triage of ambiguous issues (docs/triage.md). Absent: no triage, ever. */
+  triage: triageSchema.optional(),
+  /** Opt-in bounded escalation to a more capable tier (docs/capacity-and-escalation.md). Absent: never escalates. */
+  escalation: escalationSchema.optional(),
+});
+
 export const triggerSchema = z.strictObject({
   event: z.literal('issue.labeled'),
   label: z.string().min(1),
@@ -155,9 +236,14 @@ export const workflowSchema = z.strictObject({
   trigger: triggerSchema,
   action: name,
   pool: poolSelectorSchema,
+  /** Opt-in local complexity/risk routing to capability-tier pools. */
+  tiers: tierSchema.optional(),
   /** Overrides dispatch.allowedActors for this workflow. */
   allowedActors: z.array(z.string().min(1)).optional(),
-  /** With repositories.<repo>.review: the pool reviewer runs are routed to. Default: the pool the job itself was routed to. */
+  /**
+   * With repositories.<repo>.review: the pool reviewer runs are routed to. Default:
+   * repositories.<repo>.review.pool, else the pool the job itself was routed to.
+   */
   reviewPool: name.optional(),
 });
 
@@ -212,6 +298,12 @@ export const repositorySchema = z.strictObject({
     .union([
       z.boolean(),
       z.strictObject({
+        /**
+         * The pool reviewer runs are routed to, for every workflow of this repository that sets no
+         * reviewPool of its own. One agent in it fixes the reviewer; several are taken in turn.
+         * Default: the pool the job itself was routed to.
+         */
+        pool: name.optional(),
         /** Let the agent that wrote the code also review it when the review pool has no other enabled agent. Default false. */
         allowSameAgent: z.boolean().default(false),
       }),
@@ -254,6 +346,28 @@ export const githubAppSchema = z.strictObject({
   commitAsApp: z.boolean().optional(),
 });
 
+/**
+ * Subscription capacity groups (docs/capacity-and-escalation.md). A group is a user-declared set
+ * of agent profiles that share one authenticated CLI account (`agents.<name>.capacityGroup`).
+ */
+export const capacityGroupSchema = z.strictObject({
+  /** Runs allowed at once across all profiles in the group. Default 1. */
+  maxConcurrent: z.number().int().min(1).max(32).default(1),
+  /** Cooldown after a recognized usage-limit exit when the CLI gave no reliable retry-after. Default 60. */
+  defaultCooldownMinutes: z.number().int().min(1).max(10080).default(60),
+  /** A stated retry-after is honored up to this long. Default 360 (6 hours). */
+  maxCooldownMinutes: z.number().int().min(1).max(10080).default(360),
+});
+
+export const capacitySchema = z.strictObject({
+  groups: z.record(name, capacityGroupSchema).default({}),
+  /** Cooldown applied to a profile with no capacityGroup after a usage limit. Default 60. */
+  defaultCooldownMinutes: z.number().int().min(1).max(10080).default(60),
+  maxCooldownMinutes: z.number().int().min(1).max(10080).default(360),
+  /** Times one job may be put back in the queue by usage limits before it fails. Default 5. */
+  maxDeferrals: z.number().int().min(1).max(50).default(5),
+});
+
 export const configSchema = z.strictObject({
   version: z.literal(CONFIG_VERSION),
   pollIntervalSeconds: z.number().int().min(10).max(3600).default(60),
@@ -288,6 +402,8 @@ export const configSchema = z.strictObject({
       reviewers: z.array(z.string().min(1)).default([]),
     })
     .default({ reviewers: [] }),
+  /** Opt-in usage-limit handling and shared subscription capacity. Absent: nothing changes. */
+  capacity: capacitySchema.optional(),
   agents: z.record(name, agentSchema),
   pools: z.record(name, poolSchema),
   actions: z.record(name, actionSchema),
@@ -304,6 +420,10 @@ export type ActionConfig = z.output<typeof actionSchema>;
 export type VerifyCommand = NonNullable<ActionConfig['verify']>[number];
 export type WorkflowConfig = z.output<typeof workflowSchema>;
 export type RepositoryConfig = z.output<typeof repositorySchema>;
+export type TierConfig = z.output<typeof tierSchema>;
+export type EscalationConfig = z.output<typeof escalationSchema>;
+export type CapacityConfig = z.output<typeof capacitySchema>;
+export type TriageConfig = z.output<typeof triageSchema>;
 export type PoolSelector = z.output<typeof poolSelectorSchema>;
 
 export function workflowId(wf: Pick<WorkflowConfig, 'id' | 'action' | 'trigger'>): string {
@@ -335,10 +455,18 @@ export function reviseActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pic
 }
 
 /** repositories.<repo>.review as settings: off unless set to true or to an options object. */
-export function reviewSettings(repo: Pick<RepositoryConfig, 'review'>): { enabled: boolean; allowSameAgent: boolean } {
-  if (repo.review === undefined || repo.review === false) return { enabled: false, allowSameAgent: false };
-  if (repo.review === true) return { enabled: true, allowSameAgent: false };
-  return { enabled: true, allowSameAgent: repo.review.allowSameAgent };
+export function reviewSettings(repo: Pick<RepositoryConfig, 'review'>): { enabled: boolean; allowSameAgent: boolean; pool: string | null } {
+  if (repo.review === undefined || repo.review === false) return { enabled: false, allowSameAgent: false, pool: null };
+  if (repo.review === true) return { enabled: true, allowSameAgent: false, pool: null };
+  return { enabled: true, allowSameAgent: repo.review.allowSameAgent, pool: repo.review.pool ?? null };
+}
+
+/**
+ * The pool a reviewer job is routed to: the workflow's reviewPool, else the repository's
+ * review.pool, else `codePool`, the pool the job that wrote the code was routed to.
+ */
+export function reviewPoolFor(repo: Pick<RepositoryConfig, 'review'>, wf: Pick<WorkflowConfig, 'reviewPool'> | undefined, codePool: string): string {
+  return wf?.reviewPool ?? reviewSettings(repo).pool ?? codePool;
 }
 
 /** True when reviewer runs happen for this repository: live mode, publication on, review on. */

@@ -26,7 +26,7 @@ import {
 } from './config-edit.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { agentHint } from './agents.js';
-import type { CommandContext } from './context.js';
+import { legacyNotice, type CommandContext } from './context.js';
 import { CliError, EXIT } from './errors.js';
 import type { Choice, Prompter } from './prompter.js';
 
@@ -285,6 +285,8 @@ export async function configureCommand(ctx: CommandContext): Promise<number> {
   const s: Session = { p, api, config: structuredClone(existing ?? seed), usable: new Set(), agentHints: new Map() };
   if (!existing) {
     p.info(`No config at ${configPath}; starting from defaults (allowed dispatcher: ${viewer.login}).`);
+    const notice = legacyNotice(ctx);
+    if (notice.length) p.warn(notice.join('\n'));
   }
 
   // Agents: pre-select the ones discovery finds usable here; list the rest with why.

@@ -36,7 +36,10 @@ import {
   type GitHubIssueEvent,
   type IssueEventsPage,
 } from '../github/api.js';
-import { labelEquals, selectPool } from '../routing.js';
+import { labelEquals } from '../routing.js';
+import { classifyIssue } from '../classify.js';
+import { describeRouting, routeJob, triageWanted } from '../tier-routing.js';
+import { createTriageRunner, type TriageOutcome, type TriageRunner } from '../triage/triage.js';
 import { ENVELOPE_SCHEMA_VERSION, reviewOf, revisionOf, type EventEnvelope, type IssueSnapshot, type Job, type RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { checkReviewDispatchable, queuedReviewProblem } from './review-jobs.js';
@@ -72,6 +75,10 @@ export interface PollerDeps {
    * a map attached to `db`, so successive pollOnce calls with the same db share it.
    */
   backoff?: Map<number, RepoBackoffState>;
+  /** Directory of the config file, for resolving a relative agents.<name>.command used by triage. */
+  configDir?: string;
+  /** CLI triage of ambiguous issues (docs/triage.md). Default: launch the configured agent CLI. Tests inject a stub. */
+  triage?: TriageRunner;
 }
 
 export interface RepoPollResult {
@@ -340,7 +347,19 @@ async function pollRepo(
     now: deps.now,
   });
   for (const j of inserted) {
-    log.info('job queued', { job: j.id, issue: j.issueNumber, workflow: j.workflowId, pool: j.pool, event: j.eventId });
+    const routing = j.envelope.routing;
+    log.info('job queued', {
+      job: j.id,
+      issue: j.issueNumber,
+      workflow: j.workflowId,
+      pool: j.pool,
+      event: j.eventId,
+      ...(routing?.tier ? { tier: routing.tier, risk: routing.risk, rule: routing.rule, routing: describeRouting(routing) } : {}),
+    });
+    if (routing?.hold) {
+      cancelQueuedJob(db, j.id, `needs human: ${routing.hold}`, deps.now);
+      log.warn('job held for a human: no eligible pool', { job: j.id, issue: j.issueNumber, reason: routing.hold });
+    }
   }
   return { ...base, eventsSeen: unseen.length, jobsEnqueued: inserted.length };
 }
@@ -443,7 +462,7 @@ export type IngestSkipReason = 'actor-not-allowed' | 'label-removed' | 'issue-go
  * matching event queued nothing.
  */
 export async function buildJobs(
-  deps: Pick<PollerDeps, 'config'>,
+  deps: Pick<PollerDeps, 'config' | 'db' | 'log' | 'configDir' | 'now' | 'triage'>,
   repo: RepoRef,
   cfg: RepositoryConfig,
   events: GitHubIssueEvent[],
@@ -502,7 +521,36 @@ export async function buildJobs(
         skip('label-missing', 'skipping event: issue no longer carries the trigger label');
         continue;
       }
-      const pool = selectPool(wf.pool, issue.labels);
+      const routeDeps = { poolAvailable: (p: string) => (deps.config.pools[p]?.agents ?? []).some((a) => deps.config.agents[a]?.enabled) };
+      let routing = routeJob(wf.pool, wf.tiers, issue, routeDeps);
+      const triageCfg = wf.tiers?.triage;
+      if (triageCfg && triageWanted(routing, issue.labels, triageCfg)) {
+        // Ambiguous (or explicitly requested): one bounded, cached, read-only CLI triage, then route again with its answer.
+        const classified = classifyIssue(issue);
+        const run = (deps.triage ?? createTriageRunner({ db: deps.db, config: deps.config, log: deps.log, ...(deps.configDir ? { configDir: deps.configDir } : {}), ...(deps.now ? { now: deps.now } : {}) }));
+        const outcome = await run(triageCfg, {
+          repoId: repo.id,
+          repo: repo.fullName,
+          action: wf.action,
+          issueNumber: issue.number,
+          title: issue.title,
+          body: issue.body,
+          labels: issue.labels,
+          localSignals: classified.reasons,
+          localRisk: classified.risk,
+        }).catch((err: unknown): TriageOutcome => ({ ok: false, agent: triageCfg.agent, reason: `triage failed: ${err instanceof Error ? err.message : String(err)}` }));
+        routing = routeJob(wf.pool, wf.tiers, issue, { ...routeDeps, triage: outcome });
+        const note = routing.triage;
+        log.info('issue triaged', {
+          issue: issue.number,
+          workflow: wfId,
+          agent: triageCfg.agent,
+          origin: note?.origin,
+          ...(outcome.ok ? { complexity: outcome.verdict.complexity, risk: outcome.verdict.risk, confidence: outcome.verdict.confidence } : { reason: outcome.reason }),
+          tier: routing.tier,
+        });
+      }
+      const pool = routing.pool;
       const envelope: EventEnvelope = {
         schemaVersion: ENVELOPE_SCHEMA_VERSION,
         type: 'issue.labeled',
@@ -514,6 +562,7 @@ export async function buildJobs(
         label,
         labelsAtEnqueue: [...issue.labels],
         createdAt: ev.createdAt,
+        ...(wf.tiers ? { routing } : {}),
       };
       jobs.push({
         repoId: repo.id,

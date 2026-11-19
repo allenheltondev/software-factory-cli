@@ -5,7 +5,8 @@ import { cancelCommand } from './cancel.js';
 import { cleanCommand } from './clean.js';
 import { configureCommand } from './configure.js';
 import { DEFAULT_LABEL } from './config-edit.js';
-import { createDefaultContext, println, type CommandContext, type GlobalOptions } from './context.js';
+import { MissingConfigError } from '../config/io.js';
+import { createDefaultContext, legacyNotice, println, type CommandContext, type GlobalOptions } from './context.js';
 import { doctorCommand } from './doctor.js';
 import { describeError } from './errors.js';
 import { logsCommand, type LogsOptions } from './logs.js';
@@ -14,6 +15,7 @@ import { retryCommand } from './retry.js';
 import { reviewsCommand, type ReviewsOptions } from './reviews.js';
 import { runEventCommand, type RunEventOptions } from './run-event.js';
 import { startCommand } from './start.js';
+import { statsCommand, type StatsOptions } from './stats.js';
 import { statusCommand } from './status.js';
 import { validateCommand } from './validate.js';
 
@@ -30,6 +32,7 @@ export interface Handlers {
   clean(ctx: CommandContext, opts: { dryRun?: boolean; olderThan?: string }): Promise<number>;
   publish(ctx: CommandContext, runId: string): Promise<number>;
   reviews(ctx: CommandContext, opts: ReviewsOptions): Promise<number>;
+  stats(ctx: CommandContext, opts: StatsOptions): Promise<number>;
   cancel(ctx: CommandContext, jobId: string): Promise<number>;
   logs(ctx: CommandContext, id: string, opts: LogsOptions): Promise<number>;
 }
@@ -47,6 +50,7 @@ export const defaultHandlers: Handlers = {
   clean: (ctx, opts) => cleanCommand(ctx, opts),
   publish: (ctx, runId) => publishCommand(ctx, runId),
   reviews: (ctx, opts) => reviewsCommand(ctx, opts),
+  stats: (ctx, opts) => statsCommand(ctx, opts),
   cancel: (ctx, jobId) => cancelCommand(ctx, jobId),
   logs: (ctx, id, opts) => logsCommand(ctx, id, opts),
 };
@@ -82,6 +86,7 @@ export function buildProgram(opts: ProgramOptions): Command {
     } catch (err) {
       const { message, exitCode } = describeError(err);
       println(ctx.err, `error: ${message}`);
+      if (err instanceof MissingConfigError) for (const line of legacyNotice(ctx)) println(ctx.err, line);
       setExitCode(exitCode);
     }
   };
@@ -175,6 +180,14 @@ export function buildProgram(opts: ProgramOptions): Command {
     .addOption(new Option('--json', 'machine-readable output'))
     .option('--limit <n>', 'most recent published PRs to check', '20')
     .action((o: ReviewsOptions) => exec((ctx) => handlers.reviews(ctx, o)));
+
+  program
+    .command('stats')
+    .description('Show how the factory is doing: work done, time taken, outcomes, reviews and revisions (read-only; see docs/stats.md)')
+    .addOption(new Option('--json', 'machine-readable output'))
+    .option('--since <age>', 'window: a number and a unit (h, d, w), "today" (since local midnight), or "all"', '30d')
+    .option('--repo <owner/repo>', 'only this repository')
+    .action((o: StatsOptions) => exec((ctx) => handlers.stats(ctx, o)));
 
   program
     .command('clean')

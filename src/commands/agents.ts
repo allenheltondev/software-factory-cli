@@ -1,3 +1,5 @@
+import { checkCapabilities, readHelp } from '../agents/capabilities.js';
+import { agentProfile } from '../agents/profile.js';
 import { kiroV3Problem } from '../agents/adapters/kiro.js';
 import type { AgentReport } from '../agents/discovery.js';
 import { agentAdapter } from '../config/schema.js';
@@ -74,8 +76,7 @@ export interface ContainerAgentReport {
  * checks them. Empty when there is no valid config or none is containerized: discovery above is
  * about this host's CLIs and needs no config.
  */
-export async function containerAgentReports(ctx: CommandContext, probes: Pick<DoctorProbes, 'platform' | 'env' | 'which' | 'run'>): Promise<ContainerAgentReport[]> {
-  const cfg = checkConfig(ctx.paths.configFile);
+export async function containerAgentReports(ctx: CommandContext, probes: Pick<DoctorProbes, 'platform' | 'env' | 'which' | 'run'>, cfg: ReturnType<typeof checkConfig> = checkConfig(ctx.paths.configFile)): Promise<ContainerAgentReport[]> {
   if (cfg.state !== 'ok') return [];
   const contained = Object.entries(cfg.config.agents).filter(([, a]) => a.enabled && a.container);
   return Promise.all(
@@ -107,12 +108,97 @@ export async function agentsCommand(
     println(ctx.err, 'warning: --deep sends one short prompt to each usable agent. This uses tokens or plan quota.');
   }
   const reports = await ctx.discoverAgents({ deep: Boolean(opts.deep) });
-  const containers = await containerAgentReports(ctx, probes);
+  const cfg = checkConfig(ctx.paths.configFile);
+  const containers = await containerAgentReports(ctx, probes, cfg);
+  const profiles = await profileReports(ctx, probes, cfg);
   if (opts.json) {
-    println(ctx.out, JSON.stringify({ platform: process.platform, arch: process.arch, agents: reports, ...(containers.length ? { containers } : {}) }, null, 2));
+    println(ctx.out, JSON.stringify({ platform: process.platform, arch: process.arch, agents: reports, ...(containers.length ? { containers } : {}), ...(profiles.length ? { profiles } : {}) }, null, 2));
   } else {
     println(ctx.out, renderAgents(reports, opts.deep));
     if (containers.length) println(ctx.out, renderContainerAgents(containers));
+    if (profiles.length) println(ctx.out, renderProfiles(profiles));
   }
   return reports.some((r) => r.usable) || containers.some((c) => c.usable) ? EXIT.OK : EXIT.FAILURE;
+}
+
+/** A configured agent entry (profile) and the model/effort it asks its CLI for. */
+export interface ProfileReport {
+  agent: string;
+  adapter: string;
+  enabled: boolean;
+  model: string | null;
+  modelSource: string;
+  effort: string | null;
+  effortSource: string;
+  /** Always the configured value: none of the CLIs reports which model a run resolved. */
+  note: string;
+  problems: string[];
+  /**
+   * Whether the installed CLI's `--help` advertises the options this profile uses. Only the help
+   * text is read, so no prompt is sent. 'unverified': not checked or the help could not be read.
+   */
+  capability: 'ok' | 'unsupported' | 'unverified';
+  capabilityMessages: string[];
+}
+
+type CheckedConfig = ReturnType<typeof checkConfig>;
+
+/** The config's agent entries with their model/effort, empty when there is no valid config. */
+export async function profileReports(
+  ctx: CommandContext,
+  probes: Pick<DoctorProbes, 'env' | 'run'>,
+  cfg: CheckedConfig = checkConfig(ctx.paths.configFile),
+): Promise<ProfileReport[]> {
+  if (cfg.state !== 'ok') return [];
+  const helpCache = new Map<string, Promise<string | null>>();
+  return Promise.all(
+    Object.entries(cfg.config.agents).map(async ([name, agent]) => {
+      const adapter = agentAdapter(name, agent);
+      const p = agentProfile(adapter, agent);
+      let capability: ProfileReport['capability'] = 'unverified';
+      let capabilityMessages: string[] = [];
+      const uses = p.model.value !== null || p.effort.value !== null;
+      if (uses && agent.enabled && !agent.container) {
+        const env = agentLookupEnv(probes.env, agent);
+        const key = JSON.stringify([adapter, agent.command ?? null, agent.env ?? null]);
+        let help = helpCache.get(key);
+        if (!help) {
+          help = ctx
+            .discoverAgents({ adapters: [adapter], env, ...(agent.command ? { command: agent.command } : {}), baseDir: ctx.paths.configDir })
+            .then((r) => readHelp(adapter, r[0]?.launch, probes.run))
+            .catch(() => null);
+          helpCache.set(key, help);
+        }
+        const cap = checkCapabilities(adapter, p, await help);
+        capability = cap.state;
+        capabilityMessages = cap.messages;
+      } else if (!uses) {
+        capability = 'ok';
+      }
+      return {
+        agent: name,
+        adapter,
+        enabled: agent.enabled,
+        model: p.model.value,
+        modelSource: p.model.source,
+        effort: p.effort.value,
+        effortSource: p.effort.source,
+        note: 'configured values; the CLI decides the model it actually uses unless one is set here',
+        problems: p.problems,
+        capability,
+        capabilityMessages,
+      };
+    }),
+  );
+}
+
+export function renderProfiles(reports: ProfileReport[]): string {
+  const lines = ['', "Agent profiles in the config (configured model/effort; option support read from each CLI's --help, values not verified):"];
+  for (const r of reports) {
+    const show = (v: string | null, src: string) => (v === null ? 'CLI default' : `${v} (${src})`);
+    lines.push(`  ${r.agent} (adapter ${r.adapter}${r.enabled ? '' : ', disabled'}): model ${show(r.model, r.modelSource)}, effort ${show(r.effort, r.effortSource)}`);
+    for (const p of r.problems) lines.push(`    ! ${p}`);
+    for (const m of r.capabilityMessages) lines.push(`    ${r.capability === 'unsupported' ? '✗' : '!'} ${m}`);
+  }
+  return lines.join('\n');
 }

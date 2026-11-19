@@ -19,7 +19,7 @@ import type { GitHubApi, GitHubIssueEvent } from '../github/api.js';
 import { labelEquals } from '../routing.js';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
-import { buildJobs, findRepo, isGone, type IngestSkipReason } from './poller.js';
+import { buildJobs, findRepo, isGone, type IngestSkipReason, type PollerDeps } from './poller.js';
 
 /** Why a delivery queued nothing. */
 export type NothingToDoReason =
@@ -64,6 +64,12 @@ export interface WebhookDeps {
   api: GitHubApi;
   config: UpdraftConfig;
   log: Logger;
+  /** The state database: the poller's rules use it when a workflow routes by triage (its cache). */
+  db: PollerDeps['db'];
+  /** As for the poller: where relative paths in the config resolve, the clock, and a triage runner for tests. */
+  configDir?: string;
+  now?: () => number;
+  triage?: PollerDeps['triage'];
   signal?: AbortSignal;
   /**
    * The issue's events can trail the webhook by a moment: how many times to read them again when

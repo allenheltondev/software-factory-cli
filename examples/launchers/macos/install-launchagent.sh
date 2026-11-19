@@ -18,7 +18,7 @@
 # Works with macOS's /bin/bash 3.2. Paths may contain spaces.
 set -euo pipefail
 
-APP_DIR=updraft
+HOME_DIR=.updraft
 PACKAGE=@allenheltondev/updraft
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 
@@ -72,11 +72,12 @@ fi
 # --- Per-user locations (mirrors src/paths.ts) ---------------------------------------------
 if [ -n "$updraft_home" ]; then
   updraft_home=$(abspath "$updraft_home")
-  default_config="$updraft_home/config.yaml"
+  root="$updraft_home"
 else
-  default_config="$HOME/Library/Application Support/$APP_DIR/config.yaml"
+  root="$HOME/$HOME_DIR"
 fi
-log_dir="$HOME/Library/Logs/$APP_DIR"
+default_config="$root/config.yaml"
+log_dir="$root/logs"
 
 config=$(abspath "${config:-$default_config}")
 [ -f "$config" ] || warn "config file not found: $config (run 'updraft configure' or pass --config)"

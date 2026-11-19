@@ -3,6 +3,7 @@
 import type { Publication, PublicationState } from '../types.js';
 import { nowIso } from '../util/ids.js';
 import { transaction, type Db } from './database.js';
+import { notePrOpened } from './metrics.js';
 
 interface PublicationRow {
   run_id: string;
@@ -195,14 +196,18 @@ export function finishPublication(
   r: { state: 'published' | 'failed' | 'skipped'; error?: string | null; retryable?: boolean; nextAttemptAt?: string | null; now?: () => number },
 ): boolean {
   const at = nowIso(r.now);
-  const res = db
-    .prepare(
-      `UPDATE publications SET state = ?, error = ?, retryable = ?, next_attempt_at = ?, lease_expires_at = NULL,
-              published_at = CASE WHEN ? = 'published' THEN ? ELSE published_at END, updated_at = ?
-       WHERE ${OWNED}`,
-    )
-    .run(r.state, r.error ?? null, r.retryable ? 1 : 0, r.nextAttemptAt ?? null, r.state, at, at, runId, attempt);
-  return Number(res.changes) > 0;
+  return transaction(db, () => {
+    const res = db
+      .prepare(
+        `UPDATE publications SET state = ?, error = ?, retryable = ?, next_attempt_at = ?, lease_expires_at = NULL,
+                published_at = CASE WHEN ? = 'published' THEN ? ELSE published_at END, updated_at = ?
+         WHERE ${OWNED}`,
+      )
+      .run(r.state, r.error ?? null, r.retryable ? 1 : 0, r.nextAttemptAt ?? null, r.state, at, at, runId, attempt);
+    if (Number(res.changes) === 0) return false;
+    if (r.state === 'published') notePrOpened(db, runId);
+    return true;
+  });
 }
 
 /**

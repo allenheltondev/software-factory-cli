@@ -1,3 +1,4 @@
+import { describeRouting } from '../tier-routing.js';
 import { existsSync } from 'node:fs';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import type { FailureComment } from '../db/failure-comments.js';
@@ -7,7 +8,7 @@ import { getStatusSnapshot, type StatusSnapshot } from '../db/queue.js';
 import type { ReviewRequest } from '../db/revisions.js';
 import { reviewOf, revisionOf, type Job, type JobStatus, type Publication, type Revision } from '../types.js';
 import { describeVerifyResult, verificationNotes } from '../worker/verify.js';
-import { println, type CommandContext } from './context.js';
+import { legacyNotice, println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 import { checkConfig } from './validate.js';
 
@@ -243,6 +244,8 @@ export function renderStatus(v: StatusView): string {
     lines.push(
       `  ${run.id}  ${job.repoFullName}#${job.issueNumber}${revisionNote(job)}  ${job.workflowId}  agent ${run.agent} (pool ${run.pool})  ${phase}${canceling}`,
     );
+    const routed = describeRouting(job.envelope?.routing);
+    if (routed) lines.push(`    routing: ${routed}`);
   }
 
   lines.push('', 'Recent jobs:');
@@ -349,6 +352,18 @@ export function renderStatus(v: StatusView): string {
     }
   }
 
+  if (s.cooldowns?.length) {
+    lines.push('', 'Capacity cooldowns:');
+    for (const c of s.cooldowns) {
+      lines.push(`  ${c.scope} ${c.name}  wakes ${c.until} (${c.stated ? 'retry-after from the CLI' : 'configured default'})${c.runId ? `  run ${c.runId}` : ''}`);
+      lines.push(`    ${oneLine(c.reason, 140)}`);
+    }
+  }
+  if (s.policyEvents?.length) {
+    lines.push('', 'Recent capacity and escalation decisions:');
+    for (const e of s.policyEvents) lines.push(`  ${e.at}  ${e.kind.padEnd(17)}  job ${e.jobId}${e.runId ? `  run ${e.runId}` : ''}  ${oneLine(e.detail, 140)}`);
+  }
+
   lines.push('', 'Recent errors:');
   if (!s.recentErrors.length) lines.push('  (none)');
   for (const e of s.recentErrors) {
@@ -403,5 +418,6 @@ export async function statusCommand(ctx: CommandContext, opts: { json?: boolean 
   });
   if (opts.json) println(ctx.out, JSON.stringify(view, null, 2));
   else println(ctx.out, renderStatus(view));
+  if (!opts.json && configState === 'missing') for (const line of legacyNotice(ctx)) println(ctx.err, line);
   return EXIT.OK;
 }

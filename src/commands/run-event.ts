@@ -382,9 +382,24 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     const credentials: GitHubCredentials = ctx.createCredentials(config, { log: log.child({ component: 'github' }) });
     const api = await ctx.createApi({ log: log.child({ component: 'github' }), credentials });
 
-    // 1. What the event is, and whether the poller's rules queue anything for it.
+    // 1. What the event is, and whether the poller's rules queue anything for it. Those rules
+    // can run a triage, which caches its answer in the state database, so the database is
+    // there for them, but opened only when something asks: an event with nothing to do must
+    // not leave state behind.
+    const stateDb = (): Db => (db ??= ctx.openDb(paths.dbFile));
     const decision = await decideWebhook(
-      { api, config, log: log.child({ component: 'event' }), signal: controller.signal, ...(deps.eventLookup ? { eventLookup: deps.eventLookup } : {}) },
+      {
+        api,
+        config,
+        get db() {
+          return stateDb();
+        },
+        configDir: paths.configDir,
+        now: ctx.now,
+        log: log.child({ component: 'event' }),
+        signal: controller.signal,
+        ...(deps.eventLookup ? { eventLookup: deps.eventLookup } : {}),
+      },
       { eventName: summary.event.name, deliveryId: opts.deliveryId ?? null, payload },
     );
     summary.event = decision.event;
@@ -428,8 +443,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     }
 
     // 4. Queue it, under ids any other run of this event would derive too.
-    db = ctx.openDb(paths.dbFile);
-    const openDb = db;
+    const openDb = stateDb();
     const inserted = commitPollBatch(openDb, {
       repoId: repo.id,
       fullName: repo.fullName,

@@ -177,8 +177,27 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     // Each review was of one exact commit, and the verdicts are the worker's own record.
     expect(reviewOf(review1)).toMatchObject({ headSha: head1, authorAgent: 'claude', pullRequest: { number: PR, branch: prBranch, baseBranch: 'main' } });
     expect(reviewOf(review2)).toMatchObject({ headSha: head2, authorAgent: 'claude' });
-    expect(getPrReview(db, runOf(review1).id)).toMatchObject({ verdict: 'changes-requested', headSha: head1, state: 'published', outcome: 'revision-queued', revisionJobId: revision.id, agent: 'codex' });
-    expect(getPrReview(db, runOf(review2).id)).toMatchObject({ verdict: 'ready-to-merge', headSha: head2, state: 'published', outcome: 'ready' });
+    expect(getPrReview(db, runOf(review1).id)).toMatchObject({
+      verdict: 'changes-requested',
+      headSha: head1,
+      state: 'published',
+      outcome: 'revision-queued',
+      revisionJobId: revision.id,
+      agent: 'codex',
+      findingsCount: 1,
+    });
+    expect(getPrReview(db, runOf(review2).id)).toMatchObject({ verdict: 'ready-to-merge', headSha: head2, state: 'published', outcome: 'ready', findingsCount: 0 });
+    // The count line is telemetry: it is not part of the findings that were kept, posted or passed on.
+    expect(getPrReview(db, runOf(review1).id)!.findings).not.toContain('UPDRAFT-FINDINGS');
+    // And it is in the rollup, with the merge and the revision round.
+    expect(
+      db.prepare("SELECT kind, outcome, findings FROM metric_events WHERE kind IN ('review.verdict', 'pr.merged', 'revision.pushed') ORDER BY at, id").all(),
+    ).toEqual([
+      { kind: 'review.verdict', outcome: 'changes-requested', findings: 1 },
+      { kind: 'revision.pushed', outcome: null, findings: null },
+      { kind: 'review.verdict', outcome: 'ready-to-merge', findings: 0 },
+      { kind: 'pr.merged', outcome: 'merged', findings: null },
+    ]);
 
     // The revision came from the reviewer's verdict, from local state, with its findings as fenced input.
     expect(revisionOf(revision)).toMatchObject({ trigger: 'updraft_review', reviewedSha: head1, review: { author: 'updraft-bot', id: `updraft-review:${runOf(review1).id}` } });
@@ -204,8 +223,9 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(posted[0]!.body).toContain('**Updraft review: changes requested**');
     expect(posted[0]!.body).toContain(reviewMarker(runOf(review1).id));
     expect(posted[1]!.body).toContain('**Updraft review: ready to merge**');
-    // The findings are inert: the mention and the closing keyword sit inside a code fence.
-    expect(posted[0]!.body).toMatch(/```text\n[\s\S]*@octocat says this closes #1[\s\S]*\n```/);
+    // The findings are inert: the mention is broken up.
+    expect(posted[0]!.body).toContain('@\u200Boctocat says this closes \u200B#1');
+    expect(posted[0]!.body).not.toContain('@octocat');
 
     // The second reviewer was given the first review's findings and both commits to diff.
     const reviewPrompt = readFileSync(join(paths.runsDir, runOf(review2).id, 'prompt.md'), 'utf8');
@@ -270,6 +290,23 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(prStage(db, pr, 3)).toMatchObject({ stage: 'needs-human', detail: expect.stringMatching(/did not finish/) });
   });
 
+  it('keeps the verdict when the findings count is broken: no count is recorded, and run.log says why', async () => {
+    const s = setup({ repo: { autoMerge: undefined }, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge', '--findings', 'lots'] });
+    const { db, gh } = s;
+    const worker = start(s);
+    await vi.waitFor(() => expect(gh.writes.some((w) => w.startsWith('ready '))).toBe(true), { timeout: 150_000, interval: 100 });
+    await worker.stop();
+
+    const job = jobsOf(db).find((j) => j.envelope.type === 'pull_request.review')!;
+    const run = latestRunOfJob(db, job.id)!;
+    expect(run.outcome).toBe('succeeded');
+    expect(getPrReview(db, run.id)).toMatchObject({ verdict: 'ready-to-merge', outcome: 'ready', findingsCount: null });
+    const log = readFileSync(run.logPath!, 'utf8');
+    expect(log).toContain('review verdict for');
+    expect(log.match(/review findings count: none \(the reviewer's UPDRAFT-FINDINGS line is not a whole number from 0 to 999999\); the verdict is unaffected/g)).toHaveLength(1);
+    expect(db.prepare("SELECT findings FROM metric_events WHERE kind = 'review.verdict'").all()).toEqual([{ findings: null }]);
+  });
+
   it('with autoMerge off, stops at a PR that is ready for review and merges nothing', async () => {
     const s = setup({ repo: { autoMerge: undefined }, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] });
     const { db, gh } = s;
@@ -287,5 +324,45 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     const pr = getLoopPr(db, REPO_ID, PR)!;
     expect(pr.mergeState).toBeNull();
     expect(prStage(db, pr, 3)).toMatchObject({ stage: 'ready-to-merge' });
+  });
+
+  // kiro-cli logs to stderr while answering on stdout. Through one shared descriptor a record can
+  // land on either end of an unterminated verdict line (seen on a real Kiro review of PR #47).
+  const stderrLogs = ['--mode', 'review', '--verdict', 'ready-to-merge', '--stderr-logs'];
+
+  it('reads the verdict from stdout alone when the adapter asks for separate stderr, and keeps the stderr in run.log', async () => {
+    restores.push(registerAdapter(fakeAdapter({ name: 'codex', separateStderr: true })));
+    const s = setup({ repo: { autoMerge: undefined }, reviewerArgs: stderrLogs });
+    const { db, gh } = s;
+    const worker = start(s);
+    await vi.waitFor(() => expect(gh.writes.some((w) => w.startsWith('ready '))).toBe(true), { timeout: 150_000, interval: 100 });
+    await worker.stop();
+
+    const job = jobsOf(db).find((j) => j.envelope.type === 'pull_request.review')!;
+    const run = latestRunOfJob(db, job.id)!;
+    expect(run.outcome).toBe('succeeded');
+    expect(getPrReview(db, run.id)).toMatchObject({ verdict: 'ready-to-merge', outcome: 'ready' });
+    const log = readFileSync(run.logPath!, 'utf8');
+    expect(log).toContain('---- agent output (stdout; stderr follows once the agent has exited) ----');
+    // The stdout ends with the bare verdict; both records follow, in a section of their own.
+    const out = log.slice(log.indexOf('---- agent output'), log.indexOf('---- agent stderr ----'));
+    expect(out).toMatch(/UPDRAFT-VERDICT: ready-to-merge\s*$/);
+    expect(out).not.toContain('[KRS]');
+    expect(log.slice(log.indexOf('---- agent stderr ----'))).toMatch(/totalEvents=139\[INFO\] \[KRS\] <-- GenerateAssistantResponseCommand done totalEvents=140/);
+    expect(log.indexOf('---- agent stderr ----')).toBeLessThan(log.indexOf('---- end of agent output ----'));
+  });
+
+  it('without separate stderr the same output glues the records onto the verdict, which fails closed', async () => {
+    const s = setup({ repo: { autoMerge: undefined }, reviewerArgs: stderrLogs });
+    const { db, gh } = s;
+    const worker = start(s);
+    const reviewJob = () => jobsOf(db).find((j) => j.envelope.type === 'pull_request.review');
+    await vi.waitFor(() => expect(reviewJob()?.status).toBe('failed'), { timeout: 150_000, interval: 100 });
+    await worker.stop();
+
+    expect(reviewJob()!.statusReason).toMatch(/^no verdict: /);
+    expect(gh.writes.some((w) => w.startsWith('ready '))).toBe(false);
+    const log = readFileSync(latestRunOfJob(db, reviewJob()!.id)!.logPath!, 'utf8');
+    expect(log).toContain('totalEvents=139UPDRAFT-VERDICT: ready-to-merge[INFO] [KRS]');
   });
 });

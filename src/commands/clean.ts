@@ -79,11 +79,11 @@ const message = (err: unknown) => (err instanceof Error ? err.message : String(e
 
 const AGE_UNITS_MS: Record<string, number> = { h: 3_600_000, d: 86_400_000, w: 7 * 86_400_000 };
 
-/** Parse an --older-than value ("30d", "12h", "2w") into milliseconds. */
-export function parseAge(text: string): number {
+/** Parse an --older-than value ("30d", "12h", "2w") into milliseconds. `option` names the flag in the error. */
+export function parseAge(text: string, option = '--older-than'): number {
   const m = /^(\d+)\s*([hdw])$/i.exec(text.trim());
   if (!m) {
-    throw new CliError(`Invalid --older-than "${text}": use a number and a unit (h, d or w), for example 30d.`, EXIT.USAGE);
+    throw new CliError(`Invalid ${option} "${text}": use a number and a unit (h, d or w), for example 30d.`, EXIT.USAGE);
   }
   return Number(m[1]) * AGE_UNITS_MS[m[2]!.toLowerCase()]!;
 }

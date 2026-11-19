@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import { agentProfile, effectiveArgs } from '../agents/profile.js';
 import { getAdapter } from '../agents/adapters/registry.js';
 import {
   KNOWN_ADAPTERS,
@@ -9,6 +10,7 @@ import {
   publishMode,
   reviseActive,
   reviewActive,
+  reviewPoolFor,
   reviewSettings,
   repoNeedsCheckout,
   workflowId,
@@ -46,6 +48,12 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
 
   for (const [agentName, agent] of Object.entries(config.agents)) {
     const adapter = agentAdapter(agentName, agent);
+    if (agent.capacityGroup !== undefined && !Object.hasOwn(config.capacity?.groups ?? {}, agent.capacityGroup)) {
+      errors.push({
+        path: `agents.${agentName}.capacityGroup`,
+        message: `unknown capacity group "${agent.capacityGroup}"; declare it under capacity.groups`,
+      });
+    }
     if (!(KNOWN_ADAPTERS as readonly string[]).includes(adapter)) {
       errors.push({
         path: `agents.${agentName}`,
@@ -59,6 +67,9 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
           `live execution is not implemented for adapter "${adapter}", so live mode cannot run this agent; ` +
           'use execution.mode prepare-only, or disable the agent',
       });
+    }
+    for (const problem of agentProfile(adapter, agent).problems) {
+      errors.push({ path: `agents.${agentName}`, message: problem });
     }
     if (agent.container) {
       const base = `agents.${agentName}.container`;
@@ -191,6 +202,13 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       }
     }
 
+    if (review.pool !== null) {
+      if (!Object.hasOwn(config.pools, review.pool)) errors.push({ path: `repositories.${repoName}.review.pool`, message: `unknown pool "${review.pool}"` });
+      else if (repo.workflows.every((wf) => wf.reviewPool !== undefined)) {
+        warnings.push({ path: `repositories.${repoName}.review.pool`, message: 'has no effect: every workflow of this repository sets its own reviewPool' });
+      }
+    }
+
     const wfIds = new Set<string>();
     repo.workflows.forEach((wf, i) => {
       const base = `repositories.${repoName}.workflows.${i}`;
@@ -198,28 +216,74 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       if (wfIds.has(id)) errors.push({ path: `${base}.id`, message: `duplicate workflow id "${id}"; set a unique id` });
       wfIds.add(id);
 
-      if (!config.actions[wf.action]) errors.push({ path: `${base}.action`, message: `unknown action "${wf.action}"` });
+      if (!Object.hasOwn(config.actions, wf.action)) errors.push({ path: `${base}.action`, message: `unknown action "${wf.action}"` });
 
       const pools = typeof wf.pool === 'string' ? [wf.pool] : [...wf.pool.rules.map((r) => r.use), wf.pool.default];
       for (const p of pools) {
-        if (!config.pools[p]) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
+        if (!Object.hasOwn(config.pools, p)) errors.push({ path: `${base}.pool`, message: `unknown pool "${p}"` });
+      }
+      if (wf.tiers) {
+        const t = wf.tiers;
+        const tierPools: [string, string][] = [
+          ['pools.routine', t.pools.routine],
+          ['pools.standard', t.pools.standard],
+          ['pools.complex', t.pools.complex],
+          ...(t.highRisk ? [['highRisk.pool', t.highRisk.pool] as [string, string]] : []),
+        ];
+        for (const [k, p] of tierPools) {
+          if (!Object.hasOwn(config.pools, p)) errors.push({ path: `${base}.tiers.${k}`, message: `unknown pool "${p}"` });
+        }
+        if (t.highRisk && !review.enabled) {
+          errors.push({
+            path: `${base}.tiers.highRisk`,
+            message: `high-risk work requires independent review: enable repositories.${repoName}.review (with allowSameAgent false)`,
+          });
+        } else if (t.highRisk && review.allowSameAgent) {
+          errors.push({ path: `${base}.tiers.highRisk`, message: 'high-risk work requires independent review: review.allowSameAgent must be false' });
+        }
+        if (t.escalation?.enabled && t.escalation.ceiling === 'high-risk' && !t.highRisk) {
+          errors.push({ path: `${base}.tiers.escalation.ceiling`, message: 'a high-risk ceiling needs tiers.highRisk (with independent review)' });
+        }
+        if (!t.highRisk) warnings.push({ path: `${base}.tiers.highRisk`, message: 'no high-risk pool: high-risk issues will be held for a human' });
+        if (t.triage?.enabled) {
+          const tp = `${base}.tiers.triage.agent`;
+          const triageAgent = config.agents[t.triage.agent];
+          if (!triageAgent) errors.push({ path: tp, message: `unknown agent "${t.triage.agent}"` });
+          else {
+            const adapterName = agentAdapter(t.triage.agent, triageAgent);
+            const adapter = getAdapter(adapterName);
+            if (!triageAgent.enabled) errors.push({ path: tp, message: `agent "${t.triage.agent}" is disabled` });
+            if (triageAgent.container) errors.push({ path: tp, message: 'triage runs the agent CLI on the host; an agent with a container cannot be used' });
+            if (!adapter?.buildTriageInvocation) errors.push({ path: tp, message: `the ${adapterName} adapter cannot run triage` });
+            else {
+              try {
+                adapter.buildTriageInvocation({ launch: { file: 'agent', args: [] }, extraArgs: effectiveArgs(adapterName, triageAgent), platform: 'linux' });
+              } catch (err) {
+                errors.push({ path: tp, message: (err as Error).message });
+              }
+              if (adapter.triageIsolation === 'best-effort') {
+                warnings.push({ path: tp, message: `the ${adapterName} adapter cannot guarantee a read-only, no-tools triage run (see docs/triage.md)` });
+              }
+            }
+          }
+        }
       }
       if (wf.reviewPool !== undefined) {
-        if (!config.pools[wf.reviewPool]) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
+        if (!Object.hasOwn(config.pools, wf.reviewPool)) errors.push({ path: `${base}.reviewPool`, message: `unknown pool "${wf.reviewPool}"` });
         if (!review.enabled) warnings.push({ path: `${base}.reviewPool`, message: `has no effect without repositories.${repoName}.review` });
       }
       // The reviewer must be able to be a different agent than the one that wrote the code. For
       // each pool the job can be routed to: is there a coding agent that would leave the review
-      // pool (reviewPool, else that same pool) with nobody else enabled?
+      // pool (reviewPool, else review.pool, else that same pool) with nobody else enabled?
       if (reviewActive(config, repo) && !review.allowSameAgent) {
         const enabledIn = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
         for (const p of new Set(pools)) {
-          const reviewPool = wf.reviewPool ?? p;
+          const reviewPool = reviewPoolFor(repo, wf, p);
           const reviewers = enabledIn(reviewPool);
           const alone = enabledIn(p).find((author) => reviewers.every((r) => r === author));
           if (alone !== undefined && reviewers.length > 0) {
             errors.push({
-              path: wf.reviewPool !== undefined ? `${base}.reviewPool` : `${base}.pool`,
+              path: wf.reviewPool !== undefined ? `${base}.reviewPool` : review.pool !== null ? `repositories.${repoName}.review.pool` : `${base}.pool`,
               message:
                 `review needs a reviewer other than the agent that wrote the code, but "${alone}" is the only enabled agent in pool "${reviewPool}" ` +
                 `and also writes code in pool "${p}"; add another agent, set reviewPool to a pool with a different agent, or set ` +

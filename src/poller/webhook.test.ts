@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
+import { openDatabase } from '../db/database.js';
 import { isJobBranchName, jobBranchName } from '../git/worktree.js';
 import type { GitHubApi, GitHubIssue, GitHubIssueEvent } from '../github/api.js';
 import { silentLogger } from '../util/log.js';
@@ -38,7 +39,8 @@ function deps(events: GitHubIssueEvent[] | (() => GitHubIssueEvent[]), issue: Pa
     },
     getIssue: async (): Promise<GitHubIssue> => ({ number: 7, title: 'Add a widget', body: 'b', htmlUrl: `https://github.com/${FULL}/issues/7`, state: 'open', labels: [LABEL], isPullRequest: false, ...issue }),
   } as unknown as GitHubApi;
-  return { api, config, log: silentLogger, eventLookup: { retries: 2, delayMs: 1 }, reads: () => reads };
+  // A state database as run-event opens it; only a workflow that routes by triage touches it.
+  return { api, config, db: openDatabase(':memory:'), log: silentLogger, eventLookup: { retries: 2, delayMs: 1 }, reads: () => reads };
 }
 
 const payload = (over: Record<string, unknown> = {}) => ({

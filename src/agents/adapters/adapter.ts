@@ -41,6 +41,15 @@ export interface AgentInvocation {
   promptVia: 'stdin' | 'file-arg';
   /** Variables the adapter needs set. Applied over the worker's environment; agents.<name>.env wins over these. */
   env?: Record<string, string>;
+  /**
+   * Keep the agent's stderr apart from its stdout. Normally both go to run.log through one file
+   * descriptor, so their writes interleave in no guaranteed order and a line of one can end up
+   * glued to a line of the other. With this set, stderr goes to a file of its own while the agent
+   * runs. The verdict and {@link AgentAdapter.finalMessage} then see stdout alone, and the stderr
+   * is appended to run.log, under its own header, once the agent has exited. For CLIs that log to
+   * stderr while writing their answer to stdout.
+   */
+  separateStderr?: boolean;
 }
 
 /** How the agent process ended on its own (not timed out, not stopped by the worker). */
@@ -48,13 +57,17 @@ export interface AgentExit {
   /** Exit code, or null when a signal ended it. */
   code: number | null;
   signal: NodeJS.Signals | null;
-  /** The last lines of the agent's combined stdout and stderr, cleaned and capped for display. */
+  /**
+   * The last lines of the agent's combined stdout and stderr, cleaned and capped for display.
+   * With {@link AgentInvocation.separateStderr}, the last lines of its stdout.
+   */
   outputTail: string[];
   /**
    * The agent's raw combined stdout and stderr from run.log: all of it, or its last
    * {@link RAW_OUTPUT_BYTES} bytes starting at a line boundary. For adapters that parse
    * structured output (lines are not cut or cleaned here). The line the window starts in is
-   * left out, so a line is either complete here or absent, never partial.
+   * left out, so a line is either complete here or absent, never partial. With
+   * {@link AgentInvocation.separateStderr}, its stdout followed by its stderr, each read the same way.
    */
   output: string;
   /** The arguments the agent ran with (InvocationResult.args), so an adapter knows which output mode was in effect. */
@@ -63,6 +76,23 @@ export interface AgentExit {
 
 /** How much of the agent's raw output {@link AgentExit.output} and {@link AgentAdapter.summarizeOutput} see. */
 export const RAW_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+/** What a triage launch (src/triage) asks of an adapter: the CLI, and the profile args the user configured. */
+export interface TriageInvocationRequest {
+  launch: LaunchSpec;
+  /** agents.<name>.args (and model/effort) from the config. Settings that widen access are refused. */
+  extraArgs: readonly string[];
+  platform: NodeJS.Platform;
+}
+
+/** How tightly a triage launch is confined; see docs/triage.md. */
+export type TriageIsolation =
+  /** The CLI is started with its tools turned off. */
+  | 'no-tools'
+  /** Tools exist but the CLI's own sandbox or approval policy blocks writes and commands. */
+  | 'read-only'
+  /** The adapter withholds trust for tools, but cannot promise the CLI has no read-only tool. */
+  | 'best-effort';
 
 export interface AgentVerdict {
   outcome: 'succeeded' | 'failed';
@@ -90,6 +120,15 @@ export interface AgentAdapter {
    * output is plain text, and the whole of it is the message.
    */
   finalMessage?(output: string): string | null | undefined;
+  /**
+   * Opt-in triage (src/triage): the invocation for one read-only classification run, the prompt
+   * on stdin, in the same output mode as {@link buildInvocation} so {@link finalMessage} reads
+   * the answer. Never grants write access; throws an Error (shown as the fallback reason) when
+   * the configured args would. Absent: this adapter cannot triage.
+   */
+  buildTriageInvocation?(req: TriageInvocationRequest): AgentInvocation;
+  /** How tightly {@link buildTriageInvocation} confines the run. */
+  readonly triageIsolation?: TriageIsolation;
 }
 
 export function defaultVerdict(exit: AgentExit): AgentVerdict {

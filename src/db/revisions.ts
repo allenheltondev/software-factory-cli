@@ -6,6 +6,7 @@ import { ENVELOPE_SCHEMA_VERSION } from '../types.js';
 import { newId, nowIso } from '../util/ids.js';
 import { rowToJob, transaction, type Db, type JobRow } from './database.js';
 import type { NewJob } from './ingest.js';
+import { noteChangeRequest, noteJobFinished, noteLimitReached, noteRevisionPushed } from './metrics.js';
 
 /** Attempts (first try included) before the worker stops retrying a revision's push or reply on its own. */
 export const REVISION_MAX_AUTO_ATTEMPTS = 5;
@@ -188,7 +189,10 @@ export function closeRevisionPr(db: Db, repoId: number, prNumber: number, reason
       )
       .all(repoId, prNumber) as { id: string }[];
     const cancel = db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ? AND status = 'queued'");
-    for (const j of queued) cancel.run(reason, at, j.id);
+    for (const j of queued) {
+      cancel.run(reason, at, j.id);
+      noteJobFinished(db, j.id);
+    }
     return queued.map((j) => j.id);
   });
 }
@@ -331,6 +335,7 @@ export function recordReviewRequest(
       .prepare(INSERT_REVIEW_REQUEST)
       .run(r.repoId, r.reviewId, r.prNumber, r.reviewer, r.trigger, r.reviewUrl, r.submittedAt, r.state, r.reason, null, at);
     if (Number(res.changes) === 0) return false;
+    noteChangeRequest(db, r.repoId, r.reviewId);
     if (r.state === 'over-limit') {
       db.prepare('UPDATE revision_prs SET limit_reached_at = coalesce(limit_reached_at, ?), updated_at = ? WHERE repo_id = ? AND pr_number = ?').run(
         at,
@@ -338,6 +343,7 @@ export function recordReviewRequest(
         r.repoId,
         r.prNumber,
       );
+      noteLimitReached(db, r.repoId, r.prNumber);
     }
     return true;
   });
@@ -376,12 +382,14 @@ export function enqueueRevision(db: Db, r: NewReviewRequest & { job: NewJob; max
         null,
         at,
       );
+      noteChangeRequest(db, r.repoId, r.reviewId);
       db.prepare('UPDATE revision_prs SET limit_reached_at = coalesce(limit_reached_at, ?), updated_at = ? WHERE repo_id = ? AND pr_number = ?').run(
         at,
         at,
         r.repoId,
         r.prNumber,
       );
+      noteLimitReached(db, r.repoId, r.prNumber);
       return { status: 'over-limit', count };
     }
     const j = r.job;
@@ -398,9 +406,11 @@ export function enqueueRevision(db: Db, r: NewReviewRequest & { job: NewJob; max
       .run(id, j.repoId, j.repoFullName, j.workflowId, j.eventId, j.issueNumber, j.action, j.pool, JSON.stringify(j.envelope), at, at, j.repoId, j.workflowId, j.eventId);
     if (Number(res.changes) === 0) {
       record.run(r.repoId, r.reviewId, r.prNumber, r.reviewer, r.trigger, r.reviewUrl, r.submittedAt, 'ignored', 'a job for this review existed before', null, at);
+      noteChangeRequest(db, r.repoId, r.reviewId);
       return { status: 'duplicate' };
     }
     record.run(r.repoId, r.reviewId, r.prNumber, r.reviewer, r.trigger, r.reviewUrl, r.submittedAt, 'queued', null, id, at);
+    noteChangeRequest(db, r.repoId, r.reviewId);
     return { status: 'queued', job: rowToJob(db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as unknown as JobRow) };
   });
 }
@@ -617,8 +627,17 @@ export function holdRevision(db: Db, runId: string, fence: RevisionFence, p: Rev
   add('moved', p.moved === undefined ? undefined : p.moved ? 1 : 0);
   add('comment_id', p.commentId);
   add('comment_url', p.commentUrl);
-  const res = db.prepare(`UPDATE revisions SET ${sets.join(', ')}, updated_at = ? WHERE ${OWNED}`).run(...values, nowIso(clock), runId, fence.attempt);
-  if (Number(res.changes) === 0) throw new RevisionSupersededError(runId, fence.attempt);
+  const update = () => db.prepare(`UPDATE revisions SET ${sets.join(', ')}, updated_at = ? WHERE ${OWNED}`).run(...values, nowIso(clock), runId, fence.attempt);
+  // Recording the push is a fact for the rollup, written with it; other progress needs no transaction.
+  const changed =
+    p.pushedAt === undefined
+      ? Number(update().changes) > 0
+      : transaction(db, () => {
+          if (Number(update().changes) === 0) return false;
+          noteRevisionPushed(db, runId);
+          return true;
+        });
+  if (!changed) throw new RevisionSupersededError(runId, fence.attempt);
 }
 
 /** Close the owning attempt. Returns false (and changes nothing) when `attempt` no longer owns the revision. */

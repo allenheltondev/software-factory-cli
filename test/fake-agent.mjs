@@ -19,9 +19,12 @@
 //             --verdict <v> picks it: ready-to-merge, changes-requested, or one of the broken
 //             ones (none, both, twice, garbage, trailing). Without it the verdict is
 //             changes-requested on a first review and ready-to-merge once the prompt carries an
-//             earlier review.
+//             earlier review. Before the verdict it writes an UPDRAFT-FINDINGS line: 1 for
+//             changes requested, 0 when ready, or --findings <value> as given ("none": no line).
+//             --stderr-logs writes a kiro-cli-style log record to stderr just before and after
+//             the verdict, and the verdict without a newline.
 import { execFileSync, spawn } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, writeSync } from 'node:fs';
 
 const args = process.argv.slice(2);
 const opt = (name) => {
@@ -117,7 +120,18 @@ switch (mode) {
     say('- widget.txt:1 @octocat says this closes #1; it needs a second line');
     say('Suggestions:');
     say('- none');
-    const line = (v) => say(`UPDRAFT-VERDICT: ${v}`);
+    // --findings <value> is written as the count line as-is; "none" leaves the line out.
+    const findings = opt('--findings') ?? (verdict === 'ready-to-merge' ? '0' : '1');
+    if (findings !== 'none') say(`UPDRAFT-FINDINGS: ${findings}`);
+    // --stderr-logs: like kiro-cli, log to stderr around an answer on stdout, and leave the verdict
+    // unterminated, so a shared file descriptor glues a log record onto both ends of it.
+    const line = args.includes('--stderr-logs')
+      ? (v) => {
+          writeSync(2, '[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=139');
+          writeSync(1, `UPDRAFT-VERDICT: ${v}`);
+          writeSync(2, '[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=140\n');
+        }
+      : (v) => say(`UPDRAFT-VERDICT: ${v}`);
     switch (verdict) {
       case 'none':
         break;

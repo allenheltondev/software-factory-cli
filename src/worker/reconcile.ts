@@ -1,5 +1,6 @@
 // OWNER: queue/worker workstream. Startup reconciliation of runs left open by a previous worker.
-import { recordError, type Db } from '../db/database.js';
+import { recordError, transaction, type Db } from '../db/database.js';
+import { noteJobFinished } from '../db/metrics.js';
 import { finishRun, listOpenRuns, releaseClaim } from '../db/queue.js';
 import type { Run } from '../types.js';
 import { nowIso } from '../util/ids.js';
@@ -97,12 +98,15 @@ export async function reconcileInterruptedRuns(db: Db, opts: ReconcileOptions): 
   for (const j of stranded) {
     const at = nowIso(now);
     const reason = 'job was running with no open run when the worker started';
-    db.prepare("UPDATE jobs SET status = 'interrupted', status_reason = ?, updated_at = ? WHERE id = ?").run(
-      reason,
-      at,
-      j.id,
-    );
-    recordError(db, { scope: 'worker', jobId: j.id, repoFullName: j.repo_full_name, message: reason, at });
+    transaction(db, () => {
+      db.prepare("UPDATE jobs SET status = 'interrupted', status_reason = ?, updated_at = ? WHERE id = ?").run(
+        reason,
+        at,
+        j.id,
+      );
+      noteJobFinished(db, j.id);
+      recordError(db, { scope: 'worker', jobId: j.id, repoFullName: j.repo_full_name, message: reason, at });
+    });
   }
   return result;
 }

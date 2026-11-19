@@ -95,10 +95,36 @@ their current heads.
 
 ## Who reviews
 
-The reviewer must not be the agent that wrote the code. Reviewer jobs go to the workflow's
-`reviewPool`, or to the pool the original job was routed to when there is none, and when a
-job is claimed the agent of the PR's latest code run is left out: the job waits for another
-agent in the pool to have capacity.
+Reviewers are your coding agents (Claude Code, Codex, Kiro), each review in a fresh context:
+see [A fresh context per review](#a-fresh-context-per-review). Which of them reviews is set
+with a pool, the same way coding work is routed. The first of these that is set wins:
+
+1. the workflow's `reviewPool`;
+2. the repository's `review.pool`, for every workflow of the repository that names none;
+3. the pool the original job was routed to.
+
+```yaml
+pools:
+  coders: { agents: [claude] }
+  reviewers: { agents: [codex, kiro, claude] }   # taken in turn
+
+repositories:
+  octo/widgets:
+    review: { pool: reviewers }
+```
+
+- **A fixed reviewer** is a pool with one agent: `reviewers: { agents: [kiro] }`.
+- **Round robin** is a pool with several. Reviewer jobs rotate on a cursor of their own, apart
+  from the cursor of the pool's coding jobs, so the reviewers take turns even when the same
+  pool also writes code, and the rotation survives restarts. Successive heads of one PR
+  therefore usually get different reviewers; each is given the earlier reviews' findings.
+- A reviewer that is disabled, at its `maxConcurrent` or just failed to start the job is passed
+  over for the next one in turn, as for any job.
+
+The reviewer must not be the agent that wrote the code. When a reviewer job is claimed, the
+agent of the PR's latest code run is left out of the rotation: the job waits for another
+agent in the pool to have capacity. With the pool above and Claude writing every PR, reviews
+alternate between Codex and Kiro.
 
 A configuration in which that can never work is rejected by `updraft validate`: for example a
 coding pool and a review pool that hold the same single enabled agent. To let an agent review
@@ -109,6 +135,23 @@ its own work on purpose, say so:
 ```
 
 Even then another enabled agent in the pool is preferred whenever there is one.
+
+### A fresh context per review
+
+Every reviewer run is a new agent process started in a new worktree: `claude -p`, `codex exec`
+or `kiro-cli chat --no-interactive`, never a resumed or continued session. It shares nothing
+with the run that wrote the code or with an earlier review except what the prompt below hands
+it, as fenced text: the PR, the issue, earlier reviews' findings and people's change
+requests. In particular it never sees the coding agent's conversation, its reasoning or its
+own summary of what it did, only the commits.
+
+Outside a container the agent runs as your user, so per-user settings of the agent CLI still
+apply to it (a global `CLAUDE.md` or Codex `AGENTS.md`, for example), as they do for coding runs.
+A [container](isolation.md) gives it a scratch `HOME` instead.
+
+Updraft's reviewer and an outside reviewer such as a ChatGPT task are independent: the review
+loop never waits for or reads an outside review, and the outside review's
+[result block](review-result.md) is still shown by `updraft reviews`. You can run both.
 
 ## What the reviewer is given
 
@@ -153,6 +196,27 @@ text after the line makes the reviewer run **failed**. A failed review is never 
 the PR goes to "needs a human", and with `commentOnFailure` the PR gets the usual
 [failure comment](failure-comments.md).
 
+### The findings count
+
+Before the verdict line, the prompt also asks for one line with the number of findings
+(blockers and suggestions together):
+
+```
+UPDRAFT-FINDINGS: 3
+UPDRAFT-VERDICT: changes-requested
+```
+
+The count is telemetry for [`updraft stats`](stats.md) and nothing else. It is read from the
+findings after the verdict has been decided, and never changes or fails a verdict: the rules
+above are applied exactly as if the line were not there. Exactly one such line with a whole
+number from 0 to 999999 gives the count. A missing line, two of them, or any other value gives
+no count, and one line in `run.log` says why (`review findings count: none (...)`). The line
+must still come before the verdict line: written after it, it is text after the verdict and the
+run fails as it always would. The count line is left out of the findings Updraft stores, posts
+on the PR and gives to later reviews and revisions. It is stored with the verdict
+(`pr_reviews.findings_count`) and in the stats rollup. A person's "Request changes" review has
+no count; it counts as a round only.
+
 A verdict is bound to the commit that was reviewed. If the PR's head is a different commit
 when the verdict is recorded, or when the revision it queued would start, or when a merge is
 considered, the verdict is stale and nothing follows from it.
@@ -161,8 +225,9 @@ considered, the verdict is stale and nothing follows from it.
 
 One comment review per reviewer run, attached to the reviewed commit, with the verdict, the
 reviewed commit, the reviewing agent and the findings. The findings are an agent's text about
-untrusted code, so they are inside a code fence: mentions, links and closing keywords in them
-do nothing. A hidden marker with the run id lets a retry find the review instead of posting a
+untrusted code, so they are rendered as sanitized Markdown (headings, lists and code display
+normally in a blockquote): mentions, closing keywords and HTML comments in them do nothing.
+See [Publication](publication.md). A hidden marker with the run id lets a retry find the review instead of posting a
 second one (only among the worker's own reviews). Posting uses the same lease, retries and
 `updraft publish RUN_ID` as publication.
 

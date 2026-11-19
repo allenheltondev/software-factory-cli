@@ -16,6 +16,40 @@ export interface RepoRef {
  * Transport-independent description of the GitHub event that caused a job.
  * Polling builds these today; a webhook relay could build the same shape later.
  */
+/** How a job's pool was chosen (see docs/tier-routing.md). Decided at enqueue, then fixed for the job. */
+export interface RoutingDecision {
+  rule: 'default' | 'legacy-label' | 'override-label' | 'heuristic' | 'triage';
+  pool: string;
+  /** Set when tier routing is on. */
+  tier?: 'routine' | 'standard' | 'complex' | 'high-risk';
+  complexity?: 'routine' | 'standard' | 'complex';
+  risk?: 'low' | 'medium' | 'high';
+  confidence?: number;
+  /** Why this rule chose this way. */
+  detail?: string;
+  /** Set when no eligible pool exists: the job is not run and needs a human. */
+  hold?: string;
+  /** Heuristic rule only: the local classifier's confidence was below tiers.minConfidence. */
+  uncertain?: boolean;
+  /** Set when CLI triage was consulted (docs/triage.md). Holds no issue text. */
+  triage?: TriageNote;
+}
+
+/** What CLI triage contributed to a routing decision, kept on the job for status and logs. */
+export interface TriageNote {
+  /** cli: a triage run just answered; cache: an earlier answer was reused; fallback: no usable answer, local routing stands. */
+  origin: 'cli' | 'cache' | 'fallback';
+  agent: string;
+  /** The agent's validated verdict; absent for a fallback. */
+  complexity?: 'routine' | 'standard' | 'complex';
+  risk?: 'low' | 'medium' | 'high';
+  confidence?: number;
+  /** The agent's short explanation (clipped, untrusted text), or the reason for the fallback. */
+  reason: string;
+  /** Why a verdict was not followed in full (a policy floor was higher). */
+  conflict?: string;
+}
+
 export interface EventEnvelope {
   schemaVersion: typeof ENVELOPE_SCHEMA_VERSION;
   /**
@@ -36,6 +70,8 @@ export interface EventEnvelope {
   /** Labels on the issue when the job was enqueued (used for routing). */
   labelsAtEnqueue: string[];
   createdAt: string;
+  /** Routing decision for issue jobs when tier routing is on. */
+  routing?: RoutingDecision;
   /** Present exactly when `type` is pull_request.changes_requested. */
   revision?: RevisionRequest;
   /** Present exactly when `type` is pull_request.review. */
@@ -254,6 +290,11 @@ export interface ReviewResult {
   baseSha: string | null;
   verdict: ReviewVerdict;
   findings: string;
+  /**
+   * The reviewer's UPDRAFT-FINDINGS count; null when its line was missing, repeated or malformed.
+   * Telemetry only: it never affects the verdict. Absent in summaries from before it existed.
+   */
+  findingsCount?: number | null;
 }
 
 /**

@@ -802,8 +802,8 @@ describe('startup sweep', { timeout: 60_000 }, () => {
     expect(api.pulls).toHaveLength(1);
     expect(api.comments).toHaveLength(1);
     expect(readFileSync(s.logPath, 'utf8')).toContain('publication: attempt 1 (draft-pr, startup sweep)');
-    expect(out.text()).toMatch(new RegExp(`startup sweep: publishing a succeeded run that has no publication record .*runId=${s.runId}`));
-    expect(out.text()).toMatch(/INFO {2}published .*source=startup sweep/);
+    expect(out.text()).toMatch(new RegExp(`\\[run:${s.runId}\\] +startup sweep: publishing a succeeded run that has no publication record`));
+    expect(out.text()).toMatch(/INFO +\[run:[^\]]+\] +published .*source="startup sweep"/);
 
     // Running it again changes nothing: the run has a publication record now.
     await createPublisher(deps(s, api, { config })).sweepUnpublished();
@@ -1066,10 +1066,10 @@ describe('helpers', () => {
       },
     });
     expect(body.startsWith('Closes #3\n')).toBe(true);
-    // The final message is inside a fence longer than any backtick run in it.
-    expect(body).toContain('`````text\ndone ```` tricky');
+    // The final message is Markdown in a blockquote; its forged marker is broken, the worker's is not.
+    expect(body).toContain('> done ```` tricky');
+    expect(body).not.toContain('<!-- updraft-run: run_other -->');
     expect(body.match(/<!-- updraft-run: run_x -->/g)).toHaveLength(1);
-    expect(body.indexOf('closes #9')).toBeGreaterThan(body.indexOf('```text'));
   });
 });
 

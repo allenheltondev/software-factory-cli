@@ -20,7 +20,7 @@ import type { GitHubApi } from '../github/api.js';
 import type { UpdraftPaths } from '../paths.js';
 import { createFailureCommenter } from '../publish/failure-comment.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job } from '../types.js';
-import { silentLogger } from '../util/log.js';
+import { silentLogger, type Logger } from '../util/log.js';
 import { runDaemon, WorkerLockedError, type DaemonDeps } from './daemon.js';
 import { canceledByUser, StartFailedError, type ExecutionResult, type Executor } from './executor.js';
 import { acquireWorkerLock, readWorkerLock, WORKER_STALE_MS } from './lock.js';
@@ -389,6 +389,31 @@ describe('runDaemon', () => {
     expect(retries).toBeGreaterThanOrEqual(1);
   });
 
+  it('with capacity configured, a usage-limit exit cools the profile down and requeues the job instead of failing it', async () => {
+    const db = openDatabase(':memory:');
+    const calls: string[] = [];
+    const executor: Executor = {
+      name: 'limited',
+      execute: async (c): Promise<ExecutionResult> => {
+        calls.push(c.run.agent);
+        return { outcome: 'failed', error: 'agent exited 1', cliOutput: "ERROR: You've hit your usage limit. Try again in 2 hours." };
+      },
+    };
+    const commented: string[] = [];
+    const failureCommenter = { afterRun: async (id: string) => void commented.push(id), retryDue: async () => {}, sweepUnpublished: async () => {} };
+    const config = makeConfig({ capacity: { groups: {}, maxDeferrals: 3 }, pools: { solo: { agents: ['claude'] } } });
+    const deps = baseDeps(db, { executor, failureCommenter, config });
+    const job = insertJob(db, { pool: 'solo' });
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    await vi.waitFor(() => expect(getJob(db, job)?.status).toBe('queued'));
+    deps.controller.abort();
+    await done;
+    expect(getJob(db, job)?.statusReason).toMatch(/waiting: .*claude.*usage limit/);
+    expect(calls).toEqual(['claude']); // cooling down: not started again
+    expect(commented).toEqual([]); // a deferral is not a failure to announce
+  });
+
   it('with commentOnFailure, comments once when a job ends failed and not when it is requeued, canceled or interrupted', async () => {
     const db = openDatabase(':memory:');
     const config = makeConfig({
@@ -462,6 +487,30 @@ describe('runDaemon', () => {
     ]);
   });
 
+  it('announces the assignment only for claims that pass the dispatch check, and never blocks the agent', async () => {
+    const db = openDatabase(':memory:');
+    const announced: { job: string; run: string; agent: string }[] = [];
+    const assignmentCommenter = {
+      announce: async (job: Job, run: { id: string; agent: string }) => {
+        announced.push({ job: job.id, run: run.id, agent: run.agent });
+        throw new Error('GitHub is down'); // a misbehaving commenter must not matter
+      },
+    };
+    const executor: Executor = { name: 'fake', execute: async () => ({ outcome: 'succeeded' }) };
+    const deps = baseDeps(db, {
+      executor,
+      assignmentCommenter: assignmentCommenter as never,
+      checkDispatchable: async (job) => (job.issueNumber === 2 ? { ok: false, reason: 'issue was closed' } : { ok: true }),
+    });
+    const [accepted, rejected] = [1, 2].map((issue) => insertJob(db, { issue }));
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect([accepted, rejected].map((j) => getJob(db, j!)?.status)).toEqual(['succeeded', 'canceled']));
+    deps.controller.abort();
+    await done;
+    expect(announced).toHaveLength(1);
+    expect(announced[0]).toMatchObject({ job: accepted, agent: getRun(db, announced[0]!.run)!.agent });
+  });
+
   it('at start, records the publish settings and sweeps unpublished runs once, after reconcile and before the first poll', async () => {
     const db = openDatabase(':memory:');
     const workflows = [{ trigger: { event: 'issue.labeled' as const, label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }];
@@ -494,6 +543,63 @@ describe('runDaemon', () => {
     });
     await runDaemon(deps);
     expect(events).toEqual([`sweep (left-over run interrupted, publish draft-pr since ${new Date(T0).toISOString()})`, 'poll']);
+  });
+
+  it('logs an info-level "worker alive" line once per status interval, with polls and failures since the last one', async () => {
+    const db = openDatabase(':memory:');
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const recording: Logger = {
+      debug: () => {},
+      info: (msg, fields) => lines.push({ msg, fields }),
+      warn: () => {},
+      error: () => {},
+      child: () => recording,
+    };
+    // Every read of the clock moves it 10 minutes, so polls come back to back and an hour of
+    // worker time passes in a few of them.
+    let t = Date.parse('2026-01-01T00:00:00Z');
+    let calls = 0;
+    const deps = baseDeps(db, {
+      log: recording,
+      now: () => (t += 10 * 60_000),
+      timing: { statusLogMs: 60 * 60_000 },
+      poll: async () => {
+        calls++;
+        if (calls % 2 === 0) throw new Error('rate limited');
+      },
+    });
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(lines.filter((l) => l.msg === 'worker alive').length).toBeGreaterThanOrEqual(2));
+    deps.controller.abort();
+    await done;
+    const alive = lines.filter((l) => l.msg === 'worker alive');
+    const first = alive[0]!.fields!;
+    expect(first.inFlight).toBe(0);
+    expect(first.polls as number).toBeGreaterThan(0);
+    expect(first.pollFailures as number).toBeLessThanOrEqual(first.polls as number);
+    // Counters restart after each line, and uptime keeps growing.
+    const total = alive.reduce((n, l) => n + (l.fields!.polls as number), 0);
+    expect(total).toBeLessThanOrEqual(calls);
+    expect(alive[1]!.fields!.uptimeMinutes as number).toBeGreaterThan(first.uptimeMinutes as number);
+  });
+
+  it('logs no "worker alive" line before the status interval has passed', async () => {
+    const db = openDatabase(':memory:');
+    const msgs: string[] = [];
+    const recording: Logger = {
+      debug: () => {},
+      info: (msg) => msgs.push(msg),
+      warn: () => {},
+      error: () => {},
+      child: () => recording,
+    };
+    let polls = 0;
+    const deps = baseDeps(db, { log: recording, poll: async () => void polls++ });
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(polls).toBeGreaterThanOrEqual(1));
+    deps.controller.abort();
+    await done;
+    expect(msgs).not.toContain('worker alive');
   });
 
   it('records poll failures and keeps running', async () => {

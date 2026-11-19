@@ -15,6 +15,14 @@ export class ConfigError extends Error {
   }
 }
 
+/** No config file at the path. */
+export class MissingConfigError extends ConfigError {
+  constructor(readonly path: string) {
+    super(`No config at ${path}. Run "updraft configure" or pass --config.`);
+    this.name = 'MissingConfigError';
+  }
+}
+
 export interface LoadedConfig {
   config: UpdraftConfig;
   path: string;
@@ -36,9 +44,7 @@ export function readRawConfig(path: string): unknown {
 }
 
 export function loadConfig(path: string): LoadedConfig {
-  if (!existsSync(path)) {
-    throw new ConfigError(`No config at ${path}. Run "updraft configure" or pass --config.`);
-  }
+  if (!existsSync(path)) throw new MissingConfigError(path);
   const result = validateConfig(readRawConfig(path));
   if (!result.ok) throw new ConfigError(`Invalid config ${path}`, result.errors);
   return { config: result.config, path, warnings: result.warnings };

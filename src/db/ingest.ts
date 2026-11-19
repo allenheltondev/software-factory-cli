@@ -3,6 +3,7 @@
 import { rowToJob, transaction, type Db, type JobRow } from './database.js';
 import type { EventEnvelope, Job } from '../types.js';
 import { newId, nowIso } from '../util/ids.js';
+import { noteJobFinished } from './metrics.js';
 
 export interface Checkpoint {
   repoId: number;
@@ -196,10 +197,14 @@ export function listQueuedJobs(db: Db): Job[] {
 
 /** Mark a job canceled only if it is still queued. Returns true if it changed. */
 export function cancelQueuedJob(db: Db, jobId: string, reason: string, now?: () => number): boolean {
-  const res = db
-    .prepare(
-      "UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
-    )
-    .run(reason, nowIso(now), jobId);
-  return Number(res.changes) > 0;
+  return transaction(db, () => {
+    const res = db
+      .prepare(
+        "UPDATE jobs SET status = 'canceled', status_reason = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
+      )
+      .run(reason, nowIso(now), jobId);
+    if (Number(res.changes) === 0) return false;
+    noteJobFinished(db, jobId);
+    return true;
+  });
 }
