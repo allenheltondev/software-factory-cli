@@ -104,8 +104,9 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
+      # No point-in-time recovery yet: enabling it needs dynamodb:UpdateContinuousBackups, which the
+      # deploy role does not have (same as ai-fantasy-league's table). Turn it on before #67 stores
+      # anything that matters.
       StreamSpecification:
         StreamViewType: NEW_AND_OLD_IMAGES
       TimeToLiveSpecification:
@@ -221,12 +222,6 @@ Resources:
             RestApiId: !Ref UpdraftApi
             Path: /api/v1/{proxy+}
             Method: ANY
-
-  ApiFunctionLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${ApiFunction}
-      RetentionInDays: 30
 
   # ---------------------------------------------------------------------------
   # Hosting: a private S3 bucket and one CloudFront distribution with two origins, so the browser
