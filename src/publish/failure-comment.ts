@@ -50,6 +50,8 @@ export interface FailureCommentDeps {
   api: GitHubApi;
   log: Logger;
   now?: () => number;
+  /** As PublishDeps.scope: the runs whose comment is retried by this process. Absent: all. */
+  scope?: { run(runId: string): boolean };
 }
 
 export type FailureCommentResult =
@@ -421,7 +423,7 @@ export function createFailureCommenter(deps: FailureCommentDeps): FailureComment
     async retryDue(signal) {
       let due: string[];
       try {
-        due = listDueFailureComments(deps.db, { maxAttempts: MAX_AUTO_ATTEMPTS, now: deps.now });
+        due = listDueFailureComments(deps.db, { maxAttempts: MAX_AUTO_ATTEMPTS, now: deps.now }).filter((id) => deps.scope?.run(id) ?? true);
       } catch (err) {
         deps.log.error('could not list failure comments to retry', { error: message(err) });
         return;

@@ -2,12 +2,14 @@
 
 `updraft start` is a worker that stays up: it polls GitHub, queues jobs and runs them.
 `updraft run-event` is the same work for exactly one GitHub webhook event. It takes the payload
-GitHub delivered, carries it through to the end (agent, verification, pull request) and exits.
-Nothing polls and nothing waits for more work.
+GitHub delivered, carries it through to the end (agent, verification, pull request, and where
+they are configured the review, the revision and the merge) and exits. Nothing polls and nothing
+waits for more work.
 
 It is for places where a machine exists per event: a launcher receives the webhook of a GitHub
 App, starts a fresh machine, and that machine runs this command once. It needs no clone prepared
-in advance and no state from an earlier run.
+in advance. It works with an empty state directory, and better with a state database that is
+shared between the runs ([Shared state](#shared-state)).
 
 ```
 updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>] [--json]
@@ -20,32 +22,43 @@ updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>]
 | `--event-name <name>` | The delivery's `X-GitHub-Event` header. Default `issues` |
 | `--delivery-id <id>` | The delivery's `X-GitHub-Delivery` header. Only written to the logs and the summary; it decides nothing |
 | `--json` | Print one JSON object on stdout when the command ends (see [The summary](#the-summary)) |
-| `--deadline-minutes <n>` | Stop everything, a running agent included, after this long. Default: no limit of its own; the action's `timeoutMinutes` and `verifyTimeoutMinutes` bound the agent and the verification |
+| `--deadline-minutes <n>` | Stop everything, a running agent included, after this long. Default: no limit of its own; the action's `timeoutMinutes` and `verifyTimeoutMinutes` bound each agent and verification, and `autoMergeWaitMinutes` the wait for checks |
 | `--worker-git-credentials` | Fetch with the worker's GitHub credentials even into a clone this command did not create (see [The clone](#the-clone)) |
 
 `-c, --config <path>`, `UPDRAFT_CONFIG` and `UPDRAFT_HOME` work as for every command.
+
+## Events
+
+| `--event-name` | `action` | What it sets off |
+| --- | --- | --- |
+| `issues` | `labeled` | The workflow's job for the issue, if the poller's dispatch rules would queue one |
+| `pull_request_review` | `submitted`, `edited`, `dismissed` | The review loop's look at that pull request: a change request by an allowed actor queues a revision |
+| `pull_request` | `synchronize`, `closed`, `reopened` | The same look: a new head commit gets its reviewer run; a closed or merged pull request stops being watched and its queued work is canceled |
+
+Every other event name or action is "nothing to do", decided from the payload alone.
 
 ## What the caller provides
 
 - **A config** with `execution.mode: live`. Any other mode is an error: this command exists to
   start an agent. The repository is configured as for `updraft start` (its numeric `id`, a
-  workflow with the trigger label, `dispatch.allowedActors`, usually `publish`).
-  `repositories.<repo>.checkoutPath` is still required, but the directory need not exist.
+  workflow with the trigger label, `dispatch.allowedActors`, usually `publish`, and `revise`,
+  `review`, `autoMerge` as wanted). `repositories.<repo>.checkoutPath` is still required, but
+  the directory need not exist.
 - **Credentials for GitHub**, as for the worker: `GH_TOKEN` / `GITHUB_TOKEN` (or a `gh` sign-in),
   or a GitHub App (`github.app`, with its private key file; see [github-app.md](github-app.md)).
   The same credentials serve the API, the fetch and the push.
-- **The agent**: its CLI installed and signed in, as `updraft doctor` checks it.
-- **An empty state directory** of its own. The command creates the database, logs, clone and
-  worktree it needs. Do not point it at the state directory of a running `updraft start`: that
-  worker holds the lock, and the command exits with code 3 (the job it queued is then that
-  worker's to run). A state directory left by an earlier `run-event` works too.
+- **The agents**: each CLI installed and signed in, as `updraft doctor` checks it. With `review`,
+  the pool that reviews needs an agent other than the one that wrote the code, as always.
+- **A state directory of its own.** Empty, or holding a `state.db` that is a copy of the shared
+  state database (see [Shared state](#shared-state)). The command creates the database, logs,
+  clone and worktrees it needs. Do not point it at the state directory of a running
+  `updraft start`: that worker holds the lock, and the command exits with code 3.
 - **The payload file**, and the event name when it is not `issues`.
 
-## What it does
+## What it does for `issues.labeled`
 
-1. **Recognises the event.** Handled now: `issues` with `action: "labeled"`. Every other event
-   name or action is "nothing to do". So is a payload for a pull request, for a repository whose
-   id is not configured, or for a label that is not the trigger label of a workflow; those are
+1. **Recognises the event.** A payload for a pull request, for a repository whose id is not
+   configured, or for a label that is not the trigger label of a workflow is "nothing to do",
    settled from the payload without a request to GitHub.
 2. **Applies the worker's dispatch rules, from the API.** The payload came through a launcher, so
    it decides nothing by itself: it only says which repository (by id), issue and label to look
@@ -53,27 +66,50 @@ updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>]
    poller uses decides whether it queues a job: the actor GitHub reports for the event must be an
    allowed actor, the issue must be open, must not be a pull request and must still carry the
    label, the label must not have been removed again since, and the pool is routed from the
-   issue's current labels.
-3. **Checks whether the event was already handled** (see [Idempotency](#idempotency)).
+   issue's current labels, tiers and triage ([tier-routing.md](tier-routing.md),
+   [triage.md](triage.md); the triage cache and its hourly limit are in the state database).
+3. **Checks whether the event was already handled** (see [Idempotency](#idempotency)): first in
+   the state database, then on GitHub.
 4. **Makes the repository available** (see [The clone](#the-clone)).
-5. **Runs the one job through the worker**, in a mode that drains the queue and stops: the
-   pre-start check (which in live mode cancels the job when the label application is no longer
-   the current one, its actor is no longer allowed, or the issue's title or body was edited since
-   by someone who is not allowed), the live executor, the action's `verify` commands, publication
-   and, for a failed job, the failure comment. Everything in [live-execution.md](live-execution.md),
-   [verification.md](verification.md), [publication.md](publication.md) and
-   [failure-comments.md](failure-comments.md) applies unchanged.
+5. **Runs the job through the worker**, in a mode that works until the event's work is done and
+   then stops. It is wired as `updraft start` wires it: the pre-start check (which in live mode
+   cancels the job when the label application is no longer the current one, its actor is no
+   longer allowed, or the issue's title or body was edited since by someone who is not allowed),
+   the assignment comment, the live executor, capacity groups, cooldowns and escalation, the
+   action's `verify` commands, publication, the review loop and, for a failed job, the failure
+   comment. Everything in [live-execution.md](live-execution.md),
+   [verification.md](verification.md), [publication.md](publication.md),
+   [assignment-comments.md](assignment-comments.md),
+   [capacity-and-escalation.md](capacity-and-escalation.md), [revisions.md](revisions.md),
+   [review-loop.md](review-loop.md) and [failure-comments.md](failure-comments.md) applies.
 6. **Prints the summary and exits.**
-
-A publication or failure comment that fails for a passing reason (GitHub unavailable, a rate
-limit) is retried when it comes due, as the worker does, but only while that is within five
-minutes of the job ending. A retry scheduled for later is left: the summary reports the failure,
-and the state directory, if kept, can finish it with `updraft publish RUN_ID`.
 
 The agent never receives the worker's GitHub credentials, here as elsewhere.
 
-Not acted on by this command: `repositories.<repo>.revise` and `review`. Those loops are driven by
-polling pull requests; `updraft start` runs them.
+### The review loop in one run
+
+With `review` (and `revise`, `autoMerge`) on for the repository, the loop runs inside the same
+process, one step queuing the next:
+
+1. the code run is published as a pull request;
+2. a reviewer job for its head commit is queued and run by another agent of the review pool;
+3. a "changes requested" verdict queues a revision, which is pushed to the pull request, and the
+   new head gets its reviewer job (up to `maxRevisions`);
+4. a "ready to merge" verdict marks the draft ready for review;
+5. with `autoMerge`, every gate of [review-loop.md](review-loop.md#auto-merge) is evaluated. A
+   merge that waits for checks is asked about every 30 seconds, for up to
+   `autoMergeWaitMinutes`; the command stays up for that. The merge request names the reviewed
+   commit.
+
+The command ends when none of this is left: no job of the event queued or running, no review
+or push being made, no merge still waiting. `--deadline-minutes` cuts all of it short. The
+summary's `loop` field says where the pull request ended up.
+
+What the long-running worker does "after each poll" (retrying a publication or comment that
+failed for a passing reason, queuing reviewer jobs, the merge step, the comments that say why a
+pull request was not merged or that it reached `maxRevisions`) happens every few seconds here.
+A retry is waited for only while it is due within five minutes of the work running out; one
+scheduled for later is left, and the summary's `drain` says `retries-abandoned`.
 
 ### Finding the event
 
@@ -92,12 +128,116 @@ A payload naming a sender who did not apply the label therefore matches nothing,
 for an older application of the label is judged as that application (superseded, so nothing to
 do), not as the current one.
 
+## What it does for a pull request event
+
+`pull_request_review` and `pull_request` deliveries need [shared state](#shared-state): which
+pull requests Updraft opened is only on record there.
+
+1. **From the payload, only where to look:** the repository (by id) and the pull request number.
+   Nothing else in the payload is used: not the review's state, not its author, not its text,
+   not the head commit. A repository that is not configured, or that has neither `revise` nor
+   `review` on, is "nothing to do".
+2. **From the state database, whether it is one of ours.** A pull request that is not on record
+   as opened by Updraft is "nothing to do" (`pull-request-not-watched`), before any request to
+   GitHub, any clone and any agent. So is one on record as closed (`pull-request-closed`):
+   closed is final, and reopening a pull request does not bring it back.
+3. **The review poller, for that pull request.** The same code `updraft start` runs after each
+   poll (`src/poller/reviews.ts`) reads the pull request from the API, once, and applies every
+   rule of [revisions.md](revisions.md) and [review-loop.md](review-loop.md): a review counts
+   only if GitHub says an allowed actor wrote it and nobody else edited it; the review text the
+   agent is given is the snapshot taken now from the API; a review already on record (by its id)
+   is never acted on twice; `maxRevisions` holds; a head commit someone pushed gets its reviewer
+   job; a closed or merged pull request stops being watched and its queued jobs are canceled.
+   The repository's other pull requests are left to their own events.
+4. **If that queued nothing and nothing is left over for the pull request:** "nothing to do"
+   (`no-new-work`, or `pull-request-closed`).
+5. **Otherwise the clone, and the same run-until-done as above,** for what is queued for that
+   pull request. A revision that is pushed gets its reviewer run in the same process, and so on
+   through the loop.
+
+### Updraft's own activity sends these events too
+
+GitHub delivers `pull_request.synchronize` for the revision Updraft itself pushes, and
+`pull_request_review.submitted` for the comment review it posts. A machine started for such a
+delivery usually overlaps with the run that caused it, which has not uploaded its state yet:
+
+- When the pull request is not in the shared state yet (the run that opened it is still going),
+  the delivery ends `pull-request-not-watched` without a request to GitHub.
+- When the head on record is the current one, it costs one read of the pull request and ends
+  `no-new-work`. The worker's own review is a comment, never a change request.
+- When the other run has pushed a commit that the shared state does not know yet, with `review`
+  on it can cost a **second reviewer run of the same commit**: the new machine sees a head
+  without a review on record and reviews it, while the first run does the same in its own loop.
+  Both reviews are posted. Nothing is pushed or merged twice
+  ([shared-state.md](shared-state.md#what-concurrent-runs-can-and-cannot-do-to-each-other)).
+
+`run-event` cannot tell the two cases apart from the API: the head is simply a commit on the
+branch. The launcher can: when Updraft acts as a GitHub App, a delivery whose `sender` is the
+App's own bot account was caused by Updraft, and need not start a machine. (With a personal
+token the sender is that person either way, so there is nothing to filter on; expect the
+duplicate review, or leave `pull_request.synchronize` out of the webhook's events and let a
+person's push wait for the next review event.) Skipping a delivery is always safe: the payload
+can only ever make Updraft do less.
+
+## Shared state
+
+A machine that starts with an empty state directory handles `issues.labeled` on its own, as
+before. Everything that depends on earlier runs needs their state: cooldowns, the triage cache,
+rotation, `updraft stats`, the review loop across events (a person's review arrives hours after
+the run that opened the pull request), and noticing a duplicate delivery without asking GitHub.
+
+The runs therefore share one state database, passed around as a file. The caller downloads it
+into `<UPDRAFT_HOME>/state.db` before the run (keeping a copy as the snapshot), and afterwards
+merges what the run changed into the latest shared copy with
+`updraft state merge --changed <UPDRAFT_HOME>/state.db --base <snapshot> --into <latest>`.
+[shared-state.md](shared-state.md) describes the merge, its rule for every table, and what runs
+that overlap can and cannot do to each other.
+
+What `run-event` does differently from `updraft start` because the database is shared:
+
+- **It only works on its own event.** Its jobs are the ones it queued for the event (or found
+  queued for it), and the reviewer and revision jobs of the pull requests those jobs opened or
+  the event is about. Other queued jobs in the database belong to other events; they are never
+  claimed, canceled, failed or changed.
+- **It never reconciles.** A run that another process left open in the database is another
+  machine's, which may be at work right now: it is not closed, not marked interrupted, its
+  process id is never signalled, its job is not requeued. (A restarted `updraft start` does all
+  of that, because there every open run is its own predecessor's.) Such runs do not count towards
+  `maxConcurrent`, an agent's or a capacity group's limit, or the one-job-per-issue rule either.
+- **Its retries, reviewer jobs, merge step and notices are limited the same way,** and the
+  startup sweep that publishes runs "a previous worker stopped before publishing" is skipped.
+- **A stale worker lock in the snapshot is taken over** and released at the end; it never ends
+  up in the shared database. A fresh one (see [shared-state.md](shared-state.md#seeding-and-maintenance))
+  ends the command with exit code 3.
+- **A state database written by a newer `updraft`** ends the command with exit code 5 before
+  anything is started.
+
+### Cooldowns
+
+With `capacity` configured ([capacity-and-escalation.md](capacity-and-escalation.md)), a job
+whose every eligible agent is cooling down after a usage limit stays queued. A worker that stays
+up simply runs it when the cooldown ends. This command:
+
+- **waits**, when the cooldown ends before `--deadline-minutes` (without a deadline: within five
+  minutes), and then runs the job;
+- otherwise **ends with outcome `deferred` and exit code 4.** The job stays `queued` in the state
+  database and `deferredUntil` says when the cooldown ends. Nothing retries it by itself:
+  **delivering the event again after that time is the retry.** The next run finds the queued job
+  in the shared state and continues it (`resumed: true`), or defers again if it is still too
+  early. This holds for a reviewer or revision job in the middle of the loop too: the event's
+  own job is done, the rest is deferred, and the same redelivery continues it.
+
+A usage limit hit by the agent mid-run is the same case: the run is recorded as failed, the
+cooldown starts, the job goes back in the queue (up to `maxDeferrals` times), and the command
+waits or defers as above.
+
 ## The clone
 
 Where `checkoutPath` is missing or an empty directory, the command creates the clone there: an
 empty repository with `origin` set to `https://github.com/OWNER/REPO.git`. The run's own
 preparation then fetches the one branch it builds on (`baseBranch`, or the remote's default
-branch), with its whole history and without tags, and makes the job's worktree from it.
+branch; for a revision or a review, the pull request's branch), with its whole history and
+without tags, and makes the job's worktree from it.
 
 The clone is neither shallow nor partial, on purpose:
 
@@ -131,13 +271,22 @@ has its `run.log`. Without `--json`, stdout carries one line for a person instea
 {
   "event": {
     "name": "issues", "action": "labeled", "deliveryId": "d0c0…",
-    "repository": "octo/widgets", "repositoryId": 42, "issue": 7,
+    "repository": "octo/widgets", "repositoryId": 42, "issue": 7, "pullRequest": null,
     "label": "updraft:ready", "sender": "allen", "eventId": "9001"
   },
   "dispatched": true,
+  "resumed": false,
   "outcome": "succeeded",
   "reason": null,
-  "message": "job job_ev9001x3f0c1d2e4a succeeded: https://github.com/octo/widgets/pull/100",
+  "deferredUntil": null,
+  "loop": {
+    "pullRequest": 100, "url": "https://github.com/octo/widgets/pull/100",
+    "rounds": 1, "maxRevisions": 3, "reviews": 2,
+    "verdict": "ready-to-merge", "verdictSha": "…", "headSha": "…",
+    "stage": "merged", "detail": "merged by Updraft at … (head …)",
+    "ready": true, "merged": true, "mergeCommitSha": "…", "notMergedReason": null
+  },
+  "message": "job job_ev9001x3f0c1d2e4a succeeded: https://github.com/octo/widgets/pull/100; pull request #100 is merged after 1 revision round(s) (…)",
   "jobId": "job_ev9001x3f0c1d2e4a",
   "workflowId": "wf",
   "status": "succeeded",
@@ -161,62 +310,89 @@ has its `run.log`. Without `--json`, stdout carries one line for a person instea
 
 | Field | Meaning |
 | --- | --- |
-| `event` | What the delivery was about, as far as the payload could be read. `repository`, `sender` and the rest are the payload's; `eventId` is the timeline event's id from the API (null until it was found) |
+| `event` | What the delivery was about, as far as the payload could be read. `repository`, `sender` and the rest are the payload's; `eventId` is the timeline event's id from the API (null until it was found, and for pull request events); `pullRequest` is the pull request of a `pull_request` or `pull_request_review` delivery |
 | `dispatched` | True when a job was queued for the event in this run |
-| `outcome` | `nothing-to-do`, `succeeded`, `canceled` (queued, then canceled by the pre-start check before any agent started), `superseded` (see [Idempotency](#idempotency)), `failed` (the agent run failed, could not start or was interrupted), `publish-failed` (the run succeeded, its publication did not), `not-started` (the job was still queued when the command ended) or `error` (the command itself failed: config, GitHub, the event file) |
-| `reason` | Why nothing was done, as a code; null otherwise. From the payload: `unsupported-event`, `unsupported-action`, `malformed-payload`, `pull-request`, `repository-not-configured`, `label-not-configured`. From the API: `actor-not-allowed`, `label-removed`, `label-missing`, `issue-closed`, `issue-gone`, `pull-request`. Others: `already-handled`, `duplicate-delivery` (this state directory already has the event's job), `canceled-before-start`, `published-by-another-run` |
+| `resumed` | True when this run continued work an earlier run of the event left in the state database (a deferred job, a loop that was cut short) |
+| `outcome` | `nothing-to-do`, `succeeded`, `canceled` (queued, then canceled by the pre-start check before any agent started), `superseded` (see [Idempotency](#idempotency)), `failed` (the agent run failed, could not start or was interrupted), `publish-failed` (the run succeeded, its publication, push or review posting did not), `not-started` (the job was still queued when the command ended), `deferred` (work of the event waits for a cooldown; see [Cooldowns](#cooldowns)) or `error` (the command itself failed: config, GitHub, the event file, the state database) |
+| `reason` | Why nothing was done, as a code; null otherwise. From the payload: `unsupported-event`, `unsupported-action`, `malformed-payload`, `pull-request`, `repository-not-configured`, `label-not-configured`, `review-loop-off`. From the API: `actor-not-allowed`, `label-removed`, `label-missing`, `issue-closed`, `issue-gone`, `pull-request`. From the state database: `duplicate-delivery` (it already has the event's job, and nothing of it is left to do), `pull-request-not-watched`, `pull-request-closed`, `no-new-work`. Others: `already-handled`, `canceled-before-start`, `published-by-another-run`, `cooldown` (with `deferred`) |
+| `deferredUntil` | With `deferred`: when the cooldown ends (ISO time). Null otherwise |
+| `loop` | Where the review loop left the event's pull request, from the state database; null when the event has no pull request (yet). `rounds`: revision rounds so far, of `maxRevisions`. `reviews`: reviewer verdicts recorded. `verdict`, `verdictSha`: the newest verdict (`ready-to-merge`, `changes-requested`) and the commit it is for. `headSha`: the newest head known. `stage`, `detail`: the stage `updraft status` shows (`awaiting-review`, `reviewing`, `changes-requested`, `revising`, `ready-to-merge`, `merging`, `merged`, `needs-human`, `closed`). `ready`: the draft was marked ready for review. `merged`, `mergeCommitSha`, and `notMergedReason` (why it is not merged: `autoMerge` is off, the gate that blocked it, or the stage it is in) |
 | `message` | One line saying the same to a person |
-| `jobId`, `workflowId`, `status` | The job and its final status in the queue |
+| `jobId`, `workflowId`, `status` | The job and its final status in the queue. For `issues.labeled`, the event's job; for a pull request event, the first job that was queued for the pull request (a revision or a reviewer job) |
 | `runId`, `agent`, `runOutcome`, `logPath` | The job's last run; `runOutcome` is null when no agent run ended |
 | `error` | The worker's own reason when the job did not succeed or was not published |
 | `branch`, `baseSha`, `headSha`, `commitCount` | What the run left |
 | `verification` | `passed` and each command's status; null when the action has no `verify` or it did not run |
-| `publication`, `publicationError`, `prNumber`, `prUrl` | The publication's state (`published`, `skipped` when there were no commits, `failed`), or null when `publish` is off or nothing was attempted |
+| `publication`, `publicationError`, `prNumber`, `prUrl` | The publication's state (`published`, `skipped` when there were no commits, `failed`), or null when `publish` is off or nothing was attempted. For a revision job: its push to the pull request; for a reviewer job: the posting of its review |
 | `failureCommentUrl` | The comment posted for a failed job (`commentOnFailure`) |
-| `drain` | How the worker stopped: `idle`, `retries-abandoned`, `stalled`, `deadline`, `stopped` (a signal); null when it never started |
-| `jobs` | Present only when several workflows share the trigger label, so the event has several jobs: each job's fields. The top-level fields then describe the first |
+| `drain` | How the worker stopped: `idle`, `retries-abandoned` (a retry or a merge was left for later), `stalled`, `deferred`, `deadline`, `stopped` (a signal); null when it never started |
+| `jobs` | Present only when the summary covers several jobs (several workflows share the trigger label, or several jobs were queued for the pull request): each job's fields. The top-level fields then describe the first |
 | `exitCode` | The process's exit code |
+
+The jobs the loop adds in the same run (reviewer runs, revisions) are not listed one by one;
+`loop` is their result, and `updraft status` on the state directory shows each.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Nothing to do; or the job succeeded (and was published, where `publish` is on); or the job was canceled before an agent started; or another run of the same event published first |
+| 0 | Nothing to do; or the job succeeded (and was published, where `publish` is on); or the job was canceled before an agent started; or another run of the same event published first. The loop's result is in `loop`: a pull request that was reviewed and not merged is still exit code 0 |
 | 1 | The job failed, was not published, or never started; or the command failed (invalid config, a mode other than `live`, GitHub unreachable, the event could not be matched) |
 | 2 | The event file is missing or not JSON, or `--deadline-minutes` is not a positive number |
 | 3 | Another worker holds the lock of this state directory |
+| 4 | Deferred: work of the event waits for a usage-limit cooldown and is still queued in the state database. Merge the state as usual and deliver the event again after `deferredUntil` |
+| 5 | The state database was written by a newer `updraft`. Nothing was started; use a newer version |
 
 On SIGINT or SIGTERM the command stops the agent and exits 1, with the job `interrupted`.
 
+Whatever the exit code, merge the state database afterwards when you share it: a failed run
+has a job, a run, errors and metrics worth keeping, and `updraft state merge` reports
+`changed: false` when there is nothing.
+
 ## Idempotency
 
-GitHub redelivers webhooks, and a launcher can start two machines for one delivery. Each has its
-own empty state directory, so the local database cannot tell them apart. GitHub is the only
-state they share, and it is what decides.
+GitHub redelivers webhooks, and a launcher can start two machines for one delivery.
 
 - **The job id is derived from the event**: repository id, workflow id and the timeline event's
   id. The job branch is named after the job id (`updraft/issue-<n>-<job id>`), so every run of
-  one event works on the same branch name, wherever it runs.
-- **Before anything is queued**, the command asks GitHub whether that branch already has a pull
-  request (in any state: a merged pull request counts, also after its branch was deleted) or
-  exists on the remote. If so, there is nothing to do: `reason: "already-handled"`, exit code 0,
-  no clone fetched and no agent started.
+  one event works on the same job and the same branch name, wherever it runs.
+- **First the state database is asked.** If it already has the event's job:
+  - and nothing of the event is left to do (the job reached an end, and no reviewer job,
+    revision, review posting or merge of its pull request is pending): nothing to do,
+    `reason: "duplicate-delivery"`, exit code 0, before any clone or agent. This includes a job
+    that **failed**: with shared state a redelivery does not run a failed job again. Requeue it
+    with `updraft retry JOB_ID` on a copy of the shared database, upload that, and deliver the
+    event again;
+  - and something is left (the job is still `queued` after a deferral, or the loop was cut
+    short by a deadline or a cooldown): the run continues it, `resumed: true`.
+- **Then GitHub is asked**, for a job that has not started: whether its branch already has a
+  pull request (in any state: a merged pull request counts, also after its branch was deleted)
+  or exists on the remote. If so, there is nothing to do: `reason: "already-handled"`, exit
+  code 0, no clone fetched and no agent started. This is what stops a second run whose snapshot
+  was taken before the first run's state was uploaded, and every second run when no state is
+  shared.
 - **Publication creates and never moves.** The push only creates the branch; Git refuses it if
   the branch appeared meanwhile. A pull request is opened only when none exists for the branch.
+- **A review is acted on once**, by its id in `review_requests`, and a head commit is reviewed
+  once, by the reviewer job's dedupe key. Both are in the shared state.
 
 What remains:
 
-- **Two runs that start at the same moment both run the agent.** Neither sees a branch yet. Only
-  one can publish: the other's push is refused, nothing on GitHub is changed by it, and it ends
-  with `outcome: "superseded"`, `reason: "published-by-another-run"` and exit code 0. The cost
-  is one agent run. The window is the length of an agent run, from the first run's check to its
-  push.
+- **Two runs that start at the same moment both run the agent.** Neither sees the other's state
+  or a branch yet. Only one can publish: the other's push is refused, nothing on GitHub is
+  changed by it, and it ends with `outcome: "superseded"`, `reason: "published-by-another-run"`
+  and exit code 0. The cost is one agent run. The window is the length of an agent run, from
+  the first run's check to its push.
+- **Two events about the same pull request at the same moment** can both act on the same review
+  or head commit. [shared-state.md](shared-state.md#what-concurrent-runs-can-and-cannot-do-to-each-other)
+  says exactly what that can and cannot do; in short, the agent may run twice and a review
+  comment may appear twice, but nothing is pushed twice and nothing is merged twice or at the
+  wrong commit.
 - **A run that pushed its branch and died before opening the pull request** leaves a branch
   without a pull request. Later runs of the event see the branch and do nothing. Delete the
-  branch on GitHub and redeliver the event to run it again (or keep the state directory and run
-  `updraft publish RUN_ID`).
-- **A failed job leaves nothing on GitHub that marks the event as handled**, so a redelivery
-  runs it again. That is usually what a redelivery is for, but each failed run posts its own
-  failure comment where `commentOnFailure` is on.
+  branch on GitHub and redeliver the event to run it again.
+- **Without shared state, a failed job leaves nothing that marks the event as handled**, so a
+  redelivery runs it again, and each failed run posts its own failure comment where
+  `commentOnFailure` is on.
 - A new application of the label (remove it, apply it again) is a new event with a new id and a
   new branch, as for the long-running worker.

@@ -2,21 +2,26 @@
 // docs/run-event.md is the contract; this file is the wiring.
 //
 //   payload file -> decideWebhook (the poller's ingestion rules, from the API)
-//                -> "already handled?" (GitHub is the only state shared between processes)
+//                -> "already in this state database?" (shared between runs: docs/shared-state.md)
+//                -> "already handled?" (GitHub, for runs that could not see each other's state)
 //                -> the clone, created if missing
-//                -> the queue, with a job id derived from the event
-//                -> drainQueue (runDaemon until the queue is empty: pre-start check, live
-//                   executor, verification, publication, failure comment)
+//                -> the queue, with a job id derived from the event; or, for a pull request
+//                   event, the review poller (reviews.ts) for that pull request
+//                -> drainQueue (runDaemon until the event's work is done: pre-start check, live
+//                   executor, verification, publication, the review loop, auto-merge, failure
+//                   comment), scoped to the event (src/worker/scope.ts)
 //                -> one summary, one exit code
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../config/io.js';
-import { publishMode, type UpdraftConfig } from '../config/schema.js';
+import { autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
 import { getFailureComment } from '../db/failure-comments.js';
-import { commitPollBatch } from '../db/ingest.js';
+import { cancelQueuedJob, commitPollBatch } from '../db/ingest.js';
+import { getLoopPr, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
 import { getPublication } from '../db/publications.js';
 import { getJob, latestRunOfJob, MAX_START_FAILURES } from '../db/queue.js';
+import { countRevisions, getRevisionPr, syncRevisionPrs } from '../db/revisions.js';
 import { ensureClone, githubCloneUrl, workerNetworkGit, type NetworkGit } from '../git/clone.js';
 import { listRemotes, runGit, selectRepoRemote, type GitOptions } from '../git/git.js';
 import { jobBranchName, withCheckoutLock } from '../git/worktree.js';
@@ -24,16 +29,21 @@ import type { GitHubApi } from '../github/api.js';
 import { redactGitHubSecrets } from '../github/app-auth.js';
 import { appCommitIdentity, type GitHubCredentials } from '../github/credentials.js';
 import { checkJobDispatchable } from '../poller/poller.js';
+import { pollRepoReviews } from '../poller/reviews.js';
 import { decideWebhook, type WebhookDeps, type WebhookEventInfo } from '../poller/webhook.js';
+import { createAssignmentCommenter, type AssignmentCommenter } from '../publish/assignment-comment.js';
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
-import { createPublisher, publicationEnabled } from '../publish/publish.js';
-import type { RepoRef, VerificationSummary } from '../types.js';
+import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
+import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
+import { createRevisionPublisher, revisionsEnabled } from '../publish/revision.js';
+import { reviewOf, revisionOf, type RepoRef, type VerificationSummary } from '../types.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import type { DaemonDeps } from '../worker/daemon.js';
 import { drainQueue, type DrainEnd, type DrainOptions } from '../worker/drain.js';
 import { findRepoConfig } from '../worker/executor.js';
 import type { LiveExecutorOptions } from '../worker/live.js';
 import { createExecutor } from '../worker/prepare-only.js';
+import { createEventScope, nothingPending, pendingWork, type EventScope } from '../worker/scope.js';
 import { println, type CommandContext } from './context.js';
 import { CliError, describeError, EXIT } from './errors.js';
 import { installSignalHandlers } from './start.js';
@@ -60,7 +70,7 @@ export interface RunEventDeps {
   /** Injected in tests. */
   runDaemon?: (deps: DaemonDeps) => Promise<void>;
   /** Drain timings; injected in tests. */
-  drain?: Omit<DrainOptions, 'runDaemon' | 'deadlineMs'>;
+  drain?: Omit<DrainOptions, 'runDaemon' | 'deadlineMs' | 'scope'>;
   eventLookup?: WebhookDeps['eventLookup'];
   /** Extra options for the live executor; injected in tests. */
   executor?: LiveExecutorOptions;
@@ -99,6 +109,31 @@ export interface RunEventJobSummary {
   logPath: string | null;
 }
 
+/** Where the review loop left a pull request of the event (repositories.<repo>.review, revise, autoMerge). */
+export interface RunEventLoopSummary {
+  pullRequest: number;
+  url: string;
+  /** Revision rounds the pull request has had (change requests that queued a revision), against maxRevisions. */
+  rounds: number;
+  maxRevisions: number;
+  /** Reviewer verdicts recorded for it, all runs of all events together. */
+  reviews: number;
+  /** The newest verdict (ready-to-merge, changes-requested) and the commit it is for; null before the first. */
+  verdict: string | null;
+  verdictSha: string | null;
+  /** The newest head commit the state database knows of. */
+  headSha: string | null;
+  /** The stage `updraft status` shows (awaiting-review, reviewing, changes-requested, revising, ready-to-merge, merging, merged, needs-human, closed), and its detail line. */
+  stage: string;
+  detail: string;
+  /** True once the draft was marked ready for review. */
+  ready: boolean;
+  merged: boolean;
+  mergeCommitSha: string | null;
+  /** Why it is not merged; null when it is. */
+  notMergedReason: string | null;
+}
+
 /**
  * What `updraft run-event --json` prints: one object, always, whatever happened.
  * `outcome` and `exitCode` say how it went; the job fields describe the event's job.
@@ -107,6 +142,8 @@ export interface RunEventSummary extends Omit<RunEventJobSummary, 'jobId' | 'wor
   event: WebhookEventInfo;
   /** True when a job was queued for the event in this run. */
   dispatched: boolean;
+  /** True when this run continued work that an earlier run of the event left in the state database. */
+  resumed: boolean;
   /**
    * - nothing-to-do: no job was queued (`reason` says why).
    * - succeeded: the job ran and, where publish is on, its result was published (or there was nothing to publish).
@@ -116,14 +153,22 @@ export interface RunEventSummary extends Omit<RunEventJobSummary, 'jobId' | 'wor
    * - superseded: the run succeeded, but another run of the same event published first; this
    *   run's commits were not pushed and nothing on GitHub was changed by it.
    * - not-started: the job was still queued when the drain ended.
+   * - deferred: work of the event is queued behind a usage-limit cooldown that ends after this
+   *   run would; it stays queued in the state database, and delivering the event again later
+   *   continues it (`deferredUntil`).
    * - error: the command itself failed (configuration, GitHub, the event file).
    */
-  outcome: 'nothing-to-do' | 'succeeded' | 'canceled' | 'superseded' | 'failed' | 'publish-failed' | 'not-started' | 'error';
+  outcome: 'nothing-to-do' | 'succeeded' | 'canceled' | 'superseded' | 'failed' | 'publish-failed' | 'not-started' | 'deferred' | 'error';
   /**
    * Why nothing was done (or nothing was published), as a code: a NothingToDoReason,
-   * "already-handled", "duplicate-delivery", "canceled-before-start" or "published-by-another-run".
+   * "already-handled", "duplicate-delivery", "pull-request-not-watched", "pull-request-closed",
+   * "no-new-work", "canceled-before-start", "published-by-another-run" or "cooldown".
    */
   reason: string | null;
+  /** With outcome `deferred`: when the cooldown ends (ISO time). Null otherwise. */
+  deferredUntil: string | null;
+  /** The review loop's result for the event's pull request; null when the event has none, or the loop is off. */
+  loop: RunEventLoopSummary | null;
   /** One line for a person. */
   message: string;
   jobId: string | null;
@@ -234,6 +279,34 @@ function summarizeVerification(v: VerificationSummary | undefined): RunEventJobS
 function summarizeJob(db: Db, config: UpdraftConfig, jobId: string): RunEventJobSummary {
   const job = getJob(db, jobId)!;
   const run = latestRunOfJob(db, jobId);
+  // A revision run is pushed to its pull request and a reviewer run is posted on it: each has
+  // its own record in place of a publication, reported in the publication fields.
+  const loopPr = revisionOf(job)?.pullRequest ?? reviewOf(job)?.pullRequest;
+  if (loopPr) {
+    const table = revisionOf(job) ? 'revisions' : 'pr_reviews';
+    const step = run ? (db.prepare(`SELECT state, error, head_sha FROM ${table} WHERE run_id = ?`).get(run.id) as { state: string; error: string | null; head_sha: string | null } | undefined) : undefined;
+    const failed = job.status === 'succeeded' && step?.state === 'failed';
+    return {
+      jobId,
+      workflowId: job.workflowId,
+      status: job.status,
+      runId: run?.id ?? null,
+      agent: run?.agent ?? null,
+      runOutcome: run?.outcome ?? null,
+      error: job.status === 'succeeded' ? (failed ? (step?.error ?? null) : null) : (job.statusReason ?? run?.error ?? null),
+      branch: run?.summary?.branch ?? null,
+      baseSha: run?.summary?.baseSha ?? null,
+      headSha: step?.head_sha ?? run?.summary?.headSha ?? null,
+      commitCount: run?.summary?.commitCount ?? null,
+      verification: summarizeVerification(run?.summary?.verification),
+      publication: step?.state ?? null,
+      publicationError: step && step.state !== 'published' ? step.error : null,
+      prNumber: loopPr.number,
+      prUrl: loopPr.url,
+      failureCommentUrl: (run ? getFailureComment(db, run.id) : null)?.commentUrl ?? null,
+      logPath: run?.logPath ?? null,
+    };
+  }
   const pub = run ? getPublication(db, run.id) : null;
   const comment = run ? getFailureComment(db, run.id) : null;
   const found = findRepoConfig(config, job);
@@ -280,7 +353,38 @@ function jobOutcome(j: RunEventJobSummary): JobOutcome {
 }
 
 /** Worst first: what the whole event is reported as when it has several jobs. */
-const OUTCOME_RANK: JobOutcome[] = ['failed', 'publish-failed', 'not-started', 'succeeded', 'superseded', 'canceled'];
+const OUTCOME_RANK: JobOutcome[] = ['failed', 'publish-failed', 'not-started', 'deferred', 'succeeded', 'superseded', 'canceled'];
+
+function summarizeLoop(db: Db, config: UpdraftConfig, repoId: number, prNumber: number): RunEventLoopSummary | null {
+  const pr = getLoopPr(db, repoId, prNumber);
+  const cfg = Object.values(config.repositories).find((r) => r.id === repoId);
+  if (!pr || !cfg) return null;
+  const maxRevisions = cfg.maxRevisions ?? DEFAULT_MAX_REVISIONS;
+  const stage = prStage(db, pr, maxRevisions);
+  const merged = pr.mergeState === 'merged';
+  let notMergedReason: string | null = null;
+  if (!merged) {
+    if (!autoMergeMethod(config, cfg)) notMergedReason = 'autoMerge is off for the repository';
+    else if (pr.mergeSha === pr.headSha && pr.mergeReason) notMergedReason = pr.mergeReason;
+    else notMergedReason = stage.detail;
+  }
+  return {
+    pullRequest: pr.prNumber,
+    url: pr.prUrl,
+    rounds: countRevisions(db, repoId, prNumber),
+    maxRevisions,
+    reviews: (db.prepare('SELECT count(*) AS n FROM pr_reviews WHERE repo_id = ? AND pr_number = ?').get(repoId, prNumber) as { n: number }).n,
+    verdict: pr.verdict,
+    verdictSha: pr.verdictSha,
+    headSha: pr.headSha,
+    stage: stage.stage,
+    detail: stage.detail,
+    ready: pr.readyMarkedAt !== null,
+    merged,
+    mergeCommitSha: pr.mergeCommitSha,
+    notMergedReason,
+  };
+}
 
 function jobMessage(j: RunEventJobSummary, outcome: JobOutcome): string {
   switch (outcome) {
@@ -296,6 +400,8 @@ function jobMessage(j: RunEventJobSummary, outcome: JobOutcome): string {
       return `job ${j.jobId} succeeded, but another run of this event published first; nothing was pushed (${j.error})`;
     case 'not-started':
       return `job ${j.jobId} did not start: ${j.error ?? 'nothing could start it before the run ended'}`;
+    case 'deferred':
+      return `job ${j.jobId} is waiting for a usage-limit cooldown: ${j.error ?? 'no agent of its pool can take it now'}`;
     case 'failed':
       return `job ${j.jobId} failed: ${j.error ?? 'no reason recorded'}`;
   }
@@ -311,13 +417,17 @@ export async function runEventCommand(ctx: CommandContext, opts: RunEventOptions
       repository: null,
       repositoryId: null,
       issue: null,
+      pullRequest: null,
       label: null,
       sender: null,
       eventId: null,
     },
     dispatched: false,
+    resumed: false,
     outcome: 'error',
     reason: null,
+    deferredUntil: null,
+    loop: null,
     message: '',
     jobId: null,
     workflowId: null,
@@ -344,6 +454,13 @@ export async function runEventCommand(ctx: CommandContext, opts: RunEventOptions
     println(ctx.out, summary.outcome === 'nothing-to-do' ? `Nothing to do: ${summary.message}` : summary.message);
   }
   return summary.exitCode;
+}
+
+/** How long the end of the command waits for an assignment comment that is still being delivered. */
+const ANNOUNCE_WAIT_MS = 10_000;
+
+function loopMessage(l: RunEventLoopSummary): string {
+  return `pull request #${l.pullRequest} is ${l.stage} after ${l.rounds} revision round(s) (${l.detail})`;
 }
 
 async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEventDeps, summary: RunEventSummary): Promise<number> {
@@ -378,6 +495,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     controller.abort();
   });
   let db: Db | undefined;
+  const announcements = new Set<Promise<void>>();
   try {
     const credentials: GitHubCredentials = ctx.createCredentials(config, { log: log.child({ component: 'github' }) });
     const api = await ctx.createApi({ log: log.child({ component: 'github' }), credentials });
@@ -385,8 +503,20 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     // 1. What the event is, and whether the poller's rules queue anything for it. Those rules
     // can run a triage, which caches its answer in the state database, so the database is
     // there for them, but opened only when something asks: an event with nothing to do must
-    // not leave state behind.
-    const stateDb = (): Db => (db ??= ctx.openDb(paths.dbFile));
+    // not create state. A state database that is already there (a snapshot of the shared one,
+    // docs/shared-state.md) is used as it is.
+    const hadState = existsSync(paths.dbFile);
+    const stateDb = (): Db => {
+      if (db) return db;
+      try {
+        return (db = ctx.openDb(paths.dbFile));
+      } catch (err) {
+        if (err instanceof Error && /newer than this CLI supports/.test(err.message)) {
+          throw new CliError(`${paths.dbFile}: ${err.message}. Nothing was started; handle the event with a newer updraft.`, EXIT.SCHEMA_TOO_NEW);
+        }
+        throw err;
+      }
+    };
     const decision = await decideWebhook(
       {
         api,
@@ -403,15 +533,73 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       { eventName: summary.event.name, deliveryId: opts.deliveryId ?? null, payload },
     );
     summary.event = decision.event;
-    if (!decision.dispatch) return nothing(decision.reason, decision.message);
+    if (decision.dispatch === false) return nothing(decision.reason, decision.message);
     const { repo } = decision;
     const repoCfg = config.repositories[repo.fullName]!;
     // The schema requires checkoutPath in live mode; here it may name a directory that does not exist yet.
     if (!repoCfg.checkoutPath) throw new CliError(`repositories.${repo.fullName}.checkoutPath is not set; run-event creates the clone there`);
     const checkoutPath = resolve(paths.configDir, repoCfg.checkoutPath);
-    log.info('event matched', { repo: repo.fullName, issue: decision.event.issue, event: decision.event.eventId, jobs: decision.jobs.map((j) => j.id) });
 
-    // 2. The clone, and how the worker's own git commands reach GitHub from it.
+    // 2. What the state database already holds for the event. Everything from here on is
+    // limited to the event's own jobs and pull requests (scope): the rest of the database
+    // belongs to other events, whose machines may still be working.
+    let scope: EventScope | undefined;
+    const issueJobs = decision.dispatch === true ? decision.jobs : [];
+    /** Event jobs the state database already has. */
+    let known: Array<{ id: string; status: string; issueNumber: number }> = [];
+    if (decision.dispatch === 'poll-reviews') {
+      const n = decision.pullRequest;
+      const notWatched = () =>
+        nothing('pull-request-not-watched', `pull request #${n} of ${repo.fullName} is not one Updraft opened, as far as this state database knows; nothing acts on it`);
+      // Without state there is no record of any pull request Updraft opened.
+      if (!hadState) return notWatched();
+      const openDb = stateDb();
+      syncRevisionPrs(openDb, repo.id);
+      const watched = getRevisionPr(openDb, repo.id, n);
+      if (!watched) return notWatched();
+      if (watched.state !== 'open') return nothing('pull-request-closed', `pull request #${n} of ${repo.fullName} was closed or merged; it is no longer watched`);
+      scope = createEventScope(openDb);
+      scope.addPr(repo.id, n);
+      log.info('event matched', { repo: repo.fullName, pr: n, action: decision.event.action });
+      // The review poller, for this pull request: the API says what its reviews and its head
+      // are, and the loop's own rules decide what that queues or cancels.
+      const polled = await pollRepoReviews({ db: openDb, api, config }, repo, repoCfg, log.child({ component: 'reviews', repo: repo.fullName }), { only: n });
+      summary.dispatched = (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0) > 0;
+      summary.loop = summarizeLoop(openDb, config, repo.id, n);
+      if (nothingPending(pendingWork(openDb, config, scope))) {
+        if (getRevisionPr(openDb, repo.id, n)?.state !== 'open') {
+          return nothing('pull-request-closed', `pull request #${n} of ${repo.fullName} was closed or merged; ${polled?.jobsCanceled ?? 0} queued job(s) for it were canceled`);
+        }
+        return nothing('no-new-work', `nothing on pull request #${n} of ${repo.fullName} asks for work: no new change request by an allowed actor, and no head commit without a review`);
+      }
+      summary.resumed = !summary.dispatched;
+    } else {
+      log.info('event matched', { repo: repo.fullName, issue: decision.event.issue, event: decision.event.eventId, jobs: issueJobs.map((j) => j.id) });
+      if (hadState) {
+        const openDb = stateDb();
+        known = issueJobs.flatMap((j) => {
+          const found = getJob(openDb, j.id);
+          return found ? [{ id: found.id, status: found.status, issueNumber: found.issueNumber }] : [];
+        });
+      }
+      if (known.length) {
+        const openDb = stateDb();
+        scope = createEventScope(openDb);
+        for (const j of known) scope.addJob(j.id);
+        const mine = scope;
+        // A published head whose reviewer job was never queued is work that is left, too.
+        if (reviewsEnabled(config)) scheduleAllReviews(openDb, config, undefined, (pr) => mine.pr(pr.repoId, pr.prNumber));
+        const left = !nothingPending(pendingWork(openDb, config, scope));
+        if (known.length === issueJobs.length && !left) {
+          const pr = scope.prs()[0];
+          if (pr) summary.loop = summarizeLoop(openDb, config, pr.repoId, pr.prNumber);
+          return nothing('duplicate-delivery', `this state database already has the job for this event, and nothing of it is left to do (${known.map((j) => `${j.id}: ${j.status}`).join(', ')})`);
+        }
+        summary.resumed = left;
+      }
+    }
+
+    // 3. The clone, and how the worker's own git commands reach GitHub from it.
     const clone = await ensureClone({ checkoutPath, cloneUrl: deps.cloneUrl(repo.fullName), ...(deps.executor?.git ? { git: deps.executor.git } : {}) });
     if (clone.created) log.info('created the clone', { path: checkoutPath });
     const withWorkerCredentials = clone.managed || opts.workerGitCredentials === true;
@@ -429,49 +617,84 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
             hooksPath: join(paths.dataDir, 'no-hooks'),
           })
         : null;
-
-    // 3. Was this event already handled by another run of it? Only GitHub can say.
     const net = await networkGit();
-    for (const job of decision.jobs) {
-      let existing: ExistingWork | null;
-      try {
-        existing = await findExistingWork({ api, repo, job, checkoutPath, remote: remote.name, net: { ...local, signal: controller.signal, ...(net ? { env: net.env } : {}) } });
-      } catch (err) {
-        throw new CliError(`could not check whether the event was already handled: ${net ? net.redact(errText(err)) : errText(err)}`);
+
+    const fresh = issueJobs.filter((j) => !known.some((k) => k.id === j.id));
+    if (decision.dispatch === true) {
+      // 4. Was this event already handled by a run whose state this one has not seen? Only
+      // GitHub can say. Asked for the jobs that have not started: new ones, and ones an earlier
+      // run left queued. An event that was leaves no state behind.
+      const unstarted = [...fresh.map((j) => ({ id: j.id, issueNumber: j.issueNumber })), ...known.filter((k) => k.status === 'queued')];
+      for (const job of unstarted) {
+        let existing: ExistingWork | null;
+        try {
+          existing = await findExistingWork({ api, repo, job, checkoutPath, remote: remote.name, net: { ...local, signal: controller.signal, ...(net ? { env: net.env } : {}) } });
+        } catch (err) {
+          throw new CliError(`could not check whether the event was already handled: ${net ? net.redact(errText(err)) : errText(err)}`);
+        }
+        if (!existing) continue;
+        // A queued job in the state database for work that is on GitHub already must not run later either.
+        for (const k of known) if (k.status === 'queued') cancelQueuedJob(stateDb(), k.id, describeExisting(existing));
+        return nothing('already-handled', describeExisting(existing));
       }
-      if (existing) return nothing('already-handled', describeExisting(existing));
     }
 
-    // 4. Queue it, under ids any other run of this event would derive too.
     const openDb = stateDb();
-    const inserted = commitPollBatch(openDb, {
-      repoId: repo.id,
-      fullName: repo.fullName,
-      lastEventId: decision.applied.id,
-      lastEventCreatedAt: decision.applied.createdAt,
-      etag: null,
-      jobs: decision.jobs,
-      now: ctx.now,
-    });
-    if (!inserted.length) {
-      return nothing('duplicate-delivery', `this state directory already has the job for this event (${decision.jobs.map((j) => j.id).join(', ')})`);
+    scope ??= createEventScope(openDb);
+    if (decision.dispatch === true) {
+      // 5. Queue it, under ids any other run of this event would derive too.
+      const inserted = fresh.length
+        ? commitPollBatch(openDb, {
+            repoId: repo.id,
+            fullName: repo.fullName,
+            lastEventId: decision.applied.id,
+            lastEventCreatedAt: decision.applied.createdAt,
+            etag: null,
+            jobs: fresh,
+            now: ctx.now,
+          })
+        : [];
+      if (!inserted.length && !known.length) {
+        return nothing('duplicate-delivery', `this state database already had a job for this event and pruned it (${issueJobs.map((j) => j.id).join(', ')})`);
+      }
+      summary.dispatched = inserted.length > 0;
+      for (const j of inserted) {
+        scope.addJob(j.id);
+        log.info('job queued', { job: j.id, issue: j.issueNumber, workflow: j.workflowId, pool: j.pool, event: j.eventId });
+      }
+      if (summary.resumed) log.info('continuing work an earlier run of this event left', { jobs: known.map((j) => `${j.id}: ${j.status}`) });
     }
-    summary.dispatched = true;
-    for (const j of inserted) log.info('job queued', { job: j.id, issue: j.issueNumber, workflow: j.workflowId, pool: j.pool, event: j.eventId });
+    /** The jobs the summary describes: the event's own, or for a pull request event what is queued for it now. */
+    const eventJobIds =
+      decision.dispatch === true
+        ? issueJobs.map((j) => j.id).filter((id) => getJob(openDb, id) !== null)
+        : pendingWork(openDb, config, scope).queued.map((j) => j.id);
 
-    // 5. Drain: the worker of `updraft start`, until the queue is empty.
-    const publisher = publicationEnabled(config)
-      ? createPublisher({
-          db: openDb,
-          config,
-          paths,
-          api,
-          log: log.child({ component: 'publish' }),
-          token: (repoFullName) => credentials.token(repoFullName, { fresh: true }),
-          workerKind: credentials.kind,
-          env: ctx.env,
-        })
-      : undefined;
+    // 6. Drain: the worker of `updraft start`, wired as it is there, until the event's work is done.
+    const eventScope = scope;
+    const publishDeps = (component: string): PublishDeps => ({
+      db: openDb,
+      config,
+      paths,
+      api,
+      log: log.child({ component }),
+      token: (repoFullName) => credentials.token(repoFullName, { fresh: true }),
+      workerKind: credentials.kind,
+      env: ctx.env,
+      scope: eventScope,
+    });
+    const publication = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
+    const revising = revisionsEnabled(config) ? createRevisionPublisher(publishDeps('revision'), publication) : publication;
+    const publisher = reviewsEnabled(config) ? createReviewLoopPublisher(publishDeps('review'), revising) : revising;
+    // The worker does not wait for an assignment comment; a process that is about to exit has to.
+    const announcer = createAssignmentCommenter({ db: openDb, config, api, log: log.child({ component: 'assignment-comment' }) });
+    const assignmentCommenter: AssignmentCommenter = {
+      announce(job, run, signal) {
+        const p: Promise<void> = announcer.announce(job, run, signal).finally(() => announcements.delete(p));
+        announcements.add(p);
+        return p;
+      },
+    };
     const appAuth = credentials.app;
     const drained = await drainQueue(
       {
@@ -487,40 +710,60 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
           networkGit,
         }),
         ...(publisher ? { publisher } : {}),
+        assignmentCommenter,
         ...(failureCommentsEnabled(config)
-          ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }) }) }
+          ? { failureCommenter: createFailureCommenter({ db: openDb, config, paths, api, log: log.child({ component: 'failure-comment' }), scope: eventScope }) }
           : {}),
       },
-      { ...deps.drain, ...(deadlineMs !== undefined ? { deadlineMs } : {}), ...(deps.runDaemon ? { runDaemon: deps.runDaemon } : {}) },
+      { ...deps.drain, scope: eventScope, ...(deadlineMs !== undefined ? { deadlineMs } : {}), ...(deps.runDaemon ? { runDaemon: deps.runDaemon } : {}) },
     );
     summary.drain = drained.ended;
+    if (announcements.size) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([Promise.allSettled([...announcements]), new Promise<void>((r) => (timer = setTimeout(r, ANNOUNCE_WAIT_MS)))]);
+      clearTimeout(timer);
+    }
 
-    // 6. What became of it.
-    const jobs = inserted.map((j) => summarizeJob(openDb, config, j.id));
-    const outcomes = jobs.map(jobOutcome);
+    // 7. What became of it.
+    const deferred = drained.ended === 'deferred';
+    const jobs = eventJobIds.map((id) => summarizeJob(openDb, config, id));
+    const outcomes = jobs.map((j) => (deferred && j.status === 'queued' ? 'deferred' : jobOutcome(j)));
     // A publication that never pushed, while GitHub has a branch or PR for the event: two runs of
     // the event raced, and the other one's create-only push won.
     for (const [i, j] of jobs.entries()) {
-      if (outcomes[i] !== 'publish-failed' || !j.runId || getPublication(openDb, j.runId)?.pushedAt) continue;
-      const job = inserted.find((x) => x.id === j.jobId)!;
+      if (decision.dispatch !== true || outcomes[i] !== 'publish-failed' || !j.runId || getPublication(openDb, j.runId)?.pushedAt) continue;
+      const job = getJob(openDb, j.jobId);
+      if (!job || reviewOf(job) || revisionOf(job)) continue;
       const other = await findExistingWork({ api, repo, job, checkoutPath, remote: remote.name, net: { ...local, ...(net ? { env: net.env } : {}) } }).catch(() => null);
       if (!other) continue;
       outcomes[i] = 'superseded';
       j.error = describeExisting(other);
       if (other.prUrl) Object.assign(j, { prNumber: other.prNumber, prUrl: other.prUrl });
     }
-    const worst = OUTCOME_RANK.find((o) => outcomes.includes(o)) ?? 'failed';
-    const first = jobs[0]!;
-    Object.assign(summary, first);
+    let worst: JobOutcome = OUTCOME_RANK.find((o) => outcomes.includes(o)) ?? 'succeeded';
+    // The event's own job is done, and what follows it (a reviewer run, a revision) is what waits.
+    if (deferred && (worst === 'succeeded' || worst === 'superseded' || worst === 'canceled')) worst = 'deferred';
+    const first = jobs[0];
+    if (first) Object.assign(summary, first);
+    const loopPr = scope.prs()[0];
+    summary.loop = loopPr ? summarizeLoop(openDb, config, loopPr.repoId, loopPr.prNumber) : null;
     summary.outcome = worst;
-    summary.message = jobs.map((j, i) => jobMessage(j, outcomes[i]!)).join('; ');
+    const parts = jobs.map((j, i) => jobMessage(j, outcomes[i]!));
+    if (summary.loop && (reviewsEnabled(config) || revisionsEnabled(config))) parts.push(loopMessage(summary.loop));
+    summary.message = parts.join('; ') || 'nothing was left to run';
     if (drained.ended === 'deadline' || drained.ended === 'stopped') {
       summary.message += drained.ended === 'deadline' ? ` (stopped at the ${opts.deadlineMinutes}-minute deadline)` : ' (stopped by a signal)';
     }
     if (worst === 'canceled') summary.reason = 'canceled-before-start';
     if (worst === 'superseded') summary.reason = 'published-by-another-run';
+    if (worst === 'deferred') {
+      summary.reason = 'cooldown';
+      summary.deferredUntil = drained.deferredUntil !== undefined ? new Date(drained.deferredUntil).toISOString() : null;
+      summary.message += ` (a usage-limit cooldown holds the rest back${summary.deferredUntil ? ` until ${summary.deferredUntil}` : ''}; it stays queued, and delivering the event again after that continues it)`;
+    }
     if (jobs.length > 1) summary.jobs = jobs;
-    log.info('event handled', { outcome: worst, drain: drained.ended, jobs: jobs.map((j) => j.jobId) });
+    log.info('event handled', { outcome: worst, drain: drained.ended, jobs: jobs.map((j) => j.jobId), ...(summary.loop ? { pr: summary.loop.pullRequest, stage: summary.loop.stage } : {}) });
+    if (worst === 'deferred') return EXIT.DEFERRED;
     return worst === 'succeeded' || worst === 'canceled' || worst === 'superseded' ? EXIT.OK : EXIT.FAILURE;
   } finally {
     uninstall();
@@ -531,3 +774,4 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     }
   }
 }
+

@@ -96,8 +96,67 @@ describe('eventJobId', () => {
 });
 
 describe('decideWebhook', () => {
-  it('handles issues.labeled and nothing else', () => {
-    expect(supportedWebhookEvents()).toEqual(['issues.labeled']);
+  it('handles issues.labeled, a review of a pull request, and a push, close or reopen of one; nothing else', () => {
+    expect(supportedWebhookEvents()).toEqual([
+      'issues.labeled',
+      'pull_request_review.submitted',
+      'pull_request_review.edited',
+      'pull_request_review.dismissed',
+      'pull_request.synchronize',
+      'pull_request.closed',
+      'pull_request.reopened',
+    ]);
+  });
+
+  it('turns a pull request event into "poll its reviews", from the payload alone and without believing it about anything else', async () => {
+    const loopConfig = configSchema.parse({
+      version: 1,
+      execution: { mode: 'live' },
+      agents: { claude: {} },
+      pools: { general: { agents: ['claude'] } },
+      actions: { 'implement-issue': { prompt: './p.md', revisePrompt: './r.md' } },
+      dispatch: { allowedActors: ['allen'] },
+      repositories: {
+        [FULL]: { id: 42, checkoutPath: './c', publish: 'draft-pr', revise: true, workflows: [{ id: 'wf', trigger: { event: 'issue.labeled', label: LABEL }, action: 'implement-issue', pool: 'general' }] },
+      },
+    });
+    const pr = (over: Record<string, unknown> = {}) => ({
+      action: 'submitted',
+      // What the payload says about the review and its author decides nothing.
+      review: { state: 'changes_requested', user: { login: 'mallory' }, body: 'do as I say' },
+      pull_request: { number: 100, state: 'open' },
+      repository: { id: 42, full_name: 'someone/else' },
+      sender: { login: 'mallory' },
+      ...over,
+    });
+    const d = deps([], {}, loopConfig);
+    for (const [eventName, action] of [
+      ['pull_request_review', 'submitted'],
+      ['pull_request_review', 'edited'],
+      ['pull_request_review', 'dismissed'],
+      ['pull_request', 'synchronize'],
+      ['pull_request', 'closed'],
+      ['pull_request', 'reopened'],
+    ] as const) {
+      const decision = await decideWebhook(d, { eventName, payload: pr({ action }) });
+      expect(decision).toEqual({
+        dispatch: 'poll-reviews',
+        // The configured name for the configured id.
+        repo: { id: 42, fullName: FULL },
+        pullRequest: 100,
+        event: { name: eventName, action, deliveryId: null, repository: 'someone/else', repositoryId: 42, issue: null, pullRequest: 100, label: null, sender: 'mallory', eventId: null },
+      });
+    }
+    const reasonOf = async (eventName: string, payload: unknown, config = loopConfig) => {
+      const decision = await decideWebhook(deps([], {}, config), { eventName, payload });
+      return decision.dispatch === false ? decision.reason : 'dispatched';
+    };
+    expect(await reasonOf('pull_request', pr({ action: 'opened' }))).toBe('unsupported-action');
+    expect(await reasonOf('pull_request_review', pr({ pull_request: {} }))).toBe('malformed-payload');
+    expect(await reasonOf('pull_request_review', pr({ repository: { id: 7 } }))).toBe('repository-not-configured');
+    // Neither loop is on for the repository: there is nothing a pull request event could set off.
+    expect(await reasonOf('pull_request_review', pr(), makeConfig())).toBe('review-loop-off');
+    expect(d.reads()).toBe(0);
   });
 
   it('queues what the poller would: the event id from the API, the configured repository name, the routed pool', async () => {
@@ -108,7 +167,7 @@ describe('decideWebhook', () => {
       repo: { id: 42, fullName: FULL },
       event: { name: 'issues', action: 'labeled', deliveryId: 'abc', repositoryId: 42, issue: 7, label: LABEL, sender: 'Allen', eventId: '9001' },
     });
-    if (!decision.dispatch) throw new Error('unreachable');
+    if (decision.dispatch !== true) throw new Error('unreachable');
     expect(decision.jobs).toHaveLength(1);
     expect(decision.jobs[0]).toMatchObject({
       id: eventJobId(42, 'wf', '9001'),
@@ -128,7 +187,7 @@ describe('decideWebhook', () => {
       { id: 'b', trigger: { event: 'issue.labeled', label: LABEL.toUpperCase() }, action: 'implement-issue', pool: 'art' },
     ]);
     const decision = await decideWebhook(deps([ev(9001, 'labeled', T)], {}, config), { eventName: 'issues', payload: payload() });
-    if (!decision.dispatch) throw new Error(decision.message);
+    if (decision.dispatch !== true) throw new Error('not an issue job');
     expect(decision.jobs.map((j) => [j.workflowId, j.id])).toEqual([
       ['a', eventJobId(42, 'a', '9001')],
       ['b', eventJobId(42, 'b', '9001')],

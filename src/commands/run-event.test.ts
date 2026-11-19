@@ -232,7 +232,8 @@ describe('updraft run-event, end to end', { timeout: 120_000 }, () => {
     const head = remoteHead(w.f, BRANCH);
     expect(head).toBe(s.headSha);
     expect(s.baseSha).toBe(remoteHead(w.f, 'main'));
-    expect(w.gh.writes).toEqual([`open draft PR ${BRANCH} -> main`, `comment #${ISSUE}`]);
+    // The assignment comment, then the pull request and the comment that links it.
+    expect(w.gh.writes).toEqual([`comment #${ISSUE}`, `open draft PR ${BRANCH} -> main`, `comment #${ISSUE}`]);
 
     // The clone: created by the command, never shallow, only the base branch fetched, and the
     // token in none of its files. The agent ran in a worktree of it.
@@ -286,7 +287,8 @@ describe('updraft run-event, end to end', { timeout: 120_000 }, () => {
     expect(r.summary.error).toMatch(/exit(ed)? (with )?(code )?3/);
     expect(r.summary.message).toContain(`job ${JOB_ID} failed`);
     expect(r.summary.failureCommentUrl).toContain(`/issues/${ISSUE}#issuecomment-`);
-    expect(w.gh.writes).toEqual([`comment #${ISSUE}`]);
+    // The assignment comment and the failure comment.
+    expect(w.gh.writes).toEqual([`comment #${ISSUE}`, `comment #${ISSUE}`]);
     expect(remoteHead(w.f, BRANCH)).toBe('');
     // Nothing on GitHub marks the event as handled, so a redelivery tries again.
     rmSync(w.received);
@@ -324,13 +326,14 @@ describe('updraft run-event, end to end', { timeout: 120_000 }, () => {
     expect(r.summary).toMatchObject({ dispatched: true, outcome: 'superseded', reason: 'published-by-another-run', status: 'succeeded', publication: 'failed', exitCode: 0 });
     expect(r.summary.publicationError).toContain('refusing to overwrite it');
     expect(remoteHead(w.f, BRANCH)).toBe(raced);
-    expect(w.gh.writes).toEqual([]);
+    // Only the assignment comment: nothing was pushed or opened.
+    expect(w.gh.writes).toEqual([`comment #${ISSUE}`]);
   });
 });
 
 describe('updraft run-event: nothing to do', { timeout: 60_000 }, () => {
   const cases: Array<{ name: string; reason: string; message: RegExp; payload?: unknown; eventName?: string; arrange?: (w: World) => void; api?: boolean }> = [
-    { name: 'another event name', reason: 'unsupported-event', message: /"pull_request_review" events are not handled/, eventName: 'pull_request_review', api: false },
+    { name: 'another event name', reason: 'unsupported-event', message: /"push" events are not handled/, eventName: 'push', api: false },
     { name: 'another action', reason: 'unsupported-action', message: /action "opened" are not handled/, payload: payloadOf({ action: 'opened' }), api: false },
     { name: 'a payload that is not an event', reason: 'malformed-payload', message: /no action/, payload: { zen: 'Keep it logically awesome.' }, api: false },
     {
@@ -400,7 +403,7 @@ describe('updraft run-event: nothing to do', { timeout: 60_000 }, () => {
     const w = world();
     const v = vm(w, 'vm', { payload: payloadOf({ action: 'closed' }) });
     expect(await runEventCommand(v.ctx, { eventFile: v.eventFile }, v.deps)).toBe(0);
-    expect(v.ctx.out.text).toBe('Nothing to do: issues events with action "closed" are not handled (handled: issues.labeled)\n');
+    expect(v.ctx.out.text).toMatch(/^Nothing to do: issues events with action "closed" are not handled \(handled: issues\.labeled, pull_request_review\.submitted, .*\)\n$/);
   });
 });
 

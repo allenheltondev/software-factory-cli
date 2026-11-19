@@ -15,6 +15,7 @@ import { retryCommand } from './retry.js';
 import { reviewsCommand, type ReviewsOptions } from './reviews.js';
 import { runEventCommand, type RunEventOptions } from './run-event.js';
 import { startCommand } from './start.js';
+import { stateInfoCommand, stateMergeCommand, type StateMergeOptions } from './state.js';
 import { statsCommand, type StatsOptions } from './stats.js';
 import { statusCommand } from './status.js';
 import { validateCommand } from './validate.js';
@@ -25,6 +26,8 @@ export interface Handlers {
   validate(ctx: CommandContext): Promise<number>;
   start(ctx: CommandContext): Promise<number>;
   runEvent(ctx: CommandContext, opts: RunEventOptions): Promise<number>;
+  stateMerge(ctx: CommandContext, opts: StateMergeOptions): Promise<number>;
+  stateInfo(ctx: CommandContext, opts: { db: string; json?: boolean }): Promise<number>;
   status(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   doctor(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   retry(ctx: CommandContext, jobId: string): Promise<number>;
@@ -43,6 +46,8 @@ export const defaultHandlers: Handlers = {
   validate: validateCommand,
   start: (ctx) => startCommand(ctx),
   runEvent: (ctx, opts) => runEventCommand(ctx, opts),
+  stateMerge: (ctx, opts) => stateMergeCommand(ctx, opts),
+  stateInfo: (ctx, opts) => stateInfoCommand(ctx, opts),
   status: statusCommand,
   doctor: (ctx, opts) => doctorCommand(ctx, opts),
   retry: (ctx, jobId) => retryCommand(ctx, jobId),
@@ -128,6 +133,22 @@ export function buildProgram(opts: ProgramOptions): Command {
     .option('--worker-git-credentials', "fetch with the worker's GitHub credentials even into a clone run-event did not create")
     .addOption(new Option('--json', 'print one JSON summary object on stdout'))
     .action((o: RunEventOptions) => exec((ctx) => handlers.runEvent(ctx, o)));
+
+  const state = program.command('state').description('Work with a state database as a file shared between runs (see docs/shared-state.md)');
+  state
+    .command('merge')
+    .description('Apply what one finished run changed in its copy of the state database to the latest shared copy (a three-way merge by key)')
+    .requiredOption('--changed <file>', 'the state database the run used')
+    .requiredOption('--into <file>', 'the latest shared copy; created when it does not exist')
+    .option('--base <file>', 'the snapshot the run started from (omit when it started from nothing)')
+    .addOption(new Option('--json', 'print one JSON object on stdout: per-table counts, schema version, and whether anything changed'))
+    .action((o: StateMergeOptions) => exec((ctx) => handlers.stateMerge(ctx, o)));
+  state
+    .command('info')
+    .description('Show the schema version and row counts of a state database file (read-only)')
+    .requiredOption('--db <file>', 'the state database file')
+    .addOption(new Option('--json', 'machine-readable output'))
+    .action((o: { db: string; json?: boolean }) => exec((ctx) => handlers.stateInfo(ctx, o)));
 
   program
     .command('status')

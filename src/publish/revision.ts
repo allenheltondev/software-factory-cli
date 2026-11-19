@@ -504,10 +504,10 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
  * worker calls this (after a poll), and it looks for the marker before posting, so a PR gets one
  * comment however often this runs. Never throws.
  */
-export async function postLimitNotices(deps: Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now'>, signal?: AbortSignal): Promise<void> {
+export async function postLimitNotices(deps: Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'scope'>, signal?: AbortSignal): Promise<void> {
   let pending: RevisionPr[];
   try {
-    pending = listPendingLimitNotices(deps.db, REVISION_MAX_AUTO_ATTEMPTS);
+    pending = listPendingLimitNotices(deps.db, REVISION_MAX_AUTO_ATTEMPTS).filter((pr) => deps.scope?.pr(pr.repoId, pr.prNumber) ?? true);
   } catch (err) {
     deps.log.error('could not list pull requests that reached maxRevisions', { error: message(err) });
     return;
@@ -574,7 +574,7 @@ export function createRevisionPublisher(deps: PublishDeps, inner?: Publisher): P
       await inner?.retryDue(signal);
       let due: string[];
       try {
-        due = listDueRevisions(deps.db, { now: deps.now });
+        due = listDueRevisions(deps.db, { now: deps.now }).filter((id) => deps.scope?.run(id) ?? true);
       } catch (err) {
         deps.log.error('could not list revisions to retry', { error: message(err) });
         return;

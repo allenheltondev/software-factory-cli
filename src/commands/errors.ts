@@ -11,6 +11,14 @@ export const EXIT = {
   USAGE: 2,
   /** Another worker holds the lock. Launchers can treat this as "already running". */
   LOCKED: 3,
+  /**
+   * `run-event` only: the event's work could not go on now (a usage-limit cooldown that ends after
+   * this run would) and is still queued in the state database. Delivering the event again later
+   * is the retry.
+   */
+  DEFERRED: 4,
+  /** A state database was written by a newer CLI than this one. Nothing was changed; use a newer updraft. */
+  SCHEMA_TOO_NEW: 5,
 } as const;
 
 /** Raised for user-facing failures whose message is already friendly. */

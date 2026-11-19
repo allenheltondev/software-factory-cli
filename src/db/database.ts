@@ -591,6 +591,21 @@ export function openDatabaseReadOnly(file: string): Db {
   return db;
 }
 
+/**
+ * Fold a database's write-ahead log into its main file, so that the one file is all of it. No
+ * migration and no change to what the database holds. For `updraft state merge`.
+ */
+export function foldWriteAheadLog(file: string): void {
+  const { DatabaseSync } = loadSqlite();
+  const db = new DatabaseSync(file);
+  try {
+    db.exec('PRAGMA busy_timeout = 5000;');
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+  } finally {
+    db.close();
+  }
+}
+
 /** The schema version a state database is at (PRAGMA user_version). */
 export function schemaVersion(db: Db): number {
   return (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;

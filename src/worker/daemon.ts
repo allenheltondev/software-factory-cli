@@ -97,6 +97,13 @@ export interface DaemonDeps {
    * on. Returning true ends the loop as an abort would. Absent: the worker runs until aborted.
    */
   idle?: () => boolean;
+  /**
+   * Single-event mode on a state database that is shared between machines (drain.ts): the only
+   * jobs this worker may claim. With it, what other workers left in the database is not this
+   * worker's: their open runs are not reconciled and do not count towards the limits, and the
+   * startup publication sweep is skipped. Absent: the worker owns everything in its database.
+   */
+  scope?: { job(jobId: string): boolean };
   now?: () => number;
   /** Defaults to the log-only executor. */
   executor?: Executor;
@@ -306,6 +313,10 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     inFlight.set(run.id, { claim, controller, done });
   };
 
+  /** With `scope`: the queued jobs that are not this worker's to run. */
+  const queuedOutOfScope = (): string[] =>
+    (db.prepare("SELECT id FROM jobs WHERE status = 'queued'").all() as { id: string }[]).map((r) => r.id).filter((id) => !deps.scope!.job(id));
+
   const startJobs = async () => {
     while (!signal.aborted && !lockLost) {
       let claim: Claim | null;
@@ -316,8 +327,9 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
           leaseSeconds,
           runsDir: paths.runsDir,
           now,
-          excludeJobIds: deferred,
+          excludeJobIds: deps.scope ? new Set([...deferred, ...queuedOutOfScope()]) : deferred,
           lockWorkerId: workerId,
+          ...(deps.scope ? { ownRunsOnly: true } : {}),
         });
       } catch (err) {
         if (err instanceof WorkerLockLostError) {
@@ -452,7 +464,8 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const heartbeatTimer = setInterval(heartbeat, heartbeatMs);
   const cancelTimer = setInterval(checkCancelRequests, cancelCheckMs);
   try {
-    await reconcileInterruptedRuns(db, { hostname, processControl, containers, log, now });
+    // With `scope`, open runs in the database belong to other machines: nothing to reconcile.
+    if (!deps.scope) await reconcileInterruptedRuns(db, { hostname, processControl, containers, log, now });
 
     // Record when publish was turned on or off per repository (the config has no history), then
     // publish succeeded runs a previous worker stopped before publishing, if they ended since.
@@ -465,7 +478,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     } catch (err) {
       log.error('could not record publish settings; skipping the startup publication sweep', { error: message(err) });
     }
-    if (settingsSynced && deps.publisher && !signal.aborted && !lockLost) await deps.publisher.sweepUnpublished(signal);
+    if (settingsSynced && deps.publisher && !deps.scope && !signal.aborted && !lockLost) await deps.publisher.sweepUnpublished(signal);
 
     let nextPollAt = now();
     const statusLogMs = deps.timing?.statusLogMs ?? STATUS_LOG_MS;

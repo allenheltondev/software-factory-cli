@@ -300,13 +300,21 @@ export function enqueueReviewJob(
  * over the heads the worker pushed, and queue the reviewer job of every open PR's current head
  * that has none. No GitHub request. Returns the jobs queued; nothing when review is off for it.
  */
-export function scheduleReviews(db: Db, config: UpdraftConfig, repoFullName: string, cfg: RepositoryConfig, now?: () => number): Job[] {
+export function scheduleReviews(
+  db: Db,
+  config: UpdraftConfig,
+  repoFullName: string,
+  cfg: RepositoryConfig,
+  now?: () => number,
+  /** Queue reviewer jobs for these pull requests only (a single-event run; see PublishDeps.scope). */
+  only?: (pr: LoopPr) => boolean,
+): Job[] {
   if (!reviewActive(config, cfg)) return [];
   syncRevisionPrs(db, cfg.id, now);
   adoptOwnPushes(db, cfg.id, now);
   const queued: Job[] = [];
   for (const pr of listOpenLoopPrs(db, cfg.id)) {
-    if (!pr.headSha) continue;
+    if (!pr.headSha || (only && !only(pr))) continue;
     const wf = cfg.workflows.find((w) => workflowId(w) === pr.workflowId);
     const job = enqueueReviewJob(db, {
       repo: { id: cfg.id, fullName: repoFullName },
@@ -322,8 +330,8 @@ export function scheduleReviews(db: Db, config: UpdraftConfig, repoFullName: str
 }
 
 /** scheduleReviews for every configured repository. */
-export function scheduleAllReviews(db: Db, config: UpdraftConfig, now?: () => number): Job[] {
-  return Object.entries(config.repositories).flatMap(([fullName, cfg]) => scheduleReviews(db, config, fullName, cfg, now));
+export function scheduleAllReviews(db: Db, config: UpdraftConfig, now?: () => number, only?: (pr: LoopPr) => boolean): Job[] {
+  return Object.entries(config.repositories).flatMap(([fullName, cfg]) => scheduleReviews(db, config, fullName, cfg, now, only));
 }
 
 // ---------------------------------------------------------------------------

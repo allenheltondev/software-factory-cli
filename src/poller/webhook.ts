@@ -13,7 +13,7 @@
 // `labeled` event for this label, by the payload's sender, created at the payload's time. From
 // there the existing pre-start checks run unchanged.
 import { createHash } from 'node:crypto';
-import type { UpdraftConfig } from '../config/schema.js';
+import { reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
 import type { NewJob } from '../db/ingest.js';
 import type { GitHubApi, GitHubIssueEvent } from '../github/api.js';
 import { labelEquals } from '../routing.js';
@@ -29,6 +29,7 @@ export type NothingToDoReason =
   | 'pull-request'
   | 'repository-not-configured'
   | 'label-not-configured'
+  | 'review-loop-off'
   | IngestSkipReason;
 
 /** What the delivery was about, as far as it could be read. `eventId` is the timeline event's id, from the API. */
@@ -39,6 +40,8 @@ export interface WebhookEventInfo {
   repository: string | null;
   repositoryId: number | null;
   issue: number | null;
+  /** The pull request a `pull_request` or `pull_request_review` delivery is about; null for an issue event. */
+  pullRequest: number | null;
   label: string | null;
   sender: string | null;
   eventId: string | null;
@@ -46,7 +49,13 @@ export interface WebhookEventInfo {
 
 export type WebhookDecision =
   | { dispatch: false; reason: NothingToDoReason; message: string; event: WebhookEventInfo }
-  | { dispatch: true; repo: RepoRef; jobs: Array<NewJob & { id: string }>; applied: GitHubIssueEvent; event: WebhookEventInfo };
+  | { dispatch: true; repo: RepoRef; jobs: Array<NewJob & { id: string }>; applied: GitHubIssueEvent; event: WebhookEventInfo }
+  /**
+   * Something happened on a pull request (a review, a push, a close). The payload queues nothing
+   * and is believed about nothing: the caller runs the review poller (reviews.ts) for this pull
+   * request, which reads it from the API and applies the review loop's own rules.
+   */
+  | { dispatch: 'poll-reviews'; repo: RepoRef; pullRequest: number; event: WebhookEventInfo };
 
 /**
  * The label application of a delivery could not be found among the issue's events, even after
@@ -106,11 +115,13 @@ type Handler = (deps: WebhookDeps, payload: Payload, event: WebhookEventInfo) =>
 
 /**
  * What is recognised: event name (the X-GitHub-Event header) to action to handler. Everything
- * else is "nothing to do". `pull_request_review` (the revision and review loops) belongs here
- * when those loops are driven by webhooks.
+ * else is "nothing to do". The pull request events drive the revision and review loops: a
+ * person's review (submitted, edited or dismissed), a push to the branch, a close or a reopen.
  */
 const HANDLERS: Readonly<Record<string, Readonly<Record<string, Handler>>>> = {
   issues: { labeled: issueLabeled },
+  pull_request_review: { submitted: pullRequestChanged, edited: pullRequestChanged, dismissed: pullRequestChanged },
+  pull_request: { synchronize: pullRequestChanged, closed: pullRequestChanged, reopened: pullRequestChanged },
 };
 
 /** Event names and actions `decideWebhook` acts on, for messages and docs. */
@@ -133,6 +144,7 @@ export async function decideWebhook(deps: WebhookDeps, input: { eventName: strin
     repository: str(repository?.full_name),
     repositoryId: int(repository?.id),
     issue: int(issue?.number),
+    pullRequest: int(obj(payload?.pull_request)?.number),
     label: str(obj(payload?.label)?.name),
     sender: str(obj(payload?.sender)?.login),
     eventId: null,
@@ -187,6 +199,27 @@ export function findLabelApplication(
     }
   });
   return best;
+}
+
+/**
+ * A `pull_request_review` or `pull_request` delivery. Settled from the payload and the config
+ * alone, and only towards "nothing to do": which repository (by id) and which pull request to
+ * look at. Whether the pull request is one Updraft opened, what its reviews say and who wrote
+ * them is for the review poller to read from the API and the state database.
+ */
+async function pullRequestChanged(deps: WebhookDeps, _payload: Payload, event: WebhookEventInfo): Promise<WebhookDecision> {
+  const nothing = (reason: NothingToDoReason, message: string): WebhookDecision => ({ dispatch: false, reason, message, event });
+  if (event.repositoryId === null || event.pullRequest === null) {
+    return nothing('malformed-payload', `the ${event.name}.${event.action} event lacks a repository id or a pull request number`);
+  }
+  const found = findRepo(deps.config, event.repositoryId);
+  if (!found) {
+    return nothing('repository-not-configured', `no configured repository has id ${event.repositoryId}${event.repository ? ` (${event.repository})` : ''}`);
+  }
+  if (!reviseActive(deps.config, found.cfg) && !reviewActive(deps.config, found.cfg)) {
+    return nothing('review-loop-off', `neither revise nor review is on for ${found.fullName} (both need publish and execution.mode: live), so nothing acts on its pull requests`);
+  }
+  return { dispatch: 'poll-reviews', repo: { id: found.cfg.id, fullName: found.fullName }, pullRequest: event.pullRequest, event };
 }
 
 async function issueLabeled(deps: WebhookDeps, payload: Payload, event: WebhookEventInfo): Promise<WebhookDecision> {
