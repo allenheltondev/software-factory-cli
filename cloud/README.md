@@ -87,8 +87,8 @@ There is no `sam build`. `ApiFunction`'s `CodeUri` is the bundled `server/dist`,
 1. **AWS accounts.** Staging and Production are separate accounts, and both need rsc-core deployed. The template reads `/readysetcloud/auth/user-pool-id` and `/readysetcloud/auth/user-pool-arn` from SSM.
 2. **Deploy role.** In each account, create an IAM role that this repository can assume through GitHub OIDC. Its trust policy should be scoped to `repo:allenheltondev/software-factory-cli:environment:<Production|Staging>`. It needs permission to deploy this stack: CloudFormation, Lambda, API Gateway, IAM roles for the function, S3, CloudFront, ACM, Route 53 records in the zone, DynamoDB, Cognito user pool clients, SSM read, CloudWatch Logs, and the SAM managed bucket.
 3. **GitHub environments** (Settings > Environments):
-   - `Production`: secret `AWS_DEPLOY_ROLE_ARN`, and variable `HOSTED_ZONE_ID` set to the readysetcloud.io hosted zone id.
-   - `Staging`: secret `AWS_DEPLOY_ROLE_ARN`.
+   - `Production`: secret `AWS_DEPLOYMENT_ROLE_ARN`, and variable `HOSTED_ZONE_ID` set to the readysetcloud.io hosted zone id.
+   - `Staging`: secret `AWS_DEPLOYMENT_ROLE_ARN`.
 
    Until a secret exists, that environment's deploy skips with a notice instead of failing.
 

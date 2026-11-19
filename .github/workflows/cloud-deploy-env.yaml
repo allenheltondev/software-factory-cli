@@ -3,10 +3,10 @@ name: Deploy Updraft Cloud (one environment)
 # Called by cloud-production.yaml (push to main) and cloud-staging.yaml (pull requests). One job:
 # check the code, deploy the stack and the SPA, then run the anonymous smoke checks against the
 # result. Staging and Production are the same stack name in two AWS accounts; the environment's
-# AWS_DEPLOY_ROLE_ARN secret picks the account.
+# AWS_DEPLOYMENT_ROLE_ARN secret picks the account.
 #
 # One-time setup per GitHub environment (Settings > Environments):
-#   secret   AWS_DEPLOY_ROLE_ARN   an IAM role this repo may assume through GitHub OIDC
+#   secret   AWS_DEPLOYMENT_ROLE_ARN   an IAM role this repo may assume through GitHub OIDC
 #   variable HOSTED_ZONE_ID        Production only: the readysetcloud.io Route 53 hosted zone id
 # Until the secret exists the job skips with a notice instead of failing.
 
@@ -48,10 +48,10 @@ jobs:
         id: gate
         working-directory: .
         env:
-          AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          AWS_DEPLOYMENT_ROLE_ARN: ${{ secrets.AWS_DEPLOYMENT_ROLE_ARN }}
         run: |
-          if [ -z "${AWS_DEPLOY_ROLE_ARN}" ]; then
-            echo "::notice title=${{ inputs.environment }} deploy skipped::The ${{ inputs.environment }} environment has no AWS_DEPLOY_ROLE_ARN secret. Add it (Settings > Environments > ${{ inputs.environment }}) to deploy Updraft Cloud."
+          if [ -z "${AWS_DEPLOYMENT_ROLE_ARN}" ]; then
+            echo "::notice title=${{ inputs.environment }} deploy skipped::The ${{ inputs.environment }} environment has no AWS_DEPLOYMENT_ROLE_ARN secret. Add it (Settings > Environments > ${{ inputs.environment }}) to deploy Updraft Cloud."
             echo "ready=false" >> "$GITHUB_OUTPUT"
           else
             echo "ready=true" >> "$GITHUB_OUTPUT"
@@ -86,7 +86,7 @@ jobs:
         if: steps.gate.outputs.ready == 'true'
         uses: aws-actions/configure-aws-credentials@6.2.2
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_DEPLOYMENT_ROLE_ARN }}
           role-session-name: GitHubActions-UpdraftCloud-${{ inputs.environment }}
           aws-region: us-east-1
 

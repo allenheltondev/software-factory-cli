@@ -4,7 +4,7 @@
 # CloudFormation stack the infra/ SAM template deploys into. It is threaded through SAM_DEPLOY_ARGS
 # (samconfig.toml carries its own stack_name, which would otherwise win). Staging and Production
 # are the same stack name in two different accounts; CI picks the account through each GitHub
-# environment's AWS_DEPLOY_ROLE_ARN.
+# environment's AWS_DEPLOYMENT_ROLE_ARN.
 STACK_NAME ?= updraft-cloud
 # Empty means "whatever samconfig.toml/AWS_REGION says"; CI sets it so a stack never lands in a
 # surprise region. The stack must be in us-east-1 for the CloudFront certificate.
