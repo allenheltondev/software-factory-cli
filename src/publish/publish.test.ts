@@ -159,6 +159,14 @@ class FakePublishApi extends ReviewLoopApiStubs implements GitHubApi {
     return c;
   }
 
+  async updateIssueComment(repo: RepoRef, commentId: number, body: string) {
+    this.calls.push(`updateComment ${repo.id} ${commentId}`);
+    const c = this.comments.find((x) => x.id === commentId);
+    if (!c) throw new GitHubError('comment not found', 404);
+    c.body = body;
+    return c;
+  }
+
   get creates(): string[] {
     return this.calls.filter((c) => c.startsWith('create'));
   }

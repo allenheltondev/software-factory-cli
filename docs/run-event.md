@@ -13,7 +13,7 @@ shared between the runs ([Shared state](#shared-state)).
 
 ```
 updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>] [--json]
-                  [--deadline-minutes <n>] [--worker-git-credentials]
+                  [--deadline-minutes <n>] [--worker-git-credentials] [--shared-state <file>]
 ```
 
 | Option | Meaning |
@@ -24,6 +24,7 @@ updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>]
 | `--json` | Print one JSON object on stdout when the command ends (see [The summary](#the-summary)) |
 | `--deadline-minutes <n>` | Stop everything, a running agent included, after this long. Default: no limit of its own; the action's `timeoutMinutes` and `verifyTimeoutMinutes` bound each agent and verification, and `autoMergeWaitMinutes` the wait for checks |
 | `--worker-git-credentials` | Fetch with the worker's GitHub credentials even into a clone this command did not create (see [The clone](#the-clone)) |
+| `--shared-state <file>` | A copy of the shared state database that the caller keeps fresher than the one this run started from. Read, never written, during [the last look](#the-last-look). A file that is missing, unreadable or at another schema version is logged and otherwise ignored |
 
 `-c, --config <path>`, `UPDRAFT_CONFIG` and `UPDRAFT_HOME` work as for every command.
 
@@ -213,7 +214,43 @@ revision for a change request by an allowed actor, a reviewer run for a head som
 - When the work is deferred behind a cooldown, the look still records what it finds; it stays
   queued with the rest.
 
-The summary's `finalLook` says what happened: `{ "looks": 2, "queued": 1, "error": null }`.
+- A review that another run has already answered is not answered again
+  ([One review, one revision](#one-review-one-revision)). With `--shared-state`, the reviews
+  that fresher copy has on record for the pull request are taken over just before the look
+  decides anything, so such a review is not even queued (`knownElsewhere` counts them).
+  Without it, or when the other run's record has not reached the shared copy yet, the
+  revision job is queued and then canceled before an agent starts, because the pull request
+  itself says that the review has its revision.
+
+The summary's `finalLook` says what happened:
+`{ "looks": 2, "queued": 1, "knownElsewhere": 0, "error": null }`.
+
+### One review, one revision
+
+Two machines can meet the same review without either having seen the other's record of it:
+the machine the review's own delivery started, and the last look of the run that opened the
+pull request. Each has its own copy of the state, so the state cannot settle it before the
+merge. The pull request can, and does ([revisions.md](revisions.md#one-revision-per-review-across-machines)
+has the mechanism):
+
+- **Before an agent starts for a review**, the pull request is read. If it is still at the
+  commit the review was submitted against, nothing has been pushed since and the job goes
+  ahead. Otherwise its comments are read: when the worker's own identity has left the
+  comment of a revision for this review there, and the branch has moved on from where that
+  revision started, the job is canceled with a reason that begins `superseded: `. No agent
+  runs, nothing is posted, exit code 0 (a canceled job is not a failure).
+- **Before a revision is pushed**, it announces the push in its comment on the pull request,
+  and the push is only ever a fast-forward from the exact commit the run started from. Two
+  runs that both got as far as an agent therefore end with one push: the other finds the
+  first one's announcement made good on (in the history it started from, or where the branch
+  now is), pushes nothing, withdraws its own announcement if it had made one, and ends with
+  its job `succeeded`, its revision `skipped` with a `superseded: ` reason, and the outcome
+  `superseded`. Exit code 0, no failure comment, no retry.
+
+So a review produces at most one revision push, whichever machines see it and in whichever
+order. What a race can still cost is one agent run. After the merge of both machines' state
+there is one revision job for the review (the two are the same job, by the review's id), one
+`review_requests` row, and it counts once towards `maxRevisions`.
 
 ### Updraft's own activity sends these events too
 
@@ -385,7 +422,7 @@ has its `run.log`. Without `--json`, stdout carries one line for a person instea
   "followOnJobs": [
     { "jobId": "job_0mb3…", "kind": "review", "status": "succeeded", "outcome": "succeeded", "agent": "codex", "publication": "published", "…": "the job fields below" }
   ],
-  "finalLook": { "looks": 1, "queued": 0, "error": null },
+  "finalLook": { "looks": 1, "queued": 0, "knownElsewhere": 0, "error": null },
   "exitCode": 0
 }
 ```
@@ -395,7 +432,7 @@ has its `run.log`. Without `--json`, stdout carries one line for a person instea
 | `event` | What the delivery was about, as far as the payload could be read. `repository`, `sender` and the rest are the payload's; `eventId` is the timeline event's id from the API (null until it was found, and for pull request events); `pullRequest` is the pull request of a `pull_request` or `pull_request_review` delivery |
 | `dispatched` | True when a job was queued for the event in this run |
 | `resumed` | True when this run continued work an earlier run of the event left in the state database (a deferred job, a loop that was cut short) |
-| `outcome` | `nothing-to-do`, `succeeded`, `canceled` (queued, then canceled by the pre-start check before any agent started), `superseded` (see [Idempotency](#idempotency)), `failed` (an agent run failed, could not start or was interrupted), `publish-failed` (a run succeeded, its publication, push or review posting did not), `not-started` (a job was still queued when the command ended), `deferred` (work of the event waits for a cooldown; see [Cooldowns](#cooldowns)), `state-pending` (see [A pull request the state database does not know](#a-pull-request-the-state-database-does-not-know)) or `error` (the command itself failed: config, GitHub, the event file, the state database). It is the worst of the event's own jobs **and** the jobs that followed from them in this run: see [What counts as success](#what-counts-as-success) |
+| `outcome` | `nothing-to-do`, `succeeded`, `canceled` (queued, then canceled by the pre-start check before any agent started), `superseded` (the agent ran and nothing was pushed, because another run of the same event published first, see [Idempotency](#idempotency), or another run revised for the same review first, see [One review, one revision](#one-review-one-revision)), `failed` (an agent run failed, could not start or was interrupted), `publish-failed` (a run succeeded, its publication, push or review posting did not), `not-started` (a job was still queued when the command ended), `deferred` (work of the event waits for a cooldown; see [Cooldowns](#cooldowns)), `state-pending` (see [A pull request the state database does not know](#a-pull-request-the-state-database-does-not-know)) or `error` (the command itself failed: config, GitHub, the event file, the state database). It is the worst of the event's own jobs **and** the jobs that followed from them in this run: see [What counts as success](#what-counts-as-success) |
 | `reason` | Why nothing was done, as a code; null otherwise. From the payload: `unsupported-event`, `unsupported-action`, `malformed-payload`, `pull-request`, `repository-not-configured`, `label-not-configured`, `review-loop-off`. From the API: `actor-not-allowed`, `label-removed`, `label-missing`, `issue-closed`, `issue-gone`, `pull-request`. From the state database: `duplicate-delivery` (it already has the event's job, and nothing of it is left to do), `pull-request-closed`, `no-new-work`. From the state database and then the API: `pull-request-not-watched`, `state-pending` (with the outcome of that name). Others: `already-handled`, `canceled-before-start`, `published-by-another-run`, `cooldown` (with `deferred`), `state-not-restorable` (with `error`; see [Restoring lost state](#restoring-lost-state)) |
 | `stateRestored` | True when this run put a lost publication back on record from the GitHub API (with `reason: "already-handled"`). The job fields then describe the restored job. False otherwise |
 | `abandonedRun` | Set when the state database had the event's job as `running` under a run that is gone, and this run closed it ([An abandoned run](#an-abandoned-run)): `jobId`, `runId` (the run that was left open), `heldUntil` (when its hold ended; null when none is on record), `settled` (`interrupted`, or `released` for a run that was only claimed), `resumed` (true when this run then did the job itself), `existingBranch` (the branch or pull request branch GitHub has for the event, which is why nothing was started; null otherwise) and `detail`. Null otherwise |
@@ -412,7 +449,7 @@ has its `run.log`. Without `--json`, stdout carries one line for a person instea
 | `drain` | How the worker stopped: `idle`, `retries-abandoned` (a retry or a merge was left for later), `stalled`, `deferred`, `deadline`, `stopped` (a signal); null when it never started |
 | `jobs` | Present only when the summary covers several jobs (several workflows share the trigger label, or several jobs were queued for the pull request): each job's fields. The top-level fields then describe the first |
 | `followOnJobs` | Present when jobs followed from the event's in this run (reviewer runs, revisions, in the order they were queued): each with the job fields above, `kind` (`review`, `revision`) and its own `outcome`. They count towards the top-level `outcome` |
-| `finalLook` | What [the last look](#the-last-look) did: `looks`, `queued`, `error`. Null when none was due (no open pull request in scope, neither loop on, the run was cut short) |
+| `finalLook` | What [the last look](#the-last-look) did: `looks`, `queued`, `knownElsewhere` (reviews left alone because `--shared-state` had them on record), `error`. Null when none was due (no open pull request in scope, neither loop on, the run was cut short) |
 | `exitCode` | The process's exit code |
 
 ### What counts as success
@@ -429,7 +466,8 @@ the pull request was opened, and the reviewer run after it failed.
 | Its agent run failed, could not start, or was interrupted (a reviewer run that exits non-zero or gives no valid verdict included) | `failed`, exit code 1 |
 | It succeeded, and its publication, its revision push or the posting of its review failed | `publish-failed`, exit code 1 |
 | It was still queued when the run ended (nothing could start it, or the deadline came first) | `not-started`, exit code 1; behind a cooldown: `deferred`, exit code 4 |
-| A follow-on job was canceled (its pull request was closed, its review withdrawn or outdated) | Not a failure |
+| A follow-on job was canceled (its pull request was closed, its review withdrawn or outdated, or another run had already revised for the review) | Not a failure |
+| A revision ran and gave way to another run's revision for the same review | `superseded`: not a failure |
 
 The worst of these is the outcome (`failed`, then `publish-failed`, `not-started`,
 `deferred`). What is **not** a failure, and ends with exit code 0 when no job failed:
@@ -504,9 +542,10 @@ What remains:
   the first run's check to its push.
 - **Two events about the same pull request at the same moment** can both act on the same review
   or head commit. [shared-state.md](shared-state.md#what-concurrent-runs-can-and-cannot-do-to-each-other)
-  says exactly what that can and cannot do; in short, the agent may run twice and a review
-  comment may appear twice, but nothing is pushed twice and nothing is merged twice or at the
-  wrong commit.
+  says exactly what that can and cannot do; in short, the agent may run twice and a reviewer
+  comment may appear twice, but one review gets one revision push
+  ([One review, one revision](#one-review-one-revision)) and nothing is merged twice or at
+  the wrong commit.
 - **A run that pushed its branch and died before opening the pull request** leaves a branch
   without a pull request. Later runs of the event see the branch and do nothing. Without
   shared state: delete the branch on GitHub and redeliver the event to run it again. With

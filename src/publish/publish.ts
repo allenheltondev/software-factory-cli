@@ -118,6 +118,13 @@ export interface PublishDeps {
    * limited to these runs and pull requests. Absent: everything in the database, as for the worker.
    */
   scope?: PublishScope;
+  /**
+   * Single-event runs again: another machine may be revising for the same review, from a state
+   * database this one cannot see. With this set, a revision announces its push on the pull
+   * request before making it, and gives way to one that got there first (src/publish/revision.ts,
+   * "One revision per review"). Absent: the worker's own database is the only one, and says.
+   */
+  claimReviews?: boolean;
 }
 
 /** Which runs and pull requests a publisher may act on by itself (PublishDeps.scope). */

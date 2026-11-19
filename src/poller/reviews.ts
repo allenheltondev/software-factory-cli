@@ -94,6 +94,7 @@ function snapshotReview(review: GitHubReview, decision: Extract<ReturnType<typeo
       diffHunk: capStart(c.diffHunk, MAX_DIFF_HUNK),
     })),
     omittedComments: decision.omittedComments + (decision.comments.length - kept.length),
+    ...(review.commitSha ? { headSha: review.commitSha } : {}),
   };
 }
 
@@ -116,7 +117,15 @@ export async function pollRepoReviews(
    * directly instead of being looked for in the listing, the repository's other watched pull
    * requests are left to their own events, and the listing checkpoint is not touched.
    */
-  opts: { only?: number } = {},
+  opts: {
+    only?: number;
+    /**
+     * Called for a pull request after its reviews were read from the API and before any of them
+     * is decided. `updraft run-event --shared-state` uses it to learn, as late as it can, which
+     * reviews another machine has on record. The worker has one database and passes nothing.
+     */
+    beforeIngest?: (prNumber: number) => void;
+  } = {},
 ): Promise<ReviewPollResult | null> {
   const revising = reviseActive(deps.config, cfg);
   const reviewing = reviewActive(deps.config, cfg);
@@ -203,7 +212,10 @@ export async function pollRepoReviews(
     if (reviewing && pr.headRef === w.branch && observeHead(db, repo.id, w.prNumber, pr.headSha, readAt)) {
       log.info('pull request head changed', { pr: w.prNumber, head: pr.headSha });
     }
-    if (revising) result.revisionsQueued += ingestReviews(deps, repo, cfg, w, pr, log);
+    if (revising) {
+      opts.beforeIngest?.(w.prNumber);
+      result.revisionsQueued += ingestReviews(deps, repo, cfg, w, pr, log);
+    }
     // The listed time, not the read's: a review that landed between the two is then read again.
     markRevisionPrSeen(db, repo.id, w.prNumber, seen?.updatedAt ?? pr.updatedAt, deps.now);
   }

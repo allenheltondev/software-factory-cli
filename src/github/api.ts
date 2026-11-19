@@ -143,6 +143,8 @@ export interface GitHubReview {
   comments: GitHubReviewComment[];
   /** How many inline comments the review has in all. */
   commentCount: number;
+  /** The commit the review was submitted against (the pull request's head at that moment); null or absent when GitHub does not say. */
+  commitSha?: string | null;
 }
 
 /** A pull request with its newest reviews, read in one request. */
@@ -274,6 +276,8 @@ export interface GitHubApi {
   listIssueComments(repo: RepoRef, issueNumber: number): Promise<GitHubIssueComment[]>;
   /** Write: comment on an issue. Used only by the publication step. */
   createIssueComment(repo: RepoRef, issueNumber: number, body: string): Promise<GitHubIssueComment>;
+  /** Replace the body of an issue or pull request comment the worker posted. */
+  updateIssueComment(repo: RepoRef, commentId: number, body: string): Promise<GitHubIssueComment>;
   /** One pull request with its head, base, draft flag and mergeability (REST). Throws GitHubError(404) when it does not exist. */
   getPullRequest(repo: RepoRef, pullNumber: number): Promise<PullRequestDetails>;
   /** Every submitted review of one pull request, oldest first (REST, paginated internally). */

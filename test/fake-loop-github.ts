@@ -78,7 +78,7 @@ export class FakeLoopGitHub {
     this.touch();
     const id = this.nextId++;
     const url = `https://github.com/${this.fullName}/pull/${this.pull?.number ?? this.nextPullNumber}#pullrequestreview-${id}`;
-    const review: GitHubReview = { id: `PRR_${id}`, state, author, submittedAt: this.updatedAt, body, url, lastEditedAt: null, editor: null, comments: [], commentCount: 0 };
+    const review: GitHubReview = { id: `PRR_${id}`, state, author, submittedAt: this.updatedAt, body, url, lastEditedAt: null, editor: null, comments: [], commentCount: 0, commitSha: this.headSha() };
     this.humanReviews.push(review);
     this.reviews.push({ id, state, user: author, body, htmlUrl: url, submittedAt: this.updatedAt, commitId: this.headSha() });
     return review;
@@ -125,6 +125,14 @@ export class FakeLoopGitHub {
     const id = this.nextId++;
     const c = { id, htmlUrl: `https://github.com/${this.fullName}/issues/${issue}#issuecomment-${id}`, body, user: this.login, issue };
     this.comments.push(c);
+    this.touch();
+    return c;
+  }
+  async updateIssueComment(_repo: RepoRef, commentId: number, body: string): Promise<GitHubIssueComment> {
+    const c = this.comments.find((x) => x.id === commentId);
+    if (!c) throw new GitHubError('comment not found', 404);
+    this.writes.push(`edit comment #${c.issue}`);
+    c.body = body;
     this.touch();
     return c;
   }

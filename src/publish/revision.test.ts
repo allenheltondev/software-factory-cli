@@ -23,7 +23,7 @@ import { silentLogger } from '../util/log.js';
 import { summarizeRun } from '../worker/run-summary.js';
 import { failureCommentMarker, postFailureComment } from './failure-comment.js';
 import { publishRun, type PublishDeps, type Publisher, type RunGit } from './publish.js';
-import { createRevisionPublisher, postLimitNotices, REVISION_LIMIT_MARKER, reviseRun, revisionMarker } from './revision.js';
+import { createRevisionPublisher, findRevisionClaims, postLimitNotices, REVISION_LIMIT_MARKER, reviseRun, revisionClaimMarker, revisionMarker } from './revision.js';
 
 const REPO_ID = 42;
 const FULL = 'octo/widgets';
@@ -66,6 +66,19 @@ class FakeCommentsApi {
       throw new GitHubError('POST /repositories/42/issues/100/comments: network error: socket hang up', 0);
     }
     return c;
+  }
+
+  async updateIssueComment(repo: RepoRef, commentId: number, body: string): Promise<GitHubIssueComment> {
+    this.calls.push(`updateComment ${repo.id} ${commentId}`);
+    const c = this.comments.find((x) => x.id === commentId);
+    if (!c) throw new GitHubError('comment not found', 404);
+    c.body = body;
+    return c;
+  }
+
+  /** Who the worker is: its comments carry this login (`allen`, as createIssueComment writes it). */
+  async getWorkerIdentity(): Promise<{ kind: 'user'; login: string; id: number }> {
+    return { kind: 'user', login: 'allen', id: 1 };
   }
 
   get api(): GitHubApi {
@@ -543,6 +556,96 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     expect(r).toMatchObject({ status: 'not-eligible', reason: expect.stringContaining('revision of an existing pull request') as string });
     expect(getPublication(s.db, s.runId)).toBeNull();
     expect(remoteSha(s, s.localBranch)).toBeNull();
+  });
+});
+
+describe('reviseRun with claimReviews: one revision per review across machines', { timeout: 120_000 }, () => {
+  /** The id of the review the scenario's run answers. */
+  const reviewId = (s: RevisionScenario) => (JSON.parse((s.db.prepare('SELECT envelope FROM jobs WHERE id = ?').get(s.jobId) as { envelope: string }).envelope) as { revision: RevisionRequest }).revision.review.id;
+  const claimed = (p: Published, api: FakeCommentsApi, over: Partial<PublishDeps> = {}) => deps(p, api, { claimReviews: true, ...over });
+  /** A comment as another machine's revision of the same review leaves it. */
+  const foreignClaim = (api: FakeCommentsApi, review: string, base: string, head: string, user = 'allen') =>
+    api.comments.push({ id: 900 + api.comments.length, htmlUrl: 'https://github.com/octo/widgets/pull/100#issuecomment-900', body: `Updraft pushed 1 commit(s)\n\n${revisionMarker('run_other')}\n${revisionClaimMarker(review, base, head)}`, user, issue: PR });
+
+  it('announces the push in the comment that then becomes the reply: one comment, written before the push', async () => {
+    const s = await revised(await published());
+    const REVIEW_ID = reviewId(s);
+    const api = new FakeCommentsApi();
+    let atPush: string[] = [];
+    const git = recordingGit({ beforePush: () => (atPush = api.comments.map((c) => c.body)) });
+    const r = await reviseRun(claimed(s, api, { runGit: git.runGit }), s.runId);
+    expect(r).toMatchObject({ status: 'published' });
+    expect(remoteSha(s)).toBe(s.localSha);
+    const marker = revisionClaimMarker(REVIEW_ID, s.baseSha, s.localSha);
+    expect(atPush).toHaveLength(1);
+    expect(atPush[0]).toContain('Updraft is pushing 1 commit(s)');
+    expect(atPush[0]).toContain(marker);
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]!.body).toContain('Updraft pushed 1 commit(s)');
+    expect(api.comments[0]!.body).toContain(marker);
+    expect(api.comments[0]!.body).toContain(revisionMarker(s.runId));
+    expect(await findRevisionClaims(api.api, { id: REPO_ID, fullName: FULL }, PR, REVIEW_ID)).toMatchObject([{ baseSha: s.baseSha, headSha: s.localSha, runId: s.runId }]);
+  });
+
+  it('gives way, without a push or a comment, when the head it started from already holds another run\'s revision for the review', async () => {
+    const p = await published();
+    // Another machine pushed its revision for the review; this run was prepared after that, on top of it.
+    const before = remoteSha(p)!;
+    const theirs = p.f.pushCommit(p.prBranch, 'theirs.txt', 'the other machine\'s revision\n');
+    const s = await revised(p);
+    expect(s.baseSha).toBe(theirs);
+    const api = new FakeCommentsApi();
+    foreignClaim(api, reviewId(s), before, theirs);
+    const git = recordingGit();
+    const r = await reviseRun(claimed(s, api, { runGit: git.runGit }), s.runId);
+    expect(r).toMatchObject({ status: 'skipped' });
+    expect(git.calls.some((c) => c[0] === 'push')).toBe(false);
+    expect(remoteSha(s)).toBe(theirs);
+    expect(api.comments).toHaveLength(1);
+    expect(getRevision(s.db, s.runId)).toMatchObject({ state: 'skipped', pushedAt: null, retryable: false, moved: false });
+    expect(getRevision(s.db, s.runId)!.error).toMatch(/^superseded: /);
+    expect(listDueRevisions(s.db, { now: () => T0 + 24 * 3600_000 })).toEqual([]);
+    // Without claimReviews (the worker): the same run is pushed, as it always was.
+    const s2 = await revised(await published());
+    expect(await reviseRun(deps(s2, new FakeCommentsApi()), s2.runId)).toMatchObject({ status: 'published' });
+  });
+
+  it('ignores a claim whose push never came, and one that the worker did not write', async () => {
+    const s = await revised(await published());
+    const api = new FakeCommentsApi();
+    // A run that announced a push from the same head and died: the branch is still where it was.
+    foreignClaim(api, reviewId(s), s.baseSha, 'a'.repeat(40));
+    // Anybody can write a comment that looks like a claim for the commit the branch is at.
+    foreignClaim(api, reviewId(s), 'b'.repeat(40), s.baseSha, 'mallory');
+    const r = await reviseRun(claimed(s, api), s.runId);
+    expect(r).toMatchObject({ status: 'published' });
+    expect(remoteSha(s)).toBe(s.localSha);
+  });
+
+  it('takes its announcement back when the push fails for good', async () => {
+    const s = await revised(await published());
+    const api = new FakeCommentsApi();
+    const git = recordingGit({ failPushWith: new GitError('git push failed: remote: Permission to octo/widgets.git denied', ['push'], 128, 'remote: Permission to octo/widgets.git denied') });
+    const r = await reviseRun(claimed(s, api, { runGit: git.runGit }), s.runId);
+    // Refused for good (no permission to push): not retried, so nothing is still to come.
+    expect(r).toMatchObject({ status: 'failed', retryable: false, moved: false });
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]!.body).toContain('did not push it');
+    expect(await findRevisionClaims(api.api, { id: REPO_ID, fullName: FULL }, PR, reviewId(s))).toEqual([]);
+  });
+
+  it('still says so on the pull request when it was a person who moved the branch: the announcement becomes the notice', async () => {
+    const s = await revised(await published());
+    const api = new FakeCommentsApi();
+    let theirs = '';
+    const git = recordingGit({ beforePush: () => (theirs = s.f.pushCommit(s.prBranch, 'by-hand.txt', 'pushed between the check and the push\n')) });
+    const r = await reviseRun(claimed(s, api, { runGit: git.runGit }), s.runId);
+    expect(r).toMatchObject({ status: 'failed', moved: true, retryable: false });
+    expect(remoteSha(s)).toBe(theirs);
+    expect(api.comments).toHaveLength(1);
+    expect(api.comments[0]!.body).toContain('did not push it');
+    // No longer a claim: a later revision for the review is free to push.
+    expect(await findRevisionClaims(api.api, { id: REPO_ID, fullName: FULL }, PR, reviewId(s))).toEqual([]);
   });
 });
 

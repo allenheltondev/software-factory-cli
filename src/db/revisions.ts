@@ -292,14 +292,17 @@ export function getReviewRequest(db: Db, repoId: number, reviewId: string): Revi
 
 /**
  * Revision jobs this PR has been given: change requests that queued a job, except those whose
- * job was canceled before it ran to an end. A job that was pruned still counts.
+ * job was canceled before it ran to an end. A job that was pruned still counts, and so does one
+ * that was canceled because another machine had already made the revision ("superseded: ",
+ * src/publish/revision.ts): the pull request got that revision, whoever made it.
  */
 export function countRevisions(db: Db, repoId: number, prNumber: number): number {
   return (
     db
       .prepare(
         `SELECT count(*) AS n FROM review_requests r LEFT JOIN jobs j ON j.id = r.job_id
-         WHERE r.repo_id = ? AND r.pr_number = ? AND r.state = 'queued' AND (j.id IS NULL OR j.status != 'canceled')`,
+         WHERE r.repo_id = ? AND r.pr_number = ? AND r.state = 'queued'
+           AND (j.id IS NULL OR j.status != 'canceled' OR substr(coalesce(j.status_reason, ''), 1, 12) = 'superseded: ')`,
       )
       .get(repoId, prNumber) as { n: number }
   ).n;

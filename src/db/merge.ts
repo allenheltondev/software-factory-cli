@@ -82,6 +82,10 @@ const jobConflict: Resolve = (c) => {
   const mineRebuilt = isReconstructedText(c.mine.status_reason);
   const theirsRebuilt = isReconstructedText(c.theirs.status_reason);
   let winner = mineDone !== theirsDone ? (mineDone ? c.mine : c.theirs) : text(c.mine.updated_at) >= text(c.theirs.updated_at) ? c.mine : c.theirs;
+  // One machine did the job and another called its copy of it off (it saw that the work was
+  // there already): the job was done, whichever of them wrote last.
+  const statuses = [text(c.mine.status), text(c.theirs.status)];
+  if (statuses.includes('succeeded') && statuses.includes('canceled')) winner = c.mine.status === 'succeeded' ? c.mine : c.theirs;
   if (mineRebuilt !== theirsRebuilt) {
     const recorded = mineRebuilt ? c.theirs : c.mine;
     if (TERMINAL.has(text(recorded.status))) winner = recorded;
@@ -158,7 +162,7 @@ export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
     kind: 'keyed',
     conflict: jobConflict,
     rule:
-      'a finished job beats an unfinished one, otherwise the later updated_at wins (this run on a tie); attempts, retries, deferrals and ' +
+      'a finished job beats an unfinished one and a succeeded job a canceled one, otherwise the later updated_at wins (this run on a tie); attempts, retries, deferrals and ' +
       'escalation_hops take the larger value. A job the shared copy pruned is not brought back. A job whose dedupe key (repository, workflow, ' +
       'event) the shared copy already has under another id is folded into that job. A reconstructed row never replaces a finished job a run recorded',
   },

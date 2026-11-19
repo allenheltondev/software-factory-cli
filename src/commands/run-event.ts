@@ -30,7 +30,7 @@ import { countRevisions, getRevisionPr, syncRevisionPrs } from '../db/revisions.
 import { ensureClone, githubCloneUrl, workerNetworkGit, type NetworkGit } from '../git/clone.js';
 import { listRemotes, runGit, selectRepoRemote, type GitOptions } from '../git/git.js';
 import { jobBranchName, withCheckoutLock } from '../git/worktree.js';
-import type { GitHubApi } from '../github/api.js';
+import { GitHubError, type GitHubApi } from '../github/api.js';
 import { redactGitHubSecrets } from '../github/app-auth.js';
 import { appCommitIdentity, type GitHubCredentials } from '../github/credentials.js';
 import { checkJobDispatchable } from '../poller/poller.js';
@@ -40,8 +40,8 @@ import { createAssignmentCommenter, type AssignmentCommenter } from '../publish/
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
 import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
-import { createRevisionPublisher, revisionsEnabled } from '../publish/revision.js';
-import { reviewOf, revisionOf, type RepoRef, type VerificationSummary } from '../types.js';
+import { createRevisionPublisher, findRevisionClaims, revisionsEnabled, SUPERSEDED_PREFIX } from '../publish/revision.js';
+import { reviewOf, revisionOf, type Job, type RepoRef, type VerificationSummary } from '../types.js';
 import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import type { DaemonDeps } from '../worker/daemon.js';
 import { drainQueue, type DrainEnd, type DrainOptions, type DrainResult } from '../worker/drain.js';
@@ -54,6 +54,7 @@ import { println, type CommandContext } from './context.js';
 import { CliError, describeError, EXIT } from './errors.js';
 import { holdEnd, requeueAbandonedJob, settleAbandonedJob, type AbandonedRunSummary } from './run-event-abandoned.js';
 import { readOwnPullRequest, restorePublication } from './run-event-restore.js';
+import { adoptReviewRequests } from './run-event-shared-state.js';
 import { installSignalHandlers } from './start.js';
 
 export interface RunEventOptions {
@@ -67,6 +68,11 @@ export interface RunEventOptions {
   deadlineMinutes?: string;
   /** Fetch with the worker's GitHub credentials even into a clone run-event did not create. */
   workerGitCredentials?: boolean;
+  /**
+   * A copy of the shared state database that the caller keeps fresher than the one this run
+   * started from. Read, never written, before each last look (run-event-shared-state.ts).
+   */
+  sharedState?: string;
 }
 
 export interface RunEventDeps {
@@ -130,6 +136,8 @@ export interface RunEventFinalLook {
   looks: number;
   /** Jobs those reads queued (a person's change request, a head someone pushed), which this run then ran. */
   queued: number;
+  /** Reviews that were not looked at because `--shared-state` showed that another run has them on record. */
+  knownElsewhere: number;
   /** Why a look failed; null when none did. A failed look changes nothing else about the run. */
   error: string | null;
 }
@@ -327,6 +335,34 @@ function describeExisting(e: ExistingWork): string {
         'if no pull request follows, delete the branch and redeliver the event';
 }
 
+/**
+ * The cheap half of "one revision per review" (src/publish/revision.ts): before an agent is
+ * started for a review, ask the pull request whether a revision for that review is there
+ * already. It is when the worker's own identity left a claim for the review on the pull request
+ * and the branch is no longer at the commit that claim started from (or the claim was a reply
+ * that had nothing to push). Returns the reason to cancel the job with, or null.
+ *
+ * A pull request that is still at the commit the review was submitted against has had no push
+ * since the review, so nothing is listed for it: one read of the pull request, usually.
+ */
+async function revisionAnsweredElsewhere(api: GitHubApi, job: Job): Promise<string | null> {
+  const revision = revisionOf(job);
+  if (!revision) return null;
+  const repo = { id: job.repoId, fullName: job.repoFullName };
+  const n = revision.pullRequest.number;
+  let head: string;
+  try {
+    head = (await api.getPullRequest(repo, n)).headSha;
+  } catch (err) {
+    if (err instanceof GitHubError && [301, 404, 410].includes(err.status)) return null; // the ordinary check says what to do about that
+    throw err;
+  }
+  if (revision.review.headSha !== undefined && head === revision.review.headSha) return null;
+  const claim = (await findRevisionClaims(api, repo, n, revision.review.id)).find((c) => c.baseSha !== head || c.headSha === c.baseSha);
+  if (!claim) return null;
+  return `${SUPERSEDED_PREFIX}another run already answered this review on pull request #${n} (${claim.url}${claim.runId ? `, run ${claim.runId}` : ''}); no agent was started`;
+}
+
 function summarizeVerification(v: VerificationSummary | undefined): RunEventJobSummary['verification'] {
   if (!v) return null;
   return { passed: v.passed, commands: v.commands.map((c) => ({ command: c.command, status: c.status })) };
@@ -453,6 +489,7 @@ function jobMessage(j: RunEventJobSummary, outcome: JobOutcome): string {
     case 'publish-failed':
       return `job ${j.jobId} succeeded but was not published: ${j.error}`;
     case 'superseded':
+      if (j.error?.startsWith(SUPERSEDED_PREFIX)) return `job ${j.jobId} succeeded, but another run revised for the same review first; nothing was pushed (${j.error})`;
       return `job ${j.jobId} succeeded, but another run of this event published first; nothing was pushed (${j.error})`;
     case 'not-started':
       return `job ${j.jobId} did not start: ${j.error ?? 'nothing could start it before the run ended'}`;
@@ -921,6 +958,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       workerKind: credentials.kind,
       env: ctx.env,
       scope: eventScope,
+      claimReviews: true,
     });
     const publication = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
     const revising = revisionsEnabled(config) ? createRevisionPublisher(publishDeps('revision'), publication) : publication;
@@ -943,7 +981,11 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
           config,
           paths,
           log: log.child({ component: 'worker' }),
-          checkDispatchable: (job) => checkJobDispatchable({ api, config }, job),
+          checkDispatchable: async (job) => {
+            // Another machine may have revised for this review already, from a state this run never saw: GitHub knows.
+            const elsewhere = await revisionAnsweredElsewhere(api, job);
+            return elsewhere ? { ok: false, reason: elsewhere } : checkJobDispatchable({ api, config }, job);
+          },
           signal: controller.signal,
           executor: createExecutor(config, {
             ...deps.executor,
@@ -966,7 +1008,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     // runs what that queues. A further look needs the one before to have queued something, so
     // this ends by itself; the deadline bounds it like everything else.
     if (loopsOn) {
-      const look: RunEventFinalLook = { looks: 0, queued: 0, error: null };
+      const look: RunEventFinalLook = { looks: 0, queued: 0, knownElsewhere: 0, error: null };
       for (let i = 0; i < MAX_FINAL_LOOKS; i++) {
         if (drained.ended === 'deadline' || drained.ended === 'stopped' || controller.signal.aborted) break;
         const timeLeftMs = deadlineMs === undefined ? undefined : deadlineMs - (Date.now() - startedAt);
@@ -978,7 +1020,19 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
         let queued = 0;
         try {
           for (const p of open) {
-            const polled = await pollRepoReviews({ db: openDb, api, config }, repo, repoCfg, log.child({ component: 'reviews', repo: repo.fullName }), { only: p.prNumber });
+            // What another run has decided about this pull request's reviews since this run's
+            // snapshot, where the caller can say: read after GitHub was, so as late as possible.
+            const sharedState = opts.sharedState;
+            const beforeIngest =
+              sharedState === undefined
+                ? undefined
+                : (prNumber: number) => {
+                    const known = adoptReviewRequests(openDb, resolve(sharedState), p.repoId, prNumber);
+                    look.knownElsewhere += known.adopted;
+                    if (known.skipped) log.warn('--shared-state was not read', { file: sharedState, reason: known.skipped });
+                    else if (known.adopted) log.info('reviews another run has on record are left to it', { pr: prNumber, reviews: known.adopted });
+                  };
+            const polled = await pollRepoReviews({ db: openDb, api, config }, repo, repoCfg, log.child({ component: 'reviews', repo: repo.fullName }), { only: p.prNumber, ...(beforeIngest ? { beforeIngest } : {}) });
             queued += (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0);
           }
         } catch (err) {
@@ -1005,7 +1059,15 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     // 7. What became of it.
     const deferred = drained.ended === 'deferred';
     const jobs = eventJobIds.map((id) => summarizeJob(openDb, config, id));
-    const outcomes = jobs.map((j) => (deferred && j.status === 'queued' ? 'deferred' : jobOutcome(j)));
+    /** A revision that gave way to another run's for the same review: it succeeded, and what it made was not pushed. */
+    const gaveWay = (j: RunEventJobSummary) => j.status === 'succeeded' && j.publication === 'skipped' && (j.publicationError?.startsWith(SUPERSEDED_PREFIX) ?? false);
+    const outcomeOf = (j: RunEventJobSummary): JobOutcome => {
+      if (deferred && j.status === 'queued') return 'deferred';
+      if (!gaveWay(j)) return jobOutcome(j);
+      j.error = j.publicationError;
+      return 'superseded';
+    };
+    const outcomes = jobs.map(outcomeOf);
     // What followed from the event in this run counts as much as the event's own job: a reviewer
     // run that failed, a revision that was not pushed. (A follow-on job that was canceled is not
     // a failure: its pull request was closed, or its review withdrawn.)
@@ -1015,7 +1077,8 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
         const j = summarizeJob(openDb, config, r.id);
         const job = getJob(openDb, r.id);
         const kind = job && reviewOf(job) ? 'review' : job && revisionOf(job) ? 'revision' : 'other';
-        return { ...j, kind, outcome: deferred && j.status === 'queued' ? 'deferred' : jobOutcome(j) };
+        const outcome = outcomeOf(j);
+        return { ...j, kind, outcome };
       });
     // A publication that never pushed, while GitHub has a branch or PR for the event: two runs of
     // the event raced, and the other one's create-only push won.

@@ -251,6 +251,9 @@ class FakeGitHub extends ReviewLoopApiStubs implements GitHubApi {
   async createIssueComment(): Promise<GitHubIssueComment> {
     throw new Error('not used by the poller');
   }
+  async updateIssueComment(): Promise<GitHubIssueComment> {
+    throw new Error('not used by the poller');
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -132,12 +132,58 @@ a second one:
 If the revision run itself fails and `commentOnFailure` is on, the PR gets one short
 [failure comment](failure-comments.md) with the same safety rules as on an issue.
 
+## One revision per review, across machines
+
+One worker with one state database acts on a review once because the review is on record by
+its id. [`updraft run-event`](run-event.md) is one process per event, each with its own copy
+of a [shared state database](shared-state.md), and two of them can meet the same review
+before either has seen the other's record. There, the pull request is what both can read
+and write, and it is used to make sure a review gets **at most one revision push**:
+
+- **The review's commit.** When a review is ingested, the commit it was submitted against
+  (GitHub records it with the review) is kept with the job, as `revision.review.headSha` in
+  the job's envelope. It is the same on every machine. A pull request that is still at that
+  commit has had no push since the review, by anyone.
+- **The announcement.** Before it pushes, a revision posts its comment on the pull request:
+  "Updraft is pushing N commit(s)...". The comment carries, hidden, the review's id and the
+  commits the push is from and to (`<!-- updraft-revision-of: <review id> <from>..<to> -->`).
+  After the push the same comment is edited into the reply described above, and keeps the
+  marker; if the push is refused it is edited into the "did not push" notice, without it. A
+  reply for a run that made no commits carries the marker too (`<from>..<from>`).
+- **Giving way.** A revision does not push when the worker's own identity has left such a
+  marker for the same review, from another run, and that push has happened as far as this
+  run can tell: the announced commit is in the history this run started from, or is where
+  the branch is now. It records itself as `skipped` with a reason beginning `superseded: `,
+  takes back its own announcement if it had made one, and that is all: no notice, no retry.
+  An announcement whose push never came (the machine died in between) gives nobody way.
+  Comments by anyone else are not announcements, whatever they contain.
+- **The push** is the same as ever: a fast-forward from the exact commit the run started
+  from. A run announces before it pushes, so a run that starts from a branch that holds
+  another's revision can always see whose it is; and a run that could not see it did not
+  build on it, so its push is refused.
+- **Before the agent.** `updraft run-event` also asks before it starts a revision's agent
+  ([run-event.md](run-event.md#one-review-one-revision)): a review whose revision is already
+  on the pull request is canceled there, which is the usual way a duplicate ends.
+
+**A person pushing between the review and the revision** is unchanged: the revision starts
+from the branch's current remote head and builds on those commits, and its push is leased on
+that head. The review's commit is not where the revision starts and not what the push is
+leased on, deliberately: starting from it would refuse every revision of a pull request
+somebody pushed to after reviewing, and every second review of the same commit once the
+first one's revision is in. What was wrong before was only that "the current head" could
+already contain another machine's revision for the same review.
+
+The long-running worker does none of this and needs none of it: it posts the reply after the
+push, once, as described above. What it shares with single-event runs is the recorded
+commit of the review, which it does not act on.
+
 ## Limits
 
 - `maxRevisions` (default 3, at most 20) is the number of revision jobs one PR gets, whoever
   asked for them: change requests by people and by Updraft's reviewer count together. A job
-  canceled before it ran does not count; `updraft retry` of a failed revision does not use
-  another. Once the limit is reached, further change requests are recorded and listed in
+  canceled before it ran does not count, unless it was canceled because another machine had
+  already made the revision for that review (the pull request got that revision); `updraft
+  retry` of a failed revision does not use another. Once the limit is reached, further change requests are recorded and listed in
   `updraft status`, not acted on, and one comment on the PR says so. Raising the limit lets
   new reviews through; reviews already recorded as over the limit stay that way.
 - One revision at a time per PR. A change request that arrives while a revision is running

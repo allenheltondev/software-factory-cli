@@ -110,6 +110,14 @@ export interface ReviewSnapshot {
   comments: ReviewCommentSnapshot[];
   /** Inline comments left out: beyond the cap, or not written by an allowed actor. */
   omittedComments: number;
+  /**
+   * The commit the review was submitted against: the pull request's head at that moment, as
+   * GitHub records it with the review. It is the same on every machine that reads the review,
+   * which is what lets one tell that the branch has moved since (docs/revisions.md, "One
+   * revision per review"). Absent for reviews ingested before it was recorded, and when GitHub
+   * does not say.
+   */
+  headSha?: string;
 }
 
 /** The revision a pull_request.changes_requested job carries out. */

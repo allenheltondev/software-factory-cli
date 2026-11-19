@@ -398,19 +398,28 @@ while they work, because a snapshot is only as new as the last upload before it 
 - **Two events for the same pull request at the same moment** (a review and a push, or a review
   that is submitted and then edited). Each run reads the pull request from the API and may queue
   the same revision or the same reviewer run. What they can do: run the agent twice, and post
-  two review comments for the same head commit. What they cannot do: push twice. A revision
-  push only fast-forwards from the exact commit it started from, so the second is refused and
-  changes nothing on the branch (it does leave a comment on the pull request that says so).
+  two reviewer comments for the same head commit. What they cannot do: push two revisions
+  for one review. A revision announces its push on the pull request, only fast-forwards from
+  the exact commit it started from, and gives way to a revision for the same review that is
+  already there ([revisions.md](revisions.md#one-revision-per-review-across-machines)): the
+  second run ends with its job canceled before an agent started, or with its revision
+  `skipped` as `superseded`, and leaves nothing on the pull request.
   Nor can they merge twice or merge the wrong commit: the merge request names the reviewed
   commit, and GitHub refuses it for any other head. In the merge, the second run's revision or
-  reviewer job is folded into the first one's (same event key), `review_requests` keeps the
-  first decision, and `revision_prs` keeps the further-advanced row.
+  reviewer job is folded into the first one's (same event key; a succeeded job beats a
+  canceled one, whichever is merged first), `review_requests` keeps the first decision,
+  `revision_prs` keeps the further-advanced row, and `revisions` has one `published` row and,
+  where the second run got as far as an agent, its `skipped` one.
 - **A review handled in two places.** A person's review that is submitted while the run that
   opened the pull request is still going is acted on by the run its own delivery started (the
   pull request is on record after the first checkpoint), and it is also found by the first
   run's [last look](run-event.md#the-last-look), which does not have the other run's record of
   it. This is the case above with a different timing, and with the same bounds: at most one
-  extra agent run and one extra comment, never two pushes. In the merge, the second revision
+  extra agent run, never two pushes. It used to be able to end in two pushes: the second run
+  started from a branch that already held the first one's revision, so its fast-forward was
+  accepted. Now the last look takes over the other run's record of the review where the
+  caller provides a fresher copy of the shared state (`run-event --shared-state`), and in
+  every case asks the pull request before an agent starts. In the merge, the second revision
   job is folded into the first and `review_requests` keeps the first decision.
 - **A dead run's work waits for its hold.** A run that checkpointed and then vanished (no
   final merge) leaves its jobs `running` or `queued` and its hold in force until `until`. Other

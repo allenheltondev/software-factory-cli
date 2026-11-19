@@ -16,6 +16,7 @@ import { setCooldown } from '../db/capacity.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { mergeState } from '../db/merge.js';
 import { getLoopPr } from '../db/pr-reviews.js';
+import { countRevisions } from '../db/revisions.js';
 import { claimNextJob, getJob } from '../db/queue.js';
 import type { GitHubIssue, GitHubPullRequest } from '../github/api.js';
 import { createUserCredentials } from '../github/credentials.js';
@@ -119,7 +120,7 @@ interface VmOptions {
 function vm(w: World, name: string, o: VmOptions = {}) {
   const home = join(w.f.root, name);
   mkdirSync(join(home, 'prompts'), { recursive: true });
-  for (const p of ['implement', 'revise', 'review']) writeFileSync(join(home, 'prompts', `${p}.md`), `${p} the thing below.\n`);
+  for (const p of ['implement', 'revise', 'review']) writeFileSync(join(home, 'prompts', `${p}.md`), `${p === 'revise' && o.revise ? o.revise : `${p} the thing below.`}\n`);
   const emptyGitConfig = join(home, 'agent gitconfig');
   writeFileSync(emptyGitConfig, '');
   const env = {
@@ -264,7 +265,9 @@ describe('updraft run-event: the whole review loop in one run', { timeout: 180_0
       `open draft PR ${BRANCH} -> main`,
       `comment #${ISSUE}`,
       `review #${PR} COMMENT at ${head1}`,
+      // The revision announces its push on the pull request, and the same comment becomes its reply.
       `comment #${PR}`,
+      `edit comment #${PR}`,
       `review #${PR} COMMENT at ${head2}`,
       `ready PR_node_${PR}`,
       `merge #${PR} squash at ${head2}`,
@@ -279,7 +282,7 @@ describe('updraft run-event: the whole review loop in one run', { timeout: 180_0
     again.download();
     const d = await again.run();
     expect(d.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery', dispatched: false, exitCode: 0, loop: { stage: 'merged', merged: true } });
-    expect(w.gh.writes).toHaveLength(8);
+    expect(w.gh.writes).toHaveLength(9);
     // Only the event lookup itself asked GitHub anything.
     expect(w.gh.calls.slice(calls).filter((c) => c.startsWith('listPullRequestsForHead'))).toEqual([]);
     expect(again.upload()).toMatchObject({ changed: false });
@@ -467,7 +470,12 @@ describe('updraft run-event: pull request events', { timeout: 180_000 }, () => {
     const head2 = remoteHead(w.f, BRANCH);
     expect(head2).not.toBe(head1);
     expect(w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'rev-parse', `${head2}~1`)).toBe(head1);
-    expect(w.gh.writes.slice(-1)).toEqual([`comment #${PR}`]);
+    // One comment: announced before the push, and replaced by the reply after it.
+    expect(w.gh.writes.slice(-2)).toEqual([`comment #${PR}`, `edit comment #${PR}`]);
+    const reply = w.gh.comments.filter((c) => c.issue === PR);
+    expect(reply).toHaveLength(1);
+    expect(reply[0]!.body).toContain('Updraft pushed 1 commit(s)');
+    expect(reply[0]!.body).toContain(`<!-- updraft-revision-of: ${w.gh.humanReviews[0]!.id} ${head1}..${head2} -->`);
     expect(v.upload().tables.review_requests).toMatchObject({ inserted: 1 });
     expect(jobsOf(w.shared)).toEqual([
       ['issue.labeled', 'succeeded'],
@@ -998,5 +1006,154 @@ describe('updraft run-event: a run that checkpointed and then vanished', { timeo
     expect(r.summary.message).toContain('updraft retry');
     expect(existsSync(w.received)).toBe(false);
     expect(withDb(late.state, (db) => getJob(db, JOB_ID))).toMatchObject({ status: 'interrupted' });
+  });
+});
+
+describe('updraft run-event: one review, two machines', { timeout: 180_000 }, () => {
+  const REVISE = { revise: true };
+  /** A pull request on record in the shared state, a change request on it, and two machines that both start from that state. */
+  async function twoMachines() {
+    const w = world();
+    const first = vm(w, 'vm publish', { repo: REVISE });
+    expect((await first.run()).code).toBe(0);
+    first.upload();
+    rmSync(w.received, { force: true });
+    const head1 = remoteHead(w.f, BRANCH);
+    const review = w.gh.humanReview('allen', 'CHANGES_REQUESTED', 'Please add a second line.');
+    const a = vm(w, 'vm a', { payload: pullRequestEvent('submitted'), repo: REVISE, revise: 'revise it the way machine A does.' });
+    const b = vm(w, 'vm b', { payload: pullRequestEvent('submitted'), repo: REVISE, revise: 'revise it the way machine B does.' });
+    a.download();
+    b.download();
+    return { w, a, b, head1, review };
+  }
+  const parentOf = (w: World, sha: string) => w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'rev-parse', `${sha}~1`);
+  const revisionsOf = (file: string) =>
+    withDb(file, (db) => db.prepare('SELECT state, pushed_at IS NOT NULL AS pushed, substr(coalesce(error, \'\'), 1, 11) AS why FROM revisions ORDER BY state').all() as Array<{ state: string; pushed: number; why: string }>);
+  /** Merge the two machines' databases into a copy of the shared one, in the given order, and return what is on record. */
+  function merged(w: World, order: Array<ReturnType<typeof vm>>, name: string) {
+    const into = join(w.f.root, `${name}.db`);
+    copyFileSync(w.shared, into);
+    for (const m of order) mergeState({ changed: m.state, base: join(m.home, 'snapshot.db'), into });
+    return withDb(into, (db) => ({
+      jobs: (db.prepare("SELECT status FROM jobs WHERE event_id LIKE 'review:%'").all() as Array<{ status: string }>).map((j) => j.status),
+      requests: db.prepare('SELECT r.state, j.status AS job FROM review_requests r LEFT JOIN jobs j ON j.id = r.job_id').all(),
+      revisions: db.prepare("SELECT state, substr(coalesce(error, ''), 1, 11) AS why FROM revisions ORDER BY state").all(),
+      rounds: countRevisions(db, REPO_ID, PR),
+      dangling: db.prepare('SELECT count(*) AS n FROM runs WHERE job_id NOT IN (SELECT id FROM jobs)').get(),
+    }));
+  }
+  const ONE_REVISION = { jobs: ['succeeded'], requests: [{ state: 'queued', job: 'succeeded' }], rounds: 1, dangling: { n: 0 } };
+
+  it('one after the other: the second machine finds the first one\'s push on GitHub and starts no agent', async () => {
+    const { w, a, b, head1 } = await twoMachines();
+    const ra = await a.run({ eventName: 'pull_request_review', deliveryId: 'd-a' });
+    expect(ra.summary).toMatchObject({ outcome: 'succeeded', exitCode: 0, publication: 'published' });
+    const head2 = remoteHead(w.f, BRANCH);
+    expect(parentOf(w, head2)).toBe(head1);
+    rmSync(w.received);
+    const writes = w.gh.writes.length;
+
+    // Machine B knows nothing of that: its snapshot is from before the review.
+    const rb = await b.run({ eventName: 'pull_request_review', deliveryId: 'd-b' });
+    expect(rb.code).toBe(0);
+    expect(rb.summary).toMatchObject({ outcome: 'canceled', reason: 'canceled-before-start', status: 'canceled', exitCode: 0, failureCommentUrl: null, loop: { rounds: 1 } });
+    expect(rb.summary.error).toMatch(/^superseded: /);
+    expect(existsSync(w.received)).toBe(false);
+    expect(remoteHead(w.f, BRANCH)).toBe(head2);
+    expect(w.gh.writes).toHaveLength(writes);
+    expect(revisionsOf(b.state)).toEqual([]);
+
+    // The shared state afterwards, whichever machine's merge comes first: one revision, published.
+    for (const [name, order] of [['a first', [a, b]], ['b first', [b, a]]] as const) {
+      expect(merged(w, [...order], name)).toMatchObject({ ...ONE_REVISION, revisions: [{ state: 'published', why: '' }] });
+    }
+  });
+
+  it('at the same time: both run their agent, one push is accepted, and the other ends quietly as superseded', async () => {
+    const { w, a, b, head1 } = await twoMachines();
+    // Machine A does everything, start to end, at the moment machine B is about to push.
+    let other: Awaited<ReturnType<typeof a.run>> | undefined;
+    const post = w.gh.createIssueComment.bind(w.gh);
+    w.gh.createIssueComment = async (...args) => {
+      if (!other) {
+        other = { code: -1 } as Awaited<ReturnType<typeof a.run>>;
+        other = await a.run({ eventName: 'pull_request_review', deliveryId: 'd-a' });
+      }
+      return post(...args);
+    };
+    const rb = await b.run({ eventName: 'pull_request_review', deliveryId: 'd-b' });
+    expect(other?.summary).toMatchObject({ outcome: 'succeeded', exitCode: 0, publication: 'published' });
+    const head2 = remoteHead(w.f, BRANCH);
+    // One commit on top of the head the review was for: machine A's.
+    expect(parentOf(w, head2)).toBe(head1);
+    expect(head2).toBe(other?.summary.headSha);
+
+    expect(rb.code).toBe(0);
+    expect(rb.summary).toMatchObject({ outcome: 'superseded', reason: 'published-by-another-run', status: 'succeeded', runOutcome: 'succeeded', publication: 'skipped', exitCode: 0, failureCommentUrl: null });
+    expect(rb.summary.publicationError).toMatch(/^superseded: /);
+    expect(revisionsOf(a.state)).toEqual([{ state: 'published', pushed: 1, why: '' }]);
+    expect(revisionsOf(b.state)).toEqual([{ state: 'skipped', pushed: 0, why: 'superseded:' }]);
+    // What is left on the pull request: machine A's reply, and one line where machine B had announced its push.
+    const comments = w.gh.comments.filter((c) => c.issue === PR).map((c) => c.body);
+    expect(comments.filter((c) => c.includes('Updraft pushed 1 commit(s)'))).toHaveLength(1);
+    expect(comments.filter((c) => c.includes('<!-- updraft-revision-of: '))).toHaveLength(1);
+    expect(comments.filter((c) => c.includes('did not push'))).toEqual([]);
+
+    for (const [name, order] of [['a first', [a, b]], ['b first', [b, a]]] as const) {
+      expect(merged(w, [...order], name)).toMatchObject({
+        ...ONE_REVISION,
+        revisions: [
+          { state: 'published', why: '' },
+          { state: 'skipped', why: 'superseded:' },
+        ],
+      });
+    }
+  });
+
+  it('the last look of the run that opened the pull request skips a review another machine has pushed for', async () => {
+    for (const sharedState of [false, true]) {
+      const w = world();
+      const x = vm(w, 'vm issue', { repo: REVISE, revise: 'revise it the way the issue run does.' });
+      // While the issue run is at its last look: its checkpoint is in the shared state, a person
+      // requests changes, and the machine that delivery starts revises and pushes.
+      let reviewVm: Awaited<ReturnType<typeof x.run>> | undefined;
+      const read = w.gh.getPullRequestReviews.bind(w.gh);
+      w.gh.getPullRequestReviews = async (...args) => {
+        if (!reviewVm) {
+          reviewVm = { code: -1 } as Awaited<ReturnType<typeof x.run>>;
+          mergeState({ changed: x.state, into: w.shared, live: true });
+          w.gh.humanReview('allen', 'CHANGES_REQUESTED', 'Please add a second line.');
+          const a = vm(w, 'vm review', { payload: pullRequestEvent('submitted'), repo: REVISE, revise: 'revise it the way the review machine does.' });
+          a.download();
+          reviewVm = await a.run({ eventName: 'pull_request_review' });
+          a.upload();
+          rmSync(w.received);
+        }
+        return read(...args);
+      };
+      const r = await x.run(sharedState ? { sharedState: w.shared } : {});
+      expect(reviewVm?.summary).toMatchObject({ outcome: 'succeeded', publication: 'published' });
+      const head2 = remoteHead(w.f, BRANCH);
+      expect(head2).toBe(reviewVm?.summary.headSha);
+      expect(r.code).toBe(0);
+      expect(r.summary).toMatchObject({ outcome: 'succeeded', exitCode: 0, publication: 'published' });
+      // No second agent run and no second push, either way.
+      expect(existsSync(w.received)).toBe(false);
+      expect(w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'rev-list', '--count', `main..${head2}`)).toBe('2');
+      if (sharedState) {
+        // The fresher copy of the shared state had the review on record: it was never queued here.
+        expect(r.summary.finalLook).toMatchObject({ queued: 0, knownElsewhere: 1, error: null });
+        expect(r.summary.followOnJobs).toBeUndefined();
+      } else {
+        // Without it GitHub said so, before any agent started.
+        expect(r.summary.finalLook).toMatchObject({ queued: 1, knownElsewhere: 0, error: null });
+        expect(r.summary.followOnJobs).toMatchObject([{ kind: 'revision', status: 'canceled', outcome: 'canceled' }]);
+      }
+      x.upload();
+      withDb(w.shared, (db) => {
+        expect(db.prepare('SELECT state FROM revisions').all()).toEqual([{ state: 'published' }]);
+        expect(countRevisions(db, REPO_ID, PR)).toBe(1);
+      });
+    }
   });
 });
