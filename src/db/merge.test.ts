@@ -583,7 +583,7 @@ describe('updraft state merge / info', () => {
       changed: true,
       schemaVersion: SCHEMA_VERSION,
       created: false,
-      tables: { jobs: { inserted: 1, updated: 0, appended: 0, conflicts: 0, dropped: 0 }, runs: { inserted: 1 }, metric_events: { appended: 2 } },
+      tables: { jobs: { inserted: 1, updated: 0, appended: 0, conflicts: 0, dropped: 0 }, runs: { inserted: 1 }, metric_events: { appended: 3 } },
       totals: { inserted: 2 },
       exitCode: 0,
     });

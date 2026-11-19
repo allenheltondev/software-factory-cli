@@ -80,7 +80,7 @@ merge by primary key, table by table, not a file copy.
 {
   "ok": true,
   "changed": true,
-  "schemaVersion": 15,
+  "schemaVersion": 16,
   "created": false,
   "migratedFrom": null,
   "tables": {
