@@ -2,7 +2,8 @@
 // real AWS clients and the image's settings to runJob (job.mjs) and exits when it is done.
 import os from 'node:os';
 import { createAwsDeps } from './aws.mjs';
-import { parseRunRequest } from './hooks.mjs';
+import { createBrokerClient, startBrokerJob } from './broker.mjs';
+import { BROKER_PAYLOAD_VERSION, parseRunRequest } from './hooks.mjs';
 import { SANDBOX_IMAGE, SANDBOX_RUNTIME, createNftFilter, credentialEndpoints } from './isolation.mjs';
 import { runJob } from './job.mjs';
 
@@ -61,8 +62,25 @@ async function main() {
     isolation = { setupProblem: error?.message ?? String(error) };
   }
 
-  const result = await runJob(request, {
-    ...createAwsDeps(request.payload.region),
+  // Version 2 (Updraft Cloud): the job's data and its credentials come from the job broker, and
+  // reach only this tenant's; the execution role reaches no tenant's data itself.
+  let job = { request, aws: createAwsDeps(request.payload.region) };
+  if (request.payload.version === BROKER_PAYLOAD_VERSION) {
+    try {
+      const client = createBrokerClient({ ...request.payload.broker, region: request.payload.region });
+      const started = await startBrokerJob(request.payload, { client, createAwsDeps });
+      job = { request: { ...request, payload: started.payload }, aws: started.deps };
+    } catch (error) {
+      // Without the broker there is nowhere to report to; stop the microVM rather than bill it.
+      log(`the job broker did not start this job: ${error?.message ?? error}`);
+      await job.aws.terminate(request.microvmId).catch(() => {});
+      process.exitCode = 2;
+      return;
+    }
+  }
+
+  const result = await runJob(job.request, {
+    ...job.aws,
     isolation,
     stateRoot: process.env.UPDRAFT_STATE_ROOT ?? '/var/lib/updraft-jobs',
     updraftCommand: [process.env.UPDRAFT_COMMAND ?? 'updraft'],

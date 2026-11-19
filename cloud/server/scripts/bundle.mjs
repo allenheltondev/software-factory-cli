@@ -12,7 +12,7 @@ const outdir = join(root, 'dist');
 rmSync(outdir, { recursive: true, force: true });
 
 await build({
-  entryPoints: { index: join(root, 'src', 'lambda.ts'), webhook: join(root, 'src', 'webhook-lambda.ts'), cleanup: join(root, 'src', 'cleanup-lambda.ts') },
+  entryPoints: { index: join(root, 'src', 'lambda.ts'), webhook: join(root, 'src', 'webhook-lambda.ts'), cleanup: join(root, 'src', 'cleanup-lambda.ts'), broker: join(root, 'src', 'broker-lambda.ts') },
   // The Node.js 22 runtime ships AWS SDK v3; use it rather than bundling a copy.
   external: ['@aws-sdk/*'],
   outdir,

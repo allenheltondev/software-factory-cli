@@ -415,6 +415,116 @@ describe.runIf(onLinuxLikeHost)('runJob: logs and deduplication record', () => {
   });
 });
 
+/** A version 2 (Updraft Cloud) job as startBrokerJob hands it to runJob: the descriptor filled in. */
+function brokerRequest(overrides = {}) {
+  const { payload, microvmId } = request();
+  const rest = { ...payload };
+  delete rest.secrets;
+  return {
+    microvmId,
+    payload: {
+      ...rest,
+      version: 2,
+      broker: { functionName: 'broker', jobId: 'job_abc12345', jobToken: 'x'.repeat(43) },
+      agentKeySecrets: {
+        ANTHROPIC_API_KEY: 'updraft/tenants/55/agent-keys/ANTHROPIC_API_KEY',
+        OPENAI_API_KEY: 'updraft/tenants/55/agent-keys/OPENAI_API_KEY',
+        FAKE_UPDRAFT_MODE: 'updraft/tenants/55/agent-keys/FAKE_UPDRAFT_MODE',
+        FAKE_UPDRAFT_RECORD: 'updraft/tenants/55/agent-keys/FAKE_UPDRAFT_RECORD',
+      },
+      ...overrides,
+    },
+  };
+}
+
+const tokenFile = (n) => ({
+  app: { id: 1, slug: 'updraft-cloud' },
+  installationId: 55,
+  token: `ghs_job_token_${n}`,
+  expiresAt: new Date(START + 3_600_000).toISOString(),
+  permissions: { contents: 'write' },
+  repositories: ['o/r'],
+  bot: { id: 777, login: 'updraft-cloud[bot]' },
+});
+
+function brokerDeps(mode, overrides = {}) {
+  const harness = fakeDeps(mode, {
+    ...overrides,
+    secrets: {
+      // The tenant set no OpenAI key: that secret does not exist.
+      'updraft/tenants/55/agent-keys/ANTHROPIC_API_KEY': 'sk-ant-tenant',
+      'updraft/tenants/55/agent-keys/FAKE_UPDRAFT_MODE': mode,
+      'updraft/tenants/55/agent-keys/FAKE_UPDRAFT_RECORD': recordFile,
+      ...overrides.secrets,
+    },
+  });
+  let issued = 0;
+  harness.deps.githubToken = async () => {
+    harness.calls.push(['githubToken']);
+    issued += 1;
+    return tokenFile(issued);
+  };
+  harness.deps.finishJob = async (outcome) => {
+    harness.calls.push(['finishJob', outcome]);
+  };
+  return harness;
+}
+
+describe.runIf(onLinuxLikeHost)('runJob, version 2 (job broker)', () => {
+  it('gives the job an installation token instead of the key, the tenant\'s keys as its environment, and finishes the job', async () => {
+    const { deps, calls } = brokerDeps('success');
+    const result = await runJob(brokerRequest(), deps);
+    expect(result.outcome).toBe('succeeded');
+
+    const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+    expect(record.keyMode).toBeNull();
+    expect(record.token).toEqual(tokenFile(1));
+    expect(record.tokenMode).toBe(0o600);
+    expect(record.env.ANTHROPIC_API_KEY).toBe('sk-ant-tenant');
+    expect(record.env).not.toHaveProperty('OPENAI_API_KEY');
+    expect(JSON.stringify(record.env)).not.toContain('ghs_job_token');
+
+    // No key secret is read at all; the job is finished with the broker before the microVM goes.
+    expect(calls.filter(([name, id]) => name === 'getSecret' && !id.startsWith('updraft/tenants/55/'))).toEqual([]);
+    expect(names(calls).slice(-3)).toEqual(['s3Put', 'finishJob', 'terminate']);
+    expect(calls.find(([name]) => name === 'finishJob')).toEqual(['finishJob', 'succeeded']);
+  });
+
+  it('replaces the token file while the job runs', async () => {
+    const { deps, calls } = brokerDeps('slow-state', {
+      deps: { tokenRefreshMs: 40 },
+      secrets: { 'updraft/tenants/55/agent-keys/FAKE_UPDRAFT_SLOW_ROWS': '["a","b","c"]' },
+    });
+    const req = brokerRequest();
+    req.payload.agentKeySecrets.FAKE_UPDRAFT_SLOW_ROWS = 'updraft/tenants/55/agent-keys/FAKE_UPDRAFT_SLOW_ROWS';
+    const result = await runJob(req, deps);
+    expect(result.outcome).toBe('succeeded');
+    expect(calls.filter(([name]) => name === 'githubToken').length).toBeGreaterThan(2);
+  });
+
+  it('reports a runner error, without starting updraft, when the broker gives no token', async () => {
+    const { deps, calls } = brokerDeps('success');
+    deps.githubToken = async () => ({ token: 42 });
+    const result = await runJob(brokerRequest(), deps);
+    expect(result.outcome).toBe('runner_error');
+    expect(result.error).toMatch(/no usable GitHub token/);
+    expect(fs.existsSync(recordFile)).toBe(false);
+    expect(names(calls).slice(-2)).toEqual(['finishJob', 'terminate']);
+  });
+
+  it('still terminates when the broker cannot be told the job is over', async () => {
+    const { deps, calls, logs } = brokerDeps('success');
+    deps.finishJob = async () => {
+      calls.push(['finishJob']);
+      throw new Error('the job broker refused finish (refused)');
+    };
+    const result = await runJob(brokerRequest(), deps);
+    expect(result.outcome).toBe('succeeded');
+    expect(calls.at(-1)[0]).toBe('terminate');
+    expect(logs.join('\n')).toMatch(/refused finish/);
+  });
+});
+
 describe('deadlineMinutes', () => {
   it('leaves the margin between run-event\'s deadline and the watchdog', () => {
     expect(deadlineMinutes(6_900_000)).toBe(112);

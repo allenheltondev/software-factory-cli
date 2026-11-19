@@ -25,9 +25,13 @@ import {
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
 const KEY_FILE = 'github-app.pem';
+/** Version 2 (Updraft Cloud): an installation token for the job's repository instead of the key. */
+const TOKEN_FILE = 'app-token.json';
 const EVENT_FILE = 'event.json';
 const CONFIG_FILE = 'config.yaml';
-const RESERVED_FILES = new Set([KEY_FILE, EVENT_FILE, STATE_DB_FILE, `${STATE_DB_FILE}-wal`, `${STATE_DB_FILE}-shm`]);
+const RESERVED_FILES = new Set([KEY_FILE, TOKEN_FILE, EVENT_FILE, STATE_DB_FILE, `${STATE_DB_FILE}-wal`, `${STATE_DB_FILE}-shm`]);
+/** How often a version 2 job's token file is replaced (installation tokens last an hour). */
+const TOKEN_REFRESH_MS = 20 * 60 * 1000;
 /** The longest the runner waits for a coalescing window to close (the launcher's limit, plus slack). */
 const MAX_NOT_BEFORE_WAIT_MS = 310 * 1000;
 
@@ -256,6 +260,7 @@ export async function runJob(request, deps) {
   // Registered first, so that a /terminate during preparation is not lost.
   let stopRequested = false;
   let stopChild = () => {};
+  let stopTokenRefresh = () => {};
   let stopWaiting = () => {};
   let hurrySync = () => {};
   deps.onStop?.(() => {
@@ -280,7 +285,7 @@ export async function runJob(request, deps) {
     // or the credentials. Throws IsolationError; the job then never starts.
     await verifyIsolation(
       result.isolation,
-      { stateDir, protectedFiles: [KEY_FILE, STATE_DB_FILE, CONFIG_FILE, EVENT_FILE].map((name) => path.join(stateDir, name)) },
+      { stateDir, protectedFiles: [payload.version === 2 ? TOKEN_FILE : KEY_FILE, STATE_DB_FILE, CONFIG_FILE, EVENT_FILE].map((name) => path.join(stateDir, name)) },
       deps,
     );
     // A pull request event that other deliveries were coalesced into: start only when the
@@ -311,6 +316,9 @@ export async function runJob(request, deps) {
     const pendingWaitMs = (payload.statePendingWaitSeconds ?? DEFAULT_STATE_PENDING_WAIT_SECONDS) * 1000;
     const checkpointMs = (payload.stateCheckpointSeconds ?? DEFAULT_CHECKPOINT_SECONDS) * 1000;
     const checkpoints = [];
+    // Version 2: the token in the token file lasts an hour; replace it well before that, for as
+    // long as the job runs (Updraft reads the file again for every token it needs).
+    if (payload.version === 2) stopTokenRefresh = startTokenRefresh(stateDir, deps);
     for (;;) {
       // Checkpoints: what the run records (the pull request it opened, above all) reaches the
       // shared database while it runs, not only at its end. Stopped before anything else
@@ -401,6 +409,7 @@ export async function runJob(request, deps) {
     }
     log(`job could not run: ${result.error}`);
   }
+  stopTokenRefresh();
 
   // Save what the run changed in the shared state, whatever the job's outcome: a failed run
   // also recorded things later runs need (a capacity cooldown, a review it has seen).
@@ -470,6 +479,14 @@ export async function runJob(request, deps) {
       log(`could not remove the deduplication record; a redelivery is refused until it expires: ${error?.message ?? error}`);
     }
   }
+  // Version 2: tell the broker the job is over, so nothing more is served for its token.
+  if (payload.version === 2 && deps.finishJob) {
+    try {
+      await retry(() => deps.finishJob(result.outcome), deps);
+    } catch (error) {
+      log(`could not tell the job broker the job finished; its token stops working at the maximum duration: ${error?.message ?? error}`);
+    }
+  }
   // Whatever happened, do not leave the microVM running (and billed) until its maximum
   // duration. If this fails too, the maximum duration is the backstop.
   try {
@@ -530,11 +547,17 @@ async function prepare(payload, deps) {
   }
   if (!sawConfig) throw new Error(`no ${CONFIG_FILE} at s3://${payload.bucket}/${payload.configPrefix}${CONFIG_FILE}`);
 
-  const privateKey = await deps.getSecret(payload.secrets.githubAppPrivateKey);
-  if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(privateKey ?? '')) {
-    throw new Error('the GitHub App private key secret is empty or not a PEM private key');
+  if (payload.version === 2) {
+    // Updraft Cloud: no key in the job at all. An installation token for this job's repository,
+    // which the tenant's compiled config reads (github.app.tokenFile: ./app-token.json).
+    await writeTokenFile(stateDir, await deps.githubToken(), deps);
+  } else {
+    const privateKey = await deps.getSecret(payload.secrets.githubAppPrivateKey);
+    if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(privateKey ?? '')) {
+      throw new Error('the GitHub App private key secret is empty or not a PEM private key');
+    }
+    await fs.writeFile(path.join(stateDir, KEY_FILE), privateKey.endsWith('\n') ? privateKey : `${privateKey}\n`, { mode: 0o600 });
   }
-  await fs.writeFile(path.join(stateDir, KEY_FILE), privateKey.endsWith('\n') ? privateKey : `${privateKey}\n`, { mode: 0o600 });
 
   // Last, so that the snapshot is as fresh as it can be when the job starts.
   let state;
@@ -548,6 +571,55 @@ async function prepare(payload, deps) {
 
   if (jobUser.uid !== undefined && jobUser.gid !== undefined) await chownTree(stateDir, jobUser.uid, jobUser.gid);
   return { stateDir, state };
+}
+
+/**
+ * Writes the token file (Updraft's github.app.tokenFile format) owner-only, by writing a new file
+ * and renaming it over the old one, so Updraft never reads half a file. Owned by the job user,
+ * like the rest of the state directory. Never logged.
+ */
+async function writeTokenFile(stateDir, document, deps) {
+  if (!document || typeof document.token !== 'string' || typeof document.expiresAt !== 'string') {
+    throw new Error('the job broker returned no usable GitHub token');
+  }
+  const target = path.join(stateDir, TOKEN_FILE);
+  const temp = path.join(stateDir, `.${TOKEN_FILE}.${process.pid}.tmp`);
+  await fs.writeFile(temp, `${JSON.stringify(document)}\n`, { mode: 0o600, flag: 'wx' });
+  const { uid, gid } = deps.jobUser;
+  if (uid !== undefined && gid !== undefined) await fs.lchown(temp, uid, gid);
+  await fs.rename(temp, target);
+}
+
+/**
+ * Replaces the token file every TOKEN_REFRESH_MS while the job runs. A failed refresh is logged
+ * and retried on the next tick; the token in place stays valid for the rest of its hour.
+ */
+function startTokenRefresh(stateDir, deps) {
+  const timer = setInterval(() => {
+    deps
+      .githubToken()
+      .then((document) => writeTokenFile(stateDir, document, deps))
+      .catch((error) => deps.log(`could not refresh the GitHub token: ${error?.message ?? error}`));
+  }, deps.tokenRefreshMs ?? TOKEN_REFRESH_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+/**
+ * A version 2 job's agent environment: the tenant's key secrets the broker named, read with the
+ * tenant-scoped credentials. A secret that does not exist is a key the tenant has not set.
+ */
+async function brokerAgentEnv(payload, deps) {
+  const env = {};
+  for (const [name, secretId] of Object.entries(payload.agentKeySecrets ?? {})) {
+    try {
+      const value = await deps.getSecret(secretId);
+      if (value) env[name] = value;
+    } catch (error) {
+      if (!/ResourceNotFound/.test(`${error?.name ?? ''} ${error?.message ?? ''}`)) throw error;
+    }
+  }
+  return env;
 }
 
 /**
@@ -657,7 +729,7 @@ async function uploadLogs(stateDir, summary, keyPrefix, bucket, deps) {
 async function runUpdraft(payload, stateDir, budgetMs, deadline, deps, registerStop) {
   const spawn = deps.spawn ?? nodeSpawn;
   const killGraceMs = deps.killGraceMs ?? 20_000;
-  const agentEnv = parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
+  const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
   const [command, ...leading] = deps.updraftCommand;
   const args = [
     ...leading,

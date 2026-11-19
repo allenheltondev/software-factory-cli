@@ -61,7 +61,18 @@ export interface GitHubApi {
   getOrgMembership(userToken: string, org: string): Promise<OrgMembership | null>;
   /** The App's view of one installation (GET /app/installations/{id}), or null when it is not ours. */
   getInstallation(appJwt: string, installationId: number): Promise<GitHubInstallation | null>;
-  createInstallationToken(appJwt: string, installationId: number): Promise<{ token: string; expiresAt: number }>;
+  /**
+   * An installation token. With `scope`, one that reaches only those repositories and has only
+   * those permissions (POST /app/installations/{id}/access_tokens with repository_ids and
+   * permissions): what a job gets, so it can touch nothing but its own repository.
+   */
+  createInstallationToken(
+    appJwt: string,
+    installationId: number,
+    scope?: { repositoryIds: number[]; permissions: Record<string, string> },
+  ): Promise<{ token: string; expiresAt: number; permissions?: Record<string, string> }>;
+  /** The App's bot user (`<slug>[bot]`), read with any token. */
+  getBotUser(token: string, slug: string): Promise<GitHubUser>;
   listInstallationRepositories(installationToken: string): Promise<GitHubRepository[]>;
 }
 
@@ -141,12 +152,21 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       };
     },
 
-    async createInstallationToken(jwt, installationId) {
-      const out = await json<Json>(
-        await call(`/app/installations/${installationId}/access_tokens`, jwt, { method: 'POST' }),
-        'POST /app/installations/access_tokens',
-      );
-      return { token: String(out.token), expiresAt: Date.parse(String(out.expires_at)) };
+    async createInstallationToken(jwt, installationId, scope) {
+      const init: RequestInit = { method: 'POST' };
+      if (scope) {
+        init.body = JSON.stringify({ repository_ids: scope.repositoryIds, permissions: scope.permissions });
+        init.headers = { 'content-type': 'application/json' };
+      }
+      const out = await json<Json>(await call(`/app/installations/${installationId}/access_tokens`, jwt, init), 'POST /app/installations/access_tokens');
+      const permissions = out.permissions && typeof out.permissions === 'object' ? (out.permissions as Record<string, string>) : undefined;
+      return { token: String(out.token), expiresAt: Date.parse(String(out.expires_at)), ...(permissions ? { permissions } : {}) };
+    },
+
+    async getBotUser(token, slug) {
+      const login = `${slug}[bot]`;
+      const u = await json<Json>(await call(`/users/${encodeURIComponent(login)}`, token), 'GET /users/<bot>');
+      return { id: Number(u.id), login: String(u.login ?? login) };
     },
 
     async listInstallationRepositories(token) {

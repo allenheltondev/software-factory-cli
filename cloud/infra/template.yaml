@@ -358,6 +358,158 @@ Resources:
                 aws:SecureTransport: false
 
   # ---------------------------------------------------------------------------
+  # Jobs (#68): every tenant's jobs run in microVMs with one execution role, which therefore reaches
+  # no tenant's data. A job's runner invokes the job broker (server/src/broker/broker.ts) with its
+  # single-use job token and gets back what that one job may have: AWS credentials from JobDataRole
+  # with a session policy for its tenant's prefix and key secrets, and an installation token for its
+  # one repository. The App's private key never enters a microVM. The MicroVM image and the
+  # launcher that starts jobs come next (#68, PR 4).
+  # ---------------------------------------------------------------------------
+  BrokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: broker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Jobs and their tenants only: read a job and its tenant, mark a job finished.
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt UpdraftTable.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys:
+                      - 'JOB#*'
+                      - 'TENANT#*'
+              - Effect: Allow
+                Action: ssm:GetParameter*
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/updraft/app/*
+              # The App's private key, to mint installation tokens. It stays in the broker.
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
+
+  # Separate from BrokerRole, which JobDataRole's trust policy names (an inline policy would be a cycle).
+  BrokerAssumeJobDataPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: assume-job-data
+      Roles:
+        - !Ref BrokerRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !GetAtt JobDataRole.Arn
+
+  # Never used as it is: the broker assumes it with a session policy for one job (jobSessionPolicy),
+  # and AWS intersects the two. What it allows here is the most any job's credentials could have.
+  JobDataRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Role chaining caps a session at an hour anyway; the runner asks for new credentials.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt BrokerRole.Arn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: tenant-data
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub ${TenantBucket.Arn}/tenants/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt TenantBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: tenants/*
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/tenants/*
+
+  BrokerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: BrokerAssumeJobDataPolicy
+    Properties:
+      CodeUri: ../server/dist
+      Handler: broker.handler
+      Role: !GetAtt BrokerRole.Arn
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UpdraftTable
+          TENANT_BUCKET: !Ref TenantBucket
+          JOB_DATA_ROLE_ARN: !GetAtt JobDataRole.Arn
+          PARTITION: !Ref AWS::Partition
+          ACCOUNT_ID: !Ref AWS::AccountId
+          NODE_OPTIONS: --enable-source-maps
+
+  # Runtime logs of the job microVMs (one stream per microVM), with a retention period.
+  MicrovmLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda-microvms/${AWS::StackName}-job
+      RetentionInDays: 30
+
+  # Assumed by Lambda for a running microVM. Everything in a microVM, agents included, must be
+  # assumed able to use it, so it reaches no tenant's data: it can ask the broker for one job's
+  # (with that job's token), stop a microVM, and write logs.
+  MicrovmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: job
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt BrokerFunction.Arn
+              # Authorised against the image ARN, so any microVM of this image, not only its own.
+              - Effect: Allow
+                Action: lambda:TerminateMicrovm
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/${AWS::StackName}-job
+                  - !GetAtt MicrovmLogGroup.Arn
+
+  # ---------------------------------------------------------------------------
   # Hosting: a private S3 bucket and one CloudFront distribution with two origins, so the browser
   # sees a single origin for the app and the API (no CORS, relative /api/v1 paths).
   # ---------------------------------------------------------------------------
@@ -554,3 +706,9 @@ Outputs:
   TenantBucket:
     Description: Tenant config bundles, state and results, under tenants/<installationId>/
     Value: !Ref TenantBucket
+  BrokerFunctionName:
+    Description: The job broker; a job's runner invokes it with its job token
+    Value: !Ref BrokerFunction
+  MicrovmExecutionRoleArn:
+    Description: The one execution role of every job microVM (it reaches no tenant's data itself)
+    Value: !GetAtt MicrovmExecutionRole.Arn

@@ -19,7 +19,9 @@ import { compileTenantConfig, type CompileResult, type ConfigIssue, type Platfor
  * so publishing never changes a job already running.
  */
 
-export const configPrefix = (installationId: number, version: number) => `tenants/${installationId}/config/${version}/`;
+import { configPrefix } from './paths.js';
+
+export { configPrefix };
 
 export interface PublishDeps {
   store: Store;

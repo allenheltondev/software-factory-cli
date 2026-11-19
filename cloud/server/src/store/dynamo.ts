@@ -8,7 +8,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import type { AgentKeyMeta, CleanupEntry, ConfigVersion, GitHubLink, InstallationOffer, Member, OAuthState, Store, Tenant } from './store.js';
+import type { AgentKeyMeta, CleanupEntry, ConfigVersion, GitHubLink, InstallationOffer, Job, Member, OAuthState, Store, Tenant } from './store.js';
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
@@ -353,6 +353,56 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         }
       }
       throw new Error(`markUninstalled: tenant ${id} kept changing; retry the delivery`);
+    },
+
+    async putJob(job) {
+      // A week after the job may last, the record goes; nothing is served for it by then anyway.
+      await client.send(
+        new PutCommand({
+          TableName: T,
+          Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 },
+          ConditionExpression: 'attribute_not_exists(pk)',
+        }),
+      );
+    },
+
+    async getJob(jobId): Promise<Job | null> {
+      // Strongly consistent: the launcher wrote it moments before the microVM asks for it.
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' }, ConsistentRead: true }));
+      const i = out.Item;
+      if (!i) return null;
+      return {
+        jobId: String(i.jobId),
+        tokenHash: String(i.tokenHash),
+        installationId: Number(i.installationId),
+        repository: String(i.repository),
+        repositoryId: Number(i.repositoryId),
+        configVersion: Number(i.configVersion),
+        deliveryId: String(i.deliveryId),
+        eventName: String(i.eventName),
+        status: i.status === 'finished' ? 'finished' : 'launched',
+        ...(typeof i.outcome === 'string' ? { outcome: i.outcome } : {}),
+        createdAt: String(i.createdAt),
+        expiresAt: Number(i.expiresAt),
+      };
+    },
+
+    async finishJob(jobId, outcome) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: { pk: `JOB#${jobId}`, sk: 'META' },
+            UpdateExpression: 'SET #status = :finished, outcome = :outcome',
+            ConditionExpression: 'attribute_exists(pk) AND #status <> :finished',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        // Already finished (or never recorded): the first outcome stands.
+      }
     },
 
     async purgeTenantPartition(id) {
