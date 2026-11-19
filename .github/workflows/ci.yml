@@ -104,3 +104,39 @@ jobs:
             --updraft-home "$RUNNER_TEMP/launcher updraft home" > "$RUNNER_TEMP/unit/updraft.service"
           cat "$RUNNER_TEMP/unit/updraft.service"
           systemd-analyze verify "$RUNNER_TEMP/unit/updraft.service"
+
+  # Updraft Cloud (cloud/): its own npm project, so the CLI matrix above never installs it. Not one
+  # of the required checks on main; the deploy workflows run the same steps before deploying.
+  cloud:
+    name: cloud
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cloud
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - uses: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+      - name: Validate the SAM template
+        run: make validate-template
+      - name: Dry-run the deploy targets
+        run: |
+          make -n deploy-backend APP_DOMAIN_NAME=updraft.readysetcloud.io APP_HOSTED_ZONE_ID=Z0000000000000 > /dev/null
+          make -n deploy-frontend > /dev/null

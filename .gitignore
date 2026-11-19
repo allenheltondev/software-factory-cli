@@ -155,3 +155,7 @@ vite.config.ts.timestamp-*
 .nx/cache
 .nx/workspace-data
 .nx/migrate-runs
+
+# Updraft Cloud (cloud/): the dev sign-in config `make dev-auth-config` writes, and SAM's work dir
+cloud/app/public/auth-config.json
+.aws-sam/

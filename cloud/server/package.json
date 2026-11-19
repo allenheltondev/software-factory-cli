@@ -1,0 +1,22 @@
+{
+  "name": "@updraft-cloud/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The Updraft Cloud API: a Hono app behind API Gateway (REST) with a Cognito authorizer",
+  "scripts": {
+    "dev": "tsx watch src/local.ts",
+    "build": "node scripts/bundle.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "hono": "^4.13.9"
+  },
+  "devDependencies": {
+    "@hono/node-server": "^2.1.1",
+    "@types/aws-lambda": "^8.10.160",
+    "aws-jwt-verify": "^5.2.1",
+    "tsx": "^4.23.15"
+  }
+}

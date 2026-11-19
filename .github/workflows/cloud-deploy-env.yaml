@@ -1,0 +1,133 @@
+name: Deploy Updraft Cloud (one environment)
+
+# Called by cloud-production.yaml (push to main) and cloud-staging.yaml (pull requests). One job:
+# check the code, deploy the stack and the SPA, then run the anonymous smoke checks against the
+# result. Staging and Production are the same stack name in two AWS accounts; the environment's
+# AWS_DEPLOYMENT_ROLE_ARN secret picks the account.
+#
+# One-time setup per GitHub environment (Settings > Environments):
+#   secret   AWS_DEPLOYMENT_ROLE_ARN   an IAM role this repo may assume through GitHub OIDC
+#   variable HOSTED_ZONE_ID        Production only: the readysetcloud.io Route 53 hosted zone id
+# Until the secret exists the job skips with a notice instead of failing.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment (Production or Staging)
+        required: true
+        type: string
+      domain:
+        description: Custom domain to serve on; empty serves on the CloudFront domain
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.outputs.outputs.app_url }}
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: cloud
+    env:
+      STACK_NAME: updraft-cloud
+      DEPLOY_REGION: us-east-1
+    steps:
+      - name: Check deploy prerequisites
+        id: gate
+        working-directory: .
+        env:
+          AWS_DEPLOYMENT_ROLE_ARN: ${{ secrets.AWS_DEPLOYMENT_ROLE_ARN }}
+        run: |
+          if [ -z "${AWS_DEPLOYMENT_ROLE_ARN}" ]; then
+            echo "::notice title=${{ inputs.environment }} deploy skipped::The ${{ inputs.environment }} environment has no AWS_DEPLOYMENT_ROLE_ARN secret. Add it (Settings > Environments > ${{ inputs.environment }}) to deploy Updraft Cloud."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+
+      - name: Check
+        if: steps.gate.outputs.ready == 'true'
+        run: |
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm test
+
+      - uses: aws-actions/setup-sam@v3
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.gate.outputs.ready == 'true'
+        uses: aws-actions/configure-aws-credentials@6.2.2
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOYMENT_ROLE_ARN }}
+          role-session-name: GitHubActions-UpdraftCloud-${{ inputs.environment }}
+          aws-region: us-east-1
+
+      - name: Deploy the stack
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          APP_DOMAIN_NAME: ${{ inputs.domain }}
+          APP_HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID }}
+        run: |
+          if [ -n "${APP_DOMAIN_NAME}" ]; then
+            if [ -z "${APP_HOSTED_ZONE_ID}" ]; then
+              echo "::error title=No hosted zone::Set the ${{ inputs.environment }} environment's HOSTED_ZONE_ID variable to the hosted zone that holds ${APP_DOMAIN_NAME}."
+              exit 1
+            fi
+            make deploy-backend STACK_NAME="${STACK_NAME}" DEPLOY_REGION="${DEPLOY_REGION}" \
+              APP_DOMAIN_NAME="${APP_DOMAIN_NAME}" APP_HOSTED_ZONE_ID="${APP_HOSTED_ZONE_ID}"
+          else
+            make deploy-backend STACK_NAME="${STACK_NAME}" DEPLOY_REGION="${DEPLOY_REGION}"
+          fi
+
+      - name: Deploy the SPA
+        if: steps.gate.outputs.ready == 'true'
+        run: make deploy-frontend STACK_NAME="${STACK_NAME}" DEPLOY_REGION="${DEPLOY_REGION}"
+
+      - name: Read stack outputs
+        id: outputs
+        if: steps.gate.outputs.ready == 'true'
+        run: |
+          url=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${DEPLOY_REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='AppUrl'].OutputValue" --output text)
+          echo "app_url=${url}" >> "$GITHUB_OUTPUT"
+          echo "Deployed: ${url}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test
+        if: steps.gate.outputs.ready == 'true'
+        run: node scripts/smoke.mjs --url "${{ steps.outputs.outputs.app_url }}"
+
+      - name: Diagnose a failed deploy
+        if: failure() && steps.gate.outputs.ready == 'true'
+        run: |
+          echo "==== describe-stack-events (latest 50) ===="
+          aws cloudformation describe-stack-events --stack-name "${STACK_NAME}" --region "${DEPLOY_REGION}" \
+            --query "StackEvents[:50].[Timestamp,LogicalResourceId,ResourceType,ResourceStatus,ResourceStatusReason]" \
+            --output table || true

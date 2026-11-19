@@ -1,0 +1,28 @@
+name: Deploy Updraft Cloud to Staging
+
+# A pull request that changes Updraft Cloud deploys to the Staging account (served on its
+# CloudFront domain). Pull requests from forks get no environment secrets and are skipped.
+on:
+  pull_request:
+    paths:
+      - 'cloud/**'
+      - '.github/workflows/cloud-*.yaml'
+
+# One Staging stack: deploys queue instead of cancelling each other halfway through a change set.
+concurrency:
+  group: updraft-cloud-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  staging:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    uses: ./.github/workflows/cloud-deploy-env.yaml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      environment: Staging
+    secrets: inherit
