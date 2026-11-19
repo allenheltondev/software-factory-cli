@@ -84,6 +84,15 @@ describe('createTokenFileAuth', () => {
     expect(auth.privateKeyPath).toBeUndefined();
   });
 
+  it('accepts a stateless installation token of the current length (about 520 characters) and longer', async () => {
+    const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
+    for (const pad of [240, 2000]) {
+      const stateless = `ghs_4242_${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iss: '4242', inst: 55, pad: 'x'.repeat(pad) })}.${'s1Gn-_'.repeat(30)}`;
+      expect(stateless.length).toBeGreaterThan(512);
+      await expect(setup(good({ token: stateless })).auth.installationToken('acme/web')).resolves.toMatchObject({ token: stateless });
+    }
+  });
+
   it('reads the file again, so a replaced token is used at once', async () => {
     const { auth, write } = setup();
     await auth.installationToken('acme/web');

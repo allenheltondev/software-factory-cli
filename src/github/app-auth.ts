@@ -99,7 +99,9 @@ const PEM_BLOCK = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*
 /** header.payload.signature, each base64url; a JWT header always starts with `{"` (eyJ). */
 const JWT = /\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}/g;
 /** GitHub's token formats: ghs_ (installation), ghp_/gho_/ghu_/ghr_ and fine-grained github_pat_. */
-const GITHUB_TOKEN = /\b(?:gh[a-z]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,})/g;
+// Stateless installation tokens (GitHub, 2026-10) are `ghs_<app id>_<JWT>`: base64url parts joined
+// by dots, about 520 characters. The whole of one is matched, not just what comes before its first dot.
+const GITHUB_TOKEN = /\b(?:gh[a-z]_[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]+)*|github_pat_[A-Za-z0-9_]{20,})/g;
 /** The basic-auth header publication gives git: base64 of `x-access-token:<token>`, whose first 20 characters are fixed. */
 const BASIC_ACCESS_TOKEN = /eC1hY2Nlc3MtdG9rZW46[A-Za-z0-9+/=]*/g;
 

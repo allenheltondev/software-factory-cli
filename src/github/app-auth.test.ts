@@ -510,6 +510,13 @@ describe('redactGitHubSecrets', () => {
     expect(redactGitHubSecrets(plain)).toBe(plain);
   });
 
+  it('removes the whole of a stateless installation token, JWT included', () => {
+    const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
+    const stateless = `ghs_123456_${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iss: '123456', inst: 55, exp: 1_800_000_000, pad: 'x'.repeat(240) })}.${'s1Gn-_'.repeat(30)}`;
+    expect(stateless.length).toBeGreaterThan(512);
+    expect(redactGitHubSecrets(`push failed with ${stateless}; retrying`)).toBe('push failed with ***; retrying');
+  });
+
   it('removes a key whose end is cut off', () => {
     expect(redactGitHubSecrets(`oops ${PEM.slice(0, 200)}`)).toBe('oops ***');
   });

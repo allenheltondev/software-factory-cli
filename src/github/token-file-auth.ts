@@ -50,11 +50,13 @@ const SLUG = /^[a-z0-9][a-z0-9-]*$/i;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const CLIENT_ID = /^[A-Za-z0-9._-]+$/;
 /**
- * What a GitHub token is made of (ghs_ installation tokens are letters, digits and underscores).
+ * The characters a GitHub token is made of: letters, digits and `_`, plus the `.` and `-` of the
+ * base64url JWT in a stateless installation token (`ghs_<app id>_<JWT>`, about 520 characters).
  * Anything else, a line break above all, is refused before it can reach an Authorization header,
- * whose validation error would otherwise repeat the value.
+ * whose validation error would otherwise repeat the value. No length is assumed: GitHub has
+ * changed it before.
  */
-const TOKEN = /^[A-Za-z0-9_.-]{1,512}$/;
+const TOKEN = /^[A-Za-z0-9_.-]+$/;
 
 function fail(path: string, what: string): never {
   throw new GitHubAppError(`the GitHub App token file ${path} ${what}. See ${APP_DOC} ("A token file instead of the key").`, 'token-file');
