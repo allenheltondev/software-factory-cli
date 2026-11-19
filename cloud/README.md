@@ -49,7 +49,13 @@ browser ── https://updraft.readysetcloud.io ──> CloudFront (one distribu
 
   When the App is uninstalled, every item in the tenant's partition gets the table's `ttl`, 30 days out. DynamoDB deletes them after that, and reads treat the tenant as gone as soon as the deadline passes.
   - **Interrupted cleanup:** if a write fails partway, the webhook answers 500 so GitHub shows a delivery you can redeliver, and a redelivered delete finishes the sweep with the first deadline.
-  - **No late members:** a member is only ever added in a transaction that checks the tenant isn't uninstalled, so no member misses the TTL.
+  - **No late members:** a member, or an agent key's metadata, is only ever added in a transaction that checks the tenant isn't uninstalled, so none misses the TTL.
+  - **Outside the table:** the uninstall also records a cleanup entry with no TTL. It's written in the same transaction that disables the tenant (or records its tombstone), so no uninstall exists without one. Once a day, `CleanupFunction` (`server/src/tenants/cleanup.ts`) cleans up every uninstalled tenant past its deadline:
+    - the S3 prefix `tenants/<id>/`;
+    - the agent key secrets;
+    - any of the tenant's rows still in the table, which covers an interrupted sweep.
+
+    It forgets the entry only once all three are gone, so a run that fails is finished by the next one.
   - **Strongly consistent sweep:** the sweep and its replay read strongly, so a member committed just before the uninstall is found.
   - **Tombstones:** a delete for an installation with no tenant yet records one already uninstalled, expiring with the same TTL. A Connect or install callback that passed its GitHub check just before the delete can't create the tenant afterwards.
 - **GitHub.** Linking and installing both leave for github.com and come back to the SPA's `/github/callback`, which posts what GitHub returned to `POST /api/v1/github/callback`.
@@ -163,6 +169,50 @@ The manifest sets everything #67 describes:
 - **Repository permissions:** Metadata (read); Contents, Issues and Pull requests (read and write); Checks and Commit statuses (read).
 - **Organization permission:** Members (read). A user's token needs it to show their own org membership, which is how ownership of an org installation is checked.
 - **Events:** Issues, Pull request and Pull request review. Installation events always arrive.
+
+### Tenant config and agent keys
+
+A tenant's jobs run with that tenant's own Updraft config and agent keys (#68). Until the console can edit them (#69, #70), an admin sets them with `server/scripts/tenant-admin.ts`, using AWS credentials for the stack's account:
+
+```sh
+cd cloud
+npm run tenant-admin --workspace=server -- config publish --installation 55 --file tenant.yaml --prompts ./prompts
+npm run tenant-admin --workspace=server -- config list    --installation 55
+npm run tenant-admin --workspace=server -- key set        --installation 55 --name ANTHROPIC_API_KEY   # the key on stdin, never in argv
+npm run tenant-admin --workspace=server -- key status     --installation 55
+```
+
+**The config** is an ordinary Updraft config: `agents`, `pools`, `actions`, `repositories`, `dispatch` and `review`. Prompts are `./prompts/<name>.md`, taken from the `--prompts` directory. `server/src/tenants/config.ts` compiles it as follows.
+
+- **Tenant input the platform owns is rejected, with its path.** It's never silently overridden:
+  - `github`, `execution`, `maxConcurrent`, `pollIntervalSeconds` and `capacity`;
+  - an agent's `command`, `args`, `env`, `container`, `capacityGroup` or `maxConcurrent`;
+  - a repository's `id`, `checkoutPath`, `remote` or `dependencies`;
+  - any `tiers.triage`;
+  - agents other than `claude` and `codex`;
+  - publish modes other than `draft-pr` and `pr`;
+  - timeouts over 120 minutes (agent) or 30 minutes (verify).
+- **What the platform writes:**
+  - live mode, one job at a time;
+  - the platform App through `tokenFile` (#77), committing as its bot;
+  - each agent in the sandbox runtime with only its own key's variable;
+  - each repository's id, from what the installation can actually reach, and a checkout under `./clones/`.
+- **Validation:** the result is checked with the worker's own `validateConfig` (imported from `src/`, as Linux), so a config that publishes is one the job accepts.
+- **Publishing** (`server/src/tenants/publish.ts`):
+  1. allocate the next version as pending (versions only grow, and none is rewritten);
+  2. upload the bundle to `s3://<TenantBucket>/tenants/<id>/config/<version>/`;
+  3. mark it ready;
+  4. activate it, in one conditional write.
+
+  If anything fails, the previous version stays active. Activation also only moves forward: a slow publish that finishes after a later one is reported as `superseded`, and the newer version stays active. Jobs will pin the version active when they're dispatched (PR 4).
+
+**Agent keys** each get their own Secrets Manager secret, `updraft/tenants/<id>/agent-keys/<NAME>` (for `ANTHROPIC_API_KEY` and `CODEX_API_KEY`), tagged with the installation id.
+- **No lost keys:** setting one key never reads or rewrites another, so two keys set at the same moment both survive.
+- **Write-only:** nothing reads a value back. The table records only that a key is set, when, and by whom.
+- **Shape check:** a value that doesn't look like the named key is refused without being repeated.
+- **During an uninstall:** a key set that races an uninstall is refused, and the secret it wrote is removed again.
+
+`tenant-admin` builds every AWS client from one region: `--region`, or else the SDK's own resolution. So stack discovery, the table, the bucket, the App settings and the key secrets are always in the same region.
 
 ## Not verified yet
 

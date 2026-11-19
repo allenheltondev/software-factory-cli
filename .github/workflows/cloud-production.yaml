@@ -6,6 +6,9 @@ on:
     branches: [main]
     paths:
       - 'cloud/**'
+      # The server bundles the CLI's config schema and agent profiles from src/.
+      - 'src/config/**'
+      - 'src/agents/**'
       - '.github/workflows/cloud-*.yaml'
   workflow_dispatch:
 

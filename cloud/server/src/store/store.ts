@@ -45,6 +45,27 @@ export interface Tenant {
   deleteAfter?: number;
   createdAt: string;
   createdBy: string;
+  /** The config version jobs start with; absent until one is published (no config, no jobs). */
+  activeConfigVersion?: number;
+}
+
+/** One published config: an immutable bundle under tenants/<id>/config/<version>/ in the tenant bucket. */
+export interface ConfigVersion {
+  installationId: number;
+  version: number;
+  /** pending: allocated, the upload may not have finished (never activated). ready: fully uploaded. */
+  status: 'pending' | 'ready';
+  sha256: string;
+  files: string[];
+  publishedBy: string;
+  publishedAt: string;
+}
+
+/** That an agent key is set (never its value, which lives only in Secrets Manager). */
+export interface AgentKeyMeta {
+  name: string;
+  updatedAt: string;
+  updatedBy: string;
 }
 
 export type MemberRole = 'owner' | 'editor';
@@ -118,6 +139,44 @@ export interface Store {
   setSuspended(installationId: number, suspended: boolean): Promise<'updated' | 'uninstalled' | 'no_tenant'>;
   getMember(installationId: number, sub: string): Promise<Member | null>;
   listMemberships(sub: string): Promise<Member[]>;
+
+  /**
+   * Allocates the next config version as `pending` (versions only ever grow). `uninstalled`: the
+   * tenant is gone or going, so nothing is allocated; `no_tenant`: there is no such tenant.
+   */
+  createConfigVersion(installationId: number, meta: Omit<ConfigVersion, 'installationId' | 'version' | 'status'>): Promise<number | 'uninstalled' | 'no_tenant'>;
+  /** The bundle is fully uploaded. */
+  markConfigReady(installationId: number, version: number): Promise<void>;
+  /**
+   * Makes a ready version the one jobs start with, in one transaction with the checks. Only ever
+   * forward: `superseded` when a newer version is active already (a slow publish finishing after
+   * a later one). The previous active version stays active on any refusal.
+   */
+  activateConfig(installationId: number, version: number): Promise<'activated' | 'superseded' | 'not_ready' | 'uninstalled' | 'no_tenant'>;
+  listConfigVersions(installationId: number): Promise<ConfigVersion[]>;
+
+  /** Refused (`uninstalled`) once the tenant is uninstalled or gone, so no row escapes the sweep. */
+  putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<'stored' | 'uninstalled'>;
+  listAgentKeyMeta(installationId: number): Promise<AgentKeyMeta[]>;
+
+  /**
+   * Uninstalled tenants whose deadline has passed and whose data outside the table (the S3 prefix,
+   * the key secrets) is not deleted yet. markUninstalled records them, without a TTL, so they
+   * outlive the tenant's own rows.
+   */
+  listDueCleanups(now: number): Promise<CleanupEntry[]>;
+  /** The tenant's data outside the table is gone: forget the entry. */
+  completeCleanup(entry: CleanupEntry): Promise<void>;
+  /**
+   * At the deadline: deletes every row of the tenant's partition, including any an interrupted
+   * uninstall sweep left without a TTL. Safe to repeat.
+   */
+  purgeTenantPartition(installationId: number): Promise<void>;
+}
+
+export interface CleanupEntry {
+  installationId: number;
+  deleteAfter: number;
 }
 
 /** In-memory Store for tests and local dev without AWS. `ttl` is recorded as DynamoDB would hold it. */
@@ -128,6 +187,9 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const offers = new Map<string, InstallationOffer>();
   const tenants = new Map<number, Tenant & { ttl?: number }>();
   const members = new Map<string, Member & { ttl?: number }>();
+  const configs = new Map<string, ConfigVersion>();
+  const cleanups = new Map<number, CleanupEntry>();
+  const keys = new Map<string, AgentKeyMeta>();
   const memberKey = (id: number, sub: string) => `${id}/${sub}`;
   const strip = <T extends { ttl?: number }>(item: T): Omit<T, 'ttl'> => {
     const { ttl: _ttl, ...rest } = item;
@@ -193,6 +255,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
           createdAt: new Date(0).toISOString(),
           createdBy: 'github:installation.deleted',
         });
+        cleanups.set(id, { installationId: id, deleteAfter });
         return 'tombstone';
       }
       const already = t.disabledReason === 'uninstalled';
@@ -200,6 +263,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const ttl = Math.ceil(deadline / 1000);
       if (!already) tenants.set(id, { ...t, status: 'disabled', disabledReason: 'uninstalled', deleteAfter, ttl });
       for (const [k, m] of members) if (m.installationId === id && m.ttl !== ttl) members.set(k, { ...m, ttl });
+      cleanups.set(id, { installationId: id, deleteAfter: deadline });
       return already ? 'already' : 'marked';
     },
     async setSuspended(id, suspended) {
@@ -218,6 +282,51 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async listMemberships(sub) {
       return [...members.values()].filter((m) => m.sub === sub).map((m) => strip(m) as Member);
+    },
+    async createConfigVersion(id, meta) {
+      const t = tenants.get(id);
+      if (!t) return 'no_tenant';
+      if (t.disabledReason === 'uninstalled') return 'uninstalled';
+      const version = Math.max(0, ...[...configs.values()].filter((c) => c.installationId === id).map((c) => c.version)) + 1;
+      configs.set(`${id}/${version}`, { ...meta, installationId: id, version, status: 'pending' });
+      return version;
+    },
+    async markConfigReady(id, version) {
+      const c = configs.get(`${id}/${version}`);
+      if (c) configs.set(`${id}/${version}`, { ...c, status: 'ready' });
+    },
+    async activateConfig(id, version) {
+      const t = tenants.get(id);
+      if (!t) return 'no_tenant';
+      if (t.disabledReason === 'uninstalled') return 'uninstalled';
+      if (configs.get(`${id}/${version}`)?.status !== 'ready') return 'not_ready';
+      if (t.activeConfigVersion !== undefined && t.activeConfigVersion >= version) return 'superseded';
+      tenants.set(id, { ...t, activeConfigVersion: version });
+      return 'activated';
+    },
+    async listConfigVersions(id) {
+      return [...configs.values()].filter((c) => c.installationId === id).sort((a, b) => a.version - b.version).map((c) => ({ ...c }));
+    },
+    async putAgentKeyMeta(id, meta) {
+      const t = tenants.get(id);
+      if (!t || t.disabledReason === 'uninstalled') return 'uninstalled';
+      keys.set(`${id}/${meta.name}`, { ...meta });
+      return 'stored';
+    },
+    async listDueCleanups(now) {
+      return [...cleanups.values()].filter((c) => c.deleteAfter <= now).map((c) => ({ ...c }));
+    },
+    async purgeTenantPartition(id) {
+      tenants.delete(id);
+      for (const [k, m] of members) if (m.installationId === id) members.delete(k);
+      for (const [k, c] of configs) if (c.installationId === id) configs.delete(k);
+      for (const k of [...keys.keys()]) if (k.startsWith(`${id}/`)) keys.delete(k);
+    },
+    async completeCleanup(entry) {
+      if (cleanups.get(entry.installationId)?.deleteAfter === entry.deleteAfter) cleanups.delete(entry.installationId);
+    },
+    async listAgentKeyMeta(id) {
+      return [...keys.entries()].filter(([k]) => k.startsWith(`${id}/`)).map(([, v]) => ({ ...v })).sort((a, b) => a.name.localeCompare(b.name));
     },
     ttlOf(id) {
       return {

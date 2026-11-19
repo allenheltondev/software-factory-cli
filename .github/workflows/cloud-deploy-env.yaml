@@ -67,7 +67,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: cloud/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            cloud/package-lock.json
+
+      # The server bundles the CLI's config schema from src/ (zod), so the CLI's dependencies too.
+      - name: Install the CLI's dependencies
+        if: steps.gate.outputs.ready == 'true'
+        working-directory: .
+        run: npm ci
 
       - name: Check
         if: steps.gate.outputs.ready == 'true'

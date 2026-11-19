@@ -1,0 +1,62 @@
+import type { AgentKeyMeta, Store } from '../store/store.js';
+// Not from config.ts: that pulls in the CLI's whole validator, which nothing here needs.
+import { AGENT_KEY_ENV } from './agents.js';
+
+/**
+ * A tenant's agent API keys (bring your own, #64). Each key is its own Secrets Manager secret,
+ * `updraft/tenants/<installationId>/agent-keys/<NAME>`, whose value is the key itself. The job
+ * broker (PR 3) reads a tenant's keys for that tenant's jobs only.
+ *
+ * One secret per key, not one JSON secret per tenant: writing a key never reads or rewrites
+ * another, so two keys set at the same moment both survive.
+ *
+ * Write-only: nothing here, or anywhere in the API, returns a value. What can be read is that a
+ * key is set, when, and by whom (AgentKeyMeta in the table).
+ */
+
+export const AGENT_KEY_NAMES = Object.values(AGENT_KEY_ENV) as string[];
+/** Every key secret of a tenant starts with this (the uninstall cleanup deletes them by name). */
+export const agentKeySecretPrefix = (installationId: number) => `updraft/tenants/${installationId}/agent-keys/`;
+export const agentKeySecretName = (installationId: number, name: string) => `${agentKeySecretPrefix(installationId)}${name}`;
+
+/** The Secrets Manager calls this needs, so tests need no AWS. */
+export interface SecretsPort {
+  /** Writes a new value, creating the secret (with these tags) when it does not exist. */
+  put(name: string, value: string, tags: Record<string, string>): Promise<void>;
+  /** Deletes the secret at once (no recovery window); nothing when it does not exist. */
+  remove(name: string): Promise<void>;
+}
+
+/** Shapes of the keys we know, to catch a value pasted into the wrong name. Not a validity check. */
+const KEY_SHAPE: Record<string, RegExp> = {
+  ANTHROPIC_API_KEY: /^sk-ant-[A-Za-z0-9_-]{20,}$/,
+  CODEX_API_KEY: /^sk-[A-Za-z0-9_-]{20,}$/,
+};
+
+export type SetKeyResult = { ok: true; meta: AgentKeyMeta } | { ok: false; message: string };
+
+export async function setAgentKey(
+  input: { installationId: number; name: string; value: string; updatedBy: string },
+  deps: { secrets: SecretsPort; store: Store; now?: () => number },
+): Promise<SetKeyResult> {
+  const { installationId, name, updatedBy } = input;
+  const value = input.value.trim();
+  if (!AGENT_KEY_NAMES.includes(name)) return { ok: false, message: `${name} is not an agent key Updraft Cloud uses (${AGENT_KEY_NAMES.join(', ')})` };
+  // The value is never repeated, in any message.
+  if (!KEY_SHAPE[name]!.test(value)) return { ok: false, message: `that does not look like a ${name}; nothing was changed` };
+  const tenant = await deps.store.getTenant(installationId);
+  if (!tenant) return { ok: false, message: `there is no tenant for installation ${installationId}` };
+  if (tenant.disabledReason === 'uninstalled') return { ok: false, message: `installation ${installationId} was uninstalled` };
+
+  const secretName = agentKeySecretName(installationId, name);
+  await deps.secrets.put(secretName, value, { installationId: String(installationId), app: 'updraft-cloud' });
+  const meta: AgentKeyMeta = { name, updatedAt: new Date((deps.now ?? Date.now)()).toISOString(), updatedBy };
+  // Guarded: refused once the tenant is uninstalled, so no key row escapes the uninstall sweep.
+  // The secret written in that race is removed again (and the uninstall cleanup deletes every
+  // key secret of the tenant at the deadline in any case).
+  if ((await deps.store.putAgentKeyMeta(installationId, meta)) !== 'stored') {
+    await deps.secrets.remove(secretName).catch(() => {});
+    return { ok: false, message: `installation ${installationId} was uninstalled` };
+  }
+  return { ok: true, meta };
+}

@@ -23,6 +23,14 @@ function fakeTable() {
   function condition(expr: string | undefined, item: Item | undefined, values: Values = {}): boolean {
     if (!expr) return true;
     if (expr === 'attribute_not_exists(pk)') return !item;
+    if (expr === 'attribute_exists(pk)') return Boolean(item);
+    if (
+      expr ===
+      'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND (attribute_not_exists(activeConfigVersion) OR activeConfigVersion < :v)'
+    ) {
+      return Boolean(item) && item!.disabledReason !== values[':uninstalled'] && (item!.activeConfigVersion === undefined || (item!.activeConfigVersion as number) < (values[':v'] as number));
+    }
+    if (expr === '#status = :ready') return item?.status === values[':ready'];
     if (expr === 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)') {
       return Boolean(item) && (item!.disabledReason === undefined || item!.disabledReason !== values[':uninstalled']);
     }
@@ -81,11 +89,14 @@ function fakeTable() {
             return { Items: [...items.values()].filter((i) => i.GSI1PK === pk && String(i.GSI1SK).startsWith(String(values?.[':prefix']))) };
           }
           const pk = values?.[':pk'];
-          return {
-            Items: [...items.values()]
-              .filter((i) => i.pk === pk && visible(key(i), input))
-              .map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })),
-          };
+          const prefix = String(input.KeyConditionExpression).includes('begins_with(sk, :prefix)') ? String(values?.[':prefix']) : '';
+          const until = String(input.KeyConditionExpression).includes('sk <= :until') ? String(values?.[':until']) : null;
+          let found = [...items.values()]
+            .filter((i) => i.pk === pk && String(i.sk).startsWith(prefix) && (until === null || String(i.sk) <= until) && visible(key(i), input))
+            .sort((a, b) => String(a.sk).localeCompare(String(b.sk)));
+          if (input.ScanIndexForward === false) found.reverse();
+          if (typeof input.Limit === 'number') found = found.slice(0, input.Limit);
+          return { Items: input.ProjectionExpression ? found.map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })) : found.map((i) => ({ ...i })) };
         }
         case 'TransactWriteCommand': {
           const ops = input.TransactItems as Item[];
@@ -245,5 +256,137 @@ describe('dynamo store: identities and offers', () => {
   it('keeps the GitHub identity on memberships and lists them by user', async () => {
     const { store } = await seeded();
     expect(await store.listMemberships('sub-a')).toEqual([member('sub-a')]);
+  });
+});
+
+describe('dynamo store: config versions and agent keys', () => {
+  const meta = { sha256: 'abc', files: ['config.yaml'], publishedBy: 'admin', publishedAt: '2026-11-19T00:00:00.000Z' };
+
+  it('allocates versions that only grow, and activates only a ready one', async () => {
+    const { store, table } = await seeded();
+    expect(await store.createConfigVersion(55, meta)).toBe(1);
+    expect(await store.createConfigVersion(55, meta)).toBe(2);
+    expect(table.items.has('TENANT#55|CONFIG#0000000002')).toBe(true);
+    expect(await store.activateConfig(55, 2)).toBe('not_ready');
+    await store.markConfigReady(55, 2);
+    expect(await store.activateConfig(55, 2)).toBe('activated');
+    expect((await store.getTenant(55))?.activeConfigVersion).toBe(2);
+    expect((await store.listConfigVersions(55)).map((v) => [v.version, v.status])).toEqual([
+      [1, 'pending'],
+      [2, 'ready'],
+    ]);
+  });
+
+  it('takes the next number when a concurrent publish claimed this one', async () => {
+    const { store, table } = await seeded();
+    await store.createConfigVersion(55, meta);
+    // A concurrent publish claims 2 between this one's read and its claim: the claim fails, and 3 wins.
+    let raced = false;
+    table.fail((name) => {
+      if (name === 'TransactWriteCommand' && !raced) {
+        raced = true;
+        table.items.set('TENANT#55|CONFIG#0000000002', { pk: 'TENANT#55', sk: 'CONFIG#0000000002', version: 2, status: 'pending' });
+      }
+      return false;
+    });
+    expect(await store.createConfigVersion(55, meta)).toBe(3);
+    expect(raced).toBe(true);
+  });
+
+  it('neither allocates nor activates for an uninstalled tenant, and the version keeps the TTL sweep', async () => {
+    const { store, table } = await seeded();
+    const v = await store.createConfigVersion(55, meta);
+    await store.markConfigReady(55, v as number);
+    await store.markUninstalled(55, DEADLINE);
+    expect(table.items.get('TENANT#55|CONFIG#0000000001')?.ttl).toBe(TTL);
+    expect(await store.createConfigVersion(55, meta)).toBe('uninstalled');
+    expect(await store.activateConfig(55, 1)).toBe('uninstalled');
+    expect(await store.createConfigVersion(77, meta)).toBe('no_tenant');
+  });
+
+  it('records that an agent key is set, never its value', async () => {
+    const { store } = await seeded();
+    await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't2', updatedBy: 'admin' });
+    await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't1', updatedBy: 'admin' });
+    expect(await store.listAgentKeyMeta(55)).toEqual([
+      { name: 'ANTHROPIC_API_KEY', updatedAt: 't1', updatedBy: 'admin' },
+      { name: 'CODEX_API_KEY', updatedAt: 't2', updatedBy: 'admin' },
+    ]);
+  });
+});
+
+describe('dynamo store: review fixes on #78', () => {
+  const meta = { sha256: 'abc', files: ['config.yaml'], publishedBy: 'admin', publishedAt: 't' };
+
+  it('never activates an older version after a newer one (superseded)', async () => {
+    const { store } = await seeded();
+    const v1 = (await store.createConfigVersion(55, meta)) as number;
+    const v2 = (await store.createConfigVersion(55, meta)) as number;
+    await store.markConfigReady(55, v2);
+    expect(await store.activateConfig(55, v2)).toBe('activated');
+    await store.markConfigReady(55, v1);
+    expect(await store.activateConfig(55, v1)).toBe('superseded');
+    expect((await store.getTenant(55))?.activeConfigVersion).toBe(v2);
+    expect(await store.activateConfig(55, v2)).toBe('superseded');
+  });
+
+  it('refuses key metadata once the tenant is uninstalled', async () => {
+    const { store, table } = await seeded();
+    expect(await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'a' })).toBe('stored');
+    await store.markUninstalled(55, DEADLINE);
+    expect(table.items.get('TENANT#55|KEY#ANTHROPIC_API_KEY')?.ttl).toBe(TTL);
+    expect(await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'a' })).toBe('uninstalled');
+    expect(table.items.has('TENANT#55|KEY#CODEX_API_KEY')).toBe(false);
+    expect(await store.putAgentKeyMeta(77, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'a' })).toBe('uninstalled');
+  });
+
+  it('records a cleanup entry for every uninstall (marked, repeated, tombstone), without a TTL, due at the deadline', async () => {
+    const { store, table } = await seeded();
+    await store.markUninstalled(55, DEADLINE);
+    await store.markUninstalled(55, DEADLINE + 5000); // repeated: the first deadline
+    await store.markUninstalled(66, DEADLINE + 10_000, { id: 1, login: 'x', type: 'User' }); // tombstone
+    const entries = [...table.items.values()].filter((i) => i.pk === 'CLEANUP');
+    expect(entries.map((e) => [e.installationId, e.deleteAfter, e.ttl])).toEqual([
+      [55, DEADLINE, undefined],
+      [66, DEADLINE + 10_000, undefined],
+    ]);
+    expect(await store.listDueCleanups(DEADLINE - 1)).toEqual([]);
+    expect(await store.listDueCleanups(DEADLINE)).toEqual([{ installationId: 55, deleteAfter: DEADLINE }]);
+    await store.completeCleanup({ installationId: 55, deleteAfter: DEADLINE });
+    expect(await store.listDueCleanups(DEADLINE + 10_000)).toEqual([{ installationId: 66, deleteAfter: DEADLINE + 10_000 }]);
+  });
+});
+
+describe('dynamo store: the uninstall and its cleanup entry are one transaction', () => {
+  it('a sweep that fails part-way still leaves a due cleanup entry (the review case)', async () => {
+    const { store, table } = await seeded();
+    table.fail((name, input) => name === 'UpdateCommand' && String((input.Key as Item).sk).startsWith('MEMBER#'));
+    await expect(store.markUninstalled(55, DEADLINE)).rejects.toThrow(/injected failure/);
+    table.fail(null);
+    expect(table.items.get('TENANT#55|META')?.disabledReason).toBe('uninstalled');
+    expect(await store.listDueCleanups(DEADLINE)).toEqual([{ installationId: 55, deleteAfter: DEADLINE }]);
+  });
+
+  it('a failed transaction changes nothing, so the uninstall is never half-recorded', async () => {
+    const { store, table } = await seeded();
+    table.fail((name) => name === 'TransactWriteCommand');
+    await expect(store.markUninstalled(55, DEADLINE)).rejects.toThrow(/injected failure/);
+    await expect(store.markUninstalled(66, DEADLINE)).rejects.toThrow(/injected failure/); // the tombstone too
+    table.fail(null);
+    expect(table.items.get('TENANT#55|META')?.disabledReason).toBeUndefined();
+    expect(table.items.has('TENANT#66|META')).toBe(false);
+    expect(await store.listDueCleanups(DEADLINE)).toEqual([]);
+  });
+
+  it('purges every row of the partition, including one the sweep never reached', async () => {
+    const { store, table } = await seeded();
+    table.fail((name, input) => name === 'UpdateCommand' && String((input.Key as Item).sk).startsWith('MEMBER#'));
+    await store.markUninstalled(55, DEADLINE).catch(() => {});
+    table.fail(null);
+    expect(table.items.get('TENANT#55|MEMBER#sub-a')?.ttl).toBeUndefined();
+    await store.purgeTenantPartition(55);
+    expect([...table.items.keys()].filter((k) => k.startsWith('TENANT#55|'))).toEqual([]);
+    await store.purgeTenantPartition(55); // again: nothing to do
+    expect(await store.listDueCleanups(DEADLINE)).toEqual([{ installationId: 55, deleteAfter: DEADLINE }]);
   });
 });

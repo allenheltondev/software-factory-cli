@@ -123,8 +123,14 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: cloud/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            cloud/package-lock.json
 
+      # The server validates tenant configs with the CLI's own schema, imported from src/ (zod).
+      - name: Install the CLI's dependencies
+        working-directory: .
+        run: npm ci
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
