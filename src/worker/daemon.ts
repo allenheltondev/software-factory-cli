@@ -7,6 +7,7 @@ import {
   cancelClaim,
   claimNextJob,
   finishRun,
+  getJob,
   getRun,
   heartbeatRun,
   holdsWorkerLock,
@@ -44,6 +45,7 @@ import {
 import { defaultContainerControl, type ContainerControl } from './container.js';
 import { defaultProcessControl, terminateIfSameProcess, type ProcessControl } from './process.js';
 import { reconcileInterruptedRuns } from './reconcile.js';
+import { decideFailureHandling, hasEscalation, type PolicyOutcome } from './failure-policy.js';
 
 export { WorkerLockedError } from './lock.js';
 
@@ -254,8 +256,26 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       // closes as canceled even if its agent finished first, and a run another worker already
       // reconciled is left as that worker recorded it.
       let finished: FinishedRun | null = null;
+      let policyRequeued = false;
       try {
-        finished = finishRun(db, run.id, { outcome: result.outcome, error: result.error ?? null, now });
+        // Opt-in policy (usage limits, escalation): may close a clean-exit pre-edit deferral as
+        // failed and put the job back instead of failing it. A no-op without that configuration.
+        let policy: PolicyOutcome = { outcome: result.outcome, error: result.error ?? null };
+        if (config.capacity || hasEscalation(config)) {
+          try {
+            policy = decideFailureHandling(db, config, job, run, result, now());
+          } catch (err) {
+            runLog.error('could not apply failure policy; recording the run as reported', { error: message(err) });
+          }
+        }
+        finished = finishRun(db, run.id, {
+          outcome: policy.outcome,
+          error: policy.error ?? null,
+          now,
+          ...(policy.handling ? { handling: policy.handling } : {}),
+        });
+        policyRequeued = !!policy.handling && getJob(db, job.id)?.status === 'queued';
+        if (policy.handling) runLog.info('failure policy applied', { kind: policy.handling.kind, detail: policy.error ?? undefined });
         if (finished?.canceledByUser) runLog.info('run canceled by user', { executorOutcome: result.outcome });
         else runLog.info('run finished', { outcome: result.outcome, ...(result.error ? { error: result.error } : {}) });
       } catch (err) {
@@ -268,7 +288,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       // Not for interrupted runs: the worker is stopping, and whoever stops it is there to retry.
       // Decided by what was recorded: a run the user canceled is closed as canceled whatever the
       // executor reported, and must not be announced as a failure.
-      if (finished && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.failureCommenter) {
+      if (finished && !policyRequeued && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.failureCommenter) {
         await deps.failureCommenter.afterRun(run.id, controller.signal);
       }
     })().finally(() => {

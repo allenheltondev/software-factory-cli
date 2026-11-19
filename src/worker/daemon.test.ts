@@ -389,6 +389,31 @@ describe('runDaemon', () => {
     expect(retries).toBeGreaterThanOrEqual(1);
   });
 
+  it('with capacity configured, a usage-limit exit cools the profile down and requeues the job instead of failing it', async () => {
+    const db = openDatabase(':memory:');
+    const calls: string[] = [];
+    const executor: Executor = {
+      name: 'limited',
+      execute: async (c): Promise<ExecutionResult> => {
+        calls.push(c.run.agent);
+        return { outcome: 'failed', error: 'agent exited 1', cliOutput: "ERROR: You've hit your usage limit. Try again in 2 hours." };
+      },
+    };
+    const commented: string[] = [];
+    const failureCommenter = { afterRun: async (id: string) => void commented.push(id), retryDue: async () => {}, sweepUnpublished: async () => {} };
+    const config = makeConfig({ capacity: { groups: {}, maxDeferrals: 3 }, pools: { solo: { agents: ['claude'] } } });
+    const deps = baseDeps(db, { executor, failureCommenter, config });
+    const job = insertJob(db, { pool: 'solo' });
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    await vi.waitFor(() => expect(getJob(db, job)?.status).toBe('queued'));
+    deps.controller.abort();
+    await done;
+    expect(getJob(db, job)?.statusReason).toMatch(/waiting: .*claude.*usage limit/);
+    expect(calls).toEqual(['claude']); // cooling down: not started again
+    expect(commented).toEqual([]); // a deferral is not a failure to announce
+  });
+
   it('with commentOnFailure, comments once when a job ends failed and not when it is requeued, canceled or interrupted', async () => {
     const db = openDatabase(':memory:');
     const config = makeConfig({

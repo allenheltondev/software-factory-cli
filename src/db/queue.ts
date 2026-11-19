@@ -16,6 +16,16 @@ import {
   type RevisionPr,
 } from './revisions.js';
 import { newId, nowIso } from '../util/ids.js';
+import {
+  activeCooldowns,
+  capacityBlock,
+  listRecentPolicyEvents,
+  recordPolicyEvent,
+  setCooldown,
+  type CapacityKey,
+  type Cooldown,
+  type PolicyEvent,
+} from './capacity.js';
 import { noteJobFinished, noteRunEnded } from './metrics.js';
 import { WORKER_STALE_MS } from '../worker/lock.js';
 
@@ -122,6 +132,9 @@ function pickAgent(
   load: Map<string, number>,
   /** Never picked, whatever its capacity (the author of the code a reviewer job reviews). */
   exclude: string | null = null,
+  /** Capacity policy (docs/capacity-and-escalation.md): why an agent cannot take the run now, or null. */
+  blocked: ((agent: string) => string | null) | null = null,
+  blockedReasons: string[] = [],
 ): string | null {
   const n = poolAgents.length;
   if (n === 0) return null;
@@ -134,7 +147,11 @@ function pickAgent(
     const index = (start + k) % n;
     const name = poolAgents[index]!;
     const agent = ownEntry(config.agents, name);
-    if (name !== exclude && agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) capable.push({ name, index });
+    if (name !== exclude && agent && agent.enabled && (load.get(name) ?? 0) < agent.maxConcurrent) {
+      const why = blocked?.(name) ?? null;
+      if (why) blockedReasons.push(`${name}: ${why}`);
+      else capable.push({ name, index });
+    }
   }
   if (capable.length === 0) return null;
   const failed = startFailedAgents(db, job.id, job.start_failures);
@@ -239,6 +256,8 @@ export function claimNextJob(
     if (open >= config.maxConcurrent) return null;
 
     const load = runningByAgent(db);
+    const cooldowns = config.capacity ? activeCooldowns(db, clock()) : [];
+    const blocked = config.capacity ? (name: string) => capacityBlock(config, name, cooldowns, load) : null;
     const busyIssues = new Set(
       (
         db
@@ -284,8 +303,16 @@ export function claimNextJob(
         failUnroutable(db, row, reviewer.problem, at);
         continue;
       }
-      const agent = pickAgent(db, config, row, cursorKey(row), pool.agents, load, reviewer.exclude);
-      if (!agent) continue; // this pool is saturated; later jobs in other pools may still start
+      const blockedReasons: string[] = [];
+      const agent = pickAgent(db, config, row, cursorKey(row), pool.agents, load, reviewer.exclude, blocked, blockedReasons);
+      if (!agent) {
+        // Saturated, or held back by capacity policy. Say so on the job (once) so `status` can explain the wait.
+        if (blockedReasons.length) {
+          const waiting = `waiting: no eligible agent in pool "${row.pool}" (${blockedReasons.join('; ')})`.slice(0, 500);
+          if (row.status_reason !== waiting) db.prepare('UPDATE jobs SET status_reason = ? WHERE id = ?').run(waiting, row.id);
+        }
+        continue; // later jobs in other pools may still start
+      }
 
       const runId = newId('run');
       const runRow: RunRow = {
@@ -437,10 +464,25 @@ export interface FinishedRun {
  * Idempotent: closing an already-closed run is a no-op and returns null. Only a job still
  * `running` is moved.
  */
+/**
+ * What the worker's policy decided to do with a failed run instead of leaving its job failed
+ * (docs/capacity-and-escalation.md). The run itself is still recorded as an ordinary failed run
+ * whose error explains why; the job goes back in the queue.
+ */
+export type FailureHandling =
+  | {
+      kind: 'usage-limit';
+      cooldown: CapacityKey & { untilMs: number; stated: boolean };
+      /** Times one job may be put back by usage limits before it fails. */
+      maxDeferrals: number;
+      detail: string;
+    }
+  | { kind: 'escalate'; fromTier: string; toTier: string; pool: string; reason: string; source: string };
+
 export function finishRun(
   db: Db,
   runId: string,
-  result: { outcome: RunOutcome; error?: string | null; now?: () => number },
+  result: { outcome: RunOutcome; error?: string | null; now?: () => number; handling?: FailureHandling },
 ): FinishedRun | null {
   const at = nowIso(result.now ?? Date.now);
   return transaction(db, () => {
@@ -482,6 +524,34 @@ export function finishRun(
       case 'failed':
         status = 'failed';
         reason = error ?? `run ${runId} on ${run.agent} failed`;
+        if (result.handling) {
+          const h = result.handling;
+          const nowMs = (result.now ?? Date.now)();
+          if (h.kind === 'usage-limit') {
+            setCooldown(db, { ...h.cooldown, reason: h.detail, jobId: job.id, runId, nowMs });
+            recordPolicyEvent(db, {
+              kind: 'cooldown',
+              jobId: job.id,
+              runId,
+              detail: `${h.cooldown.scope} "${h.cooldown.name}" cooling down until ${new Date(h.cooldown.untilMs).toISOString()} (${h.cooldown.stated ? 'retry-after stated by the CLI' : 'configured default'}): ${h.detail}`,
+              now: result.now,
+            });
+            if (job.deferrals + 1 > h.maxDeferrals) {
+              reason = `usage limit hit ${job.deferrals + 1} times (cap ${h.maxDeferrals}); not requeued: ${h.detail}`;
+              recordPolicyEvent(db, { kind: 'exhausted', jobId: job.id, runId, detail: reason, now: result.now });
+            } else {
+              db.prepare('UPDATE jobs SET deferrals = deferrals + 1 WHERE id = ?').run(job.id);
+              status = 'queued';
+              reason = `waiting: ${run.agent} hit a usage limit; ${h.cooldown.scope} "${h.cooldown.name}" cools down until ${new Date(h.cooldown.untilMs).toISOString()}`;
+              recordPolicyEvent(db, { kind: 'deferred', jobId: job.id, runId, detail: `requeued after a usage limit on ${run.agent} (deferral ${job.deferrals + 1} of ${h.maxDeferrals})`, now: result.now });
+            }
+          } else {
+            db.prepare('UPDATE jobs SET pool = ?, escalation_hops = escalation_hops + 1 WHERE id = ?').run(h.pool, job.id);
+            status = 'queued';
+            reason = `escalated ${h.fromTier} -> ${h.toTier} (pool ${h.pool}): ${h.reason}`;
+            recordPolicyEvent(db, { kind: 'escalated', jobId: job.id, runId, detail: `${h.source}: ${reason}`, now: result.now });
+          }
+        }
         break;
       case 'interrupted':
         status = 'interrupted';
@@ -689,6 +759,10 @@ export interface StatusSnapshot {
   pullRequests?: Array<{ pr: LoopPr; stage: PrStageInfo }>;
   /** Recent reviewer verdicts and their posting, newest first. */
   reviews?: PrReview[];
+  /** Capacity groups or profiles cooling down after a usage limit, with when they wake (docs/capacity-and-escalation.md). */
+  cooldowns?: Cooldown[];
+  /** Recent cooldowns, deferrals and escalations by job and run, oldest first. */
+  policyEvents?: PolicyEvent[];
 }
 
 export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => number): StatusSnapshot {
@@ -783,5 +857,23 @@ export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => num
       return repo && reviewSettings(repo).enabled ? [{ pr, stage: prStage(db, pr, repo.maxRevisions ?? DEFAULT_MAX_REVISIONS) }] : [];
     }),
     reviews: listRecentPrReviews(db, 10),
+    // Only where capacity or escalation policy is in use (or has ever acted); otherwise absent.
+    ...policySnapshot(db, config, nowMs),
   };
+}
+
+function policySnapshot(db: Db, config: UpdraftConfig, nowMs: number): Pick<StatusSnapshot, 'cooldowns' | 'policyEvents'> {
+  try {
+    return config.capacity || hasPolicyEvents(db) ? { cooldowns: activeCooldowns(db, nowMs), policyEvents: listRecentPolicyEvents(db, 10) } : {};
+  } catch {
+    return {}; // a database from before the tables existed (status reads without migrating)
+  }
+}
+
+function hasPolicyEvents(db: Db): boolean {
+  try {
+    return db.prepare('SELECT 1 FROM policy_events LIMIT 1').get() !== undefined;
+  } catch {
+    return false; // a database from before the table existed
+  }
 }

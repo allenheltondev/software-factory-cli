@@ -310,3 +310,20 @@ describe('selectPool', () => {
     expect(selectPool('general', ['art'])).toBe('general');
   });
 });
+
+describe('capacity and escalation config', () => {
+  it('rejects an agent naming an undeclared capacity group', () => {
+    const cfg = example();
+    cfg.agents.codex.capacityGroup = 'nope';
+    const r = validateConfig(cfg);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errors).toContainEqual({ path: 'agents.codex.capacityGroup', message: expect.stringMatching(/unknown capacity group "nope"/) });
+  });
+
+  it('accepts a declared group', () => {
+    const cfg = example();
+    cfg.capacity = { groups: { acct: { maxConcurrent: 2 } } };
+    cfg.agents.codex.capacityGroup = 'acct';
+    expect(validateConfig(cfg).ok).toBe(true);
+  });
+});

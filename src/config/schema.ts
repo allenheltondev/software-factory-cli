@@ -84,6 +84,12 @@ export const agentSchema = z.strictObject({
   env: z.record(envName, z.string()).optional(),
   /** Live mode: run this agent in a container. `env` above is then set inside the container. */
   container: containerSchema.optional(),
+  /**
+   * Opt-in: the name of a `capacity.groups` entry. Profiles that run under the same signed-in CLI
+   * account name the same group and then share its concurrency budget and its cooldown after a
+   * usage limit (docs/capacity-and-escalation.md). Updraft never infers this from credentials.
+   */
+  capacityGroup: name.optional(),
 });
 
 export const poolSchema = z.strictObject({
@@ -174,6 +180,24 @@ export const triageSchema = z.strictObject({
   failureCooldownMinutes: z.number().int().min(1).max(1440).default(60),
 });
 /**
+ * Opt-in escalation of a job to a more capable tier pool. A run can only *request* it (reason,
+ * tier, evidence); this policy decides, and the ceiling, hop cap and pools here are never
+ * overridable by model output.
+ */
+export const escalationSchema = z.strictObject({
+  /** Per-workflow opt-out without deleting the block. Default true (the block itself is the opt-in). */
+  enabled: z.boolean().default(true),
+  /** Escalations one job may get in total. Default 1, at most 3. */
+  maxHops: z.number().int().min(1).max(3).default(1),
+  /** The most capable tier escalation may reach. high-risk needs tiers.highRisk. Default complex. */
+  ceiling: z.enum(['standard', 'complex', 'high-risk']).default('complex'),
+  /** Escalate one tier after a failed verification, without the agent asking. Default true. */
+  onVerificationFailure: z.boolean().default(true),
+  /** Honor an agent's `updraft-escalation:` request line. Default true. */
+  allowAgentRequests: z.boolean().default(true),
+});
+
+/**
  * Opt-in tier routing (docs/tier-routing.md). Absent: routing is exactly `pool` as before.
  * `pool` is still required and is used for non-tiered paths such as legacy `rules`.
  */
@@ -194,6 +218,8 @@ export const tierSchema = z.strictObject({
   minConfidence: z.number().min(0).max(1).optional(),
   /** Opt-in CLI triage of ambiguous issues (docs/triage.md). Absent: no triage, ever. */
   triage: triageSchema.optional(),
+  /** Opt-in bounded escalation to a more capable tier (docs/capacity-and-escalation.md). Absent: never escalates. */
+  escalation: escalationSchema.optional(),
 });
 
 export const triggerSchema = z.strictObject({
@@ -320,6 +346,28 @@ export const githubAppSchema = z.strictObject({
   commitAsApp: z.boolean().optional(),
 });
 
+/**
+ * Subscription capacity groups (docs/capacity-and-escalation.md). A group is a user-declared set
+ * of agent profiles that share one authenticated CLI account (`agents.<name>.capacityGroup`).
+ */
+export const capacityGroupSchema = z.strictObject({
+  /** Runs allowed at once across all profiles in the group. Default 1. */
+  maxConcurrent: z.number().int().min(1).max(32).default(1),
+  /** Cooldown after a recognized usage-limit exit when the CLI gave no reliable retry-after. Default 60. */
+  defaultCooldownMinutes: z.number().int().min(1).max(10080).default(60),
+  /** A stated retry-after is honored up to this long. Default 360 (6 hours). */
+  maxCooldownMinutes: z.number().int().min(1).max(10080).default(360),
+});
+
+export const capacitySchema = z.strictObject({
+  groups: z.record(name, capacityGroupSchema).default({}),
+  /** Cooldown applied to a profile with no capacityGroup after a usage limit. Default 60. */
+  defaultCooldownMinutes: z.number().int().min(1).max(10080).default(60),
+  maxCooldownMinutes: z.number().int().min(1).max(10080).default(360),
+  /** Times one job may be put back in the queue by usage limits before it fails. Default 5. */
+  maxDeferrals: z.number().int().min(1).max(50).default(5),
+});
+
 export const configSchema = z.strictObject({
   version: z.literal(CONFIG_VERSION),
   pollIntervalSeconds: z.number().int().min(10).max(3600).default(60),
@@ -354,6 +402,8 @@ export const configSchema = z.strictObject({
       reviewers: z.array(z.string().min(1)).default([]),
     })
     .default({ reviewers: [] }),
+  /** Opt-in usage-limit handling and shared subscription capacity. Absent: nothing changes. */
+  capacity: capacitySchema.optional(),
   agents: z.record(name, agentSchema),
   pools: z.record(name, poolSchema),
   actions: z.record(name, actionSchema),
@@ -371,6 +421,8 @@ export type VerifyCommand = NonNullable<ActionConfig['verify']>[number];
 export type WorkflowConfig = z.output<typeof workflowSchema>;
 export type RepositoryConfig = z.output<typeof repositorySchema>;
 export type TierConfig = z.output<typeof tierSchema>;
+export type EscalationConfig = z.output<typeof escalationSchema>;
+export type CapacityConfig = z.output<typeof capacitySchema>;
 export type TriageConfig = z.output<typeof triageSchema>;
 export type PoolSelector = z.output<typeof poolSelectorSchema>;
 

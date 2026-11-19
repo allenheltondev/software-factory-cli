@@ -72,6 +72,7 @@ import { commitIdentityEnv, type CommitIdentity } from '../github/credentials.js
 import { processStartTime, taskkillPath } from './process.js';
 import { discardReviewWorktree, readReviewVerdict, reviewBase, type ReviewRunState } from './review-run.js';
 import { cleanSummaryLines, countUncommitted, hasSubmodules, headCommit, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
+import { ESCALATION_MARKER } from '../escalation/escalation.js';
 import { displayVerifyCommand, verifyInvocation, type VerifyInvocation } from './verify.js';
 
 const isWindows = process.platform === 'win32';
@@ -903,6 +904,7 @@ export class LiveExecutor implements Executor {
     }
     let outcome: RunOutcome;
     let error: string | undefined;
+    let cliFailureOutput: string | undefined;
     if (agentRun.stopped === 'timeout') {
       outcome = 'failed';
       error = `agent timed out after ${timeoutMinutes} min; its process tree was stopped`;
@@ -921,6 +923,7 @@ export class LiveExecutor implements Executor {
       }
       outcome = verdict.outcome;
       error = verdict.error ?? (outcome === 'failed' ? defaultVerdict(exit).error : undefined);
+      if (outcome === 'failed') cliFailureOutput = rawOutput || outputTail.join('\n');
       if (box && agentRun.code === CONTAINER_RUN_FAILED) {
         // The code the runtime exits with when it fails itself (bad option, daemon gone, name in use).
         outcome = 'failed';
@@ -1053,6 +1056,13 @@ export class LiveExecutor implements Executor {
     if (outcome !== 'succeeded' && !review) tail.push(`The worktree is kept for inspection: ${prepared.worktreePath}`);
     await log(tail);
     ctx.log.info('agent finished', { outcome, ...(error ? { error } : {}), seconds, logPath });
-    return { outcome, ...(error ? { error } : {}), summary };
+    const escalationRequest = !review && agentOutput.toLowerCase().includes(ESCALATION_MARKER) ? agentOutput : undefined;
+    return {
+      outcome,
+      ...(error ? { error } : {}),
+      summary,
+      ...(cliFailureOutput && outcome === 'failed' ? { cliOutput: cliFailureOutput.slice(-RAW_OUTPUT_BYTES) } : {}),
+      ...(escalationRequest ? { escalationRequest } : {}),
+    };
   }
 }
