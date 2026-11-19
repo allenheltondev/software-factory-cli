@@ -27,7 +27,9 @@ function allFiles(dir: string): string[] {
   });
 }
 
-describe('ensureClone', () => {
+// Real git, several commands a test: well under a second on Linux, up to ten on a loaded Windows
+// runner, so the default 5 s per test is too tight there.
+describe('ensureClone', { timeout: 60_000 }, () => {
   it('creates an empty repository with the remote and nothing else, and marks it as its own', async () => {
     const f = fixture();
     const checkoutPath = join(f.root, 'state dir', 'checkouts', 'widgets');
@@ -108,7 +110,7 @@ describe('workerNetworkGit', () => {
   });
 });
 
-describe('a created clone, fetched with a network environment', () => {
+describe('a created clone, fetched with a network environment', { timeout: 60_000 }, () => {
   it('gives the environment to the fetch, so a clone with no usable credentials of its own can be prepared', async () => {
     const f = fixture();
     const checkoutPath = join(f.root, 'checkouts', 'widgets');
