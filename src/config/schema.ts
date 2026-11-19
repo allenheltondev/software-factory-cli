@@ -335,8 +335,16 @@ export const githubAppSchema = z.strictObject({
   /**
    * The PEM private key downloaded from the App's settings, relative to the config file's
    * directory. UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH in the worker's environment names another file.
+   * Exactly one of privateKeyPath and tokenFile.
    */
-  privateKeyPath: z.string().min(1),
+  privateKeyPath: z.string().min(1).optional(),
+  /**
+   * Instead of the key: a JSON file holding an installation token that somebody else mints and
+   * replaces before it expires (docs/github-app.md, "A token file instead of the key"), relative
+   * to the config file's directory. The worker never holds the key and reaches only what the
+   * token reaches. UPDRAFT_GITHUB_APP_TOKEN_FILE in the worker's environment names another file.
+   */
+  tokenFile: z.string().min(1).optional(),
   /** Use this installation for every repository. Default: look the installation up per repository. */
   installationId: z.number().int().positive().optional(),
   /**
@@ -344,6 +352,18 @@ export const githubAppSchema = z.strictObject({
    * agent's environment). Default false: commits carry the local git identity.
    */
   commitAsApp: z.boolean().optional(),
+}).superRefine((app, ctx) => {
+  const both = app.privateKeyPath !== undefined && app.tokenFile !== undefined;
+  const neither = app.privateKeyPath === undefined && app.tokenFile === undefined;
+  if (both || neither) {
+    ctx.addIssue({
+      code: 'custom',
+      path: [both ? 'tokenFile' : 'privateKeyPath'],
+      message: both
+        ? 'set privateKeyPath or tokenFile, not both'
+        : 'set privateKeyPath (the App private key) or tokenFile (a file of installation tokens)',
+    });
+  }
 });
 
 /**

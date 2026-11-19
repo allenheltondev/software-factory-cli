@@ -31,7 +31,7 @@ function zodIssues(err: z.ZodError): ConfigIssue[] {
 }
 
 /** The worker's own GitHub credentials, which a live run never passes on (WITHHELD_ENV in src/worker/live.ts). */
-const WITHHELD_FROM_AGENTS = ['GH_TOKEN', 'GITHUB_TOKEN', 'UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH'];
+const WITHHELD_FROM_AGENTS = ['GH_TOKEN', 'GITHUB_TOKEN', 'UPDRAFT_GITHUB_APP_PRIVATE_KEY_PATH', 'UPDRAFT_GITHUB_APP_TOKEN_FILE'];
 
 /**
  * Parse and cross-check a config object: referenced actions, pools, agents,

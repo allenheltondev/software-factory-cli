@@ -64,7 +64,15 @@ export type GitHubAppProblem =
   /** GitHub answered 401 to an installation token it issued. */
   | 'token-rejected'
   /** The request is one only a user account can make. */
-  | 'not-for-apps';
+  | 'not-for-apps'
+  /** github.app.tokenFile (or UPDRAFT_GITHUB_APP_TOKEN_FILE) is missing, unreadable, malformed or expired. */
+  | 'token-file';
+
+/**
+ * Environment variable naming a token file (token-file-auth.ts) to use instead of
+ * github.app.tokenFile or the private key. Never passed to an agent.
+ */
+export const APP_TOKEN_FILE_ENV = 'UPDRAFT_GITHUB_APP_TOKEN_FILE';
 
 /**
  * A GitHub App problem that waiting does not fix; the message says what to change. It is a
@@ -250,7 +258,10 @@ export interface AppAuthOptions {
 
 export interface AppAuth {
   readonly appId: number | string;
-  readonly privateKeyPath: string;
+  /** The key file (createAppAuth). */
+  readonly privateKeyPath?: string;
+  /** The token file, when the identity comes from one instead of the key (token-file-auth.ts). */
+  readonly tokenFile?: string;
   /** The App behind the key (`GET /app`). Cached once it succeeded. */
   app(): Promise<GitHubApp>;
   /** The installation that covers `repoFullName`, as GitHub reports it now (not cached). */

@@ -67,7 +67,7 @@ import {
   untrackContainer,
   type ContainedInvocation,
 } from './container.js';
-import { APP_KEY_PATH_ENV } from '../github/app-auth.js';
+import { APP_KEY_PATH_ENV, APP_TOKEN_FILE_ENV } from '../github/app-auth.js';
 import { commitIdentityEnv, type CommitIdentity } from '../github/credentials.js';
 import { processStartTime, taskkillPath } from './process.js';
 import { discardReviewWorktree, readReviewVerdict, reviewBase, type ReviewRunState } from './review-run.js';
@@ -81,9 +81,9 @@ const DEFAULT_KILL_GRACE_MS = 5_000;
 const EXIT_WAIT_MS = 10_000;
 /**
  * Variables the worker may hold for its own GitHub access (its token, or where its GitHub App's
- * private key is); an agent working on untrusted input doesn't get them.
+ * private key or token file is); an agent working on untrusted input doesn't get them.
  */
-const WITHHELD_ENV = ['GH_TOKEN', 'GITHUB_TOKEN', APP_KEY_PATH_ENV];
+const WITHHELD_ENV = ['GH_TOKEN', 'GITHUB_TOKEN', APP_KEY_PATH_ENV, APP_TOKEN_FILE_ENV];
 
 export interface LiveExecutorOptions {
   /** git executable for worktree preparation and the summary. */

@@ -2,7 +2,9 @@
 // it there". Two kinds:
 // - user (the default): the person's own account, through GH_TOKEN / GITHUB_TOKEN or `gh auth token`.
 // - app (github.app in the config): a GitHub App installation, `<app-slug>[bot]`, with tokens
-//   that last an hour and reach only the repositories the App is installed on (app-auth.ts).
+//   that last an hour and reach only the repositories the App is installed on. Minted with the
+//   App's private key (app-auth.ts), or read from a token file that something else keeps
+//   current, so the worker never holds the key (token-file-auth.ts).
 //
 // The API client (client.ts) asks the provider for a token per request, and publication asks it
 // for one per push; neither knows which kind it has. An installation token belongs to one
@@ -13,7 +15,8 @@
 import { isAbsolute, resolve } from 'node:path';
 import type { UpdraftConfig } from '../config/schema.js';
 import type { Logger } from '../util/log.js';
-import { APP_KEY_PATH_ENV, createAppAuth, GitHubAppError, loadAppPrivateKey, type AppAuth, type GitHubApp } from './app-auth.js';
+import { APP_KEY_PATH_ENV, APP_TOKEN_FILE_ENV, createAppAuth, GitHubAppError, loadAppPrivateKey, type AppAuth, type GitHubApp } from './app-auth.js';
+import { createTokenFileAuth, loadTokenFile } from './token-file-auth.js';
 
 export type WorkerKind = 'user' | 'app';
 
@@ -115,9 +118,23 @@ export function createAppCredentials(auth: AppAuth): GitHubCredentials {
 
 export type GitHubAppConfig = NonNullable<NonNullable<UpdraftConfig['github']>['app']>;
 
+/**
+ * Where the App's token file is (token-file-auth.ts), or null when the identity comes from the
+ * private key: UPDRAFT_GITHUB_APP_TOKEN_FILE if set, else github.app.tokenFile; relative to the
+ * config file's directory. A token file wins over a key.
+ */
+export function appTokenFilePath(app: Pick<GitHubAppConfig, 'tokenFile'>, o: { configDir: string; env: NodeJS.ProcessEnv }): string | null {
+  const p = o.env[APP_TOKEN_FILE_ENV]?.trim() || app.tokenFile;
+  if (!p) return null;
+  return isAbsolute(p) ? p : resolve(o.configDir, p);
+}
+
 /** Where the App's private key is: the path in the environment variable if set, else the config's; relative to the config file's directory. */
 export function appPrivateKeyPath(app: Pick<GitHubAppConfig, 'privateKeyPath'>, o: { configDir: string; env: NodeJS.ProcessEnv }): string {
   const p = o.env[APP_KEY_PATH_ENV]?.trim() || app.privateKeyPath;
+  if (!p) {
+    throw new GitHubAppError(`github.app has no privateKeyPath (and ${APP_KEY_PATH_ENV} is not set)`, 'key');
+  }
   return isAbsolute(p) ? p : resolve(o.configDir, p);
 }
 
@@ -139,6 +156,20 @@ export interface WorkerCredentialOptions {
 export function createWorkerCredentials(config: Pick<UpdraftConfig, 'github'> | null, o: WorkerCredentialOptions): GitHubCredentials {
   const app = config?.github?.app;
   if (!app) return createUserCredentials(o.userToken);
+  const tokenFile = appTokenFilePath(app, o);
+  if (tokenFile) {
+    // Read once here, like the key, so an unusable file stops the command at once.
+    loadTokenFile(tokenFile);
+    return createAppCredentials(
+      createTokenFileAuth({
+        path: tokenFile,
+        appId: app.appId,
+        ...(o.log ? { log: o.log } : {}),
+        ...(o.fetch ? { fetch: o.fetch } : {}),
+        ...(o.now ? { now: o.now } : {}),
+      }),
+    );
+  }
   const privateKeyPath = appPrivateKeyPath(app, o);
   loadAppPrivateKey(privateKeyPath);
   return createAppCredentials(
