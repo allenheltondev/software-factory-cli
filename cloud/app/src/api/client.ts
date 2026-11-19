@@ -16,8 +16,9 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
 
-  constructor(status: number, code: string) {
-    super(`API request failed (${status} ${code})`);
+  /** A message the server meant for people (flow errors carry one), or a generic one. */
+  constructor(status: number, code: string, message?: string) {
+    super(message ?? `API request failed (${status} ${code})`);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
@@ -29,6 +30,48 @@ export interface ApiClientOptions {
   onUnauthorized?: () => void;
   fetch?: typeof fetch;
 }
+
+export interface TenantSummary {
+  installationId: number;
+  accountLogin: string;
+  accountType: string;
+  status: 'active' | 'disabled';
+  disabledReason?: 'suspended' | 'uninstalled';
+  role: 'owner' | 'editor';
+}
+
+export interface GitHubStatus {
+  configured: boolean;
+  appSlug?: string;
+  linked: { githubLogin: string; githubUserId: number } | null;
+  tenants: TenantSummary[];
+}
+
+export interface Repository {
+  id: number;
+  fullName: string;
+  private: boolean;
+  htmlUrl: string;
+}
+
+export interface CallbackInput {
+  code?: string;
+  state?: string;
+  installationId?: string;
+  setupAction?: string;
+}
+
+export interface ConnectableInstallation {
+  installationId: number;
+  accountLogin: string;
+  accountType: string;
+  connected: boolean;
+}
+
+export type CallbackResult =
+  | { kind: 'linked'; githubLogin: string; installations: ConnectableInstallation[] }
+  | { kind: 'installed'; githubLogin: string; installationId: number; accountLogin: string }
+  | { kind: 'requested'; githubLogin: string };
 
 export interface Me {
   sub: string;
@@ -48,13 +91,15 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     if (response.status === 401) onUnauthorized?.();
     if (!response.ok) {
       let code = 'error';
+      let message: string | undefined;
       try {
-        const body = (await response.json()) as { error?: unknown };
+        const body = (await response.json()) as { error?: unknown; message?: unknown };
         if (typeof body.error === 'string') code = body.error;
+        if (typeof body.message === 'string') message = body.message;
       } catch {
         // Not JSON (an API Gateway or CloudFront error page): keep the generic code.
       }
-      throw new ApiError(response.status, code);
+      throw new ApiError(response.status, code, message);
     }
     return (await response.json()) as T;
   }
@@ -62,6 +107,16 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
   return {
     request,
     me: () => request<Me>('/me'),
+    githubStatus: () => request<GitHubStatus>('/github'),
+    startLink: () => request<{ url: string }>('/github/link', { method: 'POST' }),
+    unlink: () => request<{ ok: true }>('/github/link', { method: 'DELETE' }),
+    startInstall: () => request<{ url: string }>('/github/install', { method: 'POST' }),
+    completeCallback: (input: CallbackInput) =>
+      request<CallbackResult>('/github/callback', { method: 'POST', body: JSON.stringify(input) }),
+    connect: (installationId: number) =>
+      request<{ installationId: number; accountLogin: string }>(`/github/connect/${installationId}`, { method: 'POST' }),
+    repositories: (installationId: number) =>
+      request<{ tenant: TenantSummary; repositories: Repository[] }>(`/installations/${installationId}/repositories`),
   };
 }
 

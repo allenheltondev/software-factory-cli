@@ -6,6 +6,8 @@ import { ForgotPasswordPage, LoginPage, SignUpPage } from './auth/AuthScreens';
 import { RequireSignIn } from './auth/RequireSignIn';
 import { AppLayout } from './layout/AppLayout';
 import { DashboardPage } from './pages/DashboardPage';
+import { GitHubCallbackPage } from './pages/GitHubCallbackPage';
+import { InstallationPage } from './pages/InstallationPage';
 
 function NotFoundPage() {
   return (
@@ -22,7 +24,7 @@ function NotFoundPage() {
 }
 
 /** The route table. The router is supplied by the caller (main.tsx, tests); tests can pass a fake API. */
-export function App({ api }: { api?: Pick<ApiClient, 'me'> }) {
+export function App({ api }: { api?: ApiClient }) {
   return (
     <AuthProvider>
       <Routes>
@@ -38,6 +40,8 @@ export function App({ api }: { api?: Pick<ApiClient, 'me'> }) {
           }
         >
           <Route index element={<DashboardPage api={api} />} />
+          <Route path="github/callback" element={<GitHubCallbackPage api={api} />} />
+          <Route path="installations/:id" element={<InstallationPage api={api} />} />
           <Route path="*" element={<NotFoundPage />} />
         </Route>
       </Routes>
