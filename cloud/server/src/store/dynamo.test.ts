@@ -356,3 +356,37 @@ describe('dynamo store: review fixes on #78', () => {
     expect(await store.listDueCleanups(DEADLINE + 10_000)).toEqual([{ installationId: 66, deleteAfter: DEADLINE + 10_000 }]);
   });
 });
+
+describe('dynamo store: the uninstall and its cleanup entry are one transaction', () => {
+  it('a sweep that fails part-way still leaves a due cleanup entry (the review case)', async () => {
+    const { store, table } = await seeded();
+    table.fail((name, input) => name === 'UpdateCommand' && String((input.Key as Item).sk).startsWith('MEMBER#'));
+    await expect(store.markUninstalled(55, DEADLINE)).rejects.toThrow(/injected failure/);
+    table.fail(null);
+    expect(table.items.get('TENANT#55|META')?.disabledReason).toBe('uninstalled');
+    expect(await store.listDueCleanups(DEADLINE)).toEqual([{ installationId: 55, deleteAfter: DEADLINE }]);
+  });
+
+  it('a failed transaction changes nothing, so the uninstall is never half-recorded', async () => {
+    const { store, table } = await seeded();
+    table.fail((name) => name === 'TransactWriteCommand');
+    await expect(store.markUninstalled(55, DEADLINE)).rejects.toThrow(/injected failure/);
+    await expect(store.markUninstalled(66, DEADLINE)).rejects.toThrow(/injected failure/); // the tombstone too
+    table.fail(null);
+    expect(table.items.get('TENANT#55|META')?.disabledReason).toBeUndefined();
+    expect(table.items.has('TENANT#66|META')).toBe(false);
+    expect(await store.listDueCleanups(DEADLINE)).toEqual([]);
+  });
+
+  it('purges every row of the partition, including one the sweep never reached', async () => {
+    const { store, table } = await seeded();
+    table.fail((name, input) => name === 'UpdateCommand' && String((input.Key as Item).sk).startsWith('MEMBER#'));
+    await store.markUninstalled(55, DEADLINE).catch(() => {});
+    table.fail(null);
+    expect(table.items.get('TENANT#55|MEMBER#sub-a')?.ttl).toBeUndefined();
+    await store.purgeTenantPartition(55);
+    expect([...table.items.keys()].filter((k) => k.startsWith('TENANT#55|'))).toEqual([]);
+    await store.purgeTenantPartition(55); // again: nothing to do
+    expect(await store.listDueCleanups(DEADLINE)).toEqual([{ installationId: 55, deleteAfter: DEADLINE }]);
+  });
+});

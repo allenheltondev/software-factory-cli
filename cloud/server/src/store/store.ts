@@ -167,6 +167,11 @@ export interface Store {
   listDueCleanups(now: number): Promise<CleanupEntry[]>;
   /** The tenant's data outside the table is gone: forget the entry. */
   completeCleanup(entry: CleanupEntry): Promise<void>;
+  /**
+   * At the deadline: deletes every row of the tenant's partition, including any an interrupted
+   * uninstall sweep left without a TTL. Safe to repeat.
+   */
+  purgeTenantPartition(installationId: number): Promise<void>;
 }
 
 export interface CleanupEntry {
@@ -310,6 +315,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async listDueCleanups(now) {
       return [...cleanups.values()].filter((c) => c.deleteAfter <= now).map((c) => ({ ...c }));
+    },
+    async purgeTenantPartition(id) {
+      tenants.delete(id);
+      for (const [k, m] of members) if (m.installationId === id) members.delete(k);
+      for (const [k, c] of configs) if (c.installationId === id) configs.delete(k);
+      for (const k of [...keys.keys()]) if (k.startsWith(`${id}/`)) keys.delete(k);
     },
     async completeCleanup(entry) {
       if (cleanups.get(entry.installationId)?.deleteAfter === entry.deleteAfter) cleanups.delete(entry.installationId);

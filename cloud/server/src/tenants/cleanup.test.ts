@@ -68,6 +68,16 @@ describe('runCleanup', () => {
     expect([...objects].some((k) => k.startsWith(tenantPrefix(55)))).toBe(false);
   });
 
+  it("also removes the tenant's rows still in the table at the deadline", async () => {
+    const { store, deps } = await setup();
+    await store.markUninstalled(55, NOW - DAY);
+    expect(await store.getMember(55, 's')).not.toBeNull();
+    await runCleanup(deps);
+    expect(await store.getTenant(55)).toBeNull();
+    expect(await store.getMember(55, 's')).toBeNull();
+    expect(await store.getTenant(66)).not.toBeNull();
+  });
+
   it('also cleans up after a tombstone (a delete for a tenant that never existed)', async () => {
     const { store, deps } = await setup();
     await store.markUninstalled(99, NOW - DAY);

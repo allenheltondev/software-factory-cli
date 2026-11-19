@@ -274,67 +274,106 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
 
     async markUninstalled(id, deleteAfter, account) {
       const ttl = Math.ceil(deleteAfter / 1000);
+      const cleanup = { Put: { TableName: T, Item: { ...cleanupKey({ installationId: id, deleteAfter }), installationId: id, deleteAfter } } };
+      const conditionFailed = (err: unknown) =>
+        err instanceof TransactionCanceledException && err.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed';
       // Three outcomes, retried if the tenant changes between the steps:
       //   marked     an existing tenant is now uninstalled
       //   already    it was uninstalled before: finish the sweep with the stored deadline
       //   tombstone  there is no tenant (yet): record one already uninstalled, so that a Connect or
       //              install callback that passed its GitHub check a moment ago cannot create it
+      // The cleanup entry is written in the same transaction as the transition, before the sweep:
+      // an uninstall is never recorded without its cleanup, whatever fails after it.
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           await client.send(
-            new UpdateCommand({
-              TableName: T,
-              Key: tenantKey(id),
-              UpdateExpression: 'SET #status = :disabled, disabledReason = :uninstalled, deleteAfter = :deleteAfter, #ttl = :ttl',
-              ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
-              ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
-              ExpressionAttributeValues: { ':disabled': 'disabled', ':uninstalled': 'uninstalled', ':deleteAfter': deleteAfter, ':ttl': ttl },
+            new TransactWriteCommand({
+              TransactItems: [
+                {
+                  Update: {
+                    TableName: T,
+                    Key: tenantKey(id),
+                    UpdateExpression: 'SET #status = :disabled, disabledReason = :uninstalled, deleteAfter = :deleteAfter, #ttl = :ttl',
+                    ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+                    ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
+                    ExpressionAttributeValues: { ':disabled': 'disabled', ':uninstalled': 'uninstalled', ':deleteAfter': deleteAfter, ':ttl': ttl },
+                  },
+                },
+                cleanup,
+              ],
             }),
           );
           await sweepPartition(id, ttl);
-          await recordCleanup({ installationId: id, deleteAfter });
           return 'marked';
         } catch (err) {
-          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+          if (!conditionFailed(err)) throw err;
         }
         const existing = await getTenantItem(id, true);
         if (existing?.disabledReason === 'uninstalled') {
           // Uninstalled before: finish (or redo) the sweep with the deadline stored then, so one a
-          // failure or timeout cut short completes on the next delivery.
+          // failure or timeout cut short completes on the next delivery. (At the deadline the daily
+          // cleanup removes whatever is left either way.)
           const stored = typeof existing.deleteAfter === 'number' ? existing.deleteAfter : deleteAfter;
-          await sweepPartition(id, Math.ceil(stored / 1000));
           await recordCleanup({ installationId: id, deleteAfter: stored });
+          await sweepPartition(id, Math.ceil(stored / 1000));
           return 'already';
         }
         if (existing) continue; // created or changed since the update was refused: try again
         try {
           await client.send(
-            new PutCommand({
-              TableName: T,
-              Item: {
-                ...tenantKey(id),
-                installationId: id,
-                accountId: account?.id ?? 0,
-                accountLogin: account?.login ?? '',
-                accountType: account?.type ?? '',
-                status: 'disabled',
-                disabledReason: 'uninstalled',
-                deleteAfter,
-                ttl,
-                createdAt: new Date().toISOString(),
-                createdBy: 'github:installation.deleted',
-              },
-              ConditionExpression: 'attribute_not_exists(pk)',
+            new TransactWriteCommand({
+              TransactItems: [
+                {
+                  Put: {
+                    TableName: T,
+                    Item: {
+                      ...tenantKey(id),
+                      installationId: id,
+                      accountId: account?.id ?? 0,
+                      accountLogin: account?.login ?? '',
+                      accountType: account?.type ?? '',
+                      status: 'disabled',
+                      disabledReason: 'uninstalled',
+                      deleteAfter,
+                      ttl,
+                      createdAt: new Date().toISOString(),
+                      createdBy: 'github:installation.deleted',
+                    },
+                    ConditionExpression: 'attribute_not_exists(pk)',
+                  },
+                },
+                cleanup,
+              ],
             }),
           );
-          await recordCleanup({ installationId: id, deleteAfter });
           return 'tombstone';
         } catch (err) {
-          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+          if (!conditionFailed(err)) throw err;
           // A tenant was created in between: mark that one on the next pass.
         }
       }
       throw new Error(`markUninstalled: tenant ${id} kept changing; retry the delivery`);
+    },
+
+    async purgeTenantPartition(id) {
+      // At the deadline: every row the TTL should have removed, including any an interrupted sweep
+      // never reached. Strongly consistent, so nothing just written is missed. Safe to repeat.
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk',
+            ExpressionAttributeValues: { ':pk': `TENANT#${id}` },
+            ProjectionExpression: 'pk, sk, #ttl',
+            ExpressionAttributeNames: { '#ttl': 'ttl' },
+            ConsistentRead: true,
+            ExclusiveStartKey,
+          }),
+        );
+        for (const item of page.Items ?? []) await client.send(new DeleteCommand({ TableName: T, Key: { pk: item.pk, sk: item.sk } }));
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
     },
 
     async setSuspended(id, suspended) {
