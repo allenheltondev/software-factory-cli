@@ -97,6 +97,9 @@ export async function checkWait(deps: DependencyWatcherDeps, w: DependencyWait):
   if ('problem' in cfg) return end('canceled', cfg.problem!);
   const { settings } = cfg;
   const repo = { id: w.repoId, fullName: cfg.fullName };
+  const deadline = Date.parse(w.createdAt) + settings.maxWaitMs;
+  const expire = (detail: string, title?: string) => end('expired', `${ref} ${detail} (dependencies.maxWaitDays)`, title);
+  let mergedInTime = false;
 
   try {
     // 1. Does the issue still want the work? A follow-up for it would be canceled before it started.
@@ -131,6 +134,12 @@ export async function checkWait(deps: DependencyWatcherDeps, w: DependencyWait):
     }
     const title = pr.title ?? '';
     if (pr.merged) {
+      // A delayed check can still discover a merge that happened by the deadline.
+      const mergedAt = Date.parse(pr.mergedAt ?? '');
+      if (Number.isFinite(mergedAt) ? mergedAt > deadline : now() >= deadline) {
+        return expire('did not have a confirmed merge by the wait deadline', title);
+      }
+      mergedInTime = true;
       const r = resumeDependencyWait(deps.db, w.runId, {
         pullRequest: { repo: w.depRepo, number: w.depNumber, url: pr.htmlUrl || w.depUrl, title, mergedAt: pr.mergedAt ?? null, mergeCommitSha: pr.mergeCommitSha ?? null },
         now,
@@ -143,19 +152,24 @@ export async function checkWait(deps: DependencyWatcherDeps, w: DependencyWait):
       return { kind: 'resumed', jobId: r.jobId };
     }
     if (pr.state === 'closed') return end('closed', `${ref} was closed without being merged`, title);
-    if (now() - Date.parse(w.createdAt) >= settings.maxWaitMs) {
-      return end('expired', `${ref} was still not merged ${Math.round(settings.maxWaitMs / 86_400_000)} day(s) after the wait began (dependencies.maxWaitDays)`, title);
-    }
-    const nextCheckAt = new Date(now() + settings.checkIntervalMs).toISOString();
+    const checkedAt = now();
+    if (checkedAt >= deadline) return expire('was still open at the wait deadline', title);
+    const nextCheckAt = new Date(Math.min(checkedAt + settings.checkIntervalMs, deadline)).toISOString();
     recordWaitChecked(deps.db, w.runId, { nextCheckAt, depRepoId, depUrl: pr.htmlUrl || undefined, depTitle: title || undefined, now });
     log.debug('still waiting', { nextCheckAt });
     return { kind: 'waiting', nextCheckAt };
   } catch (err) {
-    // Anything else: the wait stays, and is looked at again later, backing off while it repeats.
+    // An on-time merge can be retried if recording its follow-up job failed.
+    const checkedAt = now();
     const error = message(err);
+    if (!mergedInTime && checkedAt >= deadline) {
+      log.warn('could not verify the merge by the wait deadline', { error });
+      return expire('could not be confirmed merged by the wait deadline');
+    }
     const backoff = transient(err) ? Math.min(MAX_CHECK_BACKOFF_MS, settings.checkIntervalMs * 2 ** w.failures) : settings.checkIntervalMs;
     const retryAfter = err instanceof GitHubError && err.retryAfterSeconds ? err.retryAfterSeconds * 1000 : 0;
-    const nextCheckAt = new Date(now() + Math.max(backoff, retryAfter)).toISOString();
+    const backedOffUntil = checkedAt + backoff;
+    const nextCheckAt = new Date(Math.max(checkedAt + retryAfter, mergedInTime ? backedOffUntil : Math.min(backedOffUntil, deadline))).toISOString();
     recordWaitCheckFailed(deps.db, w.runId, { error, nextCheckAt, now });
     try {
       recordError(deps.db, {
@@ -175,26 +189,37 @@ export async function checkWait(deps: DependencyWatcherDeps, w: DependencyWait):
 
 export function createDependencyWatcher(deps: DependencyWatcherDeps): DependencyWatcher {
   const now = deps.now ?? Date.now;
-  const comment = async (w: DependencyWait, signal?: AbortSignal) => {
-    const cfg = configFor(deps.config, w);
-    // A comment is the feature's: with its config gone, the worker stops speaking for it.
-    if ('problem' in cfg) {
+  const commenting = new Set<string>();
+  const comment = async (runId: string, signal?: AbortSignal) => {
+    // The run-completion task and the polling loop can both find the same comment pending.
+    if (commenting.has(runId)) return;
+    commenting.add(runId);
+    try {
+      const w = getDependencyWait(deps.db, runId);
+      if (!w || w.state === 'canceled' || w.state === 'resumed') return;
       const which = w.state === 'waiting' ? 'wait' : 'end';
-      recordWaitComment(deps.db, w.runId, which, { error: `not posted: ${cfg.problem}`, giveUp: true }, now);
-      return;
+      const cfg = configFor(deps.config, w);
+      if ('problem' in cfg) {
+        recordWaitComment(deps.db, runId, which, { error: `not posted: ${cfg.problem}`, giveUp: true }, now);
+        return;
+      }
+      const agent = getRun(deps.db, runId)?.agent ?? 'unknown';
+      await postWaitComment({ db: deps.db, api: deps.api, log: deps.log, now }, w, which, {
+        repoFullName: cfg.fullName,
+        agent,
+        triggerLabel: cfg.label,
+        checkIntervalMs: cfg.settings.checkIntervalMs,
+        maxWaitMs: cfg.settings.maxWaitMs,
+        signal,
+      });
+    } finally {
+      commenting.delete(runId);
     }
-    const agent = getRun(deps.db, w.runId)?.agent ?? 'unknown';
-    const o = { repoFullName: cfg.fullName, agent, triggerLabel: cfg.label, checkIntervalMs: cfg.settings.checkIntervalMs, maxWaitMs: cfg.settings.maxWaitMs, signal };
-    const commentDeps = { db: deps.db, api: deps.api, log: deps.log, now };
-    // The "waiting" comment only while it is still news; once the wait has ended it would mislead.
-    if (w.waitComment.id === null && w.state === 'waiting') await postWaitComment(commentDeps, w, 'wait', o);
-    if (w.state === 'closed' || w.state === 'expired') await postWaitComment(commentDeps, w, 'end', o);
   };
   return {
     async afterRun(runId, signal) {
       try {
-        const w = getDependencyWait(deps.db, runId);
-        if (w) await comment(w, signal);
+        await comment(runId, signal);
       } catch (err) {
         deps.log.error('wait comment crashed', { runId, error: message(err) });
       }
@@ -225,7 +250,7 @@ export function createDependencyWatcher(deps: DependencyWatcherDeps): Dependency
       for (const w of pending) {
         if (signal?.aborted) return;
         try {
-          await comment(w, signal);
+          await comment(w.runId, signal);
         } catch (err) {
           deps.log.error('wait comment crashed', { runId: w.runId, error: message(err) });
         }

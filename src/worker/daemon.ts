@@ -300,7 +300,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
           now,
           ...(policy.handling ? { handling: policy.handling } : {}),
           ...(result.dependency && waitSettings
-            ? { dependency: { ...result.dependency, firstCheckAt: new Date(now() + waitSettings.checkIntervalMs).toISOString() } }
+            ? { dependency: { ...result.dependency, firstCheckAt: new Date(now() + Math.min(waitSettings.checkIntervalMs, waitSettings.maxWaitMs)).toISOString() } }
             : {}),
         });
         policyRequeued = !!policy.handling && getJob(db, job.id)?.status === 'queued';

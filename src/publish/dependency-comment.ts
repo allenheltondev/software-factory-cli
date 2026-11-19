@@ -7,7 +7,7 @@
 // Same rules as the other comments: only what the worker itself knows (no agent output, no pull
 // request title), idempotent by a hidden marker carrying the run id that is searched for before
 // every write, and what was posted is recorded on the wait's row. Never changes a run or a wait.
-import { dependencyRef, recordWaitComment, WAIT_COMMENT_MAX_ATTEMPTS, type DependencyWait } from '../db/dependency-waits.js';
+import { dependencyRef, getDependencyWait, recordWaitComment, WAIT_COMMENT_MAX_ATTEMPTS, type DependencyWait } from '../db/dependency-waits.js';
 import { recordError, type Db } from '../db/database.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import { GitHubAppError } from '../github/app-auth.js';
@@ -49,8 +49,8 @@ export function renderWaitComment(o: {
     `Run ${code(o.runId)} (agent ${code(o.agent)}) found that this issue needs that pull request first: ${o.url}. ` +
       'Nothing from that run was published.',
     '',
-    `The worker checks the pull request every ${interval(o.checkIntervalMs)} and runs this issue again once it is merged. ` +
-      `If it is closed without being merged, or is still open after ${days(o.maxWaitMs)}, the worker stops waiting and says so here.`,
+    `The worker checks the pull request every ${interval(o.checkIntervalMs)}. The wait expires after ${days(o.maxWaitMs)} unless the pull request merges by then. ` +
+      'If it merges in time, the worker runs this issue again. If it closes unmerged or the wait expires, the worker will say so here.',
     '',
     `To stop waiting, remove the ${code(o.triggerLabel)} label from this issue, or run ${code(`updraft cancel ${o.jobId}`)} on the machine running the worker.`,
     '',
@@ -101,6 +101,7 @@ export async function postWaitComment(
     let comment = (await deps.api.listIssueComments(repo, w.issueNumber)).find((c) => c.body.includes(marker));
     const found = Boolean(comment);
     if (!comment) {
+      if (which === 'wait' && getDependencyWait(deps.db, w.runId)?.state !== 'waiting') return;
       const body =
         which === 'wait'
           ? renderWaitComment({

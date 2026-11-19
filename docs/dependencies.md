@@ -83,8 +83,8 @@ as succeeded without its wait. In particular, a publication can't slip in betwee
 
 ## Checking the pull request
 
-After each poll, the worker (`updraft start`) checks the waits whose time has come. The first
-check is `checkIntervalMinutes` after the run ends, and later checks follow at the same interval.
+After each poll, the worker (`updraft start`) checks the waits whose time has come. It schedules
+checks every `checkIntervalMinutes` after the run ends, with a final check due at the wait deadline.
 It checks at most 20 waits per pass and leaves the rest for the next one. Each check costs two or
 three REST requests: the issue, the pull request, and once per wait the dependency repository
 (to learn its stable id).
@@ -93,11 +93,11 @@ three REST requests: the issue, the pull request, and once per wait the dependen
 | --- | --- |
 | The issue is closed, deleted, or no longer carries the workflow's trigger label | The wait ends **canceled**. No comment: someone chose this |
 | The repository, its `dependencies` or its workflow is gone from the config, or the pull request's repository is no longer listed | The wait ends **canceled**. No comment |
-| The pull request was **merged** | A follow-up job is queued, and the wait ends **resumed** |
+| The pull request was **merged** by the wait deadline | A follow-up job is queued, and the wait ends **resumed**, even if the worker discovers the merge later |
 | The pull request was **closed without merging**, or it (or its repository) can't be read: 404, or 403 for the repository | The wait ends **closed**, and the issue gets a failure comment |
-| It is still open after `maxWaitDays` | The wait ends **expired**, and the issue gets a failure comment |
+| The deadline set by `maxWaitDays` has passed and the worker cannot confirm a merge by that deadline | The wait ends **expired**, and the issue gets a failure comment |
 | It is still open | The next check is scheduled |
-| GitHub can't be reached, or answers 5xx or a rate limit | The wait stays. The next check backs off (the interval, then doubling, up to 6 hours, or longer when GitHub's `Retry-After` asks for it). The error is in `updraft status` |
+| Before the deadline, GitHub can't be reached, or answers 5xx or a rate limit | The next check backs off up to the deadline (the interval, then doubling, up to 6 hours). The worker honors GitHub's `Retry-After` if it delays the check further. The error is in `updraft status` |
 
 A wait ends exactly once. If a check and `updraft cancel` race, the first one stands.
 

@@ -573,8 +573,10 @@ export function noteDependencyWaiting(db: Db, w: { runId: string; jobId: string;
 /** A wait ended: resumed (the pull request merged), closed (closed unmerged or unreadable), canceled or expired. */
 export function noteDependencyEnded(
   db: Db,
-  w: { runId: string; jobId: string; repoId: number; repoFullName: string; outcome: 'resumed' | 'closed' | 'canceled' | 'expired'; startAt: string; at: string },
+  w: { runId: string; jobId: string; repoId: number; repoFullName: string; outcome: 'resumed' | 'closed' | 'canceled' | 'expired'; startAt: string; at: string; mergedAt?: string | null },
 ): void {
+  const mergedAt = Date.parse(w.mergedAt ?? '');
+  const waitUntil = Number.isFinite(mergedAt) ? mergedAt : Date.parse(w.at);
   insertRouting(db, {
     kind: 'dependency.ended',
     subject: w.runId,
@@ -585,7 +587,7 @@ export function noteDependencyEnded(
     jobKind: 'implement',
     outcome: w.outcome,
     startAt: w.startAt,
-    waitMs: Math.max(0, Date.parse(w.at) - Date.parse(w.startAt)) || 0,
+    waitMs: Math.max(0, waitUntil - Date.parse(w.startAt)) || 0,
   });
 }
 

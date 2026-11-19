@@ -210,6 +210,32 @@ describe('recording a wait', () => {
     expect(body).not.toContain('The hook belongs');
     expect(getDependencyWait(s.db, s.runId)?.waitComment.url).toBe(s.api.comments[0]!.htmlUrl);
   });
+
+  it('posts one waiting comment when the run-completion and polling paths overlap', async () => {
+    const s = waitingJob();
+    const listComments = s.api.listIssueComments.bind(s.api);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    s.api.listIssueComments = async () => {
+      const snapshot = await listComments();
+      await pending;
+      return snapshot;
+    };
+    const announcing = s.watcher.afterRun(s.runId);
+    const polling = s.watcher.checkDue();
+    release();
+    await Promise.all([announcing, polling]);
+    expect(s.api.comments).toHaveLength(1);
+    expect(getDependencyWait(s.db, s.runId)?.waitComment.attempts).toBe(1);
+  });
+
+  it('skips the waiting comment if the wait ends while looking for the marker', async () => {
+    const s = waitingJob();
+    const announcing = s.watcher.afterRun(s.runId);
+    expect(endDependencyWait(s.db, s.runId, { state: 'canceled', reason: 'canceled by user', now: s.deps.now })).toBe(true);
+    await announcing;
+    expect(s.api.comments).toEqual([]);
+  });
 });
 
 describe('checking a wait', () => {
@@ -281,6 +307,36 @@ describe('checking a wait', () => {
     expect(s.api.comments[0]?.body).toContain(dependencyEndedMarker(s.runId));
   });
 
+  it('ends an overdue wait even when GitHub cannot report the PR state', async () => {
+    const s = waitingJob();
+    s.clock.t = T0 + 3 * DAY;
+    s.api.failNext.getPullRequest = new GitHubError('Bad Gateway', 502);
+    await s.watcher.checkDue();
+    expect(getDependencyWait(s.db, s.runId)).toMatchObject({ state: 'expired', resumeJobId: null });
+    expect(s.api.comments[0]?.body).toContain(dependencyEndedMarker(s.runId));
+  });
+
+  it.each([
+    { days: 1, state: 'resumed' },
+    { days: 2, state: 'resumed' },
+    { days: 2.5, state: 'expired' },
+  ])('marks a wait $state when a delayed poll finds a PR merged after $days days', async ({ days, state }) => {
+    const s = waitingJob();
+    s.clock.t = T0 + 3 * DAY;
+    s.api.pr = { state: 'closed', merged: true, mergedAt: new Date(T0 + days * DAY).toISOString() };
+    await s.watcher.checkDue();
+    const wait = getDependencyWait(s.db, s.runId)!;
+    expect(wait.state).toBe(state);
+    expect(Boolean(wait.resumeJobId)).toBe(state === 'resumed');
+  });
+
+  it('checks at the deadline when it comes before the next regular check', async () => {
+    const s = waitingJob();
+    s.clock.t = T0 + 2 * DAY - MIN;
+    await s.watcher.checkDue();
+    expect(getDependencyWait(s.db, s.runId)?.nextCheckAt).toBe(new Date(T0 + 2 * DAY).toISOString());
+  });
+
   it('cancels the wait, without a comment, when the issue was closed or lost its label, or the config no longer allows it', async () => {
     const closed = waitingJob();
     closed.clock.t = T0 + 5 * MIN;
@@ -331,6 +387,18 @@ describe('checking a wait', () => {
 });
 
 describe('status and stats', () => {
+  it('measures time to merge from GitHub while recording when the worker saw it', async () => {
+    const s = waitingJob();
+    s.clock.t = T0 + 60 * MIN;
+    s.api.pr = { state: 'closed', merged: true, mergedAt: new Date(T0 + 10 * MIN).toISOString() };
+    await s.watcher.checkDue();
+    expect(computeStats(s.db, { since: null, now: T0 + DAY, label: 'all' }).overall.dependencies.waitToMerge).toMatchObject({
+      count: 1,
+      medianMs: 10 * MIN,
+    });
+    expect(getDependencyWait(s.db, s.runId)?.endedAt).toBe(new Date(s.clock.t).toISOString());
+  });
+
   it('shows the wait in updraft status and counts it in updraft stats', async () => {
     const s = waitingJob();
     const view = () =>

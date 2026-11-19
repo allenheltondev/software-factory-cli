@@ -357,7 +357,9 @@ export function resumeDependencyWait(
       at,
       runId,
     );
-    noteDependencyEnded(db, { runId, jobId: w.jobId, repoId: w.repoId, repoFullName: w.repoFullName, outcome: 'resumed', startAt: w.createdAt, at });
+    noteDependencyEnded(db, {
+      runId, jobId: w.jobId, repoId: w.repoId, repoFullName: w.repoFullName, outcome: 'resumed', startAt: w.createdAt, at, mergedAt: o.pullRequest.mergedAt,
+    });
     if (Number(res.changes) === 0) return { status: 'already', jobId: existing };
     return { status: 'queued', job: rowToJob(db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as unknown as JobRow) };
   });
