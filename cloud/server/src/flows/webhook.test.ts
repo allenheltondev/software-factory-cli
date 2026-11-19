@@ -163,12 +163,21 @@ describe('webhook', () => {
     expect(again.body.disposition).toBe('tenant_uninstalled');
   });
 
-  it('creates nothing for an installation that was never onboarded', async () => {
+  it('creates no tenant for an install or suspend of an installation never onboarded', async () => {
     const { lifecycle, store } = await setup();
     expect((await lifecycle('created', 66)).body.disposition).toBe('ignored');
     expect((await lifecycle('suspend', 66)).body.disposition).toBe('no_tenant');
-    expect((await lifecycle('deleted', 66)).body.disposition).toBe('no_tenant');
     expect(await store.getTenant(66)).toBeNull();
+  });
+
+  it('records a delete of an installation never onboarded as an uninstalled tombstone that expires', async () => {
+    const { deliver, store } = await setup();
+    const res = await deliver('installation', { action: 'deleted', installation: { id: 66, account: { id: 7, login: 'late', type: 'User' } } });
+    expect(res.body.disposition).toBe('tombstone');
+    expect(await store.getTenant(66)).toMatchObject({ status: 'disabled', disabledReason: 'uninstalled', deleteAfter: NOW + RETENTION_MS, accountLogin: 'late' });
+    expect(store.ttlOf(66).tenant).toBe(Math.ceil((NOW + RETENTION_MS) / 1000));
+    // Nothing can be added to it.
+    expect(await store.putTenantWithMember({ ...tenant, installationId: 66 }, { installationId: 66, sub: 's', role: 'owner', githubUserId: 1, githubLogin: 'x', addedAt: '' })).toBe('uninstalled');
   });
 
   it('answers ping and acknowledges other events without acting', async () => {

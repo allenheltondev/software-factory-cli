@@ -12,7 +12,9 @@ import type { Store } from '../store/store.js';
  *
  *   installation.deleted     tenant uninstalled, finally: everything in its partition gets the
  *                            table TTL for 30 days on, and reads stop at once when they pass. A
- *                            repeated delete keeps the first deadline.
+ *                            repeated delete keeps the first deadline. With no tenant yet, an
+ *                            uninstalled one is recorded (a tombstone with the same TTL) so a
+ *                            racing Connect or install callback cannot create it.
  *   installation.suspend /   GitHub can deliver events out of order, so these do not trust their
  *   installation.unsuspend   own order: the handler asks GitHub for the installation's state now
  *                            (gone, suspended or active) and records that. If GitHub cannot be
@@ -20,8 +22,8 @@ import type { Store } from '../store/store.js';
  *                            uninstall (a conditional write).
  *   installation_repositories  nothing stored yet: repositories are read live from GitHub
  *
- * An installation that was never onboarded has no tenant, so its events change nothing: installing
- * the App on GitHub alone never creates a tenant.
+ * Installing the App on GitHub alone never creates a tenant; only a delete records one (the
+ * tombstone above), and it can never become active.
  */
 
 export const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -67,7 +69,7 @@ export function createWebhookHandler({
 
     const event = header('x-github-event') ?? '';
     const delivery = header('x-github-delivery') ?? '';
-    let payload: { action?: unknown; installation?: { id?: unknown } };
+    let payload: { action?: unknown; installation?: { id?: unknown; account?: { id?: unknown; login?: unknown; type?: unknown } } };
     try {
       payload = JSON.parse(req.body) as typeof payload;
     } catch {
@@ -84,9 +86,14 @@ export function createWebhookHandler({
     if (event === 'ping') return done('pong');
     if (event !== 'installation' || !Number.isSafeInteger(installationId) || installationId <= 0) return done('ignored');
 
+    const a = payload.installation?.account;
+    const account =
+      a && typeof a.login === 'string' ? { id: Number(a.id) || 0, login: a.login, type: typeof a.type === 'string' ? a.type : '' } : undefined;
     const uninstall = async () => {
-      const result = await store.markUninstalled(installationId, now() + RETENTION_MS);
-      return done(result === 'marked' ? 'tenant_uninstalled' : result === 'already' ? 'already_uninstalled' : 'no_tenant');
+      const result = await store.markUninstalled(installationId, now() + RETENTION_MS, account);
+      // tombstone: no tenant yet. One is recorded already uninstalled, so a Connect or install
+      // callback that checked GitHub just before this delete cannot create it afterwards.
+      return done(result === 'marked' ? 'tenant_uninstalled' : result === 'already' ? 'already_uninstalled' : 'tombstone');
     };
 
     if (action === 'deleted') return uninstall();

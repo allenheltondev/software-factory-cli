@@ -50,6 +50,8 @@ browser ── https://updraft.readysetcloud.io ──> CloudFront (one distribu
   When the App is uninstalled, every item in the tenant's partition gets the table's `ttl`, 30 days out. DynamoDB deletes them after that, and reads treat the tenant as gone as soon as the deadline passes.
   - **Interrupted cleanup:** if a write fails partway, the webhook answers 500 so GitHub shows a delivery you can redeliver, and a redelivered delete finishes the sweep with the first deadline.
   - **No late members:** a member is only ever added in a transaction that checks the tenant isn't uninstalled, so no member misses the TTL.
+  - **Strongly consistent sweep:** the sweep and its replay read strongly, so a member committed just before the uninstall is found.
+  - **Tombstones:** a delete for an installation with no tenant yet records one already uninstalled, expiring with the same TTL. A Connect or install callback that passed its GitHub check just before the delete can't create the tenant afterwards.
 - **GitHub.** Linking and installing both leave for github.com and come back to the SPA's `/github/callback`, which posts what GitHub returned to `POST /api/v1/github/callback`.
   - **Callbacks:** a callback counts only with a `state` the server issued for this user, unused and under 10 minutes old.
   - **Installations:** an `installation_id` is never taken on trust. It must be listed by `GET /user/installations` for the GitHub user, the App must see it (`GET /app/installations/{id}`), and the user must own it: they *are* the account, or they're an active org **admin** (`GET /user/memberships/orgs/{org}`).

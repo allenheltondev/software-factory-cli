@@ -77,6 +77,12 @@ export interface InstallationOffer {
   expiresAt: number;
 }
 
+export interface InstallationAccount {
+  id: number;
+  login: string;
+  type: string;
+}
+
 export interface Store {
   putOAuthState(state: OAuthState): Promise<void>;
   /** Removes and returns the state, or null when it does not exist (never issued, or already used). */
@@ -104,8 +110,10 @@ export interface Store {
    * Uninstalled: final. Sets the deadline and the TTL of every item in the tenant's partition.
    * `already`: it was uninstalled before and keeps its original deadline; the partition sweep runs
    * again with that deadline, so one cut short by a failure completes on the next delivery.
+   * `tombstone`: there was no tenant, so one is recorded already uninstalled (and expiring with the
+   * same TTL): a Connect or install callback racing the delete cannot create the tenant afterwards.
    */
-  markUninstalled(installationId: number, deleteAfter: number): Promise<'marked' | 'already' | 'no_tenant'>;
+  markUninstalled(installationId: number, deleteAfter: number, account?: InstallationAccount): Promise<'marked' | 'already' | 'tombstone'>;
   /** Suspended or active again, unless the tenant was uninstalled (one conditional write). */
   setSuspended(installationId: number, suspended: boolean): Promise<'updated' | 'uninstalled' | 'no_tenant'>;
   getMember(installationId: number, sub: string): Promise<Member | null>;
@@ -170,9 +178,23 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       members.set(memberKey(member.installationId, member.sub), { ...member });
       return 'added';
     },
-    async markUninstalled(id, deleteAfter) {
+    async markUninstalled(id, deleteAfter, account) {
       const t = tenants.get(id);
-      if (!t) return 'no_tenant';
+      if (!t) {
+        tenants.set(id, {
+          installationId: id,
+          accountId: account?.id ?? 0,
+          accountLogin: account?.login ?? '',
+          accountType: account?.type ?? '',
+          status: 'disabled',
+          disabledReason: 'uninstalled',
+          deleteAfter,
+          ttl: Math.ceil(deleteAfter / 1000),
+          createdAt: new Date(0).toISOString(),
+          createdBy: 'github:installation.deleted',
+        });
+        return 'tombstone';
+      }
       const already = t.disabledReason === 'uninstalled';
       const deadline = already ? (t.deleteAfter ?? deleteAfter) : deleteAfter;
       const ttl = Math.ceil(deadline / 1000);

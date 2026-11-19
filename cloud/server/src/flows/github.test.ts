@@ -5,7 +5,9 @@ import type { Caller } from '../caller.js';
 import { GitHubError, type GitHubApi, type GitHubInstallation, type OrgMembership } from '../github/client.js';
 import type { AppSettings } from '../github/settings.js';
 import { createMemoryStore } from '../store/store.js';
+import { signBody } from '../github/signature.js';
 import { createGitHubFlows, STATE_TTL_MS } from './github.js';
+import { createWebhookHandler } from './webhook.js';
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const SETTINGS: AppSettings = {
@@ -439,6 +441,44 @@ describe('GitHub flows', () => {
       gh.installations.set(55, { ...acme, account: { id: 999, login: 'someone-else', type: 'Organization' } });
       await expect(flows.connect(PAT, 55)).rejects.toMatchObject({ code: 'not_authorized' });
       expect(await store.getTenant(55)).toBeNull();
+    });
+
+    /** GitHub answers the installation check, then removes the App: its delete arrives before Updraft writes. */
+    function deleteRightAfterTheCheck() {
+      const handle = createWebhookHandler({ store, github: gh.api, loadSettings: async () => SETTINGS, now: () => clock, log: () => {} });
+      const original = gh.api.getInstallation.bind(gh.api);
+      const dispositions: string[] = [];
+      gh.api.getInstallation = async (jwt, id) => {
+        const current = await original(jwt, id);
+        gh.installations.delete(id);
+        const body = JSON.stringify({ action: 'deleted', installation: { id, account: { id: 900, login: 'acme', type: 'Organization' } } });
+        const res = await handle({ body, headers: { 'x-github-event': 'installation', 'x-hub-signature-256': signBody(body, SETTINGS.webhookSecret) } });
+        dispositions.push(res.body.disposition);
+        return current;
+      };
+      return dispositions;
+    }
+
+    it('a delete delivered between the GitHub check and the first tenant write leaves no active tenant (the review\x27s case)', async () => {
+      await linkedWithInstallations();
+      const dispositions = deleteRightAfterTheCheck();
+      await expect(flows.connect(PAT, 55)).rejects.toMatchObject({ code: 'tenant_disabled' });
+      expect(dispositions).toEqual(['tombstone']);
+      expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'uninstalled' });
+      expect(await store.getMember(55, PAT.sub)).toBeNull();
+      expect((await flows.status(PAT)).tenants).toEqual([]);
+    });
+
+    it('the same race on the first-install callback leaves no active tenant', async () => {
+      const state = await startedInstall(PAT);
+      const token = gh.code('i1', PAT_GH);
+      gh.userInstallations.set(token, [55]);
+      gh.installations.set(55, acme);
+      gh.memberships.set(`${token}/acme`, { role: 'admin', state: 'active' });
+      deleteRightAfterTheCheck();
+      await expect(flows.completeCallback(PAT, { code: 'i1', state, installationId: '55' })).rejects.toMatchObject({ code: 'tenant_disabled' });
+      expect(await store.getTenant(55)).toMatchObject({ disabledReason: 'uninstalled' });
+      expect(await store.getMember(55, PAT.sub)).toBeNull();
     });
 
     it('refuses to connect an installation that was uninstalled', async () => {

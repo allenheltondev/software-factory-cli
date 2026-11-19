@@ -16,6 +16,9 @@ function fakeTable() {
   const items = new Map<string, Item>();
   const key = (k: Item) => `${String(k.pk)}|${String(k.sk)}`;
   let failWhen: ((name: string, input: Item) => boolean) | null = null;
+  /** Written, but not yet visible to an eventually consistent read. */
+  const hidden = new Set<string>();
+  const visible = (k: string, input: Item) => input.ConsistentRead === true || !hidden.has(k);
 
   function condition(expr: string | undefined, item: Item | undefined, values: Values = {}): boolean {
     if (!expr) return true;
@@ -49,8 +52,10 @@ function fakeTable() {
       if (failWhen?.(name, input)) throw new Error(`injected failure: ${name}`);
       const values = input.ExpressionAttributeValues as Values | undefined;
       switch (name) {
-        case 'GetCommand':
-          return { Item: items.get(key(input.Key as Item)) };
+        case 'GetCommand': {
+          const k = key(input.Key as Item);
+          return { Item: visible(k, input) ? items.get(k) : undefined };
+        }
         case 'PutCommand': {
           const item = input.Item as Item;
           if (!condition(input.ConditionExpression as string, items.get(key(item)), values)) throw ccf();
@@ -76,7 +81,11 @@ function fakeTable() {
             return { Items: [...items.values()].filter((i) => i.GSI1PK === pk && String(i.GSI1SK).startsWith(String(values?.[':prefix']))) };
           }
           const pk = values?.[':pk'];
-          return { Items: [...items.values()].filter((i) => i.pk === pk).map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })) };
+          return {
+            Items: [...items.values()]
+              .filter((i) => i.pk === pk && visible(key(i), input))
+              .map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })),
+          };
         }
         case 'TransactWriteCommand': {
           const ops = input.TransactItems as Item[];
@@ -111,6 +120,9 @@ function fakeTable() {
     items,
     fail(fn: ((name: string, input: Item) => boolean) | null) {
       failWhen = fn;
+    },
+    hideFromEventual(k: string) {
+      hidden.add(k);
     },
   };
 }
@@ -171,9 +183,31 @@ describe('dynamo store: uninstall', () => {
     expect(memberTtls()).toEqual([TTL, TTL]);
   });
 
-  it('reports a tenant it does not know', async () => {
-    const { store } = await seeded();
-    expect(await store.markUninstalled(66, DEADLINE)).toBe('no_tenant');
+  it('records a tombstone for a tenant it does not know, which no member can join', async () => {
+    const { store, table } = await seeded();
+    expect(await store.markUninstalled(66, DEADLINE, { id: 7, login: 'late', type: 'User' })).toBe('tombstone');
+    expect(table.items.get('TENANT#66|META')).toMatchObject({ disabledReason: 'uninstalled', deleteAfter: DEADLINE, ttl: TTL, accountLogin: 'late' });
+    const late = { ...tenant, installationId: 66 };
+    expect(await store.putTenantWithMember(late, { ...member('sub-c'), installationId: 66 })).toBe('uninstalled');
+    expect(table.items.get('TENANT#66|META')?.status).toBe('disabled');
+    expect(table.items.has('TENANT#66|MEMBER#sub-c')).toBe(false);
+  });
+
+  it('finds a member an eventually consistent query would still miss', async () => {
+    const { store, table, memberTtls } = await seeded();
+    table.hideFromEventual('TENANT#55|MEMBER#sub-b'); // committed just before the uninstall
+    expect(await store.markUninstalled(55, DEADLINE)).toBe('marked');
+    expect(memberTtls()).toEqual([TTL, TTL]);
+  });
+
+  it('reads the stored deadline strongly on a replay', async () => {
+    const { store, table, memberTtls } = await seeded();
+    table.fail((name, input) => name === 'UpdateCommand' && String((input.Key as Item).sk).startsWith('MEMBER#'));
+    await expect(store.markUninstalled(55, DEADLINE)).rejects.toThrow();
+    table.fail(null);
+    table.hideFromEventual('TENANT#55|META'); // a stale read would not see the uninstall yet
+    expect(await store.markUninstalled(55, DEADLINE + 1000)).toBe('already');
+    expect(memberTtls()).toEqual([TTL, TTL]);
   });
 
   it('adds no member to an uninstalled tenant, so none escapes the TTL', async () => {

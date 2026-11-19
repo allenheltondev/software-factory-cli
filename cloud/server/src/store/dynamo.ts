@@ -34,6 +34,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           ExpressionAttributeValues: { ':pk': `TENANT#${id}` },
           ProjectionExpression: 'pk, sk, #ttl',
           ExpressionAttributeNames: { '#ttl': 'ttl' },
+          // Strongly consistent: a member whose transaction committed just before the uninstall
+          // must be found, or it would never get the TTL.
+          ConsistentRead: true,
           ExclusiveStartKey,
         }),
       );
@@ -51,6 +54,11 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
       ExclusiveStartKey = page.LastEvaluatedKey;
     } while (ExclusiveStartKey);
+  }
+
+  async function getTenantItem(id: number, consistent = false): Promise<Record<string, unknown> | undefined> {
+    const out = await client.send(new GetCommand({ TableName: T, Key: tenantKey(id), ...(consistent ? { ConsistentRead: true } : {}) }));
+    return out.Item;
   }
 
   const toTenant = (item: Record<string, unknown>): Tenant => {
@@ -255,32 +263,66 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       };
     },
 
-    async markUninstalled(id, deleteAfter) {
-      let result: 'marked' | 'already' = 'marked';
-      let deadline = deleteAfter;
-      try {
-        // Final, and only once: a repeated delete keeps the original deadline.
-        await client.send(
-          new UpdateCommand({
-            TableName: T,
-            Key: tenantKey(id),
-            UpdateExpression: 'SET #status = :disabled, disabledReason = :uninstalled, deleteAfter = :deleteAfter, #ttl = :ttl',
-            ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
-            ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
-            ExpressionAttributeValues: { ':disabled': 'disabled', ':uninstalled': 'uninstalled', ':deleteAfter': deleteAfter, ':ttl': Math.ceil(deleteAfter / 1000) },
-          }),
-        );
-      } catch (err) {
-        if (!(err instanceof ConditionalCheckFailedException)) throw err;
-        const tenant = await this.getTenant(id);
-        if (!tenant) return 'no_tenant';
-        // Uninstalled before: finish (or redo) the sweep with the deadline stored then, so a sweep
-        // a failure or timeout cut short is completed by the next delivery of the event.
-        result = 'already';
-        deadline = tenant.deleteAfter ?? deleteAfter;
+    async markUninstalled(id, deleteAfter, account) {
+      const ttl = Math.ceil(deleteAfter / 1000);
+      // Three outcomes, retried if the tenant changes between the steps:
+      //   marked     an existing tenant is now uninstalled
+      //   already    it was uninstalled before: finish the sweep with the stored deadline
+      //   tombstone  there is no tenant (yet): record one already uninstalled, so that a Connect or
+      //              install callback that passed its GitHub check a moment ago cannot create it
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await client.send(
+            new UpdateCommand({
+              TableName: T,
+              Key: tenantKey(id),
+              UpdateExpression: 'SET #status = :disabled, disabledReason = :uninstalled, deleteAfter = :deleteAfter, #ttl = :ttl',
+              ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+              ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
+              ExpressionAttributeValues: { ':disabled': 'disabled', ':uninstalled': 'uninstalled', ':deleteAfter': deleteAfter, ':ttl': ttl },
+            }),
+          );
+          await sweepPartition(id, ttl);
+          return 'marked';
+        } catch (err) {
+          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        }
+        const existing = await getTenantItem(id, true);
+        if (existing?.disabledReason === 'uninstalled') {
+          // Uninstalled before: finish (or redo) the sweep with the deadline stored then, so one a
+          // failure or timeout cut short completes on the next delivery.
+          const stored = typeof existing.deleteAfter === 'number' ? existing.deleteAfter : deleteAfter;
+          await sweepPartition(id, Math.ceil(stored / 1000));
+          return 'already';
+        }
+        if (existing) continue; // created or changed since the update was refused: try again
+        try {
+          await client.send(
+            new PutCommand({
+              TableName: T,
+              Item: {
+                ...tenantKey(id),
+                installationId: id,
+                accountId: account?.id ?? 0,
+                accountLogin: account?.login ?? '',
+                accountType: account?.type ?? '',
+                status: 'disabled',
+                disabledReason: 'uninstalled',
+                deleteAfter,
+                ttl,
+                createdAt: new Date().toISOString(),
+                createdBy: 'github:installation.deleted',
+              },
+              ConditionExpression: 'attribute_not_exists(pk)',
+            }),
+          );
+          return 'tombstone';
+        } catch (err) {
+          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+          // A tenant was created in between: mark that one on the next pass.
+        }
       }
-      await sweepPartition(id, Math.ceil(deadline / 1000));
-      return result;
+      throw new Error(`markUninstalled: tenant ${id} kept changing; retry the delivery`);
     },
 
     async setSuspended(id, suspended) {
@@ -303,7 +345,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         return 'updated';
       } catch (err) {
         if (!(err instanceof ConditionalCheckFailedException)) throw err;
-        return (await this.getTenant(id)) ? 'uninstalled' : 'no_tenant';
+        return (await getTenantItem(id, true)) ? 'uninstalled' : 'no_tenant';
       }
     },
 
