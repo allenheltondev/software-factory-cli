@@ -20,8 +20,13 @@ const rawText = {
   },
 };
 
+// CommonJS dependencies require() Node's built-ins (the SDK's parts, and yaml, which the API's
+// config validation uses), and an ES module has no require of its own.
+const requireBanner = { js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" };
+
 const common = {
   plugins: [rawText],
+  banner: requireBanner,
   outdir,
   outExtension: { '.js': '.mjs' },
   bundle: true,
@@ -43,7 +48,6 @@ await build({
 // The broker, the webhook (the launcher) and cleanup (quota reconciliation) bundle their SDK
 // clients: the MicroVMs client is newer than the runtime's SDK, and mixing a bundled client with
 // the runtime's core packages would pair mismatched versions.
-// The SDK's CommonJS parts require() Node's built-ins, which an ES module has no require for.
 await build({
   ...common,
   entryPoints: {
@@ -51,5 +55,4 @@ await build({
     webhook: join(root, 'src', 'webhook-lambda.ts'),
     cleanup: join(root, 'src', 'cleanup-lambda.ts'),
   },
-  banner: { js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" },
 });
