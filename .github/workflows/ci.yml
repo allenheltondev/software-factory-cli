@@ -105,6 +105,28 @@ jobs:
           cat "$RUNNER_TEMP/unit/updraft.service"
           systemd-analyze verify "$RUNNER_TEMP/unit/updraft.service"
 
+  # The workflow files themselves. A workflow that does not parse never runs, and nothing else
+  # fails for it (a reusable one fails only when it is called, in the deploy). actionlint parses
+  # each file and checks its keys, expressions, job needs and action inputs. Its shellcheck and
+  # pyflakes passes are off: this job is about the workflows, not the scripts in their steps.
+  # Not one of the required checks on main.
+  workflows:
+    name: workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      # go run fetches the pinned release through the Go module proxy and checks it against the
+      # checksum database.
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color -shellcheck= -pyflakes=
+
   # Updraft Cloud (cloud/): its own npm project, so the CLI matrix above never installs it. Not one
   # of the required checks on main; the deploy workflows run the same steps before deploying.
   cloud:
