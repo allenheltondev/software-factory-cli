@@ -239,6 +239,14 @@ Resources:
           TABLE_NAME: !Ref UpdraftTable
           USER_POOL_ID: !Ref AuthUserPoolId
           USER_POOL_CLIENT_ID: !Ref AuthClient
+          # The admin view shows each tenant's quotas: the same defaults the launcher applies.
+          QUOTA_CONCURRENT_JOBS: !Ref QuotaConcurrentJobs
+          QUOTA_JOBS_PER_DAY: !Ref QuotaJobsPerDay
+          QUOTA_MICROVM_MINUTES_PER_MONTH: !Ref QuotaMicrovmMinutesPerMonth
+          PLATFORM_CONCURRENT_JOBS: !Ref PlatformConcurrentJobs
+          # Who may use the admin view (server/src/admin/access.ts). Not created by the stack:
+          # nobody is an admin until an operator writes it.
+          ADMINS_PARAMETER: /updraft/admins
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - DynamoDBCrudPolicy:
@@ -246,6 +254,8 @@ Resources:
         # The GitHub App's settings (github/settings.ts), written by scripts/register-github-app.mjs.
         - SSMParameterReadPolicy:
             ParameterName: updraft/app/*
+        - SSMParameterReadPolicy:
+            ParameterName: updraft/admins
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue

@@ -36,7 +36,7 @@ export interface TenantSummary {
   accountLogin: string;
   accountType: string;
   status: 'active' | 'disabled';
-  disabledReason?: 'suspended' | 'uninstalled';
+  disabledReason?: 'suspended' | 'uninstalled' | 'admin';
   role: 'owner' | 'editor';
 }
 
@@ -77,6 +77,77 @@ export interface Me {
   sub: string;
   email?: string;
   name?: string;
+  /** May use the admin view (the server's allow-list). */
+  admin?: boolean;
+}
+
+// The admin view (server/src/admin/admin.ts).
+
+export interface Quotas {
+  concurrentJobs: number;
+  jobsPerDay: number;
+  microvmMinutesPerMonth: number;
+  platformConcurrentJobs: number;
+}
+
+export type TenantLimits = Partial<Pick<Quotas, 'concurrentJobs' | 'jobsPerDay' | 'microvmMinutesPerMonth'>>;
+
+export interface Usage {
+  day: string;
+  jobsToday: number;
+  month: string;
+  jobsThisMonth: number;
+  microvmSecondsThisMonth: number;
+  throttledThisMonth: number;
+  failedThisMonth: number;
+}
+
+export interface AdminTenant {
+  installationId: number;
+  accountLogin: string;
+  accountType: string;
+  status: 'active' | 'disabled';
+  disabledReason?: 'suspended' | 'uninstalled' | 'admin';
+  adminDisabled?: { at: string; by: string; reason?: string };
+  activeConfigVersion?: number;
+  createdAt: string;
+  quotas: Quotas;
+  limits?: TenantLimits;
+  defaults: Quotas;
+  usage: Usage;
+}
+
+export interface JobSummary {
+  jobId: string;
+  repository: string;
+  issue?: number;
+  label?: string;
+  sender?: string;
+  createdAt: string;
+  status: 'launched' | 'finished';
+  outcome?: string;
+}
+
+export interface AdminActiveJob {
+  jobId: string;
+  phase: 'reserved' | 'launching';
+  reservedAt: string;
+  expiresAt: string;
+  repository?: string;
+  issue?: number;
+  microvmId?: string;
+  startedAt?: string;
+  outcome?: string;
+}
+
+export interface AdminTenantDetail extends AdminTenant {
+  recentJobs: JobSummary[];
+  activeJobs: AdminActiveJob[];
+}
+
+export interface AdminOverview {
+  tenants: AdminTenant[];
+  platform: { activeJobs: number; platformConcurrentJobs: number };
 }
 
 export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (...a) => fetch(...a) }: ApiClientOptions) {
@@ -117,6 +188,14 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
       request<{ installationId: number; accountLogin: string }>(`/github/connect/${installationId}`, { method: 'POST' }),
     repositories: (installationId: number) =>
       request<{ tenant: TenantSummary; repositories: Repository[] }>(`/installations/${installationId}/repositories`),
+    adminTenants: () => request<AdminOverview>('/admin/tenants'),
+    adminTenant: (installationId: number) => request<AdminTenantDetail>(`/admin/tenants/${installationId}`),
+    adminDisable: (installationId: number, reason?: string) =>
+      request<AdminTenantDetail>(`/admin/tenants/${installationId}/disable`, { method: 'POST', body: JSON.stringify(reason ? { reason } : {}) }),
+    adminEnable: (installationId: number) => request<AdminTenantDetail>(`/admin/tenants/${installationId}/enable`, { method: 'POST', body: '{}' }),
+    adminSetLimits: (installationId: number, limits: TenantLimits | null) =>
+      request<AdminTenantDetail>(`/admin/tenants/${installationId}/limits`, { method: 'PUT', body: JSON.stringify({ limits }) }),
+    adminReleaseJob: (jobId: string) => request<AdminTenantDetail>(`/admin/jobs/${encodeURIComponent(jobId)}/release`, { method: 'POST', body: '{}' }),
   };
 }
 

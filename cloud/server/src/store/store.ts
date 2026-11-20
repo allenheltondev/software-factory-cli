@@ -12,6 +12,7 @@
  *   TENANT#<installId>   USAGE#DAY#<date>      jobs started that day (UTC)
  *   TENANT#<installId>   USAGE#MONTH#<yyyy-mm>  jobs, microVM seconds and throttled deliveries that month
  *   TENANT#<installId>   NOTICE#<repo>#<issue>#<date>  an over-quota comment was posted (once a day)
+ *   TENANT#<installId>   JOB#<createdAt>#<jobId>  a job's summary, for the admin view (TTL 30 days)
  *   PLATFORM#JOBS        SLOT#<n>              a running job's place in the platform-wide ceiling
  *   PLATFORM#ACTIVE      JOB#<jobId>           a reservation not yet released: what reconciliation looks at
  *
@@ -45,8 +46,13 @@ export interface Tenant {
   accountLogin: string;
   accountType: string;
   status: TenantStatus;
-  /** Why it is disabled: suspended or uninstalled on GitHub. Uninstalled is final. */
-  disabledReason?: 'suspended' | 'uninstalled';
+  /**
+   * Why it is disabled: suspended or uninstalled on GitHub (uninstalled is final), or `admin`: an
+   * Updraft admin disabled it (`adminDisabled`) and GitHub has it active.
+   */
+  disabledReason?: 'suspended' | 'uninstalled' | 'admin';
+  /** An Updraft admin disabled it: jobs stop, whatever GitHub says, until an admin enables it. */
+  adminDisabled?: { at: string; by: string; reason?: string };
   /** Epoch ms after which an uninstalled tenant is gone (reads stop at once; DynamoDB TTL deletes it). */
   deleteAfter?: number;
   createdAt: string;
@@ -106,6 +112,20 @@ export interface Usage {
   jobsThisMonth: number;
   microvmSecondsThisMonth: number;
   throttledThisMonth: number;
+  /** Jobs that month whose first outcome was a failure (jobs/quotas.ts FAILED_OUTCOMES). */
+  failedThisMonth: number;
+}
+
+/** A job as the admin view lists it: what started it and how it ended. */
+export interface JobSummary {
+  jobId: string;
+  repository: string;
+  issue?: number;
+  label?: string;
+  sender?: string;
+  createdAt: string;
+  status: Job['status'];
+  outcome?: string;
 }
 
 /** One published config: an immutable bundle under tenants/<id>/config/<version>/ in the tenant bucket. */
@@ -266,7 +286,19 @@ export interface Store {
   markUninstalled(installationId: number, deleteAfter: number, account?: InstallationAccount): Promise<'marked' | 'already' | 'tombstone'>;
   /** An admin's quota overrides; null removes them (the stack's defaults again). */
   setTenantLimits(installationId: number, limits: TenantLimits | null): Promise<'updated' | 'no_tenant'>;
-  /** Suspended or active again, unless the tenant was uninstalled (one conditional write). */
+  /**
+   * An admin disables the tenant (jobs stop at once: the launcher and the broker read its status)
+   * or enables it again. Enabling makes it active only if GitHub has it active too.
+   */
+  setAdminDisabled(installationId: number, disabled: { by: string; reason?: string } | null): Promise<'updated' | 'uninstalled' | 'no_tenant'>;
+  /** Every tenant, for the admin view (a scan: the table is small, and admins are few). */
+  listTenants(): Promise<Tenant[]>;
+  /** The tenant's most recent jobs, newest first. */
+  listRecentJobs(installationId: number, limit: number): Promise<JobSummary[]>;
+  /**
+   * Suspended or active again, unless the tenant was uninstalled (one conditional write). An
+   * unsuspend leaves a tenant an admin disabled disabled.
+   */
   setSuspended(installationId: number, suspended: boolean): Promise<'updated' | 'uninstalled' | 'no_tenant'>;
   getMember(installationId: number, sub: string): Promise<Member | null>;
   listMemberships(sub: string): Promise<Member[]>;
@@ -305,7 +337,10 @@ export interface Store {
    */
   purgeTenantPartition(installationId: number): Promise<void>;
 
-  /** Records a job (the launcher), before its microVM is started. Its own partition, expiring a week after the job may last. */
+  /**
+   * Records a job (the launcher), before its microVM is started: its own partition, expiring a
+   * week after the job may last, and in the same write its summary in the tenant's partition.
+   */
   putJob(job: Job): Promise<void>;
   /**
    * The launcher is about to call RunMicrovm: the job's active entry becomes `launching`, and is
@@ -316,6 +351,7 @@ export interface Store {
   /**
    * The runner said it is done: nothing more is served for it. Only the first outcome is kept, and
    * it is what this returns (null for an unknown job), so a repeated finish acts on the same one.
+   * The first one also goes on the job's summary, and a failure counts in the month's usage.
    */
   finishJob(jobId: string, outcome: string): Promise<string | null>;
   /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
@@ -394,6 +430,14 @@ export interface Store {
   releaseDelivery(installationId: number, deliveryId: string, jobId: string): Promise<void>;
 }
 
+/**
+ * Outcomes that count as a failed job in the admin view: anything but a clean success, an
+ * unconfirmed one (it ran, without a summary), and jobs that never ran for a quota or a
+ * redelivery (throttled, superseded).
+ */
+export const NOT_FAILURES: ReadonlySet<string> = new Set(['succeeded', 'unconfirmed', 'throttled', 'superseded']);
+export const isFailure = (outcome: string) => !NOT_FAILURES.has(outcome);
+
 export interface CleanupEntry {
   installationId: number;
   deleteAfter: number;
@@ -419,6 +463,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const months = new Map<string, { jobs: number; seconds: number; throttled: number }>();
   const notices = new Set<string>();
   const active = new Map<string, ActiveJob>();
+  const summaries = new Map<string, JobSummary & { installationId: number }>();
+  const failed = new Map<string, number>();
   const month = (key: string) => months.get(key) ?? { jobs: 0, seconds: 0, throttled: 0 };
   const free = (key: string, now: number) => {
     const s = slots.get(key);
@@ -505,6 +551,35 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       cleanups.set(id, { installationId: id, deleteAfter: deadline });
       return already ? 'already' : 'marked';
     },
+    async setAdminDisabled(id, disabled) {
+      const t = tenants.get(id);
+      if (!t) return 'no_tenant';
+      if (t.disabledReason === 'uninstalled') return 'uninstalled';
+      const next: Tenant & { ttl?: number } = { ...t };
+      if (disabled) {
+        next.adminDisabled = { at: new Date().toISOString(), by: disabled.by, ...(disabled.reason ? { reason: disabled.reason } : {}) };
+        next.status = 'disabled';
+        if (!next.disabledReason) next.disabledReason = 'admin';
+      } else {
+        delete next.adminDisabled;
+        if (next.disabledReason === 'admin') {
+          delete next.disabledReason;
+          next.status = 'active';
+        }
+      }
+      tenants.set(id, next);
+      return 'updated';
+    },
+    async listTenants() {
+      return [...tenants.values()].map((t) => strip(t) as Tenant);
+    },
+    async listRecentJobs(id, limit) {
+      return [...summaries.values()]
+        .filter((s) => s.installationId === id)
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0))
+        .slice(0, limit)
+        .map(({ installationId: _id, ...s }) => ({ ...s }));
+    },
     async setTenantLimits(id, limits) {
       const t = tenants.get(id);
       if (!t) return 'no_tenant';
@@ -518,8 +593,9 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const t = tenants.get(id);
       if (!t) return 'no_tenant';
       if (t.disabledReason === 'uninstalled') return 'uninstalled';
-      const next: Tenant & { ttl?: number } = { ...t, status: suspended ? 'disabled' : 'active' };
+      const next: Tenant & { ttl?: number } = { ...t, status: suspended || t.adminDisabled ? 'disabled' : 'active' };
       if (suspended) next.disabledReason = 'suspended';
+      else if (t.adminDisabled) next.disabledReason = 'admin';
       else delete next.disabledReason;
       tenants.set(id, next);
       return 'updated';
@@ -671,7 +747,15 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async getUsage(id, day, m) {
       const u = month(`${id}/${m}`);
-      return { day, jobsToday: days.get(`${id}/${day}`) ?? 0, month: m, jobsThisMonth: u.jobs, microvmSecondsThisMonth: u.seconds, throttledThisMonth: u.throttled };
+      return {
+        day,
+        jobsToday: days.get(`${id}/${day}`) ?? 0,
+        month: m,
+        jobsThisMonth: u.jobs,
+        microvmSecondsThisMonth: u.seconds,
+        throttledThisMonth: u.throttled,
+        failedThisMonth: failed.get(`${id}/${m}`) ?? 0,
+      };
     },
     async releaseDelivery(id, deliveryId, jobId) {
       const key = `${id}/${deliveryId}`;
@@ -688,6 +772,16 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async putJob(job) {
       jobs.set(job.jobId, { ...job });
+      summaries.set(job.jobId, {
+        installationId: job.installationId,
+        jobId: job.jobId,
+        repository: job.repository,
+        ...(job.issue !== undefined ? { issue: job.issue } : {}),
+        ...(job.label ? { label: job.label } : {}),
+        ...(job.sender ? { sender: job.sender } : {}),
+        createdAt: job.createdAt,
+        status: job.status,
+      });
     },
     async getJob(jobId) {
       const j = jobs.get(jobId);
@@ -698,6 +792,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       if (!j) return null;
       if (j.status === 'finished') return j.outcome ?? null;
       jobs.set(jobId, { ...j, status: 'finished', outcome });
+      const s = summaries.get(jobId);
+      if (s) summaries.set(jobId, { ...s, status: 'finished', outcome });
+      if (isFailure(outcome)) {
+        const key = `${j.installationId}/${j.createdAt.slice(0, 7)}`;
+        failed.set(key, (failed.get(key) ?? 0) + 1);
+      }
       return outcome;
     },
     async attachMicrovm(jobId, microvmId) {

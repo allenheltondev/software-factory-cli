@@ -1,7 +1,10 @@
 import { Hono, type Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
+import type { AdminAccess } from './admin/access.js';
+import type { AdminService } from './admin/admin.js';
 import type { Caller } from './caller.js';
 import { FlowError, type GitHubFlows } from './flows/github.js';
+import type { TenantLimits } from './store/store.js';
 
 /**
  * The API, mounted at /api because CloudFront forwards `/api/*` paths to API Gateway unchanged.
@@ -16,6 +19,14 @@ import { FlowError, type GitHubFlows } from './flows/github.js';
  *   POST   /api/v1/github/connect/:id                connect an installation the last link offered
  *   GET    /api/v1/installations/:id/repositories    a tenant's repositories (members only)
  *
+ * Admins only (admin/access.ts; anyone else gets 403):
+ *   GET    /api/v1/admin/tenants                     every tenant: quotas, usage, failures
+ *   GET    /api/v1/admin/tenants/:id                 one tenant, with its recent and running jobs
+ *   POST   /api/v1/admin/tenants/:id/disable         { reason? }: jobs stop at once
+ *   POST   /api/v1/admin/tenants/:id/enable
+ *   PUT    /api/v1/admin/tenants/:id/limits          { limits: { concurrentJobs?, jobsPerDay?, microvmMinutesPerMonth? } | null }
+ *   POST   /api/v1/admin/jobs/:jobId/release         give back a job's capacity (its microVM is not running)
+ *
  * Everything under /api/v1 needs a caller. How one is found depends on where the app runs
  * (`lambda.ts`: the Cognito authorizer's claims; `local.ts`: a token verified in process), so the
  * entry points pass `resolveCaller` in. The GitHub webhook is a separate function (webhook.ts).
@@ -26,6 +37,7 @@ export type ResolveCaller = (c: Context) => Caller | null | Promise<Caller | nul
 export interface AppOptions {
   resolveCaller: ResolveCaller;
   github?: GitHubFlows;
+  admin?: { access: AdminAccess; service: AdminService };
   /** Logs unexpected errors. The response never carries their details. */
   logError?: (err: unknown) => void;
 }
@@ -33,8 +45,13 @@ export interface AppOptions {
 type Env = { Variables: { caller: Caller } };
 
 const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
+const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
+const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 
-export function createApp({ resolveCaller, github, logError = (err) => console.error(err) }: AppOptions) {
+/** Who did it, for the admin's actions: their email, else their sub. */
+const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
+
+export function createApp({ resolveCaller, github, admin, logError = (err) => console.error(err) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -46,7 +63,61 @@ export function createApp({ resolveCaller, github, logError = (err) => console.e
     await next();
   });
 
-  app.get('/v1/me', (c) => c.json(c.get('caller')));
+  app.get('/v1/me', async (c) => {
+    const caller = c.get('caller');
+    return c.json({ ...caller, admin: admin ? await admin.access.isAdmin(caller) : false });
+  });
+
+  if (admin) {
+    const { access, service } = admin;
+    const tenantId = (raw: string) => {
+      const id = Number(raw);
+      return Number.isSafeInteger(id) && id > 0 ? id : null;
+    };
+    app.use('/v1/admin/*', async (c, next) => {
+      if (!(await access.isAdmin(c.get('caller')))) return c.json({ error: 'forbidden' }, 403);
+      await next();
+    });
+    app.get('/v1/admin/tenants', async (c) => c.json(await service.listTenants()));
+    app.get('/v1/admin/tenants/:id', async (c) => {
+      const id = tenantId(c.req.param('id'));
+      return id ? c.json(await service.tenant(id)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.post('/v1/admin/tenants/:id/disable', async (c) => {
+      const id = tenantId(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      const body = (await c.req.json().catch(() => ({}))) as { reason?: unknown };
+      return c.json(await service.disable(id, adminName(c.get('caller')), str(body.reason)));
+    });
+    app.post('/v1/admin/tenants/:id/enable', async (c) => {
+      const id = tenantId(c.req.param('id'));
+      return id ? c.json(await service.enable(id, adminName(c.get('caller')))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.put('/v1/admin/tenants/:id/limits', async (c) => {
+      const id = tenantId(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      let body: { limits?: unknown };
+      try {
+        body = (await c.req.json()) as { limits?: unknown };
+      } catch {
+        return c.json({ error: 'bad_request' }, 400);
+      }
+      if (body.limits !== null && (typeof body.limits !== 'object' || body.limits === undefined)) return c.json({ error: 'bad_request' }, 400);
+      const given = body.limits as Record<string, unknown> | null;
+      if (given && Object.keys(given).some((k) => !(LIMIT_NAMES as readonly string[]).includes(k))) {
+        return c.json({ error: 'invalid_limits', message: `Limits are ${LIMIT_NAMES.join(', ')}` }, 400);
+      }
+      const limits = given
+        ? (Object.fromEntries(Object.entries(given).filter(([, v]) => v !== null && v !== undefined && v !== '').map(([k, v]) => [k, Number(v)])) as TenantLimits)
+        : null;
+      return c.json(await service.setLimits(id, adminName(c.get('caller')), limits));
+    });
+    app.post('/v1/admin/jobs/:jobId/release', async (c) => {
+      const jobId = c.req.param('jobId');
+      if (!JOB_ID.test(jobId)) return c.json({ error: 'not_found' }, 404);
+      return c.json(await service.releaseJob(jobId, adminName(c.get('caller'))));
+    });
+  }
 
   if (github) {
     app.get('/v1/github', async (c) => c.json(await github.status(c.get('caller'))));

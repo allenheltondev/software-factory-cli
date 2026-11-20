@@ -1,10 +1,14 @@
+import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { handle } from 'hono/aws-lambda';
+import { ADMINS_PARAMETER, createAdminAccess } from './admin/access.js';
+import { createAdminService } from './admin/admin.js';
 import { createApp } from './app.js';
 import { callerFromClaims, type Claims } from './caller.js';
 import { createGitHubFlows } from './flows/github.js';
 import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
+import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 
 /**
@@ -16,6 +20,8 @@ import { createDynamoStore } from './store/dynamo.js';
 const clientId = process.env.USER_POOL_CLIENT_ID ?? '';
 if (!clientId) console.error('USER_POOL_CLIENT_ID is not set; every /api/v1 request will be refused');
 const tableName = process.env.TABLE_NAME ?? '';
+const store = tableName ? createDynamoStore(tableName) : undefined;
+const ssm = new SSMClient({});
 
 const app = createApp({
   resolveCaller: (c) => {
@@ -23,8 +29,23 @@ const app = createApp({
     const claims = event?.requestContext?.authorizer?.claims as Claims | undefined;
     return callerFromClaims(claims, clientId);
   },
-  ...(tableName
-    ? { github: createGitHubFlows({ store: createDynamoStore(tableName), github: createGitHubApi(), loadSettings: createSettingsLoader() }) }
+  ...(store
+    ? {
+        github: createGitHubFlows({ store, github: createGitHubApi(), loadSettings: createSettingsLoader() }),
+        admin: {
+          access: createAdminAccess({
+            read: async () => {
+              try {
+                return (await ssm.send(new GetParameterCommand({ Name: process.env.ADMINS_PARAMETER || ADMINS_PARAMETER }))).Parameter?.Value ?? null;
+              } catch (err) {
+                if (err instanceof ParameterNotFound) return null;
+                throw err;
+              }
+            },
+          }),
+          service: createAdminService({ store, quotas: quotasFromEnv(process.env) }),
+        },
+      }
     : {}),
 });
 

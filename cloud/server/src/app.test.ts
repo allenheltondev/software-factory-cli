@@ -49,7 +49,7 @@ describe('createApp', () => {
   it('returns the caller from /api/v1/me', async () => {
     const res = await signedIn.request('/api/v1/me');
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ sub: 'user-1', email: 'pat@example.com' });
+    expect(await res.json()).toEqual({ sub: 'user-1', email: 'pat@example.com', admin: false });
   });
 
   it('refuses /api/v1 without a caller, including unknown routes', async () => {

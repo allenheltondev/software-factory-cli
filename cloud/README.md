@@ -290,6 +290,25 @@ aws ssm put-parameter --name /updraft/kill-switch --type String --value on --ove
 aws ssm put-parameter --name /updraft/kill-switch --type String --value off --overwrite
 ```
 
+### The admin view
+
+The console's **Admin** page (`/admin`) has two levels:
+- **The tenant list:** every tenant with its status, today's jobs and this month's microVM minutes against its quotas, and its failed and throttled jobs for the month.
+- **One tenant:** its jobs that hold capacity, its last 30 days of jobs with their outcomes, and three actions:
+  - **Disable.** No new job starts, and running jobs are served nothing more, so they end within the hour. GitHub suspending or unsuspending the App doesn't undo it (`adminDisabled` on the tenant record); only **Enable** does. Enabling makes the tenant active again only if GitHub has it active too.
+  - **Quotas.** Overrides of the stack's defaults, from 1 up to the ceiling, the same as `tenant-admin limits`.
+  - **Release** a job that holds capacity it shouldn't. This is for a launch interrupted after it asked for a microVM: nothing can tell whether one started, so its slot stays taken until the job's maximum duration. Release only once you've checked in Lambda that no microVM of the job is running. The job is retired, and its slots and unused microVM time are given back.
+
+**Who's an admin** comes from the SSM parameter `/updraft/admins`, one per account. Its entries are separated by commas or whitespace. Each is a Cognito `sub`, or `group:<name>` for everyone in that Ready, Set, Cloud group. The stack doesn't create it, so nobody is an admin until you write it:
+
+```powershell
+aws ssm put-parameter --name /updraft/admins --type String --value "group:updraft-admins" --overwrite
+```
+
+The API reads it at most once a minute. If it can't be read, nobody is an admin. Every admin route answers 403 to anyone else, and `/api/v1/me` says whether the caller is an admin, which decides whether the console shows the link. Each action is logged with the admin's email.
+
+The job summaries (`TENANT#<id>`/`JOB#<createdAt>#<jobId>`) are written with each job record and keep its first outcome. A failure also counts in the month's usage. The tenant list comes from a table scan, which is fine while there are few tenants.
+
 ### The job image
 
 Jobs run the same image as the self-hosted stack (`deploy/aws-microvm/image/`), with this repository's CLI packed into it and both agents installed. `server/scripts/build-job-image.ts` builds it:

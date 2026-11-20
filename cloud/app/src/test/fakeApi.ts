@@ -14,6 +14,12 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     completeCallback: vi.fn(),
     connect: vi.fn(),
     repositories: vi.fn(),
+    adminTenants: vi.fn(),
+    adminTenant: vi.fn(),
+    adminDisable: vi.fn(),
+    adminEnable: vi.fn(),
+    adminSetLimits: vi.fn(),
+    adminReleaseJob: vi.fn(),
     ...overrides,
   } as ApiClient;
 }

@@ -51,6 +51,13 @@ function fakeTable() {
     }
     if (expr === 'attribute_exists(pk) AND #status <> :finished') return Boolean(item) && item!.status !== values[':finished'];
     if (expr === 'jobId = :job') return Boolean(item) && item!.jobId === values[':job'];
+    if (expr === 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND attribute_not_exists(adminDisabledAt)') {
+      return Boolean(item) && item!.disabledReason !== values[':uninstalled'] && item!.adminDisabledAt === undefined;
+    }
+    if (expr === 'attribute_exists(adminDisabledAt) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)') {
+      return Boolean(item) && item!.adminDisabledAt !== undefined && item!.disabledReason !== values[':uninstalled'];
+    }
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(disabledReason)') return Boolean(item) && item!.disabledReason === undefined;
     if (expr === 'phase = :reserved') return Boolean(item) && item!.phase === values[':reserved'];
     if (expr === 'attribute_exists(pk) AND phase = :phase') return Boolean(item) && item!.phase === values[':phase'];
     throw new Error(`fake table: unsupported condition ${expr}`);
@@ -116,8 +123,9 @@ function fakeTable() {
           const k = key(input.Key as Item);
           const existing = items.get(k);
           if (!condition(input.ConditionExpression as string, existing, values)) throw ccf();
-          items.set(k, update(existing ?? { ...(input.Key as Item) }, String(input.UpdateExpression), input.ExpressionAttributeNames as Record<string, string>, values));
-          return {};
+          const next = update(existing ?? { ...(input.Key as Item) }, String(input.UpdateExpression), input.ExpressionAttributeNames as Record<string, string>, values);
+          items.set(k, next);
+          return input.ReturnValues === 'ALL_NEW' ? { Attributes: { ...next } } : {};
         }
         case 'DeleteCommand': {
           const k = key(input.Key as Item);
@@ -140,6 +148,11 @@ function fakeTable() {
           if (input.ScanIndexForward === false) found.reverse();
           if (typeof input.Limit === 'number') found = found.slice(0, input.Limit);
           return { Items: input.ProjectionExpression ? found.map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })) : found.map((i) => ({ ...i })) };
+        }
+        case 'ScanCommand': {
+          // FilterExpression 'sk = :meta AND begins_with(pk, :tenant)', the one scan the store makes.
+          const found = [...items.values()].filter((i) => i.sk === values?.[':meta'] && String(i.pk).startsWith(String(values?.[':tenant'])));
+          return { Items: found.map((i) => ({ ...i })) };
         }
         case 'TransactWriteCommand': {
           const ops = input.TransactItems as Item[];
@@ -435,6 +448,73 @@ describe('dynamo store: the uninstall and its cleanup entry are one transaction'
   });
 });
 
+describe('dynamo store: the admin view', () => {
+  const LATER = Date.now() + 3_600_000;
+  it("an admin's disable outlasts GitHub's suspend and unsuspend; enabling follows GitHub's state", async () => {
+    const { store, table } = await seeded();
+    expect(await store.setAdminDisabled(55, { by: 'admin:ops', reason: 'abuse' })).toBe('updated');
+    expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'admin', adminDisabled: { by: 'admin:ops', reason: 'abuse' } });
+    // The item keeps GitHub's reason only: none here.
+    expect(table.items.get('TENANT#55|META')?.disabledReason).toBeUndefined();
+
+    expect(await store.setSuspended(55, true)).toBe('updated');
+    expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'suspended' });
+    expect(await store.setSuspended(55, false)).toBe('updated');
+    expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'admin' });
+
+    expect(await store.setAdminDisabled(55, null)).toBe('updated');
+    expect(await store.getTenant(55)).toMatchObject({ status: 'active' });
+    expect((await store.getTenant(55))?.adminDisabled).toBeUndefined();
+
+    // Enabled while suspended on GitHub: still suspended.
+    await store.setAdminDisabled(55, { by: 'admin:ops' });
+    await store.setSuspended(55, true);
+    expect(await store.setAdminDisabled(55, null)).toBe('updated');
+    expect(await store.getTenant(55)).toMatchObject({ status: 'disabled', disabledReason: 'suspended' });
+
+    // Never over an uninstall, and nothing for a tenant that does not exist.
+    await store.markUninstalled(55, DEADLINE);
+    expect(await store.setAdminDisabled(55, { by: 'admin:ops' })).toBe('uninstalled');
+    expect(await store.setAdminDisabled(56, { by: 'admin:ops' })).toBe('no_tenant');
+  });
+
+  it('lists every tenant, and keeps a summary of each job with its first outcome', async () => {
+    const { store, table } = await seeded();
+    await store.putTenantWithMember({ ...tenant, installationId: 66, accountLogin: 'zeta' }, { ...member('sub-a'), installationId: 66 });
+    expect((await store.listTenants()).map((t) => t.installationId).sort()).toEqual([55, 66]);
+
+    const job: Job = {
+      jobId: 'job_first0001',
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 1,
+      deliveryId: 'd-1',
+      eventName: 'issues',
+      status: 'launched',
+      createdAt: '2026-11-20T12:00:00.000Z',
+      expiresAt: LATER,
+      issue: 12,
+      label: 'updraft',
+    };
+    await store.putJob(job);
+    await store.putJob({ ...job, jobId: 'job_second001', deliveryId: 'd-2', createdAt: '2026-11-20T13:00:00.000Z' });
+    expect(await store.finishJob('job_first0001', 'timed_out')).toBe('timed_out');
+    // A repeated finish changes neither the summary nor the count.
+    await store.finishJob('job_first0001', 'succeeded');
+    expect((await store.listRecentJobs(55, 10)).map((j) => [j.jobId, j.status, j.outcome ?? null])).toEqual([
+      ['job_second001', 'launched', null],
+      ['job_first0001', 'finished', 'timed_out'],
+    ]);
+    expect((await store.listRecentJobs(55, 1)).map((j) => j.jobId)).toEqual(['job_second001']);
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).failedThisMonth).toBe(1);
+    // A clean success is not a failure.
+    await store.finishJob('job_second001', 'succeeded');
+    expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.failed).toBe(1);
+  });
+});
+
 describe('dynamo store: delivery claims and finished jobs (review fixes on #80)', () => {
   const LATER = Date.now() + 3_600_000;
 
@@ -546,6 +626,7 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
       jobsThisMonth: 1,
       microvmSecondsThisMonth: 0,
       throttledThisMonth: 0,
+      failedThisMonth: 0,
     });
     // One at a time: a second is refused, and takes nothing.
     expect(await reserve(55, 'job_b00000001')).toEqual({ ok: false, limit: 'concurrent_jobs' });
@@ -668,7 +749,8 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     await store.putJob(base);
     await store.finishJob(base.jobId, 'start_failed');
     expect(await store.startJob(base, LATER)).toEqual({ result: 'retired' });
-    expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')).toBeUndefined();
+    // Charged nothing (the month counts it as a failed job, nothing more).
+    expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBeUndefined();
 
     // Launches that passed the launcher's check on the same remainder (200 minutes): the first two
     // starts are charged 180 each while the month is under, and the third finds it spent.

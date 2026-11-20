@@ -51,7 +51,7 @@ describe('lambda handler', () => {
   it('returns the caller from the authorizer claims', async () => {
     const res = await handler(restEvent('/api/v1/me', { sub: 'u1', aud: CLIENT, token_use: 'id', email: 'a@b.c' }), context);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ sub: 'u1', email: 'a@b.c' });
+    expect(JSON.parse(res.body)).toEqual({ sub: 'u1', email: 'a@b.c', admin: false });
   });
 
   it('refuses a token from another client in the pool', async () => {

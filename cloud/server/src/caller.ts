@@ -13,6 +13,8 @@ export interface Caller {
   sub: string;
   email?: string;
   name?: string;
+  /** The caller's Ready, Set, Cloud (Cognito) groups. */
+  groups?: string[];
 }
 
 export type Claims = Record<string, unknown>;
@@ -34,5 +36,21 @@ export function callerFromClaims(claims: Claims | null | undefined, clientId: st
   if (email) caller.email = email;
   const name = [str(claims.given_name), str(claims.family_name)].filter(Boolean).join(' ');
   if (name) caller.name = name;
+  const groups = groupsFrom(claims['cognito:groups']);
+  if (groups.length > 0) caller.groups = groups;
   return caller;
+}
+
+/**
+ * `cognito:groups` as a list. A verified token carries an array; API Gateway's authorizer hands
+ * claims over as strings, an array arriving as "[a, b]" or "a,b".
+ */
+export function groupsFrom(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((g): g is string => typeof g === 'string' && g.trim() !== '').map((g) => g.trim());
+  if (typeof value !== 'string') return [];
+  return value
+    .replace(/^\[|\]$/g, '')
+    .split(/[\s,]+/)
+    .map((g) => g.trim())
+    .filter(Boolean);
 }
