@@ -4,6 +4,7 @@ import type { GitHubInstallation } from '../github/client.js';
 import { signBody, verifySignature } from '../github/signature.js';
 import type { AppSettings } from '../github/settings.js';
 import { createMemoryStore, type Tenant } from '../store/store.js';
+import type { Launcher } from '../jobs/launch.js';
 import { createWebhookHandler, RETENTION_MS } from './webhook.js';
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -29,7 +30,7 @@ const installation = (suspendedAt: string | null): GitHubInstallation => ({
 });
 
 /** `github` says what GitHub reports for installation 55 right now: an installation, gone (null), or an error. */
-async function setup(github: { current: GitHubInstallation | null | Error } = { current: installation(null) }) {
+async function setup(github: { current: GitHubInstallation | null | Error } = { current: installation(null) }, launch?: Launcher) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant, {
     installationId: 55,
@@ -50,6 +51,7 @@ async function setup(github: { current: GitHubInstallation | null | Error } = { 
       },
     },
     loadSettings: async () => SETTINGS,
+    ...(launch ? { launch } : {}),
     now: () => clock.now,
     log: () => {},
   });
@@ -183,7 +185,31 @@ describe('webhook', () => {
   it('answers ping and acknowledges other events without acting', async () => {
     const { deliver } = await setup();
     expect((await deliver('ping', { zen: 'hi' })).body.disposition).toBe('pong');
-    expect((await deliver('issues', { action: 'labeled', installation: { id: 55 } })).body).toEqual({ ok: true, disposition: 'ignored' });
+    expect((await deliver('issues', { action: 'opened', installation: { id: 55 } })).body).toEqual({ ok: true, disposition: 'ignored' });
+    expect((await deliver('pull_request', { action: 'synchronize', installation: { id: 55 } })).body).toEqual({ ok: true, disposition: 'ignored' });
+    // Without a launcher (local development), a labeled issue starts nothing.
+    expect((await deliver('issues', { action: 'labeled', installation: { id: 55 } })).body).toEqual({ ok: true, disposition: 'jobs_not_configured' });
+  });
+
+  it('hands a labeled issue to the launcher, with the body exactly as signed, and answers as it does', async () => {
+    const calls: Parameters<Launcher>[0][] = [];
+    const answers = [
+      { status: 202, disposition: 'launched', jobId: 'job_1' },
+      { status: 500, disposition: 'launch_failed' },
+    ];
+    const launch: Launcher = async (req) => {
+      calls.push(req);
+      return answers.shift()!;
+    };
+    const { deliver } = await setup(undefined, launch);
+    const payload = { action: 'labeled', installation: { id: 55 }, label: { name: 'updraft' }, repository: { id: 9, full_name: 'acme/web' } };
+    const first = await deliver('issues', payload);
+    expect(first).toEqual({ status: 202, body: { ok: true, disposition: 'launched' } });
+    expect(calls[0]).toMatchObject({ installationId: 55, deliveryId: 'd1', body: JSON.stringify(payload), payload: { label: { name: 'updraft' } } });
+    expect(await deliver('issues', payload)).toEqual({ status: 500, body: { ok: false, disposition: 'launch_failed' } });
+    // An event for no installation never reaches it.
+    await deliver('issues', { action: 'labeled' });
+    expect(calls).toHaveLength(2);
   });
 
   it('rejects a signed body that is not JSON', async () => {

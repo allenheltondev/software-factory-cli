@@ -479,10 +479,13 @@ export async function runJob(request, deps) {
       log(`could not remove the deduplication record; a redelivery is refused until it expires: ${error?.message ?? error}`);
     }
   }
-  // Version 2: tell the broker the job is over, so nothing more is served for its token.
+  // Version 2: tell the broker the job is over, so nothing more is served for its token. As with
+  // the deduplication record above, only a clean success keeps the delivery's claim: a success
+  // without a summary is reported as "unconfirmed", which lets a redelivery run it again.
   if (payload.version === 2 && deps.finishJob) {
+    const outcome = result.outcome === 'succeeded' && result.summaryMissing ? 'unconfirmed' : result.outcome;
     try {
-      await retry(() => deps.finishJob(result.outcome), deps);
+      await retry(() => deps.finishJob(outcome), deps);
     } catch (error) {
       log(`could not tell the job broker the job finished; its token stops working at the maximum duration: ${error?.message ?? error}`);
     }

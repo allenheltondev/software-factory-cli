@@ -116,7 +116,8 @@ describe('the job broker', () => {
     expect(await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded' })).toEqual({ ok: true, finished: true });
     expect((await store.getJob(job.jobId))?.outcome).toBe('succeeded');
     expect(await handle({ action: 'github-token', jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
-    expect(await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed' })).toEqual({ ok: false, error: 'refused' });
+    // A repeated finish is answered (it may be a retry) but changes nothing: the first outcome stands.
+    expect(await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed' })).toEqual({ ok: true, finished: true });
     expect((await store.getJob(job.jobId))?.outcome).toBe('succeeded');
   });
 
@@ -172,6 +173,93 @@ describe('the job broker', () => {
     await store.setSuspended(55, true);
     expect(await handle({ action: 'terminate', jobId: job.jobId, token, microvmId: 'mvm-other' })).toEqual({ ok: true, terminated: true });
     expect(terminateMicrovm).toHaveBeenCalledExactlyOnceWith('mvm-own');
+  });
+
+  it("gives up the delivery's claim unless the job succeeded, so a redelivery retries a failed job", async () => {
+    const later = Date.now() + 3_600_000;
+    await store.claimDelivery(55, 'd-1', later, job.jobId);
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded' });
+    expect(await store.claimDelivery(55, 'd-1', later, 'job_next0001')).toBe(false);
+
+    const other = { ...job, jobId: 'job_def67890', deliveryId: 'd-2' };
+    await store.putJob(other);
+    await store.claimDelivery(55, 'd-2', later, other.jobId);
+    await handle({ action: 'finish', jobId: other.jobId, token, outcome: 'unconfirmed' });
+    expect(await store.claimDelivery(55, 'd-2', later, 'job_next0001')).toBe(true);
+  });
+
+  it('a finish retried after the claim release failed releases it then', async () => {
+    const later = Date.now() + 3_600_000;
+    await store.claimDelivery(55, 'd-1', later, job.jobId);
+    const release = store.releaseDelivery.bind(store);
+    store.releaseDelivery = vi.fn().mockRejectedValueOnce(new Error('throttled')).mockImplementation(release);
+    await expect(handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed' })).rejects.toThrow('throttled');
+    // The outcome is recorded, the claim is still held: the runner retries finish.
+    expect((await store.getJob(job.jobId))?.status).toBe('finished');
+    expect(await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed' })).toEqual({ ok: true, finished: true });
+    expect(await store.claimDelivery(55, 'd-1', later, 'job_next0001')).toBe(true);
+  });
+
+  it("a late finish from an earlier job never releases the redelivery's claim", async () => {
+    const later = Date.now() + 3_600_000;
+    await store.claimDelivery(55, 'd-1', later, job.jobId);
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed' });
+    // The redelivery started a new job, which holds the claim now.
+    expect(await store.claimDelivery(55, 'd-1', later, 'job_next0001')).toBe(true);
+    // The first job's finish, retried late (or concurrently), leaves that claim alone.
+    expect(await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed' })).toEqual({ ok: true, finished: true });
+    expect(await store.claimDelivery(55, 'd-1', later, 'job_third001')).toBe(false);
+  });
+
+  it('records the finish of a job whose tenant was suspended, and releases its claim', async () => {
+    const later = Date.now() + 3_600_000;
+    await store.claimDelivery(55, 'd-1', later, job.jobId);
+    await store.setSuspended(55, true);
+    expect(await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'start_failed' })).toEqual({ ok: true, finished: true });
+    expect((await store.getJob(job.jobId))?.outcome).toBe('start_failed');
+    expect(await store.claimDelivery(55, 'd-1', later, 'job_next0001')).toBe(true);
+  });
+
+  describe("start holds the delivery's claim (the launcher's is short)", () => {
+    // The memory store's claims expire by the real clock: run these on it.
+    beforeEach(async () => {
+      clock = Date.now();
+      job = { ...job, expiresAt: clock + 3_600_000 };
+      await store.putJob(job);
+    });
+
+    it('extends the claim to the job\'s lifetime, so a redelivery is still a duplicate', async () => {
+      await store.claimDelivery(55, 'd-1', clock + 60_000, job.jobId);
+      expect((await handle({ action: 'start', jobId: job.jobId, token })).ok).toBe(true);
+      clock += 120_000;
+      expect(await store.claimDelivery(55, 'd-1', Date.now() + 120_000, 'job_next0001')).toBe(false);
+      await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed' });
+      expect(await store.claimDelivery(55, 'd-1', Date.now() + 120_000, 'job_next0001')).toBe(true);
+    });
+
+    it('takes the claim back when it ran out and nobody else took it', async () => {
+      await store.claimDelivery(55, 'd-1', clock - 1_000, job.jobId);
+      expect((await handle({ action: 'start', jobId: job.jobId, token })).ok).toBe(true);
+      expect(await store.claimDelivery(55, 'd-1', Date.now() + 120_000, 'job_next0001')).toBe(false);
+    });
+
+    it("refuses to start once a redelivery's job holds the claim, and finishes this one as superseded", async () => {
+      await store.claimDelivery(55, 'd-1', clock - 1_000, job.jobId);
+      expect(await store.claimDelivery(55, 'd-1', Date.now() + 120_000, 'job_next0001')).toBe(true);
+      expect(await handle({ action: 'start', jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
+      expect(assumeRole).not.toHaveBeenCalled();
+      expect((await store.getJob(job.jobId))?.outcome).toBe('superseded');
+      // The runner's own finish then changes nothing, and leaves the redelivery's claim alone.
+      await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'start_failed' });
+      expect((await store.getJob(job.jobId))?.outcome).toBe('superseded');
+      expect(await store.claimDelivery(55, 'd-1', Date.now() + 120_000, 'job_third001')).toBe(false);
+    });
+  });
+
+  it('refuses a finish with the wrong token', async () => {
+    const r = await handle({ action: 'finish', jobId: job.jobId, token: randomBytes(32).toString('base64url'), outcome: 'failed' });
+    expect(r).toEqual({ ok: false, error: 'refused' });
+    expect((await store.getJob(job.jobId))?.status).toBe('launched');
   });
 
   it('keeps an unexpected outcome out of the record', async () => {

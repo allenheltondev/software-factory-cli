@@ -20,11 +20,14 @@ import { configPrefix } from '../tenants/paths.js';
  *   start / credentials   the job's descriptor (bucket and keys) and AWS credentials for an hour,
  *                         from AssumeRole with a session policy that reaches only this tenant's
  *                         prefix (this job's event, config version and results; the tenant's
- *                         state) and only this tenant's agent key secrets
+ *                         state) and only this tenant's agent key secrets. `start` also holds
+ *                         the delivery's claim for the job's lifetime (refused if a redelivery's
+ *                         job holds it)
  *   github-token          an installation token for the job's one repository with only the
  *                         permissions a job needs, as the CLI's token file (#77)
- *   finish                the job is over; nothing more is served for it
- *   terminate             stop the job's own microVM (as the launcher recorded it), whatever the
+ *   finish                the job is over; nothing more is served for it. Whatever the job's state,
+ *                         and safe to repeat: a retried finish redoes what a failed one left undone
+ *   terminate            stop the job's own microVM (as the launcher recorded it), whatever the
  *                         job's state; the shared execution role cannot terminate microVMs
  *
  * Refused alike, so nothing can be probed: an unknown job, a wrong token, a finished or expired
@@ -126,6 +129,8 @@ export type BrokerResponse =
 const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 const OUTCOME = /^[a-z_]{1,40}$/;
 const REFUSED: BrokerResponse = { ok: false, error: 'refused' };
+/** A job that started after a redelivery's job had taken its delivery's claim: it never runs. */
+export const SUPERSEDED_OUTCOME = 'superseded';
 
 export function createBroker(deps: BrokerDeps) {
   const now = deps.now ?? Date.now;
@@ -170,11 +175,27 @@ export function createBroker(deps: BrokerDeps) {
       return { ok: true, terminated: true };
     }
 
+    // Finishing only ever takes away (nothing more is served for the job) and gives up this job's
+    // own claim, so it is allowed whatever the job's state, and repeatable: the first outcome is
+    // kept, and a finish retried because releasing the claim failed releases it this time. The
+    // claim is released only if this job holds it; a redelivery's job keeps its own.
+    if (action === 'finish') {
+      const given = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
+      const recorded = (await deps.store.finishJob(job.jobId, given)) ?? given;
+      // Redelivering the webhook is how a failed job is retried: anything but a clean success
+      // gives up the delivery's claim, so the launcher starts a job for the redelivery.
+      if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
+      return { ok: true, finished: true };
+    }
+
     if (!(await servable(job))) return REFUSED;
 
-    if (action === 'finish') {
-      await deps.store.finishJob(job.jobId, typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown');
-      return { ok: true, finished: true };
+    // The launcher's claim on the delivery is short, so it runs out on its own if the launch never
+    // got this far (its Lambda stopped before RunMicrovm, say). A job that does start holds the
+    // claim for as long as it may run; if a redelivery's job holds it now, that one runs, not this.
+    if (action === 'start' && !(await deps.store.holdDelivery(job.installationId, job.deliveryId, job.expiresAt, job.jobId))) {
+      await deps.store.finishJob(job.jobId, SUPERSEDED_OUTCOME);
+      return REFUSED;
     }
 
     if (action === 'start' || action === 'credentials') {

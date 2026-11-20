@@ -59,6 +59,17 @@ export interface ConfigVersion {
   files: string[];
   publishedBy: string;
   publishedAt: string;
+  /** What the launcher checks before it starts a job with this version (tenants/dispatch.ts). */
+  dispatch?: DispatchRules;
+}
+
+/**
+ * The part of a compiled config the launcher needs, kept with the version so dispatch reads no
+ * bundle: per repository (OWNER/REPO, lower-case), its GitHub id and its triggers, each with the
+ * label (lower-case, as GitHub compares labels) and the logins allowed to apply it (lower-case).
+ */
+export interface DispatchRules {
+  repositories: Record<string, { id: number; triggers: { label: string; actors: string[] }[] }>;
 }
 
 /** That an agent key is set (never its value, which lives only in Secrets Manager). */
@@ -69,7 +80,7 @@ export interface AgentKeyMeta {
 }
 
 /**
- * One job: a microVM the launcher started for a tenant's webhook delivery (PR 4). The broker
+ * One job: a microVM the launcher (jobs/launch.ts) started for a tenant's webhook delivery. The broker
  * (broker/broker.ts) serves it only to whoever holds the job's token, only while it runs, and only
  * what this record pins: the tenant, the repository and the config version.
  */
@@ -93,6 +104,11 @@ export interface Job {
   expiresAt: number;
   /** The job's microVM, recorded by the launcher once RunMicrovm returns: the only one the job may stop. */
   microvmId?: string;
+  /** What started it: the trigger label and who applied it. */
+  label?: string;
+  sender?: string;
+  /** The MicroVM image version it runs. */
+  imageVersion?: string;
 }
 
 export type MemberRole = 'owner' | 'editor';
@@ -182,6 +198,7 @@ export interface Store {
    */
   activateConfig(installationId: number, version: number): Promise<'activated' | 'superseded' | 'not_ready' | 'uninstalled' | 'no_tenant'>;
   listConfigVersions(installationId: number): Promise<ConfigVersion[]>;
+  getConfigVersion(installationId: number, version: number, options?: { consistent?: boolean }): Promise<ConfigVersion | null>;
 
   /** Refused (`uninstalled`) once the tenant is uninstalled or gone, so no row escapes the sweep. */
   putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<'stored' | 'uninstalled'>;
@@ -201,13 +218,35 @@ export interface Store {
    */
   purgeTenantPartition(installationId: number): Promise<void>;
 
-  /** Records a job (the launcher, PR 4). Its own partition, expiring a week after the job may last. */
+  /** Records a job (the launcher). Its own partition, expiring a week after the job may last. */
   putJob(job: Job): Promise<void>;
   getJob(jobId: string): Promise<Job | null>;
-  /** The runner said it is done: nothing more is served for it. Only the first outcome is kept. */
-  finishJob(jobId: string, outcome: string): Promise<void>;
+  /**
+   * The runner said it is done: nothing more is served for it. Only the first outcome is kept, and
+   * it is what this returns (null for an unknown job), so a repeated finish acts on the same one.
+   */
+  finishJob(jobId: string, outcome: string): Promise<string | null>;
   /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
+
+  /**
+   * Deduplication: claims a tenant's webhook delivery unless an unexpired claim exists (false: a
+   * job was already started for it). `expiresAt` in epoch ms; the claim is the table's TTL too.
+   * The claim is held by `jobId`, the job started for it.
+   */
+  claimDelivery(installationId: number, deliveryId: string, expiresAt: number, jobId: string): Promise<boolean>;
+  /**
+   * A job that has started holds its delivery's claim until `expiresAt` (epoch ms): it extends its
+   * own claim, or takes one that is gone or expired. False when another job holds an unexpired
+   * claim (a redelivery started it after this job's claim ran out): this job must not run.
+   */
+  holdDelivery(installationId: number, deliveryId: string, expiresAt: number, jobId: string): Promise<boolean>;
+  /**
+   * Lets a redelivery start the job again (it failed, or it never started). Only the job holding
+   * the claim gives it up: a late release from an earlier job leaves a redelivery's claim alone.
+   * Nothing happens when there is no such claim, so it is safe to repeat.
+   */
+  releaseDelivery(installationId: number, deliveryId: string, jobId: string): Promise<void>;
 }
 
 export interface CleanupEntry {
@@ -227,6 +266,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
   const jobs = new Map<string, Job>();
+  /** `<installationId>/<deliveryId>` -> expiry (epoch ms) and the job holding the claim. */
+  const deliveries = new Map<string, { expiresAt: number; jobId: string }>();
   const memberKey = (id: number, sub: string) => `${id}/${sub}`;
   const strip = <T extends { ttl?: number }>(item: T): Omit<T, 'ttl'> => {
     const { ttl: _ttl, ...rest } = item;
@@ -344,6 +385,28 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async listConfigVersions(id) {
       return [...configs.values()].filter((c) => c.installationId === id).sort((a, b) => a.version - b.version).map((c) => ({ ...c }));
     },
+    async getConfigVersion(id, version) {
+      const c = configs.get(`${id}/${version}`);
+      return c ? { ...c } : null;
+    },
+    async claimDelivery(id, deliveryId, expiresAt, jobId) {
+      const key = `${id}/${deliveryId}`;
+      const existing = deliveries.get(key);
+      if (existing !== undefined && existing.expiresAt > Date.now()) return false;
+      deliveries.set(key, { expiresAt, jobId });
+      return true;
+    },
+    async holdDelivery(id, deliveryId, expiresAt, jobId) {
+      const key = `${id}/${deliveryId}`;
+      const existing = deliveries.get(key);
+      if (existing !== undefined && existing.jobId !== jobId && existing.expiresAt > Date.now()) return false;
+      deliveries.set(key, { expiresAt, jobId });
+      return true;
+    },
+    async releaseDelivery(id, deliveryId, jobId) {
+      const key = `${id}/${deliveryId}`;
+      if (deliveries.get(key)?.jobId === jobId) deliveries.delete(key);
+    },
     async putAgentKeyMeta(id, meta) {
       const t = tenants.get(id);
       if (!t || t.disabledReason === 'uninstalled') return 'uninstalled';
@@ -362,7 +425,10 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async finishJob(jobId, outcome) {
       const j = jobs.get(jobId);
-      if (j && j.status !== 'finished') jobs.set(jobId, { ...j, status: 'finished', outcome });
+      if (!j) return null;
+      if (j.status === 'finished') return j.outcome ?? null;
+      jobs.set(jobId, { ...j, status: 'finished', outcome });
+      return outcome;
     },
     async attachMicrovm(jobId, microvmId) {
       const j = jobs.get(jobId);

@@ -8,7 +8,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import type { AgentKeyMeta, CleanupEntry, ConfigVersion, GitHubLink, InstallationOffer, Job, Member, OAuthState, Store, Tenant } from './store.js';
+import type { AgentKeyMeta, CleanupEntry, ConfigVersion, DispatchRules, GitHubLink, InstallationOffer, Job, Member, OAuthState, Store, Tenant } from './store.js';
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
@@ -20,6 +20,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
   const memberKey = (id: number, sub: string) => ({ pk: `TENANT#${id}`, sk: `MEMBER#${sub}` });
   // Zero-padded, so the sort key orders versions numerically.
   const configKey = (id: number, version: number) => ({ pk: `TENANT#${id}`, sk: `CONFIG#${String(version).padStart(10, '0')}` });
+  // Its own partition (not the tenant's): claims expire on their own, well before any uninstall deadline.
+  const deliveryKey = (id: number, deliveryId: string) => ({ pk: `DELIVERY#${id}#${deliveryId}`, sk: 'CLAIM' });
   // Uninstalled tenants whose data outside the table must be deleted at the deadline. One
   // partition, ordered by deadline, and no TTL: these must outlive the tenant's own rows.
   const cleanupKey = (entry: CleanupEntry) => ({ pk: 'CLEANUP', sk: `${String(entry.deleteAfter).padStart(15, '0')}#${entry.installationId}` });
@@ -63,6 +65,18 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       ExclusiveStartKey = page.LastEvaluatedKey;
     } while (ExclusiveStartKey);
   }
+
+  const toConfigVersion = (id: number, i: Record<string, unknown>): ConfigVersion => ({
+    installationId: id,
+    version: Number(i.version),
+    status: i.status === 'ready' ? 'ready' : 'pending',
+    sha256: String(i.sha256),
+    files: Array.isArray(i.files) ? i.files.map(String) : [],
+    publishedBy: String(i.publishedBy),
+    publishedAt: String(i.publishedAt),
+    // Stored as written by the publish (tenants/dispatch.ts); absent on versions published before it existed.
+    ...(i.dispatch && typeof i.dispatch === 'object' ? { dispatch: i.dispatch as DispatchRules } : {}),
+  });
 
   async function getTenantItem(id: number, consistent = false): Promise<Record<string, unknown> | undefined> {
     const out = await client.send(new GetCommand({ TableName: T, Key: tenantKey(id), ...(consistent ? { ConsistentRead: true } : {}) }));
@@ -385,6 +399,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         createdAt: String(i.createdAt),
         expiresAt: Number(i.expiresAt),
         ...(typeof i.microvmId === 'string' ? { microvmId: i.microvmId } : {}),
+        ...(typeof i.label === 'string' ? { label: i.label } : {}),
+        ...(typeof i.sender === 'string' ? { sender: i.sender } : {}),
+        ...(typeof i.imageVersion === 'string' ? { imageVersion: i.imageVersion } : {}),
       };
     },
 
@@ -418,9 +435,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
           }),
         );
+        return outcome;
       } catch (err) {
         if (!(err instanceof ConditionalCheckFailedException)) throw err;
         // Already finished (or never recorded): the first outcome stands.
+        const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' }, ConsistentRead: true }));
+        return typeof out.Item?.outcome === 'string' ? out.Item.outcome : null;
       }
     },
 
@@ -603,20 +623,71 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             ExclusiveStartKey,
           }),
         );
-        for (const i of page.Items ?? []) {
-          out.push({
-            installationId: id,
-            version: Number(i.version),
-            status: i.status === 'ready' ? 'ready' : 'pending',
-            sha256: String(i.sha256),
-            files: Array.isArray(i.files) ? i.files.map(String) : [],
-            publishedBy: String(i.publishedBy),
-            publishedAt: String(i.publishedAt),
-          });
-        }
+        for (const i of page.Items ?? []) out.push(toConfigVersion(id, i));
         ExclusiveStartKey = page.LastEvaluatedKey;
       } while (ExclusiveStartKey);
       return out.sort((a, b) => a.version - b.version);
+    },
+
+    async getConfigVersion(id, version, options) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: configKey(id, version), ConsistentRead: options?.consistent === true }));
+      return out.Item ? toConfigVersion(id, out.Item) : null;
+    },
+
+    async claimDelivery(id, deliveryId, expiresAt, jobId) {
+      // DynamoDB deletes expired items lazily, so an expired claim counts as none.
+      const now = Math.floor(Date.now() / 1000);
+      try {
+        await client.send(
+          new PutCommand({
+            TableName: T,
+            Item: { ...deliveryKey(id, deliveryId), installationId: id, deliveryId, jobId, ttl: Math.ceil(expiresAt / 1000) },
+            ConditionExpression: 'attribute_not_exists(pk) OR #ttl < :now',
+            ExpressionAttributeNames: { '#ttl': 'ttl' },
+            ExpressionAttributeValues: { ':now': now },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (err instanceof ConditionalCheckFailedException) return false;
+        throw err;
+      }
+    },
+
+    async holdDelivery(id, deliveryId, expiresAt, jobId) {
+      // This job's own claim, or none (gone or expired): another job's live claim wins.
+      const now = Math.floor(Date.now() / 1000);
+      try {
+        await client.send(
+          new PutCommand({
+            TableName: T,
+            Item: { ...deliveryKey(id, deliveryId), installationId: id, deliveryId, jobId, ttl: Math.ceil(expiresAt / 1000) },
+            ConditionExpression: 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now',
+            ExpressionAttributeNames: { '#ttl': 'ttl' },
+            ExpressionAttributeValues: { ':job': jobId, ':now': now },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (err instanceof ConditionalCheckFailedException) return false;
+        throw err;
+      }
+    },
+
+    async releaseDelivery(id, deliveryId, jobId) {
+      // Only the holder's: a redelivery's claim (another job) stays, and no claim is no-op.
+      try {
+        await client.send(
+          new DeleteCommand({
+            TableName: T,
+            Key: deliveryKey(id, deliveryId),
+            ConditionExpression: 'jobId = :job',
+            ExpressionAttributeValues: { ':job': jobId },
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+      }
     },
 
     async putAgentKeyMeta(id, meta: AgentKeyMeta) {

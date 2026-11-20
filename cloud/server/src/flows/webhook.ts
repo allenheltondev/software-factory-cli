@@ -2,13 +2,15 @@ import type { GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import { verifySignature } from '../github/signature.js';
 import type { LoadSettings } from '../github/settings.js';
+import type { Launcher } from '../jobs/launch.js';
 import type { Store } from '../store/store.js';
 
 /**
  * The GitHub webhook (POST /api/webhooks/github, no authorizer: the HMAC is the authentication).
  *
- * #67 handles the installation lifecycle only; issue and pull request events, which start jobs,
- * arrive with the multi-tenant launcher (#68) and are acknowledged without action until then.
+ * Jobs (#68): `issues.labeled` goes to the multi-tenant launcher (jobs/launch.ts), which starts a
+ * job when the tenant's active config says so. Pull request events are acknowledged without
+ * action until the review loop comes to Updraft Cloud.
  *
  *   installation.deleted     tenant uninstalled, finally: everything in its partition gets the
  *                            table TTL for 30 days on, and reads stop at once when they pass. A
@@ -47,12 +49,15 @@ export function createWebhookHandler({
   store,
   github,
   loadSettings,
+  launch,
   now = () => Date.now(),
   log = (m: string) => console.log(m),
 }: {
   store: Store;
   github: Pick<GitHubApi, 'getInstallation'>;
   loadSettings: LoadSettings;
+  /** Absent: no job is ever started (local development, tests of the lifecycle). */
+  launch?: Launcher;
   now?: () => number;
   log?: (message: string) => void;
 }) {
@@ -69,7 +74,14 @@ export function createWebhookHandler({
 
     const event = header('x-github-event') ?? '';
     const delivery = header('x-github-delivery') ?? '';
-    let payload: { action?: unknown; installation?: { id?: unknown; account?: { id?: unknown; login?: unknown; type?: unknown } } };
+    let payload: {
+      action?: unknown;
+      installation?: { id?: unknown; account?: { id?: unknown; login?: unknown; type?: unknown } };
+      repository?: { id?: unknown; full_name?: unknown };
+      label?: { name?: unknown };
+      sender?: { login?: unknown };
+      issue?: { number?: unknown };
+    };
     try {
       payload = JSON.parse(req.body) as typeof payload;
     } catch {
@@ -78,12 +90,18 @@ export function createWebhookHandler({
     const action = typeof payload.action === 'string' ? payload.action : '';
     const installationId = Number(payload.installation?.id);
 
-    const done = (disposition: string) => {
+    const done = (disposition: string, status = 200) => {
       log(JSON.stringify({ delivery, event, action, installationId: installationId || undefined, disposition }));
-      return { status: 200, body: { ok: true, disposition } };
+      return { status, body: { ok: status < 300, disposition } };
     };
 
     if (event === 'ping') return done('pong');
+    if (event === 'issues') {
+      if (action !== 'labeled' || !Number.isSafeInteger(installationId) || installationId <= 0) return done('ignored');
+      if (!launch) return done('jobs_not_configured');
+      const result = await launch({ installationId, deliveryId: delivery, body: req.body, payload });
+      return done(result.disposition, result.status);
+    }
     if (event !== 'installation' || !Number.isSafeInteger(installationId) || installationId <= 0) return done('ignored');
 
     const a = payload.installation?.account;

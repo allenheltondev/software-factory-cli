@@ -512,6 +512,13 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2 (job broker)', () => {
     expect(names(calls).slice(-2)).toEqual(['finishJob', 'terminate']);
   });
 
+  it('reports a success without a summary as unconfirmed, so the broker lets a redelivery run it again', async () => {
+    const { deps, calls } = brokerDeps('no-summary');
+    const result = await runJob(brokerRequest(), deps);
+    expect(result).toMatchObject({ outcome: 'succeeded', summaryMissing: true });
+    expect(calls.find(([name]) => name === 'finishJob')).toEqual(['finishJob', 'unconfirmed']);
+  });
+
   it('still terminates when the broker cannot be told the job is over', async () => {
     const { deps, calls, logs } = brokerDeps('success');
     deps.finishJob = async () => {
