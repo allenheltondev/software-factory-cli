@@ -239,14 +239,7 @@ Each of these that fails answers 200 with why (`no_tenant`, `tenant_inactive`, `
 
 ### The job image
 
-Jobs run the same image as the self-hosted stack (`deploy/aws-microvm/image/`), with this repository's CLI packed into it and both agents installed. It's built outside the stack, by an admin with AWS credentials for the account:
-
-```sh
-cd cloud
-npm run build-job-image --workspace=server -- --stack updraft-cloud   # add --no-activate to build without switching
-```
-
-The script:
+Jobs run the same image as the self-hosted stack (`deploy/aws-microvm/image/`), with this repository's CLI packed into it and both agents installed. `server/scripts/build-job-image.ts` builds it:
 1. packs the CLI (`npm pack` at the repository root);
 2. zips the build context, with LF line endings even from a Windows checkout;
 3. uploads it to `JobImageBucket`;
@@ -254,6 +247,37 @@ The script:
 5. writes the version to `/updraft/<stack>/job-image-version`.
 
 **Until that parameter exists, the launcher starts no jobs (`jobs_off`).** It reads the parameter at most once a minute, so a new build, or setting the parameter back to an earlier version, takes effect without a deploy.
+
+**CI builds it.** The deploy workflow has an `image` job that runs after the stack deploy. It builds only when one of these is true:
+- something the image is built from changed since the base commit (`scripts/job-image-paths.sh`):
+  - `deploy/aws-microvm/image/`;
+  - the build script and its helpers;
+  - `src/config/`, because the server validates tenant configs with it and the image's CLI runs them;
+  - the root `package.json` or `package-lock.json`;
+- the environment has never published an image;
+- a manual Production run sets `build_image`.
+
+Any other change deploys without rebuilding the image. In particular, a change to the rest of the CLI (`src/`) reaches jobs only with the next image built for one of those reasons, or a `build_image` run. Staging builds for a pull request that touches those paths. Production builds when such a change merges to main, and activates it within a minute. To roll back, set the parameter to the previous version (`aws lambda-microvms list-microvm-image-versions --image-identifier updraft-cloud-job` lists them).
+
+**The deploy role needs these permissions** for the `image` job, in each account (Staging and Production), on top of what the stack deploy uses. `<account>` is that account's id:
+
+```json
+[
+  { "Effect": "Allow", "Action": ["lambda:GetMicrovmImage", "lambda:CreateMicrovmImage", "lambda:UpdateMicrovmImage", "lambda:GetMicrovmImageVersion", "lambda:TagResource"],
+    "Resource": "arn:aws:lambda:us-east-1:<account>:microvm-image:updraft-cloud-job*" },
+  { "Effect": "Allow", "Action": "iam:PassRole", "Resource": "arn:aws:iam::<account>:role/updraft-cloud-MicrovmBuildRole-*",
+    "Condition": { "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" } } },
+  { "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::updraft-cloud-jobimagebucket-*/image/*" },
+  { "Effect": "Allow", "Action": ["ssm:GetParameter", "ssm:PutParameter"], "Resource": "arn:aws:ssm:us-east-1:<account>:parameter/updraft/updraft-cloud/job-image-version" }
+]
+```
+
+An admin can also run the build by hand, with credentials for the account:
+
+```sh
+cd cloud
+npm run build-job-image --workspace=server -- --stack updraft-cloud   # add --no-activate to build without switching
+```
 
 ### Jobs and the job broker
 

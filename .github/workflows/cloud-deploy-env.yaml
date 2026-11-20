@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: ''
+      build_image:
+        description: Build the job image even if nothing it is built from changed
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -139,3 +144,102 @@ jobs:
           aws cloudformation describe-stack-events --stack-name "${STACK_NAME}" --region "${DEPLOY_REGION}" \
             --query "StackEvents[:50].[Timestamp,LogicalResourceId,ResourceType,ResourceStatus,ResourceStatusReason]" \
             --output table || true
+
+  # The job MicroVM image (cloud/server/scripts/build-job-image.ts), after the stack it reads its
+  # outputs from. A build takes a long time, so it runs only when something the image is built
+  # from changed (scripts/job-image-paths.sh), when the environment has never published one, or
+  # when asked (build_image). Everything else deploys without it.
+  image:
+    name: Job image for ${{ inputs.environment }}
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      STACK_NAME: updraft-cloud
+      DEPLOY_REGION: us-east-1
+    steps:
+      - name: Check deploy prerequisites
+        id: gate
+        env:
+          AWS_DEPLOYMENT_ROLE_ARN: ${{ secrets.AWS_DEPLOYMENT_ROLE_ARN }}
+        run: echo "ready=$([ -n "${AWS_DEPLOYMENT_ROLE_ARN}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          persist-credentials: false
+          # The whole history, so the change check can compare with the base commit.
+          fetch-depth: 0
+
+      - name: Did anything the image is built from change?
+        id: changed
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          FORCE: ${{ inputs.build_image }}
+          EVENT: ${{ github.event_name }}
+          # A pull request compares with its base; a push to main with the commit before it.
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ "${FORCE}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; echo "build requested"; exit 0
+          fi
+          # A manual run has nothing to compare with; it builds only when asked (build_image).
+          if [ "${EVENT}" = "workflow_dispatch" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "manual run without build_image"; exit 0
+          fi
+          if [ -z "${BASE}" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; echo "no base commit to compare with; building"; exit 0
+          fi
+          files="$(git diff --name-only "${BASE}" HEAD)"
+          matched="$(printf '%s\n' "${files}" | bash cloud/scripts/job-image-paths.sh)"
+          if [ -n "${matched}" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            printf 'the image is built from files that changed:\n%s\n' "${matched}"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "nothing the image is built from changed"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.gate.outputs.ready == 'true'
+        uses: aws-actions/configure-aws-credentials@6.2.2
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOYMENT_ROLE_ARN }}
+          role-session-name: GitHubActions-UpdraftCloud-Image-${{ inputs.environment }}
+          aws-region: us-east-1
+
+      # An environment that has never published an image starts no jobs at all: build one.
+      - name: Is an image published?
+        id: published
+        if: steps.gate.outputs.ready == 'true' && steps.changed.outputs.build != 'true'
+        run: |
+          if aws ssm get-parameter --name "/updraft/${STACK_NAME}/job-image-version" --region "${DEPLOY_REGION}" >/dev/null 2>&1; then
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+            echo "Job image: unchanged, not rebuilt" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+            echo "no job image is published yet; building"
+          fi
+
+      - uses: actions/setup-node@v5
+        id: node
+        if: steps.gate.outputs.ready == 'true' && (steps.changed.outputs.build == 'true' || steps.published.outputs.missing == 'true')
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            cloud/package-lock.json
+
+      # npm pack builds the CLI (prepack) that goes into the image; the script runs from cloud/.
+      - name: Build and publish the job image
+        if: steps.node.outcome == 'success'
+        run: |
+          npm ci
+          (cd cloud && npm ci && npm run build-job-image --workspace=server -- --stack "${STACK_NAME}" --region "${DEPLOY_REGION}")
+          echo "Job image: built and published ($(aws ssm get-parameter --name "/updraft/${STACK_NAME}/job-image-version" --region "${DEPLOY_REGION}" --query Parameter.Value --output text))" >> "$GITHUB_STEP_SUMMARY"

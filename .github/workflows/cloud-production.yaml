@@ -9,8 +9,17 @@ on:
       # The server bundles the CLI's config schema and agent profiles from src/.
       - 'src/config/**'
       - 'src/agents/**'
+      # The job image (cloud-deploy-env.yaml rebuilds it only when these change).
+      - 'deploy/aws-microvm/image/**'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/cloud-*.yaml'
   workflow_dispatch:
+    inputs:
+      build_image:
+        description: Build the job image even if nothing it is built from changed
+        type: boolean
+        default: false
 
 concurrency:
   group: updraft-cloud-production
@@ -28,4 +37,5 @@ jobs:
     with:
       environment: Production
       domain: updraft.readysetcloud.io
+      build_image: ${{ inputs.build_image == true }}
     secrets: inherit

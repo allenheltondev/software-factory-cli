@@ -9,6 +9,10 @@ on:
       # The server bundles the CLI's config schema and agent profiles from src/.
       - 'src/config/**'
       - 'src/agents/**'
+      # The job image (cloud-deploy-env.yaml rebuilds it only when these change).
+      - 'deploy/aws-microvm/image/**'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/cloud-*.yaml'
 
 # One Staging stack: deploys queue instead of cancelling each other halfway through a change set.
