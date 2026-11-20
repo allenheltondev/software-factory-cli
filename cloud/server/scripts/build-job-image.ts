@@ -60,10 +60,12 @@ async function main() {
   const microvms = new LambdaMicrovmsClient({ region });
   const stack = await clients.cloudFormation.send(new DescribeStacksCommand({ StackName: values.stack }));
   const outputs = Object.fromEntries((stack.Stacks?.[0]?.Outputs ?? []).map((o) => [o.OutputKey ?? '', o.OutputValue ?? '']));
-  for (const name of ['JobImageName', 'JobImageBucket', 'JobImageBuildRoleArn', 'JobImageVersionParameter', 'MicrovmLogGroup']) {
+  for (const name of ['JobImageName', 'JobImageArn', 'JobImageBucket', 'JobImageBuildRoleArn', 'JobImageVersionParameter', 'MicrovmLogGroup']) {
     if (!outputs[name]) throw new Error(`stack ${values.stack} has no ${name} output; deploy it first`);
   }
   const imageName = outputs.JobImageName!;
+  // Every call but Create identifies the image by its ARN: the API refuses the bare name.
+  const imageArn = outputs.JobImageArn!;
 
   const scratch = mkdtempSync(join(tmpdir(), 'updraft-job-image-'));
   try {
@@ -93,20 +95,20 @@ async function main() {
 
     let exists = true;
     try {
-      await microvms.send(new GetMicrovmImageCommand({ imageIdentifier: imageName }));
+      await microvms.send(new GetMicrovmImageCommand({ imageIdentifier: imageArn }));
     } catch (err) {
       if (!(err instanceof ResourceNotFoundException)) throw err;
       exists = false;
     }
     const version = exists
-      ? (await microvms.send(new UpdateMicrovmImageCommand({ imageIdentifier: imageName, ...common }))).imageVersion
+      ? (await microvms.send(new UpdateMicrovmImageCommand({ imageIdentifier: imageArn, ...common }))).imageVersion
       : (await microvms.send(new CreateMicrovmImageCommand({ name: imageName, tags: { 'updraft:stack': values.stack! }, ...common }))).imageVersion;
     if (!version) throw new Error('the API returned no image version');
     console.log(`==> ${exists ? 'updated' : 'created'} ${imageName}; waiting for version ${version} to build (logs: ${outputs.MicrovmLogGroup})`);
 
     const started = Date.now();
     for (;;) {
-      const v = await microvms.send(new GetMicrovmImageVersionCommand({ imageIdentifier: imageName, imageVersion: version }));
+      const v = await microvms.send(new GetMicrovmImageVersionCommand({ imageIdentifier: imageArn, imageVersion: version }));
       if (v.state === 'SUCCESSFUL') break;
       if (v.state === 'FAILED') {
         const reason = (v as { stateReason?: string }).stateReason ?? 'no reason given';

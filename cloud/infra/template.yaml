@@ -799,8 +799,11 @@ Outputs:
     Description: The one execution role of every job microVM (it reaches no tenant's data itself)
     Value: !GetAtt MicrovmExecutionRole.Arn
   JobImageName:
-    Description: The MicroVM image jobs run (cloud/scripts/build-job-image.mjs builds it)
+    Description: The MicroVM image jobs run (server/scripts/build-job-image.ts builds it)
     Value: !Sub ${AWS::StackName}-job
+  JobImageArn:
+    Description: The image's ARN, which the MicroVMs API takes as its identifier (not the name)
+    Value: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
   JobImageBucket:
     Description: Where the image build uploads its build context
     Value: !Ref JobImageBucket
