@@ -143,3 +143,39 @@ describe('compileTenantConfig', () => {
     expect(bundleHash({ a: '1' })).not.toBe(bundleHash({ a: '2' }));
   });
 });
+
+describe('the agent keys a config needs', () => {
+  const keysOf = (repo: Record<string, unknown>) => {
+    const r = compileTenantConfig(
+      {
+        config: {
+          dispatch: { allowedActors: ['pat'] },
+          agents: { coder: { adapter: 'codex' }, reviewer: { adapter: 'codex' }, claude: {} },
+          pools: { code: { agents: ['coder'] }, review: { agents: ['reviewer'] }, fallback: { agents: ['claude'] } },
+          actions: { go: { prompt: './prompts/go.md', reviewPrompt: './prompts/review.md' } },
+          repositories: { 'acme/web': { publish: 'draft-pr', ...repo } },
+        },
+        prompts: { 'go.md': '# Go', 'review.md': '# Review' },
+      },
+      PLATFORM,
+      REPOS,
+    );
+    if (!r.ok) throw new Error(JSON.stringify(r.errors));
+    return r.keys.map((k) => `${k.path}=${k.key}`);
+  };
+  const wf = (over: Record<string, unknown> = {}) => ({ trigger: { event: 'issue.labeled', label: 'go' }, action: 'go', pool: 'code', ...over });
+
+  it("a repository's review pool that every workflow overrides needs no key (#83 review)", () => {
+    // Codex writes and reviews; the unused Claude default must not demand an Anthropic key.
+    expect(keysOf({ review: { pool: 'fallback' }, workflows: [wf({ reviewPool: 'review' })] })).toEqual(['agents.coder=CODEX_API_KEY', 'agents.reviewer=CODEX_API_KEY']);
+  });
+
+  it("a workflow without its own reviewPool uses the repository's", () => {
+    expect(keysOf({ review: { pool: 'fallback' }, workflows: [wf()] })).toEqual(['agents.claude=ANTHROPIC_API_KEY', 'agents.coder=CODEX_API_KEY']);
+  });
+
+  it('with neither, the reviewer comes from the coding pool, and review off needs no reviewer at all', () => {
+    expect(keysOf({ review: { allowSameAgent: true }, workflows: [wf()] })).toEqual(['agents.coder=CODEX_API_KEY']);
+    expect(keysOf({ workflows: [wf({ reviewPool: 'fallback' })] })).toEqual(['agents.coder=CODEX_API_KEY']);
+  });
+});

@@ -263,7 +263,7 @@ export const MAX_VERSION_RECORD_BYTES = 300 * 1024;
 /**
  * The agents a job of an enabled (not paused) repository can start, and each one's API key: every
  * enabled agent of every pool its workflows route to (the pool, its rules and default, the tier
- * pools) and, with review on, the pools reviewers are routed to. From a compiled config that
+ * pools) and, with review on, the pool each workflow's reviewer is routed to (reviewPoolFor). From a compiled config that
  * `validateConfig` accepted, so every name resolves.
  */
 function agentKeysNeeded(compiled: { agents: Record<string, Record<string, unknown>>; pools: unknown; repositories: Record<string, Record<string, unknown>> }, paused: ReadonlySet<string>): AgentKeyNeed[] {
@@ -275,7 +275,7 @@ function agentKeysNeeded(compiled: { agents: Record<string, Record<string, unkno
   for (const [fullName, repo] of Object.entries(compiled.repositories)) {
     if (paused.has(fullName)) continue;
     const review = repo.review === true || isObject(repo.review);
-    if (isObject(repo.review)) addPool(repo.review.pool);
+    const repoReviewPool = isObject(repo.review) ? repo.review.pool : undefined;
     for (const wf of Array.isArray(repo.workflows) ? repo.workflows : []) {
       if (!isObject(wf)) continue;
       if (isObject(wf.pool)) {
@@ -286,7 +286,9 @@ function agentKeysNeeded(compiled: { agents: Record<string, Record<string, unkno
         if (isObject(wf.tiers.pools)) for (const p of Object.values(wf.tiers.pools)) addPool(p);
         if (isObject(wf.tiers.highRisk)) addPool(wf.tiers.highRisk.pool);
       }
-      if (review) addPool(wf.reviewPool);
+      // As the worker picks it (reviewPoolFor): the workflow's reviewPool, else the repository's
+      // review.pool, else the pool the code was written by, which is collected above.
+      if (review) addPool(wf.reviewPool ?? repoReviewPool);
     }
   }
   const out = new Map<string, AgentKeyNeed>();
