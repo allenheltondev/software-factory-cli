@@ -8,10 +8,10 @@ import type { Job, QuotaLimit, Quotas, TenantLimits } from '../store/store.js';
  * (`limits` on the tenant record, scripts/tenant-admin.ts). The launcher checks them all in one
  * transaction (Store.reserveJob):
  *
- *   concurrent jobs     a slot per running job, the tenant's and the platform's. Short at launch,
- *                       held for the job's lifetime once its microVM runs (the broker's `start`,
- *                       refused or not), and freed once Lambda shows that microVM terminated; a
- *                       slot whose job never got that far runs out on its own.
+ *   concurrent jobs     a slot per running job, the tenant's and the platform's,
+ *                       taken at launch for the job's lifetime, before its microVM exists, and
+ *                       freed once Lambda shows that microVM terminated (reconciliation), or when
+ *                       the launch fails.
  *   jobs per day        counted at launch (UTC days), whatever becomes of the job
  *   microVM minutes     checked at launch, and again by the broker's start in the transaction that
  *                       charges the job its maximum duration, so launches that pass together are

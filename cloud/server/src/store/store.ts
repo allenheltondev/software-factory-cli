@@ -333,9 +333,10 @@ export interface Store {
   /** Its microVM was asked to stop: the job is retired for serving and starting. Set once. */
   markStopping(jobId: string): Promise<void>;
   /**
-   * Holds the job's slots (its own, or free) until `until` (epoch ms), each on its own: a launched
-   * microVM keeps its capacity until it is seen terminated, or runs out. False when another job
-   * holds one of them: this job's microVM runs outside the quota.
+   * Holds the job's slots (its own, or free) until `until` (epoch ms), each on its own and only
+   * while the job is not released (nothing to hold then): a running microVM keeps its capacity
+   * until it is seen terminated, or runs out. False when another job holds one of them: this job's
+   * microVM runs outside the quota.
    */
   holdSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>, until: number): Promise<boolean>;
   /** The platform's unexpired slots and the jobs holding them. */
@@ -565,6 +566,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async holdSlots(job, until) {
       const now = Date.now();
+      const current = jobs.get(job.jobId);
+      if (!current || current.releasedAt !== undefined) return true;
       let all = true;
       for (const key of slotKeys(job)) {
         if (mine(key, job.jobId, now)) slots.set(key, { expiresAt: until, jobId: job.jobId });

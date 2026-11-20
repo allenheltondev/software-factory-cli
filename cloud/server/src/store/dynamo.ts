@@ -842,11 +842,29 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       let all = true;
       for (const key of jobSlotKeys(job)) {
         try {
-          await client.send(new PutCommand(holdItem(key, job.jobId, ttl).Put));
+          // Only while the job is not released, in the same transaction: a hold made from a read
+          // taken before a release (a slow reconciliation) cannot bring its slots back.
+          await client.send(
+            new TransactWriteCommand({
+              TransactItems: [
+                {
+                  ConditionCheck: {
+                    TableName: T,
+                    Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
+                    ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(releasedAt)',
+                  },
+                },
+                holdItem(key, job.jobId, ttl),
+              ],
+            }),
+          );
         } catch (err) {
+          if (!(err instanceof TransactionCanceledException)) throw err;
+          // Released (or gone): nothing to hold any more.
+          if (cancelledAt(err, 0)) return true;
           // Another job's live slot: not this one's to hold.
-          if (!(err instanceof ConditionalCheckFailedException)) throw err;
-          all = false;
+          if (cancelledAt(err, 1)) all = false;
+          else throw err;
         }
       }
       return all;

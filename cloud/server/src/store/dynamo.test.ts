@@ -612,6 +612,9 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(1800);
     expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
     expect(typeof (await store.getJob(job.jobId))?.releasedAt).toBe('number');
+    // A hold from a read taken before the release (a slow reconciliation) brings nothing back.
+    expect(await store.holdSlots(job, LATER)).toBe(true);
+    expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
     // Released: no longer an active job for reconciliation, and retired: it can never start.
     expect(await store.listActiveJobs()).toEqual([]);
     expect(typeof (await store.getJob(job.jobId))?.stopRequestedAt).toBe('number');

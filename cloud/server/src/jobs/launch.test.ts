@@ -381,51 +381,50 @@ describe('the launcher', () => {
       }
     });
 
-    it("retries a quota hold that fails after the launch, and stops the microVM when it cannot be made", async () => {
-      const terminateMicrovm = vi.fn(async () => {});
-      const hold = store.holdSlots.bind(store);
-      // Fails twice, then holds: launched, with its slots held for its lifetime.
-      store.holdSlots = vi.fn().mockRejectedValueOnce(new Error('throttled')).mockRejectedValueOnce(new Error('throttled')).mockImplementation(hold);
-      const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, terminateMicrovm });
-      const first = await launch(request());
-      expect(first).toMatchObject({ status: 202, disposition: 'launched' });
-      expect((await store.listPlatformSlots()).find((s) => s.jobId === first.jobId)?.expiresAt).toBe((await store.getJob(first.jobId!))!.expiresAt);
-      expect(terminateMicrovm).not.toHaveBeenCalled();
-
-      // Never holds: the job is retired and its microVM asked to stop, and reconciliation releases
-      // it once Lambda shows it terminated.
-      await store.releaseJob((await store.getJob(first.jobId!))!);
-      store.holdSlots = vi.fn().mockRejectedValue(new Error('throttled'));
-      const second = await launch(request({}, 'delivery-2'));
-      expect(second).toEqual({ status: 500, disposition: 'launch_failed', jobId: second.jobId });
-      expect(terminateMicrovm).toHaveBeenCalledWith('mvm-0001');
-      const job = (await store.getJob(second.jobId!))!;
-      expect(job).toMatchObject({ status: 'finished', outcome: 'launch_failed', microvmId: 'mvm-0001' });
-      expect(typeof job.stopRequestedAt).toBe('number');
-      expect(await store.listActiveJobs()).toContain(second.jobId);
-      store.holdSlots = hold;
-      expect((await createReconciler({ store, microvmState: async () => 'TERMINATED', log: () => {} })()).released).toEqual([second.jobId]);
-      expect(await store.listActiveJobs()).toEqual([]);
-    });
-
-    it('reconciliation finds a running job whose slots ran out, and holds them again', async () => {
+    it('reserves the slots for the job\'s lifetime before its microVM exists, so no later write can lose them', async () => {
       vi.useFakeTimers({ toFake: ['Date'], now: NOW });
       try {
-        const hold = store.holdSlots.bind(store);
-        // The launcher's hold "succeeded" but did not stick (say, a slot written with a short TTL).
-        store.holdSlots = vi.fn(async (job, _until) => hold(job, Date.now() + 60_000));
+        // RunMicrovm never answers (the Lambda's deadline): nothing after it runs.
+        const stuck = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now(), runMicrovm: () => new Promise(() => {}) });
+        void stuck(request());
+        await vi.waitFor(async () => expect(await store.listPlatformSlots()).toHaveLength(1));
+        // Held to the job's own end (vi.waitFor moves the fake clock a little while it waits).
+        const [jobId] = await store.listActiveJobs();
+        expect((await store.listPlatformSlots())[0]!.expiresAt).toBe((await store.getJob(jobId!))!.expiresAt);
+
+        // Well past the launcher's five minutes: still taken, and the job still reconciled.
+        vi.setSystemTime(NOW + 4 * PRELAUNCH_CLAIM_MS);
         const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now() });
-        const first = await launch(request());
-        store.holdSlots = hold;
-        vi.setSystemTime(NOW + 2 * 60_000);
-        expect(await store.listPlatformSlots()).toEqual([]);
-        // The reconciler still finds it (it is active), sees it RUNNING, and holds its slots again.
-        expect(await createReconciler({ store, microvmState: async () => 'RUNNING', now: () => Date.now(), log: () => {} })()).toMatchObject({ held: 1, released: [] });
-        expect((await store.listPlatformSlots()).map((s) => s.jobId)).toEqual([first.jobId]);
         expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+        expect(await store.listActiveJobs()).toHaveLength(1);
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it("reconciliation holds a running job's slots again, but never a job released while it looked", async () => {
+      const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME });
+      const first = await launch(request());
+      const job = (await store.getJob(first.jobId!))!;
+      // Its slots went missing (say, a delete that should not have happened): held again.
+      await store.releaseJobSlots(job);
+      expect(await createReconciler({ store, microvmState: async () => 'RUNNING', log: () => {} })()).toMatchObject({ held: 1 });
+      expect((await store.listPlatformSlots()).map((s) => s.jobId)).toEqual([first.jobId]);
+
+      // Released (by the broker's terminate, say) while reconciliation waits on Lambda: its stale
+      // hold must not bring the slots back.
+      const reconcile = createReconciler({
+        store,
+        microvmState: async () => {
+          await store.releaseJob(job);
+          return 'RUNNING';
+        },
+        log: () => {},
+      });
+      await reconcile();
+      expect(await store.listPlatformSlots()).toEqual([]);
+      expect(await store.listActiveJobs()).toEqual([]);
+      expect((await launch(request({}, 'delivery-2'))).disposition).toBe('launched');
     });
 
     it('gives the reservation back when the launch fails', async () => {
