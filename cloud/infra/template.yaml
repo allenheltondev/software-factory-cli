@@ -369,6 +369,10 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:DeleteSecret
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/tenants/*
+            # Quota reconciliation: a job's capacity is freed once its microVM shows TERMINATED.
+            - Effect: Allow
+              Action: lambda:GetMicrovm
+              Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
       Events:
         Daily:
           Type: ScheduleV2
@@ -377,6 +381,14 @@ Resources:
             ScheduleExpression: cron(23 4 * * ? *)
             RetryPolicy:
               MaximumRetryAttempts: 2
+        Reconcile:
+          Type: ScheduleV2
+          Properties:
+            Description: Free the quota slots of jobs whose microVM has terminated (server/src/jobs/reconcile.ts)
+            ScheduleExpression: rate(5 minutes)
+            Input: '{"task":"reconcile"}'
+            RetryPolicy:
+              MaximumRetryAttempts: 0
 
   # ---------------------------------------------------------------------------
   # Tenant data (#68): everything a tenant's jobs read and write, under tenants/<installationId>/

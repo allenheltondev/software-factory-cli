@@ -1,4 +1,4 @@
-import type { QuotaLimit, Quotas, TenantLimits } from '../store/store.js';
+import type { Job, QuotaLimit, Quotas, TenantLimits } from '../store/store.js';
 
 /**
  * Quotas and abuse controls (#68). Per tenant: concurrent jobs, jobs per day and microVM minutes
@@ -9,16 +9,16 @@ import type { QuotaLimit, Quotas, TenantLimits } from '../store/store.js';
  * transaction (Store.reserveJob):
  *
  *   concurrent jobs     a slot per running job, the tenant's and the platform's. Short at launch,
- *                       held for the job's lifetime once the broker's `start` serves it, and freed
- *                       once its microVM is seen stopping (the broker's `terminate`); a slot whose
- *                       job never got that far runs out on its own.
+ *                       held for the job's lifetime once its microVM runs (the broker's `start`,
+ *                       refused or not), and freed once Lambda shows that microVM terminated; a
+ *                       slot whose job never got that far runs out on its own.
  *   jobs per day        counted at launch (UTC days), whatever becomes of the job
  *   microVM minutes     checked at launch, and again by the broker's start in the transaction that
  *                       charges the job its maximum duration, so launches that pass together are
  *                       not all charged on one remainder. A job starts while the month is under its
  *                       quota, so the last one can end over it. What it did not use is refunded
- *                       once Lambda shows its microVM stopping; a runner that never says so is
- *                       charged in full, and keeps its slots for its maximum duration.
+ *                       once Lambda shows its microVM terminated (the broker's terminate, or
+ *                       reconciliation every five minutes: reconcile.ts).
  *
  * A delivery over a quota starts nothing: it is recorded as throttled, and the issue gets one
  * comment a day saying why. Re-applying the label is how to try again.
@@ -74,6 +74,16 @@ export function limitProblems(limits: TenantLimits): string[] {
     }
   }
   return problems;
+}
+
+/** Lambda's word that a microVM's resources are free: TERMINATED, or no such microVM (null). */
+export const isTerminated = (state: string | null) => state === null || state === 'TERMINATED';
+
+/** The microVM time a started job was charged and did not use, refunded when it is released. */
+export function unusedTime(job: Job, now: number): { month: string; seconds: number } | undefined {
+  if (job.startedAt === undefined || !job.reservedSeconds) return undefined;
+  const used = Math.min(job.reservedSeconds, Math.max(0, Math.ceil((now - job.startedAt) / 1000)));
+  return { month: job.createdAt.slice(0, 7), seconds: job.reservedSeconds - used };
 }
 
 /** The UTC day and month a time counts against: `2026-11-20`, `2026-11`. */

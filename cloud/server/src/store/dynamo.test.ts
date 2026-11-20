@@ -41,9 +41,10 @@ function fakeTable() {
     if (expr === 'attribute_not_exists(seconds) OR seconds < :limit') {
       return !item || item.seconds === undefined || (item.seconds as number) < (values[':limit'] as number);
     }
-    if (expr === 'attribute_exists(pk) AND attribute_not_exists(startedAt) AND #status <> :finished') {
-      return Boolean(item) && item!.startedAt === undefined && item!.status !== values[':finished'];
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(startedAt) AND attribute_not_exists(stopRequestedAt) AND #status <> :finished') {
+      return Boolean(item) && item!.startedAt === undefined && item!.stopRequestedAt === undefined && item!.status !== values[':finished'];
     }
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(stopRequestedAt)') return Boolean(item) && item!.stopRequestedAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(releasedAt)') return Boolean(item) && item!.releasedAt === undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
       return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
@@ -644,6 +645,43 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.startJob(fourth!, LATER)).toEqual({ result: 'throttled', limit: 'microvm_minutes' });
     expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(21600);
     expect((await store.getJob(fourth!.jobId))?.startedAt).toBeUndefined();
+  });
+
+  it('a stopping job never starts; a refused one holds what slots it has; reconciliation lists the platform slots', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    const job: Job = {
+      jobId: 'job_first0001',
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 1,
+      deliveryId: 'd-1',
+      eventName: 'issues',
+      status: 'launched',
+      createdAt: '2026-11-20T12:00:00.000Z',
+      expiresAt: LATER,
+      tenantSlot: 0,
+      platformSlot: 1,
+    };
+    await store.putJob(job);
+    await store.markStopping(job.jobId);
+    const stopping = (await store.getJob(job.jobId))!.stopRequestedAt;
+    expect(typeof stopping).toBe('number');
+    await store.markStopping(job.jobId);
+    expect((await store.getJob(job.jobId))!.stopRequestedAt).toBe(stopping);
+    expect(await store.startJob(job, LATER)).toEqual({ result: 'retired' });
+
+    // Its own short slot is held on; another job's live slot is left alone.
+    table.items.set('TENANT#55|SLOT#0000', { pk: 'TENANT#55', sk: 'SLOT#0000', jobId: job.jobId, ttl: Math.ceil((Date.now() + 60_000) / 1000) });
+    table.items.set('PLATFORM#JOBS|SLOT#0001', { pk: 'PLATFORM#JOBS', sk: 'SLOT#0001', jobId: 'job_other001', ttl: Math.ceil(LATER / 1000) });
+    await store.holdSlots(job, LATER);
+    expect(table.items.get('TENANT#55|SLOT#0000')).toMatchObject({ jobId: job.jobId, ttl: Math.ceil(LATER / 1000) });
+    expect(table.items.get('PLATFORM#JOBS|SLOT#0001')?.jobId).toBe('job_other001');
+
+    table.items.set('PLATFORM#JOBS|SLOT#0002', { pk: 'PLATFORM#JOBS', sk: 'SLOT#0002', jobId: 'job_expired1', ttl: Math.floor(Date.now() / 1000) - 10 });
+    expect(await store.listPlatformSlots()).toEqual([{ jobId: 'job_other001', expiresAt: Math.ceil(LATER / 1000) * 1000 }]);
   });
 
   it('keeps a tenant\'s quota overrides, and removes them', async () => {

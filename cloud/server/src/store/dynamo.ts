@@ -488,6 +488,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(i.quotas && typeof i.quotas === 'object' ? { quotas: i.quotas as Quotas } : {}),
         ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
         ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
+        ...(typeof i.stopRequestedAt === 'number' ? { stopRequestedAt: i.stopRequestedAt } : {}),
         ...(typeof i.releasedAt === 'number' ? { releasedAt: i.releasedAt } : {}),
       };
     },
@@ -772,8 +773,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   TableName: T,
                   Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
                   UpdateExpression: 'SET startedAt = :at',
-                  // Never a finished job: a finish that won the race leaves nothing to serve.
-                  ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(startedAt) AND #status <> :finished',
+                  // Never a finished job, or one whose microVM was asked to stop: a finish or a
+                  // terminate that won the race leaves nothing to serve.
+                  ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(startedAt) AND attribute_not_exists(stopRequestedAt) AND #status <> :finished',
                   ExpressionAttributeNames: { '#status': 'status' },
                   ExpressionAttributeValues: { ':at': Date.now(), ':finished': 'finished' },
                 },
@@ -804,7 +806,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         if (!(err instanceof TransactionCanceledException)) throw err;
         if (cancelledAt(err, 0)) {
           const current = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' }, ConsistentRead: true }));
-          return { result: !current.Item || current.Item.status === 'finished' ? 'retired' : 'already' };
+          const retired = !current.Item || current.Item.status === 'finished' || current.Item.stopRequestedAt !== undefined;
+          return { result: retired ? 'retired' : 'already' };
         }
         if (cancelledAt(err, 1)) return { result: 'superseded' };
         if (job.tenantSlot !== undefined && cancelledAt(err, 2)) return { result: 'throttled', limit: 'concurrent_jobs' };
@@ -812,6 +815,56 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         if (cancelledAt(err, 2 + slots.length)) return { result: 'throttled', limit: 'microvm_minutes' };
         throw err;
       }
+    },
+
+    async markStopping(jobId) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: { pk: `JOB#${jobId}`, sk: 'META' },
+            UpdateExpression: 'SET stopRequestedAt = :at',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(stopRequestedAt)',
+            ExpressionAttributeValues: { ':at': Date.now() },
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+      }
+    },
+
+    async holdSlots(job, until) {
+      const ttl = Math.ceil(until / 1000);
+      for (const key of jobSlotKeys(job)) {
+        try {
+          await client.send(new PutCommand(holdItem(key, job.jobId, ttl).Put));
+        } catch (err) {
+          // Another job's live slot: not this one's to hold.
+          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        }
+      }
+    },
+
+    async listPlatformSlots() {
+      const now = Math.floor(Date.now() / 1000);
+      const held: { jobId: string; expiresAt: number }[] = [];
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+            ExpressionAttributeValues: { ':pk': PLATFORM, ':prefix': 'SLOT#' },
+            ConsistentRead: true,
+            ExclusiveStartKey,
+          }),
+        );
+        for (const item of page.Items ?? []) {
+          if (typeof item.ttl === 'number' && item.ttl >= now && typeof item.jobId === 'string') held.push({ jobId: item.jobId, expiresAt: item.ttl * 1000 });
+        }
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return held;
     },
 
     async releaseJob(job, refund) {

@@ -1,19 +1,47 @@
+import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException } from '@aws-sdk/client-lambda-microvms';
 import { DeleteObjectsCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import { DeleteSecretCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { createReconciler } from './jobs/reconcile.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { runCleanup } from './tenants/cleanup.js';
 
 /**
- * The daily uninstall cleanup (dist/cleanup.mjs, CleanupFunction on a schedule): deletes the S3
- * prefix and key secrets of every uninstalled tenant past its deadline (tenants/cleanup.ts).
+ * CleanupFunction (dist/cleanup.mjs), on two schedules:
+ *   daily                 the uninstall cleanup: deletes the S3 prefix and key secrets of every
+ *                         uninstalled tenant past its deadline (tenants/cleanup.ts)
+ *   `{ task: 'reconcile' }`  every five minutes: frees the quota capacity of jobs whose microVM
+ *                         Lambda shows terminated (jobs/reconcile.ts)
  */
 
 const bucket = process.env.TENANT_BUCKET ?? '';
 const s3 = new S3Client({});
 const secrets = new SecretsManagerClient({});
 const store = createDynamoStore(process.env.TABLE_NAME ?? '');
+const microvms = new LambdaMicrovmsClient({});
 
-export async function handler(): Promise<{ cleaned: number[]; failed: number }> {
+const reconcile = createReconciler({
+  store,
+  async microvmState(microvmId) {
+    try {
+      return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }))).state ?? 'UNKNOWN';
+    } catch (err) {
+      if (err instanceof ResourceNotFoundException) return null;
+      throw err;
+    }
+  },
+});
+
+export async function handler(event?: { task?: unknown }): Promise<unknown> {
+  if (event?.task === 'reconcile') {
+    const report = await reconcile();
+    // The next run (five minutes on) retries what failed; fail this one so alarms see it.
+    if (report.failed > 0) throw new Error(`reconciliation failed for ${report.failed} job(s)`);
+    return report;
+  }
+  return cleanupTenants();
+}
+
+async function cleanupTenants(): Promise<{ cleaned: number[]; failed: number }> {
   const report = await runCleanup({
     store,
     async listObjects(prefix) {

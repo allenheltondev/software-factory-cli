@@ -168,7 +168,12 @@ export interface Job {
   issue?: number;
   /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
   startedAt?: number;
-  /** Epoch ms when its slots and unused time were given back (releaseJob), once its microVM was seen stopping. */
+  /**
+   * Epoch ms when its microVM was asked to stop (the broker's terminate, or a refused start):
+   * nothing is served for it after, and it can never start, whatever its outcome says.
+   */
+  stopRequestedAt?: number;
+  /** Epoch ms when its slots and unused time were given back (releaseJob), once Lambda showed its microVM terminated. */
   releasedAt?: number;
 }
 
@@ -315,10 +320,19 @@ export interface Store {
   /** Frees the job's slots (only while it holds them). Safe to repeat. */
   releaseJobSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>): Promise<void>;
   /**
-   * The job's microVM was seen stopping: refunds the microVM seconds it did not use (`refund`) and
-   * marks it released, at most once, then frees its slots. Safe to repeat.
+   * Lambda shows the job's microVM terminated (or has none): refunds the microVM seconds it did not
+   * use (`refund`) and marks it released, at most once, then frees its slots. Safe to repeat.
    */
   releaseJob(job: Job, refund?: { month: string; seconds: number }): Promise<void>;
+  /** Its microVM was asked to stop: the job is retired for serving and starting. Set once. */
+  markStopping(jobId: string): Promise<void>;
+  /**
+   * Holds whatever slots the job still has (its own, or free) until `until` (epoch ms), each on its
+   * own: a refused job's microVM keeps its capacity until it is seen terminated, or runs out.
+   */
+  holdSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>, until: number): Promise<void>;
+  /** The platform's unexpired slots and the jobs holding them: what reconciliation looks at. */
+  listPlatformSlots(): Promise<{ jobId: string; expiresAt: number }[]>;
 
   /**
    * Quotas, at launch (jobs/launch.ts): takes a free slot of the tenant's and one of the
@@ -520,7 +534,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async startJob(job, holdUntil) {
       const now = Date.now();
       const current = jobs.get(job.jobId);
-      if (!current || current.status === 'finished') return { result: 'retired' };
+      if (!current || current.status === 'finished' || current.stopRequestedAt !== undefined) return { result: 'retired' };
       if (current.startedAt !== undefined) return { result: 'already' };
       const claimKey = `${job.installationId}/${job.deliveryId}`;
       const claim = deliveries.get(claimKey);
@@ -534,6 +548,18 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       if (job.reservedSeconds) months.set(monthKey, { ...month(monthKey), seconds: month(monthKey).seconds + job.reservedSeconds });
       jobs.set(job.jobId, { ...current, startedAt: now });
       return { result: 'started' };
+    },
+    async markStopping(jobId) {
+      const current = jobs.get(jobId);
+      if (current && current.stopRequestedAt === undefined) jobs.set(jobId, { ...current, stopRequestedAt: Date.now() });
+    },
+    async holdSlots(job, until) {
+      const now = Date.now();
+      for (const key of slotKeys(job)) if (mine(key, job.jobId, now)) slots.set(key, { expiresAt: until, jobId: job.jobId });
+    },
+    async listPlatformSlots() {
+      const now = Date.now();
+      return [...slots.entries()].filter(([key, s]) => key.startsWith('platform/') && s.expiresAt >= now).map(([, s]) => ({ ...s }));
     },
     async releaseJob(job, refund) {
       const current = jobs.get(job.jobId);
