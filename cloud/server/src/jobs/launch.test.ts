@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type Tenant } from '../store/store.js';
 import { dispatchRules } from '../tenants/dispatch.js';
-import { createLauncher, PRELAUNCH_CLAIM_MS, type LaunchDeps, type LaunchRequest, type RunMicrovmInput } from './launch.js';
+import { createLauncher, PRELAUNCH_CLAIM_MS, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
 
 // Relative to the real clock: the memory store judges a delivery claim's expiry by it.
 const NOW = Date.now();
@@ -66,6 +66,8 @@ describe('the launcher', () => {
         events[key] = body;
       },
       runMicrovm: (input) => runMicrovm(input),
+      // Generous, so the tests of everything else are never throttled.
+      quotas: { concurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 },
       now: () => NOW,
       log: () => {},
       retryDelayMs: 1,
@@ -264,6 +266,86 @@ describe('the launcher', () => {
       expect(redelivered.disposition).toBe('launched');
       expect(await broker({ action: 'start', jobId: slow.jobId, token: tokenOf(1) })).toEqual({ ok: false, error: 'refused' });
       expect((await broker({ action: 'start', jobId: redelivered.jobId, token: tokenOf(2) })).ok).toBe(true);
+    });
+  });
+
+  describe('quotas and the kill switch', () => {
+    const day = new Date(NOW).toISOString().slice(0, 10);
+    const month = day.slice(0, 7);
+    const ONE_AT_A_TIME = { concurrentJobs: 1, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 };
+
+    it('starts nothing while the kill switch is on, and claims nothing', async () => {
+      let engaged = true;
+      const launch = createLauncher({ ...deps, killSwitch: { engaged: async () => engaged } });
+      expect(await launch(request())).toEqual({ status: 200, disposition: 'kill_switch' });
+      expect(runs).toEqual([]);
+      engaged = false;
+      expect((await launch(request())).disposition).toBe('launched');
+    });
+
+    it('records the job\'s slots and the microVM time it reserves', async () => {
+      const result = await createLauncher(deps)(request());
+      expect(await store.getJob(result.jobId!)).toMatchObject({ tenantSlot: 0, platformSlot: expect.any(Number), reservedSeconds: 10800 });
+      expect(await store.getUsage(55, day, month)).toMatchObject({ jobsToday: 1, jobsThisMonth: 1 });
+    });
+
+    it('throttles a delivery over a quota: nothing started, the claim given up, one comment a day on the issue', async () => {
+      const notices: ThrottleNotice[] = [];
+      const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, notifyThrottled: async (n) => void notices.push(n) });
+      const first = await launch(request());
+      expect(first.disposition).toBe('launched');
+
+      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(await launch(request({}, 'delivery-3'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(runs).toHaveLength(1);
+      expect(notices).toEqual([{ installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12, limit: 'concurrent_jobs', quotas: ONE_AT_A_TIME }]);
+      // Another issue gets its own comment.
+      await launch(request({ issue: { number: 13 } }, 'delivery-4'));
+      expect(notices.map((n) => n.issue)).toEqual([12, 13]);
+      expect((await store.getUsage(55, day, month)).throttledThisMonth).toBe(3);
+
+      // Once the first job is done, redelivering a throttled delivery starts it.
+      const job = (await store.getJob(first.jobId!))!;
+      await store.releaseJobSlots(job);
+      expect((await launch(request({}, 'delivery-2'))).disposition).toBe('launched');
+    });
+
+    it("applies the tenant's overrides over the stack's defaults", async () => {
+      await store.setTenantLimits(55, { jobsPerDay: 1 });
+      const notices: ThrottleNotice[] = [];
+      const launch = createLauncher({ ...deps, notifyThrottled: async (n) => void notices.push(n) });
+      expect((await launch(request())).disposition).toBe('launched');
+      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(notices[0]).toMatchObject({ limit: 'jobs_per_day', quotas: { jobsPerDay: 1, concurrentJobs: 10 } });
+    });
+
+    it('a comment that fails is only logged', async () => {
+      const logged: Record<string, unknown>[] = [];
+      const launch = createLauncher({
+        ...deps,
+        quotas: ONE_AT_A_TIME,
+        log: (e) => logged.push(e),
+        notifyThrottled: async () => {
+          throw new Error('GitHub is down');
+        },
+      });
+      await launch(request());
+      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(logged.some((e) => String(e.warning).includes('could not comment on the issue: GitHub is down'))).toBe(true);
+    });
+
+    it('gives the reservation back when the launch fails', async () => {
+      runMicrovm = async () => {
+        throw new Error('throttled by Lambda');
+      };
+      const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME });
+      expect((await launch(request())).disposition).toBe('launch_failed');
+      expect(await store.getUsage(55, day, month)).toMatchObject({ jobsToday: 0, jobsThisMonth: 0 });
+      runMicrovm = async (input) => {
+        runs.push(input);
+        return { microvmId: 'mvm-0002' };
+      };
+      expect((await launch(request())).disposition).toBe('launched');
     });
   });
 

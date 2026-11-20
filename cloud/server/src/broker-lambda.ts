@@ -1,8 +1,10 @@
 import { LambdaMicrovmsClient, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
+import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import { AssumeRoleCommand, STSClient } from '@aws-sdk/client-sts';
 import { createBroker } from './broker/broker.js';
 import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
+import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createDynamoStore } from './store/dynamo.js';
 
 /**
@@ -13,6 +15,7 @@ import { createDynamoStore } from './store/dynamo.js';
 
 const sts = new STSClient({});
 const microvms = new LambdaMicrovmsClient({});
+const ssm = new SSMClient({});
 const roleArn = process.env.JOB_DATA_ROLE_ARN ?? '';
 
 const handle = createBroker({
@@ -25,6 +28,16 @@ const handle = createBroker({
     region: process.env.AWS_REGION ?? '',
     accountId: process.env.ACCOUNT_ID ?? '',
   },
+  killSwitch: createKillSwitch({
+    read: async () => {
+      try {
+        return (await ssm.send(new GetParameterCommand({ Name: process.env.KILL_SWITCH_PARAMETER || KILL_SWITCH_PARAMETER }))).Parameter?.Value ?? null;
+      } catch (err) {
+        if (err instanceof ParameterNotFound) return null;
+        throw err;
+      }
+    },
+  }),
   async assumeRole({ sessionName, policy, durationSeconds }) {
     const out = await sts.send(new AssumeRoleCommand({ RoleArn: roleArn, RoleSessionName: sessionName, Policy: policy, DurationSeconds: durationSeconds }));
     const c = out.Credentials;

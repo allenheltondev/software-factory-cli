@@ -256,6 +256,67 @@ describe('the job broker', () => {
     });
   });
 
+  describe('quotas and the kill switch', () => {
+    const QUOTAS = { concurrentJobs: 1, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 };
+    const month = () => job.createdAt.slice(0, 7);
+
+    // The memory store's slots and claims expire by the real clock: run these on it.
+    beforeEach(async () => {
+      clock = Date.now();
+      const reserved = await store.reserveJob({ installationId: 55, jobId: job.jobId, holdUntil: clock + 60_000, day: '2026-11-20', month: month(), quotas: QUOTAS });
+      if (!reserved.ok) throw new Error('not reserved');
+      job = { ...job, createdAt: new Date(clock).toISOString(), expiresAt: clock + 3_600_000, tenantSlot: reserved.tenantSlot, platformSlot: reserved.platformSlot, reservedSeconds: 3600 };
+      await store.putJob(job);
+      await store.claimDelivery(55, 'd-1', clock + 60_000, job.jobId);
+    });
+
+    it('serves nothing but finish and terminate while the kill switch is on', async () => {
+      let engaged = true;
+      handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, terminateMicrovm, policy: POLICY, now: () => clock, killSwitch: { engaged: async () => engaged } });
+      await store.attachMicrovm(job.jobId, 'mvm-0001');
+      for (const action of ['start', 'credentials', 'github-token']) {
+        expect(await handle({ action, jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
+      }
+      expect(assumeRole).not.toHaveBeenCalled();
+      expect(await handle({ action: 'terminate', jobId: job.jobId, token })).toEqual({ ok: true, terminated: true });
+      engaged = false;
+      expect((await handle({ action: 'start', jobId: job.jobId, token })).ok).toBe(true);
+      engaged = true;
+      expect(await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'cancelled' })).toEqual({ ok: true, finished: true });
+    });
+
+    it('charges the maximum duration at start, and finish refunds what was not used and frees the slot', async () => {
+      expect((await handle({ action: 'start', jobId: job.jobId, token })).ok).toBe(true);
+      expect((await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth).toBe(3600);
+      // The slot is held for the job's lifetime: another job of the tenant cannot have it.
+      const other = { installationId: 55, jobId: 'job_other001', holdUntil: Date.now() + 60_000, day: '2026-11-20', month: month(), quotas: QUOTAS };
+      expect(await store.reserveJob(other)).toEqual({ ok: false, limit: 'concurrent_jobs' });
+
+      clock += 600_000;
+      await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded' });
+      const used = (await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth;
+      // Ten minutes by the broker's clock (the store marks the start by the real one).
+      expect(used).toBeGreaterThanOrEqual(600);
+      expect(used).toBeLessThan(610);
+      expect(await store.reserveJob(other)).toMatchObject({ ok: true });
+
+      // A repeated finish refunds nothing more.
+      await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded' });
+      expect((await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth).toBe(used);
+    });
+
+    it("refuses to start a job whose slot another job took after its own ran out, and gives up its claim", async () => {
+      await store.releaseJobSlots(job);
+      const other = await store.reserveJob({ installationId: 55, jobId: 'job_other001', holdUntil: Date.now() + 60_000, day: '2026-11-20', month: month(), quotas: QUOTAS });
+      expect(other).toMatchObject({ ok: true, tenantSlot: job.tenantSlot });
+      expect(await handle({ action: 'start', jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
+      expect((await store.getJob(job.jobId))?.outcome).toBe('throttled');
+      expect((await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth).toBe(0);
+      // Re-applying the label, or redelivering this one, can start it again.
+      expect(await store.claimDelivery(55, 'd-1', Date.now() + 60_000, 'job_next0001')).toBe(true);
+    });
+  });
+
   it('refuses a finish with the wrong token', async () => {
     const r = await handle({ action: 'finish', jobId: job.jobId, token: randomBytes(32).toString('base64url'), outcome: 'failed' });
     expect(r).toEqual({ ok: false, error: 'refused' });

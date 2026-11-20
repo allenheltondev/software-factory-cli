@@ -223,19 +223,65 @@ A labeled issue in a tenant's repository starts a job. `WebhookFunction` is the 
 
 1. The tenant is active and has an active config version.
 2. That version's dispatch rules match: the repository (by name *and* id), a trigger label, and a sender allowed to apply it.
-3. Jobs are on: a job image version is published (see "The job image" below).
+3. Jobs are on: a job image version is published (see "The job image" below), and the kill switch is off (see "Quotas and the kill switch").
 4. The delivery isn't already claimed. Each tenant's delivery is claimed once (`DELIVERY#<id>#<delivery>`), so a redelivery while a job for it may run starts nothing. The launcher's claim lasts five minutes. When the job's microVM starts, its broker `start` holds the claim for the job's whole lifetime. So a launch that stopped partway (the webhook Lambda timed out before or during `RunMicrovm`) blocks a redelivery for five minutes at most. If a redelivery's job has taken the claim by the time a slow job starts, the slow one is refused and recorded as `superseded`, so only one job runs per delivery. `RunMicrovm` gets the job id as its idempotency token.
 
-Each of these that fails answers 200 with why (`no_tenant`, `tenant_inactive`, `no_config`, `not_dispatched`, `jobs_off`, `duplicate`), and nothing is started. Otherwise the launcher:
+5. The tenant is under its quotas.
+
+Each of these that fails answers 200 with why (`no_tenant`, `tenant_inactive`, `no_config`, `not_dispatched`, `jobs_off`, `kill_switch`, `duplicate`, `throttled`), and nothing is started. Otherwise the launcher:
 
 - stores the event at `tenants/<id>/events/<delivery>/event.json`;
-- records the job (`JOB#<jobId>`), pinning the repository, label, sender, config version and image version, plus the hash of a new job token;
+- records the job (`JOB#<jobId>`), pinning the repository, label, sender, config version and image version, its quota slots and the microVM time it reserves, plus the hash of a new job token;
 - starts the microVM with a version 2 run-hook payload, which carries only the broker's name and the job's token;
 - records the microVM's id on the job, the only microVM the broker will stop for it.
 
-**Failures:** if storing or launching fails, the webhook answers 500 so the delivery can be redelivered. It releases the claim so the redelivery isn't refused, and retires the job record so its token is never served. A job that ends without a clean success also releases the claim when it reports `finish`, so redelivering the webhook is how a failed job is retried. A success without a summary counts as unconfirmed.
+**Failures:** if storing or launching fails, the webhook answers 500 so the delivery can be redelivered. It releases the claim and the quota reservation so the redelivery isn't refused, and retires the job record so its token is never served. A job that ends without a clean success also releases the claim when it reports `finish`, so redelivering the webhook is how a failed job is retried. A success without a summary counts as unconfirmed.
 
-`updraft run-event` in the microVM still makes the final decision, against GitHub and the same config. The launcher only makes sure no job starts that the config wouldn't allow. Pull request events (the review loop) and quotas aren't handled yet.
+`updraft run-event` in the microVM still makes the final decision, against GitHub and the same config. The launcher only makes sure no job starts that the config wouldn't allow. Pull request events (the review loop) aren't handled yet.
+
+### Quotas and the kill switch
+
+`server/src/jobs/quotas.ts` has the details. Each tenant has three quotas, and the platform has a ceiling:
+
+| Quota | Default (template parameter) | Counted |
+| --- | --- | --- |
+| Concurrent jobs | 1 (`QuotaConcurrentJobs`) | A slot per running job, `TENANT#<id>`/`SLOT#<n>` |
+| Jobs per day | 20 (`QuotaJobsPerDay`) | At launch, per UTC day, whatever becomes of the job |
+| MicroVM minutes per month | 1200 (`QuotaMicrovmMinutesPerMonth`) | Per UTC month: a job is charged its maximum duration when it starts, and `finish` refunds what it didn't use |
+| Platform concurrency | 20 (`PlatformConcurrentJobs`) | A slot per running job across every tenant, `PLATFORM#JOBS`/`SLOT#<n>` |
+
+- **Checked together.** The launcher takes both slots and counts the job against the day and the month in one transaction, or takes nothing and says which quota stopped it.
+- **Slots behave like the delivery claim.** They last five minutes at launch. The broker's `start` holds them for the job's lifetime, and `finish` frees them. A slot whose job never started runs out on its own. If another job has taken a slot by the time a slow job starts, the slow job is refused and recorded as `throttled`.
+- **Charging the full duration at start** means a runner that never reports `finish` is charged in full. A launch starts while the month is under its quota, so the last job of a month can end over it.
+- **Over a quota**, the delivery is recorded as throttled in the month's usage, and its claim is given up. The issue gets one comment a day saying which quota stopped it and how to try again: remove the label and add it back. The comment is posted with an installation token for that one repository, allowed only to write issues.
+
+**Overrides.** An admin overrides a tenant's quotas on its record (`limits`), from 1 up to a ceiling (`LIMIT_CEILING`):
+
+```powershell
+npm run tenant-admin --workspace=server -- limits set --installation 55 --concurrent-jobs 2 --minutes-per-month 3000
+```
+```powershell
+npm run tenant-admin --workspace=server -- limits show --installation 55
+```
+```powershell
+npm run tenant-admin --workspace=server -- limits clear --installation 55
+```
+
+`show` prints the effective quotas, each marked as an override or the default, with today's and this month's usage.
+
+**The kill switch** is the SSM parameter `/updraft/kill-switch`, one per account. While it's `on` (or `true`, `1` or `engaged`):
+- the launcher starts nothing (`kill_switch`);
+- the broker refuses `start`, `credentials` and `github-token`, so running jobs lose their credentials and GitHub token within the hour and stop;
+- `finish` and `terminate` still work.
+
+The stack doesn't create the parameter, so a deploy never resets it. No parameter means off. One that exists but can't be read counts as on. The webhook and the broker each read it at most every 30 seconds.
+
+```powershell
+aws ssm put-parameter --name /updraft/kill-switch --type String --value on --overwrite
+```
+```powershell
+aws ssm put-parameter --name /updraft/kill-switch --type String --value off --overwrite
+```
 
 ### The job image
 
@@ -289,9 +335,9 @@ Every tenant's jobs run in microVMs with one execution role, `MicrovmExecutionRo
 
 | Action | Answer |
 | --- | --- |
-| `start`, `credentials` | Where the job's data is, and AWS credentials for an hour. They come from `sts:AssumeRole` on `JobDataRole`, with a session policy for this job only. It can read this job's event and config version, read and write the tenant's state, write this job's results, and read the tenant's agent key secrets. |
+| `start`, `credentials` | Where the job's data is, and AWS credentials for an hour. `start` also holds the job's delivery claim and quota slots for its lifetime, and charges its microVM time. They come from `sts:AssumeRole` on `JobDataRole`, with a session policy for this job only. It can read this job's event and config version, read and write the tenant's state, write this job's results, and read the tenant's agent key secrets. |
 | `github-token` | An installation token for the job's one repository (`repository_ids`), with only `contents`, `issues` and `pull_requests` write, and `checks`, `statuses` and `metadata` read. It's shaped as the CLI's token file (#77). The runner writes it to `app-token.json` in the protected state directory and replaces it every 20 minutes. |
-| `finish` | The job is over. Nothing more is served for its token. |
+| `finish` | The job is over. Nothing more is served for its token. Its slots are freed and its unused microVM time is refunded. |
 | `terminate` | Stops the job's own microVM: the one the launcher recorded with the job (`attachMicrovm`, set once). This works whatever the job's state, finished or with its tenant suspended included, because it only ever ends that one microVM. |
 
 - **The App's private key never enters a microVM.** Only the broker reads it, to mint tokens.
@@ -311,7 +357,8 @@ Not run on AWS yet: the job path end to end. That covers:
 - building the job image with `build-job-image`;
 - `RunMicrovm` from the launcher, with the Lambda-provided connectors;
 - the runner's broker calls, from a microVM under the execution role;
-- a labeled issue producing a pull request.
+- a labeled issue producing a pull request;
+- the quota transactions against DynamoDB itself, and the over-quota comment on a real issue.
 
 Deliberately off:
 - **API Gateway access and execution logging.** Both need the account-level API Gateway CloudWatch role, which this stack does not own.

@@ -2,7 +2,7 @@ import { ConditionalCheckFailedException, TransactionCanceledException } from '@
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { describe, expect, it } from 'vitest';
 import { createDynamoStore } from './dynamo.js';
-import type { Member, Tenant } from './store.js';
+import type { Job, Member, Quotas, Tenant } from './store.js';
 
 /**
  * The real DynamoDB store against a stand-in document client: an in-memory table that understands
@@ -37,6 +37,11 @@ function fakeTable() {
     if (expr === 'attribute_not_exists(pk) OR #sub = :sub') return !item || item.sub === values[':sub'];
     if (expr === 'attribute_not_exists(githubUserId) OR githubUserId = :id') return !item || item.githubUserId === undefined || item.githubUserId === values[':id'];
     if (expr === 'attribute_not_exists(pk) OR #ttl < :now') return !item || (item.ttl as number) < (values[':now'] as number);
+    if (expr === 'attribute_not_exists(jobs) OR jobs < :limit') return !item || item.jobs === undefined || (item.jobs as number) < (values[':limit'] as number);
+    if (expr === 'attribute_not_exists(seconds) OR seconds < :limit') {
+      return !item || item.seconds === undefined || (item.seconds as number) < (values[':limit'] as number);
+    }
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(startedAt)') return Boolean(item) && item!.startedAt === undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
       return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
     }
@@ -45,15 +50,40 @@ function fakeTable() {
     throw new Error(`fake table: unsupported condition ${expr}`);
   }
 
+  /** SET (with if_not_exists), ADD and REMOVE clauses, in any order. */
   function update(item: Item, expr: string, names: Record<string, string> = {}, values: Values = {}): Item {
     const next = { ...item };
     const name = (n: string) => names[n] ?? n;
-    const [, setPart = '', removePart = ''] = /^(?:SET (.*?))?(?: ?REMOVE (.*))?$/.exec(expr) ?? [];
-    for (const assignment of setPart.split(',').map((a) => a.trim()).filter(Boolean)) {
-      const [lhs, rhs] = assignment.split('=').map((x) => x.trim());
-      next[name(lhs!)] = values[rhs!];
+    // Commas outside parentheses separate the actions of a clause.
+    const actions = (body: string) => {
+      const out: string[] = [];
+      let depth = 0;
+      let current = '';
+      for (const ch of body) {
+        if (ch === '(') depth++;
+        if (ch === ')') depth--;
+        if (ch === ',' && depth === 0) {
+          out.push(current.trim());
+          current = '';
+        } else current += ch;
+      }
+      if (current.trim()) out.push(current.trim());
+      return out;
+    };
+    for (const [, kind, body = ''] of expr.matchAll(/(SET|ADD|REMOVE)\s+(.*?)(?=\s+(?:SET|ADD|REMOVE)\s|$)/g)) {
+      for (const action of actions(body)) {
+        if (kind === 'REMOVE') delete next[name(action)];
+        else if (kind === 'ADD') {
+          const [attr = '', value = ''] = action.split(/\s+/);
+          const current = next[name(attr)];
+          next[name(attr)] = (typeof current === 'number' ? current : 0) + (values[value] as number);
+        } else {
+          const [lhs = '', rhs = ''] = action.split('=').map((x) => x.trim());
+          const ifNotExists = /^if_not_exists\((\S+?),\s*(\S+?)\)$/.exec(rhs);
+          next[name(lhs)] = ifNotExists ? (next[name(ifNotExists[1]!)] ?? values[ifNotExists[2]!]) : values[rhs];
+        }
+      }
     }
-    for (const attr of removePart.split(',').map((a) => a.trim()).filter(Boolean)) delete next[name(attr)];
     return next;
   }
 
@@ -156,6 +186,7 @@ const tenant: Tenant = {
 };
 const member = (sub: string): Member => ({ installationId: 55, sub, role: 'owner', githubUserId: 1, githubLogin: sub, addedAt: tenant.createdAt });
 const DEADLINE = Date.UTC(2026, 11, 19);
+const QUOTAS: Quotas = { concurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 };
 const TTL = Math.ceil(DEADLINE / 1000);
 
 async function seeded() {
@@ -428,28 +459,169 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(true);
   });
 
-  it('a started job holds its own claim, takes an expired or missing one, and loses to a live one', async () => {
+  it("a started job holds its claim and slots for its lifetime, is charged once, and loses to another job's live claim or slot", async () => {
     const table = fakeTable();
     const store = createDynamoStore('T', table.client);
     const SOON = Date.now() + 60_000;
+    const MONTH = 'USAGE#MONTH#2026-11';
+    const job = (jobId: string, deliveryId: string, extra: Partial<Job> = {}): Job => ({
+      jobId,
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 1,
+      deliveryId,
+      eventName: 'issues',
+      status: 'launched',
+      createdAt: '2026-11-20T12:00:00.000Z',
+      expiresAt: LATER,
+      ...extra,
+    });
 
-    // Its own short pre-launch claim, extended to the job's lifetime.
-    expect(await store.claimDelivery(55, 'd-1', SOON, 'job_first0001')).toBe(true);
-    expect(await store.holdDelivery(55, 'd-1', LATER, 'job_first0001')).toBe(true);
-    expect(table.items.get('DELIVERY#55#d-1|CLAIM')?.ttl).toBe(Math.ceil(LATER / 1000));
+    // Its own short claim and slots, held to the job's lifetime and charged its maximum duration.
+    const first = job('job_first0001', 'd-1', { tenantSlot: 0, platformSlot: 3, reservedSeconds: 10800 });
+    await store.putJob(first);
+    expect(await store.claimDelivery(55, 'd-1', SOON, first.jobId)).toBe(true);
+    expect(await store.reserveJob({ installationId: 55, jobId: first.jobId, holdUntil: SOON, day: '2026-11-20', month: '2026-11', quotas: { ...QUOTAS, platformConcurrentJobs: 1 } })).toMatchObject({ ok: true });
+    table.items.set('PLATFORM#JOBS|SLOT#0003', { pk: 'PLATFORM#JOBS', sk: 'SLOT#0003', jobId: first.jobId, ttl: Math.ceil(SOON / 1000) });
+    expect(await store.startJob(first, LATER)).toBe('started');
+    for (const k of ['DELIVERY#55#d-1|CLAIM', 'TENANT#55|SLOT#0000', 'PLATFORM#JOBS|SLOT#0003']) {
+      expect(table.items.get(k)).toMatchObject({ jobId: first.jobId, ttl: Math.ceil(LATER / 1000) });
+    }
+    expect(table.items.get(`TENANT#55|${MONTH}`)?.seconds).toBe(10800);
+    expect(typeof (await store.getJob(first.jobId))?.startedAt).toBe('number');
     expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(false);
 
-    // No claim (released, or deleted by TTL): taken.
-    await store.releaseDelivery(55, 'd-1', 'job_first0001');
-    expect(await store.holdDelivery(55, 'd-1', LATER, 'job_first0001')).toBe(true);
+    // A retried start: nothing more is charged.
+    expect(await store.startJob(first, LATER)).toBe('already');
+    expect(table.items.get(`TENANT#55|${MONTH}`)?.seconds).toBe(10800);
 
-    // Another job's live claim wins; its expired one does not.
-    expect(await store.claimDelivery(55, 'd-2', LATER, 'job_second001')).toBe(true);
-    expect(await store.holdDelivery(55, 'd-2', LATER, 'job_first0001')).toBe(false);
-    expect(table.items.get('DELIVERY#55#d-2|CLAIM')?.jobId).toBe('job_second001');
-    expect(await store.claimDelivery(55, 'd-3', Date.now() - 5_000, 'job_second001')).toBe(true);
-    expect(await store.holdDelivery(55, 'd-3', LATER, 'job_first0001')).toBe(true);
-    expect(table.items.get('DELIVERY#55#d-3|CLAIM')?.jobId).toBe('job_first0001');
+    // A redelivery's job holds the claim: superseded, and nothing changed.
+    const second = job('job_second001', 'd-2', { tenantSlot: 1, reservedSeconds: 600 });
+    await store.putJob(second);
+    expect(await store.claimDelivery(55, 'd-2', LATER, 'job_other0001')).toBe(true);
+    expect(await store.startJob(second, LATER)).toBe('superseded');
+    expect(table.items.get(`TENANT#55|${MONTH}`)?.seconds).toBe(10800);
+    expect((await store.getJob(second.jobId))?.startedAt).toBeUndefined();
+
+    // Another job holds its slot (its own ran out and was taken): throttled.
+    const third = job('job_third0001', 'd-3', { tenantSlot: 0 });
+    await store.putJob(third);
+    expect(await store.startJob(third, LATER)).toBe('throttled');
+
+    // A missing or expired claim is taken back.
+    const fourth = job('job_fourth001', 'd-4');
+    await store.putJob(fourth);
+    expect(await store.claimDelivery(55, 'd-4', Date.now() - 5_000, fourth.jobId)).toBe(true);
+    expect(await store.startJob(fourth, LATER)).toBe('started');
+
+    // The slots go only with their own job.
+    await store.releaseJobSlots(third);
+    expect(table.items.has('TENANT#55|SLOT#0000')).toBe(true);
+    await store.releaseJobSlots(first);
+    expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
+    expect(table.items.has('PLATFORM#JOBS|SLOT#0003')).toBe(false);
+  });
+
+  it('reserves a slot of the tenant and of the platform and counts the job, until a quota stops it', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    const SOON = Date.now() + 60_000;
+    const reserve = (installationId: number, jobId: string, quotas: Partial<typeof QUOTAS> = {}, holdUntil = SOON) =>
+      store.reserveJob({ installationId, jobId, holdUntil, day: '2026-11-20', month: '2026-11', quotas: { ...QUOTAS, concurrentJobs: 1, jobsPerDay: 2, ...quotas } });
+
+    const a = await reserve(55, 'job_a00000001');
+    expect(a).toEqual({ ok: true, tenantSlot: 0, platformSlot: expect.any(Number) });
+    expect(await store.getUsage(55, '2026-11-20', '2026-11')).toEqual({
+      day: '2026-11-20',
+      jobsToday: 1,
+      month: '2026-11',
+      jobsThisMonth: 1,
+      microvmSecondsThisMonth: 0,
+      throttledThisMonth: 0,
+    });
+    // One at a time: a second is refused, and takes nothing.
+    expect(await reserve(55, 'job_b00000001')).toEqual({ ok: false, limit: 'concurrent_jobs' });
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(1);
+
+    // A failed launch gives everything back.
+    if (!a.ok) throw new Error('unreachable');
+    await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: a.tenantSlot, platformSlot: a.platformSlot, day: '2026-11-20', month: '2026-11' });
+    expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(0);
+
+    // Jobs per day: counted at launch, whatever becomes of the job.
+    for (const jobId of ['job_c00000001', 'job_d00000001']) {
+      const r = await reserve(55, jobId);
+      if (!r.ok) throw new Error(`refused: ${r.limit}`);
+      await store.releaseJobSlots({ installationId: 55, jobId, tenantSlot: r.tenantSlot, platformSlot: r.platformSlot });
+    }
+    expect(await reserve(55, 'job_e00000001')).toEqual({ ok: false, limit: 'jobs_per_day' });
+    // The day's refusal left the slots it would have taken free.
+    expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
+
+    // A slot whose job never started runs out: it is free again.
+    expect(await reserve(56, 'job_f00000001', {}, Date.now() - 5_000)).toMatchObject({ ok: true });
+    expect(await reserve(56, 'job_g00000001')).toMatchObject({ ok: true, tenantSlot: 0 });
+
+    // MicroVM minutes: a month at its quota starts nothing.
+    table.items.set('TENANT#57|USAGE#MONTH#2026-11', { pk: 'TENANT#57', sk: 'USAGE#MONTH#2026-11', seconds: 60 });
+    expect(await reserve(57, 'job_h00000001', { microvmMinutesPerMonth: 1 })).toEqual({ ok: false, limit: 'microvm_minutes' });
+    expect(await reserve(57, 'job_h00000001', { microvmMinutesPerMonth: 2 })).toMatchObject({ ok: true });
+
+  });
+
+  it("stops at the platform's ceiling, across tenants", async () => {
+    const store = createDynamoStore('T', fakeTable().client);
+    const reserve = (installationId: number) =>
+      store.reserveJob({ installationId, jobId: `job_p000000${installationId}`, holdUntil: Date.now() + 60_000, day: '2026-11-20', month: '2026-11', quotas: { ...QUOTAS, platformConcurrentJobs: 2 } });
+    const taken = [await reserve(60), await reserve(61)];
+    expect(taken.map((r) => (r.ok ? r.platformSlot : null)).sort()).toEqual([0, 1]);
+    expect(await reserve(62)).toEqual({ ok: false, limit: 'platform_concurrency' });
+  });
+
+  it('refunds the unused microVM time with the finish that records the outcome, and only then', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    table.items.set('TENANT#55|USAGE#MONTH#2026-11', { pk: 'TENANT#55', sk: 'USAGE#MONTH#2026-11', seconds: 10800 });
+    await store.putJob({
+      jobId: 'job_first0001',
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 1,
+      deliveryId: 'd-1',
+      eventName: 'issues',
+      status: 'launched',
+      createdAt: '2026-11-20T12:00:00.000Z',
+      expiresAt: LATER,
+    });
+    const refund = { installationId: 55, month: '2026-11', seconds: 9000 };
+    expect(await store.finishJob('job_first0001', 'succeeded', refund)).toBe('succeeded');
+    expect(await store.finishJob('job_first0001', 'failed', refund)).toBe('succeeded');
+    expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(1800);
+  });
+
+  it('keeps a tenant\'s quota overrides, and removes them', async () => {
+    const { store } = await seeded();
+    expect(await store.setTenantLimits(55, { concurrentJobs: 3, microvmMinutesPerMonth: 5000 })).toBe('updated');
+    expect((await store.getTenant(55))?.limits).toEqual({ concurrentJobs: 3, microvmMinutesPerMonth: 5000 });
+    expect(await store.setTenantLimits(55, null)).toBe('updated');
+    expect((await store.getTenant(55))?.limits).toBeUndefined();
+    expect(await store.setTenantLimits(56, { jobsPerDay: 1 })).toBe('no_tenant');
+  });
+
+  it('counts throttled deliveries, and says to comment once per issue a day', async () => {
+    const store = createDynamoStore('T', fakeTable().client);
+    const notice = { repositoryId: 99, issue: 12, day: '2026-11-20' };
+    expect(await store.recordThrottle(55, '2026-11', notice)).toBe(true);
+    expect(await store.recordThrottle(55, '2026-11', notice)).toBe(false);
+    expect(await store.recordThrottle(55, '2026-11', { ...notice, issue: 13 })).toBe(true);
+    expect(await store.recordThrottle(55, '2026-11', { ...notice, day: '2026-11-21' })).toBe(true);
+    expect(await store.recordThrottle(55, '2026-11')).toBe(false);
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).throttledThisMonth).toBe(5);
   });
 
   it('finishing keeps the first outcome and returns it, also to a repeated finish', async () => {

@@ -40,6 +40,29 @@ Parameters:
     Default: 40
     Description: Burst capacity for the GitHub webhook route alone.
 
+  # Quotas (server/src/jobs/quotas.ts): every tenant's defaults; an admin overrides them per
+  # tenant (scripts/tenant-admin.ts limits set). The platform's ceiling counts every tenant's jobs.
+  QuotaConcurrentJobs:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Jobs one tenant may run at once.
+  QuotaJobsPerDay:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Jobs one tenant may start per UTC day.
+  QuotaMicrovmMinutesPerMonth:
+    Type: Number
+    Default: 1200
+    MinValue: 1
+    Description: MicroVM minutes one tenant may use per UTC month (a job is charged its maximum duration at start, then refunded what it did not use).
+  PlatformConcurrentJobs:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Jobs every tenant together may run at once.
+
   AppDomainName:
     Type: String
     Default: ''
@@ -268,6 +291,12 @@ Resources:
           # Agent timeouts are capped at 120 minutes and verify at 30 (tenants/config.ts).
           MAX_DURATION_SECONDS: '10800'
           WATCHDOG_RESERVE_SECONDS: '600'
+          QUOTA_CONCURRENT_JOBS: !Ref QuotaConcurrentJobs
+          QUOTA_JOBS_PER_DAY: !Ref QuotaJobsPerDay
+          QUOTA_MICROVM_MINUTES_PER_MONTH: !Ref QuotaMicrovmMinutesPerMonth
+          PLATFORM_CONCURRENT_JOBS: !Ref PlatformConcurrentJobs
+          # Not created by the stack (a deploy must never turn it off): see README, "The kill switch".
+          KILL_SWITCH_PARAMETER: /updraft/kill-switch
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - DynamoDBCrudPolicy:
@@ -276,6 +305,8 @@ Resources:
             ParameterName: updraft/app/*
         - SSMParameterReadPolicy:
             ParameterName: !Sub updraft/${AWS::StackName}/job-image-version
+        - SSMParameterReadPolicy:
+            ParameterName: updraft/kill-switch
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -414,8 +445,8 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Jobs and their tenants only: read a job and its tenant, mark a job finished, and
-              # give up a failed job's delivery claim (so a redelivery retries it).
+              # Jobs and their tenants only: read a job and its tenant, mark a job started or
+              # finished, and count its microVM time in the tenant's usage.
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -426,8 +457,9 @@ Resources:
                     dynamodb:LeadingKeys:
                       - 'JOB#*'
                       - 'TENANT#*'
-              # A delivery's claim: a started job holds it for its lifetime (start, a conditional
-              # PutItem), and a failed one gives it up (finish, a conditional DeleteItem).
+              # A delivery's claim and a job's quota slots (the tenant's and the platform's): a
+              # started job holds them for its lifetime (start, conditional PutItems in one
+              # transaction with its microVM time), and finish frees them (conditional DeleteItems).
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
@@ -437,6 +469,12 @@ Resources:
                   ForAllValues:StringLike:
                     dynamodb:LeadingKeys:
                       - 'DELIVERY#*'
+                      - 'TENANT#*'
+                      - 'PLATFORM#*'
+              # The kill switch: while it is on, nothing but finish and terminate is served.
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/updraft/kill-switch
               - Effect: Allow
                 Action: ssm:GetParameter*
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/updraft/app/*
@@ -513,6 +551,7 @@ Resources:
           JOB_DATA_ROLE_ARN: !GetAtt JobDataRole.Arn
           PARTITION: !Ref AWS::Partition
           ACCOUNT_ID: !Ref AWS::AccountId
+          KILL_SWITCH_PARAMETER: /updraft/kill-switch
           NODE_OPTIONS: --enable-source-maps
 
   # Runtime logs of the job microVMs (one stream per microVM), with a retention period.

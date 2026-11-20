@@ -74,6 +74,8 @@ export interface GitHubApi {
   /** The App's bot user (`<slug>[bot]`), read with any token. */
   getBotUser(token: string, slug: string): Promise<GitHubUser>;
   listInstallationRepositories(installationToken: string): Promise<GitHubRepository[]>;
+  /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
+  createIssueComment(installationToken: string, repository: string, issue: number, body: string): Promise<void>;
 }
 
 const API = 'https://api.github.com';
@@ -167,6 +169,13 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       const login = `${slug}[bot]`;
       const u = await json<Json>(await call(`/users/${encodeURIComponent(login)}`, token), 'GET /users/<bot>');
       return { id: Number(u.id), login: String(u.login ?? login) };
+    },
+
+    async createIssueComment(token, repository, issue, body) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue}/comments`;
+      const res = await call(path, token, { method: 'POST', body: JSON.stringify({ body }), headers: { 'content-type': 'application/json' } });
+      await json<Json>(res, 'POST /repos/issues/comments');
     },
 
     async listInstallationRepositories(token) {

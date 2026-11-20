@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import type { GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
+import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import type { Job, Store } from '../store/store.js';
 import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 // Not from publish.ts, which pulls in the CLI's validator.
@@ -21,17 +22,20 @@ import { configPrefix } from '../tenants/paths.js';
  *                         from AssumeRole with a session policy that reaches only this tenant's
  *                         prefix (this job's event, config version and results; the tenant's
  *                         state) and only this tenant's agent key secrets. `start` also holds
- *                         the delivery's claim for the job's lifetime (refused if a redelivery's
- *                         job holds it)
+ *                         the delivery's claim and the job's quota slots for its lifetime
+ *                         (refused if another job holds one by then), and charges the month its
+ *                         maximum duration in microVM time
  *   github-token          an installation token for the job's one repository with only the
  *                         permissions a job needs, as the CLI's token file (#77)
- *   finish                the job is over; nothing more is served for it. Whatever the job's state,
- *                         and safe to repeat: a retried finish redoes what a failed one left undone
+ *   finish                the job is over; nothing more is served for it. Its slots are freed and
+ *                         the microVM time it did not use refunded. Whatever the job's state, and
+ *                         safe to repeat: a retried finish redoes what a failed one left undone
  *   terminate            stop the job's own microVM (as the launcher recorded it), whatever the
  *                         job's state; the shared execution role cannot terminate microVMs
  *
  * Refused alike, so nothing can be probed: an unknown job, a wrong token, a finished or expired
- * job, a tenant that is no longer active.
+ * job, a tenant that is no longer active, and anything but finish and terminate while the
+ * platform's kill switch is on.
  */
 
 /** What a job's installation token may do: the publication permissions, nothing administrative. */
@@ -116,6 +120,8 @@ export interface BrokerDeps {
   /** lambda:TerminateMicrovm, with the broker's role. */
   terminateMicrovm(microvmId: string): Promise<void>;
   policy: PolicyContext;
+  /** Absent: never engaged. */
+  killSwitch?: KillSwitch;
   now?: () => number;
 }
 
@@ -131,9 +137,12 @@ const OUTCOME = /^[a-z_]{1,40}$/;
 const REFUSED: BrokerResponse = { ok: false, error: 'refused' };
 /** A job that started after a redelivery's job had taken its delivery's claim: it never runs. */
 export const SUPERSEDED_OUTCOME = 'superseded';
+/** A job that started after another job had taken one of its quota slots: it never runs. */
+export const THROTTLED_OUTCOME = 'throttled';
 
 export function createBroker(deps: BrokerDeps) {
   const now = deps.now ?? Date.now;
+  const killSwitch = deps.killSwitch ?? OFF_SWITCH;
   const bots = new Map<string, { id: number; login: string }>();
 
   /** The job, if the token is its token; else null. */
@@ -154,6 +163,13 @@ export function createBroker(deps: BrokerDeps) {
     // request, rather than one that happens to read a stale replica.
     const tenant = await deps.store.getTenant(job.installationId, { consistent: true });
     return tenant?.status === 'active';
+  }
+
+  /** The microVM time a started job was charged and did not use, for finish to refund. */
+  function unusedTime(job: Job): { installationId: number; month: string; seconds: number } | undefined {
+    if (job.startedAt === undefined || !job.reservedSeconds) return undefined;
+    const used = Math.min(job.reservedSeconds, Math.max(0, Math.ceil((now() - job.startedAt) / 1000)));
+    return { installationId: job.installationId, month: job.createdAt.slice(0, 7), seconds: job.reservedSeconds - used };
   }
 
   return async function handle(request: unknown): Promise<BrokerResponse> {
@@ -181,7 +197,8 @@ export function createBroker(deps: BrokerDeps) {
     // claim is released only if this job holds it; a redelivery's job keeps its own.
     if (action === 'finish') {
       const given = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
-      const recorded = (await deps.store.finishJob(job.jobId, given)) ?? given;
+      const recorded = (await deps.store.finishJob(job.jobId, given, unusedTime(job))) ?? given;
+      await deps.store.releaseJobSlots(job);
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
       if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
@@ -189,13 +206,20 @@ export function createBroker(deps: BrokerDeps) {
     }
 
     if (!(await servable(job))) return REFUSED;
+    if (await killSwitch.engaged()) return REFUSED;
 
-    // The launcher's claim on the delivery is short, so it runs out on its own if the launch never
-    // got this far (its Lambda stopped before RunMicrovm, say). A job that does start holds the
-    // claim for as long as it may run; if a redelivery's job holds it now, that one runs, not this.
-    if (action === 'start' && !(await deps.store.holdDelivery(job.installationId, job.deliveryId, job.expiresAt, job.jobId))) {
-      await deps.store.finishJob(job.jobId, SUPERSEDED_OUTCOME);
-      return REFUSED;
+    // The launcher's claim on the delivery and its quota slots are short, so they run out on their
+    // own if the launch never got this far (its Lambda stopped before RunMicrovm, say). A job that
+    // does start holds them for as long as it may run; if another job holds one by now (a
+    // redelivery's, or another launch in its slot), that one runs, not this.
+    if (action === 'start') {
+      const started = await deps.store.startJob(job, job.expiresAt);
+      if (started === 'superseded' || started === 'throttled') {
+        await deps.store.finishJob(job.jobId, started === 'superseded' ? SUPERSEDED_OUTCOME : THROTTLED_OUTCOME);
+        await deps.store.releaseJobSlots(job);
+        if (started === 'throttled') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
+        return REFUSED;
+      }
     }
 
     if (action === 'start' || action === 'credentials') {

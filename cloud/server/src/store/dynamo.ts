@@ -8,7 +8,23 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import type { AgentKeyMeta, CleanupEntry, ConfigVersion, DispatchRules, GitHubLink, InstallationOffer, Job, Member, OAuthState, Store, Tenant } from './store.js';
+import type {
+  AgentKeyMeta,
+  CleanupEntry,
+  ConfigVersion,
+  DispatchRules,
+  GitHubLink,
+  InstallationOffer,
+  Job,
+  Member,
+  OAuthState,
+  Store,
+  Tenant,
+  TenantLimits,
+} from './store.js';
+
+const DAY_SECONDS = 24 * 3600;
+const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
@@ -22,6 +38,62 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
   const configKey = (id: number, version: number) => ({ pk: `TENANT#${id}`, sk: `CONFIG#${String(version).padStart(10, '0')}` });
   // Its own partition (not the tenant's): claims expire on their own, well before any uninstall deadline.
   const deliveryKey = (id: number, deliveryId: string) => ({ pk: `DELIVERY#${id}#${deliveryId}`, sk: 'CLAIM' });
+  // Quotas (jobs/quotas.ts). Slots expire by their TTL; usage counters keep a month and a year.
+  const slotSk = (n: number) => `SLOT#${String(n).padStart(4, '0')}`;
+  const PLATFORM = 'PLATFORM#JOBS';
+  const tenantSlotKey = (id: number, n: number) => ({ pk: `TENANT#${id}`, sk: slotSk(n) });
+  const platformSlotKey = (n: number) => ({ pk: PLATFORM, sk: slotSk(n) });
+  const dayKey = (id: number, day: string) => ({ pk: `TENANT#${id}`, sk: `USAGE#DAY#${day}` });
+  const monthKey = (id: number, month: string) => ({ pk: `TENANT#${id}`, sk: `USAGE#MONTH#${month}` });
+  const usageTtl = (days: number) => Math.floor(Date.now() / 1000) + days * DAY_SECONDS;
+  const jobSlotKeys = (job: Pick<Job, 'installationId' | 'tenantSlot' | 'platformSlot'>) => [
+    ...(job.tenantSlot !== undefined ? [tenantSlotKey(job.installationId, job.tenantSlot)] : []),
+    ...(job.platformSlot !== undefined ? [platformSlotKey(job.platformSlot)] : []),
+  ];
+  /** A free slot below `count` (none, or expired), or null. Strongly consistent. */
+  async function freeSlot(pk: string, count: number, spread: boolean): Promise<number | null> {
+    const now = Math.floor(Date.now() / 1000);
+    const held = new Set<string>();
+    let ExclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const page = await client.send(
+        new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': pk, ':prefix': 'SLOT#' },
+          ConsistentRead: true,
+          ExclusiveStartKey,
+        }),
+      );
+      for (const item of page.Items ?? []) if (typeof item.ttl === 'number' && item.ttl >= now) held.add(String(item.sk));
+      ExclusiveStartKey = page.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+    // The platform's slots are shared by every tenant: start anywhere, so launches rarely race.
+    const start = spread && count > 0 ? Math.floor(Math.random() * count) : 0;
+    for (let i = 0; i < count; i++) {
+      const n = (start + i) % count;
+      if (!held.has(slotSk(n))) return n;
+    }
+    return null;
+  }
+  /** Puts a claim or slot held by `jobId` until `ttl`, unless another job's unexpired one is there. */
+  const holdItem = (key: { pk: string; sk: string }, jobId: string, ttl: number, extra: Record<string, unknown> = {}) => ({
+    Put: {
+      TableName: T,
+      Item: { ...key, ...extra, jobId, ttl },
+      ConditionExpression: 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now',
+      ExpressionAttributeNames: { '#ttl': 'ttl' },
+      ExpressionAttributeValues: { ':job': jobId, ':now': Math.floor(Date.now() / 1000) },
+    },
+  });
+  const cancelledAt = (err: TransactionCanceledException, i: number) => err.CancellationReasons?.[i]?.Code === 'ConditionalCheckFailed';
+  async function deleteIfHeld(key: { pk: string; sk: string }, jobId: string): Promise<void> {
+    try {
+      await client.send(new DeleteCommand({ TableName: T, Key: key, ConditionExpression: 'jobId = :job', ExpressionAttributeValues: { ':job': jobId } }));
+    } catch (err) {
+      if (!(err instanceof ConditionalCheckFailedException)) throw err;
+    }
+  }
   // Uninstalled tenants whose data outside the table must be deleted at the deadline. One
   // partition, ordered by deadline, and no TTL: these must outlive the tenant's own rows.
   const cleanupKey = (entry: CleanupEntry) => ({ pk: 'CLEANUP', sk: `${String(entry.deleteAfter).padStart(15, '0')}#${entry.installationId}` });
@@ -96,6 +168,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     if (item.disabledReason === 'suspended' || item.disabledReason === 'uninstalled') t.disabledReason = item.disabledReason;
     if (typeof item.deleteAfter === 'number') t.deleteAfter = item.deleteAfter;
     if (typeof item.activeConfigVersion === 'number') t.activeConfigVersion = item.activeConfigVersion;
+    if (item.limits && typeof item.limits === 'object') {
+      const given = item.limits as Record<string, unknown>;
+      const limits: TenantLimits = {};
+      for (const name of LIMIT_NAMES) if (typeof given[name] === 'number') limits[name] = given[name] as number;
+      if (Object.keys(limits).length > 0) t.limits = limits;
+    }
     return t;
   };
   const toMember = (item: Record<string, unknown>): Member => ({
@@ -402,6 +480,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(typeof i.label === 'string' ? { label: i.label } : {}),
         ...(typeof i.sender === 'string' ? { sender: i.sender } : {}),
         ...(typeof i.imageVersion === 'string' ? { imageVersion: i.imageVersion } : {}),
+        ...(typeof i.tenantSlot === 'number' ? { tenantSlot: i.tenantSlot } : {}),
+        ...(typeof i.platformSlot === 'number' ? { platformSlot: i.platformSlot } : {}),
+        ...(typeof i.reservedSeconds === 'number' ? { reservedSeconds: i.reservedSeconds } : {}),
+        ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
       };
     },
 
@@ -423,21 +505,40 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async finishJob(jobId, outcome) {
+    async finishJob(jobId, outcome, refund) {
+      const finish = {
+        TableName: T,
+        Key: { pk: `JOB#${jobId}`, sk: 'META' },
+        UpdateExpression: 'SET #status = :finished, outcome = :outcome',
+        ConditionExpression: 'attribute_exists(pk) AND #status <> :finished',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
+      };
       try {
-        await client.send(
-          new UpdateCommand({
-            TableName: T,
-            Key: { pk: `JOB#${jobId}`, sk: 'META' },
-            UpdateExpression: 'SET #status = :finished, outcome = :outcome',
-            ConditionExpression: 'attribute_exists(pk) AND #status <> :finished',
-            ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
-          }),
-        );
+        if (refund && refund.seconds > 0) {
+          // The refund only with the finish that records the outcome: a repeated finish refunds nothing.
+          await client.send(
+            new TransactWriteCommand({
+              TransactItems: [
+                { Update: finish },
+                {
+                  Update: {
+                    TableName: T,
+                    Key: monthKey(refund.installationId, refund.month),
+                    UpdateExpression: 'ADD seconds :refund',
+                    ExpressionAttributeValues: { ':refund': -refund.seconds },
+                  },
+                },
+              ],
+            }),
+          );
+        } else {
+          await client.send(new UpdateCommand(finish));
+        }
         return outcome;
       } catch (err) {
-        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        const refused = err instanceof ConditionalCheckFailedException || (err instanceof TransactionCanceledException && cancelledAt(err, 0));
+        if (!refused) throw err;
         // Already finished (or never recorded): the first outcome stands.
         const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' }, ConsistentRead: true }));
         return typeof out.Item?.outcome === 'string' ? out.Item.outcome : null;
@@ -463,6 +564,24 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         for (const item of page.Items ?? []) await client.send(new DeleteCommand({ TableName: T, Key: { pk: item.pk, sk: item.sk } }));
         ExclusiveStartKey = page.LastEvaluatedKey;
       } while (ExclusiveStartKey);
+    },
+
+    async setTenantLimits(id, limits) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: tenantKey(id),
+            UpdateExpression: limits ? 'SET limits = :limits' : 'REMOVE limits',
+            ConditionExpression: 'attribute_exists(pk)',
+            ...(limits ? { ExpressionAttributeValues: { ':limits': limits } } : {}),
+          }),
+        );
+        return 'updated';
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return 'no_tenant';
+      }
     },
 
     async setSuspended(id, suspended) {
@@ -654,24 +773,158 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async holdDelivery(id, deliveryId, expiresAt, jobId) {
-      // This job's own claim, or none (gone or expired): another job's live claim wins.
-      const now = Math.floor(Date.now() / 1000);
+    async startJob(job, holdUntil) {
+      const ttl = Math.ceil(holdUntil / 1000);
+      const slots = jobSlotKeys(job);
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Update: {
+                  TableName: T,
+                  Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
+                  UpdateExpression: 'SET startedAt = :at',
+                  ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(startedAt)',
+                  ExpressionAttributeValues: { ':at': Date.now() },
+                },
+              },
+              holdItem(deliveryKey(job.installationId, job.deliveryId), job.jobId, ttl, { installationId: job.installationId, deliveryId: job.deliveryId }),
+              ...slots.map((key) => holdItem(key, job.jobId, ttl)),
+              ...(job.reservedSeconds
+                ? [
+                    {
+                      Update: {
+                        TableName: T,
+                        Key: monthKey(job.installationId, job.createdAt.slice(0, 7)),
+                        UpdateExpression: 'ADD seconds :seconds SET #ttl = if_not_exists(#ttl, :ttl)',
+                        ExpressionAttributeNames: { '#ttl': 'ttl' },
+                        ExpressionAttributeValues: { ':seconds': job.reservedSeconds, ':ttl': usageTtl(400) },
+                      },
+                    },
+                  ]
+                : []),
+            ],
+          }),
+        );
+        return 'started';
+      } catch (err) {
+        if (!(err instanceof TransactionCanceledException)) throw err;
+        if (cancelledAt(err, 0)) return 'already';
+        if (cancelledAt(err, 1)) return 'superseded';
+        if (slots.some((_, i) => cancelledAt(err, 2 + i))) return 'throttled';
+        throw err;
+      }
+    },
+
+    async releaseJobSlots(job) {
+      for (const key of jobSlotKeys(job)) await deleteIfHeld(key, job.jobId);
+    },
+
+    async reserveJob({ installationId: id, jobId, holdUntil, day, month, quotas }) {
+      const ttl = Math.ceil(holdUntil / 1000);
+      // A slot another launch took between the read and the write: look again.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const tenantSlot = await freeSlot(`TENANT#${id}`, quotas.concurrentJobs, false);
+        if (tenantSlot === null) return { ok: false, limit: 'concurrent_jobs' };
+        const platformSlot = await freeSlot(PLATFORM, quotas.platformConcurrentJobs, true);
+        if (platformSlot === null) return { ok: false, limit: 'platform_concurrency' };
+        const take = (key: { pk: string; sk: string }) => ({
+          Put: {
+            TableName: T,
+            Item: { ...key, jobId, ttl },
+            ConditionExpression: 'attribute_not_exists(pk) OR #ttl < :now',
+            ExpressionAttributeNames: { '#ttl': 'ttl' },
+            ExpressionAttributeValues: { ':now': Math.floor(Date.now() / 1000) },
+          },
+        });
+        try {
+          await client.send(
+            new TransactWriteCommand({
+              TransactItems: [
+                take(tenantSlotKey(id, tenantSlot)),
+                take(platformSlotKey(platformSlot)),
+                {
+                  Update: {
+                    TableName: T,
+                    Key: dayKey(id, day),
+                    UpdateExpression: 'ADD jobs :one SET #ttl = if_not_exists(#ttl, :ttl)',
+                    ConditionExpression: 'attribute_not_exists(jobs) OR jobs < :limit',
+                    ExpressionAttributeNames: { '#ttl': 'ttl' },
+                    ExpressionAttributeValues: { ':one': 1, ':ttl': usageTtl(40), ':limit': quotas.jobsPerDay },
+                  },
+                },
+                {
+                  Update: {
+                    TableName: T,
+                    Key: monthKey(id, month),
+                    UpdateExpression: 'ADD jobs :one SET #ttl = if_not_exists(#ttl, :ttl)',
+                    ConditionExpression: 'attribute_not_exists(seconds) OR seconds < :limit',
+                    ExpressionAttributeNames: { '#ttl': 'ttl' },
+                    ExpressionAttributeValues: { ':one': 1, ':ttl': usageTtl(400), ':limit': quotas.microvmMinutesPerMonth * 60 },
+                  },
+                },
+              ],
+            }),
+          );
+          return { ok: true, tenantSlot, platformSlot };
+        } catch (err) {
+          if (!(err instanceof TransactionCanceledException)) throw err;
+          if (cancelledAt(err, 2)) return { ok: false, limit: 'jobs_per_day' };
+          if (cancelledAt(err, 3)) return { ok: false, limit: 'microvm_minutes' };
+        }
+      }
+      throw new Error(`reserveJob: the slots of tenant ${id} kept changing; retry the delivery`);
+    },
+
+    async cancelReservation(r) {
+      await deleteIfHeld(tenantSlotKey(r.installationId, r.tenantSlot), r.jobId);
+      await deleteIfHeld(platformSlotKey(r.platformSlot), r.jobId);
+      for (const key of [dayKey(r.installationId, r.day), monthKey(r.installationId, r.month)]) {
+        await client.send(new UpdateCommand({ TableName: T, Key: key, UpdateExpression: 'ADD jobs :minus', ExpressionAttributeValues: { ':minus': -1 } }));
+      }
+    },
+
+    async recordThrottle(id, month, notice) {
+      await client.send(
+        new UpdateCommand({
+          TableName: T,
+          Key: monthKey(id, month),
+          UpdateExpression: 'ADD throttled :one SET #ttl = if_not_exists(#ttl, :ttl)',
+          ExpressionAttributeNames: { '#ttl': 'ttl' },
+          ExpressionAttributeValues: { ':one': 1, ':ttl': usageTtl(400) },
+        }),
+      );
+      if (!notice) return false;
       try {
         await client.send(
           new PutCommand({
             TableName: T,
-            Item: { ...deliveryKey(id, deliveryId), installationId: id, deliveryId, jobId, ttl: Math.ceil(expiresAt / 1000) },
-            ConditionExpression: 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now',
-            ExpressionAttributeNames: { '#ttl': 'ttl' },
-            ExpressionAttributeValues: { ':job': jobId, ':now': now },
+            Item: { pk: `TENANT#${id}`, sk: `NOTICE#${notice.repositoryId}#${notice.issue}#${notice.day}`, ttl: usageTtl(2) },
+            ConditionExpression: 'attribute_not_exists(pk)',
           }),
         );
         return true;
       } catch (err) {
-        if (err instanceof ConditionalCheckFailedException) return false;
-        throw err;
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
       }
+    },
+
+    async getUsage(id, day, month) {
+      const [d, m] = await Promise.all([
+        client.send(new GetCommand({ TableName: T, Key: dayKey(id, day) })),
+        client.send(new GetCommand({ TableName: T, Key: monthKey(id, month) })),
+      ]);
+      const n = (v: unknown) => (typeof v === 'number' ? v : 0);
+      return {
+        day,
+        jobsToday: n(d.Item?.jobs),
+        month,
+        jobsThisMonth: n(m.Item?.jobs),
+        microvmSecondsThisMonth: n(m.Item?.seconds),
+        throttledThisMonth: n(m.Item?.throttled),
+      };
     },
 
     async releaseDelivery(id, deliveryId, jobId) {

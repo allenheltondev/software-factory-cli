@@ -1,26 +1,33 @@
 import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
-import type { Job, Store } from '../store/store.js';
+import type { Job, QuotaLimit, Quotas, Store } from '../store/store.js';
 import { decideDispatch } from '../tenants/dispatch.js';
+import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
+import { dayOf, monthOf, tenantQuotas } from './quotas.js';
 
 /**
  * The multi-tenant launcher (#68): what the webhook does with a tenant's `issues.labeled`.
  *
  *   1. the tenant: active, with an active config version
  *   2. that version's dispatch rules: the repository (name and id), a trigger label, an allowed actor
- *   3. jobs are on: a MicroVM image version is published (the image build sets it)
+ *   3. jobs are on: a MicroVM image version is published (the image build sets it), and the
+ *      platform's kill switch is off (kill-switch.ts)
  *   4. deduplication: one job per delivery, per tenant. The launcher's claim is short
  *      (PRELAUNCH_CLAIM_MS), so a launch that stops partway (its Lambda timed out) does not block
  *      a redelivery for long; the job's microVM holds it for its whole lifetime once it starts
  *      (the broker's `start`), and does not run if a redelivery's job has taken it by then
- *   5. the event body to tenants/<id>/events/<delivery>/event.json
- *   6. the job record: its tenant, repository, label, sender, config and image versions, and the
- *      hash of a fresh job token
- *   7. RunMicrovm, with a version 2 run-hook payload: the broker and the job's token, nothing else
- *   8. the microVM's id on the job, which is what lets the broker stop that microVM (and no other)
+ *   5. quotas (quotas.ts): a slot of the tenant's and of the platform's, the day's jobs and the
+ *      month's microVM minutes. Over one: recorded as throttled, the claim given up, one comment a
+ *      day on the issue, and nothing started
+ *   6. the event body to tenants/<id>/events/<delivery>/event.json
+ *   7. the job record: its tenant, repository, label, sender, config and image versions, its
+ *      slots and reserved seconds, and the hash of a fresh job token
+ *   8. RunMicrovm, with a version 2 run-hook payload: the broker and the job's token, nothing else
+ *   9. the microVM's id on the job, which is what lets the broker stop that microVM (and no other)
  *
  * Anything that is not a job answers 200 with why; a failure after the claim answers 500 (so the
- * delivery can be redelivered) and releases the claim, so the redelivery is not refused.
+ * delivery can be redelivered) and releases the claim and the reservation, so the redelivery is
+ * not refused.
  */
 
 export const RUN_HOOK_PAYLOAD_VERSION = 2;
@@ -72,6 +79,12 @@ export interface LaunchDeps {
   imageVersion: () => Promise<string | null>;
   putEvent: (key: string, body: string) => Promise<void>;
   runMicrovm: (input: RunMicrovmInput) => Promise<{ microvmId?: string }>;
+  /** The stack's default quotas; a tenant's `limits` override them. */
+  quotas: Quotas;
+  /** Absent: never engaged. */
+  killSwitch?: KillSwitch;
+  /** Posts the over-quota comment on the issue (once a day per issue). Its failure is only logged. */
+  notifyThrottled?: (input: ThrottleNotice) => Promise<void>;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
   /** Retry pause for recording the microVM on the job. */
@@ -91,6 +104,15 @@ export interface LaunchRequest {
   };
 }
 
+export interface ThrottleNotice {
+  installationId: number;
+  repository: string;
+  repositoryId: number;
+  issue: number;
+  limit: QuotaLimit;
+  quotas: Quotas;
+}
+
 export interface LaunchResult {
   status: number;
   disposition: string;
@@ -104,6 +126,7 @@ export function createLauncher(deps: LaunchDeps) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((entry) => console.log(JSON.stringify(entry)));
   const s = deps.settings;
+  const killSwitch = deps.killSwitch ?? OFF_SWITCH;
 
   return async function launch(req: LaunchRequest): Promise<LaunchResult> {
     const skip = (disposition: string): LaunchResult => ({ status: 200, disposition });
@@ -131,6 +154,10 @@ export function createLauncher(deps: LaunchDeps) {
 
     const imageVersion = await deps.imageVersion();
     if (!imageVersion) return skip('jobs_off');
+    if (await killSwitch.engaged()) {
+      log({ delivery: req.deliveryId, installationId: req.installationId, ignored: 'the kill switch is on' });
+      return skip('kill_switch');
+    }
 
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
@@ -138,6 +165,32 @@ export function createLauncher(deps: LaunchDeps) {
     // Short, until the job starts and holds it for its lifetime; released early (by this job only)
     // when it fails.
     if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + PRELAUNCH_CLAIM_MS, jobId))) return skip('duplicate');
+
+    // The slots are short like the claim, and the broker's start holds them for the job's lifetime.
+    const quotas = tenantQuotas(deps.quotas, tenant.limits);
+    const day = dayOf(launchedAt);
+    const month = monthOf(launchedAt);
+    let reserved;
+    try {
+      reserved = await deps.store.reserveJob({ installationId: req.installationId, jobId, holdUntil: launchedAt + PRELAUNCH_CLAIM_MS, day, month, quotas });
+    } catch (err) {
+      await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      throw err;
+    }
+    if (!reserved.ok) {
+      // Not this delivery's to keep: re-applying the label (a new delivery) or redelivering it tries again.
+      await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      const issue = req.payload.issue!.number as number;
+      const first = await deps.store.recordThrottle(req.installationId, month, { repositoryId: decision.repositoryId, issue, day });
+      log({ delivery: req.deliveryId, installationId: req.installationId, repository: decision.repository, issue, throttled: reserved.limit });
+      if (first && deps.notifyThrottled) {
+        await deps
+          .notifyThrottled({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, issue, limit: reserved.limit, quotas })
+          .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
+      }
+      return skip('throttled');
+    }
+    const reservation = { installationId: req.installationId, jobId, tenantSlot: reserved.tenantSlot, platformSlot: reserved.platformSlot, day, month };
 
     const token = randomBytes(32).toString('base64url');
     const sender = req.payload.sender?.login;
@@ -156,6 +209,9 @@ export function createLauncher(deps: LaunchDeps) {
       label: decision.label,
       ...(typeof sender === 'string' ? { sender } : {}),
       imageVersion,
+      tenantSlot: reserved.tenantSlot,
+      platformSlot: reserved.platformSlot,
+      reservedSeconds: s.maximumDurationSeconds,
     };
 
     let recorded = false;
@@ -169,6 +225,7 @@ export function createLauncher(deps: LaunchDeps) {
     } catch (err) {
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: (err as Error)?.message });
       await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      await deps.store.cancelReservation(reservation).catch(() => {});
       // Nothing runs for this record; its token must not be served.
       if (recorded) await deps.store.finishJob(jobId, 'launch_failed').catch(() => {});
       return { status: 500, disposition: 'launch_failed', jobId };
