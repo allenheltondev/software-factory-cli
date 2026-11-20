@@ -1,4 +1,4 @@
-import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
+import { LambdaMicrovmsClient, RunMicrovmCommand, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
@@ -80,6 +80,9 @@ function launcher(): Launcher | undefined {
     runMicrovm: async (input) => {
       const out = await microvms.send(new RunMicrovmCommand(input));
       return { microvmId: out.microvmId };
+    },
+    terminateMicrovm: async (microvmId) => {
+      await microvms.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId }));
     },
     quotas: quotasFromEnv(env),
     killSwitch,

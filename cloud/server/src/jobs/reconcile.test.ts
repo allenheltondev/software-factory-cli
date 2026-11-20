@@ -29,6 +29,15 @@ async function admitted(store: ReturnType<typeof createMemoryStore>, jobId: stri
 }
 
 describe('quota reconciliation', () => {
+  it('releases a job with no recorded microVM only after its maximum duration', async () => {
+    const store = createMemoryStore();
+    const job = await admitted(store, 'job_novm00001');
+    const reconcile = (at: number) => createReconciler({ store, microvmState: vi.fn(), now: () => at, log: () => {} })();
+    expect(await reconcile(job.expiresAt - 1)).toMatchObject({ released: [], held: 1 });
+    expect(await reconcile(job.expiresAt + 1)).toMatchObject({ released: ['job_novm00001'], held: 0 });
+    expect(await store.listActiveJobs()).toEqual([]);
+  });
+
   it('releases only the jobs whose microVM Lambda shows terminated or has no more', async () => {
     const store = createMemoryStore();
     await admitted(store, 'job_running01', { microvmId: 'mvm-run' });

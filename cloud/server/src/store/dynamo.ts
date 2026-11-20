@@ -43,6 +43,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
   // Quotas (jobs/quotas.ts). Slots expire by their TTL; usage counters keep a month and a year.
   const slotSk = (n: number) => `SLOT#${String(n).padStart(4, '0')}`;
   const PLATFORM = 'PLATFORM#JOBS';
+  const activeKey = (jobId: string) => ({ pk: 'PLATFORM#ACTIVE', sk: `JOB#${jobId}` });
   const tenantSlotKey = (id: number, n: number) => ({ pk: `TENANT#${id}`, sk: slotSk(n) });
   const platformSlotKey = (n: number) => ({ pk: PLATFORM, sk: slotSk(n) });
   const dayKey = (id: number, day: string) => ({ pk: `TENANT#${id}`, sk: `USAGE#DAY#${day}` });
@@ -451,11 +452,14 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
 
     async putJob(job) {
       // A week after the job may last, the record goes; nothing is served for it by then anyway.
+      // The active entry with it, in one write: a job whose microVM may run is always reconciled.
+      const ttl = Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600;
       await client.send(
-        new PutCommand({
-          TableName: T,
-          Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 },
-          ConditionExpression: 'attribute_not_exists(pk)',
+        new TransactWriteCommand({
+          TransactItems: [
+            { Put: { TableName: T, Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl }, ConditionExpression: 'attribute_not_exists(pk)' } },
+            { Put: { TableName: T, Item: { ...activeKey(job.jobId), jobId: job.jobId, ttl } } },
+          ],
         }),
       );
     },
@@ -835,14 +839,36 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
 
     async holdSlots(job, until) {
       const ttl = Math.ceil(until / 1000);
+      let all = true;
       for (const key of jobSlotKeys(job)) {
         try {
           await client.send(new PutCommand(holdItem(key, job.jobId, ttl).Put));
         } catch (err) {
           // Another job's live slot: not this one's to hold.
           if (!(err instanceof ConditionalCheckFailedException)) throw err;
+          all = false;
         }
       }
+      return all;
+    },
+
+    async listActiveJobs() {
+      const ids: string[] = [];
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+            ExpressionAttributeValues: { ':pk': 'PLATFORM#ACTIVE', ':prefix': 'JOB#' },
+            ConsistentRead: true,
+            ExclusiveStartKey,
+          }),
+        );
+        for (const item of page.Items ?? []) if (typeof item.jobId === 'string') ids.push(item.jobId);
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return ids;
     },
 
     async listPlatformSlots() {
@@ -901,8 +927,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         const already = err instanceof ConditionalCheckFailedException || (err instanceof TransactionCanceledException && cancelledAt(err, 0));
         if (!already) throw err;
       }
-      // After the refund: a failure here leaves the slots to run out, never a refund undone.
+      // After the refund: a failure here leaves the slots to run out, never a refund undone, and
+      // the active entry for the next reconciliation to finish.
       for (const key of jobSlotKeys(job)) await deleteIfHeld(key, job.jobId);
+      await client.send(new DeleteCommand({ TableName: T, Key: activeKey(job.jobId) }));
     },
 
     async releaseJobSlots(job) {

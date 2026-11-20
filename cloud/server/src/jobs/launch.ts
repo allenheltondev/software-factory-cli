@@ -81,6 +81,8 @@ export interface LaunchDeps {
   imageVersion: () => Promise<string | null>;
   putEvent: (key: string, body: string) => Promise<void>;
   runMicrovm: (input: RunMicrovmInput) => Promise<{ microvmId?: string }>;
+  /** lambda:TerminateMicrovm: a launched microVM whose quota slots could not be held is stopped. */
+  terminateMicrovm?: (microvmId: string) => Promise<void>;
   /** The stack's default quotas; a tenant's `limits` override them. */
   quotas: Quotas;
   /** Absent: never engaged. */
@@ -221,33 +223,51 @@ export function createLauncher(deps: LaunchDeps) {
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: (err as Error)?.message });
       await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
       await deps.store.cancelReservation(reservation).catch(() => {});
-      // Nothing runs for this record; its token must not be served.
-      if (recorded) await deps.store.finishJob(jobId, 'launch_failed').catch(() => {});
+      // Nothing runs for this record; its token must not be served, and it needs no reconciling.
+      if (recorded) {
+        await deps.store.finishJob(jobId, 'launch_failed').catch(() => {});
+        await deps.store.releaseJob(job).catch(() => {});
+      }
       return { status: 500, disposition: 'launch_failed', jobId };
     }
 
-    // A microVM exists now: its capacity is held for as long as it may run, whether or not its
-    // start is ever admitted (the kill switch, a failed start), until Lambda shows it terminated
-    // (reconciliation, jobs/reconcile.ts), or, with no microVM id to look at, its maximum duration.
-    await deps.store
-      .holdSlots(job, job.expiresAt)
-      .catch((err: unknown) => log({ delivery: req.deliveryId, jobId, warning: `could not hold the job's quota slots: ${(err as Error)?.message}` }));
+    const retried = async (what: string, operation: () => Promise<boolean>): Promise<boolean> => {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          if (await operation()) return true;
+          if (attempt === 3) log({ delivery: req.deliveryId, jobId, microvmId, warning: `could not ${what}: another job holds it` });
+        } catch (err) {
+          if (attempt === 3) log({ delivery: req.deliveryId, jobId, microvmId, warning: `could not ${what}: ${(err as Error)?.message}` });
+        }
+        if (attempt < 3) await new Promise((r) => setTimeout(r, (deps.retryDelayMs ?? 200) * attempt));
+      }
+      return false;
+    };
 
     if (!microvmId) {
       log({ delivery: req.deliveryId, jobId, warning: 'RunMicrovm returned no microVM id; the job cannot stop its own microVM, its maximum duration will' });
     } else {
-      // The runner asks the broker to stop "its" microVM: this record is the only link. Retried,
-      // and the runner retries too; if it never lands, the maximum duration ends the microVM.
-      let attached = false;
-      for (let attempt = 1; attempt <= 3 && !attached; attempt++) {
-        try {
-          await deps.store.attachMicrovm(jobId, microvmId);
-          attached = true;
-        } catch (err) {
-          if (attempt === 3) log({ delivery: req.deliveryId, jobId, microvmId, warning: `could not record the microVM: ${(err as Error)?.message}` });
-          else await new Promise((r) => setTimeout(r, (deps.retryDelayMs ?? 200) * attempt));
-        }
+      // The runner asks the broker to stop "its" microVM, and reconciliation asks Lambda about it:
+      // this record is the only link. If it never lands, the maximum duration ends the microVM.
+      await retried('record the microVM', async () => {
+        await deps.store.attachMicrovm(jobId, microvmId!);
+        return true;
+      });
+    }
+
+    // A microVM exists now: its capacity is held for as long as it may run, whether or not its
+    // start is ever admitted (the kill switch, a failed start), until Lambda shows it terminated.
+    // Reconciliation holds it again every run, so a hold that fails for a while is retried. One
+    // that cannot be made here at all stops the job instead: it is not admitted, and its microVM
+    // is asked to stop (reconciliation releases it once Lambda shows it terminated).
+    if (!(await retried("hold the job's quota slots", () => deps.store.holdSlots(job, job.expiresAt)))) {
+      await deps.store.markStopping(jobId).catch(() => {});
+      await deps.store.finishJob(jobId, 'launch_failed').catch(() => {});
+      await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      if (microvmId && deps.terminateMicrovm) {
+        await deps.terminateMicrovm(microvmId).catch((err: unknown) => log({ delivery: req.deliveryId, jobId, microvmId, warning: `could not stop the microVM: ${(err as Error)?.name}` }));
       }
+      return { status: 500, disposition: 'launch_failed', jobId };
     }
     log({ delivery: req.deliveryId, installationId: req.installationId, jobId, microvmId, repository: job.repository, configVersion: job.configVersion, imageVersion, launched: true });
     return { status: 202, disposition: 'launched', jobId };

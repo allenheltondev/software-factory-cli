@@ -3,15 +3,19 @@ import { isTerminated, unusedTime } from './quotas.js';
 
 /**
  * Quota reconciliation (#68), every five minutes (CleanupFunction's Reconcile schedule): the
- * platform-side path that gives a job's capacity back once Lambda shows its microVM gone, whatever
- * the runner did or did not report.
+ * platform-side path that keeps a launched job's capacity held while its microVM may run, and gives
+ * it back once Lambda shows the microVM gone, whatever the runner did or did not report.
  *
- * For each job holding a platform slot (every admitted job holds one), it asks Lambda for the
- * microVM's state. `TERMINATED`, or no such microVM, releases the job: its slots are freed and the
- * microVM time it did not use refunded, once (Store.releaseJob). Anything else, including
- * `TERMINATING` (Lambda runs the /terminate hook before it frees the microVM's resources), waits for
- * the next run. A job with no recorded microVM keeps its slots until they run out, which is no later
- * than its maximum duration, when Lambda stops any microVM it had.
+ * It goes through the platform's active jobs (recorded with the job, before its microVM starts,
+ * until it is released), not their slots, so a job whose slots ran out is still found:
+ *
+ *   microVM TERMINATED, or no such microVM     released: its slots freed and the microVM time it
+ *                                              did not use refunded, once (Store.releaseJob)
+ *   past its maximum duration, no microVM id   released: Lambda has stopped any microVM it had
+ *   anything else (RUNNING, TERMINATING...)    its slots held again until its maximum duration,
+ *                                              which retries a hold that failed at launch
+ *
+ * `TERMINATING` waits: Lambda runs the /terminate hook before it frees the microVM's resources.
  */
 export function createReconciler({
   store,
@@ -29,27 +33,26 @@ export function createReconciler({
     const released: string[] = [];
     let held = 0;
     let failed = 0;
-    for (const { jobId } of await store.listPlatformSlots()) {
+    for (const jobId of await store.listActiveJobs()) {
       try {
         const job = await store.getJob(jobId);
-        // No record (it expired): the slot runs out on its own.
+        // No record (it expired a week after the job could last): the entry's TTL removes it.
         if (!job) continue;
         if (job.releasedAt !== undefined) {
-          // Released before, with a slot left over (a delete that failed): free it now.
-          await store.releaseJobSlots(job);
+          // Released before, with something left over (a delete that failed): finish it now.
+          await store.releaseJob(job);
           continue;
         }
-        if (!job.microvmId) {
-          held++;
+        const gone = job.microvmId ? isTerminated(await microvmState(job.microvmId)) : now() > job.expiresAt;
+        if (gone) {
+          await store.releaseJob(job, unusedTime(job, now()));
+          released.push(jobId);
           continue;
         }
-        const state = await microvmState(job.microvmId);
-        if (!isTerminated(state)) {
-          held++;
-          continue;
+        held++;
+        if (!(await store.holdSlots(job, job.expiresAt))) {
+          log({ reconcile: 'warning', jobId, warning: "another job holds one of this running job's slots: it runs outside the quota" });
         }
-        await store.releaseJob(job, unusedTime(job, now()));
-        released.push(jobId);
       } catch (err) {
         failed++;
         log({ reconcile: 'error', jobId, name: (err as Error)?.name, message: (err as Error)?.message });

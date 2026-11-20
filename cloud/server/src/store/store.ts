@@ -13,6 +13,7 @@
  *   TENANT#<installId>   USAGE#MONTH#<yyyy-mm>  jobs, microVM seconds and throttled deliveries that month
  *   TENANT#<installId>   NOTICE#<repo>#<issue>#<date>  an over-quota comment was posted (once a day)
  *   PLATFORM#JOBS        SLOT#<n>              a running job's place in the platform-wide ceiling
+ *   PLATFORM#ACTIVE      JOB#<jobId>           a launched job not yet released: what reconciliation looks at
  *
  * Everything in a TENANT# partition gets the table's `ttl` (epoch seconds) when the App is
  * uninstalled, so DynamoDB deletes the tenant and its members once the retention has passed.
@@ -291,7 +292,11 @@ export interface Store {
    */
   purgeTenantPartition(installationId: number): Promise<void>;
 
-  /** Records a job (the launcher). Its own partition, expiring a week after the job may last. */
+  /**
+   * Records a job (the launcher), before its microVM is started. Its own partition, expiring a
+   * week after the job may last, and in the same write an entry in the platform's active jobs,
+   * which reconciliation reads until the job is released (releaseJob).
+   */
   putJob(job: Job): Promise<void>;
   getJob(jobId: string): Promise<Job | null>;
   /**
@@ -320,20 +325,23 @@ export interface Store {
   /** Frees the job's slots (only while it holds them). Safe to repeat. */
   releaseJobSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>): Promise<void>;
   /**
-   * Lambda shows the job's microVM terminated (or has none): refunds the microVM seconds it did not
-   * use (`refund`) and marks it released (and stopping, so it can never start), at most once, then
-   * frees its slots. Safe to repeat.
+   * Lambda shows the job's microVM terminated (or it has none): refunds the microVM seconds it did
+   * not use (`refund`) and marks it released (and stopping, so it can never start), at most once,
+   * then frees its slots and drops it from the active jobs. Safe to repeat.
    */
   releaseJob(job: Job, refund?: { month: string; seconds: number }): Promise<void>;
   /** Its microVM was asked to stop: the job is retired for serving and starting. Set once. */
   markStopping(jobId: string): Promise<void>;
   /**
-   * Holds whatever slots the job still has (its own, or free) until `until` (epoch ms), each on its
-   * own: a refused job's microVM keeps its capacity until it is seen terminated, or runs out.
+   * Holds the job's slots (its own, or free) until `until` (epoch ms), each on its own: a launched
+   * microVM keeps its capacity until it is seen terminated, or runs out. False when another job
+   * holds one of them: this job's microVM runs outside the quota.
    */
-  holdSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>, until: number): Promise<void>;
-  /** The platform's unexpired slots and the jobs holding them: what reconciliation looks at. */
+  holdSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>, until: number): Promise<boolean>;
+  /** The platform's unexpired slots and the jobs holding them. */
   listPlatformSlots(): Promise<{ jobId: string; expiresAt: number }[]>;
+  /** The launched jobs not yet released (putJob to releaseJob): what reconciliation looks at. */
+  listActiveJobs(): Promise<string[]>;
 
   /**
    * Quotas, at launch (jobs/launch.ts): takes a free slot of the tenant's and one of the
@@ -385,6 +393,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const days = new Map<string, number>();
   const months = new Map<string, { jobs: number; seconds: number; throttled: number }>();
   const notices = new Set<string>();
+  const active = new Set<string>();
   const month = (key: string) => months.get(key) ?? { jobs: 0, seconds: 0, throttled: 0 };
   const free = (key: string, now: number) => {
     const s = slots.get(key);
@@ -556,7 +565,15 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async holdSlots(job, until) {
       const now = Date.now();
-      for (const key of slotKeys(job)) if (mine(key, job.jobId, now)) slots.set(key, { expiresAt: until, jobId: job.jobId });
+      let all = true;
+      for (const key of slotKeys(job)) {
+        if (mine(key, job.jobId, now)) slots.set(key, { expiresAt: until, jobId: job.jobId });
+        else all = false;
+      }
+      return all;
+    },
+    async listActiveJobs() {
+      return [...active];
     },
     async listPlatformSlots() {
       const now = Date.now();
@@ -573,6 +590,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
         }
       }
       for (const key of slotKeys(job)) if (slots.get(key)?.jobId === job.jobId) slots.delete(key);
+      active.delete(job.jobId);
     },
     async releaseJobSlots(job) {
       for (const key of slotKeys(job)) if (slots.get(key)?.jobId === job.jobId) slots.delete(key);
@@ -628,6 +646,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async putJob(job) {
       jobs.set(job.jobId, { ...job });
+      active.add(job.jobId);
     },
     async getJob(jobId) {
       const j = jobs.get(jobId);

@@ -605,12 +605,15 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
       tenantSlot: 0,
     };
     await store.putJob(job);
+    expect(await store.listActiveJobs()).toEqual([job.jobId]);
+    expect(table.items.has('PLATFORM#ACTIVE|JOB#job_first0001')).toBe(true);
     await store.releaseJob(job, { month: '2026-11', seconds: 9000 });
     await store.releaseJob(job, { month: '2026-11', seconds: 9000 });
     expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(1800);
     expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
     expect(typeof (await store.getJob(job.jobId))?.releasedAt).toBe('number');
-    // Released is retired: it can never start.
+    // Released: no longer an active job for reconciliation, and retired: it can never start.
+    expect(await store.listActiveJobs()).toEqual([]);
     expect(typeof (await store.getJob(job.jobId))?.stopRequestedAt).toBe('number');
     expect(await store.startJob({ ...job, status: 'launched' }, LATER)).toEqual({ result: 'retired' });
   });
@@ -679,7 +682,7 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     // Its own short slot is held on; another job's live slot is left alone.
     table.items.set('TENANT#55|SLOT#0000', { pk: 'TENANT#55', sk: 'SLOT#0000', jobId: job.jobId, ttl: Math.ceil((Date.now() + 60_000) / 1000) });
     table.items.set('PLATFORM#JOBS|SLOT#0001', { pk: 'PLATFORM#JOBS', sk: 'SLOT#0001', jobId: 'job_other001', ttl: Math.ceil(LATER / 1000) });
-    await store.holdSlots(job, LATER);
+    expect(await store.holdSlots(job, LATER)).toBe(false);
     expect(table.items.get('TENANT#55|SLOT#0000')).toMatchObject({ jobId: job.jobId, ttl: Math.ceil(LATER / 1000) });
     expect(table.items.get('PLATFORM#JOBS|SLOT#0001')?.jobId).toBe('job_other001');
 
