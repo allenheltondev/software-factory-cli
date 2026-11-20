@@ -10,15 +10,29 @@ import type { QuotaLimit, Quotas, TenantLimits } from '../store/store.js';
  *
  *   concurrent jobs     a slot per running job, the tenant's and the platform's. Short at launch,
  *                       held for the job's lifetime once the broker's `start` serves it, and freed
- *                       by `finish`; a slot whose job never got that far runs out on its own.
+ *                       once its microVM is seen stopping (the broker's `terminate`); a slot whose
+ *                       job never got that far runs out on its own.
  *   jobs per day        counted at launch (UTC days), whatever becomes of the job
- *   microVM minutes     a job is charged its maximum duration when it starts, and finish refunds
- *                       what it did not use; so a runner that never reports is charged in full.
- *                       A launch starts while the month is under its quota (it can end over it).
+ *   microVM minutes     checked at launch, and again by the broker's start in the transaction that
+ *                       charges the job its maximum duration, so launches that pass together are
+ *                       not all charged on one remainder. A job starts while the month is under its
+ *                       quota, so the last one can end over it. What it did not use is refunded
+ *                       once Lambda shows its microVM stopping; a runner that never says so is
+ *                       charged in full, and keeps its slots for its maximum duration.
  *
  * A delivery over a quota starts nothing: it is recorded as throttled, and the issue gets one
  * comment a day saying why. Re-applying the label is how to try again.
  */
+
+/** An over-quota comment to post on the issue whose label started nothing. */
+export interface ThrottleNotice {
+  installationId: number;
+  repository: string;
+  repositoryId: number;
+  issue: number;
+  limit: QuotaLimit;
+  quotas: Quotas;
+}
 
 export const DEFAULT_QUOTAS: Quotas = {
   concurrentJobs: 1,

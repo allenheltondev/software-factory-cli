@@ -247,12 +247,14 @@ Each of these that fails answers 200 with why (`no_tenant`, `tenant_inactive`, `
 | --- | --- | --- |
 | Concurrent jobs | 1 (`QuotaConcurrentJobs`) | A slot per running job, `TENANT#<id>`/`SLOT#<n>` |
 | Jobs per day | 20 (`QuotaJobsPerDay`) | At launch, per UTC day, whatever becomes of the job |
-| MicroVM minutes per month | 1200 (`QuotaMicrovmMinutesPerMonth`) | Per UTC month: a job is charged its maximum duration when it starts, and `finish` refunds what it didn't use |
+| MicroVM minutes per month | 1200 (`QuotaMicrovmMinutesPerMonth`) | Per UTC month: a job is charged its maximum duration when it starts, and refunded what it didn't use once its microVM is seen stopping |
 | Platform concurrency | 20 (`PlatformConcurrentJobs`) | A slot per running job across every tenant, `PLATFORM#JOBS`/`SLOT#<n>` |
 
 - **Checked together.** The launcher takes both slots and counts the job against the day and the month in one transaction, or takes nothing and says which quota stopped it.
-- **Slots behave like the delivery claim.** They last five minutes at launch. The broker's `start` holds them for the job's lifetime, and `finish` frees them. A slot whose job never started runs out on its own. If another job has taken a slot by the time a slow job starts, the slow job is refused and recorded as `throttled`.
-- **Charging the full duration at start** means a runner that never reports `finish` is charged in full. A launch starts while the month is under its quota, so the last job of a month can end over it.
+- **Slots behave like the delivery claim.** They last five minutes at launch, and the broker's `start` holds them for the job's lifetime. A slot whose job never started runs out on its own. If another job has taken a slot by the time a slow job starts, the slow job is refused and recorded as `throttled`.
+- **Capacity follows the microVM, not the outcome.** `finish` only records the outcome. The slots are freed, and the unused time refunded, only when the broker's `terminate` sees Lambda show the microVM `TERMINATING` or gone (`GetMicrovm`, looked at a few times). This happens once. If the broker can't see it stopping, or the runner never calls `terminate`, the job keeps its slots and its full charge until its maximum duration, when Lambda stops it anyway.
+- **The month is checked twice.** The launcher checks it, and the broker's `start` checks it again in the same transaction that charges the job. So launches that passed the launcher together can't all be charged against the same remaining minutes: one that finds the month spent is refused and recorded as `throttled`, with the same comment on the issue. A job starts while the month is under its quota, so the last job of a month can end over it.
+- **No credentials before admission.** `credentials` and `github-token` serve only a job whose `start` committed, and `start` never commits for a job that's already finished.
 - **Over a quota**, the delivery is recorded as throttled in the month's usage, and its claim is given up. The issue gets one comment a day saying which quota stopped it and how to try again: remove the label and add it back. The comment is posted with an installation token for that one repository, allowed only to write issues.
 
 **Overrides.** An admin overrides a tenant's quotas on its record (`limits`), from 1 up to a ceiling (`LIMIT_CEILING`):
@@ -337,8 +339,8 @@ Every tenant's jobs run in microVMs with one execution role, `MicrovmExecutionRo
 | --- | --- |
 | `start`, `credentials` | Where the job's data is, and AWS credentials for an hour. `start` also holds the job's delivery claim and quota slots for its lifetime, and charges its microVM time. They come from `sts:AssumeRole` on `JobDataRole`, with a session policy for this job only. It can read this job's event and config version, read and write the tenant's state, write this job's results, and read the tenant's agent key secrets. |
 | `github-token` | An installation token for the job's one repository (`repository_ids`), with only `contents`, `issues` and `pull_requests` write, and `checks`, `statuses` and `metadata` read. It's shaped as the CLI's token file (#77). The runner writes it to `app-token.json` in the protected state directory and replaces it every 20 minutes. |
-| `finish` | The job is over. Nothing more is served for its token. Its slots are freed and its unused microVM time is refunded. |
-| `terminate` | Stops the job's own microVM: the one the launcher recorded with the job (`attachMicrovm`, set once). This works whatever the job's state, finished or with its tenant suspended included, because it only ever ends that one microVM. |
+| `finish` | The job is over. Nothing more is served for its token. Its quota slots stay until its microVM is seen stopping. |
+| `terminate` | Stops the job's own microVM: the one the launcher recorded with the job (`attachMicrovm`, set once). This works whatever the job's state, finished or with its tenant suspended included, because it only ever ends that one microVM. Once Lambda shows that microVM stopping, the job's quota slots are freed and its unused microVM time refunded. |
 
 - **The App's private key never enters a microVM.** Only the broker reads it, to mint tokens.
 - **Refused alike:** an unknown job, a wrong token, a finished or expired job, and a tenant that's no longer active all get the same `refused`, so nothing can be probed. The tenant's status is read strongly consistently, so a suspend or uninstall that has committed stops the very next request. Errors are logged without their details, which could carry a credential.

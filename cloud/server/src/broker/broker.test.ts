@@ -39,6 +39,7 @@ describe('the job broker', () => {
   let clock: number;
   const assumeRole = vi.fn();
   const terminateMicrovm = vi.fn();
+  const microvmState = vi.fn();
   const github = { createInstallationToken: vi.fn(), getBotUser: vi.fn() };
   let handle: ReturnType<typeof createBroker>;
 
@@ -66,7 +67,8 @@ describe('the job broker', () => {
     github.createInstallationToken.mockReset().mockResolvedValue({ token: 'ghs_4242_scoped', expiresAt: NOW + 3_600_000, permissions: JOB_PERMISSIONS });
     github.getBotUser.mockReset().mockResolvedValue({ id: 777, login: 'updraft[bot]' });
     terminateMicrovm.mockReset().mockResolvedValue(undefined);
-    handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, terminateMicrovm, policy: POLICY, now: () => clock });
+    microvmState.mockReset().mockResolvedValue('TERMINATING');
+    handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, terminateMicrovm, microvmState, stopCheckDelayMs: 1, policy: POLICY, now: () => clock });
   });
 
   it('starts a job: its descriptor and credentials limited to its own tenant, event, config version and results', async () => {
@@ -130,6 +132,7 @@ describe('the job broker', () => {
   });
 
   it('mints an installation token for the job\'s repository only, as a token file the CLI reads', async () => {
+    await handle({ action: 'start', jobId: job.jobId, token });
     const r = await handle({ action: 'github-token', jobId: job.jobId, token });
     expect(github.createInstallationToken).toHaveBeenCalledWith(expect.any(String), 55, { repositoryIds: [99], permissions: JOB_PERMISSIONS });
     expect(r.ok && 'tokenFile' in r).toBe(true);
@@ -272,7 +275,7 @@ describe('the job broker', () => {
 
     it('serves nothing but finish and terminate while the kill switch is on', async () => {
       let engaged = true;
-      handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, terminateMicrovm, policy: POLICY, now: () => clock, killSwitch: { engaged: async () => engaged } });
+      handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, terminateMicrovm, microvmState, policy: POLICY, now: () => clock, killSwitch: { engaged: async () => engaged } });
       await store.attachMicrovm(job.jobId, 'mvm-0001');
       for (const action of ['start', 'credentials', 'github-token']) {
         expect(await handle({ action, jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
@@ -285,24 +288,84 @@ describe('the job broker', () => {
       expect(await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'cancelled' })).toEqual({ ok: true, finished: true });
     });
 
-    it('charges the maximum duration at start, and finish refunds what was not used and frees the slot', async () => {
+    it('charges the maximum duration at start; only a microVM seen stopping frees the slot and refunds the rest', async () => {
+      await store.attachMicrovm(job.jobId, 'mvm-0001');
       expect((await handle({ action: 'start', jobId: job.jobId, token })).ok).toBe(true);
       expect((await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth).toBe(3600);
       // The slot is held for the job's lifetime: another job of the tenant cannot have it.
       const other = { installationId: 55, jobId: 'job_other001', holdUntil: Date.now() + 60_000, day: '2026-11-20', month: month(), quotas: QUOTAS };
       expect(await store.reserveJob(other)).toEqual({ ok: false, limit: 'concurrent_jobs' });
 
+      // Finishing records the outcome only: the microVM may still be running.
       clock += 600_000;
       await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded' });
+      expect((await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth).toBe(3600);
+      expect(await store.reserveJob(other)).toEqual({ ok: false, limit: 'concurrent_jobs' });
+
+      // A terminate that Lambda does not show taking effect keeps the lease (and the full charge).
+      microvmState.mockResolvedValue('RUNNING');
+      expect(await handle({ action: 'terminate', jobId: job.jobId, token })).toEqual({ ok: true, terminated: true });
+      expect(microvmState).toHaveBeenCalledTimes(4);
+      expect(await store.reserveJob(other)).toEqual({ ok: false, limit: 'concurrent_jobs' });
+      expect((await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth).toBe(3600);
+      // ...and so does a terminate that fails.
+      terminateMicrovm.mockRejectedValueOnce(new Error('throttled'));
+      await expect(handle({ action: 'terminate', jobId: job.jobId, token })).rejects.toThrow('throttled');
+      expect(await store.reserveJob(other)).toEqual({ ok: false, limit: 'concurrent_jobs' });
+
+      // Seen stopping: the slot is free, and the time it did not use refunded.
+      microvmState.mockResolvedValueOnce('RUNNING').mockResolvedValue('TERMINATING');
+      await handle({ action: 'terminate', jobId: job.jobId, token });
       const used = (await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth;
       // Ten minutes by the broker's clock (the store marks the start by the real one).
       expect(used).toBeGreaterThanOrEqual(600);
       expect(used).toBeLessThan(610);
       expect(await store.reserveJob(other)).toMatchObject({ ok: true });
 
-      // A repeated finish refunds nothing more.
-      await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded' });
+      // A repeated terminate refunds nothing more; a microVM Lambda no longer has counts as stopped.
+      microvmState.mockResolvedValue(null);
+      await handle({ action: 'terminate', jobId: job.jobId, token });
       expect((await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth).toBe(used);
+    });
+
+    it('serves credentials and tokens only to a job whose start committed', async () => {
+      for (const action of ['credentials', 'github-token']) {
+        expect(await handle({ action, jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
+      }
+      expect(assumeRole).not.toHaveBeenCalled();
+      expect(github.createInstallationToken).not.toHaveBeenCalled();
+      expect((await handle({ action: 'start', jobId: job.jobId, token })).ok).toBe(true);
+      expect((await handle({ action: 'credentials', jobId: job.jobId, token })).ok).toBe(true);
+      expect((await handle({ action: 'github-token', jobId: job.jobId, token })).ok).toBe(true);
+    });
+
+    it('refuses a start whose month was spent by another launch, and says so on the issue once', async () => {
+      const notices: unknown[] = [];
+      handle = createBroker({
+        store,
+        loadSettings: async () => SETTINGS,
+        github,
+        assumeRole,
+        terminateMicrovm,
+        microvmState,
+        policy: POLICY,
+        now: () => clock,
+        notifyThrottled: async (n) => void notices.push(n),
+      });
+      job = { ...job, issue: 12, quotas: { ...QUOTAS, microvmMinutesPerMonth: 60 } };
+      await store.putJob(job);
+      // Another job of the tenant started first and was charged its hour: the month is spent.
+      const spent = { ...job, jobId: 'job_first0001', tokenHash: hashToken('x'.repeat(43)), deliveryId: 'd-0', tenantSlot: undefined, platformSlot: undefined };
+      await store.putJob(spent);
+      expect((await store.startJob(spent, clock + 3_600_000)).result).toBe('started');
+
+      expect(await handle({ action: 'start', jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
+      expect((await store.getJob(job.jobId))?.outcome).toBe('throttled');
+      expect(notices).toEqual([{ installationId: 55, repository: 'acme/web', repositoryId: 99, issue: 12, limit: 'microvm_minutes', quotas: job.quotas }]);
+      expect((await store.getUsage(55, '2026-11-20', month())).throttledThisMonth).toBe(1);
+      // Its slot and claim are free again; it was charged nothing.
+      expect((await store.getUsage(55, '2026-11-20', month())).microvmSecondsThisMonth).toBe(3600);
+      expect(await store.claimDelivery(55, 'd-1', Date.now() + 60_000, 'job_next0001')).toBe(true);
     });
 
     it("refuses to start a job whose slot another job took after its own ran out, and gives up its claim", async () => {

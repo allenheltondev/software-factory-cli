@@ -1,10 +1,12 @@
-import { LambdaMicrovmsClient, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
+import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import { AssumeRoleCommand, STSClient } from '@aws-sdk/client-sts';
 import { createBroker } from './broker/broker.js';
 import { createGitHubApi } from './github/client.js';
+import { appJwt } from './github/jwt.js';
 import { createSettingsLoader } from './github/settings.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
+import { throttledComment } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 
 /**
@@ -17,11 +19,13 @@ const sts = new STSClient({});
 const microvms = new LambdaMicrovmsClient({});
 const ssm = new SSMClient({});
 const roleArn = process.env.JOB_DATA_ROLE_ARN ?? '';
+const github = createGitHubApi();
+const loadSettings = createSettingsLoader();
 
 const handle = createBroker({
   store: createDynamoStore(process.env.TABLE_NAME ?? ''),
-  loadSettings: createSettingsLoader(),
-  github: createGitHubApi(),
+  loadSettings,
+  github,
   policy: {
     bucket: process.env.TENANT_BUCKET ?? '',
     partition: process.env.PARTITION ?? 'aws',
@@ -46,6 +50,24 @@ const handle = createBroker({
   },
   async terminateMicrovm(microvmId) {
     await microvms.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId }));
+  },
+  async microvmState(microvmId) {
+    try {
+      return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }))).state ?? 'UNKNOWN';
+    } catch (err) {
+      if (err instanceof ResourceNotFoundException) return null;
+      throw err;
+    }
+  },
+  // The App's own token for that one repository, allowed only to write issues.
+  async notifyThrottled({ installationId, repository, repositoryId, issue, limit, quotas }) {
+    const settings = await loadSettings();
+    if (!settings) return;
+    const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId, {
+      repositoryIds: [repositoryId],
+      permissions: { issues: 'write' },
+    });
+    await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas));
   },
 });
 

@@ -18,6 +18,8 @@ import type {
   Job,
   Member,
   OAuthState,
+  Quotas,
+  StartResult,
   Store,
   Tenant,
   TenantLimits,
@@ -483,7 +485,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(typeof i.tenantSlot === 'number' ? { tenantSlot: i.tenantSlot } : {}),
         ...(typeof i.platformSlot === 'number' ? { platformSlot: i.platformSlot } : {}),
         ...(typeof i.reservedSeconds === 'number' ? { reservedSeconds: i.reservedSeconds } : {}),
+        ...(i.quotas && typeof i.quotas === 'object' ? { quotas: i.quotas as Quotas } : {}),
+        ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
         ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
+        ...(typeof i.releasedAt === 'number' ? { releasedAt: i.releasedAt } : {}),
       };
     },
 
@@ -505,40 +510,21 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async finishJob(jobId, outcome, refund) {
-      const finish = {
-        TableName: T,
-        Key: { pk: `JOB#${jobId}`, sk: 'META' },
-        UpdateExpression: 'SET #status = :finished, outcome = :outcome',
-        ConditionExpression: 'attribute_exists(pk) AND #status <> :finished',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
-      };
+    async finishJob(jobId, outcome) {
       try {
-        if (refund && refund.seconds > 0) {
-          // The refund only with the finish that records the outcome: a repeated finish refunds nothing.
-          await client.send(
-            new TransactWriteCommand({
-              TransactItems: [
-                { Update: finish },
-                {
-                  Update: {
-                    TableName: T,
-                    Key: monthKey(refund.installationId, refund.month),
-                    UpdateExpression: 'ADD seconds :refund',
-                    ExpressionAttributeValues: { ':refund': -refund.seconds },
-                  },
-                },
-              ],
-            }),
-          );
-        } else {
-          await client.send(new UpdateCommand(finish));
-        }
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: { pk: `JOB#${jobId}`, sk: 'META' },
+            UpdateExpression: 'SET #status = :finished, outcome = :outcome',
+            ConditionExpression: 'attribute_exists(pk) AND #status <> :finished',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
+          }),
+        );
         return outcome;
       } catch (err) {
-        const refused = err instanceof ConditionalCheckFailedException || (err instanceof TransactionCanceledException && cancelledAt(err, 0));
-        if (!refused) throw err;
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
         // Already finished (or never recorded): the first outcome stands.
         const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' }, ConsistentRead: true }));
         return typeof out.Item?.outcome === 'string' ? out.Item.outcome : null;
@@ -773,9 +759,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async startJob(job, holdUntil) {
+    async startJob(job, holdUntil): Promise<StartResult> {
       const ttl = Math.ceil(holdUntil / 1000);
       const slots = jobSlotKeys(job);
+      const monthLimit = job.quotas ? job.quotas.microvmMinutesPerMonth * 60 : undefined;
       try {
         await client.send(
           new TransactWriteCommand({
@@ -785,8 +772,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   TableName: T,
                   Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
                   UpdateExpression: 'SET startedAt = :at',
-                  ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(startedAt)',
-                  ExpressionAttributeValues: { ':at': Date.now() },
+                  // Never a finished job: a finish that won the race leaves nothing to serve.
+                  ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(startedAt) AND #status <> :finished',
+                  ExpressionAttributeNames: { '#status': 'status' },
+                  ExpressionAttributeValues: { ':at': Date.now(), ':finished': 'finished' },
                 },
               },
               holdItem(deliveryKey(job.installationId, job.deliveryId), job.jobId, ttl, { installationId: job.installationId, deliveryId: job.deliveryId }),
@@ -798,8 +787,11 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                         TableName: T,
                         Key: monthKey(job.installationId, job.createdAt.slice(0, 7)),
                         UpdateExpression: 'ADD seconds :seconds SET #ttl = if_not_exists(#ttl, :ttl)',
+                        // The month's quota, checked with the charge: launches that passed the
+                        // launcher's check together cannot all be charged on the same remainder.
+                        ...(monthLimit !== undefined ? { ConditionExpression: 'attribute_not_exists(seconds) OR seconds < :limit' } : {}),
                         ExpressionAttributeNames: { '#ttl': 'ttl' },
-                        ExpressionAttributeValues: { ':seconds': job.reservedSeconds, ':ttl': usageTtl(400) },
+                        ExpressionAttributeValues: { ':seconds': job.reservedSeconds, ':ttl': usageTtl(400), ...(monthLimit !== undefined ? { ':limit': monthLimit } : {}) },
                       },
                     },
                   ]
@@ -807,14 +799,56 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             ],
           }),
         );
-        return 'started';
+        return { result: 'started' };
       } catch (err) {
         if (!(err instanceof TransactionCanceledException)) throw err;
-        if (cancelledAt(err, 0)) return 'already';
-        if (cancelledAt(err, 1)) return 'superseded';
-        if (slots.some((_, i) => cancelledAt(err, 2 + i))) return 'throttled';
+        if (cancelledAt(err, 0)) {
+          const current = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' }, ConsistentRead: true }));
+          return { result: !current.Item || current.Item.status === 'finished' ? 'retired' : 'already' };
+        }
+        if (cancelledAt(err, 1)) return { result: 'superseded' };
+        if (job.tenantSlot !== undefined && cancelledAt(err, 2)) return { result: 'throttled', limit: 'concurrent_jobs' };
+        if (job.platformSlot !== undefined && cancelledAt(err, 2 + (job.tenantSlot !== undefined ? 1 : 0))) return { result: 'throttled', limit: 'platform_concurrency' };
+        if (cancelledAt(err, 2 + slots.length)) return { result: 'throttled', limit: 'microvm_minutes' };
         throw err;
       }
+    },
+
+    async releaseJob(job, refund) {
+      // Marked once, with the refund: a repeated release refunds nothing.
+      const mark = {
+        TableName: T,
+        Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
+        UpdateExpression: 'SET releasedAt = :at',
+        ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(releasedAt)',
+        ExpressionAttributeValues: { ':at': Date.now() },
+      };
+      try {
+        if (refund && refund.seconds > 0) {
+          await client.send(
+            new TransactWriteCommand({
+              TransactItems: [
+                { Update: mark },
+                {
+                  Update: {
+                    TableName: T,
+                    Key: monthKey(job.installationId, refund.month),
+                    UpdateExpression: 'ADD seconds :refund',
+                    ExpressionAttributeValues: { ':refund': -refund.seconds },
+                  },
+                },
+              ],
+            }),
+          );
+        } else {
+          await client.send(new UpdateCommand(mark));
+        }
+      } catch (err) {
+        const already = err instanceof ConditionalCheckFailedException || (err instanceof TransactionCanceledException && cancelledAt(err, 0));
+        if (!already) throw err;
+      }
+      // After the refund: a failure here leaves the slots to run out, never a refund undone.
+      for (const key of jobSlotKeys(job)) await deleteIfHeld(key, job.jobId);
     },
 
     async releaseJobSlots(job) {

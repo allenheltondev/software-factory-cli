@@ -159,12 +159,23 @@ export interface Job {
   platformSlot?: number;
   /**
    * MicroVM seconds charged to the month of `createdAt` when it starts (its maximum duration);
-   * finish refunds what it did not use.
+   * what it did not use is refunded once its microVM is seen stopping (releaseJob).
    */
   reservedSeconds?: number;
-  /** Epoch ms when the broker's `start` served it (startJob). */
+  /** The tenant's quotas when it was launched: `start` checks the month against them, and a refusal says why. */
+  quotas?: Quotas;
+  /** The issue whose label started it, for an over-quota comment. */
+  issue?: number;
+  /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
   startedAt?: number;
+  /** Epoch ms when its slots and unused time were given back (releaseJob), once its microVM was seen stopping. */
+  releasedAt?: number;
 }
+
+/** What the broker's `start` did (Store.startJob). */
+export type StartResult =
+  | { result: 'started' | 'already' | 'retired' | 'superseded' }
+  | { result: 'throttled'; limit: QuotaLimit };
 
 export type MemberRole = 'owner' | 'editor';
 
@@ -281,9 +292,8 @@ export interface Store {
   /**
    * The runner said it is done: nothing more is served for it. Only the first outcome is kept, and
    * it is what this returns (null for an unknown job), so a repeated finish acts on the same one.
-   * `refund`: microVM seconds given back to that month, only by the finish that records the outcome.
    */
-  finishJob(jobId: string, outcome: string, refund?: { installationId: number; month: string; seconds: number }): Promise<string | null>;
+  finishJob(jobId: string, outcome: string): Promise<string | null>;
   /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
 
@@ -296,13 +306,19 @@ export interface Store {
   /**
    * The broker's `start`, in one transaction: the job holds its delivery's claim and its slots
    * until `holdUntil` (epoch ms), taking back any that ran out and nobody took, is charged its
-   * reserved seconds, and is marked started. `superseded`: a redelivery's job holds the claim;
-   * `throttled`: another job holds one of its slots. Either way this job must not run, and nothing
-   * changed. `already`: it was started before (a retried start), and is not charged again.
+   * reserved seconds while the month is under its quota (`job.quotas`), and is marked started.
+   * Refusals change nothing, and the job must not run: `retired` (it is finished), `superseded`
+   * (a redelivery's job holds the claim), `throttled` (another job holds one of its slots, or the
+   * month is spent). `already`: it was started before (a retried start), and is not charged again.
    */
-  startJob(job: Job, holdUntil: number): Promise<'started' | 'already' | 'superseded' | 'throttled'>;
+  startJob(job: Job, holdUntil: number): Promise<StartResult>;
   /** Frees the job's slots (only while it holds them). Safe to repeat. */
   releaseJobSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>): Promise<void>;
+  /**
+   * The job's microVM was seen stopping: refunds the microVM seconds it did not use (`refund`) and
+   * marks it released, at most once, then frees its slots. Safe to repeat.
+   */
+  releaseJob(job: Job, refund?: { month: string; seconds: number }): Promise<void>;
 
   /**
    * Quotas, at launch (jobs/launch.ts): takes a free slot of the tenant's and one of the
@@ -504,19 +520,31 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async startJob(job, holdUntil) {
       const now = Date.now();
       const current = jobs.get(job.jobId);
-      if (current?.startedAt !== undefined) return 'already';
+      if (!current || current.status === 'finished') return { result: 'retired' };
+      if (current.startedAt !== undefined) return { result: 'already' };
       const claimKey = `${job.installationId}/${job.deliveryId}`;
       const claim = deliveries.get(claimKey);
-      if (claim !== undefined && claim.jobId !== job.jobId && claim.expiresAt > now) return 'superseded';
-      if (!slotKeys(job).every((key) => mine(key, job.jobId, now))) return 'throttled';
+      if (claim !== undefined && claim.jobId !== job.jobId && claim.expiresAt > now) return { result: 'superseded' };
+      if (job.tenantSlot !== undefined && !mine(`${job.installationId}/${job.tenantSlot}`, job.jobId, now)) return { result: 'throttled', limit: 'concurrent_jobs' };
+      if (job.platformSlot !== undefined && !mine(`platform/${job.platformSlot}`, job.jobId, now)) return { result: 'throttled', limit: 'platform_concurrency' };
+      const monthKey = `${job.installationId}/${job.createdAt.slice(0, 7)}`;
+      if (job.reservedSeconds && job.quotas && month(monthKey).seconds >= job.quotas.microvmMinutesPerMonth * 60) return { result: 'throttled', limit: 'microvm_minutes' };
       deliveries.set(claimKey, { expiresAt: holdUntil, jobId: job.jobId });
       for (const key of slotKeys(job)) slots.set(key, { expiresAt: holdUntil, jobId: job.jobId });
-      if (job.reservedSeconds) {
-        const key = `${job.installationId}/${job.createdAt.slice(0, 7)}`;
-        months.set(key, { ...month(key), seconds: month(key).seconds + job.reservedSeconds });
+      if (job.reservedSeconds) months.set(monthKey, { ...month(monthKey), seconds: month(monthKey).seconds + job.reservedSeconds });
+      jobs.set(job.jobId, { ...current, startedAt: now });
+      return { result: 'started' };
+    },
+    async releaseJob(job, refund) {
+      const current = jobs.get(job.jobId);
+      if (current && current.releasedAt === undefined) {
+        jobs.set(job.jobId, { ...current, releasedAt: Date.now() });
+        if (refund && refund.seconds > 0) {
+          const key = `${job.installationId}/${refund.month}`;
+          months.set(key, { ...month(key), seconds: month(key).seconds - refund.seconds });
+        }
       }
-      if (current) jobs.set(job.jobId, { ...current, startedAt: now });
-      return 'started';
+      for (const key of slotKeys(job)) if (slots.get(key)?.jobId === job.jobId) slots.delete(key);
     },
     async releaseJobSlots(job) {
       for (const key of slotKeys(job)) if (slots.get(key)?.jobId === job.jobId) slots.delete(key);
@@ -577,15 +605,11 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const j = jobs.get(jobId);
       return j ? { ...j } : null;
     },
-    async finishJob(jobId, outcome, refund) {
+    async finishJob(jobId, outcome) {
       const j = jobs.get(jobId);
       if (!j) return null;
       if (j.status === 'finished') return j.outcome ?? null;
       jobs.set(jobId, { ...j, status: 'finished', outcome });
-      if (refund && refund.seconds > 0) {
-        const key = `${refund.installationId}/${refund.month}`;
-        months.set(key, { ...month(key), seconds: month(key).seconds - refund.seconds });
-      }
       return outcome;
     },
     async attachMicrovm(jobId, microvmId) {

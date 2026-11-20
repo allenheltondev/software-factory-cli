@@ -1,9 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
-import type { Job, QuotaLimit, Quotas, Store } from '../store/store.js';
+import type { Job, Quotas, Store } from '../store/store.js';
 import { decideDispatch } from '../tenants/dispatch.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
-import { dayOf, monthOf, tenantQuotas } from './quotas.js';
+import { dayOf, monthOf, tenantQuotas, type ThrottleNotice } from './quotas.js';
+
+export type { ThrottleNotice } from './quotas.js';
 
 /**
  * The multi-tenant launcher (#68): what the webhook does with a tenant's `issues.labeled`.
@@ -102,15 +104,6 @@ export interface LaunchRequest {
     sender?: { login?: unknown };
     issue?: { number?: unknown };
   };
-}
-
-export interface ThrottleNotice {
-  installationId: number;
-  repository: string;
-  repositoryId: number;
-  issue: number;
-  limit: QuotaLimit;
-  quotas: Quotas;
 }
 
 export interface LaunchResult {
@@ -212,6 +205,8 @@ export function createLauncher(deps: LaunchDeps) {
       tenantSlot: reserved.tenantSlot,
       platformSlot: reserved.platformSlot,
       reservedSeconds: s.maximumDurationSeconds,
+      quotas,
+      issue: req.payload.issue!.number as number,
     };
 
     let recorded = false;

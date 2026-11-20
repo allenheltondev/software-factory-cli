@@ -137,6 +137,7 @@ describe('the launcher', () => {
       github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
       assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(NOW + 3_600_000).toISOString() }),
       terminateMicrovm,
+      microvmState: async () => 'TERMINATING',
       policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
       now: () => NOW,
     });
@@ -232,6 +233,7 @@ describe('the launcher', () => {
         github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
         assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(Date.now() + 3_600_000).toISOString() }),
         terminateMicrovm: vi.fn(async () => {}),
+        microvmState: async () => 'TERMINATING',
         policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
         now: () => Date.now(),
       });

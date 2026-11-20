@@ -482,9 +482,12 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
-              # A job's own microVM, the one the launcher recorded for it (the terminate action).
+              # A job's own microVM, the one the launcher recorded for it (the terminate action),
+              # and its state: the job's quota slots are freed once it is seen stopping.
               - Effect: Allow
-                Action: lambda:TerminateMicrovm
+                Action:
+                  - lambda:TerminateMicrovm
+                  - lambda:GetMicrovm
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
 
   # Separate from BrokerRole, which JobDataRole's trust policy names (an inline policy would be a cycle).

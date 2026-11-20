@@ -41,7 +41,10 @@ function fakeTable() {
     if (expr === 'attribute_not_exists(seconds) OR seconds < :limit') {
       return !item || item.seconds === undefined || (item.seconds as number) < (values[':limit'] as number);
     }
-    if (expr === 'attribute_exists(pk) AND attribute_not_exists(startedAt)') return Boolean(item) && item!.startedAt === undefined;
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(startedAt) AND #status <> :finished') {
+      return Boolean(item) && item!.startedAt === undefined && item!.status !== values[':finished'];
+    }
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(releasedAt)') return Boolean(item) && item!.releasedAt === undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
       return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
     }
@@ -485,7 +488,7 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.claimDelivery(55, 'd-1', SOON, first.jobId)).toBe(true);
     expect(await store.reserveJob({ installationId: 55, jobId: first.jobId, holdUntil: SOON, day: '2026-11-20', month: '2026-11', quotas: { ...QUOTAS, platformConcurrentJobs: 1 } })).toMatchObject({ ok: true });
     table.items.set('PLATFORM#JOBS|SLOT#0003', { pk: 'PLATFORM#JOBS', sk: 'SLOT#0003', jobId: first.jobId, ttl: Math.ceil(SOON / 1000) });
-    expect(await store.startJob(first, LATER)).toBe('started');
+    expect(await store.startJob(first, LATER)).toEqual({ result: 'started' });
     for (const k of ['DELIVERY#55#d-1|CLAIM', 'TENANT#55|SLOT#0000', 'PLATFORM#JOBS|SLOT#0003']) {
       expect(table.items.get(k)).toMatchObject({ jobId: first.jobId, ttl: Math.ceil(LATER / 1000) });
     }
@@ -494,27 +497,27 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(false);
 
     // A retried start: nothing more is charged.
-    expect(await store.startJob(first, LATER)).toBe('already');
+    expect(await store.startJob(first, LATER)).toEqual({ result: 'already' });
     expect(table.items.get(`TENANT#55|${MONTH}`)?.seconds).toBe(10800);
 
     // A redelivery's job holds the claim: superseded, and nothing changed.
     const second = job('job_second001', 'd-2', { tenantSlot: 1, reservedSeconds: 600 });
     await store.putJob(second);
     expect(await store.claimDelivery(55, 'd-2', LATER, 'job_other0001')).toBe(true);
-    expect(await store.startJob(second, LATER)).toBe('superseded');
+    expect(await store.startJob(second, LATER)).toEqual({ result: 'superseded' });
     expect(table.items.get(`TENANT#55|${MONTH}`)?.seconds).toBe(10800);
     expect((await store.getJob(second.jobId))?.startedAt).toBeUndefined();
 
     // Another job holds its slot (its own ran out and was taken): throttled.
     const third = job('job_third0001', 'd-3', { tenantSlot: 0 });
     await store.putJob(third);
-    expect(await store.startJob(third, LATER)).toBe('throttled');
+    expect(await store.startJob(third, LATER)).toEqual({ result: 'throttled', limit: 'concurrent_jobs' });
 
     // A missing or expired claim is taken back.
     const fourth = job('job_fourth001', 'd-4');
     await store.putJob(fourth);
     expect(await store.claimDelivery(55, 'd-4', Date.now() - 5_000, fourth.jobId)).toBe(true);
-    expect(await store.startJob(fourth, LATER)).toBe('started');
+    expect(await store.startJob(fourth, LATER)).toEqual({ result: 'started' });
 
     // The slots go only with their own job.
     await store.releaseJobSlots(third);
@@ -581,11 +584,37 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await reserve(62)).toEqual({ ok: false, limit: 'platform_concurrency' });
   });
 
-  it('refunds the unused microVM time with the finish that records the outcome, and only then', async () => {
+  it('releases a job once its microVM stopped: the unused time refunded once, and its slots freed', async () => {
     const table = fakeTable();
     const store = createDynamoStore('T', table.client);
     table.items.set('TENANT#55|USAGE#MONTH#2026-11', { pk: 'TENANT#55', sk: 'USAGE#MONTH#2026-11', seconds: 10800 });
-    await store.putJob({
+    table.items.set('TENANT#55|SLOT#0000', { pk: 'TENANT#55', sk: 'SLOT#0000', jobId: 'job_first0001', ttl: Math.ceil(LATER / 1000) });
+    const job: Job = {
+      jobId: 'job_first0001',
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 1,
+      deliveryId: 'd-1',
+      eventName: 'issues',
+      status: 'finished',
+      createdAt: '2026-11-20T12:00:00.000Z',
+      expiresAt: LATER,
+      tenantSlot: 0,
+    };
+    await store.putJob(job);
+    await store.releaseJob(job, { month: '2026-11', seconds: 9000 });
+    await store.releaseJob(job, { month: '2026-11', seconds: 9000 });
+    expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(1800);
+    expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
+    expect(typeof (await store.getJob(job.jobId))?.releasedAt).toBe('number');
+  });
+
+  it('never starts a finished job, and checks the month in the transaction that charges it', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    const base: Job = {
       jobId: 'job_first0001',
       tokenHash: 'ab',
       installationId: 55,
@@ -597,11 +626,24 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
       status: 'launched',
       createdAt: '2026-11-20T12:00:00.000Z',
       expiresAt: LATER,
-    });
-    const refund = { installationId: 55, month: '2026-11', seconds: 9000 };
-    expect(await store.finishJob('job_first0001', 'succeeded', refund)).toBe('succeeded');
-    expect(await store.finishJob('job_first0001', 'failed', refund)).toBe('succeeded');
-    expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(1800);
+      reservedSeconds: 10800,
+      quotas: { ...QUOTAS, microvmMinutesPerMonth: 200 },
+    };
+    // Finished before its start committed (a concurrent finish): retired, nothing charged.
+    await store.putJob(base);
+    await store.finishJob(base.jobId, 'start_failed');
+    expect(await store.startJob(base, LATER)).toEqual({ result: 'retired' });
+    expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')).toBeUndefined();
+
+    // Launches that passed the launcher's check on the same remainder (200 minutes): the first two
+    // starts are charged 180 each while the month is under, and the third finds it spent.
+    const [second, third, fourth] = ['job_second001', 'job_third0001', 'job_fourth001'].map((jobId, i) => ({ ...base, jobId, deliveryId: `d-${i + 2}` }));
+    for (const j of [second!, third!, fourth!]) await store.putJob(j);
+    expect(await store.startJob(second!, LATER)).toEqual({ result: 'started' });
+    expect(await store.startJob(third!, LATER)).toEqual({ result: 'started' });
+    expect(await store.startJob(fourth!, LATER)).toEqual({ result: 'throttled', limit: 'microvm_minutes' });
+    expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(21600);
+    expect((await store.getJob(fourth!.jobId))?.startedAt).toBeUndefined();
   });
 
   it('keeps a tenant\'s quota overrides, and removes them', async () => {
