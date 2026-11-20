@@ -12,6 +12,8 @@
 
 export const HOOK_BASE_PATH = '/aws/lambda-microvms/runtime/v1';
 export const PAYLOAD_VERSION = 1;
+/** Updraft Cloud's payload: the job's broker instead of the job's data (parseBrokerPayload). */
+export const BROKER_PAYLOAD_VERSION = 2;
 
 const MAX_BODY_BYTES = 64 * 1024; // the run hook payload is at most 16 KB
 const DELIVERY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
@@ -43,8 +45,9 @@ export function parseRunRequest(body) {
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('runHookPayload is not a JSON object');
   }
+  if (payload.version === BROKER_PAYLOAD_VERSION) return { microvmId, payload: parseBrokerPayload(payload) };
   if (payload.version !== PAYLOAD_VERSION) {
-    throw new Error(`runHookPayload version ${JSON.stringify(payload.version)} is not ${PAYLOAD_VERSION}; rebuild the image or redeploy the launcher`);
+    throw new Error(`runHookPayload version ${JSON.stringify(payload.version)} is not ${PAYLOAD_VERSION} or ${BROKER_PAYLOAD_VERSION}; rebuild the image or redeploy the launcher`);
   }
   const text = (name, pattern) => {
     const value = payload[name];
@@ -111,6 +114,57 @@ export function parseRunRequest(body) {
       watchdogReserveSeconds: seconds('watchdogReserveSeconds', 0),
       launchedAt,
     },
+  };
+}
+
+/**
+ * Version 2 (Updraft Cloud): the payload names the job and its broker, and nothing else about
+ * where the job's data is. The runner asks the broker (broker.mjs) for the bucket and keys, with
+ * credentials that reach only this tenant's, and for the GitHub token; the execution role itself
+ * reaches no tenant's data. The job token is single use and unguessable, and is never logged.
+ */
+function parseBrokerPayload(payload) {
+  const text = (value, name, pattern) => {
+    if (typeof value !== 'string' || value === '' || (pattern && !pattern.test(value))) throw new Error(`runHookPayload.${name} is missing or malformed`);
+    return value;
+  };
+  const seconds = (name, min) => {
+    const value = payload[name];
+    if (!Number.isInteger(value) || value < min) throw new Error(`runHookPayload.${name} is missing or malformed`);
+    return value;
+  };
+  const broker = payload.broker;
+  if (broker === null || typeof broker !== 'object') throw new Error('runHookPayload.broker is missing');
+  const optionalSeconds = (name, max) => {
+    const value = payload[name];
+    if (value === undefined) return {};
+    if (!Number.isInteger(value) || value < 0 || value > max) throw new Error(`runHookPayload.${name} is malformed`);
+    return { [name]: value };
+  };
+  if (payload.notBefore !== undefined && (typeof payload.notBefore !== 'string' || Number.isNaN(Date.parse(payload.notBefore)))) {
+    throw new Error('runHookPayload.notBefore is not a date');
+  }
+  // Isolation is always enforced for a hosted job; a payload cannot turn it off.
+  if (payload.agentIsolation !== undefined && payload.agentIsolation !== 'enforced') throw new Error('runHookPayload.agentIsolation must be enforced');
+  const launchedAt = text(payload.launchedAt, 'launchedAt');
+  if (Number.isNaN(Date.parse(launchedAt))) throw new Error('runHookPayload.launchedAt is not a date');
+  return {
+    ...(payload.notBefore === undefined ? {} : { notBefore: payload.notBefore }),
+    ...optionalSeconds('stateCheckpointSeconds', 3600),
+    ...optionalSeconds('statePendingWaitSeconds', 1800),
+    agentIsolation: 'enforced',
+    version: BROKER_PAYLOAD_VERSION,
+    deliveryId: text(payload.deliveryId, 'deliveryId', DELIVERY_ID_PATTERN),
+    eventName: text(payload.eventName, 'eventName', EVENT_NAME_PATTERN),
+    region: text(payload.region, 'region', /^[a-z0-9-]{1,32}$/),
+    broker: {
+      functionName: text(broker.functionName, 'broker.functionName', /^[A-Za-z0-9:_./-]{1,170}$/),
+      jobId: text(broker.jobId, 'broker.jobId', /^[A-Za-z0-9_-]{8,64}$/),
+      jobToken: text(broker.jobToken, 'broker.jobToken', /^[A-Za-z0-9_-]{32,256}$/),
+    },
+    maximumDurationSeconds: seconds('maximumDurationSeconds', 1),
+    watchdogReserveSeconds: seconds('watchdogReserveSeconds', 0),
+    launchedAt,
   };
 }
 

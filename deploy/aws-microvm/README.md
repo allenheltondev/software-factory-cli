@@ -1137,6 +1137,36 @@ and a runner that does not know them ignores them. That also means an image buil
 they existed runs jobs from a newer launcher without shared state and without waiting for
 `notBefore`, silently: rebuild the image when you deploy this stack.
 
+Version 2 is Updraft Cloud's (`cloud/README.md`, "Jobs and the job broker"). It names no
+bucket, key or secret. In their place is the job broker and the job's single-use token:
+
+```json
+{
+  "version": 2,
+  "deliveryId": "<X-GitHub-Delivery>",
+  "eventName": "issues",
+  "region": "<region>",
+  "broker": { "functionName": "<BrokerFunction>", "jobId": "<job id>", "jobToken": "<single-use token>" },
+  "maximumDurationSeconds": 7200,
+  "watchdogReserveSeconds": 300,
+  "launchedAt": "<ISO time>"
+}
+```
+
+The runner (`image/runner/broker.mjs`) asks the broker for the job's descriptor and AWS
+credentials scoped to its tenant, and refreshes them before they expire. It reads and writes
+S3 and Secrets Manager only with those credentials. In place of the App's private key, it
+writes the broker's installation token to `app-token.json` (protected from agents like the key)
+and replaces it every 20 minutes. The agent environment is the tenant's key secrets, one
+variable each. A missing secret is a key the tenant hasn't set. At the end, the runner tells
+the broker the job finished, then asks it to stop the microVM. The execution role can't
+terminate microVMs: that permission covers every microVM of the image, so it would let one
+tenant's runner stop another's. The broker stops only the microVM the launcher recorded for
+the job. Agent isolation is always `enforced` for version 2. If the broker refuses the job,
+the runner asks it to stop the microVM without running anything. A job that ends that quickly
+can ask before the launcher has recorded its microVM, so the runner keeps asking for about
+30 seconds (`terminateThroughBroker`). The maximum duration is the backstop if that fails too.
+
 ### Idle policy
 
 A microVM with no traffic on its endpoint counts as idle and is suspended after

@@ -56,6 +56,9 @@ function fakeGitHub() {
     async createInstallationToken() {
       return { token: 'inst-token', expiresAt: Date.now() + 60 * 60 * 1000 };
     },
+    async getBotUser(_token, slug) {
+      return { id: 777, login: `${slug}[bot]` };
+    },
     async listInstallationRepositories(token) {
       expect(token).toBe('inst-token');
       return [

@@ -11,10 +11,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outdir = join(root, 'dist');
 rmSync(outdir, { recursive: true, force: true });
 
-await build({
-  entryPoints: { index: join(root, 'src', 'lambda.ts'), webhook: join(root, 'src', 'webhook-lambda.ts'), cleanup: join(root, 'src', 'cleanup-lambda.ts') },
-  // The Node.js 22 runtime ships AWS SDK v3; use it rather than bundling a copy.
-  external: ['@aws-sdk/*'],
+const common = {
   outdir,
   outExtension: { '.js': '.mjs' },
   bundle: true,
@@ -24,4 +21,20 @@ await build({
   sourcemap: true,
   legalComments: 'none',
   logLevel: 'info',
+};
+
+await build({
+  ...common,
+  entryPoints: { index: join(root, 'src', 'lambda.ts'), webhook: join(root, 'src', 'webhook-lambda.ts'), cleanup: join(root, 'src', 'cleanup-lambda.ts') },
+  // The Node.js 22 runtime ships AWS SDK v3; use it rather than bundling a copy.
+  external: ['@aws-sdk/*'],
+});
+
+// The broker bundles its SDK clients: the MicroVMs client is newer than the runtime's SDK, and
+// mixing a bundled client with the runtime's core packages would pair mismatched versions.
+// The SDK's CommonJS parts require() Node's built-ins, which an ES module has no require for.
+await build({
+  ...common,
+  entryPoints: { broker: join(root, 'src', 'broker-lambda.ts') },
+  banner: { js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" },
 });

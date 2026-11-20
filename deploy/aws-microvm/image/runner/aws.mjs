@@ -6,9 +6,16 @@ import { LambdaMicrovmsClient, TerminateMicrovmCommand } from '@aws-sdk/client-l
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 
-export function createAwsDeps(region) {
-  const s3 = new S3Client({ region });
-  const secrets = new SecretsManagerClient({ region });
+/**
+ * @param {string} region
+ * @param {{ credentials?: () => Promise<object> }} [options] for a version 2 job (Updraft Cloud):
+ *   S3 and Secrets Manager use the job broker's tenant-scoped credentials instead of the
+ *   execution role, which cannot reach any tenant's data itself. TerminateMicrovm keeps the role.
+ */
+export function createAwsDeps(region, options = {}) {
+  const scoped = options.credentials ? { credentials: options.credentials } : {};
+  const s3 = new S3Client({ region, ...scoped });
+  const secrets = new SecretsManagerClient({ region, ...scoped });
   const microvms = new LambdaMicrovmsClient({ region });
   const dynamodb = new DynamoDBClient({ region });
 

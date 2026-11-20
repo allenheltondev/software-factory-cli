@@ -68,6 +68,33 @@ export interface AgentKeyMeta {
   updatedBy: string;
 }
 
+/**
+ * One job: a microVM the launcher started for a tenant's webhook delivery (PR 4). The broker
+ * (broker/broker.ts) serves it only to whoever holds the job's token, only while it runs, and only
+ * what this record pins: the tenant, the repository and the config version.
+ */
+export interface Job {
+  jobId: string;
+  /** sha256 hex of the job token; the token itself is only ever in the run-hook payload. */
+  tokenHash: string;
+  installationId: number;
+  /** OWNER/REPO, and its GitHub id: the job's installation token reaches this repository only. */
+  repository: string;
+  repositoryId: number;
+  /** The config version active when the job was dispatched; the job keeps it to the end. */
+  configVersion: number;
+  deliveryId: string;
+  eventName: string;
+  status: 'launched' | 'finished';
+  /** The runner's outcome, once finished. */
+  outcome?: string;
+  createdAt: string;
+  /** Epoch ms: launch time plus the microVM's maximum duration. Nothing is served after it. */
+  expiresAt: number;
+  /** The job's microVM, recorded by the launcher once RunMicrovm returns: the only one the job may stop. */
+  microvmId?: string;
+}
+
 export type MemberRole = 'owner' | 'editor';
 
 export interface Member {
@@ -121,7 +148,8 @@ export interface Store {
   putOffer(offer: InstallationOffer): Promise<void>;
   getOffer(sub: string): Promise<InstallationOffer | null>;
 
-  getTenant(installationId: number): Promise<Tenant | null>;
+  /** `consistent`: a strongly consistent read, for decisions that must see a suspend or uninstall just committed. */
+  getTenant(installationId: number, options?: { consistent?: boolean }): Promise<Tenant | null>;
   /**
    * Creates the tenant if it is new (keeping an existing one as it is) and adds or updates the
    * member, atomically with a check that the tenant is not uninstalled (`uninstalled`: nothing added).
@@ -172,6 +200,14 @@ export interface Store {
    * uninstall sweep left without a TTL. Safe to repeat.
    */
   purgeTenantPartition(installationId: number): Promise<void>;
+
+  /** Records a job (the launcher, PR 4). Its own partition, expiring a week after the job may last. */
+  putJob(job: Job): Promise<void>;
+  getJob(jobId: string): Promise<Job | null>;
+  /** The runner said it is done: nothing more is served for it. Only the first outcome is kept. */
+  finishJob(jobId: string, outcome: string): Promise<void>;
+  /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
+  attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
 }
 
 export interface CleanupEntry {
@@ -190,6 +226,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const configs = new Map<string, ConfigVersion>();
   const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
+  const jobs = new Map<string, Job>();
   const memberKey = (id: number, sub: string) => `${id}/${sub}`;
   const strip = <T extends { ttl?: number }>(item: T): Omit<T, 'ttl'> => {
     const { ttl: _ttl, ...rest } = item;
@@ -315,6 +352,23 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async listDueCleanups(now) {
       return [...cleanups.values()].filter((c) => c.deleteAfter <= now).map((c) => ({ ...c }));
+    },
+    async putJob(job) {
+      jobs.set(job.jobId, { ...job });
+    },
+    async getJob(jobId) {
+      const j = jobs.get(jobId);
+      return j ? { ...j } : null;
+    },
+    async finishJob(jobId, outcome) {
+      const j = jobs.get(jobId);
+      if (j && j.status !== 'finished') jobs.set(jobId, { ...j, status: 'finished', outcome });
+    },
+    async attachMicrovm(jobId, microvmId) {
+      const j = jobs.get(jobId);
+      if (!j || j.microvmId !== undefined) return false;
+      jobs.set(jobId, { ...j, microvmId });
+      return true;
     },
     async purgeTenantPartition(id) {
       tenants.delete(id);

@@ -139,6 +139,8 @@ if (process.env.FAKE_UPDRAFT_STATE_ROWS) {
 
 if (process.env.FAKE_UPDRAFT_RECORD) {
   const keyPath = path.join(home, 'github-app.pem');
+  // A v2 job (Updraft Cloud) has a token file instead of the key.
+  const tokenPath = path.join(home, 'app-token.json');
   fs.writeFileSync(
     process.env.FAKE_UPDRAFT_RECORD,
     JSON.stringify({
@@ -149,7 +151,9 @@ if (process.env.FAKE_UPDRAFT_RECORD) {
       config: fs.readFileSync(path.join(home, 'config.yaml'), 'utf8'),
       prompt: fs.readFileSync(path.join(home, 'prompts', 'implement-issue.md'), 'utf8'),
       time: Date.now(),
-      keyMode: fs.statSync(keyPath).mode & 0o777,
+      keyMode: fs.existsSync(keyPath) ? fs.statSync(keyPath).mode & 0o777 : null,
+      token: fs.existsSync(tokenPath) ? JSON.parse(fs.readFileSync(tokenPath, 'utf8')) : null,
+      tokenMode: fs.existsSync(tokenPath) ? fs.statSync(tokenPath).mode & 0o777 : null,
       stateDirMode: fs.statSync(home).mode & 0o777,
     }),
   );

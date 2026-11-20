@@ -45,7 +45,8 @@ browser ── https://updraft.readysetcloud.io ──> CloudFront (one distribu
   - linked GitHub identities, unique per GitHub user;
   - tenants, one per App installation;
   - members of each tenant, each recording the GitHub identity that earned the membership;
-  - a 10-minute offer of existing installations to connect.
+  - a 10-minute offer of existing installations to connect;
+  - jobs, each with the hash of its job token, kept 7 days past the job's maximum duration.
 
   When the App is uninstalled, every item in the tenant's partition gets the table's `ttl`, 30 days out. DynamoDB deletes them after that, and reads treat the tenant as gone as soon as the deadline passes.
   - **Interrupted cleanup:** if a write fails partway, the webhook answers 500 so GitHub shows a delivery you can redeliver, and a redelivered delete finishes the sweep with the first deadline.
@@ -213,6 +214,23 @@ npm run tenant-admin --workspace=server -- key status     --installation 55
 - **During an uninstall:** a key set that races an uninstall is refused, and the secret it wrote is removed again.
 
 `tenant-admin` builds every AWS client from one region: `--region`, or else the SDK's own resolution. So stack discovery, the table, the bucket, the App settings and the key secrets are always in the same region.
+
+### Jobs and the job broker
+
+Every tenant's jobs run in microVMs with one execution role, `MicrovmExecutionRole`. Anything in a microVM, an agent included, has to be assumed able to use that role, so it reaches no tenant's data. It can invoke `BrokerFunction` and write its logs. Nothing else. It can't even terminate microVMs: that permission covers every microVM of the image, so it would let one tenant's runner stop another's.
+
+**The broker** (`server/src/broker/broker.ts`) hands out what one job may have, to whoever holds that job's token. The launcher (PR 4) records each job in the table (`JOB#<jobId>`): its tenant, its one repository, the config version it pinned, and the sha-256 of a single-use, random job token. The token itself travels only in the microVM's run-hook payload (version 2). The runner calls the broker with it:
+
+| Action | Answer |
+| --- | --- |
+| `start`, `credentials` | Where the job's data is, and AWS credentials for an hour. They come from `sts:AssumeRole` on `JobDataRole`, with a session policy for this job only. It can read this job's event and config version, read and write the tenant's state, write this job's results, and read the tenant's agent key secrets. |
+| `github-token` | An installation token for the job's one repository (`repository_ids`), with only `contents`, `issues` and `pull_requests` write, and `checks`, `statuses` and `metadata` read. It's shaped as the CLI's token file (#77). The runner writes it to `app-token.json` in the protected state directory and replaces it every 20 minutes. |
+| `finish` | The job is over. Nothing more is served for its token. |
+| `terminate` | Stops the job's own microVM: the one the launcher recorded with the job (`attachMicrovm`, set once). This works whatever the job's state, finished or with its tenant suspended included, because it only ever ends that one microVM. |
+
+- **The App's private key never enters a microVM.** Only the broker reads it, to mint tokens.
+- **Refused alike:** an unknown job, a wrong token, a finished or expired job, and a tenant that's no longer active all get the same `refused`, so nothing can be probed. The tenant's status is read strongly consistently, so a suspend or uninstall that has committed stops the very next request. Errors are logged without their details, which could carry a credential.
+- **Bounded either way:** `JobDataRole` allows only `tenants/*` and `updraft/tenants/*`, and AWS intersects it with each session policy. Even a broker bug can't give a job the App's secrets or the table.
 
 ## Not verified yet
 
