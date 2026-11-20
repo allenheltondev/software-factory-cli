@@ -5,6 +5,9 @@
 //   npm run tenant-admin --workspace=server -- config list    --installation 55
 //   npm run tenant-admin --workspace=server -- key set        --installation 55 --name ANTHROPIC_API_KEY   (value on stdin)
 //   npm run tenant-admin --workspace=server -- key status     --installation 55
+//   npm run tenant-admin --workspace=server -- limits show    --installation 55
+//   npm run tenant-admin --workspace=server -- limits set     --installation 55 [--concurrent-jobs 2] [--jobs-per-day 50] [--minutes-per-month 3000]
+//   npm run tenant-admin --workspace=server -- limits clear   --installation 55
 //
 //   [--stack updraft-cloud] [--region us-east-1] on any of them
 //
@@ -12,6 +15,8 @@
 // with the worker's own validator, checks every repository against what the installation can
 // reach (with the App's own credentials), stores it as a new immutable version and activates it.
 // `key set` reads the key from stdin, never from the command line, and never prints it.
+// `limits` overrides the stack's default quotas for one tenant (jobs/quotas.ts): `set` changes
+// only the limits it is given, `clear` goes back to the defaults, `show` prints both and the usage.
 import { readdirSync, readFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -23,16 +28,33 @@ import { parse } from 'yaml';
 import { createGitHubApi } from '../src/github/client.js';
 import { appJwt } from '../src/github/jwt.js';
 import { createSettingsLoader } from '../src/github/settings.js';
+import { dayOf, DEFAULT_QUOTAS, limitProblems, monthOf, tenantQuotas } from '../src/jobs/quotas.js';
+import type { Quotas, TenantLimits } from '../src/store/store.js';
 import { createDynamoStore } from '../src/store/dynamo.js';
 import { AGENT_KEY_NAMES, setAgentKey, type SecretsPort } from '../src/tenants/agent-keys.js';
 import { publishTenantConfig } from '../src/tenants/publish.js';
 import { createAdminClients, type AdminClients } from './admin-clients.js';
 
-const usage = `usage: tenant-admin <config publish|config list|key set|key status> --installation <id> [options]`;
+const usage = `usage: tenant-admin <config publish|config list|key set|key status|limits show|limits set|limits clear> --installation <id> [options]`;
 
-async function stackOutputs(clients: AdminClients, stack: string): Promise<Record<string, string>> {
+async function describeStack(clients: AdminClients, stack: string): Promise<{ outputs: Record<string, string>; parameters: Record<string, string> }> {
   const out = await clients.cloudFormation.send(new DescribeStacksCommand({ StackName: stack }));
-  return Object.fromEntries((out.Stacks?.[0]?.Outputs ?? []).map((o) => [o.OutputKey ?? '', o.OutputValue ?? '']));
+  const s = out.Stacks?.[0];
+  return {
+    outputs: Object.fromEntries((s?.Outputs ?? []).map((o) => [o.OutputKey ?? '', o.OutputValue ?? ''])),
+    parameters: Object.fromEntries((s?.Parameters ?? []).map((p) => [p.ParameterKey ?? '', p.ParameterValue ?? ''])),
+  };
+}
+
+/** The stack's default quotas, from its parameters (template.yaml). */
+function stackQuotas(parameters: Record<string, string>): Quotas {
+  const n = (name: string, fallback: number) => (Number.isInteger(Number(parameters[name])) && Number(parameters[name]) > 0 ? Number(parameters[name]) : fallback);
+  return {
+    concurrentJobs: n('QuotaConcurrentJobs', DEFAULT_QUOTAS.concurrentJobs),
+    jobsPerDay: n('QuotaJobsPerDay', DEFAULT_QUOTAS.jobsPerDay),
+    microvmMinutesPerMonth: n('QuotaMicrovmMinutesPerMonth', DEFAULT_QUOTAS.microvmMinutesPerMonth),
+    platformConcurrentJobs: n('PlatformConcurrentJobs', DEFAULT_QUOTAS.platformConcurrentJobs),
+  };
 }
 
 async function readStdin(): Promise<string> {
@@ -69,6 +91,9 @@ async function main() {
       file: { type: 'string' },
       prompts: { type: 'string' },
       name: { type: 'string' },
+      'concurrent-jobs': { type: 'string' },
+      'jobs-per-day': { type: 'string' },
+      'minutes-per-month': { type: 'string' },
       stack: { type: 'string', default: 'updraft-cloud' },
       region: { type: 'string' },
     },
@@ -78,7 +103,7 @@ async function main() {
   if (!area || !command || !Number.isSafeInteger(installationId) || installationId <= 0) throw new Error(usage);
   // One region for every client (admin-clients.ts): --region, else the SDK's own resolution.
   const clients = createAdminClients(values.region);
-  const outputs = await stackOutputs(clients, values.stack!);
+  const { outputs, parameters } = await describeStack(clients, values.stack!);
   if (!outputs.TableName || !outputs.TenantBucket) throw new Error(`stack ${values.stack} has no TableName/TenantBucket outputs; deploy it first`);
   const store = createDynamoStore(outputs.TableName, clients.dynamo);
   const tenant = await store.getTenant(installationId);
@@ -159,6 +184,45 @@ async function main() {
       return;
     }
     console.log(`${values.name} set for installation ${installationId} (${tenant.accountLogin})`);
+    return;
+  }
+
+  if (area === 'limits' && command === 'show') {
+    const defaults = stackQuotas(parameters);
+    const effective = tenantQuotas(defaults, tenant.limits);
+    const now = Date.now();
+    const used = await store.getUsage(installationId, dayOf(now), monthOf(now));
+    const row = (label: string, name: keyof TenantLimits, unit: string, value: string) =>
+      console.log(`${label}\t${effective[name]}${unit}${tenant.limits?.[name] !== undefined ? ' (override)' : ' (default)'}\t${value}`);
+    console.log(`installation ${installationId} (${tenant.accountLogin}), ${tenant.status}`);
+    row('concurrent jobs', 'concurrentJobs', '', '');
+    row('jobs per day', 'jobsPerDay', '', `${used.jobsToday} today (${used.day}, UTC)`);
+    row('microVM time', 'microvmMinutesPerMonth', ' min/month', `${Math.ceil(used.microvmSecondsThisMonth / 60)} min in ${used.month}, ${used.jobsThisMonth} jobs`);
+    console.log(`throttled\t\t${used.throttledThisMonth} in ${used.month}`);
+    console.log(`platform ceiling\t${defaults.platformConcurrentJobs} concurrent jobs`);
+    return;
+  }
+
+  if (area === 'limits' && command === 'set') {
+    const given: TenantLimits = {};
+    const read = (flag: 'concurrent-jobs' | 'jobs-per-day' | 'minutes-per-month', name: keyof TenantLimits) => {
+      if (values[flag] !== undefined) given[name] = Number(values[flag]);
+    };
+    read('concurrent-jobs', 'concurrentJobs');
+    read('jobs-per-day', 'jobsPerDay');
+    read('minutes-per-month', 'microvmMinutesPerMonth');
+    if (Object.keys(given).length === 0) throw new Error('limits set needs --concurrent-jobs, --jobs-per-day or --minutes-per-month');
+    const problems = limitProblems(given);
+    if (problems.length > 0) throw new Error(problems.join('; '));
+    const limits = { ...tenant.limits, ...given };
+    if ((await store.setTenantLimits(installationId, limits)) === 'no_tenant') throw new Error(`there is no tenant for installation ${installationId}`);
+    console.log(`limits for installation ${installationId} (${tenant.accountLogin}): ${JSON.stringify(limits)}, set by ${admin}`);
+    return;
+  }
+
+  if (area === 'limits' && command === 'clear') {
+    await store.setTenantLimits(installationId, null);
+    console.log(`installation ${installationId} (${tenant.accountLogin}) is back on the stack's default quotas`);
     return;
   }
 

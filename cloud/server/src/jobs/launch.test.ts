@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type Tenant } from '../store/store.js';
 import { dispatchRules } from '../tenants/dispatch.js';
-import { createLauncher, PRELAUNCH_CLAIM_MS, type LaunchDeps, type LaunchRequest, type RunMicrovmInput } from './launch.js';
+import { createReconciler } from './reconcile.js';
+import { createLauncher, PRELAUNCH_CLAIM_MS, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
 
 // Relative to the real clock: the memory store judges a delivery claim's expiry by it.
 const NOW = Date.now();
@@ -66,6 +67,8 @@ describe('the launcher', () => {
         events[key] = body;
       },
       runMicrovm: (input) => runMicrovm(input),
+      // Generous, so the tests of everything else are never throttled.
+      quotas: { concurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 },
       now: () => NOW,
       log: () => {},
       retryDelayMs: 1,
@@ -135,6 +138,7 @@ describe('the launcher', () => {
       github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
       assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(NOW + 3_600_000).toISOString() }),
       terminateMicrovm,
+      microvmState: async () => 'TERMINATING',
       policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
       now: () => NOW,
     });
@@ -230,6 +234,7 @@ describe('the launcher', () => {
         github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
         assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(Date.now() + 3_600_000).toISOString() }),
         terminateMicrovm: vi.fn(async () => {}),
+        microvmState: async () => 'TERMINATING',
         policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
         now: () => Date.now(),
       });
@@ -264,6 +269,230 @@ describe('the launcher', () => {
       expect(redelivered.disposition).toBe('launched');
       expect(await broker({ action: 'start', jobId: slow.jobId, token: tokenOf(1) })).toEqual({ ok: false, error: 'refused' });
       expect((await broker({ action: 'start', jobId: redelivered.jobId, token: tokenOf(2) })).ok).toBe(true);
+    });
+  });
+
+  describe('quotas and the kill switch', () => {
+    const day = new Date(NOW).toISOString().slice(0, 10);
+    const month = day.slice(0, 7);
+    const ONE_AT_A_TIME = { concurrentJobs: 1, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 };
+
+    it('starts nothing while the kill switch is on, and claims nothing', async () => {
+      let engaged = true;
+      const launch = createLauncher({ ...deps, killSwitch: { engaged: async () => engaged } });
+      expect(await launch(request())).toEqual({ status: 200, disposition: 'kill_switch' });
+      expect(runs).toEqual([]);
+      engaged = false;
+      expect((await launch(request())).disposition).toBe('launched');
+    });
+
+    it('records the job\'s slots and the microVM time it reserves', async () => {
+      const result = await createLauncher(deps)(request());
+      expect(await store.getJob(result.jobId!)).toMatchObject({ tenantSlot: 0, platformSlot: expect.any(Number), reservedSeconds: 10800 });
+      expect(await store.getUsage(55, day, month)).toMatchObject({ jobsToday: 1, jobsThisMonth: 1 });
+    });
+
+    it('throttles a delivery over a quota: nothing started, the claim given up, one comment a day on the issue', async () => {
+      const notices: ThrottleNotice[] = [];
+      const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, notifyThrottled: async (n) => void notices.push(n) });
+      const first = await launch(request());
+      expect(first.disposition).toBe('launched');
+
+      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(await launch(request({}, 'delivery-3'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(runs).toHaveLength(1);
+      expect(notices).toEqual([{ installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12, limit: 'concurrent_jobs', quotas: ONE_AT_A_TIME }]);
+      // Another issue gets its own comment.
+      await launch(request({ issue: { number: 13 } }, 'delivery-4'));
+      expect(notices.map((n) => n.issue)).toEqual([12, 13]);
+      expect((await store.getUsage(55, day, month)).throttledThisMonth).toBe(3);
+
+      // Once the first job is done, redelivering a throttled delivery starts it.
+      const job = (await store.getJob(first.jobId!))!;
+      await store.releaseJobSlots(job);
+      expect((await launch(request({}, 'delivery-2'))).disposition).toBe('launched');
+    });
+
+    it("applies the tenant's overrides over the stack's defaults", async () => {
+      await store.setTenantLimits(55, { jobsPerDay: 1 });
+      const notices: ThrottleNotice[] = [];
+      const launch = createLauncher({ ...deps, notifyThrottled: async (n) => void notices.push(n) });
+      expect((await launch(request())).disposition).toBe('launched');
+      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(notices[0]).toMatchObject({ limit: 'jobs_per_day', quotas: { jobsPerDay: 1, concurrentJobs: 10 } });
+    });
+
+    it('a comment that fails is only logged', async () => {
+      const logged: Record<string, unknown>[] = [];
+      const launch = createLauncher({
+        ...deps,
+        quotas: ONE_AT_A_TIME,
+        log: (e) => logged.push(e),
+        notifyThrottled: async () => {
+          throw new Error('GitHub is down');
+        },
+      });
+      await launch(request());
+      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(logged.some((e) => String(e.warning).includes('could not comment on the issue: GitHub is down'))).toBe(true);
+    });
+
+    it("holds a confirmed launch's capacity until Lambda shows its microVM terminated, even if its start never commits", async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      try {
+        const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now() });
+        const first = await launch(request());
+        expect(first.disposition).toBe('launched');
+        const { jobToken } = (JSON.parse(runs[0]!.runHookPayload) as { broker: { jobToken: string } }).broker;
+        let engaged = true;
+        let state: string | null = 'RUNNING';
+        const broker = createBroker({
+          store,
+          loadSettings: async () => null,
+          github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
+          assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(Date.now() + 3_600_000).toISOString() }),
+          terminateMicrovm: vi.fn(async () => {
+            throw new Error('throttled');
+          }),
+          microvmState: async () => state,
+          policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
+          killSwitch: { engaged: async () => engaged },
+          now: () => Date.now(),
+        });
+        // Refused by the kill switch, and its terminate fails: the microVM runs on.
+        expect(await broker({ action: 'start', jobId: first.jobId, token: jobToken })).toEqual({ ok: false, error: 'refused' });
+        await expect(broker({ action: 'terminate', jobId: first.jobId, token: jobToken })).rejects.toThrow('throttled');
+
+        // Well past the launcher's five minutes, its slot is still held, and reconciliation sees it.
+        vi.setSystemTime(NOW + 4 * PRELAUNCH_CLAIM_MS);
+        expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+        const reconcile = createReconciler({ store, microvmState: async () => state, log: () => {} });
+        expect(await reconcile()).toMatchObject({ released: [], held: 1 });
+
+        // Terminated: released, and retired, so a delayed start (the kill switch off by now) gets nothing.
+        state = 'TERMINATED';
+        expect((await reconcile()).released).toEqual([first.jobId]);
+        engaged = false;
+        expect(await broker({ action: 'start', jobId: first.jobId, token: jobToken })).toEqual({ ok: false, error: 'refused' });
+        expect(await broker({ action: 'credentials', jobId: first.jobId, token: jobToken })).toEqual({ ok: false, error: 'refused' });
+        expect((await launch(request({}, 'delivery-3'))).disposition).toBe('launched');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('reserves the slots for the job\'s lifetime before its microVM exists, so no later write can lose them', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      try {
+        // RunMicrovm never answers (the Lambda's deadline): nothing after it runs.
+        const stuck = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now(), runMicrovm: () => new Promise(() => {}) });
+        void stuck(request());
+        await vi.waitFor(async () => expect(await store.listPlatformSlots()).toHaveLength(1));
+        // Held to the job's own end (vi.waitFor moves the fake clock a little while it waits).
+        const [entry] = await store.listActiveJobs();
+        expect(entry).toMatchObject({ phase: 'launching' });
+        expect((await store.listPlatformSlots())[0]!.expiresAt).toBe((await store.getJob(entry!.jobId))!.expiresAt);
+
+        // Well past the launcher's five minutes: still taken, and the job still reconciled.
+        vi.setSystemTime(NOW + 4 * PRELAUNCH_CLAIM_MS);
+        const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now() });
+        expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+        expect(await store.listActiveJobs()).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("reconciliation holds a running job's slots again, but never a job released while it looked", async () => {
+      const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME });
+      const first = await launch(request());
+      const job = (await store.getJob(first.jobId!))!;
+      // Its slots went missing (say, a delete that should not have happened): held again.
+      await store.releaseJobSlots(job);
+      expect(await createReconciler({ store, microvmState: async () => 'RUNNING', log: () => {} })()).toMatchObject({ held: 1 });
+      expect((await store.listPlatformSlots()).map((s) => s.jobId)).toEqual([first.jobId]);
+
+      // Released (by the broker's terminate, say) while reconciliation waits on Lambda: its stale
+      // hold must not bring the slots back.
+      const reconcile = createReconciler({
+        store,
+        microvmState: async () => {
+          await store.releaseJob(job);
+          return 'RUNNING';
+        },
+        log: () => {},
+      });
+      await reconcile();
+      expect(await store.listPlatformSlots()).toEqual([]);
+      expect(await store.listActiveJobs()).toEqual([]);
+      expect((await launch(request({}, 'delivery-2'))).disposition).toBe('launched');
+    });
+
+    it('reclaims a reservation whose launch stopped before it asked for a microVM', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      try {
+        const reconcile = () => createReconciler({ store, microvmState: vi.fn(), now: () => Date.now(), log: () => {} })();
+        // The Lambda's deadline hits while it writes the event: nothing after the reservation is written.
+        const stuck = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now(), putEvent: () => new Promise(() => {}) });
+        void stuck(request());
+        await vi.waitFor(async () => expect(await store.listActiveJobs()).toHaveLength(1));
+        expect((await store.listActiveJobs())[0]).toMatchObject({ phase: 'reserved' });
+
+        // Too soon to tell from a launch still under way: left alone.
+        vi.setSystemTime(NOW + 60_000);
+        expect((await reconcile()).released).toEqual([]);
+        expect(await store.listPlatformSlots()).toHaveLength(1);
+
+        // Past five minutes: reclaimed, the slots and the day's count given back.
+        vi.setSystemTime(NOW + 6 * 60_000);
+        expect((await reconcile()).released).toHaveLength(1);
+        expect(await store.listPlatformSlots()).toEqual([]);
+        expect(await store.listActiveJobs()).toEqual([]);
+        expect(await store.getUsage(55, new Date(NOW).toISOString().slice(0, 10), new Date(NOW).toISOString().slice(0, 7))).toMatchObject({ jobsToday: 0, jobsThisMonth: 0 });
+        expect((await createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now() })(request({}, 'delivery-2'))).disposition).toBe('launched');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('a reclaimed reservation retires the job it recorded, which can then never start', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      try {
+        // The job is recorded, then the Lambda stops before it marks the launch (no RunMicrovm).
+        const markLaunching = store.markLaunching.bind(store);
+        store.markLaunching = () => new Promise(() => {});
+        const stuck = createLauncher({ ...deps, now: () => Date.now() });
+        void stuck(request());
+        await vi.waitFor(async () => expect(Object.keys(events)).toHaveLength(1));
+        const [entry] = await store.listActiveJobs();
+        await vi.waitFor(async () => expect(await store.getJob(entry!.jobId)).not.toBeNull());
+        store.markLaunching = markLaunching;
+
+        vi.setSystemTime(NOW + 6 * 60_000);
+        expect((await createReconciler({ store, microvmState: vi.fn(), now: () => Date.now(), log: () => {} })()).released).toEqual([entry!.jobId]);
+        const job = (await store.getJob(entry!.jobId))!;
+        expect(job).toMatchObject({ status: 'finished', outcome: 'launch_failed' });
+        expect(typeof job.stopRequestedAt).toBe('number');
+        expect(await store.startJob(job, job.expiresAt)).toEqual({ result: 'retired' });
+        // Too late to launch: marking it fails, so a launch that woke up now starts nothing.
+        await expect(store.markLaunching(job.jobId)).rejects.toThrow('no reservation to launch');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('gives the reservation back when the launch fails', async () => {
+      runMicrovm = async () => {
+        throw new Error('throttled by Lambda');
+      };
+      const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME });
+      expect((await launch(request())).disposition).toBe('launch_failed');
+      expect(await store.getUsage(55, day, month)).toMatchObject({ jobsToday: 0, jobsThisMonth: 0 });
+      runMicrovm = async (input) => {
+        runs.push(input);
+        return { microvmId: 'mvm-0002' };
+      };
+      expect((await launch(request())).disposition).toBe('launched');
     });
   });
 

@@ -4,8 +4,11 @@ import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/clie
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { createWebhookHandler } from './flows/webhook.js';
 import { createGitHubApi } from './github/client.js';
+import { appJwt } from './github/jwt.js';
 import { createSettingsLoader } from './github/settings.js';
+import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createLauncher, internetEgressConnector, noIngressConnector, type Launcher } from './jobs/launch.js';
+import { quotasFromEnv, throttledComment } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 
 /**
@@ -21,6 +24,19 @@ const clientOptions = { maxAttempts: 2 };
 const s3 = new S3Client(clientOptions);
 const ssm = new SSMClient(clientOptions);
 const microvms = new LambdaMicrovmsClient(clientOptions);
+const github = createGitHubApi();
+const loadSettings = createSettingsLoader();
+
+const killSwitch = createKillSwitch({
+  read: async () => {
+    try {
+      return (await ssm.send(new GetParameterCommand({ Name: env.KILL_SWITCH_PARAMETER || KILL_SWITCH_PARAMETER }))).Parameter?.Value ?? null;
+    } catch (err) {
+      if (err instanceof ParameterNotFound) return null;
+      throw err;
+    }
+  },
+});
 
 // The published image version (scripts/build-job-image.ts writes it after a successful build).
 // Cached briefly, so a new build is picked up within a minute without a deploy.
@@ -65,13 +81,25 @@ function launcher(): Launcher | undefined {
       const out = await microvms.send(new RunMicrovmCommand(input));
       return { microvmId: out.microvmId };
     },
+    quotas: quotasFromEnv(env),
+    killSwitch,
+    // The App's own token for that one repository, allowed only to write issues.
+    notifyThrottled: async ({ installationId, repository, repositoryId, issue, limit, quotas }) => {
+      const settings = await loadSettings();
+      if (!settings) return;
+      const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId, {
+        repositoryIds: [repositoryId],
+        permissions: { issues: 'write' },
+      });
+      await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas));
+    },
   });
 }
 
 const handleWebhook = createWebhookHandler({
   store,
-  github: createGitHubApi(),
-  loadSettings: createSettingsLoader(),
+  github,
+  loadSettings,
   launch: launcher(),
 });
 

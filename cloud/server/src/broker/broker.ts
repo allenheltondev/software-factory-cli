@@ -2,6 +2,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import type { GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
+import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
+import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
 import type { Job, Store } from '../store/store.js';
 import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 // Not from publish.ts, which pulls in the CLI's validator.
@@ -21,17 +23,26 @@ import { configPrefix } from '../tenants/paths.js';
  *                         from AssumeRole with a session policy that reaches only this tenant's
  *                         prefix (this job's event, config version and results; the tenant's
  *                         state) and only this tenant's agent key secrets. `start` also holds
- *                         the delivery's claim for the job's lifetime (refused if a redelivery's
- *                         job holds it)
+ *                         the delivery's claim and the job's quota slots for its lifetime
+ *                         (refused if another job holds one by then), and charges the month its
+ *                         maximum duration in microVM time
  *   github-token          an installation token for the job's one repository with only the
  *                         permissions a job needs, as the CLI's token file (#77)
  *   finish                the job is over; nothing more is served for it. Whatever the job's state,
  *                         and safe to repeat: a retried finish redoes what a failed one left undone
  *   terminate            stop the job's own microVM (as the launcher recorded it), whatever the
- *                         job's state; the shared execution role cannot terminate microVMs
+ *                         job's state; the shared execution role cannot terminate microVMs. The job
+ *                         is retired at once (nothing more is served, it can never start). Its
+ *                         quota slots are freed and the microVM time it did not use refunded once
+ *                         Lambda shows the microVM TERMINATED, here or by reconciliation
+ *
+ * `credentials` and `github-token` serve only a job whose `start` committed. A refused `start`
+ * retires the job and asks Lambda to stop its microVM, but keeps its slots: the microVM holds
+ * that capacity until it is seen terminated.
  *
  * Refused alike, so nothing can be probed: an unknown job, a wrong token, a finished or expired
- * job, a tenant that is no longer active.
+ * job, a tenant that is no longer active, and anything but finish and terminate while the
+ * platform's kill switch is on.
  */
 
 /** What a job's installation token may do: the publication permissions, nothing administrative. */
@@ -115,7 +126,16 @@ export interface BrokerDeps {
   assumeRole(input: { sessionName: string; policy: string; durationSeconds: number }): Promise<ScopedCredentials>;
   /** lambda:TerminateMicrovm, with the broker's role. */
   terminateMicrovm(microvmId: string): Promise<void>;
+  /** lambda:GetMicrovm: the microVM's state, or null when Lambda has no such microVM. */
+  microvmState(microvmId: string): Promise<string | null>;
+  /** Posts the over-quota comment for a job refused at start (once a day per issue). */
+  notifyThrottled?: (notice: ThrottleNotice) => Promise<void>;
+  /** Pause between looks at a microVM that was asked to stop. */
+  stopCheckDelayMs?: number;
+  log?: (entry: Record<string, unknown>) => void;
   policy: PolicyContext;
+  /** Absent: never engaged. */
+  killSwitch?: KillSwitch;
   now?: () => number;
 }
 
@@ -131,9 +151,13 @@ const OUTCOME = /^[a-z_]{1,40}$/;
 const REFUSED: BrokerResponse = { ok: false, error: 'refused' };
 /** A job that started after a redelivery's job had taken its delivery's claim: it never runs. */
 export const SUPERSEDED_OUTCOME = 'superseded';
+/** A job that started after another job had taken one of its quota slots: it never runs. */
+export const THROTTLED_OUTCOME = 'throttled';
 
 export function createBroker(deps: BrokerDeps) {
   const now = deps.now ?? Date.now;
+  const killSwitch = deps.killSwitch ?? OFF_SWITCH;
+  const log = deps.log ?? ((entry) => console.log(JSON.stringify(entry)));
   const bots = new Map<string, { id: number; login: string }>();
 
   /** The job, if the token is its token; else null. */
@@ -149,11 +173,39 @@ export function createBroker(deps: BrokerDeps) {
 
   /** Whether a verified job may still be served. */
   async function servable(job: Job): Promise<boolean> {
-    if (job.status === 'finished' || now() > job.expiresAt) return false;
+    if (job.status === 'finished' || job.stopRequestedAt !== undefined || now() > job.expiresAt) return false;
     // Strongly consistent, like the job: a suspend or uninstall that has committed stops the next
     // request, rather than one that happens to read a stale replica.
     const tenant = await deps.store.getTenant(job.installationId, { consistent: true });
     return tenant?.status === 'active';
+  }
+
+  /** Whether Lambda shows the microVM terminated (or gone), looking a few times after the terminate. */
+  async function seenTerminated(microvmId: string): Promise<boolean> {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      if (isTerminated(await deps.microvmState(microvmId))) return true;
+      if (attempt < 4) await new Promise((r) => setTimeout(r, (deps.stopCheckDelayMs ?? 500) * attempt));
+    }
+    return false;
+  }
+
+  /** Asks Lambda to stop a refused job's microVM, if the launcher has recorded it; the runner asks too. */
+  async function requestStop(job: Job): Promise<void> {
+    if (!job.microvmId) return;
+    await deps.terminateMicrovm(job.microvmId).catch((err: unknown) => log({ jobId: job.jobId, warning: `could not stop the refused microVM: ${(err as Error)?.name}` }));
+  }
+
+  /** A job refused at start for a quota: recorded as throttled, with the comment on its issue once a day. */
+  async function throttledAtStart(job: Job, limit: ThrottleNotice['limit']): Promise<void> {
+    const at = now();
+    const notice = job.issue !== undefined ? { repositoryId: job.repositoryId, issue: job.issue, day: dayOf(at) } : undefined;
+    const first = await deps.store.recordThrottle(job.installationId, job.createdAt.slice(0, 7), notice);
+    log({ jobId: job.jobId, installationId: job.installationId, throttled: limit, at: 'start' });
+    if (first && job.issue !== undefined && job.quotas && deps.notifyThrottled) {
+      await deps
+        .notifyThrottled({ installationId: job.installationId, repository: job.repository, repositoryId: job.repositoryId, issue: job.issue, limit, quotas: job.quotas })
+        .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
+    }
   }
 
   return async function handle(request: unknown): Promise<BrokerResponse> {
@@ -170,15 +222,29 @@ export function createBroker(deps: BrokerDeps) {
     // execution role every job shares cannot terminate microVMs at all, so a runner cannot stop
     // another tenant's.
     if (action === 'terminate') {
+      // Retired first, whatever its outcome: a job being stopped is served nothing more, and a
+      // delayed start can never admit it.
+      await deps.store.markStopping(job.jobId);
       if (!job.microvmId) return { ok: false, error: 'unavailable' };
       await deps.terminateMicrovm(job.microvmId);
+      // The job's quota capacity follows its microVM, not its outcome: freed (and its unused time
+      // refunded) once Lambda shows the microVM TERMINATED. Usually it is not yet (the /terminate
+      // hook runs first); reconciliation (jobs/reconcile.ts) releases it on a later run.
+      let terminated = false;
+      try {
+        terminated = await seenTerminated(job.microvmId);
+      } catch (err) {
+        log({ jobId: job.jobId, warning: `could not read the microVM's state: ${(err as Error)?.name}` });
+      }
+      if (terminated) await deps.store.releaseJob(job, unusedTime(job, now()));
       return { ok: true, terminated: true };
     }
 
     // Finishing only ever takes away (nothing more is served for the job) and gives up this job's
     // own claim, so it is allowed whatever the job's state, and repeatable: the first outcome is
     // kept, and a finish retried because releasing the claim failed releases it this time. The
-    // claim is released only if this job holds it; a redelivery's job keeps its own.
+    // claim is released only if this job holds it; a redelivery's job keeps its own. The quota
+    // slots stay: the microVM may still be running (terminate frees them).
     if (action === 'finish') {
       const given = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
       const recorded = (await deps.store.finishJob(job.jobId, given)) ?? given;
@@ -189,12 +255,30 @@ export function createBroker(deps: BrokerDeps) {
     }
 
     if (!(await servable(job))) return REFUSED;
+    if (await killSwitch.engaged()) return REFUSED;
 
-    // The launcher's claim on the delivery is short, so it runs out on its own if the launch never
-    // got this far (its Lambda stopped before RunMicrovm, say). A job that does start holds the
-    // claim for as long as it may run; if a redelivery's job holds it now, that one runs, not this.
-    if (action === 'start' && !(await deps.store.holdDelivery(job.installationId, job.deliveryId, job.expiresAt, job.jobId))) {
-      await deps.store.finishJob(job.jobId, SUPERSEDED_OUTCOME);
+    // The launcher's claim on the delivery and its quota slots are short, so they run out on their
+    // own if the launch never got this far (its Lambda stopped before RunMicrovm, say). A job that
+    // does start holds them for as long as it may run; if another job holds one by now (a
+    // redelivery's, or another launch in its slot), that one runs, not this.
+    if (action === 'start') {
+      const started = await deps.store.startJob(job, job.expiresAt);
+      if (started.result === 'retired') return REFUSED;
+      if (started.result === 'superseded' || started.result === 'throttled') {
+        // It is served nothing and charged nothing, but its microVM is running: the slots it still
+        // has are held as long as it may run, until Lambda shows it terminated (reconciliation).
+        await deps.store.markStopping(job.jobId);
+        await deps.store.finishJob(job.jobId, started.result === 'superseded' ? SUPERSEDED_OUTCOME : THROTTLED_OUTCOME);
+        await deps.store.holdSlots(job, job.expiresAt);
+        await requestStop(job);
+        if (started.result === 'throttled') {
+          await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
+          await throttledAtStart(job, started.limit);
+        }
+        return REFUSED;
+      }
+    } else if (job.startedAt === undefined) {
+      // Credentials and tokens only for a job whose start committed (its quota admission).
       return REFUSED;
     }
 

@@ -66,6 +66,9 @@ function fakeGitHub() {
         { id: 1, fullName: 'acme/api', private: false, htmlUrl: 'https://github.com/acme/api' },
       ];
     },
+    async createIssueComment() {
+      throw new Error('the sign-in flows never comment');
+    },
   };
   const issued: { token: string; user: { id: number; login: string } }[] = [];
   return {
