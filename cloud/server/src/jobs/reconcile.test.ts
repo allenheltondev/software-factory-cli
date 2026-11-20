@@ -31,6 +31,25 @@ async function admitted(store: ReturnType<typeof createMemoryStore>, jobId: stri
 }
 
 describe('quota reconciliation', () => {
+  it('reclaims an abandoned reservation once, however many runs overlap', async () => {
+    const store = createMemoryStore();
+    const quotas = { ...QUOTAS, jobsPerDay: 2 };
+    const reserve = (jobId: string) => store.reserveJob({ installationId: 55, jobId, holdUntil: Date.now() + 3_600_000, day: '2026-11-20', month: '2026-11', quotas });
+    // One launched job, and one reservation whose launch stopped before RunMicrovm.
+    await admitted(store, 'job_running01', { microvmId: 'mvm-run' });
+    expect(await reserve('job_abandon01')).toMatchObject({ ok: true });
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(2);
+
+    const later = Date.now() + 6 * 60_000;
+    const run = () => createReconciler({ store, microvmState: async () => 'RUNNING', now: () => later, log: () => {} })();
+    const reports = await Promise.all([run(), run(), run()]);
+    expect(reports.flatMap((r) => r.released)).toEqual(['job_abandon01']);
+    // The launched job still counts: one job given back, not three.
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(1);
+    expect(await reserve('job_next00001')).toMatchObject({ ok: true });
+    expect(await reserve('job_over00001')).toEqual({ ok: false, limit: 'jobs_per_day' });
+  });
+
   it('releases a job with no recorded microVM only after its maximum duration', async () => {
     const store = createMemoryStore();
     const job = await admitted(store, 'job_novm00001');

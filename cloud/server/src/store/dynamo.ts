@@ -1065,13 +1065,36 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       throw new Error(`reserveJob: the slots of tenant ${id} kept changing; retry the delivery`);
     },
 
-    async cancelReservation(r) {
+    async cancelReservation(r, phase) {
+      // The counts go back with the entry's delete, in one transaction, only while the entry is
+      // there in that phase: a retried or concurrent cancel (two reconciliations) gives back nothing.
+      let once = true;
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Delete: {
+                  TableName: T,
+                  Key: activeKey(r.jobId),
+                  ConditionExpression: 'attribute_exists(pk) AND phase = :phase',
+                  ExpressionAttributeValues: { ':phase': phase },
+                },
+              },
+              ...[dayKey(r.installationId, r.day), monthKey(r.installationId, r.month)].map((key) => ({
+                Update: { TableName: T, Key: key, UpdateExpression: 'ADD jobs :minus', ExpressionAttributeValues: { ':minus': -1 } },
+              })),
+            ],
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof TransactionCanceledException && cancelledAt(err, 0))) throw err;
+        once = false;
+      }
+      // Owner-checked, so safe to repeat whether or not this call gave the counts back.
       await deleteIfHeld(tenantSlotKey(r.installationId, r.tenantSlot), r.jobId);
       await deleteIfHeld(platformSlotKey(r.platformSlot), r.jobId);
-      for (const key of [dayKey(r.installationId, r.day), monthKey(r.installationId, r.month)]) {
-        await client.send(new UpdateCommand({ TableName: T, Key: key, UpdateExpression: 'ADD jobs :minus', ExpressionAttributeValues: { ':minus': -1 } }));
-      }
-      await client.send(new DeleteCommand({ TableName: T, Key: activeKey(r.jobId) }));
+      return once;
     },
 
     async recordThrottle(id, month, notice) {

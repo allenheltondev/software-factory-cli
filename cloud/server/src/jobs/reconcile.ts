@@ -53,9 +53,10 @@ export function createReconciler({
             await store.markStopping(jobId);
             await store.finishJob(jobId, 'launch_failed');
           }
-          await store.cancelReservation(entry);
+          // Once only, even with another run reclaiming it at the same time (or a retry of this one).
+          const reclaimed = await store.cancelReservation(entry, 'reserved');
           if (job) await store.releaseJob(job);
-          released.push(jobId);
+          if (reclaimed) released.push(jobId);
           continue;
         }
         const job = await store.getJob(jobId);

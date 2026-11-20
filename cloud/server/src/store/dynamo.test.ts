@@ -52,6 +52,7 @@ function fakeTable() {
     if (expr === 'attribute_exists(pk) AND #status <> :finished') return Boolean(item) && item!.status !== values[':finished'];
     if (expr === 'jobId = :job') return Boolean(item) && item!.jobId === values[':job'];
     if (expr === 'phase = :reserved') return Boolean(item) && item!.phase === values[':reserved'];
+    if (expr === 'attribute_exists(pk) AND phase = :phase') return Boolean(item) && item!.phase === values[':phase'];
     throw new Error(`fake table: unsupported condition ${expr}`);
   }
 
@@ -550,11 +551,17 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await reserve(55, 'job_b00000001')).toEqual({ ok: false, limit: 'concurrent_jobs' });
     expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(1);
 
-    // A failed launch gives everything back.
+    // A failed launch gives everything back, once: a repeat (a retry, a concurrent reclaim) gives nothing more.
     if (!a.ok) throw new Error('unreachable');
-    await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: a.tenantSlot, platformSlot: a.platformSlot, day: '2026-11-20', month: '2026-11' });
+    const reservation = { installationId: 55, jobId: 'job_a00000001', tenantSlot: a.tenantSlot, platformSlot: a.platformSlot, day: '2026-11-20', month: '2026-11' };
+    // Not in the phase asked for: nothing happens to the counts.
+    expect(await store.cancelReservation(reservation, 'launching')).toBe(false);
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(1);
+    expect(await store.cancelReservation(reservation, 'reserved')).toBe(true);
     expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
     expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(0);
+    expect(await store.cancelReservation(reservation, 'reserved')).toBe(false);
+    expect(await store.getUsage(55, '2026-11-20', '2026-11')).toMatchObject({ jobsToday: 0, jobsThisMonth: 0 });
 
     // Jobs per day: counted at launch, whatever becomes of the job.
     for (const jobId of ['job_c00000001', 'job_d00000001']) {
@@ -588,7 +595,7 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     await store.markLaunching('job_a00000001');
     expect((await store.listActiveJobs())[0]?.phase).toBe('launching');
     await expect(store.markLaunching('job_a00000001')).rejects.toThrow('no reservation to launch');
-    await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11' });
+    expect(await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11' }, 'launching')).toBe(true);
     expect(await store.listActiveJobs()).toEqual([]);
     await expect(store.markLaunching('job_a00000001')).rejects.toThrow('no reservation to launch');
   });

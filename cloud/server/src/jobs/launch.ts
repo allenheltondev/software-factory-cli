@@ -212,6 +212,7 @@ export function createLauncher(deps: LaunchDeps) {
     };
 
     let recorded = false;
+    let launching = false;
     let microvmId: string | undefined;
     try {
       await deps.putEvent(jobPaths(job).eventKey, req.body);
@@ -220,12 +221,13 @@ export function createLauncher(deps: LaunchDeps) {
       // From here a microVM may exist: the reservation is no longer reclaimable as a launch that
       // never got this far.
       await deps.store.markLaunching(jobId);
+      launching = true;
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt }));
       microvmId = out.microvmId;
     } catch (err) {
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: (err as Error)?.message });
       await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
-      await deps.store.cancelReservation(reservation).catch(() => {});
+      await deps.store.cancelReservation(reservation, launching ? 'launching' : 'reserved').catch(() => {});
       // Nothing runs for this record; its token must not be served, and it needs no reconciling.
       if (recorded) {
         await deps.store.finishJob(jobId, 'launch_failed').catch(() => {});

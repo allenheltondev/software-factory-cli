@@ -370,8 +370,13 @@ export interface Store {
   reserveJob(input: { installationId: number; jobId: string; holdUntil: number; day: string; month: string; quotas: Quotas }): Promise<
     { ok: true; tenantSlot: number; platformSlot: number } | { ok: false; limit: QuotaLimit }
   >;
-  /** A launch that failed after reserveJob: frees the slots, takes back the day's and the month's count, and drops its active entry. */
-  cancelReservation(reservation: Reservation): Promise<void>;
+  /**
+   * A launch that failed after reserveJob, or one reconciliation reclaims: takes back the day's
+   * and the month's count and drops the active entry, in one transaction, only while that entry
+   * exists in `phase`; so it happens once, however often or concurrently it is tried (false: it
+   * had already happened). The slots are freed either way (owner-checked, safe to repeat).
+   */
+  cancelReservation(reservation: Reservation, phase: ActiveJob['phase']): Promise<boolean>;
   /**
    * A delivery refused by a quota counts as throttled for the month. With `notice`: whether this is
    * the first for that issue that day, so the over-quota comment is posted once.
@@ -640,13 +645,17 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       active.set(jobId, { installationId: id, jobId, tenantSlot, platformSlot, day, month: m, phase: 'reserved', reservedAt: now, expiresAt: holdUntil });
       return { ok: true, tenantSlot, platformSlot };
     },
-    async cancelReservation(r) {
+    async cancelReservation(r, phase) {
+      const entry = active.get(r.jobId);
+      const once = entry !== undefined && entry.phase === phase;
+      if (once) active.delete(r.jobId);
       for (const key of slotKeys(r)) if (slots.get(key)?.jobId === r.jobId) slots.delete(key);
+      if (!once) return false;
       const dayKey = `${r.installationId}/${r.day}`;
       days.set(dayKey, Math.max(0, (days.get(dayKey) ?? 0) - 1));
       const monthKey = `${r.installationId}/${r.month}`;
       months.set(monthKey, { ...month(monthKey), jobs: Math.max(0, month(monthKey).jobs - 1) });
-      active.delete(r.jobId);
+      return true;
     },
     async recordThrottle(id, m, notice) {
       const monthKey = `${id}/${m}`;
