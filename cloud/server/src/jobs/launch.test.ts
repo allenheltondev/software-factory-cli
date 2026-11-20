@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type Tenant } from '../store/store.js';
 import { dispatchRules } from '../tenants/dispatch.js';
+import { createAdminService } from '../admin/admin.js';
 import { createReconciler } from './reconcile.js';
 import { createLauncher, PRELAUNCH_CLAIM_MS, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
 
@@ -479,6 +480,30 @@ describe('the launcher', () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it("reports an admin's release of a launch it beat as cancelled, not as a failure", async () => {
+      // The webhook pauses just before it marks its launch; an admin releases the job meanwhile.
+      let resume!: () => void;
+      const paused = new Promise<void>((r) => (resume = r));
+      const markLaunching = store.markLaunching.bind(store);
+      store.markLaunching = async (jobId) => {
+        await paused;
+        return markLaunching(jobId);
+      };
+      const pending = createLauncher(deps)(request());
+      await vi.waitFor(async () => expect(await store.listActiveJobs()).toHaveLength(1));
+      const [entry] = await store.listActiveJobs();
+      await vi.waitFor(async () => expect(await store.getJob(entry!.jobId)).not.toBeNull());
+      await createAdminService({ store, quotas: deps.quotas, log: () => {} }).releaseJob(entry!.jobId, 'admin:x');
+
+      resume();
+      expect(await pending).toEqual({ status: 200, disposition: 'cancelled', jobId: entry!.jobId });
+      expect(runs).toEqual([]);
+      expect(await store.getJob(entry!.jobId)).toMatchObject({ status: 'finished', outcome: 'released_by_admin' });
+      const day = new Date(NOW).toISOString().slice(0, 10);
+      expect((await store.getUsage(55, day, day.slice(0, 7))).failedThisMonth).toBe(0);
+      expect((await store.listRecentJobs(55, 5))[0]).toMatchObject({ status: 'finished', outcome: 'released_by_admin' });
     });
 
     it('gives the reservation back when the launch fails', async () => {

@@ -721,6 +721,34 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
 
   });
 
+  it("an admin's cancel retires the job in the same write, keeping an outcome it already had", async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    const r = await store.reserveJob({ installationId: 55, jobId: 'job_a00000001', holdUntil: LATER, day: '2026-11-20', month: '2026-11', quotas: QUOTAS });
+    if (!r.ok) throw new Error(r.limit);
+    const job: Job = {
+      jobId: 'job_a00000001',
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 1,
+      deliveryId: 'd-1',
+      eventName: 'issues',
+      status: 'launched',
+      createdAt: '2026-11-20T12:00:00.000Z',
+      expiresAt: LATER,
+    };
+    await store.putJob(job);
+    const reservation = { installationId: 55, jobId: job.jobId, tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11' };
+    expect(await store.cancelReservation(reservation, 'reserved', { job, outcome: 'released_by_admin' })).toBe('cancelled');
+    expect(await store.getJob(job.jobId)).toMatchObject({ status: 'finished', outcome: 'released_by_admin', stopRequestedAt: expect.any(Number) });
+    expect((await store.listRecentJobs(55, 1))[0]).toMatchObject({ status: 'finished', outcome: 'released_by_admin' });
+    // The launch's own finish afterwards keeps the admin's outcome, and counts no failure.
+    expect(await store.finishJob(job.jobId, 'launch_failed')).toBe('released_by_admin');
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).failedThisMonth).toBe(0);
+  });
+
   it('records each reservation as active, reserved until the launch marks it launching, and drops it when cancelled', async () => {
     const table = fakeTable();
     const store = createDynamoStore('T', table.client);

@@ -1276,10 +1276,32 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       throw new Error(`reserveJob: the slots of tenant ${id} kept changing; retry the delivery`);
     },
 
-    async cancelReservation(r, phase) {
+    async cancelReservation(r, phase, retire) {
       // The counts go back with the entry's delete, in one transaction, only while the entry is
       // there in that phase: a retried or concurrent cancel (two reconciliations) gives back nothing.
       let outcome: 'cancelled' | 'gone' | 'mismatch' = 'cancelled';
+      // An admin's release retires the job with it: a launch that finds its reservation gone then
+      // finds the job finished, with the admin's outcome (first outcome kept, as finishJob keeps it).
+      const finished = {
+        UpdateExpression: 'SET #status = :finished, outcome = if_not_exists(outcome, :outcome), stopRequestedAt = if_not_exists(stopRequestedAt, :at)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':finished': 'finished', ':outcome': retire?.outcome, ':at': Date.now() },
+      };
+      const retiring = retire
+        ? [
+            { Update: { TableName: T, Key: { pk: `JOB#${retire.job.jobId}`, sk: 'META' }, ConditionExpression: 'attribute_exists(pk)', ...finished } },
+            {
+              Update: {
+                TableName: T,
+                Key: jobSummaryKey(retire.job),
+                UpdateExpression: 'SET #status = :finished, outcome = if_not_exists(outcome, :outcome)',
+                ConditionExpression: 'attribute_exists(pk)',
+                ExpressionAttributeNames: { '#status': 'status' },
+                ExpressionAttributeValues: { ':finished': 'finished', ':outcome': retire.outcome },
+              },
+            },
+          ]
+        : [];
       try {
         await client.send(
           new TransactWriteCommand({
@@ -1295,6 +1317,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
               ...[dayKey(r.installationId, r.day), monthKey(r.installationId, r.month)].map((key) => ({
                 Update: { TableName: T, Key: key, UpdateExpression: 'ADD jobs :minus', ExpressionAttributeValues: { ':minus': -1 } },
               })),
+              ...retiring,
             ],
           }),
         );

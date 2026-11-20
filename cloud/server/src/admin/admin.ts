@@ -163,7 +163,8 @@ export function createAdminService({
         // Won against the launcher first, before anything else is touched: this cancel and the
         // launcher's markLaunching are conditional writes on the same entry, so only one of them
         // succeeds. If the launch won, its microVM may be starting: nothing is released.
-        if ((await store.cancelReservation(entry, 'reserved')) === 'mismatch') throw launching();
+        // The job is retired in the same write, so the launch sees an admin's release, not an error.
+        if ((await store.cancelReservation(entry, 'reserved', { job, outcome: ADMIN_RELEASED_OUTCOME })) === 'mismatch') throw launching();
       } else if (entry?.phase === 'launching' && now() - entry.reservedAt < RESERVATION_RECLAIM_MS) {
         // RunMicrovm may still be in flight (the webhook allows 20 seconds; this is well past it).
         throw launching();

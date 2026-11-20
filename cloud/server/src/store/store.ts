@@ -414,8 +414,14 @@ export interface Store {
    *   gone        it was done before (no entry): the slots are freed again (owner-checked), so a
    *               cancel cut short after its transaction finishes
    *   mismatch    the entry is in another phase (a launch moved it on): nothing is touched
+   * `retire`: in the same transaction, the job is finished with that outcome (unless it already has
+   * one) and marked stopping, so a launch that finds its reservation gone sees why.
    */
-  cancelReservation(reservation: Reservation, phase: ActiveJob['phase']): Promise<'cancelled' | 'gone' | 'mismatch'>;
+  cancelReservation(
+    reservation: Reservation,
+    phase: ActiveJob['phase'],
+    retire?: { job: Pick<Job, 'jobId' | 'installationId' | 'createdAt'>; outcome: string },
+  ): Promise<'cancelled' | 'gone' | 'mismatch'>;
   /**
    * A delivery refused by a quota counts as throttled for the month. With `notice`: whether this is
    * the first for that issue that day, so the over-quota comment is posted once.
@@ -432,10 +438,10 @@ export interface Store {
 
 /**
  * Outcomes that count as a failed job in the admin view: anything but a clean success, an
- * unconfirmed one (it ran, without a summary), and jobs that never ran for a quota or a
- * redelivery (throttled, superseded).
+ * unconfirmed one (it ran, without a summary), jobs that never ran for a quota or a redelivery
+ * (throttled, superseded), and an admin's release.
  */
-export const NOT_FAILURES: ReadonlySet<string> = new Set(['succeeded', 'unconfirmed', 'throttled', 'superseded']);
+export const NOT_FAILURES: ReadonlySet<string> = new Set(['succeeded', 'unconfirmed', 'throttled', 'superseded', 'released_by_admin']);
 export const isFailure = (outcome: string) => !NOT_FAILURES.has(outcome);
 
 export interface CleanupEntry {
@@ -724,12 +730,19 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       active.set(jobId, { installationId: id, jobId, tenantSlot, platformSlot, day, month: m, phase: 'reserved', reservedAt: now, expiresAt: holdUntil });
       return { ok: true, tenantSlot, platformSlot };
     },
-    async cancelReservation(r, phase) {
+    async cancelReservation(r, phase, retire) {
       const entry = active.get(r.jobId);
       if (entry !== undefined && entry.phase !== phase) return 'mismatch';
       for (const key of slotKeys(r)) if (slots.get(key)?.jobId === r.jobId) slots.delete(key);
       if (entry === undefined) return 'gone';
       active.delete(r.jobId);
+      const j = retire ? jobs.get(retire.job.jobId) : undefined;
+      if (retire && j) {
+        const outcome = j.outcome ?? retire.outcome;
+        jobs.set(j.jobId, { ...j, status: 'finished', outcome, stopRequestedAt: j.stopRequestedAt ?? Date.now() });
+        const s = summaries.get(j.jobId);
+        if (s) summaries.set(j.jobId, { ...s, status: 'finished', outcome: s.outcome ?? outcome });
+      }
       const dayKey = `${r.installationId}/${r.day}`;
       days.set(dayKey, Math.max(0, (days.get(dayKey) ?? 0) - 1));
       const monthKey = `${r.installationId}/${r.month}`;
