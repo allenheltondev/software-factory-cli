@@ -51,6 +51,7 @@ function fakeTable() {
     }
     if (expr === 'attribute_exists(pk) AND #status <> :finished') return Boolean(item) && item!.status !== values[':finished'];
     if (expr === 'jobId = :job') return Boolean(item) && item!.jobId === values[':job'];
+    if (expr === 'phase = :reserved') return Boolean(item) && item!.phase === values[':reserved'];
     throw new Error(`fake table: unsupported condition ${expr}`);
   }
 
@@ -576,6 +577,22 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
 
   });
 
+  it('records each reservation as active, reserved until the launch marks it launching, and drops it when cancelled', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    const r = await store.reserveJob({ installationId: 55, jobId: 'job_a00000001', holdUntil: LATER, day: '2026-11-20', month: '2026-11', quotas: QUOTAS });
+    if (!r.ok) throw new Error(r.limit);
+    expect(await store.listActiveJobs()).toEqual([
+      { jobId: 'job_a00000001', installationId: 55, tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11', phase: 'reserved', reservedAt: expect.any(Number), expiresAt: LATER },
+    ]);
+    await store.markLaunching('job_a00000001');
+    expect((await store.listActiveJobs())[0]?.phase).toBe('launching');
+    await expect(store.markLaunching('job_a00000001')).rejects.toThrow('no reservation to launch');
+    await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11' });
+    expect(await store.listActiveJobs()).toEqual([]);
+    await expect(store.markLaunching('job_a00000001')).rejects.toThrow('no reservation to launch');
+  });
+
   it("stops at the platform's ceiling, across tenants", async () => {
     const store = createDynamoStore('T', fakeTable().client);
     const reserve = (installationId: number) =>
@@ -605,8 +622,8 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
       tenantSlot: 0,
     };
     await store.putJob(job);
-    expect(await store.listActiveJobs()).toEqual([job.jobId]);
-    expect(table.items.has('PLATFORM#ACTIVE|JOB#job_first0001')).toBe(true);
+    table.items.set('PLATFORM#ACTIVE|JOB#job_first0001', { pk: 'PLATFORM#ACTIVE', sk: 'JOB#job_first0001', jobId: job.jobId, phase: 'launching' });
+    expect((await store.listActiveJobs()).map((e) => e.jobId)).toEqual([job.jobId]);
     await store.releaseJob(job, { month: '2026-11', seconds: 9000 });
     await store.releaseJob(job, { month: '2026-11', seconds: 9000 });
     expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(1800);

@@ -389,8 +389,9 @@ describe('the launcher', () => {
         void stuck(request());
         await vi.waitFor(async () => expect(await store.listPlatformSlots()).toHaveLength(1));
         // Held to the job's own end (vi.waitFor moves the fake clock a little while it waits).
-        const [jobId] = await store.listActiveJobs();
-        expect((await store.listPlatformSlots())[0]!.expiresAt).toBe((await store.getJob(jobId!))!.expiresAt);
+        const [entry] = await store.listActiveJobs();
+        expect(entry).toMatchObject({ phase: 'launching' });
+        expect((await store.listPlatformSlots())[0]!.expiresAt).toBe((await store.getJob(entry!.jobId))!.expiresAt);
 
         // Well past the launcher's five minutes: still taken, and the job still reconciled.
         vi.setSystemTime(NOW + 4 * PRELAUNCH_CLAIM_MS);
@@ -425,6 +426,59 @@ describe('the launcher', () => {
       expect(await store.listPlatformSlots()).toEqual([]);
       expect(await store.listActiveJobs()).toEqual([]);
       expect((await launch(request({}, 'delivery-2'))).disposition).toBe('launched');
+    });
+
+    it('reclaims a reservation whose launch stopped before it asked for a microVM', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      try {
+        const reconcile = () => createReconciler({ store, microvmState: vi.fn(), now: () => Date.now(), log: () => {} })();
+        // The Lambda's deadline hits while it writes the event: nothing after the reservation is written.
+        const stuck = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now(), putEvent: () => new Promise(() => {}) });
+        void stuck(request());
+        await vi.waitFor(async () => expect(await store.listActiveJobs()).toHaveLength(1));
+        expect((await store.listActiveJobs())[0]).toMatchObject({ phase: 'reserved' });
+
+        // Too soon to tell from a launch still under way: left alone.
+        vi.setSystemTime(NOW + 60_000);
+        expect((await reconcile()).released).toEqual([]);
+        expect(await store.listPlatformSlots()).toHaveLength(1);
+
+        // Past five minutes: reclaimed, the slots and the day's count given back.
+        vi.setSystemTime(NOW + 6 * 60_000);
+        expect((await reconcile()).released).toHaveLength(1);
+        expect(await store.listPlatformSlots()).toEqual([]);
+        expect(await store.listActiveJobs()).toEqual([]);
+        expect(await store.getUsage(55, new Date(NOW).toISOString().slice(0, 10), new Date(NOW).toISOString().slice(0, 7))).toMatchObject({ jobsToday: 0, jobsThisMonth: 0 });
+        expect((await createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now() })(request({}, 'delivery-2'))).disposition).toBe('launched');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('a reclaimed reservation retires the job it recorded, which can then never start', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      try {
+        // The job is recorded, then the Lambda stops before it marks the launch (no RunMicrovm).
+        const markLaunching = store.markLaunching.bind(store);
+        store.markLaunching = () => new Promise(() => {});
+        const stuck = createLauncher({ ...deps, now: () => Date.now() });
+        void stuck(request());
+        await vi.waitFor(async () => expect(Object.keys(events)).toHaveLength(1));
+        const [entry] = await store.listActiveJobs();
+        await vi.waitFor(async () => expect(await store.getJob(entry!.jobId)).not.toBeNull());
+        store.markLaunching = markLaunching;
+
+        vi.setSystemTime(NOW + 6 * 60_000);
+        expect((await createReconciler({ store, microvmState: vi.fn(), now: () => Date.now(), log: () => {} })()).released).toEqual([entry!.jobId]);
+        const job = (await store.getJob(entry!.jobId))!;
+        expect(job).toMatchObject({ status: 'finished', outcome: 'launch_failed' });
+        expect(typeof job.stopRequestedAt).toBe('number');
+        expect(await store.startJob(job, job.expiresAt)).toEqual({ result: 'retired' });
+        // Too late to launch: marking it fails, so a launch that woke up now starts nothing.
+        await expect(store.markLaunching(job.jobId)).rejects.toThrow('no reservation to launch');
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('gives the reservation back when the launch fails', async () => {

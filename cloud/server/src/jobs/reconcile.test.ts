@@ -25,6 +25,8 @@ async function admitted(store: ReturnType<typeof createMemoryStore>, jobId: stri
     ...extra,
   };
   await store.putJob(job);
+  // As the launcher does just before RunMicrovm.
+  await store.markLaunching(jobId);
   return job;
 }
 

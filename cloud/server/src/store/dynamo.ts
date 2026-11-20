@@ -9,6 +9,7 @@ import {
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import type {
+  ActiveJob,
   AgentKeyMeta,
   CleanupEntry,
   ConfigVersion,
@@ -452,16 +453,30 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
 
     async putJob(job) {
       // A week after the job may last, the record goes; nothing is served for it by then anyway.
-      // The active entry with it, in one write: a job whose microVM may run is always reconciled.
-      const ttl = Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600;
       await client.send(
-        new TransactWriteCommand({
-          TransactItems: [
-            { Put: { TableName: T, Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl }, ConditionExpression: 'attribute_not_exists(pk)' } },
-            { Put: { TableName: T, Item: { ...activeKey(job.jobId), jobId: job.jobId, ttl } } },
-          ],
+        new PutCommand({
+          TableName: T,
+          Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 },
+          ConditionExpression: 'attribute_not_exists(pk)',
         }),
       );
+    },
+
+    async markLaunching(jobId) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: activeKey(jobId),
+            UpdateExpression: 'SET phase = :launching',
+            ConditionExpression: 'phase = :reserved',
+            ExpressionAttributeValues: { ':launching': 'launching', ':reserved': 'reserved' },
+          }),
+        );
+      } catch (err) {
+        if (err instanceof ConditionalCheckFailedException) throw new Error(`job ${jobId} has no reservation to launch`, { cause: err });
+        throw err;
+      }
     },
 
     async getJob(jobId): Promise<Job | null> {
@@ -870,8 +885,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       return all;
     },
 
-    async listActiveJobs() {
-      const ids: string[] = [];
+    async listActiveJobs(): Promise<ActiveJob[]> {
+      const entries: ActiveJob[] = [];
       let ExclusiveStartKey: Record<string, unknown> | undefined;
       do {
         const page = await client.send(
@@ -883,10 +898,29 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             ExclusiveStartKey,
           }),
         );
-        for (const item of page.Items ?? []) if (typeof item.jobId === 'string') ids.push(item.jobId);
+        for (const i of page.Items ?? []) {
+          if (typeof i.jobId !== 'string') continue;
+          entries.push({
+            jobId: i.jobId,
+            installationId: Number(i.installationId),
+            tenantSlot: Number(i.tenantSlot),
+            platformSlot: Number(i.platformSlot),
+            day: String(i.day),
+            month: String(i.month),
+            // An entry without a phase may have a microVM: treat it as launching.
+            phase: i.phase === 'reserved' ? 'reserved' : 'launching',
+            reservedAt: Number(i.reservedAt ?? 0),
+            expiresAt: Number(i.expiresAt ?? (typeof i.ttl === 'number' ? i.ttl * 1000 : 0)),
+          });
+        }
         ExclusiveStartKey = page.LastEvaluatedKey;
       } while (ExclusiveStartKey);
-      return ids;
+      return entries;
+    },
+
+    async forgetActiveJob(entry) {
+      for (const key of jobSlotKeys(entry)) await deleteIfHeld(key, entry.jobId);
+      await client.send(new DeleteCommand({ TableName: T, Key: activeKey(entry.jobId) }));
     },
 
     async listPlatformSlots() {
@@ -998,6 +1032,26 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                     ExpressionAttributeValues: { ':one': 1, ':ttl': usageTtl(400), ':limit': quotas.microvmMinutesPerMonth * 60 },
                   },
                 },
+                // With the long leases: reconciliation finds this reservation even if the launch
+                // stops before anything else is written.
+                {
+                  Put: {
+                    TableName: T,
+                    Item: {
+                      ...activeKey(jobId),
+                      jobId,
+                      installationId: id,
+                      tenantSlot,
+                      platformSlot,
+                      day,
+                      month,
+                      phase: 'reserved',
+                      reservedAt: Date.now(),
+                      expiresAt: holdUntil,
+                      ttl: ttl + 7 * 24 * 3600,
+                    },
+                  },
+                },
               ],
             }),
           );
@@ -1017,6 +1071,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       for (const key of [dayKey(r.installationId, r.day), monthKey(r.installationId, r.month)]) {
         await client.send(new UpdateCommand({ TableName: T, Key: key, UpdateExpression: 'ADD jobs :minus', ExpressionAttributeValues: { ':minus': -1 } }));
       }
+      await client.send(new DeleteCommand({ TableName: T, Key: activeKey(r.jobId) }));
     },
 
     async recordThrottle(id, month, notice) {

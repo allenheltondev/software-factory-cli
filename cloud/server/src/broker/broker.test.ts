@@ -271,6 +271,7 @@ describe('the job broker', () => {
       if (!reserved.ok) throw new Error('not reserved');
       job = { ...job, createdAt: new Date(clock).toISOString(), expiresAt: clock + 3_600_000, tenantSlot: reserved.tenantSlot, platformSlot: reserved.platformSlot, reservedSeconds: 3600 };
       await store.putJob(job);
+      await store.markLaunching(job.jobId);
       await store.claimDelivery(55, 'd-1', clock + 60_000, job.jobId);
     });
 

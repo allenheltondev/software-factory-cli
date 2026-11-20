@@ -217,6 +217,9 @@ export function createLauncher(deps: LaunchDeps) {
       await deps.putEvent(jobPaths(job).eventKey, req.body);
       await deps.store.putJob(job);
       recorded = true;
+      // From here a microVM may exist: the reservation is no longer reclaimable as a launch that
+      // never got this far.
+      await deps.store.markLaunching(jobId);
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt }));
       microvmId = out.microvmId;
     } catch (err) {

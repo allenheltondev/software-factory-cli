@@ -13,7 +13,7 @@
  *   TENANT#<installId>   USAGE#MONTH#<yyyy-mm>  jobs, microVM seconds and throttled deliveries that month
  *   TENANT#<installId>   NOTICE#<repo>#<issue>#<date>  an over-quota comment was posted (once a day)
  *   PLATFORM#JOBS        SLOT#<n>              a running job's place in the platform-wide ceiling
- *   PLATFORM#ACTIVE      JOB#<jobId>           a launched job not yet released: what reconciliation looks at
+ *   PLATFORM#ACTIVE      JOB#<jobId>           a reservation not yet released: what reconciliation looks at
  *
  * Everything in a TENANT# partition gets the table's `ttl` (epoch seconds) when the App is
  * uninstalled, so DynamoDB deletes the tenant and its members once the retention has passed.
@@ -83,6 +83,19 @@ export interface Reservation {
   platformSlot: number;
   day: string;
   month: string;
+}
+
+/**
+ * A reservation reconciliation looks at, from reserveJob until the job is released. `reserved`: no
+ * microVM has been asked for yet, so one this old is a launch that stopped partway and can be
+ * reclaimed. `launching`: RunMicrovm may have been called, so a microVM may exist.
+ */
+export interface ActiveJob extends Reservation {
+  phase: 'reserved' | 'launching';
+  /** Epoch ms. */
+  reservedAt: number;
+  /** Epoch ms: the job's maximum duration, when its slots run out. */
+  expiresAt: number;
 }
 
 /** A tenant's usage for a day and its month. */
@@ -292,12 +305,13 @@ export interface Store {
    */
   purgeTenantPartition(installationId: number): Promise<void>;
 
-  /**
-   * Records a job (the launcher), before its microVM is started. Its own partition, expiring a
-   * week after the job may last, and in the same write an entry in the platform's active jobs,
-   * which reconciliation reads until the job is released (releaseJob).
-   */
+  /** Records a job (the launcher), before its microVM is started. Its own partition, expiring a week after the job may last. */
   putJob(job: Job): Promise<void>;
+  /**
+   * The launcher is about to call RunMicrovm: the job's active entry becomes `launching`, and is
+   * no longer reclaimable. Throws when there is no `reserved` entry (it was reclaimed): no launch.
+   */
+  markLaunching(jobId: string): Promise<void>;
   getJob(jobId: string): Promise<Job | null>;
   /**
    * The runner said it is done: nothing more is served for it. Only the first outcome is kept, and
@@ -341,20 +355,22 @@ export interface Store {
   holdSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>, until: number): Promise<boolean>;
   /** The platform's unexpired slots and the jobs holding them. */
   listPlatformSlots(): Promise<{ jobId: string; expiresAt: number }[]>;
-  /** The launched jobs not yet released (putJob to releaseJob): what reconciliation looks at. */
-  listActiveJobs(): Promise<string[]>;
+  /** The reservations not yet released (reserveJob to releaseJob): what reconciliation looks at. */
+  listActiveJobs(): Promise<ActiveJob[]>;
+  /** An active entry whose job is gone, past its maximum duration: frees its slots and drops it. */
+  forgetActiveJob(entry: ActiveJob): Promise<void>;
 
   /**
    * Quotas, at launch (jobs/launch.ts): takes a free slot of the tenant's and one of the
-   * platform's, both held until `holdUntil` (epoch ms; the broker's start holds them for the job's
-   * lifetime), and counts the job against the day and the month, in one transaction, while the
-   * day's jobs and the month's microVM seconds are under their quotas. Or says which quota stopped
-   * it, and takes nothing.
+   * platform's, both held until `holdUntil` (epoch ms, the job's maximum duration), counts the job
+   * against the day and the month, and records a `reserved` active entry for reconciliation, in
+   * one transaction, while the day's jobs and the month's microVM seconds are under their quotas.
+   * Or says which quota stopped it, and takes nothing.
    */
   reserveJob(input: { installationId: number; jobId: string; holdUntil: number; day: string; month: string; quotas: Quotas }): Promise<
     { ok: true; tenantSlot: number; platformSlot: number } | { ok: false; limit: QuotaLimit }
   >;
-  /** A launch that failed after reserveJob: frees the slots and takes back the day's and the month's count. */
+  /** A launch that failed after reserveJob: frees the slots, takes back the day's and the month's count, and drops its active entry. */
   cancelReservation(reservation: Reservation): Promise<void>;
   /**
    * A delivery refused by a quota counts as throttled for the month. With `notice`: whether this is
@@ -394,7 +410,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const days = new Map<string, number>();
   const months = new Map<string, { jobs: number; seconds: number; throttled: number }>();
   const notices = new Set<string>();
-  const active = new Set<string>();
+  const active = new Map<string, ActiveJob>();
   const month = (key: string) => months.get(key) ?? { jobs: 0, seconds: 0, throttled: 0 };
   const free = (key: string, now: number) => {
     const s = slots.get(key);
@@ -576,7 +592,16 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       return all;
     },
     async listActiveJobs() {
-      return [...active];
+      return [...active.values()].map((a) => ({ ...a }));
+    },
+    async forgetActiveJob(entry) {
+      for (const key of slotKeys(entry)) if (slots.get(key)?.jobId === entry.jobId) slots.delete(key);
+      active.delete(entry.jobId);
+    },
+    async markLaunching(jobId) {
+      const entry = active.get(jobId);
+      if (!entry || entry.phase !== 'reserved') throw new Error(`job ${jobId} has no reservation to launch`);
+      active.set(jobId, { ...entry, phase: 'launching' });
     },
     async listPlatformSlots() {
       const now = Date.now();
@@ -612,6 +637,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       slots.set(`platform/${platformSlot}`, { expiresAt: holdUntil, jobId });
       days.set(dayKey, (days.get(dayKey) ?? 0) + 1);
       months.set(monthKey, { ...month(monthKey), jobs: month(monthKey).jobs + 1 });
+      active.set(jobId, { installationId: id, jobId, tenantSlot, platformSlot, day, month: m, phase: 'reserved', reservedAt: now, expiresAt: holdUntil });
       return { ok: true, tenantSlot, platformSlot };
     },
     async cancelReservation(r) {
@@ -620,6 +646,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       days.set(dayKey, Math.max(0, (days.get(dayKey) ?? 0) - 1));
       const monthKey = `${r.installationId}/${r.month}`;
       months.set(monthKey, { ...month(monthKey), jobs: Math.max(0, month(monthKey).jobs - 1) });
+      active.delete(r.jobId);
     },
     async recordThrottle(id, m, notice) {
       const monthKey = `${id}/${m}`;
@@ -649,7 +676,6 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async putJob(job) {
       jobs.set(job.jobId, { ...job });
-      active.add(job.jobId);
     },
     async getJob(jobId) {
       const j = jobs.get(jobId);
