@@ -174,6 +174,19 @@ describe('the job broker', () => {
     expect(terminateMicrovm).toHaveBeenCalledExactlyOnceWith('mvm-own');
   });
 
+  it("gives up the delivery's claim unless the job succeeded, so a redelivery retries a failed job", async () => {
+    const later = Date.now() + 3_600_000;
+    await store.claimDelivery(55, 'd-1', later);
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded' });
+    expect(await store.claimDelivery(55, 'd-1', later)).toBe(false);
+
+    const other = { ...job, jobId: 'job_def67890', deliveryId: 'd-2' };
+    await store.putJob(other);
+    await store.claimDelivery(55, 'd-2', later);
+    await handle({ action: 'finish', jobId: other.jobId, token, outcome: 'unconfirmed' });
+    expect(await store.claimDelivery(55, 'd-2', later)).toBe(true);
+  });
+
   it('keeps an unexpected outcome out of the record', async () => {
     await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'DROP TABLE; --' });
     expect((await store.getJob(job.jobId))?.outcome).toBe('unknown');

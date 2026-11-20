@@ -9,7 +9,8 @@
     "build": "node scripts/bundle.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "tenant-admin": "tsx scripts/tenant-admin.ts"
+    "tenant-admin": "tsx scripts/tenant-admin.ts",
+    "build-job-image": "tsx scripts/build-job-image.ts"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1172.0",

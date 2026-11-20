@@ -173,7 +173,11 @@ export function createBroker(deps: BrokerDeps) {
     if (!(await servable(job))) return REFUSED;
 
     if (action === 'finish') {
-      await deps.store.finishJob(job.jobId, typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown');
+      const recorded = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
+      await deps.store.finishJob(job.jobId, recorded);
+      // Redelivering the webhook is how a failed job is retried: anything but a clean success
+      // gives up the delivery's claim, so the launcher starts a job for the redelivery.
+      if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId);
       return { ok: true, finished: true };
     }
 

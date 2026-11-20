@@ -3,6 +3,8 @@ import { stringify } from 'yaml';
 // The CLI's own schema and validator (the `@allenheltondev/updraft/config` entry point), from this
 // repository's source: a tenant's config is checked exactly as the worker in the microVM will.
 import { validateConfig } from '../../../../src/config/public.js';
+import type { DispatchRules } from '../store/store.js';
+import { dispatchRules } from './dispatch.js';
 
 /**
  * A tenant's Updraft config, compiled from what the tenant wrote plus what the platform enforces
@@ -61,7 +63,7 @@ export interface TenantSubmission {
 }
 
 export type CompileResult =
-  | { ok: true; files: Record<string, string>; sha256: string; warnings: ConfigIssue[] }
+  | { ok: true; files: Record<string, string>; sha256: string; warnings: ConfigIssue[]; dispatch: DispatchRules }
   | { ok: false; errors: ConfigIssue[] };
 
 const TOP_LEVEL = new Set(['agents', 'pools', 'actions', 'repositories', 'dispatch', 'review']);
@@ -230,7 +232,7 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
   for (const file of Object.keys(prompts)) if (!usedPrompts.has(file)) warnings.push({ path: file, message: 'not referenced by any action; it is stored anyway' });
 
   const files: Record<string, string> = { 'config.yaml': stringify(compiled), ...prompts };
-  return { ok: true, files, sha256: bundleHash(files), warnings };
+  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: dispatchRules(compiled) };
 }
 
 /** A stable hash of a bundle: every file's path and content, in path order. */

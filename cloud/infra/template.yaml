@@ -245,27 +245,52 @@ Resources:
 
   # The GitHub webhook (flows/webhook.ts). No authorizer: the HMAC over the raw body, keyed with the
   # App's webhook secret, is the authentication. Its own function, so its own concurrency and
-  # throttling (WebhookRateLimit on the route); #68 turns it into the multi-tenant launcher.
+  # throttling (WebhookRateLimit on the route). It is also the multi-tenant launcher (jobs/launch.ts):
+  # a tenant's labeled issue starts a job microVM.
   WebhookFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../server/dist
       Handler: webhook.handler
-      MemorySize: 256
-      Timeout: 10
+      MemorySize: 512
+      # GitHub gives up after 10 s; a launch that takes longer still completes.
+      Timeout: 20
       Environment:
         Variables:
           TABLE_NAME: !Ref UpdraftTable
+          TENANT_BUCKET: !Ref TenantBucket
+          PARTITION: !Ref AWS::Partition
+          JOB_IMAGE_ARN: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
+          JOB_IMAGE_VERSION_PARAMETER: !Sub /updraft/${AWS::StackName}/job-image-version
+          EXECUTION_ROLE_ARN: !GetAtt MicrovmExecutionRole.Arn
+          BROKER_FUNCTION_NAME: !Ref BrokerFunction
+          MICROVM_LOG_GROUP: !Ref MicrovmLogGroup
+          # Agent timeouts are capped at 120 minutes and verify at 30 (tenants/config.ts).
+          MAX_DURATION_SECONDS: '10800'
+          WATCHDOG_RESERVE_SECONDS: '600'
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
         - SSMParameterReadPolicy:
             ParameterName: updraft/app/*
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub updraft/${AWS::StackName}/job-image-version
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
+            # The event a job reads, under its tenant's prefix.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub ${TenantBucket.Arn}/tenants/*/events/*
+            - Effect: Allow
+              Action: lambda:RunMicrovm
+              Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
+            # RunMicrovm is given the execution role; passing a role needs iam:PassRole on exactly it.
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt MicrovmExecutionRole.Arn
       Events:
         GitHub:
           Type: Api
@@ -362,8 +387,8 @@ Resources:
   # no tenant's data. A job's runner invokes the job broker (server/src/broker/broker.ts) with its
   # single-use job token and gets back what that one job may have: AWS credentials from JobDataRole
   # with a session policy for its tenant's prefix and key secrets, and an installation token for its
-  # one repository. The App's private key never enters a microVM. The MicroVM image and the
-  # launcher that starts jobs come next (#68, PR 4).
+  # one repository. The App's private key never enters a microVM. WebhookFunction is the launcher;
+  # the image is built by server/scripts/build-job-image.ts.
   # ---------------------------------------------------------------------------
   BrokerRole:
     Type: AWS::IAM::Role
@@ -383,7 +408,8 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Jobs and their tenants only: read a job and its tenant, mark a job finished.
+              # Jobs and their tenants only: read a job and its tenant, mark a job finished, and
+              # give up a failed job's delivery claim (so a redelivery retries it).
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -394,6 +420,13 @@ Resources:
                     dynamodb:LeadingKeys:
                       - 'JOB#*'
                       - 'TENANT#*'
+              - Effect: Allow
+                Action: dynamodb:DeleteItem
+                Resource: !GetAtt UpdraftTable.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys:
+                      - 'DELIVERY#*'
               - Effect: Allow
                 Action: ssm:GetParameter*
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/updraft/app/*
@@ -509,6 +542,55 @@ Resources:
                   - logs:PutLogEvents
                 # The group and its streams. Spelled out rather than !GetAtt MicrovmLogGroup.Arn,
                 # which needs logs:DescribeLogGroups, and the deploy role does not have it.
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}:*
+
+  # The job image's build contexts (cloud/scripts/build-job-image.mjs uploads one per build). Nothing
+  # tenant-related is here; old contexts expire.
+  JobImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-build-contexts
+            Status: Enabled
+            Prefix: image/
+            ExpirationInDays: 30
+
+  # Assumed by Lambda while it builds the job image: read the build context, write build logs.
+  MicrovmBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${JobImageBucket.Arn}/image/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
                 Resource:
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}:*
@@ -716,3 +798,18 @@ Outputs:
   MicrovmExecutionRoleArn:
     Description: The one execution role of every job microVM (it reaches no tenant's data itself)
     Value: !GetAtt MicrovmExecutionRole.Arn
+  JobImageName:
+    Description: The MicroVM image jobs run (cloud/scripts/build-job-image.mjs builds it)
+    Value: !Sub ${AWS::StackName}-job
+  JobImageBucket:
+    Description: Where the image build uploads its build context
+    Value: !Ref JobImageBucket
+  JobImageBuildRoleArn:
+    Description: Role Lambda assumes while building the job image
+    Value: !GetAtt MicrovmBuildRole.Arn
+  JobImageVersionParameter:
+    Description: SSM parameter with the image version the launcher runs; jobs are off until it exists
+    Value: !Sub /updraft/${AWS::StackName}/job-image-version
+  MicrovmLogGroup:
+    Description: Build and runtime logs of the job microVMs (one stream per microVM)
+    Value: !Ref MicrovmLogGroup

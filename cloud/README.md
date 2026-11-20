@@ -65,7 +65,7 @@ browser ── https://updraft.readysetcloud.io ──> CloudFront (one distribu
   - **Existing installations:** linking also lists the installations you already own, such as one installed on GitHub directly or one whose install callback expired. You connect the ones you pick, within 10 minutes, through `POST /api/v1/github/connect/:id`.
   - **Access follows the identity:** a membership counts only while you're linked to the GitHub identity that earned it. Unlinking, or linking a different account, ends access; linking the same account again restores it.
   - **Tokens:** user tokens are used within the request and never stored.
-  - **The webhook:** `server/src/flows/webhook.ts` handles uninstall, suspend and unsuspend. Uninstall is final (a conditional write), and a repeated delete keeps the first deadline. GitHub can deliver events out of order, so for suspend and unsuspend the webhook asks GitHub for the installation's current state instead of trusting the event's order. Issue and pull request events are acknowledged without action until #68.
+  - **The webhook:** `server/src/flows/webhook.ts` handles uninstall, suspend and unsuspend. Uninstall is final (a conditional write), and a repeated delete keeps the first deadline. GitHub can deliver events out of order, so for suspend and unsuspend the webhook asks GitHub for the installation's current state instead of trusting the event's order. A labeled issue goes to the launcher ("Jobs and the job broker" below). Pull request events are acknowledged without action for now.
 
 | Path | What it is |
 | --- | --- |
@@ -205,7 +205,9 @@ npm run tenant-admin --workspace=server -- key status     --installation 55
   3. mark it ready;
   4. activate it, in one conditional write.
 
-  If anything fails, the previous version stays active. Activation also only moves forward: a slow publish that finishes after a later one is reported as `superseded`, and the newer version stays active. Jobs will pin the version active when they're dispatched (PR 4).
+  If anything fails, the previous version stays active. Activation also only moves forward: a slow publish that finishes after a later one is reported as `superseded`, and the newer version stays active. A job pins the version that was active when it was dispatched, so a publish never changes a running job.
+
+  Each version also stores its **dispatch rules**, computed from the compiled config: every repository with its GitHub id, and each trigger label with the logins allowed to apply it (`server/src/tenants/dispatch.ts`). The launcher checks these without reading the bundle, so changing triggers or actors takes a publish, not a deploy. A version published before dispatch rules existed starts nothing until it's published again.
 
 **Agent keys** each get their own Secrets Manager secret, `updraft/tenants/<id>/agent-keys/<NAME>` (for `ANTHROPIC_API_KEY` and `CODEX_API_KEY`), tagged with the installation id.
 - **No lost keys:** setting one key never reads or rewrites another, so two keys set at the same moment both survive.
@@ -215,11 +217,49 @@ npm run tenant-admin --workspace=server -- key status     --installation 55
 
 `tenant-admin` builds every AWS client from one region: `--region`, or else the SDK's own resolution. So stack discovery, the table, the bucket, the App settings and the key secrets are always in the same region.
 
+### Starting jobs
+
+A labeled issue in a tenant's repository starts a job. `WebhookFunction` is the launcher (`server/src/jobs/launch.ts`). For `issues.labeled`, it checks, in order:
+
+1. The tenant is active and has an active config version.
+2. That version's dispatch rules match: the repository (by name *and* id), a trigger label, and a sender allowed to apply it.
+3. Jobs are on: a job image version is published (see "The job image" below).
+4. The delivery isn't already claimed. Each tenant's delivery is claimed once (`DELIVERY#<id>#<delivery>`) for as long as a job for it may run, so a redelivery while it runs starts nothing.
+
+Each of these that fails answers 200 with why (`no_tenant`, `tenant_inactive`, `no_config`, `not_dispatched`, `jobs_off`, `duplicate`), and nothing is started. Otherwise the launcher:
+
+- stores the event at `tenants/<id>/events/<delivery>/event.json`;
+- records the job (`JOB#<jobId>`), pinning the repository, label, sender, config version and image version, plus the hash of a new job token;
+- starts the microVM with a version 2 run-hook payload, which carries only the broker's name and the job's token;
+- records the microVM's id on the job, the only microVM the broker will stop for it.
+
+**Failures:** if storing or launching fails, the webhook answers 500 so the delivery can be redelivered. It releases the claim so the redelivery isn't refused, and retires the job record so its token is never served. A job that ends without a clean success also releases the claim when it reports `finish`, so redelivering the webhook is how a failed job is retried. A success without a summary counts as unconfirmed.
+
+`updraft run-event` in the microVM still makes the final decision, against GitHub and the same config. The launcher only makes sure no job starts that the config wouldn't allow. Pull request events (the review loop) and quotas aren't handled yet.
+
+### The job image
+
+Jobs run the same image as the self-hosted stack (`deploy/aws-microvm/image/`), with this repository's CLI packed into it and both agents installed. It's built outside the stack, by an admin with AWS credentials for the account:
+
+```sh
+cd cloud
+npm run build-job-image --workspace=server -- --stack updraft-cloud   # add --no-activate to build without switching
+```
+
+The script:
+1. packs the CLI (`npm pack` at the repository root);
+2. zips the build context, with LF line endings even from a Windows checkout;
+3. uploads it to `JobImageBucket`;
+4. creates or updates the `<stack>-job` MicroVM image and waits for the build;
+5. writes the version to `/updraft/<stack>/job-image-version`.
+
+**Until that parameter exists, the launcher starts no jobs (`jobs_off`).** It reads the parameter at most once a minute, so a new build, or setting the parameter back to an earlier version, takes effect without a deploy.
+
 ### Jobs and the job broker
 
 Every tenant's jobs run in microVMs with one execution role, `MicrovmExecutionRole`. Anything in a microVM, an agent included, has to be assumed able to use that role, so it reaches no tenant's data. It can invoke `BrokerFunction` and write its logs. Nothing else. It can't even terminate microVMs: that permission covers every microVM of the image, so it would let one tenant's runner stop another's.
 
-**The broker** (`server/src/broker/broker.ts`) hands out what one job may have, to whoever holds that job's token. The launcher (PR 4) records each job in the table (`JOB#<jobId>`): its tenant, its one repository, the config version it pinned, and the sha-256 of a single-use, random job token. The token itself travels only in the microVM's run-hook payload (version 2). The runner calls the broker with it:
+**The broker** (`server/src/broker/broker.ts`) hands out what one job may have, to whoever holds that job's token. The launcher records each job in the table (`JOB#<jobId>`): its tenant, its one repository, the config version it pinned, and the sha-256 of a single-use, random job token. The token itself travels only in the microVM's run-hook payload (version 2). The runner calls the broker with it:
 
 | Action | Answer |
 | --- | --- |
@@ -240,6 +280,12 @@ Still unconfirmed: the GitHub flows against real GitHub, which need a registered
 - user authorization with PKCE;
 - "request user authorization during installation" returning `state` to the callback;
 - the Members permission letting a user token read its own org membership.
+
+Not run on AWS yet: the job path end to end. That covers:
+- building the job image with `build-job-image`;
+- `RunMicrovm` from the launcher, with the Lambda-provided connectors;
+- the runner's broker calls, from a microVM under the execution role;
+- a labeled issue producing a pull request.
 
 Deliberately off:
 - **API Gateway access and execution logging.** Both need the account-level API Gateway CloudWatch role, which this stack does not own.

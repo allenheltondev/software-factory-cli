@@ -15,7 +15,7 @@ import { compileTenantConfig, type CompileResult, type ConfigIssue, type Platfor
  *    being uninstalled
  *
  * A failure anywhere leaves the previous active version active: a pending version is never
- * started. A job pins the version that was active when it was dispatched (the launcher, PR 4),
+ * started. A job pins the version that was active when it was dispatched (jobs/launch.ts),
  * so publishing never changes a job already running.
  */
 
@@ -46,6 +46,7 @@ export async function publishTenantConfig(
   const version = await deps.store.createConfigVersion(id, {
     sha256: compiled.sha256,
     files: Object.keys(compiled.files).sort(),
+    dispatch: compiled.dispatch,
     publishedBy: input.publishedBy,
     publishedAt: new Date((deps.now ?? Date.now)()).toISOString(),
   });
