@@ -426,8 +426,12 @@ Resources:
                     dynamodb:LeadingKeys:
                       - 'JOB#*'
                       - 'TENANT#*'
+              # A delivery's claim: a started job holds it for its lifetime (start, a conditional
+              # PutItem), and a failed one gives it up (finish, a conditional DeleteItem).
               - Effect: Allow
-                Action: dynamodb:DeleteItem
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
                 Resource: !GetAtt UpdraftTable.Arn
                 Condition:
                   ForAllValues:StringLike:

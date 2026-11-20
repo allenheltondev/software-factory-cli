@@ -4,7 +4,8 @@
 //   npm run build-job-image --workspace=server -- [--stack updraft-cloud] [--region us-east-1]
 //     [--tarball path/to/updraft.tgz] [--no-activate] [--check]
 //
-//   1. packs this repository's Updraft CLI (`npm pack` at the root), unless --tarball names one
+//   1. packs this repository's Updraft CLI (`npm pack` at the root), unless --tarball names one;
+//      a version built from such a tarball records no fingerprint, so CI's next check rebuilds it
 //   2. zips deploy/aws-microvm/image/ (the same image the self-hosted stack builds) with it
 //   3. uploads the zip to the stack's JobImageBucket and creates or updates the image
 //   4. waits for the version to build, and reports the reason if it fails
@@ -99,7 +100,8 @@ reason=${reason}
       baseImageArn: `arn:aws:lambda:${region}:aws:microvm-image:al2023-1`,
       buildRoleArn: outputs.JobImageBuildRoleArn,
       codeArtifact: { uri: `s3://${outputs.JobImageBucket}/${key}` },
-      description: `Updraft Cloud job runner, built ${stamp}, ${describeInputs(fingerprint)}`,
+      // The fingerprint says this checkout's CLI is inside; a --tarball may be any other build.
+      description: `Updraft Cloud job runner, built ${stamp}${values.tarball ? `, CLI from ${basename(values.tarball)}` : `, ${describeInputs(fingerprint)}`}`,
       cpuConfigurations: [{ architecture: ARCHITECTURE }],
       resources: [{ minimumMemoryInMiB: MEMORY_MIB }],
       logging: { cloudWatch: { logGroup: outputs.MicrovmLogGroup } },

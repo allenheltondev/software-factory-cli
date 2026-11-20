@@ -210,7 +210,8 @@ jobs:
         if: steps.check.outputs.build == 'false'
         env:
           REASON: ${{ steps.check.outputs.reason }}
-        run: echo "Job image: not rebuilt (${REASON})" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "Job image: not rebuilt (${REASON})" >> "$GITHUB_STEP_SUMMARY"
 
       # npm pack builds the CLI (prepack) that goes into the image; the script runs from cloud/.
       - name: Build and publish the job image
