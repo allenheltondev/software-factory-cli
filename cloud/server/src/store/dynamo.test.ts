@@ -57,6 +57,7 @@ function fakeTable() {
     if (expr === 'attribute_exists(adminDisabledAt) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)') {
       return Boolean(item) && item!.adminDisabledAt !== undefined && item!.disabledReason !== values[':uninstalled'];
     }
+    if (expr === 'attribute_exists(pk) AND disabledReason = :suspended') return Boolean(item) && item!.disabledReason === values[':suspended'];
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(disabledReason)') return Boolean(item) && item!.disabledReason === undefined;
     if (expr === 'phase = :reserved') return Boolean(item) && item!.phase === values[':reserved'];
     if (expr === 'attribute_exists(pk) AND phase = :phase') return Boolean(item) && item!.phase === values[':phase'];
@@ -476,6 +477,60 @@ describe('dynamo store: the admin view', () => {
     await store.markUninstalled(55, DEADLINE);
     expect(await store.setAdminDisabled(55, { by: 'admin:ops' })).toBe('uninstalled');
     expect(await store.setAdminDisabled(56, { by: 'admin:ops' })).toBe('no_tenant');
+  });
+
+  // Runs `before` just before the nth update of the tenant's record, and `after` just after the
+  // nth read of it: writes that commit in between this call's own reads and writes.
+  function racing(table: ReturnType<typeof fakeTable>, hooks: { beforeUpdate?: [number, () => void]; afterGet?: [number, () => void] }) {
+    let updates = 0;
+    let gets = 0;
+    const client = {
+      async send(command: { constructor: { name: string }; input: Record<string, unknown> }) {
+        const key = command.input.Key as { pk?: unknown; sk?: unknown } | undefined;
+        const tenant = key?.pk === 'TENANT#55' && key?.sk === 'META';
+        if (tenant && command.constructor.name === 'UpdateCommand' && ++updates === hooks.beforeUpdate?.[0]) hooks.beforeUpdate[1]();
+        const out = await (table.client as unknown as { send: (c: unknown) => Promise<unknown> }).send(command);
+        if (tenant && command.constructor.name === 'GetCommand' && ++gets === hooks.afterGet?.[0]) hooks.afterGet[1]();
+        return out;
+      },
+    };
+    return createDynamoStore('T', client as unknown as DynamoDBDocumentClient);
+  }
+
+  it('an unsuspend never clears an uninstall that commits after it read the tenant', async () => {
+    const { table, store } = await seeded();
+    await store.setSuspended(55, true);
+    const patch = (fields: Record<string, unknown>) => table.items.set('TENANT#55|META', { ...table.items.get('TENANT#55|META')!, ...fields });
+    const raced = racing(table, {
+      // An admin disables it between its two writes, so both miss...
+      beforeUpdate: [2, () => patch({ adminDisabledAt: '2026-11-20T00:00:00.000Z', adminDisabledBy: 'admin:x' })],
+      // ...and it reads the tenant (admin-disabled, not uninstalled) just before the uninstall commits.
+      afterGet: [1, () => patch({ disabledReason: 'uninstalled', status: 'disabled', deleteAfter: DEADLINE })],
+    });
+    expect(await raced.setSuspended(55, false)).toBe('uninstalled');
+    expect(table.items.get('TENANT#55|META')).toMatchObject({ status: 'disabled', disabledReason: 'uninstalled' });
+  });
+
+  it('an admin enable looks again when GitHub unsuspends while it looks', async () => {
+    const { table, store } = await seeded();
+    await store.setSuspended(55, true);
+    await store.setAdminDisabled(55, { by: 'admin:x' });
+    // Its first write (active) misses for the suspend; GitHub unsuspends before its second.
+    const raced = racing(table, {
+      beforeUpdate: [
+        2,
+        () => {
+          const item = { ...table.items.get('TENANT#55|META')! };
+          delete item.disabledReason;
+          table.items.set('TENANT#55|META', item);
+        },
+      ],
+    });
+    expect(await raced.setAdminDisabled(55, null)).toBe('updated');
+    const t = await store.getTenant(55);
+    expect(t).toMatchObject({ status: 'active' });
+    expect(t?.adminDisabled).toBeUndefined();
+    expect(t?.disabledReason).toBeUndefined();
   });
 
   it('lists every tenant, and keeps a summary of each job with its first outcome', async () => {

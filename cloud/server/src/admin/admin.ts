@@ -152,16 +152,17 @@ export function createAdminService({
     async releaseJob(jobId: string, by: string): Promise<AdminTenantDetail> {
       const job = await store.getJob(jobId);
       if (!job) throw new FlowError('not_found', 404, `There is no job ${jobId}`);
-      if (job.releasedAt === undefined) {
-        await store.markStopping(jobId);
-        await store.finishJob(jobId, ADMIN_RELEASED_OUTCOME);
-        const entry = (await store.listActiveJobs()).find((e) => e.jobId === jobId);
-        // A reservation that never launched gives its counts back too, as reconciliation would.
-        if (entry?.phase === 'reserved') await store.cancelReservation(entry, 'reserved');
-        await store.releaseJob(job, unusedTime(job, now()));
-        await store.releaseDelivery(job.installationId, job.deliveryId, jobId);
-        log({ admin: by, installationId: job.installationId, jobId, action: 'release', microvmId: job.microvmId });
-      }
+      const first = job.releasedAt === undefined;
+      // Every step is safe to repeat (the refund and the counts go back once, the slots and the
+      // claim only from this job), so a retry after a failure part-way finishes what it left.
+      await store.markStopping(jobId);
+      await store.finishJob(jobId, ADMIN_RELEASED_OUTCOME);
+      const entry = (await store.listActiveJobs()).find((e) => e.jobId === jobId);
+      // A reservation that never launched gives its counts back too, as reconciliation would.
+      if (entry?.phase === 'reserved') await store.cancelReservation(entry, 'reserved');
+      await store.releaseJob(job, unusedTime(job, now()));
+      await store.releaseDelivery(job.installationId, job.deliveryId, jobId);
+      log({ admin: by, installationId: job.installationId, jobId, action: first ? 'release' : 'release (again)', microvmId: job.microvmId });
       return detail(job.installationId);
     },
   };

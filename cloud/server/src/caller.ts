@@ -42,15 +42,12 @@ export function callerFromClaims(claims: Claims | null | undefined, clientId: st
 }
 
 /**
- * `cognito:groups` as a list. A verified token carries an array; API Gateway's authorizer hands
- * claims over as strings, an array arriving as "[a, b]" or "a,b".
+ * `cognito:groups` as a list, from a verified token's own claims, where it is an array. API
+ * Gateway's authorizer hands claims over as strings, which flatten an array ("[a, b]") so that a
+ * group name containing a comma or a space (both legal) cannot be told from two groups: such a
+ * string grants nothing, and the API takes the groups from the token itself (lambda.ts).
  */
 export function groupsFrom(value: unknown): string[] {
-  if (Array.isArray(value)) return value.filter((g): g is string => typeof g === 'string' && g.trim() !== '').map((g) => g.trim());
-  if (typeof value !== 'string') return [];
-  return value
-    .replace(/^\[|\]$/g, '')
-    .split(/[\s,]+/)
-    .map((g) => g.trim())
-    .filter(Boolean);
+  if (!Array.isArray(value)) return [];
+  return value.filter((g): g is string => typeof g === 'string' && g !== '');
 }

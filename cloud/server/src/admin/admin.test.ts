@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createApp } from '../app.js';
 import { callerFromClaims, groupsFrom, type Caller } from '../caller.js';
 import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
@@ -62,13 +62,18 @@ describe('admin access', () => {
     expect(isAdmin({ sub: 'x', groups: ['updraft-admins'] }, 'updraft-admins')).toBe(true);
   });
 
-  it('takes groups from the token as the authorizer or a verifier hands them over', () => {
+  it("takes groups only from a verified token's array, where each name is exact", () => {
     expect(groupsFrom(['a', 'b'])).toEqual(['a', 'b']);
-    expect(groupsFrom('[a, b]')).toEqual(['a', 'b']);
-    expect(groupsFrom('a,b')).toEqual(['a', 'b']);
-    expect(groupsFrom('admin')).toEqual(['admin']);
+    // A legal group name with a comma stays one group, and matches only itself.
+    expect(groupsFrom(['ops,updraft-admins'])).toEqual(['ops,updraft-admins']);
+    expect(isAdmin({ sub: 'x', groups: groupsFrom(['ops,updraft-admins']) }, 'updraft-admins')).toBe(false);
+    // The authorizer's flattened strings cannot keep those boundaries: they grant nothing.
+    for (const flattened of ['[ops,updraft-admins]', '[a, updraft-admins]', 'updraft-admins', 'a,updraft-admins']) {
+      expect(groupsFrom(flattened), flattened).toEqual([]);
+    }
     expect(groupsFrom(undefined)).toEqual([]);
-    expect(callerFromClaims({ sub: 's', aud: 'c', token_use: 'id', 'cognito:groups': '[admin]' }, 'c')).toEqual({ sub: 's', groups: ['admin'] });
+    expect(callerFromClaims({ sub: 's', aud: 'c', token_use: 'id', 'cognito:groups': '[updraft-admins]' }, 'c')).toEqual({ sub: 's' });
+    expect(callerFromClaims({ sub: 's', aud: 'c', token_use: 'id', 'cognito:groups': ['updraft-admins'] }, 'c')).toEqual({ sub: 's', groups: ['updraft-admins'] });
   });
 });
 
@@ -157,6 +162,23 @@ describe('the admin service', () => {
     // Again: nothing more happens.
     await service.releaseJob(job.jobId, 'admin:x');
     await expect(service.releaseJob('job_nobody01', 'admin:x')).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('finishes a release that failed part-way when it is retried', async () => {
+    const store = await seeded();
+    const job = await launched(store, 'job_partial01');
+    await store.markLaunching(job.jobId);
+    await store.claimDelivery(55, job.deliveryId, Date.now() + 3_600_000, job.jobId);
+    const release = store.releaseDelivery.bind(store);
+    store.releaseDelivery = vi.fn().mockRejectedValueOnce(new Error('throttled')).mockImplementation(release);
+    const service = createAdminService({ store, quotas: QUOTAS, log: () => {} });
+    await expect(service.releaseJob(job.jobId, 'admin:x')).rejects.toThrow('throttled');
+    // Released (slots and refund), but the delivery is still claimed.
+    expect(typeof (await store.getJob(job.jobId))?.releasedAt).toBe('number');
+    expect(await store.claimDelivery(55, job.deliveryId, Date.now() + 60_000, 'job_next0001')).toBe(false);
+    // The retry finishes it.
+    await service.releaseJob(job.jobId, 'admin:x');
+    expect(await store.claimDelivery(55, job.deliveryId, Date.now() + 60_000, 'job_next0001')).toBe(true);
   });
 
   it('gives back the counts of a reservation that never launched', async () => {

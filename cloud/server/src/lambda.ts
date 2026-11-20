@@ -1,9 +1,10 @@
 import type { APIGatewayProxyEvent } from 'aws-lambda';
+import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { handle } from 'hono/aws-lambda';
 import { adminAccess, DEFAULT_ADMIN_GROUP } from './admin/access.js';
 import { createAdminService } from './admin/admin.js';
 import { createApp } from './app.js';
-import { callerFromClaims, type Claims } from './caller.js';
+import { callerFromClaims, groupsFrom, type Claims } from './caller.js';
 import { createGitHubFlows } from './flows/github.js';
 import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
@@ -13,19 +14,37 @@ import { createDynamoStore } from './store/dynamo.js';
 /**
  * The API's Lambda entry point (bundled to dist/index.mjs by scripts/bundle.mjs). API Gateway (REST,
  * Cognito authorizer) invokes it with a proxy event; the authorizer's verified claims are on
- * `requestContext.authorizer.claims`.
+ * `requestContext.authorizer.claims`. Those are all strings, so the caller's groups (what admin
+ * access is decided by) come from verifying the same ID token here, where `cognito:groups` is the
+ * token's own array and each group name is exact.
  */
 
 const clientId = process.env.USER_POOL_CLIENT_ID ?? '';
 if (!clientId) console.error('USER_POOL_CLIENT_ID is not set; every /api/v1 request will be refused');
+const userPoolId = process.env.USER_POOL_ID ?? '';
+const verifier = userPoolId && clientId ? CognitoJwtVerifier.create({ userPoolId, clientId, tokenUse: 'id' }) : null;
 const tableName = process.env.TABLE_NAME ?? '';
 const store = tableName ? createDynamoStore(tableName) : undefined;
 
 const app = createApp({
-  resolveCaller: (c) => {
+  resolveCaller: async (c) => {
     const event = (c.env as { event?: APIGatewayProxyEvent } | undefined)?.event;
     const claims = event?.requestContext?.authorizer?.claims as Claims | undefined;
-    return callerFromClaims(claims, clientId);
+    const caller = callerFromClaims(claims, clientId);
+    if (!caller || !verifier) return caller;
+    // The same token the authorizer accepted; a token that does not verify, or is someone else's,
+    // leaves the caller with no groups (no admin access), never without a session.
+    const token = (c.req.header('authorization') ?? '').replace(/^Bearer\s+/i, '');
+    try {
+      const payload = await verifier.verify(token);
+      if (payload.sub === caller.sub) {
+        const groups = groupsFrom(payload['cognito:groups']);
+        if (groups.length > 0) caller.groups = groups;
+      }
+    } catch {
+      // No groups.
+    }
+    return caller;
   },
   ...(store
     ? {

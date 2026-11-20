@@ -94,6 +94,16 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       ExpressionAttributeValues: { ':job': jobId, ':now': Math.floor(Date.now() / 1000) },
     },
   });
+  /** An update that may be refused by its condition: false when it was. */
+  async function tryUpdate(input: ConstructorParameters<typeof UpdateCommand>[0]): Promise<boolean> {
+    try {
+      await client.send(new UpdateCommand(input));
+      return true;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) return false;
+      throw err;
+    }
+  }
   const cancelledAt = (err: TransactionCanceledException, i: number) => err.CancellationReasons?.[i]?.Code === 'ConditionalCheckFailed';
   async function deleteIfHeld(key: { pk: string; sk: string }, jobId: string): Promise<void> {
     try {
@@ -691,37 +701,39 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           return missingOrUninstalled();
         }
       }
-      // Enabled: active again only if GitHub has it active (no suspend or uninstall recorded).
-      try {
-        await client.send(
-          new UpdateCommand({
+      // Enabled, by the state GitHub has it in now, each write conditioned on that state and
+      // retried if GitHub changed it in between (a suspend or unsuspend racing the enable).
+      for (let attempt = 0; attempt < 3; attempt++) {
+        // Active on GitHub: active again.
+        if (
+          await tryUpdate({
             TableName: T,
             Key: tenantKey(id),
             UpdateExpression: 'SET #status = :active REMOVE adminDisabledAt, adminDisabledBy, adminDisabledReason',
             ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(disabledReason)',
             ExpressionAttributeNames: { '#status': 'status' },
             ExpressionAttributeValues: { ':active': 'active' },
-          }),
-        );
-        return 'updated';
-      } catch (err) {
-        if (!(err instanceof ConditionalCheckFailedException)) throw err;
-      }
-      try {
-        await client.send(
-          new UpdateCommand({
+          })
+        ) {
+          return 'updated';
+        }
+        // Suspended on GitHub: the admin's disable goes, and it stays disabled for the suspend.
+        if (
+          await tryUpdate({
             TableName: T,
             Key: tenantKey(id),
             UpdateExpression: 'REMOVE adminDisabledAt, adminDisabledBy, adminDisabledReason',
-            ConditionExpression: notUninstalled,
-            ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
-          }),
-        );
-        return 'updated';
-      } catch (err) {
-        if (!(err instanceof ConditionalCheckFailedException)) throw err;
-        return missingOrUninstalled();
+            ConditionExpression: 'attribute_exists(pk) AND disabledReason = :suspended',
+            ExpressionAttributeValues: { ':suspended': 'suspended' },
+          })
+        ) {
+          return 'updated';
+        }
+        const item = await getTenantItem(id, true);
+        if (!item) return 'no_tenant';
+        if (item.disabledReason === 'uninstalled') return 'uninstalled';
       }
+      throw new Error(`setAdminDisabled: tenant ${id} kept changing; try again`);
     },
 
     async listTenants() {
@@ -765,54 +777,52 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async setSuspended(id, suspended) {
-      // An unsuspend leaves a tenant an admin disabled disabled: only GitHub's reason goes.
-      if (!suspended) {
-        try {
-          await client.send(
-            new UpdateCommand({
-              TableName: T,
-              Key: tenantKey(id),
-              UpdateExpression: 'REMOVE disabledReason',
-              ConditionExpression: 'attribute_exists(adminDisabledAt) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
-              ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
-            }),
-          );
-          return 'updated';
-        } catch (err) {
-          if (!(err instanceof ConditionalCheckFailedException)) throw err;
-        }
+      if (suspended) {
+        const updated = await tryUpdate({
+          TableName: T,
+          Key: tenantKey(id),
+          UpdateExpression: 'SET #status = :disabled, disabledReason = :suspended',
+          // Never over an uninstall, whatever order GitHub delivers events in.
+          ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':disabled': 'disabled', ':suspended': 'suspended', ':uninstalled': 'uninstalled' },
+        });
+        if (updated) return 'updated';
+        return (await getTenantItem(id, true)) ? 'uninstalled' : 'no_tenant';
       }
-      try {
-        await client.send(
-          new UpdateCommand({
+      // Unsuspended, by the state the tenant is in now: every write is conditioned on that state
+      // (never over an uninstall), and retried if an admin or GitHub changed it in between.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        // Disabled by an admin: only GitHub's reason goes, and it stays disabled.
+        if (
+          await tryUpdate({
             TableName: T,
             Key: tenantKey(id),
-            UpdateExpression: suspended ? 'SET #status = :status, disabledReason = :suspended' : 'SET #status = :status REMOVE disabledReason',
-            // Never over an uninstall, whatever order GitHub delivers events in; and an unsuspend
-            // never over an admin's disable (handled above).
-            ConditionExpression: suspended
-              ? 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)'
-              : 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND attribute_not_exists(adminDisabledAt)',
-            ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: {
-              ':status': suspended ? 'disabled' : 'active',
-              ':uninstalled': 'uninstalled',
-              ...(suspended ? { ':suspended': 'suspended' } : {}),
-            },
-          }),
-        );
-        return 'updated';
-      } catch (err) {
-        if (!(err instanceof ConditionalCheckFailedException)) throw err;
-        const item = await getTenantItem(id, true);
-        if (!item) return 'no_tenant';
-        // An admin disabled it between the two writes: only GitHub's reason goes.
-        if (!suspended && item.adminDisabledAt !== undefined && item.disabledReason !== 'uninstalled') {
-          await client.send(new UpdateCommand({ TableName: T, Key: tenantKey(id), UpdateExpression: 'REMOVE disabledReason' }));
+            UpdateExpression: 'REMOVE disabledReason',
+            ConditionExpression: 'attribute_exists(adminDisabledAt) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+            ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
+          })
+        ) {
           return 'updated';
         }
-        return 'uninstalled';
+        // Otherwise active again.
+        if (
+          await tryUpdate({
+            TableName: T,
+            Key: tenantKey(id),
+            UpdateExpression: 'SET #status = :active REMOVE disabledReason',
+            ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND attribute_not_exists(adminDisabledAt)',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':active': 'active', ':uninstalled': 'uninstalled' },
+          })
+        ) {
+          return 'updated';
+        }
+        const item = await getTenantItem(id, true);
+        if (!item) return 'no_tenant';
+        if (item.disabledReason === 'uninstalled') return 'uninstalled';
       }
+      throw new Error(`setSuspended: tenant ${id} kept changing; retry the delivery`);
     },
 
     async getMember(id, sub) {
