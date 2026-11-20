@@ -147,11 +147,14 @@ describe('the admin service', () => {
     expect(await service.setLimits(55, 'admin:x', {})).not.toHaveProperty('limits');
   });
 
+  // A launch that has been launching for six minutes: well past any webhook still sending RunMicrovm.
+  const LATER = () => Date.now() + 6 * 60_000;
+
   it("releases a stuck job's capacity once, and retires it", async () => {
     const store = await seeded();
     const job = await launched(store, 'job_stuck0001');
     await store.markLaunching(job.jobId);
-    const service = createAdminService({ store, quotas: QUOTAS, log: () => {} });
+    const service = createAdminService({ store, quotas: QUOTAS, now: LATER, log: () => {} });
     const detail = await service.releaseJob(job.jobId, 'admin:x');
     expect(detail.activeJobs).toEqual([]);
     const after = (await store.getJob(job.jobId))!;
@@ -171,7 +174,7 @@ describe('the admin service', () => {
     await store.claimDelivery(55, job.deliveryId, Date.now() + 3_600_000, job.jobId);
     const release = store.releaseDelivery.bind(store);
     store.releaseDelivery = vi.fn().mockRejectedValueOnce(new Error('throttled')).mockImplementation(release);
-    const service = createAdminService({ store, quotas: QUOTAS, log: () => {} });
+    const service = createAdminService({ store, quotas: QUOTAS, now: LATER, log: () => {} });
     await expect(service.releaseJob(job.jobId, 'admin:x')).rejects.toThrow('throttled');
     // Released (slots and refund), but the delivery is still claimed.
     expect(typeof (await store.getJob(job.jobId))?.releasedAt).toBe('number');
@@ -179,6 +182,41 @@ describe('the admin service', () => {
     // The retry finishes it.
     await service.releaseJob(job.jobId, 'admin:x');
     expect(await store.claimDelivery(55, job.deliveryId, Date.now() + 60_000, 'job_next0001')).toBe(true);
+  });
+
+  it('refuses to release a job whose launch may be under way, and touches nothing', async () => {
+    const store = await seeded();
+    const service = createAdminService({ store, quotas: QUOTAS, log: () => {} });
+    // Launching for seconds: RunMicrovm may still be in flight.
+    const young = await launched(store, 'job_young0001');
+    await store.markLaunching(young.jobId);
+    await expect(service.releaseJob(young.jobId, 'admin:x')).rejects.toMatchObject({ status: 409, code: 'launch_in_progress' });
+    expect(await store.getJob(young.jobId)).toMatchObject({ status: 'launched' });
+    expect((await store.getJob(young.jobId))?.stopRequestedAt).toBeUndefined();
+    expect((await store.listPlatformSlots()).map((s) => s.jobId)).toEqual([young.jobId]);
+  });
+
+  it('competes with the launcher for a reservation: whichever marks it first wins, and only that', async () => {
+    // The launcher marks it launching between the admin's look and the cancel: the launch wins.
+    const store = await seeded();
+    const job = await launched(store, 'job_racing001');
+    const cancel = store.cancelReservation.bind(store);
+    store.cancelReservation = vi.fn(async (r, phase) => {
+      await store.markLaunching(job.jobId);
+      return cancel(r, phase);
+    });
+    const service = createAdminService({ store, quotas: QUOTAS, log: () => {} });
+    await expect(service.releaseJob(job.jobId, 'admin:x')).rejects.toMatchObject({ status: 409 });
+    expect((await store.listActiveJobs()).map((e) => [e.jobId, e.phase])).toEqual([[job.jobId, 'launching']]);
+    expect((await store.listPlatformSlots()).map((s) => s.jobId)).toEqual([job.jobId]);
+    expect((await store.getJob(job.jobId))?.stopRequestedAt).toBeUndefined();
+
+    // The admin cancels first: the launcher can no longer mark it, so it never calls RunMicrovm.
+    const other = await launched(store, 'job_racing002');
+    store.cancelReservation = cancel;
+    await service.releaseJob(other.jobId, 'admin:x');
+    await expect(store.markLaunching(other.jobId)).rejects.toThrow('no reservation to launch');
+    expect((await store.getJob(other.jobId))?.outcome).toBe(ADMIN_RELEASED_OUTCOME);
   });
 
   it('gives back the counts of a reservation that never launched', async () => {

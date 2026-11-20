@@ -47,7 +47,8 @@ export type FlowErrorCode =
   // The admin view (admin/admin.ts).
   | 'not_found'
   | 'uninstalled'
-  | 'invalid_limits';
+  | 'invalid_limits'
+  | 'launch_in_progress';
 
 export class FlowError extends Error {
   readonly code: FlowErrorCode;

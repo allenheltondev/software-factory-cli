@@ -1,5 +1,6 @@
 import { FlowError } from '../flows/github.js';
 import { dayOf, limitProblems, monthOf, tenantQuotas, unusedTime } from '../jobs/quotas.js';
+import { RESERVATION_RECLAIM_MS } from '../jobs/reconcile.js';
 import type { ActiveJob, JobSummary, Quotas, Store, Tenant, TenantLimits, Usage } from '../store/store.js';
 
 /**
@@ -148,18 +149,29 @@ export function createAdminService({
      * Gives a job's capacity back by hand: it is retired (nothing more is served for it), its
      * slots freed, its unused microVM time refunded, and it is no longer reconciled. Only for a job
      * whose microVM an admin has seen is not running: one that is would run outside the quota.
+     * Refused (409) while its launch may be under way: a reservation the launcher has just marked
+     * launching, or a launching one younger than five minutes.
      */
     async releaseJob(jobId: string, by: string): Promise<AdminTenantDetail> {
       const job = await store.getJob(jobId);
       if (!job) throw new FlowError('not_found', 404, `There is no job ${jobId}`);
       const first = job.releasedAt === undefined;
-      // Every step is safe to repeat (the refund and the counts go back once, the slots and the
-      // claim only from this job), so a retry after a failure part-way finishes what it left.
+      const entry = (await store.listActiveJobs()).find((e) => e.jobId === jobId);
+      const launching = () =>
+        new FlowError('launch_in_progress', 409, 'This job is being launched right now, so a microVM may be starting. Look again in a few minutes.');
+      if (entry?.phase === 'reserved') {
+        // Won against the launcher first, before anything else is touched: this cancel and the
+        // launcher's markLaunching are conditional writes on the same entry, so only one of them
+        // succeeds. If the launch won, its microVM may be starting: nothing is released.
+        if ((await store.cancelReservation(entry, 'reserved')) === 'mismatch') throw launching();
+      } else if (entry?.phase === 'launching' && now() - entry.reservedAt < RESERVATION_RECLAIM_MS) {
+        // RunMicrovm may still be in flight (the webhook allows 20 seconds; this is well past it).
+        throw launching();
+      }
+      // From here every step is safe to repeat (the refund and the counts go back once, the slots
+      // and the claim only from this job), so a retry after a failure part-way finishes what it left.
       await store.markStopping(jobId);
       await store.finishJob(jobId, ADMIN_RELEASED_OUTCOME);
-      const entry = (await store.listActiveJobs()).find((e) => e.jobId === jobId);
-      // A reservation that never launched gives its counts back too, as reconciliation would.
-      if (entry?.phase === 'reserved') await store.cancelReservation(entry, 'reserved');
       await store.releaseJob(job, unusedTime(job, now()));
       await store.releaseDelivery(job.installationId, job.deliveryId, jobId);
       log({ admin: by, installationId: job.installationId, jobId, action: first ? 'release' : 'release (again)', microvmId: job.microvmId });
