@@ -25,6 +25,7 @@ const leave: Go = (url) => window.location.assign(url);
 export function tenantStatusLabel(t: Pick<TenantSummary, 'status' | 'disabledReason'>): { tone: 'success' | 'warning' | 'error'; label: string } {
   if (t.status === 'active') return { tone: 'success', label: 'Active' };
   if (t.disabledReason === 'uninstalled') return { tone: 'error', label: 'Uninstalled' };
+  if (t.disabledReason === 'admin') return { tone: 'error', label: 'Disabled' };
   return { tone: 'warning', label: 'Suspended' };
 }
 

@@ -43,7 +43,12 @@ export type FlowErrorCode =
   | 'installation_not_found'
   | 'offer_expired'
   | 'not_authorized'
-  | 'tenant_disabled';
+  | 'tenant_disabled'
+  // The admin view (admin/admin.ts).
+  | 'not_found'
+  | 'uninstalled'
+  | 'invalid_limits'
+  | 'launch_in_progress';
 
 export class FlowError extends Error {
   readonly code: FlowErrorCode;

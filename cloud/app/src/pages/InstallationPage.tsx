@@ -51,10 +51,17 @@ export function InstallationPage({ api = defaultApi }: { api?: Pick<ApiClient, '
           </CardHeader>
           <CardBody>
             {load.tenant.status !== 'active' ? (
-              <EmptyState
-                title={load.tenant.disabledReason === 'uninstalled' ? 'The App was uninstalled' : 'The installation is suspended'}
-                description="Updraft does nothing here until the App is installed and active again."
-              />
+              load.tenant.disabledReason === 'admin' ? (
+                <EmptyState
+                  title="Updraft has disabled this account"
+                  description="No jobs start here until Updraft enables it again."
+                />
+              ) : (
+                <EmptyState
+                  title={load.tenant.disabledReason === 'uninstalled' ? 'The App was uninstalled' : 'The installation is suspended'}
+                  description="Updraft does nothing here until the App is installed and active again."
+                />
+              )
             ) : load.repositories.length === 0 ? (
               <EmptyState title="No repositories" description="The installation cannot access any repositories yet." />
             ) : (

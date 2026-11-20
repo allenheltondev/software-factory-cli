@@ -229,10 +229,14 @@ export function createLauncher(deps: LaunchDeps) {
       await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
       await deps.store.cancelReservation(reservation, launching ? 'launching' : 'reserved').catch(() => {});
       // Nothing runs for this record; its token must not be served, and it needs no reconciling.
+      let outcome: string | null = null;
       if (recorded) {
-        await deps.store.finishJob(jobId, 'launch_failed').catch(() => {});
+        outcome = await deps.store.finishJob(jobId, 'launch_failed').catch(() => null);
         await deps.store.releaseJob(job).catch(() => {});
       }
+      // Finished with another outcome before it could launch: an admin released it, on purpose.
+      // Not an error to have GitHub show (and nothing to redeliver).
+      if (outcome !== null && outcome !== 'launch_failed') return { status: 200, disposition: 'cancelled', jobId };
       return { status: 500, disposition: 'launch_failed', jobId };
     }
 

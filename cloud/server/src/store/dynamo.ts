@@ -5,6 +5,7 @@ import {
   GetCommand,
   PutCommand,
   QueryCommand,
+  ScanCommand,
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
@@ -17,6 +18,7 @@ import type {
   GitHubLink,
   InstallationOffer,
   Job,
+  JobSummary,
   Member,
   OAuthState,
   Quotas,
@@ -25,6 +27,7 @@ import type {
   Tenant,
   TenantLimits,
 } from './store.js';
+import { isFailure } from './store.js';
 
 const DAY_SECONDS = 24 * 3600;
 const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
@@ -45,6 +48,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
   const slotSk = (n: number) => `SLOT#${String(n).padStart(4, '0')}`;
   const PLATFORM = 'PLATFORM#JOBS';
   const activeKey = (jobId: string) => ({ pk: 'PLATFORM#ACTIVE', sk: `JOB#${jobId}` });
+  const jobSummaryKey = (job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>) => ({ pk: `TENANT#${job.installationId}`, sk: `JOB#${job.createdAt}#${job.jobId}` });
   const tenantSlotKey = (id: number, n: number) => ({ pk: `TENANT#${id}`, sk: slotSk(n) });
   const platformSlotKey = (n: number) => ({ pk: PLATFORM, sk: slotSk(n) });
   const dayKey = (id: number, day: string) => ({ pk: `TENANT#${id}`, sk: `USAGE#DAY#${day}` });
@@ -90,6 +94,16 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       ExpressionAttributeValues: { ':job': jobId, ':now': Math.floor(Date.now() / 1000) },
     },
   });
+  /** An update that may be refused by its condition: false when it was. */
+  async function tryUpdate(input: ConstructorParameters<typeof UpdateCommand>[0]): Promise<boolean> {
+    try {
+      await client.send(new UpdateCommand(input));
+      return true;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) return false;
+      throw err;
+    }
+  }
   const cancelledAt = (err: TransactionCanceledException, i: number) => err.CancellationReasons?.[i]?.Code === 'ConditionalCheckFailed';
   async function deleteIfHeld(key: { pk: string; sk: string }, jobId: string): Promise<void> {
     try {
@@ -172,6 +186,15 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     if (item.disabledReason === 'suspended' || item.disabledReason === 'uninstalled') t.disabledReason = item.disabledReason;
     if (typeof item.deleteAfter === 'number') t.deleteAfter = item.deleteAfter;
     if (typeof item.activeConfigVersion === 'number') t.activeConfigVersion = item.activeConfigVersion;
+    if (typeof item.adminDisabledAt === 'string') {
+      t.adminDisabled = {
+        at: item.adminDisabledAt,
+        by: String(item.adminDisabledBy ?? ''),
+        ...(typeof item.adminDisabledReason === 'string' ? { reason: item.adminDisabledReason } : {}),
+      };
+      // Disabled by an admin, and active on GitHub: say so (the item itself keeps GitHub's reason only).
+      if (!t.disabledReason) t.disabledReason = 'admin';
+    }
     if (item.limits && typeof item.limits === 'object') {
       const given = item.limits as Record<string, unknown>;
       const limits: TenantLimits = {};
@@ -453,11 +476,34 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
 
     async putJob(job) {
       // A week after the job may last, the record goes; nothing is served for it by then anyway.
+      // Its summary in the tenant's partition (the admin view) stays 30 days.
       await client.send(
-        new PutCommand({
-          TableName: T,
-          Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 },
-          ConditionExpression: 'attribute_not_exists(pk)',
+        new TransactWriteCommand({
+          TransactItems: [
+            {
+              Put: {
+                TableName: T,
+                Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 },
+                ConditionExpression: 'attribute_not_exists(pk)',
+              },
+            },
+            {
+              Put: {
+                TableName: T,
+                Item: {
+                  ...jobSummaryKey(job),
+                  jobId: job.jobId,
+                  repository: job.repository,
+                  ...(job.issue !== undefined ? { issue: job.issue } : {}),
+                  ...(job.label ? { label: job.label } : {}),
+                  ...(job.sender ? { sender: job.sender } : {}),
+                  createdAt: job.createdAt,
+                  status: job.status,
+                  ttl: usageTtl(30),
+                },
+              },
+            },
+          ],
         }),
       );
     },
@@ -532,7 +578,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
 
     async finishJob(jobId, outcome) {
       try {
-        await client.send(
+        const out = await client.send(
           new UpdateCommand({
             TableName: T,
             Key: { pk: `JOB#${jobId}`, sk: 'META' },
@@ -540,8 +586,46 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             ConditionExpression: 'attribute_exists(pk) AND #status <> :finished',
             ExpressionAttributeNames: { '#status': 'status' },
             ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
+            ReturnValues: 'ALL_NEW',
           }),
         );
+        // The first outcome, on the job's summary and in the month's failures. For the admin view
+        // only, so a failure here is logged, never the finish's.
+        const job = out.Attributes;
+        if (job && typeof job.installationId === 'number' && typeof job.createdAt === 'string') {
+          const summary = jobSummaryKey({ installationId: job.installationId, createdAt: job.createdAt, jobId });
+          await client
+            .send(
+              new TransactWriteCommand({
+                TransactItems: [
+                  {
+                    Update: {
+                      TableName: T,
+                      Key: summary,
+                      UpdateExpression: 'SET #status = :finished, outcome = :outcome',
+                      ConditionExpression: 'attribute_exists(pk)',
+                      ExpressionAttributeNames: { '#status': 'status' },
+                      ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
+                    },
+                  },
+                  ...(isFailure(outcome)
+                    ? [
+                        {
+                          Update: {
+                            TableName: T,
+                            Key: monthKey(job.installationId, job.createdAt.slice(0, 7)),
+                            UpdateExpression: 'ADD failed :one SET #ttl = if_not_exists(#ttl, :ttl)',
+                            ExpressionAttributeNames: { '#ttl': 'ttl' },
+                            ExpressionAttributeValues: { ':one': 1, ':ttl': usageTtl(400) },
+                          },
+                        },
+                      ]
+                    : []),
+                ],
+              }),
+            )
+            .catch((err: unknown) => console.log(JSON.stringify({ jobId, warning: `could not record the outcome on the job's summary: ${(err as Error)?.name}` })));
+        }
         return outcome;
       } catch (err) {
         if (!(err instanceof ConditionalCheckFailedException)) throw err;
@@ -590,28 +674,155 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async setSuspended(id, suspended) {
-      try {
-        await client.send(
-          new UpdateCommand({
+    async setAdminDisabled(id, disabled) {
+      const notUninstalled = 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)';
+      const missingOrUninstalled = async () => ((await getTenantItem(id, true)) ? 'uninstalled' : 'no_tenant');
+      if (disabled) {
+        try {
+          await client.send(
+            new UpdateCommand({
+              TableName: T,
+              Key: tenantKey(id),
+              UpdateExpression: `SET #status = :disabled, adminDisabledAt = :at, adminDisabledBy = :by${disabled.reason ? ', adminDisabledReason = :reason' : ' REMOVE adminDisabledReason'}`,
+              ConditionExpression: notUninstalled,
+              ExpressionAttributeNames: { '#status': 'status' },
+              ExpressionAttributeValues: {
+                ':disabled': 'disabled',
+                ':at': new Date().toISOString(),
+                ':by': disabled.by,
+                ':uninstalled': 'uninstalled',
+                ...(disabled.reason ? { ':reason': disabled.reason } : {}),
+              },
+            }),
+          );
+          return 'updated';
+        } catch (err) {
+          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+          return missingOrUninstalled();
+        }
+      }
+      // Enabled, by the state GitHub has it in now, each write conditioned on that state and
+      // retried if GitHub changed it in between (a suspend or unsuspend racing the enable).
+      for (let attempt = 0; attempt < 3; attempt++) {
+        // Active on GitHub: active again.
+        if (
+          await tryUpdate({
             TableName: T,
             Key: tenantKey(id),
-            UpdateExpression: suspended ? 'SET #status = :status, disabledReason = :suspended' : 'SET #status = :status REMOVE disabledReason',
-            // Never over an uninstall, whatever order GitHub delivers events in.
-            ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+            UpdateExpression: 'SET #status = :active REMOVE adminDisabledAt, adminDisabledBy, adminDisabledReason',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(disabledReason)',
             ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: {
-              ':status': suspended ? 'disabled' : 'active',
-              ':uninstalled': 'uninstalled',
-              ...(suspended ? { ':suspended': 'suspended' } : {}),
-            },
+            ExpressionAttributeValues: { ':active': 'active' },
+          })
+        ) {
+          return 'updated';
+        }
+        // Suspended on GitHub: the admin's disable goes, and it stays disabled for the suspend.
+        if (
+          await tryUpdate({
+            TableName: T,
+            Key: tenantKey(id),
+            UpdateExpression: 'REMOVE adminDisabledAt, adminDisabledBy, adminDisabledReason',
+            ConditionExpression: 'attribute_exists(pk) AND disabledReason = :suspended',
+            ExpressionAttributeValues: { ':suspended': 'suspended' },
+          })
+        ) {
+          return 'updated';
+        }
+        const item = await getTenantItem(id, true);
+        if (!item) return 'no_tenant';
+        if (item.disabledReason === 'uninstalled') return 'uninstalled';
+      }
+      throw new Error(`setAdminDisabled: tenant ${id} kept changing; try again`);
+    },
+
+    async listTenants() {
+      const found: Tenant[] = [];
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(
+          new ScanCommand({
+            TableName: T,
+            FilterExpression: 'sk = :meta AND begins_with(pk, :tenant)',
+            ExpressionAttributeValues: { ':meta': 'META', ':tenant': 'TENANT#' },
+            ExclusiveStartKey,
           }),
         );
-        return 'updated';
-      } catch (err) {
-        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        for (const item of page.Items ?? []) found.push(toTenant(item));
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return found;
+    },
+
+    async listRecentJobs(id, limit): Promise<JobSummary[]> {
+      const out = await client.send(
+        new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'JOB#' },
+          ScanIndexForward: false,
+          Limit: limit,
+        }),
+      );
+      return (out.Items ?? []).map((i) => ({
+        jobId: String(i.jobId),
+        repository: String(i.repository),
+        ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
+        ...(typeof i.label === 'string' ? { label: i.label } : {}),
+        ...(typeof i.sender === 'string' ? { sender: i.sender } : {}),
+        createdAt: String(i.createdAt),
+        status: i.status === 'finished' ? 'finished' : 'launched',
+        ...(typeof i.outcome === 'string' ? { outcome: i.outcome } : {}),
+      }));
+    },
+
+    async setSuspended(id, suspended) {
+      if (suspended) {
+        const updated = await tryUpdate({
+          TableName: T,
+          Key: tenantKey(id),
+          UpdateExpression: 'SET #status = :disabled, disabledReason = :suspended',
+          // Never over an uninstall, whatever order GitHub delivers events in.
+          ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':disabled': 'disabled', ':suspended': 'suspended', ':uninstalled': 'uninstalled' },
+        });
+        if (updated) return 'updated';
         return (await getTenantItem(id, true)) ? 'uninstalled' : 'no_tenant';
       }
+      // Unsuspended, by the state the tenant is in now: every write is conditioned on that state
+      // (never over an uninstall), and retried if an admin or GitHub changed it in between.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        // Disabled by an admin: only GitHub's reason goes, and it stays disabled.
+        if (
+          await tryUpdate({
+            TableName: T,
+            Key: tenantKey(id),
+            UpdateExpression: 'REMOVE disabledReason',
+            ConditionExpression: 'attribute_exists(adminDisabledAt) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+            ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
+          })
+        ) {
+          return 'updated';
+        }
+        // Otherwise active again.
+        if (
+          await tryUpdate({
+            TableName: T,
+            Key: tenantKey(id),
+            UpdateExpression: 'SET #status = :active REMOVE disabledReason',
+            ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND attribute_not_exists(adminDisabledAt)',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':active': 'active', ':uninstalled': 'uninstalled' },
+          })
+        ) {
+          return 'updated';
+        }
+        const item = await getTenantItem(id, true);
+        if (!item) return 'no_tenant';
+        if (item.disabledReason === 'uninstalled') return 'uninstalled';
+      }
+      throw new Error(`setSuspended: tenant ${id} kept changing; retry the delivery`);
     },
 
     async getMember(id, sub) {
@@ -1065,10 +1276,32 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       throw new Error(`reserveJob: the slots of tenant ${id} kept changing; retry the delivery`);
     },
 
-    async cancelReservation(r, phase) {
+    async cancelReservation(r, phase, retire) {
       // The counts go back with the entry's delete, in one transaction, only while the entry is
       // there in that phase: a retried or concurrent cancel (two reconciliations) gives back nothing.
       let outcome: 'cancelled' | 'gone' | 'mismatch' = 'cancelled';
+      // An admin's release retires the job with it: a launch that finds its reservation gone then
+      // finds the job finished, with the admin's outcome (first outcome kept, as finishJob keeps it).
+      const finished = {
+        UpdateExpression: 'SET #status = :finished, outcome = if_not_exists(outcome, :outcome), stopRequestedAt = if_not_exists(stopRequestedAt, :at)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':finished': 'finished', ':outcome': retire?.outcome, ':at': Date.now() },
+      };
+      const retiring = retire
+        ? [
+            { Update: { TableName: T, Key: { pk: `JOB#${retire.job.jobId}`, sk: 'META' }, ConditionExpression: 'attribute_exists(pk)', ...finished } },
+            {
+              Update: {
+                TableName: T,
+                Key: jobSummaryKey(retire.job),
+                UpdateExpression: 'SET #status = :finished, outcome = if_not_exists(outcome, :outcome)',
+                ConditionExpression: 'attribute_exists(pk)',
+                ExpressionAttributeNames: { '#status': 'status' },
+                ExpressionAttributeValues: { ':finished': 'finished', ':outcome': retire.outcome },
+              },
+            },
+          ]
+        : [];
       try {
         await client.send(
           new TransactWriteCommand({
@@ -1084,6 +1317,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
               ...[dayKey(r.installationId, r.day), monthKey(r.installationId, r.month)].map((key) => ({
                 Update: { TableName: T, Key: key, UpdateExpression: 'ADD jobs :minus', ExpressionAttributeValues: { ':minus': -1 } },
               })),
+              ...retiring,
             ],
           }),
         );
@@ -1139,6 +1373,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         jobsThisMonth: n(m.Item?.jobs),
         microvmSecondsThisMonth: n(m.Item?.seconds),
         throttledThisMonth: n(m.Item?.throttled),
+        failedThisMonth: n(m.Item?.failed),
       };
     },
 
