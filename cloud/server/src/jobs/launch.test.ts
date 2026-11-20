@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type Tenant } from '../store/store.js';
 import { dispatchRules } from '../tenants/dispatch.js';
+import { createReconciler } from './reconcile.js';
 import { createLauncher, PRELAUNCH_CLAIM_MS, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
 
 // Relative to the real clock: the memory store judges a delivery claim's expiry by it.
@@ -334,6 +335,50 @@ describe('the launcher', () => {
       await launch(request());
       expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
       expect(logged.some((e) => String(e.warning).includes('could not comment on the issue: GitHub is down'))).toBe(true);
+    });
+
+    it("holds a confirmed launch's capacity until Lambda shows its microVM terminated, even if its start never commits", async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      try {
+        const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now() });
+        const first = await launch(request());
+        expect(first.disposition).toBe('launched');
+        const { jobToken } = (JSON.parse(runs[0]!.runHookPayload) as { broker: { jobToken: string } }).broker;
+        let engaged = true;
+        let state: string | null = 'RUNNING';
+        const broker = createBroker({
+          store,
+          loadSettings: async () => null,
+          github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
+          assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(Date.now() + 3_600_000).toISOString() }),
+          terminateMicrovm: vi.fn(async () => {
+            throw new Error('throttled');
+          }),
+          microvmState: async () => state,
+          policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
+          killSwitch: { engaged: async () => engaged },
+          now: () => Date.now(),
+        });
+        // Refused by the kill switch, and its terminate fails: the microVM runs on.
+        expect(await broker({ action: 'start', jobId: first.jobId, token: jobToken })).toEqual({ ok: false, error: 'refused' });
+        await expect(broker({ action: 'terminate', jobId: first.jobId, token: jobToken })).rejects.toThrow('throttled');
+
+        // Well past the launcher's five minutes, its slot is still held, and reconciliation sees it.
+        vi.setSystemTime(NOW + 4 * PRELAUNCH_CLAIM_MS);
+        expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+        const reconcile = createReconciler({ store, microvmState: async () => state, log: () => {} });
+        expect(await reconcile()).toMatchObject({ released: [], held: 1 });
+
+        // Terminated: released, and retired, so a delayed start (the kill switch off by now) gets nothing.
+        state = 'TERMINATED';
+        expect((await reconcile()).released).toEqual([first.jobId]);
+        engaged = false;
+        expect(await broker({ action: 'start', jobId: first.jobId, token: jobToken })).toEqual({ ok: false, error: 'refused' });
+        expect(await broker({ action: 'credentials', jobId: first.jobId, token: jobToken })).toEqual({ ok: false, error: 'refused' });
+        expect((await launch(request({}, 'delivery-3'))).disposition).toBe('launched');
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('gives the reservation back when the launch fails', async () => {

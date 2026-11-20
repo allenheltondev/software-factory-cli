@@ -226,6 +226,13 @@ export function createLauncher(deps: LaunchDeps) {
       return { status: 500, disposition: 'launch_failed', jobId };
     }
 
+    // A microVM exists now: its capacity is held for as long as it may run, whether or not its
+    // start is ever admitted (the kill switch, a failed start), until Lambda shows it terminated
+    // (reconciliation, jobs/reconcile.ts), or, with no microVM id to look at, its maximum duration.
+    await deps.store
+      .holdSlots(job, job.expiresAt)
+      .catch((err: unknown) => log({ delivery: req.deliveryId, jobId, warning: `could not hold the job's quota slots: ${(err as Error)?.message}` }));
+
     if (!microvmId) {
       log({ delivery: req.deliveryId, jobId, warning: 'RunMicrovm returned no microVM id; the job cannot stop its own microVM, its maximum duration will' });
     } else {

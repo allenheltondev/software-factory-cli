@@ -610,6 +610,9 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(table.items.get('TENANT#55|USAGE#MONTH#2026-11')?.seconds).toBe(1800);
     expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
     expect(typeof (await store.getJob(job.jobId))?.releasedAt).toBe('number');
+    // Released is retired: it can never start.
+    expect(typeof (await store.getJob(job.jobId))?.stopRequestedAt).toBe('number');
+    expect(await store.startJob({ ...job, status: 'launched' }, LATER)).toEqual({ result: 'retired' });
   });
 
   it('never starts a finished job, and checks the month in the transaction that charges it', async () => {

@@ -868,11 +868,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async releaseJob(job, refund) {
-      // Marked once, with the refund: a repeated release refunds nothing.
+      // Marked once, with the refund: a repeated release refunds nothing. Released is retired too:
+      // a delayed start can never admit it (stopRequestedAt, which start and serving check).
       const mark = {
         TableName: T,
         Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
-        UpdateExpression: 'SET releasedAt = :at',
+        UpdateExpression: 'SET releasedAt = :at, stopRequestedAt = if_not_exists(stopRequestedAt, :at)',
         ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(releasedAt)',
         ExpressionAttributeValues: { ':at': Date.now() },
       };

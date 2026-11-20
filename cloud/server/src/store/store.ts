@@ -321,7 +321,8 @@ export interface Store {
   releaseJobSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>): Promise<void>;
   /**
    * Lambda shows the job's microVM terminated (or has none): refunds the microVM seconds it did not
-   * use (`refund`) and marks it released, at most once, then frees its slots. Safe to repeat.
+   * use (`refund`) and marks it released (and stopping, so it can never start), at most once, then
+   * frees its slots. Safe to repeat.
    */
   releaseJob(job: Job, refund?: { month: string; seconds: number }): Promise<void>;
   /** Its microVM was asked to stop: the job is retired for serving and starting. Set once. */
@@ -564,7 +565,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async releaseJob(job, refund) {
       const current = jobs.get(job.jobId);
       if (current && current.releasedAt === undefined) {
-        jobs.set(job.jobId, { ...current, releasedAt: Date.now() });
+        const at = Date.now();
+        jobs.set(job.jobId, { ...current, releasedAt: at, stopRequestedAt: current.stopRequestedAt ?? at });
         if (refund && refund.seconds > 0) {
           const key = `${job.installationId}/${refund.month}`;
           months.set(key, { ...month(key), seconds: month(key).seconds - refund.seconds });
