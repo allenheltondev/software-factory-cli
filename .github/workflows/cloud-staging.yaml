@@ -9,7 +9,7 @@ on:
       # The server bundles the CLI's config schema and agent profiles from src/.
       - 'src/config/**'
       - 'src/agents/**'
-      # The job image (cloud-deploy-env.yaml rebuilds it only when these change).
+      # The job image (cloud-deploy-env.yaml rebuilds it when the active one was built from other inputs).
       - 'deploy/aws-microvm/image/**'
       - 'package.json'
       - 'package-lock.json'

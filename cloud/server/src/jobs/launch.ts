@@ -9,7 +9,10 @@ import { decideDispatch } from '../tenants/dispatch.js';
  *   1. the tenant: active, with an active config version
  *   2. that version's dispatch rules: the repository (name and id), a trigger label, an allowed actor
  *   3. jobs are on: a MicroVM image version is published (the image build sets it)
- *   4. deduplication: one job per delivery, per tenant, while a job for it may still run
+ *   4. deduplication: one job per delivery, per tenant. The launcher's claim is short
+ *      (PRELAUNCH_CLAIM_MS), so a launch that stops partway (its Lambda timed out) does not block
+ *      a redelivery for long; the job's microVM holds it for its whole lifetime once it starts
+ *      (the broker's `start`), and does not run if a redelivery's job has taken it by then
  *   5. the event body to tenants/<id>/events/<delivery>/event.json
  *   6. the job record: its tenant, repository, label, sender, config and image versions, and the
  *      hash of a fresh job token
@@ -21,6 +24,13 @@ import { decideDispatch } from '../tenants/dispatch.js';
  */
 
 export const RUN_HOOK_PAYLOAD_VERSION = 2;
+
+/**
+ * How long the launcher's claim on a delivery lasts: well past the webhook Lambda's timeout (20 s)
+ * and a microVM's start, after which the job holds the claim itself. A redelivery after this, of a
+ * delivery whose launch never got a job running, starts the job again.
+ */
+export const PRELAUNCH_CLAIM_MS = 5 * 60 * 1000;
 
 /** The Lambda-provided connectors: no inbound traffic, internet egress. */
 export const noIngressConnector = (partition: string, region: string) => `arn:${partition}:lambda:${region}:aws:network-connector:aws-network-connector:NO_INGRESS`;
@@ -51,6 +61,8 @@ export interface RunMicrovmInput {
   logging: { cloudWatch: { logGroup: string } };
   idlePolicy: { maxIdleDurationSeconds: number; suspendedDurationSeconds: number; autoResumeEnabled: boolean };
   runHookPayload: string;
+  /** The job's id: a retried RunMicrovm for the same job starts no second microVM. */
+  clientToken: string;
 }
 
 export interface LaunchDeps {
@@ -123,8 +135,9 @@ export function createLauncher(deps: LaunchDeps) {
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
     const jobId = `job_${randomBytes(12).toString('base64url')}`;
-    // Held by this job while it may still run; released early (by this job only) when it fails.
-    if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + durationMs, jobId))) return skip('duplicate');
+    // Short, until the job starts and holds it for its lifetime; released early (by this job only)
+    // when it fails.
+    if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + PRELAUNCH_CLAIM_MS, jobId))) return skip('duplicate');
 
     const token = randomBytes(32).toString('base64url');
     const sender = req.payload.sender?.login;
@@ -213,5 +226,6 @@ export function runMicrovmInput(s: LaunchSettings, imageVersion: string, job: { 
     // long as it may live, and never keep a suspended one (as the self-hosted launcher does).
     idlePolicy: { maxIdleDurationSeconds: s.maximumDurationSeconds, suspendedDurationSeconds: 0, autoResumeEnabled: false },
     runHookPayload: JSON.stringify(runHookPayload(s, job)),
+    clientToken: job.jobId,
   };
 }

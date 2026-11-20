@@ -2,7 +2,7 @@
 //
 // Run with AWS credentials for the stack's account (as tenant-admin):
 //   npm run build-job-image --workspace=server -- [--stack updraft-cloud] [--region us-east-1]
-//     [--tarball path/to/updraft.tgz] [--no-activate]
+//     [--tarball path/to/updraft.tgz] [--no-activate] [--check]
 //
 //   1. packs this repository's Updraft CLI (`npm pack` at the root), unless --tarball names one
 //   2. zips deploy/aws-microvm/image/ (the same image the self-hosted stack builds) with it
@@ -12,8 +12,13 @@
 //      it within a minute (--no-activate leaves the running version alone)
 //
 // Until step 5 has run once, the launcher starts no jobs at all.
+//
+// Each version records the fingerprint of what it was built from (job-image-inputs.ts) in its
+// description. --check builds nothing: it says whether the active version's fingerprint differs
+// from this checkout's (or no version is active), as `build=true|false` and `reason=...` in
+// $GITHUB_OUTPUT when that is set. The deploy workflow builds only then.
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -28,9 +33,10 @@ import {
   type UpdateMicrovmImageCommandInput,
 } from '@aws-sdk/client-lambda-microvms';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
-import { PutParameterCommand } from '@aws-sdk/client-ssm';
+import { GetParameterCommand, ParameterNotFound, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { createAdminClients } from './admin-clients.js';
 import { buildContext, IMAGE_DIR, repoRoot } from './job-image-context.js';
+import { describeInputs, imageInputFingerprint, inputsFromDescription } from './job-image-inputs.js';
 import { zip } from './zip.js';
 
 const ARCHITECTURE = 'ARM_64';
@@ -53,6 +59,7 @@ async function main() {
       region: { type: 'string' },
       tarball: { type: 'string' },
       'no-activate': { type: 'boolean', default: false },
+      check: { type: 'boolean', default: false },
     },
   });
   const clients = createAdminClients(values.region);
@@ -66,6 +73,16 @@ async function main() {
   const imageName = outputs.JobImageName!;
   // Every call but Create identifies the image by its ARN: the API refuses the bare name.
   const imageArn = outputs.JobImageArn!;
+  const fingerprint = imageInputFingerprint();
+
+  if (values.check) {
+    const { build, reason } = await compareWithActive(microvms, clients.ssm, imageArn, outputs.JobImageVersionParameter!, fingerprint);
+    console.log(`==> ${build ? 'build' : 'no build'}: ${reason}`);
+    if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `build=${build}
+reason=${reason}
+`);
+    return;
+  }
 
   const scratch = mkdtempSync(join(tmpdir(), 'updraft-job-image-'));
   try {
@@ -82,7 +99,7 @@ async function main() {
       baseImageArn: `arn:aws:lambda:${region}:aws:microvm-image:al2023-1`,
       buildRoleArn: outputs.JobImageBuildRoleArn,
       codeArtifact: { uri: `s3://${outputs.JobImageBucket}/${key}` },
-      description: `Updraft Cloud job runner, built ${stamp}`,
+      description: `Updraft Cloud job runner, built ${stamp}, ${describeInputs(fingerprint)}`,
       cpuConfigurations: [{ architecture: ARCHITECTURE }],
       resources: [{ minimumMemoryInMiB: MEMORY_MIB }],
       logging: { cloudWatch: { logGroup: outputs.MicrovmLogGroup } },
@@ -129,6 +146,34 @@ async function main() {
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+}
+
+/** Whether the active version was built from what this checkout would build (its fingerprint). */
+async function compareWithActive(
+  microvms: LambdaMicrovmsClient,
+  ssm: ReturnType<typeof createAdminClients>['ssm'],
+  imageArn: string,
+  parameter: string,
+  fingerprint: string,
+): Promise<{ build: boolean; reason: string }> {
+  let active: string | undefined;
+  try {
+    active = (await ssm.send(new GetParameterCommand({ Name: parameter }))).Parameter?.Value;
+  } catch (err) {
+    if (!(err instanceof ParameterNotFound)) throw err;
+  }
+  if (!active) return { build: true, reason: 'no job image is active yet' };
+  let description: string | undefined;
+  try {
+    description = (await microvms.send(new GetMicrovmImageVersionCommand({ imageIdentifier: imageArn, imageVersion: active }))).description;
+  } catch (err) {
+    if (!(err instanceof ResourceNotFoundException)) throw err;
+    return { build: true, reason: `the active version ${active} does not exist` };
+  }
+  const built = inputsFromDescription(description);
+  if (!built) return { build: true, reason: `the active version ${active} records no fingerprint of what it was built from` };
+  if (built !== fingerprint) return { build: true, reason: `the active version ${active} was built from other inputs than this checkout` };
+  return { build: false, reason: `the active version ${active} was built from this checkout's inputs` };
 }
 
 main().catch((err: unknown) => {

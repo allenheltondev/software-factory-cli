@@ -15,7 +15,7 @@ export const CLOUD_BUILD_ENV = 'AGENT_PACKAGES="@anthropic-ai/claude-code @opena
  * Text as the repository stores it (LF): a Windows checkout has CRLF, and the build sources
  * build.env and runs these files on Linux, where a CR breaks them. Binary files stay as they are.
  */
-function toLf(data: Buffer): Buffer {
+export function toLf(data: Buffer): Buffer {
   if (data.includes(0)) return data;
   const text = data.toString('utf8');
   return text.includes('\r\n') ? Buffer.from(text.replace(/\r\n/g, '\n'), 'utf8') : data;

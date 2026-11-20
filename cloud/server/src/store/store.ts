@@ -236,6 +236,12 @@ export interface Store {
    */
   claimDelivery(installationId: number, deliveryId: string, expiresAt: number, jobId: string): Promise<boolean>;
   /**
+   * A job that has started holds its delivery's claim until `expiresAt` (epoch ms): it extends its
+   * own claim, or takes one that is gone or expired. False when another job holds an unexpired
+   * claim (a redelivery started it after this job's claim ran out): this job must not run.
+   */
+  holdDelivery(installationId: number, deliveryId: string, expiresAt: number, jobId: string): Promise<boolean>;
+  /**
    * Lets a redelivery start the job again (it failed, or it never started). Only the job holding
    * the claim gives it up: a late release from an earlier job leaves a redelivery's claim alone.
    * Nothing happens when there is no such claim, so it is safe to repeat.
@@ -387,6 +393,13 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const key = `${id}/${deliveryId}`;
       const existing = deliveries.get(key);
       if (existing !== undefined && existing.expiresAt > Date.now()) return false;
+      deliveries.set(key, { expiresAt, jobId });
+      return true;
+    },
+    async holdDelivery(id, deliveryId, expiresAt, jobId) {
+      const key = `${id}/${deliveryId}`;
+      const existing = deliveries.get(key);
+      if (existing !== undefined && existing.jobId !== jobId && existing.expiresAt > Date.now()) return false;
       deliveries.set(key, { expiresAt, jobId });
       return true;
     },

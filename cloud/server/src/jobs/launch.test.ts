@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type Tenant } from '../store/store.js';
 import { dispatchRules } from '../tenants/dispatch.js';
-import { createLauncher, type LaunchDeps, type LaunchRequest, type RunMicrovmInput } from './launch.js';
+import { createLauncher, PRELAUNCH_CLAIM_MS, type LaunchDeps, type LaunchRequest, type RunMicrovmInput } from './launch.js';
 
 // Relative to the real clock: the memory store judges a delivery claim's expiry by it.
 const NOW = Date.now();
@@ -106,6 +106,7 @@ describe('the launcher', () => {
       maximumDurationInSeconds: 10800,
       logging: { cloudWatch: { logGroup: SETTINGS.logGroup } },
       idlePolicy: { maxIdleDurationSeconds: 10800, suspendedDurationSeconds: 0, autoResumeEnabled: false },
+      clientToken: result.jobId,
     });
     const hook = JSON.parse(input.runHookPayload) as Record<string, unknown> & { broker: { jobToken: string; jobId: string } };
     expect(hook).toEqual({
@@ -214,7 +215,56 @@ describe('the launcher', () => {
     const ok = await createLauncher(deps)(request());
     expect(getTenant).toHaveBeenCalledWith(55, { consistent: true });
     expect(getConfigVersion).toHaveBeenCalledWith(55, 1, { consistent: true });
-    expect(claim).toHaveBeenCalledWith(55, 'delivery-1', NOW + 10800 * 1000, ok.jobId);
+    expect(claim).toHaveBeenCalledWith(55, 'delivery-1', NOW + PRELAUNCH_CLAIM_MS, ok.jobId);
+  });
+
+  describe('a launch that stops partway (review fix on #80)', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const brokerFor = () =>
+      createBroker({
+        store,
+        loadSettings: async () => null,
+        github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
+        assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(Date.now() + 3_600_000).toISOString() }),
+        terminateMicrovm: vi.fn(async () => {}),
+        policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
+        now: () => Date.now(),
+      });
+
+    it('blocks a redelivery only until its short claim runs out, when no job got started', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      // The Lambda's deadline hits during RunMicrovm: nothing after it runs, not even the catch.
+      const stuck = createLauncher({ ...deps, now: () => Date.now(), runMicrovm: () => new Promise(() => {}) });
+      void stuck(request());
+      await vi.waitFor(() => expect(Object.keys(events)).toHaveLength(1));
+      expect(await createLauncher({ ...deps, now: () => Date.now() })(request())).toEqual({ status: 200, disposition: 'duplicate' });
+
+      vi.setSystemTime(NOW + PRELAUNCH_CLAIM_MS + 1_000);
+      expect((await createLauncher({ ...deps, now: () => Date.now() })(request())).disposition).toBe('launched');
+    });
+
+    it('a job that started holds the claim for its lifetime; one that starts after a redelivery took it does not run', async () => {
+      vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+      const launch = createLauncher({ ...deps, now: () => Date.now() });
+      const broker = brokerFor();
+      const tokenOf = (i: number) => (JSON.parse(runs[i]!.runHookPayload) as { broker: { jobToken: string } }).broker.jobToken;
+
+      const first = await launch(request());
+      expect((await broker({ action: 'start', jobId: first.jobId, token: tokenOf(0) })).ok).toBe(true);
+      vi.setSystemTime(NOW + PRELAUNCH_CLAIM_MS + 60_000);
+      expect(await launch(request())).toEqual({ status: 200, disposition: 'duplicate' });
+
+      // A slow job: its claim ran out before it started, and the redelivery's job took it.
+      const slow = await launch(request({}, 'delivery-2'));
+      vi.setSystemTime(NOW + 2 * PRELAUNCH_CLAIM_MS + 120_000);
+      const redelivered = await launch(request({}, 'delivery-2'));
+      expect(redelivered.disposition).toBe('launched');
+      expect(await broker({ action: 'start', jobId: slow.jobId, token: tokenOf(1) })).toEqual({ ok: false, error: 'refused' });
+      expect((await broker({ action: 'start', jobId: redelivered.jobId, token: tokenOf(2) })).ok).toBe(true);
+    });
   });
 
   it('refuses a delivery id that cannot be part of an S3 key', async () => {

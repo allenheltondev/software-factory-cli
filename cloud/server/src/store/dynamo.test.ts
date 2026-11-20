@@ -37,6 +37,9 @@ function fakeTable() {
     if (expr === 'attribute_not_exists(pk) OR #sub = :sub') return !item || item.sub === values[':sub'];
     if (expr === 'attribute_not_exists(githubUserId) OR githubUserId = :id') return !item || item.githubUserId === undefined || item.githubUserId === values[':id'];
     if (expr === 'attribute_not_exists(pk) OR #ttl < :now') return !item || (item.ttl as number) < (values[':now'] as number);
+    if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
+      return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
+    }
     if (expr === 'attribute_exists(pk) AND #status <> :finished') return Boolean(item) && item!.status !== values[':finished'];
     if (expr === 'jobId = :job') return Boolean(item) && item!.jobId === values[':job'];
     throw new Error(`fake table: unsupported condition ${expr}`);
@@ -423,6 +426,30 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     const store = createDynamoStore('T', fakeTable().client);
     expect(await store.claimDelivery(55, 'd-1', Date.now() - 5_000, 'job_first0001')).toBe(true);
     expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(true);
+  });
+
+  it('a started job holds its own claim, takes an expired or missing one, and loses to a live one', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    const SOON = Date.now() + 60_000;
+
+    // Its own short pre-launch claim, extended to the job's lifetime.
+    expect(await store.claimDelivery(55, 'd-1', SOON, 'job_first0001')).toBe(true);
+    expect(await store.holdDelivery(55, 'd-1', LATER, 'job_first0001')).toBe(true);
+    expect(table.items.get('DELIVERY#55#d-1|CLAIM')?.ttl).toBe(Math.ceil(LATER / 1000));
+    expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(false);
+
+    // No claim (released, or deleted by TTL): taken.
+    await store.releaseDelivery(55, 'd-1', 'job_first0001');
+    expect(await store.holdDelivery(55, 'd-1', LATER, 'job_first0001')).toBe(true);
+
+    // Another job's live claim wins; its expired one does not.
+    expect(await store.claimDelivery(55, 'd-2', LATER, 'job_second001')).toBe(true);
+    expect(await store.holdDelivery(55, 'd-2', LATER, 'job_first0001')).toBe(false);
+    expect(table.items.get('DELIVERY#55#d-2|CLAIM')?.jobId).toBe('job_second001');
+    expect(await store.claimDelivery(55, 'd-3', Date.now() - 5_000, 'job_second001')).toBe(true);
+    expect(await store.holdDelivery(55, 'd-3', LATER, 'job_first0001')).toBe(true);
+    expect(table.items.get('DELIVERY#55#d-3|CLAIM')?.jobId).toBe('job_first0001');
   });
 
   it('finishing keeps the first outcome and returns it, also to a repeated finish', async () => {

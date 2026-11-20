@@ -654,6 +654,26 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
+    async holdDelivery(id, deliveryId, expiresAt, jobId) {
+      // This job's own claim, or none (gone or expired): another job's live claim wins.
+      const now = Math.floor(Date.now() / 1000);
+      try {
+        await client.send(
+          new PutCommand({
+            TableName: T,
+            Item: { ...deliveryKey(id, deliveryId), installationId: id, deliveryId, jobId, ttl: Math.ceil(expiresAt / 1000) },
+            ConditionExpression: 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now',
+            ExpressionAttributeNames: { '#ttl': 'ttl' },
+            ExpressionAttributeValues: { ':job': jobId, ':now': now },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (err instanceof ConditionalCheckFailedException) return false;
+        throw err;
+      }
+    },
+
     async releaseDelivery(id, deliveryId, jobId) {
       // Only the holder's: a redelivery's claim (another job) stays, and no claim is no-op.
       try {

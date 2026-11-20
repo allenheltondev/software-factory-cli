@@ -20,7 +20,9 @@ import { configPrefix } from '../tenants/paths.js';
  *   start / credentials   the job's descriptor (bucket and keys) and AWS credentials for an hour,
  *                         from AssumeRole with a session policy that reaches only this tenant's
  *                         prefix (this job's event, config version and results; the tenant's
- *                         state) and only this tenant's agent key secrets
+ *                         state) and only this tenant's agent key secrets. `start` also holds
+ *                         the delivery's claim for the job's lifetime (refused if a redelivery's
+ *                         job holds it)
  *   github-token          an installation token for the job's one repository with only the
  *                         permissions a job needs, as the CLI's token file (#77)
  *   finish                the job is over; nothing more is served for it. Whatever the job's state,
@@ -127,6 +129,8 @@ export type BrokerResponse =
 const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 const OUTCOME = /^[a-z_]{1,40}$/;
 const REFUSED: BrokerResponse = { ok: false, error: 'refused' };
+/** A job that started after a redelivery's job had taken its delivery's claim: it never runs. */
+export const SUPERSEDED_OUTCOME = 'superseded';
 
 export function createBroker(deps: BrokerDeps) {
   const now = deps.now ?? Date.now;
@@ -185,6 +189,14 @@ export function createBroker(deps: BrokerDeps) {
     }
 
     if (!(await servable(job))) return REFUSED;
+
+    // The launcher's claim on the delivery is short, so it runs out on its own if the launch never
+    // got this far (its Lambda stopped before RunMicrovm, say). A job that does start holds the
+    // claim for as long as it may run; if a redelivery's job holds it now, that one runs, not this.
+    if (action === 'start' && !(await deps.store.holdDelivery(job.installationId, job.deliveryId, job.expiresAt, job.jobId))) {
+      await deps.store.finishJob(job.jobId, SUPERSEDED_OUTCOME);
+      return REFUSED;
+    }
 
     if (action === 'start' || action === 'credentials') {
       const credentials = await deps.assumeRole({

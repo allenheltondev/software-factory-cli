@@ -224,7 +224,7 @@ A labeled issue in a tenant's repository starts a job. `WebhookFunction` is the 
 1. The tenant is active and has an active config version.
 2. That version's dispatch rules match: the repository (by name *and* id), a trigger label, and a sender allowed to apply it.
 3. Jobs are on: a job image version is published (see "The job image" below).
-4. The delivery isn't already claimed. Each tenant's delivery is claimed once (`DELIVERY#<id>#<delivery>`) for as long as a job for it may run, so a redelivery while it runs starts nothing.
+4. The delivery isn't already claimed. Each tenant's delivery is claimed once (`DELIVERY#<id>#<delivery>`), so a redelivery while a job for it may run starts nothing. The launcher's claim lasts five minutes. When the job's microVM starts, its broker `start` holds the claim for the job's whole lifetime. So a launch that stopped partway (the webhook Lambda timed out before or during `RunMicrovm`) blocks a redelivery for five minutes at most. If a redelivery's job has taken the claim by the time a slow job starts, the slow one is refused and recorded as `superseded`, so only one job runs per delivery. `RunMicrovm` gets the job id as its idempotency token.
 
 Each of these that fails answers 200 with why (`no_tenant`, `tenant_inactive`, `no_config`, `not_dispatched`, `jobs_off`, `duplicate`), and nothing is started. Otherwise the launcher:
 
@@ -248,16 +248,15 @@ Jobs run the same image as the self-hosted stack (`deploy/aws-microvm/image/`), 
 
 **Until that parameter exists, the launcher starts no jobs (`jobs_off`).** It reads the parameter at most once a minute, so a new build, or setting the parameter back to an earlier version, takes effect without a deploy.
 
-**CI builds it.** The deploy workflow has an `image` job that runs after the stack deploy. It builds only when one of these is true:
-- something the image is built from changed since the base commit (`scripts/job-image-paths.sh`):
-  - `deploy/aws-microvm/image/`;
-  - the build script and its helpers;
-  - `src/config/`, because the server validates tenant configs with it and the image's CLI runs them;
-  - the root `package.json` or `package-lock.json`;
-- the environment has never published an image;
-- a manual Production run sets `build_image`.
+**CI builds it.** The deploy workflow has an `image` job that runs after the stack deploy. Each version records in its description a fingerprint of what it was built from (`server/scripts/job-image-inputs.ts`):
+- `deploy/aws-microvm/image/`;
+- the build script and its helpers;
+- `src/config/` and `src/agents/`, because the server validates tenant configs with them (validation checks agent profiles and adapters) and the image's CLI runs them;
+- the root `package.json` and `package-lock.json`.
 
-Any other change deploys without rebuilding the image. In particular, a change to the rest of the CLI (`src/`) reaches jobs only with the next image built for one of those reasons, or a `build_image` run. Staging builds for a pull request that touches those paths. Production builds when such a change merges to main, and activates it within a minute. To roll back, set the parameter to the previous version (`aws lambda-microvms list-microvm-image-versions --image-identifier updraft-cloud-job` lists them).
+The job builds only when the active version's fingerprint differs from the checkout's (`build-job-image --check`), or when a manual Production run sets `build_image`. Comparing with the active version, not with the previous commit, also covers an environment with no image yet, an earlier build that failed, and a Staging stack whose image another pull request built.
+
+A change to the rest of the CLI (`src/`) reaches jobs only with the next image built for one of those reasons, or a `build_image` run. Production activates a new build within a minute. To roll back, set the parameter to the previous version (`aws lambda-microvms list-microvm-image-versions --image-identifier updraft-cloud-job` lists them).
 
 **The deploy role needs these permissions** for the `image` job, in each account (Staging and Production), on top of what the stack deploy uses. `<account>` is that account's id. `lambda:CreateMicrovmImage` and `lambda:PassNetworkConnector` have no resource type in IAM, so they take `"Resource": "*"`. Creating is limited instead to an image tagged with this stack, which is how the build creates it:
 
