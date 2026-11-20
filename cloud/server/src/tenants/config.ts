@@ -62,8 +62,15 @@ export interface TenantSubmission {
   prompts: Record<string, string>;
 }
 
+/** An agent an enabled repository can start, and the API key it runs with. */
+export interface AgentKeyNeed {
+  /** Its path in the compiled config: `agents.<name>`. */
+  path: string;
+  key: string;
+}
+
 export type CompileResult =
-  | { ok: true; files: Record<string, string>; sha256: string; warnings: ConfigIssue[]; dispatch: DispatchRules }
+  | { ok: true; files: Record<string, string>; sha256: string; warnings: ConfigIssue[]; dispatch: DispatchRules; keys: AgentKeyNeed[] }
   | { ok: false; errors: ConfigIssue[] };
 
 const TOP_LEVEL = new Set(['agents', 'pools', 'actions', 'repositories', 'dispatch', 'review']);
@@ -176,6 +183,7 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
 
   // Repositories: ones the installation reaches, cloned and published the platform's way.
   const repositories: Record<string, Record<string, unknown>> = {};
+  const paused = new Set<string>();
   if (input.repositories !== undefined && !isObject(input.repositories)) err('repositories', 'must be a mapping');
   else if (isObject(input.repositories)) {
     for (const [fullName, repo] of Object.entries(input.repositories)) {
@@ -200,8 +208,13 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
         });
       }
       if (isObject(repo.tiers) && repo.tiers.triage !== undefined) err(`${path}.tiers.triage`, 'not available on Updraft Cloud: triage runs outside the sandbox');
+      // Updraft Cloud's own setting, not the CLI's: the repository stays in the config (so a job
+      // already running on it is unaffected), and the launcher starts nothing for it.
+      const { paused: pausedInput, ...cliRepo } = repo;
+      if (pausedInput !== undefined && typeof pausedInput !== 'boolean') err(`${path}.paused`, 'must be true or false');
+      if (pausedInput === true) paused.add(fullName);
       const name = fullName.split('/')[1] ?? fullName;
-      repositories[fullName] = { ...repo, ...(id !== undefined ? { id } : {}), checkoutPath: `./clones/${name}`, publish };
+      repositories[fullName] = { ...cliRepo, ...(id !== undefined ? { id } : {}), checkoutPath: `./clones/${name}`, publish };
     }
   }
 
@@ -232,7 +245,63 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
   for (const file of Object.keys(prompts)) if (!usedPrompts.has(file)) warnings.push({ path: file, message: 'not referenced by any action; it is stored anyway' });
 
   const files: Record<string, string> = { 'config.yaml': stringify(compiled), ...prompts };
-  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: dispatchRules(compiled) };
+  const rules = dispatchRules(compiled, { paused });
+  // The version's record holds its dispatch rules and file list, in one DynamoDB item (400 KB).
+  const recordBytes = Buffer.byteLength(JSON.stringify({ dispatch: rules, files: [...Object.keys(files), 'source.json'] }), 'utf8');
+  if (recordBytes > MAX_VERSION_RECORD_BYTES) {
+    return {
+      ok: false,
+      errors: [{ path: 'repositories', message: `too many repositories, triggers and allowed actors to store together (${Math.ceil(recordBytes / 1024)} KiB of dispatch rules, at most ${MAX_VERSION_RECORD_BYTES / 1024} KiB)` }],
+    };
+  }
+  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: rules, keys: agentKeysNeeded(compiled, paused) };
+}
+
+/** What a version's DynamoDB record may hold for its dispatch rules and file list, well inside the 400 KB item limit. */
+export const MAX_VERSION_RECORD_BYTES = 300 * 1024;
+
+/**
+ * The agents a job of an enabled (not paused) repository can start, and each one's API key: every
+ * enabled agent of every pool its workflows route to (the pool, its rules and default, the tier
+ * pools) and, with review on, the pool each workflow's reviewer is routed to (reviewPoolFor). From a compiled config that
+ * `validateConfig` accepted, so every name resolves.
+ */
+function agentKeysNeeded(compiled: { agents: Record<string, Record<string, unknown>>; pools: unknown; repositories: Record<string, Record<string, unknown>> }, paused: ReadonlySet<string>): AgentKeyNeed[] {
+  const pools = isObject(compiled.pools) ? compiled.pools : {};
+  const used = new Set<string>();
+  const addPool = (name: unknown) => {
+    if (typeof name === 'string' && name !== '') used.add(name);
+  };
+  for (const [fullName, repo] of Object.entries(compiled.repositories)) {
+    if (paused.has(fullName)) continue;
+    const review = repo.review === true || isObject(repo.review);
+    const repoReviewPool = isObject(repo.review) ? repo.review.pool : undefined;
+    for (const wf of Array.isArray(repo.workflows) ? repo.workflows : []) {
+      if (!isObject(wf)) continue;
+      if (isObject(wf.pool)) {
+        addPool(wf.pool.default);
+        for (const rule of Array.isArray(wf.pool.rules) ? wf.pool.rules : []) if (isObject(rule)) addPool(rule.use);
+      } else addPool(wf.pool);
+      if (isObject(wf.tiers)) {
+        if (isObject(wf.tiers.pools)) for (const p of Object.values(wf.tiers.pools)) addPool(p);
+        if (isObject(wf.tiers.highRisk)) addPool(wf.tiers.highRisk.pool);
+      }
+      // As the worker picks it (reviewPoolFor): the workflow's reviewPool, else the repository's
+      // review.pool, else the pool the code was written by, which is collected above.
+      if (review) addPool(wf.reviewPool ?? repoReviewPool);
+    }
+  }
+  const out = new Map<string, AgentKeyNeed>();
+  for (const poolName of used) {
+    const pool = pools[poolName];
+    for (const agentName of isObject(pool) && Array.isArray(pool.agents) ? pool.agents : []) {
+      const agent = typeof agentName === 'string' ? compiled.agents[agentName] : undefined;
+      if (!agent || agent.enabled === false) continue;
+      const adapter = (agent.adapter ?? agentName) as CloudAgent;
+      if (adapter in AGENT_KEY_ENV) out.set(agentName as string, { path: `agents.${agentName as string}`, key: AGENT_KEY_ENV[adapter] });
+    }
+  }
+  return [...out.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
 /** A stable hash of a bundle: every file's path and content, in path order. */

@@ -2,7 +2,7 @@
 // dist/webhook.mjs, cleanup, broker), which the SAM template's functions deploy as-is
 // (CodeUri: ../server/dist). `sam deploy` zips that directory itself, so there is no `sam build`
 // step and no artifact bucket.
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
@@ -11,7 +11,22 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outdir = join(root, 'dist');
 rmSync(outdir, { recursive: true, force: true });
 
+/** `import text from './file.md?raw'`: the file's text, as Vite gives it in tests (tenants/default-prompts.ts). */
+const rawText = {
+  name: 'raw-text',
+  setup(b) {
+    b.onResolve({ filter: /\?raw$/ }, (args) => ({ path: join(args.resolveDir, args.path.replace(/\?raw$/, '')), namespace: 'raw-text' }));
+    b.onLoad({ filter: /.*/, namespace: 'raw-text' }, (args) => ({ contents: readFileSync(args.path, 'utf8'), loader: 'text' }));
+  },
+};
+
+// CommonJS dependencies require() Node's built-ins (the SDK's parts, and yaml, which the API's
+// config validation uses), and an ES module has no require of its own.
+const requireBanner = { js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" };
+
 const common = {
+  plugins: [rawText],
+  banner: requireBanner,
   outdir,
   outExtension: { '.js': '.mjs' },
   bundle: true,
@@ -33,7 +48,6 @@ await build({
 // The broker, the webhook (the launcher) and cleanup (quota reconciliation) bundle their SDK
 // clients: the MicroVMs client is newer than the runtime's SDK, and mixing a bundled client with
 // the runtime's core packages would pair mismatched versions.
-// The SDK's CommonJS parts require() Node's built-ins, which an ES module has no require for.
 await build({
   ...common,
   entryPoints: {
@@ -41,5 +55,4 @@ await build({
     webhook: join(root, 'src', 'webhook-lambda.ts'),
     cleanup: join(root, 'src', 'cleanup-lambda.ts'),
   },
-  banner: { js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);" },
 });

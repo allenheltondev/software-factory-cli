@@ -48,7 +48,12 @@ export type FlowErrorCode =
   | 'not_found'
   | 'uninstalled'
   | 'invalid_limits'
-  | 'launch_in_progress';
+  | 'launch_in_progress'
+  // Configuration (tenants/config-service.ts).
+  | 'invalid_config'
+  | 'config_changed'
+  | 'auto_merge_unconfirmed'
+  | 'not_reactivatable';
 
 export class FlowError extends Error {
   readonly code: FlowErrorCode;
@@ -96,6 +101,14 @@ export interface GitHubStatus {
   appSlug?: string;
   linked: { githubLogin: string; githubUserId: number } | null;
   tenants: TenantSummary[];
+}
+
+export interface ConfigContext {
+  tenant: Tenant;
+  summary: TenantSummary;
+  githubLogin: string;
+  appId: number;
+  repositories: GitHubRepository[];
 }
 
 export interface FlowDeps {
@@ -267,15 +280,26 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
     return out;
   }
 
-  async function memberOf(caller: Caller, installationId: number): Promise<{ tenant: Tenant; member: Member }> {
+  async function memberOf(caller: Caller, installationId: number): Promise<{ tenant: Tenant; member: Member; link: GitHubLink }> {
     const [link, member] = await Promise.all([store.getLink(caller.sub), store.getMember(installationId, caller.sub)]);
     const tenant = member && link && member.githubUserId === link.githubUserId ? await store.getTenant(installationId) : null;
     // The same answer for "no such tenant", "not yours" and "no longer yours", so ids cannot be probed.
-    if (!member || !tenant || gone(tenant)) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
-    return { tenant, member };
+    if (!member || !link || !tenant || gone(tenant)) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
+    return { tenant, member, link };
   }
 
   const installationTokens = new Map<number, { token: string; expiresAt: number }>();
+
+  /** The repositories the installation reaches now, as GitHub reports them to the App. */
+  async function installationRepositories(s: AppSettings, installationId: number): Promise<GitHubRepository[]> {
+    let cached = installationTokens.get(installationId);
+    if (!cached || cached.expiresAt - now() < 5 * 60 * 1000) {
+      cached = await github.createInstallationToken(appJwt(s.appId, s.privateKey, now()), installationId);
+      installationTokens.set(installationId, cached);
+    }
+    const repositories = await github.listInstallationRepositories(cached.token);
+    return repositories.sort((a, b) => a.fullName.localeCompare(b.fullName));
+  }
 
   return {
     async status(caller: Caller): Promise<GitHubStatus> {
@@ -370,13 +394,24 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
       const { tenant, member } = await memberOf(caller, installationId);
       const summary = summarize(tenant, member);
       if (tenant.status !== 'active') return { tenant: summary, repositories: [] };
-      let cached = installationTokens.get(installationId);
-      if (!cached || cached.expiresAt - now() < 5 * 60 * 1000) {
-        cached = await github.createInstallationToken(appJwt(s.appId, s.privateKey, now()), installationId);
-        installationTokens.set(installationId, cached);
-      }
-      const repositories = await github.listInstallationRepositories(cached.token);
-      return { tenant: summary, repositories: repositories.sort((a, b) => a.fullName.localeCompare(b.fullName)) };
+      return { tenant: summary, repositories: await installationRepositories(s, installationId) };
+    },
+
+    /**
+     * What editing a tenant's config needs (#69), for members only: the tenant, the caller's linked
+     * GitHub login (who published a version, and the default allowed actor), the platform App's id,
+     * and the repositories the installation reaches (none while the tenant is not active).
+     */
+    async configContext(caller: Caller, installationId: number): Promise<ConfigContext> {
+      const s = await settings();
+      const { tenant, member, link } = await memberOf(caller, installationId);
+      return {
+        tenant,
+        summary: summarize(tenant, member),
+        githubLogin: link.githubLogin,
+        appId: Number(s.appId),
+        repositories: tenant.status === 'active' ? await installationRepositories(s, installationId) : [],
+      };
     },
   };
 }

@@ -166,6 +166,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     publishedAt: String(i.publishedAt),
     // Stored as written by the publish (tenants/dispatch.ts); absent on versions published before it existed.
     ...(i.dispatch && typeof i.dispatch === 'object' ? { dispatch: i.dispatch as DispatchRules } : {}),
+    ...(typeof i.copiedFrom === 'number' ? { copiedFrom: i.copiedFrom } : {}),
   });
 
   async function getTenantItem(id: number, consistent = false): Promise<Record<string, unknown> | undefined> {
@@ -905,7 +906,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       );
     },
 
-    async activateConfig(id, version) {
+    async activateConfig(id, version, options) {
+      const expected = options?.expectedActive;
+      // With an expected version, it must still be the active one (or none must be, for null).
+      const sameBase = expected === undefined ? '' : expected === null ? ' AND attribute_not_exists(activeConfigVersion)' : ' AND activeConfigVersion = :expected';
       try {
         await client.send(
           new TransactWriteCommand({
@@ -926,8 +930,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   UpdateExpression: 'SET activeConfigVersion = :v',
                   // Only ever forward: a slow publish finishing after a later one must not move it back.
                   ConditionExpression:
-                    'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND (attribute_not_exists(activeConfigVersion) OR activeConfigVersion < :v)',
-                  ExpressionAttributeValues: { ':v': version, ':uninstalled': 'uninstalled' },
+                    'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND (attribute_not_exists(activeConfigVersion) OR activeConfigVersion < :v)' +
+                    sameBase,
+                  ExpressionAttributeValues: { ':v': version, ':uninstalled': 'uninstalled', ...(typeof expected === 'number' ? { ':expected': expected } : {}) },
                 },
               },
             ],
@@ -941,7 +946,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         if (tenant?.Code === 'ConditionalCheckFailed') {
           const item = await getTenantItem(id, true);
           if (!item) return 'no_tenant';
-          return item.disabledReason === 'uninstalled' ? 'uninstalled' : 'superseded';
+          if (item.disabledReason === 'uninstalled') return 'uninstalled';
+          const current = typeof item.activeConfigVersion === 'number' ? item.activeConfigVersion : null;
+          if (current !== null && current >= version) return 'superseded';
+          return expected !== undefined && current !== expected ? 'changed' : 'superseded';
         }
         throw err;
       }

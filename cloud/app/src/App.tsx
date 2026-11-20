@@ -9,6 +9,8 @@ import { DashboardPage } from './pages/DashboardPage';
 import { GitHubCallbackPage } from './pages/GitHubCallbackPage';
 import { AdminPage } from './pages/AdminPage';
 import { AdminTenantPage } from './pages/AdminTenantPage';
+import { ConfigHistoryPage } from './pages/ConfigHistoryPage';
+import { ConfigPage } from './pages/ConfigPage';
 import { InstallationPage } from './pages/InstallationPage';
 
 function NotFoundPage() {
@@ -44,6 +46,8 @@ export function App({ api }: { api?: ApiClient }) {
           <Route index element={<DashboardPage api={api} />} />
           <Route path="github/callback" element={<GitHubCallbackPage api={api} />} />
           <Route path="installations/:id" element={<InstallationPage api={api} />} />
+          <Route path="installations/:id/config" element={<ConfigPage api={api} />} />
+          <Route path="installations/:id/config/history" element={<ConfigHistoryPage api={api} />} />
           <Route path="admin" element={<AdminPage api={api} />} />
           <Route path="admin/tenants/:id" element={<AdminTenantPage api={api} />} />
           <Route path="*" element={<NotFoundPage />} />

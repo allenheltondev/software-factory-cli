@@ -30,6 +30,10 @@ function fakeTable() {
     ) {
       return Boolean(item) && item!.disabledReason !== values[':uninstalled'] && (item!.activeConfigVersion === undefined || (item!.activeConfigVersion as number) < (values[':v'] as number));
     }
+    const activation =
+      'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND (attribute_not_exists(activeConfigVersion) OR activeConfigVersion < :v)';
+    if (expr === `${activation} AND attribute_not_exists(activeConfigVersion)`) return condition(activation, item, values) && item!.activeConfigVersion === undefined;
+    if (expr === `${activation} AND activeConfigVersion = :expected`) return condition(activation, item, values) && item!.activeConfigVersion === values[':expected'];
     if (expr === '#status = :ready') return item?.status === values[':ready'];
     if (expr === 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)') {
       return Boolean(item) && (item!.disabledReason === undefined || item!.disabledReason !== values[':uninstalled']);
@@ -386,6 +390,24 @@ describe('dynamo store: review fixes on #78', () => {
     expect(await store.activateConfig(55, v1)).toBe('superseded');
     expect((await store.getTenant(55))?.activeConfigVersion).toBe(v2);
     expect(await store.activateConfig(55, v2)).toBe('superseded');
+  });
+
+  it('two editors who saw the same active version: only the first activation wins (#83 review)', async () => {
+    const { store } = await seeded();
+    // Both checked against "nothing active"; the second allocated a later number.
+    const a = (await store.createConfigVersion(55, meta)) as number;
+    const b = (await store.createConfigVersion(55, meta)) as number;
+    await store.markConfigReady(55, a);
+    await store.markConfigReady(55, b);
+    expect(await store.activateConfig(55, a, { expectedActive: null })).toBe('activated');
+    // Without the guard, b (> a) would be accepted and overwrite a's edit.
+    expect(await store.activateConfig(55, b, { expectedActive: null })).toBe('changed');
+    expect((await store.getTenant(55))?.activeConfigVersion).toBe(a);
+    // Checked against a: accepted.
+    const c = (await store.createConfigVersion(55, meta)) as number;
+    await store.markConfigReady(55, c);
+    expect(await store.activateConfig(55, c, { expectedActive: a })).toBe('activated');
+    expect(await store.activateConfig(55, b, { expectedActive: a })).toBe('superseded');
   });
 
   it('refuses key metadata once the tenant is uninstalled', async () => {

@@ -26,7 +26,8 @@ describe('dispatchRules', () => {
             { label: 'docs', actors: ['writer'] },
           ],
         },
-        'acme/api': { id: 10, triggers: [{ label: 'updraft', actors: ['pat', 'sam'] }] },
+        // One list for every trigger: stored once.
+        'acme/api': { id: 10, actors: ['pat', 'sam'], triggers: [{ label: 'updraft' }] },
       },
     });
   });
@@ -54,5 +55,41 @@ describe('decideDispatch', () => {
 
   it('starts nothing for a version published before dispatch rules existed', () => {
     expect(decideDispatch(undefined, event()).start).toBe(false);
+  });
+});
+
+describe('paused repositories', () => {
+  it('stay in the rules, and start nothing', () => {
+    const rules = dispatchRules(compiled, { paused: new Set(['ACME/web']) });
+    expect(rules.repositories['acme/web']?.paused).toBe(true);
+    expect(rules.repositories['acme/api']?.paused).toBeUndefined();
+    expect(decideDispatch(rules, { repositoryFullName: 'acme/web', repositoryId: 9, label: 'updraft', sender: 'pat' })).toEqual({ start: false, reason: 'the repository is paused' });
+    expect(decideDispatch(rules, { repositoryFullName: 'acme/api', repositoryId: 10, label: 'updraft', sender: 'pat' })).toMatchObject({ start: true });
+  });
+});
+
+describe('stored actor lists', () => {
+  it('still decide on versions stored with the actors on every trigger', () => {
+    const legacy = { repositories: { 'acme/web': { id: 9, triggers: [{ label: 'updraft', actors: ['pat'] }] } } };
+    expect(decideDispatch(legacy, { repositoryFullName: 'acme/web', repositoryId: 9, label: 'updraft', sender: 'pat' })).toMatchObject({ start: true });
+    expect(decideDispatch(legacy, { repositoryFullName: 'acme/web', repositoryId: 9, label: 'updraft', sender: 'eve' })).toMatchObject({ start: false });
+  });
+
+  it('a shared list is stored once, and decides for every trigger', () => {
+    const rules = dispatchRules({
+      dispatch: { allowedActors: [] },
+      repositories: {
+        'acme/web': {
+          id: 9,
+          workflows: [
+            { trigger: { label: 'a' }, allowedActors: ['Pat', 'sam'] },
+            { trigger: { label: 'b' }, allowedActors: ['pat', 'sam'] },
+          ],
+        },
+      },
+    });
+    expect(rules.repositories['acme/web']).toEqual({ id: 9, actors: ['pat', 'sam'], triggers: [{ label: 'a' }, { label: 'b' }] });
+    expect(decideDispatch(rules, { repositoryFullName: 'acme/web', repositoryId: 9, label: 'B', sender: 'sam' })).toMatchObject({ start: true });
+    expect(decideDispatch(rules, { repositoryFullName: 'acme/web', repositoryId: 9, label: 'b', sender: 'eve' })).toMatchObject({ start: false });
   });
 });

@@ -46,13 +46,15 @@ describe('publishTenantConfig', () => {
     const { store, objects, publish } = await setup();
     const r = await publish();
     expect(r).toMatchObject({ ok: true, version: 1 });
-    expect([...objects.keys()].sort()).toEqual([`${configPrefix(55, 1)}config.yaml`, `${configPrefix(55, 1)}prompts/implement-issue.md`]);
+    expect([...objects.keys()].sort()).toEqual([`${configPrefix(55, 1)}config.yaml`, `${configPrefix(55, 1)}prompts/implement-issue.md`, `${configPrefix(55, 1)}source.json`]);
+    // What it was written as, beside the bundle: tenant-admin's document.
+    expect(JSON.parse(objects.get(`${configPrefix(55, 1)}source.json`)!)).toEqual({ format: 'tenant', config: submission().config });
     expect((await store.getTenant(55))?.activeConfigVersion).toBe(1);
     expect(await store.listConfigVersions(55)).toEqual([
-      expect.objectContaining({ version: 1, status: 'ready', files: ['config.yaml', 'prompts/implement-issue.md'], publishedBy: 'admin', publishedAt: '2026-11-19T00:00:00.000Z' }),
+      expect.objectContaining({ version: 1, status: 'ready', files: ['config.yaml', 'prompts/implement-issue.md', 'source.json'], publishedBy: 'admin', publishedAt: '2026-11-19T00:00:00.000Z' }),
     ]);
     // What the launcher dispatches on, from the compiled config (the repository id the installation reaches).
-    expect((await store.getConfigVersion(55, 1))?.dispatch).toEqual({ repositories: { 'acme/web': { id: 99, triggers: [{ label: 'ready', actors: ['pat'] }] } } });
+    expect((await store.getConfigVersion(55, 1))?.dispatch).toEqual({ repositories: { 'acme/web': { id: 99, actors: ['pat'], triggers: [{ label: 'ready' }] } } });
   });
 
   it('never rewrites a version: each publish is the next one', async () => {
