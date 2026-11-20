@@ -16,6 +16,30 @@
 export const CREDENTIAL_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 
 /**
+ * Asking the broker to stop this microVM: attempts, and the first delay (then twice it, three
+ * times it...), about 30 seconds in all. The launcher records the microVM's id once RunMicrovm
+ * returns, so a job that ends quickly (refused at start, say) can ask before the broker knows
+ * which microVM is its own ("unavailable"); a later attempt finds it.
+ */
+export const TERMINATE_ATTEMPTS = 6;
+export const TERMINATE_DELAY_MS = 2000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Stops this job's microVM through the broker, retrying (bounded) until the broker can. */
+export async function terminateThroughBroker(client, { attempts = TERMINATE_ATTEMPTS, delayMs = TERMINATE_DELAY_MS, wait = sleep } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await client.terminate();
+      return;
+    } catch (error) {
+      if (attempt >= attempts) throw error;
+      await wait(delayMs * attempt);
+    }
+  }
+}
+
+/**
  * @param {{ functionName: string, jobId: string, jobToken: string, region: string }} broker
  * @param {{ invoke?: (functionName: string, body: object) => Promise<object> }} [options]
  *   tests pass their own; by default a Lambda Invoke with the microVM's execution role
@@ -87,7 +111,7 @@ function toSdk(c) {
  * it), and returns the AWS calls with tenant-scoped credentials plus the broker's GitHub token,
  * finish and terminate (the broker stops this job's microVM; runJob's microVM id is not used).
  */
-export async function startBrokerJob(payload, { client, createAwsDeps, now = Date.now }) {
+export async function startBrokerJob(payload, { client, createAwsDeps, now = Date.now, terminateOptions }) {
   const started = await client.start();
   const d = started.descriptor;
   for (const name of ['bucket', 'eventKey', 'configPrefix', 'resultKeyPrefix', 'stateKey']) {
@@ -106,9 +130,8 @@ export async function startBrokerJob(payload, { client, createAwsDeps, now = Dat
     ...createAwsDeps(payload.region, { credentials: brokerCredentialProvider(client, started.credentials, { now }) }),
     githubToken: () => client.githubToken(),
     finishJob: (outcome) => client.finish(outcome),
-    terminate: async () => {
-      await client.terminate();
-    },
+    // A job that fails while preparing can end before the launcher has recorded its microVM.
+    terminate: () => terminateThroughBroker(client, terminateOptions),
   };
   return { payload: filled, deps };
 }

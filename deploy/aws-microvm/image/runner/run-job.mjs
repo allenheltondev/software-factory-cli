@@ -2,7 +2,7 @@
 // real AWS clients and the image's settings to runJob (job.mjs) and exits when it is done.
 import os from 'node:os';
 import { createAwsDeps } from './aws.mjs';
-import { createBrokerClient, startBrokerJob } from './broker.mjs';
+import { createBrokerClient, startBrokerJob, terminateThroughBroker } from './broker.mjs';
 import { BROKER_PAYLOAD_VERSION, parseRunRequest } from './hooks.mjs';
 import { SANDBOX_IMAGE, SANDBOX_RUNTIME, createNftFilter, credentialEndpoints } from './isolation.mjs';
 import { runJob } from './job.mjs';
@@ -72,10 +72,11 @@ async function main() {
       job = { request: { ...request, payload: started.payload }, aws: started.deps };
     } catch (error) {
       // Without the broker there is nowhere to report to; stop the microVM rather than bill it.
-      // Only the broker can (the execution role cannot terminate); if it cannot either, the
+      // Only the broker can (the execution role cannot terminate), and only once the launcher
+      // has recorded this microVM, so it is retried for a while; if it still cannot, the
       // microVM's maximum duration ends it.
       log(`the job broker did not start this job: ${error?.message ?? error}`);
-      await client.terminate().catch((e) => log(`the job broker did not stop this microVM: ${e?.message ?? e}`));
+      await terminateThroughBroker(client).catch((e) => log(`the job broker did not stop this microVM: ${e?.message ?? e}`));
       process.exitCode = 2;
       return;
     }

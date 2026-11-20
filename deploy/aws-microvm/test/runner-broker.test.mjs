@@ -2,7 +2,15 @@
 // payload, the broker client, the credential refresh and how a job is started. No AWS, no
 // child processes: these run everywhere. runner-job.test.mjs runs a whole version 2 job.
 import { describe, expect, it, vi } from 'vitest';
-import { brokerCredentialProvider, createBrokerClient, CREDENTIAL_REFRESH_MARGIN_MS, startBrokerJob } from '../image/runner/broker.mjs';
+import {
+  brokerCredentialProvider,
+  createBrokerClient,
+  CREDENTIAL_REFRESH_MARGIN_MS,
+  startBrokerJob,
+  TERMINATE_ATTEMPTS,
+  TERMINATE_DELAY_MS,
+  terminateThroughBroker,
+} from '../image/runner/broker.mjs';
 import { BROKER_PAYLOAD_VERSION, parseRunRequest } from '../image/runner/hooks.mjs';
 
 const TOKEN = 'a'.repeat(43);
@@ -80,6 +88,51 @@ describe('brokerCredentialProvider', () => {
 
   it('refuses credentials it cannot use', () => {
     expect(() => brokerCredentialProvider({}, { accessKeyId: 'x' })).toThrow(/no usable credentials/);
+  });
+});
+
+describe('terminateThroughBroker', () => {
+  // The broker's side: "unavailable" until the launcher has recorded the job's microVM.
+  const brokerAttachingAfter = (calls) => {
+    let seen = 0;
+    const invoke = vi.fn(async (_fn, body) => {
+      expect(body.action).toBe('terminate');
+      seen += 1;
+      return seen > calls ? { ok: true, terminated: true } : { ok: false, error: 'unavailable' };
+    });
+    return { invoke, client: createBrokerClient({ functionName: 'broker', jobId: 'job_abc12345', jobToken: TOKEN, region: 'us-east-1' }, { invoke }) };
+  };
+
+  it('keeps asking, with growing pauses, until the launcher has recorded the microVM', async () => {
+    const { invoke, client } = brokerAttachingAfter(2);
+    const wait = vi.fn(async () => {});
+    await terminateThroughBroker(client, { wait });
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(wait.mock.calls).toEqual([[TERMINATE_DELAY_MS], [2 * TERMINATE_DELAY_MS]]);
+  });
+
+  it('gives up after a bounded number of attempts, and says why', async () => {
+    const { invoke, client } = brokerAttachingAfter(Infinity);
+    const wait = vi.fn(async () => {});
+    await expect(terminateThroughBroker(client, { wait })).rejects.toThrow(/refused terminate \(unavailable\)/);
+    expect(invoke).toHaveBeenCalledTimes(TERMINATE_ATTEMPTS);
+    // About half a minute in all, so a launcher that is a little slow is waited for.
+    const total = wait.mock.calls.reduce((sum, [ms]) => sum + ms, 0);
+    expect(total).toBeGreaterThanOrEqual(25_000);
+    expect(total).toBeLessThanOrEqual(60_000);
+  });
+
+  it('is what a started job terminates with', async () => {
+    const { invoke, client } = brokerAttachingAfter(1);
+    const started = {
+      ok: true,
+      descriptor: { bucket: 'b', eventKey: 'e', configPrefix: 'c/', resultKeyPrefix: 'r/', stateKey: 's/state.db' },
+      credentials: { accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(NOW + 3_600_000).toISOString() },
+    };
+    client.start = async () => started;
+    const { deps } = await startBrokerJob(parse(v2()).payload, { client, createAwsDeps: () => ({}), now: () => NOW, terminateOptions: { wait: async () => {} } });
+    await deps.terminate('mvm-1');
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -1163,8 +1163,9 @@ the broker the job finished, then asks it to stop the microVM. The execution rol
 terminate microVMs: that permission covers every microVM of the image, so it would let one
 tenant's runner stop another's. The broker stops only the microVM the launcher recorded for
 the job. Agent isolation is always `enforced` for version 2. If the broker refuses the job,
-the runner asks it to stop the microVM without running anything. The maximum duration is the
-backstop if that fails too.
+the runner asks it to stop the microVM without running anything. A job that ends that quickly
+can ask before the launcher has recorded its microVM, so the runner keeps asking for about
+30 seconds (`terminateThroughBroker`). The maximum duration is the backstop if that fails too.
 
 ### Idle policy
 
