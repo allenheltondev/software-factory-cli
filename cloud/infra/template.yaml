@@ -63,6 +63,15 @@ Parameters:
     MinValue: 1
     Description: Jobs every tenant together may run at once.
 
+  # The admin view (server/src/admin/access.ts): the members of this group in the shared Ready,
+  # Set, Cloud user pool, from the ID token's cognito:groups.
+  AdminGroup:
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 128
+    Description: The Cognito group whose members may use Updraft's admin view.
+
   AppDomainName:
     Type: String
     Default: ''
@@ -244,9 +253,8 @@ Resources:
           QUOTA_JOBS_PER_DAY: !Ref QuotaJobsPerDay
           QUOTA_MICROVM_MINUTES_PER_MONTH: !Ref QuotaMicrovmMinutesPerMonth
           PLATFORM_CONCURRENT_JOBS: !Ref PlatformConcurrentJobs
-          # Who may use the admin view (server/src/admin/access.ts). Not created by the stack:
-          # nobody is an admin until an operator writes it.
-          ADMINS_PARAMETER: /updraft/admins
+          # Who may use the admin view: the members of this Cognito group (server/src/admin/access.ts).
+          ADMIN_GROUP: !Ref AdminGroup
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - DynamoDBCrudPolicy:
@@ -254,8 +262,6 @@ Resources:
         # The GitHub App's settings (github/settings.ts), written by scripts/register-github-app.mjs.
         - SSMParameterReadPolicy:
             ParameterName: updraft/app/*
-        - SSMParameterReadPolicy:
-            ParameterName: updraft/admins
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue

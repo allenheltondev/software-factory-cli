@@ -19,7 +19,7 @@ import type { TenantLimits } from './store/store.js';
  *   POST   /api/v1/github/connect/:id                connect an installation the last link offered
  *   GET    /api/v1/installations/:id/repositories    a tenant's repositories (members only)
  *
- * Admins only (admin/access.ts; anyone else gets 403):
+ * Admins only, the members of the stack's admin Cognito group (admin/access.ts; anyone else gets 403):
  *   GET    /api/v1/admin/tenants                     every tenant: quotas, usage, failures
  *   GET    /api/v1/admin/tenants/:id                 one tenant, with its recent and running jobs
  *   POST   /api/v1/admin/tenants/:id/disable         { reason? }: jobs stop at once

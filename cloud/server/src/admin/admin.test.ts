@@ -1,8 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { createApp } from '../app.js';
 import { callerFromClaims, groupsFrom, type Caller } from '../caller.js';
 import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
-import { createAdminAccess, isAdmin, parseAllowList } from './access.js';
+import { adminAccess, isAdmin } from './access.js';
 import { ADMIN_RELEASED_OUTCOME, createAdminService } from './admin.js';
 
 const QUOTAS = { concurrentJobs: 1, jobsPerDay: 20, microvmMinutesPerMonth: 1200, platformConcurrentJobs: 20 };
@@ -52,39 +52,23 @@ async function launched(store: ReturnType<typeof createMemoryStore>, jobId: stri
 }
 
 describe('admin access', () => {
-  it('reads subs and groups from the allow-list', () => {
-    const list = parseAllowList(' sub-1, group:updraft-admins\nsub-2 group: ');
-    expect([...list.subs]).toEqual(['sub-1', 'sub-2']);
-    expect([...list.groups]).toEqual(['updraft-admins']);
-    expect(isAdmin({ sub: 'sub-2' }, list)).toBe(true);
-    expect(isAdmin({ sub: 'x', groups: ['rsc-pro', 'updraft-admins'] }, list)).toBe(true);
-    expect(isAdmin({ sub: 'x', groups: ['rsc-pro'] }, list)).toBe(false);
-    expect(isAdmin({ sub: 'x' }, parseAllowList(null))).toBe(false);
+  it("is the stack's admin Cognito group, and nothing else", async () => {
+    const access = adminAccess('admin');
+    expect(await access.isAdmin({ sub: 'x', groups: ['rsc-pro', 'admin'] })).toBe(true);
+    expect(await access.isAdmin({ sub: 'x', groups: ['rsc-pro', 'admins'] })).toBe(false);
+    expect(await access.isAdmin({ sub: 'x' })).toBe(false);
+    // No group configured: nobody.
+    expect(await adminAccess('  ').isAdmin({ sub: 'x', groups: [''] })).toBe(false);
+    expect(isAdmin({ sub: 'x', groups: ['updraft-admins'] }, 'updraft-admins')).toBe(true);
   });
 
   it('takes groups from the token as the authorizer or a verifier hands them over', () => {
     expect(groupsFrom(['a', 'b'])).toEqual(['a', 'b']);
     expect(groupsFrom('[a, b]')).toEqual(['a', 'b']);
     expect(groupsFrom('a,b')).toEqual(['a', 'b']);
+    expect(groupsFrom('admin')).toEqual(['admin']);
     expect(groupsFrom(undefined)).toEqual([]);
-    expect(callerFromClaims({ sub: 's', aud: 'c', token_use: 'id', 'cognito:groups': '[updraft-admins]' }, 'c')).toEqual({ sub: 's', groups: ['updraft-admins'] });
-  });
-
-  it('reads the list at most once a minute, and makes nobody an admin when it cannot be read', async () => {
-    let clock = 0;
-    const read = vi.fn<() => Promise<string | null>>().mockResolvedValue('sub-1');
-    const access = createAdminAccess({ read, now: () => clock, log: () => {} });
-    expect(await access.isAdmin({ sub: 'sub-1' })).toBe(true);
-    read.mockResolvedValue('');
-    clock = 59_000;
-    expect(await access.isAdmin({ sub: 'sub-1' })).toBe(true);
-    clock = 60_000;
-    expect(await access.isAdmin({ sub: 'sub-1' })).toBe(false);
-    read.mockRejectedValue(new Error('AccessDenied'));
-    read.mockClear();
-    clock = 120_000;
-    expect(await access.isAdmin({ sub: 'sub-1' })).toBe(false);
-    expect(read).toHaveBeenCalledOnce();
+    expect(callerFromClaims({ sub: 's', aud: 'c', token_use: 'id', 'cognito:groups': '[admin]' }, 'c')).toEqual({ sub: 's', groups: ['admin'] });
   });
 });
 
@@ -186,18 +170,18 @@ describe('the admin service', () => {
 });
 
 describe('the admin routes', () => {
-  async function app(caller: Caller, admins = 'admin-sub') {
+  async function app(caller: Caller, group = 'admin') {
     const store = await seeded();
     const service = createAdminService({ store, quotas: QUOTAS, log: () => {} });
     return {
       store,
-      app: createApp({ resolveCaller: () => caller, admin: { access: createAdminAccess({ read: async () => admins }), service } }),
+      app: createApp({ resolveCaller: () => caller, admin: { access: adminAccess(group), service } }),
     };
   }
   const json = (body: unknown) => ({ method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' } });
 
-  it('are refused to anyone not on the allow-list, who /me says is no admin', async () => {
-    const { app: a } = await app({ sub: 'someone' });
+  it('are refused to anyone outside the admin group, who /me says is no admin', async () => {
+    const { app: a } = await app({ sub: 'someone', groups: ['rsc-pro'] });
     for (const [path, init] of [
       ['/api/v1/admin/tenants', {}],
       ['/api/v1/admin/tenants/55', {}],
@@ -210,19 +194,21 @@ describe('the admin routes', () => {
     expect(await (await a.request('/api/v1/me')).json()).toMatchObject({ sub: 'someone', admin: false });
   });
 
-  it('serve an admin, by sub or by group', async () => {
-    const { app: bySub } = await app({ sub: 'admin-sub' });
-    expect(await (await bySub.request('/api/v1/me')).json()).toMatchObject({ admin: true });
-    const list = (await (await bySub.request('/api/v1/admin/tenants')).json()) as { tenants: { accountLogin: string }[] };
+  it("serve a member of the admin group, whichever group the stack names", async () => {
+    const { app: a } = await app({ sub: 'x', groups: ['admin'] });
+    expect(await (await a.request('/api/v1/me')).json()).toMatchObject({ admin: true });
+    const list = (await (await a.request('/api/v1/admin/tenants')).json()) as { tenants: { accountLogin: string }[] };
     expect(list.tenants.map((t) => t.accountLogin)).toEqual(['acme', 'zeta']);
+    expect((await a.request('/api/v1/admin/tenants/55')).status).toBe(200);
+    expect((await a.request('/api/v1/admin/tenants/99')).status).toBe(404);
 
-    const { app: byGroup } = await app({ sub: 'x', groups: ['updraft-admins'] }, 'group:updraft-admins');
-    expect((await byGroup.request('/api/v1/admin/tenants/55')).status).toBe(200);
-    expect((await byGroup.request('/api/v1/admin/tenants/99')).status).toBe(404);
+    const { app: other } = await app({ sub: 'x', groups: ['updraft-admins'] }, 'updraft-admins');
+    expect((await other.request('/api/v1/admin/tenants')).status).toBe(200);
+    expect((await (await app({ sub: 'x', groups: ['admin'] }, 'updraft-admins')).app.request('/api/v1/admin/tenants')).status).toBe(403);
   });
 
   it('disable, enable and set limits, recording who did it', async () => {
-    const { app: a, store } = await app({ sub: 'admin-sub', email: 'ops@example.com' });
+    const { app: a, store } = await app({ sub: 'x', email: 'ops@example.com', groups: ['admin'] });
     expect((await a.request('/api/v1/admin/tenants/55/disable', json({ reason: 'abuse' }))).status).toBe(200);
     expect((await store.getTenant(55))?.adminDisabled).toMatchObject({ by: 'admin:ops@example.com', reason: 'abuse' });
     expect((await a.request('/api/v1/admin/tenants/55/enable', json({}))).status).toBe(200);

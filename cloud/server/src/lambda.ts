@@ -1,7 +1,6 @@
-import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { handle } from 'hono/aws-lambda';
-import { ADMINS_PARAMETER, createAdminAccess } from './admin/access.js';
+import { adminAccess, DEFAULT_ADMIN_GROUP } from './admin/access.js';
 import { createAdminService } from './admin/admin.js';
 import { createApp } from './app.js';
 import { callerFromClaims, type Claims } from './caller.js';
@@ -21,7 +20,6 @@ const clientId = process.env.USER_POOL_CLIENT_ID ?? '';
 if (!clientId) console.error('USER_POOL_CLIENT_ID is not set; every /api/v1 request will be refused');
 const tableName = process.env.TABLE_NAME ?? '';
 const store = tableName ? createDynamoStore(tableName) : undefined;
-const ssm = new SSMClient({});
 
 const app = createApp({
   resolveCaller: (c) => {
@@ -33,16 +31,7 @@ const app = createApp({
     ? {
         github: createGitHubFlows({ store, github: createGitHubApi(), loadSettings: createSettingsLoader() }),
         admin: {
-          access: createAdminAccess({
-            read: async () => {
-              try {
-                return (await ssm.send(new GetParameterCommand({ Name: process.env.ADMINS_PARAMETER || ADMINS_PARAMETER }))).Parameter?.Value ?? null;
-              } catch (err) {
-                if (err instanceof ParameterNotFound) return null;
-                throw err;
-              }
-            },
-          }),
+          access: adminAccess(process.env.ADMIN_GROUP ?? DEFAULT_ADMIN_GROUP),
           service: createAdminService({ store, quotas: quotasFromEnv(process.env) }),
         },
       }

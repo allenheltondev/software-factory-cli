@@ -299,13 +299,10 @@ The console's **Admin** page (`/admin`) has two levels:
   - **Quotas.** Overrides of the stack's defaults, from 1 up to the ceiling, the same as `tenant-admin limits`.
   - **Release** a job that holds capacity it shouldn't. This is for a launch interrupted after it asked for a microVM: nothing can tell whether one started, so its slot stays taken until the job's maximum duration. Release only once you've checked in Lambda that no microVM of the job is running. The job is retired, and its slots and unused microVM time are given back.
 
-**Who's an admin** comes from the SSM parameter `/updraft/admins`, one per account. Its entries are separated by commas or whitespace. Each is a Cognito `sub`, or `group:<name>` for everyone in that Ready, Set, Cloud group. The stack doesn't create it, so nobody is an admin until you write it:
-
-```powershell
-aws ssm put-parameter --name /updraft/admins --type String --value "group:updraft-admins" --overwrite
-```
-
-The API reads it at most once a minute. If it can't be read, nobody is an admin. Every admin route answers 403 to anyone else, and `/api/v1/me` says whether the caller is an admin, which decides whether the console shows the link. Each action is logged with the admin's email.
+**Who's an admin:** the members of one Cognito group in the shared Ready, Set, Cloud user pool, as the other Ready, Set, Cloud apps check their admins. The stack's `AdminGroup` parameter names it, and the default is `admin`. Membership comes from the verified ID token's `cognito:groups`, so adding or removing someone takes effect with their next token, within the hour.
+- Every admin route answers 403 to anyone else.
+- `/api/v1/me` says whether the caller is an admin, which decides whether the console shows the link.
+- Each action is logged with the admin's email.
 
 The job summaries (`TENANT#<id>`/`JOB#<createdAt>#<jobId>`) are written with each job record and keep its first outcome. A failure also counts in the month's usage. The tenant list comes from a table scan, which is fine while there are few tenants.
 
