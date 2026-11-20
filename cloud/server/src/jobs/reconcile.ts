@@ -48,15 +48,17 @@ export function createReconciler({
         if (entry.phase === 'reserved') {
           // The launch may still be under way; past this, it stopped before RunMicrovm.
           if (now() - entry.reservedAt < RESERVATION_RECLAIM_MS) continue;
+          // The guarded cancel goes first, and wins the reservation or touches nothing: this run's
+          // list may be stale, and the launch may have moved the entry on to launching since
+          // (mismatch). Once only, even with another run reclaiming it at the same time (gone).
+          if ((await store.cancelReservation(entry, 'reserved')) !== 'cancelled') continue;
           const job = await store.getJob(jobId);
           if (job) {
             await store.markStopping(jobId);
             await store.finishJob(jobId, 'launch_failed');
+            await store.releaseJob(job);
           }
-          // Once only, even with another run reclaiming it at the same time (or a retry of this one).
-          const reclaimed = await store.cancelReservation(entry, 'reserved');
-          if (job) await store.releaseJob(job);
-          if (reclaimed) released.push(jobId);
+          released.push(jobId);
           continue;
         }
         const job = await store.getJob(jobId);

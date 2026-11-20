@@ -31,6 +31,24 @@ async function admitted(store: ReturnType<typeof createMemoryStore>, jobId: stri
 }
 
 describe('quota reconciliation', () => {
+  it("leaves a launched job alone when its stale listing still says reserved", async () => {
+    const store = createMemoryStore();
+    // Listed while young and reserved; launched (and running) before this run reached it.
+    const job = await admitted(store, 'job_launched1', { microvmId: 'mvm-run' });
+    const [entry] = await store.listActiveJobs();
+    const stale = { ...entry!, phase: 'reserved' as const, reservedAt: Date.now() - 6 * 60_000 };
+    store.listActiveJobs = async () => [stale];
+    const report = await createReconciler({ store, microvmState: async () => 'RUNNING', log: () => {} })();
+    expect(report.released).toEqual([]);
+    // Not retired, its slots and its entry intact, its usage still counted.
+    const after = (await store.getJob(job.jobId))!;
+    expect(after.status).toBe('launched');
+    expect(after.stopRequestedAt).toBeUndefined();
+    expect((await store.listPlatformSlots()).map((s) => s.jobId)).toEqual([job.jobId]);
+    expect((await store.reserveJob({ installationId: 55, jobId: 'job_other0001', holdUntil: Date.now() + 60_000, day: '2026-11-20', month: '2026-11', quotas: { ...QUOTAS, concurrentJobs: 1 } }))).toEqual({ ok: false, limit: 'concurrent_jobs' });
+    expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(1);
+  });
+
   it('reclaims an abandoned reservation once, however many runs overlap', async () => {
     const store = createMemoryStore();
     const quotas = { ...QUOTAS, jobsPerDay: 2 };

@@ -554,13 +554,14 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     // A failed launch gives everything back, once: a repeat (a retry, a concurrent reclaim) gives nothing more.
     if (!a.ok) throw new Error('unreachable');
     const reservation = { installationId: 55, jobId: 'job_a00000001', tenantSlot: a.tenantSlot, platformSlot: a.platformSlot, day: '2026-11-20', month: '2026-11' };
-    // Not in the phase asked for: nothing happens to the counts.
-    expect(await store.cancelReservation(reservation, 'launching')).toBe(false);
+    // Not in the phase asked for: nothing is touched, the slots included.
+    expect(await store.cancelReservation(reservation, 'launching')).toBe('mismatch');
     expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(1);
-    expect(await store.cancelReservation(reservation, 'reserved')).toBe(true);
+    expect(table.items.has('TENANT#55|SLOT#0000')).toBe(true);
+    expect(await store.cancelReservation(reservation, 'reserved')).toBe('cancelled');
     expect(table.items.has('TENANT#55|SLOT#0000')).toBe(false);
     expect((await store.getUsage(55, '2026-11-20', '2026-11')).jobsToday).toBe(0);
-    expect(await store.cancelReservation(reservation, 'reserved')).toBe(false);
+    expect(await store.cancelReservation(reservation, 'reserved')).toBe('gone');
     expect(await store.getUsage(55, '2026-11-20', '2026-11')).toMatchObject({ jobsToday: 0, jobsThisMonth: 0 });
 
     // Jobs per day: counted at launch, whatever becomes of the job.
@@ -595,7 +596,7 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     await store.markLaunching('job_a00000001');
     expect((await store.listActiveJobs())[0]?.phase).toBe('launching');
     await expect(store.markLaunching('job_a00000001')).rejects.toThrow('no reservation to launch');
-    expect(await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11' }, 'launching')).toBe(true);
+    expect(await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11' }, 'launching')).toBe('cancelled');
     expect(await store.listActiveJobs()).toEqual([]);
     await expect(store.markLaunching('job_a00000001')).rejects.toThrow('no reservation to launch');
   });

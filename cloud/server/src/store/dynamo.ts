@@ -1068,7 +1068,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     async cancelReservation(r, phase) {
       // The counts go back with the entry's delete, in one transaction, only while the entry is
       // there in that phase: a retried or concurrent cancel (two reconciliations) gives back nothing.
-      let once = true;
+      let outcome: 'cancelled' | 'gone' | 'mismatch' = 'cancelled';
       try {
         await client.send(
           new TransactWriteCommand({
@@ -1089,12 +1089,15 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         );
       } catch (err) {
         if (!(err instanceof TransactionCanceledException && cancelledAt(err, 0))) throw err;
-        once = false;
+        const entry = await client.send(new GetCommand({ TableName: T, Key: activeKey(r.jobId), ConsistentRead: true }));
+        outcome = entry.Item ? 'mismatch' : 'gone';
       }
-      // Owner-checked, so safe to repeat whether or not this call gave the counts back.
+      // A launch moved it on: its slots are a live microVM's, not this cancel's to free.
+      if (outcome === 'mismatch') return outcome;
+      // Owner-checked, so safe to repeat: a cancel cut short after its transaction finishes here.
       await deleteIfHeld(tenantSlotKey(r.installationId, r.tenantSlot), r.jobId);
       await deleteIfHeld(platformSlotKey(r.platformSlot), r.jobId);
-      return once;
+      return outcome;
     },
 
     async recordThrottle(id, month, notice) {
