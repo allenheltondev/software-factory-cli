@@ -401,6 +401,10 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
+              # A job's own microVM, the one the launcher recorded for it (the terminate action).
+              - Effect: Allow
+                Action: lambda:TerminateMicrovm
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
 
   # Separate from BrokerRole, which JobDataRole's trust policy names (an inline policy would be a cycle).
   BrokerAssumeJobDataPolicy:
@@ -476,8 +480,8 @@ Resources:
       RetentionInDays: 30
 
   # Assumed by Lambda for a running microVM. Everything in a microVM, agents included, must be
-  # assumed able to use it, so it reaches no tenant's data: it can ask the broker for one job's
-  # (with that job's token), stop a microVM, and write logs.
+  # assumed able to use it, so it reaches no tenant's data and no other microVM: it can ask the
+  # broker for one job's data or to stop that job's microVM (with that job's token), and write logs.
   MicrovmExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -493,13 +497,11 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # No lambda:TerminateMicrovm: it is authorised against the image, so it would let one
+              # tenant's runner stop another's microVM. The broker stops a job's own microVM instead.
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !GetAtt BrokerFunction.Arn
-              # Authorised against the image ARN, so any microVM of this image, not only its own.
-              - Effect: Allow
-                Action: lambda:TerminateMicrovm
-                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup

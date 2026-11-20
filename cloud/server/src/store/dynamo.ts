@@ -194,9 +194,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       );
     },
 
-    async getTenant(id) {
-      const out = await client.send(new GetCommand({ TableName: T, Key: tenantKey(id) }));
-      return out.Item ? toTenant(out.Item) : null;
+    async getTenant(id, options) {
+      const item = await getTenantItem(id, options?.consistent === true);
+      return item ? toTenant(item) : null;
     },
 
     async putTenantWithMember(tenant, member) {
@@ -384,7 +384,26 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(typeof i.outcome === 'string' ? { outcome: i.outcome } : {}),
         createdAt: String(i.createdAt),
         expiresAt: Number(i.expiresAt),
+        ...(typeof i.microvmId === 'string' ? { microvmId: i.microvmId } : {}),
       };
+    },
+
+    async attachMicrovm(jobId, microvmId) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: { pk: `JOB#${jobId}`, sk: 'META' },
+            UpdateExpression: 'SET microvmId = :id',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(microvmId)',
+            ExpressionAttributeValues: { ':id': microvmId },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
     },
 
     async finishJob(jobId, outcome) {

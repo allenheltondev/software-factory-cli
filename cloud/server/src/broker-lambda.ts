@@ -1,3 +1,4 @@
+import { LambdaMicrovmsClient, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { AssumeRoleCommand, STSClient } from '@aws-sdk/client-sts';
 import { createBroker } from './broker/broker.js';
 import { createGitHubApi } from './github/client.js';
@@ -11,6 +12,7 @@ import { createDynamoStore } from './store/dynamo.js';
  */
 
 const sts = new STSClient({});
+const microvms = new LambdaMicrovmsClient({});
 const roleArn = process.env.JOB_DATA_ROLE_ARN ?? '';
 
 const handle = createBroker({
@@ -28,6 +30,9 @@ const handle = createBroker({
     const c = out.Credentials;
     if (!c?.AccessKeyId || !c.SecretAccessKey || !c.SessionToken || !c.Expiration) throw new Error('AssumeRole returned no credentials');
     return { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken, expiration: c.Expiration.toISOString() };
+  },
+  async terminateMicrovm(microvmId) {
+    await microvms.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId }));
   },
 });
 

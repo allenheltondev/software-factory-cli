@@ -1155,13 +1155,16 @@ bucket, key or secret. In their place is the job broker and the job's single-use
 
 The runner (`image/runner/broker.mjs`) asks the broker for the job's descriptor and AWS
 credentials scoped to its tenant, and refreshes them before they expire. It reads and writes
-S3 and Secrets Manager only with those credentials, and terminates the microVM with the
-execution role. In place of the App's private key, it writes the broker's installation token to
-`app-token.json` (protected from agents like the key) and replaces it every 20 minutes. The
-agent environment is the tenant's key secrets, one variable each. A missing secret is a key
-the tenant hasn't set. At the end, the runner tells the broker the job finished. Agent
-isolation is always `enforced` for version 2. If the broker refuses the job, the runner
-terminates the microVM without running anything.
+S3 and Secrets Manager only with those credentials. In place of the App's private key, it
+writes the broker's installation token to `app-token.json` (protected from agents like the key)
+and replaces it every 20 minutes. The agent environment is the tenant's key secrets, one
+variable each. A missing secret is a key the tenant hasn't set. At the end, the runner tells
+the broker the job finished, then asks it to stop the microVM. The execution role can't
+terminate microVMs: that permission covers every microVM of the image, so it would let one
+tenant's runner stop another's. The broker stops only the microVM the launcher recorded for
+the job. Agent isolation is always `enforced` for version 2. If the broker refuses the job,
+the runner asks it to stop the microVM without running anything. The maximum duration is the
+backstop if that fails too.
 
 ### Idle policy
 

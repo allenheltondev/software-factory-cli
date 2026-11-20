@@ -217,7 +217,7 @@ npm run tenant-admin --workspace=server -- key status     --installation 55
 
 ### Jobs and the job broker
 
-Every tenant's jobs run in microVMs with one execution role, `MicrovmExecutionRole`. Anything in a microVM, an agent included, has to be assumed able to use that role, so it reaches no tenant's data. It can invoke `BrokerFunction`, stop a microVM, and write its logs. Nothing else.
+Every tenant's jobs run in microVMs with one execution role, `MicrovmExecutionRole`. Anything in a microVM, an agent included, has to be assumed able to use that role, so it reaches no tenant's data. It can invoke `BrokerFunction` and write its logs. Nothing else. It can't even terminate microVMs: that permission covers every microVM of the image, so it would let one tenant's runner stop another's.
 
 **The broker** (`server/src/broker/broker.ts`) hands out what one job may have, to whoever holds that job's token. The launcher (PR 4) records each job in the table (`JOB#<jobId>`): its tenant, its one repository, the config version it pinned, and the sha-256 of a single-use, random job token. The token itself travels only in the microVM's run-hook payload (version 2). The runner calls the broker with it:
 
@@ -226,9 +226,10 @@ Every tenant's jobs run in microVMs with one execution role, `MicrovmExecutionRo
 | `start`, `credentials` | Where the job's data is, and AWS credentials for an hour. They come from `sts:AssumeRole` on `JobDataRole`, with a session policy for this job only. It can read this job's event and config version, read and write the tenant's state, write this job's results, and read the tenant's agent key secrets. |
 | `github-token` | An installation token for the job's one repository (`repository_ids`), with only `contents`, `issues` and `pull_requests` write, and `checks`, `statuses` and `metadata` read. It's shaped as the CLI's token file (#77). The runner writes it to `app-token.json` in the protected state directory and replaces it every 20 minutes. |
 | `finish` | The job is over. Nothing more is served for its token. |
+| `terminate` | Stops the job's own microVM: the one the launcher recorded with the job (`attachMicrovm`, set once). This works whatever the job's state, finished or with its tenant suspended included, because it only ever ends that one microVM. |
 
 - **The App's private key never enters a microVM.** Only the broker reads it, to mint tokens.
-- **Refused alike:** an unknown job, a wrong token, a finished or expired job, and a tenant that's no longer active all get the same `refused`, so nothing can be probed. Errors are logged without their details, which could carry a credential.
+- **Refused alike:** an unknown job, a wrong token, a finished or expired job, and a tenant that's no longer active all get the same `refused`, so nothing can be probed. The tenant's status is read strongly consistently, so a suspend or uninstall that has committed stops the very next request. Errors are logged without their details, which could carry a credential.
 - **Bounded either way:** `JobDataRole` allows only `tenants/*` and `updraft/tenants/*`, and AWS intersects it with each session policy. Even a broker bug can't give a job the App's secrets or the table.
 
 ## Not verified yet

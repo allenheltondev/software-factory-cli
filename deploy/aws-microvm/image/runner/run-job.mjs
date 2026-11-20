@@ -66,14 +66,16 @@ async function main() {
   // reach only this tenant's; the execution role reaches no tenant's data itself.
   let job = { request, aws: createAwsDeps(request.payload.region) };
   if (request.payload.version === BROKER_PAYLOAD_VERSION) {
+    const client = createBrokerClient({ ...request.payload.broker, region: request.payload.region });
     try {
-      const client = createBrokerClient({ ...request.payload.broker, region: request.payload.region });
       const started = await startBrokerJob(request.payload, { client, createAwsDeps });
       job = { request: { ...request, payload: started.payload }, aws: started.deps };
     } catch (error) {
       // Without the broker there is nowhere to report to; stop the microVM rather than bill it.
+      // Only the broker can (the execution role cannot terminate); if it cannot either, the
+      // microVM's maximum duration ends it.
       log(`the job broker did not start this job: ${error?.message ?? error}`);
-      await job.aws.terminate(request.microvmId).catch(() => {});
+      await client.terminate().catch((e) => log(`the job broker did not stop this microVM: ${e?.message ?? e}`));
       process.exitCode = 2;
       return;
     }

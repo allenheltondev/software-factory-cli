@@ -91,6 +91,8 @@ export interface Job {
   createdAt: string;
   /** Epoch ms: launch time plus the microVM's maximum duration. Nothing is served after it. */
   expiresAt: number;
+  /** The job's microVM, recorded by the launcher once RunMicrovm returns: the only one the job may stop. */
+  microvmId?: string;
 }
 
 export type MemberRole = 'owner' | 'editor';
@@ -146,7 +148,8 @@ export interface Store {
   putOffer(offer: InstallationOffer): Promise<void>;
   getOffer(sub: string): Promise<InstallationOffer | null>;
 
-  getTenant(installationId: number): Promise<Tenant | null>;
+  /** `consistent`: a strongly consistent read, for decisions that must see a suspend or uninstall just committed. */
+  getTenant(installationId: number, options?: { consistent?: boolean }): Promise<Tenant | null>;
   /**
    * Creates the tenant if it is new (keeping an existing one as it is) and adds or updates the
    * member, atomically with a check that the tenant is not uninstalled (`uninstalled`: nothing added).
@@ -203,6 +206,8 @@ export interface Store {
   getJob(jobId: string): Promise<Job | null>;
   /** The runner said it is done: nothing more is served for it. Only the first outcome is kept. */
   finishJob(jobId: string, outcome: string): Promise<void>;
+  /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
+  attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
 }
 
 export interface CleanupEntry {
@@ -358,6 +363,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async finishJob(jobId, outcome) {
       const j = jobs.get(jobId);
       if (j && j.status !== 'finished') jobs.set(jobId, { ...j, status: 'finished', outcome });
+    },
+    async attachMicrovm(jobId, microvmId) {
+      const j = jobs.get(jobId);
+      if (!j || j.microvmId !== undefined) return false;
+      jobs.set(jobId, { ...j, microvmId });
+      return true;
     },
     async purgeTenantPartition(id) {
       tenants.delete(id);

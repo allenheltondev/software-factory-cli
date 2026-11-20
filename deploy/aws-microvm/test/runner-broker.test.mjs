@@ -58,6 +58,8 @@ describe('createBrokerClient', () => {
     expect(err.message).toMatch(/refused finish \(refused\)/);
     expect(err.message).not.toContain(TOKEN);
     expect(invoke).toHaveBeenLastCalledWith('broker', { action: 'finish', jobId: 'job_abc12345', token: TOKEN, outcome: 'succeeded' });
+    await client.terminate();
+    expect(invoke).toHaveBeenLastCalledWith('broker', { action: 'terminate', jobId: 'job_abc12345', token: TOKEN });
   });
 });
 
@@ -96,8 +98,10 @@ describe('startBrokerJob', () => {
       start: vi.fn(async () => ({ ok: true, descriptor, credentials: { accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(NOW + 3_600_000).toISOString() } })),
       githubToken: vi.fn(async () => ({ token: 'ghs_x' })),
       finish: vi.fn(async () => ({ ok: true })),
+      terminate: vi.fn(async () => ({ ok: true, terminated: true })),
     };
-    const createAwsDeps = vi.fn((_region, options) => ({ s3Get: 'scoped', credentials: options.credentials }));
+    const executionRoleTerminate = vi.fn();
+    const createAwsDeps = vi.fn((_region, options) => ({ s3Get: 'scoped', credentials: options.credentials, terminate: executionRoleTerminate }));
     const { payload, deps } = await startBrokerJob(parse(v2()).payload, { client, createAwsDeps, now: () => NOW });
     expect(payload).toMatchObject({ version: 2, bucket: 'tenant-bucket', eventKey: descriptor.eventKey, configPrefix: descriptor.configPrefix, stateKey: descriptor.stateKey, agentKeySecrets: descriptor.agentKeySecrets });
     expect(createAwsDeps).toHaveBeenCalledWith('us-east-1', { credentials: expect.any(Function) });
@@ -105,6 +109,10 @@ describe('startBrokerJob', () => {
     await expect(deps.githubToken()).resolves.toEqual({ token: 'ghs_x' });
     await deps.finishJob('succeeded');
     expect(client.finish).toHaveBeenCalledWith('succeeded');
+    // The broker stops the job's own microVM; the execution role is never asked to.
+    await deps.terminate('mvm-anything');
+    expect(client.terminate).toHaveBeenCalledOnce();
+    expect(executionRoleTerminate).not.toHaveBeenCalled();
   });
 
   it('refuses a descriptor that does not say where the job\'s data is', async () => {

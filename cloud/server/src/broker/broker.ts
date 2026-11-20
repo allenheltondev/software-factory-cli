@@ -24,6 +24,8 @@ import { configPrefix } from '../tenants/paths.js';
  *   github-token          an installation token for the job's one repository with only the
  *                         permissions a job needs, as the CLI's token file (#77)
  *   finish                the job is over; nothing more is served for it
+ *   terminate             stop the job's own microVM (as the launcher recorded it), whatever the
+ *                         job's state; the shared execution role cannot terminate microVMs
  *
  * Refused alike, so nothing can be probed: an unknown job, a wrong token, a finished or expired
  * job, a tenant that is no longer active.
@@ -108,6 +110,8 @@ export interface BrokerDeps {
   github: Pick<GitHubApi, 'createInstallationToken' | 'getBotUser'>;
   /** sts:AssumeRole on the job data role with this session policy. */
   assumeRole(input: { sessionName: string; policy: string; durationSeconds: number }): Promise<ScopedCredentials>;
+  /** lambda:TerminateMicrovm, with the broker's role. */
+  terminateMicrovm(microvmId: string): Promise<void>;
   policy: PolicyContext;
   now?: () => number;
 }
@@ -116,6 +120,7 @@ export type BrokerResponse =
   | { ok: true; descriptor: JobPaths & { bucket: string; region: string; agentKeySecrets: Record<string, string> }; credentials: ScopedCredentials }
   | { ok: true; tokenFile: Record<string, unknown> }
   | { ok: true; finished: true }
+  | { ok: true; terminated: true }
   | { ok: false; error: 'refused' | 'bad_request' | 'unavailable' };
 
 const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -126,26 +131,46 @@ export function createBroker(deps: BrokerDeps) {
   const now = deps.now ?? Date.now;
   const bots = new Map<string, { id: number; login: string }>();
 
-  /** The job, if the token is its token and it may still be served; else null (one answer for all). */
-  async function authorize(jobId: unknown, token: unknown): Promise<Job | null> {
+  /** The job, if the token is its token; else null. */
+  async function verify(jobId: unknown, token: unknown): Promise<Job | null> {
     if (typeof jobId !== 'string' || !JOB_ID.test(jobId) || typeof token !== 'string' || token.length < 32 || token.length > 256) return null;
     const job = await deps.store.getJob(jobId);
     if (!job) return null;
     const given = Buffer.from(hashToken(token), 'hex');
     const stored = Buffer.from(job.tokenHash, 'hex');
     if (given.length !== stored.length || !timingSafeEqual(given, stored)) return null;
-    if (job.status === 'finished' || now() > job.expiresAt) return null;
-    const tenant = await deps.store.getTenant(job.installationId);
-    if (!tenant || tenant.status !== 'active') return null;
     return job;
+  }
+
+  /** Whether a verified job may still be served. */
+  async function servable(job: Job): Promise<boolean> {
+    if (job.status === 'finished' || now() > job.expiresAt) return false;
+    // Strongly consistent, like the job: a suspend or uninstall that has committed stops the next
+    // request, rather than one that happens to read a stale replica.
+    const tenant = await deps.store.getTenant(job.installationId, { consistent: true });
+    return tenant?.status === 'active';
   }
 
   return async function handle(request: unknown): Promise<BrokerResponse> {
     if (typeof request !== 'object' || request === null) return { ok: false, error: 'bad_request' };
     const { action, jobId, token, outcome } = request as Record<string, unknown>;
-    if (action !== 'start' && action !== 'credentials' && action !== 'github-token' && action !== 'finish') return { ok: false, error: 'bad_request' };
-    const job = await authorize(jobId, token);
+    if (action !== 'start' && action !== 'credentials' && action !== 'github-token' && action !== 'finish' && action !== 'terminate') {
+      return { ok: false, error: 'bad_request' };
+    }
+    const job = await verify(jobId, token);
     if (!job) return REFUSED;
+
+    // Stopping the job's own microVM is allowed whatever the job's state (finished, expired, its
+    // tenant suspended): it only ever ends that one microVM, which the launcher recorded. The
+    // execution role every job shares cannot terminate microVMs at all, so a runner cannot stop
+    // another tenant's.
+    if (action === 'terminate') {
+      if (!job.microvmId) return { ok: false, error: 'unavailable' };
+      await deps.terminateMicrovm(job.microvmId);
+      return { ok: true, terminated: true };
+    }
+
+    if (!(await servable(job))) return REFUSED;
 
     if (action === 'finish') {
       await deps.store.finishJob(job.jobId, typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown');

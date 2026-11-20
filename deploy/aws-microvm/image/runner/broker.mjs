@@ -7,6 +7,8 @@
 //   github-token         an installation token for the job's one repository, as Updraft's
 //                        token file (github.app.tokenFile)
 //   finish               the job is over
+//   terminate            stop this job's microVM; the execution role cannot terminate microVMs,
+//                        since that would reach every tenant's
 //
 // Nothing here ever logs a token or a credential.
 
@@ -47,6 +49,8 @@ export function createBrokerClient(broker, options = {}) {
     /** The token file document (Updraft's github.app.tokenFile format). */
     githubToken: async () => (await call('github-token')).tokenFile,
     finish: (outcome) => call('finish', { outcome }),
+    /** Stops this job's microVM (the one the launcher recorded); works after finish too. */
+    terminate: () => call('terminate'),
   };
 }
 
@@ -80,8 +84,8 @@ function toSdk(c) {
 /**
  * Starts a version 2 job: asks the broker for the job's descriptor and first credentials, fills
  * the descriptor into the payload (where the job's data is, as a version 1 payload would carry
- * it), and returns the AWS calls with tenant-scoped credentials plus the broker's GitHub token
- * and finish. Termination keeps the execution role (createAwsDeps).
+ * it), and returns the AWS calls with tenant-scoped credentials plus the broker's GitHub token,
+ * finish and terminate (the broker stops this job's microVM; runJob's microVM id is not used).
  */
 export async function startBrokerJob(payload, { client, createAwsDeps, now = Date.now }) {
   const started = await client.start();
@@ -102,6 +106,9 @@ export async function startBrokerJob(payload, { client, createAwsDeps, now = Dat
     ...createAwsDeps(payload.region, { credentials: brokerCredentialProvider(client, started.credentials, { now }) }),
     githubToken: () => client.githubToken(),
     finishJob: (outcome) => client.finish(outcome),
+    terminate: async () => {
+      await client.terminate();
+    },
   };
   return { payload: filled, deps };
 }

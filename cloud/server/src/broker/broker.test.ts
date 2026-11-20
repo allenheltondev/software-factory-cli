@@ -38,6 +38,7 @@ describe('the job broker', () => {
   let job: Job;
   let clock: number;
   const assumeRole = vi.fn();
+  const terminateMicrovm = vi.fn();
   const github = { createInstallationToken: vi.fn(), getBotUser: vi.fn() };
   let handle: ReturnType<typeof createBroker>;
 
@@ -64,7 +65,8 @@ describe('the job broker', () => {
     assumeRole.mockReset().mockResolvedValue({ accessKeyId: 'ASIA', secretAccessKey: 'secret', sessionToken: 'session', expiration: new Date(NOW + 3_600_000).toISOString() });
     github.createInstallationToken.mockReset().mockResolvedValue({ token: 'ghs_4242_scoped', expiresAt: NOW + 3_600_000, permissions: JOB_PERMISSIONS });
     github.getBotUser.mockReset().mockResolvedValue({ id: 777, login: 'updraft[bot]' });
-    handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, policy: POLICY, now: () => clock });
+    terminateMicrovm.mockReset().mockResolvedValue(undefined);
+    handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, terminateMicrovm, policy: POLICY, now: () => clock });
   });
 
   it('starts a job: its descriptor and credentials limited to its own tenant, event, config version and results', async () => {
@@ -145,6 +147,31 @@ describe('the job broker', () => {
     // The bot user is looked up once.
     await handle({ action: 'github-token', jobId: job.jobId, token });
     expect(github.getBotUser).toHaveBeenCalledOnce();
+  });
+
+  it('reads the tenant strongly consistently, so a suspend that has committed stops the next request', async () => {
+    const getTenant = vi.spyOn(store, 'getTenant');
+    await handle({ action: 'credentials', jobId: job.jobId, token });
+    expect(getTenant).toHaveBeenCalledWith(55, { consistent: true });
+  });
+
+  it("stops only the job's own recorded microVM, for its token, whatever the job's state", async () => {
+    // Not recorded yet: nothing to stop.
+    expect(await handle({ action: 'terminate', jobId: job.jobId, token })).toEqual({ ok: false, error: 'unavailable' });
+    expect(await store.attachMicrovm(job.jobId, 'mvm-own')).toBe(true);
+    // Recorded once: a second launch record cannot point the job at another microVM.
+    expect(await store.attachMicrovm(job.jobId, 'mvm-other')).toBe(false);
+    expect(await store.attachMicrovm('job_nobody00', 'mvm-other')).toBe(false);
+
+    const wrong = await handle({ action: 'terminate', jobId: job.jobId, token: randomBytes(32).toString('base64url') });
+    expect(wrong).toEqual({ ok: false, error: 'refused' });
+    expect(terminateMicrovm).not.toHaveBeenCalled();
+
+    // After finish, and with the tenant suspended, the job can still stop its own microVM.
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded' });
+    await store.setSuspended(55, true);
+    expect(await handle({ action: 'terminate', jobId: job.jobId, token, microvmId: 'mvm-other' })).toEqual({ ok: true, terminated: true });
+    expect(terminateMicrovm).toHaveBeenCalledExactlyOnceWith('mvm-own');
   });
 
   it('keeps an unexpected outcome out of the record', async () => {
