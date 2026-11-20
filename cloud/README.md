@@ -244,9 +244,11 @@ Compiled, workflow `W` is agent `W`, a reviewer `W.review` when some repository 
 **Preview and publish:**
 
 1. **Preview** shows the generated `config.yaml`, read-only.
-2. Preview and publish check the same things: the console's shape and limits (`CONSOLE_LIMITS`), the platform-enforced fields (config.ts), repositories the installation reaches, agents whose keys are set, and the worker's own `validateConfig`. Each problem is reported on the field it's about.
+2. Preview and publish check the same things: the console's shape and limits (`CONSOLE_LIMITS`), the platform-enforced fields (config.ts), repositories the installation reaches, the worker's own `validateConfig`, and the size of the version's record. Each problem is reported on the field it's about.
+   - **Keys:** every enabled agent that a repository which isn't paused can start needs its key set: the agents of its workflows' pools, rule and tier pools, and review pools. This is checked on the compiled config, so it applies to anything published or re-activated, tenant-admin versions included.
+   - **Record size:** a version's dispatch rules and file list share one DynamoDB item (400 KB). A repository's actor list is stored once when all its triggers share it, which the console's always do. Rules larger than 300 KiB are refused at preview and publish.
 3. **Publish** stores the bundle at `config/<n+1>/` and only then switches `activeConfigVersion`, with a conditional write. If validation or the upload fails, the active version stays as it was.
-   - **Edits never cross:** a publish names the version it was edited from (`baseVersion`). If another version was activated since, it's refused with `config_changed`.
+   - **Edits never cross:** a publish names the version it was edited from (`baseVersion`). If another version was activated since, it's refused with `config_changed`. The activation write itself also requires the version the publish was checked against to still be active (`expectedActive`). So of two editors who both saw the same version, the second to finish is refused, even when its version number is higher. Its auto-merge confirmation was computed against that same version. Re-activating is guarded the same way.
    - **Disabled tenants:** a tenant that's suspended or disabled can't publish.
 4. **Running jobs** keep the version pinned in their `JOB#` record. Pause, trigger and allowed-actor changes reach the launcher with the next webhook, with no deploy.
 

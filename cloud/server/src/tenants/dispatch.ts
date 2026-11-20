@@ -31,13 +31,20 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
   for (const [fullName, raw] of Object.entries(compiled.repositories ?? {})) {
     const repo = raw as Repository;
     if (typeof repo.id !== 'number') continue;
-    const triggers: DispatchRules['repositories'][string]['triggers'] = [];
+    const triggers: { label: string; actors: string[] }[] = [];
     for (const wf of Array.isArray(repo.workflows) ? (repo.workflows as Workflow[]) : []) {
       const label = wf.trigger?.label;
       if (typeof label !== 'string' || label === '') continue;
       triggers.push({ label: label.toLowerCase(), actors: wf.allowedActors === undefined ? fallbackActors : lowerStrings(wf.allowedActors) });
     }
-    repositories[fullName.toLowerCase()] = { id: repo.id, ...(paused.has(fullName.toLowerCase()) ? { paused: true } : {}), triggers };
+    // One shared list is stored once, not copied to each trigger.
+    const first = triggers[0]?.actors;
+    const shared = first !== undefined && triggers.every((t) => t.actors!.length === first.length && t.actors!.every((a, i) => a === first[i]));
+    repositories[fullName.toLowerCase()] = {
+      id: repo.id,
+      ...(paused.has(fullName.toLowerCase()) ? { paused: true } : {}),
+      ...(shared ? { actors: first, triggers: triggers.map((t) => ({ label: t.label })) } : { triggers }),
+    };
   }
   return { repositories };
 }
@@ -63,6 +70,6 @@ export function decideDispatch(
   const matching = repo.triggers.filter((t) => t.label === label);
   if (matching.length === 0) return { start: false, reason: 'the label is not a trigger' };
   const sender = typeof event.sender === 'string' ? event.sender.toLowerCase() : '';
-  if (!matching.some((t) => t.actors.includes(sender))) return { start: false, reason: 'the sender may not dispatch work' };
+  if (!matching.some((t) => (t.actors ?? repo.actors ?? []).includes(sender))) return { start: false, reason: 'the sender may not dispatch work' };
   return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, label: event.label };
 }

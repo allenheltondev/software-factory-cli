@@ -72,6 +72,8 @@ const settings = (repos: Record<string, unknown> = { 'acme/web': repo() }) => ({
 let store: Store;
 let objects: Map<string, string>;
 let failPuts: boolean;
+/** Holds uploads into config/<version>/ until released: two publishes interleaved, as in the #83 review. */
+let gates: Map<number, Promise<void>>;
 let app: ReturnType<typeof createApp>;
 
 /** A response, as far as the assertions read it. */
@@ -99,6 +101,7 @@ beforeEach(async () => {
   store = createMemoryStore();
   objects = new Map();
   failPuts = false;
+  gates = new Map();
   for (const [t, sub, login, uid] of [
     [tenant(55, 'acme'), PAT.sub, 'pat', 1],
     [tenant(66, 'globex'), EVE.sub, 'eve', 2],
@@ -111,6 +114,8 @@ beforeEach(async () => {
     get: async (key) => objects.get(key) ?? null,
     put: async (key, body) => {
       if (failPuts) throw new Error('S3 is down');
+      const version = Number(/\/config\/(\d+)\//.exec(key)?.[1]);
+      await gates.get(version);
       objects.set(key, body);
     },
   };
@@ -263,6 +268,24 @@ describe('publishing', () => {
     expect((await store.getTenant(55))?.activeConfigVersion).toBe(1);
   });
 
+  it('two editors who both saw the same active version: the second to finish is refused, even with the higher number', async () => {
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    gates.set(1, new Promise<void>((r) => (releaseFirst = r)));
+    gates.set(2, new Promise<void>((r) => (releaseSecond = r)));
+    // Both pass the baseVersion check against "nothing active"; A allocates 1, B allocates 2.
+    const a = publish(settings({ 'acme/web': repo() }), { baseVersion: null });
+    await new Promise((r) => setTimeout(r, 10));
+    const b = publish(settings({ 'acme/api': repo() }), { baseVersion: null });
+    await new Promise((r) => setTimeout(r, 10));
+    releaseFirst();
+    expect(await a).toMatchObject({ status: 200, body: { version: 1 } });
+    releaseSecond();
+    // Before the fix, 2 > 1 was enough and B silently replaced A's edit.
+    expect(await b).toMatchObject({ status: 409, body: { error: 'config_changed' } });
+    expect((await store.getTenant(55))?.activeConfigVersion).toBe(1);
+  });
+
   it('turning auto-merge on takes an explicit confirmation; keeping it on does not', async () => {
     const on = settings({ 'acme/web': repo({ review: true, autoMerge: { method: 'squash' } }) });
     expect(await publish(on, { baseVersion: null })).toMatchObject({ status: 409, body: { error: 'auto_merge_unconfirmed' } });
@@ -359,6 +382,46 @@ describe('history', () => {
     const res = await call(PAT, 'POST', '/installations/55/config/versions/1/reactivate', {});
     expect(res).toMatchObject({ status: 200, body: { version: 3 } });
     expect(objects.get(`${configPrefix(55, 3)}prompts/go.md`)).toBe('# Go');
+  });
+
+  it('re-activating a tenant-admin version checks the keys its agents need today', async () => {
+    // A tenant with only the Codex key, and a tenant-admin version that runs Claude.
+    const t = tenant(77, 'initech');
+    await store.link('sub-ivy', { githubUserId: 3, githubLogin: 'ivy', linkedAt: t.createdAt });
+    await store.putTenantWithMember(t, { installationId: 77, sub: 'sub-ivy', role: 'owner', githubUserId: 3, githubLogin: 'ivy', addedAt: t.createdAt });
+    await store.putAgentKeyMeta(77, { name: 'CODEX_API_KEY', updatedAt: t.createdAt, updatedBy: 'ivy' });
+    const adminVersion = await publishTenantConfig(
+      {
+        installationId: 77,
+        submission: {
+          config: {
+            dispatch: { allowedActors: ['ivy'] },
+            agents: { claude: {}, spare: { adapter: 'claude', enabled: false } },
+            pools: { general: { agents: ['claude', 'spare'] } },
+            actions: { go: { prompt: './prompts/go.md' } },
+            repositories: { 'globex/app': { workflows: [{ trigger: { event: 'issue.labeled', label: 'go' }, action: 'go', pool: 'general' }] } },
+          },
+          prompts: { 'go.md': '# Go' },
+        },
+        platform: { appId: 4242 },
+        repositoryIds: new Map([['globex/app', 300]]),
+        publishedBy: 'admin:ops',
+      },
+      { store, putObject: async (k, b) => void objects.set(k, b), now: () => NOW },
+    );
+    expect(adminVersion).toMatchObject({ ok: true, version: 1 });
+    const defaults = defaultConsoleConfig();
+    const codexOnly = {
+      ...defaults,
+      workflows: { implement: { ...defaults.workflows.implement!, agent: { adapter: 'codex' } } },
+      repositories: { 'globex/app': repo({ allowedActors: ['ivy'] }) },
+    };
+    expect(await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/publish', { config: codexOnly, baseVersion: 1 })).toMatchObject({ status: 200, body: { version: 2 } });
+
+    const res = await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/versions/1/reactivate', {});
+    // Only the enabled agent its pool can start: the disabled spare needs nothing.
+    expect(res).toMatchObject({ status: 400, body: { error: 'invalid_config', errors: [{ path: 'agents.claude', message: expect.stringMatching(/ANTHROPIC_API_KEY/) }] } });
+    expect((await store.getTenant(77))?.activeConfigVersion).toBe(2);
   });
 
   it('a version published before versions kept their source cannot be re-activated', async () => {

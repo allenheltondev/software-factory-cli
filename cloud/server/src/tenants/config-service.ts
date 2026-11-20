@@ -139,6 +139,11 @@ export function createConfigService({ store, github, objects, now = () => Date.n
     const result = compileTenantConfig(submission, { appId: ctx.appId }, repositoryIds(ctx));
     const map = (issues: ConfigIssue[]) => (consoleConfig ? issues.map((i) => ({ ...i, path: toConsolePath(i.path, consoleConfig) })) : issues);
     if (!result.ok) return { ok: false, errors: map(result.errors), warnings: [] };
+    // Whatever it was written as (a tenant-admin version being re-activated included): every agent
+    // an enabled repository can start needs its key set now, or its jobs would fail.
+    const keys = await keysSet(ctx.tenant.installationId);
+    const unset = result.keys.filter((k) => !keys.has(k.key)).map((k) => ({ path: k.path, message: `set the tenant's ${k.key} first: jobs run this agent with your own key` }));
+    if (unset.length) return { ok: false, errors: map(unset), warnings: [] };
     return { ok: true, compiled: { submission, source, yaml: result.files['config.yaml']!, warnings: map(result.warnings) } };
   }
 
@@ -154,8 +159,12 @@ export function createConfigService({ store, github, objects, now = () => Date.n
     }
   }
 
-  /** Stores and activates a compiled config; conflicts and confirmations are the caller's to check first. */
-  async function storeVersion(ctx: ConfigContext, compiled: Compiled, copiedFrom?: number): Promise<PublishOutcome> {
+  /**
+   * Stores and activates a compiled config. `expectedActive` is the active version its conflict
+   * and auto-merge checks were made against: activation is refused unless it is still active, in
+   * the same conditional write, so a concurrent editor's version is never overwritten.
+   */
+  async function storeVersion(ctx: ConfigContext, compiled: Compiled, expectedActive: number | null, copiedFrom?: number): Promise<PublishOutcome> {
     const result = await publishTenantConfig(
       {
         installationId: ctx.tenant.installationId,
@@ -164,13 +173,16 @@ export function createConfigService({ store, github, objects, now = () => Date.n
         repositoryIds: repositoryIds(ctx),
         publishedBy: ctx.githubLogin,
         source: compiled.source,
+        expectedActive,
         ...(copiedFrom !== undefined ? { copiedFrom } : {}),
       },
       { store, putObject: objects.put, now },
     );
     if (result.ok) return { ok: true, version: result.version, yaml: result.yaml, warnings: compiled.warnings };
     if (result.reason === 'invalid') return { ok: false, errors: result.errors, warnings: [] };
-    if (result.reason === 'superseded') throw new FlowError('config_changed', 409, 'Someone published a newer version at the same time; it stays active. Reload to see it.');
+    if (result.reason === 'superseded' || result.reason === 'changed') {
+      throw new FlowError('config_changed', 409, 'Someone published another version at the same time; it stays active. Reload to see it, then make your changes again.');
+    }
     if (result.reason === 'uninstalled' || result.reason === 'no_tenant') throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
     throw new FlowError('config_changed', 409, result.message);
   }
@@ -235,7 +247,7 @@ export function createConfigService({ store, github, objects, now = () => Date.n
       const out = await compile(ctx, { format: 'console', config: input.config }, null);
       if (!out.ok) return out;
       confirmAutoMerge(turnedOn(await activeSource(installationId, active ?? undefined), out.compiled.source), input.confirmAutoMerge === true);
-      return storeVersion(ctx, out.compiled);
+      return storeVersion(ctx, out.compiled, active);
     },
 
     async versions(caller: Caller, installationId: number): Promise<{ activeVersion: number | null; versions: VersionSummary[] }> {
@@ -302,8 +314,9 @@ export function createConfigService({ store, github, objects, now = () => Date.n
       }
       const out = await compile(ctx, source, prompts);
       if (!out.ok) return out;
-      confirmAutoMerge(turnedOn(await activeSource(installationId, ctx.tenant.activeConfigVersion), out.compiled.source), input.confirmAutoMerge === true);
-      return storeVersion(ctx, out.compiled, version);
+      const active = ctx.tenant.activeConfigVersion ?? null;
+      confirmAutoMerge(turnedOn(await activeSource(installationId, active ?? undefined), out.compiled.source), input.confirmAutoMerge === true);
+      return storeVersion(ctx, out.compiled, active, version);
     },
   };
 }

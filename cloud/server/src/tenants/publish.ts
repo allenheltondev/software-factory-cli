@@ -41,7 +41,7 @@ export interface PublishDeps {
 export type PublishResult =
   | { ok: true; version: number; sha256: string; warnings: ConfigIssue[]; yaml: string }
   | { ok: false; reason: 'invalid'; errors: ConfigIssue[] }
-  | { ok: false; reason: 'no_tenant' | 'uninstalled' | 'superseded' | 'not_activated'; message: string };
+  | { ok: false; reason: 'no_tenant' | 'uninstalled' | 'superseded' | 'changed' | 'not_activated'; message: string };
 
 export async function publishTenantConfig(
   input: {
@@ -54,6 +54,11 @@ export async function publishTenantConfig(
     source?: ConfigSource;
     /** Re-activating: the earlier version this one copies. */
     copiedFrom?: number;
+    /**
+     * The active version the caller checked this publish against (null: none). Activation is
+     * refused (`changed`) unless that is still the active version, in the same conditional write.
+     */
+    expectedActive?: number | null;
   },
   deps: PublishDeps,
 ): Promise<PublishResult> {
@@ -82,7 +87,10 @@ export async function publishTenantConfig(
   }
   await deps.store.markConfigReady(id, version);
 
-  const activated = await deps.store.activateConfig(id, version);
+  const activated = await deps.store.activateConfig(id, version, input.expectedActive !== undefined ? { expectedActive: input.expectedActive } : undefined);
+  if (activated === 'changed') {
+    return { ok: false, reason: 'changed', message: `version ${version} was stored but not activated: another version was activated after this one was checked` };
+  }
   if (activated === 'superseded') {
     // A later publish finished first; activation only moves forward, so that one stays active.
     return { ok: false, reason: 'superseded', message: `version ${version} was stored, but a newer version was activated meanwhile and stays active` };

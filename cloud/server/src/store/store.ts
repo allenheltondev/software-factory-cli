@@ -150,8 +150,13 @@ export interface ConfigVersion {
  * label (lower-case, as GitHub compares labels) and the logins allowed to apply it (lower-case).
  */
 export interface DispatchRules {
-  /** `paused`: the repository stays configured, but no labeled issue of it starts a job. */
-  repositories: Record<string, { id: number; paused?: boolean; triggers: { label: string; actors: string[] }[] }>;
+  /**
+   * `paused`: the repository stays configured, but no labeled issue of it starts a job.
+   * `actors`: when every trigger allows the same logins, they are stored once here and the
+   * triggers carry none (a version's record is one DynamoDB item); otherwise each trigger has its
+   * own. Versions stored before this have them on every trigger.
+   */
+  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; triggers: { label: string; actors?: string[] }[] }>;
 }
 
 /** That an agent key is set (never its value, which lives only in Secrets Manager). */
@@ -318,7 +323,18 @@ export interface Store {
    * forward: `superseded` when a newer version is active already (a slow publish finishing after
    * a later one). The previous active version stays active on any refusal.
    */
-  activateConfig(installationId: number, version: number): Promise<'activated' | 'superseded' | 'not_ready' | 'uninstalled' | 'no_tenant'>;
+  activateConfig(
+    installationId: number,
+    version: number,
+    options?: {
+      /**
+       * The active version this publish was checked against (null: none). The write also requires
+       * it still to be active, so two editors who both saw it can't both win; the loser gets
+       * `changed`.
+       */
+      expectedActive?: number | null;
+    },
+  ): Promise<'activated' | 'superseded' | 'changed' | 'not_ready' | 'uninstalled' | 'no_tenant'>;
   listConfigVersions(installationId: number): Promise<ConfigVersion[]>;
   getConfigVersion(installationId: number, version: number, options?: { consistent?: boolean }): Promise<ConfigVersion | null>;
 
@@ -628,11 +644,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const c = configs.get(`${id}/${version}`);
       if (c) configs.set(`${id}/${version}`, { ...c, status: 'ready' });
     },
-    async activateConfig(id, version) {
+    async activateConfig(id, version, options) {
       const t = tenants.get(id);
       if (!t) return 'no_tenant';
       if (t.disabledReason === 'uninstalled') return 'uninstalled';
       if (configs.get(`${id}/${version}`)?.status !== 'ready') return 'not_ready';
+      if (options?.expectedActive !== undefined && (t.activeConfigVersion ?? null) !== options.expectedActive) return 'changed';
       if (t.activeConfigVersion !== undefined && t.activeConfigVersion >= version) return 'superseded';
       tenants.set(id, { ...t, activeConfigVersion: version });
       return 'activated';

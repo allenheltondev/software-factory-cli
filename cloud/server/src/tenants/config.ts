@@ -62,8 +62,15 @@ export interface TenantSubmission {
   prompts: Record<string, string>;
 }
 
+/** An agent an enabled repository can start, and the API key it runs with. */
+export interface AgentKeyNeed {
+  /** Its path in the compiled config: `agents.<name>`. */
+  path: string;
+  key: string;
+}
+
 export type CompileResult =
-  | { ok: true; files: Record<string, string>; sha256: string; warnings: ConfigIssue[]; dispatch: DispatchRules }
+  | { ok: true; files: Record<string, string>; sha256: string; warnings: ConfigIssue[]; dispatch: DispatchRules; keys: AgentKeyNeed[] }
   | { ok: false; errors: ConfigIssue[] };
 
 const TOP_LEVEL = new Set(['agents', 'pools', 'actions', 'repositories', 'dispatch', 'review']);
@@ -238,7 +245,61 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
   for (const file of Object.keys(prompts)) if (!usedPrompts.has(file)) warnings.push({ path: file, message: 'not referenced by any action; it is stored anyway' });
 
   const files: Record<string, string> = { 'config.yaml': stringify(compiled), ...prompts };
-  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: dispatchRules(compiled, { paused }) };
+  const rules = dispatchRules(compiled, { paused });
+  // The version's record holds its dispatch rules and file list, in one DynamoDB item (400 KB).
+  const recordBytes = Buffer.byteLength(JSON.stringify({ dispatch: rules, files: [...Object.keys(files), 'source.json'] }), 'utf8');
+  if (recordBytes > MAX_VERSION_RECORD_BYTES) {
+    return {
+      ok: false,
+      errors: [{ path: 'repositories', message: `too many repositories, triggers and allowed actors to store together (${Math.ceil(recordBytes / 1024)} KiB of dispatch rules, at most ${MAX_VERSION_RECORD_BYTES / 1024} KiB)` }],
+    };
+  }
+  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: rules, keys: agentKeysNeeded(compiled, paused) };
+}
+
+/** What a version's DynamoDB record may hold for its dispatch rules and file list, well inside the 400 KB item limit. */
+export const MAX_VERSION_RECORD_BYTES = 300 * 1024;
+
+/**
+ * The agents a job of an enabled (not paused) repository can start, and each one's API key: every
+ * enabled agent of every pool its workflows route to (the pool, its rules and default, the tier
+ * pools) and, with review on, the pools reviewers are routed to. From a compiled config that
+ * `validateConfig` accepted, so every name resolves.
+ */
+function agentKeysNeeded(compiled: { agents: Record<string, Record<string, unknown>>; pools: unknown; repositories: Record<string, Record<string, unknown>> }, paused: ReadonlySet<string>): AgentKeyNeed[] {
+  const pools = isObject(compiled.pools) ? compiled.pools : {};
+  const used = new Set<string>();
+  const addPool = (name: unknown) => {
+    if (typeof name === 'string' && name !== '') used.add(name);
+  };
+  for (const [fullName, repo] of Object.entries(compiled.repositories)) {
+    if (paused.has(fullName)) continue;
+    const review = repo.review === true || isObject(repo.review);
+    if (isObject(repo.review)) addPool(repo.review.pool);
+    for (const wf of Array.isArray(repo.workflows) ? repo.workflows : []) {
+      if (!isObject(wf)) continue;
+      if (isObject(wf.pool)) {
+        addPool(wf.pool.default);
+        for (const rule of Array.isArray(wf.pool.rules) ? wf.pool.rules : []) if (isObject(rule)) addPool(rule.use);
+      } else addPool(wf.pool);
+      if (isObject(wf.tiers)) {
+        if (isObject(wf.tiers.pools)) for (const p of Object.values(wf.tiers.pools)) addPool(p);
+        if (isObject(wf.tiers.highRisk)) addPool(wf.tiers.highRisk.pool);
+      }
+      if (review) addPool(wf.reviewPool);
+    }
+  }
+  const out = new Map<string, AgentKeyNeed>();
+  for (const poolName of used) {
+    const pool = pools[poolName];
+    for (const agentName of isObject(pool) && Array.isArray(pool.agents) ? pool.agents : []) {
+      const agent = typeof agentName === 'string' ? compiled.agents[agentName] : undefined;
+      if (!agent || agent.enabled === false) continue;
+      const adapter = (agent.adapter ?? agentName) as CloudAgent;
+      if (adapter in AGENT_KEY_ENV) out.set(agentName as string, { path: `agents.${agentName as string}`, key: AGENT_KEY_ENV[adapter] });
+    }
+  }
+  return [...out.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
 /** A stable hash of a bundle: every file's path and content, in path order. */

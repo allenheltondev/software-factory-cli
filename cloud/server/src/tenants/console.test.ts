@@ -60,7 +60,9 @@ describe('parseConsoleConfig', () => {
     expect(r.files['prompts/implement.md']).toBe(DEFAULT_PROMPTS.implement);
     // No reviewer agent or prompts when no repository reviews or revises.
     expect(Object.keys(r.files).sort()).toEqual(['config.yaml', 'prompts/implement.md']);
-    expect(r.dispatch.repositories['acme/web']).toEqual({ id: 99, triggers: [{ label: 'updraft', actors: ['pat'] }] });
+    expect(r.dispatch.repositories['acme/web']).toEqual({ id: 99, actors: ['pat'], triggers: [{ label: 'updraft' }] });
+    // What the agents it can start need: the workflow's agent; no reviewer without review.
+    expect(r.keys).toEqual([{ path: 'agents.implement', key: 'ANTHROPIC_API_KEY' }]);
   });
 
   it('refuses an empty allowed-actor list', () => {
@@ -147,6 +149,31 @@ describe('toTenantSubmission', () => {
     });
     expect(yaml.repositories['acme/web']).toMatchObject({ review: true, revise: true, maxRevisions: 2, autoMerge: 'squash', autoMergeWaitMinutes: 30, autoMergeRequiredChecks: ['ci'] });
     expect(yaml.repositories['acme/web']?.workflows[0]?.reviewPool).toBe('implement.review');
+  });
+});
+
+describe('the version record (#83 review)', () => {
+  // 50 distinct 30-character logins on 30 repositories with 10 triggers each: copied to every
+  // trigger, the actors alone came to about 450 KB, over DynamoDB's 400 KB item limit.
+  const actors = Array.from({ length: 50 }, (_, i) => `user-${String(i).padStart(2, '0')}-${'x'.repeat(22)}`);
+  const triggers = Array.from({ length: 10 }, (_, i) => ({ label: `label-${i}`, workflow: 'implement' }));
+  const many = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`acme/repo-${i}`, repo({ allowedActors: actors, triggers })]));
+  const ids = new Map(Object.keys(many).map((name, i) => [name, 1000 + i]));
+
+  it('stores a shared actor list once per repository, so the example from the review fits', () => {
+    const r = compile(ok(settings(many)), ids);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(Buffer.byteLength(JSON.stringify(r.dispatch))).toBeLessThan(60 * 1024);
+  });
+
+  it('refuses dispatch rules too large for one record, at preview as at publish', () => {
+    const sub = toTenantSubmission(ok(settings(many)));
+    // Different actors on every trigger (possible in a tenant-admin document): nothing to share.
+    const repos = (sub.config as { repositories: Record<string, { workflows: { allowedActors: string[] }[] }> }).repositories;
+    for (const r of Object.values(repos)) r.workflows.forEach((w, i) => (w.allowedActors = actors.map((a) => `${a.slice(0, 28)}${i}`)));
+    const r = compileTenantConfig(sub, { appId: 4242 }, ids);
+    expect(r).toEqual({ ok: false, errors: [expect.objectContaining({ path: 'repositories', message: expect.stringMatching(/too many/) })] });
   });
 });
 
