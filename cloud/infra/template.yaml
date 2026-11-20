@@ -287,6 +287,12 @@ Resources:
             - Effect: Allow
               Action: lambda:RunMicrovm
               Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
+            # RunMicrovm is given the Lambda-provided NO_INGRESS and INTERNET_EGRESS connectors, and
+            # AWS authorizes passing them separately. The action has no resource type in IAM, so a
+            # statement scoped to the connector ARNs would never match: it takes "*".
+            - Effect: Allow
+              Action: lambda:PassNetworkConnector
+              Resource: '*'
             # RunMicrovm is given the execution role; passing a role needs iam:PassRole on exactly it.
             - Effect: Allow
               Action: iam:PassRole

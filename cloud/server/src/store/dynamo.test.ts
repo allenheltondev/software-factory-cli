@@ -36,6 +36,9 @@ function fakeTable() {
     }
     if (expr === 'attribute_not_exists(pk) OR #sub = :sub') return !item || item.sub === values[':sub'];
     if (expr === 'attribute_not_exists(githubUserId) OR githubUserId = :id') return !item || item.githubUserId === undefined || item.githubUserId === values[':id'];
+    if (expr === 'attribute_not_exists(pk) OR #ttl < :now') return !item || (item.ttl as number) < (values[':now'] as number);
+    if (expr === 'attribute_exists(pk) AND #status <> :finished') return Boolean(item) && item!.status !== values[':finished'];
+    if (expr === 'jobId = :job') return Boolean(item) && item!.jobId === values[':job'];
     throw new Error(`fake table: unsupported condition ${expr}`);
   }
 
@@ -80,6 +83,7 @@ function fakeTable() {
         case 'DeleteCommand': {
           const k = key(input.Key as Item);
           const old = items.get(k);
+          if (!condition(input.ConditionExpression as string, old, values)) throw ccf();
           items.delete(k);
           return { Attributes: input.ReturnValues === 'ALL_OLD' ? old : undefined };
         }
@@ -388,5 +392,66 @@ describe('dynamo store: the uninstall and its cleanup entry are one transaction'
     expect([...table.items.keys()].filter((k) => k.startsWith('TENANT#55|'))).toEqual([]);
     await store.purgeTenantPartition(55); // again: nothing to do
     expect(await store.listDueCleanups(DEADLINE)).toEqual([{ installationId: 55, deleteAfter: DEADLINE }]);
+  });
+});
+
+describe('dynamo store: delivery claims and finished jobs (review fixes on #80)', () => {
+  const LATER = Date.now() + 3_600_000;
+
+  it('a claim is released only by the job holding it, and releasing again is harmless', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    expect(await store.claimDelivery(55, 'd-1', LATER, 'job_first0001')).toBe(true);
+    expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(false);
+    expect(table.items.get('DELIVERY#55#d-1|CLAIM')?.jobId).toBe('job_first0001');
+
+    // A late release from some other job (an earlier delivery's, delayed) leaves the claim alone.
+    await store.releaseDelivery(55, 'd-1', 'job_second001');
+    expect(table.items.has('DELIVERY#55#d-1|CLAIM')).toBe(true);
+
+    await store.releaseDelivery(55, 'd-1', 'job_first0001');
+    expect(table.items.has('DELIVERY#55#d-1|CLAIM')).toBe(false);
+    await store.releaseDelivery(55, 'd-1', 'job_first0001'); // no claim: nothing happens
+
+    // The redelivery's job claims it; the first job's repeated release cannot take it away.
+    expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(true);
+    await store.releaseDelivery(55, 'd-1', 'job_first0001');
+    expect(table.items.get('DELIVERY#55#d-1|CLAIM')?.jobId).toBe('job_second001');
+  });
+
+  it('an expired claim counts as none', async () => {
+    const store = createDynamoStore('T', fakeTable().client);
+    expect(await store.claimDelivery(55, 'd-1', Date.now() - 5_000, 'job_first0001')).toBe(true);
+    expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(true);
+  });
+
+  it('finishing keeps the first outcome and returns it, also to a repeated finish', async () => {
+    const store = createDynamoStore('T', fakeTable().client);
+    await store.putJob({
+      jobId: 'job_first0001',
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 1,
+      deliveryId: 'd-1',
+      eventName: 'issues',
+      status: 'launched',
+      createdAt: tenant.createdAt,
+      expiresAt: LATER,
+    });
+    expect(await store.finishJob('job_first0001', 'failed')).toBe('failed');
+    expect(await store.finishJob('job_first0001', 'succeeded')).toBe('failed');
+    expect((await store.getJob('job_first0001'))?.outcome).toBe('failed');
+    expect(await store.finishJob('job_nobody001', 'failed')).toBeNull();
+  });
+
+  it('reads a config version strongly consistently when asked (dispatch right after a publish)', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    table.items.set('TENANT#55|CONFIG#0000000001', { pk: 'TENANT#55', sk: 'CONFIG#0000000001', version: 1, status: 'ready', createdAt: tenant.createdAt, createdBy: 'sub-a' });
+    table.hideFromEventual('TENANT#55|CONFIG#0000000001');
+    expect(await store.getConfigVersion(55, 1)).toBeNull();
+    expect((await store.getConfigVersion(55, 1, { consistent: true }))?.version).toBe(1);
   });
 });

@@ -23,8 +23,9 @@ import { configPrefix } from '../tenants/paths.js';
  *                         state) and only this tenant's agent key secrets
  *   github-token          an installation token for the job's one repository with only the
  *                         permissions a job needs, as the CLI's token file (#77)
- *   finish                the job is over; nothing more is served for it
- *   terminate             stop the job's own microVM (as the launcher recorded it), whatever the
+ *   finish                the job is over; nothing more is served for it. Whatever the job's state,
+ *                         and safe to repeat: a retried finish redoes what a failed one left undone
+ *   terminate            stop the job's own microVM (as the launcher recorded it), whatever the
  *                         job's state; the shared execution role cannot terminate microVMs
  *
  * Refused alike, so nothing can be probed: an unknown job, a wrong token, a finished or expired
@@ -170,16 +171,20 @@ export function createBroker(deps: BrokerDeps) {
       return { ok: true, terminated: true };
     }
 
-    if (!(await servable(job))) return REFUSED;
-
+    // Finishing only ever takes away (nothing more is served for the job) and gives up this job's
+    // own claim, so it is allowed whatever the job's state, and repeatable: the first outcome is
+    // kept, and a finish retried because releasing the claim failed releases it this time. The
+    // claim is released only if this job holds it; a redelivery's job keeps its own.
     if (action === 'finish') {
-      const recorded = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
-      await deps.store.finishJob(job.jobId, recorded);
+      const given = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
+      const recorded = (await deps.store.finishJob(job.jobId, given)) ?? given;
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
-      if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId);
+      if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
       return { ok: true, finished: true };
     }
+
+    if (!(await servable(job))) return REFUSED;
 
     if (action === 'start' || action === 'credentials') {
       const credentials = await deps.assumeRole({

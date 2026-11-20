@@ -98,11 +98,14 @@ export function createLauncher(deps: LaunchDeps) {
     if (!DELIVERY_ID.test(req.deliveryId)) return { status: 400, disposition: 'bad_delivery_id' };
     if (!Number.isInteger(req.payload.issue?.number)) return skip('ignored');
 
-    const tenant = await deps.store.getTenant(req.installationId);
+    // Strongly consistent, both: a delivery right after a publish sees the new active config (not
+    // "no_config"), and one right after a republish or a suspend does not start a job under the
+    // config or the status it replaced.
+    const tenant = await deps.store.getTenant(req.installationId, { consistent: true });
     if (!tenant) return skip('no_tenant');
     if (tenant.status !== 'active') return skip('tenant_inactive');
     if (tenant.activeConfigVersion === undefined) return skip('no_config');
-    const config = await deps.store.getConfigVersion(req.installationId, tenant.activeConfigVersion);
+    const config = await deps.store.getConfigVersion(req.installationId, tenant.activeConfigVersion, { consistent: true });
     const decision = decideDispatch(config?.dispatch, {
       repositoryFullName: req.payload.repository?.full_name,
       repositoryId: req.payload.repository?.id,
@@ -119,10 +122,10 @@ export function createLauncher(deps: LaunchDeps) {
 
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
-    // Held while a job for this delivery may still run; released early when it fails.
-    if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + durationMs))) return skip('duplicate');
-
     const jobId = `job_${randomBytes(12).toString('base64url')}`;
+    // Held by this job while it may still run; released early (by this job only) when it fails.
+    if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + durationMs, jobId))) return skip('duplicate');
+
     const token = randomBytes(32).toString('base64url');
     const sender = req.payload.sender?.login;
     const job: Job = {
@@ -152,7 +155,7 @@ export function createLauncher(deps: LaunchDeps) {
       microvmId = out.microvmId;
     } catch (err) {
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: (err as Error)?.message });
-      await deps.store.releaseDelivery(req.installationId, req.deliveryId).catch(() => {});
+      await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
       // Nothing runs for this record; its token must not be served.
       if (recorded) await deps.store.finishJob(jobId, 'launch_failed').catch(() => {});
       return { status: 500, disposition: 'launch_failed', jobId };

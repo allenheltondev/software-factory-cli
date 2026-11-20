@@ -259,12 +259,15 @@ Jobs run the same image as the self-hosted stack (`deploy/aws-microvm/image/`), 
 
 Any other change deploys without rebuilding the image. In particular, a change to the rest of the CLI (`src/`) reaches jobs only with the next image built for one of those reasons, or a `build_image` run. Staging builds for a pull request that touches those paths. Production builds when such a change merges to main, and activates it within a minute. To roll back, set the parameter to the previous version (`aws lambda-microvms list-microvm-image-versions --image-identifier updraft-cloud-job` lists them).
 
-**The deploy role needs these permissions** for the `image` job, in each account (Staging and Production), on top of what the stack deploy uses. `<account>` is that account's id:
+**The deploy role needs these permissions** for the `image` job, in each account (Staging and Production), on top of what the stack deploy uses. `<account>` is that account's id. `lambda:CreateMicrovmImage` and `lambda:PassNetworkConnector` have no resource type in IAM, so they take `"Resource": "*"`. Creating is limited instead to an image tagged with this stack, which is how the build creates it:
 
 ```json
 [
-  { "Effect": "Allow", "Action": ["lambda:GetMicrovmImage", "lambda:CreateMicrovmImage", "lambda:UpdateMicrovmImage", "lambda:GetMicrovmImageVersion", "lambda:TagResource"],
+  { "Effect": "Allow", "Action": ["lambda:GetMicrovmImage", "lambda:UpdateMicrovmImage", "lambda:GetMicrovmImageVersion", "lambda:TagResource"],
     "Resource": "arn:aws:lambda:us-east-1:<account>:microvm-image:updraft-cloud-job*" },
+  { "Effect": "Allow", "Action": "lambda:CreateMicrovmImage", "Resource": "*",
+    "Condition": { "StringEquals": { "aws:RequestTag/updraft:stack": "updraft-cloud" } } },
+  { "Effect": "Allow", "Action": "lambda:PassNetworkConnector", "Resource": "*" },
   { "Effect": "Allow", "Action": "iam:PassRole", "Resource": "arn:aws:iam::<account>:role/updraft-cloud-MicrovmBuildRole-*",
     "Condition": { "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" } } },
   { "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::updraft-cloud-jobimagebucket-*/image/*" },

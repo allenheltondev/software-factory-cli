@@ -3,9 +3,11 @@
 // child processes: these run everywhere. runner-job.test.mjs runs a whole version 2 job.
 import { describe, expect, it, vi } from 'vitest';
 import {
+  abandonBrokerJob,
   brokerCredentialProvider,
   createBrokerClient,
   CREDENTIAL_REFRESH_MARGIN_MS,
+  START_FAILED_OUTCOME,
   startBrokerJob,
   TERMINATE_ATTEMPTS,
   TERMINATE_DELAY_MS,
@@ -133,6 +135,39 @@ describe('terminateThroughBroker', () => {
     const { deps } = await startBrokerJob(parse(v2()).payload, { client, createAwsDeps: () => ({}), now: () => NOW, terminateOptions: { wait: async () => {} } });
     await deps.terminate('mvm-1');
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('abandonBrokerJob (the broker did not start the job)', () => {
+  const clientWith = (invoke) => createBrokerClient({ functionName: 'broker', jobId: 'job_abc12345', jobToken: TOKEN, region: 'us-east-1' }, { invoke });
+
+  it('reports the failed start first, so the delivery can be redelivered, then stops the microVM', async () => {
+    // The broker's start failed transiently (a throttled STS call); finish and terminate answer.
+    const invoke = vi.fn(async (_fn, body) => (body.action === 'finish' ? { ok: true, finished: true } : { ok: true, terminated: true }));
+    expect(await abandonBrokerJob(clientWith(invoke), { wait: async () => {} })).toEqual([]);
+    expect(invoke.mock.calls.map(([, body]) => body)).toEqual([
+      { action: 'finish', jobId: 'job_abc12345', token: TOKEN, outcome: START_FAILED_OUTCOME },
+      { action: 'terminate', jobId: 'job_abc12345', token: TOKEN },
+    ]);
+    expect(START_FAILED_OUTCOME).not.toBe('succeeded');
+  });
+
+  it('retries the finish, and stops the microVM even when the finish never lands', async () => {
+    let finishes = 0;
+    const invoke = vi.fn(async (_fn, body) => {
+      if (body.action === 'terminate') return { ok: true, terminated: true };
+      finishes += 1;
+      if (finishes === 1) throw new Error('Rate exceeded');
+      return { ok: true, finished: true };
+    });
+    expect(await abandonBrokerJob(clientWith(invoke), { wait: async () => {} })).toEqual([]);
+    expect(finishes).toBe(2);
+
+    const down = vi.fn(async (_fn, body) => (body.action === 'terminate' ? { ok: true, terminated: true } : { ok: false, error: 'unavailable' }));
+    const problems = await abandonBrokerJob(clientWith(down), { wait: async () => {} });
+    expect(problems).toEqual([expect.stringMatching(/did not record the failed start.*refused finish \(unavailable\)/)]);
+    expect(down.mock.calls.filter(([, body]) => body.action === 'finish')).toHaveLength(TERMINATE_ATTEMPTS);
+    expect(down).toHaveBeenLastCalledWith('broker', { action: 'terminate', jobId: 'job_abc12345', token: TOKEN });
   });
 });
 

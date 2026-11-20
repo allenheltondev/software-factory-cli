@@ -198,7 +198,7 @@ export interface Store {
    */
   activateConfig(installationId: number, version: number): Promise<'activated' | 'superseded' | 'not_ready' | 'uninstalled' | 'no_tenant'>;
   listConfigVersions(installationId: number): Promise<ConfigVersion[]>;
-  getConfigVersion(installationId: number, version: number): Promise<ConfigVersion | null>;
+  getConfigVersion(installationId: number, version: number, options?: { consistent?: boolean }): Promise<ConfigVersion | null>;
 
   /** Refused (`uninstalled`) once the tenant is uninstalled or gone, so no row escapes the sweep. */
   putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<'stored' | 'uninstalled'>;
@@ -221,18 +221,26 @@ export interface Store {
   /** Records a job (the launcher). Its own partition, expiring a week after the job may last. */
   putJob(job: Job): Promise<void>;
   getJob(jobId: string): Promise<Job | null>;
-  /** The runner said it is done: nothing more is served for it. Only the first outcome is kept. */
-  finishJob(jobId: string, outcome: string): Promise<void>;
+  /**
+   * The runner said it is done: nothing more is served for it. Only the first outcome is kept, and
+   * it is what this returns (null for an unknown job), so a repeated finish acts on the same one.
+   */
+  finishJob(jobId: string, outcome: string): Promise<string | null>;
   /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
 
   /**
    * Deduplication: claims a tenant's webhook delivery unless an unexpired claim exists (false: a
    * job was already started for it). `expiresAt` in epoch ms; the claim is the table's TTL too.
+   * The claim is held by `jobId`, the job started for it.
    */
-  claimDelivery(installationId: number, deliveryId: string, expiresAt: number): Promise<boolean>;
-  /** Lets a redelivery start the job again (it failed, or it never started). */
-  releaseDelivery(installationId: number, deliveryId: string): Promise<void>;
+  claimDelivery(installationId: number, deliveryId: string, expiresAt: number, jobId: string): Promise<boolean>;
+  /**
+   * Lets a redelivery start the job again (it failed, or it never started). Only the job holding
+   * the claim gives it up: a late release from an earlier job leaves a redelivery's claim alone.
+   * Nothing happens when there is no such claim, so it is safe to repeat.
+   */
+  releaseDelivery(installationId: number, deliveryId: string, jobId: string): Promise<void>;
 }
 
 export interface CleanupEntry {
@@ -252,8 +260,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
   const jobs = new Map<string, Job>();
-  /** `<installationId>/<deliveryId>` -> expiry (epoch ms). */
-  const deliveries = new Map<string, number>();
+  /** `<installationId>/<deliveryId>` -> expiry (epoch ms) and the job holding the claim. */
+  const deliveries = new Map<string, { expiresAt: number; jobId: string }>();
   const memberKey = (id: number, sub: string) => `${id}/${sub}`;
   const strip = <T extends { ttl?: number }>(item: T): Omit<T, 'ttl'> => {
     const { ttl: _ttl, ...rest } = item;
@@ -375,15 +383,16 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const c = configs.get(`${id}/${version}`);
       return c ? { ...c } : null;
     },
-    async claimDelivery(id, deliveryId, expiresAt) {
+    async claimDelivery(id, deliveryId, expiresAt, jobId) {
       const key = `${id}/${deliveryId}`;
       const existing = deliveries.get(key);
-      if (existing !== undefined && existing > Date.now()) return false;
-      deliveries.set(key, expiresAt);
+      if (existing !== undefined && existing.expiresAt > Date.now()) return false;
+      deliveries.set(key, { expiresAt, jobId });
       return true;
     },
-    async releaseDelivery(id, deliveryId) {
-      deliveries.delete(`${id}/${deliveryId}`);
+    async releaseDelivery(id, deliveryId, jobId) {
+      const key = `${id}/${deliveryId}`;
+      if (deliveries.get(key)?.jobId === jobId) deliveries.delete(key);
     },
     async putAgentKeyMeta(id, meta) {
       const t = tenants.get(id);
@@ -403,7 +412,10 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async finishJob(jobId, outcome) {
       const j = jobs.get(jobId);
-      if (j && j.status !== 'finished') jobs.set(jobId, { ...j, status: 'finished', outcome });
+      if (!j) return null;
+      if (j.status === 'finished') return j.outcome ?? null;
+      jobs.set(jobId, { ...j, status: 'finished', outcome });
+      return outcome;
     },
     async attachMicrovm(jobId, microvmId) {
       const j = jobs.get(jobId);

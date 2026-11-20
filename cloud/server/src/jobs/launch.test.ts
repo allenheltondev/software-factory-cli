@@ -207,6 +207,16 @@ describe('the launcher', () => {
     expect(logged.some((e) => String(e.warning).includes('could not record the microVM'))).toBe(true);
   });
 
+  it("reads the tenant and its active config strongly consistently, and the claim is held by the job's id", async () => {
+    const getTenant = vi.spyOn(store, 'getTenant');
+    const getConfigVersion = vi.spyOn(store, 'getConfigVersion');
+    const claim = vi.spyOn(store, 'claimDelivery');
+    const ok = await createLauncher(deps)(request());
+    expect(getTenant).toHaveBeenCalledWith(55, { consistent: true });
+    expect(getConfigVersion).toHaveBeenCalledWith(55, 1, { consistent: true });
+    expect(claim).toHaveBeenCalledWith(55, 'delivery-1', NOW + 10800 * 1000, ok.jobId);
+  });
+
   it('refuses a delivery id that cannot be part of an S3 key', async () => {
     expect(await createLauncher(deps)(request({}, '../../x'))).toEqual({ status: 400, disposition: 'bad_delivery_id' });
   });

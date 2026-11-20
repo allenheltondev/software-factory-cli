@@ -435,9 +435,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
           }),
         );
+        return outcome;
       } catch (err) {
         if (!(err instanceof ConditionalCheckFailedException)) throw err;
         // Already finished (or never recorded): the first outcome stands.
+        const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' }, ConsistentRead: true }));
+        return typeof out.Item?.outcome === 'string' ? out.Item.outcome : null;
       }
     },
 
@@ -626,19 +629,19 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       return out.sort((a, b) => a.version - b.version);
     },
 
-    async getConfigVersion(id, version) {
-      const out = await client.send(new GetCommand({ TableName: T, Key: configKey(id, version) }));
+    async getConfigVersion(id, version, options) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: configKey(id, version), ConsistentRead: options?.consistent === true }));
       return out.Item ? toConfigVersion(id, out.Item) : null;
     },
 
-    async claimDelivery(id, deliveryId, expiresAt) {
+    async claimDelivery(id, deliveryId, expiresAt, jobId) {
       // DynamoDB deletes expired items lazily, so an expired claim counts as none.
       const now = Math.floor(Date.now() / 1000);
       try {
         await client.send(
           new PutCommand({
             TableName: T,
-            Item: { ...deliveryKey(id, deliveryId), installationId: id, deliveryId, ttl: Math.ceil(expiresAt / 1000) },
+            Item: { ...deliveryKey(id, deliveryId), installationId: id, deliveryId, jobId, ttl: Math.ceil(expiresAt / 1000) },
             ConditionExpression: 'attribute_not_exists(pk) OR #ttl < :now',
             ExpressionAttributeNames: { '#ttl': 'ttl' },
             ExpressionAttributeValues: { ':now': now },
@@ -651,8 +654,20 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async releaseDelivery(id, deliveryId) {
-      await client.send(new DeleteCommand({ TableName: T, Key: deliveryKey(id, deliveryId) }));
+    async releaseDelivery(id, deliveryId, jobId) {
+      // Only the holder's: a redelivery's claim (another job) stays, and no claim is no-op.
+      try {
+        await client.send(
+          new DeleteCommand({
+            TableName: T,
+            Key: deliveryKey(id, deliveryId),
+            ConditionExpression: 'jobId = :job',
+            ExpressionAttributeValues: { ':job': jobId },
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+      }
     },
 
     async putAgentKeyMeta(id, meta: AgentKeyMeta) {

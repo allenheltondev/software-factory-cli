@@ -27,11 +27,34 @@ export const TERMINATE_DELAY_MS = 2000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Stops this job's microVM through the broker, retrying (bounded) until the broker can. */
-export async function terminateThroughBroker(client, { attempts = TERMINATE_ATTEMPTS, delayMs = TERMINATE_DELAY_MS, wait = sleep } = {}) {
+export async function terminateThroughBroker(client, options = {}) {
+  await retryBroker(() => client.terminate(), options);
+}
+
+/** The outcome a job reports when the broker would not start it. */
+export const START_FAILED_OUTCOME = 'start_failed';
+
+/**
+ * A job the broker did not start (its `start` failed: a throttled STS call, say): report it
+ * finished with a failed outcome, which gives up the delivery's claim so a redelivery can start
+ * the job again, then stop the microVM. Both are retried (bounded); neither failing stops the
+ * other. Resolves to what could not be done, for the log.
+ */
+export async function abandonBrokerJob(client, options = {}) {
+  const problems = [];
+  await retryBroker(() => client.finish(START_FAILED_OUTCOME), options).catch((error) => {
+    problems.push(`the job broker did not record the failed start (a redelivery is refused until the claim expires): ${error?.message ?? error}`);
+  });
+  await terminateThroughBroker(client, options).catch((error) => {
+    problems.push(`the job broker did not stop this microVM: ${error?.message ?? error}`);
+  });
+  return problems;
+}
+
+async function retryBroker(operation, { attempts = TERMINATE_ATTEMPTS, delayMs = TERMINATE_DELAY_MS, wait = sleep } = {}) {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      await client.terminate();
-      return;
+      return await operation();
     } catch (error) {
       if (attempt >= attempts) throw error;
       await wait(delayMs * attempt);
