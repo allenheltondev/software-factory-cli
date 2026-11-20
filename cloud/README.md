@@ -299,7 +299,7 @@ The console's **Admin** page (`/admin`) has two levels:
   - **Quotas.** Overrides of the stack's defaults, from 1 up to the ceiling, the same as `tenant-admin limits`.
   - **Release** a job that holds capacity it shouldn't. This is for a launch interrupted after it asked for a microVM: nothing can tell whether one started, so its slot stays taken until the job's maximum duration. Release only once you've checked in Lambda that no microVM of the job is running. The job is retired, and its slots and unused microVM time are given back.
 
-**Who's an admin:** the members of one Cognito group in the shared Ready, Set, Cloud user pool, as the other Ready, Set, Cloud apps check their admins. The stack's `AdminGroup` parameter names it, and the default is `admin`. Membership comes from the verified ID token's `cognito:groups`, so adding or removing someone takes effect with their next token, within the hour.
+**Who's an admin:** the members of one Cognito group in the shared Ready, Set, Cloud user pool, as the other Ready, Set, Cloud apps check their admins. The stack's `AdminGroup` parameter names it, and the default is `updraft-admins`, a group of its own: the pool is shared, so a generic `admin` group could include other apps' admins. Membership comes from the verified ID token's `cognito:groups`, so adding or removing someone takes effect with their next token, within the hour.
 - Every admin route answers 403 to anyone else.
 - `/api/v1/me` says whether the caller is an admin, which decides whether the console shows the link.
 - Each action is logged with the admin's email.

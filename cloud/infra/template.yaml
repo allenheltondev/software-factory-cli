@@ -67,7 +67,7 @@ Parameters:
   # Set, Cloud user pool, from the ID token's cognito:groups.
   AdminGroup:
     Type: String
-    Default: admin
+    Default: updraft-admins
     MinLength: 1
     MaxLength: 128
     Description: The Cognito group whose members may use Updraft's admin view.
