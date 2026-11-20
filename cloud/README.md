@@ -9,12 +9,15 @@ It is a Ready, Set, Cloud app, built the way the other rsc-core consumer apps ar
 
 This directory is its own npm project. It is not part of the `@allenheltondev/updraft` package, and the CLI's install, tests and CI matrix never touch it.
 
-So far it covers two phases:
+So far it covers these phases:
 
 - **The hosting skeleton** ([#66](https://github.com/allenheltondev/software-factory-cli/issues/66)): sign in with a Ready, Set, Cloud account.
 - **GitHub linking and installations** ([#67](https://github.com/allenheltondev/software-factory-cli/issues/67)): link a GitHub account, install the Updraft GitHub App on an account or organization you own, and see the repositories it can access.
 
-Configuration, keys, jobs and status follow in #68–#71.
+- **The multi-tenant engine** ([#68](https://github.com/allenheltondev/software-factory-cli/issues/68)): a labeled issue in a tenant's repository runs a job with that tenant's config and keys, within quotas.
+- **Configuration** ([#69](https://github.com/allenheltondev/software-factory-cli/issues/69)): repositories and workflows are configured and published in the browser, with versions and a history.
+
+Agent keys in the console and status follow in #70 and #71.
 
 ## Architecture
 
@@ -173,7 +176,7 @@ The manifest sets everything #67 describes:
 
 ### Tenant config and agent keys
 
-A tenant's jobs run with that tenant's own Updraft config and agent keys (#68). Until the console can edit them (#69, #70), an admin sets them with `server/scripts/tenant-admin.ts`, using AWS credentials for the stack's account:
+A tenant's jobs run with that tenant's own Updraft config and agent keys (#68). Members configure it in the console ("Configuring in the console" below). An admin can also publish a config document, and set keys until the console has them (#70), with `server/scripts/tenant-admin.ts`, using AWS credentials for the stack's account:
 
 ```sh
 cd cloud
@@ -205,9 +208,11 @@ npm run tenant-admin --workspace=server -- key status     --installation 55
   3. mark it ready;
   4. activate it, in one conditional write.
 
+  Beside the bundle, `source.json` keeps what the version was written as: the console's settings, or tenant-admin's document. It's what the editor loads and what re-activating copies. A job downloads it with the bundle but doesn't use it.
+
   If anything fails, the previous version stays active. Activation also only moves forward: a slow publish that finishes after a later one is reported as `superseded`, and the newer version stays active. A job pins the version that was active when it was dispatched, so a publish never changes a running job.
 
-  Each version also stores its **dispatch rules**, computed from the compiled config: every repository with its GitHub id, and each trigger label with the logins allowed to apply it (`server/src/tenants/dispatch.ts`). The launcher checks these without reading the bundle, so changing triggers or actors takes a publish, not a deploy. A version published before dispatch rules existed starts nothing until it's published again.
+  Each version also stores its **dispatch rules**, computed from the compiled config: every repository with its GitHub id, whether it's paused (`repositories.<repo>.paused`, Updraft Cloud's own setting, which isn't written to `config.yaml`), and each trigger label with the logins allowed to apply it (`server/src/tenants/dispatch.ts`). The launcher checks these without reading the bundle, so changing triggers or actors takes a publish, not a deploy. A version published before dispatch rules existed starts nothing until it's published again.
 
 **Agent keys** each get their own Secrets Manager secret, `updraft/tenants/<id>/agent-keys/<NAME>` (for `ANTHROPIC_API_KEY` and `CODEX_API_KEY`), tagged with the installation id.
 - **No lost keys:** setting one key never reads or rewrites another, so two keys set at the same moment both survive.
@@ -216,6 +221,38 @@ npm run tenant-admin --workspace=server -- key status     --installation 55
 - **During an uninstall:** a key set that races an uninstall is refused, and the secret it wrote is removed again.
 
 `tenant-admin` builds every AWS client from one region: `--region`, or else the SDK's own resolution. So stack discovery, the table, the bucket, the App settings and the key secrets are always in the same region.
+
+### Configuring in the console
+
+A member configures a tenant on **Configure** (`/installations/<id>/config`), and sees its versions on the history page (`/installations/<id>/config/history`). The API is in `server/src/tenants/config-service.ts`, and every route answers 403 to anyone who isn't a member of that tenant, the same answer as for a tenant that doesn't exist.
+
+The editor works in its own terms (`server/src/tenants/console.ts`), which it turns into an ordinary tenant config before compiling:
+
+- **Per repository:**
+  - enabled or paused. A paused repository stays configured, and the launcher starts nothing for it;
+  - trigger labels, each mapped to a workflow;
+  - allowed actors: a new repository starts with your GitHub login, and an empty list is refused;
+  - base branch, review, revision (with a maximum), and a comment on failure;
+  - publication: a draft PR by default, or a PR. Auto-merge is off by default, needs review, and turning it on takes an explicit confirmation. The editor asks for it, and a publish that turns auto-merge on without `confirmAutoMerge` is refused with `auto_merge_unconfirmed`.
+- **Per workflow:**
+  - the agent and the reviewer: Claude Code (`claude`) or Codex (`codex`), the agents the image ships, with a model and reasoning effort. They're checked by the CLI's own profile validation;
+  - the prompt, starting from the packaged `examples/prompts/implement-issue.md`, and the review and revision prompts (`review-pr.md`, `revise-pr.md`);
+  - verify commands, which run in the sandbox, and the agent and verify timeouts, within the platform's ceilings.
+
+Compiled, workflow `W` is agent `W`, a reviewer `W.review` when some repository that runs it reviews, an action `W` with `./prompts/W.md` (and `W.review.md`, `W.revise.md` when they're used), and a one-agent pool for each. Each trigger becomes a CLI workflow that carries the repository's allowed actors.
+
+**Preview and publish:**
+
+1. **Preview** shows the generated `config.yaml`, read-only.
+2. Preview and publish check the same things: the console's shape and limits (`CONSOLE_LIMITS`), the platform-enforced fields (config.ts), repositories the installation reaches, agents whose keys are set, and the worker's own `validateConfig`. Each problem is reported on the field it's about.
+3. **Publish** stores the bundle at `config/<n+1>/` and only then switches `activeConfigVersion`, with a conditional write. If validation or the upload fails, the active version stays as it was.
+   - **Edits never cross:** a publish names the version it was edited from (`baseVersion`). If another version was activated since, it's refused with `config_changed`.
+   - **Disabled tenants:** a tenant that's suspended or disabled can't publish.
+4. **Running jobs** keep the version pinned in their `JOB#` record. Pause, trigger and allowed-actor changes reach the launcher with the next webhook, with no deploy.
+
+**History:** every version, newest first, with who published it (their GitHub login, or `admin:<user>` for tenant-admin) and when. The page diffs each version's `config.yaml` and prompts against the version before it. **Re-activate** publishes a copy of an earlier version as a new one (`copiedFrom`), checked against today's rules and asking again before it turns auto-merge on. A version published before versions kept `source.json` can't be re-activated, and the editor starts from the defaults when one is active.
+
+The API function can read and write only `tenants/*/config/*` in the tenant bucket. It reads only files a version lists, so it needs no `ListBucket`.
 
 ### Starting jobs
 
@@ -381,7 +418,8 @@ Not run on AWS yet: the job path end to end. That covers:
 - `RunMicrovm` from the launcher, with the Lambda-provided connectors;
 - the runner's broker calls, from a microVM under the execution role;
 - a labeled issue producing a pull request;
-- the quota transactions against DynamoDB itself, and the over-quota comment on a real issue.
+- the quota transactions against DynamoDB itself, and the over-quota comment on a real issue;
+- publishing from the console against the real bucket and table, with the API function's narrowed S3 permissions.
 
 Deliberately off:
 - **API Gateway access and execution logging.** Both need the account-level API Gateway CloudWatch role, which this stack does not own.

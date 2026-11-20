@@ -56,3 +56,13 @@ describe('decideDispatch', () => {
     expect(decideDispatch(undefined, event()).start).toBe(false);
   });
 });
+
+describe('paused repositories', () => {
+  it('stay in the rules, and start nothing', () => {
+    const rules = dispatchRules(compiled, { paused: new Set(['ACME/web']) });
+    expect(rules.repositories['acme/web']?.paused).toBe(true);
+    expect(rules.repositories['acme/api']?.paused).toBeUndefined();
+    expect(decideDispatch(rules, { repositoryFullName: 'acme/web', repositoryId: 9, label: 'updraft', sender: 'pat' })).toEqual({ start: false, reason: 'the repository is paused' });
+    expect(decideDispatch(rules, { repositoryFullName: 'acme/api', repositoryId: 10, label: 'updraft', sender: 'pat' })).toMatchObject({ start: true });
+  });
+});

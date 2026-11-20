@@ -2,7 +2,7 @@
 // dist/webhook.mjs, cleanup, broker), which the SAM template's functions deploy as-is
 // (CodeUri: ../server/dist). `sam deploy` zips that directory itself, so there is no `sam build`
 // step and no artifact bucket.
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
@@ -11,7 +11,17 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outdir = join(root, 'dist');
 rmSync(outdir, { recursive: true, force: true });
 
+/** `import text from './file.md?raw'`: the file's text, as Vite gives it in tests (tenants/default-prompts.ts). */
+const rawText = {
+  name: 'raw-text',
+  setup(b) {
+    b.onResolve({ filter: /\?raw$/ }, (args) => ({ path: join(args.resolveDir, args.path.replace(/\?raw$/, '')), namespace: 'raw-text' }));
+    b.onLoad({ filter: /.*/, namespace: 'raw-text' }, (args) => ({ contents: readFileSync(args.path, 'utf8'), loader: 'text' }));
+  },
+};
+
 const common = {
+  plugins: [rawText],
   outdir,
   outExtension: { '.js': '.mjs' },
   bundle: true,

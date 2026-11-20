@@ -140,6 +140,8 @@ export interface ConfigVersion {
   publishedAt: string;
   /** What the launcher checks before it starts a job with this version (tenants/dispatch.ts). */
   dispatch?: DispatchRules;
+  /** Published by re-activating this earlier version: a copy of it, under a new number. */
+  copiedFrom?: number;
 }
 
 /**
@@ -148,7 +150,8 @@ export interface ConfigVersion {
  * label (lower-case, as GitHub compares labels) and the logins allowed to apply it (lower-case).
  */
 export interface DispatchRules {
-  repositories: Record<string, { id: number; triggers: { label: string; actors: string[] }[] }>;
+  /** `paused`: the repository stays configured, but no labeled issue of it starts a job. */
+  repositories: Record<string, { id: number; paused?: boolean; triggers: { label: string; actors: string[] }[] }>;
 }
 
 /** That an agent key is set (never its value, which lives only in Secrets Manager). */

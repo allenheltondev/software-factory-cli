@@ -1,3 +1,4 @@
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { handle } from 'hono/aws-lambda';
@@ -10,6 +11,7 @@ import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
 import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
+import { createConfigService, type ObjectStore } from './tenants/config-service.js';
 
 /**
  * The API's Lambda entry point (bundled to dist/index.mjs by scripts/bundle.mjs). API Gateway (REST,
@@ -25,6 +27,21 @@ const userPoolId = process.env.USER_POOL_ID ?? '';
 const verifier = userPoolId && clientId ? CognitoJwtVerifier.create({ userPoolId, clientId, tokenUse: 'id' }) : null;
 const tableName = process.env.TABLE_NAME ?? '';
 const store = tableName ? createDynamoStore(tableName) : undefined;
+const github = store ? createGitHubFlows({ store, github: createGitHubApi(), loadSettings: createSettingsLoader() }) : undefined;
+
+// Tenant config bundles (tenants/config-service.ts). The function's role reaches only
+// tenants/*/config/* in the bucket (template.yaml).
+const bucket = process.env.TENANT_BUCKET ?? '';
+const s3 = new S3Client({});
+const objects: ObjectStore = {
+  async get(key) {
+    const out = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    return (await out.Body?.transformToString('utf8')) ?? null;
+  },
+  async put(key, body, contentType) {
+    await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: contentType }));
+  },
+};
 
 const app = createApp({
   resolveCaller: async (c) => {
@@ -46,9 +63,10 @@ const app = createApp({
     }
     return caller;
   },
-  ...(store
+  ...(store && github
     ? {
-        github: createGitHubFlows({ store, github: createGitHubApi(), loadSettings: createSettingsLoader() }),
+        github,
+        ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         admin: {
           access: adminAccess(process.env.ADMIN_GROUP ?? DEFAULT_ADMIN_GROUP),
           service: createAdminService({ store, quotas: quotasFromEnv(process.env) }),

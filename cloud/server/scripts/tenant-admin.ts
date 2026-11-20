@@ -1,4 +1,5 @@
-// Admin commands for Updraft Cloud tenants, until the console has them (#69 config, #70 keys).
+// Admin commands for Updraft Cloud tenants. Members configure a tenant in the console (#69); keys
+// are set here until the console has them (#70).
 // Run with AWS credentials for the stack's account:
 //
 //   npm run tenant-admin --workspace=server -- config publish --installation 55 --file tenant.yaml [--prompts ./prompts]

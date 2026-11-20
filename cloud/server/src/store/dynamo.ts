@@ -166,6 +166,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     publishedAt: String(i.publishedAt),
     // Stored as written by the publish (tenants/dispatch.ts); absent on versions published before it existed.
     ...(i.dispatch && typeof i.dispatch === 'object' ? { dispatch: i.dispatch as DispatchRules } : {}),
+    ...(typeof i.copiedFrom === 'number' ? { copiedFrom: i.copiedFrom } : {}),
   });
 
   async function getTenantItem(id: number, consistent = false): Promise<Record<string, unknown> | undefined> {

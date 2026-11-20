@@ -40,13 +40,20 @@ export function InstallationPage({ api = defaultApi }: { api?: Pick<ApiClient, '
       {load.state === 'ok' && (
         <Card data-testid="installation">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              {load.tenant.accountLogin}
-              <StatusBadge tone={tenantStatusLabel(load.tenant).tone}>{tenantStatusLabel(load.tenant).label}</StatusBadge>
+            <CardTitle className="flex flex-wrap items-center justify-between gap-2">
+              <span className="flex items-center gap-2">
+                {load.tenant.accountLogin}
+                <StatusBadge tone={tenantStatusLabel(load.tenant).tone}>{tenantStatusLabel(load.tenant).label}</StatusBadge>
+              </span>
+              {load.tenant.status === 'active' && (
+                <Link className="auth-link text-base font-normal" to={`/installations/${load.tenant.installationId}/config`} data-testid="configure-link">
+                  Configure
+                </Link>
+              )}
             </CardTitle>
             <CardDescription>
               The repositories the Updraft App can access. Change which ones on GitHub, in the App&apos;s installation settings.
-              Choosing which of them Updraft runs on comes next.
+              Choose which of them Updraft works on, and how, under Configure.
             </CardDescription>
           </CardHeader>
           <CardBody>

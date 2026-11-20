@@ -150,6 +150,112 @@ export interface AdminOverview {
   platform: { activeJobs: number; platformConcurrentJobs: number };
 }
 
+// A tenant's configuration (server/src/tenants/console.ts and config-service.ts).
+
+export type AgentAdapter = 'claude' | 'codex';
+export type MergeMethod = 'squash' | 'merge' | 'rebase';
+
+export interface ConsoleAgent {
+  adapter: AgentAdapter;
+  model?: string;
+  effort?: string;
+}
+
+export interface ConsoleWorkflow {
+  agent: ConsoleAgent;
+  prompt: string;
+  reviewer: ConsoleAgent & { prompt: string };
+  revisePrompt: string;
+  verify: string[];
+  timeoutMinutes?: number;
+  verifyTimeoutMinutes?: number;
+}
+
+export interface ConsoleTrigger {
+  label: string;
+  workflow: string;
+}
+
+export interface ConsoleRepository {
+  /** false: paused. */
+  enabled: boolean;
+  triggers: ConsoleTrigger[];
+  allowedActors: string[];
+  baseBranch?: string;
+  publish: 'draft-pr' | 'pr';
+  commentOnFailure: boolean;
+  review: boolean;
+  revise: boolean;
+  maxRevisions?: number;
+  /** Absent: off. */
+  autoMerge?: { method: MergeMethod; waitMinutes?: number; requiredChecks?: string[] };
+}
+
+export interface ConsoleConfig {
+  version: 1;
+  workflows: Record<string, ConsoleWorkflow>;
+  repositories: Record<string, ConsoleRepository>;
+}
+
+export interface ConfigIssue {
+  path: string;
+  message: string;
+}
+
+export interface ConfigView {
+  tenant: TenantSummary;
+  githubLogin: string;
+  repositories: Repository[];
+  agentKeys: Record<string, boolean>;
+  activeVersion: number | null;
+  source: 'console' | 'tenant' | 'none';
+  config: ConsoleConfig;
+  defaults: { prompts: { implement: string; review: string; revise: string } };
+  limits: {
+    ceilings: { timeoutMinutes: number; verifyTimeoutMinutes: number; autoMergeWaitMinutes: number; maxRevisions: number };
+    console: Record<string, number>;
+  };
+}
+
+export type PreviewResult =
+  | { ok: true; yaml: string; warnings: ConfigIssue[]; autoMergeTurnedOn: string[] }
+  | { ok: false; errors: ConfigIssue[]; warnings: ConfigIssue[] };
+
+export interface PublishResult {
+  ok: true;
+  version: number;
+  yaml: string;
+  warnings: ConfigIssue[];
+}
+
+export interface VersionSummary {
+  version: number;
+  status: 'pending' | 'ready';
+  publishedAt: string;
+  publishedBy: string;
+  sha256: string;
+  active: boolean;
+  copiedFrom?: number;
+}
+
+export interface VersionFiles {
+  version: VersionSummary;
+  /** config.yaml and prompts/<name>.md, as jobs see them. */
+  files: Record<string, string>;
+}
+
+/** A publish the server refused as invalid: every problem, with the field it is about. */
+export class ConfigInvalidError extends ApiError {
+  readonly errors: ConfigIssue[];
+  readonly warnings: ConfigIssue[];
+  constructor(errors: ConfigIssue[], warnings: ConfigIssue[]) {
+    super(400, 'invalid_config', 'The configuration has problems; nothing was published');
+    this.name = 'ConfigInvalidError';
+    this.errors = errors;
+    this.warnings = warnings;
+  }
+}
+
 export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (...a) => fetch(...a) }: ApiClientOptions) {
   async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const token = await getToken();
@@ -163,13 +269,18 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     if (!response.ok) {
       let code = 'error';
       let message: string | undefined;
+      let issues: { errors: ConfigIssue[]; warnings: ConfigIssue[] } | null = null;
       try {
-        const body = (await response.json()) as { error?: unknown; message?: unknown };
+        const body = (await response.json()) as { error?: unknown; message?: unknown; errors?: unknown; warnings?: unknown };
         if (typeof body.error === 'string') code = body.error;
         if (typeof body.message === 'string') message = body.message;
+        if (code === 'invalid_config' && Array.isArray(body.errors)) {
+          issues = { errors: body.errors as ConfigIssue[], warnings: Array.isArray(body.warnings) ? (body.warnings as ConfigIssue[]) : [] };
+        }
       } catch {
         // Not JSON (an API Gateway or CloudFront error page): keep the generic code.
       }
+      if (issues) throw new ConfigInvalidError(issues.errors, issues.warnings);
       throw new ApiError(response.status, code, message);
     }
     return (await response.json()) as T;
@@ -188,6 +299,17 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
       request<{ installationId: number; accountLogin: string }>(`/github/connect/${installationId}`, { method: 'POST' }),
     repositories: (installationId: number) =>
       request<{ tenant: TenantSummary; repositories: Repository[] }>(`/installations/${installationId}/repositories`),
+    config: (installationId: number) => request<ConfigView>(`/installations/${installationId}/config`),
+    previewConfig: (installationId: number, config: ConsoleConfig) =>
+      request<PreviewResult>(`/installations/${installationId}/config/preview`, { method: 'POST', body: JSON.stringify({ config }) }),
+    /** Throws ConfigInvalidError (400), or ApiError `config_changed` / `auto_merge_unconfirmed` (409). */
+    publishConfig: (installationId: number, input: { config: ConsoleConfig; baseVersion: number | null; confirmAutoMerge?: boolean }) =>
+      request<PublishResult>(`/installations/${installationId}/config/publish`, { method: 'POST', body: JSON.stringify(input) }),
+    configVersions: (installationId: number) =>
+      request<{ activeVersion: number | null; versions: VersionSummary[] }>(`/installations/${installationId}/config/versions`),
+    configVersion: (installationId: number, version: number) => request<VersionFiles>(`/installations/${installationId}/config/versions/${version}`),
+    reactivateConfig: (installationId: number, version: number, input: { confirmAutoMerge?: boolean } = {}) =>
+      request<PublishResult>(`/installations/${installationId}/config/versions/${version}/reactivate`, { method: 'POST', body: JSON.stringify(input) }),
     adminTenants: () => request<AdminOverview>('/admin/tenants'),
     adminTenant: (installationId: number) => request<AdminTenantDetail>(`/admin/tenants/${installationId}`),
     adminDisable: (installationId: number, reason?: string) =>

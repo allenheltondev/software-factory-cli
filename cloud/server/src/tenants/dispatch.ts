@@ -14,11 +14,18 @@ import type { DispatchRules } from '../store/store.js';
 type Workflow = { trigger?: { label?: unknown }; allowedActors?: unknown };
 type Repository = { id?: unknown; workflows?: unknown };
 
+/** What a repository's dispatch rules need beyond the compiled config: whether it is paused. */
+export interface DispatchOptions {
+  /** OWNER/REPO (any case) of repositories that stay configured but start nothing. */
+  paused?: ReadonlySet<string>;
+}
+
 const lowerStrings = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string' && v !== '').map((v) => v.toLowerCase()) : [];
 
 /** From a compiled (validated) config: `repositories` and `dispatch.allowedActors`. */
-export function dispatchRules(compiled: { repositories?: Record<string, unknown>; dispatch?: { allowedActors?: unknown } }): DispatchRules {
+export function dispatchRules(compiled: { repositories?: Record<string, unknown>; dispatch?: { allowedActors?: unknown } }, options: DispatchOptions = {}): DispatchRules {
+  const paused = new Set([...(options.paused ?? [])].map((r) => r.toLowerCase()));
   const fallbackActors = lowerStrings(compiled.dispatch?.allowedActors);
   const repositories: DispatchRules['repositories'] = {};
   for (const [fullName, raw] of Object.entries(compiled.repositories ?? {})) {
@@ -30,7 +37,7 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
       if (typeof label !== 'string' || label === '') continue;
       triggers.push({ label: label.toLowerCase(), actors: wf.allowedActors === undefined ? fallbackActors : lowerStrings(wf.allowedActors) });
     }
-    repositories[fullName.toLowerCase()] = { id: repo.id, triggers };
+    repositories[fullName.toLowerCase()] = { id: repo.id, ...(paused.has(fullName.toLowerCase()) ? { paused: true } : {}), triggers };
   }
   return { repositories };
 }
@@ -50,6 +57,7 @@ export function decideDispatch(
   const repository = event.repositoryFullName.toLowerCase();
   const repo = rules.repositories[repository];
   if (!repo || repo.id !== event.repositoryId) return { start: false, reason: 'the repository is not in the active config' };
+  if (repo.paused) return { start: false, reason: 'the repository is paused' };
   if (typeof event.label !== 'string' || event.label === '') return { start: false, reason: 'no label in the event' };
   const label = event.label.toLowerCase();
   const matching = repo.triggers.filter((t) => t.label === label);

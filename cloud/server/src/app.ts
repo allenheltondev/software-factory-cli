@@ -5,6 +5,7 @@ import type { AdminService } from './admin/admin.js';
 import type { Caller } from './caller.js';
 import { FlowError, type GitHubFlows } from './flows/github.js';
 import type { TenantLimits } from './store/store.js';
+import type { ConfigService, PublishOutcome } from './tenants/config-service.js';
 
 /**
  * The API, mounted at /api because CloudFront forwards `/api/*` paths to API Gateway unchanged.
@@ -18,6 +19,14 @@ import type { TenantLimits } from './store/store.js';
  *   POST   /api/v1/github/callback                   finish either: { code, state, installationId?, setupAction? }
  *   POST   /api/v1/github/connect/:id                connect an installation the last link offered
  *   GET    /api/v1/installations/:id/repositories    a tenant's repositories (members only)
+ *
+ * A tenant's configuration (tenants/config-service.ts), members only:
+ *   GET    /api/v1/installations/:id/config          what the editor loads: settings, repositories, keys set
+ *   POST   /api/v1/installations/:id/config/preview  { config }: the generated YAML, or every problem
+ *   POST   /api/v1/installations/:id/config/publish  { config, baseVersion, confirmAutoMerge? }
+ *   GET    /api/v1/installations/:id/config/versions             the history, newest first
+ *   GET    /api/v1/installations/:id/config/versions/:v          one version's files
+ *   POST   /api/v1/installations/:id/config/versions/:v/reactivate  { confirmAutoMerge? }: publish a copy
  *
  * Admins only, the members of the stack's admin Cognito group (admin/access.ts; anyone else gets 403):
  *   GET    /api/v1/admin/tenants                     every tenant: quotas, usage, failures
@@ -38,6 +47,7 @@ export interface AppOptions {
   resolveCaller: ResolveCaller;
   github?: GitHubFlows;
   admin?: { access: AdminAccess; service: AdminService };
+  config?: ConfigService;
   /** Logs unexpected errors. The response never carries their details. */
   logError?: (err: unknown) => void;
 }
@@ -51,7 +61,7 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** Who did it, for the admin's actions: their email, else their sub. */
 const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
 
-export function createApp({ resolveCaller, github, admin, logError = (err) => console.error(err) }: AppOptions) {
+export function createApp({ resolveCaller, github, admin, config, logError = (err) => console.error(err) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -151,6 +161,71 @@ export function createApp({ resolveCaller, github, admin, logError = (err) => co
       const id = Number(c.req.param('id'));
       if (!Number.isSafeInteger(id) || id <= 0) return c.json({ error: 'not_found' }, 404);
       return c.json(await github.repositories(c.get('caller'), id));
+    });
+  }
+
+  if (config) {
+    const positive = (raw: string) => {
+      const n = Number(raw);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    };
+    const body = async (c: Context): Promise<Record<string, unknown> | null> => {
+      try {
+        const b = (await c.req.json()) as unknown;
+        return typeof b === 'object' && b !== null && !Array.isArray(b) ? (b as Record<string, unknown>) : null;
+      } catch {
+        return null;
+      }
+    };
+    // An invalid config is a 400 that carries every problem, with the field it is about.
+    const outcome = (c: Context, out: PublishOutcome) => (out.ok ? c.json(out) : c.json({ error: 'invalid_config', errors: out.errors, warnings: out.warnings }, 400));
+    const MAX_BODY = 4 * 1024 * 1024;
+    const tooLarge = (c: Context) => Number(c.req.header('content-length') ?? 0) > MAX_BODY;
+
+    app.get('/v1/installations/:id/config', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await config.load(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.post('/v1/installations/:id/config/preview', async (c) => {
+      const id = positive(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      if (tooLarge(c)) return c.json({ error: 'too_large' }, 413);
+      const b = await body(c);
+      if (!b) return c.json({ error: 'bad_request' }, 400);
+      return c.json(await config.preview(c.get('caller'), id, b.config));
+    });
+    app.post('/v1/installations/:id/config/publish', async (c) => {
+      const id = positive(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      if (tooLarge(c)) return c.json({ error: 'too_large' }, 413);
+      const b = await body(c);
+      if (!b) return c.json({ error: 'bad_request' }, 400);
+      const base = b.baseVersion;
+      if (base !== undefined && base !== null && positive(String(base)) === null) return c.json({ error: 'bad_request' }, 400);
+      return outcome(
+        c,
+        await config.publish(c.get('caller'), id, {
+          config: b.config,
+          ...(base !== undefined ? { baseVersion: base === null ? null : Number(base) } : {}),
+          confirmAutoMerge: b.confirmAutoMerge === true,
+        }),
+      );
+    });
+    app.get('/v1/installations/:id/config/versions', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await config.versions(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.get('/v1/installations/:id/config/versions/:v', async (c) => {
+      const id = positive(c.req.param('id'));
+      const v = positive(c.req.param('v'));
+      return id && v ? c.json(await config.version(c.get('caller'), id, v)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.post('/v1/installations/:id/config/versions/:v/reactivate', async (c) => {
+      const id = positive(c.req.param('id'));
+      const v = positive(c.req.param('v'));
+      if (!id || !v) return c.json({ error: 'not_found' }, 404);
+      const b = (await body(c)) ?? {};
+      return outcome(c, await config.reactivate(c.get('caller'), id, v, { confirmAutoMerge: b.confirmAutoMerge === true }));
     });
   }
 

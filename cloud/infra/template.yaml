@@ -246,6 +246,8 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref UpdraftTable
+          # Tenant config bundles: the console publishes them (tenants/config-service.ts).
+          TENANT_BUCKET: !Ref TenantBucket
           USER_POOL_ID: !Ref AuthUserPoolId
           USER_POOL_CLIENT_ID: !Ref AuthClient
           # The admin view shows each tenant's quotas: the same defaults the launcher applies.
@@ -266,6 +268,13 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
+            # Config bundles only: never a tenant's state, events or results. It reads only files
+            # a version lists, so it needs no ListBucket.
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub ${TenantBucket.Arn}/tenants/*/config/*
       Events:
         Health:
           Type: Api

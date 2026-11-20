@@ -176,6 +176,7 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
 
   // Repositories: ones the installation reaches, cloned and published the platform's way.
   const repositories: Record<string, Record<string, unknown>> = {};
+  const paused = new Set<string>();
   if (input.repositories !== undefined && !isObject(input.repositories)) err('repositories', 'must be a mapping');
   else if (isObject(input.repositories)) {
     for (const [fullName, repo] of Object.entries(input.repositories)) {
@@ -200,8 +201,13 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
         });
       }
       if (isObject(repo.tiers) && repo.tiers.triage !== undefined) err(`${path}.tiers.triage`, 'not available on Updraft Cloud: triage runs outside the sandbox');
+      // Updraft Cloud's own setting, not the CLI's: the repository stays in the config (so a job
+      // already running on it is unaffected), and the launcher starts nothing for it.
+      const { paused: pausedInput, ...cliRepo } = repo;
+      if (pausedInput !== undefined && typeof pausedInput !== 'boolean') err(`${path}.paused`, 'must be true or false');
+      if (pausedInput === true) paused.add(fullName);
       const name = fullName.split('/')[1] ?? fullName;
-      repositories[fullName] = { ...repo, ...(id !== undefined ? { id } : {}), checkoutPath: `./clones/${name}`, publish };
+      repositories[fullName] = { ...cliRepo, ...(id !== undefined ? { id } : {}), checkoutPath: `./clones/${name}`, publish };
     }
   }
 
@@ -232,7 +238,7 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
   for (const file of Object.keys(prompts)) if (!usedPrompts.has(file)) warnings.push({ path: file, message: 'not referenced by any action; it is stored anyway' });
 
   const files: Record<string, string> = { 'config.yaml': stringify(compiled), ...prompts };
-  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: dispatchRules(compiled) };
+  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: dispatchRules(compiled, { paused }) };
 }
 
 /** A stable hash of a bundle: every file's path and content, in path order. */
