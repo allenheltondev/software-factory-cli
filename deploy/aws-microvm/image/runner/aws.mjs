@@ -88,8 +88,9 @@ export function createAwsDeps(region, options = {}) {
         throw error;
       }
     },
-    async getSecret(secretId) {
-      const response = await secrets.send(new GetSecretValueCommand({ SecretId: secretId }));
+    /** The secret's current value, or exactly `versionId` when one is given. */
+    async getSecret(secretId, versionId) {
+      const response = await secrets.send(new GetSecretValueCommand({ SecretId: secretId, ...(versionId ? { VersionId: versionId } : {}) }));
       return response.SecretString ?? '';
     },
     async releaseDelivery(table, deliveryId) {

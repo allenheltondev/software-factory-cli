@@ -76,6 +76,12 @@ export interface StatsSection {
     findings: { changesRequestedReviews: number; withCount: number; withoutCount: number; total: number; average: number | null; allReviewsWithoutCount: number };
     /** PRs whose first review is in the window, and how many of those got ready-to-merge on their first reviewed head. */
     firstPass: { prs: number; readyToMerge: number; rate: number | null };
+    /**
+     * Reviewer runs whose agent ran, by the model their selection configured (the key is as in
+     * `routing.byModel`; "unknown" before selections were recorded): what each verdict was and the
+     * findings it counted. `failed`: no readable verdict, or the agent failed.
+     */
+    byModel: Record<string, ReviewModelStats>;
   };
   backAndForth: {
     /** PRs opened in the window; the rest of this block counts their whole history. */
@@ -91,6 +97,37 @@ export interface StatsSection {
   pressure: PressureStats;
   /** Waits on pull requests in other repositories (docs/dependencies.md). */
   dependencies: DependencyStats;
+  /** The same window day by day (UTC), oldest first; only days with a fact are listed. */
+  daily: DailyStats[];
+}
+
+export interface ReviewModelStats {
+  adapter: string | null;
+  model: string | null;
+  effort: string | null;
+  /** Reviewer runs whose agent ran. */
+  runs: number;
+  readyToMerge: number;
+  changesRequested: number;
+  failed: number;
+  /** UPDRAFT-FINDINGS counts over this model's changes-requested verdicts that have one. */
+  findings: { total: number; withCount: number; average: number | null };
+}
+
+/** One UTC day of the window. Jobs by their latest final status that day; the rest as their facts. */
+export interface DailyStats {
+  /** YYYY-MM-DD, UTC. */
+  day: string;
+  jobsSucceeded: number;
+  jobsFailed: number;
+  prsOpened: number;
+  prsMerged: number;
+  /** Reviewer verdicts recorded. */
+  reviews: number;
+  changesRequested: number;
+  /** UPDRAFT-FINDINGS counts of that day's changes-requested verdicts. */
+  findings: number;
+  revisions: number;
 }
 
 export interface DependencyStats {
@@ -539,6 +576,23 @@ function section(windowed: readonly EventRow[], all: readonly EventRow[], queue:
   const windowedVerdict = new Set(verdicts.map((v) => v.subject_id));
   const firsts = [...firstReview.values()].filter((v) => windowedVerdict.has(v.subject_id));
   const firstReady = firsts.filter((v) => v.outcome === 'ready-to-merge').length;
+  const selByRun = new Map(of(all, 'run.selected').map((e) => [e.subject_id, e]));
+  const reviewByModel = byKey(reviewRuns, (r) => modelLabel(selByRun.get(r.subject_id)), (rows) => {
+    const sample = selByRun.get(rows[0]!.subject_id);
+    const runIds = new Set(rows.map((r) => r.subject_id));
+    const asked = changes.filter((v) => runIds.has(v.subject_id) && v.findings !== null);
+    const total = asked.reduce((a, v) => a + v.findings!, 0);
+    return {
+      adapter: sample?.adapter ?? null,
+      model: sample?.model ?? null,
+      effort: sample?.effort ?? null,
+      runs: rows.length,
+      readyToMerge: rows.filter((r) => verdictOfRun.get(r.subject_id) === 'ready-to-merge').length,
+      changesRequested: rows.filter((r) => verdictOfRun.get(r.subject_id) === 'changes-requested').length,
+      failed: rows.filter((r) => r.outcome === 'failed').length,
+      findings: { total, withCount: asked.length, average: asked.length ? total / asked.length : null },
+    } satisfies ReviewModelStats;
+  });
 
   // 5. Back-and-forths, over the whole history of the PRs opened in the window.
   const prs = [...new Set(opened.map(prKey))];
@@ -611,6 +665,7 @@ function section(windowed: readonly EventRow[], all: readonly EventRow[], queue:
         allReviewsWithoutCount: verdicts.filter((v) => v.findings === null).length,
       },
       firstPass: { prs: firsts.length, readyToMerge: firstReady, rate: firsts.length ? firstReady / firsts.length : null },
+      byModel: reviewByModel,
     },
     backAndForth: {
       prs: prs.length,
@@ -630,7 +685,37 @@ function section(windowed: readonly EventRow[], all: readonly EventRow[], queue:
     routing: routingSection(windowed, all, jobs, opened),
     pressure: pressureSection(windowed, runs),
     dependencies: dependencySection(windowed, queue),
+    daily: dailySection(windowed, jobs),
   };
+}
+
+/** The window day by day (UTC). `jobs` are the window's jobs at their latest final status. */
+function dailySection(windowed: readonly EventRow[], jobs: readonly EventRow[]): DailyStats[] {
+  const days = new Map<string, DailyStats>();
+  const day = (at: string): DailyStats => {
+    const d = new Date(Date.parse(at)).toISOString().slice(0, 10);
+    let row = days.get(d);
+    if (!row) days.set(d, (row = { day: d, jobsSucceeded: 0, jobsFailed: 0, prsOpened: 0, prsMerged: 0, reviews: 0, changesRequested: 0, findings: 0, revisions: 0 }));
+    return row;
+  };
+  for (const j of jobs) {
+    if (j.outcome === 'succeeded') day(j.at).jobsSucceeded++;
+    else if (j.outcome === 'failed') day(j.at).jobsFailed++;
+  }
+  for (const e of windowed) {
+    if (e.kind === 'pr.opened') day(e.at).prsOpened++;
+    else if (e.kind === 'pr.merged') day(e.at).prsMerged++;
+    else if (e.kind === 'revision.pushed') day(e.at).revisions++;
+    else if (e.kind === 'review.verdict') {
+      const d = day(e.at);
+      d.reviews++;
+      if (e.outcome === 'changes-requested') {
+        d.changesRequested++;
+        d.findings += e.findings ?? 0;
+      }
+    }
+  }
+  return [...days.values()].sort((a, b) => a.day.localeCompare(b.day));
 }
 
 function dependencySection(windowed: readonly EventRow[], queue: readonly QueueRow[]): DependencyStats {

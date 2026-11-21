@@ -4,6 +4,7 @@ import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, 
 import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog, type JobView } from '../api/client';
 import { DISPOSITION, JOB_RESULT, deliveryReason, formatBytes, formatDuration } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
+import { Lifecycle } from '../components/lifecycle';
 
 type JobApi = Pick<ApiClient, 'job' | 'jobLog'>;
 type Load = { state: 'loading' } | { state: 'ok'; job: JobView; deliveries: Delivery[] } | { state: 'error'; message: string };
@@ -125,6 +126,18 @@ function Loaded({ job, deliveries, api, installationId }: { job: JobView; delive
         </CardBody>
       </Card>
 
+      <Card data-testid="job-lifecycle-card">
+        <CardHeader>
+          <CardTitle>Lifecycle</CardTitle>
+          <CardDescription>What the run did, in order: the change, each review and revision, and where the pull request ended up.</CardDescription>
+        </CardHeader>
+        <CardBody>
+          <Lifecycle detail={job.detail} running={job.result === 'running'} />
+        </CardBody>
+      </Card>
+
+      <AgentTimeline job={job} installationId={installationId} />
+
       {deliveries.length > 0 && (
         <Card>
           <CardHeader>
@@ -147,6 +160,64 @@ function Loaded({ job, deliveries, api, installationId }: { job: JobView; delive
 
       <Logs job={job} api={api} installationId={installationId} />
     </>
+  );
+}
+
+/** Where to see this job's agents at work: its trace, and the issue's conversation in Agent Timeline. */
+function AgentTimeline({ job, installationId }: { job: JobView; installationId: number }) {
+  const t = job.telemetry;
+  const [copied, setCopied] = useState(false);
+  if (!t) {
+    return (
+      <Card data-testid="job-telemetry">
+        <CardHeader>
+          <CardTitle>Agent timeline</CardTitle>
+          <CardDescription>
+            Send what the agents did (every model call and tool call, in order) to Honeycomb and watch it in Agent Timeline.{' '}
+            <Link className="auth-link" to={`/installations/${installationId}/telemetry`}>
+              Set up agent telemetry
+            </Link>
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(t.conversationId ?? t.traceId);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // No clipboard: the id is on screen.
+    }
+  };
+  return (
+    <Card data-testid="job-telemetry">
+      <CardHeader>
+        <CardTitle>Agent timeline</CardTitle>
+        <CardDescription>This job's agents, as traced in Honeycomb. The issue's conversation holds this job and every review and revision after it.</CardDescription>
+      </CardHeader>
+      <CardBody className="flex flex-col gap-3 text-sm">
+        <div className="flex flex-wrap items-center gap-3">
+          {t.traceUrl && (
+            <a className="auth-link font-semibold" href={t.traceUrl} target="_blank" rel="noreferrer" data-testid="job-trace-link">
+              View trace in Honeycomb ↗
+            </a>
+          )}
+          {t.conversationId && (
+            <span className="flex items-center gap-2">
+              Conversation <code data-testid="job-conversation">{t.conversationId}</code>
+              <Button variant="ghost" onClick={() => void copy()}>
+                {copied ? 'Copied' : 'Copy'}
+              </Button>
+            </span>
+          )}
+        </div>
+        <p className={t.failed > 0 ? 'text-warning-700 dark:text-warning-300' : 'text-muted-foreground'} data-testid="job-telemetry-count">
+          {t.exported} of {t.spans} span{t.spans === 1 ? '' : 's'} sent{t.lastError ? ` (last error: ${t.lastError})` : ''} · trace <code>{t.traceId}</code>
+        </p>
+      </CardBody>
+    </Card>
   );
 }
 

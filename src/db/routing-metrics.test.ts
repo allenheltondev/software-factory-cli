@@ -232,6 +232,22 @@ describe('review results by tier', () => {
     const all = computeStats(h.db, WINDOW);
     const routine = all.overall.routing.byTier.routine!;
     expect(routine).toMatchObject({ jobs: 1, prsOpened: 1, reviewed: 1, changesRequested: 1, reviewReady: { count: 0, of: 1 } });
+    // The reviewer's verdict, by the model its run was selected with.
+    expect(all.overall.review.byModel).toEqual({
+      'codex/cli-default': {
+        adapter: 'codex',
+        model: null,
+        effort: null,
+        runs: 1,
+        readyToMerge: 0,
+        changesRequested: 1,
+        failed: 0,
+        findings: { total: 2, withCount: 1, average: 2 },
+      },
+    });
+    expect(all.overall.daily).toEqual([
+      { day: '2026-11-18', jobsSucceeded: 2, jobsFailed: 0, prsOpened: 1, prsMerged: 0, reviews: 1, changesRequested: 1, findings: 2, revisions: 0 },
+    ]);
     const one = computeStats(h.db, { ...WINDOW, repo: 'octo/other' });
     expect(one.overall.routing.byTier).toEqual({});
     expect(computeStats(h.db, { ...WINDOW, repo: 'OCTO/widgets' }).overall.routing.byTier.routine).toMatchObject({ jobs: 1 });

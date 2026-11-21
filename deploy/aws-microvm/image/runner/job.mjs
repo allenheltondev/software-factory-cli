@@ -23,6 +23,7 @@ import {
   syncState,
   waitForStateChange,
 } from './state.mjs';
+import { HONEYCOMB_ENDPOINTS, createAgentTracer, createExporter } from './telemetry.mjs';
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
 const KEY_FILE = 'github-app.pem';
@@ -274,6 +275,8 @@ export async function runJob(request, deps) {
   });
 
   let stateDirForLogs;
+  // Agent telemetry (telemetry.mjs), when the tenant set it up: started with the job process.
+  let tracer;
   // Set once `updraft run-event` has run, whatever its outcome: only then is there a
   // database worth merging.
   let stateToSync;
@@ -325,7 +328,33 @@ export async function runJob(request, deps) {
     // The agents' keys, read once for every try. From here, nothing the runner forwards or
     // keeps (the log stream, the uploaded logs, the result) carries a value of them.
     const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
-    redact = createRedactor(secretValues(payload, agentEnv));
+    // The telemetry key is the runner's own, like the token: it is never in the job's
+    // environment, and it is redacted wherever it might appear.
+    const telemetry = payload.version === 2 ? await telemetrySetup(payload, deps, log) : null;
+    redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? [telemetry.apiKey] : [])]);
+    if (telemetry) {
+      tracer = createAgentTracer({
+        runsDir: path.join(stateDir, 'logs', 'runs'),
+        // The job user owns everything under the state directory: reads are confined to it.
+        confineTo: stateDir,
+        captureContent: telemetry.captureContent,
+        redact,
+        log,
+        now,
+        exporter: createExporter({
+          endpoint: telemetry.endpoint,
+          apiKey: telemetry.apiKey,
+          redact,
+          resource: { 'service.name': telemetry.serviceName, 'updraft.delivery.id': payload.deliveryId, 'updraft.microvm.id': microvmId },
+          ...(deps.fetch ? { fetch: deps.fetch } : {}),
+          log,
+          now,
+        }),
+        ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}),
+      });
+      tracer.start();
+      log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.endpoint}${telemetry.captureContent ? ', with content' : ''}`);
+    }
     for (;;) {
       // Checkpoints: what the run records (the pull request it opened, above all) reaches the
       // shared database while it runs, not only at its end. Stopped before anything else
@@ -417,6 +446,17 @@ export async function runJob(request, deps) {
     log(`job could not run: ${result.error}`);
   }
   stopTokenRefresh();
+  if (tracer) {
+    // The last spans, with how the job ended. Little time when the microVM is being stopped.
+    result.telemetry = await tracer.stop({
+      outcome: result.outcome,
+      summary: result.summary,
+      deliveryId: payload.deliveryId,
+      eventName: payload.eventName,
+      budgetMs: deps.telemetryBudgetMs ?? (stopRequested ? 5_000 : 15_000),
+    });
+    log(`agent telemetry: ${result.telemetry.exported} of ${result.telemetry.spans} span(s) sent${result.telemetry.lastError ? ` (last error: ${result.telemetry.lastError})` : ''}`);
+  }
 
   // Save what the run changed in the shared state, whatever the job's outcome: a failed run
   // also recorded things later runs need (a capacity cooldown, a review it has seen).
@@ -638,7 +678,66 @@ export function finishDetail(result) {
   if (typeof result.summary?.prUrl === 'string') detail.prUrl = result.summary.prUrl;
   const logs = (result.logs ?? []).map((key) => String(key).split('/').pop());
   if (logs.length) detail.logs = logs;
+  // Agent telemetry: the trace, for a link to it, and whether it got there.
+  if (result.telemetry) {
+    const t = result.telemetry;
+    detail.telemetry = { traceId: t.traceId, spans: t.spans, exported: t.exported, failed: t.failed, startedAt: t.startedAt, ...(t.lastError ? { lastError: t.lastError } : {}) };
+  }
+  // The lifecycle (the console's job timeline): where the review loop left the pull request, and
+  // each step in order. The broker keeps only codes, counts and booleans of it.
+  const loop = result.summary?.loop;
+  if (loop && typeof loop === 'object') {
+    detail.loop = { rounds: loop.rounds, maxRevisions: loop.maxRevisions, reviews: loop.reviews, verdict: loop.verdict, stage: loop.stage, merged: loop.merged };
+  }
+  if (result.summary && typeof result.summary === 'object') {
+    const event = result.summary.event?.name;
+    const ownKind = event === 'issues' ? 'implement' : null;
+    const own = Array.isArray(result.summary.jobs) && result.summary.jobs.length ? result.summary.jobs : result.summary.jobId ? [result.summary] : [];
+    const follow = Array.isArray(result.summary.followOnJobs) ? result.summary.followOnJobs : [];
+    const step = (j, kind) => ({
+      kind,
+      agent: j.agent ?? undefined,
+      outcome: j.outcome ?? j.runOutcome ?? j.status ?? undefined,
+      verificationPassed: typeof j.verification?.passed === 'boolean' ? j.verification.passed : undefined,
+      publication: j.publication ?? undefined,
+    });
+    const steps = [
+      ...own.map((j) => step(j, j.kind === 'review' || j.kind === 'revision' ? j.kind : ownKind)).filter((s) => s.kind),
+      ...follow.filter((j) => j.kind === 'review' || j.kind === 'revision').map((j) => step(j, j.kind)),
+    ];
+    if (steps.length) detail.steps = steps;
+  }
   return detail;
+}
+
+/**
+ * The job's telemetry settings, from the broker's descriptor, with the key read from the
+ * tenant's secret. Null when telemetry is off, or the key cannot be read (the job runs anyway).
+ */
+async function telemetrySetup(payload, deps, log) {
+  const t = payload.telemetry;
+  if (!t || typeof t !== 'object' || typeof t.secret !== 'string') return null;
+  const endpoint = HONEYCOMB_ENDPOINTS[t.region] ?? null;
+  if (!endpoint) return null;
+  try {
+    // The version the tenant's settings name: the key is the one checked for this region and
+    // team, whatever was written to the secret since. Settings from before versions: the current.
+    const version = typeof t.secretVersion === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(t.secretVersion) ? t.secretVersion : undefined;
+    const apiKey = (await deps.getSecret(t.secret, version))?.trim();
+    if (!apiKey) {
+      log('agent telemetry is on, but its key is not set; nothing is sent');
+      return null;
+    }
+    return {
+      apiKey,
+      endpoint,
+      serviceName: typeof t.serviceName === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(t.serviceName) ? t.serviceName : 'updraft',
+      captureContent: t.captureContent === true,
+    };
+  } catch (error) {
+    log(`agent telemetry is on, but its key could not be read (${error?.name ?? 'error'}); nothing is sent`);
+    return null;
+  }
 }
 
 /**

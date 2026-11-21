@@ -8,6 +8,8 @@ import { FlowError, type GitHubFlows } from './flows/github.js';
 import type { TenantLimits } from './store/store.js';
 import type { AgentKeyService } from './tenants/agent-key-service.js';
 import type { StatusService } from './tenants/status-service.js';
+import type { StatsService } from './tenants/stats-service.js';
+import type { TelemetryService } from './tenants/telemetry-service.js';
 import type { ConfigService, PublishOutcome } from './tenants/config-service.js';
 
 /**
@@ -42,6 +44,16 @@ import type { ConfigService, PublishOutcome } from './tenants/config-service.js'
  *   GET    /api/v1/installations/:id/jobs/:jobId                one job, with its deliveries
  *   GET    /api/v1/installations/:id/jobs/:jobId/logs/:name     the end of updraft.log or run.log
  *
+ * A tenant's agent telemetry (tenants/telemetry-service.ts), members only. The key is write-only:
+ *   GET    /api/v1/installations/:id/telemetry           settings, whether a key is set, its team and environment, the last export
+ *   PUT    /api/v1/installations/:id/telemetry           { enabled?, serviceName?, captureContent? }
+ *   PUT    /api/v1/installations/:id/telemetry/key       { value, region }: checked with Honeycomb's /1/auth, then saved
+ *   DELETE /api/v1/installations/:id/telemetry/key       telemetry is off until a new key is set
+ *
+ * A tenant's insights (tenants/stats-service.ts), members only:
+ *   GET    /api/v1/installations/:id/insights?window=&repo=     `updraft stats` over the shared state: issues worked,
+ *                                                               review findings, rounds, by repository and by model
+ *
  * Admins only, the members of the stack's admin Cognito group (admin/access.ts; anyone else gets 403):
  *   GET    /api/v1/admin/tenants                     every tenant: quotas, usage, failures
  *   GET    /api/v1/admin/tenants/:id                 one tenant, with its recent and running jobs
@@ -64,6 +76,8 @@ export interface AppOptions {
   config?: ConfigService;
   agentKeys?: AgentKeyService;
   status?: StatusService;
+  stats?: StatsService;
+  telemetry?: TelemetryService;
   /** Logs unexpected errors. The response never carries their details. */
   logError?: (err: unknown) => void;
 }
@@ -77,7 +91,7 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** Who did it, for the admin's actions: their email, else their sub. */
 const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
 
-export function createApp({ resolveCaller, github, admin, config, agentKeys, status, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
+export function createApp({ resolveCaller, github, admin, config, agentKeys, status, stats, telemetry, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -297,6 +311,39 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, sta
     app.get('/v1/installations/:id/jobs/:jobId/logs/:name', async (c) => {
       const id = positive(c.req.param('id'));
       return id ? c.json(await status.log(c.get('caller'), id, c.req.param('jobId'), c.req.param('name'))) : c.json({ error: 'not_found' }, 404);
+    });
+  }
+
+  if (telemetry) {
+    const idOf = (c: Context) => {
+      const n = Number(c.req.param('id'));
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    };
+    const body = async (c: Context) => ((await c.req.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
+    app.get('/v1/installations/:id/telemetry', async (c) => {
+      const id = idOf(c);
+      return id ? c.json(await telemetry.view(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.put('/v1/installations/:id/telemetry', async (c) => {
+      const id = idOf(c);
+      return id ? c.json(await telemetry.update(c.get('caller'), id, await body(c))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.put('/v1/installations/:id/telemetry/key', async (c) => {
+      const id = idOf(c);
+      return id ? c.json(await telemetry.setKey(c.get('caller'), id, await body(c))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.delete('/v1/installations/:id/telemetry/key', async (c) => {
+      const id = idOf(c);
+      return id ? c.json(await telemetry.removeKey(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+  }
+
+  if (stats) {
+    app.get('/v1/installations/:id/insights', async (c) => {
+      const n = Number(c.req.param('id'));
+      if (!Number.isSafeInteger(n) || n <= 0) return c.json({ error: 'not_found' }, 404);
+      c.header('Cache-Control', 'no-store');
+      return c.json(await stats.insights(c.get('caller'), n, { window: c.req.query('window'), repo: c.req.query('repo') }));
     });
   }
 

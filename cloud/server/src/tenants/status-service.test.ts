@@ -223,6 +223,27 @@ describe('status and diagnostics (#71)', () => {
       expect(finishDetail({ repository: 'acme/web' }, { prUrl: 'https://github.com/evil/web/pull/7', updraftOutcome: 'Robert"); DROP' })).toBeUndefined();
       expect(finishDetail({ repository: 'acme/web' }, 'nope')).toBeUndefined();
     });
+
+    it('keeps the lifecycle as codes, counts and booleans only', () => {
+      const d = finishDetail(
+        { repository: 'acme/web' },
+        {
+          loop: { rounds: 2, maxRevisions: 3, reviews: 3, verdict: 'ready-to-merge', stage: 'merged', merged: true, detail: 'free text' },
+          steps: [
+            { kind: 'implement', agent: 'claude', outcome: 'succeeded', verificationPassed: true, publication: 'published' },
+            { kind: 'review', agent: 'codex<script>', outcome: 'Not A Code' },
+            { kind: 'deploy' },
+            'nope',
+          ],
+        },
+      );
+      expect(d).toEqual({
+        loop: { rounds: 2, maxRevisions: 3, reviews: 3, verdict: 'ready-to-merge', stage: 'merged', merged: true },
+        steps: [{ kind: 'implement', agent: 'claude', outcome: 'succeeded', verificationPassed: true, publication: 'published' }, { kind: 'review' }],
+      });
+      expect(finishDetail({ repository: 'acme/web' }, { loop: { rounds: -1, reviews: 1 }, steps: [] })).toBeUndefined();
+      expect(finishDetail({ repository: 'acme/web' }, { loop: { rounds: 0, reviews: 0, stage: 'launching-rockets' } })).toEqual({ loop: { rounds: 0, reviews: 0 } });
+    });
   });
 
   describe('logs', () => {

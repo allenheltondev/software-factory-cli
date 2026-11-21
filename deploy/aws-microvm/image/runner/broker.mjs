@@ -149,6 +149,8 @@ export async function startBrokerJob(payload, { client, createAwsDeps, now = Dat
     resultKeyPrefix: d.resultKeyPrefix,
     stateKey: d.stateKey,
     agentKeySecrets: d.agentKeySecrets ?? {},
+    // The tenant's agent telemetry (telemetry.mjs), when it is on: where to, and the key's secret.
+    ...(d.telemetry && typeof d.telemetry === 'object' ? { telemetry: d.telemetry } : {}),
   };
   const deps = {
     ...createAwsDeps(payload.region, { credentials: brokerCredentialProvider(client, started.credentials, { now }) }),

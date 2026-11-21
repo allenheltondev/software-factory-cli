@@ -102,6 +102,32 @@ describe('the job broker', () => {
     expect(JSON.stringify(policy)).not.toContain('tenants/55/config/2/');
   });
 
+  it('hands the job its telemetry settings, never as an agent key, only while telemetry is on with a key', async () => {
+    const base = { provider: 'honeycomb' as const, region: 'eu' as const, serviceName: 'factory', captureContent: true, updatedAt: '', updatedBy: 'pat' };
+    await store.putTelemetry(55, { ...base, enabled: true }, 0);
+    const noKey = await handle({ action: 'start', jobId: job.jobId, token });
+    expect(noKey.ok && 'descriptor' in noKey && noKey.descriptor.telemetry).toBeFalsy();
+    await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }, 1);
+    const on = await handle({ action: 'credentials', jobId: job.jobId, token });
+    expect(on).toMatchObject({
+      ok: true,
+      descriptor: { telemetry: { region: 'eu', secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001', serviceName: 'factory', captureContent: true } },
+    });
+    if (on.ok && 'descriptor' in on) expect(Object.keys(on.descriptor.agentKeySecrets)).not.toContain('HONEYCOMB_API_KEY');
+    await store.putTelemetry(55, { ...base, enabled: false, key: { updatedAt: '', updatedBy: 'pat' } }, 2);
+    const off = await handle({ action: 'credentials', jobId: job.jobId, token });
+    expect(off.ok && 'descriptor' in off && off.descriptor.telemetry).toBeFalsy();
+  });
+
+  it('keeps the trace a finish reports, and records how the export went', async () => {
+    await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat' } }, 0);
+    await handle({ action: 'start', jobId: job.jobId, token });
+    const traceId = 'ab'.repeat(16);
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { telemetry: { traceId, spans: 40, exported: 38, failed: 2, lastError: 'HTTP 503', startedAt: '2026-11-20T12:00:00.000Z' } } });
+    expect((await store.getJobSummary(55, job.jobId))?.detail?.telemetry).toEqual({ traceId, spans: 40, exported: 38, failed: 2, lastError: 'HTTP 503', startedAt: '2026-11-20T12:00:00.000Z' });
+    expect((await store.getTelemetry(55))?.lastExport).toMatchObject({ jobId: job.jobId, traceId, exported: 38, failed: 2, lastError: 'HTTP 503' });
+  });
+
   it('refuses a wrong token, an unknown job and malformed input with the same answer', async () => {
     const wrong = await handle({ action: 'start', jobId: job.jobId, token: randomBytes(32).toString('base64url') });
     const unknown = await handle({ action: 'start', jobId: 'job_nobody00', token });

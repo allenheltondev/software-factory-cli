@@ -66,6 +66,8 @@ function fakeTable() {
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(disabledReason)') return Boolean(item) && item!.disabledReason === undefined;
     if (expr === 'phase = :reserved') return Boolean(item) && item!.phase === values[':reserved'];
     if (expr === 'attribute_exists(pk) AND phase = :phase') return Boolean(item) && item!.phase === values[':phase'];
+    if (expr === 'attribute_not_exists(pk) OR attribute_not_exists(version)') return !item || item.version === undefined;
+    if (expr === 'version = :v') return item?.version === values[':v'];
     throw new Error(`fake table: unsupported condition ${expr}`);
   }
 
@@ -414,6 +416,21 @@ describe('dynamo store: review fixes on #78', () => {
     await store.markConfigReady(55, c);
     expect(await store.activateConfig(55, c, { expectedActive: a })).toBe('activated');
     expect(await store.activateConfig(55, b, { expectedActive: a })).toBe('superseded');
+  });
+
+  it('writes telemetry settings only over the version that was read, and not after the uninstall', async () => {
+    const { store } = await seeded();
+    const settings = { provider: 'honeycomb' as const, enabled: true, region: 'us' as const, serviceName: 'updraft', captureContent: false, updatedAt: 't', updatedBy: 'a' };
+    expect(await store.getTelemetry(55)).toBeNull();
+    expect(await store.putTelemetry(55, settings, 0)).toBe('stored');
+    expect(await store.putTelemetry(55, { ...settings, captureContent: true }, 0)).toBe('conflict');
+    expect(await store.getTelemetry(55)).toMatchObject({ version: 1, captureContent: false });
+    expect(await store.putTelemetry(55, { ...settings, captureContent: true }, 1)).toBe('stored');
+    expect(await store.getTelemetry(55)).toMatchObject({ version: 2, captureContent: true });
+    await store.recordTelemetryExport(55, { at: 't', jobId: 'job_1', spans: 3, exported: 3, failed: 0 });
+    expect((await store.getTelemetry(55))?.lastExport).toMatchObject({ jobId: 'job_1', exported: 3 });
+    await store.markUninstalled(55, DEADLINE);
+    expect(await store.putTelemetry(55, settings, 2)).toBe('uninstalled');
   });
 
   it('refuses key metadata once the tenant is uninstalled', async () => {

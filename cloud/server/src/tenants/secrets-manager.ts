@@ -6,16 +6,18 @@ export function createSecretsManagerPort(client = new SecretsManagerClient({})):
   const missing = (err: unknown) => (err as { name?: string }).name === 'ResourceNotFoundException';
   return {
     async put(name, value, tags) {
+      // The version written: immutable, so a reader can be pinned to exactly this value.
+      const version = (out: { VersionId?: string | undefined }) => (out.VersionId ? { versionId: out.VersionId } : {});
       try {
-        await client.send(new PutSecretValueCommand({ SecretId: name, SecretString: value }));
+        return version(await client.send(new PutSecretValueCommand({ SecretId: name, SecretString: value })));
       } catch (err) {
         if (!missing(err)) throw err;
         try {
-          await client.send(new CreateSecretCommand({ Name: name, SecretString: value, Tags: Object.entries(tags).map(([Key, Value]) => ({ Key, Value })) }));
+          return version(await client.send(new CreateSecretCommand({ Name: name, SecretString: value, Tags: Object.entries(tags).map(([Key, Value]) => ({ Key, Value })) })));
         } catch (e) {
           // Created by a concurrent write between the two calls: this one replaces it.
           if ((e as { name?: string }).name !== 'ResourceExistsException') throw e;
-          await client.send(new PutSecretValueCommand({ SecretId: name, SecretString: value }));
+          return version(await client.send(new PutSecretValueCommand({ SecretId: name, SecretString: value })));
         }
       }
     },
