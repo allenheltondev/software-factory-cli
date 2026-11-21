@@ -331,6 +331,150 @@ function parseJson(line) {
   }
 }
 
+/** Total length of a set of [start, end] intervals, overlaps counted once. */
+function unionMs(intervals) {
+  let total = 0;
+  let curStart = null;
+  let curEnd = null;
+  for (const [s, e] of [...intervals].sort((a, b) => a[0] - b[0])) {
+    if (curEnd === null || s > curEnd) {
+      if (curEnd !== null) total += curEnd - curStart;
+      curStart = s;
+      curEnd = e;
+    } else curEnd = Math.max(curEnd, e);
+  }
+  return curEnd === null ? total : total + curEnd - curStart;
+}
+
+/** Thresholds past which a run is marked as going in circles (`updraft.agent.thrashing`). */
+export const THRASH = { repeatedCommands: 3, editsOneFile: 8, consecutiveToolErrors: 5 };
+
+/**
+ * How the agent worked, from the order and outcome of its calls: when it first edited and first
+ * tested, how many edit→test cycles it went through and how many test runs it took to get one
+ * to pass, whether it repeated itself, which file it kept coming back to, how its time split
+ * between the model, the tools and neither, and how its context grew. Commands are compared in
+ * memory only; nothing but counts, times and a path leaves this.
+ */
+export function createBehavior() {
+  const b = {
+    categories: {},
+    firstToolAt: null,
+    firstEditAt: null,
+    firstTestAt: null,
+    firstGreenAt: null,
+    testRuns: 0,
+    testRunsFailed: 0,
+    testRunsUntilGreen: null,
+    editTestCycles: 0,
+    editedSinceTest: false,
+    edits: 0,
+    commands: new Map(),
+    repeatedCommands: 0,
+    editsByFile: new Map(),
+    filesRead: new Set(),
+    errorStreak: 0,
+    maxErrorStreak: 0,
+    toolIntervals: [],
+    chatIntervals: [],
+    chats: 0,
+    firstContext: null,
+    lastContext: null,
+    peakContext: 0,
+    inputTotal: 0,
+    cachedTotal: 0,
+  };
+  return {
+    tool({ category, name, attrs, command, failed, start, end }) {
+      const c = category ?? 'other';
+      b.categories[c] = (b.categories[c] ?? 0) + 1;
+      b.firstToolAt ??= start;
+      b.toolIntervals.push([start, end]);
+      b.errorStreak = failed ? b.errorStreak + 1 : 0;
+      b.maxErrorStreak = Math.max(b.maxErrorStreak, b.errorStreak);
+      if (c === 'edit' && !failed) {
+        b.firstEditAt ??= start;
+        b.edits += 1;
+        b.editedSinceTest = true;
+        const paths = attrs['updraft.tool.file.paths'] ?? (attrs['updraft.tool.file.path'] ? [attrs['updraft.tool.file.path']] : []);
+        for (const p of paths) b.editsByFile.set(p, (b.editsByFile.get(p) ?? 0) + 1);
+      }
+      if (name === 'Read' && attrs['updraft.tool.file.path']) b.filesRead.add(attrs['updraft.tool.file.path']);
+      if (c === 'test') {
+        b.firstTestAt ??= start;
+        b.testRuns += 1;
+        const red = failed || (attrs['updraft.test.failed'] ?? 0) > 0;
+        if (red) b.testRunsFailed += 1;
+        else if (b.firstGreenAt === null) {
+          b.firstGreenAt = end;
+          b.testRunsUntilGreen = b.testRuns;
+        }
+        if (b.editedSinceTest) b.editTestCycles += 1;
+        b.editedSinceTest = false;
+      }
+      if (typeof command === 'string' && command.trim()) {
+        // The same command again with no edit since: it cannot have a different answer.
+        const key = command.trim().replace(/\s+/g, ' ');
+        if (b.commands.get(key) === b.edits) b.repeatedCommands += 1;
+        if (b.commands.size < 5000) b.commands.set(key, b.edits);
+      }
+    },
+    /** One model response; returns attributes for its chat span. */
+    chat({ start, end, input, cached, main }) {
+      b.chatIntervals.push([start, end]);
+      if (!main) return { 'updraft.chat.cache_hit_ratio': input ? Math.round((cached / input) * 1000) / 1000 : undefined };
+      b.chats += 1;
+      b.firstContext ??= input;
+      b.lastContext = input;
+      b.peakContext = Math.max(b.peakContext, input);
+      b.inputTotal += input;
+      b.cachedTotal += cached;
+      return { 'updraft.chat.index': b.chats, 'updraft.chat.cache_hit_ratio': input ? Math.round((cached / input) * 1000) / 1000 : undefined };
+    },
+    /** The run's behavior, for its invoke_agent span. */
+    attributes(start, end) {
+      const since = (t) => (t === null ? undefined : Math.max(0, t - start));
+      let hotFile;
+      let maxEdits = 0;
+      for (const [p, n] of b.editsByFile) {
+        if (n > maxEdits) {
+          maxEdits = n;
+          hotFile = p;
+        }
+      }
+      const model = unionMs(b.chatIntervals);
+      const tool = unionMs(b.toolIntervals);
+      const busy = unionMs([...b.chatIntervals, ...b.toolIntervals]);
+      const thrashing = b.repeatedCommands >= THRASH.repeatedCommands || maxEdits >= THRASH.editsOneFile || b.maxErrorStreak >= THRASH.consecutiveToolErrors;
+      return {
+        ...Object.fromEntries(Object.entries(b.categories).map(([c, n]) => [`updraft.agent.tools.${c}`, n])),
+        'updraft.agent.time_to_first_tool_ms': since(b.firstToolAt),
+        'updraft.agent.time_to_first_edit_ms': since(b.firstEditAt),
+        'updraft.agent.time_to_first_test_ms': since(b.firstTestAt),
+        'updraft.agent.time_to_first_green_ms': since(b.firstGreenAt),
+        'updraft.agent.test_runs': b.testRuns,
+        'updraft.agent.test_runs_failed': b.testRunsFailed,
+        'updraft.agent.test_runs_until_green': b.testRunsUntilGreen ?? undefined,
+        'updraft.agent.edit_test_cycles': b.editTestCycles,
+        'updraft.agent.edited_after_last_test': b.editedSinceTest && b.testRuns > 0 ? true : undefined,
+        'updraft.agent.repeated_commands': b.repeatedCommands,
+        'updraft.agent.files_edited': b.editsByFile.size,
+        'updraft.agent.files_read': b.filesRead.size,
+        'updraft.agent.max_edits_one_file': maxEdits || undefined,
+        'updraft.agent.hot_file': maxEdits >= 3 ? hotFile : undefined,
+        'updraft.agent.max_consecutive_tool_errors': b.maxErrorStreak,
+        'updraft.agent.thrashing': thrashing,
+        'updraft.agent.model_ms': model,
+        'updraft.agent.tool_ms': tool,
+        'updraft.agent.idle_ms': Math.max(0, end - start - busy),
+        'updraft.agent.peak_context_tokens': b.peakContext || undefined,
+        'updraft.agent.context_growth_tokens': b.lastContext !== null ? b.lastContext - b.firstContext : undefined,
+        'updraft.agent.cache_hit_ratio': b.inputTotal ? Math.round((b.cachedTotal / b.inputTotal) * 1000) / 1000 : undefined,
+      };
+    },
+  };
+}
+
 /**
  * One run's log, turned into spans as it is read. `emit(span)` gets each span when it ends.
  * Lines come with the time they were read (`at`), which is when they were written, give or take
@@ -359,6 +503,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   /** Updraft's publication, review and revision steps after the run, by step. */
   const steps = new Map();
   let compactions = 0;
+  const behavior = createBehavior();
   /** Where the agent's paths are relative to: its own working directory, and the worktree. */
   const roots = () => [h.cwd, h.checkout].filter(Boolean);
 
@@ -490,6 +635,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     summary.chats += 1;
     summary.inputTokens += input;
     summary.outputTokens += output;
+    Object.assign(c.span.attributes, behavior.chat({ start: c.span.start, end: c.end ?? at, input, cached: cacheRead, main: !ctx.sub }));
     finish(c.span, c.end ?? at);
   }
 
@@ -622,6 +768,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
           tool.span.attributes['error.type'] = 'tool_error';
           summary.toolErrors += 1;
         } else tool.span.attributes['gen_ai.tool.call.result'] = content(text);
+        behavior.tool({ category: tool.category, name: tool.name, attrs: tool.span.attributes, command: tool.name === 'Bash' ? tool.input.command : undefined, failed, start: tool.span.start, end: at });
         // The subagent this tool ran, if any, ends with it.
         const sub = contexts.get(block.tool_use_id);
         if (sub) {
@@ -716,6 +863,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     summary.chats += 1;
     summary.inputTokens += input;
     summary.outputTokens += output;
+    if (usage) Object.assign(t.span.attributes, behavior.chat({ start: t.span.start, end: at, input, cached, main: true }));
     finish(t.span, at);
   }
 
@@ -808,6 +956,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (item.type === 'command_execution') Object.assign(open.span.attributes, resultAttributes(open.category, open.name, typeof item.aggregated_output === 'string' ? item.aggregated_output : '', failed));
     if (typeof item.exit_code === 'number') open.span.attributes['updraft.tool.exit_code'] = item.exit_code;
     if (result !== undefined && !failed) open.span.attributes['gen_ai.tool.call.result'] = content(result);
+    behavior.tool({ category: open.category, name: open.name, attrs: open.span.attributes, command: item.type === 'command_execution' ? item.command : undefined, failed, start: open.span.start, end: at });
     finish(open.span, at);
   }
 
@@ -1101,6 +1250,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
           'updraft.agent.tool_calls': summary.tools,
           'updraft.agent.tool_errors': summary.toolErrors,
           'updraft.agent.compactions': compactions || undefined,
+          ...behavior.attributes(agentSpan.start, agentSpan.end ?? at),
           'gen_ai.usage.input_tokens': summary.inputTokens || undefined,
           'gen_ai.usage.output_tokens': summary.outputTokens || undefined,
           ...(summary.change
@@ -1117,6 +1267,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
               }
             : {}),
         });
+        summary.thrashing = agentSpan.attributes['updraft.agent.thrashing'] === true;
         finish(agentSpan, agentSpan.end ?? at);
       }
     },
@@ -1360,6 +1511,7 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
               'updraft.runs': traces.length,
               'updraft.runs.kinds': [...new Set(runSummaries.map((r) => r.kind).filter(Boolean))],
               'updraft.runs.failed': runSummaries.filter((r) => r.outcome && r.outcome !== 'succeeded').length,
+              'updraft.agent.thrashing': runSummaries.some((r) => r.thrashing),
               'gen_ai.usage.input_tokens': sum((r) => r.inputTokens) || undefined,
               'gen_ai.usage.output_tokens': sum((r) => r.outputTokens) || undefined,
               'updraft.agent.reported_cost_usd': costs.length ? costs.reduce((n, r) => n + r.costUsd, 0) : undefined,

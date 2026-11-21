@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import * as claude from '../../../test/claude-stream.ts';
 import * as codex from '../../../test/codex-stream.ts';
 import { createRedactor } from '../image/runner/redact.mjs';
-import { MAX_ATTRIBUTE_CHARS, createAgentTracer, createExporter, otlpRequest, parseHeaderLine, toOtlpSpan } from '../image/runner/telemetry.mjs';
+import { MAX_ATTRIBUTE_CHARS, agentSpanIdFor, createAgentTracer, createExporter, otlpRequest, parseHeaderLine, toOtlpSpan } from '../image/runner/telemetry.mjs';
 
 /** The header the worker writes at the top of run.log (src/worker/live.ts). */
 function header({ runId = 'run_1', kind = 'implement', agent = 'claude-opus', adapter = 'claude', model = 'claude-opus-4-1' } = {}) {
@@ -434,6 +434,87 @@ describe('agent telemetry: structural detail, without content', () => {
     expect(one(spans, 'execute_tool apply_patch').attributes).toMatchObject({ 'updraft.tool.file.path': 'src/theme.test.ts', 'updraft.tool.file.test': true, 'updraft.tool.category': 'edit' });
     expect(one(spans, 'chat gpt-5-codex').attributes['updraft.usage.reasoning_output_tokens']).toBe(64);
     expect(one(spans, 'invoke_agent codex').events.find((e) => e.name === 'todo.update').attributes).toMatchObject({ 'updraft.todo.total': 2, 'updraft.todo.completed': 1 });
+  });
+});
+
+describe('agent telemetry: how the agent worked', () => {
+  const edit = (id, file) => ({ type: 'assistant', parent_tool_use_id: null, message: { id: `msg_${id}`, model: 'claude-sonnet-4-5', content: [{ type: 'tool_use', id, name: 'Edit', input: { file_path: `/work/tree/${file}`, old_string: 'a', new_string: 'b' } }], stop_reason: 'tool_use', usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 } } });
+  const bash = (id, command) => ({ ...claude.assistantToolUse(id, command), message: { ...claude.assistantToolUse(id, command).message, id: `msg_${id}` } });
+  const failedResult = (id, text) => {
+    const r = claude.toolResult(id, text);
+    r.message.content[0].is_error = true;
+    return r;
+  };
+
+  it('times the first edit, test and green run, counts edit→test cycles and repeats, and splits the time', async () => {
+    const t = setup();
+    await t.step('run_1', `${header()}\n`, 0);
+    await t.step('run_1', claude.stream(claude.init('/work/tree')), 1000);
+    await t.step('run_1', claude.stream(bash('t0', 'ls src')), 2000); // model: 3s since the start
+    await t.step('run_1', claude.stream(claude.toolResult('t0', 'a.ts')), 1000);
+    await t.step('run_1', claude.stream(bash('t1', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(failedResult('t1', 'Exit code 1\n Tests  1 failed | 1 passed (2)')), 4000);
+    await t.step('run_1', claude.stream(bash('t2', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(failedResult('t2', 'Exit code 1\n Tests  1 failed | 1 passed (2)')), 4000);
+    for (const [i, id] of ['e1', 'e2', 'e3'].entries()) {
+      await t.step('run_1', claude.stream(edit(id, 'src/theme.ts')), 1000);
+      await t.step('run_1', claude.stream(claude.toolResult(id, 'ok')), 100 + i);
+    }
+    await t.step('run_1', claude.stream(bash('t3', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(claude.toolResult('t3', ' Tests  2 passed (2)')), 4000);
+    await t.step('run_1', claude.stream(claude.assistantText('done'), claude.success('ok')), 1000);
+    await t.step('run_1', '---- end of agent output ----\noutcome: succeeded\n', 0);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const agent = one(t.exporter.spans, 'invoke_agent claude-opus');
+    expect(agent.attributes).toMatchObject({
+      'updraft.agent.tools.search': 1,
+      'updraft.agent.tools.test': 3,
+      'updraft.agent.tools.edit': 3,
+      'updraft.agent.time_to_first_tool_ms': 3000,
+      'updraft.agent.test_runs': 3,
+      'updraft.agent.test_runs_failed': 2,
+      'updraft.agent.test_runs_until_green': 3,
+      // npm test, npm test with no edit between: one repeat; the third came after edits.
+      'updraft.agent.repeated_commands': 1,
+      'updraft.agent.edit_test_cycles': 1,
+      'updraft.agent.files_edited': 1,
+      'updraft.agent.max_edits_one_file': 3,
+      'updraft.agent.hot_file': 'src/theme.ts',
+      'updraft.agent.max_consecutive_tool_errors': 2,
+      'updraft.agent.thrashing': false,
+      'updraft.agent.peak_context_tokens': 2000,
+    });
+    const a = agent.attributes;
+    expect(a['updraft.agent.time_to_first_edit_ms']).toBeGreaterThan(a['updraft.agent.time_to_first_test_ms']);
+    expect(a['updraft.agent.time_to_first_green_ms']).toBe(agent.end - agent.start - 1000);
+    expect(a['updraft.agent.model_ms'] + a['updraft.agent.tool_ms'] + a['updraft.agent.idle_ms']).toBe(agent.end - agent.start);
+    const chats = t.exporter.spans.filter((s) => s.name.startsWith('chat'));
+    expect(chats.map((c) => c.attributes['updraft.chat.index'])).toEqual(chats.map((_, i) => i + 1));
+  });
+
+  it('marks a run that goes in circles', async () => {
+    const t = setup();
+    await t.step('run_1', `${header()}\n`, 0);
+    for (let i = 0; i < 4; i++) {
+      await t.step('run_1', claude.stream(bash(`b${i}`, 'npm run build')), 500);
+      await t.step('run_1', claude.stream(failedResult(`b${i}`, 'Exit code 2')), 500);
+    }
+    await t.step('run_1', '---- end of agent output ----\noutcome: failed\n', 0);
+    await t.tracer.stop({ outcome: 'failed' });
+    expect(one(t.exporter.spans, 'invoke_agent claude-opus').attributes).toMatchObject({ 'updraft.agent.repeated_commands': 3, 'updraft.agent.thrashing': true, 'updraft.agent.max_consecutive_tool_errors': 4 });
+    expect(one(t.exporter.spans, 'invoke_workflow updraft').attributes['updraft.agent.thrashing']).toBe(true);
+  });
+
+  it('links a run to the earlier runs it follows, in other traces', async () => {
+    const t = setup();
+    const review = 'c'.repeat(32);
+    await t.step('run_9', `${header({ runId: 'run_9', kind: 'revision' }).replace('pool: deep', 'follows: run run_5 (review, trace ' + review + ')\npool: deep')}\n`, 0);
+    await t.step('run_9', '---- end of agent output ----\noutcome: succeeded\n', 1000);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const agent = one(t.exporter.spans, 'invoke_agent claude-opus');
+    expect(agent.spanId).toBe(agentSpanIdFor('run_9'));
+    expect(agent.links).toEqual([{ traceId: review, spanId: agentSpanIdFor('run_5'), attributes: { 'updraft.link.relation': 'review', 'updraft.run.id': 'run_5' } }]);
+    expect(toOtlpSpan(agent).links).toEqual([{ traceId: review, spanId: agentSpanIdFor('run_5'), attributes: [{ key: 'updraft.link.relation', value: { stringValue: 'review' } }, { key: 'updraft.run.id', value: { stringValue: 'run_5' } }] }]);
   });
 });
 

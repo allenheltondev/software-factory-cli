@@ -117,6 +117,40 @@ invoke_workflow updraft
 The root span is the job in one wide event: tokens, reported cost and tool calls over every
 run, the last review's verdict, findings and outcome, and the last change's size.
 
+## How the agent worked
+
+From the order and outcome of a run's calls, its `invoke_agent` span also says how it went:
+
+| Attribute | What it is |
+| --- | --- |
+| `updraft.agent.tools.<category>` | tool calls by category |
+| `updraft.agent.time_to_first_tool_ms`, `_edit_ms`, `_test_ms`, `_green_ms` | from the agent's start to its first tool call, edit, test run and passing test run: how long it explored before it changed anything |
+| `updraft.agent.test_runs`, `.test_runs_failed`, `.test_runs_until_green` | test runs, the red ones, and how many it took to see green |
+| `updraft.agent.edit_test_cycles` | an edit followed by a test run, counted once per test run; `.edited_after_last_test` when it changed code after its last test |
+| `updraft.agent.repeated_commands` | a command run again with no edit since, which cannot answer differently |
+| `updraft.agent.files_edited`, `.files_read`, `.max_edits_one_file`, `.hot_file` | the file it kept coming back to (3 edits or more) |
+| `updraft.agent.max_consecutive_tool_errors` | the longest run of failed tool calls |
+| `updraft.agent.thrashing` | 3 or more repeated commands, 8 or more edits to one file, or 5 or more tool errors in a row; also on the job's span if any run was |
+| `updraft.agent.model_ms`, `.tool_ms`, `.idle_ms` | time waiting on the model, in tools, and in neither (overlaps counted once; they add up to the span) |
+| `updraft.agent.peak_context_tokens`, `.context_growth_tokens`, `.cache_hit_ratio` | how the main agent's context grew; each `chat` span has `updraft.chat.index` and `updraft.chat.cache_hit_ratio` |
+
+Commands are compared in memory, by their text; only the counts leave the microVM.
+
+## Across jobs
+
+Each job is its own trace, so a revision and the review it answers are in different traces.
+They are linked: the runner gives `updraft run-event` its trace id (`UPDRAFT_TRACE_ID`), the
+worker records it with every run it starts (a `trace:<run>` row in `meta`, merged into the
+shared state and pruned with the run), and writes the earlier traced runs a run follows into
+its `run.log` header (`follows: run <id> (<relation>, trace <trace id>)`). A run's
+`invoke_agent` span id is derived from its run id, so the runner turns each line into a span
+link to that run's `invoke_agent` span, with `updraft.link.relation`:
+
+- `review`: the review whose findings a revision answers, and `source`, the run that opened the pull request;
+- `code`: the run that pushed the commit a review looks at;
+- `resumes`: the run that waited on another pull request, for its follow-up;
+- `retry`: the job's earlier attempt.
+
 ## Content
 
 Off by default. With **Prompts and outputs** on, spans also carry:
