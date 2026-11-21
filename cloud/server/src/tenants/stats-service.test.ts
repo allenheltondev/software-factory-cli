@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -93,6 +93,55 @@ describe('insights', () => {
     expect(res.headers.get('cache-control')).toBe('no-store');
     expect(((await res.json()) as { window: string }).window).toBe('7d');
     expect((await app.request('/api/v1/installations/x/insights')).status).toBe(404);
+  });
+});
+
+describe('the snapshot cache', () => {
+  function many(bytes: Uint8Array, cacheBytes: number) {
+    const etags = new Map<number, string>();
+    const readState: StateReader = async (key, etag) => {
+      const id = Number(/tenants\/(\d+)\//.exec(key)![1]);
+      const current = etags.get(id) ?? '"v1"';
+      if (etag === current) return { unchanged: true };
+      return { body: bytes, etag: current };
+    };
+    const cacheDir = join(mkdtempSync(join(tmpdir(), 'updraft-cache-')), 'state');
+    const service = createStatsService({ github: { member: async () => ({}) as never }, readState, cacheDir, cacheBytes, now: () => END, log: () => {} });
+    return { service, cacheDir, etags, files: () => readdirSync(cacheDir) };
+  }
+
+  it('keeps snapshots of many tenants within the byte budget, least recently used out first', async () => {
+    const bytes = stateBytes();
+    const { service, files } = many(bytes, bytes.byteLength * 3);
+    for (let id = 1; id <= 70; id++) await service.insights(caller, id, {});
+    expect(files()).toHaveLength(3);
+    expect(files().map((f) => f.split('-')[0]).sort()).toEqual(['68', '69', '70']);
+  });
+
+  it('removes a tenant\'s previous snapshot before writing its new one', async () => {
+    const bytes = stateBytes();
+    const { service, files, etags } = many(bytes, bytes.byteLength);
+    await service.insights(caller, 1, {});
+    etags.set(1, '"v2"');
+    await service.insights(caller, 1, { window: '7d' });
+    expect(files()).toHaveLength(1);
+  });
+
+  it('reads a snapshot larger than the budget once, and does not keep it', async () => {
+    const bytes = stateBytes();
+    const { service, files } = many(bytes, bytes.byteLength - 1);
+    const out = await service.insights(caller, 1, {});
+    expect(out.hasState).toBe(true);
+    expect(out.report.overall.work.finished.total.total).toBeGreaterThan(0);
+    expect(files()).toEqual([]);
+  });
+
+  it('takes an inherited name for a window as an unsupported one', async () => {
+    const bytes = stateBytes();
+    const { service } = many(bytes, bytes.byteLength * 2);
+    for (const window of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      expect((await service.insights(caller, 1, { window })).window).toBe('30d');
+    }
   });
 });
 

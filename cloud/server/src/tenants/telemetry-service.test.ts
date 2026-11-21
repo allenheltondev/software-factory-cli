@@ -68,6 +68,45 @@ describe('agent telemetry settings', () => {
     expect(off).toMatchObject({ enabled: false, keyConfigured: false, serviceName: 'factory' });
   });
 
+  it('keeps an opt-out made while a key rotation was being checked', async () => {
+    let release: () => void = () => {};
+    const paused = new Promise<void>((r) => (release = r));
+    let calls = 0;
+    const { service, store } = await setup(async () => {
+      calls += 1;
+      if (calls === 2) await paused;
+      return { result: 'valid', auth: { type: 'ingest', canSend: true, team: { name: 'Acme', slug: 'acme' } } };
+    });
+    await service.setKey(caller, 55, { value: KEY });
+    await service.update(caller, 55, { captureContent: true });
+    // A rotation starts and waits on Honeycomb; meanwhile another member opts out of both.
+    const rotation = service.setKey(caller, 55, { value: KEY });
+    await new Promise((r) => setTimeout(r, 5));
+    await service.update(caller, 55, { enabled: false, captureContent: false });
+    release();
+    const after = await rotation;
+    expect(after).toMatchObject({ enabled: false, captureContent: false, keyConfigured: true });
+    expect(await store.getTelemetry(55)).toMatchObject({ enabled: false, captureContent: false });
+  });
+
+  it('writes only over the version it read, and retries on a conflict', async () => {
+    const { service, store } = await setup();
+    await service.setKey(caller, 55, { value: KEY });
+    const v = (await store.getTelemetry(55))!.version!;
+    expect(await store.putTelemetry(55, (await store.getTelemetry(55))!, v - 1)).toBe('conflict');
+    // Another write lands between this update's read and its write: it is reapplied on top.
+    const put = store.putTelemetry.bind(store);
+    let once = true;
+    store.putTelemetry = async (id, settings, expected) => {
+      if (once) {
+        once = false;
+        await put(id, { ...(await store.getTelemetry(id))!, serviceName: 'theirs' }, expected);
+      }
+      return put(id, settings, expected);
+    };
+    expect(await service.update(caller, 55, { captureContent: true })).toMatchObject({ captureContent: true, serviceName: 'theirs' });
+  });
+
   it('is for members only, and served at /api/v1/installations/:id/telemetry', async () => {
     const { service } = await setup();
     await expect(service.view(caller, 56)).rejects.toMatchObject({ status: 403 });

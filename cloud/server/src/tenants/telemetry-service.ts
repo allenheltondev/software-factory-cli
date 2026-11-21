@@ -140,11 +140,25 @@ export interface TelemetryServiceDeps {
 
 export function createTelemetryService({ store, github, secrets, check, now = Date.now }: TelemetryServiceDeps) {
   const at = () => new Date(now()).toISOString();
-  async function save(installationId: number, settings: TelemetrySettings): Promise<TelemetryView> {
-    if ((await store.putTelemetry(installationId, settings)) === 'uninstalled') throw new FlowError('uninstalled', 409, 'This installation was uninstalled');
-    return telemetryView(settings);
+  const current = async (installationId: number): Promise<TelemetrySettings> =>
+    (await store.getTelemetry(installationId)) ?? { ...DEFAULT_TELEMETRY, updatedAt: '', updatedBy: '' };
+
+  /**
+   * Applies `change` to the settings as they are now and writes them over that version only; on
+   * a conflict (another member saved in between) it reads again and reapplies the change. A
+   * change names only the fields it sets, so it never undoes someone else's (an opt-out made
+   * while a key was being checked stays an opt-out).
+   */
+  async function mutate(installationId: number, change: (latest: TelemetrySettings) => TelemetrySettings): Promise<TelemetryView> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const latest = await current(installationId);
+      const next = change(latest);
+      const out = await store.putTelemetry(installationId, next, latest.version ?? 0);
+      if (out === 'uninstalled') throw new FlowError('uninstalled', 409, 'This installation was uninstalled');
+      if (out === 'stored') return telemetryView({ ...next, version: (latest.version ?? 0) + 1 });
+    }
+    throw new FlowError('invalid_settings', 409, 'Someone else is changing these settings right now; reload and try again');
   }
-  const current = async (installationId: number) => (await store.getTelemetry(installationId)) ?? { ...DEFAULT_TELEMETRY, updatedAt: '', updatedBy: '' };
 
   return {
     async view(caller: Caller, installationId: number): Promise<TelemetryView> {
@@ -156,8 +170,7 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
       const ctx = await github.configContext(caller, installationId);
       const value = typeof input.value === 'string' ? input.value.trim() : '';
       if (!KEY_SHAPE.test(value)) throw new FlowError('invalid_key', 400, 'That does not look like a Honeycomb API key; nothing was changed');
-      const before = await current(installationId);
-      const region: Region = input.region === 'eu' ? 'eu' : input.region === 'us' ? 'us' : before.region;
+      const region: Region = input.region === 'eu' ? 'eu' : input.region === 'us' ? 'us' : (await current(installationId)).region;
       // The value is never repeated, in any message.
       const verdict = await check(region, value);
       if (verdict.result === 'invalid') throw new FlowError('invalid_key', 400, `Honeycomb (${region.toUpperCase()}) rejected that key; nothing was changed. Is it for the other region?`);
@@ -167,45 +180,36 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
       if (!tenant || tenant.disabledReason === 'uninstalled') throw new FlowError('uninstalled', 409, 'This installation was uninstalled');
       await secrets.put(telemetrySecretName(installationId), value, { 'updraft:installation': String(installationId), 'updraft:key': TELEMETRY_KEY_NAME });
       const { team, environment, type } = verdict.auth;
-      return save(installationId, {
-        ...before,
-        region,
-        // The first key turns telemetry on; a rotation keeps what was chosen.
-        enabled: before.key ? before.enabled : true,
-        updatedAt: at(),
-        updatedBy: ctx.githubLogin,
-        key: { updatedAt: at(), updatedBy: ctx.githubLogin, type, ...(team ? { team } : {}), ...(environment ? { environment } : {}) },
-      });
+      const key = { updatedAt: at(), updatedBy: ctx.githubLogin, type, ...(team ? { team } : {}), ...(environment ? { environment } : {}) };
+      // Read after the check, not before it: only the region and the key change, and the first key
+      // turns sending on. Whether it sends, and with content, stay what the latest save said.
+      return mutate(installationId, (latest) => ({ ...latest, region, key, enabled: latest.key ? latest.enabled : true, updatedAt: at(), updatedBy: ctx.githubLogin }));
     },
 
     async update(caller: Caller, installationId: number, input: { enabled?: unknown; serviceName?: unknown; captureContent?: unknown }): Promise<TelemetryView> {
       const ctx = await github.configContext(caller, installationId);
-      const before = await current(installationId);
-      const next = { ...before };
-      if (input.enabled !== undefined) {
-        if (typeof input.enabled !== 'boolean') throw new FlowError('invalid_settings', 400, '`enabled` is true or false');
-        if (input.enabled && !before.key) throw new FlowError('invalid_settings', 400, 'Add a Honeycomb key before turning telemetry on');
-        next.enabled = input.enabled;
+      if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new FlowError('invalid_settings', 400, '`enabled` is true or false');
+      if (input.serviceName !== undefined && (typeof input.serviceName !== 'string' || !SERVICE_NAME.test(input.serviceName))) {
+        throw new FlowError('invalid_settings', 400, 'The service name is 1 to 64 letters, digits, dots, dashes or underscores');
       }
-      if (input.serviceName !== undefined) {
-        if (typeof input.serviceName !== 'string' || !SERVICE_NAME.test(input.serviceName)) {
-          throw new FlowError('invalid_settings', 400, 'The service name is 1 to 64 letters, digits, dots, dashes or underscores');
-        }
-        next.serviceName = input.serviceName;
-      }
-      if (input.captureContent !== undefined) {
-        if (typeof input.captureContent !== 'boolean') throw new FlowError('invalid_settings', 400, '`captureContent` is true or false');
-        next.captureContent = input.captureContent;
-      }
-      return save(installationId, { ...next, updatedAt: at(), updatedBy: ctx.githubLogin });
+      if (input.captureContent !== undefined && typeof input.captureContent !== 'boolean') throw new FlowError('invalid_settings', 400, '`captureContent` is true or false');
+      return mutate(installationId, (latest) => {
+        if (input.enabled === true && !latest.key) throw new FlowError('invalid_settings', 400, 'Add a Honeycomb key before turning telemetry on');
+        return {
+          ...latest,
+          ...(input.enabled !== undefined ? { enabled: input.enabled as boolean } : {}),
+          ...(input.serviceName !== undefined ? { serviceName: input.serviceName as string } : {}),
+          ...(input.captureContent !== undefined ? { captureContent: input.captureContent as boolean } : {}),
+          updatedAt: at(),
+          updatedBy: ctx.githubLogin,
+        };
+      });
     },
 
     async removeKey(caller: Caller, installationId: number): Promise<TelemetryView> {
       const ctx = await github.configContext(caller, installationId);
-      const before = await current(installationId);
       await secrets.remove(telemetrySecretName(installationId));
-      const { key: _key, ...rest } = before;
-      return save(installationId, { ...rest, enabled: false, updatedAt: at(), updatedBy: ctx.githubLogin });
+      return mutate(installationId, ({ key: _key, ...rest }) => ({ ...rest, enabled: false, updatedAt: at(), updatedBy: ctx.githubLogin }));
     },
   };
 }

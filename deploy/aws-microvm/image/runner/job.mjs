@@ -335,6 +335,8 @@ export async function runJob(request, deps) {
     if (telemetry) {
       tracer = createAgentTracer({
         runsDir: path.join(stateDir, 'logs', 'runs'),
+        // The job user owns everything under the state directory: reads are confined to it.
+        confineTo: stateDir,
         captureContent: telemetry.captureContent,
         redact,
         log,
@@ -342,6 +344,7 @@ export async function runJob(request, deps) {
         exporter: createExporter({
           endpoint: telemetry.endpoint,
           apiKey: telemetry.apiKey,
+          redact,
           resource: { 'service.name': telemetry.serviceName, 'updraft.delivery.id': payload.deliveryId, 'updraft.microvm.id': microvmId },
           ...(deps.fetch ? { fetch: deps.fetch } : {}),
           log,

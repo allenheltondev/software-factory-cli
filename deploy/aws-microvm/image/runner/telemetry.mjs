@@ -26,6 +26,7 @@
 // and the verify commands (which are configuration, not content).
 /* global AbortSignal */
 import { randomBytes } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -46,6 +47,8 @@ const MAX_LINE_CHARS = 8 * 1024 * 1024;
 /** One content attribute at most (Honeycomb keeps up to 64 KB per field). */
 export const MAX_ATTRIBUTE_CHARS = 16 * 1024;
 const MAX_RUNS = 64;
+/** The most of a run's prompt that is read. */
+const MAX_PROMPT_BYTES = 256 * 1024;
 const MAX_SPANS_PER_RUN = 20000;
 
 const KIND_INTERNAL = 1;
@@ -103,8 +106,12 @@ export function otlpRequest(spans, resource) {
  * Sends finished spans in batches (OTLP/HTTP, JSON encoding) to `<endpoint>/v1/traces` with the
  * `x-honeycomb-team` header. Never throws: a failure is counted and logged, and the job goes on.
  */
-export function createExporter({ endpoint, apiKey, resource, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
+export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
   const queue = [];
+  // The one way out: every string of every span, and of the resource, passes the job's redactor
+  // here, whatever produced it (a span name, a tool or model name read from the transcript, an
+  // id, a URL). Content was redacted when it was recorded too; redacting twice changes nothing.
+  const cleanResource = redactAttributes(resource ?? {}, redact);
   const stats = { exported: 0, failed: 0, dropped: 0, requests: 0, lastError: null, lastOkAt: null };
   let sending = Promise.resolve();
   const url = `${endpoint.replace(/\/+$/, '')}/v1/traces`;
@@ -116,7 +123,7 @@ export function createExporter({ endpoint, apiKey, resource, fetch: fetchImpl = 
         const res = await fetchImpl(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-honeycomb-team': apiKey },
-          body: JSON.stringify(otlpRequest(batch, resource)),
+          body: JSON.stringify(otlpRequest(batch, cleanResource)),
           signal: AbortSignal.timeout(timeoutMs),
         });
         if (res.ok) {
@@ -139,7 +146,7 @@ export function createExporter({ endpoint, apiKey, resource, fetch: fetchImpl = 
   return {
     stats,
     push(span) {
-      queue.push(span);
+      queue.push(redactSpan(span, redact));
       if (queue.length > MAX_QUEUED_SPANS) {
         const over = queue.length - MAX_QUEUED_SPANS;
         queue.splice(0, over);
@@ -154,6 +161,25 @@ export function createExporter({ endpoint, apiKey, resource, fetch: fetchImpl = 
       return sending;
     },
     pending: () => queue.length,
+  };
+}
+
+/** Every string value (and every string in an array value) of attributes, redacted. */
+function redactAttributes(attrs, redact) {
+  const out = {};
+  for (const [k, v] of Object.entries(attrs)) {
+    out[redact(k)] = typeof v === 'string' ? redact(v) : Array.isArray(v) ? v.map((x) => (typeof x === 'string' ? redact(x) : x)) : v;
+  }
+  return out;
+}
+
+/** A span with its name, attributes and error message redacted; ids are hex the runner made. */
+export function redactSpan(span, redact) {
+  return {
+    ...span,
+    name: redact(span.name),
+    attributes: redactAttributes(span.attributes ?? {}, redact),
+    ...(span.errorMessage ? { errorMessage: redact(span.errorMessage) } : {}),
   };
 }
 
@@ -710,7 +736,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
  * reads what is left, ends the job's root span with what the summary says, and sends the rest
  * within `budgetMs`. Never throws.
  */
-export function createAgentTracer({ runsDir, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs }) {
+export function createAgentTracer({ runsDir, confineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs }) {
   const traceId = newTraceId();
   const rootSpanId = newSpanId();
   const startedAt = now();
@@ -725,18 +751,71 @@ export function createAgentTracer({ runsDir, exporter, captureContent = false, r
     exporter.push(span);
   };
 
-  async function readRun(dir, entry) {
-    const file = path.join(dir, 'run.log');
-    let st;
+  // Run logs are written by the job user, and the tracer runs as root and sends what it reads:
+  // a file is read only when what was opened is a regular file at exactly
+  // <confineTo, resolved>/logs/runs/<run>/<file>, so no link anywhere on the way leads it elsewhere.
+  // The anchor is the state directory, resolved once, before the job could change anything under it.
+  const base = confineTo ?? runsDir;
+  const anchor = fsImpl.realpath(base).then(
+    (real) => path.join(real, path.relative(base, runsDir)),
+    () => null,
+  );
+  const expectedRoot = async () => {
+    const root = await anchor;
+    if (root === null) throw Object.assign(new Error('the state directory cannot be resolved'), { code: 'ENOENT' });
+    return root;
+  };
+  const refused = new Set();
+
+  async function openConfined(name, file) {
+    const where = path.join(runsDir, name, file);
+    let expected;
     try {
-      st = await fsImpl.stat(file);
+      expected = path.join(await expectedRoot(), name, file);
     } catch {
-      return;
+      return null;
     }
-    if (!st.isFile() || st.size <= entry.offset) return;
-    const length = Math.min(st.size - entry.offset, MAX_READ_BYTES);
-    const handle = await fsImpl.open(file, 'r');
+    let handle;
     try {
+      handle = await fsImpl.open(where, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && !refused.has(where)) {
+        refused.add(where);
+        log(`agent telemetry: not reading ${name}/${file} (${error?.code ?? 'error'})`);
+      }
+      return null;
+    }
+    try {
+      const st = await handle.stat();
+      let real;
+      try {
+        real = await fsImpl.readlink(`/proc/self/fd/${handle.fd}`);
+      } catch {
+        // No /proc: the path as it resolves now (the final link was refused by O_NOFOLLOW).
+        real = await fsImpl.realpath(where);
+      }
+      if (!st.isFile() || real !== expected) {
+        if (!refused.has(where)) {
+          refused.add(where);
+          log(`agent telemetry: not reading ${name}/${file}: it is not a regular file in the run's log directory`);
+        }
+        await handle.close();
+        return null;
+      }
+      return { handle, size: st.size };
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
+  }
+
+  async function readRun(name, entry) {
+    const opened = await openConfined(name, 'run.log');
+    if (!opened) return;
+    const { handle, size } = opened;
+    try {
+      if (size <= entry.offset) return;
+      const length = Math.min(size - entry.offset, MAX_READ_BYTES);
       const buf = Buffer.alloc(length);
       const { bytesRead } = await handle.read(buf, 0, length, entry.offset);
       entry.offset += bytesRead;
@@ -782,8 +861,16 @@ export function createAgentTracer({ runsDir, exporter, captureContent = false, r
             redact,
             emit,
             readPrompt: async () => {
-              const text = await fsImpl.readFile(path.join(dir, 'prompt.md'), 'utf8');
-              return text.length > 256 * 1024 ? text.slice(0, 256 * 1024) : text;
+              // Capped before it is read, not after.
+              const opened = await openConfined(name, 'prompt.md');
+              if (!opened) return null;
+              try {
+                const buf = Buffer.alloc(Math.min(opened.size, MAX_PROMPT_BYTES));
+                const { bytesRead } = await opened.handle.read(buf, 0, buf.length, 0);
+                return new StringDecoder('utf8').end(buf.subarray(0, bytesRead));
+              } finally {
+                await opened.handle.close();
+              }
             },
           }),
         };
@@ -791,7 +878,7 @@ export function createAgentTracer({ runsDir, exporter, captureContent = false, r
         stats.runs += 1;
       }
       try {
-        await readRun(path.join(runsDir, name), entry);
+        await readRun(name, entry);
       } catch (error) {
         log(`agent telemetry: could not read ${name}/run.log: ${error?.code ?? error?.name ?? 'error'}`);
       }

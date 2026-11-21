@@ -244,6 +244,8 @@ export interface TelemetrySettings {
   captureContent: boolean;
   updatedAt: string;
   updatedBy: string;
+  /** Bumped by every write; a write names the version it read (putTelemetry). */
+  version?: number;
   key?: {
     updatedAt: string;
     updatedBy: string;
@@ -464,8 +466,13 @@ export interface Store {
    */
   recordAgentKeyUse(installationId: number, name: string, use: { at: string; ok: boolean; jobStartedAt: string }): Promise<void>;
   getTelemetry(installationId: number): Promise<TelemetrySettings | null>;
-  /** Refused (`uninstalled`) once the tenant is uninstalled or gone, like a key's metadata. */
-  putTelemetry(installationId: number, settings: TelemetrySettings): Promise<'stored' | 'uninstalled'>;
+  /**
+   * Writes the settings as version `expected + 1`, only while the stored version is still
+   * `expected` (0: none stored yet): `conflict` when another write got there first, so a change
+   * is always made to what is there now. Refused (`uninstalled`) once the tenant is uninstalled
+   * or gone, like a key's metadata.
+   */
+  putTelemetry(installationId: number, settings: TelemetrySettings, expected: number): Promise<'stored' | 'conflict' | 'uninstalled'>;
   /** How a job's export went; nothing when telemetry was never set up. */
   recordTelemetryExport(installationId: number, result: TelemetryExport): Promise<void>;
   recordRefusal(installationId: number, refusal: DispatchRefusal): Promise<void>;
@@ -1024,10 +1031,11 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const t = telemetry.get(id);
       return t ? structuredClone(t) : null;
     },
-    async putTelemetry(id, settings) {
+    async putTelemetry(id, settings, expected) {
       const t = tenants.get(id);
       if (!t || t.disabledReason === 'uninstalled') return 'uninstalled';
-      telemetry.set(id, structuredClone(settings));
+      if ((telemetry.get(id)?.version ?? 0) !== expected) return 'conflict';
+      telemetry.set(id, structuredClone({ ...settings, version: expected + 1 }));
       return 'stored';
     },
     async recordTelemetryExport(id, result) {

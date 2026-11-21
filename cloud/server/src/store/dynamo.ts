@@ -65,6 +65,7 @@ function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
     captureContent: i.captureContent === true,
     updatedAt: String(i.updatedAt ?? ''),
     updatedBy: String(i.updatedBy ?? ''),
+    ...(typeof i.version === 'number' ? { version: i.version } : {}),
     ...(key
       ? {
           key: {
@@ -1622,8 +1623,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       return out.Item ? toTelemetry(out.Item) : null;
     },
 
-    async putTelemetry(id, settings: TelemetrySettings) {
-      // As for a key's metadata: with the uninstall check in the same transaction.
+    async putTelemetry(id, settings: TelemetrySettings, expected: number) {
+      // As for a key's metadata: with the uninstall check in the same transaction. The row is
+      // written only over the version the caller read (none yet: 0).
       try {
         await client.send(
           new TransactWriteCommand({
@@ -1636,13 +1638,24 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
                 },
               },
-              { Put: { TableName: T, Item: { pk: `TENANT#${id}`, sk: 'TELEMETRY', ...settings } } },
+              {
+                Put: {
+                  TableName: T,
+                  Item: { pk: `TENANT#${id}`, sk: 'TELEMETRY', ...settings, version: expected + 1 },
+                  ConditionExpression: expected === 0 ? 'attribute_not_exists(pk) OR attribute_not_exists(version)' : 'version = :v',
+                  ...(expected === 0 ? {} : { ExpressionAttributeValues: { ':v': expected } }),
+                },
+              },
             ],
           }),
         );
         return 'stored';
       } catch (err) {
-        if (err instanceof TransactionCanceledException && err.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed') return 'uninstalled';
+        if (err instanceof TransactionCanceledException) {
+          const [tenant, row] = err.CancellationReasons ?? [];
+          if (tenant?.Code === 'ConditionalCheckFailed') return 'uninstalled';
+          if (row?.Code === 'ConditionalCheckFailed') return 'conflict';
+        }
         throw err;
       }
     },

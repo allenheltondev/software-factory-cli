@@ -36,6 +36,26 @@ export const STATS_WINDOWS: Record<string, number | null> = {
 export const DEFAULT_STATS_WINDOW = '30d';
 /** The runner refuses a larger snapshot; so does this. */
 const MAX_STATE_BYTES = 256 * 1024 * 1024;
+/**
+ * Snapshot bytes kept on disk between requests, over every tenant: well inside Lambda's default
+ * 512 MB of /tmp, with room for one more download being written.
+ */
+export const CACHE_BYTES = 192 * 1024 * 1024;
+
+/** A snapshot, with the -wal and -shm files SQLite makes beside it when it opens one. */
+async function removeSnapshot(path: string): Promise<void> {
+  await Promise.all(['', '-wal', '-shm', '.part'].map((suffix) => rm(`${path}${suffix}`, { force: true })));
+}
+
+interface LocalState {
+  etag: string;
+  path: string;
+  bytes: number;
+  /** Larger than the budget: deleted once its report is made. */
+  transient: boolean;
+  lastModified?: string;
+}
+
 /** Reports kept per process, newest last. */
 const REPORT_CACHE = 64;
 /** A report is reused for this long for the same state object (its "now" moves on). */
@@ -56,45 +76,80 @@ export interface StatsServiceDeps {
   readState?: StateReader;
   /** Where downloaded databases are kept (Lambda's /tmp). */
   cacheDir: string;
+  /** The most bytes of snapshots kept between requests, over every tenant. */
+  cacheBytes?: number;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
 }
 
 export const stateKeyOf = (installationId: number) => `tenants/${installationId}/state/state.db`;
 
-export function createStatsService({ github, readState, cacheDir, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatsServiceDeps) {
-  /** The newest download of each tenant's state, as a file in cacheDir. */
-  const files = new Map<number, { etag: string; path: string; lastModified?: string }>();
+export function createStatsService({ github, readState, cacheDir, cacheBytes = CACHE_BYTES, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatsServiceDeps) {
+  /**
+   * Downloaded snapshots, least recently used first, within `cacheBytes` in all: Lambda's /tmp is
+   * shared by every tenant a warm environment serves. A snapshot larger than the budget is read
+   * once and deleted as soon as its report is made.
+   */
+  const files = new Map<number, LocalState>();
   const reports = new Map<string, { at: number; insights: Insights }>();
   let seq = 0;
+  let prepared = false;
+  const held = () => [...files.values()].reduce((n, f) => n + f.bytes, 0);
 
-  async function localState(installationId: number): Promise<{ etag: string; path: string; lastModified?: string } | null> {
+  async function forget(installationId: number): Promise<void> {
+    const f = files.get(installationId);
+    if (!f) return;
+    files.delete(installationId);
+    await removeSnapshot(f.path);
+  }
+
+  async function localState(installationId: number): Promise<LocalState | null> {
     if (!readState) return null;
-    const held = files.get(installationId);
-    const out = await readState(stateKeyOf(installationId), held?.etag);
+    if (!prepared) {
+      // Whatever an earlier process in this environment left behind is not on the books.
+      await rm(cacheDir, { recursive: true, force: true });
+      await mkdir(cacheDir, { recursive: true });
+      prepared = true;
+    }
+    const known = files.get(installationId);
+    const out = await readState(stateKeyOf(installationId), known?.etag);
     if (!out) {
-      if (held) {
-        files.delete(installationId);
-        await rm(held.path, { force: true });
-      }
+      await forget(installationId);
       return null;
     }
-    if (out.unchanged) return held ?? null;
+    if (out.unchanged && known) {
+      // Most recently used now.
+      files.delete(installationId);
+      files.set(installationId, known);
+      return known;
+    }
+    if (out.unchanged) return null;
     if (out.body.byteLength > MAX_STATE_BYTES) throw new FlowError('state_too_large', 502, 'The state database is too large to read here');
-    await mkdir(cacheDir, { recursive: true });
-    // A file per download: a report being computed from the previous one keeps its file.
+    // Room first: the tenant's previous snapshot, then the least recently used others.
+    await forget(installationId);
+    const bytes = out.body.byteLength;
+    const transient = bytes > cacheBytes;
+    for (const id of [...files.keys()]) {
+      if (held() + (transient ? 0 : bytes) <= cacheBytes) break;
+      await forget(id);
+    }
     const path = join(cacheDir, `${installationId}-${process.pid}-${++seq}.db`);
-    await writeFile(`${path}.part`, out.body);
-    await rename(`${path}.part`, path);
-    files.set(installationId, { etag: out.etag, path, ...(out.lastModified ? { lastModified: out.lastModified } : {}) });
-    if (held) await rm(held.path, { force: true });
-    return files.get(installationId)!;
+    try {
+      await writeFile(`${path}.part`, out.body);
+      await rename(`${path}.part`, path);
+    } catch (err) {
+      await rm(`${path}.part`, { force: true });
+      throw err;
+    }
+    const state: LocalState = { etag: out.etag, path, bytes, transient, ...(out.lastModified ? { lastModified: out.lastModified } : {}) };
+    if (!transient) files.set(installationId, state);
+    return state;
   }
 
   return {
     async insights(caller: Caller, installationId: number, query: { window?: string; repo?: string } = {}): Promise<Insights> {
       await github.member(caller, installationId);
-      const window = query.window && query.window in STATS_WINDOWS ? query.window : DEFAULT_STATS_WINDOW;
+      const window = query.window && Object.hasOwn(STATS_WINDOWS, query.window) ? query.window : DEFAULT_STATS_WINDOW;
       const repo = query.repo && REPO.test(query.repo) ? query.repo : null;
       const at = now();
       const back = STATS_WINDOWS[window]!;
@@ -125,6 +180,9 @@ export function createStatsService({ github, readState, cacheDir, now = Date.now
           };
         } finally {
           db.close();
+          // Read only, so SQLite's -wal and -shm beside it hold nothing worth keeping.
+          if (state.transient) await removeSnapshot(state.path);
+          else await Promise.all(['-wal', '-shm'].map((suffix) => rm(`${state.path}${suffix}`, { force: true })));
         }
       }
       reports.delete(cacheKey);

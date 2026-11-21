@@ -268,6 +268,94 @@ describe('agent telemetry: Codex and the review loop', () => {
   });
 });
 
+describe('agent telemetry: what leaves the microVM', () => {
+  it('redacts every field of every span and the resource, not only content (content capture off)', async () => {
+    const key = 'sk-ant-api03-PLANTEDSECRETVALUE0123456789';
+    const sent = [];
+    const exporter = createExporter({
+      endpoint: 'https://api.honeycomb.io',
+      apiKey: 'hcaik_x',
+      resource: { 'service.name': 'updraft', [`odd.${key}`]: key },
+      redact: createRedactor([key]),
+      fetch: async (_url, init) => {
+        sent.push(init.body);
+        return { ok: true, status: 200 };
+      },
+    });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-telemetry-'));
+    const runsDir = path.join(dir, 'logs', 'runs');
+    fs.mkdirSync(path.join(runsDir, 'run_1'), { recursive: true });
+    const tracer = createAgentTracer({ runsDir, confineTo: dir, exporter, captureContent: false, redact: createRedactor([key]), pollMs: 1e9, exportMs: 1e9 });
+    // The key, planted wherever the transcript supplies metadata: the agent's name and model in
+    // the header, the session id, a message id and model, a tool's name and id, a verify command.
+    const evil = [
+      header({ agent: `agent-${key}`, model: key }),
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: key, model: key }),
+      JSON.stringify({ type: 'assistant', message: { id: key, model: key, content: [{ type: 'tool_use', id: key, name: `mcp__${key}`, input: {} }], stop_reason: key, usage: { input_tokens: 1, output_tokens: 1 } } }),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: key, content: key }] } }),
+      '---- end of agent output ----',
+      '---- verification (x) ----',
+      `---- verify 1/1: echo ${key} ----`,
+      'exit: code 0 after 1s',
+      '---- end of verification: passed ----',
+      `outcome: ${key}`,
+      '',
+    ].join('\n');
+    fs.writeFileSync(path.join(runsDir, 'run_1', 'run.log'), evil);
+    await tracer.poll();
+    await tracer.stop({ outcome: 'failed', summary: { prUrl: `https://github.com/o/r/pull/1?${key}`, outcome: key, loop: { stage: key } }, deliveryId: key, eventName: key });
+    const body = sent.join('\n');
+    expect(body.length).toBeGreaterThan(1000);
+    expect(body).not.toContain(key);
+    expect(body).toContain('[redacted]');
+  });
+
+  it('reads only regular files at their own place in the run log directory, never through a link', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-telemetry-'));
+    const runsDir = path.join(dir, 'logs', 'runs');
+    fs.mkdirSync(runsDir, { recursive: true });
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-outside-'));
+    const secretLog = `${header()}\n${claude.stream(claude.assistantText('ROOT-ONLY SECRET'))}---- end of agent output ----\n`;
+    fs.writeFileSync(path.join(outside, 'run.log'), secretLog);
+    fs.writeFileSync(path.join(outside, 'prompt.md'), 'ROOT-ONLY PROMPT');
+    // A run log that is a link, a run directory that is a link, and a real run whose prompt is a link.
+    fs.mkdirSync(path.join(runsDir, 'run_a'));
+    fs.symlinkSync(path.join(outside, 'run.log'), path.join(runsDir, 'run_a', 'run.log'));
+    fs.symlinkSync(outside, path.join(runsDir, 'run_b'));
+    fs.mkdirSync(path.join(runsDir, 'run_c'));
+    fs.writeFileSync(path.join(runsDir, 'run_c', 'run.log'), `${header({ runId: 'run_c' })}\n${claude.stream(claude.assistantText('fine'))}---- end of agent output ----\n`);
+    fs.symlinkSync(path.join(outside, 'prompt.md'), path.join(runsDir, 'run_c', 'prompt.md'));
+    const spans = [];
+    const exporter = { stats: { exported: 0, failed: 0, dropped: 0 }, push: (s) => spans.push(s), flush: async () => {}, pending: () => 0 };
+    const logs = [];
+    const tracer = createAgentTracer({ runsDir, confineTo: dir, exporter, captureContent: true, log: (m) => logs.push(m), pollMs: 1e9, exportMs: 1e9 });
+    await tracer.poll();
+    await new Promise((r) => setTimeout(r, 20));
+    await tracer.stop({ outcome: 'succeeded' });
+    const all = JSON.stringify(spans);
+    expect(all).not.toContain('ROOT-ONLY');
+    expect(spans.filter((s) => s.name.startsWith('invoke_agent')).map((s) => s.attributes['updraft.run.id'])).toEqual(['run_c']);
+    expect(logs.join('\n')).toMatch(/not reading run_a\/run.log/);
+    expect(logs.join('\n')).toMatch(/not reading run_b\/run.log/);
+  });
+
+  it('reads at most 256 KiB of a prompt', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-telemetry-'));
+    const runsDir = path.join(dir, 'logs', 'runs');
+    fs.mkdirSync(path.join(runsDir, 'run_1'), { recursive: true });
+    fs.writeFileSync(path.join(runsDir, 'run_1', 'prompt.md'), 'p'.repeat(2 * 1024 * 1024));
+    fs.writeFileSync(path.join(runsDir, 'run_1', 'run.log'), `${header()}\n`);
+    const spans = [];
+    const exporter = { stats: { exported: 0, failed: 0, dropped: 0 }, push: (s) => spans.push(s), flush: async () => {}, pending: () => 0 };
+    const tracer = createAgentTracer({ runsDir, confineTo: dir, exporter, captureContent: true, pollMs: 1e9, exportMs: 1e9 });
+    await tracer.poll();
+    await new Promise((r) => setTimeout(r, 20));
+    await tracer.stop({ outcome: 'succeeded' });
+    const input = spans.find((s) => s.name.startsWith('invoke_agent')).attributes['gen_ai.input.messages'];
+    expect(JSON.parse(input)[0].parts[0].content.length).toBeLessThanOrEqual(MAX_ATTRIBUTE_CHARS + 64);
+  });
+});
+
 describe('the header', () => {
   it('reads the agent, adapter, model and kind', () => {
     const h = { kind: 'implement' };
