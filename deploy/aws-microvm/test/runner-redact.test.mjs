@@ -31,6 +31,22 @@ describe('redactingWriter (#70)', () => {
     }
   });
 
+  it('stays bounded through an endless key-shaped token, and later lines still reach the log', () => {
+    const out = sink();
+    const writer = redactingWriter(out.write, createRedactor([PLAIN]));
+    const started = Date.now();
+    writer.write(`start sk-${'a'.repeat(64 * 1024 - 9)}`);
+    // About 6 MiB more of the same token, in 64 KiB chunks, as a pipe gives it.
+    for (let i = 0; i < 96; i++) writer.write('a'.repeat(64 * 1024));
+    writer.write(' after the token\nnext line\n');
+    writer.write(`and ${PLAIN} later\n`);
+    writer.end();
+    const all = out.all();
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(all).toBe(`start [redacted] after the token\nnext line\nand [redacted] later\n`);
+    expect(Math.max(...out.writes.map((w) => w.length))).toBeLessThan(70 * 1024);
+  });
+
   it('finds a key split across two writes of one line', () => {
     const out = sink();
     const writer = redactingWriter(out.write, createRedactor([PLAIN]));

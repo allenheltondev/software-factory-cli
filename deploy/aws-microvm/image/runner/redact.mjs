@@ -36,6 +36,9 @@ export function createRedactor(known = []) {
 /** The longest a secret is assumed to be: a stream keeps this much back so a value split across chunks is still found. */
 export const MAX_SECRET_BYTES = 1024;
 
+/** What ends a token the redactor matched: whitespace, a quote, a comma, a semicolon or a brace. */
+const TOKEN_END = /[\s"',;}]/;
+
 /**
  * A text stream that redacts before writing. Output is redacted per line; a line longer than
  * `flushAt` is written in pieces. A piece ends where no secret can be cut: at least
@@ -43,20 +46,55 @@ export const MAX_SECRET_BYTES = 1024;
  * part), and before anything the redactor would match across the cut (a known key, or a
  * key-shaped token that may still be growing). The piece and the rest are then redacted
  * separately, and neither holds part of a secret the other completes.
+ *
+ * Bounded: a match already longer than MAX_SECRET_BYTES is no key we know, and holding it back
+ * could hold everything after it. It is written as one "[redacted]", and if it is still growing
+ * at the end of what has arrived, what follows is dropped until the token ends. So at most about
+ * `flushAt` characters are ever held, whatever the job writes.
  */
 export function redactingWriter(write, redact, flushAt = 64 * 1024) {
   let pending = '';
+  let skipping = false;
+  const spansOf = (text) => (redact.spans ? redact.spans(text) : []);
   return {
     write(chunk) {
+      if (skipping) {
+        const end = chunk.search(TOKEN_END);
+        if (end === -1) return;
+        chunk = chunk.slice(end);
+        skipping = false;
+      }
       pending += chunk;
       const newline = pending.lastIndexOf('\n');
       if (newline !== -1) {
         write(redact(pending.slice(0, newline + 1)));
         pending = pending.slice(newline + 1);
       }
-      if (pending.length > flushAt) {
+      while (pending.length > flushAt) {
+        const spans = spansOf(pending);
         let cut = pending.length - MAX_SECRET_BYTES;
-        const spans = redact.spans ? redact.spans(pending) : [];
+        const crossing = spans.filter(([start, end]) => start < cut && end > cut);
+        const overlong = crossing.find(([start, end]) => end - start > MAX_SECRET_BYTES);
+        if (overlong) {
+          // From the earliest start of anything overlapping it, so no other match is cut.
+          let start = Math.min(...crossing.map(([s0]) => s0));
+          for (let moved = true; moved; ) {
+            moved = false;
+            for (const [s0, e0] of spans) {
+              if (s0 < start && e0 > start) {
+                start = s0;
+                moved = true;
+              }
+            }
+          }
+          const end = Math.max(...spans.filter(([s0]) => s0 >= start && s0 < cut).map(([, e0]) => e0));
+          write(`${redact(pending.slice(0, start))}${REDACTED}`);
+          if (end >= pending.length) {
+            skipping = true;
+            pending = '';
+          } else pending = pending.slice(end);
+          continue;
+        }
         for (let moved = true; moved; ) {
           moved = false;
           for (const [start, end] of spans) {
@@ -66,15 +104,15 @@ export function redactingWriter(write, redact, flushAt = 64 * 1024) {
             }
           }
         }
-        if (cut > 0) {
-          write(redact(pending.slice(0, cut)));
-          pending = pending.slice(cut);
-        }
+        if (cut <= 0) break;
+        write(redact(pending.slice(0, cut)));
+        pending = pending.slice(cut);
       }
     },
     end() {
       if (pending !== '') write(redact(pending));
       pending = '';
+      skipping = false;
     },
   };
 }
