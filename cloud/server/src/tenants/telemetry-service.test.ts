@@ -172,7 +172,45 @@ describe('agent telemetry settings', () => {
       order.push('secret');
     });
     await service.removeKey(caller, 55);
-    expect(order).toEqual(['row', 'secret']);
+    // The key off the row, the secret deleted, then the lease given back.
+    expect(order).toEqual(['row', 'secret', 'row']);
+  });
+
+  it('holds the lease until the secret is deleted: a save while the delete is under way is refused, not deleted with it', async () => {
+    const { service, store, secrets } = await setup();
+    let n = 0;
+    secrets.put.mockImplementation(async () => ({ versionId: `v-${++n}-0000000000` }));
+    await service.setKey(caller, 55, { value: KEY });
+    let finishDelete: () => void = () => {};
+    const deleting = new Promise<void>((r) => (finishDelete = r));
+    secrets.remove.mockImplementation(async () => {
+      await deleting;
+    });
+    const removal = service.removeKey(caller, 55);
+    await new Promise((r) => setTimeout(r, 5));
+    // The row already says no key and not sending, and the lease is still held.
+    expect(await store.getTelemetry(55)).toMatchObject({ enabled: false, keyChange: expect.objectContaining({ id: expect.any(String) }) });
+    expect((await store.getTelemetry(55))?.key).toBeUndefined();
+    await expect(service.setKey(caller, 55, { value: KEY })).rejects.toMatchObject({ status: 409, message: /under way/ });
+    expect(secrets.put).toHaveBeenCalledTimes(1);
+    finishDelete();
+    await removal;
+    expect((await store.getTelemetry(55))?.keyChange).toBeUndefined();
+    // Once the delete is done, a new key is saved and stays: nothing outstanding can delete it.
+    expect(await service.setKey(caller, 55, { value: KEY })).toMatchObject({ keyConfigured: true, enabled: true });
+    expect(await store.getTelemetry(55)).toMatchObject({ key: { secretVersion: 'v-2-0000000000' } });
+    expect(secrets.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives the lease back when the delete fails, with the key already off the row', async () => {
+    const { service, store, secrets } = await setup();
+    await service.setKey(caller, 55, { value: KEY });
+    secrets.remove.mockRejectedValueOnce(new Error('throttled'));
+    await expect(service.removeKey(caller, 55)).rejects.toThrow('throttled');
+    const after = await store.getTelemetry(55);
+    expect(after?.key).toBeUndefined();
+    expect(after?.enabled).toBe(false);
+    expect(after?.keyChange).toBeUndefined();
   });
 
   it('writes only over the version it read, and retries on a conflict', async () => {

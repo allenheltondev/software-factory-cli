@@ -116,7 +116,8 @@ not redacted: they are what the content is.
   exactly that version. Key changes take a two-minute lease on the settings, so a rotation and
   another rotation, or a removal, never overlap; a change that stops halfway leaves the settings
   naming the previous version, which Secrets Manager keeps. A removal clears the settings first
-  and deletes the secret second.
+  and deletes the secret second, holding the lease until the delete is done, so a new key saved
+  meanwhile can never be deleted with the old one.
 - Every setting change is a compare-and-set on the version it read, so an opt-out made while a
   key was being checked is never undone.
 - A failed export (Honeycomb unreachable, the key revoked) is counted and reported; it never fails

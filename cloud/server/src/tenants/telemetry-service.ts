@@ -262,20 +262,21 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
     async removeKey(caller: Caller, installationId: number): Promise<TelemetryView> {
       const ctx = await github.configContext(caller, installationId);
       const lease = await acquire(installationId);
-      let done = false;
       try {
-        // The row first: from then on no job is handed the key. Then the secret. Stopped between the
-        // two, the secret is left unreferenced (the uninstall cleanup deletes it), never referenced and gone.
+        // The row first, keeping the lease: from then on no job is handed the key, and no other key
+        // change can start until the secret is gone too. Stopped between the two, the secret is left
+        // unreferenced (the next save replaces it, the uninstall cleanup deletes it), never
+        // referenced and gone.
         const view = await mutate(installationId, (latest) => {
           if (latest.keyChange?.id !== lease) throw lost();
-          const { key: _key, keyChange: _lease, ...rest } = latest;
+          const { key: _key, ...rest } = latest;
           return { ...rest, enabled: false, updatedAt: at(), updatedBy: ctx.githubLogin };
         });
-        done = true;
         await secrets.remove(telemetrySecretName(installationId));
         return view;
       } finally {
-        if (!done) await release(installationId, lease);
+        // Only now may a save write a new version: the delete can no longer take it with it.
+        await release(installationId, lease);
       }
     },
   };
