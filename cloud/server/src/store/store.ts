@@ -20,7 +20,7 @@
  * uninstalled, so DynamoDB deletes the tenant and its members once the retention has passed.
  */
 
-import type { JobLoop, JobStep } from '../jobs/lifecycle.js';
+import type { JobLoop, JobStep, JobTelemetryReport } from '../jobs/lifecycle.js';
 
 export type OAuthKind = 'link' | 'install';
 
@@ -158,6 +158,8 @@ export interface JobFinishDetail {
   loop?: JobLoop;
   /** Each step the run took, in order: its own job, then reviewer runs and revisions. */
   steps?: JobStep[];
+  /** The trace its agents' telemetry was sent as. */
+  telemetry?: JobTelemetryReport;
 }
 
 /**
@@ -225,6 +227,42 @@ export interface AgentKeyMeta {
   /** The last job that ran with this key, and whether it worked. Cleared when the key is rotated. */
   lastUsedAt?: string;
   lastUsedOk?: boolean;
+}
+
+/**
+ * A tenant's agent telemetry (tenants/telemetry-service.ts): where jobs send traces of what their
+ * agents did. The key itself is a secret (`agent-keys/HONEYCOMB_API_KEY`); this holds only that
+ * it is set, which Honeycomb team and environment it belongs to, and how the last export went.
+ */
+export interface TelemetrySettings {
+  provider: 'honeycomb';
+  enabled: boolean;
+  region: 'us' | 'eu';
+  /** `service.name`: the dataset traces land in. */
+  serviceName: string;
+  /** Record prompts, model output and tool arguments and results (redacted). */
+  captureContent: boolean;
+  updatedAt: string;
+  updatedBy: string;
+  key?: {
+    updatedAt: string;
+    updatedBy: string;
+    /** What Honeycomb's /1/auth said the key is. */
+    type?: string;
+    team?: { name: string; slug: string };
+    environment?: { name: string; slug: string };
+  };
+  lastExport?: TelemetryExport;
+}
+
+export interface TelemetryExport {
+  at: string;
+  jobId: string;
+  traceId?: string;
+  spans: number;
+  exported: number;
+  failed: number;
+  lastError?: string;
 }
 
 /** A launch the launcher refused, and why, kept 30 days for the console (never anything secret). */
@@ -425,6 +463,11 @@ export interface Store {
    * rotated after `jobStartedAt` (ISO): the job ran with the value before.
    */
   recordAgentKeyUse(installationId: number, name: string, use: { at: string; ok: boolean; jobStartedAt: string }): Promise<void>;
+  getTelemetry(installationId: number): Promise<TelemetrySettings | null>;
+  /** Refused (`uninstalled`) once the tenant is uninstalled or gone, like a key's metadata. */
+  putTelemetry(installationId: number, settings: TelemetrySettings): Promise<'stored' | 'uninstalled'>;
+  /** How a job's export went; nothing when telemetry was never set up. */
+  recordTelemetryExport(installationId: number, result: TelemetryExport): Promise<void>;
   recordRefusal(installationId: number, refusal: DispatchRefusal): Promise<void>;
   /** Newest first. */
   listRefusals(installationId: number, limit: number): Promise<DispatchRefusal[]>;
@@ -577,6 +620,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const configs = new Map<string, ConfigVersion>();
   const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
+  const telemetry = new Map<number, TelemetrySettings>();
   const refusals: { id: number; r: DispatchRefusal }[] = [];
   const deliveries2: { id: number; d: DeliveryRecord }[] = [];
   const jobs = new Map<string, Job>();
@@ -961,6 +1005,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       for (const [k, m] of members) if (m.installationId === id) members.delete(k);
       for (const [k, c] of configs) if (c.installationId === id) configs.delete(k);
       for (const k of [...keys.keys()]) if (k.startsWith(`${id}/`)) keys.delete(k);
+      telemetry.delete(id);
       for (let i = refusals.length - 1; i >= 0; i--) if (refusals[i]!.id === id) refusals.splice(i, 1);
       for (let i = deliveries2.length - 1; i >= 0; i--) if (deliveries2[i]!.id === id) deliveries2.splice(i, 1);
       for (const m of [slots, days, months]) for (const k of [...m.keys()]) if (k.startsWith(`${id}/`)) m.delete(k);
@@ -974,6 +1019,20 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async recordRefusal(id, r) {
       refusals.push({ id, r: { ...r } });
+    },
+    async getTelemetry(id) {
+      const t = telemetry.get(id);
+      return t ? structuredClone(t) : null;
+    },
+    async putTelemetry(id, settings) {
+      const t = tenants.get(id);
+      if (!t || t.disabledReason === 'uninstalled') return 'uninstalled';
+      telemetry.set(id, structuredClone(settings));
+      return 'stored';
+    },
+    async recordTelemetryExport(id, result) {
+      const t = telemetry.get(id);
+      if (t) telemetry.set(id, { ...t, lastExport: { ...result } });
     },
     async listRefusals(id, limit) {
       return refusals.filter((x) => x.id === id).map((x) => ({ ...x.r })).sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);

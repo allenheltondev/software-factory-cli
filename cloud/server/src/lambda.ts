@@ -18,6 +18,7 @@ import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
 import { createS3LogReader, createS3StateReader } from './tenants/s3-logs.js';
 import { createStatsService } from './tenants/stats-service.js';
+import { checkHoneycombKey, createTelemetryService } from './tenants/telemetry-service.js';
 import { createStatusService } from './tenants/status-service.js';
 import { createConfigService, type ObjectStore } from './tenants/config-service.js';
 
@@ -110,6 +111,7 @@ const app = createApp({
         }),
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         // Insights: the tenant's shared state database, read only (tenants/*/state/state.db).
+        telemetry: createTelemetryService({ store, github, secrets: createSecretsManagerPort(), check: checkHoneycombKey() }),
         stats: createStatsService({ github, ...(bucket ? { readState: createS3StateReader(s3, bucket) } : {}), cacheDir: '/tmp/updraft-state' }),
         admin: {
           access: adminAccess(process.env.ADMIN_GROUP ?? DEFAULT_ADMIN_GROUP),

@@ -15,6 +15,7 @@ import { ConfigHistoryPage } from './pages/ConfigHistoryPage';
 import { ConfigPage } from './pages/ConfigPage';
 import { InstallationPage } from './pages/InstallationPage';
 import { InsightsPage } from './pages/InsightsPage';
+import { TelemetryPage } from './pages/TelemetryPage';
 
 function NotFoundPage() {
   return (
@@ -50,6 +51,7 @@ export function App({ api }: { api?: ApiClient }) {
           <Route path="github/callback" element={<GitHubCallbackPage api={api} />} />
           <Route path="installations/:id" element={<InstallationPage api={api} />} />
           <Route path="installations/:id/insights" element={<InsightsPage api={api} />} />
+          <Route path="installations/:id/telemetry" element={<TelemetryPage api={api} />} />
           <Route path="installations/:id/jobs/:jobId" element={<JobPage api={api} />} />
           <Route path="installations/:id/keys" element={<AgentKeysPage api={api} />} />
           <Route path="installations/:id/config" element={<ConfigPage api={api} />} />

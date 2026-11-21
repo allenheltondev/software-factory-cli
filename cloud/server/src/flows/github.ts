@@ -46,6 +46,8 @@ export type FlowErrorCode =
   | 'tenant_disabled'
   // Insights (tenants/stats-service.ts).
   | 'state_newer'
+  // Agent telemetry (tenants/telemetry-service.ts).
+  | 'invalid_settings'
   | 'state_too_large'
   // The admin view (admin/admin.ts).
   | 'not_found'

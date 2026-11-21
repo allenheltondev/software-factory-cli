@@ -1,4 +1,4 @@
-import { loopOf, stepsOf } from '../jobs/lifecycle.js';
+import { loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import {
   DeleteCommand,
@@ -13,6 +13,7 @@ import {
 import type {
   ActiveJob,
   AgentKeyMeta,
+  TelemetrySettings,
   CleanupEntry,
   ConfigVersion,
   DeliveryRecord,
@@ -46,6 +47,51 @@ function toDelivery(i: Record<string, unknown>): DeliveryRecord {
   return d;
 }
 
+const named = (v: unknown) =>
+  v && typeof v === 'object' && typeof (v as Record<string, unknown>).slug === 'string'
+    ? { name: String((v as Record<string, unknown>).name ?? ''), slug: String((v as Record<string, unknown>).slug) }
+    : undefined;
+
+function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
+  const key = i.key && typeof i.key === 'object' ? (i.key as Record<string, unknown>) : undefined;
+  const e = i.lastExport && typeof i.lastExport === 'object' ? (i.lastExport as Record<string, unknown>) : undefined;
+  const team = named(key?.team);
+  const environment = named(key?.environment);
+  return {
+    provider: 'honeycomb',
+    enabled: i.enabled === true,
+    region: i.region === 'eu' ? 'eu' : 'us',
+    serviceName: typeof i.serviceName === 'string' ? i.serviceName : 'updraft',
+    captureContent: i.captureContent === true,
+    updatedAt: String(i.updatedAt ?? ''),
+    updatedBy: String(i.updatedBy ?? ''),
+    ...(key
+      ? {
+          key: {
+            updatedAt: String(key.updatedAt ?? ''),
+            updatedBy: String(key.updatedBy ?? ''),
+            ...(typeof key.type === 'string' ? { type: key.type } : {}),
+            ...(team ? { team } : {}),
+            ...(environment ? { environment } : {}),
+          },
+        }
+      : {}),
+    ...(e
+      ? {
+          lastExport: {
+            at: String(e.at ?? ''),
+            jobId: String(e.jobId ?? ''),
+            ...(typeof e.traceId === 'string' ? { traceId: e.traceId } : {}),
+            spans: Number(e.spans) || 0,
+            exported: Number(e.exported) || 0,
+            failed: Number(e.failed) || 0,
+            ...(typeof e.lastError === 'string' ? { lastError: e.lastError } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
 function toJobSummary(i: Record<string, unknown>): JobSummary {
   const d = i.detail && typeof i.detail === 'object' ? (i.detail as Record<string, unknown>) : undefined;
   const detail: JobFinishDetail = {};
@@ -59,6 +105,8 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
     if (loop) detail.loop = loop;
     const steps = stepsOf(d.steps);
     if (steps) detail.steps = steps;
+    const telemetry = telemetryOf(d.telemetry);
+    if (telemetry) detail.telemetry = telemetry;
   }
   return {
     jobId: String(i.jobId),
@@ -1567,6 +1615,46 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
 
     async completeCleanup(entry) {
       await client.send(new DeleteCommand({ TableName: T, Key: cleanupKey(entry) }));
+    },
+
+    async getTelemetry(id) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: 'TELEMETRY' }, ConsistentRead: true }));
+      return out.Item ? toTelemetry(out.Item) : null;
+    },
+
+    async putTelemetry(id, settings: TelemetrySettings) {
+      // As for a key's metadata: with the uninstall check in the same transaction.
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                ConditionCheck: {
+                  TableName: T,
+                  Key: tenantKey(id),
+                  ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+                  ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
+                },
+              },
+              { Put: { TableName: T, Item: { pk: `TENANT#${id}`, sk: 'TELEMETRY', ...settings } } },
+            ],
+          }),
+        );
+        return 'stored';
+      } catch (err) {
+        if (err instanceof TransactionCanceledException && err.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed') return 'uninstalled';
+        throw err;
+      }
+    },
+
+    async recordTelemetryExport(id, result) {
+      await tryUpdate({
+        TableName: T,
+        Key: { pk: `TENANT#${id}`, sk: 'TELEMETRY' },
+        UpdateExpression: 'SET lastExport = :e',
+        ConditionExpression: 'attribute_exists(pk)',
+        ExpressionAttributeValues: { ':e': result },
+      });
     },
 
     async listAgentKeyMeta(id) {

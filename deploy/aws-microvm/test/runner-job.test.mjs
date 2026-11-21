@@ -493,6 +493,55 @@ function brokerDeps(mode, overrides = {}) {
   return harness;
 }
 
+describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
+  const telemetry = { region: 'us', secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', serviceName: 'updraft', captureContent: true };
+
+  it('tails the run log while the job runs and sends GenAI spans, with the key redacted and never in the job environment', async () => {
+    const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push({ url, headers: init.headers, body: JSON.parse(init.body) });
+      return { ok: true, status: 200 };
+    };
+    harness.deps.telemetryPollMs = 50;
+    const result = await runJob(brokerRequest({ telemetry }), harness.deps);
+    expect(result.outcome).toBe('succeeded');
+    expect(posts.length).toBeGreaterThan(0);
+    expect(posts[0].url).toBe('https://api.honeycomb.io/v1/traces');
+    expect(posts[0].headers['x-honeycomb-team']).toBe('hcaik_01honeycombsecretvalue');
+    const spans = posts.flatMap((p) => p.body.resourceSpans[0].scopeSpans[0].spans);
+    expect(spans.map((s) => s.name).sort()).toEqual(['chat claude-x', 'execute_tool Bash', 'invoke_agent claude', 'invoke_workflow updraft']);
+    const resource = posts[0].body.resourceSpans[0].resource.attributes;
+    expect(resource).toContainEqual({ key: 'service.name', value: { stringValue: 'updraft' } });
+    const bodies = JSON.stringify(posts.map((p) => p.body));
+    expect(bodies).toContain('"gen_ai.conversation.id"');
+    expect(bodies).toContain('echo [redacted]');
+    expect(bodies).not.toContain('sk-ant-tenant');
+    expect(bodies).not.toContain('hcaik_01honeycombsecretvalue');
+    // The finish reports the trace, for the console's link to it.
+    expect(harness.finishDetails[0].telemetry).toMatchObject({ traceId: expect.stringMatching(/^[0-9a-f]{32}$/), spans: 4, exported: 4, failed: 0 });
+    // The job process never had the telemetry key.
+    const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+    expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');
+  });
+
+  it('runs the job without telemetry when the key is not set, and does not fail it when Honeycomb is down', async () => {
+    const noKey = brokerDeps('telemetry');
+    noKey.deps.fetch = async () => {
+      throw new Error('must not be called');
+    };
+    expect((await runJob(brokerRequest({ telemetry }), noKey.deps)).outcome).toBe('succeeded');
+    expect(noKey.finishDetails[0].telemetry).toBeUndefined();
+
+    const down = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
+    down.deps.fetch = async () => ({ ok: false, status: 401 });
+    down.deps.telemetryBudgetMs = 2000;
+    const result = await runJob(brokerRequest({ telemetry }), down.deps);
+    expect(result.outcome).toBe('succeeded');
+    expect(down.finishDetails[0].telemetry).toMatchObject({ exported: 0, lastError: 'HTTP 401' });
+  });
+});
+
 describe.runIf(onLinuxLikeHost)('runJob, version 2 (job broker)', () => {
   it('gives the job an installation token instead of the key, the tenant\'s keys as its environment, and finishes the job', async () => {
     const harness = brokerDeps('success');

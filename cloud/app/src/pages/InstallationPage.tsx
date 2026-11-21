@@ -161,6 +161,9 @@ function Loaded({
           <Link className="auth-link" to={`${base}/keys`} data-testid="keys-link">
             Agent keys
           </Link>
+          <Link className="auth-link" to={`${base}/telemetry`} data-testid="telemetry-link">
+            Agent telemetry
+          </Link>
           <a className="auth-link" href={installationSettingsUrl(t)} target="_blank" rel="noreferrer">
             Installation on GitHub ↗
           </a>
@@ -317,6 +320,11 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
               </a>
             )}
             <LoopBadges job={j} />
+            {j.telemetry?.traceUrl && (
+              <a className="auth-link text-sm" href={j.telemetry.traceUrl} target="_blank" rel="noreferrer">
+                Trace ↗
+              </a>
+            )}
             <span className="ml-auto flex flex-wrap items-center gap-3 text-sm">
               {j.configVersion !== undefined && <span title="Configuration version">v{j.configVersion}</span>}
               {j.result !== 'running' && <span title="Duration">{formatDuration(j.durationSeconds)}</span>}

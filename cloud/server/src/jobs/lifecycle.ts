@@ -71,3 +71,26 @@ export function stepsOf(raw: unknown): JobStep[] | undefined {
   }
   return out.length ? out : undefined;
 }
+
+/** What a job's runner sent to the tenant's telemetry: the trace, for a link, and how many spans got there. */
+export interface JobTelemetryReport {
+  traceId: string;
+  spans: number;
+  exported: number;
+  failed: number;
+  /** When the trace started (ISO), for the link's time range. */
+  startedAt?: string;
+  /** A short code (HTTP 401, timeout, ...). */
+  lastError?: string;
+}
+
+export function telemetryOf(raw: unknown): JobTelemetryReport | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const t = raw as Record<string, unknown>;
+  if (typeof t.traceId !== 'string' || !/^[0-9a-f]{32}$/.test(t.traceId)) return undefined;
+  const n = (v: unknown) => count(v, 10_000_000) ?? 0;
+  const out: JobTelemetryReport = { traceId: t.traceId, spans: n(t.spans), exported: n(t.exported), failed: n(t.failed) };
+  if (typeof t.startedAt === 'string' && /^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(t.startedAt)) out.startedAt = t.startedAt;
+  if (typeof t.lastError === 'string' && /^[A-Za-z0-9 ._-]{1,40}$/.test(t.lastError)) out.lastError = t.lastError;
+  return out;
+}
