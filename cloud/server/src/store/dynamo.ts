@@ -848,20 +848,28 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async recordDelivery(id, d: DeliveryRecord) {
-      await client.send(new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: `DELIVERY#${d.at}#${d.deliveryId}`, ...d, ttl: usageTtl(30) } }));
+      // Two rows of one attempt, with the same TTL: by time (the list), and by delivery id (a
+      // job's history, its redeliveries included, without reading the tenant's whole month).
+      const ttl = usageTtl(30);
+      await client.send(
+        new TransactWriteCommand({
+          TransactItems: [
+            { Put: { TableName: T, Item: { pk: `TENANT#${id}`, sk: `DELIVERY#${d.at}#${d.deliveryId}`, ...d, ttl } } },
+            { Put: { TableName: T, Item: { pk: `TENANT#${id}`, sk: `ATTEMPT#${d.deliveryId}#${d.at}`, ...d, ttl } } },
+          ],
+        }),
+      );
     },
 
-    async listDeliveriesOf(id, deliveryId, since) {
+    async listDeliveriesOf(id, deliveryId) {
       const out: DeliveryRecord[] = [];
       let ExclusiveStartKey: Record<string, unknown> | undefined;
       do {
-        // Keyed by time: from `since` on (the job's own window), then by id.
         const page = await client.send(
           new QueryCommand({
             TableName: T,
-            KeyConditionExpression: 'pk = :pk AND sk BETWEEN :from AND :to',
-            FilterExpression: 'deliveryId = :d',
-            ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':from': `DELIVERY#${since}`, ':to': 'DELIVERY#~', ':d': deliveryId },
+            KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+            ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': `ATTEMPT#${deliveryId}#` },
             ExclusiveStartKey,
           }),
         );

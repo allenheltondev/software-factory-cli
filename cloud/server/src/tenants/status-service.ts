@@ -192,8 +192,9 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
       await github.member(caller, installationId);
       const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
       if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
-      // Its event's deliveries, by id, from just before the job on: the first and any redelivery.
-      const deliveries = job.deliveryId ? await store.listDeliveriesOf(installationId, job.deliveryId, new Date(Date.parse(job.createdAt) - HOUR_MS).toISOString()) : [];
+      // Every kept attempt of its delivery: GitHub reuses the id on a redelivery, so an earlier
+      // attempt (one that failed to launch, a day before) is part of this job's history.
+      const deliveries = job.deliveryId ? await store.listDeliveriesOf(installationId, job.deliveryId) : [];
       return { job: jobView(job), deliveries };
     },
 
@@ -204,14 +205,17 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
       if (!job || !LOG_NAMES.has(name) || !jobView(job).logs.includes(name) || !readLog) {
         throw new FlowError('not_found', 404, 'This job has no such log');
       }
-      // The daily cleanup deletes results older than the retention, so past it (an hour early, as
-      // the log was written a little before the job's finish) the log is expired, read or not.
-      const expired = () => new FlowError('log_expired', 410, 'This log has expired; logs are kept for the retention period of the deployment');
-      const ended = Date.parse(job.finishedAt ?? job.createdAt);
-      if (now() > ended + resultRetentionDays * DAY_MS - HOUR_MS) throw expired();
+      // Read first: a log that is still there is served, however old. Only a missing one is
+      // judged by the job's age against the stack's ResultRetentionDays, which the daily cleanup
+      // deletes by: past it, expired. The object is written a little before the job's finish, so
+      // the cleanup can take it up to that much before finish + retention: an hour of margin.
       const key = `tenants/${installationId}/results/${job.deliveryId}/${job.microvmId}/${name}`;
       const out = await readLog(key, LOG_TAIL_BYTES);
       if (!out) {
+        const ended = Date.parse(job.finishedAt ?? job.createdAt);
+        if (now() > ended + resultRetentionDays * DAY_MS - HOUR_MS) {
+          throw new FlowError('log_expired', 410, 'This log has expired; logs are kept for the retention period of the deployment');
+        }
         // Within the retention, and S3 has no such object for us (or would not say): not expired,
         // so something is wrong. Logged to look into; never shown as expired.
         log({ installationId, jobId, warning: `a log within the retention could not be read: ${key}` });

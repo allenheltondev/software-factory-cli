@@ -39,7 +39,7 @@ const job = (over: Partial<Job> = {}): Job => ({
   ...over,
 });
 
-async function setup(opts: { installation?: GitHubInstallation | null | Error; logs?: Record<string, string> } = {}) {
+async function setup(opts: { installation?: GitHubInstallation | null | Error; logs?: Record<string, string>; retentionDays?: number } = {}) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant(), { installationId: 55, sub: 'u1', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
   const gh = 'installation' in opts ? opts.installation : { id: 55, account: { id: 900, login: 'acme', type: 'Organization' }, suspendedAt: null, permissions: ALL };
@@ -58,7 +58,7 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
   const service = createStatusService({
     store,
     now: () => clock.now,
-    resultRetentionDays: 30,
+    resultRetentionDays: opts.retentionDays ?? 30,
     github: {
       member,
       installation: async (c, id) => {
@@ -131,13 +131,18 @@ describe('status and diagnostics (#71)', () => {
       expect(body.activity).toMatchObject({ deliveries: { filtered: ACTIVITY_SAMPLE }, window: { deliveries: ACTIVITY_SAMPLE, deliveriesComplete: false, jobsComplete: true } });
     });
 
-    it('shows a job its own deliveries, however many others arrived since', async () => {
+    it('shows a job every attempt of its delivery, an earlier failed one included, however many others arrived since', async () => {
       const { store, get } = await setup();
       await store.putJob(job());
+      // The day before: the first attempt failed to launch; GitHub's redelivery (same id) launched this job.
+      await store.recordDelivery(55, { at: '2026-11-19T12:00:00.000Z', deliveryId: 'd-1', event: 'issues', disposition: 'launch_failed', errorClass: 'ServiceException' });
       await store.recordDelivery(55, { at: '2026-11-20T11:59:59.000Z', deliveryId: 'd-1', event: 'issues', disposition: 'launched', jobId: 'job_status0001' });
       for (let n = 0; n < 250; n++) await store.recordDelivery(55, { at: `2026-11-20T13:00:${String(n).padStart(4, '0')}Z`, deliveryId: `other-${n}`, event: 'issues', disposition: 'filtered' });
       const { body } = await get('55/jobs/job_status0001');
-      expect((body.deliveries as { deliveryId: string }[]).map((d) => d.deliveryId)).toEqual(['d-1']);
+      expect((body.deliveries as { deliveryId: string; disposition: string }[]).map((d) => [d.deliveryId, d.disposition])).toEqual([
+        ['d-1', 'launch_failed'],
+        ['d-1', 'launched'],
+      ]);
     });
 
     it.each([
@@ -256,18 +261,19 @@ describe('status and diagnostics (#71)', () => {
       expect(reads).toEqual([]);
     });
 
-    it('answers 410 for a log past the retention, without reading it, and 502 for one within it that cannot be read', async () => {
+    it('serves a log that is still there, however old; a missing one is expired (410) past the retention, else 502', async () => {
       const DAY = 24 * 3600 * 1000;
-      const { store, get, reads, clock } = await setup({ logs: {} });
+      const logs: Record<string, string> = {};
+      const { store, get, clock } = await setup({ logs, retentionDays: 7 });
       await finished(store);
       // Within the retention: the reader found nothing (S3 says 403 for a missing object to this role).
-      const within = await get('55/jobs/job_status0001/logs/run.log');
-      expect(within).toMatchObject({ status: 502, body: { error: 'log_unavailable' } });
-      expect(reads).toEqual([KEY]);
-      clock.now += 30 * DAY;
-      const after = await get('55/jobs/job_status0001/logs/run.log');
-      expect(after).toMatchObject({ status: 410, body: { error: 'log_expired' } });
-      expect(reads).toEqual([KEY]);
+      expect(await get('55/jobs/job_status0001/logs/run.log')).toMatchObject({ status: 502, body: { error: 'log_unavailable' } });
+      // The stack's setting decides, not a default: missing on day 8 of 7 is expired.
+      clock.now += 8 * DAY;
+      expect(await get('55/jobs/job_status0001/logs/run.log')).toMatchObject({ status: 410, body: { error: 'log_expired' } });
+      // At the boundary, a log the cleanup has not reached yet is still served.
+      logs[KEY] = 'still here\n';
+      expect(await get('55/jobs/job_status0001/logs/run.log')).toMatchObject({ status: 200, body: { text: 'still here\n' } });
     });
   });
 

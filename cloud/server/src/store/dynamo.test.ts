@@ -1024,15 +1024,19 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
       { at: '2026-11-20T12:00:00.000Z', deliveryId: 'd-1', event: 'issues', action: 'labeled', disposition: 'launched', jobId: job.jobId, issue: 12 },
     ]);
     expect(await store.listDeliveries(56, 10)).toEqual([]);
-    // A job's own deliveries, by id, however many others came after them.
+    // Every attempt of a delivery (GitHub reuses the id on a redelivery), however long apart and
+    // however many others came between: an earlier failed attempt is part of the job's history.
+    await store.recordDelivery(55, { at: '2026-11-19T09:00:00.000Z', deliveryId: 'd-1', event: 'issues', disposition: 'launch_failed', errorClass: 'ServiceException' });
     for (let n = 0; n < 250; n++) await store.recordDelivery(55, { at: `2026-11-20T13:${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}.000Z`, deliveryId: `other-${n}`, event: 'issues', disposition: 'filtered', reason: 'not_trigger' });
     await store.recordDelivery(55, { at: '2026-11-20T14:30:00.000Z', deliveryId: 'd-1', event: 'issues', disposition: 'deduped' });
-    expect((await store.listDeliveriesOf(55, 'd-1', '2026-11-20T11:00:00.000Z')).map((d) => [d.at, d.disposition])).toEqual([
+    expect((await store.listDeliveriesOf(55, 'd-1')).map((d) => [d.at, d.disposition])).toEqual([
+      ['2026-11-19T09:00:00.000Z', 'launch_failed'],
       ['2026-11-20T12:00:00.000Z', 'launched'],
       ['2026-11-20T14:30:00.000Z', 'deduped'],
     ]);
-    expect(await store.listDeliveriesOf(55, 'd-1', '2026-11-20T12:01:00.000Z')).toHaveLength(1);
-    expect(await store.listDeliveriesOf(56, 'd-1', '2026-11-20T11:00:00.000Z')).toEqual([]);
+    expect(await store.listDeliveriesOf(56, 'd-1')).toEqual([]);
+    // Both rows of an attempt expire together.
+    expect(table.items.get('TENANT#55|ATTEMPT#d-1#2026-11-20T12:00:00.000Z')?.ttl).toBe(table.items.get('TENANT#55|DELIVERY#2026-11-20T12:00:00.000Z#d-1')?.ttl);
     // Kept 30 days.
     expect(table.items.get('TENANT#55|DELIVERY#2026-11-20T12:00:00.000Z#d-1')?.ttl).toEqual(expect.any(Number));
   });
