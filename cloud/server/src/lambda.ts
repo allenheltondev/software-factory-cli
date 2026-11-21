@@ -1,4 +1,4 @@
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetObjectCommand, NoSuchKey, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { handle } from 'hono/aws-lambda';
@@ -16,6 +16,7 @@ import { createSecretsManagerPort } from './tenants/secrets-manager.js';
 import { checkAgentKeyWithProvider } from './tenants/key-check.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
+import { createStatusService, type LogReader } from './tenants/status-service.js';
 import { createConfigService, type ObjectStore } from './tenants/config-service.js';
 
 /**
@@ -48,6 +49,44 @@ const objects: ObjectStore = {
   },
 };
 
+// A job's logs (tenants/status-service.ts): only their end, read with a range. The function's
+// role reaches tenants/*/results/* for this, read only.
+const readLog: LogReader = async (key, maxBytes) => {
+  try {
+    const out = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key, Range: `bytes=-${maxBytes}` }));
+    const range = /\/(\d+)$/.exec(out.ContentRange ?? '');
+    const text = (await out.Body?.transformToString('utf8')) ?? '';
+    return { text, size: range ? Number(range[1]) : (out.ContentLength ?? text.length) };
+  } catch (err) {
+    if (err instanceof NoSuchKey || (err as { name?: string }).name === 'NoSuchKey') return null;
+    // An empty object cannot satisfy a suffix range.
+    if ((err as { name?: string }).name === 'InvalidRange') return { text: '', size: 0 };
+    throw err;
+  }
+};
+
+const agentKeyService =
+  store && github
+    ? createAgentKeyService({
+        store,
+        github,
+        secrets: createSecretsManagerPort(),
+        check: checkAgentKeyWithProvider(),
+        ...(bucket
+          ? {
+              bundleKeys: createBundleKeys(async (key) => {
+                try {
+                  return await objects.get(key);
+                } catch (err) {
+                  if ((err as { name?: string }).name === 'NoSuchKey') return null;
+                  throw err;
+                }
+              }, configPrefix),
+            }
+          : {}),
+      })
+    : undefined;
+
 const app = createApp({
   resolveCaller: async (c) => {
     const event = (c.env as { event?: APIGatewayProxyEvent } | undefined)?.event;
@@ -68,27 +107,11 @@ const app = createApp({
     }
     return caller;
   },
-  ...(store && github
+  ...(store && github && agentKeyService
     ? {
         github,
-        agentKeys: createAgentKeyService({
-          store,
-          github,
-          secrets: createSecretsManagerPort(),
-          check: checkAgentKeyWithProvider(),
-          ...(bucket
-            ? {
-                bundleKeys: createBundleKeys(async (key) => {
-                  try {
-                    return await objects.get(key);
-                  } catch (err) {
-                    if ((err as { name?: string }).name === 'NoSuchKey') return null;
-                    throw err;
-                  }
-                }, configPrefix),
-              }
-            : {}),
-        }),
+        agentKeys: agentKeyService,
+        status: createStatusService({ store, github, agentKeys: agentKeyService, ...(bucket ? { readLog } : {}) }),
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         admin: {
           access: adminAccess(process.env.ADMIN_GROUP ?? DEFAULT_ADMIN_GROUP),

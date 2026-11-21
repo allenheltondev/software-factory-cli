@@ -4,7 +4,7 @@ import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
-import { isFailure, type Job, type Store } from '../store/store.js';
+import { isFailure, type Job, type JobFinishDetail, type Store } from '../store/store.js';
 import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
@@ -210,7 +210,7 @@ export function createBroker(deps: BrokerDeps) {
 
   return async function handle(request: unknown): Promise<BrokerResponse> {
     if (typeof request !== 'object' || request === null) return { ok: false, error: 'bad_request' };
-    const { action, jobId, token, outcome } = request as Record<string, unknown>;
+    const { action, jobId, token, outcome, detail } = request as Record<string, unknown>;
     if (action !== 'start' && action !== 'credentials' && action !== 'github-token' && action !== 'finish' && action !== 'terminate') {
       return { ok: false, error: 'bad_request' };
     }
@@ -247,7 +247,7 @@ export function createBroker(deps: BrokerDeps) {
     // slots stay: the microVM may still be running (terminate frees them).
     if (action === 'finish') {
       const given = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
-      const recorded = (await deps.store.finishJob(job.jobId, given)) ?? given;
+      const recorded = (await deps.store.finishJob(job.jobId, given, { at: now(), detail: finishDetail(job, detail) })) ?? given;
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
       if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
@@ -330,3 +330,30 @@ export function createBroker(deps: BrokerDeps) {
 }
 
 export type Broker = ReturnType<typeof createBroker>;
+
+const LOG_NAMES = new Set(['updraft.log', 'run.log']);
+
+/**
+ * What the runner reported at the finish, kept only where it checks out (#71): it is shown to the
+ * tenant, so a pull request link must be one of the job's own repository, and anything else is
+ * a short code, a boolean or a known log name.
+ */
+export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFinishDetail | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const d = raw as Record<string, unknown>;
+  const out: JobFinishDetail = {};
+  if (typeof d.updraftOutcome === 'string' && /^[a-z][a-z-]{0,39}$/.test(d.updraftOutcome)) out.updraftOutcome = d.updraftOutcome;
+  if (typeof d.verificationPassed === 'boolean') out.verificationPassed = d.verificationPassed;
+  if (typeof d.prUrl === 'string') {
+    const m = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]{0,9})$/.exec(d.prUrl);
+    if (m && m[1]!.toLowerCase() === job.repository.toLowerCase()) {
+      out.prUrl = d.prUrl;
+      out.prNumber = Number(m[2]);
+    }
+  }
+  if (Array.isArray(d.logs)) {
+    const logs = [...new Set(d.logs.filter((n): n is string => typeof n === 'string' && LOG_NAMES.has(n)))];
+    if (logs.length) out.logs = logs;
+  }
+  return Object.keys(out).length ? out : undefined;
+}

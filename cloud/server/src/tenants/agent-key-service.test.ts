@@ -29,6 +29,10 @@ async function setup(verdict: KeyCheck = 'valid') {
       if (id !== 55) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
       return { githubLogin: 'pat' } as never;
     },
+    member: async (_c: Caller, id: number) => {
+      if (id !== 55) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
+      return {} as never;
+    },
   };
   const service = createAgentKeyService({ store, github, secrets, check, now: () => Date.parse('2026-11-21T00:00:00Z') });
   const app = createApp({ resolveCaller: () => caller, agentKeys: service, logError: () => {} });
@@ -79,7 +83,7 @@ describe('agent keys in the console (#70)', () => {
       await store.activateConfig(55, v as number);
       const withBundle = createAgentKeyService({
         store,
-        github: { configContext: async () => ({ githubLogin: 'pat' }) as never },
+        github: { configContext: async () => ({ githubLogin: 'pat' }) as never, member: async () => ({}) as never },
         secrets: { put: async () => {}, remove: async () => {} },
         check: async () => 'valid',
         bundleKeys: createBundleKeys(async () => bundle, configPrefix),

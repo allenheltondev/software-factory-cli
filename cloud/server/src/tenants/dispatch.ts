@@ -63,7 +63,10 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
  * `keys`: the agent keys the job can need (those of every matching trigger the sender may
  * apply), or null when the version predates them and they must be read from its bundle.
  */
-export type DispatchDecision = { start: true; repository: string; repositoryId: number; label: string; keys: string[] | null } | { start: false; reason: string };
+export type DispatchDecision = { start: true; repository: string; repositoryId: number; label: string; keys: string[] | null } | { start: false; reason: string; code: DispatchRefusalCode };
+
+/** Why a delivery started nothing, as the console shows it (#71). */
+export type DispatchRefusalCode = 'no_rules' | 'unknown_repo' | 'paused' | 'not_trigger' | 'actor_not_allowed';
 
 /**
  * Whether an `issues.labeled` delivery starts a job under these rules. The repository must match
@@ -73,19 +76,19 @@ export function decideDispatch(
   rules: DispatchRules | undefined,
   event: { repositoryFullName: unknown; repositoryId: unknown; label: unknown; sender: unknown },
 ): DispatchDecision {
-  if (!rules) return { start: false, reason: 'the active config has no dispatch rules (publish it again)' };
-  if (typeof event.repositoryFullName !== 'string' || typeof event.repositoryId !== 'number') return { start: false, reason: 'no repository in the event' };
+  if (!rules) return { start: false, reason: 'the active config has no dispatch rules (publish it again)', code: 'no_rules' };
+  if (typeof event.repositoryFullName !== 'string' || typeof event.repositoryId !== 'number') return { start: false, reason: 'no repository in the event', code: 'unknown_repo' };
   const repository = event.repositoryFullName.toLowerCase();
   const repo = rules.repositories[repository];
-  if (!repo || repo.id !== event.repositoryId) return { start: false, reason: 'the repository is not in the active config' };
-  if (repo.paused) return { start: false, reason: 'the repository is paused' };
-  if (typeof event.label !== 'string' || event.label === '') return { start: false, reason: 'no label in the event' };
+  if (!repo || repo.id !== event.repositoryId) return { start: false, reason: 'the repository is not in the active config', code: 'unknown_repo' };
+  if (repo.paused) return { start: false, reason: 'the repository is paused', code: 'paused' };
+  if (typeof event.label !== 'string' || event.label === '') return { start: false, reason: 'no label in the event', code: 'not_trigger' };
   const label = event.label.toLowerCase();
   const matching = repo.triggers.filter((t) => t.label === label);
-  if (matching.length === 0) return { start: false, reason: 'the label is not a trigger' };
+  if (matching.length === 0) return { start: false, reason: 'the label is not a trigger', code: 'not_trigger' };
   const sender = typeof event.sender === 'string' ? event.sender.toLowerCase() : '';
   const allowed = matching.filter((t) => (t.actors ?? repo.actors ?? []).includes(sender));
-  if (allowed.length === 0) return { start: false, reason: 'the sender may not dispatch work' };
+  if (allowed.length === 0) return { start: false, reason: 'the sender may not dispatch work', code: 'actor_not_allowed' };
   const keysOf = (t: { keys?: string[] }) => t.keys ?? repo.keys;
   const keys = allowed.every((t) => Array.isArray(keysOf(t))) ? [...new Set(allowed.flatMap((t) => keysOf(t)!))].sort() : null;
   return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, label: event.label, keys };

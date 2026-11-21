@@ -114,6 +114,12 @@ export interface LaunchResult {
   status: number;
   disposition: string;
   jobId?: string;
+  /** Why it started nothing, as a code (dispatch.ts DispatchRefusalCode, or the quota limit). */
+  reason?: string;
+  /** The same for people (no secret, no AWS message). */
+  message?: string;
+  /** launch_failed: the error's class. */
+  errorClass?: string;
 }
 
 // A GitHub delivery id is a GUID; it becomes part of an S3 key, so nothing else is accepted.
@@ -126,7 +132,7 @@ export function createLauncher(deps: LaunchDeps) {
   const killSwitch = deps.killSwitch ?? OFF_SWITCH;
 
   return async function launch(req: LaunchRequest): Promise<LaunchResult> {
-    const skip = (disposition: string): LaunchResult => ({ status: 200, disposition });
+    const skip = (disposition: string, why: { reason?: string; message?: string } = {}): LaunchResult => ({ status: 200, disposition, ...why });
     if (!DELIVERY_ID.test(req.deliveryId)) return { status: 400, disposition: 'bad_delivery_id' };
     if (!Number.isInteger(req.payload.issue?.number)) return skip('ignored');
 
@@ -146,7 +152,7 @@ export function createLauncher(deps: LaunchDeps) {
     });
     if (!decision.start) {
       log({ delivery: req.deliveryId, installationId: req.installationId, ignored: decision.reason });
-      return skip('not_dispatched');
+      return skip('not_dispatched', { reason: decision.code, message: decision.reason });
     }
 
     const imageVersion = await deps.imageVersion();
@@ -178,7 +184,7 @@ export function createLauncher(deps: LaunchDeps) {
       await deps.store
         .recordRefusal(req.installationId, { at: new Date(now()).toISOString(), deliveryId: req.deliveryId, repository: decision.repository, issue: issueNumber, reason })
         .catch((err: unknown) => log({ delivery: req.deliveryId, warning: `could not record the refusal: ${(err as Error)?.name}` }));
-      return skip('missing_key');
+      return skip('missing_key', { reason: 'missing_key', message: reason });
     };
     if (needed === null) return refuse('Updraft could not tell which agent keys this workflow needs: publish the configuration again', { unknown: true });
     if (needed.length > 0) {
@@ -220,7 +226,7 @@ export function createLauncher(deps: LaunchDeps) {
           .notifyThrottled({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, issue, limit: reserved.limit, quotas })
           .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
       }
-      return skip('throttled');
+      return skip('throttled', { reason: reserved.limit });
     }
     const reservation = { installationId: req.installationId, jobId, tenantSlot: reserved.tenantSlot, platformSlot: reserved.platformSlot, day, month };
 
@@ -275,7 +281,7 @@ export function createLauncher(deps: LaunchDeps) {
       // Finished with another outcome before it could launch: an admin released it, on purpose.
       // Not an error to have GitHub show (and nothing to redeliver).
       if (outcome !== null && outcome !== 'launch_failed') return { status: 200, disposition: 'cancelled', jobId };
-      return { status: 500, disposition: 'launch_failed', jobId };
+      return { status: 500, disposition: 'launch_failed', jobId, errorClass: errorClassOf(err) };
     }
 
     if (!microvmId) {
@@ -302,6 +308,12 @@ export function createLauncher(deps: LaunchDeps) {
 }
 
 export type Launcher = ReturnType<typeof createLauncher>;
+
+/** An error's class for the console: its name when it is a plain identifier (an AWS exception's), else Error. */
+export function errorClassOf(err: unknown): string {
+  const name = (err as { name?: unknown })?.name;
+  return typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : 'Error';
+}
 
 /** The run-hook payload: the broker and the job's token; the runner gets everything else from the broker. */
 export function runHookPayload(s: LaunchSettings, job: { jobId: string; token: string; deliveryId: string; launchedAt: number }) {

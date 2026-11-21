@@ -14,10 +14,12 @@ import type {
   AgentKeyMeta,
   CleanupEntry,
   ConfigVersion,
+  DeliveryRecord,
   DispatchRules,
   GitHubLink,
   InstallationOffer,
   Job,
+  JobFinishDetail,
   JobSummary,
   Member,
   OAuthState,
@@ -27,12 +29,40 @@ import type {
   Tenant,
   TenantLimits,
 } from './store.js';
-import { isFailure } from './store.js';
+import { finishFields, isFailure } from './store.js';
 
 const DAY_SECONDS = 24 * 3600;
 const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
+function toJobSummary(i: Record<string, unknown>): JobSummary {
+  const d = i.detail && typeof i.detail === 'object' ? (i.detail as Record<string, unknown>) : undefined;
+  const detail: JobFinishDetail = {};
+  if (d) {
+    if (typeof d.updraftOutcome === 'string') detail.updraftOutcome = d.updraftOutcome;
+    if (typeof d.verificationPassed === 'boolean') detail.verificationPassed = d.verificationPassed;
+    if (typeof d.prUrl === 'string') detail.prUrl = d.prUrl;
+    if (typeof d.prNumber === 'number') detail.prNumber = d.prNumber;
+    if (Array.isArray(d.logs)) detail.logs = d.logs.map(String);
+  }
+  return {
+    jobId: String(i.jobId),
+    repository: String(i.repository),
+    ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
+    ...(typeof i.label === 'string' ? { label: i.label } : {}),
+    ...(typeof i.sender === 'string' ? { sender: i.sender } : {}),
+    createdAt: String(i.createdAt),
+    status: i.status === 'finished' ? 'finished' : 'launched',
+    ...(typeof i.outcome === 'string' ? { outcome: i.outcome } : {}),
+    ...(typeof i.configVersion === 'number' ? { configVersion: i.configVersion } : {}),
+    ...(typeof i.deliveryId === 'string' ? { deliveryId: i.deliveryId } : {}),
+    ...(typeof i.finishedAt === 'string' ? { finishedAt: i.finishedAt } : {}),
+    ...(typeof i.durationSeconds === 'number' ? { durationSeconds: i.durationSeconds } : {}),
+    ...(typeof i.microvmId === 'string' ? { microvmId: i.microvmId } : {}),
+    ...(Object.keys(detail).length ? { detail } : {}),
+  };
+}
+
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
   const T = tableName;
   const userKey = (sub: string) => ({ pk: `USER#${sub}`, sk: 'PROFILE' });
@@ -49,6 +79,21 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
   const PLATFORM = 'PLATFORM#JOBS';
   const activeKey = (jobId: string) => ({ pk: 'PLATFORM#ACTIVE', sk: `JOB#${jobId}` });
   const jobSummaryKey = (job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>) => ({ pk: `TENANT#${job.installationId}`, sk: `JOB#${job.createdAt}#${job.jobId}` });
+  /** An item whose TTL has passed is gone, whether or not DynamoDB has deleted it yet. */
+  const liveItem = (i: Record<string, unknown>) => typeof i.ttl !== 'number' || i.ttl * 1000 > Date.now();
+  /** The summary's update at a finish: the outcome and, when given, what the finish reported. */
+  const summaryFinish = (key: { pk: string; sk: string }, outcome: string, extra: Partial<JobSummary>) => {
+    const names: Record<string, string> = { '#status': 'status' };
+    const values: Record<string, unknown> = { ':finished': 'finished', ':outcome': outcome };
+    const sets = ['#status = :finished', 'outcome = :outcome'];
+    for (const [k, v] of Object.entries(extra)) {
+      if (v === undefined) continue;
+      names[`#${k}`] = k;
+      values[`:${k}`] = v;
+      sets.push(`#${k} = :${k}`);
+    }
+    return { TableName: T, Key: key, UpdateExpression: `SET ${sets.join(', ')}`, ConditionExpression: 'attribute_exists(pk)', ExpressionAttributeNames: names, ExpressionAttributeValues: values };
+  };
   const tenantSlotKey = (id: number, n: number) => ({ pk: `TENANT#${id}`, sk: slotSk(n) });
   const platformSlotKey = (n: number) => ({ pk: PLATFORM, sk: slotSk(n) });
   const dayKey = (id: number, day: string) => ({ pk: `TENANT#${id}`, sk: `USAGE#DAY#${day}` });
@@ -500,6 +545,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   ...(job.sender ? { sender: job.sender } : {}),
                   createdAt: job.createdAt,
                   status: job.status,
+                  configVersion: job.configVersion,
+                  deliveryId: job.deliveryId,
                   ttl: usageTtl(30),
                 },
               },
@@ -578,7 +625,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async finishJob(jobId, outcome) {
+    async finishJob(jobId, outcome, finish) {
       try {
         const out = await client.send(
           new UpdateCommand({
@@ -601,14 +648,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
               new TransactWriteCommand({
                 TransactItems: [
                   {
-                    Update: {
-                      TableName: T,
-                      Key: summary,
-                      UpdateExpression: 'SET #status = :finished, outcome = :outcome',
-                      ConditionExpression: 'attribute_exists(pk)',
-                      ExpressionAttributeNames: { '#status': 'status' },
-                      ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
-                    },
+                    Update: summaryFinish(summary, outcome, finishFields({ ...(typeof job.startedAt === 'number' ? { startedAt: job.startedAt } : {}), ...(typeof job.microvmId === 'string' ? { microvmId: job.microvmId } : {}) }, finish)),
                   },
                   ...(isFailure(outcome)
                     ? [
@@ -766,16 +806,61 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           Limit: limit,
         }),
       );
-      return (out.Items ?? []).map((i) => ({
-        jobId: String(i.jobId),
-        repository: String(i.repository),
-        ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
-        ...(typeof i.label === 'string' ? { label: i.label } : {}),
-        ...(typeof i.sender === 'string' ? { sender: i.sender } : {}),
-        createdAt: String(i.createdAt),
-        status: i.status === 'finished' ? 'finished' : 'launched',
-        ...(typeof i.outcome === 'string' ? { outcome: i.outcome } : {}),
-      }));
+      return (out.Items ?? []).map(toJobSummary);
+    },
+
+    async getJobSummary(id, jobId) {
+      // The job's own record says when it was created, which is the summary's key; it is kept a
+      // week past the job's end, the summary 30 days, so after that the tenant's summaries are
+      // searched. Either way only this tenant's partition is read.
+      const meta = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' } }));
+      if (meta.Item) {
+        if (Number(meta.Item.installationId) !== id) return null;
+        const out = await client.send(new GetCommand({ TableName: T, Key: jobSummaryKey({ installationId: id, createdAt: String(meta.Item.createdAt), jobId }) }));
+        return out.Item && liveItem(out.Item) ? toJobSummary(out.Item) : null;
+      }
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+            FilterExpression: 'jobId = :job',
+            ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'JOB#', ':job': jobId },
+            ExclusiveStartKey,
+          }),
+        );
+        const hit = (page.Items ?? []).find(liveItem);
+        if (hit) return toJobSummary(hit);
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return null;
+    },
+
+    async recordDelivery(id, d: DeliveryRecord) {
+      await client.send(new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: `DELIVERY#${d.at}#${d.deliveryId}`, ...d, ttl: usageTtl(30) } }));
+    },
+
+    async listDeliveries(id, limit) {
+      const out = await client.send(
+        new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'DELIVERY#' },
+          ScanIndexForward: false,
+          Limit: limit,
+        }),
+      );
+      const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
+      return (out.Items ?? []).filter(liveItem).map((i) => {
+        const d: DeliveryRecord = { at: String(i.at), deliveryId: String(i.deliveryId), event: String(i.event), disposition: i.disposition as DeliveryRecord['disposition'] };
+        for (const k of ['action', 'repository', 'label', 'sender', 'reason', 'message', 'errorClass', 'jobId'] as const) {
+          const v = str(i[k]);
+          if (v !== undefined) d[k] = v;
+        }
+        if (typeof i.issue === 'number') d.issue = i.issue;
+        return d;
+      });
     },
 
     async setSuspended(id, suspended) {

@@ -1,0 +1,72 @@
+import type { DeliveryRecord, JobSummary } from '../store/store.js';
+
+/**
+ * How a job ended, as the console shows it (#71). From the outcome the runner reported to the
+ * broker and what it said with it (JobFinishDetail).
+ *
+ *   running          not finished yet
+ *   success          it ran and published (or had nothing to publish)
+ *   nothing_to_do    run-event found nothing to do for the event
+ *   agent_failure    an agent run failed, could not start or was interrupted
+ *   verify_failure   the agent's change failed the workflow's verify commands
+ *   publish_failure  the run succeeded; its pull request could not be published
+ *   timeout          stopped by the watchdog before the microVM's maximum duration
+ *   state_not_saved  it ran, and what it changed in the shared state was not saved
+ *   terminated       the microVM was stopped while the job ran
+ *   runner_error     the job could not run (the runner, or the sandbox check, failed)
+ *   unconfirmed      it exited cleanly without a summary
+ *   not_run          never ran: over a quota, superseded by a redelivery, released by an admin
+ *   other            anything else (a newer outcome)
+ */
+export type JobResult =
+  | 'running'
+  | 'success'
+  | 'nothing_to_do'
+  | 'agent_failure'
+  | 'verify_failure'
+  | 'publish_failure'
+  | 'timeout'
+  | 'state_not_saved'
+  | 'terminated'
+  | 'runner_error'
+  | 'unconfirmed'
+  | 'not_run'
+  | 'other';
+
+export function jobResult(job: Pick<JobSummary, 'status' | 'outcome' | 'detail'>): JobResult {
+  if (job.status !== 'finished' || job.outcome === undefined) return 'running';
+  const d = job.detail ?? {};
+  switch (job.outcome) {
+    case 'succeeded':
+      return d.updraftOutcome === 'nothing-to-do' ? 'nothing_to_do' : 'success';
+    case 'failed':
+      if (d.updraftOutcome === 'publish-failed') return 'publish_failure';
+      if (d.verificationPassed === false) return 'verify_failure';
+      return 'agent_failure';
+    case 'timed_out':
+      return 'timeout';
+    case 'state_not_saved':
+    case 'terminated':
+    case 'runner_error':
+    case 'unconfirmed':
+      return job.outcome;
+    case 'start_failed':
+      return 'runner_error';
+    case 'throttled':
+    case 'superseded':
+    case 'launch_failed':
+    case 'released_by_admin':
+      return 'not_run';
+    default:
+      return 'other';
+  }
+}
+
+/** Counts of each value, for a summary row. */
+export function countBy<T extends string>(values: readonly T[]): Partial<Record<T, number>> {
+  const out: Partial<Record<T, number>> = {};
+  for (const v of values) out[v] = (out[v] ?? 0) + 1;
+  return out;
+}
+
+export const deliveryCounts = (deliveries: readonly DeliveryRecord[]) => countBy(deliveries.map((d) => d.disposition));

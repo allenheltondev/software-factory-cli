@@ -126,6 +126,53 @@ export interface JobSummary {
   createdAt: string;
   status: Job['status'];
   outcome?: string;
+  /** The config version the job pinned (#71). Absent on summaries from before it was recorded. */
+  configVersion?: number;
+  /** What the job's finish reported (#71); absent while it runs, and for a job that never ran. */
+  finishedAt?: string;
+  /** From the broker's start to the finish. */
+  durationSeconds?: number;
+  /** Its microVM: where its logs are, `results/<delivery>/<microvmId>/`. */
+  microvmId?: string;
+  deliveryId?: string;
+  detail?: JobFinishDetail;
+}
+
+/**
+ * What a job's runner reports at its finish, beyond the outcome (#71), as the broker checked it:
+ * shown in the console, never trusted for anything else.
+ */
+export interface JobFinishDetail {
+  /** `updraft run-event`'s own outcome (succeeded, failed, publish-failed, nothing-to-do, ...). */
+  updraftOutcome?: string;
+  /** false: the job's verify commands failed. */
+  verificationPassed?: boolean;
+  /** The pull request it opened or updated: a URL of the job's own repository. */
+  prUrl?: string;
+  prNumber?: number;
+  /** The logs it uploaded: updraft.log, run.log. */
+  logs?: string[];
+}
+
+/**
+ * One webhook delivery of a tenant, and what became of it (#71), kept 30 days. `reason` is a code
+ * (jobs/deliveries.ts), `message` the words for people.
+ */
+export interface DeliveryRecord {
+  at: string;
+  deliveryId: string;
+  event: string;
+  action?: string;
+  repository?: string;
+  issue?: number;
+  label?: string;
+  sender?: string;
+  disposition: 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched';
+  reason?: string;
+  message?: string;
+  /** launch_failed: the AWS error's class (its name), never its message. */
+  errorClass?: string;
+  jobId?: string;
 }
 
 /** One published config: an immutable bundle under tenants/<id>/config/<version>/ in the tenant bucket. */
@@ -322,6 +369,11 @@ export interface Store {
   listTenants(): Promise<Tenant[]>;
   /** The tenant's most recent jobs, newest first. */
   listRecentJobs(installationId: number, limit: number): Promise<JobSummary[]>;
+  /** One of the tenant's job summaries (30 days), or null: never another tenant's. */
+  getJobSummary(installationId: number, jobId: string): Promise<JobSummary | null>;
+  recordDelivery(installationId: number, delivery: DeliveryRecord): Promise<void>;
+  /** Newest first. */
+  listDeliveries(installationId: number, limit: number): Promise<DeliveryRecord[]>;
   /**
    * Suspended or active again, unless the tenant was uninstalled (one conditional write). An
    * unsuspend leaves a tenant an admin disabled disabled.
@@ -399,7 +451,7 @@ export interface Store {
    * it is what this returns (null for an unknown job), so a repeated finish acts on the same one.
    * The first one also goes on the job's summary, and a failure counts in the month's usage.
    */
-  finishJob(jobId: string, outcome: string): Promise<string | null>;
+  finishJob(jobId: string, outcome: string, finish?: { at: number; detail?: JobFinishDetail }): Promise<string | null>;
   /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
 
@@ -495,6 +547,17 @@ export interface CleanupEntry {
   deleteAfter: number;
 }
 
+/** The fields a finish adds to a job's summary: when, how long it ran, its microVM, and what it reported. */
+export function finishFields(job: Pick<Job, 'startedAt' | 'microvmId'>, finish?: { at: number; detail?: JobFinishDetail }): Partial<JobSummary> {
+  if (!finish) return {};
+  return {
+    finishedAt: new Date(finish.at).toISOString(),
+    ...(job.startedAt !== undefined ? { durationSeconds: Math.max(0, Math.round((finish.at - job.startedAt) / 1000)) } : {}),
+    ...(job.microvmId ? { microvmId: job.microvmId } : {}),
+    ...(finish.detail && Object.keys(finish.detail).length ? { detail: finish.detail } : {}),
+  };
+}
+
 /** In-memory Store for tests and local dev without AWS. `ttl` is recorded as DynamoDB would hold it. */
 export function createMemoryStore(): Store & { ttlOf(installationId: number): { tenant?: number; members: (number | undefined)[] } } {
   const states = new Map<string, OAuthState>();
@@ -507,6 +570,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
   const refusals: { id: number; r: DispatchRefusal }[] = [];
+  const deliveries2: { id: number; d: DeliveryRecord }[] = [];
   const jobs = new Map<string, Job>();
   /** `<installationId>/<deliveryId>` -> expiry (epoch ms) and the job holding the claim. */
   const deliveries = new Map<string, { expiresAt: number; jobId: string }>();
@@ -842,19 +906,33 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
         ...(job.sender ? { sender: job.sender } : {}),
         createdAt: job.createdAt,
         status: job.status,
+        configVersion: job.configVersion,
+        deliveryId: job.deliveryId,
       });
+    },
+    async getJobSummary(id, jobId) {
+      const s = summaries.get(jobId);
+      if (!s || s.installationId !== id) return null;
+      const { installationId: _id, ...rest } = s;
+      return structuredClone(rest);
+    },
+    async recordDelivery(id, d) {
+      deliveries2.push({ id, d: { ...d } });
+    },
+    async listDeliveries(id, limit) {
+      return deliveries2.filter((x) => x.id === id).map((x) => ({ ...x.d })).sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);
     },
     async getJob(jobId) {
       const j = jobs.get(jobId);
       return j ? { ...j } : null;
     },
-    async finishJob(jobId, outcome) {
+    async finishJob(jobId, outcome, finish) {
       const j = jobs.get(jobId);
       if (!j) return null;
       if (j.status === 'finished') return j.outcome ?? null;
       jobs.set(jobId, { ...j, status: 'finished', outcome });
       const s = summaries.get(jobId);
-      if (s) summaries.set(jobId, { ...s, status: 'finished', outcome });
+      if (s) summaries.set(jobId, { ...s, status: 'finished', outcome, ...finishFields(j, finish) });
       if (isFailure(outcome)) {
         const key = `${j.installationId}/${j.createdAt.slice(0, 7)}`;
         failed.set(key, (failed.get(key) ?? 0) + 1);
@@ -873,6 +951,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       for (const [k, c] of configs) if (c.installationId === id) configs.delete(k);
       for (const k of [...keys.keys()]) if (k.startsWith(`${id}/`)) keys.delete(k);
       for (let i = refusals.length - 1; i >= 0; i--) if (refusals[i]!.id === id) refusals.splice(i, 1);
+      for (let i = deliveries2.length - 1; i >= 0; i--) if (deliveries2[i]!.id === id) deliveries2.splice(i, 1);
       for (const m of [slots, days, months]) for (const k of [...m.keys()]) if (k.startsWith(`${id}/`)) m.delete(k);
     },
     async completeCleanup(entry) {

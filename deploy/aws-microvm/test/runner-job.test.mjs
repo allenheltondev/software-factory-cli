@@ -486,17 +486,21 @@ function brokerDeps(mode, overrides = {}) {
     issued += 1;
     return tokenFile(issued);
   };
-  harness.deps.finishJob = async (outcome) => {
+  harness.deps.finishJob = async (outcome, detail) => {
     harness.calls.push(['finishJob', outcome]);
+    harness.finishDetails = [...(harness.finishDetails ?? []), detail];
   };
   return harness;
 }
 
 describe.runIf(onLinuxLikeHost)('runJob, version 2 (job broker)', () => {
   it('gives the job an installation token instead of the key, the tenant\'s keys as its environment, and finishes the job', async () => {
-    const { deps, calls } = brokerDeps('success');
+    const harness = brokerDeps('success');
+    const { deps, calls } = harness;
     const result = await runJob(brokerRequest(), deps);
     expect(result.outcome).toBe('succeeded');
+    // What the console shows of the job (#71): the pull request and the logs, as names.
+    expect(harness.finishDetails).toEqual([{ updraftOutcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logs: ['updraft.log', 'run.log'] }]);
 
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(record.keyMode).toBeNull();

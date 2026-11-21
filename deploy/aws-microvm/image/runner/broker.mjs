@@ -95,7 +95,8 @@ export function createBrokerClient(broker, options = {}) {
     credentials: () => call('credentials'),
     /** The token file document (Updraft's github.app.tokenFile format). */
     githubToken: async () => (await call('github-token')).tokenFile,
-    finish: (outcome) => call('finish', { outcome }),
+    /** `detail`: what the console shows of the job (#71): its pull request, verification, logs. */
+    finish: (outcome, detail) => call('finish', detail ? { outcome, detail } : { outcome }),
     /** Stops this job's microVM (the one the launcher recorded); works after finish too. */
     terminate: () => call('terminate'),
   };
@@ -152,7 +153,7 @@ export async function startBrokerJob(payload, { client, createAwsDeps, now = Dat
   const deps = {
     ...createAwsDeps(payload.region, { credentials: brokerCredentialProvider(client, started.credentials, { now }) }),
     githubToken: () => client.githubToken(),
-    finishJob: (outcome) => client.finish(outcome),
+    finishJob: (outcome, detail) => client.finish(outcome, detail),
     // A job that fails while preparing can end before the launcher has recorded its microVM.
     terminate: () => terminateThroughBroker(client, terminateOptions),
   };

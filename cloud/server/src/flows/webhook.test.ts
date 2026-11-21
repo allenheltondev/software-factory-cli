@@ -218,4 +218,52 @@ describe('webhook', () => {
     const res = await handle({ body, headers: { 'x-github-event': 'installation', 'x-hub-signature-256': signBody(body, 'hook-secret') } });
     expect(res.status).toBe(400);
   });
+
+  describe('the deliveries list (#71)', () => {
+    const labeled = { action: 'labeled', installation: { id: 55 }, repository: { id: 9, full_name: 'acme/web' }, issue: { number: 12 }, label: { name: 'updraft' }, sender: { login: 'pat' } };
+
+    it("records what became of a tenant's labeled issue, with the event's details", async () => {
+      const launch: Launcher = async () => ({ status: 500, disposition: 'launch_failed', jobId: 'job_1', errorClass: 'ServiceException' });
+      const { deliver, store } = await setup(undefined, launch);
+      await deliver('issues', labeled);
+      expect(await store.listDeliveries(55, 5)).toEqual([
+        {
+          at: new Date(NOW).toISOString(),
+          deliveryId: 'd1',
+          event: 'issues',
+          action: 'labeled',
+          repository: 'acme/web',
+          issue: 12,
+          label: 'updraft',
+          sender: 'pat',
+          disposition: 'launch_failed',
+          errorClass: 'ServiceException',
+          jobId: 'job_1',
+        },
+      ]);
+    });
+
+    it('lists work events Updraft Cloud does not take as filtered, and never lifecycle events or other installations', async () => {
+      const { deliver, lifecycle, store } = await setup(undefined, async () => ({ status: 200, disposition: 'no_tenant' }));
+      await deliver('pull_request', { action: 'opened', installation: { id: 55 }, repository: { full_name: 'acme/web' } });
+      await deliver('issues', { ...labeled, action: 'opened' });
+      await deliver('issues', { ...labeled, installation: { id: 77 } });
+      await deliver('pull_request', { action: 'opened', installation: { id: 77 } });
+      await lifecycle('suspend');
+      expect((await store.listDeliveries(55, 10)).map((d) => [d.event, d.action, d.disposition, d.reason])).toEqual([
+        ['pull_request', 'opened', 'filtered', 'event_not_accepted'],
+        ['issues', 'opened', 'filtered', 'event_not_accepted'],
+      ]);
+      expect(await store.listDeliveries(77, 10)).toEqual([]);
+    });
+
+    it('answers the delivery even when it cannot be recorded', async () => {
+      const launch: Launcher = async () => ({ status: 202, disposition: 'launched', jobId: 'job_1' });
+      const { deliver, store } = await setup(undefined, launch);
+      store.recordDelivery = async () => {
+        throw new Error('throttled');
+      };
+      expect(await deliver('issues', labeled)).toEqual({ status: 202, body: { ok: true, disposition: 'launched' } });
+    });
+  });
 });

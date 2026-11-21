@@ -30,7 +30,7 @@ export interface AgentKeysView {
 
 export interface AgentKeyServiceDeps {
   store: Store;
-  github: Pick<GitHubFlows, 'configContext'>;
+  github: Pick<GitHubFlows, 'configContext' | 'member'>;
   secrets: SecretsPort;
   check: KeyChecker;
   /** Reads key needs from the bundle of a version published before they were recorded. */
@@ -77,7 +77,8 @@ export function createAgentKeyService({ store, github, secrets, check, bundleKey
 
   return {
     async list(caller: Caller, installationId: number): Promise<AgentKeysView> {
-      await member(caller, installationId);
+      // The cheap membership check: nothing here needs GitHub.
+      await github.member(caller, installationId);
       return view(installationId);
     },
     async set(caller: Caller, installationId: number, name: string, value: unknown): Promise<AgentKeysView> {

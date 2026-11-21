@@ -54,6 +54,8 @@ export type FlowErrorCode =
   | 'config_changed'
   | 'auto_merge_unconfirmed'
   | 'not_reactivatable'
+  // Status and diagnostics (tenants/status-service.ts).
+  | 'log_expired'
   // Agent keys (tenants/agent-key-service.ts).
   | 'invalid_key';
 
@@ -397,6 +399,22 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
       const summary = summarize(tenant, member);
       if (tenant.status !== 'active') return { tenant: summary, repositories: [] };
       return { tenant: summary, repositories: await installationRepositories(s, installationId) };
+    },
+
+    /** A member's view of the tenant, or not_authorized (403): the check every tenant page makes, with no GitHub call. */
+    async member(caller: Caller, installationId: number): Promise<{ tenant: Tenant; summary: TenantSummary }> {
+      const { tenant, member } = await memberOf(caller, installationId);
+      return { tenant, summary: summarize(tenant, member) };
+    },
+
+    /**
+     * The installation as GitHub has it now (#71): whether it still exists, is suspended, and what
+     * it grants the App. null when GitHub no longer has it. For members only.
+     */
+    async installation(caller: Caller, installationId: number): Promise<GitHubInstallation | null> {
+      const s = await settings();
+      await memberOf(caller, installationId);
+      return github.getInstallation(appJwt(s.appId, s.privateKey, now()), installationId);
     },
 
     /**

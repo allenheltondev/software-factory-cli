@@ -195,8 +195,8 @@ describe('startBrokerJob', () => {
     expect(createAwsDeps).toHaveBeenCalledWith('us-east-1', { credentials: expect.any(Function) });
     expect((await deps.credentials()).accessKeyId).toBe('ASIA');
     await expect(deps.githubToken()).resolves.toEqual({ token: 'ghs_x' });
-    await deps.finishJob('succeeded');
-    expect(client.finish).toHaveBeenCalledWith('succeeded');
+    await deps.finishJob('succeeded', { prUrl: 'https://github.com/o/r/pull/7' });
+    expect(client.finish).toHaveBeenCalledWith('succeeded', { prUrl: 'https://github.com/o/r/pull/7' });
     // The broker stops the job's own microVM; the execution role is never asked to.
     await deps.terminate('mvm-anything');
     expect(client.terminate).toHaveBeenCalledOnce();

@@ -3,7 +3,8 @@ import { appJwt } from '../github/jwt.js';
 import { verifySignature } from '../github/signature.js';
 import type { LoadSettings } from '../github/settings.js';
 import type { Launcher } from '../jobs/launch.js';
-import type { Store } from '../store/store.js';
+import { deliveryFromLaunch, LIFECYCLE_EVENTS, type DeliveryEvent } from '../jobs/deliveries.js';
+import type { DeliveryRecord, Store } from '../store/store.js';
 
 /**
  * The GitHub webhook (POST /api/webhooks/github, no authorizer: the HMAC is the authentication).
@@ -23,6 +24,9 @@ import type { Store } from '../store/store.js';
  *                            asked, the event's action is used. Neither ever overrides an
  *                            uninstall (a conditional write).
  *   installation_repositories  nothing stored yet: repositories are read live from GitHub
+ *
+ * Every other delivery for a tenant is recorded for its deliveries list (jobs/deliveries.ts, #71),
+ * with what became of it.
  *
  * Installing the App on GitHub alone never creates a tenant; only a delete records one (the
  * tombstone above), and it can never become active.
@@ -95,14 +99,35 @@ export function createWebhookHandler({
       return { status, body: { ok: status < 300, disposition } };
     };
 
+    const validInstallation = Number.isSafeInteger(installationId) && installationId > 0;
+    const base: DeliveryEvent = {
+      at: new Date(now()).toISOString(),
+      deliveryId: delivery.slice(0, 64),
+      event: event.slice(0, 64),
+      ...(action ? { action: action.slice(0, 64) } : {}),
+      ...(typeof payload.repository?.full_name === 'string' ? { repository: payload.repository.full_name.slice(0, 200) } : {}),
+      ...(Number.isSafeInteger(payload.issue?.number) ? { issue: payload.issue!.number as number } : {}),
+      ...(typeof payload.label?.name === 'string' ? { label: payload.label.name.slice(0, 100) } : {}),
+      ...(typeof payload.sender?.login === 'string' ? { sender: payload.sender.login.slice(0, 100) } : {}),
+    };
+    // The tenant's deliveries list (#71). Never fails the delivery: it is for people to read.
+    const record = async (d: DeliveryRecord | null) => {
+      if (!d || !validInstallation) return;
+      await store.recordDelivery(installationId, d).catch((err: unknown) => log(JSON.stringify({ delivery, warning: `could not record the delivery: ${(err as Error)?.name}` })));
+    };
+
     if (event === 'ping') return done('pong');
-    if (event === 'issues') {
-      if (action !== 'labeled' || !Number.isSafeInteger(installationId) || installationId <= 0) return done('ignored');
-      if (!launch) return done('jobs_not_configured');
+    if (event === 'issues' && action === 'labeled' && validInstallation && launch) {
       const result = await launch({ installationId, deliveryId: delivery, body: req.body, payload });
+      await record(deliveryFromLaunch(base, result));
       return done(result.disposition, result.status);
     }
-    if (event !== 'installation' || !Number.isSafeInteger(installationId) || installationId <= 0) return done('ignored');
+    if (!LIFECYCLE_EVENTS.has(event)) {
+      // Work Updraft Cloud does not take (yet): listed for the tenant it was meant for.
+      if (validInstallation && (await store.getTenant(installationId))) await record({ ...base, disposition: 'filtered', reason: 'event_not_accepted' });
+      return done(event === 'issues' && action === 'labeled' && !launch ? 'jobs_not_configured' : 'ignored');
+    }
+    if (event !== 'installation' || !validInstallation) return done('ignored');
 
     const a = payload.installation?.account;
     const account =
