@@ -12,14 +12,25 @@ const API_KEY_HEADER = /\b((?:x-api-key|api[-_]?key|authorization)["']?\s*[:=]\s
 /** Shorter values are never matched literally (they would redact ordinary words). */
 const MIN_KNOWN = 8;
 
-/** A redactor for these secret values. */
+/**
+ * A redactor for these secret values: a function from text to redacted text. Its `spans` gives
+ * where in a text each thing it redacts starts and ends (before redaction), for a stream that
+ * must not cut through one.
+ */
 export function createRedactor(known = []) {
   const values = [...new Set(known.filter((v) => typeof v === 'string' && v.length >= MIN_KNOWN))].sort((a, b) => b.length - a.length);
-  return (text) => {
+  const redact = (text) => {
     let out = String(text);
     for (const value of values) out = out.split(value).join(REDACTED);
     return out.replace(KEY_SHAPED, REDACTED).replace(BEARER, `$1${REDACTED}`).replace(API_KEY_HEADER, `$1${REDACTED}`);
   };
+  redact.spans = (text) => {
+    const spans = [];
+    for (const value of values) for (let i = text.indexOf(value); i !== -1; i = text.indexOf(value, i + 1)) spans.push([i, i + value.length]);
+    for (const re of [KEY_SHAPED, BEARER, API_KEY_HEADER]) for (const m of text.matchAll(new RegExp(re.source, re.flags))) spans.push([m.index, m.index + m[0].length]);
+    return spans;
+  };
+  return redact;
 }
 
 /** The longest a secret is assumed to be: a stream keeps this much back so a value split across chunks is still found. */
@@ -27,8 +38,11 @@ export const MAX_SECRET_BYTES = 1024;
 
 /**
  * A text stream that redacts before writing. Output is redacted per line; a line longer than
- * `flushAt` is written in pieces, holding back MAX_SECRET_BYTES so a secret that spans two
- * pieces is still whole in one of them.
+ * `flushAt` is written in pieces. A piece ends where no secret can be cut: at least
+ * MAX_SECRET_BYTES before the end of what has arrived (a secret still arriving is in that
+ * part), and before anything the redactor would match across the cut (a known key, or a
+ * key-shaped token that may still be growing). The piece and the rest are then redacted
+ * separately, and neither holds part of a secret the other completes.
  */
 export function redactingWriter(write, redact, flushAt = 64 * 1024) {
   let pending = '';
@@ -41,12 +55,21 @@ export function redactingWriter(write, redact, flushAt = 64 * 1024) {
         pending = pending.slice(newline + 1);
       }
       if (pending.length > flushAt) {
-        // Cut where no secret can be split: before the last MAX_SECRET_BYTES, at a space if there is one.
         let cut = pending.length - MAX_SECRET_BYTES;
-        const space = pending.lastIndexOf(' ', cut);
-        if (space > 0) cut = space + 1;
-        write(redact(pending.slice(0, cut)));
-        pending = pending.slice(cut);
+        const spans = redact.spans ? redact.spans(pending) : [];
+        for (let moved = true; moved; ) {
+          moved = false;
+          for (const [start, end] of spans) {
+            if (start < cut && end > cut) {
+              cut = start;
+              moved = true;
+            }
+          }
+        }
+        if (cut > 0) {
+          write(redact(pending.slice(0, cut)));
+          pending = pending.slice(cut);
+        }
       }
     },
     end() {

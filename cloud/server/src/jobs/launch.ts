@@ -163,7 +163,14 @@ export function createLauncher(deps: LaunchDeps) {
     // bundle; one whose bundle cannot tell is refused, not run without its keys checked.
     let needed = decision.keys;
     if (needed === null) {
-      needed = deps.bundleKeys ? await deps.bundleKeys.forTrigger(req.installationId, tenant.activeConfigVersion, decision.repository, decision.label) : null;
+      needed = deps.bundleKeys
+        ? await deps.bundleKeys.forEvent(req.installationId, tenant.activeConfigVersion, {
+            repositoryFullName: req.payload.repository?.full_name,
+            repositoryId: req.payload.repository?.id,
+            label: req.payload.label?.name,
+            sender: req.payload.sender?.login,
+          })
+        : null;
     }
     const issueNumber = req.payload.issue!.number as number;
     const refuse = async (reason: string, detail: Record<string, unknown>) => {

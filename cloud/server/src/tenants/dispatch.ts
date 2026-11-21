@@ -18,8 +18,8 @@ type Repository = { id?: unknown; workflows?: unknown };
 export interface DispatchOptions {
   /** OWNER/REPO (any case) of repositories that stay configured but start nothing. */
   paused?: ReadonlySet<string>;
-  /** Per repository and label (lower-case), the agent keys its jobs can need (key-needs.ts keysByTrigger). */
-  keys?: Record<string, Record<string, string[]>>;
+  /** The agent keys a job of this workflow can need (key-needs.ts workflowKeys). Absent: triggers record none. */
+  keysFor?: (repo: Record<string, unknown>, workflow: Record<string, unknown>) => string[];
 }
 
 const lowerStrings = (value: unknown): string[] =>
@@ -34,11 +34,11 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
     const repo = raw as Repository;
     if (typeof repo.id !== 'number') continue;
     const triggers: { label: string; actors: string[]; keys?: string[] }[] = [];
-    const repoKeys = options.keys?.[fullName.toLowerCase()];
     for (const wf of Array.isArray(repo.workflows) ? (repo.workflows as Workflow[]) : []) {
       const label = wf.trigger?.label;
       if (typeof label !== 'string' || label === '') continue;
-      const keys = options.keys ? (repoKeys?.[label.toLowerCase()] ?? []) : undefined;
+      // Each workflow's own keys: two workflows on one label, for different actors, each keep theirs.
+      const keys = options.keysFor ? options.keysFor(repo as Record<string, unknown>, wf as Record<string, unknown>) : undefined;
       triggers.push({ label: label.toLowerCase(), actors: wf.allowedActors === undefined ? fallbackActors : lowerStrings(wf.allowedActors), ...(keys ? { keys } : {}) });
     }
     // One shared list (of actors, of keys) is stored once, not copied to each trigger.

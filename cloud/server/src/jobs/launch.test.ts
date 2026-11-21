@@ -34,7 +34,7 @@ const tenant = (status: Tenant['status'] = 'active'): Tenant => ({
 const rules = dispatchRules({
   dispatch: { allowedActors: ['pat'] },
   repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
-}, { keys: {} });
+}, { keysFor: () => [] });
 
 describe('the launcher', () => {
   let store: ReturnType<typeof createMemoryStore>;
@@ -167,11 +167,11 @@ describe('the launcher', () => {
           dispatch: { allowedActors: ['pat'] },
           repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }, { trigger: { label: 'codex' } }] } },
         },
-        { keys: { 'acme/web': { updraft: ['ANTHROPIC_API_KEY'], codex: ['CODEX_API_KEY'] } } },
+        { keysFor: (_repo, wf) => ((wf.trigger as { label: string }).label === 'codex' ? ['CODEX_API_KEY'] : ['ANTHROPIC_API_KEY']) },
       );
     const withKeys = async (keys: string[]) => activate(dispatchRules(
       { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } } },
-      { keys: { 'acme/web': { updraft: keys } } },
+      { keysFor: () => keys },
     ));
     const setKey = (name: string) => store.putAgentKeyMeta(55, { name, updatedAt: '2000-01-01T00:00:00.000Z', updatedBy: 'pat' });
     const finishWith = async (jobId: string, token: string, outcome: string) => {
@@ -217,6 +217,7 @@ describe('the launcher', () => {
       const legacy = () => dispatchRules({ dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } } });
       const bundle = (version: number) => ({
         [`tenants/55/config/${version}/config.yaml`]: [
+          'dispatch: { allowedActors: [pat] }',
           'agents:',
           '  claude: { adapter: claude }',
           'pools:',

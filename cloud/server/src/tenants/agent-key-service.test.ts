@@ -70,7 +70,7 @@ describe('agent keys in the console (#70)', () => {
 
   it('reads what a version from before key needs were recorded requires from its bundle, and shows every key required when it cannot tell', async () => {
     for (const [bundle, expected] of [
-      ['agents:\n  codex: { adapter: codex }\npools:\n  p: { agents: [codex] }\nrepositories:\n  acme/web:\n    workflows:\n      - { trigger: { label: updraft }, pool: p }\n', [false, true]],
+      ['dispatch: { allowedActors: [pat] }\nagents:\n  codex: { adapter: codex }\npools:\n  p: { agents: [codex] }\nrepositories:\n  acme/web:\n    id: 9\n    workflows:\n      - { trigger: { label: updraft }, pool: p }\n', [false, true]],
       [null, [true, true]],
     ] as const) {
       const { store, service } = await setup();

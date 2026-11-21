@@ -1,4 +1,4 @@
-import { keysByTrigger, poolAgentKeys, workflowPools } from './key-needs.js';
+import { poolAgentKeys, workflowKeys, workflowPools } from './key-needs.js';
 import { createHash } from 'node:crypto';
 import { stringify } from 'yaml';
 // The CLI's own schema and validator (the `@allenheltondev/updraft/config` entry point), from this
@@ -246,7 +246,7 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
   for (const file of Object.keys(prompts)) if (!usedPrompts.has(file)) warnings.push({ path: file, message: 'not referenced by any action; it is stored anyway' });
 
   const files: Record<string, string> = { 'config.yaml': stringify(compiled), ...prompts };
-  const rules = dispatchRules(compiled, { paused, keys: keysByTrigger(compiled) });
+  const rules = dispatchRules(compiled, { paused, keysFor: (repo, wf) => workflowKeys(compiled, repo, wf) });
   // The version's record holds its dispatch rules and file list, in one DynamoDB item (400 KB).
   const recordBytes = Buffer.byteLength(JSON.stringify({ dispatch: rules, files: [...Object.keys(files), 'source.json'] }), 'utf8');
   if (recordBytes > MAX_VERSION_RECORD_BYTES) {

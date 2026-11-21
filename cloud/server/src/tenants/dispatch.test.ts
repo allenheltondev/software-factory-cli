@@ -42,13 +42,24 @@ describe('decideDispatch', () => {
     expect(decideDispatch(rules, event({ label: 'docs', sender: 'writer' })).start).toBe(true);
   });
 
-  it("returns the keys of the matching triggers the sender may apply; null for rules that predate keys (#70)", () => {
-    const withKeys = dispatchRules(
-      { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }, { trigger: { label: 'Updraft' }, allowedActors: ['sam'] }, { trigger: { label: 'codex' } }] } } },
-      { keys: { 'acme/web': { updraft: ['ANTHROPIC_API_KEY'], codex: ['CODEX_API_KEY'] } } },
+  it("returns the keys of the workflows the label and sender match, each workflow's own (#70 review)", () => {
+    // One label, two workflows: only alice may start Claude, only bob Codex.
+    const shared = dispatchRules(
+      {
+        repositories: {
+          'acme/web': {
+            id: 9,
+            workflows: [
+              { trigger: { label: 'updraft' }, allowedActors: ['alice'], agent: 'claude' },
+              { trigger: { label: 'updraft' }, allowedActors: ['bob'], agent: 'codex' },
+            ],
+          },
+        },
+      },
+      { keysFor: (_repo, wf) => (wf.agent === 'codex' ? ['CODEX_API_KEY'] : ['ANTHROPIC_API_KEY']) },
     );
-    expect(decideDispatch(withKeys, event())).toMatchObject({ start: true, keys: ['ANTHROPIC_API_KEY'] });
-    expect(decideDispatch(withKeys, event({ label: 'codex' }))).toMatchObject({ start: true, keys: ['CODEX_API_KEY'] });
+    expect(decideDispatch(shared, event({ sender: 'alice' }))).toMatchObject({ start: true, keys: ['ANTHROPIC_API_KEY'] });
+    expect(decideDispatch(shared, event({ sender: 'bob' }))).toMatchObject({ start: true, keys: ['CODEX_API_KEY'] });
   });
 
   it.each([
