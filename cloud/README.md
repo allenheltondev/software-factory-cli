@@ -35,6 +35,17 @@ So far it covers these phases:
   - **A microVM that ends without the job's finish** (stopped, crashed, out of time): reconciliation records the job as finished, `microvm_gone`, unless a finish got there first, so the console does not show it running.
   - **Retention:** results (result documents and logs) follow the stack's `ResultRetentionDays` (default 30): the daily cleanup deletes each tenant's older objects under `tenants/<id>/results/`.
 
+- **Insights and the job lifecycle**: how the factory is doing, for each installation, under Insights in the console.
+  - **Insights** (`GET /api/v1/installations/:id/insights?window=24h|7d|30d|90d|all&repo=owner/name`): `updraft stats --json` (docs/stats.md), computed by the CLI's own `computeStats` over the tenant's shared state database (`tenants/<id>/state/state.db`). It covers issues worked and how they ended, pull requests opened and merged, what review caught (verdicts, findings, first-pass ready), revision rounds per pull request, time per step, why merges were blocked, per repository, and by model for writing code (`routing.byModel`) and for reviewing (`review.byModel`), with a day-by-day series (`daily`) for the trend charts. Runners checkpoint the state every few seconds while a job runs, so the page is close to live.
+    - The API's role may read that one object (never the unsaved databases a failed sync leaves beside it). It downloads it to `/tmp` only when its ETag changed (`If-None-Match`), opens it read-only with `node:sqlite`, and reuses a report for 15 seconds.
+    - A state database written by a newer Updraft than the API bundles answers 503 `state_newer`; one from before stats were recorded reports zeros.
+  - **Lifecycle** (on each job's page, and as badges in the jobs list): the runner reports at `finish` where the review loop left the pull request (`loop`: stage, rounds of `maxRevisions`, reviews, verdict, merged) and each step in order (`steps`: implement, review, revision, with agent, outcome, verification and publication). The broker keeps only codes, counts and booleans of it (`server/src/jobs/lifecycle.ts`).
+
+- **Agent telemetry**: what each job's agents did, sent to the tenant's own Honeycomb for its Agent Timeline ([docs/agent-timeline.md](../docs/agent-timeline.md)).
+  - **Settings** (`GET/PUT /api/v1/installations/:id/telemetry`, `PUT/DELETE .../telemetry/key`): a Honeycomb Ingest key, checked with Honeycomb's `/1/auth` in the chosen region before it is saved (write-only, like an agent key: `agent-keys/HONEYCOMB_API_KEY`), sending on or paused, the service name, and whether prompts and outputs are recorded. Saving the first key turns it on.
+  - **Broker**: a job of a tenant with telemetry on gets `descriptor.telemetry` (region, the key's secret name, service name, content on or off). It is never among `agentKeySecrets`, so the key never reaches an agent's environment.
+  - **Runner** (`deploy/aws-microvm/image/runner/telemetry.mjs`): tails every `run.log` while the job runs and sends OpenTelemetry GenAI spans (`invoke_workflow`, `invoke_agent`, `chat`, `execute_tool`) over OTLP/HTTP JSON, one trace per job, `gen_ai.conversation.id` = `owner/repo#issue`. Its `finish` reports the trace id and how many spans got there; the console links each job to its trace, and the settings page shows the last export.
+
 ## Architecture
 
 ```

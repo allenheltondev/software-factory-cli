@@ -2,9 +2,10 @@ import { JOB_PERMISSIONS } from '../broker/broker.js';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows, type TenantSummary } from '../flows/github.js';
 import { countBy, deliveryCounts, jobResult, type JobResult } from '../jobs/status.js';
-import type { DeliveryRecord, JobSummary, Store } from '../store/store.js';
+import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { redact } from './redact.js';
+import { traceUrl } from './telemetry-service.js';
 
 /**
  * A tenant's status and diagnostics in the console (#71), for its members only:
@@ -50,6 +51,8 @@ export interface JobView extends JobSummary {
   prUrl?: string;
   /** Logs the API can serve (the job uploaded them; they may since have expired). */
   logs: string[];
+  /** Its agents' trace in the tenant's Honeycomb, when telemetry was on for it. */
+  telemetry?: { traceId: string; traceUrl?: string; conversationId?: string; spans: number; exported: number; failed: number; lastError?: string };
 }
 
 export interface Overview {
@@ -100,10 +103,24 @@ export function missingPermissions(granted: Record<string, string> | undefined):
   return out;
 }
 
-export function jobView(job: JobSummary): JobView {
+export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = null): JobView {
   const view: JobView = { ...job, result: jobResult(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
   if (job.issue !== undefined) view.issueUrl = `https://github.com/${job.repository}/issues/${job.issue}`;
   if (job.detail?.prUrl) view.prUrl = job.detail.prUrl;
+  const t = job.detail?.telemetry;
+  if (t) {
+    const url = traceUrl(telemetry, t.traceId, t.startedAt ?? job.createdAt, job.finishedAt);
+    view.telemetry = {
+      traceId: t.traceId,
+      ...(url ? { traceUrl: url } : {}),
+      // The conversation Agent Timeline groups this job's traces under (the runner's telemetry.mjs).
+      ...(job.issue !== undefined ? { conversationId: `${job.repository}#${job.issue}` } : {}),
+      spans: t.spans,
+      exported: t.exported,
+      failed: t.failed,
+      ...(t.lastError ? { lastError: t.lastError } : {}),
+    };
+  }
   return view;
 }
 
@@ -185,7 +202,8 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
 
     async jobs(caller: Caller, installationId: number, limit?: unknown): Promise<{ jobs: JobView[] }> {
       await github.member(caller, installationId);
-      return { jobs: (await store.listRecentJobs(installationId, limitOf(limit))).map(jobView) };
+      const [jobs, telemetry] = await Promise.all([store.listRecentJobs(installationId, limitOf(limit)), store.getTelemetry(installationId).catch(() => null)]);
+      return { jobs: jobs.map((j) => jobView(j, telemetry)) };
     },
 
     async job(caller: Caller, installationId: number, jobId: string): Promise<{ job: JobView; deliveries: DeliveryRecord[] }> {
@@ -195,7 +213,7 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
       // Every kept attempt of its delivery: GitHub reuses the id on a redelivery, so an earlier
       // attempt (one that failed to launch, a day before) is part of this job's history.
       const deliveries = job.deliveryId ? await store.listDeliveriesOf(installationId, job.deliveryId) : [];
-      return { job: jobView(job), deliveries };
+      return { job: jobView(job, await store.getTelemetry(installationId).catch(() => null)), deliveries };
     },
 
     /** The end of one of a job's logs. The job is looked up in the tenant's own partition, so another tenant's log cannot be named. */

@@ -4,10 +4,13 @@ import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
+import { loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
 import { isFailure, type Job, type JobFinishDetail, type Store } from '../store/store.js';
 import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
+// Not the whole telemetry service: only the secret's name.
+import { telemetrySecretName } from '../tenants/telemetry-service.js';
 
 /**
  * The job broker (#68, "Isolation between tenants"): what a job's microVM may have, handed out to
@@ -108,6 +111,15 @@ export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersio
   };
 }
 
+/** Where a job sends its agent telemetry (the runner's telemetry.mjs), when the tenant turned it on. */
+export interface JobTelemetry {
+  region: 'us' | 'eu';
+  /** The key's secret, which the job's credentials can read (it is under the agent-keys prefix). */
+  secret: string;
+  serviceName: string;
+  captureContent: boolean;
+}
+
 export const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 
 export interface ScopedCredentials {
@@ -140,7 +152,7 @@ export interface BrokerDeps {
 }
 
 export type BrokerResponse =
-  | { ok: true; descriptor: JobPaths & { bucket: string; region: string; agentKeySecrets: Record<string, string> }; credentials: ScopedCredentials }
+  | { ok: true; descriptor: JobPaths & { bucket: string; region: string; agentKeySecrets: Record<string, string>; telemetry?: JobTelemetry }; credentials: ScopedCredentials }
   | { ok: true; tokenFile: Record<string, unknown> }
   | { ok: true; finished: true }
   | { ok: true; terminated: true }
@@ -251,6 +263,13 @@ export function createBroker(deps: BrokerDeps) {
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
       if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
+      // How the job's telemetry export went, for the settings page. Best effort, like the key's use.
+      const sent = finishDetail(job, detail)?.telemetry;
+      if (sent) {
+        await deps.store
+          .recordTelemetryExport(job.installationId, { at: new Date(now()).toISOString(), jobId: job.jobId, traceId: sent.traceId, spans: sent.spans, exported: sent.exported, failed: sent.failed, ...(sent.lastError ? { lastError: sent.lastError } : {}) })
+          .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not record the telemetry export: ${(err as Error)?.name}` }));
+      }
       // The key's "last used": this job ran with it (it started) and it worked or it did not.
       // Best effort: a failure here must not fail the job's finish.
       if (job.agentKeys?.length && job.startedAt !== undefined && (recorded === 'succeeded' || (isFailure(recorded) && recorded !== 'terminated'))) {
@@ -299,7 +318,12 @@ export function createBroker(deps: BrokerDeps) {
       // The tenant's key secrets by variable name; the runner reads them with the credentials (a
       // missing one is a key the tenant has not set).
       const agentKeySecrets = Object.fromEntries(AGENT_KEY_NAMES.map((name) => [name, agentKeySecretName(job.installationId, name)]));
-      return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets }, credentials };
+      // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
+      // telemetry key is the runner's alone. A failed read only means no telemetry for this job.
+      const t = await deps.store.getTelemetry(job.installationId).catch(() => null);
+      const telemetry: JobTelemetry | undefined =
+        t?.enabled && t.key ? { region: t.region, secret: telemetrySecretName(job.installationId), serviceName: t.serviceName, captureContent: t.captureContent } : undefined;
+      return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
     }
 
     // github-token: a token for this job's repository only, as the CLI reads it (token-file-auth.ts).
@@ -336,7 +360,7 @@ const LOG_NAMES = new Set(['updraft.log', 'run.log']);
 /**
  * What the runner reported at the finish, kept only where it checks out (#71): it is shown to the
  * tenant, so a pull request link must be one of the job's own repository, and anything else is
- * a short code, a boolean or a known log name.
+ * a short code, a boolean, a count or a known log name (the loop and the steps: jobs/lifecycle.ts).
  */
 export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFinishDetail | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
@@ -355,5 +379,11 @@ export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFin
     const logs = [...new Set(d.logs.filter((n): n is string => typeof n === 'string' && LOG_NAMES.has(n)))];
     if (logs.length) out.logs = logs;
   }
+  const loop = loopOf(d.loop);
+  if (loop) out.loop = loop;
+  const telemetry = telemetryOf(d.telemetry);
+  if (telemetry) out.telemetry = telemetry;
+  const steps = stepsOf(d.steps);
+  if (steps) out.steps = steps;
   return Object.keys(out).length ? out : undefined;
 }

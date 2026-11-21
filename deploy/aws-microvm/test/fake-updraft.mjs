@@ -212,6 +212,33 @@ switch (mode) {
     }
     break;
   }
+  case 'telemetry': {
+    // An agent run as the real CLI logs it ($UPDRAFT_HOME/logs/runs/<run>/run.log): the worker's
+    // header, Claude Code's stream-json written as it goes, the end marker. The agent echoes
+    // the tenant's key, which must never reach the telemetry.
+    const dir = path.join(home, 'logs', 'runs', 'run_t1');
+    fs.mkdirSync(dir, { recursive: true });
+    const log = path.join(dir, 'run.log');
+    const head = ['updraft run run_t1', 'job: job_t1 (attempt 1)', 'repository: o/r (id 1)', 'issue: #7 A title', 'agent: claude (adapter claude)', '---- agent output (stdout and stderr) ----'];
+    const lines = [
+      { type: 'assistant', message: { id: 'm1', model: 'claude-x', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: `echo ${process.env.ANTHROPIC_API_KEY}` } }], usage: { input_tokens: 5, output_tokens: 2 } } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } },
+      { type: 'result', subtype: 'success', is_error: false, result: 'done', num_turns: 2 },
+    ].map((e) => JSON.stringify(e));
+    fs.writeFileSync(log, `${head.join('\n')}\n`);
+    const pauseMs = Number(process.env.FAKE_UPDRAFT_SLOW_MS ?? 150);
+    const step = () => {
+      if (!lines.length) {
+        fs.appendFileSync(log, '---- end of agent output ----\noutcome: succeeded\n');
+        console.log(JSON.stringify({ outcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logPath: log, exitCode: 0 }));
+        return;
+      }
+      fs.appendFileSync(log, `${lines.shift()}\n`);
+      setTimeout(step, pauseMs);
+    };
+    setTimeout(step, pauseMs);
+    break;
+  }
   case 'success':
     console.log(JSON.stringify({ outcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logPath: writeLogs(), exitCode: 0 }));
     break;

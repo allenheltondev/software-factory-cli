@@ -222,6 +222,162 @@ export interface JobView {
   issueUrl?: string;
   prUrl?: string;
   logs: string[];
+  /** What the runner reported at the finish (as the broker checked it). */
+  detail?: JobDetail;
+  /** Its agents' trace in the installation's Honeycomb, when telemetry was on. */
+  telemetry?: { traceId: string; traceUrl?: string; conversationId?: string; spans: number; exported: number; failed: number; lastError?: string };
+}
+
+export type TelemetryRegion = 'us' | 'eu';
+export interface TelemetryView {
+  provider: 'honeycomb';
+  enabled: boolean;
+  region: TelemetryRegion;
+  serviceName: string;
+  captureContent: boolean;
+  keyConfigured: boolean;
+  key?: { updatedAt: string; updatedBy: string; type?: string; team?: { name: string; slug: string }; environment?: { name: string; slug: string } };
+  lastExport?: { at: string; jobId: string; traceId?: string; traceUrl?: string; spans: number; exported: number; failed: number; lastError?: string };
+  environmentUrl?: string;
+  updatedAt?: string;
+  updatedBy?: string;
+}
+
+export type StepKind = 'implement' | 'revision' | 'review';
+export type LoopStage = 'awaiting-review' | 'reviewing' | 'changes-requested' | 'revising' | 'ready-to-merge' | 'merging' | 'merged' | 'needs-human' | 'closed';
+
+export interface JobDetail {
+  updraftOutcome?: string;
+  verificationPassed?: boolean;
+  prNumber?: number;
+  /** Where the review loop left the pull request. */
+  loop?: { rounds: number; maxRevisions?: number; reviews: number; verdict?: 'ready-to-merge' | 'changes-requested'; stage?: LoopStage; merged?: boolean };
+  /** Each step of the run, in order: the job itself, then reviews and revisions. */
+  steps?: Array<{ kind: StepKind; agent?: string; outcome?: string; verificationPassed?: boolean; publication?: string }>;
+}
+
+/**
+ * Insights: `updraft stats --json` over the tenant's shared state (docs/stats.md). Only the
+ * fields the console reads are typed here.
+ */
+export type InsightsWindow = '24h' | '7d' | '30d' | '90d' | 'all';
+
+export interface Distribution {
+  count: number;
+  averageMs: number | null;
+  medianMs: number | null;
+  p90Ms: number | null;
+}
+export interface CoveredDistribution extends Distribution {
+  total: number;
+}
+export interface KindCounts {
+  implement: number;
+  revision: number;
+  review: number;
+  unknown: number;
+  total: number;
+}
+export interface Rate {
+  count: number;
+  of: number;
+  rate: number | null;
+  low: number | null;
+  high: number | null;
+}
+export interface CodingModelStats {
+  jobs: number;
+  smallSample: boolean;
+  success: Rate;
+  escalatedIn: { jobs: number; succeeded: number };
+  escalatedOut: number;
+  retries: number;
+  verificationFailures: number;
+  prsOpened: number;
+  reviewed: number;
+  reviewReady: Rate;
+  changesRequested: number;
+  revisions: { average: number | null; total: number };
+  labelToPr: CoveredDistribution;
+  queueWait: Distribution;
+  adapter?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  modelSource?: 'configured' | 'observed' | 'unknown';
+}
+export interface ReviewModelStats {
+  adapter: string | null;
+  model: string | null;
+  effort: string | null;
+  runs: number;
+  readyToMerge: number;
+  changesRequested: number;
+  failed: number;
+  findings: { total: number; withCount: number; average: number | null };
+}
+export interface DailyStats {
+  day: string;
+  jobsSucceeded: number;
+  jobsFailed: number;
+  prsOpened: number;
+  prsMerged: number;
+  reviews: number;
+  changesRequested: number;
+  findings: number;
+  revisions: number;
+}
+export interface StatsSection {
+  work: {
+    finished: { succeeded: KindCounts; failed: KindCounts; interrupted: KindCounts; canceled: KindCounts; total: KindCounts };
+    current: { queued: KindCounts; running: KindCounts };
+  };
+  time: {
+    agentRun: { all: CoveredDistribution; byKind: Record<StepKind, CoveredDistribution>; byAgent: Record<string, CoveredDistribution> };
+    queueWait: { all: Distribution };
+    labelToPr: CoveredDistribution;
+    prToMerge: CoveredDistribution;
+  };
+  outcomes: {
+    prsOpened: number;
+    prsMerged: number;
+    mergeBlocked: { heads: number; prs: number; reasons: Array<{ code: string; count: number }> };
+    runs: Record<string, number> & { total: number };
+    failedRuns: { total: number; verifyFailed: number };
+  };
+  review: {
+    reviewerRuns: { total: number; readyToMerge: number; changesRequested: number; failed: number; other: number };
+    changesRequestedRounds: { reviewer: number; people: number; reviewerQueued: number; peopleQueued: number };
+    findings: { changesRequestedReviews: number; withCount: number; withoutCount: number; total: number; average: number | null; allReviewsWithoutCount: number };
+    firstPass: { prs: number; readyToMerge: number; rate: number | null };
+    /** Absent in a report from before reviewer models were reported. */
+    byModel?: Record<string, ReviewModelStats>;
+  };
+  backAndForth: {
+    prs: number;
+    revisionsPerPr: { average: number | null; max: number | null; distribution: { '0': number; '1': number; '2': number; '3+': number } };
+    reviewsPerPr: { average: number | null; max: number | null };
+    limitReached: number;
+  };
+  routing: { minSample: number; byModel: Record<string, CodingModelStats>; byProfile: Record<string, CodingModelStats> };
+  pressure: { cooldowns: { count: number; totalMs: number }; deferrals: { count: number }; unavailable: { startFailedRuns: number } };
+  /** Absent in a report from before the daily series. */
+  daily?: DailyStats[];
+}
+export interface StatsReport {
+  version: number;
+  generatedAt: string;
+  window: { label: string; since: string | null; until: string };
+  repo: string | null;
+  database: boolean;
+  facts: { total: number; backfilled: number };
+  overall: StatsSection;
+  byRepo: Array<{ repo: string; repoId: number; stats: StatsSection }>;
+}
+export interface Insights {
+  window: InsightsWindow;
+  hasState: boolean;
+  stateUpdatedAt?: string;
+  report: StatsReport;
 }
 
 export interface Overview {
@@ -408,12 +564,26 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     reactivateConfig: (installationId: number, version: number, input: { confirmAutoMerge?: boolean } = {}) =>
       request<PublishResult>(`/installations/${installationId}/config/versions/${version}/reactivate`, { method: 'POST', body: JSON.stringify(input) }),
     overview: (installationId: number) => request<Overview>(`/installations/${installationId}/overview`),
+    insights: (installationId: number, query: { window?: InsightsWindow; repo?: string } = {}) => {
+      const q = new URLSearchParams();
+      if (query.window) q.set('window', query.window);
+      if (query.repo) q.set('repo', query.repo);
+      const qs = q.toString();
+      return request<Insights>(`/installations/${installationId}/insights${qs ? `?${qs}` : ''}`);
+    },
     deliveries: (installationId: number, limit = 100) => request<{ deliveries: Delivery[] }>(`/installations/${installationId}/deliveries?limit=${limit}`),
     jobs: (installationId: number, limit = 100) => request<{ jobs: JobView[] }>(`/installations/${installationId}/jobs?limit=${limit}`),
     job: (installationId: number, jobId: string) => request<{ job: JobView; deliveries: Delivery[] }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}`),
     /** The end of a log; throws ApiError `log_expired` (410) once it is past the retention. */
     jobLog: (installationId: number, jobId: string, name: string) =>
       request<JobLog>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/logs/${encodeURIComponent(name)}`),
+    telemetry: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry`),
+    updateTelemetry: (installationId: number, input: { enabled?: boolean; serviceName?: string; captureContent?: boolean }) =>
+      request<TelemetryView>(`/installations/${installationId}/telemetry`, { method: 'PUT', body: JSON.stringify(input) }),
+    /** The key is sent once and never comes back. */
+    setTelemetryKey: (installationId: number, value: string, region: TelemetryRegion) =>
+      request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify({ value, region }) }),
+    removeTelemetryKey: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'DELETE' }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */
     setAgentKey: (installationId: number, name: string, value: string) =>

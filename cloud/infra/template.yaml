@@ -286,6 +286,11 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource: !Sub ${TenantBucket.Arn}/tenants/*/results/*
+            # Insights (tenants/stats-service.ts): the shared state database, read only. Only
+            # the one object, never the databases a failed sync left beside it.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub ${TenantBucket.Arn}/tenants/*/state/state.db
             # Writing a tenant's agent keys (tenants/agent-keys.ts). Write-only: this function can
             # create and replace them, never read one back.
             - Effect: Allow
