@@ -2,6 +2,8 @@ import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import type { Job, Quotas, Store } from '../store/store.js';
 import { decideDispatch } from '../tenants/dispatch.js';
+import type { BundleKeys } from '../tenants/key-needs.js';
+import { safeMessage } from '../tenants/redact.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
 import { dayOf, monthOf, tenantQuotas, type ThrottleNotice } from './quotas.js';
 
@@ -85,6 +87,8 @@ export interface LaunchDeps {
   quotas: Quotas;
   /** Absent: never engaged. */
   killSwitch?: KillSwitch;
+  /** Reads the keys of a version published before dispatch rules recorded them (key-needs.ts). Absent: such a version is refused. */
+  bundleKeys?: BundleKeys;
   /** Posts the over-quota comment on the issue (once a day per issue). Its failure is only logged. */
   notifyThrottled?: (input: ThrottleNotice) => Promise<void>;
   now?: () => number;
@@ -152,6 +156,39 @@ export function createLauncher(deps: LaunchDeps) {
       return skip('kill_switch');
     }
 
+    // Bring your own key (#64): the agents this trigger's workflows run need their keys set.
+    // Refused here, with the reason recorded for the console, rather than failing in a microVM
+    // we pay for. Only the matched trigger's keys: a Codex workflow on another label does not
+    // hold up this one. A version published before keys were recorded has them read from its
+    // bundle; one whose bundle cannot tell is refused, not run without its keys checked.
+    let needed = decision.keys;
+    if (needed === null) {
+      needed = deps.bundleKeys
+        ? await deps.bundleKeys.forEvent(req.installationId, tenant.activeConfigVersion, {
+            repositoryFullName: req.payload.repository?.full_name,
+            repositoryId: req.payload.repository?.id,
+            label: req.payload.label?.name,
+            sender: req.payload.sender?.login,
+          })
+        : null;
+    }
+    const issueNumber = req.payload.issue!.number as number;
+    const refuse = async (reason: string, detail: Record<string, unknown>) => {
+      log({ delivery: req.deliveryId, installationId: req.installationId, repository: decision.repository, refused: 'missing_key', ...detail });
+      await deps.store
+        .recordRefusal(req.installationId, { at: new Date(now()).toISOString(), deliveryId: req.deliveryId, repository: decision.repository, issue: issueNumber, reason })
+        .catch((err: unknown) => log({ delivery: req.deliveryId, warning: `could not record the refusal: ${(err as Error)?.name}` }));
+      return skip('missing_key');
+    };
+    if (needed === null) return refuse('Updraft could not tell which agent keys this workflow needs: publish the configuration again', { unknown: true });
+    if (needed.length > 0) {
+      const set = new Set((await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name));
+      const missing = needed.filter((k) => !set.has(k));
+      if (missing.length > 0) {
+        return refuse(`${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not set: add ${missing.length > 1 ? 'them' : 'it'} under Agent keys`, { missing });
+      }
+    }
+
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
     const jobId = `job_${randomBytes(12).toString('base64url')}`;
@@ -208,6 +245,7 @@ export function createLauncher(deps: LaunchDeps) {
       platformSlot: reserved.platformSlot,
       reservedSeconds: s.maximumDurationSeconds,
       quotas,
+      ...(needed.length ? { agentKeys: needed } : {}),
       issue: req.payload.issue!.number as number,
     };
 
@@ -225,7 +263,7 @@ export function createLauncher(deps: LaunchDeps) {
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt }));
       microvmId = out.microvmId;
     } catch (err) {
-      log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: (err as Error)?.message });
+      log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: safeMessage(err) });
       await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
       await deps.store.cancelReservation(reservation, launching ? 'launching' : 'reserved').catch(() => {});
       // Nothing runs for this record; its token must not be served, and it needs no reconciling.

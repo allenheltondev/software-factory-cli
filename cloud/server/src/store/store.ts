@@ -155,15 +155,32 @@ export interface DispatchRules {
    * `actors`: when every trigger allows the same logins, they are stored once here and the
    * triggers carry none (a version's record is one DynamoDB item); otherwise each trigger has its
    * own. Versions stored before this have them on every trigger.
+   * `keys`: the agent keys (variable names) a job the trigger starts can need; the launcher
+   * refuses it while one is not set. Stored once on the repository when every trigger needs the
+   * same, like `actors`. Absent everywhere on versions published before #70 (the launcher then
+   * reads them from the bundle, key-needs.ts).
    */
-  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; triggers: { label: string; actors?: string[] }[] }>;
+  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; keys?: string[]; triggers: { label: string; actors?: string[]; keys?: string[] }[] }>;
 }
 
 /** That an agent key is set (never its value, which lives only in Secrets Manager). */
 export interface AgentKeyMeta {
   name: string;
+  /** When the value was last set: "last rotated". */
   updatedAt: string;
   updatedBy: string;
+  /** The last job that ran with this key, and whether it worked. Cleared when the key is rotated. */
+  lastUsedAt?: string;
+  lastUsedOk?: boolean;
+}
+
+/** A launch the launcher refused, and why, kept 30 days for the console (never anything secret). */
+export interface DispatchRefusal {
+  at: string;
+  deliveryId: string;
+  repository: string;
+  issue: number;
+  reason: string;
 }
 
 /**
@@ -206,6 +223,8 @@ export interface Job {
   reservedSeconds?: number;
   /** The tenant's quotas when it was launched: `start` checks the month against them, and a refusal says why. */
   quotas?: Quotas;
+  /** The agent keys (variable names) this job needs; at finish each is marked used, OK or failed. */
+  agentKeys?: string[];
   /** The issue whose label started it, for an over-quota comment. */
   issue?: number;
   /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
@@ -341,6 +360,14 @@ export interface Store {
   /** Refused (`uninstalled`) once the tenant is uninstalled or gone, so no row escapes the sweep. */
   putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<'stored' | 'uninstalled'>;
   listAgentKeyMeta(installationId: number): Promise<AgentKeyMeta[]>;
+  /**
+   * Records the outcome of a job that used the key. Nothing when the key is not set, or was
+   * rotated after `jobStartedAt` (ISO): the job ran with the value before.
+   */
+  recordAgentKeyUse(installationId: number, name: string, use: { at: string; ok: boolean; jobStartedAt: string }): Promise<void>;
+  recordRefusal(installationId: number, refusal: DispatchRefusal): Promise<void>;
+  /** Newest first. */
+  listRefusals(installationId: number, limit: number): Promise<DispatchRefusal[]>;
 
   /**
    * Uninstalled tenants whose deadline has passed and whose data outside the table (the S3 prefix,
@@ -479,6 +506,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const configs = new Map<string, ConfigVersion>();
   const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
+  const refusals: { id: number; r: DispatchRefusal }[] = [];
   const jobs = new Map<string, Job>();
   /** `<installationId>/<deliveryId>` -> expiry (epoch ms) and the job holding the claim. */
   const deliveries = new Map<string, { expiresAt: number; jobId: string }>();
@@ -844,10 +872,21 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       for (const [k, m] of members) if (m.installationId === id) members.delete(k);
       for (const [k, c] of configs) if (c.installationId === id) configs.delete(k);
       for (const k of [...keys.keys()]) if (k.startsWith(`${id}/`)) keys.delete(k);
+      for (let i = refusals.length - 1; i >= 0; i--) if (refusals[i]!.id === id) refusals.splice(i, 1);
       for (const m of [slots, days, months]) for (const k of [...m.keys()]) if (k.startsWith(`${id}/`)) m.delete(k);
     },
     async completeCleanup(entry) {
       if (cleanups.get(entry.installationId)?.deleteAfter === entry.deleteAfter) cleanups.delete(entry.installationId);
+    },
+    async recordAgentKeyUse(id, name, use) {
+      const k = keys.get(`${id}/${name}`);
+      if (k && k.updatedAt <= use.jobStartedAt) keys.set(`${id}/${name}`, { ...k, lastUsedAt: use.at, lastUsedOk: use.ok });
+    },
+    async recordRefusal(id, r) {
+      refusals.push({ id, r: { ...r } });
+    },
+    async listRefusals(id, limit) {
+      return refusals.filter((x) => x.id === id).map((x) => ({ ...x.r })).sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);
     },
     async listAgentKeyMeta(id) {
       return [...keys.entries()].filter(([k]) => k.startsWith(`${id}/`)).map(([, v]) => ({ ...v })).sort((a, b) => a.name.localeCompare(b.name));

@@ -55,6 +55,7 @@ function fakeTable() {
     }
     if (expr === 'attribute_exists(pk) AND #status <> :finished') return Boolean(item) && item!.status !== values[':finished'];
     if (expr === 'jobId = :job') return Boolean(item) && item!.jobId === values[':job'];
+    if (expr === 'attribute_exists(pk) AND updatedAt <= :started') return Boolean(item) && String(item!.updatedAt) <= String(values[':started']);
     if (expr === 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled) AND attribute_not_exists(adminDisabledAt)') {
       return Boolean(item) && item!.disabledReason !== values[':uninstalled'] && item!.adminDisabledAt === undefined;
     }
@@ -944,6 +945,39 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.finishJob('job_first0001', 'succeeded')).toBe('failed');
     expect((await store.getJob('job_first0001'))?.outcome).toBe('failed');
     expect(await store.finishJob('job_nobody001', 'failed')).toBeNull();
+  });
+
+  it('keeps the keys a job needs on its record (the broker marks them used at finish, #70)', async () => {
+    const store = createDynamoStore('T', fakeTable().client);
+    const job: Job = {
+      jobId: 'job_keys00001',
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 1,
+      deliveryId: 'd-1',
+      eventName: 'issues',
+      status: 'launched',
+      createdAt: tenant.createdAt,
+      expiresAt: LATER,
+      agentKeys: ['ANTHROPIC_API_KEY'],
+    };
+    await store.putJob(job);
+    expect((await store.getJob(job.jobId))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
+  });
+
+  it("records a key's last use only for the value the job could have read (#70)", async () => {
+    const { store } = await seeded();
+    await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: '2026-11-21T10:00:00.000Z', updatedBy: 'pat' });
+    // Started before the rotation: it ran with the previous value, and says nothing about this one.
+    await store.recordAgentKeyUse(55, 'ANTHROPIC_API_KEY', { at: '2026-11-21T11:00:00.000Z', ok: false, jobStartedAt: '2026-11-21T09:59:00.000Z' });
+    expect((await store.listAgentKeyMeta(55))[0]).not.toHaveProperty('lastUsedAt');
+    await store.recordAgentKeyUse(55, 'ANTHROPIC_API_KEY', { at: '2026-11-21T11:05:00.000Z', ok: true, jobStartedAt: '2026-11-21T10:01:00.000Z' });
+    expect((await store.listAgentKeyMeta(55))[0]).toMatchObject({ lastUsedAt: '2026-11-21T11:05:00.000Z', lastUsedOk: true });
+    // A key that is not set is not created by a use.
+    await store.recordAgentKeyUse(55, 'CODEX_API_KEY', { at: 'x', ok: true, jobStartedAt: 'z' });
+    expect((await store.listAgentKeyMeta(55)).map((k) => k.name)).toEqual(['ANTHROPIC_API_KEY']);
   });
 
   it('reads a config version strongly consistently when asked (dispatch right after a publish)', async () => {

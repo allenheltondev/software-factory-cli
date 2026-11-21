@@ -18,6 +18,8 @@ type Repository = { id?: unknown; workflows?: unknown };
 export interface DispatchOptions {
   /** OWNER/REPO (any case) of repositories that stay configured but start nothing. */
   paused?: ReadonlySet<string>;
+  /** The agent keys a job of this workflow can need (key-needs.ts workflowKeys). Absent: triggers record none. */
+  keysFor?: (repo: Record<string, unknown>, workflow: Record<string, unknown>) => string[];
 }
 
 const lowerStrings = (value: unknown): string[] =>
@@ -31,25 +33,37 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
   for (const [fullName, raw] of Object.entries(compiled.repositories ?? {})) {
     const repo = raw as Repository;
     if (typeof repo.id !== 'number') continue;
-    const triggers: { label: string; actors: string[] }[] = [];
+    const triggers: { label: string; actors: string[]; keys?: string[] }[] = [];
     for (const wf of Array.isArray(repo.workflows) ? (repo.workflows as Workflow[]) : []) {
       const label = wf.trigger?.label;
       if (typeof label !== 'string' || label === '') continue;
-      triggers.push({ label: label.toLowerCase(), actors: wf.allowedActors === undefined ? fallbackActors : lowerStrings(wf.allowedActors) });
+      // Each workflow's own keys: two workflows on one label, for different actors, each keep theirs.
+      const keys = options.keysFor ? options.keysFor(repo as Record<string, unknown>, wf as Record<string, unknown>) : undefined;
+      triggers.push({ label: label.toLowerCase(), actors: wf.allowedActors === undefined ? fallbackActors : lowerStrings(wf.allowedActors), ...(keys ? { keys } : {}) });
     }
-    // One shared list is stored once, not copied to each trigger.
+    // One shared list (of actors, of keys) is stored once, not copied to each trigger.
+    const same = (a: string[] | undefined, b: string[] | undefined) => a !== undefined && b !== undefined && a.length === b.length && a.every((x, i) => x === b[i]);
     const first = triggers[0]?.actors;
-    const shared = first !== undefined && triggers.every((t) => t.actors!.length === first.length && t.actors!.every((a, i) => a === first[i]));
+    const shared = first !== undefined && triggers.every((t) => same(t.actors, first));
+    const firstKeys = triggers[0]?.keys;
+    const sharedKeys = firstKeys !== undefined && triggers.every((t) => same(t.keys, firstKeys));
+    const stored = triggers.map(({ actors, keys, ...t }) => ({ ...t, ...(shared ? {} : { actors }), ...(sharedKeys || keys === undefined ? {} : { keys }) }));
     repositories[fullName.toLowerCase()] = {
       id: repo.id,
       ...(paused.has(fullName.toLowerCase()) ? { paused: true } : {}),
-      ...(shared ? { actors: first, triggers: triggers.map((t) => ({ label: t.label })) } : { triggers }),
+      ...(shared ? { actors: first } : {}),
+      ...(sharedKeys ? { keys: firstKeys } : {}),
+      triggers: stored,
     };
   }
   return { repositories };
 }
 
-export type DispatchDecision = { start: true; repository: string; repositoryId: number; label: string } | { start: false; reason: string };
+/**
+ * `keys`: the agent keys the job can need (those of every matching trigger the sender may
+ * apply), or null when the version predates them and they must be read from its bundle.
+ */
+export type DispatchDecision = { start: true; repository: string; repositoryId: number; label: string; keys: string[] | null } | { start: false; reason: string };
 
 /**
  * Whether an `issues.labeled` delivery starts a job under these rules. The repository must match
@@ -70,6 +84,9 @@ export function decideDispatch(
   const matching = repo.triggers.filter((t) => t.label === label);
   if (matching.length === 0) return { start: false, reason: 'the label is not a trigger' };
   const sender = typeof event.sender === 'string' ? event.sender.toLowerCase() : '';
-  if (!matching.some((t) => (t.actors ?? repo.actors ?? []).includes(sender))) return { start: false, reason: 'the sender may not dispatch work' };
-  return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, label: event.label };
+  const allowed = matching.filter((t) => (t.actors ?? repo.actors ?? []).includes(sender));
+  if (allowed.length === 0) return { start: false, reason: 'the sender may not dispatch work' };
+  const keysOf = (t: { keys?: string[] }) => t.keys ?? repo.keys;
+  const keys = allowed.every((t) => Array.isArray(keysOf(t))) ? [...new Set(allowed.flatMap((t) => keysOf(t)!))].sort() : null;
+  return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, label: event.label, keys };
 }

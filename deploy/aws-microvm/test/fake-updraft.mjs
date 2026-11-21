@@ -224,6 +224,21 @@ switch (mode) {
     fs.symlinkSync(process.env.FAKE_OUTSIDE_FILE, path.join(home, 'link.log'));
     console.log(JSON.stringify({ outcome: 'succeeded', logPath: path.join(home, 'link.log'), exitCode: 0 }));
     break;
+  case 'leak': {
+    // Prints the agent keys everywhere the runner forwards or keeps output (#70): stdout, stderr
+    // (split across two writes), its own log, the run log, the summary's message.
+    const secret = process.env.ANTHROPIC_API_KEY ?? '';
+    const custom = process.env.CUSTOM_TOKEN ?? '';
+    console.log(`provider said: invalid x-api-key ${secret}`);
+    process.stderr.write(`error with ${secret.slice(0, 5)}`);
+    process.stderr.write(`${secret.slice(5)} and ${custom}\n`);
+    const logPath = writeLogs();
+    fs.appendFileSync(path.join(home, 'logs', 'updraft.log'), `key ${secret}\n`);
+    fs.appendFileSync(logPath, `token ${custom}\n`);
+    console.log(JSON.stringify({ outcome: 'failed', message: `rejected ${secret}`, logPath, exitCode: 1 }));
+    process.exitCode = 1;
+    break;
+  }
   case 'fail':
     console.error('fake-updraft: verification failed');
     console.log(JSON.stringify({ outcome: 'failed', message: 'verify command failed', exitCode: 1 }));

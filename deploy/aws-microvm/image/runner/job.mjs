@@ -9,6 +9,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { MAX_SECRET_BYTES, createRedactor, redactingWriter } from './redact.mjs';
 import { IsolationError, beginIsolation, isolationMode, verifyIsolation } from './isolation.mjs';
 import {
   DEFAULT_CHECKPOINT_SECONDS,
@@ -220,7 +221,9 @@ export function watchdogBudgetMs(payload, nowMs) {
 export async function runJob(request, deps) {
   const { microvmId, payload } = request;
   const now = deps.now ?? Date.now;
-  const log = deps.log;
+  // Until the job's keys are loaded only the shape-based rules apply; then its keys too (#70).
+  let redact = createRedactor();
+  const log = (message) => deps.log(redact(message));
   const startedAt = now();
   const result = {
     deliveryId: payload.deliveryId,
@@ -319,6 +322,10 @@ export async function runJob(request, deps) {
     // Version 2: the token in the token file lasts an hour; replace it well before that, for as
     // long as the job runs (Updraft reads the file again for every token it needs).
     if (payload.version === 2) stopTokenRefresh = startTokenRefresh(stateDir, deps);
+    // The agents' keys, read once for every try. From here, nothing the runner forwards or
+    // keeps (the log stream, the uploaded logs, the result) carries a value of them.
+    const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
+    redact = createRedactor(secretValues(payload, agentEnv));
     for (;;) {
       // Checkpoints: what the run records (the pull request it opened, above all) reaches the
       // shared database while it runs, not only at its end. Stopped before anything else
@@ -332,7 +339,7 @@ export async function runJob(request, deps) {
           : undefined;
       checkpointer?.start();
       try {
-        run = await runUpdraft(payload, stateDir, budget, deadlineNow, deps, (stop) => {
+        run = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log }, { agentEnv, redact }, (stop) => {
           stopChild = stop;
           if (stopRequested) stop();
         });
@@ -457,7 +464,15 @@ export async function runJob(request, deps) {
   // The microVM's disk is gone after termination: keep Updraft's own log and the run log
   // (the agent's transcript) next to the result.
   if (stateDirForLogs) {
-    result.logs = await uploadLogs(stateDirForLogs, result.summary, `${payload.resultKeyPrefix}${microvmId}/`, payload.bucket, deps);
+    result.logs = await uploadLogs(stateDirForLogs, result.summary, `${payload.resultKeyPrefix}${microvmId}/`, payload.bucket, { ...deps, log }, redact);
+  }
+  // What is kept and returned carries no secret: the summary and the error are the job's own
+  // words. Redacted as JSON text (the redaction never adds a quote, so it stays JSON).
+  try {
+    Object.assign(result, JSON.parse(redact(JSON.stringify(result))));
+  } catch {
+    result.summary = null;
+    result.error = redact(String(result.error ?? ''));
   }
   // One line in the log as well, so the outcome survives a failed upload.
   log(`RESULT ${JSON.stringify({ ...result, stderrTail: undefined })}`);
@@ -609,6 +624,18 @@ function startTokenRefresh(stateDir, deps) {
 }
 
 /**
+ * The values to redact. Version 2: every value is a tenant's key. Version 1's agent-env secret
+ * may also hold settings that are not secret (a model name, a mode); those whose name says
+ * key, token, secret, password or credential are redacted.
+ */
+function secretValues(payload, agentEnv) {
+  if (payload.version === 2) return Object.values(agentEnv);
+  return Object.entries(agentEnv)
+    .filter(([name]) => /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(name))
+    .map(([, value]) => value);
+}
+
+/**
  * A version 2 job's agent environment: the tenant's key secrets the broker named, read with the
  * tenant-scoped credentials. A secret that does not exist is a key the tenant has not set.
  */
@@ -689,7 +716,7 @@ function jobEnvironment(payload, stateDir, agentEnv, deps) {
  * the job's output, and this process is root, so only a regular file that really lies inside
  * the state directory is read. Returns the keys written.
  */
-async function uploadLogs(stateDir, summary, keyPrefix, bucket, deps) {
+async function uploadLogs(stateDir, summary, keyPrefix, bucket, deps, redact) {
   const maxBytes = deps.maxLogBytes ?? MAX_LOG_BYTES;
   // With UPDRAFT_HOME set, Updraft keeps its worker log under logs/ (src/paths.ts).
   const candidates = [['updraft.log', path.join(stateDir, 'logs', 'updraft.log')]];
@@ -711,16 +738,21 @@ async function uploadLogs(stateDir, summary, keyPrefix, bucket, deps) {
       if (!stat.isFile()) throw new Error('it is not a regular file');
       const handle = await fs.open(real, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       let body;
+      // A log larger than the limit is cut to its end, which is where a failure shows. A little
+      // more is read and redacted than is kept, so a secret the cut runs through is still whole
+      // when it is redacted (what is kept then starts inside "[redacted]", never inside a key).
+      const length = Math.min(stat.size, maxBytes);
+      const extra = Math.min(stat.size - length, MAX_SECRET_BYTES);
       try {
-        // A log larger than the limit is cut to its end, which is where a failure shows.
-        const length = Math.min(stat.size, maxBytes);
-        body = Buffer.alloc(length);
-        await handle.read(body, 0, length, stat.size - length);
+        body = Buffer.alloc(length + extra);
+        await handle.read(body, 0, length + extra, stat.size - length - extra);
       } finally {
         await handle.close();
       }
+      const redactedAll = Buffer.from(redact(body.toString('utf8')), 'utf8');
+      const redacted = extra > 0 ? redactedAll.subarray(Math.max(0, redactedAll.length - length)) : redactedAll;
       const key = `${keyPrefix}${name}`;
-      await retry(() => deps.s3Put(bucket, key, body, 'text/plain; charset=utf-8'), deps);
+      await retry(() => deps.s3Put(bucket, key, redacted, 'text/plain; charset=utf-8'), deps);
       uploaded.push(key);
     } catch (error) {
       if (error?.code !== 'ENOENT') deps.log(`could not upload ${name}: ${error?.message ?? error}`);
@@ -729,10 +761,9 @@ async function uploadLogs(stateDir, summary, keyPrefix, bucket, deps) {
   return uploaded;
 }
 
-async function runUpdraft(payload, stateDir, budgetMs, deadline, deps, registerStop) {
+async function runUpdraft(payload, stateDir, budgetMs, deadline, deps, { agentEnv, redact }, registerStop) {
   const spawn = deps.spawn ?? nodeSpawn;
   const killGraceMs = deps.killGraceMs ?? 20_000;
-  const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
   const [command, ...leading] = deps.updraftCommand;
   const args = [
     ...leading,
@@ -773,8 +804,15 @@ async function runUpdraft(payload, stateDir, budgetMs, deadline, deps, registerS
       stop();
     }, budgetMs);
 
+    // stderr is redacted on its way to the log stream, holding back a partial line; stdout line by line.
+    const stderrOut = redactingWriter((text) => {
+      deps.logStream.write(text);
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL_BYTES);
+    }, redact);
+    // The summary is read from the line as Updraft wrote it (its paths are used); only what is
+    // kept (the result document) is redacted.
     const takeLine = (line) => {
-      deps.logStream.write(`${line}\n`);
+      deps.logStream.write(`${redact(line)}\n`);
       if (line.trim() !== '') lastLine = line;
     };
     child.stdout.setEncoding('utf8');
@@ -795,8 +833,7 @@ async function runUpdraft(payload, stateDir, budgetMs, deadline, deps, registerS
     });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
-      deps.logStream.write(chunk);
-      stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_BYTES);
+      stderrOut.write(chunk);
     });
 
     child.on('error', (error) => {
@@ -808,6 +845,7 @@ async function runUpdraft(payload, stateDir, budgetMs, deadline, deps, registerS
       clearTimeout(watchdog);
       clearTimeout(killTimer);
       if (pending !== '' && !pendingOversized) takeLine(pending);
+      stderrOut.end();
       // Nothing the job started may outlive it: the state database is merged next, and the
       // microVM is about to go away.
       signalGroup(child, 'SIGKILL');

@@ -553,6 +553,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(typeof i.reservedSeconds === 'number' ? { reservedSeconds: i.reservedSeconds } : {}),
         ...(i.quotas && typeof i.quotas === 'object' ? { quotas: i.quotas as Quotas } : {}),
         ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
+        ...(Array.isArray(i.agentKeys) ? { agentKeys: (i.agentKeys as unknown[]).map(String) } : {}),
         ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
         ...(typeof i.stopRequestedAt === 'number' ? { stopRequestedAt: i.stopRequestedAt } : {}),
         ...(typeof i.releasedAt === 'number' ? { releasedAt: i.releasedAt } : {}),
@@ -1458,8 +1459,44 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         }),
       );
       return (out.Items ?? [])
-        .map((i) => ({ name: String(i.name), updatedAt: String(i.updatedAt), updatedBy: String(i.updatedBy) }))
+        .map((i) => ({
+          name: String(i.name),
+          updatedAt: String(i.updatedAt),
+          updatedBy: String(i.updatedBy),
+          ...(typeof i.lastUsedAt === 'string' ? { lastUsedAt: i.lastUsedAt, lastUsedOk: i.lastUsedOk === true } : {}),
+        }))
         .sort((a, b) => a.name.localeCompare(b.name));
+    },
+
+    async recordAgentKeyUse(id, name, use) {
+      // Only a key that is set, and only the value the job could have read: a key rotated after
+      // the job started is a newer value, whose status this job says nothing about.
+      await tryUpdate({
+        TableName: T,
+        Key: { pk: `TENANT#${id}`, sk: `KEY#${name}` },
+        UpdateExpression: 'SET lastUsedAt = :at, lastUsedOk = :ok',
+        ConditionExpression: 'attribute_exists(pk) AND updatedAt <= :started',
+        ExpressionAttributeValues: { ':at': use.at, ':ok': use.ok, ':started': use.jobStartedAt },
+      });
+    },
+
+    async recordRefusal(id, r) {
+      await client.send(
+        new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: `REFUSAL#${r.at}#${r.deliveryId}`, ...r, ttl: usageTtl(30) } }),
+      );
+    },
+
+    async listRefusals(id, limit) {
+      const out = await client.send(
+        new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'REFUSAL#' },
+          ScanIndexForward: false,
+          Limit: limit,
+        }),
+      );
+      return (out.Items ?? []).map((i) => ({ at: String(i.at), deliveryId: String(i.deliveryId), repository: String(i.repository), issue: Number(i.issue), reason: String(i.reason) }));
     },
   };
 }

@@ -38,8 +38,28 @@ describe('decideDispatch', () => {
   const event = (overrides: Record<string, unknown> = {}) => ({ repositoryFullName: 'acme/WEB', repositoryId: 9, label: 'UPDRAFT', sender: 'PAT', ...overrides });
 
   it('starts a job for a trigger label applied by an allowed actor, whatever the case', () => {
-    expect(decideDispatch(rules, event())).toEqual({ start: true, repository: 'acme/WEB', repositoryId: 9, label: 'UPDRAFT' });
+    expect(decideDispatch(rules, event())).toEqual({ start: true, repository: 'acme/WEB', repositoryId: 9, label: 'UPDRAFT', keys: null });
     expect(decideDispatch(rules, event({ label: 'docs', sender: 'writer' })).start).toBe(true);
+  });
+
+  it("returns the keys of the workflows the label and sender match, each workflow's own (#70 review)", () => {
+    // One label, two workflows: only alice may start Claude, only bob Codex.
+    const shared = dispatchRules(
+      {
+        repositories: {
+          'acme/web': {
+            id: 9,
+            workflows: [
+              { trigger: { label: 'updraft' }, allowedActors: ['alice'], agent: 'claude' },
+              { trigger: { label: 'updraft' }, allowedActors: ['bob'], agent: 'codex' },
+            ],
+          },
+        },
+      },
+      { keysFor: (_repo, wf) => (wf.agent === 'codex' ? ['CODEX_API_KEY'] : ['ANTHROPIC_API_KEY']) },
+    );
+    expect(decideDispatch(shared, event({ sender: 'alice' }))).toMatchObject({ start: true, keys: ['ANTHROPIC_API_KEY'] });
+    expect(decideDispatch(shared, event({ sender: 'bob' }))).toMatchObject({ start: true, keys: ['CODEX_API_KEY'] });
   });
 
   it.each([

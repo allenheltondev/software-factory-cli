@@ -1,6 +1,7 @@
 import type { AgentKeyMeta, Store } from '../store/store.js';
 // Not from config.ts: that pulls in the CLI's whole validator, which nothing here needs.
 import { AGENT_KEY_ENV } from './agents.js';
+import type { KeyChecker } from './key-check.js';
 
 /**
  * A tenant's agent API keys (bring your own, #64). Each key is its own Secrets Manager secret,
@@ -33,11 +34,13 @@ const KEY_SHAPE: Record<string, RegExp> = {
   CODEX_API_KEY: /^sk-[A-Za-z0-9_-]{20,}$/,
 };
 
+const providerOf = (name: string) => (name === 'ANTHROPIC_API_KEY' ? 'Anthropic' : 'OpenAI');
+
 export type SetKeyResult = { ok: true; meta: AgentKeyMeta } | { ok: false; message: string };
 
 export async function setAgentKey(
   input: { installationId: number; name: string; value: string; updatedBy: string },
-  deps: { secrets: SecretsPort; store: Store; now?: () => number },
+  deps: { secrets: SecretsPort; store: Store; check: KeyChecker; now?: () => number },
 ): Promise<SetKeyResult> {
   const { installationId, name, updatedBy } = input;
   const value = input.value.trim();
@@ -47,6 +50,12 @@ export async function setAgentKey(
   const tenant = await deps.store.getTenant(installationId);
   if (!tenant) return { ok: false, message: `there is no tenant for installation ${installationId}` };
   if (tenant.disabledReason === 'uninstalled') return { ok: false, message: `installation ${installationId} was uninstalled` };
+
+  // One cheap call to the provider, before anything is saved: a key it rejects is never stored.
+  // If the provider cannot be reached, nothing is saved either (a bad key would break jobs later).
+  const verdict = await deps.check(name, value);
+  if (verdict === 'invalid') return { ok: false, message: `${providerOf(name)} rejected that key; nothing was changed` };
+  if (verdict === 'unavailable') return { ok: false, message: `could not check the key with ${providerOf(name)} just now; nothing was changed, try again` };
 
   const secretName = agentKeySecretName(installationId, name);
   await deps.secrets.put(secretName, value, { installationId: String(installationId), app: 'updraft-cloud' });

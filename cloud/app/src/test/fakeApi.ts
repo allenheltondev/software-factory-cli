@@ -20,6 +20,8 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     configVersions: vi.fn(),
     configVersion: vi.fn(),
     reactivateConfig: vi.fn(),
+    agentKeys: vi.fn(),
+    setAgentKey: vi.fn(),
     adminTenants: vi.fn(),
     adminTenant: vi.fn(),
     adminDisable: vi.fn(),
