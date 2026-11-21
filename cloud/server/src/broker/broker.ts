@@ -118,6 +118,8 @@ export interface JobTelemetry {
   secret: string;
   serviceName: string;
   captureContent: boolean;
+  /** The secret's version that holds the key the settings were checked with; the runner reads exactly it. */
+  secretVersion?: string;
 }
 
 export const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
@@ -322,7 +324,15 @@ export function createBroker(deps: BrokerDeps) {
       // telemetry key is the runner's alone. A failed read only means no telemetry for this job.
       const t = await deps.store.getTelemetry(job.installationId).catch(() => null);
       const telemetry: JobTelemetry | undefined =
-        t?.enabled && t.key ? { region: t.region, secret: telemetrySecretName(job.installationId), serviceName: t.serviceName, captureContent: t.captureContent } : undefined;
+        t?.enabled && t.key
+          ? {
+              region: t.region,
+              secret: telemetrySecretName(job.installationId),
+              serviceName: t.serviceName,
+              captureContent: t.captureContent,
+              ...(t.key.secretVersion ? { secretVersion: t.key.secretVersion } : {}),
+            }
+          : undefined;
       return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
     }
 

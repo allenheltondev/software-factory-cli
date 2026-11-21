@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows } from '../flows/github.js';
 import type { Store, TelemetryExport, TelemetrySettings } from '../store/store.js';
@@ -93,7 +94,7 @@ export function telemetryView(s: TelemetrySettings | null): TelemetryView {
     serviceName: t.serviceName,
     captureContent: t.captureContent,
     keyConfigured: Boolean(t.key),
-    ...(t.key ? { key: t.key } : {}),
+    ...(t.key ? { key: (({ secretVersion: _v, ...k }) => k)(t.key) } : {}),
     ...(t.lastExport ? { lastExport: withTraceUrl(t, t.lastExport) } : {}),
     ...(t.key?.team ? { environmentUrl: environmentUrl(t) } : {}),
     ...(t.updatedAt ? { updatedAt: t.updatedAt, updatedBy: t.updatedBy } : {}),
@@ -116,6 +117,9 @@ export function traceUrl(s: Pick<TelemetrySettings, 'region' | 'serviceName' | '
 }
 
 const HOUR_MS = 3600 * 1000;
+/** How long a key change may hold the settings: a Honeycomb check and two writes, with room to spare. */
+export const KEY_CHANGE_LEASE_MS = 2 * 60 * 1000;
+const NOT_OURS = new Error('not our lease');
 
 function withTraceUrl(s: TelemetrySettings, e: TelemetryExport): TelemetryExport & { traceUrl?: string } {
   if (!e.traceId) return e;
@@ -160,6 +164,33 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
     throw new FlowError('invalid_settings', 409, 'Someone else is changing these settings right now; reload and try again');
   }
 
+  /** Takes the key-change lease, or says another change is under way. */
+  async function acquire(installationId: number): Promise<string> {
+    const id = randomUUID();
+    await mutate(installationId, (latest) => {
+      if (latest.keyChange && latest.keyChange.until > now()) {
+        throw new FlowError('invalid_settings', 409, 'Another change to the Honeycomb key is under way; try again in a moment');
+      }
+      return { ...latest, keyChange: { id, until: now() + KEY_CHANGE_LEASE_MS } };
+    });
+    return id;
+  }
+
+  /** Gives the lease back after a change that did not finish; nothing when it is no longer ours. */
+  async function release(installationId: number, lease: string): Promise<void> {
+    try {
+      await mutate(installationId, (latest) => {
+        if (latest.keyChange?.id !== lease) throw NOT_OURS;
+        const { keyChange: _lease, ...rest } = latest;
+        return rest;
+      });
+    } catch {
+      // Not ours any more, or the write failed: the lease runs out on its own.
+    }
+  }
+
+  const lost = () => new FlowError('invalid_settings', 409, 'The key change took too long and another one may have started; check the key and try again');
+
   return {
     async view(caller: Caller, installationId: number): Promise<TelemetryView> {
       await github.member(caller, installationId);
@@ -170,20 +201,42 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
       const ctx = await github.configContext(caller, installationId);
       const value = typeof input.value === 'string' ? input.value.trim() : '';
       if (!KEY_SHAPE.test(value)) throw new FlowError('invalid_key', 400, 'That does not look like a Honeycomb API key; nothing was changed');
-      const region: Region = input.region === 'eu' ? 'eu' : input.region === 'us' ? 'us' : (await current(installationId)).region;
-      // The value is never repeated, in any message.
-      const verdict = await check(region, value);
-      if (verdict.result === 'invalid') throw new FlowError('invalid_key', 400, `Honeycomb (${region.toUpperCase()}) rejected that key; nothing was changed. Is it for the other region?`);
-      if (verdict.result === 'unavailable') throw new FlowError('invalid_key', 400, 'Could not check the key with Honeycomb just now; nothing was changed, try again');
-      if (!verdict.auth.canSend) throw new FlowError('invalid_key', 400, 'That key cannot send events. Use an Ingest key (Environment settings → API Keys in Honeycomb); nothing was changed');
-      const tenant = await store.getTenant(installationId);
-      if (!tenant || tenant.disabledReason === 'uninstalled') throw new FlowError('uninstalled', 409, 'This installation was uninstalled');
-      await secrets.put(telemetrySecretName(installationId), value, { 'updraft:installation': String(installationId), 'updraft:key': TELEMETRY_KEY_NAME });
-      const { team, environment, type } = verdict.auth;
-      const key = { updatedAt: at(), updatedBy: ctx.githubLogin, type, ...(team ? { team } : {}), ...(environment ? { environment } : {}) };
-      // Read after the check, not before it: only the region and the key change, and the first key
-      // turns sending on. Whether it sends, and with content, stay what the latest save said.
-      return mutate(installationId, (latest) => ({ ...latest, region, key, enabled: latest.key ? latest.enabled : true, updatedAt: at(), updatedBy: ctx.githubLogin }));
+      // One key change at a time: the secret and the row are two stores, changed in order under the lease.
+      const lease = await acquire(installationId);
+      let done = false;
+      try {
+        const region: Region = input.region === 'eu' ? 'eu' : input.region === 'us' ? 'us' : (await current(installationId)).region;
+        // The value is never repeated, in any message.
+        const verdict = await check(region, value);
+        if (verdict.result === 'invalid') throw new FlowError('invalid_key', 400, `Honeycomb (${region.toUpperCase()}) rejected that key; nothing was changed. Is it for the other region?`);
+        if (verdict.result === 'unavailable') throw new FlowError('invalid_key', 400, 'Could not check the key with Honeycomb just now; nothing was changed, try again');
+        if (!verdict.auth.canSend) throw new FlowError('invalid_key', 400, 'That key cannot send events. Use an Ingest key (Environment settings → API Keys in Honeycomb); nothing was changed');
+        const tenant = await store.getTenant(installationId);
+        if (!tenant || tenant.disabledReason === 'uninstalled') throw new FlowError('uninstalled', 409, 'This installation was uninstalled');
+        // The secret first, then the row naming its version. Stopped between the two, the row still
+        // names the version before (kept as AWSPREVIOUS), which matches the row's region and team.
+        const written = await secrets.put(telemetrySecretName(installationId), value, { 'updraft:installation': String(installationId), 'updraft:key': TELEMETRY_KEY_NAME });
+        const { team, environment, type } = verdict.auth;
+        const key = {
+          updatedAt: at(),
+          updatedBy: ctx.githubLogin,
+          ...(written?.versionId ? { secretVersion: written.versionId } : {}),
+          type,
+          ...(team ? { team } : {}),
+          ...(environment ? { environment } : {}),
+        };
+        // Read after the check, not before it: only the region and the key change, and the first key
+        // turns sending on. Whether it sends, and with content, stay what the latest save said.
+        const view = await mutate(installationId, (latest) => {
+          if (latest.keyChange?.id !== lease) throw lost();
+          const { keyChange: _lease, ...rest } = latest;
+          return { ...rest, region, key, enabled: latest.key ? latest.enabled : true, updatedAt: at(), updatedBy: ctx.githubLogin };
+        });
+        done = true;
+        return view;
+      } finally {
+        if (!done) await release(installationId, lease);
+      }
     },
 
     async update(caller: Caller, installationId: number, input: { enabled?: unknown; serviceName?: unknown; captureContent?: unknown }): Promise<TelemetryView> {
@@ -208,8 +261,22 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
 
     async removeKey(caller: Caller, installationId: number): Promise<TelemetryView> {
       const ctx = await github.configContext(caller, installationId);
-      await secrets.remove(telemetrySecretName(installationId));
-      return mutate(installationId, ({ key: _key, ...rest }) => ({ ...rest, enabled: false, updatedAt: at(), updatedBy: ctx.githubLogin }));
+      const lease = await acquire(installationId);
+      let done = false;
+      try {
+        // The row first: from then on no job is handed the key. Then the secret. Stopped between the
+        // two, the secret is left unreferenced (the uninstall cleanup deletes it), never referenced and gone.
+        const view = await mutate(installationId, (latest) => {
+          if (latest.keyChange?.id !== lease) throw lost();
+          const { key: _key, keyChange: _lease, ...rest } = latest;
+          return { ...rest, enabled: false, updatedAt: at(), updatedBy: ctx.githubLogin };
+        });
+        done = true;
+        await secrets.remove(telemetrySecretName(installationId));
+        return view;
+      } finally {
+        if (!done) await release(installationId, lease);
+      }
     },
   };
 }

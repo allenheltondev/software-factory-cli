@@ -66,11 +66,15 @@ function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
     updatedAt: String(i.updatedAt ?? ''),
     updatedBy: String(i.updatedBy ?? ''),
     ...(typeof i.version === 'number' ? { version: i.version } : {}),
+    ...(i.keyChange && typeof i.keyChange === 'object' && typeof (i.keyChange as Record<string, unknown>).id === 'string'
+      ? { keyChange: { id: String((i.keyChange as Record<string, unknown>).id), until: Number((i.keyChange as Record<string, unknown>).until) || 0 } }
+      : {}),
     ...(key
       ? {
           key: {
             updatedAt: String(key.updatedAt ?? ''),
             updatedBy: String(key.updatedBy ?? ''),
+            ...(typeof key.secretVersion === 'string' ? { secretVersion: key.secretVersion } : {}),
             ...(typeof key.type === 'string' ? { type: key.type } : {}),
             ...(team ? { team } : {}),
             ...(environment ? { environment } : {}),

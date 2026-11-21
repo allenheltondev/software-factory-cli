@@ -136,6 +136,24 @@ describe('the snapshot cache', () => {
     expect(files()).toEqual([]);
   });
 
+  it('leaves no snapshot over the budget behind when its report comes from the cache', async () => {
+    const bytes = stateBytes();
+    const { service, files } = many(bytes, bytes.byteLength - 1);
+    for (let i = 0; i < 4; i++) {
+      expect((await service.insights(caller, 1, {})).hasState).toBe(true);
+      expect(files()).toEqual([]);
+    }
+  });
+
+  it('removes a snapshot that cannot be opened, over the budget or within it', async () => {
+    const junk = new Uint8Array(8192).fill(7);
+    for (const cacheBytes of [100, 1 << 20]) {
+      const { service, files } = many(junk, cacheBytes);
+      await expect(service.insights(caller, 1, {})).rejects.toThrow();
+      expect(files()).toEqual([]);
+    }
+  });
+
   it('takes an inherited name for a window as an unsupported one', async () => {
     const bytes = stateBytes();
     const { service } = many(bytes, bytes.byteLength * 2);

@@ -246,9 +246,13 @@ export interface TelemetrySettings {
   updatedBy: string;
   /** Bumped by every write; a write names the version it read (putTelemetry). */
   version?: number;
+  /** A key change under way (tenants/telemetry-service.ts): one at a time, until it ends or `until` passes. */
+  keyChange?: { id: string; until: number };
   key?: {
     updatedAt: string;
     updatedBy: string;
+    /** The Secrets Manager version holding this key: jobs read exactly it, so the key and where it sends always match. */
+    secretVersion?: string;
     /** What Honeycomb's /1/auth said the key is. */
     type?: string;
     team?: { name: string; slug: string };

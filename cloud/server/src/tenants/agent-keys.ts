@@ -22,8 +22,8 @@ export const agentKeySecretName = (installationId: number, name: string) => `${a
 
 /** The Secrets Manager calls this needs, so tests need no AWS. */
 export interface SecretsPort {
-  /** Writes a new value, creating the secret (with these tags) when it does not exist. */
-  put(name: string, value: string, tags: Record<string, string>): Promise<void>;
+  /** Writes a new value, creating the secret (with these tags) when it does not exist; says which version it wrote. */
+  put(name: string, value: string, tags: Record<string, string>): Promise<{ versionId?: string } | void>;
   /** Deletes the secret at once (no recovery window); nothing when it does not exist. */
   remove(name: string): Promise<void>;
 }

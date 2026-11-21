@@ -50,7 +50,10 @@ describe('agent telemetry settings', () => {
       const { service, secrets, store } = await setup(check);
       await expect(service.setKey(caller, 55, { value: KEY })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(message) });
       expect(secrets.put).not.toHaveBeenCalled();
-      expect(await store.getTelemetry(55)).toBeNull();
+      // The lease was taken and given back: no key, and nothing holding the settings.
+      const after = await store.getTelemetry(55);
+      expect(after?.key).toBeUndefined();
+      expect(after?.keyChange).toBeUndefined();
     }
     const { service } = await setup();
     await expect(service.setKey(caller, 55, { value: 'nope' })).rejects.toMatchObject({ status: 400 });
@@ -87,6 +90,89 @@ describe('agent telemetry settings', () => {
     const after = await rotation;
     expect(after).toMatchObject({ enabled: false, captureContent: false, keyConfigured: true });
     expect(await store.getTelemetry(55)).toMatchObject({ enabled: false, captureContent: false });
+  });
+
+  it('pins the key to the secret version it was written as, so its region and team always match it', async () => {
+    const { service, store, secrets } = await setup();
+    let n = 0;
+    secrets.put.mockImplementation(async () => ({ versionId: `v-${++n}-0000000000` }));
+    await service.setKey(caller, 55, { value: KEY, region: 'us' });
+    expect((await store.getTelemetry(55))?.key?.secretVersion).toBe('v-1-0000000000');
+    const view = await service.setKey(caller, 55, { value: KEY, region: 'eu' });
+    expect(await store.getTelemetry(55)).toMatchObject({ region: 'eu', key: { secretVersion: 'v-2-0000000000' } });
+    // Not shown to members: it is how jobs find the key, nothing more.
+    expect(JSON.stringify(view)).not.toContain('secretVersion');
+  });
+
+  it('lets one key change run at a time: a second rotation or a removal meanwhile is refused, and nothing is split', async () => {
+    let release: () => void = () => {};
+    const paused = new Promise<void>((r) => (release = r));
+    let calls = 0;
+    const { service, store, secrets } = await setup(async (region) => {
+      calls += 1;
+      if (calls === 1) await paused;
+      return { result: 'valid', auth: { type: 'ingest', canSend: true, team: { name: region === 'eu' ? 'EU team' : 'US team', slug: region } } };
+    });
+    let n = 0;
+    secrets.put.mockImplementation(async () => ({ versionId: `v-${++n}-0000000000` }));
+    // Rotation A (US) waits on Honeycomb; B (EU) and a removal come in meanwhile.
+    const a = service.setKey(caller, 55, { value: KEY, region: 'us' });
+    await new Promise((r) => setTimeout(r, 5));
+    await expect(service.setKey(caller, 55, { value: KEY, region: 'eu' })).rejects.toMatchObject({ status: 409, message: /under way/ });
+    await expect(service.removeKey(caller, 55)).rejects.toMatchObject({ status: 409 });
+    expect(secrets.put).not.toHaveBeenCalled();
+    expect(secrets.remove).not.toHaveBeenCalled();
+    release();
+    await a;
+    // The row names A's region and team, and the version A wrote: the key a job reads matches.
+    expect(await store.getTelemetry(55)).toMatchObject({ region: 'us', key: { team: { slug: 'us' }, secretVersion: 'v-1-0000000000' } });
+    expect((await store.getTelemetry(55))?.keyChange).toBeUndefined();
+    // Now the next change goes through.
+    expect(await service.setKey(caller, 55, { value: KEY, region: 'eu' })).toMatchObject({ region: 'eu' });
+  });
+
+  it('takes over a lease that ran out, and refuses to finish a change whose lease was taken', async () => {
+    const { store, secrets } = await setup();
+    const clock = { t: Date.UTC(2026, 10, 21) };
+    const allow = async () => ({ githubLogin: 'pat' }) as never;
+    let resume: () => void = () => {};
+    const paused = new Promise<void>((r) => (resume = r));
+    let calls = 0;
+    const service = createTelemetryService({
+      store,
+      github: { configContext: allow, member: allow },
+      secrets,
+      check: async () => {
+        calls += 1;
+        if (calls === 1) await paused;
+        return { result: 'valid', auth: { type: 'ingest', canSend: true, team: { name: 'T', slug: 't' } } };
+      },
+      now: () => clock.t,
+    });
+    secrets.put.mockResolvedValue({ versionId: 'v-0000000000' });
+    const slow = service.setKey(caller, 55, { value: KEY, region: 'us' });
+    await new Promise((r) => setTimeout(r, 5));
+    clock.t += 3 * 60 * 1000;
+    await service.setKey(caller, 55, { value: KEY, region: 'eu' });
+    resume();
+    await expect(slow).rejects.toMatchObject({ status: 409, message: /took too long/ });
+    expect(await store.getTelemetry(55)).toMatchObject({ region: 'eu' });
+  });
+
+  it('removes the key from the row before the secret, so no job is ever pointed at a deleted key', async () => {
+    const { service, store, secrets } = await setup();
+    await service.setKey(caller, 55, { value: KEY });
+    const order: string[] = [];
+    const put = store.putTelemetry.bind(store);
+    store.putTelemetry = async (id, settings, expected) => {
+      if (!settings.key) order.push('row');
+      return put(id, settings, expected);
+    };
+    secrets.remove.mockImplementation(async () => {
+      order.push('secret');
+    });
+    await service.removeKey(caller, 55);
+    expect(order).toEqual(['row', 'secret']);
   });
 
   it('writes only over the version it read, and retries on a conflict', async () => {

@@ -111,5 +111,13 @@ not redacted: they are what the content is.
   it, with the broker's tenant-scoped credentials.
 - The broker passes it to the runner as telemetry settings, never among the agent keys, so it is
   never in the job process's or an agent's environment. The runner reads it as root.
+- The key and where it sends always match. The settings record the Secrets Manager version the
+  key was written as, in the same conditional write as its region and team, and the runner reads
+  exactly that version. Key changes take a two-minute lease on the settings, so a rotation and
+  another rotation, or a removal, never overlap; a change that stops halfway leaves the settings
+  naming the previous version, which Secrets Manager keeps. A removal clears the settings first
+  and deletes the secret second.
+- Every setting change is a compare-and-set on the version it read, so an opt-out made while a
+  key was being checked is never undone.
 - A failed export (Honeycomb unreachable, the key revoked) is counted and reported; it never fails
   the job.

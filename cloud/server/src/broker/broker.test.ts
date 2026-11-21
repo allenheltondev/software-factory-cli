@@ -107,9 +107,12 @@ describe('the job broker', () => {
     await store.putTelemetry(55, { ...base, enabled: true }, 0);
     const noKey = await handle({ action: 'start', jobId: job.jobId, token });
     expect(noKey.ok && 'descriptor' in noKey && noKey.descriptor.telemetry).toBeFalsy();
-    await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat' } }, 1);
+    await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }, 1);
     const on = await handle({ action: 'credentials', jobId: job.jobId, token });
-    expect(on).toMatchObject({ ok: true, descriptor: { telemetry: { region: 'eu', secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', serviceName: 'factory', captureContent: true } } });
+    expect(on).toMatchObject({
+      ok: true,
+      descriptor: { telemetry: { region: 'eu', secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001', serviceName: 'factory', captureContent: true } },
+    });
     if (on.ok && 'descriptor' in on) expect(Object.keys(on.descriptor.agentKeySecrets)).not.toContain('HONEYCOMB_API_KEY');
     await store.putTelemetry(55, { ...base, enabled: false, key: { updatedAt: '', updatedBy: 'pat' } }, 2);
     const off = await handle({ action: 'credentials', jobId: job.jobId, token });

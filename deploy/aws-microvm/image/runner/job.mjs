@@ -720,7 +720,10 @@ async function telemetrySetup(payload, deps, log) {
   const endpoint = HONEYCOMB_ENDPOINTS[t.region] ?? null;
   if (!endpoint) return null;
   try {
-    const apiKey = (await deps.getSecret(t.secret))?.trim();
+    // The version the tenant's settings name: the key is the one checked for this region and
+    // team, whatever was written to the secret since. Settings from before versions: the current.
+    const version = typeof t.secretVersion === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(t.secretVersion) ? t.secretVersion : undefined;
+    const apiKey = (await deps.getSecret(t.secret, version))?.trim();
     if (!apiKey) {
       log('agent telemetry is on, but its key is not set; nothing is sent');
       return null;

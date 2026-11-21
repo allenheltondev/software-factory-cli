@@ -156,34 +156,49 @@ export function createStatsService({ github, readState, cacheDir, cacheBytes = C
       const range = { since: back === null ? null : at - back, now: at, label: window, repo };
 
       const state = await localState(installationId);
-      const cacheKey = `${installationId}|${state?.etag ?? '-'}|${window}|${repo ?? ''}`;
-      const cached = reports.get(cacheKey);
-      if (cached && at - cached.at < REPORT_TTL_MS) return cached.insights;
-
+      // From here every way out (a cached report, a database that will not open, a newer
+      // schema, a report) passes the cleanup: a snapshot over the budget is never left behind.
       let insights: Insights;
-      if (!state) {
-        insights = { window, hasState: false, report: computeStats(null, range) };
-      } else {
-        const db = openDatabaseReadOnly(state.path);
-        try {
-          const version = schemaVersion(db);
-          if (version > SCHEMA_VERSION) {
-            log({ installationId, warning: `the state database is at schema v${version}, newer than the API reads (v${SCHEMA_VERSION})` });
-            throw new FlowError('state_newer', 503, 'The state was written by a newer Updraft than this console reads yet; try again after the next deploy');
+      let cacheKey: string;
+      try {
+        cacheKey = `${installationId}|${state?.etag ?? '-'}|${window}|${repo ?? ''}`;
+        const cached = reports.get(cacheKey);
+        if (cached && at - cached.at < REPORT_TTL_MS) return cached.insights;
+        if (!state) {
+          insights = { window, hasState: false, report: computeStats(null, range) };
+        } else {
+          let db: ReturnType<typeof openDatabaseReadOnly> | undefined;
+          let version: number;
+          try {
+            db = openDatabaseReadOnly(state.path);
+            // SQLite opens any file; the first read is where a file that is no database fails.
+            version = schemaVersion(db);
+          } catch (err) {
+            // Not a database we can read: do not keep it for the next request either.
+            db?.close();
+            await forget(installationId);
+            throw err;
           }
-          // A database from before stats were recorded has no facts to report.
-          insights = {
-            window,
-            hasState: true,
-            ...(state.lastModified ? { stateUpdatedAt: state.lastModified } : {}),
-            report: computeStats(version < METRICS_SCHEMA_VERSION ? null : db, range),
-          };
-        } finally {
-          db.close();
-          // Read only, so SQLite's -wal and -shm beside it hold nothing worth keeping.
-          if (state.transient) await removeSnapshot(state.path);
-          else await Promise.all(['-wal', '-shm'].map((suffix) => rm(`${state.path}${suffix}`, { force: true })));
+          try {
+            if (version > SCHEMA_VERSION) {
+              log({ installationId, warning: `the state database is at schema v${version}, newer than the API reads (v${SCHEMA_VERSION})` });
+              throw new FlowError('state_newer', 503, 'The state was written by a newer Updraft than this console reads yet; try again after the next deploy');
+            }
+            // A database from before stats were recorded has no facts to report.
+            insights = {
+              window,
+              hasState: true,
+              ...(state.lastModified ? { stateUpdatedAt: state.lastModified } : {}),
+              report: computeStats(version < METRICS_SCHEMA_VERSION ? null : db, range),
+            };
+          } finally {
+            db.close();
+          }
         }
+      } finally {
+        if (state?.transient) await removeSnapshot(state.path);
+        // Read only, so SQLite's -wal and -shm beside a kept one hold nothing worth keeping.
+        else if (state) await Promise.all(['-wal', '-shm'].map((suffix) => rm(`${state.path}${suffix}`, { force: true })));
       }
       reports.delete(cacheKey);
       reports.set(cacheKey, { at, insights });

@@ -89,8 +89,8 @@ function fakeDeps(mode, overrides = {}) {
     s3Put: async (bucket, key, body, contentType) => {
       calls.push(['s3Put', bucket, key, body, contentType]);
     },
-    getSecret: async (id) => {
-      calls.push(['getSecret', id]);
+    getSecret: async (id, version) => {
+      calls.push(['getSecret', id, ...(version ? [version] : [])]);
       if (!(id in secrets)) throw new Error('ResourceNotFoundException');
       return secrets[id];
     },
@@ -523,6 +523,13 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     // The job process never had the telemetry key.
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');
+  });
+
+  it('reads exactly the secret version the settings name', async () => {
+    const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
+    harness.deps.fetch = async () => ({ ok: true, status: 200 });
+    await runJob(brokerRequest({ telemetry: { ...telemetry, secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }), harness.deps);
+    expect(harness.calls).toContainEqual(['getSecret', 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', 'a1b2c3d4-0000-4000-8000-000000000001']);
   });
 
   it('runs the job without telemetry when the key is not set, and does not fail it when Honeycomb is down', async () => {
