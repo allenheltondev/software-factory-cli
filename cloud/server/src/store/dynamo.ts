@@ -35,6 +35,16 @@ const DAY_SECONDS = 24 * 3600;
 const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
+function toDelivery(i: Record<string, unknown>): DeliveryRecord {
+  const d: DeliveryRecord = { at: String(i.at), deliveryId: String(i.deliveryId), event: String(i.event), disposition: i.disposition as DeliveryRecord['disposition'] };
+  for (const k of ['action', 'repository', 'label', 'sender', 'reason', 'message', 'errorClass', 'jobId'] as const) {
+    const v = i[k];
+    if (typeof v === 'string') d[k] = v;
+  }
+  if (typeof i.issue === 'number') d.issue = i.issue;
+  return d;
+}
+
 function toJobSummary(i: Record<string, unknown>): JobSummary {
   const d = i.detail && typeof i.detail === 'object' ? (i.detail as Record<string, unknown>) : undefined;
   const detail: JobFinishDetail = {};
@@ -841,6 +851,26 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       await client.send(new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: `DELIVERY#${d.at}#${d.deliveryId}`, ...d, ttl: usageTtl(30) } }));
     },
 
+    async listDeliveriesOf(id, deliveryId, since) {
+      const out: DeliveryRecord[] = [];
+      let ExclusiveStartKey: Record<string, unknown> | undefined;
+      do {
+        // Keyed by time: from `since` on (the job's own window), then by id.
+        const page = await client.send(
+          new QueryCommand({
+            TableName: T,
+            KeyConditionExpression: 'pk = :pk AND sk BETWEEN :from AND :to',
+            FilterExpression: 'deliveryId = :d',
+            ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':from': `DELIVERY#${since}`, ':to': 'DELIVERY#~', ':d': deliveryId },
+            ExclusiveStartKey,
+          }),
+        );
+        out.push(...(page.Items ?? []).filter(liveItem).map(toDelivery));
+        ExclusiveStartKey = page.LastEvaluatedKey;
+      } while (ExclusiveStartKey);
+      return out;
+    },
+
     async listDeliveries(id, limit) {
       const out = await client.send(
         new QueryCommand({
@@ -851,16 +881,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           Limit: limit,
         }),
       );
-      const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
-      return (out.Items ?? []).filter(liveItem).map((i) => {
-        const d: DeliveryRecord = { at: String(i.at), deliveryId: String(i.deliveryId), event: String(i.event), disposition: i.disposition as DeliveryRecord['disposition'] };
-        for (const k of ['action', 'repository', 'label', 'sender', 'reason', 'message', 'errorClass', 'jobId'] as const) {
-          const v = str(i[k]);
-          if (v !== undefined) d[k] = v;
-        }
-        if (typeof i.issue === 'number') d.issue = i.issue;
-        return d;
-      });
+      return (out.Items ?? []).filter(liveItem).map(toDelivery);
     },
 
     async setSuspended(id, suspended) {

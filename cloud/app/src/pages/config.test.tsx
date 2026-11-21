@@ -82,7 +82,7 @@ describe('InstallationPage', () => {
         repositories: [],
         config: { activeVersion: null },
         keys: [],
-        activity: { deliveries: {}, jobs: {}, running: 0 },
+        activity: { window: { deliveries: 3, deliveriesComplete: true, jobs: 2, jobsComplete: true }, deliveries: {}, jobs: {}, running: 0 },
       }),
       jobs: vi.fn().mockResolvedValue({ jobs: [] }),
       deliveries: vi.fn().mockResolvedValue({ deliveries: [] }),

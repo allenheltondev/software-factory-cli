@@ -28,6 +28,10 @@ export type LogReader = (key: string, maxBytes: number) => Promise<{ text: strin
 /** The most of a log the API returns: its end, where a failure shows. */
 export const LOG_TAIL_BYTES = 1024 * 1024;
 const LIST_LIMIT = 100;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+/** How many of each the overview counts: more than this in 30 days, and it says the counts are of the latest. */
+export const ACTIVITY_SAMPLE = 500;
 
 const LEVEL: Record<string, number> = { read: 1, write: 2, admin: 3 };
 
@@ -59,8 +63,12 @@ export interface Overview {
   repositories: { fullName: string; htmlUrl?: string; private?: boolean; reachable: boolean; configured: boolean; paused: boolean }[];
   config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string };
   keys: AgentKeyView[];
-  /** The last 30 days, as far as the lists go. */
+  /**
+   * Counts over the last 30 days, or, when `window` says a list is not complete, over its latest
+   * ACTIVITY_SAMPLE entries (running counts the latest jobs only).
+   */
   activity: {
+    window: { deliveries: number; deliveriesComplete: boolean; jobs: number; jobsComplete: boolean };
     deliveries: Partial<Record<DeliveryRecord['disposition'], number>>;
     jobs: Partial<Record<JobResult, number>>;
     lastDeliveryAt?: string;
@@ -73,6 +81,9 @@ export interface StatusServiceDeps {
   github: Pick<GitHubFlows, 'member' | 'installation' | 'repositories'>;
   agentKeys: Pick<AgentKeyService, 'list'>;
   readLog?: LogReader;
+  /** The stack's ResultRetentionDays: a job's logs are expired once it ended longer ago than that. */
+  resultRetentionDays?: number;
+  now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
 }
 
@@ -96,7 +107,7 @@ export function jobView(job: JobSummary): JobView {
   return view;
 }
 
-export function createStatusService({ store, github, agentKeys, readLog, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
+export function createStatusService({ store, github, agentKeys, readLog, resultRetentionDays = 30, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
   const limitOf = (raw: unknown) => {
     const n = Number(raw);
     return Number.isSafeInteger(n) && n > 0 ? Math.min(n, LIST_LIMIT) : 50;
@@ -130,8 +141,8 @@ export function createStatusService({ store, github, agentKeys, readLog, log = (
         status === 'uninstalled' || status === 'suspended' ? Promise.resolve([]) : github.repositories(caller, installationId).then((r) => r.repositories).catch(() => []),
         tenant.activeConfigVersion !== undefined ? store.getConfigVersion(installationId, tenant.activeConfigVersion) : Promise.resolve(null),
         agentKeys.list(caller, installationId).then((v) => v.keys),
-        store.listDeliveries(installationId, 200),
-        store.listRecentJobs(installationId, 200),
+        store.listDeliveries(installationId, ACTIVITY_SAMPLE + 1),
+        store.listRecentJobs(installationId, ACTIVITY_SAMPLE + 1),
       ]);
 
       const configured = version?.dispatch?.repositories ?? {};
@@ -145,6 +156,11 @@ export function createStatusService({ store, github, agentKeys, readLog, log = (
         if (!repos.has(name)) repos.set(name, { fullName: name, reachable: false, configured: true, paused: Boolean(c.paused) });
       }
 
+      // Counts of the last 30 days (what is kept), or of the latest ACTIVITY_SAMPLE when there are more.
+      const deliveriesComplete = deliveries.length <= ACTIVITY_SAMPLE;
+      const jobsComplete = jobs.length <= ACTIVITY_SAMPLE;
+      deliveries.splice(ACTIVITY_SAMPLE);
+      jobs.splice(ACTIVITY_SAMPLE);
       const results = jobs.map(jobResult);
       return {
         tenant: summary,
@@ -157,6 +173,7 @@ export function createStatusService({ store, github, agentKeys, readLog, log = (
           jobs: countBy(results.filter((r) => r !== 'running')),
           ...(deliveries[0] ? { lastDeliveryAt: deliveries[0].at } : {}),
           running: results.filter((r) => r === 'running').length,
+          window: { deliveries: deliveries.length, deliveriesComplete, jobs: jobs.length, jobsComplete },
         },
       };
     },
@@ -175,7 +192,8 @@ export function createStatusService({ store, github, agentKeys, readLog, log = (
       await github.member(caller, installationId);
       const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
       if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
-      const deliveries = job.deliveryId ? (await store.listDeliveries(installationId, 200)).filter((d) => d.deliveryId === job.deliveryId) : [];
+      // Its event's deliveries, by id, from just before the job on: the first and any redelivery.
+      const deliveries = job.deliveryId ? await store.listDeliveriesOf(installationId, job.deliveryId, new Date(Date.parse(job.createdAt) - HOUR_MS).toISOString()) : [];
       return { job: jobView(job), deliveries };
     },
 
@@ -186,9 +204,19 @@ export function createStatusService({ store, github, agentKeys, readLog, log = (
       if (!job || !LOG_NAMES.has(name) || !jobView(job).logs.includes(name) || !readLog) {
         throw new FlowError('not_found', 404, 'This job has no such log');
       }
+      // The daily cleanup deletes results older than the retention, so past it (an hour early, as
+      // the log was written a little before the job's finish) the log is expired, read or not.
+      const expired = () => new FlowError('log_expired', 410, 'This log has expired; logs are kept for the retention period of the deployment');
+      const ended = Date.parse(job.finishedAt ?? job.createdAt);
+      if (now() > ended + resultRetentionDays * DAY_MS - HOUR_MS) throw expired();
       const key = `tenants/${installationId}/results/${job.deliveryId}/${job.microvmId}/${name}`;
       const out = await readLog(key, LOG_TAIL_BYTES);
-      if (!out) throw new FlowError('log_expired', 410, 'This log has expired; logs are kept for the retention period of the deployment');
+      if (!out) {
+        // Within the retention, and S3 has no such object for us (or would not say): not expired,
+        // so something is wrong. Logged to look into; never shown as expired.
+        log({ installationId, jobId, warning: `a log within the retention could not be read: ${key}` });
+        throw new FlowError('log_unavailable', 502, 'The log could not be read just now; try again later');
+      }
       // The runner redacted it with the job's keys; this catches anything shaped like a key it did not know.
       let text = redact(out.text);
       const truncated = out.size > LOG_TAIL_BYTES;

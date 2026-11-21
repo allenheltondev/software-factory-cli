@@ -148,12 +148,14 @@ function fakeTable() {
           const pk = values?.[':pk'];
           const prefix = String(input.KeyConditionExpression).includes('begins_with(sk, :prefix)') ? String(values?.[':prefix']) : '';
           const until = String(input.KeyConditionExpression).includes('sk <= :until') ? String(values?.[':until']) : null;
+          const between = String(input.KeyConditionExpression).includes('sk BETWEEN :from AND :to') ? [String(values?.[':from']), String(values?.[':to'])] : null;
           let found = [...items.values()]
-            .filter((i) => i.pk === pk && String(i.sk).startsWith(prefix) && (until === null || String(i.sk) <= until) && visible(key(i), input))
+            .filter((i) => i.pk === pk && String(i.sk).startsWith(prefix) && (until === null || String(i.sk) <= until) && (!between || (String(i.sk) >= between[0]! && String(i.sk) <= between[1]!)) && visible(key(i), input))
             .sort((a, b) => String(a.sk).localeCompare(String(b.sk)));
           if (input.ScanIndexForward === false) found.reverse();
           // The one query filter the store sends (getJobSummary).
           if (input.FilterExpression === 'jobId = :job') found = found.filter((i) => i.jobId === values?.[':job']);
+          else if (input.FilterExpression === 'deliveryId = :d') found = found.filter((i) => i.deliveryId === values?.[':d']);
           else if (input.FilterExpression) throw new Error(`unsupported filter: ${String(input.FilterExpression)}`);
           if (typeof input.Limit === 'number') found = found.slice(0, input.Limit);
           return { Items: input.ProjectionExpression ? found.map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })) : found.map((i) => ({ ...i })) };
@@ -1022,6 +1024,15 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
       { at: '2026-11-20T12:00:00.000Z', deliveryId: 'd-1', event: 'issues', action: 'labeled', disposition: 'launched', jobId: job.jobId, issue: 12 },
     ]);
     expect(await store.listDeliveries(56, 10)).toEqual([]);
+    // A job's own deliveries, by id, however many others came after them.
+    for (let n = 0; n < 250; n++) await store.recordDelivery(55, { at: `2026-11-20T13:${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}.000Z`, deliveryId: `other-${n}`, event: 'issues', disposition: 'filtered', reason: 'not_trigger' });
+    await store.recordDelivery(55, { at: '2026-11-20T14:30:00.000Z', deliveryId: 'd-1', event: 'issues', disposition: 'deduped' });
+    expect((await store.listDeliveriesOf(55, 'd-1', '2026-11-20T11:00:00.000Z')).map((d) => [d.at, d.disposition])).toEqual([
+      ['2026-11-20T12:00:00.000Z', 'launched'],
+      ['2026-11-20T14:30:00.000Z', 'deduped'],
+    ]);
+    expect(await store.listDeliveriesOf(55, 'd-1', '2026-11-20T12:01:00.000Z')).toHaveLength(1);
+    expect(await store.listDeliveriesOf(56, 'd-1', '2026-11-20T11:00:00.000Z')).toEqual([]);
     // Kept 30 days.
     expect(table.items.get('TENANT#55|DELIVERY#2026-11-20T12:00:00.000Z#d-1')?.ttl).toEqual(expect.any(Number));
   });

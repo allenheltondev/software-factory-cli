@@ -646,3 +646,17 @@ describe('configRelativePath', () => {
     expect(configRelativePath('config/prompts/event.json', 'config/')).toBe(path.join('prompts', 'event.json'));
   });
 });
+
+describe('finishDetail (#71)', () => {
+  it('reports a failed verification from whichever job failed it, and run-event\'s own outcome', async () => {
+    const { finishDetail } = await import('../image/runner/job.mjs');
+    const revisionFailed = {
+      updraftOutcome: 'failed',
+      summary: { verification: { passed: true, commands: [] }, followOnJobs: [{ kind: 'revision', verification: { passed: false, commands: [] } }] },
+      logs: ['results/d/m/updraft.log'],
+    };
+    expect(finishDetail(revisionFailed)).toEqual({ updraftOutcome: 'failed', verificationPassed: false, logs: ['updraft.log'] });
+    expect(finishDetail({ updraftOutcome: 'canceled', summary: {}, logs: [] })).toEqual({ updraftOutcome: 'canceled' });
+    expect(finishDetail({ updraftOutcome: 'succeeded', summary: { verification: { passed: true }, jobs: [{ verification: { passed: true } }] }, logs: [] })).toEqual({ updraftOutcome: 'succeeded', verificationPassed: true });
+  });
+});

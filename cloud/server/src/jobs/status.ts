@@ -7,6 +7,9 @@ import type { DeliveryRecord, JobSummary } from '../store/store.js';
  *   running          not finished yet
  *   success          it ran and published (or had nothing to publish)
  *   nothing_to_do    run-event found nothing to do for the event
+ *   canceled         the job was canceled before any agent started
+ *   superseded       it ran, and another run of the same event published first
+ *   deferred         its work waits behind a usage-limit cooldown; delivering the event again later continues it
  *   agent_failure    an agent run failed, could not start or was interrupted
  *   verify_failure   the agent's change failed the workflow's verify commands
  *   publish_failure  the run succeeded; its pull request could not be published
@@ -22,6 +25,9 @@ export type JobResult =
   | 'running'
   | 'success'
   | 'nothing_to_do'
+  | 'canceled'
+  | 'superseded'
+  | 'deferred'
   | 'agent_failure'
   | 'verify_failure'
   | 'publish_failure'
@@ -38,13 +44,21 @@ export function jobResult(job: Pick<JobSummary, 'status' | 'outcome' | 'detail'>
   const d = job.detail ?? {};
   switch (job.outcome) {
     case 'succeeded':
-      return d.updraftOutcome === 'nothing-to-do' ? 'nothing_to_do' : 'success';
+      // run-event exits 0 for these too: they completed nothing.
+      if (d.updraftOutcome === 'nothing-to-do') return 'nothing_to_do';
+      if (d.updraftOutcome === 'canceled') return 'canceled';
+      if (d.updraftOutcome === 'superseded') return 'superseded';
+      return 'success';
     case 'failed':
+      if (d.updraftOutcome === 'deferred') return 'deferred';
+      if (d.updraftOutcome === 'not-started') return 'not_run';
       if (d.updraftOutcome === 'publish-failed') return 'publish_failure';
       if (d.verificationPassed === false) return 'verify_failure';
       return 'agent_failure';
     case 'timed_out':
       return 'timeout';
+    case 'microvm_gone':
+      return 'terminated';
     case 'state_not_saved':
     case 'terminated':
     case 'runner_error':

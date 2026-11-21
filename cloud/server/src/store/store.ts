@@ -374,6 +374,8 @@ export interface Store {
   recordDelivery(installationId: number, delivery: DeliveryRecord): Promise<void>;
   /** Newest first. */
   listDeliveries(installationId: number, limit: number): Promise<DeliveryRecord[]>;
+  /** Every kept delivery with this id (a delivery and its redeliveries) recorded at or after `since` (ISO), oldest first. */
+  listDeliveriesOf(installationId: number, deliveryId: string, since: string): Promise<DeliveryRecord[]>;
   /**
    * Suspended or active again, unless the tenant was uninstalled (one conditional write). An
    * unsuspend leaves a tenant an admin disabled disabled.
@@ -918,6 +920,9 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async recordDelivery(id, d) {
       deliveries2.push({ id, d: { ...d } });
+    },
+    async listDeliveriesOf(id, deliveryId, since) {
+      return deliveries2.filter((x) => x.id === id && x.d.deliveryId === deliveryId && x.d.at >= since).map((x) => ({ ...x.d })).sort((a, b) => a.at.localeCompare(b.at));
     },
     async listDeliveries(id, limit) {
       return deliveries2.filter((x) => x.id === id).map((x) => ({ ...x.d })).sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);

@@ -56,6 +56,7 @@ export type FlowErrorCode =
   | 'not_reactivatable'
   // Status and diagnostics (tenants/status-service.ts).
   | 'log_expired'
+  | 'log_unavailable'
   // Agent keys (tenants/agent-key-service.ts).
   | 'invalid_key';
 

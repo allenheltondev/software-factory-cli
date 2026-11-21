@@ -133,7 +133,7 @@ function Loaded({ job, deliveries, api, installationId }: { job: JobView; delive
           </CardHeader>
           <CardBody>
             <ol className="flex flex-col gap-2" data-testid="job-deliveries">
-              {[...deliveries].reverse().map((d) => (
+              {deliveries.map((d) => (
                 <li key={`${d.at}-${d.disposition}`} className="flex flex-wrap items-center gap-3 text-sm">
                   <span title={exact(d.at)}>{relativeTime(d.at)}</span>
                   <strong>{DISPOSITION[d.disposition].label}</strong>

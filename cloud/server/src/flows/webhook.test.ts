@@ -257,6 +257,16 @@ describe('webhook', () => {
       expect(await store.listDeliveries(77, 10)).toEqual([]);
     });
 
+    it('records a launch that fails before the launcher handles it, and still answers 500', async () => {
+      const launch: Launcher = async () => {
+        throw Object.assign(new Error('Rate exceeded: secret detail'), { name: 'ProvisionedThroughputExceededException' });
+      };
+      const { deliver, store } = await setup(undefined, launch);
+      expect(await deliver('issues', labeled)).toMatchObject({ status: 500 });
+      expect(await store.listDeliveries(55, 5)).toEqual([expect.objectContaining({ disposition: 'launch_failed', errorClass: 'ProvisionedThroughputExceededException' })]);
+      expect(JSON.stringify(await store.listDeliveries(55, 5))).not.toContain('secret detail');
+    });
+
     it('answers the delivery even when it cannot be recorded', async () => {
       const launch: Launcher = async () => ({ status: 202, disposition: 'launched', jobId: 'job_1' });
       const { deliver, store } = await setup(undefined, launch);

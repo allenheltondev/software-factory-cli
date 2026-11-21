@@ -189,7 +189,7 @@ function Loaded({
         <StatTile label="Repositories" value={`${configured.length} of ${overview.repositories.filter((r) => r.reachable).length}`} meta="configured, of those the App reaches" />
         <StatTile label="Agent keys" value={`${keysSet} of ${overview.keys.length}`} meta={overview.keys.some((k) => k.required && !k.configured) ? 'A required key is missing' : 'set'} />
         <StatTile
-          label="Jobs, 30 days"
+          label={overview.activity.window.jobsComplete ? 'Jobs, 30 days' : `Latest ${overview.activity.window.jobs} jobs`}
           value={finished === 0 ? '0' : `${Math.round((succeeded / finished) * 100)}%`}
           meta={finished === 0 ? `${deliveryTotal} deliveries, no jobs finished yet` : `succeeded, of ${finished} finished`}
         />

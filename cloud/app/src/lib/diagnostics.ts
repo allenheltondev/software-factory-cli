@@ -23,6 +23,13 @@ export const JOB_RESULT: Record<JobResult, { label: string; tone: Tone; help: st
   running: { label: 'Running', tone: 'primary', help: 'The job is running in its microVM.' },
   success: { label: 'Succeeded', tone: 'success', help: 'The agent did the work and the pull request was published.' },
   nothing_to_do: { label: 'Nothing to do', tone: 'neutral', help: 'Updraft looked at the event and found nothing to do (for example, work that was already done).' },
+  canceled: { label: 'Canceled', tone: 'neutral', help: 'The job was canceled before any agent started (the issue changed, or the work was no longer wanted).' },
+  superseded: { label: 'Superseded', tone: 'neutral', help: 'The job ran, but another run of the same event published first. Nothing on GitHub was changed by this one.' },
+  deferred: {
+    label: 'Deferred',
+    tone: 'warning',
+    help: 'An agent’s usage limit was reached, so the rest of the work waits for the cooldown. Delivering the event again after it continues the work.',
+  },
   agent_failure: { label: 'Agent failed', tone: 'error', help: 'An agent run failed, could not start, or was interrupted. The run log shows what the agent did.' },
   verify_failure: { label: 'Verification failed', tone: 'error', help: "The agent's change did not pass the workflow's verify commands. The run log shows which command failed." },
   publish_failure: { label: 'Publish failed', tone: 'error', help: 'The agent succeeded, but the pull request could not be published. Check the App can push and open pull requests.' },

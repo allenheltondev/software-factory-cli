@@ -8,7 +8,8 @@ import { deliveryFromLaunch } from '../jobs/deliveries.js';
 import { jobResult } from '../jobs/status.js';
 import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
 import { expireResults } from './results-retention.js';
-import { createStatusService, LOG_TAIL_BYTES, missingPermissions, type LogReader } from './status-service.js';
+import { createS3LogReader } from './s3-logs.js';
+import { ACTIVITY_SAMPLE, createStatusService, LOG_TAIL_BYTES, missingPermissions, type LogReader } from './status-service.js';
 
 const caller = { sub: 'u1' } as Caller;
 const ALL = { metadata: 'read', contents: 'write', issues: 'write', pull_requests: 'write', checks: 'read', statuses: 'read' };
@@ -53,8 +54,11 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
     const t = (await store.getTenant(55))!;
     return { tenant: t, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: t.status, role: 'owner' as const } };
   };
+  const clock = { now: Date.now() };
   const service = createStatusService({
     store,
+    now: () => clock.now,
+    resultRetentionDays: 30,
     github: {
       member,
       installation: async (c, id) => {
@@ -79,7 +83,7 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
     const res = await app.request(`/api/v1/installations/${path}`);
     return { status: res.status, body: (await res.json()) as Record<string, unknown>, cache: res.headers.get('cache-control') };
   };
-  return { store, service, get, reads };
+  return { store, service, get, reads, clock };
 }
 
 describe('status and diagnostics (#71)', () => {
@@ -104,7 +108,12 @@ describe('status and diagnostics (#71)', () => {
       expect(body).toMatchObject({
         installation: { status: 'active', checked: true, missingPermissions: [] },
         config: { activeVersion: 1, publishedBy: 'pat' },
-        activity: { deliveries: { launched: 1, filtered: 1 }, running: 1, lastDeliveryAt: '2026-11-20T12:01:00.000Z' },
+        activity: {
+          deliveries: { launched: 1, filtered: 1 },
+          running: 1,
+          lastDeliveryAt: '2026-11-20T12:01:00.000Z',
+          window: { deliveries: 2, deliveriesComplete: true, jobs: 1, jobsComplete: true },
+        },
       });
       // Configured first; one configured that the installation no longer reaches.
       expect(body.repositories).toEqual([
@@ -113,6 +122,22 @@ describe('status and diagnostics (#71)', () => {
         { fullName: 'acme/docs', htmlUrl: 'https://github.com/acme/docs', private: false, reachable: true, configured: false, paused: false },
       ]);
       expect((body.keys as unknown[]).length).toBe(2);
+    });
+
+    it('says when its counts are of the latest deliveries only, not all 30 days', async () => {
+      const { store, get } = await setup();
+      for (let n = 0; n <= ACTIVITY_SAMPLE; n++) await store.recordDelivery(55, { at: `2026-11-20T12:00:${String(n).padStart(4, '0')}Z`, deliveryId: `d-${n}`, event: 'issues', disposition: 'filtered', reason: 'not_trigger' });
+      const { body } = await get('55/overview');
+      expect(body.activity).toMatchObject({ deliveries: { filtered: ACTIVITY_SAMPLE }, window: { deliveries: ACTIVITY_SAMPLE, deliveriesComplete: false, jobsComplete: true } });
+    });
+
+    it('shows a job its own deliveries, however many others arrived since', async () => {
+      const { store, get } = await setup();
+      await store.putJob(job());
+      await store.recordDelivery(55, { at: '2026-11-20T11:59:59.000Z', deliveryId: 'd-1', event: 'issues', disposition: 'launched', jobId: 'job_status0001' });
+      for (let n = 0; n < 250; n++) await store.recordDelivery(55, { at: `2026-11-20T13:00:${String(n).padStart(4, '0')}Z`, deliveryId: `other-${n}`, event: 'issues', disposition: 'filtered' });
+      const { body } = await get('55/jobs/job_status0001');
+      expect((body.deliveries as { deliveryId: string }[]).map((d) => d.deliveryId)).toEqual(['d-1']);
     });
 
     it.each([
@@ -171,6 +196,10 @@ describe('status and diagnostics (#71)', () => {
       [{ status: 'launched' }, 'running'],
       [{ status: 'finished', outcome: 'succeeded' }, 'success'],
       [{ status: 'finished', outcome: 'succeeded', detail: { updraftOutcome: 'nothing-to-do' } }, 'nothing_to_do'],
+      [{ status: 'finished', outcome: 'succeeded', detail: { updraftOutcome: 'canceled' } }, 'canceled'],
+      [{ status: 'finished', outcome: 'succeeded', detail: { updraftOutcome: 'superseded' } }, 'superseded'],
+      [{ status: 'finished', outcome: 'failed', detail: { updraftOutcome: 'deferred' } }, 'deferred'],
+      [{ status: 'finished', outcome: 'microvm_gone' }, 'terminated'],
       [{ status: 'finished', outcome: 'failed' }, 'agent_failure'],
       [{ status: 'finished', outcome: 'failed', detail: { verificationPassed: false } }, 'verify_failure'],
       [{ status: 'finished', outcome: 'failed', detail: { updraftOutcome: 'publish-failed' } }, 'publish_failure'],
@@ -219,14 +248,52 @@ describe('status and diagnostics (#71)', () => {
       expect(String(body.text).endsWith('the failure\n')).toBe(true);
     });
 
-    it('answers 404 for a log the job did not upload, and 410 for one that has expired', async () => {
+    it('answers 404 for a log the job did not upload', async () => {
       const { store, get, reads } = await setup({ logs: {} });
       await finished(store);
       expect((await get('55/jobs/job_status0001/logs/updraft.log')).status).toBe(404);
       expect((await get('55/jobs/job_status0001/logs/..%2F..%2Fconfig.yaml')).status).toBe(404);
       expect(reads).toEqual([]);
-      expect((await get('55/jobs/job_status0001/logs/run.log')).body).toMatchObject({ error: 'log_expired' });
     });
+
+    it('answers 410 for a log past the retention, without reading it, and 502 for one within it that cannot be read', async () => {
+      const DAY = 24 * 3600 * 1000;
+      const { store, get, reads, clock } = await setup({ logs: {} });
+      await finished(store);
+      // Within the retention: the reader found nothing (S3 says 403 for a missing object to this role).
+      const within = await get('55/jobs/job_status0001/logs/run.log');
+      expect(within).toMatchObject({ status: 502, body: { error: 'log_unavailable' } });
+      expect(reads).toEqual([KEY]);
+      clock.now += 30 * DAY;
+      const after = await get('55/jobs/job_status0001/logs/run.log');
+      expect(after).toMatchObject({ status: 410, body: { error: 'log_expired' } });
+      expect(reads).toEqual([KEY]);
+    });
+  });
+
+  it("reads a log's end from S3, and takes the deployed role's 403 for a missing object as missing", async () => {
+    const calls: unknown[] = [];
+    const reader = (answer: () => unknown) =>
+      createS3LogReader(
+        {
+          send: (async (cmd: { input: unknown }) => {
+            calls.push(cmd.input);
+            return answer();
+          }) as never,
+        },
+        'tenant-bucket',
+      );
+    const ok = reader(() => ({ ContentRange: 'bytes 4-9/10', Body: { transformToString: async () => 'tail!\n' } }));
+    expect(await ok('tenants/55/results/d/m/run.log', 6)).toEqual({ text: 'tail!\n', size: 10 });
+    expect(calls[0]).toEqual({ Bucket: 'tenant-bucket', Key: 'tenants/55/results/d/m/run.log', Range: 'bytes=-6' });
+    const fail = (name: string, status: number) => () => {
+      throw Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+    };
+    // Without s3:ListBucket, S3 answers a missing object with 403 AccessDenied.
+    expect(await reader(fail('AccessDenied', 403))('k', 6)).toBeNull();
+    expect(await reader(fail('NoSuchKey', 404))('k', 6)).toBeNull();
+    expect(await reader(fail('InvalidRange', 416))('k', 6)).toEqual({ text: '', size: 0 });
+    await expect(reader(fail('SlowDown', 503))('k', 6)).rejects.toThrow('SlowDown');
   });
 
   it('records each delivery as one disposition', () => {

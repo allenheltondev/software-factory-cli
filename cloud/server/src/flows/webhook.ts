@@ -2,7 +2,7 @@ import type { GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import { verifySignature } from '../github/signature.js';
 import type { LoadSettings } from '../github/settings.js';
-import type { Launcher } from '../jobs/launch.js';
+import { errorClassOf, type Launcher } from '../jobs/launch.js';
 import { deliveryFromLaunch, LIFECYCLE_EVENTS, type DeliveryEvent } from '../jobs/deliveries.js';
 import type { DeliveryRecord, Store } from '../store/store.js';
 
@@ -118,7 +118,15 @@ export function createWebhookHandler({
 
     if (event === 'ping') return done('pong');
     if (event === 'issues' && action === 'labeled' && validInstallation && launch) {
-      const result = await launch({ installationId, deliveryId: delivery, body: req.body, payload });
+      let result;
+      try {
+        result = await launch({ installationId, deliveryId: delivery, body: req.body, payload });
+      } catch (err) {
+        // Failed before the launcher's own handling (the image version, the claim, the quota
+        // reservation): listed for a known tenant, and still answered 500 so GitHub can redeliver.
+        if (await store.getTenant(installationId).catch(() => null)) await record({ ...base, disposition: 'launch_failed', errorClass: errorClassOf(err) });
+        throw err;
+      }
       await record(deliveryFromLaunch(base, result));
       return done(result.disposition, result.status);
     }

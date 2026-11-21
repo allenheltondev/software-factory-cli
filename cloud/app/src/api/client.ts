@@ -175,6 +175,9 @@ export type JobResult =
   | 'running'
   | 'success'
   | 'nothing_to_do'
+  | 'canceled'
+  | 'superseded'
+  | 'deferred'
   | 'agent_failure'
   | 'verify_failure'
   | 'publish_failure'
@@ -228,6 +231,8 @@ export interface Overview {
   config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string };
   keys: AgentKeyView[];
   activity: {
+    /** Counts over 30 days, or of the latest entries when a list is not complete. */
+    window: { deliveries: number; deliveriesComplete: boolean; jobs: number; jobsComplete: boolean };
     deliveries: Partial<Record<DeliveryDisposition, number>>;
     jobs: Partial<Record<JobResult, number>>;
     lastDeliveryAt?: string;

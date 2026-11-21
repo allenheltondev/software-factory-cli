@@ -20,7 +20,7 @@ const overview = (over: Partial<Overview> = {}): Overview => ({
     { name: 'ANTHROPIC_API_KEY', configured: true, required: true },
     { name: 'CODEX_API_KEY', configured: false, required: false },
   ],
-  activity: { deliveries: { launched: 2, filtered: 1 }, jobs: { success: 1, verify_failure: 1 }, running: 0, lastDeliveryAt: NOW },
+  activity: { window: { deliveries: 3, deliveriesComplete: true, jobs: 2, jobsComplete: true }, deliveries: { launched: 2, filtered: 1 }, jobs: { success: 1, verify_failure: 1 }, running: 0, lastDeliveryAt: NOW },
   ...over,
 });
 const job = (over: Partial<JobView> = {}): JobView => ({
@@ -80,6 +80,11 @@ describe('InstallationPage (#71)', () => {
     expect(within(screen.getByTestId('job-job_abcdefgh02')).getByRole('link', { name: /pull request/i })).toHaveAttribute('href', 'https://github.com/acme/web/pull/7');
   });
 
+  it('says when its counts are of the latest jobs, not all 30 days', async () => {
+    showInstallation(api({ overview: vi.fn().mockResolvedValue(overview({ activity: { ...overview().activity, window: { deliveries: 500, deliveriesComplete: false, jobs: 500, jobsComplete: false } } })) }));
+    expect(await screen.findByTestId('stats')).toHaveTextContent('Latest 500 jobs');
+  });
+
   it('says what needs attention, and where to fix each', async () => {
     showInstallation(
       api({
@@ -122,7 +127,7 @@ describe('InstallationPage (#71)', () => {
   it('refreshes itself while a job runs', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
-      const a = api({ overview: vi.fn().mockResolvedValue(overview({ activity: { deliveries: {}, jobs: {}, running: 1 } })) });
+      const a = api({ overview: vi.fn().mockResolvedValue(overview({ activity: { window: { deliveries: 3, deliveriesComplete: true, jobs: 2, jobsComplete: true }, deliveries: {}, jobs: {}, running: 1 } })) });
       showInstallation(a, '/installations/55', 1000);
       await screen.findByTestId('installation-status');
       expect(a.overview).toHaveBeenCalledTimes(1);

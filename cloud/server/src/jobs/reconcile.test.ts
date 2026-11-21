@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createMemoryStore, type Job } from '../store/store.js';
-import { createReconciler } from './reconcile.js';
+import { createReconciler, MICROVM_GONE_OUTCOME } from './reconcile.js';
 
 const QUOTAS = { concurrentJobs: 5, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 };
 
@@ -111,5 +111,15 @@ describe('quota reconciliation', () => {
     // The leftover is freed without asking Lambda again.
     expect(microvmState).not.toHaveBeenCalledWith(leftover.microvmId);
     expect((await store.listPlatformSlots()).map((s) => s.jobId)).toEqual(['job_broken001']);
+  });
+
+  it('ends the job for the console when its microVM is gone without a finish, and keeps a finish that won the race (#71)', async () => {
+    const store = createMemoryStore();
+    await admitted(store, 'job_gone00001', { microvmId: 'mvm-gone' });
+    const finished = await admitted(store, 'job_finish001', { microvmId: 'mvm-done' });
+    await store.finishJob(finished.jobId, 'succeeded', { at: Date.now() });
+    await createReconciler({ store, microvmState: async () => 'TERMINATED', log: () => {} })();
+    expect((await store.getJobSummary(55, 'job_gone00001'))).toMatchObject({ status: 'finished', outcome: MICROVM_GONE_OUTCOME, finishedAt: expect.any(String) });
+    expect((await store.getJobSummary(55, 'job_finish001'))?.outcome).toBe('succeeded');
   });
 });
