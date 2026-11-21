@@ -67,6 +67,13 @@ Parameters:
     Default: 20
     MinValue: 1
     Description: Jobs every tenant together may run at once.
+  # Agent Timeline has no documented link to a conversation (tenants/telemetry-service.ts):
+  # empty, and the console links to the conversation's query instead.
+  HoneycombTimelineUrl:
+    Type: String
+    Default: ''
+    MaxLength: 512
+    Description: "A template for a link to a conversation in Honeycomb's Agent Timeline, starting with {ui}/{team}/ and naming {conversation} (also {environment}, {dataset}, {start}, {end}). Empty: no such link."
 
   # The admin view (server/src/admin/access.ts): the members of this group in the shared Ready,
   # Set, Cloud user pool, from the ID token's cognito:groups.
@@ -257,6 +264,8 @@ Resources:
           USER_POOL_CLIENT_ID: !Ref AuthClient
           # When a job's logs count as expired (tenants/status-service.ts): the cleanup's own setting.
           RESULT_RETENTION_DAYS: !Ref ResultRetentionDays
+          # A link to a job's conversation in Agent Timeline, when set (tenants/telemetry-service.ts).
+          HONEYCOMB_TIMELINE_URL: !Ref HoneycombTimelineUrl
           # The admin view shows each tenant's quotas: the same defaults the launcher applies.
           QUOTA_CONCURRENT_JOBS: !Ref QuotaConcurrentJobs
           QUOTA_JOBS_PER_DAY: !Ref QuotaJobsPerDay

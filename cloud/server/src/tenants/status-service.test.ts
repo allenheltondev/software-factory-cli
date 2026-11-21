@@ -197,6 +197,23 @@ describe('status and diagnostics (#71)', () => {
       expect((await get('55/jobs/job_nobody00001')).status).toBe(404);
     });
 
+    it("shows a job with the other recent jobs of its conversation, newest first", async () => {
+      const { store, get } = await setup();
+      const traceId = 'ab'.repeat(16);
+      const finished = async (jobId: string, over: Partial<Job>, conversationId?: string) => {
+        await store.putJob(job({ jobId, deliveryId: `d-${jobId}`, ...over }));
+        await store.finishJob(jobId, 'succeeded', { at: Date.now(), detail: { telemetry: { traceId, spans: 1, exported: 1, failed: 0, ...(conversationId ? { conversationId } : {}) } } });
+      };
+      await finished('job_conv00001', { createdAt: '2026-11-20T10:00:00.000Z' });
+      // A review of the issue's pull request: no issue on the job, the runner named the conversation.
+      await finished('job_conv00002', { createdAt: '2026-11-20T11:00:00.000Z', issue: undefined, eventName: 'pull_request_review' }, 'acme/web#12');
+      await finished('job_conv00003', { createdAt: '2026-11-20T12:00:00.000Z', issue: 13 });
+      const { body } = await get('55/jobs/job_conv00001');
+      expect((body.conversation as { jobId: string }[]).map((j) => j.jobId)).toEqual(['job_conv00002']);
+      expect((await get('55/jobs/job_conv00002')).body.conversation).toMatchObject([{ jobId: 'job_conv00001' }]);
+      expect((await get('55/jobs/job_conv00003')).body.conversation).toEqual([]);
+    });
+
     it.each([
       [{ status: 'launched' }, 'running'],
       [{ status: 'finished', outcome: 'succeeded' }, 'success'],

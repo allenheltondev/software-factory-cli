@@ -218,10 +218,45 @@ not redacted: they are what the content is.
 - **Agent telemetry** (`/installations/:id/telemetry`): the key (never its value), the Honeycomb
   team and environment it belongs to, sending on or paused, content on or off, the service name,
   and the last job's export: how many spans got there, the last error, and a link to its trace.
-- **Each job's page**: **View trace in Honeycomb**, a
-  [direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace) built from the
-  team and environment slugs, and the conversation id to open in AI Ecosystem → Conversations.
-- **The jobs list**: a **Trace** link on each job that sent telemetry.
+- **Each job's page**:
+  - **View trace in Honeycomb**, a
+    [direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace) built from the
+    team and environment slugs.
+  - **Open conversation**, the conversation's spans in Honeycomb's query builder, a
+    [shared query](https://docs.honeycomb.io/investigate/collaborate/share-query):
+    `gen_ai.conversation.id = <owner/repo#issue>`, broken down by conversation and agent, with a span
+    count and a trace count, from a week before the job to a week after it (or now). Selecting the
+    conversation id in the results opens it in Agent Timeline. If the deployment sets an Agent
+    Timeline link (below), **Open in Agent Timeline** shows instead.
+  - **Jump to**: the trace opened at a span (`&span=<span id>`) for each run's `invoke_agent` span
+    (with its review verdict, and whether it failed or went in circles), the first failing test run,
+    the first passing one after it, the first failed verify command, and the first failed Updraft
+    or runner step.
+  - **This conversation**: the other recent jobs of the same conversation (the implementation, each
+    review and revision), each with its trace.
+  - The conversation id, to copy into AI Ecosystem → Conversations.
+- **The jobs list**: a **Trace** and a **Conversation** link on each job that sent telemetry.
+
+### Spans worth a link
+
+The runner reports these with the job's finish (`telemetry.marks`): a kind (`agent`,
+`test_failed`, `test_green`, `verify_failed`, `step_failed`), the span id, the run kind, and for an
+agent span its profile, verdict, and whether it failed or thrashed. Only spans that were sent are
+marked, so a link never opens the root span instead, and there are at most 8 per run and 32 per job.
+It also reports the conversation id, so a review's job, which has no issue of its own, links to the
+issue's conversation. The broker keeps only marks of a known kind, with a 16-hex span id and plain
+words.
+
+### A link into Agent Timeline itself
+
+Honeycomb documents no URL for a conversation in Agent Timeline. A deployment that knows the path
+the UI uses can set the `HoneycombTimelineUrl` stack parameter (`HONEYCOMB_TIMELINE_URL`) to a
+template, for example
+`{ui}/{team}/environments/{environment}/<path>?conversation={conversation}`, with the placeholders
+`{ui}`, `{team}`, `{environment}`, `{dataset}`, `{conversation}`, `{start}` and `{end}` (UNIX
+seconds, the same window as the query). It must start with `{ui}/{team}/` and name
+`{conversation}`, or it is ignored with a warning. Every value is URL-encoded. As an undocumented
+path it can change without notice; the query link works either way.
 
 ## Security
 

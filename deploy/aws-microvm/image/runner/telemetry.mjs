@@ -322,6 +322,10 @@ export function parseHeaderLine(line, h) {
  * The span id of a run's invoke_agent span: derived from the run id, so a later job (another
  * microVM, another trace) can link to it knowing only the run and the trace it was in.
  */
+/** At most this many marks per run, and per job (stop's `marks`). */
+export const MAX_MARKS_PER_RUN = 8;
+export const MAX_MARKS_PER_JOB = 32;
+
 export const agentSpanIdFor = (runId) => createHash('sha256').update(`updraft-agent-span:${runId}`).digest('hex').slice(0, 16);
 
 const isJsonLine = (line) => line.startsWith('{') && line.endsWith('}');
@@ -507,6 +511,14 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   const steps = new Map();
   let compactions = 0;
   const behavior = createBehavior();
+  /**
+   * Spans worth a link of their own (stop's `marks`): the run's agent span, its first red test
+   * run and the first green one after it, its first failed verify command, its first failed
+   * Updraft step. Only spans that were sent: a link to one that was not would open the root.
+   */
+  const marks = [];
+  const marked = new Set();
+  let sawRedTest = false;
   /** Where the agent's paths are relative to: its own working directory, and the worktree. */
   const roots = () => [h.cwd, h.checkout].filter(Boolean);
 
@@ -529,7 +541,40 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (span.ended) return;
     span.ended = true;
     span.end = Math.max(span.start, span.end ?? at);
-    if (spans++ < MAX_SPANS_PER_RUN) emit(span);
+    if (spans++ < MAX_SPANS_PER_RUN) {
+      emit(span);
+      noteMark(span);
+    }
+  }
+
+  function noteMark(span) {
+    const a = span.attributes ?? {};
+    const add = (kind, extra = {}) => {
+      if (marks.length < MAX_MARKS_PER_RUN) marks.push({ kind, spanId: span.spanId, at: span.start, ...(h.kind ? { run: h.kind } : {}), ...extra });
+    };
+    const once = (kind, extra) => {
+      if (marked.has(kind)) return;
+      marked.add(kind);
+      add(kind, extra);
+    };
+    if (span === agentSpan) {
+      const verdict = a['updraft.review.verdict'];
+      add('agent', {
+        ...(h.agent ? { agent: h.agent } : {}),
+        ...(span.error ? { failed: true } : {}),
+        ...(a['updraft.agent.thrashing'] === true ? { thrashing: true } : {}),
+        ...(typeof verdict === 'string' ? { verdict } : {}),
+      });
+    } else if (span.name === 'execute_tool verify') {
+      if (span.error) once('verify_failed');
+    } else if (a['gen_ai.operation.name'] === 'execute_tool' && a['updraft.tool.category'] === 'test') {
+      if (span.error || (a['updraft.test.failed'] ?? 0) > 0) {
+        sawRedTest = true;
+        once('test_failed');
+      } else if (sawRedTest) once('test_green');
+    } else if (span.error && a['gen_ai.agent.name'] === 'updraft' && typeof a['updraft.step'] === 'string') {
+      once('step_failed', { step: a['updraft.step'] });
+    }
   }
 
   /** Updraft's own steps: on the "updraft" lane, with no provider. */
@@ -1263,6 +1308,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   return {
     header: h,
     summary,
+    marks,
     agentEvent,
     get conversationId() {
       return conversationId();
@@ -1556,6 +1602,8 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
     async stop({ outcome, summary, deliveryId, eventName, budgetMs = 15_000, steps = [] } = {}) {
       clearInterval(pollTimer);
       clearInterval(exportTimer);
+      /** The runner's own failed steps, as marks (each run's are in its trace's). */
+      const runnerMarks = [];
       try {
         await schedulePoll();
         const at = now();
@@ -1569,9 +1617,11 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
           const loop = summary?.loop && typeof summary.loop === 'object' ? summary.loop : null;
           const failed = outcome !== 'succeeded';
           for (const step of runnerSteps) {
+            const spanId = newSpanId();
+            if (step.error) runnerMarks.push({ kind: 'step_failed', spanId, at: step.start, step: `runner_${step.name}` });
             emit({
               traceId,
-              spanId: newSpanId(),
+              spanId,
               parentSpanId: rootSpanId,
               name: `runner ${step.name}`,
               kind: KIND_INTERNAL,
@@ -1638,9 +1688,22 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
         log(`agent telemetry: ${error?.message ?? error}`);
       }
       const conversations = [...new Set([...runs.values()].map((r) => r.trace.conversationId))];
+      // The issue's conversation (the one Agent Timeline lists), else the run's or the delivery's.
+      const traces = [...runs.values()].map((r) => r.trace);
+      const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? conversations[0];
+      const marks = [...traces.flatMap((t) => t.marks), ...runnerMarks]
+        .sort((x, y) => x.at - y.at)
+        .slice(0, MAX_MARKS_PER_JOB)
+        .map((m) => {
+          const out = { ...m };
+          delete out.at;
+          return out;
+        });
       return {
         traceId,
+        ...(conversationId ? { conversationId } : {}),
         conversationIds: conversations,
+        marks,
         runs: [...runs.values()].map((r) => r.trace.summary),
         spans: stats.spans,
         exported: exporter.stats.exported,

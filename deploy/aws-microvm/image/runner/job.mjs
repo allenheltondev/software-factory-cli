@@ -724,7 +724,17 @@ export function finishDetail(result) {
   // Agent telemetry: the trace, for a link to it, and whether it got there.
   if (result.telemetry) {
     const t = result.telemetry;
-    detail.telemetry = { traceId: t.traceId, spans: t.spans, exported: t.exported, failed: t.failed, startedAt: t.startedAt, ...(t.lastError ? { lastError: t.lastError } : {}) };
+    detail.telemetry = {
+      traceId: t.traceId,
+      spans: t.spans,
+      exported: t.exported,
+      failed: t.failed,
+      startedAt: t.startedAt,
+      ...(t.lastError ? { lastError: t.lastError } : {}),
+      // Where the links on the job's page go: its conversation, and spans worth opening at.
+      ...(t.conversationId ? { conversationId: t.conversationId } : {}),
+      ...(t.marks?.length ? { marks: t.marks } : {}),
+    };
   }
   // The lifecycle (the console's job timeline): where the review loop left the pull request, and
   // each step in order. The broker keeps only codes, counts and booleans of it.

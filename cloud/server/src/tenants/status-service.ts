@@ -5,7 +5,8 @@ import { countBy, deliveryCounts, jobResult, type JobResult } from '../jobs/stat
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { redact } from './redact.js';
-import { traceUrl } from './telemetry-service.js';
+import type { TelemetryMarkKind } from '../jobs/lifecycle.js';
+import { conversationUrl, timelineUrl, traceUrl } from './telemetry-service.js';
 
 /**
  * A tenant's status and diagnostics in the console (#71), for its members only:
@@ -52,7 +53,40 @@ export interface JobView extends JobSummary {
   /** Logs the API can serve (the job uploaded them; they may since have expired). */
   logs: string[];
   /** Its agents' trace in the tenant's Honeycomb, when telemetry was on for it. */
-  telemetry?: { traceId: string; traceUrl?: string; conversationId?: string; spans: number; exported: number; failed: number; lastError?: string };
+  telemetry?: JobTelemetryView;
+}
+
+export interface JobTelemetryView {
+  traceId: string;
+  traceUrl?: string;
+  conversationId?: string;
+  /** The conversation's spans in Honeycomb's query builder, by agent; from there, Agent Timeline. */
+  conversationUrl?: string;
+  /** The conversation in Agent Timeline itself, when the deployment set HONEYCOMB_TIMELINE_URL. */
+  timelineUrl?: string;
+  /** Spans worth opening the trace at: each run's agent, the first red and green test runs, a failed verify or step. */
+  links?: JobTraceLink[];
+  spans: number;
+  exported: number;
+  failed: number;
+  lastError?: string;
+}
+
+export interface JobTraceLink {
+  kind: TelemetryMarkKind;
+  url: string;
+  run?: string;
+  agent?: string;
+  failed?: boolean;
+  thrashing?: boolean;
+  verdict?: string;
+  step?: string;
+}
+
+/** What links on a job need besides its own record: the time, and the deployment's Agent Timeline template. */
+export interface JobViewOptions {
+  now?: number;
+  timelineTemplate?: string | null;
 }
 
 export interface Overview {
@@ -86,6 +120,8 @@ export interface StatusServiceDeps {
   readLog?: LogReader;
   /** The stack's ResultRetentionDays: a job's logs are expired once it ended longer ago than that. */
   resultRetentionDays?: number;
+  /** HONEYCOMB_TIMELINE_URL, as parseTimelineTemplate accepted it: a link to a conversation in Agent Timeline. */
+  timelineTemplate?: string | null;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
 }
@@ -103,18 +139,37 @@ export function missingPermissions(granted: Record<string, string> | undefined):
   return out;
 }
 
-export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = null): JobView {
+/**
+ * The conversation Agent Timeline groups a job's traces under: what its runner reported, else
+ * `owner/repo#issue` for a job of an issue (the runner's telemetry.mjs names it the same way).
+ */
+export function conversationOf(job: JobSummary): string | undefined {
+  return job.detail?.telemetry?.conversationId ?? (job.issue !== undefined ? `${job.repository}#${job.issue}` : undefined);
+}
+
+export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = null, { now = Date.now(), timelineTemplate = null }: JobViewOptions = {}): JobView {
   const view: JobView = { ...job, result: jobResult(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
   if (job.issue !== undefined) view.issueUrl = `https://github.com/${job.repository}/issues/${job.issue}`;
   if (job.detail?.prUrl) view.prUrl = job.detail.prUrl;
   const t = job.detail?.telemetry;
   if (t) {
-    const url = traceUrl(telemetry, t.traceId, t.startedAt ?? job.createdAt, job.finishedAt);
+    const startedAt = t.startedAt ?? job.createdAt;
+    const url = traceUrl(telemetry, t.traceId, startedAt, job.finishedAt);
+    const conversationId = conversationOf(job);
+    const queryUrl = conversationId ? conversationUrl(telemetry, conversationId, startedAt, now) : null;
+    const timeline = conversationId ? timelineUrl(timelineTemplate, telemetry, conversationId, startedAt, now) : null;
+    const links: JobTraceLink[] = [];
+    for (const m of t.marks ?? []) {
+      const at = traceUrl(telemetry, t.traceId, startedAt, job.finishedAt, m.spanId);
+      if (at) links.push({ ...(({ spanId: _s, ...rest }) => rest)(m), url: at });
+    }
     view.telemetry = {
       traceId: t.traceId,
       ...(url ? { traceUrl: url } : {}),
-      // The conversation Agent Timeline groups this job's traces under (the runner's telemetry.mjs).
-      ...(job.issue !== undefined ? { conversationId: `${job.repository}#${job.issue}` } : {}),
+      ...(conversationId ? { conversationId } : {}),
+      ...(queryUrl ? { conversationUrl: queryUrl } : {}),
+      ...(timeline ? { timelineUrl: timeline } : {}),
+      ...(links.length ? { links } : {}),
       spans: t.spans,
       exported: t.exported,
       failed: t.failed,
@@ -124,7 +179,8 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
   return view;
 }
 
-export function createStatusService({ store, github, agentKeys, readLog, resultRetentionDays = 30, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
+export function createStatusService({ store, github, agentKeys, readLog, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
+  const view = (job: JobSummary, telemetry: TelemetrySettings | null) => jobView(job, telemetry, { now: now(), timelineTemplate });
   const limitOf = (raw: unknown) => {
     const n = Number(raw);
     return Number.isSafeInteger(n) && n > 0 ? Math.min(n, LIST_LIMIT) : 50;
@@ -203,17 +259,27 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
     async jobs(caller: Caller, installationId: number, limit?: unknown): Promise<{ jobs: JobView[] }> {
       await github.member(caller, installationId);
       const [jobs, telemetry] = await Promise.all([store.listRecentJobs(installationId, limitOf(limit)), store.getTelemetry(installationId).catch(() => null)]);
-      return { jobs: jobs.map((j) => jobView(j, telemetry)) };
+      return { jobs: jobs.map((j) => view(j, telemetry)) };
     },
 
-    async job(caller: Caller, installationId: number, jobId: string): Promise<{ job: JobView; deliveries: DeliveryRecord[] }> {
+    /**
+     * One job, every kept attempt of its delivery, and the other recent jobs of its conversation
+     * (the issue's implement run, reviews and revisions; newest first, among the latest jobs).
+     */
+    async job(caller: Caller, installationId: number, jobId: string): Promise<{ job: JobView; deliveries: DeliveryRecord[]; conversation: JobView[] }> {
       await github.member(caller, installationId);
       const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
       if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
       // Every kept attempt of its delivery: GitHub reuses the id on a redelivery, so an earlier
       // attempt (one that failed to launch, a day before) is part of this job's history.
-      const deliveries = job.deliveryId ? await store.listDeliveriesOf(installationId, job.deliveryId) : [];
-      return { job: jobView(job, await store.getTelemetry(installationId).catch(() => null)), deliveries };
+      const conversationId = conversationOf(job);
+      const [deliveries, telemetry, recent] = await Promise.all([
+        job.deliveryId ? store.listDeliveriesOf(installationId, job.deliveryId) : Promise.resolve([]),
+        store.getTelemetry(installationId).catch(() => null),
+        conversationId ? store.listRecentJobs(installationId, LIST_LIMIT).catch(() => []) : Promise.resolve([]),
+      ]);
+      const conversation = recent.filter((j) => j.jobId !== job.jobId && conversationOf(j) === conversationId).map((j) => view(j, telemetry));
+      return { job: view(job, telemetry), deliveries, conversation };
     },
 
     /** The end of one of a job's logs. The job is looked up in the tenant's own partition, so another tenant's log cannot be named. */

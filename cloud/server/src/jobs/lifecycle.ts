@@ -82,6 +82,53 @@ export interface JobTelemetryReport {
   startedAt?: string;
   /** A short code (HTTP 401, timeout, ...). */
   lastError?: string;
+  /** The conversation Agent Timeline groups the trace under: `owner/repo#issue`, or `delivery/<id>`. */
+  conversationId?: string;
+  /** Spans worth a link of their own (the runner's telemetry.mjs), in the order they started. */
+  marks?: TelemetryMark[];
+}
+
+export const TELEMETRY_MARK_KINDS = ['agent', 'test_failed', 'test_green', 'verify_failed', 'step_failed'] as const;
+export type TelemetryMarkKind = (typeof TELEMETRY_MARK_KINDS)[number];
+
+/** One span of a job's trace worth opening the trace at. */
+export interface TelemetryMark {
+  kind: TelemetryMarkKind;
+  spanId: string;
+  /** The run it is in: implement, review, revision. */
+  run?: string;
+  /** agent: the profile that ran. */
+  agent?: string;
+  /** agent: the run did not succeed. */
+  failed?: boolean;
+  /** agent: it went in circles (repeated commands, one file over and over, errors in a row). */
+  thrashing?: boolean;
+  /** agent of a review: its verdict (approved, changes-requested, ...). */
+  verdict?: string;
+  /** step_failed: which step (publish, prepare, runner_restore_state, ...). */
+  step?: string;
+}
+
+const MAX_MARKS = 32;
+const CONVERSATION_ID = /^(?:[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}#[1-9][0-9]{0,9}|delivery\/[A-Za-z0-9_.-]{1,128})$/;
+
+function markOf(raw: unknown): TelemetryMark | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const m = raw as Record<string, unknown>;
+  if (typeof m.kind !== 'string' || !(TELEMETRY_MARK_KINDS as readonly string[]).includes(m.kind)) return undefined;
+  if (typeof m.spanId !== 'string' || !/^[0-9a-f]{16}$/.test(m.spanId)) return undefined;
+  const out: TelemetryMark = { kind: m.kind as TelemetryMarkKind, spanId: m.spanId };
+  const word = (v: unknown, max: number) => (typeof v === 'string' && new RegExp(`^[a-z][a-z0-9_-]{0,${max - 1}}$`).test(v) ? v : undefined);
+  const run = word(m.run, 24);
+  if (run) out.run = run;
+  if (typeof m.agent === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(m.agent)) out.agent = m.agent;
+  if (m.failed === true) out.failed = true;
+  if (m.thrashing === true) out.thrashing = true;
+  const verdict = word(m.verdict, 32);
+  if (verdict) out.verdict = verdict;
+  const step = word(m.step, 48);
+  if (step) out.step = step;
+  return out;
 }
 
 export function telemetryOf(raw: unknown): JobTelemetryReport | undefined {
@@ -92,5 +139,10 @@ export function telemetryOf(raw: unknown): JobTelemetryReport | undefined {
   const out: JobTelemetryReport = { traceId: t.traceId, spans: n(t.spans), exported: n(t.exported), failed: n(t.failed) };
   if (typeof t.startedAt === 'string' && /^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(t.startedAt)) out.startedAt = t.startedAt;
   if (typeof t.lastError === 'string' && /^[A-Za-z0-9 ._-]{1,40}$/.test(t.lastError)) out.lastError = t.lastError;
+  if (typeof t.conversationId === 'string' && CONVERSATION_ID.test(t.conversationId)) out.conversationId = t.conversationId;
+  if (Array.isArray(t.marks)) {
+    const marks = t.marks.slice(0, MAX_MARKS).map(markOf).filter((m): m is TelemetryMark => m !== undefined);
+    if (marks.length) out.marks = marks;
+  }
   return out;
 }

@@ -103,17 +103,102 @@ export function telemetryView(s: TelemetrySettings | null): TelemetryView {
 
 /**
  * A link to a job's trace in Honeycomb: `<ui>/<team>/environments/<env>/trace?trace_id=...` with
- * the time range around it, or the Classic form with the dataset. Null without the slugs.
+ * the time range around it, or the Classic form with the dataset. With `spanId`, the trace opens
+ * at that span (Honeycomb opens the root when it is not in the trace). Null without the slugs.
  */
-export function traceUrl(s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> | null, traceId: string, startedAt: string, finishedAt?: string): string | null {
+export function traceUrl(s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> | null, traceId: string, startedAt: string, finishedAt?: string, spanId?: string): string | null {
   if (!s?.key?.team || !/^[0-9a-f]{32}$/.test(traceId)) return null;
   const start = Math.floor(Date.parse(startedAt) / 1000);
   if (!Number.isFinite(start)) return null;
   const end = finishedAt && Number.isFinite(Date.parse(finishedAt)) ? Math.ceil(Date.parse(finishedAt) / 1000) : start + 6 * 3600;
-  const q = `trace?trace_id=${traceId}&trace_start_ts=${start - 60}&trace_end_ts=${end + 300}`;
-  const team = encodeURIComponent(s.key.team.slug);
+  const span = spanId && /^[0-9a-f]{16}$/.test(spanId) ? `&span=${spanId}` : '';
+  const q = `trace?trace_id=${traceId}${span}&trace_start_ts=${start - 60}&trace_end_ts=${end + 300}`;
+  return `${place(s)}/${q}`;
+}
+
+/** The environment (or, Classic, the dataset) a link is in: `<ui>/<team>/environments/<env>` or `<ui>/<team>/datasets/<dataset>`. */
+function place(s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'>): string {
+  const team = encodeURIComponent(s.key!.team!.slug);
+  const env = s.key?.environment?.slug;
+  return env ? `${HONEYCOMB_UI[s.region]}/${team}/environments/${encodeURIComponent(env)}` : `${HONEYCOMB_UI[s.region]}/${team}/datasets/${encodeURIComponent(s.serviceName)}`;
+}
+
+/**
+ * How far around a job a conversation link looks: a conversation (an issue's implement run,
+ * reviews and revisions) can start days before the job and go on days after it.
+ */
+export const CONVERSATION_WINDOW_S = 7 * 24 * 3600;
+
+/** UNIX seconds: a week before the job started, to a week after it or now, whichever is first. */
+function conversationWindow(startedAt: string, nowMs: number): { start: number; end: number } | null {
+  const at = Math.floor(Date.parse(startedAt) / 1000);
+  if (!Number.isFinite(at)) return null;
+  const start = at - CONVERSATION_WINDOW_S;
+  const end = Math.max(at + 3600, Math.min(at + CONVERSATION_WINDOW_S, Math.ceil(nowMs / 1000)));
+  return { start, end };
+}
+
+/**
+ * A link to a conversation's spans in Honeycomb's query builder, the documented way to share a
+ * query (docs.honeycomb.io/investigate/collaborate/share-query): every span with this
+ * `gen_ai.conversation.id`, broken down by agent. Selecting the conversation id in the results
+ * opens it in Agent Timeline. Null without the team's slug.
+ */
+export function conversationUrl(s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> | null, conversationId: string, startedAt: string, nowMs: number): string | null {
+  if (!s?.key?.team || !conversationId) return null;
+  const w = conversationWindow(startedAt, nowMs);
+  if (!w) return null;
+  const query = {
+    start_time: w.start,
+    end_time: w.end,
+    breakdowns: ['gen_ai.conversation.id', 'gen_ai.agent.name'],
+    calculations: [{ op: 'COUNT' }, { op: 'COUNT_DISTINCT', column: 'trace.trace_id' }],
+    filters: [{ column: 'gen_ai.conversation.id', op: '=', value: conversationId }],
+  };
+  // Classic has no environments: the dataset is already in the place.
+  const dataset = s.key.environment?.slug ? `/datasets/${encodeURIComponent(s.serviceName)}` : '';
+  return `${place(s)}${dataset}/?query=${encodeURIComponent(JSON.stringify(query))}`;
+}
+
+/**
+ * Agent Timeline has no documented link to a conversation. A deployment that knows one can set
+ * it as a template (HONEYCOMB_TIMELINE_URL), for example
+ * `{ui}/{team}/environments/{environment}/<the path the UI uses>?conversation={conversation}`.
+ * Placeholders: {ui} {team} {environment} {dataset} {conversation} {start} {end} ({start} and
+ * {end} in UNIX seconds, the same window as the conversation's query). It must start with
+ * `{ui}/{team}/`, so it can only point into the tenant's own Honeycomb team.
+ */
+export const TIMELINE_PLACEHOLDERS = ['ui', 'team', 'environment', 'dataset', 'conversation', 'start', 'end'] as const;
+
+/** The template, when it is one a link can be made from; null (no Agent Timeline link) otherwise. */
+export function parseTimelineTemplate(raw: string | undefined): string | null {
+  const t = raw?.trim();
+  if (!t || t.length > 512 || !t.startsWith('{ui}/{team}/')) return null;
+  if (!/^[A-Za-z0-9{}/._~?&=%-]+$/.test(t)) return null;
+  const names = [...t.matchAll(/\{([^{}]*)\}/g)].map((m) => m[1]!);
+  if (!names.every((n) => (TIMELINE_PLACEHOLDERS as readonly string[]).includes(n))) return null;
+  // Every brace is part of a placeholder.
+  if (t.replace(/\{[a-z]+\}/g, '').includes('{') || t.replace(/\{[a-z]+\}/g, '').includes('}')) return null;
+  return names.includes('conversation') ? t : null;
+}
+
+/** A conversation in Agent Timeline, from a template parseTimelineTemplate accepted. Null when the template needs a slug the key did not give. */
+export function timelineUrl(template: string | null, s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> | null, conversationId: string, startedAt: string, nowMs: number): string | null {
+  if (!template || !s?.key?.team || !conversationId) return null;
+  const w = conversationWindow(startedAt, nowMs);
+  if (!w) return null;
   const env = s.key.environment?.slug;
-  return env ? `${HONEYCOMB_UI[s.region]}/${team}/environments/${encodeURIComponent(env)}/${q}` : `${HONEYCOMB_UI[s.region]}/${team}/datasets/${encodeURIComponent(s.serviceName)}/${q}`;
+  if (template.includes('{environment}') && !env) return null;
+  const values: Record<string, string> = {
+    ui: HONEYCOMB_UI[s.region],
+    team: encodeURIComponent(s.key.team.slug),
+    environment: encodeURIComponent(env ?? ''),
+    dataset: encodeURIComponent(s.serviceName),
+    conversation: encodeURIComponent(conversationId),
+    start: String(w.start),
+    end: String(w.end),
+  };
+  return template.replace(/\{([a-z]+)\}/g, (_, name: string) => values[name] ?? '');
 }
 
 const HOUR_MS = 3600 * 1000;

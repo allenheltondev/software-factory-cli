@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router';
-import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, SegmentedControl, Skeleton } from '@readysetcloud/ui';
-import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog, type JobView } from '../api/client';
+import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, SegmentedControl, Skeleton, StatusBadge } from '@readysetcloud/ui';
+import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog, type JobTraceLink, type JobView } from '../api/client';
 import { DISPOSITION, JOB_RESULT, deliveryReason, formatBytes, formatDuration } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
 import { Lifecycle } from '../components/lifecycle';
 
 type JobApi = Pick<ApiClient, 'job' | 'jobLog'>;
-type Load = { state: 'loading' } | { state: 'ok'; job: JobView; deliveries: Delivery[] } | { state: 'error'; message: string };
+type Load = { state: 'loading' } | { state: 'ok'; job: JobView; deliveries: Delivery[]; conversation?: JobView[] } | { state: 'error'; message: string };
 type LogLoad = { state: 'loading' } | { state: 'ok'; log: JobLog } | { state: 'expired' } | { state: 'error'; message: string };
 
 const JOB_ID = /^job_[A-Za-z0-9_-]{8,64}$/;
@@ -61,12 +61,12 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
           {load.message}
         </Alert>
       )}
-      {load.state === 'ok' && <Loaded job={load.job} deliveries={load.deliveries} api={api} installationId={installationId} />}
+      {load.state === 'ok' && <Loaded job={load.job} deliveries={load.deliveries} conversation={load.conversation ?? []} api={api} installationId={installationId} />}
     </div>
   );
 }
 
-function Loaded({ job, deliveries, api, installationId }: { job: JobView; deliveries: Delivery[]; api: JobApi; installationId: number }) {
+function Loaded({ job, deliveries, conversation, api, installationId }: { job: JobView; deliveries: Delivery[]; conversation: JobView[]; api: JobApi; installationId: number }) {
   const r = JOB_RESULT[job.result];
   return (
     <>
@@ -138,6 +138,8 @@ function Loaded({ job, deliveries, api, installationId }: { job: JobView; delive
 
       <AgentTimeline job={job} installationId={installationId} />
 
+      <Conversation job={job} others={conversation} installationId={installationId} />
+
       {deliveries.length > 0 && (
         <Card>
           <CardHeader>
@@ -163,7 +165,32 @@ function Loaded({ job, deliveries, api, installationId }: { job: JobView; delive
   );
 }
 
-/** Where to see this job's agents at work: its trace, and the issue's conversation in Agent Timeline. */
+const RUN_LABEL: Record<string, string> = { implement: 'Implementation', review: 'Review', revision: 'Revision' };
+const runLabel = (run?: string) => (run ? (RUN_LABEL[run] ?? run) : 'Run');
+
+/** What a span link is, in words: "Review · claude-opus", "First failing test run (Revision)", ... */
+export function traceLinkLabel(l: JobTraceLink): { title: string; notes: string[] } {
+  const inRun = l.run ? ` (${runLabel(l.run).toLowerCase()})` : '';
+  switch (l.kind) {
+    case 'agent': {
+      const notes: string[] = [];
+      if (l.verdict) notes.push(l.verdict === 'none' ? 'no verdict' : l.verdict.replace(/-/g, ' '));
+      if (l.failed) notes.push('did not succeed');
+      if (l.thrashing) notes.push('went in circles');
+      return { title: `${runLabel(l.run)}${l.agent ? ` · ${l.agent}` : ''}`, notes };
+    }
+    case 'test_failed':
+      return { title: `First failing test run${inRun}`, notes: [] };
+    case 'test_green':
+      return { title: `First passing test run after it${inRun}`, notes: [] };
+    case 'verify_failed':
+      return { title: `Failed verify command${inRun}`, notes: [] };
+    case 'step_failed':
+      return { title: `Failed step: ${(l.step ?? 'unknown').replace(/_/g, ' ')}`, notes: [] };
+  }
+}
+
+/** Where to see this job's agents at work: its trace, the spans worth opening it at, and the issue's conversation in Agent Timeline. */
 function AgentTimeline({ job, installationId }: { job: JobView; installationId: number }) {
   const t = job.telemetry;
   const [copied, setCopied] = useState(false);
@@ -191,16 +218,34 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
       // No clipboard: the id is on screen.
     }
   };
+  const links = t.links ?? [];
   return (
     <Card data-testid="job-telemetry">
       <CardHeader>
         <CardTitle>Agent timeline</CardTitle>
         <CardDescription>This job's agents, as traced in Honeycomb. The issue's conversation holds this job and every review and revision after it.</CardDescription>
       </CardHeader>
-      <CardBody className="flex flex-col gap-3 text-sm">
-        <div className="flex flex-wrap items-center gap-3">
+      <CardBody className="flex flex-col gap-4 text-sm">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          {t.timelineUrl && (
+            <a className="auth-link font-semibold" href={t.timelineUrl} target="_blank" rel="noreferrer" data-testid="job-timeline-link">
+              Open in Agent Timeline ↗
+            </a>
+          )}
+          {!t.timelineUrl && t.conversationUrl && (
+            <a
+              className="auth-link font-semibold"
+              href={t.conversationUrl}
+              target="_blank"
+              rel="noreferrer"
+              data-testid="job-conversation-link"
+              title="Every span of the conversation, by agent. Select the conversation id in the results to open it in Agent Timeline."
+            >
+              Open conversation ↗
+            </a>
+          )}
           {t.traceUrl && (
-            <a className="auth-link font-semibold" href={t.traceUrl} target="_blank" rel="noreferrer" data-testid="job-trace-link">
+            <a className={`auth-link ${t.timelineUrl || t.conversationUrl ? '' : 'font-semibold'}`} href={t.traceUrl} target="_blank" rel="noreferrer" data-testid="job-trace-link">
               View trace in Honeycomb ↗
             </a>
           )}
@@ -213,9 +258,76 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
             </span>
           )}
         </div>
+        {!t.timelineUrl && t.conversationUrl && <p className="text-muted-foreground">In the conversation's results, select its id to open it in Agent Timeline.</p>}
+        {links.length > 0 && (
+          <div className="flex flex-col gap-2">
+            <h3 className="font-medium">Jump to</h3>
+            <ul className="flex flex-col gap-1.5" data-testid="job-trace-links">
+              {links.map((l, i) => {
+                const { title, notes } = traceLinkLabel(l);
+                const problem = l.kind === 'test_failed' || l.kind === 'verify_failed' || l.kind === 'step_failed' || l.failed || l.thrashing;
+                return (
+                  <li key={`${l.kind}-${i}`} className="flex flex-wrap items-center gap-2" data-testid={`job-trace-link-${l.kind}`}>
+                    <a className="auth-link" href={l.url} target="_blank" rel="noreferrer">
+                      {title} ↗
+                    </a>
+                    {notes.map((n) => (
+                      <StatusBadge key={n} tone={problem ? 'warning' : 'neutral'}>
+                        {n}
+                      </StatusBadge>
+                    ))}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
         <p className={t.failed > 0 ? 'text-warning-700 dark:text-warning-300' : 'text-muted-foreground'} data-testid="job-telemetry-count">
           {t.exported} of {t.spans} span{t.spans === 1 ? '' : 's'} sent{t.lastError ? ` (last error: ${t.lastError})` : ''} · trace <code>{t.traceId}</code>
         </p>
+      </CardBody>
+    </Card>
+  );
+}
+
+/** The other recent jobs of this job's conversation: the issue's implement run, its reviews and revisions. */
+function Conversation({ job, others, installationId }: { job: JobView; others: JobView[]; installationId: number }) {
+  if (!others.length) return null;
+  // Oldest first, with this job in its place.
+  const all = [...others, job].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return (
+    <Card data-testid="job-conversation-card">
+      <CardHeader>
+        <CardTitle>This conversation</CardTitle>
+        <CardDescription>
+          Every recent job of <code>{job.telemetry?.conversationId ?? `${job.repository}#${job.issue ?? ''}`}</code>, oldest first: the implementation, each review and revision.
+        </CardDescription>
+      </CardHeader>
+      <CardBody>
+        <ol className="flex flex-col gap-2" data-testid="job-conversation-jobs">
+          {all.map((j) => {
+            const r = JOB_RESULT[j.result];
+            const self = j.jobId === job.jobId;
+            return (
+              <li key={j.jobId} className="flex flex-wrap items-center gap-3 text-sm" data-testid={`job-conversation-${j.jobId}`}>
+                <StatusBadge tone={r.tone}>{r.label}</StatusBadge>
+                {self ? (
+                  <strong>This job</strong>
+                ) : (
+                  <Link className="auth-link" to={`/installations/${installationId}/jobs/${j.jobId}`}>
+                    {runLabel(j.detail?.steps?.[0]?.kind)}
+                  </Link>
+                )}
+                <span title={exact(j.createdAt)}>{relativeTime(j.createdAt)}</span>
+                {j.telemetry?.traceUrl && (
+                  <a className="auth-link" href={j.telemetry.traceUrl} target="_blank" rel="noreferrer">
+                    Trace ↗
+                  </a>
+                )}
+              </li>
+            );
+          })}
+        </ol>
       </CardBody>
     </Card>
   );

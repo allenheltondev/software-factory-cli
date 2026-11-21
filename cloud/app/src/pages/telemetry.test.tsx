@@ -105,6 +105,70 @@ describe('the job page links to its trace', () => {
     expect(screen.getByTestId('job-telemetry-count')).toHaveTextContent('31 of 31 spans sent');
   });
 
+  it('links to the conversation and to the spans worth opening the trace at', async () => {
+    const trace = 'https://ui.honeycomb.io/acme/environments/prod/trace?trace_id=abab';
+    showJob(
+      job({
+        telemetry: {
+          traceId: 'ab'.repeat(16),
+          traceUrl: trace,
+          conversationId: 'acme/web#12',
+          conversationUrl: 'https://ui.honeycomb.io/acme/environments/prod/datasets/updraft/?query=q',
+          links: [
+            { kind: 'agent', run: 'implement', agent: 'claude-opus', url: `${trace}&span=1`, failed: true, thrashing: true },
+            { kind: 'test_failed', run: 'implement', url: `${trace}&span=2` },
+            { kind: 'agent', run: 'review', agent: 'codex', verdict: 'changes-requested', url: `${trace}&span=3` },
+            { kind: 'step_failed', step: 'runner_restore_state', url: `${trace}&span=4` },
+          ],
+          spans: 31,
+          exported: 31,
+          failed: 0,
+        },
+      }),
+    );
+    expect(await screen.findByTestId('job-conversation-link')).toHaveAttribute('href', 'https://ui.honeycomb.io/acme/environments/prod/datasets/updraft/?query=q');
+    expect(screen.queryByTestId('job-timeline-link')).not.toBeInTheDocument();
+    const links = screen.getByTestId('job-trace-links');
+    expect(links).toHaveTextContent('Implementation · claude-opus');
+    expect(links).toHaveTextContent('did not succeed');
+    expect(links).toHaveTextContent('went in circles');
+    expect(links).toHaveTextContent('First failing test run (implementation)');
+    expect(links).toHaveTextContent('Review · codex');
+    expect(links).toHaveTextContent('changes requested');
+    expect(links).toHaveTextContent('Failed step: runner restore state');
+    expect(screen.getByRole('link', { name: 'First failing test run (implementation) ↗' })).toHaveAttribute('href', `${trace}&span=2`);
+  });
+
+  it('prefers the Agent Timeline link when the deployment has one, and lists the conversation', async () => {
+    const other = job({ jobId: 'job_abcdefgh02', createdAt: new Date(Date.now() + 60_000).toISOString(), detail: { steps: [{ kind: 'review' }] }, telemetry: { traceId: 'cd'.repeat(16), traceUrl: 'https://ui.honeycomb.io/t2', spans: 1, exported: 1, failed: 0 } });
+    render(
+      <MemoryRouter initialEntries={['/installations/55/jobs/job_abcdefgh01']}>
+        <Routes>
+          <Route
+            path="/installations/:id/jobs/:jobId"
+            element={
+              <JobPage
+                api={fakeApi({
+                  job: vi.fn().mockResolvedValue({
+                    job: job({ telemetry: { traceId: 'ab'.repeat(16), conversationId: 'acme/web#12', conversationUrl: 'https://q', timelineUrl: 'https://ui.honeycomb.io/acme/timeline', spans: 1, exported: 1, failed: 0 } }),
+                    deliveries: [],
+                    conversation: [other],
+                  }),
+                  jobLog: vi.fn(),
+                })}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByTestId('job-timeline-link')).toHaveAttribute('href', 'https://ui.honeycomb.io/acme/timeline');
+    expect(screen.queryByTestId('job-conversation-link')).not.toBeInTheDocument();
+    const list = screen.getByTestId('job-conversation-jobs');
+    expect(list.textContent).toMatch(/This job.*Review/);
+    expect(screen.getByRole('link', { name: 'Review' })).toHaveAttribute('href', '/installations/55/jobs/job_abcdefgh02');
+  });
+
   it('points to the settings when it was not', async () => {
     showJob(job());
     expect(await screen.findByRole('link', { name: 'Set up agent telemetry' })).toHaveAttribute('href', '/installations/55/telemetry');

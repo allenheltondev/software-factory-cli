@@ -539,6 +539,64 @@ describe('agent telemetry: how the agent worked', () => {
   });
 });
 
+describe('agent telemetry: spans worth a link', () => {
+  const bash = (id, command) => ({ ...claude.assistantToolUse(id, command), message: { ...claude.assistantToolUse(id, command).message, id: `msg_${id}` } });
+  const failedResult = (id, text) => {
+    const r = claude.toolResult(id, text);
+    r.message.content[0].is_error = true;
+    return r;
+  };
+
+  it("reports the agent span, the first red test, the first green after it, a failed verify command and the conversation", async () => {
+    const t = setup();
+    await t.step('run_1', `${header()}\n`, 0);
+    await t.step('run_1', claude.stream(bash('t1', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(failedResult('t1', 'Exit code 1\n Tests  1 failed | 1 passed (2)')), 1000);
+    await t.step('run_1', claude.stream(bash('t2', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(failedResult('t2', 'Exit code 1\n Tests  1 failed | 1 passed (2)')), 1000);
+    await t.step('run_1', claude.stream(bash('t3', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(claude.toolResult('t3', ' Tests  2 passed (2)')), 1000);
+    await t.step('run_1', claude.stream(bash('t4', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(claude.toolResult('t4', ' Tests  2 passed (2)')), 1000);
+    await t.step('run_1', claude.stream(claude.success('ok')), 1000);
+    await t.step('run_1', '---- end of agent output ----\n---- verification (x) ----\n---- verify 1/2: npm run lint ----\nexit: code 0 after 1s\n---- verify 2/2: npm test ----\nexit: code 1 after 3s\n---- end of verification: failed ----\noutcome: failed\n', 1000);
+    const out = await t.tracer.stop({ outcome: 'failed' });
+    const spans = t.exporter.spans;
+    const tests = byName(spans, 'execute_tool Bash');
+    const verify = byName(spans, 'execute_tool verify');
+    expect(out.conversationId).toBe('octo/widgets#7');
+    expect(out.marks).toEqual([
+      // The same npm test four times with no edit between: it thrashed, too.
+      { kind: 'agent', spanId: agentSpanIdFor('run_1'), run: 'implement', agent: 'claude-opus', failed: true, thrashing: true },
+      { kind: 'test_failed', spanId: tests[0].spanId, run: 'implement' },
+      { kind: 'test_green', spanId: tests[2].spanId, run: 'implement' },
+      { kind: 'verify_failed', spanId: verify[1].spanId, run: 'implement' },
+    ]);
+    // Every mark names a span that was sent.
+    for (const m of out.marks) expect(spans.some((s) => s.spanId === m.spanId), m.kind).toBe(true);
+  });
+
+  it("marks a review's verdict, a run that thrashed, and a failed runner step", async () => {
+    const t = setup();
+    await t.step('run_1', `${header({ kind: 'review' })}\n`, 0);
+    await t.step('run_1', claude.stream(claude.assistantText('UPDRAFT-VERDICT: changes-requested'), claude.success('ok')), 1000);
+    await t.step('run_1', '---- end of agent output ----\nreview verdict for abcdef0123456789: changes-requested\noutcome: succeeded\n', 1000);
+    await t.step('run_2', `${header({ runId: 'run_2', kind: 'revision' })}\n`, 0);
+    for (let i = 0; i < 4; i++) {
+      await t.step('run_2', claude.stream(bash(`b${i}`, 'npm run build')), 500);
+      await t.step('run_2', claude.stream(failedResult(`b${i}`, 'Exit code 2')), 500);
+    }
+    await t.step('run_2', '---- end of agent output ----\noutcome: failed\n', 0);
+    const at = t.clock.t;
+    const out = await t.tracer.stop({ outcome: 'failed', steps: [{ name: 'state_wait', start: at, end: at + 10, error: 'timeout' }] });
+    expect(out.marks).toEqual([
+      { kind: 'agent', spanId: agentSpanIdFor('run_1'), run: 'review', agent: 'claude-opus', verdict: 'changes-requested' },
+      { kind: 'agent', spanId: agentSpanIdFor('run_2'), run: 'revision', agent: 'claude-opus', failed: true, thrashing: true },
+      { kind: 'step_failed', spanId: one(t.exporter.spans, 'runner state_wait').spanId, step: 'runner_state_wait' },
+    ]);
+  });
+});
+
 describe('agent telemetry: what leaves the microVM', () => {
   it('redacts every field of every span and the resource, not only content (content capture off)', async () => {
     const key = 'sk-ant-api03-PLANTEDSECRETVALUE0123456789';

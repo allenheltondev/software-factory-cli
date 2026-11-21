@@ -325,6 +325,18 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
                 Trace ↗
               </a>
             )}
+            {(j.telemetry?.timelineUrl ?? j.telemetry?.conversationUrl) && (
+              <a
+                className="auth-link text-sm"
+                href={j.telemetry.timelineUrl ?? j.telemetry.conversationUrl}
+                target="_blank"
+                rel="noreferrer"
+                title={j.telemetry.timelineUrl ? 'The issue in Agent Timeline' : "Every span of the issue's conversation, by agent; select its id to open it in Agent Timeline"}
+                data-testid={`job-conversation-${j.jobId}`}
+              >
+                Conversation ↗
+              </a>
+            )}
             <span className="ml-auto flex flex-wrap items-center gap-3 text-sm">
               {j.configVersion !== undefined && <span title="Configuration version">v{j.configVersion}</span>}
               {j.result !== 'running' && <span title="Duration">{formatDuration(j.durationSeconds)}</span>}
