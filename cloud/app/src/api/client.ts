@@ -155,6 +155,8 @@ export interface AdminOverview {
 export interface AgentKeyView {
   name: string;
   configured: boolean;
+  /** The active config runs an agent that needs it. */
+  required: boolean;
   lastRotatedAt?: string;
   lastRotatedBy?: string;
   lastUsed?: { at: string; ok: boolean };

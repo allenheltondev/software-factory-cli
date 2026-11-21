@@ -44,11 +44,20 @@ describe('agent keys in the console (#70)', () => {
     const list = await app.request('/api/v1/installations/55/agent-keys');
     const text = await list.text();
     expect(JSON.parse(text).keys).toEqual([
-      { name: 'ANTHROPIC_API_KEY', configured: true, lastRotatedAt: '2026-11-21T00:00:00.000Z', lastRotatedBy: 'pat', lastUsed: { at: '2026-11-21T01:00:00.000Z', ok: true } },
-      { name: 'CODEX_API_KEY', configured: false },
+      { name: 'ANTHROPIC_API_KEY', configured: true, required: false, lastRotatedAt: '2026-11-21T00:00:00.000Z', lastRotatedBy: 'pat', lastUsed: { at: '2026-11-21T01:00:00.000Z', ok: true } },
+      { name: 'CODEX_API_KEY', configured: false, required: false },
     ]);
     expect(text).not.toContain(ANTHROPIC);
     expect(await (await put('CODEX_API_KEY', OPENAI)).text()).not.toContain(OPENAI);
+  });
+
+  it('marks the keys the active config runs agents with as required', async () => {
+    const { app, store } = await setup();
+    const v = await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: { repositories: {}, keys: ['ANTHROPIC_API_KEY'] } });
+    await store.markConfigReady(55, v as number);
+    await store.activateConfig(55, v as number);
+    const keys = ((await (await app.request('/api/v1/installations/55/agent-keys')).json()) as { keys: { name: string; required: boolean }[] }).keys;
+    expect(keys.map((k) => [k.name, k.required])).toEqual([['ANTHROPIC_API_KEY', true], ['CODEX_API_KEY', false]]);
   });
 
   it('validates with the provider before saving: a rejected key, or an unreachable provider, saves nothing', async () => {

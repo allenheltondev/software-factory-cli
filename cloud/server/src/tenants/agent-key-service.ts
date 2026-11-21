@@ -13,6 +13,8 @@ import type { KeyChecker } from './key-check.js';
 export interface AgentKeyView {
   name: string;
   configured: boolean;
+  /** The active config runs an agent that needs this key: without it no job starts. */
+  required: boolean;
   lastRotatedAt?: string;
   lastRotatedBy?: string;
   /** Absent until a job has used the key. */
@@ -35,15 +37,18 @@ export interface AgentKeyServiceDeps {
 
 export function createAgentKeyService({ store, github, secrets, check, now }: AgentKeyServiceDeps) {
   async function view(installationId: number): Promise<AgentKeysView> {
-    const [metas, refusals] = await Promise.all([store.listAgentKeyMeta(installationId), store.listRefusals(installationId, 10)]);
+    const [metas, refusals, tenant] = await Promise.all([store.listAgentKeyMeta(installationId), store.listRefusals(installationId, 10), store.getTenant(installationId, { consistent: true })]);
+    const active = tenant?.activeConfigVersion;
+    const needed = new Set(active === undefined ? [] : ((await store.getConfigVersion(installationId, active, { consistent: true }))?.dispatch?.keys ?? []));
     const byName = new Map(metas.map((m) => [m.name, m]));
     return {
       keys: AGENT_KEY_NAMES.map((name) => {
         const m = byName.get(name);
-        if (!m) return { name, configured: false };
+        if (!m) return { name, configured: false, required: needed.has(name) };
         return {
           name,
           configured: true,
+          required: needed.has(name),
           lastRotatedAt: m.updatedAt,
           lastRotatedBy: m.updatedBy,
           ...(m.lastUsedAt ? { lastUsed: { at: m.lastUsedAt, ok: m.lastUsedOk === true } } : {}),
