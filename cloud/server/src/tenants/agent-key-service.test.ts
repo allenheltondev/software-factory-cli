@@ -5,6 +5,8 @@ import { FlowError } from '../flows/github.js';
 import { createMemoryStore } from '../store/store.js';
 import { agentKeySecretName, type SecretsPort } from './agent-keys.js';
 import { createAgentKeyService } from './agent-key-service.js';
+import { createBundleKeys } from './key-needs.js';
+import { configPrefix } from './paths.js';
 import type { KeyCheck } from './key-check.js';
 import { redact, REDACTED, safeMessage } from './redact.js';
 
@@ -40,7 +42,7 @@ describe('agent keys in the console (#70)', () => {
     const { app, put, store } = await setup();
     const res = await put('ANTHROPIC_API_KEY', ANTHROPIC);
     expect(res.status).toBe(200);
-    await store.recordAgentKeyUse(55, 'ANTHROPIC_API_KEY', { at: '2026-11-21T01:00:00.000Z', ok: true });
+    await store.recordAgentKeyUse(55, 'ANTHROPIC_API_KEY', { at: '2026-11-21T01:00:00.000Z', ok: true, jobStartedAt: '2026-11-21T00:30:00.000Z' });
     const list = await app.request('/api/v1/installations/55/agent-keys');
     const text = await list.text();
     expect(JSON.parse(text).keys).toEqual([
@@ -53,11 +55,39 @@ describe('agent keys in the console (#70)', () => {
 
   it('marks the keys the active config runs agents with as required', async () => {
     const { app, store } = await setup();
-    const v = await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: { repositories: {}, keys: ['ANTHROPIC_API_KEY'] } });
+    const v = await store.createConfigVersion(55, {
+      sha256: 'x',
+      files: ['config.yaml'],
+      publishedBy: 's',
+      publishedAt: '',
+      dispatch: { repositories: { 'acme/web': { id: 9, actors: ['pat'], triggers: [{ label: 'updraft', keys: ['ANTHROPIC_API_KEY'] }] }, 'acme/old': { id: 8, paused: true, actors: ['pat'], triggers: [{ label: 'codex', keys: ['CODEX_API_KEY'] }] } } },
+    });
     await store.markConfigReady(55, v as number);
     await store.activateConfig(55, v as number);
     const keys = ((await (await app.request('/api/v1/installations/55/agent-keys')).json()) as { keys: { name: string; required: boolean }[] }).keys;
     expect(keys.map((k) => [k.name, k.required])).toEqual([['ANTHROPIC_API_KEY', true], ['CODEX_API_KEY', false]]);
+  });
+
+  it('reads what a version from before key needs were recorded requires from its bundle, and shows every key required when it cannot tell', async () => {
+    for (const [bundle, expected] of [
+      ['agents:\n  codex: { adapter: codex }\npools:\n  p: { agents: [codex] }\nrepositories:\n  acme/web:\n    workflows:\n      - { trigger: { label: updraft }, pool: p }\n', [false, true]],
+      [null, [true, true]],
+    ] as const) {
+      const { store, service } = await setup();
+      const v = await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: { repositories: { 'acme/web': { id: 9, actors: ['pat'], triggers: [{ label: 'updraft' }] } } } });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      const withBundle = createAgentKeyService({
+        store,
+        github: { configContext: async () => ({ githubLogin: 'pat' }) as never },
+        secrets: { put: async () => {}, remove: async () => {} },
+        check: async () => 'valid',
+        bundleKeys: createBundleKeys(async () => bundle, configPrefix),
+      });
+      expect((await withBundle.list(caller, 55)).keys.map((k) => k.required)).toEqual(expected);
+      // Without a bundle reader: unknown, so every key.
+      expect((await service.list(caller, 55)).keys.map((k) => k.required)).toEqual([true, true]);
+    }
   });
 
   it('validates with the provider before saving: a rejected key, or an unreachable provider, saves nothing', async () => {
@@ -77,7 +107,7 @@ describe('agent keys in the console (#70)', () => {
   it('rotation replaces the value, and the next job reads the new one (the secret name is the same)', async () => {
     const { put, values, store } = await setup();
     await put('ANTHROPIC_API_KEY', ANTHROPIC);
-    await store.recordAgentKeyUse(55, 'ANTHROPIC_API_KEY', { at: 'x', ok: true });
+    await store.recordAgentKeyUse(55, 'ANTHROPIC_API_KEY', { at: 'x', ok: true, jobStartedAt: '2026-11-21T00:30:00.000Z' });
     const rotated = 'sk-ant-api03-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
     expect((await put('ANTHROPIC_API_KEY', rotated)).status).toBe(200);
     expect(values.get(agentKeySecretName(55, 'ANTHROPIC_API_KEY'))).toBe(rotated);

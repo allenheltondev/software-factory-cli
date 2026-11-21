@@ -1,5 +1,5 @@
 import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { createWebhookHandler } from './flows/webhook.js';
@@ -7,6 +7,8 @@ import { createGitHubApi } from './github/client.js';
 import { appJwt } from './github/jwt.js';
 import { createSettingsLoader } from './github/settings.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
+import { createBundleKeys } from './tenants/key-needs.js';
+import { configPrefix } from './tenants/paths.js';
 import { createLauncher, internetEgressConnector, noIngressConnector, type Launcher } from './jobs/launch.js';
 import { quotasFromEnv, throttledComment } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
@@ -74,6 +76,15 @@ function launcher(): Launcher | undefined {
       watchdogReserveSeconds: Number(env.WATCHDOG_RESERVE_SECONDS ?? 600),
     },
     imageVersion,
+    bundleKeys: createBundleKeys(async (key) => {
+      try {
+        const out = await s3.send(new GetObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key }));
+        return (await out.Body?.transformToString('utf8')) ?? null;
+      } catch (err) {
+        if ((err as { name?: string }).name === 'NoSuchKey') return null;
+        throw err;
+      }
+    }, configPrefix),
     putEvent: async (key, body) => {
       await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key, Body: body, ContentType: 'application/json' }));
     },

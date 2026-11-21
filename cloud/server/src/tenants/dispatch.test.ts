@@ -38,8 +38,17 @@ describe('decideDispatch', () => {
   const event = (overrides: Record<string, unknown> = {}) => ({ repositoryFullName: 'acme/WEB', repositoryId: 9, label: 'UPDRAFT', sender: 'PAT', ...overrides });
 
   it('starts a job for a trigger label applied by an allowed actor, whatever the case', () => {
-    expect(decideDispatch(rules, event())).toEqual({ start: true, repository: 'acme/WEB', repositoryId: 9, label: 'UPDRAFT' });
+    expect(decideDispatch(rules, event())).toEqual({ start: true, repository: 'acme/WEB', repositoryId: 9, label: 'UPDRAFT', keys: null });
     expect(decideDispatch(rules, event({ label: 'docs', sender: 'writer' })).start).toBe(true);
+  });
+
+  it("returns the keys of the matching triggers the sender may apply; null for rules that predate keys (#70)", () => {
+    const withKeys = dispatchRules(
+      { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }, { trigger: { label: 'Updraft' }, allowedActors: ['sam'] }, { trigger: { label: 'codex' } }] } } },
+      { keys: { 'acme/web': { updraft: ['ANTHROPIC_API_KEY'], codex: ['CODEX_API_KEY'] } } },
+    );
+    expect(decideDispatch(withKeys, event())).toMatchObject({ start: true, keys: ['ANTHROPIC_API_KEY'] });
+    expect(decideDispatch(withKeys, event({ label: 'codex' }))).toMatchObject({ start: true, keys: ['CODEX_API_KEY'] });
   });
 
   it.each([

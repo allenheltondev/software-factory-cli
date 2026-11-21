@@ -20,9 +20,12 @@ So far it covers these phases:
 - **Agent credentials** ([#70](https://github.com/allenheltondev/software-factory-cli/issues/70)): bring your own `ANTHROPIC_API_KEY` / `CODEX_API_KEY`, under Agent keys in the console.
   - **Write-only:** a member sees `configured`, `last rotated` and `last used OK/failed` per key. `PUT /api/v1/installations/:id/agent-keys/:name` takes a value; no route returns one.
   - **Validated first:** the key is checked with one cheap provider call (listing models) before it is saved. A key the provider rejects, or a provider that cannot be reached, saves nothing. Rotating replaces the secret under the same name, so the next job reads the new key, and clears `last used`.
-  - **Launcher:** a config version records the keys its enabled repositories need. If one is not set, the launcher starts nothing, answers 200 `missing_key` and records the reason (shown under "Recently refused", kept 30 days).
-  - **Last used:** the job pins the keys it needs; when it finishes, each is marked OK (`succeeded`) or failed (any other outcome that was not a termination).
-  - **Redaction:** `server/src/tenants/redact.ts` removes known key values and anything shaped like a provider key, bearer token or key header. It is applied to the API's logged errors and the launcher's logged launch failures, and is the function to run on job logs before any endpoint serves them (#71).
+  - **Launcher:** a config version records, per trigger, the keys its workflows' agents need (stored once per repository when every trigger needs the same ones). If one of the matched trigger's keys is not set, the launcher starts nothing, answers 200 `missing_key` and records the reason (shown under "Recently not started", kept 30 days). A Codex workflow on one label does not hold up a Claude workflow on another.
+    - **Versions published before this:** their dispatch rules have no keys, so the launcher reads them from the version's `config.yaml` (once per version per process; `tenants/key-needs.ts`). A version whose bundle cannot tell is refused, never run unchecked; the console shows every key as required for it.
+  - **Last used:** the job pins the keys its trigger needs; when it finishes, each is marked OK (`succeeded`) or failed (any other outcome that was not a termination). A job that started before the key was rotated says nothing about the new value, so it is not recorded.
+  - **Redaction:**
+    - **In the microVM** (`deploy/aws-microvm/image/runner/redact.mjs`): with the keys the runner loaded, before anything leaves it. That covers the job's stdout and stderr on their way to the log stream (line by line, so a key split across writes is still found), `updraft.log` and the run log before they are uploaded, the result document (`summary`, `error`, `stderrTail`) and the runner's own log lines. Anything shaped like a provider key, bearer token or key header goes too.
+    - **In the API** (`server/src/tenants/redact.ts`): the same rules for the API's logged errors and the launcher's logged launch failures.
 
 Status follows in #71.
 

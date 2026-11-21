@@ -150,15 +150,17 @@ export interface ConfigVersion {
  * label (lower-case, as GitHub compares labels) and the logins allowed to apply it (lower-case).
  */
 export interface DispatchRules {
-  /** The agent keys (variable names) the config's enabled repositories run with; the launcher refuses when one is not set. */
-  keys?: string[];
   /**
    * `paused`: the repository stays configured, but no labeled issue of it starts a job.
    * `actors`: when every trigger allows the same logins, they are stored once here and the
    * triggers carry none (a version's record is one DynamoDB item); otherwise each trigger has its
    * own. Versions stored before this have them on every trigger.
+   * `keys`: the agent keys (variable names) a job the trigger starts can need; the launcher
+   * refuses it while one is not set. Stored once on the repository when every trigger needs the
+   * same, like `actors`. Absent everywhere on versions published before #70 (the launcher then
+   * reads them from the bundle, key-needs.ts).
    */
-  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; triggers: { label: string; actors?: string[] }[] }>;
+  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; keys?: string[]; triggers: { label: string; actors?: string[]; keys?: string[] }[] }>;
 }
 
 /** That an agent key is set (never its value, which lives only in Secrets Manager). */
@@ -358,8 +360,11 @@ export interface Store {
   /** Refused (`uninstalled`) once the tenant is uninstalled or gone, so no row escapes the sweep. */
   putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<'stored' | 'uninstalled'>;
   listAgentKeyMeta(installationId: number): Promise<AgentKeyMeta[]>;
-  /** Records the outcome of a job that used the key. Nothing when the key is not set. */
-  recordAgentKeyUse(installationId: number, name: string, use: { at: string; ok: boolean }): Promise<void>;
+  /**
+   * Records the outcome of a job that used the key. Nothing when the key is not set, or was
+   * rotated after `jobStartedAt` (ISO): the job ran with the value before.
+   */
+  recordAgentKeyUse(installationId: number, name: string, use: { at: string; ok: boolean; jobStartedAt: string }): Promise<void>;
   recordRefusal(installationId: number, refusal: DispatchRefusal): Promise<void>;
   /** Newest first. */
   listRefusals(installationId: number, limit: number): Promise<DispatchRefusal[]>;
@@ -875,7 +880,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async recordAgentKeyUse(id, name, use) {
       const k = keys.get(`${id}/${name}`);
-      if (k) keys.set(`${id}/${name}`, { ...k, lastUsedAt: use.at, lastUsedOk: use.ok });
+      if (k && k.updatedAt <= use.jobStartedAt) keys.set(`${id}/${name}`, { ...k, lastUsedAt: use.at, lastUsedOk: use.ok });
     },
     async recordRefusal(id, r) {
       refusals.push({ id, r: { ...r } });

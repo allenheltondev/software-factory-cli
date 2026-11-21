@@ -385,6 +385,28 @@ describe.runIf(onLinuxLikeHost)('runJob: logs and deduplication record', () => {
     }
   });
 
+  it('redacts the job\'s keys from the log stream, the uploaded logs and the result (#70)', async () => {
+    const { deps, calls, logs, output } = fakeDeps('leak', {
+      secrets: { [ENV_ARN]: JSON.stringify({ ANTHROPIC_API_KEY: 'sk-ant-test-value', CUSTOM_TOKEN: 'plainsecretvalue123', FAKE_UPDRAFT_MODE: 'leak', FAKE_UPDRAFT_RECORD: recordFile }) },
+    });
+    const result = await runJob(request(), deps);
+    const kept = [
+      output.join(''),
+      logs.join('\n'),
+      ...calls.filter(([name]) => name === 's3Put').map(([, , , body]) => String(body)),
+      JSON.stringify(result),
+    ];
+    for (const text of kept) {
+      expect(text).not.toContain('sk-ant-test-value');
+      expect(text).not.toContain('plainsecretvalue123');
+    }
+    expect(output.join('')).toContain('provider said: invalid x-api-key [redacted]');
+    expect(result.stderrTail).toContain('error with [redacted] and [redacted]');
+    expect(result.summary.message).toBe('rejected [redacted]');
+    const uploads = calls.filter(([name, , key]) => name === 's3Put' && /\.log$/.test(key)).map(([, , , body]) => String(body));
+    expect(uploads).toEqual(['updraft.log contents\nkey [redacted]\n', 'agent transcript\ntoken [redacted]\n']);
+  });
+
   it('uploads only the end of a very large log', async () => {
     const { deps, calls } = fakeDeps('success', { deps: { maxLogBytes: 8 } });
     await runJob(request(), deps);

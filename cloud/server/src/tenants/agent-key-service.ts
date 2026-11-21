@@ -3,6 +3,7 @@ import { FlowError, type GitHubFlows } from '../flows/github.js';
 import type { DispatchRefusal, Store } from '../store/store.js';
 import { AGENT_KEY_NAMES, setAgentKey, type SecretsPort } from './agent-keys.js';
 import type { KeyChecker } from './key-check.js';
+import { keysOfRules, type BundleKeys } from './key-needs.js';
 
 /**
  * A tenant's agent keys in the console (#70), for its members only. Values are write-only:
@@ -32,14 +33,27 @@ export interface AgentKeyServiceDeps {
   github: Pick<GitHubFlows, 'configContext'>;
   secrets: SecretsPort;
   check: KeyChecker;
+  /** Reads key needs from the bundle of a version published before they were recorded. */
+  bundleKeys?: BundleKeys;
   now?: () => number;
 }
 
-export function createAgentKeyService({ store, github, secrets, check, now }: AgentKeyServiceDeps) {
+export function createAgentKeyService({ store, github, secrets, check, bundleKeys, now }: AgentKeyServiceDeps) {
+  /** What the active version's enabled repositories need; a version from before #70 from its bundle. */
+  async function requiredKeys(installationId: number, active: number | undefined): Promise<string[]> {
+    if (active === undefined) return [];
+    const version = await store.getConfigVersion(installationId, active, { consistent: true });
+    const fromRules = keysOfRules(version?.dispatch);
+    if (fromRules) return fromRules;
+    const paused = new Set(Object.entries(version!.dispatch!.repositories).filter(([, r]) => r.paused).map(([name]) => name));
+    // Unknown (no bundle reader, or a bundle that cannot tell): every key is shown as required,
+    // which is what the launcher assumes too (it refuses such a version).
+    return (bundleKeys ? await bundleKeys.forVersion(installationId, active, paused).catch(() => null) : null) ?? [...AGENT_KEY_NAMES];
+  }
+
   async function view(installationId: number): Promise<AgentKeysView> {
     const [metas, refusals, tenant] = await Promise.all([store.listAgentKeyMeta(installationId), store.listRefusals(installationId, 10), store.getTenant(installationId, { consistent: true })]);
-    const active = tenant?.activeConfigVersion;
-    const needed = new Set(active === undefined ? [] : ((await store.getConfigVersion(installationId, active, { consistent: true }))?.dispatch?.keys ?? []));
+    const needed = new Set(await requiredKeys(installationId, tenant?.activeConfigVersion));
     const byName = new Map(metas.map((m) => [m.name, m]));
     return {
       keys: AGENT_KEY_NAMES.map((name) => {

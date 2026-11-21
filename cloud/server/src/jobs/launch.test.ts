@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
-import { createMemoryStore, type Tenant } from '../store/store.js';
+import { createMemoryStore, type DispatchRules, type Tenant } from '../store/store.js';
+import { createBundleKeys } from '../tenants/key-needs.js';
+import { configPrefix } from '../tenants/paths.js';
 import { dispatchRules } from '../tenants/dispatch.js';
 import { createAdminService } from '../admin/admin.js';
 import { createReconciler } from './reconcile.js';
@@ -32,7 +34,7 @@ const tenant = (status: Tenant['status'] = 'active'): Tenant => ({
 const rules = dispatchRules({
   dispatch: { allowedActors: ['pat'] },
   repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
-});
+}, { keys: {} });
 
 describe('the launcher', () => {
   let store: ReturnType<typeof createMemoryStore>;
@@ -152,11 +154,26 @@ describe('the launcher', () => {
   });
 
   describe('bring your own key (#70)', () => {
-    const withKeys = async (keys: string[]) => {
-      const v = await store.createConfigVersion(55, { sha256: 'y', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: { ...rules, keys } });
+    const activate = async (dispatch: DispatchRules) => {
+      const v = await store.createConfigVersion(55, { sha256: 'y', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch });
       await store.markConfigReady(55, v as number);
       await store.activateConfig(55, v as number);
+      return v as number;
     };
+    // Two workflows: Claude on `updraft`, Codex on `codex` (as dispatchRules stores them now).
+    const twoAgents = (): DispatchRules =>
+      dispatchRules(
+        {
+          dispatch: { allowedActors: ['pat'] },
+          repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }, { trigger: { label: 'codex' } }] } },
+        },
+        { keys: { 'acme/web': { updraft: ['ANTHROPIC_API_KEY'], codex: ['CODEX_API_KEY'] } } },
+      );
+    const withKeys = async (keys: string[]) => activate(dispatchRules(
+      { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } } },
+      { keys: { 'acme/web': { updraft: keys } } },
+    ));
+    const setKey = (name: string) => store.putAgentKeyMeta(55, { name, updatedAt: '2000-01-01T00:00:00.000Z', updatedBy: 'pat' });
     const finishWith = async (jobId: string, token: string, outcome: string) => {
       const broker = createBroker({
         store,
@@ -185,14 +202,68 @@ describe('the launcher', () => {
       expect(await createLauncher(deps)(request())).toMatchObject({ status: 202, disposition: 'launched' });
     });
 
+    it("checks only the matched trigger's keys, and pins only those on the job", async () => {
+      await activate(twoAgents());
+      await setKey('ANTHROPIC_API_KEY');
+      // Codex is not set: its label is refused, Claude's label is not held up by it.
+      expect(await createLauncher(deps)(request({ label: { name: 'codex' } }, 'delivery-codex'))).toEqual({ status: 200, disposition: 'missing_key' });
+      const result = await createLauncher(deps)(request());
+      expect(result).toMatchObject({ status: 202, disposition: 'launched' });
+      expect((await store.getJob(result.jobId!))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
+    });
+
+    describe('a version published before key needs were recorded', () => {
+      // Its dispatch rules: no `keys` on any trigger.
+      const legacy = () => dispatchRules({ dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } } });
+      const bundle = (version: number) => ({
+        [`tenants/55/config/${version}/config.yaml`]: [
+          'agents:',
+          '  claude: { adapter: claude }',
+          'pools:',
+          '  default: { agents: [claude] }',
+          'repositories:',
+          '  acme/web:',
+          '    id: 9',
+          '    workflows:',
+          '      - { trigger: { label: updraft }, pool: default }',
+        ].join('\n'),
+      });
+      const reader = (objects: Record<string, string>) => {
+        const reads: string[] = [];
+        return { reads, bundleKeys: createBundleKeys(async (key) => (reads.push(key), objects[key] ?? null), configPrefix) };
+      };
+
+      it('reads them from its bundle: refused without the key, started (and pinned) with it, read once', async () => {
+        const v = await activate(legacy());
+        const { reads, bundleKeys } = reader(bundle(v));
+        const launch = createLauncher({ ...deps, bundleKeys });
+        expect(await launch(request())).toEqual({ status: 200, disposition: 'missing_key' });
+        expect((await store.listRefusals(55, 1))[0]?.reason).toBe('ANTHROPIC_API_KEY is not set: add it under Agent keys');
+        await setKey('ANTHROPIC_API_KEY');
+        const result = await launch(request({}, 'delivery-2'));
+        expect(result).toMatchObject({ status: 202, disposition: 'launched' });
+        expect((await store.getJob(result.jobId!))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
+        expect(reads).toEqual([`tenants/55/config/${v}/config.yaml`]);
+      });
+
+      it('is refused, with the reason, when its bundle cannot tell (never run unchecked)', async () => {
+        await activate(legacy());
+        await setKey('ANTHROPIC_API_KEY');
+        expect(await createLauncher({ ...deps, bundleKeys: reader({}).bundleKeys })(request())).toEqual({ status: 200, disposition: 'missing_key' });
+        expect(await createLauncher(deps)(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'missing_key' });
+        expect((await store.listRefusals(55, 1))[0]?.reason).toContain('publish the configuration again');
+        expect(runs).toEqual([]);
+      });
+    });
+
     it('marks each key the job used as OK or failed when it finishes, and never stores a value', async () => {
       await withKeys(['ANTHROPIC_API_KEY']);
-      await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+      await setKey('ANTHROPIC_API_KEY');
       const result = await createLauncher(deps)(request());
       expect((await store.getJob(result.jobId!))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
       const { jobToken } = (JSON.parse(runs[0]!.runHookPayload) as { broker: { jobToken: string } }).broker;
       await finishWith(result.jobId!, jobToken, 'failed');
-      expect(await store.listAgentKeyMeta(55)).toEqual([{ name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat', lastUsedAt: new Date(NOW).toISOString(), lastUsedOk: false }]);
+      expect(await store.listAgentKeyMeta(55)).toEqual([{ name: 'ANTHROPIC_API_KEY', updatedAt: '2000-01-01T00:00:00.000Z', updatedBy: 'pat', lastUsedAt: new Date(NOW).toISOString(), lastUsedOk: false }]);
     });
   });
 

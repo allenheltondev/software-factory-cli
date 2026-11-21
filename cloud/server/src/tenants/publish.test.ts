@@ -54,7 +54,7 @@ describe('publishTenantConfig', () => {
       expect.objectContaining({ version: 1, status: 'ready', files: ['config.yaml', 'prompts/implement-issue.md', 'source.json'], publishedBy: 'admin', publishedAt: '2026-11-19T00:00:00.000Z' }),
     ]);
     // What the launcher dispatches on, from the compiled config (the repository id the installation reaches).
-    expect((await store.getConfigVersion(55, 1))?.dispatch).toEqual({ keys: ['ANTHROPIC_API_KEY'], repositories: { 'acme/web': { id: 99, actors: ['pat'], triggers: [{ label: 'ready' }] } } });
+    expect((await store.getConfigVersion(55, 1))?.dispatch).toEqual({ repositories: { 'acme/web': { id: 99, actors: ['pat'], keys: ['ANTHROPIC_API_KEY'], triggers: [{ label: 'ready' }] } } });
   });
 
   it('never rewrites a version: each publish is the next one', async () => {

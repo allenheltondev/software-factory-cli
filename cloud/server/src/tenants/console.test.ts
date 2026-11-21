@@ -60,7 +60,7 @@ describe('parseConsoleConfig', () => {
     expect(r.files['prompts/implement.md']).toBe(DEFAULT_PROMPTS.implement);
     // No reviewer agent or prompts when no repository reviews or revises.
     expect(Object.keys(r.files).sort()).toEqual(['config.yaml', 'prompts/implement.md']);
-    expect(r.dispatch.repositories['acme/web']).toEqual({ id: 99, actors: ['pat'], triggers: [{ label: 'updraft' }] });
+    expect(r.dispatch.repositories['acme/web']).toEqual({ id: 99, actors: ['pat'], keys: ['ANTHROPIC_API_KEY'], triggers: [{ label: 'updraft' }] });
     // What the agents it can start need: the workflow's agent; no reviewer without review.
     expect(r.keys).toEqual([{ path: 'agents.implement', key: 'ANTHROPIC_API_KEY' }]);
   });

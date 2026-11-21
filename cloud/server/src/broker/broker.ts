@@ -254,7 +254,7 @@ export function createBroker(deps: BrokerDeps) {
       // The key's "last used": this job ran with it (it started) and it worked or it did not.
       // Best effort: a failure here must not fail the job's finish.
       if (job.agentKeys?.length && job.startedAt !== undefined && (recorded === 'succeeded' || (isFailure(recorded) && recorded !== 'terminated'))) {
-        const use = { at: new Date(now()).toISOString(), ok: recorded === 'succeeded' };
+        const use = { at: new Date(now()).toISOString(), ok: recorded === 'succeeded', jobStartedAt: new Date(job.startedAt).toISOString() };
         await Promise.all(job.agentKeys.map((name) => deps.store.recordAgentKeyUse(job.installationId, name, use))).catch((err: unknown) =>
           log({ jobId: job.jobId, warning: `could not record the key use: ${(err as Error)?.name}` }),
         );

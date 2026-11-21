@@ -1,3 +1,4 @@
+import { keysByTrigger, poolAgentKeys, workflowPools } from './key-needs.js';
 import { createHash } from 'node:crypto';
 import { stringify } from 'yaml';
 // The CLI's own schema and validator (the `@allenheltondev/updraft/config` entry point), from this
@@ -245,7 +246,7 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
   for (const file of Object.keys(prompts)) if (!usedPrompts.has(file)) warnings.push({ path: file, message: 'not referenced by any action; it is stored anyway' });
 
   const files: Record<string, string> = { 'config.yaml': stringify(compiled), ...prompts };
-  const rules = dispatchRules(compiled, { paused });
+  const rules = dispatchRules(compiled, { paused, keys: keysByTrigger(compiled) });
   // The version's record holds its dispatch rules and file list, in one DynamoDB item (400 KB).
   const recordBytes = Buffer.byteLength(JSON.stringify({ dispatch: rules, files: [...Object.keys(files), 'source.json'] }), 'utf8');
   if (recordBytes > MAX_VERSION_RECORD_BYTES) {
@@ -255,7 +256,6 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
     };
   }
   const keys = agentKeysNeeded(compiled, paused);
-  rules.keys = [...new Set(keys.map((k) => k.key))].sort();
   return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: rules, keys };
 }
 
@@ -263,44 +263,17 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
 export const MAX_VERSION_RECORD_BYTES = 300 * 1024;
 
 /**
- * The agents a job of an enabled (not paused) repository can start, and each one's API key: every
- * enabled agent of every pool its workflows route to (the pool, its rules and default, the tier
- * pools) and, with review on, the pool each workflow's reviewer is routed to (reviewPoolFor). From a compiled config that
+ * The agents a job of an enabled (not paused) repository can start, and each one's API key
+ * (key-needs.ts decides which pools a workflow reaches). From a compiled config that
  * `validateConfig` accepted, so every name resolves.
  */
 function agentKeysNeeded(compiled: { agents: Record<string, Record<string, unknown>>; pools: unknown; repositories: Record<string, Record<string, unknown>> }, paused: ReadonlySet<string>): AgentKeyNeed[] {
-  const pools = isObject(compiled.pools) ? compiled.pools : {};
-  const used = new Set<string>();
-  const addPool = (name: unknown) => {
-    if (typeof name === 'string' && name !== '') used.add(name);
-  };
+  const out = new Map<string, AgentKeyNeed>();
   for (const [fullName, repo] of Object.entries(compiled.repositories)) {
     if (paused.has(fullName)) continue;
-    const review = repo.review === true || isObject(repo.review);
-    const repoReviewPool = isObject(repo.review) ? repo.review.pool : undefined;
     for (const wf of Array.isArray(repo.workflows) ? repo.workflows : []) {
       if (!isObject(wf)) continue;
-      if (isObject(wf.pool)) {
-        addPool(wf.pool.default);
-        for (const rule of Array.isArray(wf.pool.rules) ? wf.pool.rules : []) if (isObject(rule)) addPool(rule.use);
-      } else addPool(wf.pool);
-      if (isObject(wf.tiers)) {
-        if (isObject(wf.tiers.pools)) for (const p of Object.values(wf.tiers.pools)) addPool(p);
-        if (isObject(wf.tiers.highRisk)) addPool(wf.tiers.highRisk.pool);
-      }
-      // As the worker picks it (reviewPoolFor): the workflow's reviewPool, else the repository's
-      // review.pool, else the pool the code was written by, which is collected above.
-      if (review) addPool(wf.reviewPool ?? repoReviewPool);
-    }
-  }
-  const out = new Map<string, AgentKeyNeed>();
-  for (const poolName of used) {
-    const pool = pools[poolName];
-    for (const agentName of isObject(pool) && Array.isArray(pool.agents) ? pool.agents : []) {
-      const agent = typeof agentName === 'string' ? compiled.agents[agentName] : undefined;
-      if (!agent || agent.enabled === false) continue;
-      const adapter = (agent.adapter ?? agentName) as CloudAgent;
-      if (adapter in AGENT_KEY_ENV) out.set(agentName as string, { path: `agents.${agentName as string}`, key: AGENT_KEY_ENV[adapter] });
+      for (const pool of workflowPools(repo, wf)) for (const { agent, key } of poolAgentKeys(compiled, pool)) out.set(agent, { path: `agents.${agent}`, key });
     }
   }
   return [...out.values()].sort((a, b) => a.path.localeCompare(b.path));
