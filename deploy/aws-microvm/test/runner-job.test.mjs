@@ -486,17 +486,21 @@ function brokerDeps(mode, overrides = {}) {
     issued += 1;
     return tokenFile(issued);
   };
-  harness.deps.finishJob = async (outcome) => {
+  harness.deps.finishJob = async (outcome, detail) => {
     harness.calls.push(['finishJob', outcome]);
+    harness.finishDetails = [...(harness.finishDetails ?? []), detail];
   };
   return harness;
 }
 
 describe.runIf(onLinuxLikeHost)('runJob, version 2 (job broker)', () => {
   it('gives the job an installation token instead of the key, the tenant\'s keys as its environment, and finishes the job', async () => {
-    const { deps, calls } = brokerDeps('success');
+    const harness = brokerDeps('success');
+    const { deps, calls } = harness;
     const result = await runJob(brokerRequest(), deps);
     expect(result.outcome).toBe('succeeded');
+    // What the console shows of the job (#71): the pull request and the logs, as names.
+    expect(harness.finishDetails).toEqual([{ updraftOutcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logs: ['updraft.log', 'run.log'] }]);
 
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(record.keyMode).toBeNull();
@@ -640,5 +644,19 @@ describe('configRelativePath', () => {
     }
     // Only the top-level names are reserved.
     expect(configRelativePath('config/prompts/event.json', 'config/')).toBe(path.join('prompts', 'event.json'));
+  });
+});
+
+describe('finishDetail (#71)', () => {
+  it('reports a failed verification from whichever job failed it, and run-event\'s own outcome', async () => {
+    const { finishDetail } = await import('../image/runner/job.mjs');
+    const revisionFailed = {
+      updraftOutcome: 'failed',
+      summary: { verification: { passed: true, commands: [] }, followOnJobs: [{ kind: 'revision', verification: { passed: false, commands: [] } }] },
+      logs: ['results/d/m/updraft.log'],
+    };
+    expect(finishDetail(revisionFailed)).toEqual({ updraftOutcome: 'failed', verificationPassed: false, logs: ['updraft.log'] });
+    expect(finishDetail({ updraftOutcome: 'canceled', summary: {}, logs: [] })).toEqual({ updraftOutcome: 'canceled' });
+    expect(finishDetail({ updraftOutcome: 'succeeded', summary: { verification: { passed: true }, jobs: [{ verification: { passed: true } }] }, logs: [] })).toEqual({ updraftOutcome: 'succeeded', verificationPassed: true });
   });
 });

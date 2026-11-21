@@ -22,6 +22,8 @@ export interface GitHubInstallation {
   id: number;
   account: GitHubAccount;
   suspendedAt: string | null;
+  /** What the installation grants the App (`contents: write`, ...). */
+  permissions?: Record<string, string>;
 }
 
 export interface GitHubRepository {
@@ -151,6 +153,9 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
         id: Number(i.id),
         account: { id: Number(account.id), login: String(account.login), type: String(account.type) },
         suspendedAt: typeof i.suspended_at === 'string' ? i.suspended_at : null,
+        ...(i.permissions && typeof i.permissions === 'object'
+          ? { permissions: Object.fromEntries(Object.entries(i.permissions as Json).filter(([, v]) => typeof v === 'string')) as Record<string, string> }
+          : {}),
       };
     },
 

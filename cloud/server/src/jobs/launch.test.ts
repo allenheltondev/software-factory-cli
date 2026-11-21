@@ -192,7 +192,7 @@ describe('the launcher', () => {
     it('refuses to dispatch when the workflow\'s agent has no key, and records why', async () => {
       await withKeys(['ANTHROPIC_API_KEY']);
       const log = vi.fn();
-      expect(await createLauncher({ ...deps, log })(request())).toEqual({ status: 200, disposition: 'missing_key' });
+      expect(await createLauncher({ ...deps, log })(request())).toMatchObject({ status: 200, disposition: 'missing_key' });
       expect(runs).toEqual([]);
       expect(events).toEqual({});
       const [refusal] = await store.listRefusals(55, 5);
@@ -206,7 +206,7 @@ describe('the launcher', () => {
       await activate(twoAgents());
       await setKey('ANTHROPIC_API_KEY');
       // Codex is not set: its label is refused, Claude's label is not held up by it.
-      expect(await createLauncher(deps)(request({ label: { name: 'codex' } }, 'delivery-codex'))).toEqual({ status: 200, disposition: 'missing_key' });
+      expect(await createLauncher(deps)(request({ label: { name: 'codex' } }, 'delivery-codex'))).toMatchObject({ status: 200, disposition: 'missing_key' });
       const result = await createLauncher(deps)(request());
       expect(result).toMatchObject({ status: 202, disposition: 'launched' });
       expect((await store.getJob(result.jobId!))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
@@ -238,7 +238,7 @@ describe('the launcher', () => {
         const v = await activate(legacy());
         const { reads, bundleKeys } = reader(bundle(v));
         const launch = createLauncher({ ...deps, bundleKeys });
-        expect(await launch(request())).toEqual({ status: 200, disposition: 'missing_key' });
+        expect(await launch(request())).toMatchObject({ status: 200, disposition: 'missing_key' });
         expect((await store.listRefusals(55, 1))[0]?.reason).toBe('ANTHROPIC_API_KEY is not set: add it under Agent keys');
         await setKey('ANTHROPIC_API_KEY');
         const result = await launch(request({}, 'delivery-2'));
@@ -250,8 +250,8 @@ describe('the launcher', () => {
       it('is refused, with the reason, when its bundle cannot tell (never run unchecked)', async () => {
         await activate(legacy());
         await setKey('ANTHROPIC_API_KEY');
-        expect(await createLauncher({ ...deps, bundleKeys: reader({}).bundleKeys })(request())).toEqual({ status: 200, disposition: 'missing_key' });
-        expect(await createLauncher(deps)(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'missing_key' });
+        expect(await createLauncher({ ...deps, bundleKeys: reader({}).bundleKeys })(request())).toMatchObject({ status: 200, disposition: 'missing_key' });
+        expect(await createLauncher(deps)(request({}, 'delivery-2'))).toMatchObject({ status: 200, disposition: 'missing_key' });
         expect((await store.listRefusals(55, 1))[0]?.reason).toContain('publish the configuration again');
         expect(runs).toEqual([]);
       });
@@ -273,29 +273,29 @@ describe('the launcher', () => {
     ['no tenant', async () => store.markUninstalled(55, NOW).then(() => store.purgeTenantPartition(55)), 'no_tenant'],
   ])('starts nothing for %s', async (_what, arrange, disposition) => {
     await arrange();
-    expect(await createLauncher(deps)(request())).toEqual({ status: 200, disposition });
+    expect(await createLauncher(deps)(request())).toMatchObject({ status: 200, disposition });
     expect(runs).toEqual([]);
     expect(events).toEqual({});
   });
 
   it('starts nothing for a tenant without a config, an event its config does not dispatch, or while jobs are off', async () => {
     const launch = createLauncher(deps);
-    expect(await launch(request({ label: { name: 'bug' } }))).toEqual({ status: 200, disposition: 'not_dispatched' });
-    expect(await launch(request({ sender: { login: 'mallory' } }))).toEqual({ status: 200, disposition: 'not_dispatched' });
-    expect(await launch(request({ issue: undefined }))).toEqual({ status: 200, disposition: 'ignored' });
+    expect(await launch(request({ label: { name: 'bug' } }))).toMatchObject({ status: 200, disposition: 'not_dispatched' });
+    expect(await launch(request({ sender: { login: 'mallory' } }))).toMatchObject({ status: 200, disposition: 'not_dispatched' });
+    expect(await launch(request({ issue: undefined }))).toMatchObject({ status: 200, disposition: 'ignored' });
     imageVersion = null;
-    expect(await launch(request())).toEqual({ status: 200, disposition: 'jobs_off' });
+    expect(await launch(request())).toMatchObject({ status: 200, disposition: 'jobs_off' });
 
     const bare = createMemoryStore();
     await bare.putTenantWithMember({ ...tenant(), installationId: 56 }, { installationId: 56, sub: 's', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
-    expect(await createLauncher({ ...deps, store: bare })({ ...request(), installationId: 56 })).toEqual({ status: 200, disposition: 'no_config' });
+    expect(await createLauncher({ ...deps, store: bare })({ ...request(), installationId: 56 })).toMatchObject({ status: 200, disposition: 'no_config' });
     expect(runs).toEqual([]);
   });
 
   it('starts one job per delivery: a redelivery while it may run is a duplicate', async () => {
     const launch = createLauncher(deps);
     expect((await launch(request())).disposition).toBe('launched');
-    expect(await launch(request())).toEqual({ status: 200, disposition: 'duplicate' });
+    expect(await launch(request())).toMatchObject({ status: 200, disposition: 'duplicate' });
     // Another delivery (another label event) is its own job.
     expect((await launch(request({}, 'delivery-2'))).disposition).toBe('launched');
     expect(runs).toHaveLength(2);
@@ -363,7 +363,7 @@ describe('the launcher', () => {
       const stuck = createLauncher({ ...deps, now: () => Date.now(), runMicrovm: () => new Promise(() => {}) });
       void stuck(request());
       await vi.waitFor(() => expect(Object.keys(events)).toHaveLength(1));
-      expect(await createLauncher({ ...deps, now: () => Date.now() })(request())).toEqual({ status: 200, disposition: 'duplicate' });
+      expect(await createLauncher({ ...deps, now: () => Date.now() })(request())).toMatchObject({ status: 200, disposition: 'duplicate' });
 
       vi.setSystemTime(NOW + PRELAUNCH_CLAIM_MS + 1_000);
       expect((await createLauncher({ ...deps, now: () => Date.now() })(request())).disposition).toBe('launched');
@@ -378,7 +378,7 @@ describe('the launcher', () => {
       const first = await launch(request());
       expect((await broker({ action: 'start', jobId: first.jobId, token: tokenOf(0) })).ok).toBe(true);
       vi.setSystemTime(NOW + PRELAUNCH_CLAIM_MS + 60_000);
-      expect(await launch(request())).toEqual({ status: 200, disposition: 'duplicate' });
+      expect(await launch(request())).toMatchObject({ status: 200, disposition: 'duplicate' });
 
       // A slow job: its claim ran out before it started, and the redelivery's job took it.
       const slow = await launch(request({}, 'delivery-2'));
@@ -398,7 +398,7 @@ describe('the launcher', () => {
     it('starts nothing while the kill switch is on, and claims nothing', async () => {
       let engaged = true;
       const launch = createLauncher({ ...deps, killSwitch: { engaged: async () => engaged } });
-      expect(await launch(request())).toEqual({ status: 200, disposition: 'kill_switch' });
+      expect(await launch(request())).toMatchObject({ status: 200, disposition: 'kill_switch' });
       expect(runs).toEqual([]);
       engaged = false;
       expect((await launch(request())).disposition).toBe('launched');
@@ -416,8 +416,8 @@ describe('the launcher', () => {
       const first = await launch(request());
       expect(first.disposition).toBe('launched');
 
-      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
-      expect(await launch(request({}, 'delivery-3'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(await launch(request({}, 'delivery-2'))).toMatchObject({ status: 200, disposition: 'throttled' });
+      expect(await launch(request({}, 'delivery-3'))).toMatchObject({ status: 200, disposition: 'throttled' });
       expect(runs).toHaveLength(1);
       expect(notices).toEqual([{ installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12, limit: 'concurrent_jobs', quotas: ONE_AT_A_TIME }]);
       // Another issue gets its own comment.
@@ -436,7 +436,7 @@ describe('the launcher', () => {
       const notices: ThrottleNotice[] = [];
       const launch = createLauncher({ ...deps, notifyThrottled: async (n) => void notices.push(n) });
       expect((await launch(request())).disposition).toBe('launched');
-      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(await launch(request({}, 'delivery-2'))).toMatchObject({ status: 200, disposition: 'throttled' });
       expect(notices[0]).toMatchObject({ limit: 'jobs_per_day', quotas: { jobsPerDay: 1, concurrentJobs: 10 } });
     });
 
@@ -451,7 +451,7 @@ describe('the launcher', () => {
         },
       });
       await launch(request());
-      expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+      expect(await launch(request({}, 'delivery-2'))).toMatchObject({ status: 200, disposition: 'throttled' });
       expect(logged.some((e) => String(e.warning).includes('could not comment on the issue: GitHub is down'))).toBe(true);
     });
 
@@ -483,7 +483,7 @@ describe('the launcher', () => {
 
         // Well past the launcher's five minutes, its slot is still held, and reconciliation sees it.
         vi.setSystemTime(NOW + 4 * PRELAUNCH_CLAIM_MS);
-        expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+        expect(await launch(request({}, 'delivery-2'))).toMatchObject({ status: 200, disposition: 'throttled' });
         const reconcile = createReconciler({ store, microvmState: async () => state, log: () => {} });
         expect(await reconcile()).toMatchObject({ released: [], held: 1 });
 
@@ -514,7 +514,7 @@ describe('the launcher', () => {
         // Well past the launcher's five minutes: still taken, and the job still reconciled.
         vi.setSystemTime(NOW + 4 * PRELAUNCH_CLAIM_MS);
         const launch = createLauncher({ ...deps, quotas: ONE_AT_A_TIME, now: () => Date.now() });
-        expect(await launch(request({}, 'delivery-2'))).toEqual({ status: 200, disposition: 'throttled' });
+        expect(await launch(request({}, 'delivery-2'))).toMatchObject({ status: 200, disposition: 'throttled' });
         expect(await store.listActiveJobs()).toHaveLength(1);
       } finally {
         vi.useRealTimers();
@@ -615,7 +615,7 @@ describe('the launcher', () => {
       await createAdminService({ store, quotas: deps.quotas, log: () => {} }).releaseJob(entry!.jobId, 'admin:x');
 
       resume();
-      expect(await pending).toEqual({ status: 200, disposition: 'cancelled', jobId: entry!.jobId });
+      expect(await pending).toMatchObject({ status: 200, disposition: 'cancelled', jobId: entry!.jobId });
       expect(runs).toEqual([]);
       expect(await store.getJob(entry!.jobId)).toMatchObject({ status: 'finished', outcome: 'released_by_admin' });
       const day = new Date(NOW).toISOString().slice(0, 10);

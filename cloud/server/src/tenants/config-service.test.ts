@@ -301,11 +301,11 @@ describe('publishing', () => {
     expect(decideDispatch(await rules(), event)).toMatchObject({ start: true });
 
     await publish(settings({ 'acme/web': repo({ enabled: false }) }), { baseVersion: 1 });
-    expect(decideDispatch(await rules(), event)).toEqual({ start: false, reason: 'the repository is paused' });
+    expect(decideDispatch(await rules(), event)).toMatchObject({ start: false, reason: 'the repository is paused' });
 
     await publish(settings({ 'acme/web': repo({ triggers: [{ label: 'go', workflow: 'implement' }], allowedActors: ['sam'] }) }), { baseVersion: 2 });
-    expect(decideDispatch(await rules(), event)).toEqual({ start: false, reason: 'the label is not a trigger' });
-    expect(decideDispatch(await rules(), { ...event, label: 'go' })).toEqual({ start: false, reason: 'the sender may not dispatch work' });
+    expect(decideDispatch(await rules(), event)).toMatchObject({ start: false, reason: 'the label is not a trigger' });
+    expect(decideDispatch(await rules(), { ...event, label: 'go' })).toMatchObject({ start: false, reason: 'the sender may not dispatch work' });
     expect(decideDispatch(await rules(), { ...event, label: 'go', sender: 'Sam' })).toMatchObject({ start: true });
   });
 

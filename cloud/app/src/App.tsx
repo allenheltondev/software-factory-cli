@@ -8,6 +8,7 @@ import { AppLayout } from './layout/AppLayout';
 import { DashboardPage } from './pages/DashboardPage';
 import { GitHubCallbackPage } from './pages/GitHubCallbackPage';
 import { AgentKeysPage } from './pages/AgentKeysPage';
+import { JobPage } from './pages/JobPage';
 import { AdminPage } from './pages/AdminPage';
 import { AdminTenantPage } from './pages/AdminTenantPage';
 import { ConfigHistoryPage } from './pages/ConfigHistoryPage';
@@ -47,6 +48,7 @@ export function App({ api }: { api?: ApiClient }) {
           <Route index element={<DashboardPage api={api} />} />
           <Route path="github/callback" element={<GitHubCallbackPage api={api} />} />
           <Route path="installations/:id" element={<InstallationPage api={api} />} />
+          <Route path="installations/:id/jobs/:jobId" element={<JobPage api={api} />} />
           <Route path="installations/:id/keys" element={<AgentKeysPage api={api} />} />
           <Route path="installations/:id/config" element={<ConfigPage api={api} />} />
           <Route path="installations/:id/config/history" element={<ConfigHistoryPage api={api} />} />

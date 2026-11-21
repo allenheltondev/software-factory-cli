@@ -500,7 +500,7 @@ export async function runJob(request, deps) {
   if (payload.version === 2 && deps.finishJob) {
     const outcome = result.outcome === 'succeeded' && result.summaryMissing ? 'unconfirmed' : result.outcome;
     try {
-      await retry(() => deps.finishJob(outcome), deps);
+      await retry(() => deps.finishJob(outcome, finishDetail(result)), deps);
     } catch (error) {
       log(`could not tell the job broker the job finished; its token stops working at the maximum duration: ${error?.message ?? error}`);
     }
@@ -621,6 +621,24 @@ function startTokenRefresh(stateDir, deps) {
   }, deps.tokenRefreshMs ?? TOKEN_REFRESH_MS);
   timer.unref?.();
   return () => clearInterval(timer);
+}
+
+/**
+ * What the broker records of the job for the tenant's console (#71), from the redacted result:
+ * how run-event ended, whether verification passed, the pull request, the logs uploaded.
+ */
+export function finishDetail(result) {
+  const detail = {};
+  if (typeof result.updraftOutcome === 'string') detail.updraftOutcome = result.updraftOutcome;
+  // Every job the run did (the event's own, more of them, and what followed: a reviewer run, a
+  // revision): verification failed if it failed for any of them.
+  const jobs = [result.summary, ...(Array.isArray(result.summary?.jobs) ? result.summary.jobs : []), ...(Array.isArray(result.summary?.followOnJobs) ? result.summary.followOnJobs : [])];
+  const verdicts = jobs.map((j) => j?.verification?.passed).filter((v) => typeof v === 'boolean');
+  if (verdicts.length) detail.verificationPassed = !verdicts.includes(false);
+  if (typeof result.summary?.prUrl === 'string') detail.prUrl = result.summary.prUrl;
+  const logs = (result.logs ?? []).map((key) => String(key).split('/').pop());
+  if (logs.length) detail.logs = logs;
+  return detail;
 }
 
 /**

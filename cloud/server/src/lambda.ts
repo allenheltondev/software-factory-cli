@@ -16,6 +16,8 @@ import { createSecretsManagerPort } from './tenants/secrets-manager.js';
 import { checkAgentKeyWithProvider } from './tenants/key-check.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
+import { createS3LogReader } from './tenants/s3-logs.js';
+import { createStatusService } from './tenants/status-service.js';
 import { createConfigService, type ObjectStore } from './tenants/config-service.js';
 
 /**
@@ -48,6 +50,32 @@ const objects: ObjectStore = {
   },
 };
 
+// A job's logs (tenants/status-service.ts): only their end, read with a range. The function's
+// role reaches tenants/*/results/* for this, read only.
+const readLog = createS3LogReader(s3, bucket);
+
+const agentKeyService =
+  store && github
+    ? createAgentKeyService({
+        store,
+        github,
+        secrets: createSecretsManagerPort(),
+        check: checkAgentKeyWithProvider(),
+        ...(bucket
+          ? {
+              bundleKeys: createBundleKeys(async (key) => {
+                try {
+                  return await objects.get(key);
+                } catch (err) {
+                  if ((err as { name?: string }).name === 'NoSuchKey') return null;
+                  throw err;
+                }
+              }, configPrefix),
+            }
+          : {}),
+      })
+    : undefined;
+
 const app = createApp({
   resolveCaller: async (c) => {
     const event = (c.env as { event?: APIGatewayProxyEvent } | undefined)?.event;
@@ -68,26 +96,16 @@ const app = createApp({
     }
     return caller;
   },
-  ...(store && github
+  ...(store && github && agentKeyService
     ? {
         github,
-        agentKeys: createAgentKeyService({
+        agentKeys: agentKeyService,
+        status: createStatusService({
           store,
           github,
-          secrets: createSecretsManagerPort(),
-          check: checkAgentKeyWithProvider(),
-          ...(bucket
-            ? {
-                bundleKeys: createBundleKeys(async (key) => {
-                  try {
-                    return await objects.get(key);
-                  } catch (err) {
-                    if ((err as { name?: string }).name === 'NoSuchKey') return null;
-                    throw err;
-                  }
-                }, configPrefix),
-              }
-            : {}),
+          agentKeys: agentKeyService,
+          resultRetentionDays: Math.max(1, Number(process.env.RESULT_RETENTION_DAYS ?? 30) || 30),
+          ...(bucket ? { readLog } : {}),
         }),
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         admin: {

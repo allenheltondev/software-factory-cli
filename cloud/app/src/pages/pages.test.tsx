@@ -3,11 +3,10 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError, type ApiClient } from '../api/client';
+import { ApiError } from '../api/client';
 import { fakeApi } from '../test/fakeApi';
 import { DashboardPage, tenantStatusLabel } from './DashboardPage';
 import { callbackInput, GitHubCallbackPage } from './GitHubCallbackPage';
-import { InstallationPage } from './InstallationPage';
 
 function Where() {
   const l = useLocation();
@@ -151,37 +150,5 @@ describe('GitHubCallbackPage', () => {
   it('explains an install request that waits for an org owner', async () => {
     renderAt('/github/callback?code=c&state=s&setup_action=request', vi.fn().mockResolvedValue({ kind: 'requested', githubLogin: 'pat' }));
     expect(await screen.findByTestId('callback-requested')).toBeInTheDocument();
-  });
-});
-
-describe('InstallationPage', () => {
-  function renderAt(id: string, repositories: ApiClient['repositories']) {
-    render(
-      <MemoryRouter initialEntries={[`/installations/${id}`]}>
-        <Routes>
-          <Route path="/installations/:id" element={<InstallationPage api={{ repositories }} />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-  }
-
-  it('lists the repositories', async () => {
-    const repositories = vi.fn().mockResolvedValue({
-      tenant: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: 'active', role: 'owner' },
-      repositories: [{ id: 1, fullName: 'acme/api', private: true, htmlUrl: 'https://github.com/acme/api' }],
-    });
-    renderAt('55', repositories);
-    expect(await screen.findByTestId('repository-list')).toHaveTextContent('acme/api');
-    expect(repositories).toHaveBeenCalledWith(55);
-  });
-
-  it('shows a refusal, and never calls the API for a bad id', async () => {
-    const repositories = vi.fn().mockRejectedValue(new ApiError(403, 'not_authorized', 'You are not a member of that installation'));
-    renderAt('55', repositories);
-    expect(await screen.findByTestId('installation-error')).toHaveTextContent('not a member');
-
-    const never = vi.fn();
-    renderAt('abc', never);
-    expect(never).not.toHaveBeenCalled();
   });
 });

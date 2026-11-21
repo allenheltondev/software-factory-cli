@@ -167,6 +167,86 @@ export interface AgentKeysView {
   refusals: { at: string; deliveryId: string; repository: string; issue: number; reason: string }[];
 }
 
+// A tenant's status and diagnostics (server/src/tenants/status-service.ts).
+
+export type InstallationStatus = 'active' | 'suspended' | 'missing_permissions' | 'disabled' | 'uninstalled';
+export type DeliveryDisposition = 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched';
+export type JobResult =
+  | 'running'
+  | 'success'
+  | 'nothing_to_do'
+  | 'canceled'
+  | 'superseded'
+  | 'deferred'
+  | 'agent_failure'
+  | 'verify_failure'
+  | 'publish_failure'
+  | 'timeout'
+  | 'state_not_saved'
+  | 'terminated'
+  | 'runner_error'
+  | 'unconfirmed'
+  | 'not_run'
+  | 'other';
+
+export interface Delivery {
+  at: string;
+  deliveryId: string;
+  event: string;
+  action?: string;
+  repository?: string;
+  issue?: number;
+  label?: string;
+  sender?: string;
+  disposition: DeliveryDisposition;
+  reason?: string;
+  message?: string;
+  errorClass?: string;
+  jobId?: string;
+}
+
+export interface JobView {
+  jobId: string;
+  repository: string;
+  issue?: number;
+  label?: string;
+  sender?: string;
+  createdAt: string;
+  status: 'launched' | 'finished';
+  outcome?: string;
+  configVersion?: number;
+  finishedAt?: string;
+  durationSeconds?: number;
+  deliveryId?: string;
+  result: JobResult;
+  issueUrl?: string;
+  prUrl?: string;
+  logs: string[];
+}
+
+export interface Overview {
+  tenant: TenantSummary;
+  installation: { status: InstallationStatus; checked: boolean; missingPermissions: { name: string; needs: string; granted?: string }[] };
+  repositories: { fullName: string; htmlUrl?: string; private?: boolean; reachable: boolean; configured: boolean; paused: boolean }[];
+  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string };
+  keys: AgentKeyView[];
+  activity: {
+    /** Counts over 30 days, or of the latest entries when a list is not complete. */
+    window: { deliveries: number; deliveriesComplete: boolean; jobs: number; jobsComplete: boolean };
+    deliveries: Partial<Record<DeliveryDisposition, number>>;
+    jobs: Partial<Record<JobResult, number>>;
+    lastDeliveryAt?: string;
+    running: number;
+  };
+}
+
+export interface JobLog {
+  name: string;
+  text: string;
+  size: number;
+  truncated: boolean;
+}
+
 // A tenant's configuration (server/src/tenants/console.ts and config-service.ts).
 
 export type AgentAdapter = 'claude' | 'codex';
@@ -327,6 +407,13 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     configVersion: (installationId: number, version: number) => request<VersionFiles>(`/installations/${installationId}/config/versions/${version}`),
     reactivateConfig: (installationId: number, version: number, input: { confirmAutoMerge?: boolean } = {}) =>
       request<PublishResult>(`/installations/${installationId}/config/versions/${version}/reactivate`, { method: 'POST', body: JSON.stringify(input) }),
+    overview: (installationId: number) => request<Overview>(`/installations/${installationId}/overview`),
+    deliveries: (installationId: number, limit = 100) => request<{ deliveries: Delivery[] }>(`/installations/${installationId}/deliveries?limit=${limit}`),
+    jobs: (installationId: number, limit = 100) => request<{ jobs: JobView[] }>(`/installations/${installationId}/jobs?limit=${limit}`),
+    job: (installationId: number, jobId: string) => request<{ job: JobView; deliveries: Delivery[] }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}`),
+    /** The end of a log; throws ApiError `log_expired` (410) once it is past the retention. */
+    jobLog: (installationId: number, jobId: string, name: string) =>
+      request<JobLog>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/logs/${encodeURIComponent(name)}`),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */
     setAgentKey: (installationId: number, name: string, value: string) =>

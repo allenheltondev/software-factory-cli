@@ -75,7 +75,18 @@ describe('helpers', () => {
 
 describe('InstallationPage', () => {
   it('links an active installation to its configuration', async () => {
-    const api = fakeApi({ repositories: vi.fn().mockResolvedValue({ tenant: view().tenant, repositories: view().repositories }) });
+    const api = fakeApi({
+      overview: vi.fn().mockResolvedValue({
+        tenant: view().tenant,
+        installation: { status: 'active', checked: true, missingPermissions: [] },
+        repositories: [],
+        config: { activeVersion: null },
+        keys: [],
+        activity: { window: { deliveries: 3, deliveriesComplete: true, jobs: 2, jobsComplete: true }, deliveries: {}, jobs: {}, running: 0 },
+      }),
+      jobs: vi.fn().mockResolvedValue({ jobs: [] }),
+      deliveries: vi.fn().mockResolvedValue({ deliveries: [] }),
+    });
     at('/installations/55', <InstallationPage api={api} />, '/installations/:id');
     expect(await screen.findByTestId('configure-link')).toHaveAttribute('href', '/installations/55/config');
   });

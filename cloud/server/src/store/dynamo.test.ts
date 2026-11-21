@@ -148,10 +148,15 @@ function fakeTable() {
           const pk = values?.[':pk'];
           const prefix = String(input.KeyConditionExpression).includes('begins_with(sk, :prefix)') ? String(values?.[':prefix']) : '';
           const until = String(input.KeyConditionExpression).includes('sk <= :until') ? String(values?.[':until']) : null;
+          const between = String(input.KeyConditionExpression).includes('sk BETWEEN :from AND :to') ? [String(values?.[':from']), String(values?.[':to'])] : null;
           let found = [...items.values()]
-            .filter((i) => i.pk === pk && String(i.sk).startsWith(prefix) && (until === null || String(i.sk) <= until) && visible(key(i), input))
+            .filter((i) => i.pk === pk && String(i.sk).startsWith(prefix) && (until === null || String(i.sk) <= until) && (!between || (String(i.sk) >= between[0]! && String(i.sk) <= between[1]!)) && visible(key(i), input))
             .sort((a, b) => String(a.sk).localeCompare(String(b.sk)));
           if (input.ScanIndexForward === false) found.reverse();
+          // The one query filter the store sends (getJobSummary).
+          if (input.FilterExpression === 'jobId = :job') found = found.filter((i) => i.jobId === values?.[':job']);
+          else if (input.FilterExpression === 'deliveryId = :d') found = found.filter((i) => i.deliveryId === values?.[':d']);
+          else if (input.FilterExpression) throw new Error(`unsupported filter: ${String(input.FilterExpression)}`);
           if (typeof input.Limit === 'number') found = found.slice(0, input.Limit);
           return { Items: input.ProjectionExpression ? found.map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })) : found.map((i) => ({ ...i })) };
         }
@@ -978,6 +983,62 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     // A key that is not set is not created by a use.
     await store.recordAgentKeyUse(55, 'CODEX_API_KEY', { at: 'x', ok: true, jobStartedAt: 'z' });
     expect((await store.listAgentKeyMeta(55)).map((k) => k.name)).toEqual(['ANTHROPIC_API_KEY']);
+  });
+
+  it('keeps what a finish reported on the job summary, finds it by id in its own tenant only, and lists deliveries newest first (#71)', async () => {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    const job: Job = {
+      jobId: 'job_status0001',
+      tokenHash: 'ab',
+      installationId: 55,
+      repository: 'acme/web',
+      repositoryId: 99,
+      configVersion: 4,
+      deliveryId: 'd-1',
+      eventName: 'issues',
+      status: 'launched',
+      createdAt: '2026-11-20T12:00:00.000Z',
+      expiresAt: LATER,
+      issue: 12,
+    };
+    await store.putJob(job);
+    // As start and the launcher leave it: started, with its microVM.
+    const started = Date.parse(job.createdAt) + 5_000;
+    Object.assign(table.items.get(`JOB#${job.jobId}|META`)!, { startedAt: started, microvmId: 'mvm-1' });
+    await store.finishJob(job.jobId, 'failed', { at: started + 95_000, detail: { updraftOutcome: 'failed', verificationPassed: false, logs: ['updraft.log'] } });
+    const summary = await store.getJobSummary(55, job.jobId);
+    expect(summary).toMatchObject({ jobId: job.jobId, configVersion: 4, deliveryId: 'd-1', outcome: 'failed', microvmId: 'mvm-1', detail: { verificationPassed: false, logs: ['updraft.log'] } });
+    expect(summary).toMatchObject({ finishedAt: new Date(started + 95_000).toISOString(), durationSeconds: 95 });
+    expect(await store.getJobSummary(56, job.jobId)).toBeNull();
+    // Once its own record has gone (a week after the job), it is still found in the tenant's summaries.
+    table.items.delete(`JOB#${job.jobId}|META`);
+    expect((await store.getJobSummary(55, job.jobId))?.jobId).toBe(job.jobId);
+    expect(await store.getJobSummary(56, job.jobId)).toBeNull();
+    expect((await store.listRecentJobs(55, 5))[0]).toMatchObject({ configVersion: 4, outcome: 'failed' });
+
+    await store.recordDelivery(55, { at: '2026-11-20T12:00:00.000Z', deliveryId: 'd-1', event: 'issues', action: 'labeled', disposition: 'launched', jobId: job.jobId, issue: 12 });
+    await store.recordDelivery(55, { at: '2026-11-20T12:05:00.000Z', deliveryId: 'd-2', event: 'issues', disposition: 'filtered', reason: 'not_trigger', message: 'the label is not a trigger' });
+    expect(await store.listDeliveries(55, 10)).toEqual([
+      { at: '2026-11-20T12:05:00.000Z', deliveryId: 'd-2', event: 'issues', disposition: 'filtered', reason: 'not_trigger', message: 'the label is not a trigger' },
+      { at: '2026-11-20T12:00:00.000Z', deliveryId: 'd-1', event: 'issues', action: 'labeled', disposition: 'launched', jobId: job.jobId, issue: 12 },
+    ]);
+    expect(await store.listDeliveries(56, 10)).toEqual([]);
+    // Every attempt of a delivery (GitHub reuses the id on a redelivery), however long apart and
+    // however many others came between: an earlier failed attempt is part of the job's history.
+    await store.recordDelivery(55, { at: '2026-11-19T09:00:00.000Z', deliveryId: 'd-1', event: 'issues', disposition: 'launch_failed', errorClass: 'ServiceException' });
+    for (let n = 0; n < 250; n++) await store.recordDelivery(55, { at: `2026-11-20T13:${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}.000Z`, deliveryId: `other-${n}`, event: 'issues', disposition: 'filtered', reason: 'not_trigger' });
+    await store.recordDelivery(55, { at: '2026-11-20T14:30:00.000Z', deliveryId: 'd-1', event: 'issues', disposition: 'deduped' });
+    expect((await store.listDeliveriesOf(55, 'd-1')).map((d) => [d.at, d.disposition])).toEqual([
+      ['2026-11-19T09:00:00.000Z', 'launch_failed'],
+      ['2026-11-20T12:00:00.000Z', 'launched'],
+      ['2026-11-20T14:30:00.000Z', 'deduped'],
+    ]);
+    expect(await store.listDeliveriesOf(56, 'd-1')).toEqual([]);
+    // Both rows of an attempt expire together.
+    expect(table.items.get('TENANT#55|ATTEMPT#d-1#2026-11-20T12:00:00.000Z')?.ttl).toBe(table.items.get('TENANT#55|DELIVERY#2026-11-20T12:00:00.000Z#d-1')?.ttl);
+    // Kept 30 days.
+    expect(table.items.get('TENANT#55|DELIVERY#2026-11-20T12:00:00.000Z#d-1')?.ttl).toEqual(expect.any(Number));
   });
 
   it('reads a config version strongly consistently when asked (dispatch right after a publish)', async () => {

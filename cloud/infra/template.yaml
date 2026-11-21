@@ -57,6 +57,11 @@ Parameters:
     Default: 1200
     MinValue: 1
     Description: MicroVM minutes one tenant may use per UTC month (a job is charged its maximum duration at start, then refunded what it did not use).
+  ResultRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: How long a job's result document and logs are kept (tenants/<id>/results/; the daily cleanup deletes what is older).
   PlatformConcurrentJobs:
     Type: Number
     Default: 20
@@ -250,6 +255,8 @@ Resources:
           TENANT_BUCKET: !Ref TenantBucket
           USER_POOL_ID: !Ref AuthUserPoolId
           USER_POOL_CLIENT_ID: !Ref AuthClient
+          # When a job's logs count as expired (tenants/status-service.ts): the cleanup's own setting.
+          RESULT_RETENTION_DAYS: !Ref ResultRetentionDays
           # The admin view shows each tenant's quotas: the same defaults the launcher applies.
           QUOTA_CONCURRENT_JOBS: !Ref QuotaConcurrentJobs
           QUOTA_JOBS_PER_DAY: !Ref QuotaJobsPerDay
@@ -275,6 +282,10 @@ Resources:
                 - s3:GetObject
                 - s3:PutObject
               Resource: !Sub ${TenantBucket.Arn}/tenants/*/config/*
+            # A job's logs for the console (tenants/status-service.ts): read only, results only.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub ${TenantBucket.Arn}/tenants/*/results/*
             # Writing a tenant's agent keys (tenants/agent-keys.ts). Write-only: this function can
             # create and replace them, never read one back.
             - Effect: Allow
@@ -391,6 +402,7 @@ Resources:
         Variables:
           TABLE_NAME: !Ref UpdraftTable
           TENANT_BUCKET: !Ref TenantBucket
+          RESULT_RETENTION_DAYS: !Ref ResultRetentionDays
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - DynamoDBCrudPolicy:

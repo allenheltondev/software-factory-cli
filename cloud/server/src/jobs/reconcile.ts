@@ -26,6 +26,9 @@ export const RESERVATION_RECLAIM_MS = 5 * 60 * 1000;
  *
  * `TERMINATING` waits: Lambda runs the /terminate hook before it frees the microVM's resources.
  */
+/** The outcome of a job whose microVM ended without the job's finish. */
+export const MICROVM_GONE_OUTCOME = 'microvm_gone';
+
 export function createReconciler({
   store,
   microvmState,
@@ -74,6 +77,9 @@ export function createReconciler({
         }
         const gone = job.microvmId ? isTerminated(await microvmState(job.microvmId)) : now() > job.expiresAt;
         if (gone) {
+          // A microVM that ended without the job's finish (stopped, crashed, out of time): the job
+          // is over for the console too. finishJob keeps a finish that won the race.
+          if (job.status !== 'finished') await store.finishJob(jobId, MICROVM_GONE_OUTCOME, { at: now() });
           await store.releaseJob(job, unusedTime(job, now()));
           released.push(jobId);
           continue;

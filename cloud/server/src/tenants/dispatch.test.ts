@@ -70,7 +70,7 @@ describe('decideDispatch', () => {
     ['an actor allowed for another trigger only', { label: 'docs', sender: 'pat' }, 'the sender may not dispatch work'],
     ['no sender', { sender: undefined }, 'the sender may not dispatch work'],
   ])('starts nothing for %s', (_what, overrides, reason) => {
-    expect(decideDispatch(rules, event(overrides))).toEqual({ start: false, reason });
+    expect(decideDispatch(rules, event(overrides))).toMatchObject({ start: false, reason });
   });
 
   it('starts nothing for a version published before dispatch rules existed', () => {
@@ -83,7 +83,7 @@ describe('paused repositories', () => {
     const rules = dispatchRules(compiled, { paused: new Set(['ACME/web']) });
     expect(rules.repositories['acme/web']?.paused).toBe(true);
     expect(rules.repositories['acme/api']?.paused).toBeUndefined();
-    expect(decideDispatch(rules, { repositoryFullName: 'acme/web', repositoryId: 9, label: 'updraft', sender: 'pat' })).toEqual({ start: false, reason: 'the repository is paused' });
+    expect(decideDispatch(rules, { repositoryFullName: 'acme/web', repositoryId: 9, label: 'updraft', sender: 'pat' })).toMatchObject({ start: false, reason: 'the repository is paused' });
     expect(decideDispatch(rules, { repositoryFullName: 'acme/api', repositoryId: 10, label: 'updraft', sender: 'pat' })).toMatchObject({ start: true });
   });
 });

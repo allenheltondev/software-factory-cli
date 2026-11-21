@@ -1,0 +1,26 @@
+import { GetObjectCommand, type S3Client } from '@aws-sdk/client-s3';
+import type { LogReader } from './status-service.js';
+
+/**
+ * The end of a job's log object, read with a range (tenants/status-service.ts). The API's role
+ * may read `tenants/*\/results/*` and nothing else, not even list the bucket, so S3 answers a
+ * missing object with 403 AccessDenied rather than 404 NoSuchKey: from here the two cannot be
+ * told apart. Both are reported as `missing`; the service decides from the job's age whether
+ * that means expired (410) or not readable (an error to look into).
+ */
+export function createS3LogReader(s3: Pick<S3Client, 'send'>, bucket: string): LogReader {
+  return async (key, maxBytes) => {
+    try {
+      const out = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key, Range: `bytes=-${maxBytes}` }));
+      const range = /\/(\d+)$/.exec(out.ContentRange ?? '');
+      const text = (await out.Body?.transformToString('utf8')) ?? '';
+      return { text, size: range ? Number(range[1]) : (out.ContentLength ?? text.length) };
+    } catch (err) {
+      const name = (err as { name?: string }).name;
+      if (name === 'NoSuchKey' || name === 'AccessDenied') return null;
+      // An empty object cannot satisfy a suffix range.
+      if (name === 'InvalidRange') return { text: '', size: 0 };
+      throw err;
+    }
+  };
+}

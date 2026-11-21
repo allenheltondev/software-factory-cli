@@ -7,6 +7,7 @@ import { safeMessage } from './tenants/redact.js';
 import { FlowError, type GitHubFlows } from './flows/github.js';
 import type { TenantLimits } from './store/store.js';
 import type { AgentKeyService } from './tenants/agent-key-service.js';
+import type { StatusService } from './tenants/status-service.js';
 import type { ConfigService, PublishOutcome } from './tenants/config-service.js';
 
 /**
@@ -34,6 +35,13 @@ import type { ConfigService, PublishOutcome } from './tenants/config-service.js'
  *   GET    /api/v1/installations/:id/agent-keys          per key: configured, last rotated, last used OK/failed; recent refusals
  *   PUT    /api/v1/installations/:id/agent-keys/:name    { value }: checked with the provider, then saved (rotation replaces it)
  *
+ * A tenant's status and diagnostics (tenants/status-service.ts), members only:
+ *   GET    /api/v1/installations/:id/overview                   installation status, repositories, config, keys, activity
+ *   GET    /api/v1/installations/:id/deliveries?limit=          recent webhook deliveries, one disposition each
+ *   GET    /api/v1/installations/:id/jobs?limit=                recent jobs and how each ended
+ *   GET    /api/v1/installations/:id/jobs/:jobId                one job, with its deliveries
+ *   GET    /api/v1/installations/:id/jobs/:jobId/logs/:name     the end of updraft.log or run.log
+ *
  * Admins only, the members of the stack's admin Cognito group (admin/access.ts; anyone else gets 403):
  *   GET    /api/v1/admin/tenants                     every tenant: quotas, usage, failures
  *   GET    /api/v1/admin/tenants/:id                 one tenant, with its recent and running jobs
@@ -55,6 +63,7 @@ export interface AppOptions {
   admin?: { access: AdminAccess; service: AdminService };
   config?: ConfigService;
   agentKeys?: AgentKeyService;
+  status?: StatusService;
   /** Logs unexpected errors. The response never carries their details. */
   logError?: (err: unknown) => void;
 }
@@ -68,7 +77,7 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** Who did it, for the admin's actions: their email, else their sub. */
 const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
 
-export function createApp({ resolveCaller, github, admin, config, agentKeys, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
+export function createApp({ resolveCaller, github, admin, config, agentKeys, status, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -256,6 +265,38 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, log
         return c.json({ error: 'bad_request' }, 400);
       }
       return c.json(await agentKeys.set(c.get('caller'), id, c.req.param('name'), value));
+    });
+  }
+
+  if (status) {
+    const positive = (raw: string) => {
+      const n = Number(raw);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    };
+    // Diagnostics change by the second: never cached on the way.
+    app.use('/v1/installations/:id/*', async (c, next) => {
+      await next();
+      if (/\/(overview|deliveries|jobs)/.test(c.req.path)) c.header('Cache-Control', 'no-store');
+    });
+    app.get('/v1/installations/:id/overview', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await status.overview(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.get('/v1/installations/:id/deliveries', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await status.deliveries(c.get('caller'), id, c.req.query('limit'))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.get('/v1/installations/:id/jobs', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await status.jobs(c.get('caller'), id, c.req.query('limit'))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.get('/v1/installations/:id/jobs/:jobId', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await status.job(c.get('caller'), id, c.req.param('jobId'))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.get('/v1/installations/:id/jobs/:jobId/logs/:name', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await status.log(c.get('caller'), id, c.req.param('jobId'), c.req.param('name'))) : c.json({ error: 'not_found' }, 404);
     });
   }
 
