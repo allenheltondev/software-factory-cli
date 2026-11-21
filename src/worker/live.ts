@@ -1076,6 +1076,7 @@ export class LiveExecutor implements Executor {
         await log([`review verdict for ${prepared.baseSha}: ${parsed.verdict}`]);
         // Telemetry only: a missing or malformed count says so here and changes nothing else.
         if (parsed.findingsCount === null) await log([`review findings count: none (${parsed.findingsCountProblem}); the verdict is unaffected`]);
+        else await log([`review findings count: ${parsed.findingsCount}`]);
       } else {
         outcome = 'failed';
         error = `no verdict: ${parsed.problem}`;

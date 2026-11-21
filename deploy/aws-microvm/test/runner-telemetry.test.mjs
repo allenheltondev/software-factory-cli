@@ -268,6 +268,175 @@ describe('agent telemetry: Codex and the review loop', () => {
   });
 });
 
+describe('agent telemetry: structural detail, without content', () => {
+  const ready = ['source clone: /src/widgets', 'remote: origin (https://github.com/octo/widgets.git)', 'base: main at 0123456789abcdef0123456789abcdef01234567', 'branch: updraft/7-dark-mode', 'checkout: /work/tree', 'timeout: 30 min'].join('\n');
+
+  it('records the preparation, what each tool was about, the run summary and the publication', async () => {
+    const t = setup();
+    await t.step('run_1', `${header().replace('\n---- agent output (stdout and stderr) ----', '')}\n`, 0);
+    await t.step('run_1', `${ready}\n---- agent output (stdout and stderr) ----\n`, 7000);
+    const edit = { type: 'assistant', parent_tool_use_id: null, message: { id: 'msg_e', model: 'claude-sonnet-4-5', content: [{ type: 'tool_use', id: 'toolu_e', name: 'Edit', input: { file_path: '/work/tree/src/theme.ts', old_string: 'SECRET-OLD', new_string: 'SECRET-NEW\nmore' } }], stop_reason: 'tool_use', usage: { input_tokens: 10, output_tokens: 5 } } };
+    const todo = { type: 'assistant', parent_tool_use_id: null, message: { id: 'msg_t', model: 'claude-sonnet-4-5', content: [{ type: 'tool_use', id: 'toolu_t', name: 'TodoWrite', input: { todos: [{ content: 'PLAN-ITEM', status: 'in_progress' }, { content: 'x', status: 'pending' }] } }], stop_reason: 'tool_use', usage: { input_tokens: 10, output_tokens: 5 } } };
+    const testFail = claude.toolResult('toolu_1', 'Exit code 1\n FAIL  src/theme.test.ts > theme > toggles\n      Tests  1 failed | 4 passed (5)\n');
+    testFail.message.content[0].is_error = true;
+    await t.step('run_1', claude.stream(claude.init('/work/tree'), todo, claude.toolResult('toolu_t', 'ok')), 500);
+    await t.step('run_1', claude.stream(edit, claude.toolResult('toolu_e', 'edited')), 1000);
+    await t.step('run_1', claude.stream({ type: 'system', subtype: 'compact_boundary', session_id: claude.SESSION, compact_metadata: { trigger: 'auto', pre_tokens: 155000 } }), 100);
+    await t.step('run_1', claude.stream(claude.assistantToolUse('toolu_1', 'npm test'), testFail), 3000);
+    await t.step(
+      'run_1',
+      claude.stream(
+        claude.assistantText('done'),
+        claude.success('ok', { permission_denials: [{ tool_name: 'WebFetch', tool_use_id: 'x', tool_input: {} }], modelUsage: { 'claude-sonnet-4-5': { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 900, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.42 } } }),
+      ),
+      1000,
+    );
+    await t.step('run_1', '---- end of agent output ----\nexit: code 0 after 12s\n', 100);
+    await t.step(
+      'run_1',
+      [
+        '',
+        '---- verification (run by the worker: 1 command(s), 10 min in total) ----',
+        '---- verify 1/1: npm test ----',
+        'command: ["npm","test"]',
+        ' FAIL  src/theme.test.ts > theme > persists',
+        '      Tests  1 failed | 11 passed (12)',
+        'exit: code 1 after 6s',
+        '---- end of verification: failed ----',
+        '',
+        'summary:',
+        '  branch: updraft/7-dark-mode (base 0123456789ab)',
+        '  commits since base: 2',
+        '  changed files (git diff --stat 0123456789ab, committed and uncommitted): 2',
+        '  src/theme.ts      | 10 ++++++----',
+        '  src/theme.test.ts | 20 ++++++++++++++++++++',
+        '  2 files changed, 26 insertions(+), 4 deletions(-)',
+        '  untracked files: 0',
+        '  last agent output:',
+        '  | src/fake.ts | 99 +++',
+        '',
+        'outcome: succeeded',
+        'publication: attempt 1 (auto) at 2026-11-21T10:01:00.000Z',
+        'publication: pushing updraft/7-dark-mode (abcdef012345, 2 commit(s)) to origin (https://github.com/octo/widgets.git)',
+        'publication: opened draft PR #100: https://github.com/octo/widgets/pull/100',
+        '',
+      ].join('\n'),
+      6000,
+    );
+    await t.tracer.stop({ outcome: 'succeeded', steps: [{ name: 'isolation', start: t.clock.t - 60_000, end: t.clock.t - 59_000 }] });
+    const spans = t.exporter.spans;
+
+    const prepare = one(spans, 'updraft prepare');
+    expect(prepare.end - prepare.start).toBe(7000);
+    expect(prepare.attributes).toMatchObject({ 'gen_ai.agent.name': 'updraft', 'updraft.base.branch': 'main', 'updraft.branch': 'updraft/7-dark-mode', 'updraft.agent.timeout_minutes': 30, 'updraft.job.attempt': 1 });
+
+    expect(one(spans, 'execute_tool Edit').attributes).toMatchObject({ 'updraft.tool.file.path': 'src/theme.ts', 'updraft.tool.category': 'edit', 'updraft.tool.lines_added': 2, 'updraft.tool.lines_removed': 1 });
+    expect(one(spans, 'execute_tool Bash').attributes).toMatchObject({ 'updraft.tool.command.program': 'npm', 'updraft.tool.category': 'test', 'updraft.tool.exit_code': 1, 'updraft.test.failed': 1, 'updraft.test.passed': 4, 'updraft.test.failed_tests': ['src/theme.test.ts > theme > toggles'] });
+
+    const agent = one(spans, 'invoke_agent claude-opus');
+    expect(agent.attributes).toMatchObject({
+      'updraft.agent.cli_version': '2.1.289',
+      'updraft.agent.permission_mode': 'bypassPermissions',
+      'updraft.agent.duration_ms': 95000,
+      'updraft.agent.api_duration_ms': 61000,
+      'updraft.agent.permission_denials': 1,
+      'updraft.agent.permission_denied_tools': ['WebFetch'],
+      'updraft.agent.models': ['claude-sonnet-4-5'],
+      'updraft.agent.compactions': 1,
+      'updraft.agent.exit_code': 0,
+      'updraft.change.commits': 2,
+      'updraft.change.files': 2,
+      'updraft.change.insertions': 26,
+      'updraft.change.deletions': 4,
+      'updraft.change.test_files': 1,
+      'updraft.change.test_lines': 20,
+      'updraft.change.source_lines': 10,
+      'updraft.change.paths': ['src/theme.ts', 'src/theme.test.ts'],
+    });
+    const names = agent.events.map((e) => e.name);
+    expect(names).toEqual(expect.arrayContaining(['todo.update', 'compaction', 'model_usage']));
+    expect(agent.events.find((e) => e.name === 'compaction').attributes).toMatchObject({ 'updraft.compaction.trigger': 'auto', 'updraft.compaction.pre_tokens': 155000 });
+    expect(agent.events.find((e) => e.name === 'model_usage').attributes).toMatchObject({ 'gen_ai.response.model': 'claude-sonnet-4-5', 'updraft.usage.cost_usd': 0.42 });
+
+    const verify = one(spans, 'execute_tool verify');
+    expect(verify.attributes).toMatchObject({ 'updraft.test.framework': 'vitest', 'updraft.test.failed': 1, 'updraft.test.passed': 11, 'updraft.test.failed_tests': ['src/theme.test.ts > theme > persists'], 'updraft.verify.output_lines': 2 });
+    expect(one(spans, 'invoke_workflow verify').attributes).toMatchObject({ 'updraft.test.failed': 1, 'updraft.test.passed': 11 });
+
+    const publish = one(spans, 'updraft publish');
+    expect(publish.attributes).toMatchObject({ 'updraft.step.attempt': 1, 'updraft.push.commits': 2, 'updraft.pull_request': 100, 'updraft.pull_request.draft': true });
+    expect(publish.events.map((e) => e.name)).toEqual(['attempt', 'push', 'pull_request.opened']);
+
+    const runner = one(spans, 'runner isolation');
+    const root = one(spans, 'invoke_workflow updraft');
+    expect(runner.parentSpanId).toBe(root.spanId);
+    expect(root.attributes).toMatchObject({ 'updraft.change.commits': 2, 'updraft.agent.reported_cost_usd': 0.4213, 'updraft.runs.kinds': ['implement'] });
+
+    // Content stays out: the edit's text, the plan's items.
+    const all = JSON.stringify(spans);
+    for (const secret of ['SECRET-OLD', 'SECRET-NEW', 'PLAN-ITEM', 'src/fake.ts']) expect(all).not.toContain(secret);
+  });
+
+  it('records a review verdict and its findings count, and the review it posted', async () => {
+    const t = setup();
+    await t.step('run_1', `${header({ kind: 'review' })}\n`, 0);
+    await t.step('run_1', claude.stream(claude.assistantText('UPDRAFT-VERDICT: changes-requested'), claude.success('ok')), 1000);
+    await t.step(
+      'run_1',
+      [
+        '---- end of agent output ----',
+        'review verdict for abcdef0123456789: changes-requested',
+        'review findings count: 3',
+        'outcome: succeeded',
+        'review: attempt 1 at 2026-11-21T10:01:00.000Z: verdict changes-requested for abcdef012345 of pull request #100',
+        'review: posted a comment review on pull request #100: https://github.com/octo/widgets/pull/100#r1',
+        'review: verdict changes-requested: revision-queued',
+        '',
+      ].join('\n'),
+      1000,
+    );
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const spans = t.exporter.spans;
+    expect(one(spans, 'invoke_agent claude-opus').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3 });
+    expect(one(spans, 'updraft post_review').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.outcome': 'revision-queued' });
+    expect(one(spans, 'invoke_workflow updraft').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3, 'updraft.review.outcome': 'revision-queued' });
+  });
+
+  it('marks a preparation that failed, and the failure comment', async () => {
+    const t = setup();
+    await t.step('run_1', `${header().replace('\n---- agent output (stdout and stderr) ----', '')}\n`, 0);
+    await t.step('run_1', 'source clone: /src/widgets\nerror: could not prepare the worktree: fatal: bad object\noutcome: failed\nfailure comment: commented on issue #7: https://github.com/octo/widgets/issues/7#c1\n', 2000);
+    await t.tracer.stop({ outcome: 'failed' });
+    const spans = t.exporter.spans;
+    expect(one(spans, 'updraft prepare')).toMatchObject({ error: true, errorMessage: 'could not prepare the worktree: fatal: bad object', attributes: { 'error.type': 'failed' } });
+    expect(one(spans, 'updraft failure_comment').events.map((e) => e.name)).toEqual(['comment.posted']);
+    expect(byName(spans, 'invoke_agent claude-opus')).toHaveLength(0);
+  });
+
+  it('reads Codex commands, patches and todo lists', async () => {
+    const t = setup();
+    await t.step('run_1', `${header({ agent: 'codex', adapter: 'codex', model: 'gpt-5-codex' }).replace('\n---- agent output (stdout and stderr) ----', '')}\ncheckout: /work/tree\n---- agent output (stdout and stderr) ----\n`, 0);
+    await t.step(
+      'run_1',
+      codex.stream(
+        codex.threadStarted(),
+        codex.turnStarted(),
+        { type: 'item.updated', item: { id: 'todo_1', type: 'todo_list', items: [{ text: 'a', completed: true }, { text: 'b', completed: false }] } },
+        codex.command('item_1', "bash -lc 'npx vitest run'", ' Tests  2 failed | 8 passed (10)\n', 1),
+        codex.fileChange('item_2', '/work/tree/src/theme.test.ts'),
+        codex.turnCompleted({ reasoning_output_tokens: 64 }),
+      ),
+      2000,
+    );
+    await t.step('run_1', '---- end of agent output ----\noutcome: succeeded\n', 10);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const spans = t.exporter.spans;
+    expect(one(spans, 'execute_tool shell').attributes).toMatchObject({ 'updraft.tool.command.program': 'vitest', 'updraft.tool.category': 'test', 'updraft.test.failed': 2, 'updraft.tool.exit_code': 1 });
+    expect(one(spans, 'execute_tool apply_patch').attributes).toMatchObject({ 'updraft.tool.file.path': 'src/theme.test.ts', 'updraft.tool.file.test': true, 'updraft.tool.category': 'edit' });
+    expect(one(spans, 'chat gpt-5-codex').attributes['updraft.usage.reasoning_output_tokens']).toBe(64);
+    expect(one(spans, 'invoke_agent codex').events.find((e) => e.name === 'todo.update').attributes).toMatchObject({ 'updraft.todo.total': 2, 'updraft.todo.completed': 1 });
+  });
+});
+
 describe('agent telemetry: what leaves the microVM', () => {
   it('redacts every field of every span and the resource, not only content (content capture off)', async () => {
     const key = 'sk-ant-api03-PLANTEDSECRETVALUE0123456789';

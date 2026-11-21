@@ -277,35 +277,56 @@ export async function runJob(request, deps) {
   let stateDirForLogs;
   // Agent telemetry (telemetry.mjs), when the tenant set it up: started with the job process.
   let tracer;
+  // The runner's own steps, timed for the trace (sent only when telemetry is on): isolation, the
+  // state, the coalescing wait, each try of `updraft run-event` and each wait for newer state.
+  const steps = [];
+  const timed = async (name, attributes, operation) => {
+    const step = { name, start: now(), attributes };
+    steps.push(step);
+    try {
+      return await operation(step);
+    } catch (error) {
+      step.error = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      step.end = now();
+    }
+  };
   // Set once `updraft run-event` has run, whatever its outcome: only then is there a
   // database worth merging.
   let stateToSync;
   try {
     // First of all, before a secret is fetched or a job process exists: the packet filter
     // that keeps every user but root from the execution role's credentials.
-    result.isolation = await beginIsolation(payload, deps);
-    const { stateDir, state } = await prepare(payload, deps);
+    result.isolation = await timed('isolation', {}, () => beginIsolation(payload, deps));
+    const { stateDir, state } = await timed('restore_state', {}, async (step) => {
+      const prepared = await prepare(payload, deps);
+      step.attributes = { 'updraft.state.restored': Boolean(prepared.state) };
+      return prepared;
+    });
     if (result.state && state) result.state.snapshot = state.snapshot;
     // Nothing is started unless the boundary around agents is proven in this microVM: the
     // config contains every agent, and a probe in the sandbox cannot reach the key, the state
     // or the credentials. Throws IsolationError; the job then never starts.
-    await verifyIsolation(
+    await timed('verify_isolation', {}, () => verifyIsolation(
       result.isolation,
       { stateDir, protectedFiles: [payload.version === 2 ? TOKEN_FILE : KEY_FILE, STATE_DB_FILE, CONFIG_FILE, EVENT_FILE].map((name) => path.join(stateDir, name)) },
       deps,
-    );
+    ));
     // A pull request event that other deliveries were coalesced into: start only when the
     // launcher has stopped coalescing, so that this run sees all of them on GitHub.
     const waitMs = Math.min(MAX_NOT_BEFORE_WAIT_MS, payload.notBefore ? Date.parse(payload.notBefore) - now() : 0);
     if (waitMs > 0 && !stopRequested) {
       log(`waiting ${Math.ceil(waitMs / 1000)} s for the launcher's coalescing window to close`);
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, waitMs);
-        stopWaiting = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-      });
+      await timed('coalesce_wait', { 'updraft.wait.planned_ms': waitMs }, () =>
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, waitMs);
+          stopWaiting = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        }),
+      );
     }
     if (stopRequested) throw new Error('the microVM was terminated before the job started');
     const budgetMs = watchdogBudgetMs(payload, now());
@@ -334,6 +355,7 @@ export async function runJob(request, deps) {
     redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? [telemetry.apiKey] : [])]);
     if (telemetry) {
       tracer = createAgentTracer({
+        startedAt,
         runsDir: path.join(stateDir, 'logs', 'runs'),
         // The job user owns everything under the state directory: reads are confined to it.
         confineTo: stateDir,
@@ -368,9 +390,14 @@ export async function runJob(request, deps) {
           : undefined;
       checkpointer?.start();
       try {
-        run = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log }, { agentEnv, redact }, (stop) => {
-          stopChild = stop;
-          if (stopRequested) stop();
+        run = await timed('run_event', { 'updraft.run_event.try': pending.tries + 1, 'updraft.run_event.deadline_minutes': deadlineNow }, async (step) => {
+          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: tracer?.traceId }, { agentEnv, redact }, (stop) => {
+            stopChild = stop;
+            if (stopRequested) stop();
+          });
+          Object.assign(step.attributes, { 'updraft.run_event.exit_code': done.exitCode ?? undefined, 'updraft.run_event.signal': done.signal ?? undefined, 'updraft.run_event.timed_out': done.timedOut || undefined, 'updraft.run_event.state_pending': done.exitCode === STATE_PENDING_EXIT || undefined });
+          if (done.exitCode !== 0 && done.exitCode !== STATE_PENDING_EXIT) step.error = done.signal ? `killed by ${done.signal}` : `exited ${done.exitCode}`;
+          return done;
         });
       } finally {
         const made = await checkpointer?.stop();
@@ -394,7 +421,11 @@ export async function runJob(request, deps) {
       log(`the shared state does not know this event's pull request yet; waiting up to ${Math.round(mayWaitMs / 1000)} s for it to change (try ${pending.tries})`);
       const waiting = new AbortController();
       stopWaiting = () => waiting.abort();
-      const changed = await waitForStateChange({ bucket: payload.bucket, key: payload.stateKey, etag: current.snapshot.etag ?? undefined, timeoutMs: mayWaitMs, signal: waiting.signal }, deps);
+      const changed = await timed('state_wait', { 'updraft.wait.planned_ms': mayWaitMs, 'updraft.state_pending.try': pending.tries }, async (step) => {
+        const found = await waitForStateChange({ bucket: payload.bucket, key: payload.stateKey, etag: current.snapshot.etag ?? undefined, timeoutMs: mayWaitMs, signal: waiting.signal }, deps);
+        step.attributes['updraft.state.changed'] = Boolean(found);
+        return found;
+      });
       stopWaiting = () => {};
       pending.waitedMs += Math.max(0, now() - waitStarted);
       if (!changed || stopRequested) break;
@@ -453,6 +484,7 @@ export async function runJob(request, deps) {
       summary: result.summary,
       deliveryId: payload.deliveryId,
       eventName: payload.eventName,
+      steps,
       budgetMs: deps.telemetryBudgetMs ?? (stopRequested ? 5_000 : 15_000),
     });
     log(`agent telemetry: ${result.telemetry.exported} of ${result.telemetry.spans} span(s) sent${result.telemetry.lastError ? ` (last error: ${result.telemetry.lastError})` : ''}`);
@@ -822,6 +854,9 @@ function jobEnvironment(payload, stateDir, agentEnv, deps) {
   if (baseEnv.PLAYWRIGHT_BROWSERS_PATH) env.PLAYWRIGHT_BROWSERS_PATH = baseEnv.PLAYWRIGHT_BROWSERS_PATH;
   // Settings of the sandbox runtime client that Updraft starts (tests point it at a config).
   Object.assign(env, deps.isolation?.runtimeEnv);
+  // The job's trace, when telemetry is on: Updraft records it with each run, so a later job's
+  // trace can link back to this one (a revision to the review it answers). An id, not a secret.
+  if (typeof deps.traceId === 'string' && /^[0-9a-f]{32}$/.test(deps.traceId)) env.UPDRAFT_TRACE_ID = deps.traceId;
   // Deliberately absent: AWS_* (the runner's credentials and region), anything naming the
   // key file, and the run request. See "Security model" in the README for what this does
   // and does not achieve.

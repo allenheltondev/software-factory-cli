@@ -210,7 +210,8 @@ The count is telemetry for [`updraft stats`](stats.md) and nothing else. It is r
 findings after the verdict has been decided, and never changes or fails a verdict: the rules
 above are applied exactly as if the line were not there. Exactly one such line with a whole
 number from 0 to 999999 gives the count. A missing line, two of them, or any other value gives
-no count, and one line in `run.log` says why (`review findings count: none (...)`). The line
+no count, and one line in `run.log` says why (`review findings count: none (...)`); a count is
+logged as `review findings count: N`, which agent telemetry reads. The line
 must still come before the verdict line: written after it, it is text after the verdict and the
 run fails as it always would. The count line is left out of the findings Updraft stores, posts
 on the PR and gives to later reviews and revisions. It is stored with the verdict

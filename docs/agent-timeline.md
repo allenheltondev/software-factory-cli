@@ -79,6 +79,44 @@ Details that follow the conventions and Honeycomb's cost calculation:
 - **Nothing is sampled.** Honeycomb recommends against sampling GenAI telemetry, and the runner
   sends every span (up to 20,000 per run).
 
+## Structural detail
+
+Without content, a trace still says what each step was about. These attributes are read from
+the tool calls, the worker's lines and the CLI's own reports, and are always recorded (they are
+redacted like everything else, and never hold a command's arguments, a file's contents or a
+tool's output):
+
+| Where | Attributes |
+| --- | --- |
+| Every tool call | `updraft.tool.category` (`test`, `lint`, `build`, `install`, `git`, `github`, `network`, `run`, `edit`, `filesystem`, `search`, `read`, `web`, `plan`, `delegate`, `mcp`, `other`), `updraft.tool.output.bytes`, `updraft.tool.output.lines` |
+| A command (Bash, Codex `shell`) | `updraft.tool.command.program` (the first program that is not `cd`), `updraft.tool.command.programs`, `updraft.tool.exit_code`, `updraft.tool.background` |
+| An edit (Edit, MultiEdit, Write, `apply_patch`) | `updraft.tool.file.path` (relative to the worktree), `.extension`, `.test`, `updraft.tool.lines_added`, `updraft.tool.lines_removed`; for a patch `updraft.tool.file.paths` and counts by kind |
+| Read, Grep, Glob, WebFetch | the file or directory, the glob, how many lines or results came back; WebFetch's host only |
+| A test run (an agent's command or a verify command) | `updraft.test.framework` (vitest, jest, pytest, go, cargo, mocha, rspec, node-test), `.passed`, `.failed`, `.skipped`, `.total`, `.failed_tests` (names, never messages, up to 20); `updraft.check.errors`/`.warnings` for tsc, eslint, mypy, ruff |
+| `invoke_agent` | `updraft.agent.duration_ms` and `.api_duration_ms` (wall time against time waiting on the model, as Claude Code measured them), `.permission_denials` and `.permission_denied_tools`, `.compactions`, `.first_compaction_ms`, `.cli_version`, `.permission_mode`, `.mcp_servers(_failed)`, `.exit_code`, `.stopped_by`; `updraft.review.verdict` and `updraft.review.findings` for a review; `updraft.change.*` from the run summary (commits, files, insertions, deletions, untracked, paths, test files, and lines changed in tests and elsewhere) |
+
+Span events mark moments inside a span: `todo.update` whenever the agent's plan changes (counts
+by status; the items only with content on), `compaction` when Claude Code compacted the context
+(trigger and tokens before), `model_usage` per model at the end of a Claude run (tokens, cost),
+and `system.<subtype>` for other things the CLI reports about itself (plain values only).
+
+Updraft's own steps are spans on the `updraft` lane:
+
+```
+invoke_workflow updraft
+├─ runner isolation / restore_state / verify_isolation / coalesce_wait / run_event / state_wait
+├─ updraft prepare          prompt and worktree, until the agent starts (failed if it never did)
+├─ invoke_agent <profile>
+├─ invoke_workflow verify
+├─ updraft publish          push and pull request, one span per attempt, an event per line
+├─ updraft post_review      the review posted and what it led to (updraft.review.outcome)
+├─ updraft push_revision    a revision's push
+└─ updraft failure_comment
+```
+
+The root span is the job in one wide event: tokens, reported cost and tool calls over every
+run, the last review's verdict, findings and outcome, and the last change's size.
+
 ## Content
 
 Off by default. With **Prompts and outputs** on, spans also carry:

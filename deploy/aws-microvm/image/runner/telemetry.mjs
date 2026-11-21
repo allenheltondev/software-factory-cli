@@ -25,11 +25,23 @@
 // cut to MAX_ATTRIBUTE_CHARS. Without it, spans hold names, ids, timings, token counts, outcomes
 // and the verify commands (which are configuration, not content).
 /* global AbortSignal */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import {
+  checkAttributes,
+  claudeToolAttributes,
+  codexTodoAttributes,
+  codexToolAttributes,
+  isTestPath,
+  parseCheckOutput,
+  parseTestOutput,
+  resultAttributes,
+  testAttributes,
+  toolCategory,
+} from './telemetry-detail.mjs';
 
 export const SCOPE = { name: 'updraft-microvm-runner', version: '1' };
 /** How often the run logs are looked at. */
@@ -50,6 +62,12 @@ const MAX_RUNS = 64;
 /** The most of a run's prompt that is read. */
 const MAX_PROMPT_BYTES = 256 * 1024;
 const MAX_SPANS_PER_RUN = 20000;
+/** Span events per span at most; past it they are counted, not kept. */
+export const MAX_EVENTS_PER_SPAN = 256;
+/** The most of one verify command's output that is kept for reading its test counts. */
+const MAX_VERIFY_OUTPUT_CHARS = 512 * 1024;
+/** Updraft's own messages on span events (publication, review, revision steps), cut to this. */
+const MAX_MESSAGE_CHARS = 300;
 
 const KIND_INTERNAL = 1;
 const KIND_CLIENT = 3;
@@ -94,7 +112,21 @@ export function toOtlpSpan(s) {
     endTimeUnixNano: nanos(Math.max(s.start, s.end ?? s.start)),
     attributes: attributes(s.attributes ?? {}),
     status: s.error ? { code: STATUS_ERROR, ...(s.errorMessage ? { message: s.errorMessage } : {}) } : { code: STATUS_OK },
+    ...(s.events?.length ? { events: s.events.map((e) => ({ timeUnixNano: nanos(e.at), name: e.name, attributes: attributes(e.attributes ?? {}) })) } : {}),
+    ...(s.droppedEvents ? { droppedEventsCount: s.droppedEvents } : {}),
+    ...(s.links?.length ? { links: s.links.map((l) => ({ traceId: l.traceId, spanId: l.spanId, attributes: attributes(l.attributes ?? {}) })) } : {}),
   };
+}
+
+/** Adds a span event (a point in time inside a span, with its own attributes). */
+export function addEvent(span, at, name, attrs = {}) {
+  if (!span) return;
+  span.events ??= [];
+  if (span.events.length >= MAX_EVENTS_PER_SPAN) {
+    span.droppedEvents = (span.droppedEvents ?? 0) + 1;
+    return;
+  }
+  span.events.push({ at, name, attributes: attrs });
 }
 
 /** An OTLP/HTTP export request body for these spans. */
@@ -180,6 +212,8 @@ export function redactSpan(span, redact) {
     name: redact(span.name),
     attributes: redactAttributes(span.attributes ?? {}, redact),
     ...(span.errorMessage ? { errorMessage: redact(span.errorMessage) } : {}),
+    ...(span.events ? { events: span.events.map((e) => ({ ...e, name: redact(e.name), attributes: redactAttributes(e.attributes ?? {}, redact) })) } : {}),
+    ...(span.links ? { links: span.links.map((l) => ({ ...l, attributes: redactAttributes(l.attributes ?? {}, redact) })) } : {}),
   };
 }
 
@@ -214,6 +248,25 @@ function clip(redact, value) {
   return JSON.stringify(`[${JSON.stringify(parsed).length} characters, too large to record]`);
 }
 
+/** A name, version or id as the CLI reports it: plain characters only, else it is not recorded. */
+const SAFE_NAME = /^[A-Za-z0-9_.:@/+[\]-]{1,128}$/;
+/** Fields of a CLI event that are never put on a span: ids already there, and anything that may be content. */
+const NOT_SCALAR = new Set(['type', 'subtype', 'uuid', 'session_id', 'parent_tool_use_id', 'output', 'stdout', 'stderr', 'content', 'text', 'message', 'prompt', 'result', 'body', 'input', 'response']);
+
+/** An event's plain values (numbers, booleans, short plain strings) as attributes under `prefix`. */
+function scalarAttributes(ev, prefix) {
+  const out = {};
+  let n = 0;
+  for (const [k, v] of Object.entries(ev)) {
+    if (NOT_SCALAR.has(k) || !/^[A-Za-z_]{1,40}$/.test(k) || n >= 24) continue;
+    if (typeof v === 'number' || typeof v === 'boolean' || (typeof v === 'string' && /^[\w .:/@+-]{0,80}$/.test(v))) {
+      out[`${prefix}.${k}`] = v;
+      n++;
+    }
+  }
+  return out;
+}
+
 /** The text of a Claude tool_result's content (a string or content blocks). */
 function resultText(content) {
   if (typeof content === 'string') return content;
@@ -225,7 +278,10 @@ function resultText(content) {
 export function parseHeaderLine(line, h) {
   let m;
   if ((m = /^updraft run (\S+)/.exec(line))) h.runId = m[1];
-  else if ((m = /^job: (\S+)/.exec(line))) h.jobId = m[1];
+  else if ((m = /^job: (\S+)(?: \(attempt (\d+)\))?/.exec(line))) {
+    h.jobId = m[1];
+    if (m[2]) h.attempt = Number(m[2]);
+  }
   else if ((m = /^repository: (\S+)/.exec(line))) h.repository = m[1];
   else if ((m = /^issue: #(\d+)/.exec(line))) h.issue = Number(m[1]);
   else if ((m = /^workflow: (\S+)/.exec(line))) h.workflow = m[1];
@@ -241,7 +297,29 @@ export function parseHeaderLine(line, h) {
   } else if (line.startsWith('code written by agent: ')) h.kind = 'review';
   else if (line.startsWith('review: ') && h.kind !== 'review') h.kind = 'revision';
   else if ((m = /^pull request: #(\d+)/.exec(line))) h.pullRequest = Number(m[1]);
+  else if ((m = /^trigger: (\S+)/.exec(line))) h.trigger = m[1];
+  else if ((m = /^review: \S+ \((\d+) inline comment/.exec(line))) h.reviewComments = Number(m[1]);
+  // What the worker logs once the worktree is ready, just before the agent starts.
+  else if ((m = /^base: (\S+) at ([0-9a-f]{7,40})/.exec(line))) {
+    h.baseBranch = m[1];
+    h.baseSha = m[2];
+  } else if ((m = /^branch: (\S+)/.exec(line))) h.branch = m[1];
+  else if ((m = /^checkout: (\S+)/.exec(line))) h.checkout = m[1];
+  else if ((m = /^container: \S+ \(runtime ([A-Za-z0-9_-]+)\)/.exec(line))) h.containerRuntime = m[1];
+  else if ((m = /^timeout: (\d+) min/.exec(line))) h.timeoutMinutes = Number(m[1]);
+  else if (line.startsWith('issue body: withheld')) h.issueWithheld = true;
+  // Earlier runs of the same pull request, with the trace each was in (src/worker/live.ts).
+  else if ((m = /^follows: run ([A-Za-z0-9_-]{1,80}) \(([a-z_-]{1,32}), trace ([0-9a-f]{32})\)/.exec(line))) {
+    h.follows ??= [];
+    if (h.follows.length < 8) h.follows.push({ runId: m[1], relation: m[2], traceId: m[3] });
+  }
 }
+
+/**
+ * The span id of a run's invoke_agent span: derived from the run id, so a later job (another
+ * microVM, another trace) can link to it knowing only the run and the trace it was in.
+ */
+export const agentSpanIdFor = (runId) => createHash('sha256').update(`updraft-agent-span:${runId}`).digest('hex').slice(0, 16);
 
 const isJsonLine = (line) => line.startsWith('{') && line.endsWith('}');
 function parseJson(line) {
@@ -271,7 +349,18 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   const tools = new Map();
   /** Codex: the open turn's chat span. */
   let turn = null;
-  const summary = { runId: null, kind: null, agent: null, chats: 0, tools: 0, toolErrors: 0, inputTokens: 0, outputTokens: 0, outcome: null };
+  const summary = { runId: null, kind: null, agent: null, chats: 0, tools: 0, toolErrors: 0, inputTokens: 0, outputTokens: 0, outcome: null, costUsd: null, review: null, change: null };
+  /** When the run's first line was read: its preparation (prompt, worktree) starts then. */
+  let firstAt = null;
+  let prepareSpan = null;
+  /** Inside the run summary the worker writes at the end ('summary' or 'stat'), else null. */
+  let summarySection = null;
+  const change = { paths: [], testFiles: 0, testLines: 0, sourceLines: 0 };
+  /** Updraft's publication, review and revision steps after the run, by step. */
+  const steps = new Map();
+  let compactions = 0;
+  /** Where the agent's paths are relative to: its own working directory, and the worktree. */
+  const roots = () => [h.cwd, h.checkout].filter(Boolean);
 
   const conversationId = () => (h.repository && h.issue !== undefined ? `${h.repository}#${h.issue}` : (h.jobId ?? path.basename(runDir)));
   const provider = () => PROVIDER[h.adapter] ?? h.adapter;
@@ -295,10 +384,47 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (spans++ < MAX_SPANS_PER_RUN) emit(span);
   }
 
-  function startAgent(at) {
-    agentSpan = {
+  /** Updraft's own steps: on the "updraft" lane, with no provider. */
+  const updraftBase = () => ({ ...base('updraft'), 'gen_ai.provider.name': undefined });
+
+  /** The run's preparation, from its first line to the worker's "ready" block; ended when the agent starts or the run ends. */
+  function endPrepare(at, failure) {
+    if (firstAt === null || prepareSpan?.ended) return;
+    prepareSpan ??= {
       traceId,
       spanId: newSpanId(),
+      parentSpanId: rootSpanId,
+      name: 'updraft prepare',
+      kind: KIND_INTERNAL,
+      start: firstAt,
+    };
+    prepareSpan.attributes = {
+      ...updraftBase(),
+      'updraft.step': 'prepare',
+      'updraft.job.attempt': h.attempt,
+      'updraft.trigger': h.trigger,
+      'updraft.base.branch': h.baseBranch,
+      'updraft.base.sha': h.baseSha,
+      'updraft.branch': h.branch,
+      'updraft.container.runtime': h.containerRuntime,
+      'updraft.agent.timeout_minutes': h.timeoutMinutes,
+      'updraft.issue.withheld': h.issueWithheld,
+      'updraft.review.inline_comments': h.reviewComments,
+    };
+    if (failure) {
+      prepareSpan.error = true;
+      prepareSpan.attributes['error.type'] = failure.type;
+      if (failure.message) prepareSpan.errorMessage = failure.message.slice(0, MAX_MESSAGE_CHARS);
+    }
+    finish(prepareSpan, h.preparedAt ?? at);
+  }
+
+  function startAgent(at) {
+    endPrepare(at);
+    agentSpan = {
+      traceId,
+      // Derived from the run id, so a later job's trace can link to this run.
+      spanId: h.runId ? agentSpanIdFor(h.runId) : newSpanId(),
       parentSpanId: rootSpanId,
       name: `invoke_agent ${h.agent ?? 'agent'}`,
       kind: KIND_INTERNAL,
@@ -310,7 +436,13 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         'updraft.agent.effort': h.effort,
         'updraft.pool': h.pool,
         'updraft.workflow': h.workflow,
+        'updraft.trigger': h.trigger,
+        'updraft.job.attempt': h.attempt,
+        'updraft.branch': h.branch,
+        'updraft.base.sha': h.baseSha,
       },
+      // The runs this one follows: the review it answers, the code it reviews.
+      links: (h.follows ?? []).map((f) => ({ traceId: f.traceId, spanId: agentSpanIdFor(f.runId), attributes: { 'updraft.link.relation': f.relation, 'updraft.run.id': f.runId } })),
     };
     contexts.set('', { span: agentSpan, name: h.agent ?? 'agent', last: at, chat: null, pendingInput: [] });
     Object.assign(summary, { runId: h.runId ?? null, kind: h.kind, agent: h.agent ?? null });
@@ -321,6 +453,13 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         })
         .catch(() => {});
     }
+  }
+
+  /** The agent's plan changed (TodoWrite, a Codex todo list): its counts, and its items with content on. */
+  function todoEvent(span, at, detail, items) {
+    const counts = Object.fromEntries(Object.entries(detail).filter(([k]) => k.startsWith('updraft.todo.')));
+    if (!Object.keys(counts).length) return;
+    addEvent(span, at, 'todo.update', { ...counts, 'updraft.todo.items': items ? content(items) : undefined });
   }
 
   // ---- Claude Code stream-json --------------------------------------------------------------
@@ -379,10 +518,33 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
 
   function onClaude(ev, at) {
     if (ev.type === 'system' && ev.subtype === 'init') {
+      if (typeof ev.cwd === 'string') h.cwd = ev.cwd;
       if (agentSpan) {
-        Object.assign(agentSpan.attributes, { 'gen_ai.agent.id': typeof ev.session_id === 'string' ? ev.session_id : undefined });
+        const servers = Array.isArray(ev.mcp_servers) ? ev.mcp_servers.filter((m) => m && typeof m.name === 'string' && SAFE_NAME.test(m.name)) : [];
+        Object.assign(agentSpan.attributes, {
+          'gen_ai.agent.id': typeof ev.session_id === 'string' ? ev.session_id : undefined,
+          'updraft.agent.cli_version': typeof ev.claude_code_version === 'string' && SAFE_NAME.test(ev.claude_code_version) ? ev.claude_code_version : undefined,
+          'updraft.agent.permission_mode': typeof ev.permissionMode === 'string' && SAFE_NAME.test(ev.permissionMode) ? ev.permissionMode : undefined,
+          'updraft.agent.tools_available': Array.isArray(ev.tools) ? ev.tools.length : undefined,
+          'updraft.agent.mcp_servers': servers.length ? servers.map((m) => m.name) : undefined,
+          'updraft.agent.mcp_servers_failed': servers.some((m) => m.status !== 'connected') ? servers.filter((m) => m.status !== 'connected').map((m) => m.name) : undefined,
+        });
         if (!h.model && typeof ev.model === 'string') agentSpan.attributes['gen_ai.request.model'] = ev.model;
       }
+      return;
+    }
+    if (ev.type === 'system' && ev.subtype === 'compact_boundary') {
+      // The agent's context was compacted: the conversation so far replaced by a summary.
+      const ctx = claudeContext(ev.parent_tool_use_id, at);
+      const meta = ev.compact_metadata && typeof ev.compact_metadata === 'object' ? ev.compact_metadata : {};
+      compactions += 1;
+      addEvent(ctx.span, at, 'compaction', { 'updraft.compaction.trigger': typeof meta.trigger === 'string' && SAFE_NAME.test(meta.trigger) ? meta.trigger : undefined, 'updraft.compaction.pre_tokens': typeof meta.pre_tokens === 'number' ? meta.pre_tokens : undefined });
+      if (agentSpan && agentSpan.attributes['updraft.agent.first_compaction_ms'] === undefined) agentSpan.attributes['updraft.agent.first_compaction_ms'] = at - agentSpan.start;
+      return;
+    }
+    if (ev.type === 'system' && typeof ev.subtype === 'string' && /^[a-z_]{1,40}$/.test(ev.subtype)) {
+      // Anything else the CLI reports about itself (retries, status, hooks): its name and its plain values only.
+      addEvent(claudeContext(ev.parent_tool_use_id, at).span, at, `system.${ev.subtype}`, scalarAttributes(ev, 'updraft.system'));
       return;
     }
     if (ev.type === 'assistant' && ev.message && typeof ev.message === 'object') {
@@ -417,6 +579,8 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         else if (block?.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
           c.parts.push({ type: 'tool_call', id: block.id, name: block.name, arguments: block.input ?? {} });
           if (!c.stop) c.stop = 'tool_use';
+          const input = block.input && typeof block.input === 'object' ? block.input : {};
+          const detail = claudeToolAttributes(block.name, input, roots());
           const span = {
             traceId,
             spanId: newSpanId(),
@@ -431,9 +595,11 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
               'gen_ai.tool.call.id': block.id,
               'gen_ai.tool.type': block.name.startsWith('mcp__') ? 'extension' : 'function',
               'gen_ai.tool.call.arguments': content(block.input ?? {}),
+              ...detail,
             },
           };
-          tools.set(block.id, { span, input: block.input && typeof block.input === 'object' ? block.input : {} });
+          tools.set(block.id, { span, input, name: block.name, category: detail['updraft.tool.category'], ctx });
+          if (block.name === 'TodoWrite') todoEvent(ctx.span, at, detail, Array.isArray(input.todos) ? input.todos.map((t) => ({ content: t?.content, status: t?.status })) : null);
         }
       }
       return;
@@ -449,7 +615,9 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         if (!tool) continue;
         tools.delete(block.tool_use_id);
         summary.tools += 1;
-        if (block.is_error === true) {
+        const failed = block.is_error === true;
+        Object.assign(tool.span.attributes, resultAttributes(tool.category, tool.name, text, failed));
+        if (failed) {
           tool.span.error = true;
           tool.span.attributes['error.type'] = 'tool_error';
           summary.toolErrors += 1;
@@ -470,10 +638,38 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       const ctx = contexts.get('');
       if (ctx) closeChat(ctx, at);
       if (agentSpan) {
+        const denials = Array.isArray(ev.permission_denials) ? ev.permission_denials : null;
+        const usage = ev.modelUsage && typeof ev.modelUsage === 'object' && !Array.isArray(ev.modelUsage) ? ev.modelUsage : {};
+        const models = Object.keys(usage).filter((m) => SAFE_NAME.test(m)).slice(0, 16);
+        const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+        const word = (v) => (typeof v === 'string' && SAFE_NAME.test(v) ? v : undefined);
         Object.assign(agentSpan.attributes, {
-          'updraft.agent.turns': typeof ev.num_turns === 'number' ? ev.num_turns : undefined,
-          'updraft.agent.reported_cost_usd': typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
+          'updraft.agent.turns': num(ev.num_turns),
+          'updraft.agent.reported_cost_usd': num(ev.total_cost_usd),
+          // Wall time against time spent waiting on the model API, as the CLI measured them.
+          'updraft.agent.duration_ms': num(ev.duration_ms),
+          'updraft.agent.api_duration_ms': num(ev.duration_api_ms),
+          'updraft.agent.result.subtype': word(ev.subtype),
+          'updraft.agent.terminal_reason': word(ev.terminal_reason),
+          'updraft.agent.stop_reason': word(ev.stop_reason),
+          'updraft.agent.errors': Array.isArray(ev.errors) ? ev.errors.length : undefined,
+          'updraft.agent.permission_denials': denials ? denials.length : undefined,
+          'updraft.agent.permission_denied_tools': denials?.length ? [...new Set(denials.map((d) => d?.tool_name).filter((n) => typeof n === 'string' && SAFE_NAME.test(n)))] : undefined,
+          'updraft.agent.models': models.length ? models : undefined,
         });
+        if (typeof ev.total_cost_usd === 'number') summary.costUsd = ev.total_cost_usd;
+        for (const m of models) {
+          const u = usage[m] && typeof usage[m] === 'object' ? usage[m] : {};
+          addEvent(agentSpan, at, 'model_usage', {
+            'gen_ai.response.model': m,
+            'updraft.usage.input_tokens': num(u.inputTokens),
+            'updraft.usage.output_tokens': num(u.outputTokens),
+            'updraft.usage.cache_read_tokens': num(u.cacheReadInputTokens),
+            'updraft.usage.cache_creation_tokens': num(u.cacheCreationInputTokens),
+            'updraft.usage.web_search_requests': num(u.webSearchRequests),
+            'updraft.usage.cost_usd': num(u.costUSD),
+          });
+        }
         if (captureContent && typeof ev.result === 'string') {
           agentSpan.attributes['gen_ai.output.messages'] = clip(redact, [{ role: 'assistant', parts: [{ type: 'text', content: ev.result }], finish_reason: ev.is_error ? 'error' : 'stop' }]);
         }
@@ -505,6 +701,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     const output = Number(usage?.output_tokens) || 0;
     // OpenAI's input count already includes the cached tokens.
     Object.assign(t.span.attributes, {
+      'updraft.usage.reasoning_output_tokens': Number(usage?.reasoning_output_tokens) || undefined,
       'gen_ai.usage.input_tokens': usage ? input : undefined,
       'gen_ai.usage.output_tokens': usage ? output : undefined,
       'gen_ai.usage.cache_read.input_tokens': cached || undefined,
@@ -556,6 +753,14 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     }
     const item = ev.item;
     if (!item || typeof item !== 'object' || typeof item.id !== 'string') return;
+    if (item.type === 'todo_list') {
+      todoEvent(agentSpan, at, codexTodoAttributes(item), Array.isArray(item.items) ? item.items.map((t) => ({ content: t?.text, status: t?.completed ? 'completed' : 'pending' })) : null);
+      return;
+    }
+    if (item.type === 'error' && ev.type === 'item.completed') {
+      addEvent(agentSpan, at, 'error', { 'updraft.message': captureContent && typeof item.message === 'string' ? clip(redact, item.message.slice(0, MAX_MESSAGE_CHARS)) : undefined });
+      return;
+    }
     if (ev.type === 'item.completed' && item.type === 'agent_message' && typeof item.text === 'string') turn?.parts.push({ type: 'text', content: item.text });
     if (ev.type === 'item.completed' && item.type === 'reasoning' && typeof item.text === 'string') turn?.parts.push({ type: 'reasoning', content: item.text });
     const kind = codexTool(item);
@@ -564,7 +769,11 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (!open) {
       if (turn) turn.toolCalls += 1;
       turn?.parts.push({ type: 'tool_call', id: item.id, name: kind.name, arguments: kind.args });
+      const detail = codexToolAttributes(item, roots());
+      detail['updraft.tool.category'] = toolCategory(kind.name, detail);
       open = {
+        name: kind.name,
+        category: detail['updraft.tool.category'],
         span: {
           traceId,
           spanId: newSpanId(),
@@ -579,6 +788,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
             'gen_ai.tool.call.id': item.id,
             'gen_ai.tool.type': kind.extension ? 'extension' : 'function',
             'gen_ai.tool.call.arguments': content(kind.args),
+            ...detail,
           },
         },
       };
@@ -595,14 +805,127 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       summary.toolErrors += 1;
     }
     const result = item.aggregated_output ?? item.result ?? (item.error ? item.error.message : undefined);
+    if (item.type === 'command_execution') Object.assign(open.span.attributes, resultAttributes(open.category, open.name, typeof item.aggregated_output === 'string' ? item.aggregated_output : '', failed));
+    if (typeof item.exit_code === 'number') open.span.attributes['updraft.tool.exit_code'] = item.exit_code;
     if (result !== undefined && !failed) open.span.attributes['gen_ai.tool.call.result'] = content(result);
     finish(open.span, at);
   }
 
   // ---- The worker's own lines ----------------------------------------------------------------
 
+  /** Updraft's steps after a run, by the prefix the publish modules give their run.log lines. */
+  const STEP_PREFIXES = [
+    ['publication: ', 'publish'],
+    ['review: ', 'post_review'],
+    ['revision: ', 'push_revision'],
+    ['failure comment: ', 'failure_comment'],
+  ];
+
+  /**
+   * One line of a publication, review or revision step: a new attempt starts a span; everything
+   * else is an event on it (with the line, which is Updraft's own text), and what it says about
+   * the pull request and the review lands on the span.
+   */
+  function onStepLine(step, text, at) {
+    let m;
+    const attempt = /^attempt (\d+) (?:\(|at\b)/.exec(text);
+    let s = steps.get(step);
+    if (s && attempt) {
+      finish(s.span, s.last);
+      s = null;
+    }
+    if (!s) {
+      s = {
+        span: { traceId, spanId: newSpanId(), parentSpanId: rootSpanId, name: `updraft ${step}`, kind: KIND_INTERNAL, start: at, attributes: { ...updraftBase(), 'updraft.step': step, 'updraft.step.attempt': attempt ? Number(attempt[1]) : undefined } },
+        last: at,
+      };
+      steps.set(step, s);
+    }
+    s.last = at;
+    const a = s.span.attributes;
+    let name = 'log';
+    if ((m = /^pushing (?:\S+ \([0-9a-f]+, |[0-9a-f]+\.\.[0-9a-f]+ \()(\d+) commit/.exec(text))) {
+      name = 'push';
+      a['updraft.push.commits'] = Number(m[1]);
+    } else if ((m = /^opened (draft )?PR #(\d+): (\S+)/.exec(text))) {
+      name = 'pull_request.opened';
+      Object.assign(a, { 'updraft.pull_request': Number(m[2]), 'updraft.pull_request.url': m[3], 'updraft.pull_request.draft': Boolean(m[1]) });
+    } else if ((m = /^reusing PR #(\d+)/.exec(text))) {
+      name = 'pull_request.reused';
+      a['updraft.pull_request'] = Number(m[1]);
+    } else if (/ is already on /.test(text)) name = 'already_pushed';
+    else if (/^skipped: /.test(text)) {
+      name = 'skipped';
+      a['updraft.step.result'] = 'skipped';
+    } else if (/^not posted: /.test(text)) {
+      name = 'not_posted';
+      a['updraft.step.result'] = 'not_posted';
+      s.span.error = true;
+      a['error.type'] = 'not_posted';
+    } else if ((m = /verdict (\S+) for [0-9a-f]+ of pull request #(\d+)/.exec(text))) {
+      name = 'attempt';
+      Object.assign(a, { 'updraft.review.verdict': m[1], 'updraft.pull_request': Number(m[2]) });
+    } else if ((m = /^verdict \S+: ([a-z-]+)/.exec(text))) {
+      name = 'review.outcome';
+      a['updraft.review.outcome'] = m[1];
+      summary.review = { ...(summary.review ?? {}), outcome: m[1] };
+    } else if (/^(posted a comment review|review already on)/.test(text)) name = 'review.posted';
+    else if (/^marked pull request #\d+ ready/.test(text)) name = 'pull_request.ready';
+    else if (/^(updated the comment|commented|comment already|already on)/.test(text)) name = 'comment.posted';
+    else if (/^attempt \d+ stopped/.test(text)) name = 'superseded';
+    else if (attempt) name = 'attempt';
+    addEvent(s.span, at, name, { 'updraft.message': text.slice(0, MAX_MESSAGE_CHARS) });
+  }
+
+  /** The worker's end-of-run summary: commits, the diffstat, untracked files. */
+  function onSummaryLine(line) {
+    let m;
+    if ((m = /^ {2}commits since base: (\d+)/.exec(line))) change.commits = Number(m[1]);
+    else if ((m = /^ {2}changed files \(.*\): (\d+)$/.exec(line))) {
+      change.files = Number(m[1]);
+      summarySection = 'stat';
+    } else if (summarySection === 'stat' && (m = /^ {2}(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/.exec(line))) {
+      change.insertions = Number(m[2] ?? 0);
+      change.deletions = Number(m[3] ?? 0);
+    } else if (summarySection === 'stat' && (m = /^ {2}(\S.*?)\s+\|\s+(\d+|Bin)\b/.exec(line))) {
+      const lines = m[2] === 'Bin' ? 0 : Number(m[2]);
+      if (change.paths.length < 50) change.paths.push(m[1].slice(0, 512));
+      if (isTestPath(m[1])) {
+        change.testFiles += 1;
+        change.testLines += lines;
+      } else change.sourceLines += lines;
+    } else if ((m = /^ {2}untracked files: (\d+)/.exec(line))) {
+      change.untracked = Number(m[1]);
+      summarySection = 'summary';
+    } else if (line === '  last agent output:') summarySection = 'output';
+  }
+
   function onWorkerLine(line, at) {
     let m;
+    if (verifyStep && !line.startsWith('---- ') && !/^exit: (code|signal) /.test(line)) {
+      // A verify command's own output: kept (its end) to read the test counts from.
+      if (verifyStep.outputLines === undefined) {
+        // The first line is the worker's 'command: [...]'.
+        verifyStep.outputLines = 0;
+        verifyStep.output = '';
+        if (line.startsWith('command: ')) return;
+      }
+      verifyStep.outputLines += 1;
+      verifyStep.output += `${line}\n`;
+      if (verifyStep.output.length > MAX_VERIFY_OUTPUT_CHARS) verifyStep.output = verifyStep.output.slice(-MAX_VERIFY_OUTPUT_CHARS / 2);
+      return;
+    }
+    if (line === 'summary:' && phase === 'after') {
+      summarySection = 'summary';
+      return;
+    }
+    if (summarySection) {
+      if (line.startsWith('  ')) return onSummaryLine(line);
+      if (line !== '') summarySection = null;
+    }
+    for (const [prefix, step] of STEP_PREFIXES) {
+      if (line.startsWith(prefix) && phase === 'after') return onStepLine(step, line.slice(prefix.length), at);
+    }
     if (line.startsWith('---- agent output')) {
       phase = 'agent';
       startAgent(at);
@@ -646,11 +969,14 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         verifyStep.error = true;
         verifyStep.attributes['error.type'] = code === null ? `signal_${m[3]}` : 'exit_code';
       }
-      finish(verifyStep, at);
-      verifyStep = null;
+      endVerifyStep(at);
+    } else if ((m = /^exit: (code (-?\d+)|signal (\S+)) after (\d+)s(?: \(stopped by the worker: ([a-z_ ]+)\))?/.exec(line)) && agentSpan && !verifySpan && agentSpan.attributes['updraft.agent.exit_code'] === undefined && agentSpan.attributes['updraft.agent.exit_signal'] === undefined) {
+      // How the agent's process ended.
+      if (m[2] !== undefined) agentSpan.attributes['updraft.agent.exit_code'] = Number(m[2]);
+      else agentSpan.attributes['updraft.agent.exit_signal'] = m[3].slice(0, 32);
+      if (m[5]) agentSpan.attributes['updraft.agent.stopped_by'] = m[5];
     } else if ((m = /^---- end of verification: (\w+) ----$/.exec(line))) {
-      if (verifyStep) finish(verifyStep, at);
-      verifyStep = null;
+      if (verifyStep) endVerifyStep(at);
       if (verifySpan) {
         if (m[1] !== 'passed') {
           verifySpan.error = true;
@@ -660,8 +986,22 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         finish(verifySpan, at);
         verifySpan = null;
       }
+    } else if ((m = /^review verdict for ([0-9a-f]{7,40}): (\S+)/.exec(line))) {
+      const verdict = m[2] === 'none' ? 'none' : m[2];
+      summary.review = { ...(summary.review ?? {}), verdict };
+      if (agentSpan) Object.assign(agentSpan.attributes, { 'updraft.review.verdict': verdict, 'updraft.review.head_sha': m[1] });
+      if (verdict === 'none' && agentSpan) agentSpan.attributes['error.type'] = 'no_verdict';
+    } else if ((m = /^review findings count: (\d+)/.exec(line))) {
+      summary.review = { ...(summary.review ?? {}), findings: Number(m[1]) };
+      if (agentSpan) agentSpan.attributes['updraft.review.findings'] = Number(m[1]);
+    } else if ((m = /^waiting on: ([\w.-]+\/[\w.-]+)#(\d+)/.exec(line))) {
+      if (agentSpan) agentSpan.attributes['updraft.waiting_on'] = `${m[1]}#${m[2]}`;
+    } else if (line.startsWith('verification: skipped')) {
+      if (agentSpan) agentSpan.attributes['updraft.verify.result'] = 'skipped';
     } else if ((m = /^outcome: (\S+)/.exec(line))) {
       summary.outcome = m[1];
+      if (!agentSpan) endPrepare(at, m[1] === 'succeeded' ? null : { type: m[1], message: h.startError });
+      phase = 'after';
       if (agentSpan) {
         agentSpan.attributes['updraft.run.outcome'] = m[1];
         if (m[1] !== 'succeeded') {
@@ -670,6 +1010,26 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         }
       }
     }
+  }
+
+  /** Ends the open verify command, with what its output says about tests and checks. */
+  function endVerifyStep(at) {
+    const v = verifyStep;
+    verifyStep = null;
+    if (!v) return;
+    const tests = parseTestOutput(v.output ?? '');
+    const checks = parseCheckOutput(v.output ?? '');
+    Object.assign(v.attributes, { 'updraft.verify.output_lines': v.outputLines ?? 0, ...testAttributes(tests), ...checkAttributes(checks) });
+    if (verifySpan && tests) {
+      const a = verifySpan.attributes;
+      a['updraft.test.passed'] = (a['updraft.test.passed'] ?? 0) + tests.passed;
+      a['updraft.test.failed'] = (a['updraft.test.failed'] ?? 0) + tests.failed;
+      a['updraft.test.skipped'] = (a['updraft.test.skipped'] ?? 0) + tests.skipped;
+      if (tests.failedTests?.length) a['updraft.test.failed_tests'] = [...(a['updraft.test.failed_tests'] ?? []), ...tests.failedTests].slice(0, 20);
+    }
+    delete v.output;
+    delete v.outputLines;
+    finish(v, at);
   }
 
   function endAgent(at) {
@@ -698,9 +1058,15 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       return conversationId();
     },
     line(line, at) {
+      firstAt ??= at;
       if (phase === 'header') {
-        if (line.startsWith('---- ')) onWorkerLine(line, at);
-        else parseHeaderLine(line, h);
+        if (line.startsWith('---- ') || line.startsWith('outcome: ')) onWorkerLine(line, at);
+        else if (line.startsWith('error: ')) h.startError ??= line.slice(7);
+        else {
+          // The worker's "ready" block (source clone, base, branch, ...): the worktree is prepared.
+          if (line.startsWith('source clone: ')) h.preparedAt = at;
+          parseHeaderLine(line, h);
+        }
         return;
       }
       if (phase === 'agent' && isJsonLine(line)) {
@@ -715,15 +1081,41 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     /** Ends everything still open (the log ended, or the job is over). */
     close(at) {
       if (phase === 'agent') endAgent(at);
-      if (verifyStep) finish(verifyStep, at);
+      if (!agentSpan) endPrepare(at);
+      if (verifyStep) endVerifyStep(at);
       if (verifySpan) finish(verifySpan, at);
-      verifyStep = verifySpan = null;
+      verifySpan = null;
+      for (const s of steps.values()) finish(s.span, s.last);
+      if (change.files !== undefined || change.commits !== undefined) {
+        summary.change = {
+          commits: change.commits,
+          files: change.files,
+          insertions: change.insertions,
+          deletions: change.deletions,
+          untracked: change.untracked,
+          testFiles: change.testFiles,
+        };
+      }
       if (agentSpan) {
         Object.assign(agentSpan.attributes, {
           'updraft.agent.tool_calls': summary.tools,
           'updraft.agent.tool_errors': summary.toolErrors,
+          'updraft.agent.compactions': compactions || undefined,
           'gen_ai.usage.input_tokens': summary.inputTokens || undefined,
           'gen_ai.usage.output_tokens': summary.outputTokens || undefined,
+          ...(summary.change
+            ? {
+                'updraft.change.commits': change.commits,
+                'updraft.change.files': change.files,
+                'updraft.change.insertions': change.insertions,
+                'updraft.change.deletions': change.deletions,
+                'updraft.change.untracked': change.untracked,
+                'updraft.change.paths': change.paths.length ? change.paths : undefined,
+                'updraft.change.test_files': change.testFiles,
+                'updraft.change.test_lines': change.testLines,
+                'updraft.change.source_lines': change.sourceLines,
+              }
+            : {}),
         });
         finish(agentSpan, agentSpan.end ?? at);
       }
@@ -736,10 +1128,11 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
  * reads what is left, ends the job's root span with what the summary says, and sends the rest
  * within `budgetMs`. Never throws.
  */
-export function createAgentTracer({ runsDir, confineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs }) {
-  const traceId = newTraceId();
+export function createAgentTracer({ runsDir, confineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs, startedAt: jobStartedAt, traceId: givenTraceId }) {
+  const traceId = typeof givenTraceId === 'string' && /^[0-9a-f]{32}$/.test(givenTraceId) ? givenTraceId : newTraceId();
   const rootSpanId = newSpanId();
-  const startedAt = now();
+  // The job's start (before the tracer existed: isolation, the state, the coalescing wait), when the runner knows it.
+  const startedAt = typeof jobStartedAt === 'number' && jobStartedAt <= now() ? jobStartedAt : now();
   const runs = new Map();
   const stats = { runs: 0, spans: 0, linesSkipped: 0 };
   let pollTimer = null;
@@ -902,8 +1295,12 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
       exportTimer = setInterval(() => void exporter.flush(), exportMs);
       exportTimer.unref?.();
     },
-    /** `outcome`: the job's (succeeded, failed, ...); `summary`: run-event's JSON summary, if any. */
-    async stop({ outcome, summary, deliveryId, eventName, budgetMs = 15_000 } = {}) {
+    /**
+     * `outcome`: the job's (succeeded, failed, ...); `summary`: run-event's JSON summary, if any;
+     * `steps`: the runner's own steps ({ name, start, end, error?, attributes? }), each a span
+     * under the job's.
+     */
+    async stop({ outcome, summary, deliveryId, eventName, budgetMs = 15_000, steps = [] } = {}) {
       clearInterval(pollTimer);
       clearInterval(exportTimer);
       try {
@@ -915,6 +1312,27 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
           const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? traces[0].conversationId;
           const loop = summary?.loop && typeof summary.loop === 'object' ? summary.loop : null;
           const failed = outcome !== 'succeeded';
+          for (const step of Array.isArray(steps) ? steps.slice(0, 64) : []) {
+            if (!step || typeof step.name !== 'string' || typeof step.start !== 'number') continue;
+            emit({
+              traceId,
+              spanId: newSpanId(),
+              parentSpanId: rootSpanId,
+              name: `runner ${step.name}`,
+              kind: KIND_INTERNAL,
+              start: step.start,
+              end: typeof step.end === 'number' ? step.end : at,
+              error: Boolean(step.error),
+              ...(step.error && typeof step.error === 'string' ? { errorMessage: step.error.slice(0, MAX_MESSAGE_CHARS) } : {}),
+              attributes: { 'gen_ai.agent.name': 'updraft', 'gen_ai.conversation.id': conversationId, 'updraft.step': step.name, ...(step.error ? { 'error.type': 'runner_step' } : {}), ...(step.attributes ?? {}) },
+            });
+          }
+          // The job in one wide event: what every run cost, changed and decided.
+          const runSummaries = traces.map((t) => t.summary);
+          const sum = (f) => runSummaries.reduce((n, r) => n + (f(r) ?? 0), 0);
+          const lastReview = [...runSummaries].reverse().find((r) => r.review)?.review ?? null;
+          const lastChange = [...runSummaries].reverse().find((r) => r.change)?.change ?? null;
+          const costs = runSummaries.filter((r) => typeof r.costUsd === 'number');
           emit({
             traceId,
             spanId: rootSpanId,
@@ -940,6 +1358,21 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
               'updraft.loop.reviews': typeof loop?.reviews === 'number' ? loop.reviews : undefined,
               'updraft.loop.merged': typeof loop?.merged === 'boolean' ? loop.merged : undefined,
               'updraft.runs': traces.length,
+              'updraft.runs.kinds': [...new Set(runSummaries.map((r) => r.kind).filter(Boolean))],
+              'updraft.runs.failed': runSummaries.filter((r) => r.outcome && r.outcome !== 'succeeded').length,
+              'gen_ai.usage.input_tokens': sum((r) => r.inputTokens) || undefined,
+              'gen_ai.usage.output_tokens': sum((r) => r.outputTokens) || undefined,
+              'updraft.agent.reported_cost_usd': costs.length ? costs.reduce((n, r) => n + r.costUsd, 0) : undefined,
+              'updraft.agent.tool_calls': sum((r) => r.tools),
+              'updraft.agent.tool_errors': sum((r) => r.toolErrors),
+              'updraft.review.verdict': lastReview?.verdict,
+              'updraft.review.findings': lastReview?.findings,
+              'updraft.review.outcome': lastReview?.outcome,
+              'updraft.change.commits': lastChange?.commits,
+              'updraft.change.files': lastChange?.files,
+              'updraft.change.insertions': lastChange?.insertions,
+              'updraft.change.deletions': lastChange?.deletions,
+              'updraft.change.test_files': lastChange?.testFiles,
               ...(failed ? { 'error.type': outcome ?? 'unknown' } : {}),
             },
           });

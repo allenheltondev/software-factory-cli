@@ -510,7 +510,14 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(posts[0].url).toBe('https://api.honeycomb.io/v1/traces');
     expect(posts[0].headers['x-honeycomb-team']).toBe('hcaik_01honeycombsecretvalue');
     const spans = posts.flatMap((p) => p.body.resourceSpans[0].scopeSpans[0].spans);
-    expect(spans.map((s) => s.name).sort()).toEqual(['chat claude-x', 'execute_tool Bash', 'invoke_agent claude', 'invoke_workflow updraft']);
+    expect(spans.map((s) => s.name).filter((n) => !n.startsWith('runner ') && !n.startsWith('updraft ')).sort()).toEqual(['chat claude-x', 'execute_tool Bash', 'invoke_agent claude', 'invoke_workflow updraft']);
+    // The runner's own steps, under the job's span, which starts with the job (before the tracer did).
+    const root = spans.find((s) => s.name === 'invoke_workflow updraft');
+    const runnerSteps = spans.filter((s) => s.name.startsWith('runner '));
+    expect(runnerSteps.map((s) => s.name)).toEqual(expect.arrayContaining(['runner isolation', 'runner restore_state', 'runner verify_isolation', 'runner run_event']));
+    for (const s of runnerSteps) expect(s.parentSpanId).toBe(root.spanId);
+    expect(BigInt(root.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(runnerSteps.find((s) => s.name === 'runner isolation').startTimeUnixNano));
+    expect(runnerSteps.find((s) => s.name === 'runner run_event').attributes).toContainEqual({ key: 'updraft.run_event.exit_code', value: { intValue: '0' } });
     const resource = posts[0].body.resourceSpans[0].resource.attributes;
     expect(resource).toContainEqual({ key: 'service.name', value: { stringValue: 'updraft' } });
     const bodies = JSON.stringify(posts.map((p) => p.body));
@@ -519,10 +526,11 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(bodies).not.toContain('sk-ant-tenant');
     expect(bodies).not.toContain('hcaik_01honeycombsecretvalue');
     // The finish reports the trace, for the console's link to it.
-    expect(harness.finishDetails[0].telemetry).toMatchObject({ traceId: expect.stringMatching(/^[0-9a-f]{32}$/), spans: 4, exported: 4, failed: 0 });
-    // The job process never had the telemetry key.
+    expect(harness.finishDetails[0].telemetry).toMatchObject({ traceId: expect.stringMatching(/^[0-9a-f]{32}$/), spans: spans.length, exported: spans.length, failed: 0 });
+    // The job process never had the telemetry key; it has the trace id, to record with its runs.
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');
+    expect(JSON.stringify(record)).toContain(harness.finishDetails[0].telemetry.traceId);
   });
 
   it('reads exactly the secret version the settings name', async () => {
