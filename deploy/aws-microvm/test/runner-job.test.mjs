@@ -510,7 +510,14 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(posts[0].url).toBe('https://api.honeycomb.io/v1/traces');
     expect(posts[0].headers['x-honeycomb-team']).toBe('hcaik_01honeycombsecretvalue');
     const spans = posts.flatMap((p) => p.body.resourceSpans[0].scopeSpans[0].spans);
-    expect(spans.map((s) => s.name).sort()).toEqual(['chat claude-x', 'execute_tool Bash', 'invoke_agent claude', 'invoke_workflow updraft']);
+    expect(spans.map((s) => s.name).filter((n) => !n.startsWith('runner ') && !n.startsWith('updraft ')).sort()).toEqual(['chat claude-x', 'execute_tool Bash', 'invoke_agent claude', 'invoke_workflow updraft']);
+    // The runner's own steps, under the job's span, which starts with the job (before the tracer did).
+    const root = spans.find((s) => s.name === 'invoke_workflow updraft');
+    const runnerSteps = spans.filter((s) => s.name.startsWith('runner '));
+    expect(runnerSteps.map((s) => s.name)).toEqual(expect.arrayContaining(['runner isolation', 'runner restore_state', 'runner verify_isolation', 'runner run_event']));
+    for (const s of runnerSteps) expect(s.parentSpanId).toBe(root.spanId);
+    expect(BigInt(root.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(runnerSteps.find((s) => s.name === 'runner isolation').startTimeUnixNano));
+    expect(runnerSteps.find((s) => s.name === 'runner run_event').attributes).toContainEqual({ key: 'updraft.run_event.exit_code', value: { intValue: '0' } });
     const resource = posts[0].body.resourceSpans[0].resource.attributes;
     expect(resource).toContainEqual({ key: 'service.name', value: { stringValue: 'updraft' } });
     const bodies = JSON.stringify(posts.map((p) => p.body));
@@ -519,10 +526,62 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(bodies).not.toContain('sk-ant-tenant');
     expect(bodies).not.toContain('hcaik_01honeycombsecretvalue');
     // The finish reports the trace, for the console's link to it.
-    expect(harness.finishDetails[0].telemetry).toMatchObject({ traceId: expect.stringMatching(/^[0-9a-f]{32}$/), spans: 4, exported: 4, failed: 0 });
-    // The job process never had the telemetry key.
+    expect(harness.finishDetails[0].telemetry).toMatchObject({ traceId: expect.stringMatching(/^[0-9a-f]{32}$/), spans: spans.length, exported: spans.length, failed: 0 });
+    // The job process never had the telemetry key; it has the trace id, to record with its runs.
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');
+    expect(JSON.stringify(record)).toContain(harness.finishDetails[0].telemetry.traceId);
+  });
+
+  it('traces a job that failed before any agent ran: its runner steps, the failed one marked', async () => {
+    const harness = brokerDeps('telemetry', { objects: { 'events/delivery-1/event.json': undefined }, secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 200 };
+    };
+    const result = await runJob(brokerRequest({ telemetry }), harness.deps);
+    expect(result.outcome).toBe('runner_error');
+    const spans = posts.flatMap((p) => p.resourceSpans[0].scopeSpans[0].spans);
+    const root = spans.find((s) => s.name === 'invoke_workflow updraft');
+    expect(root.status.code).toBe(2);
+    expect(root.attributes).toContainEqual({ key: 'gen_ai.conversation.id', value: { stringValue: expect.stringMatching(/^delivery\//) } });
+    const restore = spans.find((s) => s.name === 'runner restore_state');
+    expect(restore).toMatchObject({ parentSpanId: root.spanId, status: { code: 2, message: expect.stringContaining('NoSuchKey') } });
+    expect(spans.map((s) => s.name)).toContain('runner isolation');
+    expect(JSON.stringify(posts)).not.toContain('hcaik_01honeycombsecretvalue');
+  });
+
+  it("points the agents at the runner's loopback relay, and puts Claude Code's own events on the agent span", async () => {
+    const harness = brokerDeps('telemetry-relay', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 200 };
+    };
+    harness.deps.telemetryPollMs = 50;
+    expect((await runJob(brokerRequest({ telemetry }), harness.deps)).outcome).toBe('succeeded');
+    const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+    expect(record.env).toMatchObject({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_LOGS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json', OTEL_EXPORTER_OTLP_ENDPOINT: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/) });
+    expect(record.env.OTEL_LOG_USER_PROMPTS).toBeUndefined();
+    expect(record.env.OTEL_LOG_TOOL_DETAILS).toBeUndefined();
+    expect(record.env.OTEL_EXPORTER_OTLP_HEADERS).toBeUndefined();
+    expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');
+    const spans = posts.flatMap((p) => p.resourceSpans[0].scopeSpans[0].spans);
+    const agent = spans.find((s) => s.name === 'invoke_agent claude');
+    expect(agent.events.map((e) => e.name)).toEqual(['claude_code.api_error', 'claude_code.api_request']);
+    const attrs = Object.fromEntries(agent.attributes.map((a) => [a.key, a.value]));
+    expect(attrs['updraft.agent.api_requests']).toEqual({ intValue: '1' });
+    expect(attrs['updraft.agent.api_errors']).toEqual({ intValue: '1' });
+    expect(attrs['updraft.agent.api_retries']).toEqual({ intValue: '1' });
+    expect(attrs['updraft.agent.api_duration_ms_max']).toEqual({ intValue: '900' });
+  });
+
+  it('gives the job no telemetry variables when telemetry is off', async () => {
+    const harness = brokerDeps('telemetry-relay');
+    await runJob(brokerRequest(), harness.deps);
+    const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+    expect(Object.keys(record.env).filter((k) => k.startsWith('OTEL_') || k === 'CLAUDE_CODE_ENABLE_TELEMETRY')).toEqual([]);
   });
 
   it('reads exactly the secret version the settings name', async () => {

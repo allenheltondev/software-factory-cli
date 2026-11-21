@@ -1,4 +1,5 @@
 // OWNER: queue/worker workstream. The long-running worker behind `updraft start`.
+import { followedRuns, recordRunTrace, traceIdFrom, type FollowedRun } from './trace-links.js';
 import { hostname as osHostname } from 'node:os';
 import type { UpdraftConfig } from '../config/schema.js';
 import { findRepoConfig } from './executor.js';
@@ -85,6 +86,11 @@ export interface DaemonTiming {
 
 export interface DaemonDeps {
   db: Db;
+  /**
+   * Agent telemetry: the trace this worker's runs are in (UPDRAFT_TRACE_ID, from the microVM
+   * runner). Recorded with each run, so later runs' traces can link to it. Absent: nothing is recorded.
+   */
+  traceId?: string | null;
   config: UpdraftConfig;
   paths: UpdraftPaths;
   log: Logger;
@@ -215,6 +221,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const interruptGraceMs = deps.timing?.interruptGraceMs ?? 5_000;
   const pollMs = deps.timing?.pollMs ?? config.pollIntervalSeconds * 1000;
   const log = deps.log.child({ workerId });
+  const traceId = deps.traceId === undefined ? traceIdFrom(process.env) : deps.traceId;
 
   const safeRecordError = (scope: string, msg: string, extra: { jobId?: string; repoFullName?: string } = {}) => {
     try {
@@ -251,7 +258,17 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     const { run, job } = claim;
     const controller = new AbortController();
     const runLog = log.child({ runId: run.id, jobId: job.id, agent: run.agent });
+    let follows: FollowedRun[] = [];
+    if (traceId) {
+      try {
+        recordRunTrace(db, run.id, traceId);
+        follows = followedRuns(db, job, run.id);
+      } catch (err) {
+        runLog.warn('could not record the run trace', { error: message(err) });
+      }
+    }
     const ctx: ExecutionContext = {
+      ...(follows.length ? { follows } : {}),
       config,
       paths,
       log: runLog,

@@ -9,6 +9,7 @@ import { CANCELED_BY_USER, ownEntry, type Claim, type RunProcessInfo } from '../
 import type { UpdraftPaths } from '../paths.js';
 import type { IssueSnapshot, Job, RunOutcome, RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
+import type { FollowedRun } from './trace-links.js';
 
 export interface ExecutionContext {
   config: UpdraftConfig;
@@ -35,6 +36,8 @@ export interface ExecutionContext {
    * a crash.
    */
   recordProcess(info: RunProcessInfo): void;
+  /** Agent telemetry: the earlier traced runs this run follows (trace-links.ts), for its run.log header. */
+  follows?: readonly FollowedRun[];
 }
 
 /**

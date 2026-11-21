@@ -17,6 +17,7 @@
 // the same lifecycle; only a string command differs, in that it is handed to a shell (verify.ts).
 // - with agents.<name>.container, the process is the container runtime's client and the agent
 //   runs in a container (container.ts); stopping then removes the container by name first
+import { followsLines } from './trace-links.js';
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
 import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
@@ -626,6 +627,7 @@ export class LiveExecutor implements Executor {
         ...(agentCfg && adapterName ? [describeProfile(run.agent, adapterName, agentProfile(adapterName, agentCfg))] : []),
         `action: ${job.action}${action ? ` (output ${action.output}, timeout ${timeoutMinutes} min)` : ' (no longer configured)'}`,
         `prompt: ${promptSource ?? '(none configured)'}`,
+        ...followsLines(ctx.follows ?? []),
         `run log: ${logPath}`,
         '',
       ].join('\n'),
@@ -1076,6 +1078,7 @@ export class LiveExecutor implements Executor {
         await log([`review verdict for ${prepared.baseSha}: ${parsed.verdict}`]);
         // Telemetry only: a missing or malformed count says so here and changes nothing else.
         if (parsed.findingsCount === null) await log([`review findings count: none (${parsed.findingsCountProblem}); the verdict is unaffected`]);
+        else await log([`review findings count: ${parsed.findingsCount}`]);
       } else {
         outcome = 'failed';
         error = `no verdict: ${parsed.problem}`;

@@ -1,5 +1,6 @@
 // Retention (`updraft clean --older-than`): delete old terminal jobs with everything that hangs
 // off them, and old error rows. Nothing here runs on its own; the worker never prunes.
+import { TRACE_KEY_PREFIX } from '../worker/trace-links.js';
 import { transaction, type Db } from './database.js';
 import { TERMINAL_JOB_STATUSES, type JobStatus } from '../types.js';
 import { nowIso } from '../util/ids.js';
@@ -172,6 +173,7 @@ export function pruneJob(db: Db, jobId: string, cutoff: string, now?: () => numb
     for (const t of RUN_TABLES) {
       db.prepare(`DELETE FROM ${t.table} WHERE ${t.runColumn} IN (SELECT id FROM runs WHERE job_id = ?)`).run(jobId);
     }
+    db.prepare(`DELETE FROM meta WHERE key IN (SELECT '${TRACE_KEY_PREFIX}' || id FROM runs WHERE job_id = ?)`).run(jobId);
     db.prepare('DELETE FROM runs WHERE job_id = ?').run(jobId);
     const errors = Number(db.prepare('DELETE FROM errors WHERE job_id = ?').run(jobId).changes);
     db.prepare('DELETE FROM jobs WHERE id = ?').run(jobId);

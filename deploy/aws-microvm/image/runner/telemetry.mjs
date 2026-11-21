@@ -25,11 +25,24 @@
 // cut to MAX_ATTRIBUTE_CHARS. Without it, spans hold names, ids, timings, token counts, outcomes
 // and the verify commands (which are configuration, not content).
 /* global AbortSignal */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import {
+  checkAttributes,
+  claudeToolAttributes,
+  codexTodoAttributes,
+  codexToolAttributes,
+  describeCommand,
+  isTestPath,
+  parseCheckOutput,
+  parseTestOutput,
+  resultAttributes,
+  testAttributes,
+  toolCategory,
+} from './telemetry-detail.mjs';
 
 export const SCOPE = { name: 'updraft-microvm-runner', version: '1' };
 /** How often the run logs are looked at. */
@@ -50,6 +63,14 @@ const MAX_RUNS = 64;
 /** The most of a run's prompt that is read. */
 const MAX_PROMPT_BYTES = 256 * 1024;
 const MAX_SPANS_PER_RUN = 20000;
+/** Span events per span at most; past it they are counted, not kept. */
+export const MAX_EVENTS_PER_SPAN = 256;
+/** The most of one verify command's output that is kept for reading its test counts. */
+const MAX_VERIFY_OUTPUT_CHARS = 512 * 1024;
+/** Updraft's own messages on span events (publication, review, revision steps), cut to this. */
+const MAX_MESSAGE_CHARS = 300;
+/** Agent events whose session no run has shown yet, kept until one does (or the job ends). */
+const MAX_UNMATCHED_EVENTS = 2000;
 
 const KIND_INTERNAL = 1;
 const KIND_CLIENT = 3;
@@ -93,8 +114,22 @@ export function toOtlpSpan(s) {
     startTimeUnixNano: nanos(s.start),
     endTimeUnixNano: nanos(Math.max(s.start, s.end ?? s.start)),
     attributes: attributes(s.attributes ?? {}),
+    ...(s.events?.length ? { events: s.events.map((e) => ({ timeUnixNano: nanos(e.at), name: e.name, attributes: attributes(e.attributes ?? {}) })) } : {}),
     status: s.error ? { code: STATUS_ERROR, ...(s.errorMessage ? { message: s.errorMessage } : {}) } : { code: STATUS_OK },
+    ...(s.droppedEvents ? { droppedEventsCount: s.droppedEvents } : {}),
+    ...(s.links?.length ? { links: s.links.map((l) => ({ traceId: l.traceId, spanId: l.spanId, attributes: attributes(l.attributes ?? {}) })) } : {}),
   };
+}
+
+/** Adds a span event (a point in time inside a span, with its own attributes). */
+export function addEvent(span, at, name, attrs = {}) {
+  if (!span) return;
+  span.events ??= [];
+  if (span.events.length >= MAX_EVENTS_PER_SPAN) {
+    span.droppedEvents = (span.droppedEvents ?? 0) + 1;
+    return;
+  }
+  span.events.push({ at, name, attributes: attrs });
 }
 
 /** An OTLP/HTTP export request body for these spans. */
@@ -180,6 +215,8 @@ export function redactSpan(span, redact) {
     name: redact(span.name),
     attributes: redactAttributes(span.attributes ?? {}, redact),
     ...(span.errorMessage ? { errorMessage: redact(span.errorMessage) } : {}),
+    ...(span.events ? { events: span.events.map((e) => ({ ...e, name: redact(e.name), attributes: redactAttributes(e.attributes ?? {}, redact) })) } : {}),
+    ...(span.links ? { links: span.links.map((l) => ({ ...l, attributes: redactAttributes(l.attributes ?? {}, redact) })) } : {}),
   };
 }
 
@@ -214,6 +251,25 @@ function clip(redact, value) {
   return JSON.stringify(`[${JSON.stringify(parsed).length} characters, too large to record]`);
 }
 
+/** A name, version or id as the CLI reports it: plain characters only, else it is not recorded. */
+const SAFE_NAME = /^[A-Za-z0-9_.:@/+[\]-]{1,128}$/;
+/** Fields of a CLI event that are never put on a span: ids already there, and anything that may be content. */
+const NOT_SCALAR = new Set(['type', 'subtype', 'uuid', 'session_id', 'parent_tool_use_id', 'output', 'stdout', 'stderr', 'content', 'text', 'message', 'prompt', 'result', 'body', 'input', 'response', 'error', 'errors', 'reason', 'detail', 'details', 'description']);
+
+/** An event's plain values (numbers, booleans, short plain strings) as attributes under `prefix`. */
+function scalarAttributes(ev, prefix) {
+  const out = {};
+  let n = 0;
+  for (const [k, v] of Object.entries(ev)) {
+    if (NOT_SCALAR.has(k) || !/^[A-Za-z_]{1,40}$/.test(k) || n >= 24) continue;
+    if (typeof v === 'number' || typeof v === 'boolean' || (typeof v === 'string' && /^[\w .:/@+-]{0,80}$/.test(v))) {
+      out[`${prefix}.${k}`] = v;
+      n++;
+    }
+  }
+  return out;
+}
+
 /** The text of a Claude tool_result's content (a string or content blocks). */
 function resultText(content) {
   if (typeof content === 'string') return content;
@@ -225,7 +281,10 @@ function resultText(content) {
 export function parseHeaderLine(line, h) {
   let m;
   if ((m = /^updraft run (\S+)/.exec(line))) h.runId = m[1];
-  else if ((m = /^job: (\S+)/.exec(line))) h.jobId = m[1];
+  else if ((m = /^job: (\S+)(?: \(attempt (\d+)\))?/.exec(line))) {
+    h.jobId = m[1];
+    if (m[2]) h.attempt = Number(m[2]);
+  }
   else if ((m = /^repository: (\S+)/.exec(line))) h.repository = m[1];
   else if ((m = /^issue: #(\d+)/.exec(line))) h.issue = Number(m[1]);
   else if ((m = /^workflow: (\S+)/.exec(line))) h.workflow = m[1];
@@ -241,7 +300,29 @@ export function parseHeaderLine(line, h) {
   } else if (line.startsWith('code written by agent: ')) h.kind = 'review';
   else if (line.startsWith('review: ') && h.kind !== 'review') h.kind = 'revision';
   else if ((m = /^pull request: #(\d+)/.exec(line))) h.pullRequest = Number(m[1]);
+  else if ((m = /^trigger: (\S+)/.exec(line))) h.trigger = m[1];
+  else if ((m = /^review: \S+ \((\d+) inline comment/.exec(line))) h.reviewComments = Number(m[1]);
+  // What the worker logs once the worktree is ready, just before the agent starts.
+  else if ((m = /^base: (\S+) at ([0-9a-f]{7,40})/.exec(line))) {
+    h.baseBranch = m[1];
+    h.baseSha = m[2];
+  } else if ((m = /^branch: (\S+)/.exec(line))) h.branch = m[1];
+  else if ((m = /^checkout: (\S+)/.exec(line))) h.checkout = m[1];
+  else if ((m = /^container: \S+ \(runtime ([A-Za-z0-9_-]+)\)/.exec(line))) h.containerRuntime = m[1];
+  else if ((m = /^timeout: (\d+) min/.exec(line))) h.timeoutMinutes = Number(m[1]);
+  else if (line.startsWith('issue body: withheld')) h.issueWithheld = true;
+  // Earlier runs of the same pull request, with the trace each was in (src/worker/live.ts).
+  else if ((m = /^follows: run ([A-Za-z0-9_-]{1,80}) \(([a-z_-]{1,32}), trace ([0-9a-f]{32})\)/.exec(line))) {
+    h.follows ??= [];
+    if (h.follows.length < 8) h.follows.push({ runId: m[1], relation: m[2], traceId: m[3] });
+  }
 }
+
+/**
+ * The span id of a run's invoke_agent span: derived from the run id, so a later job (another
+ * microVM, another trace) can link to it knowing only the run and the trace it was in.
+ */
+export const agentSpanIdFor = (runId) => createHash('sha256').update(`updraft-agent-span:${runId}`).digest('hex').slice(0, 16);
 
 const isJsonLine = (line) => line.startsWith('{') && line.endsWith('}');
 function parseJson(line) {
@@ -251,6 +332,150 @@ function parseJson(line) {
   } catch {
     return null;
   }
+}
+
+/** Total length of a set of [start, end] intervals, overlaps counted once. */
+function unionMs(intervals) {
+  let total = 0;
+  let curStart = null;
+  let curEnd = null;
+  for (const [s, e] of [...intervals].sort((a, b) => a[0] - b[0])) {
+    if (curEnd === null || s > curEnd) {
+      if (curEnd !== null) total += curEnd - curStart;
+      curStart = s;
+      curEnd = e;
+    } else curEnd = Math.max(curEnd, e);
+  }
+  return curEnd === null ? total : total + curEnd - curStart;
+}
+
+/** Thresholds past which a run is marked as going in circles (`updraft.agent.thrashing`). */
+export const THRASH = { repeatedCommands: 3, editsOneFile: 8, consecutiveToolErrors: 5 };
+
+/**
+ * How the agent worked, from the order and outcome of its calls: when it first edited and first
+ * tested, how many edit→test cycles it went through and how many test runs it took to get one
+ * to pass, whether it repeated itself, which file it kept coming back to, how its time split
+ * between the model, the tools and neither, and how its context grew. Commands are compared in
+ * memory only; nothing but counts, times and a path leaves this.
+ */
+export function createBehavior() {
+  const b = {
+    categories: {},
+    firstToolAt: null,
+    firstEditAt: null,
+    firstTestAt: null,
+    firstGreenAt: null,
+    testRuns: 0,
+    testRunsFailed: 0,
+    testRunsUntilGreen: null,
+    editTestCycles: 0,
+    editedSinceTest: false,
+    edits: 0,
+    commands: new Map(),
+    repeatedCommands: 0,
+    editsByFile: new Map(),
+    filesRead: new Set(),
+    errorStreak: 0,
+    maxErrorStreak: 0,
+    toolIntervals: [],
+    chatIntervals: [],
+    chats: 0,
+    firstContext: null,
+    lastContext: null,
+    peakContext: 0,
+    inputTotal: 0,
+    cachedTotal: 0,
+  };
+  return {
+    tool({ category, name, attrs, command, failed, start, end }) {
+      const c = category ?? 'other';
+      b.categories[c] = (b.categories[c] ?? 0) + 1;
+      b.firstToolAt ??= start;
+      b.toolIntervals.push([start, end]);
+      b.errorStreak = failed ? b.errorStreak + 1 : 0;
+      b.maxErrorStreak = Math.max(b.maxErrorStreak, b.errorStreak);
+      if (c === 'edit' && !failed) {
+        b.firstEditAt ??= start;
+        b.edits += 1;
+        b.editedSinceTest = true;
+        const paths = attrs['updraft.tool.file.paths'] ?? (attrs['updraft.tool.file.path'] ? [attrs['updraft.tool.file.path']] : []);
+        for (const p of paths) b.editsByFile.set(p, (b.editsByFile.get(p) ?? 0) + 1);
+      }
+      if (name === 'Read' && attrs['updraft.tool.file.path']) b.filesRead.add(attrs['updraft.tool.file.path']);
+      if (c === 'test') {
+        b.firstTestAt ??= start;
+        b.testRuns += 1;
+        const red = failed || (attrs['updraft.test.failed'] ?? 0) > 0;
+        if (red) b.testRunsFailed += 1;
+        else if (b.firstGreenAt === null) {
+          b.firstGreenAt = end;
+          b.testRunsUntilGreen = b.testRuns;
+        }
+        if (b.editedSinceTest) b.editTestCycles += 1;
+        b.editedSinceTest = false;
+      }
+      if (typeof command === 'string' && command.trim()) {
+        // The same command again with no edit since: it cannot have a different answer.
+        const key = command.trim().replace(/\s+/g, ' ');
+        if (b.commands.get(key) === b.edits) b.repeatedCommands += 1;
+        if (b.commands.size < 5000) b.commands.set(key, b.edits);
+      }
+    },
+    /** One model response; returns attributes for its chat span. */
+    chat({ start, end, input, cached, main }) {
+      b.chatIntervals.push([start, end]);
+      if (!main) return { 'updraft.chat.cache_hit_ratio': input ? Math.round((cached / input) * 1000) / 1000 : undefined };
+      b.chats += 1;
+      b.firstContext ??= input;
+      b.lastContext = input;
+      b.peakContext = Math.max(b.peakContext, input);
+      b.inputTotal += input;
+      b.cachedTotal += cached;
+      return { 'updraft.chat.index': b.chats, 'updraft.chat.cache_hit_ratio': input ? Math.round((cached / input) * 1000) / 1000 : undefined };
+    },
+    /** The run's behavior, for its invoke_agent span. */
+    attributes(start, end) {
+      const since = (t) => (t === null ? undefined : Math.max(0, t - start));
+      let hotFile;
+      let maxEdits = 0;
+      for (const [p, n] of b.editsByFile) {
+        if (n > maxEdits) {
+          maxEdits = n;
+          hotFile = p;
+        }
+      }
+      const model = unionMs(b.chatIntervals);
+      const tool = unionMs(b.toolIntervals);
+      const busy = unionMs([...b.chatIntervals, ...b.toolIntervals]);
+      const thrashing = b.repeatedCommands >= THRASH.repeatedCommands || maxEdits >= THRASH.editsOneFile || b.maxErrorStreak >= THRASH.consecutiveToolErrors;
+      return {
+        ...Object.fromEntries(Object.entries(b.categories).map(([c, n]) => [`updraft.agent.tools.${c}`, n])),
+        'updraft.agent.time_to_first_tool_ms': since(b.firstToolAt),
+        'updraft.agent.time_to_first_edit_ms': since(b.firstEditAt),
+        'updraft.agent.time_to_first_test_ms': since(b.firstTestAt),
+        'updraft.agent.time_to_first_green_ms': since(b.firstGreenAt),
+        'updraft.agent.test_runs': b.testRuns,
+        'updraft.agent.test_runs_failed': b.testRunsFailed,
+        'updraft.agent.test_runs_until_green': b.testRunsUntilGreen ?? undefined,
+        'updraft.agent.edit_test_cycles': b.editTestCycles,
+        'updraft.agent.edited_after_last_test': b.editedSinceTest && b.testRuns > 0 ? true : undefined,
+        'updraft.agent.repeated_commands': b.repeatedCommands,
+        'updraft.agent.files_edited': b.editsByFile.size,
+        'updraft.agent.files_read': b.filesRead.size,
+        'updraft.agent.max_edits_one_file': maxEdits || undefined,
+        'updraft.agent.hot_file': maxEdits >= 3 ? hotFile : undefined,
+        'updraft.agent.max_consecutive_tool_errors': b.maxErrorStreak,
+        'updraft.agent.thrashing': thrashing,
+        'updraft.agent.model_ms': model,
+        'updraft.agent.tool_ms': tool,
+        'updraft.agent.idle_ms': Math.max(0, end - start - busy),
+        'updraft.agent.peak_context_tokens': b.peakContext || undefined,
+        'updraft.agent.context_growth_tokens': b.lastContext !== null ? b.lastContext - b.firstContext : undefined,
+        'updraft.agent.cache_hit_ratio': b.inputTotal ? Math.round((b.cachedTotal / b.inputTotal) * 1000) / 1000 : undefined,
+      };
+    },
+  };
 }
 
 /**
@@ -271,7 +496,19 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   const tools = new Map();
   /** Codex: the open turn's chat span. */
   let turn = null;
-  const summary = { runId: null, kind: null, agent: null, chats: 0, tools: 0, toolErrors: 0, inputTokens: 0, outputTokens: 0, outcome: null };
+  const summary = { runId: null, kind: null, agent: null, chats: 0, tools: 0, toolErrors: 0, inputTokens: 0, outputTokens: 0, outcome: null, costUsd: null, review: null, change: null };
+  /** When the run's first line was read: its preparation (prompt, worktree) starts then. */
+  let firstAt = null;
+  let prepareSpan = null;
+  /** Inside the run summary the worker writes at the end ('summary' or 'stat'), else null. */
+  let summarySection = null;
+  const change = { paths: [], testFiles: 0, testLines: 0, sourceLines: 0 };
+  /** Updraft's publication, review and revision steps after the run, by step. */
+  const steps = new Map();
+  let compactions = 0;
+  const behavior = createBehavior();
+  /** Where the agent's paths are relative to: its own working directory, and the worktree. */
+  const roots = () => [h.cwd, h.checkout].filter(Boolean);
 
   const conversationId = () => (h.repository && h.issue !== undefined ? `${h.repository}#${h.issue}` : (h.jobId ?? path.basename(runDir)));
   const provider = () => PROVIDER[h.adapter] ?? h.adapter;
@@ -295,10 +532,48 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (spans++ < MAX_SPANS_PER_RUN) emit(span);
   }
 
-  function startAgent(at) {
-    agentSpan = {
+  /** Updraft's own steps: on the "updraft" lane, with no provider. */
+  const updraftBase = () => ({ ...base('updraft'), 'gen_ai.provider.name': undefined });
+
+  /** The run's preparation, from its first line to the worker's "ready" block; ended when the agent starts or the run ends. */
+  function endPrepare(at, failure) {
+    if (firstAt === null || prepareSpan?.ended) return;
+    prepareSpan ??= {
       traceId,
       spanId: newSpanId(),
+      parentSpanId: rootSpanId,
+      name: 'updraft prepare',
+      kind: KIND_INTERNAL,
+      start: firstAt,
+    };
+    prepareSpan.attributes = {
+      ...updraftBase(),
+      'updraft.step': 'prepare',
+      'updraft.job.attempt': h.attempt,
+      'updraft.trigger': h.trigger,
+      'updraft.base.branch': h.baseBranch,
+      'updraft.base.sha': h.baseSha,
+      'updraft.branch': h.branch,
+      'updraft.container.runtime': h.containerRuntime,
+      'updraft.agent.timeout_minutes': h.timeoutMinutes,
+      'updraft.issue.withheld': h.issueWithheld,
+      'updraft.review.inline_comments': h.reviewComments,
+    };
+    if (failure) {
+      prepareSpan.error = true;
+      prepareSpan.attributes['error.type'] = failure.type;
+      // The worker's error may quote git or the CLI (their stderr): content.
+      if (failure.message && captureContent) prepareSpan.errorMessage = clip(redact, failure.message.slice(0, MAX_MESSAGE_CHARS));
+    }
+    finish(prepareSpan, h.preparedAt ?? at);
+  }
+
+  function startAgent(at) {
+    endPrepare(at);
+    agentSpan = {
+      traceId,
+      // Derived from the run id, so a later job's trace can link to this run.
+      spanId: h.runId ? agentSpanIdFor(h.runId) : newSpanId(),
       parentSpanId: rootSpanId,
       name: `invoke_agent ${h.agent ?? 'agent'}`,
       kind: KIND_INTERNAL,
@@ -310,7 +585,13 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         'updraft.agent.effort': h.effort,
         'updraft.pool': h.pool,
         'updraft.workflow': h.workflow,
+        'updraft.trigger': h.trigger,
+        'updraft.job.attempt': h.attempt,
+        'updraft.branch': h.branch,
+        'updraft.base.sha': h.baseSha,
       },
+      // The runs this one follows: the review it answers, the code it reviews.
+      links: (h.follows ?? []).map((f) => ({ traceId: f.traceId, spanId: agentSpanIdFor(f.runId), attributes: { 'updraft.link.relation': f.relation, 'updraft.run.id': f.runId } })),
     };
     contexts.set('', { span: agentSpan, name: h.agent ?? 'agent', last: at, chat: null, pendingInput: [] });
     Object.assign(summary, { runId: h.runId ?? null, kind: h.kind, agent: h.agent ?? null });
@@ -321,6 +602,13 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         })
         .catch(() => {});
     }
+  }
+
+  /** The agent's plan changed (TodoWrite, a Codex todo list): its counts, and its items with content on. */
+  function todoEvent(span, at, detail, items) {
+    const counts = Object.fromEntries(Object.entries(detail).filter(([k]) => k.startsWith('updraft.todo.')));
+    if (!Object.keys(counts).length) return;
+    addEvent(span, at, 'todo.update', { ...counts, 'updraft.todo.items': items ? content(items) : undefined });
   }
 
   // ---- Claude Code stream-json --------------------------------------------------------------
@@ -351,6 +639,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     summary.chats += 1;
     summary.inputTokens += input;
     summary.outputTokens += output;
+    Object.assign(c.span.attributes, behavior.chat({ start: c.span.start, end: c.end ?? at, input, cached: cacheRead, main: !ctx.sub }));
     finish(c.span, c.end ?? at);
   }
 
@@ -379,10 +668,33 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
 
   function onClaude(ev, at) {
     if (ev.type === 'system' && ev.subtype === 'init') {
+      if (typeof ev.cwd === 'string') h.cwd = ev.cwd;
       if (agentSpan) {
-        Object.assign(agentSpan.attributes, { 'gen_ai.agent.id': typeof ev.session_id === 'string' ? ev.session_id : undefined });
+        const servers = Array.isArray(ev.mcp_servers) ? ev.mcp_servers.filter((m) => m && typeof m.name === 'string' && SAFE_NAME.test(m.name)) : [];
+        Object.assign(agentSpan.attributes, {
+          'gen_ai.agent.id': typeof ev.session_id === 'string' ? ev.session_id : undefined,
+          'updraft.agent.cli_version': typeof ev.claude_code_version === 'string' && SAFE_NAME.test(ev.claude_code_version) ? ev.claude_code_version : undefined,
+          'updraft.agent.permission_mode': typeof ev.permissionMode === 'string' && SAFE_NAME.test(ev.permissionMode) ? ev.permissionMode : undefined,
+          'updraft.agent.tools_available': Array.isArray(ev.tools) ? ev.tools.length : undefined,
+          'updraft.agent.mcp_servers': servers.length ? servers.map((m) => m.name) : undefined,
+          'updraft.agent.mcp_servers_failed': servers.some((m) => m.status !== 'connected') ? servers.filter((m) => m.status !== 'connected').map((m) => m.name) : undefined,
+        });
         if (!h.model && typeof ev.model === 'string') agentSpan.attributes['gen_ai.request.model'] = ev.model;
       }
+      return;
+    }
+    if (ev.type === 'system' && ev.subtype === 'compact_boundary') {
+      // The agent's context was compacted: the conversation so far replaced by a summary.
+      const ctx = claudeContext(ev.parent_tool_use_id, at);
+      const meta = ev.compact_metadata && typeof ev.compact_metadata === 'object' ? ev.compact_metadata : {};
+      compactions += 1;
+      addEvent(ctx.span, at, 'compaction', { 'updraft.compaction.trigger': typeof meta.trigger === 'string' && SAFE_NAME.test(meta.trigger) ? meta.trigger : undefined, 'updraft.compaction.pre_tokens': typeof meta.pre_tokens === 'number' ? meta.pre_tokens : undefined });
+      if (agentSpan && agentSpan.attributes['updraft.agent.first_compaction_ms'] === undefined) agentSpan.attributes['updraft.agent.first_compaction_ms'] = at - agentSpan.start;
+      return;
+    }
+    if (ev.type === 'system' && typeof ev.subtype === 'string' && /^[a-z_]{1,40}$/.test(ev.subtype)) {
+      // Anything else the CLI reports about itself (retries, status, hooks): its name and its plain values only.
+      addEvent(claudeContext(ev.parent_tool_use_id, at).span, at, `system.${ev.subtype}`, scalarAttributes(ev, 'updraft.system'));
       return;
     }
     if (ev.type === 'assistant' && ev.message && typeof ev.message === 'object') {
@@ -417,6 +729,8 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         else if (block?.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
           c.parts.push({ type: 'tool_call', id: block.id, name: block.name, arguments: block.input ?? {} });
           if (!c.stop) c.stop = 'tool_use';
+          const input = block.input && typeof block.input === 'object' ? block.input : {};
+          const detail = claudeToolAttributes(block.name, input, roots());
           const span = {
             traceId,
             spanId: newSpanId(),
@@ -431,9 +745,11 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
               'gen_ai.tool.call.id': block.id,
               'gen_ai.tool.type': block.name.startsWith('mcp__') ? 'extension' : 'function',
               'gen_ai.tool.call.arguments': content(block.input ?? {}),
+              ...detail,
             },
           };
-          tools.set(block.id, { span, input: block.input && typeof block.input === 'object' ? block.input : {} });
+          tools.set(block.id, { span, input, name: block.name, category: detail['updraft.tool.category'], ctx });
+          if (block.name === 'TodoWrite') todoEvent(ctx.span, at, detail, Array.isArray(input.todos) ? input.todos.map((t) => ({ content: t?.content, status: t?.status })) : null);
         }
       }
       return;
@@ -449,11 +765,14 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         if (!tool) continue;
         tools.delete(block.tool_use_id);
         summary.tools += 1;
-        if (block.is_error === true) {
+        const failed = block.is_error === true;
+        Object.assign(tool.span.attributes, resultAttributes(tool.category, tool.name, text, failed, tool.span.attributes['updraft.tool.command.programs']));
+        if (failed) {
           tool.span.error = true;
           tool.span.attributes['error.type'] = 'tool_error';
           summary.toolErrors += 1;
         } else tool.span.attributes['gen_ai.tool.call.result'] = content(text);
+        behavior.tool({ category: tool.category, name: tool.name, attrs: tool.span.attributes, command: tool.name === 'Bash' ? tool.input.command : undefined, failed, start: tool.span.start, end: at });
         // The subagent this tool ran, if any, ends with it.
         const sub = contexts.get(block.tool_use_id);
         if (sub) {
@@ -470,10 +789,38 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       const ctx = contexts.get('');
       if (ctx) closeChat(ctx, at);
       if (agentSpan) {
+        const denials = Array.isArray(ev.permission_denials) ? ev.permission_denials : null;
+        const usage = ev.modelUsage && typeof ev.modelUsage === 'object' && !Array.isArray(ev.modelUsage) ? ev.modelUsage : {};
+        const models = Object.keys(usage).filter((m) => SAFE_NAME.test(m)).slice(0, 16);
+        const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+        const word = (v) => (typeof v === 'string' && SAFE_NAME.test(v) ? v : undefined);
         Object.assign(agentSpan.attributes, {
-          'updraft.agent.turns': typeof ev.num_turns === 'number' ? ev.num_turns : undefined,
-          'updraft.agent.reported_cost_usd': typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
+          'updraft.agent.turns': num(ev.num_turns),
+          'updraft.agent.reported_cost_usd': num(ev.total_cost_usd),
+          // Wall time against time spent waiting on the model API, as the CLI measured them.
+          'updraft.agent.duration_ms': num(ev.duration_ms),
+          'updraft.agent.api_duration_ms': num(ev.duration_api_ms),
+          'updraft.agent.result.subtype': word(ev.subtype),
+          'updraft.agent.terminal_reason': word(ev.terminal_reason),
+          'updraft.agent.stop_reason': word(ev.stop_reason),
+          'updraft.agent.errors': Array.isArray(ev.errors) ? ev.errors.length : undefined,
+          'updraft.agent.permission_denials': denials ? denials.length : undefined,
+          'updraft.agent.permission_denied_tools': denials?.length ? [...new Set(denials.map((d) => d?.tool_name).filter((n) => typeof n === 'string' && SAFE_NAME.test(n)))] : undefined,
+          'updraft.agent.models': models.length ? models : undefined,
         });
+        if (typeof ev.total_cost_usd === 'number') summary.costUsd = ev.total_cost_usd;
+        for (const m of models) {
+          const u = usage[m] && typeof usage[m] === 'object' ? usage[m] : {};
+          addEvent(agentSpan, at, 'model_usage', {
+            'gen_ai.response.model': m,
+            'updraft.usage.input_tokens': num(u.inputTokens),
+            'updraft.usage.output_tokens': num(u.outputTokens),
+            'updraft.usage.cache_read_tokens': num(u.cacheReadInputTokens),
+            'updraft.usage.cache_creation_tokens': num(u.cacheCreationInputTokens),
+            'updraft.usage.web_search_requests': num(u.webSearchRequests),
+            'updraft.usage.cost_usd': num(u.costUSD),
+          });
+        }
         if (captureContent && typeof ev.result === 'string') {
           agentSpan.attributes['gen_ai.output.messages'] = clip(redact, [{ role: 'assistant', parts: [{ type: 'text', content: ev.result }], finish_reason: ev.is_error ? 'error' : 'stop' }]);
         }
@@ -505,6 +852,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     const output = Number(usage?.output_tokens) || 0;
     // OpenAI's input count already includes the cached tokens.
     Object.assign(t.span.attributes, {
+      'updraft.usage.reasoning_output_tokens': Number(usage?.reasoning_output_tokens) || undefined,
       'gen_ai.usage.input_tokens': usage ? input : undefined,
       'gen_ai.usage.output_tokens': usage ? output : undefined,
       'gen_ai.usage.cache_read.input_tokens': cached || undefined,
@@ -519,6 +867,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     summary.chats += 1;
     summary.inputTokens += input;
     summary.outputTokens += output;
+    if (usage) Object.assign(t.span.attributes, behavior.chat({ start: t.span.start, end: at, input, cached, main: true }));
     finish(t.span, at);
   }
 
@@ -556,6 +905,14 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     }
     const item = ev.item;
     if (!item || typeof item !== 'object' || typeof item.id !== 'string') return;
+    if (item.type === 'todo_list') {
+      todoEvent(agentSpan, at, codexTodoAttributes(item), Array.isArray(item.items) ? item.items.map((t) => ({ content: t?.text, status: t?.completed ? 'completed' : 'pending' })) : null);
+      return;
+    }
+    if (item.type === 'error' && ev.type === 'item.completed') {
+      addEvent(agentSpan, at, 'error', { 'updraft.message': captureContent && typeof item.message === 'string' ? clip(redact, item.message.slice(0, MAX_MESSAGE_CHARS)) : undefined });
+      return;
+    }
     if (ev.type === 'item.completed' && item.type === 'agent_message' && typeof item.text === 'string') turn?.parts.push({ type: 'text', content: item.text });
     if (ev.type === 'item.completed' && item.type === 'reasoning' && typeof item.text === 'string') turn?.parts.push({ type: 'reasoning', content: item.text });
     const kind = codexTool(item);
@@ -564,7 +921,11 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (!open) {
       if (turn) turn.toolCalls += 1;
       turn?.parts.push({ type: 'tool_call', id: item.id, name: kind.name, arguments: kind.args });
+      const detail = codexToolAttributes(item, roots());
+      detail['updraft.tool.category'] = toolCategory(kind.name, detail);
       open = {
+        name: kind.name,
+        category: detail['updraft.tool.category'],
         span: {
           traceId,
           spanId: newSpanId(),
@@ -579,6 +940,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
             'gen_ai.tool.call.id': item.id,
             'gen_ai.tool.type': kind.extension ? 'extension' : 'function',
             'gen_ai.tool.call.arguments': content(kind.args),
+            ...detail,
           },
         },
       };
@@ -595,14 +957,134 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       summary.toolErrors += 1;
     }
     const result = item.aggregated_output ?? item.result ?? (item.error ? item.error.message : undefined);
+    if (item.type === 'command_execution') Object.assign(open.span.attributes, resultAttributes(open.category, open.name, typeof item.aggregated_output === 'string' ? item.aggregated_output : '', failed, open.span.attributes['updraft.tool.command.programs']));
+    if (typeof item.exit_code === 'number') open.span.attributes['updraft.tool.exit_code'] = item.exit_code;
     if (result !== undefined && !failed) open.span.attributes['gen_ai.tool.call.result'] = content(result);
+    behavior.tool({ category: open.category, name: open.name, attrs: open.span.attributes, command: item.type === 'command_execution' ? item.command : undefined, failed, start: open.span.start, end: at });
     finish(open.span, at);
   }
 
   // ---- The worker's own lines ----------------------------------------------------------------
 
+  /** Step events whose line is entirely Updraft's own text (a URL, a branch, a count). */
+  const STRUCTURED_STEP_EVENTS = new Set(['attempt', 'push', 'pull_request.opened', 'pull_request.reused', 'already_pushed', 'review.posted', 'pull_request.ready', 'comment.posted', 'superseded']);
+
+  /** Updraft's steps after a run, by the prefix the publish modules give their run.log lines. */
+  const STEP_PREFIXES = [
+    ['publication: ', 'publish'],
+    ['review: ', 'post_review'],
+    ['revision: ', 'push_revision'],
+    ['failure comment: ', 'failure_comment'],
+  ];
+
+  /**
+   * One line of a publication, review or revision step: a new attempt starts a span; everything
+   * else is an event on it (with the line, which is Updraft's own text), and what it says about
+   * the pull request and the review lands on the span.
+   */
+  function onStepLine(step, text, at) {
+    let m;
+    const attempt = /^attempt (\d+) (?:\(|at\b)/.exec(text);
+    let s = steps.get(step);
+    if (s && attempt) {
+      finish(s.span, s.last);
+      s = null;
+    }
+    if (!s) {
+      s = {
+        span: { traceId, spanId: newSpanId(), parentSpanId: rootSpanId, name: `updraft ${step}`, kind: KIND_INTERNAL, start: at, attributes: { ...updraftBase(), 'updraft.step': step, 'updraft.step.attempt': attempt ? Number(attempt[1]) : undefined } },
+        last: at,
+      };
+      steps.set(step, s);
+    }
+    s.last = at;
+    const a = s.span.attributes;
+    let name = 'log';
+    if ((m = /^pushing (?:\S+ \([0-9a-f]+, |[0-9a-f]+\.\.[0-9a-f]+ \()(\d+) commit/.exec(text))) {
+      name = 'push';
+      a['updraft.push.commits'] = Number(m[1]);
+    } else if ((m = /^opened (draft )?PR #(\d+): (\S+)/.exec(text))) {
+      name = 'pull_request.opened';
+      Object.assign(a, { 'updraft.pull_request': Number(m[2]), 'updraft.pull_request.url': m[3], 'updraft.pull_request.draft': Boolean(m[1]) });
+    } else if ((m = /^reusing PR #(\d+)/.exec(text))) {
+      name = 'pull_request.reused';
+      a['updraft.pull_request'] = Number(m[1]);
+    } else if (/ is already on /.test(text)) name = 'already_pushed';
+    else if (/^skipped: /.test(text)) {
+      name = 'skipped';
+      a['updraft.step.result'] = 'skipped';
+    } else if (/^not posted: /.test(text)) {
+      name = 'not_posted';
+      a['updraft.step.result'] = 'not_posted';
+      s.span.error = true;
+      a['error.type'] = 'not_posted';
+    } else if ((m = /verdict (\S+) for [0-9a-f]+ of pull request #(\d+)/.exec(text))) {
+      name = 'attempt';
+      Object.assign(a, { 'updraft.review.verdict': m[1], 'updraft.pull_request': Number(m[2]) });
+    } else if ((m = /^verdict \S+: ([a-z-]+)/.exec(text))) {
+      name = 'review.outcome';
+      a['updraft.review.outcome'] = m[1];
+      summary.review = { ...(summary.review ?? {}), outcome: m[1] };
+    } else if (/^(posted a comment review|review already on)/.test(text)) name = 'review.posted';
+    else if (/^marked pull request #\d+ ready/.test(text)) name = 'pull_request.ready';
+    else if (/^(updated the comment|commented|comment already|already on)/.test(text)) name = 'comment.posted';
+    else if (/^attempt \d+ stopped/.test(text)) name = 'superseded';
+    else if (attempt) name = 'attempt';
+    // A line of a known shape is Updraft's own words, with values already on the span; any other
+    // (a reason, an error from GitHub) may quote anything, and is content.
+    const ownWords = STRUCTURED_STEP_EVENTS.has(name);
+    addEvent(s.span, at, name, { 'updraft.message': ownWords || captureContent ? clip(redact, text.slice(0, MAX_MESSAGE_CHARS)) : undefined });
+  }
+
+  /** The worker's end-of-run summary: commits, the diffstat, untracked files. */
+  function onSummaryLine(line) {
+    let m;
+    if ((m = /^ {2}commits since base: (\d+)/.exec(line))) change.commits = Number(m[1]);
+    else if ((m = /^ {2}changed files \(.*\): (\d+)$/.exec(line))) {
+      change.files = Number(m[1]);
+      summarySection = 'stat';
+    } else if (summarySection === 'stat' && (m = /^ {2}(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/.exec(line))) {
+      change.insertions = Number(m[2] ?? 0);
+      change.deletions = Number(m[3] ?? 0);
+    } else if (summarySection === 'stat' && (m = /^ {2}(\S.*?)\s+\|\s+(\d+|Bin)\b/.exec(line))) {
+      const lines = m[2] === 'Bin' ? 0 : Number(m[2]);
+      if (change.paths.length < 50) change.paths.push(m[1].slice(0, 512));
+      if (isTestPath(m[1])) {
+        change.testFiles += 1;
+        change.testLines += lines;
+      } else change.sourceLines += lines;
+    } else if ((m = /^ {2}untracked files: (\d+)/.exec(line))) {
+      change.untracked = Number(m[1]);
+      summarySection = 'summary';
+    } else if (line === '  last agent output:') summarySection = 'output';
+  }
+
   function onWorkerLine(line, at) {
     let m;
+    if (verifyStep && !line.startsWith('---- ') && !/^exit: (code|signal) /.test(line)) {
+      // A verify command's own output: kept (its end) to read the test counts from.
+      if (verifyStep.outputLines === undefined) {
+        // The first line is the worker's 'command: [...]'.
+        verifyStep.outputLines = 0;
+        verifyStep.output = '';
+        if (line.startsWith('command: ')) return;
+      }
+      verifyStep.outputLines += 1;
+      verifyStep.output += `${line}\n`;
+      if (verifyStep.output.length > MAX_VERIFY_OUTPUT_CHARS) verifyStep.output = verifyStep.output.slice(-MAX_VERIFY_OUTPUT_CHARS / 2);
+      return;
+    }
+    if (line === 'summary:' && phase === 'after') {
+      summarySection = 'summary';
+      return;
+    }
+    if (summarySection) {
+      if (line.startsWith('  ')) return onSummaryLine(line);
+      if (line !== '') summarySection = null;
+    }
+    for (const [prefix, step] of STEP_PREFIXES) {
+      if (line.startsWith(prefix) && phase === 'after') return onStepLine(step, line.slice(prefix.length), at);
+    }
     if (line.startsWith('---- agent output')) {
       phase = 'agent';
       startAgent(at);
@@ -638,6 +1120,8 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
           'updraft.verify.command': clip(redact, m[3]),
           'updraft.verify.index': Number(m[1]),
         },
+        // What the command runs, to tell checkers' summaries apart; not an attribute.
+        programs: describeCommand(m[3])?.programs ?? [],
       };
     } else if ((m = /^exit: (code (-?\d+)|signal (\S+)) after (\d+)s/.exec(line)) && verifyStep) {
       const code = m[2] !== undefined ? Number(m[2]) : null;
@@ -646,11 +1130,14 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         verifyStep.error = true;
         verifyStep.attributes['error.type'] = code === null ? `signal_${m[3]}` : 'exit_code';
       }
-      finish(verifyStep, at);
-      verifyStep = null;
+      endVerifyStep(at);
+    } else if ((m = /^exit: (code (-?\d+)|signal (\S+)) after (\d+)s(?: \(stopped by the worker: ([a-z_ ]+)\))?/.exec(line)) && agentSpan && !verifySpan && agentSpan.attributes['updraft.agent.exit_code'] === undefined && agentSpan.attributes['updraft.agent.exit_signal'] === undefined) {
+      // How the agent's process ended.
+      if (m[2] !== undefined) agentSpan.attributes['updraft.agent.exit_code'] = Number(m[2]);
+      else agentSpan.attributes['updraft.agent.exit_signal'] = m[3].slice(0, 32);
+      if (m[5]) agentSpan.attributes['updraft.agent.stopped_by'] = m[5];
     } else if ((m = /^---- end of verification: (\w+) ----$/.exec(line))) {
-      if (verifyStep) finish(verifyStep, at);
-      verifyStep = null;
+      if (verifyStep) endVerifyStep(at);
       if (verifySpan) {
         if (m[1] !== 'passed') {
           verifySpan.error = true;
@@ -660,8 +1147,22 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         finish(verifySpan, at);
         verifySpan = null;
       }
+    } else if ((m = /^review verdict for ([0-9a-f]{7,40}): (\S+)/.exec(line))) {
+      const verdict = m[2] === 'none' ? 'none' : m[2];
+      summary.review = { ...(summary.review ?? {}), verdict };
+      if (agentSpan) Object.assign(agentSpan.attributes, { 'updraft.review.verdict': verdict, 'updraft.review.head_sha': m[1] });
+      if (verdict === 'none' && agentSpan) agentSpan.attributes['error.type'] = 'no_verdict';
+    } else if ((m = /^review findings count: (\d+)/.exec(line))) {
+      summary.review = { ...(summary.review ?? {}), findings: Number(m[1]) };
+      if (agentSpan) agentSpan.attributes['updraft.review.findings'] = Number(m[1]);
+    } else if ((m = /^waiting on: ([\w.-]+\/[\w.-]+)#(\d+)/.exec(line))) {
+      if (agentSpan) agentSpan.attributes['updraft.waiting_on'] = `${m[1]}#${m[2]}`;
+    } else if (line.startsWith('verification: skipped')) {
+      if (agentSpan) agentSpan.attributes['updraft.verify.result'] = 'skipped';
     } else if ((m = /^outcome: (\S+)/.exec(line))) {
       summary.outcome = m[1];
+      if (!agentSpan) endPrepare(at, m[1] === 'succeeded' ? null : { type: m[1], message: h.startError });
+      phase = 'after';
       if (agentSpan) {
         agentSpan.attributes['updraft.run.outcome'] = m[1];
         if (m[1] !== 'succeeded') {
@@ -670,6 +1171,27 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         }
       }
     }
+  }
+
+  /** Ends the open verify command, with what its output says about tests and checks. */
+  function endVerifyStep(at) {
+    const v = verifyStep;
+    verifyStep = null;
+    if (!v) return;
+    const tests = parseTestOutput(v.output ?? '');
+    const checks = parseCheckOutput(v.output ?? '', v.programs ?? []);
+    Object.assign(v.attributes, { 'updraft.verify.output_lines': v.outputLines ?? 0, ...testAttributes(tests), ...checkAttributes(checks) });
+    if (verifySpan && tests) {
+      const a = verifySpan.attributes;
+      a['updraft.test.passed'] = (a['updraft.test.passed'] ?? 0) + tests.passed;
+      a['updraft.test.failed'] = (a['updraft.test.failed'] ?? 0) + tests.failed;
+      a['updraft.test.skipped'] = (a['updraft.test.skipped'] ?? 0) + tests.skipped;
+      if (tests.failedTests?.length) a['updraft.test.failed_tests'] = [...(a['updraft.test.failed_tests'] ?? []), ...tests.failedTests].slice(0, 20);
+    }
+    delete v.output;
+    delete v.outputLines;
+    delete v.programs;
+    finish(v, at);
   }
 
   function endAgent(at) {
@@ -691,16 +1213,70 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     }
   }
 
+  /** Claude Code's own log events (otlp-relay.mjs), as counted on the agent span. */
+  const api = { requests: 0, errors: 0, retries: 0, durationTotal: 0, durationMax: 0, rejections: 0, dropped: 0 };
+
+  /**
+   * One of Claude Code's own log events, when it belongs to this run's agent (its session is
+   * this run's `gen_ai.agent.id`): a span event on the agent span, and the agent span's
+   * counters. False when the session is not this run's (or not known yet).
+   */
+  function agentEvent(record) {
+    const id = agentSpan?.attributes['gen_ai.agent.id'];
+    if (!id || record?.sessionId !== id) return false;
+    // Already sent: what comes after the agent span ended has nowhere to go.
+    if (agentSpan.ended) return true;
+    const a = { ...(record.attributes ?? {}) };
+    // An API error's message is the provider's free text, which may quote the request: content.
+    // Its status, attempt and duration are kept either way.
+    if (typeof a.error === 'string' && captureContent) a.error = clip(redact, a.error);
+    else delete a.error;
+    const duration = typeof a.duration_ms === 'number' && a.duration_ms >= 0 ? a.duration_ms : 0;
+    if (record.name === 'claude_code.api_request' || record.name === 'claude_code.api_error') {
+      if (record.name === 'claude_code.api_request') api.requests += 1;
+      else api.errors += 1;
+      api.durationTotal += duration;
+      api.durationMax = Math.max(api.durationMax, duration);
+    }
+    if (typeof a.attempt === 'number' && a.attempt > 1) api.retries += 1;
+    if (record.name === 'claude_code.tool_decision' && a.decision === 'reject') api.rejections += 1;
+    if (record.name === 'claude_code.api_refusal') api.refusals = (api.refusals ?? 0) + 1;
+    if (record.name === 'claude_code.api_retries_exhausted') api.exhausted = (api.exhausted ?? 0) + 1;
+    agentSpan.events ??= [];
+    if (agentSpan.events.length < MAX_EVENTS_PER_SPAN) {
+      agentSpan.events.push({ at: Number.isFinite(record.time) ? record.time : agentSpan.start, name: String(record.name), attributes: { ...a } });
+    } else api.dropped += 1;
+    Object.assign(agentSpan.attributes, {
+      'updraft.agent.api_requests': api.requests,
+      'updraft.agent.api_errors': api.errors,
+      'updraft.agent.api_retries': api.retries,
+      'updraft.agent.api_duration_ms_total': Math.round(api.durationTotal),
+      'updraft.agent.api_duration_ms_max': Math.round(api.durationMax),
+      'updraft.agent.tool_rejections': api.rejections,
+      'updraft.agent.api_refusals': api.refusals,
+      'updraft.agent.api_retries_exhausted': api.exhausted,
+      'updraft.agent.events_dropped': api.dropped || undefined,
+    });
+    return true;
+  }
+
   return {
     header: h,
     summary,
+    agentEvent,
     get conversationId() {
       return conversationId();
     },
     line(line, at) {
+      firstAt ??= at;
       if (phase === 'header') {
-        if (line.startsWith('---- ')) onWorkerLine(line, at);
-        else parseHeaderLine(line, h);
+        if (line.startsWith('---- ') || line.startsWith('outcome: ')) onWorkerLine(line, at);
+        else if (line.startsWith('error: ')) h.startError ??= line.slice(7);
+        else {
+          // The worker's "ready" block (source clone, base, branch, ...): the worktree is prepared.
+          if (line.startsWith('source clone: ')) h.preparedAt = at;
+          parseHeaderLine(line, h);
+        }
         return;
       }
       if (phase === 'agent' && isJsonLine(line)) {
@@ -715,16 +1291,44 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     /** Ends everything still open (the log ended, or the job is over). */
     close(at) {
       if (phase === 'agent') endAgent(at);
-      if (verifyStep) finish(verifyStep, at);
+      if (!agentSpan) endPrepare(at);
+      if (verifyStep) endVerifyStep(at);
       if (verifySpan) finish(verifySpan, at);
-      verifyStep = verifySpan = null;
+      verifySpan = null;
+      for (const s of steps.values()) finish(s.span, s.last);
+      if (change.files !== undefined || change.commits !== undefined) {
+        summary.change = {
+          commits: change.commits,
+          files: change.files,
+          insertions: change.insertions,
+          deletions: change.deletions,
+          untracked: change.untracked,
+          testFiles: change.testFiles,
+        };
+      }
       if (agentSpan) {
         Object.assign(agentSpan.attributes, {
           'updraft.agent.tool_calls': summary.tools,
           'updraft.agent.tool_errors': summary.toolErrors,
+          'updraft.agent.compactions': compactions || undefined,
+          ...behavior.attributes(agentSpan.start, agentSpan.end ?? at),
           'gen_ai.usage.input_tokens': summary.inputTokens || undefined,
           'gen_ai.usage.output_tokens': summary.outputTokens || undefined,
+          ...(summary.change
+            ? {
+                'updraft.change.commits': change.commits,
+                'updraft.change.files': change.files,
+                'updraft.change.insertions': change.insertions,
+                'updraft.change.deletions': change.deletions,
+                'updraft.change.untracked': change.untracked,
+                'updraft.change.paths': change.paths.length ? change.paths : undefined,
+                'updraft.change.test_files': change.testFiles,
+                'updraft.change.test_lines': change.testLines,
+                'updraft.change.source_lines': change.sourceLines,
+              }
+            : {}),
         });
+        summary.thrashing = agentSpan.attributes['updraft.agent.thrashing'] === true;
         finish(agentSpan, agentSpan.end ?? at);
       }
     },
@@ -736,12 +1340,13 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
  * reads what is left, ends the job's root span with what the summary says, and sends the rest
  * within `budgetMs`. Never throws.
  */
-export function createAgentTracer({ runsDir, confineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs }) {
-  const traceId = newTraceId();
+export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: givenConfineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs, startedAt: jobStartedAt, traceId: givenTraceId }) {
+  const traceId = typeof givenTraceId === 'string' && /^[0-9a-f]{32}$/.test(givenTraceId) ? givenTraceId : newTraceId();
   const rootSpanId = newSpanId();
-  const startedAt = now();
+  // The job's start (before the tracer existed: isolation, the state, the coalescing wait), when the runner knows it.
+  const startedAt = typeof jobStartedAt === 'number' && jobStartedAt <= now() ? jobStartedAt : now();
   const runs = new Map();
-  const stats = { runs: 0, spans: 0, linesSkipped: 0 };
+  const stats = { runs: 0, spans: 0, linesSkipped: 0, agentEvents: 0, agentEventsUnmatched: 0 };
   let pollTimer = null;
   let exportTimer = null;
   let polling = Promise.resolve();
@@ -755,11 +1360,20 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
   // a file is read only when what was opened is a regular file at exactly
   // <confineTo, resolved>/logs/runs/<run>/<file>, so no link anywhere on the way leads it elsewhere.
   // The anchor is the state directory, resolved once, before the job could change anything under it.
-  const base = confineTo ?? runsDir;
-  const anchor = fsImpl.realpath(base).then(
-    (real) => path.join(real, path.relative(base, runsDir)),
-    () => null,
-  );
+  // The tracer can start before the state directory exists (to time the runner's first steps):
+  // `watch()` names the directory then, and nothing is read until it has.
+  let runsDir = null;
+  let anchor = Promise.resolve(null);
+  function watch({ runsDir: dir, confineTo = null }) {
+    if (runsDir !== null || typeof dir !== 'string') return;
+    runsDir = dir;
+    const base = confineTo ?? dir;
+    anchor = fsImpl.realpath(base).then(
+      (real) => path.join(real, path.relative(base, dir)),
+      () => null,
+    );
+  }
+  if (givenRunsDir) watch({ runsDir: givenRunsDir, confineTo: givenConfineTo });
   const expectedRoot = async () => {
     const root = await anchor;
     if (root === null) throw Object.assign(new Error('the state directory cannot be resolved'), { code: 'ENOENT' });
@@ -837,6 +1451,7 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
   }
 
   async function poll() {
+    if (runsDir === null) return;
     let names;
     try {
       names = await fsImpl.readdir(runsDir);
@@ -885,8 +1500,18 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
     }
   }
 
+  // Claude Code's own log events (otlp-relay.mjs). One can arrive before the run log line that
+  // says whose session it is has been read; it waits here for the next look at the logs.
+  const unmatched = [];
+  const placeEvent = (record) => [...runs.values()].some((r) => r.trace.agentEvent(record));
+  const placeUnmatched = () => {
+    if (!unmatched.length) return;
+    const waiting = unmatched.splice(0);
+    for (const record of waiting) if (!placeEvent(record)) unmatched.push(record);
+  };
+
   const schedulePoll = () => {
-    polling = polling.then(poll).catch(() => {});
+    polling = polling.then(poll).then(placeUnmatched).catch(() => {});
     return polling;
   };
 
@@ -896,14 +1521,39 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
     stats,
     /** One look at the logs now (the timer does this every pollMs). */
     poll: schedulePoll,
+    /** Names the run log directory, when the tracer started before it existed. */
+    watch,
+    /**
+     * One of Claude Code's own log events ({ name, time, sessionId, attributes }, from the
+     * relay): a span event and counters on the agent span whose `gen_ai.agent.id` is its
+     * session. Never throws.
+     */
+    agentEvent(record) {
+      try {
+        if (!record || typeof record.name !== 'string' || typeof record.sessionId !== 'string') return;
+        stats.agentEvents += 1;
+        if (placeEvent(record)) return;
+        unmatched.push(record);
+        if (unmatched.length > MAX_UNMATCHED_EVENTS) {
+          unmatched.shift();
+          stats.agentEventsUnmatched += 1;
+        }
+      } catch (error) {
+        log(`agent telemetry: ${error?.message ?? error}`);
+      }
+    },
     start() {
       pollTimer = setInterval(schedulePoll, pollMs);
       pollTimer.unref?.();
       exportTimer = setInterval(() => void exporter.flush(), exportMs);
       exportTimer.unref?.();
     },
-    /** `outcome`: the job's (succeeded, failed, ...); `summary`: run-event's JSON summary, if any. */
-    async stop({ outcome, summary, deliveryId, eventName, budgetMs = 15_000 } = {}) {
+    /**
+     * `outcome`: the job's (succeeded, failed, ...); `summary`: run-event's JSON summary, if any;
+     * `steps`: the runner's own steps ({ name, start, end, error?, attributes? }), each a span
+     * under the job's.
+     */
+    async stop({ outcome, summary, deliveryId, eventName, budgetMs = 15_000, steps = [] } = {}) {
       clearInterval(pollTimer);
       clearInterval(exportTimer);
       try {
@@ -911,10 +1561,33 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
         const at = now();
         const traces = [...runs.values()].map((r) => r.trace);
         for (const t of traces) t.close(at);
-        if (traces.length) {
-          const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? traces[0].conversationId;
+        const runnerSteps = Array.isArray(steps) ? steps.filter((step) => step && typeof step.name === 'string' && typeof step.start === 'number').slice(0, 64) : [];
+        // A job that ran no agent (it failed in the runner, or its event had nothing to run)
+        // still has its runner steps: sent under the job's span, in a conversation of the delivery.
+        if (traces.length || runnerSteps.length) {
+          const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? traces[0]?.conversationId ?? `delivery/${typeof deliveryId === 'string' && deliveryId ? deliveryId : traceId}`;
           const loop = summary?.loop && typeof summary.loop === 'object' ? summary.loop : null;
           const failed = outcome !== 'succeeded';
+          for (const step of runnerSteps) {
+            emit({
+              traceId,
+              spanId: newSpanId(),
+              parentSpanId: rootSpanId,
+              name: `runner ${step.name}`,
+              kind: KIND_INTERNAL,
+              start: step.start,
+              end: typeof step.end === 'number' ? step.end : at,
+              error: Boolean(step.error),
+              ...(step.error && typeof step.error === 'string' ? { errorMessage: step.error.slice(0, MAX_MESSAGE_CHARS) } : {}),
+              attributes: { 'gen_ai.agent.name': 'updraft', 'gen_ai.conversation.id': conversationId, 'updraft.step': step.name, ...(step.error ? { 'error.type': 'runner_step' } : {}), ...(step.attributes ?? {}) },
+            });
+          }
+          // The job in one wide event: what every run cost, changed and decided.
+          const runSummaries = traces.map((t) => t.summary);
+          const sum = (f) => runSummaries.reduce((n, r) => n + (f(r) ?? 0), 0);
+          const lastReview = [...runSummaries].reverse().find((r) => r.review)?.review ?? null;
+          const lastChange = [...runSummaries].reverse().find((r) => r.change)?.change ?? null;
+          const costs = runSummaries.filter((r) => typeof r.costUsd === 'number');
           emit({
             traceId,
             spanId: rootSpanId,
@@ -931,8 +1604,8 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
               'updraft.event.name': eventName,
               'updraft.job.outcome': outcome,
               'updraft.outcome': typeof summary?.outcome === 'string' ? summary.outcome : undefined,
-              'updraft.repository': traces[0].header.repository,
-              'updraft.issue': traces[0].header.issue,
+              'updraft.repository': traces[0]?.header.repository,
+              'updraft.issue': traces[0]?.header.issue,
               'updraft.pull_request': typeof summary?.prNumber === 'number' ? summary.prNumber : undefined,
               'updraft.pull_request.url': typeof summary?.prUrl === 'string' ? summary.prUrl : undefined,
               'updraft.loop.stage': typeof loop?.stage === 'string' ? loop.stage : undefined,
@@ -940,6 +1613,22 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
               'updraft.loop.reviews': typeof loop?.reviews === 'number' ? loop.reviews : undefined,
               'updraft.loop.merged': typeof loop?.merged === 'boolean' ? loop.merged : undefined,
               'updraft.runs': traces.length,
+              'updraft.runs.kinds': [...new Set(runSummaries.map((r) => r.kind).filter(Boolean))],
+              'updraft.runs.failed': runSummaries.filter((r) => r.outcome && r.outcome !== 'succeeded').length,
+              'updraft.agent.thrashing': runSummaries.some((r) => r.thrashing),
+              'gen_ai.usage.input_tokens': sum((r) => r.inputTokens) || undefined,
+              'gen_ai.usage.output_tokens': sum((r) => r.outputTokens) || undefined,
+              'updraft.agent.reported_cost_usd': costs.length ? costs.reduce((n, r) => n + r.costUsd, 0) : undefined,
+              'updraft.agent.tool_calls': sum((r) => r.tools),
+              'updraft.agent.tool_errors': sum((r) => r.toolErrors),
+              'updraft.review.verdict': lastReview?.verdict,
+              'updraft.review.findings': lastReview?.findings,
+              'updraft.review.outcome': lastReview?.outcome,
+              'updraft.change.commits': lastChange?.commits,
+              'updraft.change.files': lastChange?.files,
+              'updraft.change.insertions': lastChange?.insertions,
+              'updraft.change.deletions': lastChange?.deletions,
+              'updraft.change.test_files': lastChange?.testFiles,
               ...(failed ? { 'error.type': outcome ?? 'unknown' } : {}),
             },
           });
