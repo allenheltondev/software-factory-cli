@@ -533,6 +533,38 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(JSON.stringify(record)).toContain(harness.finishDetails[0].telemetry.traceId);
   });
 
+  it("points the agents at the runner's loopback relay, and puts Claude Code's own events on the agent span", async () => {
+    const harness = brokerDeps('telemetry-relay', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 200 };
+    };
+    harness.deps.telemetryPollMs = 50;
+    expect((await runJob(brokerRequest({ telemetry }), harness.deps)).outcome).toBe('succeeded');
+    const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+    expect(record.env).toMatchObject({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_LOGS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json', OTEL_EXPORTER_OTLP_ENDPOINT: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/) });
+    expect(record.env.OTEL_LOG_USER_PROMPTS).toBeUndefined();
+    expect(record.env.OTEL_LOG_TOOL_DETAILS).toBeUndefined();
+    expect(record.env.OTEL_EXPORTER_OTLP_HEADERS).toBeUndefined();
+    expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');
+    const spans = posts.flatMap((p) => p.resourceSpans[0].scopeSpans[0].spans);
+    const agent = spans.find((s) => s.name === 'invoke_agent claude');
+    expect(agent.events.map((e) => e.name)).toEqual(['claude_code.api_error', 'claude_code.api_request']);
+    const attrs = Object.fromEntries(agent.attributes.map((a) => [a.key, a.value]));
+    expect(attrs['updraft.agent.api_requests']).toEqual({ intValue: '1' });
+    expect(attrs['updraft.agent.api_errors']).toEqual({ intValue: '1' });
+    expect(attrs['updraft.agent.api_retries']).toEqual({ intValue: '1' });
+    expect(attrs['updraft.agent.api_duration_ms_max']).toEqual({ intValue: '900' });
+  });
+
+  it('gives the job no telemetry variables when telemetry is off', async () => {
+    const harness = brokerDeps('telemetry-relay');
+    await runJob(brokerRequest(), harness.deps);
+    const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+    expect(Object.keys(record.env).filter((k) => k.startsWith('OTEL_') || k === 'CLAUDE_CODE_ENABLE_TELEMETRY')).toEqual([]);
+  });
+
   it('reads exactly the secret version the settings name', async () => {
     const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
     harness.deps.fetch = async () => ({ ok: true, status: 200 });

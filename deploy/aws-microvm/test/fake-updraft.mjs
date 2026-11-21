@@ -16,6 +16,7 @@
 // there as a config object): { "record": <file to append one JSON line per call to>,
 // "merge": ok | fail | newer-schema | hang | garbage | tiny | no-json | wal, "info": ok | fail,
 // "copy": ok | fail, "failFinalMerge": true (a merge without --live fails; checkpoints work) }.
+/* global fetch */
 import fs from 'node:fs';
 import path from 'node:path';
 import { decodeStateDb, encodeStateDb } from './fake-state-db.mjs';
@@ -237,6 +238,40 @@ switch (mode) {
       setTimeout(step, pauseMs);
     };
     setTimeout(step, pauseMs);
+    break;
+  }
+  case 'telemetry-relay': {
+    // A Claude Code run that also exports its own log events where its environment says
+    // (the runner's relay), as Claude Code does with CLAUDE_CODE_ENABLE_TELEMETRY.
+    const dir = path.join(home, 'logs', 'runs', 'run_r1');
+    fs.mkdirSync(dir, { recursive: true });
+    const log = path.join(dir, 'run.log');
+    const head = ['updraft run run_r1', 'job: job_r1 (attempt 1)', 'repository: o/r (id 1)', 'issue: #8 A title', 'agent: claude (adapter claude)', '---- agent output (stdout and stderr) ----'];
+    fs.writeFileSync(log, `${head.join('\n')}\n${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-relay', model: 'claude-x' })}\n`);
+    const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+    const attr = (key, value) => ({ key, value: typeof value === 'number' ? { intValue: String(value) } : { stringValue: value } });
+    const body = {
+      resourceLogs: [
+        {
+          resource: { attributes: [attr('service.name', 'claude-code')] },
+          scopeLogs: [
+            {
+              logRecords: [
+                { timeUnixNano: `${BigInt(Date.now()) * 1000000n}`, body: { stringValue: 'claude_code.api_error' }, attributes: [attr('event.name', 'api_error'), attr('session.id', 'sess-relay'), attr('status_code', 529), attr('attempt', 2), attr('duration_ms', 40), attr('error', 'overloaded')] },
+                { timeUnixNano: `${BigInt(Date.now()) * 1000000n}`, body: { stringValue: 'claude_code.api_request' }, attributes: [attr('event.name', 'api_request'), attr('session.id', 'sess-relay'), attr('model', 'claude-x'), attr('duration_ms', 900), attr('input_tokens', 5)] },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const post = endpoint
+      ? fetch(`${endpoint}/v1/logs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).catch(() => {})
+      : Promise.resolve();
+    post.then(() => {
+      fs.appendFileSync(log, `${JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', num_turns: 1 })}\n---- end of agent output ----\noutcome: succeeded\n`);
+      console.log(JSON.stringify({ outcome: 'succeeded', logPath: log, exitCode: 0 }));
+    });
     break;
   }
   case 'success':

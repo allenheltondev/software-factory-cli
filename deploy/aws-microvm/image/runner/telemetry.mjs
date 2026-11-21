@@ -68,6 +68,8 @@ export const MAX_EVENTS_PER_SPAN = 256;
 const MAX_VERIFY_OUTPUT_CHARS = 512 * 1024;
 /** Updraft's own messages on span events (publication, review, revision steps), cut to this. */
 const MAX_MESSAGE_CHARS = 300;
+/** Agent events whose session no run has shown yet, kept until one does (or the job ends). */
+const MAX_UNMATCHED_EVENTS = 2000;
 
 const KIND_INTERNAL = 1;
 const KIND_CLIENT = 3;
@@ -111,8 +113,8 @@ export function toOtlpSpan(s) {
     startTimeUnixNano: nanos(s.start),
     endTimeUnixNano: nanos(Math.max(s.start, s.end ?? s.start)),
     attributes: attributes(s.attributes ?? {}),
-    status: s.error ? { code: STATUS_ERROR, ...(s.errorMessage ? { message: s.errorMessage } : {}) } : { code: STATUS_OK },
     ...(s.events?.length ? { events: s.events.map((e) => ({ timeUnixNano: nanos(e.at), name: e.name, attributes: attributes(e.attributes ?? {}) })) } : {}),
+    status: s.error ? { code: STATUS_ERROR, ...(s.errorMessage ? { message: s.errorMessage } : {}) } : { code: STATUS_OK },
     ...(s.droppedEvents ? { droppedEventsCount: s.droppedEvents } : {}),
     ...(s.links?.length ? { links: s.links.map((l) => ({ traceId: l.traceId, spanId: l.spanId, attributes: attributes(l.attributes ?? {}) })) } : {}),
   };
@@ -1200,9 +1202,53 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     }
   }
 
+  /** Claude Code's own log events (otlp-relay.mjs), as counted on the agent span. */
+  const api = { requests: 0, errors: 0, retries: 0, durationTotal: 0, durationMax: 0, rejections: 0, dropped: 0 };
+
+  /**
+   * One of Claude Code's own log events, when it belongs to this run's agent (its session is
+   * this run's `gen_ai.agent.id`): a span event on the agent span, and the agent span's
+   * counters. False when the session is not this run's (or not known yet).
+   */
+  function agentEvent(record) {
+    const id = agentSpan?.attributes['gen_ai.agent.id'];
+    if (!id || record?.sessionId !== id) return false;
+    // Already sent: what comes after the agent span ended has nowhere to go.
+    if (agentSpan.ended) return true;
+    const a = record.attributes ?? {};
+    const duration = typeof a.duration_ms === 'number' && a.duration_ms >= 0 ? a.duration_ms : 0;
+    if (record.name === 'claude_code.api_request' || record.name === 'claude_code.api_error') {
+      if (record.name === 'claude_code.api_request') api.requests += 1;
+      else api.errors += 1;
+      api.durationTotal += duration;
+      api.durationMax = Math.max(api.durationMax, duration);
+    }
+    if (typeof a.attempt === 'number' && a.attempt > 1) api.retries += 1;
+    if (record.name === 'claude_code.tool_decision' && a.decision === 'reject') api.rejections += 1;
+    if (record.name === 'claude_code.api_refusal') api.refusals = (api.refusals ?? 0) + 1;
+    if (record.name === 'claude_code.api_retries_exhausted') api.exhausted = (api.exhausted ?? 0) + 1;
+    agentSpan.events ??= [];
+    if (agentSpan.events.length < MAX_EVENTS_PER_SPAN) {
+      agentSpan.events.push({ at: Number.isFinite(record.time) ? record.time : agentSpan.start, name: String(record.name), attributes: { ...a } });
+    } else api.dropped += 1;
+    Object.assign(agentSpan.attributes, {
+      'updraft.agent.api_requests': api.requests,
+      'updraft.agent.api_errors': api.errors,
+      'updraft.agent.api_retries': api.retries,
+      'updraft.agent.api_duration_ms_total': Math.round(api.durationTotal),
+      'updraft.agent.api_duration_ms_max': Math.round(api.durationMax),
+      'updraft.agent.tool_rejections': api.rejections,
+      'updraft.agent.api_refusals': api.refusals,
+      'updraft.agent.api_retries_exhausted': api.exhausted,
+      'updraft.agent.events_dropped': api.dropped || undefined,
+    });
+    return true;
+  }
+
   return {
     header: h,
     summary,
+    agentEvent,
     get conversationId() {
       return conversationId();
     },
@@ -1285,7 +1331,7 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
   // The job's start (before the tracer existed: isolation, the state, the coalescing wait), when the runner knows it.
   const startedAt = typeof jobStartedAt === 'number' && jobStartedAt <= now() ? jobStartedAt : now();
   const runs = new Map();
-  const stats = { runs: 0, spans: 0, linesSkipped: 0 };
+  const stats = { runs: 0, spans: 0, linesSkipped: 0, agentEvents: 0, agentEventsUnmatched: 0 };
   let pollTimer = null;
   let exportTimer = null;
   let polling = Promise.resolve();
@@ -1429,8 +1475,18 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
     }
   }
 
+  // Claude Code's own log events (otlp-relay.mjs). One can arrive before the run log line that
+  // says whose session it is has been read; it waits here for the next look at the logs.
+  const unmatched = [];
+  const placeEvent = (record) => [...runs.values()].some((r) => r.trace.agentEvent(record));
+  const placeUnmatched = () => {
+    if (!unmatched.length) return;
+    const waiting = unmatched.splice(0);
+    for (const record of waiting) if (!placeEvent(record)) unmatched.push(record);
+  };
+
   const schedulePoll = () => {
-    polling = polling.then(poll).catch(() => {});
+    polling = polling.then(poll).then(placeUnmatched).catch(() => {});
     return polling;
   };
 
@@ -1440,6 +1496,25 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
     stats,
     /** One look at the logs now (the timer does this every pollMs). */
     poll: schedulePoll,
+    /**
+     * One of Claude Code's own log events ({ name, time, sessionId, attributes }, from the
+     * relay): a span event and counters on the agent span whose `gen_ai.agent.id` is its
+     * session. Never throws.
+     */
+    agentEvent(record) {
+      try {
+        if (!record || typeof record.name !== 'string' || typeof record.sessionId !== 'string') return;
+        stats.agentEvents += 1;
+        if (placeEvent(record)) return;
+        unmatched.push(record);
+        if (unmatched.length > MAX_UNMATCHED_EVENTS) {
+          unmatched.shift();
+          stats.agentEventsUnmatched += 1;
+        }
+      } catch (error) {
+        log(`agent telemetry: ${error?.message ?? error}`);
+      }
+    },
     start() {
       pollTimer = setInterval(schedulePoll, pollMs);
       pollTimer.unref?.();

@@ -18,7 +18,8 @@
 // config file, a new /proc and /dev, tmpfs /tmp, /run and /var/tmp, the --tmpfs paths and
 // exactly the --mount binds), new PID, IPC and UTS namespaces, a user namespace in which the
 // caller's uid is the only one, no capabilities, no_new_privs, a new session, and an
-// environment that holds only what `-e` named plus PATH and LANG. The network is shared with
+// environment that holds only what `-e` named plus PATH and LANG (and, set by the microVM
+// runner for agent telemetry, the loopback OTLP settings of TELEMETRY_ENV). The network is shared with
 // the caller unless --network none is given. Nothing else of the caller reaches the command:
 // not its other file descriptors (the three standard streams are relayed through pipes), not
 // its environment, not its working directory.
@@ -429,12 +430,41 @@ export function etcArgs(etc) {
 // ---------------------------------------------------------------------------
 
 /**
- * The environment of the sandboxed command: PATH and LANG, the config file's settings, and
- * what `-e` named (a bare name is copied from the caller's environment when it is set there).
- * Nothing else of the caller's environment.
+ * The one exception to "nothing of the caller's environment unless `-e` names it": the
+ * settings that make Claude Code send its own log events to the microVM runner's loopback
+ * relay (runner/otlp-relay.mjs, claudeTelemetryEnv), set by the runner only when the job has
+ * agent telemetry. None of them can hold a secret (no headers variable is among them), each
+ * value must be exactly of its expected form, and the endpoint must be http on 127.0.0.1, so
+ * the events can only go to this machine. If any is set but not of its form, none is passed.
+ */
+export const TELEMETRY_ENV = {
+  CLAUDE_CODE_ENABLE_TELEMETRY: /^1$/,
+  OTEL_LOGS_EXPORTER: /^otlp$/,
+  OTEL_METRICS_EXPORTER: /^none$/,
+  OTEL_TRACES_EXPORTER: /^none$/,
+  OTEL_EXPORTER_OTLP_PROTOCOL: /^http\/json$/,
+  OTEL_EXPORTER_OTLP_ENDPOINT: /^http:\/\/127\.0\.0\.1:[1-9]\d{0,4}$/,
+  OTEL_LOGS_EXPORT_INTERVAL: /^[1-9]\d{2,5}$/,
+};
+
+/** The caller's telemetry settings (TELEMETRY_ENV), when all of them are there and of their form; else none. */
+export function telemetryEnv(callerEnv) {
+  const out = {};
+  for (const [name, form] of Object.entries(TELEMETRY_ENV)) {
+    const value = callerEnv[name];
+    if (typeof value !== 'string' || !form.test(value)) return {};
+    out[name] = value;
+  }
+  return out;
+}
+
+/**
+ * The environment of the sandboxed command: PATH and LANG, the config file's settings, the
+ * runner's agent telemetry settings (TELEMETRY_ENV) and what `-e` named (a bare name is copied
+ * from the caller's environment when it is set there). Nothing else of the caller's environment.
  */
 export function sandboxEnv(run, callerEnv, config) {
-  const env = { PATH: config.path, LANG: DEFAULT_LANG, ...config.env };
+  const env = { PATH: config.path, LANG: DEFAULT_LANG, ...config.env, ...telemetryEnv(callerEnv) };
   for (const entry of run.env) {
     if (entry.value !== undefined) env[entry.name] = entry.value;
     else if (typeof callerEnv[entry.name] === 'string') env[entry.name] = callerEnv[entry.name];

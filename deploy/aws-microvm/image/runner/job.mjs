@@ -23,6 +23,7 @@ import {
   syncState,
   waitForStateChange,
 } from './state.mjs';
+import { claudeTelemetryEnv, createOtlpRelay } from './otlp-relay.mjs';
 import { HONEYCOMB_ENDPOINTS, createAgentTracer, createExporter } from './telemetry.mjs';
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
@@ -292,6 +293,10 @@ export async function runJob(request, deps) {
       step.end = now();
     }
   };
+  // With telemetry: the loopback relay Claude Code sends its own log events to (otlp-relay.mjs),
+  // and the variables that point the agents at it (no key among them).
+  let relay;
+  let agentTelemetryEnv;
   // Set once `updraft run-event` has run, whatever its outcome: only then is there a
   // database worth merging.
   let stateToSync;
@@ -375,6 +380,7 @@ export async function runJob(request, deps) {
         ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}),
       });
       tracer.start();
+      ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
       log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.endpoint}${telemetry.captureContent ? ', with content' : ''}`);
     }
     for (;;) {
@@ -391,7 +397,7 @@ export async function runJob(request, deps) {
       checkpointer?.start();
       try {
         run = await timed('run_event', { 'updraft.run_event.try': pending.tries + 1, 'updraft.run_event.deadline_minutes': deadlineNow }, async (step) => {
-          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: tracer?.traceId }, { agentEnv, redact }, (stop) => {
+          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: tracer?.traceId, agentTelemetryEnv }, { agentEnv, redact }, (stop) => {
             stopChild = stop;
             if (stopRequested) stop();
           });
@@ -477,6 +483,8 @@ export async function runJob(request, deps) {
     log(`job could not run: ${result.error}`);
   }
   stopTokenRefresh();
+  // The job process has exited: nothing more for the relay to hear before the last spans go.
+  await relay?.stop();
   if (tracer) {
     // The last spans, with how the job ended. Little time when the microVM is being stopped.
     result.telemetry = await tracer.stop({
@@ -743,6 +751,22 @@ export function finishDetail(result) {
 }
 
 /**
+ * The loopback relay for Claude Code's own log events, feeding the tracer, and the variables
+ * that point the agents at it. A relay that cannot start costs only those events.
+ */
+async function startAgentEventRelay(tracer, log) {
+  const relay = createOtlpRelay({ onRecord: (record) => tracer.agentEvent(record), log });
+  try {
+    const { port } = await relay.start();
+    return { relay, env: claudeTelemetryEnv(port) };
+  } catch (error) {
+    log(`agent telemetry: Claude Code's own events are not collected (the relay did not start: ${error?.code ?? error?.message ?? error})`);
+    await relay.stop();
+    return { relay: undefined, env: undefined };
+  }
+}
+
+/**
  * The job's telemetry settings, from the broker's descriptor, with the key read from the
  * tenant's secret. Null when telemetry is off, or the key cannot be read (the job runs anyway).
  */
@@ -857,6 +881,10 @@ function jobEnvironment(payload, stateDir, agentEnv, deps) {
   // The job's trace, when telemetry is on: Updraft records it with each run, so a later job's
   // trace can link back to this one (a revision to the review it answers). An id, not a secret.
   if (typeof deps.traceId === 'string' && /^[0-9a-f]{32}$/.test(deps.traceId)) env.UPDRAFT_TRACE_ID = deps.traceId;
+  // With agent telemetry: where Claude Code sends its own log events (the runner's loopback
+  // relay; no key). Last, so an agent key of the same name cannot point them elsewhere. The
+  // sandbox runtime passes exactly these on to a contained agent (updraft-sandbox.mjs).
+  Object.assign(env, deps.agentTelemetryEnv);
   // Deliberately absent: AWS_* (the runner's credentials and region), anything naming the
   // key file, and the run request. See "Security model" in the README for what this does
   // and does not achieve.

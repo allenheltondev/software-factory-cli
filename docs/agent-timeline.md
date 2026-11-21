@@ -151,6 +151,46 @@ link to that run's `invoke_agent` span, with `updraft.link.relation`:
 - `resumes`: the run that waited on another pull request, for its follow-up;
 - `retry`: the job's earlier attempt.
 
+## Claude Code's own events
+
+The transcript does not say how long an API request took, that it was retried, or that a tool
+was refused. Claude Code's own [OpenTelemetry log events](https://code.claude.com/docs/en/monitoring-usage)
+do, and the runner collects them without giving an agent any key:
+
+- When the job has telemetry, the runner (root) starts a small OTLP/HTTP receiver on
+  `127.0.0.1` with a random port (`deploy/aws-microvm/image/runner/otlp-relay.mjs`) before
+  `updraft run-event`, and the job gets `CLAUDE_CODE_ENABLE_TELEMETRY=1`,
+  `OTEL_LOGS_EXPORTER=otlp`, `OTEL_METRICS_EXPORTER=none`, `OTEL_TRACES_EXPORTER=none`,
+  `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`, `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:<port>`
+  and `OTEL_LOGS_EXPORT_INTERVAL=1000`. No headers, no key; `OTEL_LOG_USER_PROMPTS` and
+  `OTEL_LOG_TOOL_DETAILS` stay unset. Without telemetry none of this is set.
+- Updraft passes its environment on to an agent's runtime client, and the sandbox runtime
+  (`updraft-sandbox`) passes exactly these variables on to a contained agent, and only when
+  every one of them has its expected value and the endpoint is `http://127.0.0.1:<port>`. The
+  packet filter does not stand in the way: it only keeps non-root users from the credential
+  addresses and the lifecycle hook port. An agent with `container.network: none` has no
+  loopback to send to, and sends nothing.
+- The relay keeps six events: `claude_code.api_request`, `claude_code.api_error`,
+  `claude_code.api_refusal`, `claude_code.api_retries_exhausted`, `claude_code.tool_decision`
+  and `claude_code.tool_result`, each with a fixed list of scalar
+  attributes (model, duration, tokens, cost, status code, attempt, the error message cut to 200
+  characters, tool name, decision and its source, success, prompt id, ...). Anything else is
+  counted and dropped. It reads JSON only (415 otherwise), refuses bodies over 1 MB (413), keeps
+  at most 1,000 records per request and 50,000 per job, and accepts and discards metrics and
+  traces.
+- Each event is matched by its `session.id` to the `invoke_agent` span whose `gen_ai.agent.id`
+  is that session (the stream-json `session_id`), and added to it as a span event (at most 256
+  per span), redacted like everything else. The span also gets
+  `updraft.agent.api_requests`, `updraft.agent.api_errors`, `updraft.agent.api_retries`
+  (events with `attempt` > 1), `updraft.agent.api_duration_ms_total` and
+  `updraft.agent.api_duration_ms_max` (over requests and errors), and
+  `updraft.agent.tool_rejections`, `updraft.agent.api_refusals` and
+  `updraft.agent.api_retries_exhausted`. A subagent shares its parent's session, so its events are on
+  the run's agent span.
+
+Any process on the microVM that can reach loopback could post events to the relay; they can
+only land on an agent span of this job, as span events in the tenant's own dataset.
+
 ## Content
 
 Off by default. With **Prompts and outputs** on, spans also carry:
