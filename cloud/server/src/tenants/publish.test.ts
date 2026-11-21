@@ -54,7 +54,7 @@ describe('publishTenantConfig', () => {
       expect.objectContaining({ version: 1, status: 'ready', files: ['config.yaml', 'prompts/implement-issue.md', 'source.json'], publishedBy: 'admin', publishedAt: '2026-11-19T00:00:00.000Z' }),
     ]);
     // What the launcher dispatches on, from the compiled config (the repository id the installation reaches).
-    expect((await store.getConfigVersion(55, 1))?.dispatch).toEqual({ repositories: { 'acme/web': { id: 99, actors: ['pat'], triggers: [{ label: 'ready' }] } } });
+    expect((await store.getConfigVersion(55, 1))?.dispatch).toEqual({ keys: ['ANTHROPIC_API_KEY'], repositories: { 'acme/web': { id: 99, actors: ['pat'], triggers: [{ label: 'ready' }] } } });
   });
 
   it('never rewrites a version: each publish is the next one', async () => {
@@ -139,7 +139,7 @@ describe('setAgentKey', () => {
   it('keeps each key in its own secret, so two keys set at once both survive (the review\x27s race)', async () => {
     const { store } = await setup();
     const s = secrets();
-    const set = (name: string, value: string) => setAgentKey({ installationId: 55, name, value, updatedBy: 'admin' }, { secrets: s.port, store, now: () => NOW });
+    const set = (name: string, value: string) => setAgentKey({ installationId: 55, name, value, updatedBy: 'admin' }, { check: async () => 'valid' as const, secrets: s.port, store, now: () => NOW });
     const results = await Promise.all([set('ANTHROPIC_API_KEY', ANTHROPIC), set('CODEX_API_KEY', OPENAI)]);
     expect(results.every((r) => r.ok)).toBe(true);
     expect(s.values.get(agentKeySecretName(55, 'ANTHROPIC_API_KEY'))).toBe(ANTHROPIC);
@@ -159,7 +159,7 @@ describe('setAgentKey', () => {
       await put(...args);
       await store.markUninstalled(55, NOW + 1000);
     };
-    const r = await setAgentKey({ installationId: 55, name: 'ANTHROPIC_API_KEY', value: ANTHROPIC, updatedBy: 'admin' }, { secrets: s.port, store });
+    const r = await setAgentKey({ installationId: 55, name: 'ANTHROPIC_API_KEY', value: ANTHROPIC, updatedBy: 'admin' }, { check: async () => 'valid' as const, secrets: s.port, store });
     expect(r).toMatchObject({ ok: false, message: expect.stringMatching(/uninstalled/) });
     expect(s.values.size).toBe(0);
     expect(await store.listAgentKeyMeta(55)).toEqual([]);
@@ -168,7 +168,7 @@ describe('setAgentKey', () => {
   it('refuses an unknown name, a value of the wrong shape (without repeating it), and a missing tenant', async () => {
     const { store } = await setup();
     const s = secrets();
-    const set = (installationId: number, name: string, value: string) => setAgentKey({ installationId, name, value, updatedBy: 'admin' }, { secrets: s.port, store });
+    const set = (installationId: number, name: string, value: string) => setAgentKey({ installationId, name, value, updatedBy: 'admin' }, { check: async () => 'valid' as const, secrets: s.port, store });
     expect(await set(55, 'AWS_SECRET_ACCESS_KEY', ANTHROPIC)).toMatchObject({ ok: false, message: expect.stringMatching(/not an agent key/) });
     const wrong = await set(55, 'ANTHROPIC_API_KEY', OPENAI);
     expect(wrong).toMatchObject({ ok: false, message: expect.stringMatching(/does not look like/) });

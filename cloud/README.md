@@ -17,7 +17,14 @@ So far it covers these phases:
 - **The multi-tenant engine** ([#68](https://github.com/allenheltondev/software-factory-cli/issues/68)): a labeled issue in a tenant's repository runs a job with that tenant's config and keys, within quotas.
 - **Configuration** ([#69](https://github.com/allenheltondev/software-factory-cli/issues/69)): repositories and workflows are configured and published in the browser, with versions and a history.
 
-Agent keys in the console and status follow in #70 and #71.
+- **Agent credentials** ([#70](https://github.com/allenheltondev/software-factory-cli/issues/70)): bring your own `ANTHROPIC_API_KEY` / `CODEX_API_KEY`, under Agent keys in the console.
+  - **Write-only:** a member sees `configured`, `last rotated` and `last used OK/failed` per key. `PUT /api/v1/installations/:id/agent-keys/:name` takes a value; no route returns one.
+  - **Validated first:** the key is checked with one cheap provider call (listing models) before it is saved. A key the provider rejects, or a provider that cannot be reached, saves nothing. Rotating replaces the secret under the same name, so the next job reads the new key, and clears `last used`.
+  - **Launcher:** a config version records the keys its enabled repositories need. If one is not set, the launcher starts nothing, answers 200 `missing_key` and records the reason (shown under "Recently refused", kept 30 days).
+  - **Last used:** the job pins the keys it needs; when it finishes, each is marked OK (`succeeded`) or failed (any other outcome that was not a termination).
+  - **Redaction:** `server/src/tenants/redact.ts` removes known key values and anything shaped like a provider key, bearer token or key header. It is applied to the API's logged errors and the launcher's logged launch failures, and is the function to run on job logs before any endpoint serves them (#71).
+
+Status follows in #71.
 
 ## Architecture
 

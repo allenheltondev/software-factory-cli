@@ -53,7 +53,9 @@ export type FlowErrorCode =
   | 'invalid_config'
   | 'config_changed'
   | 'auto_merge_unconfirmed'
-  | 'not_reactivatable';
+  | 'not_reactivatable'
+  // Agent keys (tenants/agent-key-service.ts).
+  | 'invalid_key';
 
 export class FlowError extends Error {
   readonly code: FlowErrorCode;

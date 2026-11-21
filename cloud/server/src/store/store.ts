@@ -150,6 +150,8 @@ export interface ConfigVersion {
  * label (lower-case, as GitHub compares labels) and the logins allowed to apply it (lower-case).
  */
 export interface DispatchRules {
+  /** The agent keys (variable names) the config's enabled repositories run with; the launcher refuses when one is not set. */
+  keys?: string[];
   /**
    * `paused`: the repository stays configured, but no labeled issue of it starts a job.
    * `actors`: when every trigger allows the same logins, they are stored once here and the
@@ -162,8 +164,21 @@ export interface DispatchRules {
 /** That an agent key is set (never its value, which lives only in Secrets Manager). */
 export interface AgentKeyMeta {
   name: string;
+  /** When the value was last set: "last rotated". */
   updatedAt: string;
   updatedBy: string;
+  /** The last job that ran with this key, and whether it worked. Cleared when the key is rotated. */
+  lastUsedAt?: string;
+  lastUsedOk?: boolean;
+}
+
+/** A launch the launcher refused, and why, kept 30 days for the console (never anything secret). */
+export interface DispatchRefusal {
+  at: string;
+  deliveryId: string;
+  repository: string;
+  issue: number;
+  reason: string;
 }
 
 /**
@@ -206,6 +221,8 @@ export interface Job {
   reservedSeconds?: number;
   /** The tenant's quotas when it was launched: `start` checks the month against them, and a refusal says why. */
   quotas?: Quotas;
+  /** The agent keys (variable names) this job needs; at finish each is marked used, OK or failed. */
+  agentKeys?: string[];
   /** The issue whose label started it, for an over-quota comment. */
   issue?: number;
   /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
@@ -341,6 +358,11 @@ export interface Store {
   /** Refused (`uninstalled`) once the tenant is uninstalled or gone, so no row escapes the sweep. */
   putAgentKeyMeta(installationId: number, meta: AgentKeyMeta): Promise<'stored' | 'uninstalled'>;
   listAgentKeyMeta(installationId: number): Promise<AgentKeyMeta[]>;
+  /** Records the outcome of a job that used the key. Nothing when the key is not set. */
+  recordAgentKeyUse(installationId: number, name: string, use: { at: string; ok: boolean }): Promise<void>;
+  recordRefusal(installationId: number, refusal: DispatchRefusal): Promise<void>;
+  /** Newest first. */
+  listRefusals(installationId: number, limit: number): Promise<DispatchRefusal[]>;
 
   /**
    * Uninstalled tenants whose deadline has passed and whose data outside the table (the S3 prefix,
@@ -479,6 +501,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const configs = new Map<string, ConfigVersion>();
   const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
+  const refusals: { id: number; r: DispatchRefusal }[] = [];
   const jobs = new Map<string, Job>();
   /** `<installationId>/<deliveryId>` -> expiry (epoch ms) and the job holding the claim. */
   const deliveries = new Map<string, { expiresAt: number; jobId: string }>();
@@ -844,10 +867,21 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       for (const [k, m] of members) if (m.installationId === id) members.delete(k);
       for (const [k, c] of configs) if (c.installationId === id) configs.delete(k);
       for (const k of [...keys.keys()]) if (k.startsWith(`${id}/`)) keys.delete(k);
+      for (let i = refusals.length - 1; i >= 0; i--) if (refusals[i]!.id === id) refusals.splice(i, 1);
       for (const m of [slots, days, months]) for (const k of [...m.keys()]) if (k.startsWith(`${id}/`)) m.delete(k);
     },
     async completeCleanup(entry) {
       if (cleanups.get(entry.installationId)?.deleteAfter === entry.deleteAfter) cleanups.delete(entry.installationId);
+    },
+    async recordAgentKeyUse(id, name, use) {
+      const k = keys.get(`${id}/${name}`);
+      if (k) keys.set(`${id}/${name}`, { ...k, lastUsedAt: use.at, lastUsedOk: use.ok });
+    },
+    async recordRefusal(id, r) {
+      refusals.push({ id, r: { ...r } });
+    },
+    async listRefusals(id, limit) {
+      return refusals.filter((x) => x.id === id).map((x) => ({ ...x.r })).sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);
     },
     async listAgentKeyMeta(id) {
       return [...keys.entries()].filter(([k]) => k.startsWith(`${id}/`)).map(([, v]) => ({ ...v })).sort((a, b) => a.name.localeCompare(b.name));

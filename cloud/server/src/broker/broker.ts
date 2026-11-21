@@ -4,7 +4,7 @@ import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
-import type { Job, Store } from '../store/store.js';
+import { isFailure, type Job, type Store } from '../store/store.js';
 import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
@@ -251,6 +251,14 @@ export function createBroker(deps: BrokerDeps) {
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
       if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
+      // The key's "last used": this job ran with it (it started) and it worked or it did not.
+      // Best effort: a failure here must not fail the job's finish.
+      if (job.agentKeys?.length && job.startedAt !== undefined && (recorded === 'succeeded' || (isFailure(recorded) && recorded !== 'terminated'))) {
+        const use = { at: new Date(now()).toISOString(), ok: recorded === 'succeeded' };
+        await Promise.all(job.agentKeys.map((name) => deps.store.recordAgentKeyUse(job.installationId, name, use))).catch((err: unknown) =>
+          log({ jobId: job.jobId, warning: `could not record the key use: ${(err as Error)?.name}` }),
+        );
+      }
       return { ok: true, finished: true };
     }
 

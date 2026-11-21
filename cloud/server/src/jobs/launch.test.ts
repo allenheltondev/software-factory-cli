@@ -151,6 +151,51 @@ describe('the launcher', () => {
     expect(terminateMicrovm).toHaveBeenCalledWith('mvm-0001');
   });
 
+  describe('bring your own key (#70)', () => {
+    const withKeys = async (keys: string[]) => {
+      const v = await store.createConfigVersion(55, { sha256: 'y', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: { ...rules, keys } });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+    };
+    const finishWith = async (jobId: string, token: string, outcome: string) => {
+      const broker = createBroker({
+        store,
+        loadSettings: async () => null,
+        github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
+        assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(NOW + 3_600_000).toISOString() }),
+        terminateMicrovm: async () => {},
+        microvmState: async () => 'RUNNING',
+        policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
+        now: () => NOW,
+      });
+      await broker({ action: 'start', jobId, token });
+      await broker({ action: 'finish', jobId, token, outcome });
+    };
+
+    it('refuses to dispatch when the workflow\'s agent has no key, and records why', async () => {
+      await withKeys(['ANTHROPIC_API_KEY']);
+      const log = vi.fn();
+      expect(await createLauncher({ ...deps, log })(request())).toEqual({ status: 200, disposition: 'missing_key' });
+      expect(runs).toEqual([]);
+      expect(events).toEqual({});
+      const [refusal] = await store.listRefusals(55, 5);
+      expect(refusal).toMatchObject({ repository: 'acme/web', issue: 12, deliveryId: 'delivery-1', reason: 'ANTHROPIC_API_KEY is not set: add it under Agent keys' });
+      // Nothing was claimed, so setting the key and redelivering starts the job.
+      await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+      expect(await createLauncher(deps)(request())).toMatchObject({ status: 202, disposition: 'launched' });
+    });
+
+    it('marks each key the job used as OK or failed when it finishes, and never stores a value', async () => {
+      await withKeys(['ANTHROPIC_API_KEY']);
+      await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+      const result = await createLauncher(deps)(request());
+      expect((await store.getJob(result.jobId!))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
+      const { jobToken } = (JSON.parse(runs[0]!.runHookPayload) as { broker: { jobToken: string } }).broker;
+      await finishWith(result.jobId!, jobToken, 'failed');
+      expect(await store.listAgentKeyMeta(55)).toEqual([{ name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat', lastUsedAt: new Date(NOW).toISOString(), lastUsedOk: false }]);
+    });
+  });
+
   it.each([
     ['a tenant that is suspended', async () => store.setSuspended(55, true), 'tenant_inactive'],
     ['no tenant', async () => store.markUninstalled(55, NOW).then(() => store.purgeTenantPartition(55)), 'no_tenant'],

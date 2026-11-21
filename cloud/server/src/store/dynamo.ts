@@ -1458,8 +1458,43 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         }),
       );
       return (out.Items ?? [])
-        .map((i) => ({ name: String(i.name), updatedAt: String(i.updatedAt), updatedBy: String(i.updatedBy) }))
+        .map((i) => ({
+          name: String(i.name),
+          updatedAt: String(i.updatedAt),
+          updatedBy: String(i.updatedBy),
+          ...(typeof i.lastUsedAt === 'string' ? { lastUsedAt: i.lastUsedAt, lastUsedOk: i.lastUsedOk === true } : {}),
+        }))
         .sort((a, b) => a.name.localeCompare(b.name));
+    },
+
+    async recordAgentKeyUse(id, name, use) {
+      // Only a key that is set; a use recorded after a rotation replaced the row is still correct to show.
+      await tryUpdate({
+        TableName: T,
+        Key: { pk: `TENANT#${id}`, sk: `KEY#${name}` },
+        UpdateExpression: 'SET lastUsedAt = :at, lastUsedOk = :ok',
+        ConditionExpression: 'attribute_exists(pk)',
+        ExpressionAttributeValues: { ':at': use.at, ':ok': use.ok },
+      });
+    },
+
+    async recordRefusal(id, r) {
+      await client.send(
+        new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: `REFUSAL#${r.at}#${r.deliveryId}`, ...r, ttl: usageTtl(30) } }),
+      );
+    },
+
+    async listRefusals(id, limit) {
+      const out = await client.send(
+        new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'REFUSAL#' },
+          ScanIndexForward: false,
+          Limit: limit,
+        }),
+      );
+      return (out.Items ?? []).map((i) => ({ at: String(i.at), deliveryId: String(i.deliveryId), repository: String(i.repository), issue: Number(i.issue), reason: String(i.reason) }));
     },
   };
 }

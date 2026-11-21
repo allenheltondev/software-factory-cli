@@ -254,7 +254,9 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
       errors: [{ path: 'repositories', message: `too many repositories, triggers and allowed actors to store together (${Math.ceil(recordBytes / 1024)} KiB of dispatch rules, at most ${MAX_VERSION_RECORD_BYTES / 1024} KiB)` }],
     };
   }
-  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: rules, keys: agentKeysNeeded(compiled, paused) };
+  const keys = agentKeysNeeded(compiled, paused);
+  rules.keys = [...new Set(keys.map((k) => k.key))].sort();
+  return { ok: true, files, sha256: bundleHash(files), warnings, dispatch: rules, keys };
 }
 
 /** What a version's DynamoDB record may hold for its dispatch rules and file list, well inside the 400 KB item limit. */

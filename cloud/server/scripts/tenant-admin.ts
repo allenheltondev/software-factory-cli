@@ -33,6 +33,7 @@ import { dayOf, DEFAULT_QUOTAS, limitProblems, monthOf, tenantQuotas } from '../
 import type { Quotas, TenantLimits } from '../src/store/store.js';
 import { createDynamoStore } from '../src/store/dynamo.js';
 import { AGENT_KEY_NAMES, setAgentKey, type SecretsPort } from '../src/tenants/agent-keys.js';
+import { checkAgentKeyWithProvider } from '../src/tenants/key-check.js';
 import { publishTenantConfig } from '../src/tenants/publish.js';
 import { createAdminClients, type AdminClients } from './admin-clients.js';
 
@@ -178,7 +179,7 @@ async function main() {
         }
       },
     };
-    const result = await setAgentKey({ installationId, name: values.name, value: await readStdin(), updatedBy: admin }, { secrets, store });
+    const result = await setAgentKey({ installationId, name: values.name, value: await readStdin(), updatedBy: admin }, { secrets, store, check: checkAgentKeyWithProvider() });
     if (!result.ok) {
       console.error(`  ✗ ${result.message}`);
       process.exitCode = 1;

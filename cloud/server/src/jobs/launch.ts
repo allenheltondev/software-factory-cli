@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import type { Job, Quotas, Store } from '../store/store.js';
 import { decideDispatch } from '../tenants/dispatch.js';
+import { safeMessage } from '../tenants/redact.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
 import { dayOf, monthOf, tenantQuotas, type ThrottleNotice } from './quotas.js';
 
@@ -152,6 +153,22 @@ export function createLauncher(deps: LaunchDeps) {
       return skip('kill_switch');
     }
 
+    // Bring your own key (#64): the agents this config runs need their keys set. Refused here, with
+    // the reason recorded for the console, rather than failing in a microVM we pay for.
+    const needed = config?.dispatch?.keys ?? [];
+    if (needed.length > 0) {
+      const set = new Set((await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name));
+      const missing = needed.filter((k) => !set.has(k));
+      if (missing.length > 0) {
+        const reason = `${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not set: add ${missing.length > 1 ? 'them' : 'it'} under Agent keys`;
+        log({ delivery: req.deliveryId, installationId: req.installationId, repository: decision.repository, refused: 'missing_key', missing });
+        await deps.store
+          .recordRefusal(req.installationId, { at: new Date(now()).toISOString(), deliveryId: req.deliveryId, repository: decision.repository, issue: req.payload.issue!.number as number, reason })
+          .catch((err: unknown) => log({ delivery: req.deliveryId, warning: `could not record the refusal: ${(err as Error)?.name}` }));
+        return skip('missing_key');
+      }
+    }
+
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
     const jobId = `job_${randomBytes(12).toString('base64url')}`;
@@ -208,6 +225,7 @@ export function createLauncher(deps: LaunchDeps) {
       platformSlot: reserved.platformSlot,
       reservedSeconds: s.maximumDurationSeconds,
       quotas,
+      ...(needed.length ? { agentKeys: needed } : {}),
       issue: req.payload.issue!.number as number,
     };
 
@@ -225,7 +243,7 @@ export function createLauncher(deps: LaunchDeps) {
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt }));
       microvmId = out.microvmId;
     } catch (err) {
-      log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: (err as Error)?.message });
+      log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: safeMessage(err) });
       await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
       await deps.store.cancelReservation(reservation, launching ? 'launching' : 'reserved').catch(() => {});
       // Nothing runs for this record; its token must not be served, and it needs no reconciling.

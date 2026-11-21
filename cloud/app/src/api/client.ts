@@ -150,6 +150,21 @@ export interface AdminOverview {
   platform: { activeJobs: number; platformConcurrentJobs: number };
 }
 
+// A tenant's agent keys (server/src/tenants/agent-key-service.ts). Values are write-only.
+
+export interface AgentKeyView {
+  name: string;
+  configured: boolean;
+  lastRotatedAt?: string;
+  lastRotatedBy?: string;
+  lastUsed?: { at: string; ok: boolean };
+}
+
+export interface AgentKeysView {
+  keys: AgentKeyView[];
+  refusals: { at: string; deliveryId: string; repository: string; issue: number; reason: string }[];
+}
+
 // A tenant's configuration (server/src/tenants/console.ts and config-service.ts).
 
 export type AgentAdapter = 'claude' | 'codex';
@@ -310,6 +325,10 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     configVersion: (installationId: number, version: number) => request<VersionFiles>(`/installations/${installationId}/config/versions/${version}`),
     reactivateConfig: (installationId: number, version: number, input: { confirmAutoMerge?: boolean } = {}) =>
       request<PublishResult>(`/installations/${installationId}/config/versions/${version}/reactivate`, { method: 'POST', body: JSON.stringify(input) }),
+    agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
+    /** The key is sent once and never comes back. */
+    setAgentKey: (installationId: number, name: string, value: string) =>
+      request<AgentKeysView>(`/installations/${installationId}/agent-keys/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ value }) }),
     adminTenants: () => request<AdminOverview>('/admin/tenants'),
     adminTenant: (installationId: number) => request<AdminTenantDetail>(`/admin/tenants/${installationId}`),
     adminDisable: (installationId: number, reason?: string) =>

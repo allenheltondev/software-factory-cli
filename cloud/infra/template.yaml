@@ -275,6 +275,15 @@ Resources:
                 - s3:GetObject
                 - s3:PutObject
               Resource: !Sub ${TenantBucket.Arn}/tenants/*/config/*
+            # Writing a tenant's agent keys (tenants/agent-keys.ts). Write-only: this function can
+            # create and replace them, never read one back.
+            - Effect: Allow
+              Action:
+                - secretsmanager:CreateSecret
+                - secretsmanager:PutSecretValue
+                - secretsmanager:TagResource
+                - secretsmanager:DeleteSecret
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/tenants/*/agent-keys/*
       Events:
         Health:
           Type: Api

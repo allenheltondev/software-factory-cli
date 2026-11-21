@@ -46,9 +46,14 @@ export function InstallationPage({ api = defaultApi }: { api?: Pick<ApiClient, '
                 <StatusBadge tone={tenantStatusLabel(load.tenant).tone}>{tenantStatusLabel(load.tenant).label}</StatusBadge>
               </span>
               {load.tenant.status === 'active' && (
-                <Link className="auth-link text-base font-normal" to={`/installations/${load.tenant.installationId}/config`} data-testid="configure-link">
-                  Configure
-                </Link>
+                <span className="flex gap-4">
+                  <Link className="auth-link text-base font-normal" to={`/installations/${load.tenant.installationId}/keys`} data-testid="keys-link">
+                    Agent keys
+                  </Link>
+                  <Link className="auth-link text-base font-normal" to={`/installations/${load.tenant.installationId}/config`} data-testid="configure-link">
+                    Configure
+                  </Link>
+                </span>
               )}
             </CardTitle>
             <CardDescription>

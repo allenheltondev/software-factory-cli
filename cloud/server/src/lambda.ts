@@ -11,6 +11,9 @@ import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
 import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
+import { createAgentKeyService } from './tenants/agent-key-service.js';
+import { createSecretsManagerPort } from './tenants/secrets-manager.js';
+import { checkAgentKeyWithProvider } from './tenants/key-check.js';
 import { createConfigService, type ObjectStore } from './tenants/config-service.js';
 
 /**
@@ -66,6 +69,7 @@ const app = createApp({
   ...(store && github
     ? {
         github,
+        agentKeys: createAgentKeyService({ store, github, secrets: createSecretsManagerPort(), check: checkAgentKeyWithProvider() }),
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         admin: {
           access: adminAccess(process.env.ADMIN_GROUP ?? DEFAULT_ADMIN_GROUP),
