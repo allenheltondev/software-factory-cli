@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { claudeToolAttributes, codexToolAttributes, describeCommand, isTestPath, lineCount, parseCheckOutput, parseTestOutput, relativePath, resultAttributes } from '../image/runner/telemetry-detail.mjs';
 
+/** A Bash call's command attributes. */
+const commandAttributesOf = (command) => Object.fromEntries(Object.entries(claudeToolAttributes('Bash', { command }, [])).filter(([, v]) => v !== undefined));
+
 describe('describeCommand', () => {
   it.each([
     ['npm test', 'npm', 'test'],
@@ -27,7 +30,6 @@ describe('describeCommand', () => {
     ['node scripts/gen.js', 'node', 'run'],
     ["bash -lc 'npm test'", 'npm', 'test'],
     ['/usr/bin/env bash -c "cargo build --release"', 'cargo', 'build'],
-    ['some-tool --flag', 'some-tool', 'other'],
   ])('%s → %s (%s)', (command, program, category) => {
     expect(describeCommand(command)).toMatchObject({ program, category });
   });
@@ -46,6 +48,45 @@ describe('describeCommand', () => {
     expect(describeCommand("bash -lc 'grep -r \"a;b\" src && npm test'")).toEqual({ program: 'grep', programs: ['grep', 'npm'], category: 'test' });
     expect(describeCommand('npm test 2>&1 | tail -5')).toEqual({ program: 'npm', programs: ['npm', 'tail'], category: 'test' });
     expect(describeCommand('ls # rm -rf; secretword')).toEqual({ program: 'ls', programs: ['ls'], category: 'search' });
+  });
+
+  it('names only well-known programs; anything else is counted', () => {
+    expect(describeCommand('some-tool --flag')).toEqual({ program: undefined, programs: [], category: 'other', unknown: 1 });
+    expect(describeCommand('./scripts/private_fixture_value.sh && npm test')).toEqual({ program: 'npm', programs: ['npm'], category: 'test', unknown: 1 });
+    expect(describeCommand('env -u private_fixture_value npm test')).toMatchObject({ programs: [], unknown: 1 });
+    expect(commandAttributesOf('some-tool --flag')).toEqual({ 'updraft.tool.command.unknown_programs': 1, 'updraft.tool.command.category': 'other', 'updraft.tool.category': 'other' });
+  });
+
+  it('keeps a conditional or arithmetic expression whole', () => {
+    const cond = '[[ "$stage" == ready && "private_fixture_value" == "$stage" ]] && npm test';
+    expect(describeCommand(cond)).toEqual({ program: 'npm', programs: ['npm'], category: 'test' });
+    expect(describeCommand('[[ -f a || ( -d b ) ]] && make test')).toEqual({ program: 'make', programs: ['make'], category: 'test' });
+    expect(describeCommand('(( n > 1 && private_fixture_value < 3 )) && git status')).toEqual({ program: 'git', programs: ['git'], category: 'git' });
+    expect(describeCommand('[[ -f a && private_fixture_value')).toBeNull();
+  });
+
+  it("reads a shell's -c only among its own options, before its first operand", () => {
+    expect(describeCommand("bash ./check.sh -c 'private_script_argument'")).toEqual({ program: 'bash', programs: ['bash'], category: 'run' });
+    expect(describeCommand("bash -e -o pipefail -c 'npm test'")).toEqual({ program: 'npm', programs: ['npm'], category: 'test' });
+    expect(describeCommand("sh -- -c 'private_script_argument'")).toEqual({ program: 'sh', programs: ['sh'], category: 'run' });
+  });
+
+  it('never exports an unusual word, whatever the command (content off)', () => {
+    const secret = 'private_fixture_value';
+    for (const command of [
+      `[[ "$x" == a && "${secret}" == b ]] && npm test`,
+      `bash ./x.sh -c '${secret}'`,
+      `case $x in a) ${secret} ;; esac`,
+      `if true; then ${secret}; fi`,
+      `{ ${secret}; }`,
+      `xargs -I{} ${secret} {}`,
+      `sudo -u root ${secret}`,
+      `timeout -s KILL 5 ${secret}`,
+      `FOO=1 ${secret} --x`,
+      `echo a | ${secret}`,
+    ]) {
+      expect(JSON.stringify(claudeToolAttributes('Bash', { command }, [])), command).not.toContain(secret);
+    }
   });
 
   it('records no program when the boundaries are not certain', () => {
@@ -94,7 +135,10 @@ describe('tool attributes', () => {
 
   it('describes a command, a search, a fetch and a plan', () => {
     expect(claudeToolAttributes('Bash', { command: 'npm test -- --grep secret', run_in_background: true }, roots)).toMatchObject({ 'updraft.tool.command.program': 'npm', 'updraft.tool.command.category': 'test', 'updraft.tool.category': 'test', 'updraft.tool.background': true });
-    expect(claudeToolAttributes('Grep', { pattern: 'password', path: '/work/tree/src', glob: '*.ts' }, roots)).toEqual({ 'updraft.tool.search.path': 'src', 'updraft.tool.search.glob': '*.ts', 'updraft.tool.category': 'search' });
+    expect(claudeToolAttributes('Grep', { pattern: 'password', path: '/work/tree/src', glob: '*.ts' }, roots)).toEqual({ 'updraft.tool.search.path': 'src', 'updraft.tool.search.extension': 'ts', 'updraft.tool.category': 'search' });
+    // A glob is recorded only as an extension: a name in it is an argument.
+    expect(claudeToolAttributes('Glob', { pattern: '**/*private_fixture_value*' }, roots)).toEqual({ 'updraft.tool.category': 'search' });
+    expect(claudeToolAttributes('Glob', { pattern: '**/*.py' }, roots)['updraft.tool.search.extension']).toBe('py');
     expect(claudeToolAttributes('WebFetch', { url: 'https://docs.example.com/a?token=x', prompt: 'p' }, roots)).toEqual({ 'updraft.tool.url.host': 'docs.example.com', 'updraft.tool.category': 'web' });
     expect(claudeToolAttributes('TodoWrite', { todos: [{ content: 'a', status: 'completed' }, { content: 'b', status: 'in_progress' }, { content: 'c', status: 'pending' }] }, roots)).toMatchObject({ 'updraft.todo.total': 3, 'updraft.todo.completed': 1, 'updraft.todo.in_progress': 1, 'updraft.todo.pending': 1, 'updraft.tool.category': 'plan' });
     expect(claudeToolAttributes('mcp__github__get_issue', {}, roots)['updraft.tool.category']).toBe('mcp');

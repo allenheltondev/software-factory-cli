@@ -413,8 +413,17 @@ describe('agent telemetry: structural detail, without content', () => {
     expect(one(spans, 'invoke_workflow updraft').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3, 'updraft.review.outcome': 'revision-queued' });
   });
 
-  it('marks a preparation that failed, and the failure comment', async () => {
-    const t = setup();
+  it('marks a preparation that failed, and the failure comment; the error text only with content', async () => {
+    const quiet = setup();
+    await quiet.step('run_1', `${header().replace('\n---- agent output (stdout and stderr) ----', '')}\n`, 0);
+    await quiet.step('run_1', 'source clone: /src/widgets\nerror: could not prepare the worktree: fatal: private_fixture_value\noutcome: failed\nfailure comment: not posted: GitHub said private_fixture_value (retry later)\n', 2000);
+    await quiet.tracer.stop({ outcome: 'failed' });
+    expect(one(quiet.exporter.spans, 'updraft prepare')).toMatchObject({ error: true, attributes: { 'error.type': 'failed' } });
+    expect(one(quiet.exporter.spans, 'updraft prepare').errorMessage).toBeUndefined();
+    expect(one(quiet.exporter.spans, 'updraft failure_comment').events.map((e) => e.name)).toEqual(['not_posted']);
+    expect(JSON.stringify(quiet.exporter.spans)).not.toContain('private_fixture_value');
+
+    const t = setup({ captureContent: true });
     await t.step('run_1', `${header().replace('\n---- agent output (stdout and stderr) ----', '')}\n`, 0);
     await t.step('run_1', 'source clone: /src/widgets\nerror: could not prepare the worktree: fatal: bad object\noutcome: failed\nfailure comment: commented on issue #7: https://github.com/octo/widgets/issues/7#c1\n', 2000);
     await t.tracer.stop({ outcome: 'failed' });

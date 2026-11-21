@@ -26,7 +26,25 @@ const READ_PROGRAMS = new Set(['cat', 'head', 'tail', 'less', 'more', 'sed', 'aw
 const FILESYSTEM_PROGRAMS = new Set(['mv', 'cp', 'rm', 'mkdir', 'rmdir', 'touch', 'chmod', 'chown', 'ln', 'tee', 'tar', 'unzip', 'zip', 'patch']);
 const RUN_PROGRAMS = new Set(['node', 'python', 'python3', 'ruby', 'deno', 'java', 'php', 'perl', 'bash', 'sh', 'zsh', 'tsx', 'ts-node', 'docker', 'podman', 'kubectl', 'aws']);
 
-const SAFE_PROGRAM = /^[A-Za-z0-9._+-]{1,64}$/;
+/** Programs categorize() knows by name but that are in none of the sets above. */
+const OTHER_KNOWN = ['git', 'gh', 'go', 'cargo', 'dotnet', 'swift', 'mix', 'zig', 'mvn', 'mvnw', 'gradle', 'gradlew', 'just', 'rake', 'task', 'bundle', 'curl', 'wget', 'http', 'npx', 'bunx', 'pnpx', 'true', 'false', 'sleep', 'date', 'env', 'test', 'kill', 'ps', 'whoami', 'uname', 'basename', 'dirname', 'realpath', 'readlink', 'xargs', 'tr', 'paste', 'column', 'base64', 'sha256sum', 'md5sum', 'openssl', 'ssh', 'scp', 'rsync', 'make', 'terraform', 'helm', 'gcloud', 'az'];
+/**
+ * The only programs ever recorded. A word the parser takes for a program but that is not one
+ * of these is counted, never named: whatever a misparse of an unusual command picks up (an
+ * argument, a quoted string), nothing but a well-known program's name can leave this way.
+ */
+const KNOWN_PROGRAMS = new Set([
+  ...PACKAGE_MANAGERS,
+  ...TEST_PROGRAMS,
+  ...LINT_PROGRAMS,
+  ...BUILD_PROGRAMS,
+  ...INSTALL_PROGRAMS,
+  ...SEARCH_PROGRAMS,
+  ...READ_PROGRAMS,
+  ...FILESYSTEM_PROGRAMS,
+  ...RUN_PROGRAMS,
+  ...OTHER_KNOWN,
+]);
 
 const TEST_WORD = /^(test|tests|t|tst|spec|specs|e2e|unit|integration)(:|$)|^test[:_-]|[:_-]test$|^(vitest|jest|mocha|pytest|playwright|cypress)$/;
 const LINT_WORD = /^(lint|typecheck|type-check|types|check|format|fmt|prettier|eslint|stylelint)(:|$)|^lint[:_-]|[:_-]lint$/;
@@ -94,8 +112,14 @@ export function splitShell(text) {
   let words = [];
   let word = '';
   let inWord = false;
+  /** Inside `[[ ... ]]` or `(( ... ))`: their && || ( ) < > are operands' operators, not separators. */
+  let unit = null;
   const endWord = () => {
-    if (inWord) words.push(word);
+    if (inWord) {
+      words.push(word);
+      if (unit === null && words.length === 1 && word === '[[') unit = ']]';
+      else if (unit !== null && word === unit) unit = null;
+    }
     word = '';
     inWord = false;
   };
@@ -137,6 +161,20 @@ export function splitShell(text) {
       const j = text.indexOf('\n', i);
       if (j === -1) break;
       i = j;
+    } else if (c === '(' && text[i + 1] === '(' && unit === null && !inWord && words.length === 0) {
+      // (( arithmetic )): one unit, to its closing )).
+      words.push('((');
+      unit = '))';
+      i += 2;
+    } else if (unit === '))' && c === ')' && text[i + 1] === ')') {
+      endWord();
+      words.push('))');
+      unit = null;
+      i += 2;
+    } else if (unit !== null && (c === '&' || c === '|' || c === '(' || c === ')' || c === '<' || c === '>')) {
+      word += c;
+      inWord = true;
+      i++;
     } else if (c === '&' && (text[i - 1] === '>' || text[i - 1] === '<' || text[i + 1] === '>')) {
       // A redirection (2>&1, &>file), not a separator.
       word += c;
@@ -155,6 +193,8 @@ export function splitShell(text) {
     }
   }
   endCommand();
+  // A conditional or arithmetic unit still open at the end: where it ends is not known.
+  if (unit !== null) return null;
   return commands;
 }
 
@@ -173,6 +213,7 @@ export function describeCommand(command, depth = 0) {
   if (!commands) return null;
   const programs = [];
   let category = null;
+  let unknown = 0;
   const add = (program, c) => {
     programs.push(program);
     if (category === null || rank(c) < rank(category)) category = c;
@@ -202,22 +243,38 @@ export function describeCommand(command, depth = 0) {
     if (i >= tokens.length) continue;
     const program = path.basename(tokens[i]).replace(/^\.\//, '');
     if (SHELLS.has(program)) {
-      // sh -c 'script': the script's commands. A shell running a file is just a shell.
-      const flag = tokens.slice(i + 1).findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
-      const script = flag === -1 ? undefined : tokens[i + 2 + flag];
+      // sh -c 'script': the script's commands. Only the shell's own options count, before its
+      // first operand: in `bash ./x.sh -c y`, -c and y are the script's arguments.
+      let j = i + 1;
+      let commandString = false;
+      while (j < tokens.length && /^[-+]/.test(tokens[j])) {
+        if (tokens[j] === '--' || tokens[j] === '-') {
+          j++;
+          break;
+        }
+        if (/^[-+]O$|^[-+]o$/.test(tokens[j])) j++;
+        else if (/^-[A-Za-z]+$/.test(tokens[j]) && tokens[j].includes('c')) commandString = true;
+        j++;
+      }
+      const script = commandString ? tokens[j] : undefined;
       if (script !== undefined) {
         const inner = describeCommand(script, depth + 1);
         if (!inner) return null;
+        unknown += inner.unknown ?? 0;
         for (const p of inner.programs) programs.push(p);
         if (category === null || rank(inner.category) < rank(category)) category = inner.category;
         continue;
       }
     }
-    if (!SAFE_PROGRAM.test(program) || program === 'cd' || program === 'export' || program === 'set' || program === 'source' || program === '.') continue;
+    if (program === 'cd' || program === 'export' || program === 'set' || program === 'source' || program === '.' || program === '[[' || program === '((' || program === '[') continue;
+    if (!KNOWN_PROGRAMS.has(program)) {
+      unknown += 1;
+      continue;
+    }
     add(program, categorize(program, tokens.slice(i + 1)));
   }
-  if (!programs.length) return null;
-  return { program: programs[0], programs: [...new Set(programs)].slice(0, 16), category: category ?? 'other' };
+  if (!programs.length) return unknown ? { program: undefined, programs: [], category: 'other', unknown } : null;
+  return { program: programs[0], programs: [...new Set(programs)].slice(0, 16), category: category ?? 'other', ...(unknown ? { unknown } : {}) };
 }
 
 /** A path as recorded: relative to the first root it is under, else as given; cut to 512 characters. */
@@ -303,13 +360,30 @@ export function toolCategory(name, attrs = {}) {
 
 const editLines = (oldText, newText) => ({ removed: lineCount(oldText), added: lineCount(newText) });
 
+/** A described command's attributes: known programs by name, the others only counted. */
+const commandAttributes = (d) =>
+  d
+    ? {
+        'updraft.tool.command.program': d.program,
+        'updraft.tool.command.programs': d.programs.length ? d.programs : undefined,
+        'updraft.tool.command.unknown_programs': d.unknown || undefined,
+        'updraft.tool.command.category': d.category,
+      }
+    : {};
+
+/** A glob's file extension (`*.ts`, or the same under `**`), the only part of a glob recorded: the rest may name anything. */
+function globExtension(glob) {
+  const m = typeof glob === 'string' ? /^(?:\*\*\/)?\*\.([A-Za-z0-9]{1,10})$/.exec(glob.trim()) : null;
+  return m ? m[1].toLowerCase() : undefined;
+}
+
 /** Attributes of a Claude Code tool call, from its arguments. */
 export function claudeToolAttributes(name, input, roots) {
   const a = {};
   const i = input && typeof input === 'object' ? input : {};
   if (name === 'Bash') {
     const d = describeCommand(i.command);
-    if (d) Object.assign(a, { 'updraft.tool.command.program': d.program, 'updraft.tool.command.programs': d.programs, 'updraft.tool.command.category': d.category });
+    Object.assign(a, commandAttributes(d));
     if (i.run_in_background === true) a['updraft.tool.background'] = true;
     if (typeof i.timeout === 'number') a['updraft.tool.timeout_ms'] = i.timeout;
   } else if (name === 'Edit') {
@@ -334,8 +408,8 @@ export function claudeToolAttributes(name, input, roots) {
   } else if (name === 'Grep' || name === 'Glob' || name === 'LS') {
     Object.assign(a, {
       'updraft.tool.search.path': relativePath(i.path, roots) ?? undefined,
-      'updraft.tool.search.glob': typeof i.glob === 'string' ? i.glob.slice(0, 256) : name === 'Glob' && typeof i.pattern === 'string' ? i.pattern.slice(0, 256) : undefined,
-      'updraft.tool.search.type': typeof i.type === 'string' ? i.type.slice(0, 32) : undefined,
+      'updraft.tool.search.extension': globExtension(i.glob) ?? (name === 'Glob' ? globExtension(i.pattern) : undefined),
+      'updraft.tool.search.type': typeof i.type === 'string' && /^[a-z0-9+]{1,16}$/.test(i.type) ? i.type : undefined,
       'updraft.tool.search.output_mode': typeof i.output_mode === 'string' ? i.output_mode : undefined,
     });
   } else if (name === 'WebFetch') {
@@ -367,8 +441,7 @@ export function resultAttributes(category, name, text, failed, programs = []) {
 export function codexToolAttributes(item, roots) {
   const a = {};
   if (item.type === 'command_execution') {
-    const d = describeCommand(item.command);
-    if (d) Object.assign(a, { 'updraft.tool.command.program': d.program, 'updraft.tool.command.programs': d.programs, 'updraft.tool.command.category': d.category });
+    Object.assign(a, commandAttributes(describeCommand(item.command)));
   } else if (item.type === 'file_change' && Array.isArray(item.changes)) {
     const paths = item.changes.map((c) => relativePath(c?.path, roots)).filter(Boolean);
     const kinds = { add: 0, delete: 0, update: 0 };

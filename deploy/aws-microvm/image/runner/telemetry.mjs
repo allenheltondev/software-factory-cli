@@ -562,7 +562,8 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (failure) {
       prepareSpan.error = true;
       prepareSpan.attributes['error.type'] = failure.type;
-      if (failure.message) prepareSpan.errorMessage = failure.message.slice(0, MAX_MESSAGE_CHARS);
+      // The worker's error may quote git or the CLI (their stderr): content.
+      if (failure.message && captureContent) prepareSpan.errorMessage = clip(redact, failure.message.slice(0, MAX_MESSAGE_CHARS));
     }
     finish(prepareSpan, h.preparedAt ?? at);
   }
@@ -965,6 +966,9 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
 
   // ---- The worker's own lines ----------------------------------------------------------------
 
+  /** Step events whose line is entirely Updraft's own text (a URL, a branch, a count). */
+  const STRUCTURED_STEP_EVENTS = new Set(['attempt', 'push', 'pull_request.opened', 'pull_request.reused', 'already_pushed', 'review.posted', 'pull_request.ready', 'comment.posted', 'superseded']);
+
   /** Updraft's steps after a run, by the prefix the publish modules give their run.log lines. */
   const STEP_PREFIXES = [
     ['publication: ', 'publish'],
@@ -1026,7 +1030,10 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     else if (/^(updated the comment|commented|comment already|already on)/.test(text)) name = 'comment.posted';
     else if (/^attempt \d+ stopped/.test(text)) name = 'superseded';
     else if (attempt) name = 'attempt';
-    addEvent(s.span, at, name, { 'updraft.message': text.slice(0, MAX_MESSAGE_CHARS) });
+    // A line of a known shape is Updraft's own words, with values already on the span; any other
+    // (a reason, an error from GitHub) may quote anything, and is content.
+    const ownWords = STRUCTURED_STEP_EVENTS.has(name);
+    addEvent(s.span, at, name, { 'updraft.message': ownWords || captureContent ? clip(redact, text.slice(0, MAX_MESSAGE_CHARS)) : undefined });
   }
 
   /** The worker's end-of-run summary: commits, the diffstat, untracked files. */

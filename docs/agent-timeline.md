@@ -89,9 +89,9 @@ tool's output):
 | Where | Attributes |
 | --- | --- |
 | Every tool call | `updraft.tool.category` (`test`, `lint`, `build`, `install`, `git`, `github`, `network`, `run`, `edit`, `filesystem`, `search`, `read`, `web`, `plan`, `delegate`, `mcp`, `other`), `updraft.tool.output.bytes`, `updraft.tool.output.lines` |
-| A command (Bash, Codex `shell`) | `updraft.tool.command.program` (the first program that is not `cd`), `updraft.tool.command.programs`, `updraft.tool.exit_code`, `updraft.tool.background`. The command is split the way the shell would, so nothing inside quotes is taken for a program; a command whose boundaries cannot be known for certain (an unterminated quote, `$(...)` or backticks, a heredoc) gets no program |
+| A command (Bash, Codex `shell`) | `updraft.tool.command.program` (the first program that is not `cd`), `updraft.tool.command.programs`, `updraft.tool.command.unknown_programs`, `updraft.tool.exit_code`, `updraft.tool.background`. Only well-known programs (npm, git, pytest, cargo, grep, ...) are ever named; any other is only counted, so no misreading of an unusual command can export one of its words. The command is split the way the shell would (quotes, escapes, comments, redirections, `[[ ... ]]` and `(( ... ))` as one unit, a shell's `-c` only among its own options), and a command whose boundaries cannot be known for certain (an unterminated quote or conditional, `$(...)` or backticks, a heredoc) gets no program |
 | An edit (Edit, MultiEdit, Write, `apply_patch`) | `updraft.tool.file.path` (relative to the worktree), `.extension`, `.test`, `updraft.tool.lines_added`, `updraft.tool.lines_removed`; for a patch `updraft.tool.file.paths` and counts by kind |
-| Read, Grep, Glob, WebFetch | the file or directory, the glob, how many lines or results came back; WebFetch's host only |
+| Read, Grep, Glob, WebFetch | the file or directory, a glob's extension only (`*.ts`), how many lines or results came back; WebFetch's host only |
 | A test run (an agent's command or a verify command) | `updraft.test.framework` (vitest, jest, pytest, go, cargo, mocha, rspec, node-test), `.passed`, `.failed`, `.skipped`, `.total`, `.failed_tests` (names, never messages, up to 20); `updraft.check.tool`, `.errors`, `.warnings` for tsc, eslint, mypy and ruff, each told by its own summary or by the program the command ran |
 | `invoke_agent` | `updraft.agent.duration_ms` and `.api_duration_ms` (wall time against time waiting on the model, as Claude Code measured them), `.permission_denials` and `.permission_denied_tools`, `.compactions`, `.first_compaction_ms`, `.cli_version`, `.permission_mode`, `.mcp_servers(_failed)`, `.exit_code`, `.stopped_by`; `updraft.review.verdict` and `updraft.review.findings` for a review; `updraft.change.*` from the run summary (commits, files, insertions, deletions, untracked, paths, test files, and lines changed in tests and elsewhere) |
 
@@ -105,10 +105,10 @@ Updraft's own steps are spans on the `updraft` lane:
 ```
 invoke_workflow updraft
 ├─ runner isolation / restore_state / verify_isolation / coalesce_wait / run_event / state_wait
-├─ updraft prepare          prompt and worktree, until the agent starts (failed if it never did)
+├─ updraft prepare          prompt and worktree, until the agent starts (failed if it never did; the error text only with content on)
 ├─ invoke_agent <profile>
 ├─ invoke_workflow verify
-├─ updraft publish          push and pull request, one span per attempt, an event per line
+├─ updraft publish          push and pull request, one span per attempt, an event per line (its text only for Updraft's own lines; a reason or an error from GitHub only with content on)
 ├─ updraft post_review      the review posted and what it led to (updraft.review.outcome)
 ├─ updraft push_revision    a revision's push
 └─ updraft failure_comment
