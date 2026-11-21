@@ -260,6 +260,18 @@ describe('agent telemetry: Codex and the review loop', () => {
     expect(t.tracer.stats.runs).toBe(1);
   });
 
+  it("sends the job's span and its runner steps when no agent ran, a failed step marked", async () => {
+    const t = setup();
+    const at = t.clock.t;
+    const out = await t.tracer.stop({ outcome: 'runner_error', deliveryId: 'd-9', steps: [{ name: 'isolation', start: at - 5000, end: at - 4000 }, { name: 'restore_state', start: at - 4000, end: at - 3000, error: 'state object unreadable' }] });
+    const spans = t.exporter.spans;
+    const root = one(spans, 'invoke_workflow updraft');
+    expect(root).toMatchObject({ error: true, attributes: { 'gen_ai.conversation.id': 'delivery/d-9', 'updraft.job.outcome': 'runner_error', 'updraft.runs': 0 } });
+    expect(one(spans, 'runner restore_state')).toMatchObject({ parentSpanId: root.spanId, error: true, errorMessage: 'state object unreadable' });
+    expect(one(spans, 'runner isolation').error).toBe(false);
+    expect(out.spans).toBe(3);
+  });
+
   it('sends nothing for a job that ran no agent', async () => {
     const t = setup();
     const out = await t.tracer.stop({ outcome: 'succeeded' });

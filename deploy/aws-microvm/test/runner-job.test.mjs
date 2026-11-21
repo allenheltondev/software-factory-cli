@@ -533,6 +533,25 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(JSON.stringify(record)).toContain(harness.finishDetails[0].telemetry.traceId);
   });
 
+  it('traces a job that failed before any agent ran: its runner steps, the failed one marked', async () => {
+    const harness = brokerDeps('telemetry', { objects: { 'events/delivery-1/event.json': undefined }, secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 200 };
+    };
+    const result = await runJob(brokerRequest({ telemetry }), harness.deps);
+    expect(result.outcome).toBe('runner_error');
+    const spans = posts.flatMap((p) => p.resourceSpans[0].scopeSpans[0].spans);
+    const root = spans.find((s) => s.name === 'invoke_workflow updraft');
+    expect(root.status.code).toBe(2);
+    expect(root.attributes).toContainEqual({ key: 'gen_ai.conversation.id', value: { stringValue: expect.stringMatching(/^delivery\//) } });
+    const restore = spans.find((s) => s.name === 'runner restore_state');
+    expect(restore).toMatchObject({ parentSpanId: root.spanId, status: { code: 2, message: expect.stringContaining('NoSuchKey') } });
+    expect(spans.map((s) => s.name)).toContain('runner isolation');
+    expect(JSON.stringify(posts)).not.toContain('hcaik_01honeycombsecretvalue');
+  });
+
   it("points the agents at the runner's loopback relay, and puts Claude Code's own events on the agent span", async () => {
     const harness = brokerDeps('telemetry-relay', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
     const posts = [];

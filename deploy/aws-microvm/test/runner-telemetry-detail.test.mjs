@@ -38,6 +38,23 @@ describe('describeCommand', () => {
     expect(describeCommand('cd /tmp')).toBeNull();
     expect(describeCommand(42)).toBeNull();
   });
+
+  it('never takes a word inside quotes for a program', () => {
+    expect(describeCommand("printf 'a; secretword --x' && npm test")).toEqual({ program: 'printf', programs: ['printf', 'npm'], category: 'test' });
+    expect(describeCommand('echo "x | hiddenprog; y" | wc -l')).toEqual({ program: 'echo', programs: ['echo', 'wc'], category: 'read' });
+    expect(describeCommand('git commit -m a\\;b')).toMatchObject({ programs: ['git'] });
+    expect(describeCommand("bash -lc 'grep -r \"a;b\" src && npm test'")).toEqual({ program: 'grep', programs: ['grep', 'npm'], category: 'test' });
+    expect(describeCommand('npm test 2>&1 | tail -5')).toEqual({ program: 'npm', programs: ['npm', 'tail'], category: 'test' });
+    expect(describeCommand('ls # rm -rf; secretword')).toEqual({ program: 'ls', programs: ['ls'], category: 'search' });
+  });
+
+  it('records no program when the boundaries are not certain', () => {
+    expect(describeCommand("printf 'unterminated; secretword")).toBeNull();
+    expect(describeCommand('git commit -m "$(cat msg); secretword"')).toBeNull();
+    expect(describeCommand('cat <<EOF > f\nsecretword --flag\nEOF')).toBeNull();
+    expect(describeCommand('echo `secretword`')).toBeNull();
+    expect(describeCommand("bash -c 'echo \"unterminated'")).toBeNull();
+  });
 });
 
 describe('paths', () => {
@@ -136,6 +153,16 @@ describe('test runner output', () => {
   it('checkers: eslint, tsc', () => {
     expect(parseCheckOutput('✖ 5 problems (3 errors, 2 warnings)\n')).toEqual({ tool: 'eslint', errors: 3, warnings: 2 });
     expect(parseCheckOutput('src/a.ts(1,1): error TS2322: x\nsrc/b.ts(2,2): error TS2345: y\n')).toEqual({ tool: 'tsc', errors: 2, warnings: 0 });
-    expect(parseCheckOutput('Found 4 errors in 2 files.\n')).toMatchObject({ errors: 4 });
+  });
+
+  it('tells tsc, mypy and ruff apart', () => {
+    expect(parseCheckOutput('src/a.ts:1:1 - error TS2322: x\n\nFound 3 errors in 2 files.\n')).toEqual({ tool: 'tsc', errors: 3, warnings: 0 });
+    expect(parseCheckOutput('a.py:1: error: x  [arg-type]\nFound 4 errors in 2 files (checked 10 source files)\n')).toEqual({ tool: 'mypy', errors: 4, warnings: 0 });
+    expect(parseCheckOutput('Success: no issues found in 10 source files\n')).toEqual({ tool: 'mypy', errors: 0, warnings: 0 });
+    expect(parseCheckOutput('a.py:1:1: F401 unused\nFound 3 errors.\n[*] 2 fixable with the `--fix` option.\n')).toEqual({ tool: 'ruff', errors: 3, warnings: 0 });
+    expect(parseCheckOutput('Found 4 errors in 2 files.\n', ['mypy'])).toEqual({ tool: 'mypy', errors: 4, warnings: 0 });
+    expect(parseCheckOutput('Found 4 errors in 2 files.\n', ['tsc'])).toEqual({ tool: 'tsc', errors: 4, warnings: 0 });
+    expect(parseCheckOutput('All checks passed!\n', ['ruff'])).toEqual({ tool: 'ruff', errors: 0, warnings: 0 });
+    expect(parseCheckOutput('Found 4 errors in 2 files.\n')).toEqual({ tool: 'unknown', errors: 4, warnings: 0 });
   });
 });

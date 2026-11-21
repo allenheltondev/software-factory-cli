@@ -89,10 +89,10 @@ tool's output):
 | Where | Attributes |
 | --- | --- |
 | Every tool call | `updraft.tool.category` (`test`, `lint`, `build`, `install`, `git`, `github`, `network`, `run`, `edit`, `filesystem`, `search`, `read`, `web`, `plan`, `delegate`, `mcp`, `other`), `updraft.tool.output.bytes`, `updraft.tool.output.lines` |
-| A command (Bash, Codex `shell`) | `updraft.tool.command.program` (the first program that is not `cd`), `updraft.tool.command.programs`, `updraft.tool.exit_code`, `updraft.tool.background` |
+| A command (Bash, Codex `shell`) | `updraft.tool.command.program` (the first program that is not `cd`), `updraft.tool.command.programs`, `updraft.tool.exit_code`, `updraft.tool.background`. The command is split the way the shell would, so nothing inside quotes is taken for a program; a command whose boundaries cannot be known for certain (an unterminated quote, `$(...)` or backticks, a heredoc) gets no program |
 | An edit (Edit, MultiEdit, Write, `apply_patch`) | `updraft.tool.file.path` (relative to the worktree), `.extension`, `.test`, `updraft.tool.lines_added`, `updraft.tool.lines_removed`; for a patch `updraft.tool.file.paths` and counts by kind |
 | Read, Grep, Glob, WebFetch | the file or directory, the glob, how many lines or results came back; WebFetch's host only |
-| A test run (an agent's command or a verify command) | `updraft.test.framework` (vitest, jest, pytest, go, cargo, mocha, rspec, node-test), `.passed`, `.failed`, `.skipped`, `.total`, `.failed_tests` (names, never messages, up to 20); `updraft.check.errors`/`.warnings` for tsc, eslint, mypy, ruff |
+| A test run (an agent's command or a verify command) | `updraft.test.framework` (vitest, jest, pytest, go, cargo, mocha, rspec, node-test), `.passed`, `.failed`, `.skipped`, `.total`, `.failed_tests` (names, never messages, up to 20); `updraft.check.tool`, `.errors`, `.warnings` for tsc, eslint, mypy and ruff, each told by its own summary or by the program the command ran |
 | `invoke_agent` | `updraft.agent.duration_ms` and `.api_duration_ms` (wall time against time waiting on the model, as Claude Code measured them), `.permission_denials` and `.permission_denied_tools`, `.compactions`, `.first_compaction_ms`, `.cli_version`, `.permission_mode`, `.mcp_servers(_failed)`, `.exit_code`, `.stopped_by`; `updraft.review.verdict` and `updraft.review.findings` for a review; `updraft.change.*` from the run summary (commits, files, insertions, deletions, untracked, paths, test files, and lines changed in tests and elsewhere) |
 
 Span events mark moments inside a span: `todo.update` whenever the agent's plan changes (counts
@@ -113,6 +113,11 @@ invoke_workflow updraft
 ├─ updraft push_revision    a revision's push
 └─ updraft failure_comment
 ```
+
+The tracer starts as soon as the packet filter is in place (before the state is restored), so a
+job that fails in the runner, or runs no agent, still sends its span and the runner steps it got
+through, the failed one marked, in the conversation `delivery/<delivery id>`. A failure in the
+packet filter itself comes before the key is read, and is not traced.
 
 The root span is the job in one wide event: tokens, reported cost and tool calls over every
 run, the last review's verdict, findings and outcome, and the last change's size.
@@ -173,8 +178,10 @@ do, and the runner collects them without giving an agent any key:
 - The relay keeps six events: `claude_code.api_request`, `claude_code.api_error`,
   `claude_code.api_refusal`, `claude_code.api_retries_exhausted`, `claude_code.tool_decision`
   and `claude_code.tool_result`, each with a fixed list of scalar
-  attributes (model, duration, tokens, cost, status code, attempt, the error message cut to 200
-  characters, tool name, decision and its source, success, prompt id, ...). Anything else is
+  attributes (model, duration, tokens, cost, status code, attempt, tool name, decision and its
+  source, success, prompt id, ...). An API error's message is the provider's free text, so it is
+  kept only with **Prompts and outputs** on (cut to 200 characters and redacted); its status,
+  attempt and duration are kept either way. Anything else is
   counted and dropped. It reads JSON only (415 otherwise), refuses bodies over 1 MB (413), keeps
   at most 1,000 records per request and 50,000 per job, and accepts and discards metrics and
   traces.

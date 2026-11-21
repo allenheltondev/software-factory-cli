@@ -81,23 +81,103 @@ function categorize(program, args) {
   return 'other';
 }
 
-const unquote = (t) => t.replace(/^['"]|['"]$/g, '');
+/**
+ * A shell command as its simple commands, each a list of words, as far as the shell would split
+ * it: quotes ('...', "...") and backslash escapes keep their text inside one word, never
+ * splitting it into commands or words; `;`, `&`, `&&`, `||`, `|`, `(`, `)` and newlines end a
+ * command; `#` starts a comment. Null when where a command starts cannot be known for certain:
+ * an unterminated quote, a command substitution (`$(...)`, backticks) or a heredoc or here-string,
+ * whose text the shell reads by rules this does not follow.
+ */
+export function splitShell(text) {
+  const commands = [];
+  let words = [];
+  let word = '';
+  let inWord = false;
+  const endWord = () => {
+    if (inWord) words.push(word);
+    word = '';
+    inWord = false;
+  };
+  const endCommand = () => {
+    endWord();
+    if (words.length) commands.push(words);
+    words = [];
+  };
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "'") {
+      const j = text.indexOf("'", i + 1);
+      if (j === -1) return null;
+      word += text.slice(i + 1, j);
+      inWord = true;
+      i = j + 1;
+    } else if (c === '"') {
+      let j = i + 1;
+      let buf = '';
+      for (; j < text.length && text[j] !== '"'; j++) {
+        if (text[j] === '`' || (text[j] === '$' && text[j + 1] === '(')) return null;
+        if (text[j] === '\\' && j + 1 < text.length) j++;
+        buf += text[j];
+      }
+      if (j >= text.length) return null;
+      word += buf;
+      inWord = true;
+      i = j + 1;
+    } else if (c === '\\') {
+      if (i + 1 < text.length && text[i + 1] !== '\n') {
+        word += text[i + 1];
+        inWord = true;
+      }
+      i += 2;
+    } else if (c === '`' || (c === '$' && text[i + 1] === '(') || (c === '<' && text[i + 1] === '<')) {
+      return null;
+    } else if (c === '#' && !inWord) {
+      const j = text.indexOf('\n', i);
+      if (j === -1) break;
+      i = j;
+    } else if (c === '&' && (text[i - 1] === '>' || text[i - 1] === '<' || text[i + 1] === '>')) {
+      // A redirection (2>&1, &>file), not a separator.
+      word += c;
+      inWord = true;
+      i++;
+    } else if (c === ';' || c === '&' || c === '|' || c === '\n' || c === '(' || c === ')') {
+      endCommand();
+      i++;
+    } else if (/\s/.test(c)) {
+      endWord();
+      i++;
+    } else {
+      word += c;
+      inWord = true;
+      i++;
+    }
+  }
+  endCommand();
+  return commands;
+}
+
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
 
 /**
- * What a shell command runs, without its arguments: the programs of each segment (`a && b | c`),
- * the first that is not `cd`, and the most telling category among them. A `bash -lc '...'`
- * wrapper (how Codex runs commands) is looked inside. Null for anything that is not a command.
+ * What a shell command runs, without its arguments: the programs of each simple command
+ * (`a && b | c`), the first that is not `cd`, and the most telling category among them. A
+ * `bash -lc '...'` wrapper (how Codex runs commands) is looked inside. Null for anything that is
+ * not a command, and for a command whose boundaries cannot be known for certain (splitShell):
+ * nothing inside a quoted argument is ever taken for a program.
  */
-export function describeCommand(command) {
-  if (typeof command !== 'string' || !command.trim()) return null;
-  // `env [VAR=x ...] bash -c '...'`: the env is not what the command is about.
-  let text = command.replace(/^\s*(?:\/\S*\/)?env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?=(?:\/\S*\/)?(?:ba|z|da)?sh\s)/, '');
-  const wrapped = /^\s*(?:\/\S*\/)?(?:ba|z|da)?sh\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*c\s+(['"])([\s\S]*)\1\s*$/.exec(text);
-  if (wrapped) text = wrapped[2];
+export function describeCommand(command, depth = 0) {
+  if (typeof command !== 'string' || !command.trim() || depth > 2) return null;
+  const commands = splitShell(command);
+  if (!commands) return null;
   const programs = [];
   let category = null;
-  for (const segment of text.split(/&&|\|\||;|\||\n/)) {
-    const tokens = segment.trim().replace(/^[({]\s*/, '').split(/\s+/).filter(Boolean).map(unquote);
+  const add = (program, c) => {
+    programs.push(program);
+    if (category === null || rank(c) < rank(category)) category = c;
+  };
+  for (const tokens of commands) {
     let i = 0;
     for (;;) {
       while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
@@ -113,14 +193,28 @@ export function describeCommand(command) {
         while (i < tokens.length && /^-/.test(tokens[i])) i++;
         continue;
       }
+      if (t === '{' || t === '}' || t === '!') {
+        i++;
+        continue;
+      }
       break;
     }
     if (i >= tokens.length) continue;
     const program = path.basename(tokens[i]).replace(/^\.\//, '');
+    if (SHELLS.has(program)) {
+      // sh -c 'script': the script's commands. A shell running a file is just a shell.
+      const flag = tokens.slice(i + 1).findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+      const script = flag === -1 ? undefined : tokens[i + 2 + flag];
+      if (script !== undefined) {
+        const inner = describeCommand(script, depth + 1);
+        if (!inner) return null;
+        for (const p of inner.programs) programs.push(p);
+        if (category === null || rank(inner.category) < rank(category)) category = inner.category;
+        continue;
+      }
+    }
     if (!SAFE_PROGRAM.test(program) || program === 'cd' || program === 'export' || program === 'set' || program === 'source' || program === '.') continue;
-    programs.push(program);
-    const c = categorize(program, tokens.slice(i + 1));
-    if (category === null || rank(c) < rank(category)) category = c;
+    add(program, categorize(program, tokens.slice(i + 1)));
   }
   if (!programs.length) return null;
   return { program: programs[0], programs: [...new Set(programs)].slice(0, 16), category: category ?? 'other' };
@@ -256,7 +350,7 @@ export function claudeToolAttributes(name, input, roots) {
 }
 
 /** Attributes of a tool's result: its size, and what a test runner or checker printed in it. */
-export function resultAttributes(category, name, text, failed) {
+export function resultAttributes(category, name, text, failed, programs = []) {
   const out = typeof text === 'string' ? text : '';
   const a = { 'updraft.tool.output.bytes': Buffer.byteLength(out), 'updraft.tool.output.lines': lineCount(out) };
   if (name === 'Read' && !failed) a['updraft.tool.read.lines'] = lineCount(out);
@@ -265,7 +359,7 @@ export function resultAttributes(category, name, text, failed) {
     const code = /^Exit code (\d+)/.exec(out);
     if (code) a['updraft.tool.exit_code'] = Number(code[1]);
   }
-  if (category === 'test' || category === 'lint' || category === 'build') Object.assign(a, testAttributes(parseTestOutput(out)), checkAttributes(parseCheckOutput(out)));
+  if (category === 'test' || category === 'lint' || category === 'build') Object.assign(a, testAttributes(parseTestOutput(out)), checkAttributes(parseCheckOutput(out, programs)));
   return a;
 }
 
@@ -390,19 +484,35 @@ export function parseTestOutput(raw) {
   return null;
 }
 
-/** Errors and warnings a type checker or linter reported: tsc, eslint, ruff, mypy. Null if none is found. */
-export function parseCheckOutput(raw) {
+/**
+ * Errors and warnings a type checker or linter reported: eslint, tsc, mypy, ruff. Each is told
+ * by its own summary (tsc and mypy both print "Found N errors in M files"), or by the programs
+ * the command ran, when they say. Null if none is found.
+ */
+export function parseCheckOutput(raw, programs = []) {
   if (typeof raw !== 'string' || !raw) return null;
   const text = raw.replace(ANSI, '').replace(/\r/g, '');
+  const ran = (name) => programs.includes(name);
   const eslint = /✖ \d+ problems? \((\d+) errors?, (\d+) warnings?\)/.exec(text);
   if (eslint) return { tool: 'eslint', errors: Number(eslint[1]), warnings: Number(eslint[2]) };
-  const tscFound = /^Found (\d+) errors?\b/m.exec(text);
+  const found = /^Found (\d+) errors?\b/m.exec(text);
+  // mypy: "Found 2 errors in 1 file (checked 10 source files)", "Success: no issues found in 10 source files"
+  if (/\(checked \d+ source files?\)$/m.test(text) || /^Success: no issues found in \d+ source files?$/m.test(text) || (ran('mypy') && !ran('tsc'))) {
+    const mypy = /^Found (\d+) errors? in \d+ files?/m.exec(text);
+    if (mypy) return { tool: 'mypy', errors: Number(mypy[1]), warnings: 0 };
+    if (/^Success: no issues found/m.test(text)) return { tool: 'mypy', errors: 0, warnings: 0 };
+  }
+  // tsc: "src/a.ts(1,1): error TS2322: ..." / "src/a.ts:1:1 - error TS2322: ...", then "Found N errors ..."
   const tscLines = (text.match(/error TS\d+:/g) ?? []).length;
-  if (tscFound || tscLines) return { tool: 'tsc', errors: tscFound ? Number(tscFound[1]) : tscLines, warnings: 0 };
-  const mypy = /^Found (\d+) errors? in \d+ files?/m.exec(text);
-  if (mypy) return { tool: 'mypy', errors: Number(mypy[1]), warnings: 0 };
-  const ruff = /^Found (\d+) errors?\.?$/m.exec(text);
-  if (ruff) return { tool: 'ruff', errors: Number(ruff[1]), warnings: 0 };
+  if (tscLines || ran('tsc')) {
+    if (found) return { tool: 'tsc', errors: Number(found[1]), warnings: 0 };
+    if (tscLines) return { tool: 'tsc', errors: tscLines, warnings: 0 };
+  }
+  // ruff: "Found 3 errors." (and "[*] 2 fixable with the `--fix` option."), "All checks passed!"
+  const ruff = /^Found (\d+) errors?\.$/m.exec(text);
+  if (ruff && !tscLines) return { tool: 'ruff', errors: Number(ruff[1]), warnings: 0 };
+  if (ran('ruff') && /^All checks passed!$/m.test(text)) return { tool: 'ruff', errors: 0, warnings: 0 };
+  if (found) return { tool: 'unknown', errors: Number(found[1]), warnings: 0 };
   return null;
 }
 

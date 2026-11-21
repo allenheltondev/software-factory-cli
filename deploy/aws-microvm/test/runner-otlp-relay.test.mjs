@@ -148,9 +148,9 @@ describe('claudeTelemetryEnv', () => {
 
 describe("Claude Code's own events on the agent span", () => {
   const head = ['updraft run run_a', 'job: job_a (attempt 1)', 'repository: o/r (id 1)', 'issue: #7 t', 'agent: claude (adapter claude)', '---- agent output (stdout and stderr) ----'];
-  function runTrace() {
+  function runTrace({ captureContent = false } = {}) {
     const spans = [];
-    const trace = createRunTrace({ traceId: 'a'.repeat(32), rootSpanId: 'b'.repeat(16), runDir: '/x/run_a', captureContent: false, redact: (t) => t.replaceAll('sk-secret', '[redacted]'), emit: (s) => spans.push(s) });
+    const trace = createRunTrace({ traceId: 'a'.repeat(32), rootSpanId: 'b'.repeat(16), runDir: '/x/run_a', captureContent, redact: (t) => t.replaceAll('sk-secret', '[redacted]'), emit: (s) => spans.push(s) });
     for (const line of head) trace.line(line, 1000);
     trace.line(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1' }), 1001);
     return { trace, spans };
@@ -182,7 +182,7 @@ describe("Claude Code's own events on the agent span", () => {
       'updraft.agent.api_duration_ms_max': 1500,
       'updraft.agent.tool_rejections': 1,
     });
-    // As OTLP, redacted on the way out.
+    // As OTLP: without content, an error's status, attempt and duration, never its message.
     const otlp = otlpRequest([redactSpan(agent, (t) => t.replaceAll('sk-secret', '[redacted]'))], {}).resourceSpans[0].scopeSpans[0].spans[0];
     expect(otlp.events[0]).toEqual({
       timeUnixNano: '2000000000',
@@ -191,12 +191,21 @@ describe("Claude Code's own events on the agent span", () => {
         { key: 'status_code', value: { intValue: '529' } },
         { key: 'attempt', value: { intValue: '1' } },
         { key: 'duration_ms', value: { intValue: '30' } },
-        { key: 'error', value: { stringValue: 'key [redacted]' } },
       ],
     });
+    expect(JSON.stringify(otlp)).not.toContain('key ');
     // Once the span is sent, a late event is consumed and changes nothing.
     expect(trace.agentEvent(ev('claude_code.api_request', {}))).toBe(true);
     expect(agent.attributes['updraft.agent.api_requests']).toBe(2);
+  });
+
+  it("keeps an API error's message only with content on, redacted", () => {
+    const { trace, spans } = runTrace({ captureContent: true });
+    trace.agentEvent(ev('claude_code.api_error', { status_code: 400, error: 'bad request for sk-secret' }));
+    trace.agentEvent(ev('claude_code.api_retries_exhausted', { status_code: 529, attempt: 10, error: 'overloaded' }));
+    trace.close(3000);
+    const agent = spans.find((s) => s.name === 'invoke_agent claude');
+    expect(agent.events.map((e) => e.attributes.error)).toEqual(['bad request for [redacted]', 'overloaded']);
   });
 
   it('keeps at most MAX_EVENTS_PER_SPAN events, and counts on', () => {

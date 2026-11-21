@@ -35,6 +35,7 @@ import {
   claudeToolAttributes,
   codexTodoAttributes,
   codexToolAttributes,
+  describeCommand,
   isTestPath,
   parseCheckOutput,
   parseTestOutput,
@@ -253,7 +254,7 @@ function clip(redact, value) {
 /** A name, version or id as the CLI reports it: plain characters only, else it is not recorded. */
 const SAFE_NAME = /^[A-Za-z0-9_.:@/+[\]-]{1,128}$/;
 /** Fields of a CLI event that are never put on a span: ids already there, and anything that may be content. */
-const NOT_SCALAR = new Set(['type', 'subtype', 'uuid', 'session_id', 'parent_tool_use_id', 'output', 'stdout', 'stderr', 'content', 'text', 'message', 'prompt', 'result', 'body', 'input', 'response']);
+const NOT_SCALAR = new Set(['type', 'subtype', 'uuid', 'session_id', 'parent_tool_use_id', 'output', 'stdout', 'stderr', 'content', 'text', 'message', 'prompt', 'result', 'body', 'input', 'response', 'error', 'errors', 'reason', 'detail', 'details', 'description']);
 
 /** An event's plain values (numbers, booleans, short plain strings) as attributes under `prefix`. */
 function scalarAttributes(ev, prefix) {
@@ -764,7 +765,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         tools.delete(block.tool_use_id);
         summary.tools += 1;
         const failed = block.is_error === true;
-        Object.assign(tool.span.attributes, resultAttributes(tool.category, tool.name, text, failed));
+        Object.assign(tool.span.attributes, resultAttributes(tool.category, tool.name, text, failed, tool.span.attributes['updraft.tool.command.programs']));
         if (failed) {
           tool.span.error = true;
           tool.span.attributes['error.type'] = 'tool_error';
@@ -955,7 +956,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       summary.toolErrors += 1;
     }
     const result = item.aggregated_output ?? item.result ?? (item.error ? item.error.message : undefined);
-    if (item.type === 'command_execution') Object.assign(open.span.attributes, resultAttributes(open.category, open.name, typeof item.aggregated_output === 'string' ? item.aggregated_output : '', failed));
+    if (item.type === 'command_execution') Object.assign(open.span.attributes, resultAttributes(open.category, open.name, typeof item.aggregated_output === 'string' ? item.aggregated_output : '', failed, open.span.attributes['updraft.tool.command.programs']));
     if (typeof item.exit_code === 'number') open.span.attributes['updraft.tool.exit_code'] = item.exit_code;
     if (result !== undefined && !failed) open.span.attributes['gen_ai.tool.call.result'] = content(result);
     behavior.tool({ category: open.category, name: open.name, attrs: open.span.attributes, command: item.type === 'command_execution' ? item.command : undefined, failed, start: open.span.start, end: at });
@@ -1112,6 +1113,8 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
           'updraft.verify.command': clip(redact, m[3]),
           'updraft.verify.index': Number(m[1]),
         },
+        // What the command runs, to tell checkers' summaries apart; not an attribute.
+        programs: describeCommand(m[3])?.programs ?? [],
       };
     } else if ((m = /^exit: (code (-?\d+)|signal (\S+)) after (\d+)s/.exec(line)) && verifyStep) {
       const code = m[2] !== undefined ? Number(m[2]) : null;
@@ -1169,7 +1172,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     verifyStep = null;
     if (!v) return;
     const tests = parseTestOutput(v.output ?? '');
-    const checks = parseCheckOutput(v.output ?? '');
+    const checks = parseCheckOutput(v.output ?? '', v.programs ?? []);
     Object.assign(v.attributes, { 'updraft.verify.output_lines': v.outputLines ?? 0, ...testAttributes(tests), ...checkAttributes(checks) });
     if (verifySpan && tests) {
       const a = verifySpan.attributes;
@@ -1180,6 +1183,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     }
     delete v.output;
     delete v.outputLines;
+    delete v.programs;
     finish(v, at);
   }
 
@@ -1215,7 +1219,11 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (!id || record?.sessionId !== id) return false;
     // Already sent: what comes after the agent span ended has nowhere to go.
     if (agentSpan.ended) return true;
-    const a = record.attributes ?? {};
+    const a = { ...(record.attributes ?? {}) };
+    // An API error's message is the provider's free text, which may quote the request: content.
+    // Its status, attempt and duration are kept either way.
+    if (typeof a.error === 'string' && captureContent) a.error = clip(redact, a.error);
+    else delete a.error;
     const duration = typeof a.duration_ms === 'number' && a.duration_ms >= 0 ? a.duration_ms : 0;
     if (record.name === 'claude_code.api_request' || record.name === 'claude_code.api_error') {
       if (record.name === 'claude_code.api_request') api.requests += 1;
@@ -1325,7 +1333,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
  * reads what is left, ends the job's root span with what the summary says, and sends the rest
  * within `budgetMs`. Never throws.
  */
-export function createAgentTracer({ runsDir, confineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs, startedAt: jobStartedAt, traceId: givenTraceId }) {
+export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: givenConfineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs, startedAt: jobStartedAt, traceId: givenTraceId }) {
   const traceId = typeof givenTraceId === 'string' && /^[0-9a-f]{32}$/.test(givenTraceId) ? givenTraceId : newTraceId();
   const rootSpanId = newSpanId();
   // The job's start (before the tracer existed: isolation, the state, the coalescing wait), when the runner knows it.
@@ -1345,11 +1353,20 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
   // a file is read only when what was opened is a regular file at exactly
   // <confineTo, resolved>/logs/runs/<run>/<file>, so no link anywhere on the way leads it elsewhere.
   // The anchor is the state directory, resolved once, before the job could change anything under it.
-  const base = confineTo ?? runsDir;
-  const anchor = fsImpl.realpath(base).then(
-    (real) => path.join(real, path.relative(base, runsDir)),
-    () => null,
-  );
+  // The tracer can start before the state directory exists (to time the runner's first steps):
+  // `watch()` names the directory then, and nothing is read until it has.
+  let runsDir = null;
+  let anchor = Promise.resolve(null);
+  function watch({ runsDir: dir, confineTo = null }) {
+    if (runsDir !== null || typeof dir !== 'string') return;
+    runsDir = dir;
+    const base = confineTo ?? dir;
+    anchor = fsImpl.realpath(base).then(
+      (real) => path.join(real, path.relative(base, dir)),
+      () => null,
+    );
+  }
+  if (givenRunsDir) watch({ runsDir: givenRunsDir, confineTo: givenConfineTo });
   const expectedRoot = async () => {
     const root = await anchor;
     if (root === null) throw Object.assign(new Error('the state directory cannot be resolved'), { code: 'ENOENT' });
@@ -1427,6 +1444,7 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
   }
 
   async function poll() {
+    if (runsDir === null) return;
     let names;
     try {
       names = await fsImpl.readdir(runsDir);
@@ -1496,6 +1514,8 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
     stats,
     /** One look at the logs now (the timer does this every pollMs). */
     poll: schedulePoll,
+    /** Names the run log directory, when the tracer started before it existed. */
+    watch,
     /**
      * One of Claude Code's own log events ({ name, time, sessionId, attributes }, from the
      * relay): a span event and counters on the agent span whose `gen_ai.agent.id` is its
@@ -1534,12 +1554,14 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
         const at = now();
         const traces = [...runs.values()].map((r) => r.trace);
         for (const t of traces) t.close(at);
-        if (traces.length) {
-          const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? traces[0].conversationId;
+        const runnerSteps = Array.isArray(steps) ? steps.filter((step) => step && typeof step.name === 'string' && typeof step.start === 'number').slice(0, 64) : [];
+        // A job that ran no agent (it failed in the runner, or its event had nothing to run)
+        // still has its runner steps: sent under the job's span, in a conversation of the delivery.
+        if (traces.length || runnerSteps.length) {
+          const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? traces[0]?.conversationId ?? `delivery/${typeof deliveryId === 'string' && deliveryId ? deliveryId : traceId}`;
           const loop = summary?.loop && typeof summary.loop === 'object' ? summary.loop : null;
           const failed = outcome !== 'succeeded';
-          for (const step of Array.isArray(steps) ? steps.slice(0, 64) : []) {
-            if (!step || typeof step.name !== 'string' || typeof step.start !== 'number') continue;
+          for (const step of runnerSteps) {
             emit({
               traceId,
               spanId: newSpanId(),
@@ -1575,8 +1597,8 @@ export function createAgentTracer({ runsDir, confineTo = null, exporter, capture
               'updraft.event.name': eventName,
               'updraft.job.outcome': outcome,
               'updraft.outcome': typeof summary?.outcome === 'string' ? summary.outcome : undefined,
-              'updraft.repository': traces[0].header.repository,
-              'updraft.issue': traces[0].header.issue,
+              'updraft.repository': traces[0]?.header.repository,
+              'updraft.issue': traces[0]?.header.issue,
               'updraft.pull_request': typeof summary?.prNumber === 'number' ? summary.prNumber : undefined,
               'updraft.pull_request.url': typeof summary?.prUrl === 'string' ? summary.prUrl : undefined,
               'updraft.loop.stage': typeof loop?.stage === 'string' ? loop.stage : undefined,

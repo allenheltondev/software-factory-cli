@@ -304,11 +304,41 @@ export async function runJob(request, deps) {
     // First of all, before a secret is fetched or a job process exists: the packet filter
     // that keeps every user but root from the execution role's credentials.
     result.isolation = await timed('isolation', {}, () => beginIsolation(payload, deps));
+    // Agent telemetry next, so the trace has every later step, a failed one too. The key is the
+    // runner's own, like the token: it is never in the job's environment, and it is redacted
+    // wherever it might appear (until the agents' keys are loaded, it and the shape-based rules).
+    const telemetry = payload.version === 2 ? await telemetrySetup(payload, deps, log) : null;
+    if (telemetry) {
+      redact = createRedactor([telemetry.apiKey]);
+      // Through `redact` as it is when a span leaves: the agents' keys join it below.
+      const redactNow = (text) => redact(text);
+      tracer = createAgentTracer({
+        startedAt,
+        captureContent: telemetry.captureContent,
+        redact: redactNow,
+        log,
+        now,
+        exporter: createExporter({
+          endpoint: telemetry.endpoint,
+          apiKey: telemetry.apiKey,
+          redact: redactNow,
+          resource: { 'service.name': telemetry.serviceName, 'updraft.delivery.id': payload.deliveryId, 'updraft.microvm.id': microvmId },
+          ...(deps.fetch ? { fetch: deps.fetch } : {}),
+          log,
+          now,
+        }),
+        ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}),
+      });
+      tracer.start();
+      log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.endpoint}${telemetry.captureContent ? ', with content' : ''}`);
+    }
     const { stateDir, state } = await timed('restore_state', {}, async (step) => {
       const prepared = await prepare(payload, deps);
       step.attributes = { 'updraft.state.restored': Boolean(prepared.state) };
       return prepared;
     });
+    // The job user owns everything under the state directory: the run logs are read confined to it.
+    tracer?.watch({ runsDir: path.join(stateDir, 'logs', 'runs'), confineTo: stateDir });
     if (result.state && state) result.state.snapshot = state.snapshot;
     // Nothing is started unless the boundary around agents is proven in this microVM: the
     // config contains every agent, and a probe in the sandbox cannot reach the key, the state
@@ -354,35 +384,8 @@ export async function runJob(request, deps) {
     // The agents' keys, read once for every try. From here, nothing the runner forwards or
     // keeps (the log stream, the uploaded logs, the result) carries a value of them.
     const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
-    // The telemetry key is the runner's own, like the token: it is never in the job's
-    // environment, and it is redacted wherever it might appear.
-    const telemetry = payload.version === 2 ? await telemetrySetup(payload, deps, log) : null;
     redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? [telemetry.apiKey] : [])]);
-    if (telemetry) {
-      tracer = createAgentTracer({
-        startedAt,
-        runsDir: path.join(stateDir, 'logs', 'runs'),
-        // The job user owns everything under the state directory: reads are confined to it.
-        confineTo: stateDir,
-        captureContent: telemetry.captureContent,
-        redact,
-        log,
-        now,
-        exporter: createExporter({
-          endpoint: telemetry.endpoint,
-          apiKey: telemetry.apiKey,
-          redact,
-          resource: { 'service.name': telemetry.serviceName, 'updraft.delivery.id': payload.deliveryId, 'updraft.microvm.id': microvmId },
-          ...(deps.fetch ? { fetch: deps.fetch } : {}),
-          log,
-          now,
-        }),
-        ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}),
-      });
-      tracer.start();
-      ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
-      log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.endpoint}${telemetry.captureContent ? ', with content' : ''}`);
-    }
+    if (tracer) ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
     for (;;) {
       // Checkpoints: what the run records (the pull request it opened, above all) reaches the
       // shared database while it runs, not only at its end. Stopped before anything else
