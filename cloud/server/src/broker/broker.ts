@@ -4,6 +4,7 @@ import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
+import { loopOf, stepsOf } from '../jobs/lifecycle.js';
 import { isFailure, type Job, type JobFinishDetail, type Store } from '../store/store.js';
 import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 // Not from publish.ts, which pulls in the CLI's validator.
@@ -336,7 +337,7 @@ const LOG_NAMES = new Set(['updraft.log', 'run.log']);
 /**
  * What the runner reported at the finish, kept only where it checks out (#71): it is shown to the
  * tenant, so a pull request link must be one of the job's own repository, and anything else is
- * a short code, a boolean or a known log name.
+ * a short code, a boolean, a count or a known log name (the loop and the steps: jobs/lifecycle.ts).
  */
 export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFinishDetail | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
@@ -355,5 +356,9 @@ export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFin
     const logs = [...new Set(d.logs.filter((n): n is string => typeof n === 'string' && LOG_NAMES.has(n)))];
     if (logs.length) out.logs = logs;
   }
+  const loop = loopOf(d.loop);
+  if (loop) out.loop = loop;
+  const steps = stepsOf(d.steps);
+  if (steps) out.steps = steps;
   return Object.keys(out).length ? out : undefined;
 }

@@ -20,6 +20,8 @@
  * uninstalled, so DynamoDB deletes the tenant and its members once the retention has passed.
  */
 
+import type { JobLoop, JobStep } from '../jobs/lifecycle.js';
+
 export type OAuthKind = 'link' | 'install';
 
 export interface OAuthState {
@@ -152,6 +154,10 @@ export interface JobFinishDetail {
   prNumber?: number;
   /** The logs it uploaded: updraft.log, run.log. */
   logs?: string[];
+  /** Where the review loop left its pull request (jobs/lifecycle.ts). */
+  loop?: JobLoop;
+  /** Each step the run took, in order: its own job, then reviewer runs and revisions. */
+  steps?: JobStep[];
 }
 
 /**

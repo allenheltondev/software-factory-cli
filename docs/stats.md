@@ -85,11 +85,18 @@ the total of the reviewer's [`UPDRAFT-FINDINGS`](review-loop.md#the-findings-cou
 changes-requested verdicts, their average over the verdicts that have a count, and how many have
 none (the line was missing or malformed, or the review predates it). People's reviews have no
 count. First-pass ready: of the PRs whose first review is in the window, how many got
-ready-to-merge on the first head reviewed.
+ready-to-merge on the first head reviewed. Verdicts by model: the reviewer runs whose agent ran,
+grouped by the model their selection configured (`review.byModel`, keyed as `routing.byModel`), with
+their verdicts, failures and findings; runs from before selections were recorded are `unknown`.
 
 **Back-and-forths.** For the PRs opened in the window, over their whole history: revisions
 pushed per PR (average, maximum, and how many PRs had 0, 1, 2 or 3 or more) and reviews per PR,
 plus how many PRs reached `maxRevisions` in the window.
+
+**Day by day** (`daily`, JSON only). The window's UTC days that have a fact, oldest first: jobs
+succeeded and failed (by their latest final status), PRs opened and merged, reviewer verdicts,
+changes-requested verdicts and their findings, and revisions pushed. Updraft Cloud draws its trend
+charts from it.
 
 **Waiting on other repositories** (`dependencies`, shown only when there is something to show).
 Waits on another repository's pull request ([dependencies.md](dependencies.md)) that began in the
@@ -257,14 +264,17 @@ new fields may be added. Durations are in milliseconds; a measure with no rows i
     "verdictsByAgent": { "codex": { "readyToMerge": 2, "changesRequested": 2 } },
     "changesRequestedRounds": { "reviewer": 2, "people": 2, "reviewerQueued": 1, "peopleQueued": 1 },
     "findings": { "changesRequestedReviews": 2, "withCount": 1, "withoutCount": 1, "total": 3, "average": 3, "allReviewsWithoutCount": 2 },
-    "firstPass": { "prs": 3, "readyToMerge": 2, "rate": 0.667 }
+    "firstPass": { "prs": 3, "readyToMerge": 2, "rate": 0.667 },
+    "byModel": { "codex/gpt-5 effort high": { "adapter": "codex", "model": "gpt-5", "effort": "high", "runs": 4, "readyToMerge": 2, "changesRequested": 2, "failed": 0, "findings": { "total": 3, "withCount": 1, "average": 3 } } }
   },
   "backAndForth": {
     "prs": 3,
     "revisionsPerPr": { "average": 0.667, "max": 2, "distribution": { "0": 2, "1": 0, "2": 1, "3+": 0 } },
     "reviewsPerPr": { "average": 1.333, "max": 2 },
     "limitReached": 1
-  }
+  },
+  "routing": { ... }, "pressure": { ... }, "dependencies": { ... },
+  "daily": [{ "day": "2026-11-17", "jobsSucceeded": 3, "jobsFailed": 1, "prsOpened": 2, "prsMerged": 1, "reviews": 3, "changesRequested": 1, "findings": 3, "revisions": 1 }]
 }
 
 // Kinds:   { "implement": n, "revision": n, "review": n, "unknown": n, "total": n }

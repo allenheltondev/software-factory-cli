@@ -655,8 +655,38 @@ describe('finishDetail (#71)', () => {
       summary: { verification: { passed: true, commands: [] }, followOnJobs: [{ kind: 'revision', verification: { passed: false, commands: [] } }] },
       logs: ['results/d/m/updraft.log'],
     };
-    expect(finishDetail(revisionFailed)).toEqual({ updraftOutcome: 'failed', verificationPassed: false, logs: ['updraft.log'] });
+    expect(finishDetail(revisionFailed)).toEqual({
+      updraftOutcome: 'failed',
+      verificationPassed: false,
+      logs: ['updraft.log'],
+      steps: [{ kind: 'revision', verificationPassed: false }],
+    });
     expect(finishDetail({ updraftOutcome: 'canceled', summary: {}, logs: [] })).toEqual({ updraftOutcome: 'canceled' });
     expect(finishDetail({ updraftOutcome: 'succeeded', summary: { verification: { passed: true }, jobs: [{ verification: { passed: true } }] }, logs: [] })).toEqual({ updraftOutcome: 'succeeded', verificationPassed: true });
+  });
+
+  it('reports the lifecycle: where the review loop ended and each step in order', async () => {
+    const { finishDetail } = await import('../image/runner/job.mjs');
+    const summary = {
+      event: { name: 'issues' },
+      jobId: 'job_1',
+      agent: 'claude',
+      outcome: 'succeeded',
+      runOutcome: 'succeeded',
+      verification: { passed: true },
+      publication: 'published',
+      prUrl: 'https://github.com/o/r/pull/7',
+      loop: { pullRequest: 7, rounds: 1, maxRevisions: 3, reviews: 2, verdict: 'ready-to-merge', stage: 'merged', merged: true, detail: 'text not kept' },
+      followOnJobs: [
+        { kind: 'review', agent: 'codex', outcome: 'succeeded', publication: 'published' },
+        { kind: 'revision', agent: 'claude', outcome: 'succeeded', verification: { passed: true }, publication: 'published' },
+        { kind: 'review', agent: 'codex', outcome: 'succeeded', publication: 'published' },
+        { kind: 'other', agent: 'x' },
+      ],
+    };
+    const detail = finishDetail({ updraftOutcome: 'succeeded', summary, logs: [] });
+    expect(detail.loop).toEqual({ rounds: 1, maxRevisions: 3, reviews: 2, verdict: 'ready-to-merge', stage: 'merged', merged: true });
+    expect(detail.steps.map((s) => [s.kind, s.agent])).toEqual([['implement', 'claude'], ['review', 'codex'], ['revision', 'claude'], ['review', 'codex']]);
+    expect(detail.steps[0]).toMatchObject({ outcome: 'succeeded', verificationPassed: true, publication: 'published' });
   });
 });

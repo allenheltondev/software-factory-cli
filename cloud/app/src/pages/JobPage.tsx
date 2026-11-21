@@ -4,6 +4,7 @@ import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, 
 import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog, type JobView } from '../api/client';
 import { DISPOSITION, JOB_RESULT, deliveryReason, formatBytes, formatDuration } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
+import { Lifecycle } from '../components/lifecycle';
 
 type JobApi = Pick<ApiClient, 'job' | 'jobLog'>;
 type Load = { state: 'loading' } | { state: 'ok'; job: JobView; deliveries: Delivery[] } | { state: 'error'; message: string };
@@ -122,6 +123,16 @@ function Loaded({ job, deliveries, api, installationId }: { job: JobView; delive
           <p className="mt-4 text-sm">
             Job <code>{job.jobId}</code>
           </p>
+        </CardBody>
+      </Card>
+
+      <Card data-testid="job-lifecycle-card">
+        <CardHeader>
+          <CardTitle>Lifecycle</CardTitle>
+          <CardDescription>What the run did, in order: the change, each review and revision, and where the pull request ended up.</CardDescription>
+        </CardHeader>
+        <CardBody>
+          <Lifecycle detail={job.detail} running={job.result === 'running'} />
         </CardBody>
       </Card>
 

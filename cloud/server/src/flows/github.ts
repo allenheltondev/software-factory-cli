@@ -44,6 +44,9 @@ export type FlowErrorCode =
   | 'offer_expired'
   | 'not_authorized'
   | 'tenant_disabled'
+  // Insights (tenants/stats-service.ts).
+  | 'state_newer'
+  | 'state_too_large'
   // The admin view (admin/admin.ts).
   | 'not_found'
   | 'uninstalled'

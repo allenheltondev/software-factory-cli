@@ -638,6 +638,30 @@ export function finishDetail(result) {
   if (typeof result.summary?.prUrl === 'string') detail.prUrl = result.summary.prUrl;
   const logs = (result.logs ?? []).map((key) => String(key).split('/').pop());
   if (logs.length) detail.logs = logs;
+  // The lifecycle (the console's job timeline): where the review loop left the pull request, and
+  // each step in order. The broker keeps only codes, counts and booleans of it.
+  const loop = result.summary?.loop;
+  if (loop && typeof loop === 'object') {
+    detail.loop = { rounds: loop.rounds, maxRevisions: loop.maxRevisions, reviews: loop.reviews, verdict: loop.verdict, stage: loop.stage, merged: loop.merged };
+  }
+  if (result.summary && typeof result.summary === 'object') {
+    const event = result.summary.event?.name;
+    const ownKind = event === 'issues' ? 'implement' : null;
+    const own = Array.isArray(result.summary.jobs) && result.summary.jobs.length ? result.summary.jobs : result.summary.jobId ? [result.summary] : [];
+    const follow = Array.isArray(result.summary.followOnJobs) ? result.summary.followOnJobs : [];
+    const step = (j, kind) => ({
+      kind,
+      agent: j.agent ?? undefined,
+      outcome: j.outcome ?? j.runOutcome ?? j.status ?? undefined,
+      verificationPassed: typeof j.verification?.passed === 'boolean' ? j.verification.passed : undefined,
+      publication: j.publication ?? undefined,
+    });
+    const steps = [
+      ...own.map((j) => step(j, j.kind === 'review' || j.kind === 'revision' ? j.kind : ownKind)).filter((s) => s.kind),
+      ...follow.filter((j) => j.kind === 'review' || j.kind === 'revision').map((j) => step(j, j.kind)),
+    ];
+    if (steps.length) detail.steps = steps;
+  }
   return detail;
 }
 

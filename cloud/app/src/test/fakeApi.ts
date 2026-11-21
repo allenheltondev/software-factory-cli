@@ -21,6 +21,7 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     configVersion: vi.fn(),
     reactivateConfig: vi.fn(),
     overview: vi.fn(),
+    insights: vi.fn(),
     deliveries: vi.fn(),
     jobs: vi.fn(),
     job: vi.fn(),

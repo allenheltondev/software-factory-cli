@@ -133,9 +133,11 @@ function renderSection(s: StatsSection): string[] {
   const rounds = review.changesRequestedRounds;
   const f = review.findings;
   const byAgent = Object.entries(review.verdictsByAgent).map(([a, v]) => `${a} ${v.readyToMerge} ready / ${v.changesRequested} changes`);
+  const byModel = Object.entries(review.byModel).map(([m, v]) => `${m} ${v.readyToMerge} ready / ${v.changesRequested} changes, ${v.findings.total} finding(s)`);
   lines.push('', 'Caught in review', ...pairs([
     ['reviewer runs', `${rv.total}: ready-to-merge ${rv.readyToMerge}, changes-requested ${rv.changesRequested}, failed ${rv.failed}, other ${rv.other}`],
     ...(byAgent.length ? ([['verdicts by agent', byAgent.join(', ')]] as Array<[string, string]>) : []),
+    ...(byModel.length ? ([['verdicts by model', byModel.join('; ')]] as Array<[string, string]>) : []),
     ['changes requested', `by the reviewer ${rounds.reviewer} (${rounds.reviewerQueued} queued a revision), by people ${rounds.people} (${rounds.peopleQueued} queued a revision)`],
     [
       'findings',

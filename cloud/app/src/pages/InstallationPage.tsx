@@ -21,6 +21,7 @@ import {
 import { api as defaultApi, type ApiClient, type Delivery, type DeliveryDisposition, type JobView, type Overview } from '../api/client';
 import { DISPOSITION, INSTALLATION, JOB_RESULT, deliveryReason, formatDuration, installationSettingsUrl } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
+import { LoopBadges } from '../components/lifecycle';
 
 type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'>;
 type Tab = 'jobs' | 'deliveries' | 'repositories';
@@ -151,6 +152,9 @@ function Loaded({
           {overview.activity.running > 0 && <PageHeroChip tone="primary">{overview.activity.running === 1 ? '1 job running' : `${overview.activity.running} jobs running`}</PageHeroChip>}
         </PageHeroChips>
         <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+          <Link className="auth-link font-semibold" to={`${base}/insights`} data-testid="insights-link">
+            Insights
+          </Link>
           <Link className="auth-link" to={`${base}/config`} data-testid="configure-link">
             Configure
           </Link>
@@ -312,6 +316,7 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
                 Pull request ↗
               </a>
             )}
+            <LoopBadges job={j} />
             <span className="ml-auto flex flex-wrap items-center gap-3 text-sm">
               {j.configVersion !== undefined && <span title="Configuration version">v{j.configVersion}</span>}
               {j.result !== 'running' && <span title="Duration">{formatDuration(j.durationSeconds)}</span>}

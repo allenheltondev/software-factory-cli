@@ -1,3 +1,4 @@
+import { loopOf, stepsOf } from '../jobs/lifecycle.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import {
   DeleteCommand,
@@ -54,6 +55,10 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
     if (typeof d.prUrl === 'string') detail.prUrl = d.prUrl;
     if (typeof d.prNumber === 'number') detail.prNumber = d.prNumber;
     if (Array.isArray(d.logs)) detail.logs = d.logs.map(String);
+    const loop = loopOf(d.loop);
+    if (loop) detail.loop = loop;
+    const steps = stepsOf(d.steps);
+    if (steps) detail.steps = steps;
   }
   return {
     jobId: String(i.jobId),
