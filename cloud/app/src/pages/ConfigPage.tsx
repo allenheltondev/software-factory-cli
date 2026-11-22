@@ -60,11 +60,14 @@ export function newRepository(workflow: string, login: string): ConsoleRepositor
   };
 }
 
-export function newWorkflow(prompts: ConfigView['defaults']['prompts']): ConsoleWorkflow {
+/** A new workflow's agents, from those the deployment runs: Claude writes when it can, another agent reviews when there is one. */
+export function newWorkflow(prompts: ConfigView['defaults']['prompts'], offered: readonly AgentAdapter[] = DEFAULT_OFFERED): ConsoleWorkflow {
+  const agent: AgentAdapter = offered.includes('claude') ? 'claude' : (offered[0] ?? 'claude');
+  const reviewer: AgentAdapter = offered.includes('codex') && agent !== 'codex' ? 'codex' : (offered.find((x) => x !== agent) ?? agent);
   return {
-    agent: { adapter: 'claude' },
+    agent: { adapter: agent },
     prompt: prompts.implement,
-    reviewer: { adapter: 'codex', prompt: prompts.review },
+    reviewer: { adapter: reviewer, prompt: prompts.review },
     revisePrompt: prompts.revise,
     verify: [],
   };
@@ -271,7 +274,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
     if (config && Object.hasOwn(config.workflows, name)) return setWorkflowError('There is already a workflow with that name');
     setWorkflowError(undefined);
     setWorkflowName('');
-    edit({ ...config!, workflows: { ...config!.workflows, [name]: newWorkflow(prompts) } });
+    edit({ ...config!, workflows: { ...config!.workflows, [name]: newWorkflow(prompts, view.agents ?? DEFAULT_OFFERED) } });
   }
 
   const confirmAutoMerge = () => [...confirmed].some((r) => config.repositories[r]?.autoMerge !== undefined);

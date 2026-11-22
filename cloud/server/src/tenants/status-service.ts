@@ -120,6 +120,8 @@ export interface Overview {
     publishedBy?: string;
     /** The labels that start a job, by repository (enabled repositories only; at most 10): what to try first. */
     triggers?: { repository: string; label: string }[];
+    /** Configured repositories GitHub now has under another id (recreated, or a new one by that name): the config must be published again for them. */
+    replaced?: string[];
   };
   keys: AgentKeyView[];
   /** Whether traces are set up to go somewhere (a destination and its key), and are on. */
@@ -263,6 +265,7 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
 
       const configured = version?.dispatch?.repositories ?? {};
       const repos = new Map<string, Overview['repositories'][number]>();
+      const liveIds = new Map(reachable.map((r) => [r.fullName.toLowerCase(), r.id]));
       for (const r of reachable) {
         const c = configured[r.fullName.toLowerCase()];
         repos.set(r.fullName.toLowerCase(), { fullName: r.fullName, htmlUrl: r.htmlUrl, private: r.private, reachable: true, configured: Boolean(c), paused: Boolean(c?.paused) });
@@ -278,13 +281,28 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
       deliveries.splice(ACTIVITY_SAMPLE);
       jobs.splice(ACTIVITY_SAMPLE);
       const results = jobs.map(jobResult);
+      // A tenant whose first job started before the marker existed: seeded from the job records
+      // still kept (one the broker started has a duration), before they expire. Best effort.
+      let firstJobAt = tenant.firstJobAt;
+      if (!firstJobAt) {
+        const started = jobs.filter((j) => j.durationSeconds !== undefined).map((j) => j.createdAt).sort()[0];
+        if (started) {
+          firstJobAt = started;
+          await store.markFirstJob(installationId, started).catch((err: unknown) => log({ installationId, warning: `could not seed the first job: ${(err as Error)?.name}` }));
+        }
+      }
       // The labels the viewer can start a job with: in a repository the installation reaches and
       // is not paused, by the dispatch rules' own actor check, named as the installation reports
       // the repository.
       const viewer = githubLogin?.toLowerCase();
+      // Dispatch matches the published id too: a repository recreated under the same name is not the configured one.
+      const replaced = Object.entries(configured)
+        .filter(([name, c]) => liveIds.has(name) && liveIds.get(name) !== c.id)
+        .map(([name]) => repos.get(name)!.fullName)
+        .sort();
       const triggers = viewer
         ? Object.entries(configured)
-            .filter(([name, c]) => !c.paused && repos.get(name)?.reachable)
+            .filter(([name, c]) => !c.paused && repos.get(name)?.reachable && liveIds.get(name) === c.id)
             .flatMap(([name, c]) => c.triggers.filter((t) => (t.actors ?? c.actors ?? []).includes(viewer)).map((t) => ({ repository: repos.get(name)!.fullName, label: t.label })))
             .slice(0, 10)
         : [];
@@ -296,6 +314,7 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
           activeVersion: tenant.activeConfigVersion ?? null,
           ...(version ? { publishedAt: version.publishedAt, publishedBy: version.publishedBy } : {}),
           ...(triggers.length ? { triggers } : {}),
+          ...(replaced.length ? { replaced } : {}),
         },
         keys,
         telemetry: { configured: Boolean(telemetrySettings?.key), enabled: Boolean(telemetrySettings?.key && telemetrySettings.enabled) },
@@ -303,7 +322,7 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
           deliveries: deliveryCounts(deliveries),
           jobs: countBy(results.filter((r) => r !== 'running')),
           ...(deliveries[0] ? { lastDeliveryAt: deliveries[0].at } : {}),
-          ...(tenant.firstJobAt ? { firstJobAt: tenant.firstJobAt } : {}),
+          ...(firstJobAt ? { firstJobAt } : {}),
           running: results.filter((r) => r === 'running').length,
           window: { deliveries: deliveries.length, deliveriesComplete, jobs: jobs.length, jobsComplete },
         },

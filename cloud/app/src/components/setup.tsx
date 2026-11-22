@@ -108,7 +108,9 @@ export function setupSteps(overview: Overview, base: string): SetupStep[] {
           }
         : hasConfig
           ? {
-              detail: 'No label you can apply starts a job: add your GitHub login to the allowed actors of a workflow in a repository the App reaches.',
+              detail: overview.config.replaced?.length
+                ? `${overview.config.replaced.join(', ')} ${overview.config.replaced.length > 1 ? 'were' : 'was'} recreated on GitHub since the configuration was published: publish it again.`
+                : 'No label you can apply starts a job: add your GitHub login to the allowed actors of a workflow in a repository the App reaches.',
               action: (
                 <Link className={linkClass} to={`${base}/config`}>
                   Edit configuration

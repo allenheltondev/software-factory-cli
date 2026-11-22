@@ -725,9 +725,14 @@ function startTokenRefresh(stateDir, deps) {
  * What the broker records of the job for the tenant's console (#71), from the redacted result:
  * how run-event ended, whether verification passed, the pull request, the logs uploaded.
  */
+/** run-event outcomes of a job that ran no agent: it used none of its keys. */
+const NO_AGENT_OUTCOMES = new Set(['nothing-to-do', 'canceled', 'superseded', 'deferred', 'not-started']);
+
 export function finishDetail(result) {
   const detail = {};
   if (typeof result.updraftOutcome === 'string') detail.updraftOutcome = result.updraftOutcome;
+  // A job that ran no agent says so (none), whatever the tracer read.
+  if (NO_AGENT_OUTCOMES.has(result.updraftOutcome) && !result.telemetry?.adapters?.length) detail.adapters = [];
   // Every job the run did (the event's own, more of them, and what followed: a reviewer run, a
   // revision): verification failed if it failed for any of them.
   const jobs = [result.summary, ...(Array.isArray(result.summary?.jobs) ? result.summary.jobs : []), ...(Array.isArray(result.summary?.followOnJobs) ? result.summary.followOnJobs : [])];

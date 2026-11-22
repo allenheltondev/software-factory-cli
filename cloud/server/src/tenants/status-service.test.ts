@@ -144,12 +144,33 @@ describe('status and diagnostics (#71)', () => {
       await store.activateConfig(55, v as number);
       const first = (await get('55/overview')).body;
       expect((first.config as { triggers?: unknown }).triggers).toEqual([{ repository: 'acme/web', label: 'updraft' }, { repository: 'acme/web', label: 'updraft:review' }]);
+      expect(first.config).not.toHaveProperty('replaced');
       expect(first.telemetry).toEqual({ configured: false, enabled: false });
       expect(first.activity).not.toHaveProperty('firstJobAt');
       await store.markFirstJob(55, '2026-11-20T11:00:00.000Z');
       expect((await get('55/overview')).body.activity).toMatchObject({ firstJobAt: '2026-11-20T11:00:00.000Z' });
       await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat' } }, 0);
       expect((await get('55/overview')).body.telemetry).toEqual({ configured: true, enabled: true });
+    });
+
+    it('seeds the first-job marker from a started job the records still keep, so it outlives them', async () => {
+      const { store, get } = await setup();
+      const j = job({ jobId: 'job_seed00001', createdAt: '2026-11-19T09:00:00.000Z' });
+      await store.putJob(j);
+      await store.startJob(j, j.expiresAt);
+      await store.finishJob(j.jobId, 'succeeded', { at: Date.now() });
+      expect((await get('55/overview')).body.activity).toMatchObject({ firstJobAt: '2026-11-19T09:00:00.000Z' });
+      expect((await store.getTenant(55))?.firstJobAt).toBe('2026-11-19T09:00:00.000Z');
+    });
+
+    it('suggests no label in a repository GitHub now has under another id, and says it needs publishing again', async () => {
+      const { store, get } = await setup();
+      const v = await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 'pat', publishedAt: '', dispatch: { repositories: { 'acme/web': { id: 99, actors: ['pat'], triggers: [{ label: 'updraft' }] } } } });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      const { body } = await get('55/overview');
+      expect(body.config).toMatchObject({ replaced: ['acme/web'] });
+      expect(body.config).not.toHaveProperty('triggers');
     });
 
     it('says when its counts are of the latest deliveries only, not all 30 days', async () => {

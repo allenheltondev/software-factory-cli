@@ -208,12 +208,19 @@ describe('the job broker', () => {
     const used = async () => Object.fromEntries((await store.listAgentKeyMeta(55)).map((k) => [k.name, k.lastUsedAt !== undefined]));
     expect(await used()).toEqual({ ANTHROPIC_API_KEY: true, CODEX_API_KEY: false });
     expect((await store.getJobSummary(55, job.jobId))?.detail?.adapters).toEqual(['claude']);
-    // A runner from before the report: every key the job was handed counts.
-    const older = { ...both, jobId: 'job_abc12346', deliveryId: 'd-2' };
+    // A runner from before the report: every key the job was handed counts, but an unchecked one.
+    await store.putAgentKeyMeta(55, { name: 'KIRO_API_KEY', updatedAt: new Date(NOW - 60_000).toISOString(), updatedBy: 'pat' });
+    const older = { ...both, jobId: 'job_abc12346', deliveryId: 'd-2', agentKeys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY', 'KIRO_API_KEY'] };
     await store.putJob(older);
     await handle({ action: 'start', jobId: older.jobId, token });
     await handle({ action: 'finish', jobId: older.jobId, token, outcome: 'succeeded' });
-    expect(await used()).toEqual({ ANTHROPIC_API_KEY: true, CODEX_API_KEY: true });
+    expect(await used()).toEqual({ ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false });
+    // A job that ran no agent: none of its keys.
+    const noop = { ...older, jobId: 'job_abc12347', deliveryId: 'd-3' };
+    await store.putJob(noop);
+    await handle({ action: 'start', jobId: noop.jobId, token });
+    await handle({ action: 'finish', jobId: noop.jobId, token, outcome: 'succeeded', detail: { updraftOutcome: 'nothing-to-do', adapters: [] } });
+    expect(await used()).toEqual({ ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false });
   });
 
   it('keeps the trace a finish reports, and records how the export went', async () => {

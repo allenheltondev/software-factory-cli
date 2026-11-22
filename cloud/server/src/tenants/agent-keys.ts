@@ -18,6 +18,9 @@ import type { KeyChecker } from './key-check.js';
 /** The keys this deployment asks for (its agents'). */
 export const AGENT_KEY_NAMES = Object.values(AGENT_KEY_ENV) as string[];
 /** Every key any deployment may have stored: what a job may be handed and an uninstall deletes, whatever is offered now. */
+/** Keys no provider call checks when saved (Kiro's): only a job that ran its agent says whether it works. */
+export const UNCHECKED_AGENT_KEYS: ReadonlySet<string> = new Set([SUPPORTED_AGENT_KEY_ENV.kiro]);
+
 export const ALL_AGENT_KEY_NAMES = Object.values(SUPPORTED_AGENT_KEY_ENV) as string[];
 /** Every key secret of a tenant starts with this (the uninstall cleanup deletes them by name). */
 export const agentKeySecretPrefix = (installationId: number) => `updraft/tenants/${installationId}/agent-keys/`;

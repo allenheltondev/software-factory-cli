@@ -454,7 +454,10 @@ export interface Overview {
   tenant: TenantSummary;
   installation: { status: InstallationStatus; checked: boolean; missingPermissions: { name: string; needs: string; granted?: string }[] };
   repositories: { fullName: string; htmlUrl?: string; private?: boolean; reachable: boolean; configured: boolean; paused: boolean }[];
-  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string; triggers?: { repository: string; label: string }[] };
+  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string; triggers?: { repository: string; label: string }[];
+    /** Configured repositories GitHub now has under another id: publish again for them. */
+    replaced?: string[];
+  };
   keys: AgentKeyView[];
   /** Whether traces are set up to go somewhere, and are on. Absent from an older API. */
   telemetry?: { configured: boolean; enabled: boolean };

@@ -156,6 +156,9 @@ describe('InstallationPage (#71)', () => {
     expect(first).toHaveTextContent('add your GitHub login to the allowed actors');
     expect(within(first).getByRole('link', { name: 'Edit configuration' })).toHaveAttribute('href', '/installations/55/config');
     unmount();
+    const again = showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, config: { activeVersion: 2, replaced: ['acme/web'] } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    expect(await screen.findByTestId('setup-first-job')).toHaveTextContent('acme/web was recreated on GitHub since the configuration was published: publish it again.');
+    again.unmount();
     showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, activity: { ...ready.activity, firstJobAt: '2026-10-01T00:00:00.000Z' } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
     await screen.findByTestId('installation-status');
     expect(screen.queryByTestId('setup')).toBeNull();
