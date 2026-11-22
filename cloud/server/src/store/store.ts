@@ -20,7 +20,7 @@
  * uninstalled, so DynamoDB deletes the tenant and its members once the retention has passed.
  */
 
-import type { JobLoop, JobStep, JobTelemetryReport, LinkDestination } from '../jobs/lifecycle.js';
+import type { JobLoop, JobStep, JobTelemetryReport, JobTelemetrySnapshot, LinkDestination } from '../jobs/lifecycle.js';
 
 export type OAuthKind = 'link' | 'install';
 
@@ -341,10 +341,10 @@ export interface Job {
   /** The agent keys (variable names) this job needs; at finish each is marked used, OK or failed. */
   agentKeys?: string[];
   /**
-   * The link settings of the telemetry destination its descriptor named, taken with that
-   * descriptor at `start` (never a key): what its trace is linked from, whatever changes after.
+   * What its first `start` handed it for telemetry, and that destination's link settings (never a
+   * key): every later `start` or `credentials` answer is the same, and its trace is linked from it.
    */
-  telemetryLinks?: LinkDestination;
+  telemetrySnapshot?: JobTelemetrySnapshot;
   /** The issue whose label started it, for an over-quota comment. */
   issue?: number;
   /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
@@ -539,8 +539,8 @@ export interface Store {
   finishJob(jobId: string, outcome: string, finish?: { at: number; detail?: JobFinishDetail }): Promise<string | null>;
   /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
-  /** The broker records the link settings of the destination it handed the job at `start`. Set once. */
-  setJobTelemetryLinks(jobId: string, links: LinkDestination): Promise<boolean>;
+  /** The broker records what it handed the job for telemetry at its first `start`. Set once: false when it already was. */
+  setJobTelemetrySnapshot(jobId: string, snapshot: JobTelemetrySnapshot): Promise<boolean>;
 
   /**
    * Deduplication: claims a tenant's webhook delivery unless an unexpired claim exists (false: a
@@ -1036,10 +1036,10 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       jobs.set(jobId, { ...j, microvmId });
       return true;
     },
-    async setJobTelemetryLinks(jobId, links) {
+    async setJobTelemetrySnapshot(jobId, snapshot) {
       const j = jobs.get(jobId);
-      if (!j || j.telemetryLinks !== undefined) return false;
-      jobs.set(jobId, { ...j, telemetryLinks: structuredClone(links) });
+      if (!j || j.telemetrySnapshot !== undefined) return false;
+      jobs.set(jobId, { ...j, telemetrySnapshot: structuredClone(snapshot) });
       return true;
     },
     async purgeTenantPartition(id) {

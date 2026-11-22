@@ -369,10 +369,13 @@ the job is given no trace id (so no later trace links to it), Claude Code's own 
 collected, and the settings page records no export. A job's links are only built from what
 reached a destination: none for a local job, or for one whose export sent nothing.
 
-The links are built from the destination the trace went to, not from today's settings. When
-the broker hands a job its descriptor at `start`, with the key's version, it also records that
-destination's link settings on the job (`telemetryLinks`: Honeycomb's region, team and environment,
-CloudWatch's region, or a custom destination's host and link templates; never a key). The runner
+The links are built from the destination the trace went to, not from today's settings. A job's
+first `start` decides its telemetry from the settings then and records it on the job, once
+(`telemetrySnapshot`): the descriptor with the key's version (or none, when telemetry was off),
+and that destination's link settings (Honeycomb's region, team and environment, CloudWatch's
+region, or a custom destination's host and link templates; never a key). Every later `start` (a
+replay) and `credentials` answer hands out that same descriptor, so the key version the runner
+reads and the links its trace gets never part. The runner
 reports where it sent (`sentTo`: the destination kind and host), and at finish the broker keeps
 that snapshot with the job's report (`destination`) when it is where the runner sent, so no change
 made during the job (another destination, or a same-region key of another Honeycomb team) is

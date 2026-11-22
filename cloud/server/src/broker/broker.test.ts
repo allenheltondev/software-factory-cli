@@ -103,21 +103,43 @@ describe('the job broker', () => {
     expect(JSON.stringify(policy)).not.toContain('tenants/55/config/2/');
   });
 
-  it('hands the job its telemetry settings, never as an agent key, only while telemetry is on with a key', async () => {
+  it('hands the job its telemetry settings at start, never as an agent key, and the same in every later answer', async () => {
     const base = { provider: 'honeycomb' as const, region: 'eu' as const, serviceName: 'factory', captureContent: true, updatedAt: '', updatedBy: 'pat' };
-    await store.putTelemetry(55, { ...base, enabled: true }, 0);
-    const noKey = await handle({ action: 'start', jobId: job.jobId, token });
-    expect(noKey.ok && 'descriptor' in noKey && noKey.descriptor.telemetry).toBeFalsy();
-    await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }, 1);
-    const on = await handle({ action: 'credentials', jobId: job.jobId, token });
+    await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }, 0);
+    const on = await handle({ action: 'start', jobId: job.jobId, token });
     expect(on).toMatchObject({
       ok: true,
       descriptor: { telemetry: { region: 'eu', secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001', serviceName: 'factory', captureContent: true } },
     });
     if (on.ok && 'descriptor' in on) expect(Object.keys(on.descriptor.agentKeySecrets)).not.toContain('HONEYCOMB_API_KEY');
-    await store.putTelemetry(55, { ...base, enabled: false, key: { updatedAt: '', updatedBy: 'pat' } }, 2);
-    const off = await handle({ action: 'credentials', jobId: job.jobId, token });
-    expect(off.ok && 'descriptor' in off && off.descriptor.telemetry).toBeFalsy();
+    // Turned off while the job runs: the job's answers stay what its start decided.
+    await store.putTelemetry(55, { ...base, enabled: false, key: { updatedAt: '', updatedBy: 'pat' } }, 1);
+    const later = await handle({ action: 'credentials', jobId: job.jobId, token });
+    expect(later).toMatchObject({ descriptor: { telemetry: { secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } } });
+  });
+
+  it('hands no telemetry to a job that started without it, whatever is set up after', async () => {
+    const base = { provider: 'honeycomb' as const, region: 'eu' as const, serviceName: 'factory', captureContent: true, updatedAt: '', updatedBy: 'pat' };
+    await store.putTelemetry(55, { ...base, enabled: true }, 0);
+    const noKey = await handle({ action: 'start', jobId: job.jobId, token });
+    expect(noKey.ok && 'descriptor' in noKey && noKey.descriptor.telemetry).toBeFalsy();
+    await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }, 1);
+    for (const action of ['start', 'credentials'] as const) {
+      const again = await handle({ action, jobId: job.jobId, token });
+      expect(again.ok && 'descriptor' in again && again.descriptor.telemetry, action).toBeFalsy();
+    }
+  });
+
+  it('answers a replayed start with the descriptor and links of the first: the key version the runner reads is the one its trace is linked from', async () => {
+    const teamA = { provider: 'honeycomb' as const, region: 'us' as const, serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-00000000000a', team: { name: 'A', slug: 'team-a' } } };
+    await store.putTelemetry(55, teamA, 0);
+    // The first answer is lost; the key is rotated to team B in the same region; start is asked again.
+    await handle({ action: 'start', jobId: job.jobId, token });
+    await store.putTelemetry(55, { ...teamA, key: { ...teamA.key, secretVersion: 'a1b2c3d4-0000-4000-8000-00000000000b', team: { name: 'B', slug: 'team-b' } } }, 1);
+    const replay = await handle({ action: 'start', jobId: job.jobId, token });
+    expect(replay).toMatchObject({ descriptor: { telemetry: { secretVersion: 'a1b2c3d4-0000-4000-8000-00000000000a' } } });
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { telemetry: { traceId: 'ab'.repeat(16), spans: 3, exported: 3, failed: 0, sentTo: { provider: 'honeycomb', host: 'api.honeycomb.io' } } } });
+    expect((await store.getJobSummary(55, job.jobId))?.detail?.telemetry?.destination).toMatchObject({ team: { slug: 'team-a' } });
   });
 
   it('hands a custom destination to the job as saved with its key: endpoint and header, the same secret', async () => {
@@ -173,7 +195,7 @@ describe('the job broker', () => {
     const teamA = { provider: 'honeycomb' as const, region: 'us' as const, serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-00000000000a', team: { name: 'A', slug: 'team-a' }, environment: { name: 'Prod', slug: 'prod' } } };
     await store.putTelemetry(55, teamA, 0);
     await handle({ action: 'start', jobId: job.jobId, token });
-    expect((await store.getJob(job.jobId))?.telemetryLinks).toMatchObject({ provider: 'honeycomb', team: { slug: 'team-a' } });
+    expect((await store.getJob(job.jobId))?.telemetrySnapshot?.links).toMatchObject({ provider: 'honeycomb', team: { slug: 'team-a' } });
     // A same-region key of another team, saved while the job runs: the same API host.
     await store.putTelemetry(55, { ...teamA, key: { ...teamA.key, secretVersion: 'a1b2c3d4-0000-4000-8000-00000000000b', team: { name: 'B', slug: 'team-b' }, environment: { name: 'Dev', slug: 'dev' } } }, 1);
     await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { telemetry: { traceId: 'ab'.repeat(16), spans: 3, exported: 3, failed: 0, sentTo: { provider: 'honeycomb', host: 'api.honeycomb.io' } } } });

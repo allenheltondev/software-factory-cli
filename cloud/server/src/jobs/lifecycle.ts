@@ -103,6 +103,54 @@ export interface JobTelemetryReport {
   destination?: LinkDestination;
 }
 
+/** Where a job sends its agent telemetry (the runner's telemetry.mjs): what its descriptor holds. */
+export interface JobTelemetryDescriptor {
+  /** honeycomb (the default, for runners from before custom destinations), cloudwatch or otlp. */
+  provider?: 'honeycomb' | 'cloudwatch' | 'otlp';
+  region: 'us' | 'eu';
+  /** cloudwatch and otlp: where to send, and the header the key goes in, as saved with the key's version. */
+  endpoint?: string;
+  header?: string;
+  /** The key's secret, which the job's credentials can read (it is under the agent-keys prefix). */
+  secret: string;
+  serviceName: string;
+  captureContent: boolean;
+  /** The secret's version that holds the key the settings were checked with; the runner reads exactly it. */
+  secretVersion?: string;
+}
+
+/**
+ * What a job's first `start` handed it for telemetry, kept with the job so every later `start` or
+ * `credentials` answer is the same: the descriptor (none: telemetry was off), and the link
+ * settings of that destination, what its trace is linked from.
+ */
+export interface JobTelemetrySnapshot {
+  descriptor?: JobTelemetryDescriptor;
+  links?: LinkDestination;
+}
+
+export function jobTelemetrySnapshotOf(raw: unknown): JobTelemetrySnapshot | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: JobTelemetrySnapshot = {};
+  const d = r.descriptor as Record<string, unknown> | undefined;
+  if (d && typeof d === 'object' && typeof d.secret === 'string' && typeof d.serviceName === 'string') {
+    out.descriptor = {
+      ...(typeof d.provider === 'string' && (PROVIDERS as readonly string[]).includes(d.provider) && d.provider !== 'honeycomb' ? { provider: d.provider as 'cloudwatch' | 'otlp' } : {}),
+      region: d.region === 'eu' ? 'eu' : 'us',
+      ...(typeof d.endpoint === 'string' ? { endpoint: d.endpoint } : {}),
+      ...(typeof d.header === 'string' ? { header: d.header } : {}),
+      secret: d.secret,
+      serviceName: d.serviceName,
+      captureContent: d.captureContent === true,
+      ...(typeof d.secretVersion === 'string' ? { secretVersion: d.secretVersion } : {}),
+    };
+  }
+  const links = destinationOf(r.links);
+  if (links) out.links = links;
+  return out;
+}
+
 /** A destination's link settings, as they were for one job: never a key, never a secret. */
 export interface LinkDestination {
   provider: 'honeycomb' | 'cloudwatch' | 'otlp';

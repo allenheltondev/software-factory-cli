@@ -4,8 +4,8 @@ import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
-import { loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
-import { isFailure, type Job, type JobFinishDetail, type Store } from '../store/store.js';
+import { loopOf, stepsOf, telemetryOf, type JobTelemetryDescriptor, type JobTelemetrySnapshot } from '../jobs/lifecycle.js';
+import { isFailure, type Job, type JobFinishDetail, type Store, type TelemetrySettings } from '../store/store.js';
 import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
@@ -112,20 +112,7 @@ export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersio
 }
 
 /** Where a job sends its agent telemetry (the runner's telemetry.mjs), when the tenant turned it on. */
-export interface JobTelemetry {
-  /** honeycomb (the default, for runners from before custom destinations), or otlp. */
-  provider?: 'honeycomb' | 'cloudwatch' | 'otlp';
-  region: 'us' | 'eu';
-  /** otlp: where to send, and the header the key goes in, as saved with the key's version. */
-  endpoint?: string;
-  header?: string;
-  /** The key's secret, which the job's credentials can read (it is under the agent-keys prefix). */
-  secret: string;
-  serviceName: string;
-  captureContent: boolean;
-  /** The secret's version that holds the key the settings were checked with; the runner reads exactly it. */
-  secretVersion?: string;
-}
+export type JobTelemetry = JobTelemetryDescriptor;
 
 export const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 
@@ -273,9 +260,10 @@ export function createBroker(deps: BrokerDeps) {
       // before that snapshot existed: the installation's destination now, when it matches.
       if (finished?.telemetry?.sentTo) {
         const sentTo = finished.telemetry.sentTo;
-        const destination = job.telemetryLinks
-          ? sentToMatches(job.telemetryLinks, sentTo)
-            ? job.telemetryLinks
+        const snapshot = job.telemetrySnapshot;
+        const destination = snapshot
+          ? snapshot.links && sentToMatches(snapshot.links, sentTo)
+            ? snapshot.links
             : null
           : linkDestinationFor(await deps.store.getTelemetry(job.installationId).catch(() => null), sentTo);
         if (destination) finished.telemetry.destination = destination;
@@ -350,25 +338,24 @@ export function createBroker(deps: BrokerDeps) {
       // missing one is a key the tenant has not set).
       const agentKeySecrets = Object.fromEntries(AGENT_KEY_NAMES.map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
-      // telemetry key is the runner's alone. A failed read only means no telemetry for this job.
-      const t = await deps.store.getTelemetry(job.installationId).catch(() => null);
-      const telemetry: JobTelemetry | undefined =
-        t?.enabled && t.key && (t.provider === 'honeycomb' || t.otlp)
-          ? {
-              ...(t.provider !== 'honeycomb' && t.otlp ? { provider: t.provider, endpoint: t.otlp.endpoint, header: t.otlp.header } : {}),
-              region: t.region,
-              secret: telemetrySecretName(job.installationId),
-              serviceName: t.serviceName,
-              captureContent: t.captureContent,
-              ...(t.key.secretVersion ? { secretVersion: t.key.secretVersion } : {}),
-            }
-          : undefined;
-      // The descriptor's destination, as link settings, with the job: what its trace is linked from.
-      // Only at `start`, which is when the runner reads the key; best effort.
-      if (action === 'start' && telemetry && t) {
-        const links = linkDestinationOf(t);
-        if (links) await deps.store.setJobTelemetryLinks(job.jobId, links).catch((err: unknown) => log({ jobId: job.jobId, warning: `could not record the telemetry links: ${(err as Error)?.name}` }));
+      // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
+      // and keeps it with the job with that destination's link settings: every later `start` (a
+      // replay) or `credentials` answer hands out the same, so the key version the runner reads and
+      // the links its trace gets never part. A job started before that record existed: the settings now.
+      let snapshot = job.telemetrySnapshot;
+      if (!snapshot) {
+        const fresh = telemetrySnapshotNow(await deps.store.getTelemetry(job.installationId).catch(() => null), job.installationId);
+        snapshot = fresh;
+        if (action === 'start') {
+          const stored = await deps.store.setJobTelemetrySnapshot(job.jobId, fresh).catch((err: unknown) => {
+            log({ jobId: job.jobId, warning: `could not record the telemetry snapshot: ${(err as Error)?.name}` });
+            return null;
+          });
+          // Another `start` recorded it first: its record is the job's.
+          if (stored === false) snapshot = (await deps.store.getJob(job.jobId))?.telemetrySnapshot ?? fresh;
+        }
       }
+      const telemetry = snapshot.descriptor;
             return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
     }
 
@@ -408,6 +395,21 @@ const LOG_NAMES = new Set(['updraft.log', 'run.log']);
  * tenant, so a pull request link must be one of the job's own repository, and anything else is
  * a short code, a boolean, a count or a known log name (the loop and the steps: jobs/lifecycle.ts).
  */
+/** What the installation's settings hand a job for telemetry now: the descriptor (none: off) and its link settings. */
+function telemetrySnapshotNow(t: TelemetrySettings | null, installationId: number): JobTelemetrySnapshot {
+  if (!t?.enabled || !t.key || (t.provider !== 'honeycomb' && !t.otlp)) return {};
+  const descriptor: JobTelemetryDescriptor = {
+    ...(t.provider !== 'honeycomb' && t.otlp ? { provider: t.provider, endpoint: t.otlp.endpoint, header: t.otlp.header } : {}),
+    region: t.region,
+    secret: telemetrySecretName(installationId),
+    serviceName: t.serviceName,
+    captureContent: t.captureContent,
+    ...(t.key.secretVersion ? { secretVersion: t.key.secretVersion } : {}),
+  };
+  const links = linkDestinationOf(t);
+  return { descriptor, ...(links ? { links } : {}) };
+}
+
 export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFinishDetail | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
   const d = raw as Record<string, unknown>;
