@@ -138,6 +138,22 @@ export function otlpRequest(spans, resource) {
 }
 
 /**
+ * How many spans of a 200 answer's batch the receiver rejected: OTLP's partial success
+ * (`{"partialSuccess":{"rejectedSpans":"<n>"}}`, an int64 as a string in JSON). 0 for an empty or
+ * unreadable body; at most the batch.
+ */
+async function rejectedSpans(res, size) {
+  try {
+    const text = typeof res.text === 'function' ? await res.text() : '';
+    if (!text) return 0;
+    const n = Number(JSON.parse(text)?.partialSuccess?.rejectedSpans ?? 0);
+    return Number.isFinite(n) && n > 0 ? Math.min(size, Math.floor(n)) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Sends finished spans in batches (OTLP/HTTP, JSON encoding) to `<endpoint>/v1/traces` with the
  * `x-honeycomb-team` header. Never throws: a failure is counted and logged, and the job goes on.
  */
@@ -148,6 +164,8 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
   // id, a URL). Content was redacted when it was recorded too; redacting twice changes nothing.
   const cleanResource = redactAttributes(resource ?? {}, redact);
   const stats = { exported: 0, failed: 0, dropped: 0, requests: 0, lastError: null, lastOkAt: null };
+  /** The span ids Honeycomb accepted (a 2xx for their batch): only those are worth a link. */
+  const accepted = new Set();
   let sending = Promise.resolve();
   const url = `${endpoint.replace(/\/+$/, '')}/v1/traces`;
 
@@ -162,7 +180,15 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
           signal: AbortSignal.timeout(timeoutMs),
         });
         if (res.ok) {
-          stats.exported += batch.length;
+          // OTLP answers a partial success with 200 and how many spans it rejected, not which:
+          // then none of the batch counts as accepted, for a link.
+          const rejected = await rejectedSpans(res, batch.length);
+          stats.exported += batch.length - rejected;
+          if (rejected) {
+            stats.failed += rejected;
+            stats.lastError = 'partial success';
+            log(`agent telemetry: ${rejected} of ${batch.length} span(s) rejected`);
+          } else for (const span of batch) accepted.add(span.spanId);
           stats.lastOkAt = new Date(now()).toISOString();
           return;
         }
@@ -196,6 +222,8 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
       return sending;
     },
     pending: () => queue.length,
+    /** Whether Honeycomb accepted this span: false while it is queued, and when its batch failed or was dropped. */
+    accepted: (spanId) => accepted.has(spanId),
   };
 }
 
@@ -322,6 +350,10 @@ export function parseHeaderLine(line, h) {
  * The span id of a run's invoke_agent span: derived from the run id, so a later job (another
  * microVM, another trace) can link to it knowing only the run and the trace it was in.
  */
+/** At most this many marks per run, and per job (stop's `marks`). */
+export const MAX_MARKS_PER_RUN = 8;
+export const MAX_MARKS_PER_JOB = 32;
+
 export const agentSpanIdFor = (runId) => createHash('sha256').update(`updraft-agent-span:${runId}`).digest('hex').slice(0, 16);
 
 const isJsonLine = (line) => line.startsWith('{') && line.endsWith('}');
@@ -507,6 +539,14 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   const steps = new Map();
   let compactions = 0;
   const behavior = createBehavior();
+  /**
+   * Spans worth a link of their own (stop's `marks`): the run's agent span, its first red test
+   * run and the first green one after it, its first failed verify command, its first failed
+   * Updraft step. Only spans that were sent: a link to one that was not would open the root.
+   */
+  const marks = [];
+  const marked = new Set();
+  let sawRedTest = false;
   /** Where the agent's paths are relative to: its own working directory, and the worktree. */
   const roots = () => [h.cwd, h.checkout].filter(Boolean);
 
@@ -529,7 +569,43 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (span.ended) return;
     span.ended = true;
     span.end = Math.max(span.start, span.end ?? at);
-    if (spans++ < MAX_SPANS_PER_RUN) emit(span);
+    if (spans++ < MAX_SPANS_PER_RUN) {
+      emit(span);
+      noteMark(span);
+    }
+  }
+
+  function noteMark(span) {
+    const a = span.attributes ?? {};
+    const add = (kind, extra = {}) => {
+      if (marks.length < MAX_MARKS_PER_RUN) marks.push({ kind, spanId: span.spanId, at: span.start, ...(h.kind ? { run: h.kind } : {}), ...extra });
+    };
+    const once = (kind, extra) => {
+      if (marked.has(kind)) return;
+      marked.add(kind);
+      add(kind, extra);
+    };
+    if (span === agentSpan) {
+      const verdict = a['updraft.review.verdict'];
+      add('agent', {
+        ...(h.agent ? { agent: h.agent } : {}),
+        ...(span.error ? { failed: true } : {}),
+        ...(a['updraft.agent.thrashing'] === true ? { thrashing: true } : {}),
+        ...(typeof verdict === 'string' ? { verdict } : {}),
+      });
+    } else if (span.name === 'execute_tool verify') {
+      if (span.error) once('verify_failed');
+    } else if (a['gen_ai.operation.name'] === 'execute_tool' && a['updraft.tool.category'] === 'test') {
+      if (span.error || (a['updraft.test.failed'] ?? 0) > 0) {
+        sawRedTest = true;
+        once('test_failed');
+      } else if (sawRedTest && (a['updraft.test.passed'] ?? 0) > 0) {
+        // Green only on evidence: tests ran and passed (a command that printed no result, such as --help, is not it).
+        once('test_green');
+      }
+    } else if (span.error && a['gen_ai.agent.name'] === 'updraft' && typeof a['updraft.step'] === 'string') {
+      once('step_failed', { step: a['updraft.step'] });
+    }
   }
 
   /** Updraft's own steps: on the "updraft" lane, with no provider. */
@@ -1263,6 +1339,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   return {
     header: h,
     summary,
+    marks,
     agentEvent,
     get conversationId() {
       return conversationId();
@@ -1556,6 +1633,10 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
     async stop({ outcome, summary, deliveryId, eventName, budgetMs = 15_000, steps = [] } = {}) {
       clearInterval(pollTimer);
       clearInterval(exportTimer);
+      /** The runner's own failed steps, as marks (each run's are in its trace's). */
+      const runnerMarks = [];
+      /** The conversation the job's span was sent in, for the finish report. */
+      let sentConversationId;
       try {
         await schedulePoll();
         const at = now();
@@ -1566,12 +1647,15 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
         // still has its runner steps: sent under the job's span, in a conversation of the delivery.
         if (traces.length || runnerSteps.length) {
           const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? traces[0]?.conversationId ?? `delivery/${typeof deliveryId === 'string' && deliveryId ? deliveryId : traceId}`;
+          sentConversationId = conversationId;
           const loop = summary?.loop && typeof summary.loop === 'object' ? summary.loop : null;
           const failed = outcome !== 'succeeded';
           for (const step of runnerSteps) {
+            const spanId = newSpanId();
+            if (step.error) runnerMarks.push({ kind: 'step_failed', spanId, at: step.start, step: `runner_${step.name}` });
             emit({
               traceId,
-              spanId: newSpanId(),
+              spanId,
               parentSpanId: rootSpanId,
               name: `runner ${step.name}`,
               kind: KIND_INTERNAL,
@@ -1638,9 +1722,28 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
         log(`agent telemetry: ${error?.message ?? error}`);
       }
       const conversations = [...new Set([...runs.values()].map((r) => r.trace.conversationId))];
+      // The conversation the job's span went in: the issue's, else the run's or the delivery's.
+      const conversationId = sentConversationId;
+      // Only spans Honeycomb accepted: a link to one it never got would open the root instead.
+      let marks = [];
+      try {
+        marks = [...[...runs.values()].flatMap((r) => r.trace.marks), ...runnerMarks]
+          .filter((m) => exporter.accepted(m.spanId))
+          .sort((x, y) => x.at - y.at)
+          .slice(0, MAX_MARKS_PER_JOB)
+          .map((m) => {
+            const out = { ...m };
+            delete out.at;
+            return out;
+          });
+      } catch (error) {
+        log(`agent telemetry: ${error?.message ?? error}`);
+      }
       return {
         traceId,
+        ...(conversationId ? { conversationId } : {}),
         conversationIds: conversations,
+        marks,
         runs: [...runs.values()].map((r) => r.trace.summary),
         spans: stats.spans,
         exported: exporter.stats.exported,

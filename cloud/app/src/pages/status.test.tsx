@@ -59,7 +59,7 @@ function showInstallation(api: ReturnType<typeof fakeApi>, path = '/installation
 const api = (over: Partial<ReturnType<typeof fakeApi>> = {}) =>
   fakeApi({
     overview: vi.fn().mockResolvedValue(overview()),
-    jobs: vi.fn().mockResolvedValue({ jobs: [job(), job({ jobId: 'job_abcdefgh02', issue: 11, result: 'success', outcome: 'succeeded', prUrl: 'https://github.com/acme/web/pull/7' })] }),
+    jobs: vi.fn().mockResolvedValue({ jobs: [job(), job({ jobId: 'job_abcdefgh02', issue: 11, result: 'success', outcome: 'succeeded', prUrl: 'https://github.com/acme/web/pull/7', telemetry: { traceId: 'ab'.repeat(16), traceUrl: 'https://ui.honeycomb.io/t', conversationUrl: 'https://ui.honeycomb.io/q', spans: 1, exported: 1, failed: 0 } })] }),
     deliveries: vi.fn().mockResolvedValue({ deliveries }),
     ...over,
   });
@@ -78,6 +78,7 @@ describe('InstallationPage (#71)', () => {
     expect(failed).toHaveTextContent('2 min 5 s');
     expect(within(failed).getByRole('link', { name: 'acme/web#12' })).toHaveAttribute('href', '/installations/55/jobs/job_abcdefgh01');
     expect(within(screen.getByTestId('job-job_abcdefgh02')).getByRole('link', { name: /pull request/i })).toHaveAttribute('href', 'https://github.com/acme/web/pull/7');
+    expect(within(screen.getByTestId('job-job_abcdefgh02')).getByRole('link', { name: /conversation/i })).toHaveAttribute('href', 'https://ui.honeycomb.io/q');
   });
 
   it('says when its counts are of the latest jobs, not all 30 days', async () => {

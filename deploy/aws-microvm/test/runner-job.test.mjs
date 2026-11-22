@@ -527,6 +527,9 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(bodies).not.toContain('hcaik_01honeycombsecretvalue');
     // The finish reports the trace, for the console's link to it.
     expect(harness.finishDetails[0].telemetry).toMatchObject({ traceId: expect.stringMatching(/^[0-9a-f]{32}$/), spans: spans.length, exported: spans.length, failed: 0 });
+    // And the spans worth a link: here, the agent's, a span that was sent.
+    const agentMark = harness.finishDetails[0].telemetry.marks.find((m) => m.kind === 'agent');
+    expect(agentMark.spanId).toBe(spans.find((s) => s.name === 'invoke_agent claude').spanId);
     // The job process never had the telemetry key; it has the trace id, to record with its runs.
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');

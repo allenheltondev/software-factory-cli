@@ -18,7 +18,7 @@ import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
 import { createS3LogReader, createS3StateReader } from './tenants/s3-logs.js';
 import { createStatsService } from './tenants/stats-service.js';
-import { checkHoneycombKey, createTelemetryService } from './tenants/telemetry-service.js';
+import { checkHoneycombKey, createTelemetryService, parseTimelineTemplate } from './tenants/telemetry-service.js';
 import { createStatusService } from './tenants/status-service.js';
 import { createConfigService, type ObjectStore } from './tenants/config-service.js';
 
@@ -41,6 +41,11 @@ const github = store ? createGitHubFlows({ store, github: createGitHubApi(), loa
 // Tenant config bundles (tenants/config-service.ts). The function's role reaches only
 // tenants/*/config/* in the bucket (template.yaml).
 const bucket = process.env.TENANT_BUCKET ?? '';
+/** Agent Timeline has no documented conversation link; a deployment that knows one sets its template (tenants/telemetry-service.ts). */
+const timelineTemplate = parseTimelineTemplate(process.env.HONEYCOMB_TIMELINE_URL);
+if (process.env.HONEYCOMB_TIMELINE_URL && !timelineTemplate) {
+  console.log(JSON.stringify({ warning: 'HONEYCOMB_TIMELINE_URL is not a template a link can be made from (it must start with {ui}/{team}/ and name {conversation}); no Agent Timeline links' }));
+}
 const s3 = new S3Client({});
 const objects: ObjectStore = {
   async get(key) {
@@ -107,6 +112,7 @@ const app = createApp({
           github,
           agentKeys: agentKeyService,
           resultRetentionDays: Math.max(1, Number(process.env.RESULT_RETENTION_DAYS ?? 30) || 30),
+          timelineTemplate,
           ...(bucket ? { readLog } : {}),
         }),
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),

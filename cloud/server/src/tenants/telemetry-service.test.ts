@@ -4,7 +4,8 @@ import type { Caller } from '../caller.js';
 import { FlowError } from '../flows/github.js';
 import { createMemoryStore, type JobSummary, type Tenant } from '../store/store.js';
 import { jobView } from './status-service.js';
-import { checkHoneycombKey, createTelemetryService, traceUrl, type HoneycombChecker } from './telemetry-service.js';
+import { telemetryOf } from '../jobs/lifecycle.js';
+import { checkHoneycombKey, conversationUrl, createTelemetryService, parseTimelineTemplate, timelineUrl, traceUrl, type HoneycombChecker } from './telemetry-service.js';
 
 const caller = { sub: 'u1' } as Caller;
 const KEY = 'hcaik_01j1824es7n4evcmv81cn392jbSECRETSECRETSECRETSECRET';
@@ -274,7 +275,80 @@ describe('links to a trace', () => {
     expect(traceUrl(settings, 'not-a-trace', '2026-11-21T10:00:00.000Z')).toBeNull();
   });
 
-  it('puts the link and the conversation on a job', () => {
+  it('opens the trace at a span, when given one', () => {
+    expect(traceUrl(settings, traceId, '2026-11-21T10:00:00.000Z', '2026-11-21T10:20:00.000Z', 'cd'.repeat(8))).toBe(
+      `https://ui.honeycomb.io/acme/environments/prod/trace?trace_id=${traceId}&span=${'cd'.repeat(8)}&trace_start_ts=1795255140&trace_end_ts=1795256700`,
+    );
+    expect(traceUrl(settings, traceId, '2026-11-21T10:00:00.000Z', undefined, 'not-a-span')).not.toContain('span=');
+  });
+
+  it("links to the conversation's spans in the query builder, a week around the job, no later than now", () => {
+    const now = Date.parse('2026-11-22T10:00:00.000Z');
+    const url = conversationUrl(settings, 'acme/web#12', '2026-11-21T10:00:00.000Z', now)!;
+    const [base, query] = url.split('?query=');
+    expect(base).toBe('https://ui.honeycomb.io/acme/environments/prod/datasets/updraft/');
+    expect(JSON.parse(decodeURIComponent(query!))).toEqual({
+      start_time: 1795255200 - 7 * 24 * 3600,
+      end_time: now / 1000,
+      breakdowns: ['gen_ai.conversation.id', 'gen_ai.agent.name'],
+      calculations: [{ op: 'COUNT' }, { op: 'COUNT_DISTINCT', column: 'trace.trace_id' }],
+      filters: [{ column: 'gen_ai.conversation.id', op: '=', value: 'acme/web#12' }],
+    });
+    // Long after: the week after the job.
+    const later = conversationUrl(settings, 'acme/web#12', '2026-11-21T10:00:00.000Z', now + 30 * 24 * 3600 * 1000)!;
+    expect(JSON.parse(decodeURIComponent(later.split('?query=')[1]!)).end_time).toBe(1795255200 + 7 * 24 * 3600);
+    // Classic: the dataset is the place.
+    expect(conversationUrl({ ...settings, region: 'eu', key: { ...settings.key, environment: undefined } }, 'acme/web#12', '2026-11-21T10:00:00.000Z', now)).toMatch(/^https:\/\/ui-eu1\.honeycomb\.io\/acme\/datasets\/updraft\/\?query=/);
+    expect(conversationUrl(null, 'acme/web#12', '2026-11-21T10:00:00.000Z', now)).toBeNull();
+  });
+
+  it('takes an Agent Timeline template only when it stays in the tenant team and names the conversation', () => {
+    const good = '{ui}/{team}/environments/{environment}/agent-timeline?conversation={conversation}&start={start}&end={end}';
+    expect(parseTimelineTemplate(` ${good} `)).toBe(good);
+    expect(parseTimelineTemplate(undefined)).toBeNull();
+    expect(parseTimelineTemplate('https://evil.example/{conversation}')).toBeNull();
+    expect(parseTimelineTemplate('{ui}/{team}/x?c={conversation}&q={query}')).toBeNull();
+    expect(parseTimelineTemplate('{ui}/{team}/x')).toBeNull();
+    expect(parseTimelineTemplate('{ui}/{team}/x?c={conversation}{')).toBeNull();
+    expect(parseTimelineTemplate('{ui}/{team}/x?c={conversation}"><script>')).toBeNull();
+    const now = Date.parse('2026-11-22T10:00:00.000Z');
+    expect(timelineUrl(good, settings, 'acme/web#12', '2026-11-21T10:00:00.000Z', now)).toBe(
+      `https://ui.honeycomb.io/acme/environments/prod/agent-timeline?conversation=acme%2Fweb%2312&start=${1795255200 - 7 * 24 * 3600}&end=${now / 1000}`,
+    );
+    // It needs an environment the key did not give: no link.
+    expect(timelineUrl(good, { ...settings, key: { ...settings.key, environment: undefined } }, 'acme/web#12', '2026-11-21T10:00:00.000Z', now)).toBeNull();
+    expect(timelineUrl(null, settings, 'acme/web#12', '2026-11-21T10:00:00.000Z', now)).toBeNull();
+  });
+
+  it("keeps only the runner's marks it can trust, and its conversation id when it has the right shape", () => {
+    const span = 'cd'.repeat(8);
+    const t = telemetryOf({
+      traceId,
+      spans: 3,
+      conversationId: 'acme/web#12',
+      marks: [
+        { kind: 'agent', spanId: span, run: 'review', agent: 'claude-opus', verdict: 'changes-requested', failed: true, thrashing: 'yes', extra: 1 },
+        { kind: 'test_failed', spanId: span, run: 'Implement!' },
+        { kind: 'nope', spanId: span },
+        { kind: 'verify_failed', spanId: 'short' },
+        { kind: 'step_failed', spanId: span, step: 'runner_restore_state' },
+      ],
+    })!;
+    expect(t.conversationId).toBe('acme/web#12');
+    expect(t.marks).toEqual([
+      { kind: 'agent', spanId: span, run: 'review', agent: 'claude-opus', verdict: 'changes-requested', failed: true },
+      { kind: 'test_failed', spanId: span },
+      { kind: 'step_failed', spanId: span, step: 'runner_restore_state' },
+    ]);
+    expect(telemetryOf({ traceId, conversationId: 'acme/web#12"><' })!.conversationId).toBeUndefined();
+    expect(telemetryOf({ traceId, conversationId: 'delivery/d-1' })!.conversationId).toBe('delivery/d-1');
+    // A run of no issue is its own conversation, named by its job.
+    expect(telemetryOf({ traceId, conversationId: 'job_ev9001' })!.conversationId).toBe('job_ev9001');
+    expect(telemetryOf({ traceId, marks: Array.from({ length: 50 }, () => ({ kind: 'agent', spanId: span })) })!.marks).toHaveLength(32);
+  });
+
+  it('puts the links and the conversation on a job', () => {
+    const span = 'cd'.repeat(8);
     const job: JobSummary = {
       jobId: 'job_x0000001',
       repository: 'acme/web',
@@ -283,16 +357,31 @@ describe('links to a trace', () => {
       finishedAt: '2026-11-21T10:20:00.000Z',
       status: 'finished',
       outcome: 'succeeded',
-      detail: { telemetry: { traceId, spans: 9, exported: 9, failed: 0, startedAt: '2026-11-21T10:00:00.000Z' } },
+      detail: { telemetry: { traceId, spans: 9, exported: 9, failed: 0, startedAt: '2026-11-21T10:00:00.000Z', marks: [{ kind: 'agent', spanId: span, run: 'implement', agent: 'claude-opus' }] } },
     };
-    expect(jobView(job, { provider: 'honeycomb', enabled: true, captureContent: false, updatedAt: '', updatedBy: '', ...settings }).telemetry).toEqual({
+    const full = { provider: 'honeycomb' as const, enabled: true, captureContent: false, updatedAt: '', updatedBy: '', ...settings };
+    const now = Date.parse('2026-11-22T10:00:00.000Z');
+    const template = '{ui}/{team}/environments/{environment}/agent-timeline?conversation={conversation}';
+    expect(jobView(job, full, { now, timelineTemplate: template }).telemetry).toEqual({
       traceId,
-      traceUrl: expect.stringContaining(`trace_id=${traceId}`),
+      traceUrl: expect.stringContaining(`trace_id=${traceId}&trace_start_ts`),
       conversationId: 'acme/web#12',
+      conversationUrl: conversationUrl(full, 'acme/web#12', '2026-11-21T10:00:00.000Z', now),
+      timelineUrl: 'https://ui.honeycomb.io/acme/environments/prod/agent-timeline?conversation=acme%2Fweb%2312',
+      links: [{ kind: 'agent', run: 'implement', agent: 'claude-opus', url: expect.stringContaining(`trace_id=${traceId}&span=${span}&`) }],
       spans: 9,
       exported: 9,
       failed: 0,
     });
-    expect(jobView(job).telemetry?.traceUrl).toBeUndefined();
+    // No template: no Agent Timeline link, the query's still there.
+    expect(jobView(job, full, { now }).telemetry).not.toHaveProperty('timelineUrl');
+    // The runner's conversation wins: a pull request's review job has no issue of its own.
+    const review: JobSummary = { ...job, issue: undefined, detail: { telemetry: { ...job.detail!.telemetry!, conversationId: 'acme/web#3' } } };
+    expect(jobView(review, full, { now }).telemetry?.conversationId).toBe('acme/web#3');
+    // A job of an issue that ran no agent sent its spans in the delivery's conversation: that is the one to link.
+    const early: JobSummary = { ...job, detail: { telemetry: { ...job.detail!.telemetry!, conversationId: 'delivery/d-1' } } };
+    expect(jobView(early, full, { now }).telemetry?.conversationUrl).toContain(encodeURIComponent('"value":"delivery/d-1"'));
+    // Without settings (or the team's slug), nothing to link to, but the conversation id.
+    expect(jobView(job).telemetry).toEqual({ traceId, conversationId: 'acme/web#12', spans: 9, exported: 9, failed: 0 });
   });
 });

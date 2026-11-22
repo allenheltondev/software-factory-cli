@@ -225,7 +225,36 @@ export interface JobView {
   /** What the runner reported at the finish (as the broker checked it). */
   detail?: JobDetail;
   /** Its agents' trace in the installation's Honeycomb, when telemetry was on. */
-  telemetry?: { traceId: string; traceUrl?: string; conversationId?: string; spans: number; exported: number; failed: number; lastError?: string };
+  telemetry?: JobTelemetry;
+}
+
+export interface JobTelemetry {
+  traceId: string;
+  traceUrl?: string;
+  conversationId?: string;
+  /** The conversation's spans in Honeycomb's query builder; selecting the conversation id there opens Agent Timeline. */
+  conversationUrl?: string;
+  /** The conversation in Agent Timeline itself, when the deployment knows how to link to it. */
+  timelineUrl?: string;
+  /** Spans worth opening the trace at. */
+  links?: JobTraceLink[];
+  spans: number;
+  exported: number;
+  failed: number;
+  lastError?: string;
+}
+
+export type JobTraceLinkKind = 'agent' | 'test_failed' | 'test_green' | 'verify_failed' | 'step_failed';
+export interface JobTraceLink {
+  kind: JobTraceLinkKind;
+  url: string;
+  /** implement, review, revision */
+  run?: string;
+  agent?: string;
+  failed?: boolean;
+  thrashing?: boolean;
+  verdict?: string;
+  step?: string;
 }
 
 export type TelemetryRegion = 'us' | 'eu';
@@ -573,7 +602,7 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     },
     deliveries: (installationId: number, limit = 100) => request<{ deliveries: Delivery[] }>(`/installations/${installationId}/deliveries?limit=${limit}`),
     jobs: (installationId: number, limit = 100) => request<{ jobs: JobView[] }>(`/installations/${installationId}/jobs?limit=${limit}`),
-    job: (installationId: number, jobId: string) => request<{ job: JobView; deliveries: Delivery[] }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}`),
+    job: (installationId: number, jobId: string) => request<{ job: JobView; deliveries: Delivery[]; conversation?: JobView[] }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}`),
     /** The end of a log; throws ApiError `log_expired` (410) once it is past the retention. */
     jobLog: (installationId: number, jobId: string, name: string) =>
       request<JobLog>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/logs/${encodeURIComponent(name)}`),
