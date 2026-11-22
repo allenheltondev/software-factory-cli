@@ -1,14 +1,28 @@
-# Agent telemetry: Updraft in Honeycomb's Agent Timeline
+# Agent telemetry
 
-Updraft Cloud can send what each job's agents did to the tenant's own Honeycomb, as OpenTelemetry
-traces in the [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai).
-[Agent Timeline](https://docs.honeycomb.io/investigate/observe/agent-timeline) then shows every
-model call, tool call, verification and review round in order, for one issue at a time.
+Updraft Cloud can send what each job's agents did to the tenant's own tracing tool, as
+OpenTelemetry traces in the [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai):
+every model call, tool call, verification and review round, in order, with one issue's jobs as
+one conversation. Any backend that accepts OTLP/HTTP can store them; one that reads the GenAI
+conventions also shows them as an agent conversation.
 
-It is set up per installation in the console, under **Agent telemetry**: a Honeycomb Ingest key
-(checked with Honeycomb's `/1/auth` before it is saved), the region (US or EU), the service name
-(the dataset), and whether prompts and outputs are recorded. Agent Timeline is on every Honeycomb
-plan, the free one included.
+It is set up per installation in the console, under **Agent telemetry**: where the traces go
+(see [Destinations](#destinations)), the service name, and whether prompts and outputs are
+recorded. Without any of it, the job page still shows what the runner saw (see
+[What the console shows](#what-the-console-shows)).
+
+## Destinations
+
+### Honeycomb
+
+A Honeycomb Ingest key, checked with Honeycomb's `/1/auth` before it is saved, and the region (US
+or EU). The runner sends to `https://api.honeycomb.io/v1/traces` (or `api.eu1`) with the key in
+`x-honeycomb-team`; the service name is the dataset. Honeycomb's
+[Agent Timeline](https://docs.honeycomb.io/investigate/observe/agent-timeline), on every plan
+including the free one, shows each conversation. The key's team and environment slugs make the
+console's links: a [direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace)
+and a [shared query](https://docs.honeycomb.io/investigate/collaborate/share-query) for the
+conversation.
 
 ## How it works
 
@@ -22,13 +36,12 @@ needs: every run's `run.log`, which holds
 
 The runner (`deploy/aws-microvm/image/runner/telemetry.mjs`) tails those files every 500 ms while
 the job runs, so each event is timed when it is written. It turns them into spans and sends
-finished ones every few seconds over OTLP/HTTP (JSON) to `https://api.honeycomb.io/v1/traces`
-(or `api.eu1`), with the key in `x-honeycomb-team`. No collector and no SDK are involved.
+finished ones every few seconds over OTLP/HTTP (JSON) to the destination. No collector and no SDK
+are involved.
 
 Claude Code can also export OpenTelemetry itself, but its spans are named `claude_code.*` and need a
 Collector `transform` processor to carry agent names, span names and token usage in the GenAI
-conventions (Honeycomb's [Instrumenting AI Agents](https://docs.honeycomb.io/send-data/use-cases/agents)
-shows the configuration). Reading the transcripts gives the same shape for Codex too, with none
+conventions. Reading the transcripts gives the same shape for Codex too, with none
 of that.
 
 ## The spans
@@ -55,29 +68,29 @@ invoke_workflow updraft                 the job; agent "updraft"
 | `execute_tool verify` | `execute_tool` | internal | `updraft.verify.command`, `updraft.verify.index`, `updraft.tool.exit_code` |
 
 Every span carries `gen_ai.conversation.id`, which is `<owner>/<repo>#<issue>`, and
-`gen_ai.agent.name`. Agent Timeline groups traces into a conversation by the first and spans into
-lanes by the second, so one issue's implement run, each review, and each revision, over however
+`gen_ai.agent.name`. A tool that reads the conventions (Honeycomb's Agent Timeline, for one) groups
+traces into a conversation by the first and spans into lanes by the second, so one issue's implement run, each review, and each revision, over however
 many webhook events and microVMs, read as one conversation, with the coding agent, the reviewing
 agent and Updraft itself each in its own lane.
 
-Details that follow the conventions and Honeycomb's cost calculation:
+Details that follow the conventions:
 
 - **Input tokens include the cache.** Anthropic reports `input_tokens` without cache reads and
   writes; the conventions' `gen_ai.usage.input_tokens` includes them, so Updraft adds them up.
   OpenAI's count already includes cached tokens and is sent as is. With the model and provider on
-  the span, Honeycomb estimates each call's cost at ingest.
+  the span, a backend that prices models (Honeycomb does) can estimate each call's cost.
 - **One `chat` span per model response.** Claude Code streams each content block of a response as
   its own event, with the same message id; they are one span. It starts when the agent got the
   previous tool results back (or started), and ends when the response's last block arrived. A
   Codex turn has no per-call breakdown, so it is one `chat` span with the turn's usage.
 - **The calling agent emits `invoke_agent`.** A Claude Code subagent is an `execute_tool Task`
   span with an `invoke_agent <profile>/<subagent_type>` span under it; the subagent's own model and
-  tool calls carry its own agent name, as Honeycomb recommends for multi-agent workflows.
+  tool calls carry its own agent name, as the conventions suggest for multi-agent workflows.
 - **Failures are span errors.** A tool result marked `is_error`, a Codex command that exited
   non-zero or an MCP call that failed, an agent run that did not succeed, a verify command that
   failed, and a job that did not succeed: each sets the span's status to error with `error.type`.
-- **Nothing is sampled.** Honeycomb recommends against sampling GenAI telemetry, and the runner
-  sends every span (up to 20,000 per run).
+- **Nothing is sampled.** A sampled conversation has holes in it, so the runner sends every span
+  (up to 20,000 per run).
 
 ## Structural detail
 
@@ -208,10 +221,37 @@ Off by default. With **Prompts and outputs** on, spans also carry:
 - `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result` on `execute_tool`;
 - `gen_ai.agent.description` on a subagent.
 
-Every value is redacted with the job's own keys (the agent keys and the Honeycomb key) and with
+Every value is redacted with the job's own keys (the agent keys and the destination's key) and with
 patterns for anything shaped like a provider key, bearer token or key header, then cut to
 16 KB. A JSON value is cut inside its strings, so it stays valid JSON. Code and issue text are
 not redacted: they are what the content is.
+
+## The contract
+
+What a destination, a query, a board or an alert can rely on, whichever tool reads it:
+
+- **Span names and kinds**: `invoke_workflow updraft`, `invoke_agent <profile>`,
+  `invoke_agent <profile>/<subagent type>`, `chat <model>`, `execute_tool <tool>`,
+  `execute_tool verify`, `invoke_workflow verify`, `updraft <step>` and `runner <step>`, in the tree
+  under [The spans](#the-spans), one trace per job.
+- **The GenAI attributes** in the tables above, with the conventions' meaning:
+  `gen_ai.conversation.id` (`<owner>/<repo>#<issue>`, `delivery/<id>` for a job that ran no agent,
+  or a run's job id for a run of no issue), `gen_ai.agent.name`, `gen_ai.operation.name`, the
+  model, provider, token and tool attributes.
+- **The `updraft.*` attributes** in [Structural detail](#structural-detail) and
+  [How the agent worked](#how-the-agent-worked): names, types and units (counts, `_ms`
+  milliseconds, `_usd` dollars, ratios between 0 and 1) stay as documented.
+- **Span links between jobs** (`updraft.link.relation`) and the derived `invoke_agent` span id of
+  a run, so a later trace can always link to an earlier run.
+- **The finish report's marks** ([Spans worth a link](#spans-worth-a-link)): kinds and fields as
+  documented.
+
+Changes are additive: a new attribute or span event can appear, and an existing one keeps its
+name, type and meaning. Renaming or removing one is a breaking change and is called out in the
+release notes. Content attributes (`gen_ai.input.messages`, `gen_ai.output.messages`,
+`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`) are only there with content on, and their
+values follow the conventions' JSON message format, cut at 16 KB. Resource attributes are
+`service.name` (the service name setting), `updraft.delivery.id` and `updraft.microvm.id`.
 
 ## What the console shows
 
@@ -277,5 +317,5 @@ path it can change without notice; the query link works either way.
   meanwhile can never be deleted with the old one.
 - Every setting change is a compare-and-set on the version it read, so an opt-out made while a
   key was being checked is never undone.
-- A failed export (Honeycomb unreachable, the key revoked) is counted and reported; it never fails
+- A failed export (the destination unreachable, the key revoked) is counted and reported; it never fails
   the job.

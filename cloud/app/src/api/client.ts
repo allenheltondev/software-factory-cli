@@ -224,7 +224,7 @@ export interface JobView {
   logs: string[];
   /** What the runner reported at the finish (as the broker checked it). */
   detail?: JobDetail;
-  /** Its agents' trace in the installation's Honeycomb, when telemetry was on. */
+  /** Its agents' trace in the installation's tracing tool, when telemetry was on. */
   telemetry?: JobTelemetry;
 }
 
@@ -232,10 +232,16 @@ export interface JobTelemetry {
   traceId: string;
   traceUrl?: string;
   conversationId?: string;
-  /** The conversation's spans in Honeycomb's query builder; selecting the conversation id there opens Agent Timeline. */
+  /** Where the traces went, by name (Honeycomb, or the host of a custom OTLP endpoint). */
+  destination?: string;
+  /** The conversation's spans, in the destination's own search. */
   conversationUrl?: string;
-  /** The conversation in Agent Timeline itself, when the deployment knows how to link to it. */
+  /** What to do there, when it takes a step (Honeycomb: select the id to open Agent Timeline). */
+  conversationHint?: string;
+  /** The conversation in the destination's conversation view itself, when the deployment knows how to link to it. */
   timelineUrl?: string;
+  /** That link's words (Honeycomb: "Open in Agent Timeline"). */
+  timelineLabel?: string;
   /** Spans worth opening the trace at. */
   links?: JobTraceLink[];
   spans: number;

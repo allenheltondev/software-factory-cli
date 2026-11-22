@@ -93,8 +93,8 @@ function Hero({ view }: { view: TelemetryView }) {
     <PageHero data-testid="telemetry">
       <PageHeroTitle>Agent telemetry</PageHeroTitle>
       <PageHeroSubtitle>
-        See what your agents are doing: every model call, tool call and review round, in order, in Honeycomb's Agent Timeline. Each issue is one conversation, from the first change through every review and
-        revision.
+        See what your agents are doing: every model call, tool call and review round, in order, as OpenTelemetry traces in the tracing tool you already use. Each issue is one conversation, from the first
+        change through every review and revision.
       </PageHeroSubtitle>
       <PageHeroChips>
         <PageHeroChip tone={state.tone} data-testid="telemetry-state">
@@ -291,8 +291,8 @@ function SettingsCard({ view, api, installationId, onSaved }: { view: TelemetryV
           title="Content"
           description={
             view.captureContent
-              ? 'Prompts, model responses, and tool arguments and results are recorded, so Agent Timeline shows what was said, not just what happened. Keys and tokens are redacted first; code and issue text are not. Each field is cut at 16 KB.'
-              : 'Names, timing, token counts, tool names, errors and verify commands only. Turn on content to read the conversation itself in Agent Timeline.'
+              ? 'Prompts, model responses, and tool arguments and results are recorded, so a trace shows what was said, not just what happened. Keys and tokens are redacted first; code and issue text are not. Each field is cut at 16 KB.'
+              : 'Names, timing, token counts, tool names, errors and verify commands only. Turn on content to read the conversation itself.'
           }
         >
           <SegmentedControl<'meta' | 'content'>
@@ -391,11 +391,11 @@ function HowItWorks() {
           <a className="auth-link" href="https://github.com/open-telemetry/semantic-conventions-genai" target="_blank" rel="noreferrer">
             OpenTelemetry GenAI
           </a>{' '}
-          spans, so{' '}
+          spans over OTLP, so any tool that reads the GenAI conventions shows them without a collector (Honeycomb's{' '}
           <a className="auth-link" href={TIMELINE_DOCS} target="_blank" rel="noreferrer">
             Agent Timeline ↗
-          </a>{' '}
-          understands them without a collector.
+          </a>
+          , for one).
         </CardDescription>
       </CardHeader>
       <CardBody>

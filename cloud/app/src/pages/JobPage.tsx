@@ -190,7 +190,7 @@ export function traceLinkLabel(l: JobTraceLink): { title: string; notes: string[
   }
 }
 
-/** Where to see this job's agents at work: its trace, the spans worth opening it at, and the issue's conversation in Agent Timeline. */
+/** Where to see this job's agents at work: its trace, the spans worth opening it at, and the issue's conversation in the tenant's tracing tool. */
 function AgentTimeline({ job, installationId }: { job: JobView; installationId: number }) {
   const t = job.telemetry;
   const [copied, setCopied] = useState(false);
@@ -200,7 +200,7 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
         <CardHeader>
           <CardTitle>Agent timeline</CardTitle>
           <CardDescription>
-            Send what the agents did (every model call and tool call, in order) to Honeycomb and watch it in Agent Timeline.{' '}
+            Send what the agents did (every model call and tool call, in order) to your tracing tool as OpenTelemetry.{' '}
             <Link className="auth-link" to={`/installations/${installationId}/telemetry`}>
               Set up agent telemetry
             </Link>
@@ -223,13 +223,15 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
     <Card data-testid="job-telemetry">
       <CardHeader>
         <CardTitle>Agent timeline</CardTitle>
-        <CardDescription>This job's agents, as traced in Honeycomb. The issue's conversation holds this job and every review and revision after it.</CardDescription>
+        <CardDescription>
+          This job's agents, as traced{t.destination ? ` in ${t.destination}` : ''}. The issue's conversation holds this job and every review and revision after it.
+        </CardDescription>
       </CardHeader>
       <CardBody className="flex flex-col gap-4 text-sm">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           {t.timelineUrl && (
             <a className="auth-link font-semibold" href={t.timelineUrl} target="_blank" rel="noreferrer" data-testid="job-timeline-link">
-              Open in Agent Timeline ↗
+              {t.timelineLabel ?? 'Open conversation'} ↗
             </a>
           )}
           {!t.timelineUrl && t.conversationUrl && (
@@ -239,14 +241,14 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
               target="_blank"
               rel="noreferrer"
               data-testid="job-conversation-link"
-              title="Every span of the conversation, by agent. Select the conversation id in the results to open it in Agent Timeline."
+              title="Every span of the conversation, by agent."
             >
               Open conversation ↗
             </a>
           )}
           {t.traceUrl && (
             <a className={`auth-link ${t.timelineUrl || t.conversationUrl ? '' : 'font-semibold'}`} href={t.traceUrl} target="_blank" rel="noreferrer" data-testid="job-trace-link">
-              View trace in Honeycomb ↗
+              View trace ↗
             </a>
           )}
           {t.conversationId && (
@@ -258,7 +260,7 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
             </span>
           )}
         </div>
-        {!t.timelineUrl && t.conversationUrl && <p className="text-muted-foreground">In the conversation's results, select its id to open it in Agent Timeline.</p>}
+        {!t.timelineUrl && t.conversationUrl && t.conversationHint && <p className="text-muted-foreground">{t.conversationHint}</p>}
         {links.length > 0 && (
           <div className="flex flex-col gap-2">
             <h3 className="font-medium">Jump to</h3>

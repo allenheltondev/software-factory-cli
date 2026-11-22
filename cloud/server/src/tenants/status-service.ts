@@ -60,10 +60,15 @@ export interface JobTelemetryView {
   traceId: string;
   traceUrl?: string;
   conversationId?: string;
-  /** The conversation's spans in Honeycomb's query builder, by agent; from there, Agent Timeline. */
+  /** Where the traces went, by name: the link's destination, for the console's words. */
+  destination?: string;
+  /** The conversation's spans, in the destination's own search. */
   conversationUrl?: string;
-  /** The conversation in Agent Timeline itself, when the deployment set HONEYCOMB_TIMELINE_URL. */
+  /** What to do there, when it takes a step. */
+  conversationHint?: string;
+  /** The conversation in the destination's conversation view itself (Honeycomb: when the deployment set HONEYCOMB_TIMELINE_URL). */
   timelineUrl?: string;
+  timelineLabel?: string;
   /** Spans worth opening the trace at: each run's agent, the first red and green test runs, a failed verify or step. */
   links?: JobTraceLink[];
   spans: number;
@@ -167,8 +172,9 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
       traceId: t.traceId,
       ...(url ? { traceUrl: url } : {}),
       ...(conversationId ? { conversationId } : {}),
-      ...(queryUrl ? { conversationUrl: queryUrl } : {}),
-      ...(timeline ? { timelineUrl: timeline } : {}),
+      ...(telemetry ? { destination: 'Honeycomb' } : {}),
+      ...(queryUrl ? { conversationUrl: queryUrl, conversationHint: 'In the results, select the conversation id to open it in Agent Timeline.' } : {}),
+      ...(timeline ? { timelineUrl: timeline, timelineLabel: 'Open in Agent Timeline' } : {}),
       ...(links.length ? { links } : {}),
       spans: t.spans,
       exported: t.exported,
