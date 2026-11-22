@@ -185,12 +185,6 @@ ENV UPDRAFT_JOB_USER=updraft \
     HOOK_PORT=9000 \
     NODE_ENV=production
 
-# Ask the runner to verify Kiro in the job sandbox before the MicroVM is snapshotted.
-RUN set -eu; . /opt/updraft/build.env; \
-    if [ -n "${KIRO_INSTALL_COMMAND:-}" ] && [ -n "${ISOLATION_PACKAGES:-}" ]; then \
-      touch /opt/updraft/probe-kiro-on-start; \
-    fi
-
 # Lifecycle hooks only. Nothing listens for application traffic: jobs run with NO_INGRESS.
 EXPOSE 9000
 
