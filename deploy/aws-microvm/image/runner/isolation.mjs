@@ -160,19 +160,48 @@ export function missingRules(listing, { endpoints, hookPort }) {
     .map((rule) => `no rule rejects non-root traffic to ${rule.what}`);
 }
 
+const CAP_NET_ADMIN = 12n;
+
+/**
+ * Whether the effective capabilities in a `/proc/<pid>/status` text include CAP_NET_ADMIN:
+ * true or false, or undefined when the text has no CapEff line. Pure.
+ */
+export function hasNetAdmin(statusText) {
+  const match = /^CapEff:\s*([0-9a-fA-F]+)\s*$/m.exec(String(statusText ?? ''));
+  if (!match) return undefined;
+  return ((BigInt(`0x${match[1]}`) >> CAP_NET_ADMIN) & 1n) === 1n;
+}
+
+/** Said when the runner is root but may not change the packet filter (seen in a MicroVM). */
+export const NO_NET_ADMIN_PROBLEM =
+  'the runner has no CAP_NET_ADMIN, so nftables refuses every change even as root; build the image with additionalOsCapabilities ["ALL"] (deploy.sh and build-job-image.ts send it; an image version built before that lacks it)';
+
+const readOwnStatus = () => readFileSync('/proc/self/status', 'utf8');
+
 /**
  * The packet filter, with nftables (`nft`, package nftables): an owner match (`meta skuid`)
  * on locally generated packets. A process in a user namespace keeps its real uid for this
  * match, so the sandbox's uid mapping changes nothing.
  *
+ * @param {object} options
+ * @param {() => string} [options.readStatus] this process's /proc status, read only to explain a
+ *   failed install (nft -f without CAP_NET_ADMIN exits 1 and prints nothing)
  * @returns {{ install(): { ok: boolean, problem?: string }, check(): { ok: boolean, problems: string[] }, remove(): void, describe(): object }}
  */
-export function createNftFilter({ endpoints, hookPort, table = 'updraft_isolation', nft = 'nft', spawnSync = nodeSpawnSync }) {
+export function createNftFilter({ endpoints, hookPort, table = 'updraft_isolation', nft = 'nft', spawnSync = nodeSpawnSync, readStatus = readOwnStatus }) {
   const run = (args) => {
     const result = spawnSync(nft, args, { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] });
     // nft's message comes first; the lines after it only point into the input.
-    const said = `${result.stderr ?? ''}`.trim().split('\n').filter(Boolean)[0];
+    const firstLine = (text) => `${text ?? ''}`.trim().split('\n').filter(Boolean)[0];
+    const said = firstLine(result.stderr) || firstLine(result.stdout);
     return { ok: result.status === 0, stdout: result.stdout ?? '', problem: result.error ? `cannot run ${nft}: ${result.error.message}` : said || `${nft} exited ${result.status ?? result.signal}` };
+  };
+  const capabilityProblem = () => {
+    try {
+      return hasNetAdmin(readStatus()) === false ? NO_NET_ADMIN_PROBLEM : undefined;
+    } catch {
+      return undefined;
+    }
   };
   return {
     install() {
@@ -184,7 +213,9 @@ export function createNftFilter({ endpoints, hookPort, table = 'updraft_isolatio
         const file = path.join(dir, 'ruleset.nft');
         writeFileSync(file, filterRuleset({ table, endpoints, hookPort }), { mode: 0o600 });
         const done = run(['-f', file]);
-        return done.ok ? { ok: true } : { ok: false, problem: `the packet filter could not be installed: ${done.problem}` };
+        if (done.ok) return { ok: true };
+        const why = capabilityProblem();
+        return { ok: false, problem: `the packet filter could not be installed: ${done.problem}${why ? ` (${why})` : ''}` };
       } catch (error) {
         return { ok: false, problem: `the packet filter could not be installed: ${error?.message ?? error}` };
       } finally {

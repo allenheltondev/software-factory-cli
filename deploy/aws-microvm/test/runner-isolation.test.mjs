@@ -17,10 +17,12 @@ import {
   CONTAINER_HOME,
   DEFAULT_CREDENTIAL_ENDPOINTS,
   IsolationError,
+  NO_NET_ADMIN_PROBLEM,
   SANDBOX_IMAGE,
   SANDBOX_RUNTIME,
   checkAgentConfig,
   createNftFilter,
+  hasNetAdmin,
   credentialEndpoints,
   filterRuleset,
   isolationMode,
@@ -111,9 +113,35 @@ describe('the packet filter', () => {
     // The ruleset file is gone again.
     expect(fs.existsSync(calls[0][2])).toBe(false);
 
-    const broken = createNftFilter({ endpoints, hookPort: 9000, spawnSync: () => ({ status: 1, stdout: '', stderr: 'Error: Could not process rule: Operation not supported\nmore' }) });
+    const broken = createNftFilter({ endpoints, hookPort: 9000, readStatus: () => '', spawnSync: () => ({ status: 1, stdout: '', stderr: 'Error: Could not process rule: Operation not supported\nmore' }) });
     expect(broken.install()).toEqual({ ok: false, problem: 'the packet filter could not be installed: Error: Could not process rule: Operation not supported' });
     expect(broken.check().ok).toBe(false);
+  });
+
+  // What a MicroVM image built without additionalOsCapabilities showed: root, the
+  // container-default capability set, and `nft -f` exiting 1 with nothing on stderr.
+  const MICROVM_DEFAULT_STATUS = 'Name:\tnode\nUid:\t0\t0\t0\t0\nCapInh:\t0000000000000000\nCapPrm:\t00000000a80425fb\nCapEff:\t00000000a80425fb\nCapBnd:\t00000000a80425fb\n';
+
+  it('reads CAP_NET_ADMIN from a /proc status text', () => {
+    expect(hasNetAdmin(MICROVM_DEFAULT_STATUS)).toBe(false);
+    expect(hasNetAdmin('CapEff:\t000001ffffffffff\n')).toBe(true);
+    expect(hasNetAdmin('CapEff:\t0000000000001000\n')).toBe(true);
+    expect(hasNetAdmin('Name:\tnode\n')).toBeUndefined();
+  });
+
+  it('says CAP_NET_ADMIN is missing when nft fails silently without it', () => {
+    const silent = () => ({ status: 1, stdout: '', stderr: '' });
+    const filter = createNftFilter({ endpoints, hookPort: 9000, spawnSync: silent, readStatus: () => MICROVM_DEFAULT_STATUS });
+    expect(filter.install()).toEqual({ ok: false, problem: `the packet filter could not be installed: nft exited 1 (${NO_NET_ADMIN_PROBLEM})` });
+    // With the capability, or with no status to read, the failure is reported as it came.
+    for (const readStatus of [() => 'CapEff:\t000001ffffffffff\n', () => { throw new Error('no /proc'); }]) {
+      expect(createNftFilter({ endpoints, hookPort: 9000, spawnSync: silent, readStatus }).install()).toEqual({ ok: false, problem: 'the packet filter could not be installed: nft exited 1' });
+    }
+  });
+
+  it('falls back to what nft printed on stdout when stderr is empty', () => {
+    const filter = createNftFilter({ endpoints, hookPort: 9000, readStatus: () => '', spawnSync: () => ({ status: 1, stdout: 'Operation not permitted (you must be root)\n', stderr: '' }) });
+    expect(filter.install()).toEqual({ ok: false, problem: 'the packet filter could not be installed: Operation not permitted (you must be root)' });
   });
 });
 

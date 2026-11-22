@@ -152,6 +152,9 @@ build_image() {
 
   # The request, in the API's own field names (CreateMicrovmImage / UpdateMicrovmImage).
   # Hooks: Lambda POSTs to /aws/lambda-microvms/runtime/v1/<hook> on HOOK_PORT.
+  # additionalOsCapabilities: without it root in the microVM has only the container-default
+  # capabilities (no CAP_NET_ADMIN), so the packet filter cannot be installed and every job
+  # with AgentIsolation=enforced is refused. Sent on updates too, or the new version lacks it.
   local base_version_line=""
   if [ -n "${BASE_IMAGE_VERSION:-}" ]; then
     base_version_line="\"baseImageVersion\": \"${BASE_IMAGE_VERSION}\","
@@ -166,6 +169,7 @@ build_image() {
   "cpuConfigurations": [ { "architecture": "${IMAGE_ARCH}" } ],
   "resources": [ { "minimumMemoryInMiB": ${IMAGE_MEMORY_MIB} } ],
   "logging": { "cloudWatch": { "logGroup": "${log_group}" } },
+  "additionalOsCapabilities": [ "ALL" ],
   "hooks": {
     "port": ${HOOK_PORT},
     "microvmImageHooks": { "ready": "ENABLED", "readyTimeoutInSeconds": 300 },

@@ -105,6 +105,11 @@ reason=${reason}
       cpuConfigurations: [{ architecture: ARCHITECTURE }],
       resources: [{ minimumMemoryInMiB: MEMORY_MIB }],
       logging: { cloudWatch: { logGroup: outputs.MicrovmLogGroup } },
+      // Without it, root in the microVM has only the container-default capabilities: no
+      // CAP_NET_ADMIN, so the runner cannot install the packet filter that keeps agents away
+      // from the execution role's credentials, and every job is refused. Sent on every update
+      // too: an UpdateMicrovmImage without it builds a version without it.
+      additionalOsCapabilities: ['ALL'],
       hooks: {
         port: HOOK_PORT,
         microvmImageHooks: { ready: 'ENABLED', readyTimeoutInSeconds: 300 },

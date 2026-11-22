@@ -889,7 +889,7 @@ What can go wrong, either way:
 | Delivery shows `500` | The launcher's log group (`LauncherLogGroup` output). Each line is JSON with the `deliveryId`. Typical causes: the image does not exist or has no active version (`ResourceNotFoundException`), the account's MicroVM memory quota is used up (`ServiceQuotaExceededException`), a missing permission, a rejected parameter (`ValidationException`, see [Idle policy](#idle-policy)) |
 | Delivery shows `429` or `503` | HTTP API throttling (`WebhookRateLimit`) |
 | `202`, but no result object | The microVM's log stream in `/aws/lambda-microvms/<image-name>`. `aws lambda-microvms get-microvm --microvm-identifier <id>` shows `state` and `stateReason`. A microVM whose `/run` hook fails or times out is terminated without ever running |
-| Result has `errorCode: isolation-not-enforced` | The job was not started because the boundary around agents could not be shown to hold. `isolation.failedStep` is `setup`, `packet filter`, `config` or `self-test`, and `isolation.problems` lists each reason: an agent without the sandbox `container` block or with `triage` configured (fix the config), `nft` or `bwrap` missing or refused by the kernel (see "What is not verified"), a file of the state directory readable inside the sandbox, or a credential address that answered. The delivery record is released, so a redelivery tries again once it is fixed. `AgentIsolation=disabled` skips all of this, see [Security model](#security-model) |
+| Result has `errorCode: isolation-not-enforced` | The job was not started because the boundary around agents could not be shown to hold. `isolation.failedStep` is `setup`, `packet filter`, `config` or `self-test`, and `isolation.problems` lists each reason: an agent without the sandbox `container` block or with `triage` configured (fix the config), the runner without `CAP_NET_ADMIN` (the problem says so; an image version built without `additionalOsCapabilities`, rebuild it), `nft` or `bwrap` missing or refused by the kernel (see "What is not verified"), a file of the state directory readable inside the sandbox, or a credential address that answered. The delivery record is released, so a redelivery tries again once it is fixed. `AgentIsolation=disabled` skips all of this, see [Security model](#security-model) |
 | Result has `outcome: runner_error` | `error` says which step failed: reading the event or config from S3, a secret that is empty or not a PEM key, no `config.yaml`, a shared state object that is not a SQLite database (restore an earlier version, see [Shared state](#shared-state)), Updraft not startable |
 | Result has `outcome: state_not_saved` (`state.sync.saved: false` with a `notSavedReason`) | The job ran (`jobOutcome` says how it went), but what it changed in the state database since its last checkpoint was not saved; the log has a `STATE NOT SAVED` line. The run's database is kept as the backup `state.unsaved.manifestKey` names (when `state.unsaved.complete` is true); [When state is not saved](#when-state-is-not-saved) says how to merge it or restore from GitHub. `notSavedCode` is `merge-failed` (`updraft state merge` exited non-zero; its last output is in the reason), `newer-schema` (the image's Updraft is older than the shared database; rebuild the image), `merged-database-unreadable` or `merged-database-refused` (the merged file failed a check), `attempts-exhausted` (four attempts each lost to another microVM), `timed-out` or `no-time` (the microVM was at its end; raise `WatchdogReserveSeconds` or `MaximumDurationSeconds`), `shared-database-unreadable` (the object in S3 is damaged; restore a version), `no-run-database`, `merge-report-missing`. [Concurrency model](#concurrency-model) says what the missing history means |
 | Result has `outcome: failed`, `exitCode: 6`, `updraftOutcome: state-pending` | A pull request event arrived before the state of the run that opened the pull request did, and it did not arrive within `StatePendingWaitSeconds` (`state.pending`). Redeliver the delivery once that run has saved state (its first checkpoint is enough); if that run is gone, redeliver the pull request's `issues` delivery first. See [A pull request the state does not know yet](#a-pull-request-the-state-does-not-know-yet) |
@@ -1215,6 +1215,15 @@ The 60 second ceiling for the runtime hooks and 3,600 for the build hooks are fr
 CloudFormation Template Reference for `AWS::Lambda::MicrovmImage` (`MicrovmHooks`,
 `MicrovmImageHooks`); `runTimeoutInSeconds` is also named on
 `microvms-integrations-claude-managed-agents.html`.
+
+The image is also created with `"additionalOsCapabilities": ["ALL"]`. Without it, root in a
+microVM has only the container-default capability set (`CapEff` `00000000a80425fb`: no
+`CAP_NET_ADMIN`, no `CAP_SYS_ADMIN`), nftables refuses every change, and with
+`AgentIsolation=enforced` every job is refused at the packet filter step. Seen in a real
+microVM on 2026-11-22: `nft list tables` printed `Operation not permitted (you must be root)`
+to a root shell, and `nft -f` exited 1 and printed nothing. Only root gains the extra
+capabilities; the job user and the sandbox do not. `update-microvm-image` builds a version
+from the request alone, so the field is sent on every update too.
 
 Other calls: `TerminateMicrovm({ microvmIdentifier })` from the runner
 (`microvms-launching.html`, "Terminating a MicroVM"); `create-microvm-image`,
@@ -1684,9 +1693,12 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
     and whether Amazon Linux 2023 packages bubblewrap under the name `bubblewrap`. If either
     fails, the self-test fails and every enforced job is refused with the reason. The image
     build fails if the package does not exist.
-43. **The packet filter in a MicroVM.** Assumed: that the guest kernel has nf_tables with the
-    `inet` family, the output hook and `meta skuid`; that the runner, as root, may load a
-    table; and that `nftables` is the package's name. The runner reads the table back after
+43. **The packet filter in a MicroVM.** Seen: the guest kernel (6.1, `amzn2023.aarch64.microvm`)
+    has nf_tables, `nftables` v1.0.4 installs under that name, and root may load nothing
+    without `additionalOsCapabilities: ["ALL"]` (no `CAP_NET_ADMIN`; see [Lifecycle hooks](#lifecycle-hooks-image-and-runner)).
+    Assumed: that `ALL` grants `CAP_NET_ADMIN` (the API's documentation says only "additional
+    OS capabilities"), and that the kernel has the `inet` family, the output hook,
+    `meta skuid` and `reject`. The runner reads the table back after
     installing it. The self-test checks from inside and outside the sandbox that the
     credential addresses do not answer the job user. On a test host an address that answers
     is caught (a local listener stood in for it); the rule itself has not been loaded
