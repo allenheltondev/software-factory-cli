@@ -394,6 +394,9 @@ function usage(config: ConsoleConfig, which: 'all' | 'enabled') {
 export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): ConfigIssue[] {
   const out: ConfigIssue[] = [];
   const need = (path: string, adapter: CloudAgent) => {
+    // An agent this deployment does not run: compiling it says so, with what to do instead;
+    // asking for its key first would send the tenant to a key the key page cannot take.
+    if (!CONSOLE_AGENTS.includes(adapter)) return;
     const name = SUPPORTED_AGENT_KEY_ENV[adapter];
     if (!keys.has(name)) out.push({ path, message: `set the tenant's ${name} first: jobs run ${adapter} with your own key` });
   };

@@ -159,6 +159,9 @@ describe('InstallationPage (#71)', () => {
     const again = showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, config: { activeVersion: 2, replaced: ['acme/web'] } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
     expect(await screen.findByTestId('setup-first-job')).toHaveTextContent('acme/web was recreated on GitHub since the configuration was published: publish it again.');
     again.unmount();
+    const retired = showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, config: { activeVersion: 2, retiredAgents: ['kiro'] } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    expect(await screen.findByTestId('setup-first-job')).toHaveTextContent('Your workflows run Kiro, which Updraft Cloud no longer runs here: choose another agent and publish again.');
+    retired.unmount();
     showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, activity: { ...ready.activity, firstJobAt: '2026-10-01T00:00:00.000Z' } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
     await screen.findByTestId('installation-status');
     expect(screen.queryByTestId('setup')).toBeNull();

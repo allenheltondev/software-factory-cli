@@ -457,6 +457,8 @@ export interface Overview {
   config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string; triggers?: { repository: string; label: string }[];
     /** Configured repositories GitHub now has under another id: publish again for them. */
     replaced?: string[];
+    /** Agents the viewer's labels run that the deployment no longer runs. */
+    retiredAgents?: string[];
   };
   keys: AgentKeyView[];
   /** Whether traces are set up to go somewhere, and are on. Absent from an older API. */

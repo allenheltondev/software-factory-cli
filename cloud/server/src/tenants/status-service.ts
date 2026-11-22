@@ -4,6 +4,7 @@ import { FlowError, type GitHubFlows, type TenantSummary } from '../flows/github
 import { countBy, deliveryCounts, jobResult, type JobResult } from '../jobs/status.js';
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from './agents.js';
 import { redact } from './redact.js';
 import type { TelemetryMarkKind, TelemetryTotals } from '../jobs/lifecycle.js';
 import { parseOtlpEndpoint } from './otlp-destination.js';
@@ -122,6 +123,8 @@ export interface Overview {
     triggers?: { repository: string; label: string }[];
     /** Configured repositories GitHub now has under another id (recreated, or a new one by that name): the config must be published again for them. */
     replaced?: string[];
+    /** Agents the viewer's labels run that this deployment no longer runs: those workflows need another agent. */
+    retiredAgents?: string[];
   };
   keys: AgentKeyView[];
   /** Whether traces are set up to go somewhere (a destination and its key), and are on. */
@@ -300,12 +303,26 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
         .filter(([name, c]) => liveIds.has(name) && liveIds.get(name) !== c.id)
         .map(([name]) => repos.get(name)!.fullName)
         .sort();
+      // The viewer's labels, then only those whose agents this deployment runs (the launcher
+      // refuses the others). A version from before keys were recorded: its keys are not known here.
+      const offered = new Set<string>(Object.values(AGENT_KEY_ENV));
+      const retired = new Set<string>();
       const triggers = viewer
         ? Object.entries(configured)
             .filter(([name, c]) => !c.paused && repos.get(name)?.reachable && liveIds.get(name) === c.id)
-            .flatMap(([name, c]) => c.triggers.filter((t) => (t.actors ?? c.actors ?? []).includes(viewer)).map((t) => ({ repository: repos.get(name)!.fullName, label: t.label })))
+            .flatMap(([name, c]) =>
+              c.triggers
+                .filter((t) => (t.actors ?? c.actors ?? []).includes(viewer))
+                .filter((t) => {
+                  const off = (t.keys ?? c.keys ?? []).filter((k) => !offered.has(k));
+                  for (const k of off) for (const [agent, key] of Object.entries(SUPPORTED_AGENT_KEY_ENV)) if (key === k) retired.add(agent);
+                  return off.length === 0;
+                })
+                .map((t) => ({ repository: repos.get(name)!.fullName, label: t.label })),
+            )
             .slice(0, 10)
         : [];
+      const retiredAgents = triggers.length ? [] : [...retired].sort();
       return {
         tenant: summary,
         installation: { status, checked, missingPermissions: missing },
@@ -315,6 +332,7 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
           ...(version ? { publishedAt: version.publishedAt, publishedBy: version.publishedBy } : {}),
           ...(triggers.length ? { triggers } : {}),
           ...(replaced.length ? { replaced } : {}),
+          ...(retiredAgents.length ? { retiredAgents } : {}),
         },
         keys,
         telemetry: { configured: Boolean(telemetrySettings?.key), enabled: Boolean(telemetrySettings?.key && telemetrySettings.enabled) },

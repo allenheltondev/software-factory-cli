@@ -12,7 +12,8 @@ const { dispatchRules } = await import('./dispatch.js');
 const { createMemoryStore } = await import('../store/store.js');
 const { createLauncher } = await import('../jobs/launch.js');
 const { createBroker, hashToken } = await import('../broker/broker.js');
-const { CONSOLE_AGENTS, defaultConsoleConfig, parseConsoleConfig, toConsolePath, toTenantSubmission } = await import('./console.js');
+const { CONSOLE_AGENTS, defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission } = await import('./console.js');
+const { createStatusService } = await import('./status-service.js');
 
 const repo = (over: Record<string, unknown> = {}) => ({ enabled: true, triggers: [{ label: 'updraft', workflow: 'implement' }], allowedActors: ['pat'], publish: 'draft-pr', commentOnFailure: true, review: false, revise: false, ...over });
 const REPOS = new Map([['acme/web', 9]]);
@@ -40,6 +41,12 @@ describe('agents this deployment does not run', () => {
     const saved = withAgents('kiro', 'codex');
     expect(parseConsoleConfig(saved).ok).toBe(true);
     expect(compileErrors(saved)).toEqual([expect.objectContaining({ path: 'workflows.implement.agent.adapter', message: expect.stringMatching(/not an agent Updraft Cloud runs \(claude\)/) })]);
+  });
+
+  it('asks for no key of an agent it does not run: compiling says to choose another', () => {
+    const parsed = parseConsoleConfig(withAgents('kiro', 'claude'));
+    if (!parsed.ok) throw new Error('did not parse');
+    expect(missingKeys(parsed.config, new Set())).toEqual([]);
   });
 
   it('ignores a reviewer no repository uses', () => {
@@ -98,5 +105,38 @@ describe('a published version that runs an agent taken out of service', () => {
     } as never);
     const out = (await broker({ action: 'start', jobId: 'job_abc12345', token })) as { descriptor?: { agentKeySecrets?: Record<string, string> } };
     expect(Object.keys(out.descriptor?.agentKeySecrets ?? {})).toEqual(['ANTHROPIC_API_KEY']);
+  });
+});
+
+describe('the first-job step after an agent is taken out of service', () => {
+  const overview = async (triggers: { label: string; keys: string[] }[]) => {
+    const store = createMemoryStore();
+    await store.putTenantWithMember(
+      { installationId: 55, accountId: 900, accountLogin: 'acme', accountType: 'Organization', status: 'active', createdAt: '', createdBy: 's' },
+      { installationId: 55, sub: 'u1', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' },
+    );
+    const v = (await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 'pat', publishedAt: '', dispatch: { repositories: { 'acme/web': { id: 9, actors: ['pat'], triggers } } } })) as number;
+    await store.markConfigReady(55, v);
+    await store.activateConfig(55, v);
+    const member = async () => ({ tenant: (await store.getTenant(55))!, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: 'active' as const, role: 'owner' as const }, githubLogin: 'pat' });
+    const service = createStatusService({
+      store,
+      github: {
+        member,
+        installation: async () => ({ id: 55, account: { id: 900, login: 'acme', type: 'Organization' }, suspendedAt: null, permissions: { metadata: 'read', contents: 'write', issues: 'write', pull_requests: 'write', checks: 'read', statuses: 'read' } }),
+        repositories: async () => ({ tenant: {} as never, repositories: [{ id: 9, fullName: 'acme/web', private: true, htmlUrl: 'https://github.com/acme/web' }] }),
+      },
+      agentKeys: { list: async () => ({ keys: [], refusals: [] }) },
+      readLog: async () => null,
+      log: () => {},
+    } as never);
+    return (await service.overview({ sub: 'u1' }, 55)).config;
+  };
+
+  it("skips a label whose agent it no longer runs, and names the agent when no label is left", async () => {
+    expect(await overview([{ label: 'kiro', keys: ['KIRO_API_KEY'] }, { label: 'updraft', keys: ['ANTHROPIC_API_KEY'] }])).toMatchObject({ triggers: [{ repository: 'acme/web', label: 'updraft' }] });
+    const none = await overview([{ label: 'kiro', keys: ['KIRO_API_KEY'] }, { label: 'review', keys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] }]);
+    expect(none).not.toHaveProperty('triggers');
+    expect(none.retiredAgents).toEqual(['codex', 'kiro']);
   });
 });
