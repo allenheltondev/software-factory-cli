@@ -782,4 +782,20 @@ describe('the OTLP exporter', () => {
     await exporter.flush();
     expect(exporter.accepted('2'.repeat(16))).toBe(false);
   });
+
+  it("counts an OTLP partial success's rejected spans, and confirms none of that batch", async () => {
+    const bodies = ['{"partialSuccess":{"rejectedSpans":"1"}}', '{"partialSuccess":{}}'];
+    const exporter = createExporter({ endpoint: 'https://api.honeycomb.io', apiKey: 'k', resource: {}, fetch: async () => ({ ok: true, status: 200, text: async () => bodies.shift() }) });
+    exporter.push({ ...span, spanId: '1'.repeat(16) });
+    exporter.push({ ...span, spanId: '2'.repeat(16) });
+    await exporter.flush();
+    expect(exporter.stats).toMatchObject({ exported: 1, failed: 1, lastError: 'partial success' });
+    expect(exporter.accepted('1'.repeat(16))).toBe(false);
+    expect(exporter.accepted('2'.repeat(16))).toBe(false);
+    // An empty partialSuccess is a full success.
+    exporter.push({ ...span, spanId: '3'.repeat(16) });
+    await exporter.flush();
+    expect(exporter.accepted('3'.repeat(16))).toBe(true);
+    expect(exporter.stats).toMatchObject({ exported: 2, failed: 1 });
+  });
 });

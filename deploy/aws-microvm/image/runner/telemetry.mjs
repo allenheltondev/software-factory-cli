@@ -138,6 +138,22 @@ export function otlpRequest(spans, resource) {
 }
 
 /**
+ * How many spans of a 200 answer's batch the receiver rejected: OTLP's partial success
+ * (`{"partialSuccess":{"rejectedSpans":"<n>"}}`, an int64 as a string in JSON). 0 for an empty or
+ * unreadable body; at most the batch.
+ */
+async function rejectedSpans(res, size) {
+  try {
+    const text = typeof res.text === 'function' ? await res.text() : '';
+    if (!text) return 0;
+    const n = Number(JSON.parse(text)?.partialSuccess?.rejectedSpans ?? 0);
+    return Number.isFinite(n) && n > 0 ? Math.min(size, Math.floor(n)) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Sends finished spans in batches (OTLP/HTTP, JSON encoding) to `<endpoint>/v1/traces` with the
  * `x-honeycomb-team` header. Never throws: a failure is counted and logged, and the job goes on.
  */
@@ -164,8 +180,15 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
           signal: AbortSignal.timeout(timeoutMs),
         });
         if (res.ok) {
-          stats.exported += batch.length;
-          for (const span of batch) accepted.add(span.spanId);
+          // OTLP answers a partial success with 200 and how many spans it rejected, not which:
+          // then none of the batch counts as accepted, for a link.
+          const rejected = await rejectedSpans(res, batch.length);
+          stats.exported += batch.length - rejected;
+          if (rejected) {
+            stats.failed += rejected;
+            stats.lastError = 'partial success';
+            log(`agent telemetry: ${rejected} of ${batch.length} span(s) rejected`);
+          } else for (const span of batch) accepted.add(span.spanId);
           stats.lastOkAt = new Date(now()).toISOString();
           return;
         }
