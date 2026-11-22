@@ -185,19 +185,10 @@ ENV UPDRAFT_JOB_USER=updraft \
     HOOK_PORT=9000 \
     NODE_ENV=production
 
-# Exercise the same sandbox command shape and user as a real agent run.
+# Ask the runner to verify Kiro in the job sandbox before the MicroVM is snapshotted.
 RUN set -eu; . /opt/updraft/build.env; \
     if [ -n "${KIRO_INSTALL_COMMAND:-}" ] && [ -n "${ISOLATION_PACKAGES:-}" ]; then \
-      node --input-type=module -e '\
-        import { spawnSync } from "node:child_process"; \
-        import { probeRunArgs, SANDBOX_IMAGE, SANDBOX_RUNTIME } from "/opt/updraft/runner/isolation.mjs"; \
-        const uid = Number(process.env.UPDRAFT_JOB_UID); \
-        const gid = Number(process.env.UPDRAFT_JOB_GID); \
-        const workdir = process.env.UPDRAFT_JOB_HOME; \
-        const args = probeRunArgs({ name: "kiro-image-smoke", image: SANDBOX_IMAGE, user: `${uid}:${gid}`, workdir, command: ["kiro-cli", "--version"] }); \
-        const result = spawnSync(SANDBOX_RUNTIME, args, { uid, gid, cwd: workdir, stdio: "inherit", timeout: 30000 }); \
-        if (result.error) throw result.error; \
-        process.exitCode = result.status ?? 1;'; \
+      touch /opt/updraft/probe-kiro-on-start; \
     fi
 
 # Lifecycle hooks only. Nothing listens for application traffic: jobs run with NO_INGRESS.

@@ -1,41 +1,25 @@
 #!/bin/sh
 set -eu
 
-# https://kiro.dev/docs/getting-started/installation.md#amazon-linux-2023-and-2027-rpm-repository
-repo_url=https://prod.download.cli.kiro.dev/rpm
-repo_file=/etc/yum.repos.d/kiro-cli.repo
-fingerprint=9600944AF4B40FA81C3F6EE8724E8BC8D4F7DD61
+# The key matches Kiro's published GPG fingerprint. The RPM hash comes from the
+# repository metadata verified with that key.
+release=https://prod.download.cli.kiro.dev/rpm
+package=kiro-cli-3.5.0-1.aarch64.rpm
+key_hash=b1aee3f429f660ddf6fb4aae8beda0fe4b1b1c919dbc4afae818744646b0a4c6
+rpm_hash=7821d585b429b7df9c56d4ac2b0cf584a568777710760a94dcdb8424443661dd
 
-packages="$(command -v dnf || command -v microdnf)"
-if ! command -v dnf >/dev/null 2>&1; then
-    "$packages" install -y dnf
+if ! command -v rpm >/dev/null 2>&1; then
+    packages="$(command -v dnf || command -v microdnf)"
+    "$packages" install -y rpm
 fi
-if ! command -v gpg >/dev/null 2>&1 && ! command -v gpg2 >/dev/null 2>&1; then
-    dnf install -y gnupg2-minimal
-fi
-gpg="$(command -v gpg || command -v gpg2)"
 
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
-curl --proto '=https' --tlsv1.2 -fsS "$repo_url/kiro-cli.gpg" -o "$temporary/kiro-cli.gpg"
-"$gpg" --batch --homedir "$temporary" --with-colons --show-keys "$temporary/kiro-cli.gpg" > "$temporary/key-info"
-# Accept exactly one primary key, with Kiro's published fingerprint.
-published="$(awk -F: '$1 == "pub" { primary = 1 } $1 == "fpr" && primary { print $10; primary = 0 }' "$temporary/key-info")"
-if [ "$published" != "$fingerprint" ]; then
-    echo 'Kiro RPM repository signing key does not match the published fingerprint' >&2
-    exit 1
-fi
-
-cat > "$repo_file" <<EOF
-[kiro-cli]
-name=Kiro CLI
-baseurl=$repo_url/stable/\$basearch/
-enabled=0
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=file://$temporary/kiro-cli.gpg
-EOF
-trap 'rm -f "$repo_file"; rm -rf "$temporary"' EXIT
-dnf install -y --enablerepo=kiro-cli kiro-cli
+cd "$temporary"
+curl --proto '=https' --tlsv1.2 -fsS --retry 2 "$release/kiro-cli.gpg" -o kiro-cli.gpg
+curl --proto '=https' --tlsv1.2 -fsS --retry 2 "$release/stable/aarch64/$package" -o "$package"
+printf '%s  %s\n' "$key_hash" kiro-cli.gpg "$rpm_hash" "$package" | sha256sum -c -
+rpm --import kiro-cli.gpg
+rpm -K "$package"
+rpm -Uvh "$package"
 rpm -q kiro-cli
-dnf clean all

@@ -4,11 +4,13 @@
 // copy of its memory. It therefore holds nothing per-run and does nothing that needs fresh
 // randomness or a network connection: no TLS, no AWS SDK, no secrets. On /run it starts
 // run-job.mjs as a new process, which begins life inside the microVM and does all of that.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHookHandler } from './hooks.mjs';
+import { probeRunArgs, SANDBOX_IMAGE, SANDBOX_RUNTIME } from './isolation.mjs';
 
 const HOOK_PORT = Number(process.env.HOOK_PORT ?? 9000);
 // The terminate hook may take at most 60 seconds (the image is created with that timeout).
@@ -53,6 +55,17 @@ function stopJob() {
     });
     job.kill('SIGTERM');
   });
+}
+
+if (existsSync('/opt/updraft/probe-kiro-on-start')) {
+  const uid = Number(process.env.UPDRAFT_JOB_UID);
+  const gid = Number(process.env.UPDRAFT_JOB_GID);
+  const workdir = process.env.UPDRAFT_JOB_HOME;
+  const args = probeRunArgs({ name: 'kiro-image-smoke', image: SANDBOX_IMAGE, user: `${uid}:${gid}`, workdir, command: ['kiro-cli', '--version'] });
+  const result = spawnSync(SANDBOX_RUNTIME, args, { uid, gid, cwd: workdir, stdio: 'inherit', timeout: 30_000 });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`Kiro sandbox version check failed (${result.signal ?? result.status})`);
+  log('Kiro sandbox version check passed');
 }
 
 const server = http.createServer(createHookHandler({ startJob, stopJob, log }));

@@ -45,23 +45,6 @@ const MEMORY_MIB = 4096;
 const HOOK_PORT = 9000;
 const BUILD_TIMEOUT_MS = 45 * 60 * 1000;
 
-function printKiroStagingBuildLogs(logGroup: string, region: string, from: number, through: number) {
-  if (process.env.GITHUB_HEAD_REF !== 'staging/kiro-rpm-smoke') return;
-  try {
-    const json = execFileSync(
-      'aws',
-      ['logs', 'filter-log-events', '--region', region, '--log-group-name', logGroup, '--start-time', String(from), '--end-time', String(through), '--output', 'json'],
-      { encoding: 'utf8', timeout: 20_000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] },
-    );
-    const events = (JSON.parse(json) as { events: { message: string; logStreamName: string }[] }).events;
-    const relevant = events.filter((event) => !event.logStreamName.startsWith('mvm-') && /kiro|sandbox|error|failed|signing|gnupg|dnf|gpg/i.test(event.message));
-    console.log(`==> Kiro staging build diagnostics (${events.length} log events)`);
-    for (const event of relevant.slice(-35)) console.log(`${event.logStreamName} ${event.message.trim().slice(0, 600)}`);
-  } catch (error) {
-    console.log(`Could not read staging build logs: ${String((error as { stderr?: string }).stderr || (error as Error).message).trim().slice(0, 350)}`);
-  }
-}
-
 /** `npm pack` at the repository root (its prepack builds the CLI); returns the tarball's path. */
 function packCli(dest: string): string {
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
@@ -94,7 +77,6 @@ async function main() {
   const fingerprint = imageInputFingerprint();
 
   if (values.check) {
-    printKiroStagingBuildLogs(outputs.MicrovmLogGroup!, region, Date.parse('2026-11-22T16:49:00Z'), Date.parse('2026-11-22T16:53:00Z'));
     const { build, reason } = await compareWithActive(microvms, clients.ssm, imageArn, outputs.JobImageVersionParameter!, fingerprint);
     console.log(`==> ${build ? 'build' : 'no build'}: ${reason}`);
     if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `build=${build}
@@ -149,7 +131,6 @@ reason=${reason}
       if (v.state === 'SUCCESSFUL') break;
       if (v.state === 'FAILED') {
         const reason = (v as { stateReason?: string }).stateReason ?? 'no reason given';
-        printKiroStagingBuildLogs(outputs.MicrovmLogGroup!, region, started - 30_000, Date.now());
         throw new Error(`version ${version} failed to build: ${reason}; see ${outputs.MicrovmLogGroup}`);
       }
       if (Date.now() - started > BUILD_TIMEOUT_MS) throw new Error(`version ${version} is still ${v.state} after ${BUILD_TIMEOUT_MS / 60000} minutes`);
