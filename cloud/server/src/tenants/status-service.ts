@@ -55,7 +55,7 @@ export interface JobView extends JobSummary {
   prUrl?: string;
   /** Logs the API can serve (the job uploaded them; they may since have expired). */
   logs: string[];
-  /** The console can run it again (jobs/status.ts retryable). */
+  /** The console can run it again (jobs/status.ts retryable). `retriedAs` says when it already was. */
   retryable: boolean;
   /** Its agents' trace in the tenant's Honeycomb, when telemetry was on for it. */
   telemetry?: JobTelemetryView;
@@ -393,6 +393,7 @@ export function createStatusService({ store, github, agentKeys, readLog, request
       await github.member(caller, installationId);
       const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
       if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
+      if (job.retriedAs) throw new FlowError('already_retried', 409, 'This job was already retried');
       if (!retryable(job)) {
         throw new FlowError('not_retryable', 409, jobResult(job) === 'running' ? 'This job is still running' : 'This job did not end in a way that can be retried');
       }

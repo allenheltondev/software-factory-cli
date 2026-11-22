@@ -229,6 +229,8 @@ export interface JobView {
   logs: string[];
   /** The job ended without finishing its work, and the console can run it again. */
   retryable?: boolean;
+  /** The job a retry started for this one. */
+  retriedAs?: string;
   /** What the runner reported at the finish (as the broker checked it). */
   detail?: JobDetail;
   /** Its agents' trace in the installation's tracing tool, when telemetry was on. */

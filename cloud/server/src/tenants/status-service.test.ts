@@ -266,6 +266,17 @@ describe('status and diagnostics (#71)', () => {
       expect(await post('55/jobs/job_status0001/retry')).toEqual({ status: 429, body: { error: 'throttled', message: 'over a usage limit' } });
     });
 
+    it('does not offer a job a retry already started one for, and says so', async () => {
+      const requestRetry = vi.fn();
+      const { store, get, post } = await setup({ requestRetry });
+      await failed(store);
+      await store.markJobRetried({ installationId: 55, createdAt: job().createdAt, jobId: 'job_status0001' }, 'job_new000001');
+      const listed = ((await get('55/jobs')).body.jobs as Record<string, unknown>[])[0]!;
+      expect(listed).toMatchObject({ retryable: false, retriedAs: 'job_new000001' });
+      expect(await post('55/jobs/job_status0001/retry')).toMatchObject({ status: 409, body: { error: 'already_retried' } });
+      expect(requestRetry).not.toHaveBeenCalled();
+    });
+
     it('is for members only, and finds only the tenant’s own jobs', async () => {
       const requestRetry = vi.fn();
       const { store, post } = await setup({ requestRetry });

@@ -141,6 +141,8 @@ export interface JobSummary {
   microvmId?: string;
   deliveryId?: string;
   detail?: JobFinishDetail;
+  /** The job a console retry started for this one (jobs/retry.ts); set once, kept as long as the summary. */
+  retriedAs?: string;
 }
 
 /**
@@ -555,6 +557,11 @@ export interface Store {
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
   /** The broker records what it handed the job for telemetry at its first `start`. Set once: false when it already was. */
   setJobTelemetrySnapshot(jobId: string, snapshot: JobTelemetrySnapshot): Promise<boolean>;
+  /**
+   * Records on a job's summary the job its retry started. Set once (false when the job already
+   * has one, or has no summary), so a retry is not offered twice while the summary is kept.
+   */
+  markJobRetried(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>, newJobId: string): Promise<boolean>;
 
   /**
    * Deduplication: claims a tenant's webhook delivery unless an unexpired claim exists (false: a
@@ -1059,6 +1066,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const j = jobs.get(jobId);
       if (!j || j.microvmId !== undefined) return false;
       jobs.set(jobId, { ...j, microvmId });
+      return true;
+    },
+    async markJobRetried(job, newJobId) {
+      const s = summaries.get(job.jobId);
+      if (!s || s.installationId !== job.installationId || s.retriedAs !== undefined) return false;
+      summaries.set(job.jobId, { ...s, retriedAs: newJobId });
       return true;
     },
     async setJobTelemetrySnapshot(jobId, snapshot) {

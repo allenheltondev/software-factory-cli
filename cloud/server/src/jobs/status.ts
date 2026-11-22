@@ -95,7 +95,9 @@ const RETRYABLE: ReadonlySet<JobResult> = new Set<JobResult>([
  * (success, nothing to do, superseded), nor waiting out a usage limit (deferred: running it again
  * only defers it again; the cooldown's end continues it).
  */
-export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail'>): boolean {
+export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs'>): boolean {
+  // A retry started a job for it already: that one is the one to look at (and to retry).
+  if (job.retriedAs) return false;
   // A run another one beat to publishing is not a failure; `not_run` also covers a redelivery's.
   if (job.outcome === 'superseded') return false;
   return RETRYABLE.has(jobResult(job));

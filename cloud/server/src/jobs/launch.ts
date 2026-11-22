@@ -135,6 +135,8 @@ export interface LaunchRequest {
   appBot?: string;
   /** The webhook body exactly as GitHub sent it (the job reads it as its event). */
   body: string;
+  /** A retry from the console (jobs/retry.ts): the job requeues the event's failed jobs in the shared state before it runs. */
+  retry?: boolean;
   payload: {
     action?: unknown;
     repository?: { id?: unknown; full_name?: unknown };
@@ -421,7 +423,7 @@ export function createLauncher(deps: LaunchDeps) {
       // never got this far.
       await deps.store.markLaunching(jobId);
       launching = true;
-      const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}) }));
+      const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) }));
       microvmId = out.microvmId;
     } catch (err) {
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: safeMessage(err) });
@@ -470,7 +472,7 @@ export function errorClassOf(err: unknown): string {
   return typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : 'Error';
 }
 
-type HookJob = { jobId: string; token: string; deliveryId: string; launchedAt: number; eventName?: string; notBefore?: number };
+type HookJob = { jobId: string; token: string; deliveryId: string; launchedAt: number; eventName?: string; notBefore?: number; retry?: boolean };
 
 /**
  * The run-hook payload: the broker and the job's token; the runner gets everything else from the
@@ -483,6 +485,7 @@ export function runHookPayload(s: LaunchSettings, job: HookJob) {
     deliveryId: job.deliveryId,
     eventName: job.eventName ?? 'issues',
     ...(job.notBefore !== undefined ? { notBefore: new Date(job.notBefore).toISOString() } : {}),
+    ...(job.retry ? { retry: true } : {}),
     region: s.region,
     broker: { functionName: s.brokerFunctionName, jobId: job.jobId, jobToken: job.token },
     maximumDurationSeconds: s.maximumDurationSeconds,

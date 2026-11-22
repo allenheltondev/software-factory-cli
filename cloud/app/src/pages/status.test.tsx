@@ -285,8 +285,8 @@ describe('JobPage (#71)', () => {
       showJob(fakeApi({ job: jobApi, jobLog: vi.fn().mockResolvedValue({ name: 'run.log', text: 'x', size: 1, truncated: false }), retryJob }));
       await userEvent.click(await screen.findByRole('button', { name: 'Retry job' }));
       expect(retryJob).toHaveBeenCalledWith(55, 'job_abcdefgh01');
-      // The new job's page: running, so nothing to retry.
-      expect(await screen.findByTestId('job-result')).toHaveTextContent('Running');
+      // The new job's page: running, so nothing to retry. The old page has a result too, so wait for the text itself.
+      await waitFor(() => expect(screen.getByTestId('job-result')).toHaveTextContent('Running'));
       expect(jobApi).toHaveBeenCalledWith(55, 'job_newjob0001');
       expect(screen.queryByTestId('job-retry')).not.toBeInTheDocument();
     });
@@ -297,6 +297,12 @@ describe('JobPage (#71)', () => {
       await userEvent.click(await screen.findByRole('button', { name: 'Retry job' }));
       expect(await screen.findByTestId('job-retry-error')).toHaveTextContent('over a usage limit');
       expect(screen.getByRole('button', { name: 'Retry job' })).toBeEnabled();
+    });
+
+    it('links a job that was retried to the job that retry started, and offers no second retry', async () => {
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ retryable: false, retriedAs: 'job_newjob0001' }), deliveries: [] }), jobLog: vi.fn().mockResolvedValue({ name: 'run.log', text: 'x', size: 1, truncated: false }), retryJob: vi.fn() }));
+      expect(await screen.findByRole('link', { name: 'job_newjob0001' })).toHaveAttribute('href', '/installations/55/jobs/job_newjob0001');
+      expect(screen.queryByRole('button', { name: 'Retry job' })).not.toBeInTheDocument();
     });
 
     it('is not offered for a job that is running, succeeded, or cannot be retried', async () => {

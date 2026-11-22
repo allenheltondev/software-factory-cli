@@ -52,6 +52,7 @@ function fakeTable() {
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(releasedAt)') return Boolean(item) && item!.releasedAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(firstJobAt)') return Boolean(item) && item!.firstJobAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(telemetrySnapshot)') return Boolean(item) && item!.telemetrySnapshot === undefined;
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(retriedAs)') return Boolean(item) && item!.retriedAs === undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
       return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
     }
@@ -701,6 +702,10 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.setJobTelemetrySnapshot(first.jobId, { descriptor, links })).toBe(true);
     expect(await store.setJobTelemetrySnapshot(first.jobId, { descriptor: { ...descriptor, secretVersion: 'v-b' }, links: { ...links, team: { name: 'B', slug: 'team-b' } } })).toBe(false);
     expect((await store.getJob(first.jobId))?.telemetrySnapshot).toEqual({ descriptor, links });
+    // The retry a console request started for it, on its summary: set once.
+    expect(await store.markJobRetried(first, 'job_new000001')).toBe(true);
+    expect(await store.markJobRetried(first, 'job_new000002')).toBe(false);
+    expect((await store.getJobSummary(55, first.jobId))?.retriedAs).toBe('job_new000001');
 
     // A retried start: nothing more is charged.
     expect(await store.startJob(first, LATER)).toEqual({ result: 'already' });

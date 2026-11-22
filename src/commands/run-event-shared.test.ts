@@ -105,6 +105,8 @@ const remoteHead = (f: GitFixture, branch: string) => f.git(f.root, 'ls-remote',
 
 interface VmOptions {
   payload?: unknown;
+  /** The fake agent's mode (test/fake-agent.mjs). Default "success". */
+  agentMode?: string;
   /** Which loops are on for the repository. */
   repo?: Record<string, unknown>;
   reviewerArgs?: string[];
@@ -136,7 +138,7 @@ function vm(w: World, name: string, o: VmOptions = {}) {
     execution: { mode: 'live' },
     ...(o.capacity ? { capacity: { defaultCooldownMinutes: 60 } } : {}),
     agents: {
-      claude: { command: process.execPath, args: ['--mode', 'success', '--received', w.received], env },
+      claude: { command: process.execPath, args: ['--mode', o.agentMode ?? 'success', '--received', w.received], env },
       codex: { command: process.execPath, args: o.reviewerArgs ?? ['--mode', 'review'], env },
     },
     pools: { general: { agents: ['claude'] }, reviewers: { agents: ['codex'] } },
@@ -365,6 +367,57 @@ describe('updraft run-event: a state database that is not empty', { timeout: 120
     expect(d.summary.message).toContain(`${JOB_ID}: succeeded`);
     expect(existsSync(w.received)).toBe(false);
     expect(existsSync(join(again.home, 'checkouts', 'widgets'))).toBe(false);
+  });
+
+  it('--retry runs a failed job of the event again, which a plain redelivery does not', async () => {
+    const w = world();
+    const failing = vm(w, 'vm failing', { agentMode: 'fail' });
+    failing.download();
+    const first = await failing.run();
+    expect(first.code).toBe(1);
+    expect(first.summary).toMatchObject({ outcome: 'failed', jobId: JOB_ID });
+    failing.upload();
+    withDb(w.shared, (db) => expect(getJob(db, JOB_ID)).toMatchObject({ status: 'failed' }));
+
+    // A delivery as it is: the failed job is on record, so nothing runs ("updraft retry" is the way).
+    rmSync(w.received, { force: true });
+    const plain = vm(w, 'vm plain');
+    plain.download();
+    expect((await plain.run({ deliveryId: 'd-redelivered' })).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery' });
+    expect(existsSync(w.received)).toBe(false);
+
+    // With --retry the job is requeued first, as `updraft retry` would, and this run does it.
+    const retried = vm(w, 'vm retried');
+    retried.download();
+    const r = await retried.run({ deliveryId: 'd-retry', retry: true });
+    expect(r.code).toBe(0);
+    expect(r.summary).toMatchObject({ outcome: 'succeeded', jobId: JOB_ID, publication: 'published' });
+    expect(existsSync(w.received)).toBe(true);
+    withDb(retried.state, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded' });
+      expect(db.prepare('SELECT retries FROM jobs WHERE id = ?').get(JOB_ID)).toEqual({ retries: 1 });
+    });
+    // Merged back, the retried result is the shared one.
+    retried.upload();
+    withDb(w.shared, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded' });
+      expect(db.prepare('SELECT retries FROM jobs WHERE id = ?').get(JOB_ID)).toEqual({ retries: 1 });
+    });
+  });
+
+  it('--retry leaves a job that succeeded, and an event with no job on record, as they are', async () => {
+    const w = world();
+    const v = vm(w, 'vm one');
+    v.download();
+    expect((await v.run()).summary).toMatchObject({ outcome: 'succeeded' });
+    v.upload();
+    const again = vm(w, 'vm two');
+    again.download();
+    expect((await again.run({ retry: true })).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'duplicate-delivery' });
+    withDb(again.state, (db) => {
+      expect(getJob(db, JOB_ID)).toMatchObject({ status: 'succeeded' });
+      expect(db.prepare('SELECT retries FROM jobs WHERE id = ?').get(JOB_ID)).toEqual({ retries: 0 });
+    });
   });
 
   it('ends "deferred" with exit code 4 when a cooldown outlasts the run, and a later delivery continues the queued job', async () => {

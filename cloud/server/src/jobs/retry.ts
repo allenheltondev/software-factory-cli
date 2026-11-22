@@ -13,6 +13,11 @@ import { jobResult, retryable } from './status.js';
  * event the job read is kept in the tenant's bucket under the job's delivery, and is launched
  * again under a delivery id of its own, so everything a new delivery gets is checked again against
  * the configuration active now: the tenant, the dispatch rules, the keys, the quotas.
+ *
+ * The job runs with `--retry` (the run-hook payload's `retry`): the CLI derives a job's id from its
+ * event, so the shared state already holds the failed job of this event, and a plain delivery would
+ * end as a duplicate. `updraft run-event --retry` requeues it there first, as `updraft retry` does.
+ * Once a retry started a job, it is recorded on the original (`retriedAs`) and offered no more.
  */
 
 /** What the API function sends the webhook function. */
@@ -67,13 +72,17 @@ export function createRetryHandler({ store, launch, readEvent, appBot, log = (e)
   const no = (status: number, code: RetryErrorCode, message: string): RetryResult => ({ ok: false, status, code, message });
 
   return async function retry({ updraftRetry: { installationId, jobId } }: RetryRequest): Promise<RetryResult> {
-    const job = await store.getJob(jobId);
-    // Another tenant's job is not found, however it was named.
-    if (!job || job.installationId !== installationId) return no(404, 'not_found', 'There is no such job in this installation');
     const summary = await store.getJobSummary(installationId, jobId);
-    if (!summary || !retryable(summary)) {
-      return no(409, 'not_retryable', summary && jobResult(summary) === 'running' ? 'This job is still running' : 'This job did not end in a way that can be retried');
+    // Another tenant's job is not found, however it was named.
+    if (!summary) return no(404, 'not_found', 'There is no such job in this installation');
+    if (summary.retriedAs) return no(409, 'already_retried', 'This job was already retried');
+    if (!retryable(summary)) {
+      return no(409, 'not_retryable', jobResult(summary) === 'running' ? 'This job is still running' : 'This job did not end in a way that can be retried');
     }
+    // The job's own record says which event it ran (its delivery, its config version): kept a week
+    // past the job's end, the summary 30 days.
+    const job = await store.getJob(jobId);
+    if (!job || job.installationId !== installationId) return no(410, 'event_gone', 'This job is too old to run again: its event is no longer kept. Apply the label again on GitHub instead');
 
     let body: string | null;
     try {
@@ -93,13 +102,18 @@ export function createRetryHandler({ store, launch, readEvent, appBot, log = (e)
     let result;
     try {
       const bot = await appBot?.();
-      result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload });
+      result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload, retry: true });
     } catch (err) {
       log({ installationId, jobId, error: 'retry failed before launching', name: errorClassOf(err) });
       return no(500, 'launch_failed', 'The job could not be started; try again');
     }
     log({ installationId, jobId, retried: result.disposition, ...(result.jobId ? { newJobId: result.jobId } : {}) });
-    if (result.disposition === 'launched' && result.jobId) return { ok: true, jobId: result.jobId };
+    if (result.disposition === 'launched' && result.jobId) {
+      // On record for as long as the job is listed: the delivery's claim only lasts while a job
+      // holds it, and a failed one gives it up. Only now, so a retry that did not start can be tried again.
+      await store.markJobRetried(job, result.jobId).catch((err: unknown) => log({ installationId, jobId, warning: `could not record the retry: ${(err as Error)?.name}` }));
+      return { ok: true, jobId: result.jobId };
+    }
     return no(...refusal(result));
   };
 }

@@ -39,11 +39,17 @@ describe('parseRunRequest, version 2', () => {
     expect(payload.bucket).toBeUndefined();
   });
 
+  it('carries a console retry, which makes run-event requeue the event\'s failed jobs first', () => {
+    expect(parse(v2({ retry: true })).payload.retry).toBe(true);
+    expect(parse(v2()).payload).not.toHaveProperty('retry');
+  });
+
   it.each([
     ['no broker', { broker: undefined }, /broker is missing/],
     ['a short job token', { broker: { functionName: 'f', jobId: 'job_abc12345', jobToken: 'short' } }, /broker\.jobToken/],
     ['a bad job id', { broker: { functionName: 'f', jobId: '../etc', jobToken: TOKEN } }, /broker\.jobId/],
     ['isolation turned off', { agentIsolation: 'disabled' }, /must be enforced/],
+    ['a retry that is not true', { retry: 'yes' }, /retry is malformed/],
     ['no launch time', { launchedAt: 'soon' }, /launchedAt/],
   ])('refuses %s', (_what, overrides, message) => {
     expect(() => parse(v2(overrides))).toThrow(message);

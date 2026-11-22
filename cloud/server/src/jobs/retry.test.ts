@@ -36,7 +36,7 @@ const ask = (jobId = 'job_retry00001', installationId = 55) => ({ updraftRetry: 
 
 describe('retrying a job (jobs/retry.ts)', () => {
   it("runs the job's own event again under a delivery of its own", async () => {
-    const { retry, launch, readEvent, j } = await setup();
+    const { retry, launch, readEvent, j, store } = await setup();
     expect(await retry(ask())).toEqual({ ok: true, jobId: 'job_new000001' });
     expect(readEvent).toHaveBeenCalledWith(jobPaths(j).eventKey);
     expect(launch).toHaveBeenCalledWith({
@@ -46,15 +46,45 @@ describe('retrying a job (jobs/retry.ts)', () => {
       appBot: 'updraft[bot]',
       body: EVENT,
       payload: JSON.parse(EVENT),
+      // The job requeues the event's failed job in the shared state before it runs.
+      retry: true,
     });
+    // The retry is on the original job: it is not offered again.
+    expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBe('job_new000001');
     // A delivery id is letters, digits and hyphens, at most 64.
     expect(retryDeliveryId('job_a-b_c')).toMatch(/^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/);
     expect(retryDeliveryId('job_a')).not.toBe(retryDeliveryId('job_b'));
   });
 
-  it('answers a second retry of the same job with the launcher’s duplicate', async () => {
-    const { retry } = await setup({ launched: { status: 200, disposition: 'duplicate' } });
+  it('answers a second retry of the same job from its record, with no launch, however long ago the first one’s claim ended', async () => {
+    const { retry, launch } = await setup();
+    expect(await retry(ask())).toMatchObject({ ok: true });
+    // The launcher's claim is gone by now (a failed retry gives it up; a finished one's lapses): only the record stops it.
     expect(await retry(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
+    expect(launch).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers the launcher’s duplicate (two requests at once) as already retried', async () => {
+    const { retry, store, j } = await setup({ launched: { status: 200, disposition: 'duplicate' } });
+    expect(await retry(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
+    // Nothing started, so nothing is recorded.
+    expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBeUndefined();
+  });
+
+  it('lets a retry that did not start be tried again', async () => {
+    const { retry, launch, store, j } = await setup({ launched: { status: 200, disposition: 'throttled', reason: 'jobs_per_day' } });
+    expect(await retry(ask())).toMatchObject({ ok: false, status: 429 });
+    expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBeUndefined();
+    launch.mockResolvedValueOnce({ status: 202, disposition: 'launched', jobId: 'job_new000002' });
+    expect(await retry(ask())).toEqual({ ok: true, jobId: 'job_new000002' });
+    expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBe('job_new000002');
+  });
+
+  it('says the event is gone when the job’s own record has expired (the summary outlives it)', async () => {
+    const { store, launch } = await setup();
+    const retry = createRetryHandler({ store: { ...store, getJob: async () => null } as typeof store, launch, readEvent: async () => EVENT, log: () => {} });
+    expect(await retry(ask())).toMatchObject({ ok: false, status: 410, code: 'event_gone' });
+    expect(launch).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -137,5 +167,7 @@ describe('which jobs can be retried', () => {
     expect(retryable(finished('succeeded', { updraftOutcome: 'superseded' }))).toBe(false);
     expect(retryable(finished('superseded'))).toBe(false);
     expect(retryable(finished('failed', { updraftOutcome: 'deferred' }))).toBe(false);
+    // One a retry started a job for.
+    expect(retryable({ ...finished('failed'), retriedAs: 'job_new000001' })).toBe(false);
   });
 });

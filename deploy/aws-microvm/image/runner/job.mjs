@@ -66,14 +66,16 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * the Updraft repository):
  *
  *   updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>] [--json]
- *                     [--deadline-minutes <n>] [--worker-git-credentials]
+ *                     [--deadline-minutes <n>] [--worker-git-credentials] [--retry]
  *
  * It reads the normal config ($UPDRAFT_HOME/config.yaml), works on the state database at
  * $UPDRAFT_HOME/state.db (the shared snapshot the runner put there, or a new one), creates
  * the clone when checkoutPath does not exist, and with --json prints one JSON object as its
  * last stdout line, on errors too. --deadline-minutes makes it stop everything (a running
  * agent, a review round, a wait for CI) and still print that summary.
- * --worker-git-credentials is not needed here.
+ * --worker-git-credentials is not needed here. --retry is given for a retry from the console:
+ * the event's failed, interrupted or canceled jobs are requeued in the state database first,
+ * as `updraft retry` would, so that the event runs them again instead of ending as a duplicate.
  *
  * Event names passed through: issues, pull_request_review, pull_request (whatever the
  * launcher accepted). Read from the summary: that it is a JSON object, `outcome` (copied
@@ -86,7 +88,7 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * same run included (a reviewer run that failed is exit 1). One exit code is acted on here:
  * STATE_PENDING_EXIT, after which the job is run again on a newer snapshot (runJob).
  */
-export function updraftInvocation({ eventFile, eventName, deliveryId, deadlineMinutes }) {
+export function updraftInvocation({ eventFile, eventName, deliveryId, deadlineMinutes, retry = false }) {
   return [
     'run-event',
     '--event-file', eventFile,
@@ -94,6 +96,7 @@ export function updraftInvocation({ eventFile, eventName, deliveryId, deadlineMi
     '--delivery-id', deliveryId,
     '--json',
     '--deadline-minutes', String(deadlineMinutes),
+    ...(retry ? ['--retry'] : []),
   ];
 }
 
@@ -1066,6 +1069,7 @@ async function runUpdraft(payload, stateDir, budgetMs, deadline, deps, { agentEn
       eventName: payload.eventName,
       deliveryId: payload.deliveryId,
       deadlineMinutes: deadline,
+      retry: payload.retry === true,
     }),
   ];
   const options = {

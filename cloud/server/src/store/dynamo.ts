@@ -134,6 +134,7 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
     ...(typeof i.pullRequest === 'number' ? { pullRequest: i.pullRequest } : {}),
     ...(typeof i.label === 'string' ? { label: i.label } : {}),
     ...(typeof i.sender === 'string' ? { sender: i.sender } : {}),
+    ...(typeof i.retriedAs === 'string' ? { retriedAs: i.retriedAs } : {}),
     createdAt: String(i.createdAt),
     status: i.status === 'finished' ? 'finished' : 'launched',
     ...(typeof i.outcome === 'string' ? { outcome: i.outcome } : {}),
@@ -703,6 +704,24 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             UpdateExpression: 'SET microvmId = :id',
             ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(microvmId)',
             ExpressionAttributeValues: { ':id': microvmId },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
+    async markJobRetried(job, newJobId) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: jobSummaryKey(job),
+            UpdateExpression: 'SET retriedAs = :n',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs)',
+            ExpressionAttributeValues: { ':n': newJobId },
           }),
         );
         return true;

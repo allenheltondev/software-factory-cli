@@ -770,6 +770,12 @@ describe('updraftInvocation', () => {
       'run-event', '--event-file', '/s/event.json', '--event-name', 'issues', '--delivery-id', 'd', '--json',
     ]);
     expect(updraftInvocation({ eventFile: '/s/event.json', eventName: 'issues', deliveryId: 'd', deadlineMinutes: 42 }).slice(-2)).toEqual(['--deadline-minutes', '42']);
+    expect(updraftInvocation({ eventFile: '/s/event.json', eventName: 'issues', deliveryId: 'd', deadlineMinutes: 42 })).not.toContain('--retry');
+  });
+
+  it('adds --retry for a retry from the console, and only then', () => {
+    const args = updraftInvocation({ eventFile: '/s/event.json', eventName: 'issues', deliveryId: 'd', deadlineMinutes: 42, retry: true });
+    expect(args.slice(-3)).toEqual(['--deadline-minutes', '42', '--retry']);
   });
 });
 

@@ -13,7 +13,7 @@ shared between the runs ([Shared state](#shared-state)).
 
 ```
 updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>] [--json]
-                  [--deadline-minutes <n>] [--worker-git-credentials] [--shared-state <file>]
+                  [--deadline-minutes <n>] [--worker-git-credentials] [--retry] [--shared-state <file>]
 ```
 
 | Option | Meaning |
@@ -24,6 +24,7 @@ updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>]
 | `--json` | Print one JSON object on stdout when the command ends (see [The summary](#the-summary)) |
 | `--deadline-minutes <n>` | Stop everything, a running agent included, after this long. Default: no limit of its own; the action's `timeoutMinutes` and `verifyTimeoutMinutes` bound each agent and verification, and `autoMergeWaitMinutes` the wait for checks |
 | `--worker-git-credentials` | Fetch with the worker's GitHub credentials even into a clone this command did not create (see [The clone](#the-clone)) |
+| `--retry` | First requeue the event's jobs that failed, were interrupted or canceled, as `updraft retry` does, so this run does them again instead of ending as a `duplicate-delivery` (see [Idempotency](#idempotency)). A job that succeeded, or that was held for a human, is left as it is. For a launcher that retries from a console, on the state database it holds |
 | `--shared-state <file>` | A copy of the shared state database that the caller keeps fresher than the one this run started from. Read, never written, during [the last look](#the-last-look). A file that is missing, unreadable or at another schema version is logged and otherwise ignored |
 
 `-c, --config <path>`, `UPDRAFT_CONFIG` and `UPDRAFT_HOME` work as for every command.
@@ -517,7 +518,9 @@ GitHub redelivers webhooks, and a launcher can start two machines for one delive
     `reason: "duplicate-delivery"`, exit code 0, before any clone or agent. This includes a job
     that **failed**: with shared state a redelivery does not run a failed job again. Requeue it
     with `updraft retry JOB_ID` on a copy of the shared database, upload that, and deliver the
-    event again;
+    event again. A launcher that retries a failed job for a person does the same in one step
+    with `--retry`, which requeues the event's failed, interrupted or canceled jobs in the state
+    database before this check;
   - and something is left (the job is still `queued` after a deferral, or the loop was cut
     short by a deadline or a cooldown): the run continues it, `resumed: true`;
   - and the job is `running` although no run that is still going holds it: see

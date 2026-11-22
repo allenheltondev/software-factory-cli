@@ -71,6 +71,16 @@ function Retry({ job, api, installationId }: { job: JobView; api: JobApi; instal
   const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  if (job.retriedAs) {
+    return (
+      <p className="mt-4 text-sm" data-testid="job-retried">
+        Retried as{' '}
+        <Link className="auth-link" to={`/installations/${installationId}/jobs/${job.retriedAs}`}>
+          {job.retriedAs}
+        </Link>
+      </p>
+    );
+  }
   if (!job.retryable || !api.retryJob) return null;
   const retry = api.retryJob;
   const run = async () => {

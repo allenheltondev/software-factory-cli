@@ -131,6 +131,12 @@ describe('the launcher', () => {
     expect(JSON.stringify(job)).not.toContain(hook.broker.jobToken);
   });
 
+  it('tells the runner a job is a console retry, so it requeues the event\'s failed job in the shared state', async () => {
+    const result = await createLauncher(deps)({ ...request(), retry: true });
+    expect(result).toMatchObject({ status: 202, disposition: 'launched' });
+    expect(JSON.parse(runs[0]!.runHookPayload)).toMatchObject({ retry: true });
+  });
+
   it('gives the job to the broker: the token from the run hook starts it and stops its own microVM', async () => {
     const result = await createLauncher(deps)(request());
     const { jobToken } = (JSON.parse(runs[0]!.runHookPayload) as { broker: { jobToken: string } }).broker;
