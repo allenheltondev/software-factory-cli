@@ -682,6 +682,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(i.quotas && typeof i.quotas === 'object' ? { quotas: i.quotas as Quotas } : {}),
         ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
         ...(Array.isArray(i.agentKeys) ? { agentKeys: (i.agentKeys as unknown[]).map(String) } : {}),
+        ...(destinationOf(i.telemetryLinks) ? { telemetryLinks: destinationOf(i.telemetryLinks)! } : {}),
         ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
         ...(typeof i.stopRequestedAt === 'number' ? { stopRequestedAt: i.stopRequestedAt } : {}),
         ...(typeof i.releasedAt === 'number' ? { releasedAt: i.releasedAt } : {}),
@@ -697,6 +698,24 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             UpdateExpression: 'SET microvmId = :id',
             ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(microvmId)',
             ExpressionAttributeValues: { ':id': microvmId },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
+    async setJobTelemetryLinks(jobId, links) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: { pk: `JOB#${jobId}`, sk: 'META' },
+            UpdateExpression: 'SET telemetryLinks = :l',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(telemetryLinks)',
+            ExpressionAttributeValues: { ':l': links },
           }),
         );
         return true;

@@ -369,12 +369,16 @@ the job is given no trace id (so no later trace links to it), Claude Code's own 
 collected, and the settings page records no export. A job's links are only built from what
 reached a destination: none for a local job, or for one whose export sent nothing.
 
-The links are built from the destination the trace went to, not from today's settings. The
-runner reports where it sent (`sentTo`: the destination kind and host), and the broker keeps a
-snapshot of the installation's link settings with the job (`destination`: Honeycomb's region,
-team and environment, CloudWatch's region, or a custom destination's host and link templates;
-never a key), only when they are where the runner sent; it ignores any `destination` a runner
-reports itself. The settings page's last export keeps the same snapshot. So a job sent to
+The links are built from the destination the trace went to, not from today's settings. When
+the broker hands a job its descriptor at `start`, with the key's version, it also records that
+destination's link settings on the job (`telemetryLinks`: Honeycomb's region, team and environment,
+CloudWatch's region, or a custom destination's host and link templates; never a key). The runner
+reports where it sent (`sentTo`: the destination kind and host), and at finish the broker keeps
+that snapshot with the job's report (`destination`) when it is where the runner sent, so no change
+made during the job (another destination, or a same-region key of another Honeycomb team) is
+what the trace is linked from. It ignores any `destination` a runner reports itself. A job started
+before the snapshot existed is linked from the installation's destination at finish, when that
+matches. The settings page's last export keeps the same snapshot. So a job sent to
 Honeycomb still opens in Honeycomb after the installation moved to CloudWatch, and a trace id
 is never put into another backend's URL. A job from before snapshots (all of them Honeycomb's) is
 linked from the settings while they are still Honeycomb's, and not after.

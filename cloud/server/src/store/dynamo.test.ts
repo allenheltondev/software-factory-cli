@@ -50,6 +50,7 @@ function fakeTable() {
     }
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(stopRequestedAt)') return Boolean(item) && item!.stopRequestedAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(releasedAt)') return Boolean(item) && item!.releasedAt === undefined;
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(telemetryLinks)') return Boolean(item) && item!.telemetryLinks === undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
       return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
     }
@@ -683,6 +684,11 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(table.items.get(`TENANT#55|${MONTH}`)?.seconds).toBe(10800);
     expect(typeof (await store.getJob(first.jobId))?.startedAt).toBe('number');
     expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(false);
+    // The broker's snapshot of the telemetry destination it handed the job: set once, read back checked.
+    const links = { provider: 'honeycomb' as const, region: 'us' as const, serviceName: 'updraft', team: { name: 'A', slug: 'team-a' } };
+    expect(await store.setJobTelemetryLinks(first.jobId, links)).toBe(true);
+    expect(await store.setJobTelemetryLinks(first.jobId, { ...links, team: { name: 'B', slug: 'team-b' } })).toBe(false);
+    expect((await store.getJob(first.jobId))?.telemetryLinks).toEqual(links);
 
     // A retried start: nothing more is charged.
     expect(await store.startJob(first, LATER)).toEqual({ result: 'already' });

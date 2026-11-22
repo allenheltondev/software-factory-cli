@@ -136,12 +136,24 @@ export function telemetryView(s: TelemetrySettings | null): TelemetryView {
  * destination. Null otherwise: a job sent somewhere else is not linked from today's settings.
  */
 export function linkDestinationFor(s: TelemetrySettings | null, sentTo: { provider: string; host: string }): LinkDestination | null {
-  if (!s?.key || s.provider !== sentTo.provider) return null;
-  if (s.provider === 'honeycomb') {
-    if (new URL(HONEYCOMB_API[s.region]).host !== sentTo.host) return null;
-  } else {
+  const d = linkDestinationOf(s);
+  return d && sentToMatches(d, sentTo) ? d : null;
+}
+
+/** Whether a destination snapshot is where the runner says it sent: its kind, and its host. */
+export function sentToMatches(d: LinkDestination, sentTo: { provider: string; host: string }): boolean {
+  if (d.provider !== sentTo.provider) return false;
+  return d.provider === 'honeycomb' ? new URL(HONEYCOMB_API[d.region]).host === sentTo.host : d.host === sentTo.host;
+}
+
+/** The installation's destination as link settings (never the key); null without a key. */
+export function linkDestinationOf(s: TelemetrySettings | null): LinkDestination | null {
+  if (!s?.key) return null;
+  let host: string | undefined;
+  if (s.provider !== 'honeycomb') {
     const parsed = s.otlp ? parseOtlpEndpoint(s.otlp.endpoint) : null;
-    if (!parsed || !('host' in parsed) || parsed.host !== sentTo.host) return null;
+    if (!parsed || !('host' in parsed)) return null;
+    host = parsed.host;
   }
   return {
     provider: s.provider,
@@ -151,7 +163,7 @@ export function linkDestinationFor(s: TelemetrySettings | null, sentTo: { provid
     ...(s.key.environment ? { environment: s.key.environment } : {}),
     ...(s.provider === 'cloudwatch' && s.aws ? { aws: s.aws } : {}),
     ...(s.provider === 'otlp' && s.links ? { links: s.links } : {}),
-    ...(s.provider !== 'honeycomb' ? { host: sentTo.host } : {}),
+    ...(host ? { host } : {}),
   };
 }
 

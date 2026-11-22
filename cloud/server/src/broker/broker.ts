@@ -10,7 +10,7 @@ import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../te
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
 // Not the whole telemetry service: only the secret's name.
-import { linkDestinationFor, telemetrySecretName } from '../tenants/telemetry-service.js';
+import { linkDestinationFor, linkDestinationOf, sentToMatches, telemetrySecretName } from '../tenants/telemetry-service.js';
 
 /**
  * The job broker (#68, "Isolation between tenants"): what a job's microVM may have, handed out to
@@ -267,12 +267,17 @@ export function createBroker(deps: BrokerDeps) {
     if (action === 'finish') {
       const given = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
       const finished = finishDetail(job, detail);
-      // The links of the job's trace: the destination it was sent to, kept with the job, so a later
-      // change of destination never points it at another backend. Only when the installation's
-      // destination now is where the runner says it sent; best effort.
+      // The links of the job's trace: the destination its descriptor named at `start` (taken with
+      // the key's version then), so no change made since, of the destination or of the key's team,
+      // points it at another backend. Only when it is where the runner says it sent. A job started
+      // before that snapshot existed: the installation's destination now, when it matches.
       if (finished?.telemetry?.sentTo) {
-        const settings = await deps.store.getTelemetry(job.installationId).catch(() => null);
-        const destination = linkDestinationFor(settings, finished.telemetry.sentTo);
+        const sentTo = finished.telemetry.sentTo;
+        const destination = job.telemetryLinks
+          ? sentToMatches(job.telemetryLinks, sentTo)
+            ? job.telemetryLinks
+            : null
+          : linkDestinationFor(await deps.store.getTelemetry(job.installationId).catch(() => null), sentTo);
         if (destination) finished.telemetry.destination = destination;
       }
       const recorded = (await deps.store.finishJob(job.jobId, given, { at: now(), detail: finished })) ?? given;
@@ -358,7 +363,13 @@ export function createBroker(deps: BrokerDeps) {
               ...(t.key.secretVersion ? { secretVersion: t.key.secretVersion } : {}),
             }
           : undefined;
-      return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
+      // The descriptor's destination, as link settings, with the job: what its trace is linked from.
+      // Only at `start`, which is when the runner reads the key; best effort.
+      if (action === 'start' && telemetry && t) {
+        const links = linkDestinationOf(t);
+        if (links) await deps.store.setJobTelemetryLinks(job.jobId, links).catch((err: unknown) => log({ jobId: job.jobId, warning: `could not record the telemetry links: ${(err as Error)?.name}` }));
+      }
+            return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
     }
 
     // github-token: a token for this job's repository only, as the CLI reads it (token-file-auth.ts).
