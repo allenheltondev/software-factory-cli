@@ -76,6 +76,31 @@ export function jobResult(job: Pick<JobSummary, 'status' | 'outcome' | 'detail'>
   }
 }
 
+/** The results of a job that ended without finishing its work, which the console can run again. */
+const RETRYABLE: ReadonlySet<JobResult> = new Set<JobResult>([
+  'canceled',
+  'agent_failure',
+  'verify_failure',
+  'publish_failure',
+  'timeout',
+  'state_not_saved',
+  'terminated',
+  'runner_error',
+  'unconfirmed',
+  'not_run',
+]);
+
+/**
+ * Whether the console offers a retry: the job ended, and not with work done or a better run's
+ * (success, nothing to do, superseded), nor waiting out a usage limit (deferred: running it again
+ * only defers it again; the cooldown's end continues it).
+ */
+export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail'>): boolean {
+  // A run another one beat to publishing is not a failure; `not_run` also covers a redelivery's.
+  if (job.outcome === 'superseded') return false;
+  return RETRYABLE.has(jobResult(job));
+}
+
 /** Counts of each value, for a summary row. */
 export function countBy<T extends string>(values: readonly T[]): Partial<Record<T, number>> {
   const out: Partial<Record<T, number>> = {};

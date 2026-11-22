@@ -1,7 +1,8 @@
 import { JOB_PERMISSIONS } from '../broker/broker.js';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows, type TenantSummary } from '../flows/github.js';
-import { countBy, deliveryCounts, jobResult, type JobResult } from '../jobs/status.js';
+import type { RetryResult } from '../jobs/retry.js';
+import { countBy, deliveryCounts, jobResult, retryable, type JobResult } from '../jobs/status.js';
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from './agents.js';
@@ -54,6 +55,8 @@ export interface JobView extends JobSummary {
   prUrl?: string;
   /** Logs the API can serve (the job uploaded them; they may since have expired). */
   logs: string[];
+  /** The console can run it again (jobs/status.ts retryable). */
+  retryable: boolean;
   /** Its agents' trace in the tenant's Honeycomb, when telemetry was on for it. */
   telemetry?: JobTelemetryView;
 }
@@ -149,6 +152,8 @@ export interface StatusServiceDeps {
   github: Pick<GitHubFlows, 'member' | 'installation' | 'repositories'>;
   agentKeys: Pick<AgentKeyService, 'list'>;
   readLog?: LogReader;
+  /** Asks the launcher to run a job's event again (jobs/retry.ts). Absent: retrying is not offered. */
+  requestRetry?: (installationId: number, jobId: string) => Promise<RetryResult>;
   /** The stack's ResultRetentionDays: a job's logs are expired once it ended longer ago than that. */
   resultRetentionDays?: number;
   /** HONEYCOMB_TIMELINE_URL, as parseTimelineTemplate accepted it: a link to a conversation in Agent Timeline. */
@@ -188,7 +193,7 @@ export function conversationOf(job: JobSummary): string | undefined {
 }
 
 export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = null, { now = Date.now(), timelineTemplate = null }: JobViewOptions = {}): JobView {
-  const view: JobView = { ...job, result: jobResult(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
+  const view: JobView = { ...job, result: jobResult(job), retryable: retryable(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
   if (job.issue !== undefined) view.issueUrl = `https://github.com/${job.repository}/issues/${job.issue}`;
   if (job.detail?.prUrl) view.prUrl = job.detail.prUrl;
   // A job of a pull request's event (its review loop): that pull request, whatever the run reported.
@@ -228,7 +233,7 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
   return view;
 }
 
-export function createStatusService({ store, github, agentKeys, readLog, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
+export function createStatusService({ store, github, agentKeys, readLog, requestRetry, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
   const view = (job: JobSummary, telemetry: TelemetrySettings | null) => jobView(job, telemetry, { now: now(), timelineTemplate });
   const limitOf = (raw: unknown) => {
     const n = Number(raw);
@@ -378,6 +383,24 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
       ]);
       const conversation = recent.filter((j) => j.jobId !== job.jobId && conversationOf(j) === conversationId).map((j) => view(j, telemetry));
       return { job: view(job, telemetry), deliveries, conversation };
+    },
+
+    /**
+     * Runs a job that did not finish its work again, as a new job (the launcher starts it, so
+     * the tenant's quotas, keys and active configuration apply as they do to any job). Members only.
+     */
+    async retry(caller: Caller, installationId: number, jobId: string): Promise<{ jobId: string }> {
+      await github.member(caller, installationId);
+      const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
+      if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
+      if (!retryable(job)) {
+        throw new FlowError('not_retryable', 409, jobResult(job) === 'running' ? 'This job is still running' : 'This job did not end in a way that can be retried');
+      }
+      if (!requestRetry) throw new FlowError('retry_unavailable', 503, 'Retrying is not available in this deployment');
+      const out = await requestRetry(installationId, jobId);
+      if (!out.ok) throw new FlowError(out.code, out.status, out.message);
+      log({ installationId, jobId, retried: true, newJobId: out.jobId });
+      return { jobId: out.jobId };
     },
 
     /** The end of one of a job's logs. The job is looked up in the tenant's own partition, so another tenant's log cannot be named. */

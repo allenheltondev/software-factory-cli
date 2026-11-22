@@ -42,6 +42,7 @@ import type { ConfigService, PublishOutcome } from './tenants/config-service.js'
  *   GET    /api/v1/installations/:id/deliveries?limit=          recent webhook deliveries, one disposition each
  *   GET    /api/v1/installations/:id/jobs?limit=                recent jobs and how each ended
  *   GET    /api/v1/installations/:id/jobs/:jobId                one job, with its deliveries
+ *   POST   /api/v1/installations/:id/jobs/:jobId/retry          run a job that did not finish its work again: 202 { jobId } of the new job
  *   GET    /api/v1/installations/:id/jobs/:jobId/logs/:name     the end of updraft.log or run.log
  *
  * A tenant's agent telemetry (tenants/telemetry-service.ts), members only. The key is write-only:
@@ -308,6 +309,10 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, sta
     app.get('/v1/installations/:id/jobs/:jobId', async (c) => {
       const id = positive(c.req.param('id'));
       return id ? c.json(await status.job(c.get('caller'), id, c.req.param('jobId'))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.post('/v1/installations/:id/jobs/:jobId/retry', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await status.retry(c.get('caller'), id, c.req.param('jobId')), 202) : c.json({ error: 'not_found' }, 404);
     });
     app.get('/v1/installations/:id/jobs/:jobId/logs/:name', async (c) => {
       const id = positive(c.req.param('id'));

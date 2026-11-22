@@ -284,10 +284,15 @@ Resources:
           PLATFORM_CONCURRENT_JOBS: !Ref PlatformConcurrentJobs
           # Who may use the admin view: the members of this Cognito group (server/src/admin/access.ts).
           ADMIN_GROUP: !Ref AdminGroup
+          # Retrying a job from the console: the launcher lives in the webhook function (jobs/retry.ts).
+          WEBHOOK_FUNCTION_NAME: !Ref WebhookFunction
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
+        # Only this one function, and only to run a retry the API has already authorized.
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WebhookFunction
         # The GitHub App's settings (github/settings.ts), written by scripts/register-github-app.mjs.
         - SSMParameterReadPolicy:
             ParameterName: updraft/app/*
@@ -381,9 +386,12 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
-            # The event a job reads, under its tenant's prefix.
+            # The event a job reads, under its tenant's prefix. Read back only to run a job again
+            # from the console (jobs/retry.ts).
             - Effect: Allow
-              Action: s3:PutObject
+              Action:
+                - s3:PutObject
+                - s3:GetObject
               Resource: !Sub ${TenantBucket.Arn}/tenants/*/events/*
             # A config version published before its key needs were recorded: the launcher reads
             # them from its config.yaml (tenants/key-needs.ts). Config bundles only.

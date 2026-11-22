@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createApp } from '../app.js';
 import { finishDetail } from '../broker/broker.js';
 import type { Caller } from '../caller.js';
@@ -9,7 +9,7 @@ import { jobResult } from '../jobs/status.js';
 import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
 import { expireResults } from './results-retention.js';
 import { createS3LogReader } from './s3-logs.js';
-import { ACTIVITY_SAMPLE, createStatusService, LOG_TAIL_BYTES, missingPermissions, type LogReader } from './status-service.js';
+import { ACTIVITY_SAMPLE, createStatusService, LOG_TAIL_BYTES, missingPermissions, type LogReader, type StatusServiceDeps } from './status-service.js';
 
 const caller = { sub: 'u1' } as Caller;
 const ALL = { metadata: 'read', contents: 'write', issues: 'write', pull_requests: 'write', checks: 'read', statuses: 'read' };
@@ -39,7 +39,7 @@ const job = (over: Partial<Job> = {}): Job => ({
   ...over,
 });
 
-async function setup(opts: { installation?: GitHubInstallation | null | Error; logs?: Record<string, string>; retentionDays?: number } = {}) {
+async function setup(opts: { installation?: GitHubInstallation | null | Error; logs?: Record<string, string>; retentionDays?: number; requestRetry?: StatusServiceDeps['requestRetry'] } = {}) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant(), { installationId: 55, sub: 'u1', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
   const gh = 'installation' in opts ? opts.installation : { id: 55, account: { id: 900, login: 'acme', type: 'Organization' }, suspendedAt: null, permissions: ALL };
@@ -76,6 +76,7 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
     },
     agentKeys: { list: async () => ({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: false, required: false }], refusals: [] }) },
     readLog,
+    ...(opts.requestRetry ? { requestRetry: opts.requestRetry } : {}),
     log: () => {},
   });
   const app = createApp({ resolveCaller: () => caller, status: service, logError: () => {} });
@@ -83,7 +84,11 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
     const res = await app.request(`/api/v1/installations/${path}`);
     return { status: res.status, body: (await res.json()) as Record<string, unknown>, cache: res.headers.get('cache-control') };
   };
-  return { store, service, get, reads, clock };
+  const post = async (path: string) => {
+    const res = await app.request(`/api/v1/installations/${path}`, { method: 'POST' });
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+  return { store, service, get, post, reads, clock };
 }
 
 describe('status and diagnostics (#71)', () => {
@@ -219,6 +224,63 @@ describe('status and diagnostics (#71)', () => {
     for (const path of ['56/overview', '56/deliveries', '56/jobs', '56/jobs/job_status0001', '56/jobs/job_status0001/logs/run.log']) {
       expect((await get(path)).status, path).toBe(403);
     }
+  });
+
+  describe('retrying a job', () => {
+    const failed = async (store: Awaited<ReturnType<typeof setup>>['store'], outcome = 'failed') => {
+      await store.putJob(job());
+      await store.finishJob('job_status0001', outcome);
+    };
+
+    it('marks the jobs that can be retried', async () => {
+      const { store, get } = await setup();
+      await failed(store);
+      await store.putJob(job({ jobId: 'job_status0002', deliveryId: 'd-2' }));
+      const jobs = (await get('55/jobs')).body.jobs as { jobId: string; retryable: boolean }[];
+      expect(jobs.find((j) => j.jobId === 'job_status0001')!.retryable).toBe(true);
+      expect(jobs.find((j) => j.jobId === 'job_status0002')!.retryable).toBe(false);
+    });
+
+    it("asks the launcher to run a failed job again, and answers with the new job's id", async () => {
+      const requestRetry = vi.fn(async () => ({ ok: true as const, jobId: 'job_new000001' }));
+      const { store, post } = await setup({ requestRetry });
+      await failed(store);
+      expect(await post('55/jobs/job_status0001/retry')).toEqual({ status: 202, body: { jobId: 'job_new000001' } });
+      expect(requestRetry).toHaveBeenCalledWith(55, 'job_status0001');
+    });
+
+    it('refuses a job that is running or succeeded without asking the launcher', async () => {
+      const requestRetry = vi.fn();
+      const { store, post } = await setup({ requestRetry });
+      await store.putJob(job());
+      expect(await post('55/jobs/job_status0001/retry')).toMatchObject({ status: 409, body: { error: 'not_retryable', message: 'This job is still running' } });
+      await store.finishJob('job_status0001', 'succeeded');
+      expect(await post('55/jobs/job_status0001/retry')).toMatchObject({ status: 409, body: { error: 'not_retryable' } });
+      expect(requestRetry).not.toHaveBeenCalled();
+    });
+
+    it("passes on the launcher's refusal with its status and words", async () => {
+      const requestRetry = vi.fn(async () => ({ ok: false as const, status: 429, code: 'throttled' as const, message: 'over a usage limit' }));
+      const { store, post } = await setup({ requestRetry });
+      await failed(store);
+      expect(await post('55/jobs/job_status0001/retry')).toEqual({ status: 429, body: { error: 'throttled', message: 'over a usage limit' } });
+    });
+
+    it('is for members only, and finds only the tenant’s own jobs', async () => {
+      const requestRetry = vi.fn();
+      const { store, post } = await setup({ requestRetry });
+      await failed(store);
+      expect((await post('56/jobs/job_status0001/retry')).status).toBe(403);
+      expect((await post('55/jobs/job_nobody00001/retry')).status).toBe(404);
+      expect((await post('55/jobs/not-a-job/retry')).status).toBe(404);
+      expect(requestRetry).not.toHaveBeenCalled();
+    });
+
+    it('is not offered where no launcher is wired', async () => {
+      const { store, post } = await setup();
+      await failed(store);
+      expect(await post('55/jobs/job_status0001/retry')).toMatchObject({ status: 503, body: { error: 'retry_unavailable' } });
+    });
   });
 
   describe('jobs', () => {

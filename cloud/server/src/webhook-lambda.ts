@@ -11,6 +11,7 @@ import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
 import { createLauncher, internetEgressConnector, noIngressConnector, type Launcher } from './jobs/launch.js';
 import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
+import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
 
 /**
@@ -107,14 +108,40 @@ function launcher(): Launcher | undefined {
   });
 }
 
+const launch = launcher();
 const handleWebhook = createWebhookHandler({
   store,
   github,
   loadSettings,
-  launch: launcher(),
+  launch,
 });
 
-export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+// A retry from the console (jobs/retry.ts): the API function invokes this one directly, since
+// the launcher's permissions are here. Only a caller allowed to invoke the function can send it.
+const retryJob = launch
+  ? createRetryHandler({
+      store,
+      launch,
+      readEvent: async (key) => {
+        try {
+          const out = await s3.send(new GetObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key }));
+          return (await out.Body?.transformToString('utf8')) ?? null;
+        } catch (err) {
+          if ((err as { name?: string }).name === 'NoSuchKey') return null;
+          throw err;
+        }
+      },
+      appBot: async () => {
+        const settings = await loadSettings();
+        return settings?.slug ? `${settings.slug}[bot]` : undefined;
+      },
+    })
+  : undefined;
+
+export async function handler(event: APIGatewayProxyEvent | RetryRequest): Promise<APIGatewayProxyResult | RetryResult> {
+  if (isRetryRequest(event)) {
+    return retryJob ? retryJob(event) : { ok: false, status: 503, code: 'jobs_off', message: 'Jobs are not configured' };
+  }
   const body = event.isBase64Encoded && event.body ? Buffer.from(event.body, 'base64').toString('utf8') : (event.body ?? '');
   const res = await handleWebhook({ body, headers: event.headers ?? {} });
   return { statusCode: res.status, headers: { 'content-type': 'application/json' }, body: JSON.stringify(res.body) };

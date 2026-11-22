@@ -276,6 +276,36 @@ describe('JobPage (#71)', () => {
     expect(await screen.findByText('This log has expired')).toBeInTheDocument();
   });
 
+  describe('retrying', () => {
+    it('offers it for a job that did not finish its work, and opens the new job', async () => {
+      const retryJob = vi.fn().mockResolvedValue({ jobId: 'job_newjob0001' });
+      const jobApi = vi.fn().mockImplementation(async (_id: number, jobId: string) =>
+        jobId === 'job_newjob0001' ? { job: job({ jobId, status: 'launched', result: 'running', retryable: false, logs: [], durationSeconds: undefined }), deliveries: [] } : { job: job({ retryable: true }), deliveries: [] },
+      );
+      showJob(fakeApi({ job: jobApi, jobLog: vi.fn().mockResolvedValue({ name: 'run.log', text: 'x', size: 1, truncated: false }), retryJob }));
+      await userEvent.click(await screen.findByRole('button', { name: 'Retry job' }));
+      expect(retryJob).toHaveBeenCalledWith(55, 'job_abcdefgh01');
+      // The new job's page: running, so nothing to retry.
+      expect(await screen.findByTestId('job-result')).toHaveTextContent('Running');
+      expect(jobApi).toHaveBeenCalledWith(55, 'job_newjob0001');
+      expect(screen.queryByTestId('job-retry')).not.toBeInTheDocument();
+    });
+
+    it("says why when it could not start, and lets the person try again", async () => {
+      const retryJob = vi.fn().mockRejectedValueOnce(new ApiError(429, 'throttled', 'Your installation is over a usage limit right now; try again later')).mockResolvedValue({ jobId: 'job_newjob0001' });
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ retryable: true }), deliveries: [] }), jobLog: vi.fn().mockResolvedValue({ name: 'run.log', text: 'x', size: 1, truncated: false }), retryJob }));
+      await userEvent.click(await screen.findByRole('button', { name: 'Retry job' }));
+      expect(await screen.findByTestId('job-retry-error')).toHaveTextContent('over a usage limit');
+      expect(screen.getByRole('button', { name: 'Retry job' })).toBeEnabled();
+    });
+
+    it('is not offered for a job that is running, succeeded, or cannot be retried', async () => {
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ retryable: false }), deliveries: [] }), jobLog: vi.fn().mockResolvedValue({ name: 'run.log', text: 'x', size: 1, truncated: false }), retryJob: vi.fn() }));
+      await screen.findByTestId('job-result');
+      expect(screen.queryByRole('button', { name: 'Retry job' })).not.toBeInTheDocument();
+    });
+  });
+
   it('shows a running job without logs yet, and refuses a bad job id without asking', async () => {
     showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ status: 'launched', result: 'running', logs: [], durationSeconds: undefined }), deliveries: [] }) }));
     expect(await screen.findByText('Logs appear when the job ends')).toBeInTheDocument();

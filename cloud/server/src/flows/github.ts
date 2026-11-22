@@ -3,6 +3,7 @@ import type { Caller } from '../caller.js';
 import { GitHubError, type GitHubApi, type GitHubInstallation, type GitHubRepository, type GitHubUser } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { AppSettings, LoadSettings } from '../github/settings.js';
+import type { RetryErrorCode } from '../jobs/retry.js';
 import type { GitHubLink, Member, OAuthKind, OfferedInstallation, Store, Tenant } from '../store/store.js';
 
 /**
@@ -33,6 +34,9 @@ export const OFFER_TTL_MS = 10 * 60 * 1000;
 export const MAX_OFFERED = 50;
 
 export type FlowErrorCode =
+  // Retrying a job (jobs/retry.ts, tenants/status-service.ts).
+  | RetryErrorCode
+  | 'retry_unavailable'
   | 'github_app_not_configured'
   | 'state_invalid'
   | 'github_exchange_failed'
