@@ -52,7 +52,7 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
   const member = async (_c: Caller, id: number) => {
     if (id !== 55) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
     const t = (await store.getTenant(55))!;
-    return { tenant: t, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: t.status, role: 'owner' as const } };
+    return { tenant: t, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: t.status, role: 'owner' as const }, githubLogin: 'Pat' };
   };
   const clock = { now: Date.now() };
   const service = createStatusService({
@@ -124,20 +124,30 @@ describe('status and diagnostics (#71)', () => {
       expect((body.keys as unknown[]).length).toBe(2);
     });
 
-    it('names the labels that start a job, of enabled repositories only, and whether traces are set up', async () => {
+    it("names only the labels the viewer may apply, in repositories the installation reaches, and whether traces are set up", async () => {
       const { store, get } = await setup();
       const v = await store.createConfigVersion(55, {
         sha256: 'x',
         files: ['config.yaml'],
         publishedBy: 'pat',
         publishedAt: '2026-11-20T10:00:00.000Z',
-        dispatch: { repositories: { 'acme/web': { id: 9, triggers: [{ label: 'updraft' }, { label: 'updraft:review' }] }, 'acme/docs': { id: 10, paused: true, triggers: [{ label: 'paused' }] } } },
+        dispatch: {
+          repositories: {
+            'acme/web': { id: 9, actors: ['pat'], triggers: [{ label: 'updraft' }, { label: 'updraft:review' }, { label: 'others', actors: ['sam'] }] },
+            'acme/docs': { id: 10, paused: true, actors: ['pat'], triggers: [{ label: 'paused' }] },
+            'acme/api': { id: 12, triggers: [{ label: 'theirs', actors: ['sam'] }] },
+            'acme/gone': { id: 13, actors: ['pat'], triggers: [{ label: 'unreachable' }] },
+          },
+        },
       });
       await store.markConfigReady(55, v as number);
       await store.activateConfig(55, v as number);
       const first = (await get('55/overview')).body;
-      expect(first.config).toMatchObject({ triggers: [{ repository: 'acme/web', label: 'updraft' }, { repository: 'acme/web', label: 'updraft:review' }] });
+      expect((first.config as { triggers?: unknown }).triggers).toEqual([{ repository: 'acme/web', label: 'updraft' }, { repository: 'acme/web', label: 'updraft:review' }]);
       expect(first.telemetry).toEqual({ configured: false, enabled: false });
+      expect(first.activity).not.toHaveProperty('firstJobAt');
+      await store.markFirstJob(55, '2026-11-20T11:00:00.000Z');
+      expect((await get('55/overview')).body.activity).toMatchObject({ firstJobAt: '2026-11-20T11:00:00.000Z' });
       await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat' } }, 0);
       expect((await get('55/overview')).body.telemetry).toEqual({ configured: true, enabled: true });
     });

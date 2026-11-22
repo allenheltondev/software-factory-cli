@@ -1,6 +1,6 @@
 import type { AgentKeyMeta, Store } from '../store/store.js';
 // Not from config.ts: that pulls in the CLI's whole validator, which nothing here needs.
-import { AGENT_KEY_ENV } from './agents.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from './agents.js';
 import type { KeyChecker } from './key-check.js';
 
 /**
@@ -15,7 +15,10 @@ import type { KeyChecker } from './key-check.js';
  * key is set, when, and by whom (AgentKeyMeta in the table).
  */
 
+/** The keys this deployment asks for (its agents'). */
 export const AGENT_KEY_NAMES = Object.values(AGENT_KEY_ENV) as string[];
+/** Every key any deployment may have stored: what a job may be handed and an uninstall deletes, whatever is offered now. */
+export const ALL_AGENT_KEY_NAMES = Object.values(SUPPORTED_AGENT_KEY_ENV) as string[];
 /** Every key secret of a tenant starts with this (the uninstall cleanup deletes them by name). */
 export const agentKeySecretPrefix = (installationId: number) => `updraft/tenants/${installationId}/agent-keys/`;
 export const agentKeySecretName = (installationId: number, name: string) => `${agentKeySecretPrefix(installationId)}${name}`;

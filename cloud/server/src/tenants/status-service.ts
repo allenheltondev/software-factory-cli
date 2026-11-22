@@ -133,6 +133,8 @@ export interface Overview {
     deliveries: Partial<Record<DeliveryRecord['disposition'], number>>;
     jobs: Partial<Record<JobResult, number>>;
     lastDeliveryAt?: string;
+    /** When the first job ever started: kept on the tenant, so it outlives the job records. */
+    firstJobAt?: string;
     running: number;
   };
 }
@@ -228,7 +230,7 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
 
   return {
     async overview(caller: Caller, installationId: number): Promise<Overview> {
-      const { tenant, summary } = await github.member(caller, installationId);
+      const { tenant, summary, githubLogin } = await github.member(caller, installationId);
       // GitHub's view first: suspended or gone there is what the tenant needs to know, even before our record has caught up.
       let checked = true;
       let gh: Awaited<ReturnType<typeof github.installation>> | undefined;
@@ -276,11 +278,16 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
       deliveries.splice(ACTIVITY_SAMPLE);
       jobs.splice(ACTIVITY_SAMPLE);
       const results = jobs.map(jobResult);
-      // The labels that start a job, named as the installation reports the repository.
-      const triggers = Object.entries(configured)
-        .filter(([, c]) => !c.paused)
-        .flatMap(([name, c]) => c.triggers.map((t) => ({ repository: repos.get(name)?.fullName ?? name, label: t.label })))
-        .slice(0, 10);
+      // The labels the viewer can start a job with: in a repository the installation reaches and
+      // is not paused, by the dispatch rules' own actor check, named as the installation reports
+      // the repository.
+      const viewer = githubLogin?.toLowerCase();
+      const triggers = viewer
+        ? Object.entries(configured)
+            .filter(([name, c]) => !c.paused && repos.get(name)?.reachable)
+            .flatMap(([name, c]) => c.triggers.filter((t) => (t.actors ?? c.actors ?? []).includes(viewer)).map((t) => ({ repository: repos.get(name)!.fullName, label: t.label })))
+            .slice(0, 10)
+        : [];
       return {
         tenant: summary,
         installation: { status, checked, missingPermissions: missing },
@@ -296,6 +303,7 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
           deliveries: deliveryCounts(deliveries),
           jobs: countBy(results.filter((r) => r !== 'running')),
           ...(deliveries[0] ? { lastDeliveryAt: deliveries[0].at } : {}),
+          ...(tenant.firstJobAt ? { firstJobAt: tenant.firstJobAt } : {}),
           running: results.filter((r) => r === 'running').length,
           window: { deliveries: deliveries.length, deliveriesComplete, jobs: jobs.length, jobsComplete },
         },

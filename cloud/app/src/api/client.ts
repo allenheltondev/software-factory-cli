@@ -464,6 +464,8 @@ export interface Overview {
     deliveries: Partial<Record<DeliveryDisposition, number>>;
     jobs: Partial<Record<JobResult, number>>;
     lastDeliveryAt?: string;
+    /** When the first job ever started (kept for good). */
+    firstJobAt?: string;
     running: number;
   };
 }
@@ -477,7 +479,7 @@ export interface JobLog {
 
 // A tenant's configuration (server/src/tenants/console.ts and config-service.ts).
 
-export type AgentAdapter = 'claude' | 'codex';
+export type AgentAdapter = 'claude' | 'codex' | 'kiro';
 export type MergeMethod = 'squash' | 'merge' | 'rebase';
 
 export interface ConsoleAgent {
@@ -532,6 +534,8 @@ export interface ConfigView {
   githubLogin: string;
   repositories: Repository[];
   agentKeys: Record<string, boolean>;
+  /** The agents this deployment runs: what the editor offers. Absent from an older API: Claude and Codex. */
+  agents?: AgentAdapter[];
   activeVersion: number | null;
   source: 'console' | 'tenant' | 'none';
   config: ConsoleConfig;

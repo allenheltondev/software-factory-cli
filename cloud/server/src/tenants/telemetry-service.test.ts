@@ -64,6 +64,15 @@ describe('agent telemetry settings', () => {
     expect(regions).toEqual(['us', 'eu']);
     const { service: nowhere } = await setup(async () => ({ result: 'invalid' }));
     await expect(nowhere.setKey(caller, 55, { value: KEY, region: 'auto' })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/both the US and the EU/) });
+    // The US could not be asked: the EU still is, and a valid EU key is saved.
+    const { service: usDown } = await setup(async (region) => (region === 'eu' ? { result: 'valid', auth: { type: 'ingest', canSend: true } } : { result: 'unavailable' }));
+    expect(await usDown.setKey(caller, 55, { value: KEY, region: 'auto' })).toMatchObject({ region: 'eu', keyConfigured: true });
+    // Rejected in one, unreachable in the other: not known to be wrong, so try again.
+    for (const unreachable of ['us', 'eu']) {
+      const { service: half, store } = await setup(async (region) => ({ result: region === unreachable ? 'unavailable' : 'invalid' }));
+      await expect(half.setKey(caller, 55, { value: KEY, region: 'auto' })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/Could not check the key/) });
+      expect((await store.getTelemetry(55))?.key).toBeUndefined();
+    }
   });
 
   it('saves nothing for a key Honeycomb rejects, cannot reach, or one that cannot send events', async () => {

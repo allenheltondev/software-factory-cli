@@ -1,4 +1,4 @@
-import { AGENT_KEY_ENV, type CloudAgent } from './agents.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, type CloudAgent } from './agents.js';
 import { CEILINGS, type ConfigIssue, type TenantSubmission } from './config.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 
@@ -379,7 +379,7 @@ function usage(config: ConsoleConfig, which: 'all' | 'enabled') {
 export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): ConfigIssue[] {
   const out: ConfigIssue[] = [];
   const need = (path: string, adapter: CloudAgent) => {
-    const name = AGENT_KEY_ENV[adapter];
+    const name = SUPPORTED_AGENT_KEY_ENV[adapter];
     if (!keys.has(name)) out.push({ path, message: `set the tenant's ${name} first: jobs run ${adapter} with your own key` });
   };
   for (const [name, u] of usage(config, 'enabled')) {

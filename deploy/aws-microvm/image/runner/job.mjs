@@ -739,6 +739,8 @@ export function finishDetail(result) {
   // Agent telemetry: the trace, for a link to it, and whether it got there.
   if (result.telemetry) {
     const t = result.telemetry;
+    // The adapters that ran: the broker records a key's use for these only.
+    if (Array.isArray(t.adapters)) detail.adapters = t.adapters;
     detail.telemetry = {
       traceId: t.traceId,
       spans: t.spans,

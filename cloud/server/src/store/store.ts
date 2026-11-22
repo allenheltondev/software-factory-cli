@@ -63,6 +63,8 @@ export interface Tenant {
   activeConfigVersion?: number;
   /** An admin's overrides of the stack's default quotas (jobs/quotas.ts); absent: the defaults. */
   limits?: TenantLimits;
+  /** When its first job started (the broker's first committed start), kept for good: setup is done. */
+  firstJobAt?: string;
 }
 
 /** Per-tenant quotas an admin may override. Each one absent: the stack's default. */
@@ -160,6 +162,8 @@ export interface JobFinishDetail {
   steps?: JobStep[];
   /** The trace its agents' telemetry was sent as. */
   telemetry?: JobTelemetryReport;
+  /** The agent adapters that ran (claude, codex, kiro): whose keys the job used. Absent: not known. */
+  adapters?: string[];
 }
 
 /**
@@ -431,6 +435,8 @@ export interface Store {
    * same TTL): a Connect or install callback racing the delete cannot create the tenant afterwards.
    */
   markUninstalled(installationId: number, deleteAfter: number, account?: InstallationAccount): Promise<'marked' | 'already' | 'tombstone'>;
+  /** The broker marks the tenant's first started job. Set once: a later call changes nothing. */
+  markFirstJob(installationId: number, at: string): Promise<void>;
   /** An admin's quota overrides; null removes them (the stack's defaults again). */
   setTenantLimits(installationId: number, limits: TenantLimits | null): Promise<'updated' | 'no_tenant'>;
   /**
@@ -784,6 +790,10 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0))
         .slice(0, limit)
         .map(({ installationId: _id, ...s }) => ({ ...s }));
+    },
+    async markFirstJob(id, at) {
+      const t = tenants.get(id);
+      if (t && t.firstJobAt === undefined) tenants.set(id, { ...t, firstJobAt: at });
     },
     async setTenantLimits(id, limits) {
       const t = tenants.get(id);

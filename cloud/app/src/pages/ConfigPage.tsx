@@ -25,8 +25,11 @@ export const WORKFLOW_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const AGENTS: { value: AgentAdapter; label: string }[] = [
   { value: 'claude', label: 'Claude Code' },
   { value: 'codex', label: 'Codex' },
+  { value: 'kiro', label: 'Kiro' },
 ];
-const KEY_FOR: Record<AgentAdapter, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY' };
+const KEY_FOR: Record<AgentAdapter, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY' };
+/** What an API from before the deployment named its agents offers. */
+const DEFAULT_OFFERED: AgentAdapter[] = ['claude', 'codex'];
 const MERGE_METHODS: { value: MergeMethod; label: string }[] = [
   { value: 'squash', label: 'Squash and merge' },
   { value: 'merge', label: 'Merge commit' },
@@ -98,11 +101,27 @@ function ParsedText({
   );
 }
 
-function AgentFields({ agent, onChange, issues, path, title }: { agent: ConsoleAgent; onChange: (a: ConsoleAgent) => void; issues: ConfigIssue[]; path: string; title: string }) {
+function AgentFields({
+  agent,
+  onChange,
+  issues,
+  path,
+  title,
+  offered,
+}: {
+  agent: ConsoleAgent;
+  onChange: (a: ConsoleAgent) => void;
+  issues: ConfigIssue[];
+  path: string;
+  title: string;
+  offered: AgentAdapter[];
+}) {
+  // The deployment's agents, and the one already chosen if it is not among them (published before).
+  const choices = AGENTS.filter((a) => offered.includes(a.value) || a.value === agent.adapter);
   return (
     <div className="grid gap-4 sm:grid-cols-3">
       <Select label={title} value={agent.adapter} error={issuesAt(issues, `${path}.adapter`)} onChange={(e) => onChange({ ...agent, adapter: e.target.value as AgentAdapter })}>
-        {AGENTS.map((a) => (
+        {choices.map((a) => (
           <option key={a.value} value={a.value}>
             {a.label}
           </option>
@@ -611,7 +630,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                       Remove
                     </Button>
                   </div>
-                  <AgentFields title="Agent" agent={w.agent} path={`${path}.agent`} issues={errors} onChange={(agent) => updateWorkflow(name, { agent })} />
+                  <AgentFields title="Agent" agent={w.agent} path={`${path}.agent`} issues={errors} offered={view.agents ?? DEFAULT_OFFERED} onChange={(agent) => updateWorkflow(name, { agent })} />
                   <PromptField
                     label="Prompt"
                     value={w.prompt}
@@ -661,6 +680,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                       <AgentFields
                         title="Reviewer"
                         agent={w.reviewer}
+                        offered={view.agents ?? DEFAULT_OFFERED}
                         path={`${path}.reviewer`}
                         issues={errors}
                         onChange={(a) => updateWorkflow(name, { reviewer: { ...a, prompt: w.reviewer.prompt } })}

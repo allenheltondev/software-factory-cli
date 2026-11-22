@@ -92,7 +92,7 @@ export function setupSteps(overview: Overview, base: string): SetupStep[] {
     {
       id: 'first-job',
       title: 'Start your first job',
-      done: jobs > 0,
+      done: jobs > 0 || Boolean(overview.activity.firstJobAt),
       ...(trigger
         ? {
             detail: (
@@ -106,7 +106,16 @@ export function setupSteps(overview: Overview, base: string): SetupStep[] {
               </a>
             ),
           }
-        : {}),
+        : hasConfig
+          ? {
+              detail: 'No label you can apply starts a job: add your GitHub login to the allowed actors of a workflow in a repository the App reaches.',
+              action: (
+                <Link className={linkClass} to={`${base}/config`}>
+                  Edit configuration
+                </Link>
+              ),
+            }
+          : {}),
     },
   ];
 }

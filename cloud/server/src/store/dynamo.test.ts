@@ -50,6 +50,7 @@ function fakeTable() {
     }
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(stopRequestedAt)') return Boolean(item) && item!.stopRequestedAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(releasedAt)') return Boolean(item) && item!.releasedAt === undefined;
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(firstJobAt)') return Boolean(item) && item!.firstJobAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(telemetrySnapshot)') return Boolean(item) && item!.telemetrySnapshot === undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
       return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
@@ -373,6 +374,16 @@ describe('dynamo store: config versions and agent keys', () => {
     expect(await store.createConfigVersion(55, meta)).toBe('uninstalled');
     expect(await store.activateConfig(55, 1)).toBe('uninstalled');
     expect(await store.createConfigVersion(77, meta)).toBe('no_tenant');
+  });
+
+  it("keeps the first job's time once set, and the tenant's put does not erase it", async () => {
+    const { store } = await seeded();
+    await store.markFirstJob(55, '2026-11-20T10:00:00.000Z');
+    await store.markFirstJob(55, '2026-11-21T10:00:00.000Z');
+    await store.putTenantWithMember(tenant, member('sub-c'));
+    expect((await store.getTenant(55))?.firstJobAt).toBe('2026-11-20T10:00:00.000Z');
+    await store.markFirstJob(77, '2026-11-21T10:00:00.000Z');
+    expect(await store.getTenant(77)).toBeNull();
   });
 
   it('records that an agent key is set, never its value', async () => {

@@ -144,6 +144,23 @@ describe('InstallationPage (#71)', () => {
     expect(first).toHaveTextContent('Add the label updraft to an issue in acme/web.');
   });
 
+  it("sends the first job to the configuration when no label there is the viewer's to apply, and counts a first job after its record is gone", async () => {
+    const ready = overview({
+      config: { activeVersion: 2 },
+      keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }],
+      telemetry: { configured: false, enabled: false },
+      activity: { window: { deliveries: 0, deliveriesComplete: true, jobs: 0, jobsComplete: true }, deliveries: {}, jobs: {}, running: 0 },
+    });
+    const { unmount } = showInstallation(api({ overview: vi.fn().mockResolvedValue(ready), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    const first = await screen.findByTestId('setup-first-job');
+    expect(first).toHaveTextContent('add your GitHub login to the allowed actors');
+    expect(within(first).getByRole('link', { name: 'Edit configuration' })).toHaveAttribute('href', '/installations/55/config');
+    unmount();
+    showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, activity: { ...ready.activity, firstJobAt: '2026-10-01T00:00:00.000Z' } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    await screen.findByTestId('installation-status');
+    expect(screen.queryByTestId('setup')).toBeNull();
+  });
+
   it('shows no checklist once every step jobs need is done, telemetry or not', async () => {
     showInstallation(api({ overview: vi.fn().mockResolvedValue(overview({ telemetry: { configured: false, enabled: false } })) }));
     await screen.findByTestId('installation-status');
