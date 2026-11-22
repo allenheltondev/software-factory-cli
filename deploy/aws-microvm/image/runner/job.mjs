@@ -24,7 +24,7 @@ import {
   waitForStateChange,
 } from './state.mjs';
 import { claudeTelemetryEnv, createOtlpRelay } from './otlp-relay.mjs';
-import { HONEYCOMB_ENDPOINTS, createAgentTracer, createExporter } from './telemetry.mjs';
+import { HONEYCOMB_ENDPOINTS, createAgentTracer, createExporter, createLocalExporter } from './telemetry.mjs';
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
 const KEY_FILE = 'github-app.pem';
@@ -276,8 +276,10 @@ export async function runJob(request, deps) {
   });
 
   let stateDirForLogs;
-  // Agent telemetry (telemetry.mjs), when the tenant set it up: started with the job process.
+  // Agent telemetry (telemetry.mjs): started with the job process. With a destination its spans
+  // go there; without one, it still reads the run logs for the console's own view of the job.
   let tracer;
+  let sending = false;
   // The runner's own steps, timed for the trace (sent only when telemetry is on): isolation, the
   // state, the coalescing wait, each try of `updraft run-event` and each wait for newer state.
   const steps = [];
@@ -308,7 +310,11 @@ export async function runJob(request, deps) {
     // runner's own, like the token: it is never in the job's environment, and it is redacted
     // wherever it might appear (until the agents' keys are loaded, it and the shape-based rules).
     const telemetry = payload.version === 2 ? await telemetrySetup(payload, deps, log) : null;
-    if (telemetry) {
+    sending = Boolean(telemetry);
+    if (!telemetry) {
+      tracer = createAgentTracer({ startedAt, captureContent: false, redact: (text) => redact(text), log, now, exporter: createLocalExporter(), ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}) });
+      tracer.start();
+    } else {
       redact = createRedactor([telemetry.apiKey]);
       // Through `redact` as it is when a span leaves: the agents' keys join it below.
       const redactNow = (text) => redact(text);
@@ -385,7 +391,8 @@ export async function runJob(request, deps) {
     // keeps (the log stream, the uploaded logs, the result) carries a value of them.
     const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
     redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? [telemetry.apiKey] : [])]);
-    if (tracer) ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
+    // Claude Code's own events only go somewhere with a destination.
+    if (sending) ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
     for (;;) {
       // Checkpoints: what the run records (the pull request it opened, above all) reaches the
       // shared database while it runs, not only at its end. Stopped before anything else
@@ -400,7 +407,7 @@ export async function runJob(request, deps) {
       checkpointer?.start();
       try {
         run = await timed('run_event', { 'updraft.run_event.try': pending.tries + 1, 'updraft.run_event.deadline_minutes': deadlineNow }, async (step) => {
-          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: tracer?.traceId, agentTelemetryEnv }, { agentEnv, redact }, (stop) => {
+          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: sending ? tracer?.traceId : undefined, agentTelemetryEnv }, { agentEnv, redact }, (stop) => {
             stopChild = stop;
             if (stopRequested) stop();
           });
@@ -498,7 +505,7 @@ export async function runJob(request, deps) {
       steps,
       budgetMs: deps.telemetryBudgetMs ?? (stopRequested ? 5_000 : 15_000),
     });
-    log(`agent telemetry: ${result.telemetry.exported} of ${result.telemetry.spans} span(s) sent${result.telemetry.lastError ? ` (last error: ${result.telemetry.lastError})` : ''}`);
+    if (sending) log(`agent telemetry: ${result.telemetry.exported} of ${result.telemetry.spans} span(s) sent${result.telemetry.lastError ? ` (last error: ${result.telemetry.lastError})` : ''}`);
   }
 
   // Save what the run changed in the shared state, whatever the job's outcome: a failed run
@@ -734,6 +741,8 @@ export function finishDetail(result) {
       // Where the links on the job's page go: its conversation, and spans worth opening at.
       ...(t.conversationId ? { conversationId: t.conversationId } : {}),
       ...(t.marks?.length ? { marks: t.marks } : {}),
+      ...(t.local ? { local: true } : {}),
+      ...(t.totals ? { totals: t.totals } : {}),
     };
   }
   // The lifecycle (the console's job timeline): where the review loop left the pull request, and

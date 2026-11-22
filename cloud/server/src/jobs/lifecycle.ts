@@ -86,6 +86,22 @@ export interface JobTelemetryReport {
   conversationId?: string;
   /** Spans worth a link of their own (the runner's telemetry.mjs), in the order they started. */
   marks?: TelemetryMark[];
+  /** Read for the console only: there was no destination, nothing was sent, and no link can open it. */
+  local?: true;
+  /** What the job's runs added up to. */
+  totals?: TelemetryTotals;
+}
+
+export interface TelemetryTotals {
+  runs: number;
+  inputTokens: number;
+  outputTokens: number;
+  /** What the agent CLIs reported it cost, when any did. */
+  costUsd?: number;
+  toolCalls: number;
+  toolErrors: number;
+  thrashing: boolean;
+  durationMs: number;
 }
 
 export const TELEMETRY_MARK_KINDS = ['agent', 'test_failed', 'test_green', 'verify_failed', 'step_failed'] as const;
@@ -107,6 +123,9 @@ export interface TelemetryMark {
   verdict?: string;
   /** step_failed: which step (publish, prepare, runner_restore_state, ...). */
   step?: string;
+  /** When the span started, from the job's start, and how long it took. */
+  offsetMs?: number;
+  durationMs?: number;
 }
 
 const MAX_MARKS = 32;
@@ -129,6 +148,29 @@ function markOf(raw: unknown): TelemetryMark | undefined {
   if (verdict) out.verdict = verdict;
   const step = word(m.step, 48);
   if (step) out.step = step;
+  const offsetMs = count(m.offsetMs, DAY_MS);
+  if (offsetMs !== undefined) out.offsetMs = offsetMs;
+  const durationMs = count(m.durationMs, DAY_MS);
+  if (durationMs !== undefined) out.durationMs = durationMs;
+  return out;
+}
+
+const DAY_MS = 24 * 3600 * 1000;
+
+function totalsOf(raw: unknown): TelemetryTotals | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const t = raw as Record<string, unknown>;
+  const n = (v: unknown, max: number) => count(v, max) ?? 0;
+  const out: TelemetryTotals = {
+    runs: n(t.runs, 1000),
+    inputTokens: n(t.inputTokens, 1e12),
+    outputTokens: n(t.outputTokens, 1e12),
+    toolCalls: n(t.toolCalls, 10_000_000),
+    toolErrors: n(t.toolErrors, 10_000_000),
+    thrashing: t.thrashing === true,
+    durationMs: n(t.durationMs, DAY_MS),
+  };
+  if (typeof t.costUsd === 'number' && Number.isFinite(t.costUsd) && t.costUsd >= 0 && t.costUsd < 1e6) out.costUsd = Math.round(t.costUsd * 10_000) / 10_000;
   return out;
 }
 
@@ -145,5 +187,8 @@ export function telemetryOf(raw: unknown): JobTelemetryReport | undefined {
     const marks = t.marks.slice(0, MAX_MARKS).map(markOf).filter((m): m is TelemetryMark => m !== undefined);
     if (marks.length) out.marks = marks;
   }
+  if (t.local === true) out.local = true;
+  const totals = totalsOf(t.totals);
+  if (totals) out.totals = totals;
   return out;
 }

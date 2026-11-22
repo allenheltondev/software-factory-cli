@@ -243,8 +243,8 @@ What a destination, a query, a board or an alert can rely on, whichever tool rea
   milliseconds, `_usd` dollars, ratios between 0 and 1) stay as documented.
 - **Span links between jobs** (`updraft.link.relation`) and the derived `invoke_agent` span id of
   a run, so a later trace can always link to an earlier run.
-- **The finish report's marks** ([Spans worth a link](#spans-worth-a-link)): kinds and fields as
-  documented.
+- **The finish report's marks and totals** ([Spans worth a link](#spans-worth-a-link)): kinds and
+  fields as documented.
 
 Changes are additive: a new attribute or span event can appear, and an existing one keeps its
 name, type and meaning. Renaming or removing one is a breaking change and is called out in the
@@ -255,40 +255,54 @@ values follow the conventions' JSON message format, cut at 16 KB. Resource attri
 
 ## What the console shows
 
-- **Agent telemetry** (`/installations/:id/telemetry`): the key (never its value), the Honeycomb
-  team and environment it belongs to, sending on or paused, content on or off, the service name,
-  and the last job's export: how many spans got there, the last error, and a link to its trace.
+- **Agent telemetry** (`/installations/:id/telemetry`): where traces go and the key (never its
+  value), sending on or paused, content on or off, the service name, and the last job's export:
+  how many spans got there, the last error, and a link to its trace.
 - **Each job's page**:
-  - **View trace in Honeycomb**, a
-    [direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace) built from the
-    team and environment slugs.
-  - **Open conversation**, the conversation's spans in Honeycomb's query builder, a
-    [shared query](https://docs.honeycomb.io/investigate/collaborate/share-query):
-    `gen_ai.conversation.id = <owner/repo#issue>`, broken down by conversation and agent, with a span
-    count and a trace count, from a week before the job to a week after it (or now). Selecting the
-    conversation id in the results opens it in Agent Timeline. If the deployment sets an Agent
-    Timeline link (below), **Open in Agent Timeline** shows instead.
-  - **Jump to**: the trace opened at a span (`&span=<span id>`) for each run's `invoke_agent` span
-    (with its review verdict, and whether it failed or went in circles), the first failing test run,
-    the first passing one after it, the first failed verify command, and the first failed Updraft
-    or runner step.
+  - **What the agents did**, with or without a destination: the job's totals (agent runs, tokens in
+    and out, the cost the agent CLIs reported, tool calls and how many failed, whether a run went
+    in circles) and its moments in order, each at its time from the job's start on a bar the
+    length of the job: each run's agent (with its review verdict, and whether it failed or went in
+    circles), the first failing test run, the first passing one after it, the first failed verify
+    command, and the first failed Updraft or runner step. When the trace was sent somewhere with
+    links, each moment opens the trace at its span.
+  - **Traces**, when the trace was sent: **View trace**, **Open conversation** (the conversation's
+    spans in the destination's search), and the conversation id to copy. With no destination, an
+    offer to set one up.
   - **This conversation**: the other recent jobs of the same conversation (the implementation, each
     review and revision), each with its trace.
-  - The conversation id, to copy into AI Ecosystem → Conversations.
 - **The jobs list**: a **Trace** and a **Conversation** link on each job that sent telemetry.
+
+With no destination, the runner still reads the run logs as the job runs, with an exporter that
+sends nothing (`createLocalExporter`): the finish reports the marks and totals with `local: true`,
+the job is given no trace id (so no later trace links to it), Claude Code's own events are not
+collected, and the settings page records no export. A job's links are only built from what
+reached a destination: none for a local job, or for one whose export sent nothing.
+
+For Honeycomb, **View trace** is a
+[direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace) built from the
+key's team and environment slugs, and **Open conversation** a
+[shared query](https://docs.honeycomb.io/investigate/collaborate/share-query):
+`gen_ai.conversation.id = <owner/repo#issue>`, broken down by conversation and agent, with a span
+count and a trace count, from a week before the job to a week after it (or now). Selecting the
+conversation id in the results opens it in Agent Timeline. If the deployment sets an Agent Timeline
+link (below), **Open in Agent Timeline** shows instead.
 
 ### Spans worth a link
 
 The runner reports these with the job's finish (`telemetry.marks`): a kind (`agent`,
 `test_failed`, `test_green`, `verify_failed`, `step_failed`), the span id, the run kind, and for an
-agent span its profile, verdict, and whether it failed or thrashed. Only spans Honeycomb accepted
+agent span its profile, verdict, and whether it failed or thrashed, and where it was in the job
+(`offsetMs` from the job's start, `durationMs`). Only spans the destination accepted
 (a 2xx for their batch that rejected none of it: an OTLP partial success counts its rejected spans
 as failed and confirms none of the batch, since it does not say which) are reported, so a link
 never opens the root span instead of one that was refused, dropped or still queued, and there are at most 8 per run and 32 per job. A test run counts
 as the first passing one only when its output showed tests that passed. It also reports the
 conversation id the job's span was sent in, so a review's job, which has no issue of its own, links
-to the issue's conversation, and a job that ran no agent to `delivery/<id>`. The broker keeps only marks of a known kind, with a 16-hex span id and plain
-words.
+to the issue's conversation, and a job that ran no agent to `delivery/<id>`. And the job's
+`totals`: `runs`, `inputTokens`, `outputTokens`, `costUsd` (when an agent CLI reported a cost),
+`toolCalls`, `toolErrors`, `thrashing` and `durationMs`. The broker keeps only marks of a known
+kind, with a 16-hex span id, plain words and counts, and totals as counts.
 
 ### A link into Agent Timeline itself
 

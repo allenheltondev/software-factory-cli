@@ -138,6 +138,15 @@ export function otlpRequest(spans, resource) {
 }
 
 /**
+ * An exporter that sends nothing: with no destination, the tracer still reads the run logs for
+ * the console's own view of the job (its marks and totals), and every span stays here.
+ */
+export function createLocalExporter() {
+  const stats = { exported: 0, failed: 0, dropped: 0, requests: 0, lastError: null, lastOkAt: null };
+  return { stats, local: true, push() {}, flush: async () => {}, pending: () => 0, accepted: () => true };
+}
+
+/**
  * How many spans of a 200 answer's batch the receiver rejected: OTLP's partial success
  * (`{"partialSuccess":{"rejectedSpans":"<n>"}}`, an int64 as a string in JSON). 0 for an empty or
  * unreadable body; at most the batch.
@@ -578,7 +587,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   function noteMark(span) {
     const a = span.attributes ?? {};
     const add = (kind, extra = {}) => {
-      if (marks.length < MAX_MARKS_PER_RUN) marks.push({ kind, spanId: span.spanId, at: span.start, ...(h.kind ? { run: h.kind } : {}), ...extra });
+      if (marks.length < MAX_MARKS_PER_RUN) marks.push({ kind, spanId: span.spanId, at: span.start, end: span.end, ...(h.kind ? { run: h.kind } : {}), ...extra });
     };
     const once = (kind, extra) => {
       if (marked.has(kind)) return;
@@ -1652,7 +1661,7 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
           const failed = outcome !== 'succeeded';
           for (const step of runnerSteps) {
             const spanId = newSpanId();
-            if (step.error) runnerMarks.push({ kind: 'step_failed', spanId, at: step.start, step: `runner_${step.name}` });
+            if (step.error) runnerMarks.push({ kind: 'step_failed', spanId, at: step.start, end: typeof step.end === 'number' ? step.end : at, step: `runner_${step.name}` });
             emit({
               traceId,
               spanId,
@@ -1731,16 +1740,29 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
           .filter((m) => exporter.accepted(m.spanId))
           .sort((x, y) => x.at - y.at)
           .slice(0, MAX_MARKS_PER_JOB)
-          .map((m) => {
-            const out = { ...m };
-            delete out.at;
-            return out;
-          });
+          // When, from the job's start, and for how long: the console's own timeline of the job.
+          .map(({ at: start, end, ...m }) => ({ ...m, offsetMs: Math.max(0, Math.round(start - startedAt)), durationMs: Math.max(0, Math.round((end ?? start) - start)) }));
       } catch (error) {
         log(`agent telemetry: ${error?.message ?? error}`);
       }
+      // The job's totals, for the console without any destination: what every run cost and did.
+      const runSummaries = [...runs.values()].map((r) => r.trace.summary);
+      const costs = runSummaries.filter((r) => typeof r.costUsd === 'number');
+      const totals = {
+        runs: runSummaries.length,
+        inputTokens: runSummaries.reduce((n, r) => n + (r.inputTokens ?? 0), 0),
+        outputTokens: runSummaries.reduce((n, r) => n + (r.outputTokens ?? 0), 0),
+        ...(costs.length ? { costUsd: Math.round(costs.reduce((n, r) => n + r.costUsd, 0) * 10_000) / 10_000 } : {}),
+        toolCalls: runSummaries.reduce((n, r) => n + (r.tools ?? 0), 0),
+        toolErrors: runSummaries.reduce((n, r) => n + (r.toolErrors ?? 0), 0),
+        thrashing: runSummaries.some((r) => r.thrashing),
+        durationMs: Math.max(0, Math.round(now() - startedAt)),
+      };
       return {
         traceId,
+        // Read for the console only, sent nowhere (createLocalExporter): no link can open it.
+        ...(exporter.local ? { local: true } : {}),
+        totals,
         ...(conversationId ? { conversationId } : {}),
         conversationIds: conversations,
         marks,

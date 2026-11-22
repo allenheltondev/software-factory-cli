@@ -600,7 +600,11 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
       throw new Error('must not be called');
     };
     expect((await runJob(brokerRequest({ telemetry }), noKey.deps)).outcome).toBe('succeeded');
-    expect(noKey.finishDetails[0].telemetry).toBeUndefined();
+    // Nothing sent, but the console still gets its own view of the job: marks and totals, marked local.
+    expect(noKey.finishDetails[0].telemetry).toMatchObject({ local: true, exported: 0, totals: { runs: 1, toolCalls: expect.any(Number) } });
+    // And the job has no trace id to record: there is no trace anywhere to link to.
+    const env = fs.readFileSync(recordFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l).env ?? {});
+    expect(env.some((e) => 'UPDRAFT_TRACE_ID' in e)).toBe(false);
 
     const down = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
     down.deps.fetch = async () => ({ ok: false, status: 401 });
@@ -618,7 +622,7 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2 (job broker)', () => {
     const result = await runJob(brokerRequest(), deps);
     expect(result.outcome).toBe('succeeded');
     // What the console shows of the job (#71): the pull request and the logs, as names.
-    expect(harness.finishDetails).toEqual([{ updraftOutcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logs: ['updraft.log', 'run.log'] }]);
+    expect(harness.finishDetails).toEqual([{ updraftOutcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logs: ['updraft.log', 'run.log'], telemetry: expect.objectContaining({ local: true }) }]);
 
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(record.keyMode).toBeNull();

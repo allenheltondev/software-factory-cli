@@ -114,7 +114,7 @@ describe('the job page links to its trace', () => {
           traceUrl: trace,
           conversationId: 'acme/web#12',
           conversationUrl: 'https://ui.honeycomb.io/acme/environments/prod/datasets/updraft/?query=q',
-          links: [
+          timeline: [
             { kind: 'agent', run: 'implement', agent: 'claude-opus', url: `${trace}&span=1`, failed: true, thrashing: true },
             { kind: 'test_failed', run: 'implement', url: `${trace}&span=2` },
             { kind: 'agent', run: 'review', agent: 'codex', verdict: 'changes-requested', url: `${trace}&span=3` },
@@ -128,7 +128,7 @@ describe('the job page links to its trace', () => {
     );
     expect(await screen.findByTestId('job-conversation-link')).toHaveAttribute('href', 'https://ui.honeycomb.io/acme/environments/prod/datasets/updraft/?query=q');
     expect(screen.queryByTestId('job-timeline-link')).not.toBeInTheDocument();
-    const links = screen.getByTestId('job-trace-links');
+    const links = screen.getByTestId('job-timeline');
     expect(links).toHaveTextContent('Implementation · claude-opus');
     expect(links).toHaveTextContent('did not succeed');
     expect(links).toHaveTextContent('went in circles');
@@ -172,5 +172,40 @@ describe('the job page links to its trace', () => {
   it('points to the settings when it was not', async () => {
     showJob(job());
     expect(await screen.findByRole('link', { name: 'Set up agent telemetry' })).toHaveAttribute('href', '/installations/55/telemetry');
+    expect(screen.queryByTestId('job-work')).not.toBeInTheDocument();
+  });
+
+  it('shows what the agents did with no destination at all: totals and moments, no links', async () => {
+    showJob(
+      job({
+        telemetry: {
+          traceId: 'ab'.repeat(16),
+          local: true,
+          totals: { runs: 2, inputTokens: 125_000, outputTokens: 4200, costUsd: 1.234, toolCalls: 41, toolErrors: 3, thrashing: true, durationMs: 600_000 },
+          timeline: [
+            { kind: 'agent', run: 'implement', agent: 'claude-opus', offsetMs: 5000, durationMs: 300_000, thrashing: true },
+            { kind: 'test_failed', run: 'implement', offsetMs: 65_000, durationMs: 4000 },
+          ],
+          spans: 0,
+          exported: 0,
+          failed: 0,
+        },
+      }),
+    );
+    const totals = await screen.findByTestId('job-totals');
+    expect(totals).toHaveTextContent('125k / 4,200');
+    expect(totals).toHaveTextContent('$1.23');
+    expect(totals).toHaveTextContent('41 (3 failed)');
+    const timeline = screen.getByTestId('job-timeline');
+    expect(timeline).toHaveTextContent('+5 s');
+    expect(timeline).toHaveTextContent('Implementation · claude-opus');
+    expect(timeline).toHaveTextContent('5 min');
+    expect(timeline).toHaveTextContent('went in circles');
+    expect(timeline).toHaveTextContent('+1 min 5 s');
+    expect(screen.queryByRole('link', { name: /First failing test run/ })).not.toBeInTheDocument();
+    // Nothing went anywhere: no trace link, no count of spans sent, an offer to set it up.
+    expect(screen.queryByTestId('job-trace-link')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('job-telemetry-count')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Set up agent telemetry' })).toBeInTheDocument();
   });
 });

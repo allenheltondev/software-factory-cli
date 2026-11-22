@@ -242,18 +242,36 @@ export interface JobTelemetry {
   timelineUrl?: string;
   /** That link's words (Honeycomb: "Open in Agent Timeline"). */
   timelineLabel?: string;
-  /** Spans worth opening the trace at. */
-  links?: JobTraceLink[];
+  /** The job's moments, in order, each where it was in the job; with a link to its span when it was sent. */
+  timeline?: JobTimelineEntry[];
+  /** What the job's runs added up to. */
+  totals?: JobTotals;
+  /** Nothing was sent (no destination): the timeline and totals are the runner's own reading. */
+  local?: boolean;
   spans: number;
   exported: number;
   failed: number;
   lastError?: string;
 }
 
-export type JobTraceLinkKind = 'agent' | 'test_failed' | 'test_green' | 'verify_failed' | 'step_failed';
-export interface JobTraceLink {
-  kind: JobTraceLinkKind;
-  url: string;
+export interface JobTotals {
+  runs: number;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd?: number;
+  toolCalls: number;
+  toolErrors: number;
+  thrashing: boolean;
+  durationMs: number;
+}
+
+export type JobTimelineKind = 'agent' | 'test_failed' | 'test_green' | 'verify_failed' | 'step_failed';
+export interface JobTimelineEntry {
+  kind: JobTimelineKind;
+  /** The trace opened at this span, when it was sent and the destination has links. */
+  url?: string;
+  offsetMs?: number;
+  durationMs?: number;
   /** implement, review, revision */
   run?: string;
   agent?: string;

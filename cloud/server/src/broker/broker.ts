@@ -267,7 +267,8 @@ export function createBroker(deps: BrokerDeps) {
       if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
       // How the job's telemetry export went, for the settings page. Best effort, like the key's use.
       const sent = finishDetail(job, detail)?.telemetry;
-      if (sent) {
+      // A job read only for the console (no destination) exported nothing to report.
+      if (sent && !sent.local) {
         await deps.store
           .recordTelemetryExport(job.installationId, { at: new Date(now()).toISOString(), jobId: job.jobId, traceId: sent.traceId, spans: sent.spans, exported: sent.exported, failed: sent.failed, ...(sent.lastError ? { lastError: sent.lastError } : {}) })
           .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not record the telemetry export: ${(err as Error)?.name}` }));

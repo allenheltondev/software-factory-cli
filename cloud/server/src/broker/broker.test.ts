@@ -128,6 +128,16 @@ describe('the job broker', () => {
     expect((await store.getTelemetry(55))?.lastExport).toMatchObject({ jobId: job.jobId, traceId, exported: 38, failed: 2, lastError: 'HTTP 503' });
   });
 
+  it('keeps a local reading of the job for the console, and records no export for it', async () => {
+    await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: false, updatedAt: '', updatedBy: 'pat' }, 0);
+    await handle({ action: 'start', jobId: job.jobId, token });
+    const traceId = 'cd'.repeat(16);
+    const totals = { runs: 1, inputTokens: 10, outputTokens: 5, toolCalls: 2, toolErrors: 0, thrashing: false, durationMs: 9000 };
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { telemetry: { traceId, spans: 12, exported: 0, failed: 0, local: true, totals } } });
+    expect((await store.getJobSummary(55, job.jobId))?.detail?.telemetry).toMatchObject({ traceId, local: true, totals });
+    expect((await store.getTelemetry(55))?.lastExport).toBeUndefined();
+  });
+
   it('refuses a wrong token, an unknown job and malformed input with the same answer', async () => {
     const wrong = await handle({ action: 'start', jobId: job.jobId, token: randomBytes(32).toString('base64url') });
     const unknown = await handle({ action: 'start', jobId: 'job_nobody00', token });

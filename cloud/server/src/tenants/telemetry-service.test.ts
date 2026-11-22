@@ -345,6 +345,16 @@ describe('links to a trace', () => {
     // A run of no issue is its own conversation, named by its job.
     expect(telemetryOf({ traceId, conversationId: 'job_ev9001' })!.conversationId).toBe('job_ev9001');
     expect(telemetryOf({ traceId, marks: Array.from({ length: 50 }, () => ({ kind: 'agent', spanId: span })) })!.marks).toHaveLength(32);
+    // Timing and totals: counts only, anything else dropped.
+    expect(telemetryOf({ traceId, marks: [{ kind: 'agent', spanId: span, offsetMs: 5, durationMs: -1 }] })!.marks).toEqual([{ kind: 'agent', spanId: span, offsetMs: 5 }]);
+    expect(telemetryOf({ traceId, local: 'yes', totals: { runs: 2, inputTokens: 'lots', costUsd: -3, thrashing: 1 } })).toEqual({
+      traceId,
+      spans: 0,
+      exported: 0,
+      failed: 0,
+      totals: { runs: 2, inputTokens: 0, outputTokens: 0, toolCalls: 0, toolErrors: 0, thrashing: false, durationMs: 0 },
+    });
+    expect(telemetryOf({ traceId, local: true })!.local).toBe(true);
   });
 
   it('puts the links and the conversation on a job', () => {
@@ -371,7 +381,7 @@ describe('links to a trace', () => {
       conversationHint: expect.stringContaining('Agent Timeline'),
       timelineUrl: 'https://ui.honeycomb.io/acme/environments/prod/agent-timeline?conversation=acme%2Fweb%2312',
       timelineLabel: 'Open in Agent Timeline',
-      links: [{ kind: 'agent', run: 'implement', agent: 'claude-opus', url: expect.stringContaining(`trace_id=${traceId}&span=${span}&`) }],
+      timeline: [{ kind: 'agent', run: 'implement', agent: 'claude-opus', url: expect.stringContaining(`trace_id=${traceId}&span=${span}&`) }],
       spans: 9,
       exported: 9,
       failed: 0,
@@ -384,7 +394,19 @@ describe('links to a trace', () => {
     // A job of an issue that ran no agent sent its spans in the delivery's conversation: that is the one to link.
     const early: JobSummary = { ...job, detail: { telemetry: { ...job.detail!.telemetry!, conversationId: 'delivery/d-1' } } };
     expect(jobView(early, full, { now }).telemetry?.conversationUrl).toContain(encodeURIComponent('"value":"delivery/d-1"'));
-    // Without settings (or the team's slug), nothing to link to, but the conversation id.
-    expect(jobView(job).telemetry).toEqual({ traceId, conversationId: 'acme/web#12', spans: 9, exported: 9, failed: 0 });
+    // Without settings (or the team's slug), nothing to link to, but the conversation id and the timeline.
+    expect(jobView(job).telemetry).toEqual({ traceId, conversationId: 'acme/web#12', timeline: [{ kind: 'agent', run: 'implement', agent: 'claude-opus' }], spans: 9, exported: 9, failed: 0 });
+    // Sent nowhere (no destination) or nothing got there: the timeline and totals, never a link.
+    const totals = { runs: 1, inputTokens: 1200, outputTokens: 300, costUsd: 0.42, toolCalls: 7, toolErrors: 1, thrashing: false, durationMs: 60_000 };
+    for (const t of [{ local: true as const, exported: 0 }, { exported: 0 }]) {
+      const local: JobSummary = { ...job, detail: { telemetry: { ...job.detail!.telemetry!, ...t, totals, marks: [{ kind: 'agent', spanId: span, offsetMs: 1000, durationMs: 50_000 }] } } };
+      const v = jobView(local, full, { now, timelineTemplate: template }).telemetry!;
+      expect(v).not.toHaveProperty('traceUrl');
+      expect(v).not.toHaveProperty('conversationUrl');
+      expect(v).not.toHaveProperty('timelineUrl');
+      expect(v).not.toHaveProperty('destination');
+      expect(v.timeline).toEqual([{ kind: 'agent', offsetMs: 1000, durationMs: 50_000 }]);
+      expect(v.totals).toEqual(totals);
+    }
   });
 });

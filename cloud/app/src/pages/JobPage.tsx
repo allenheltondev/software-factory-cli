@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router';
 import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, SegmentedControl, Skeleton, StatusBadge } from '@readysetcloud/ui';
-import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog, type JobTraceLink, type JobView } from '../api/client';
+import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog, type JobTimelineEntry, type JobTotals, type JobView } from '../api/client';
 import { DISPOSITION, JOB_RESULT, deliveryReason, formatBytes, formatDuration } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
 import { Lifecycle } from '../components/lifecycle';
@@ -136,7 +136,9 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
         </CardBody>
       </Card>
 
-      <AgentTimeline job={job} installationId={installationId} />
+      <AgentWork job={job} />
+
+      <Traces job={job} installationId={installationId} />
 
       <Conversation job={job} others={conversation} installationId={installationId} />
 
@@ -169,7 +171,7 @@ const RUN_LABEL: Record<string, string> = { implement: 'Implementation', review:
 const runLabel = (run?: string) => (run ? (RUN_LABEL[run] ?? run) : 'Run');
 
 /** What a span link is, in words: "Review · claude-opus", "First failing test run (Revision)", ... */
-export function traceLinkLabel(l: JobTraceLink): { title: string; notes: string[] } {
+export function timelineLabel(l: JobTimelineEntry): { title: string; notes: string[] } {
   const inRun = l.run ? ` (${runLabel(l.run).toLowerCase()})` : '';
   switch (l.kind) {
     case 'agent': {
@@ -190,15 +192,94 @@ export function traceLinkLabel(l: JobTraceLink): { title: string; notes: string[
   }
 }
 
-/** Where to see this job's agents at work: its trace, the spans worth opening it at, and the issue's conversation in the tenant's tracing tool. */
-function AgentTimeline({ job, installationId }: { job: JobView; installationId: number }) {
+const isProblem = (l: JobTimelineEntry) => l.kind === 'test_failed' || l.kind === 'verify_failed' || l.kind === 'step_failed' || Boolean(l.failed) || Boolean(l.thrashing);
+const seconds = (ms: number) => formatDuration(Math.round(ms / 1000));
+const tokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1000)}k` : n.toLocaleString());
+
+/**
+ * What the agents did, read by the runner from their transcripts: totals and the job's moments
+ * in order, on a bar the length of the job. Needs no destination; a moment links to its span when
+ * the trace was sent somewhere that has links.
+ */
+function AgentWork({ job }: { job: JobView }) {
+  const t = job.telemetry;
+  const entries = t?.timeline ?? [];
+  if (!t || (!entries.length && !t.totals)) return null;
+  const total = Math.max(1, t.totals?.durationMs ?? Math.max(...entries.map((e) => (e.offsetMs ?? 0) + (e.durationMs ?? 0)), 1));
+  return (
+    <Card data-testid="job-work">
+      <CardHeader>
+        <CardTitle>What the agents did</CardTitle>
+        <CardDescription>Read from the agents' own transcripts as they worked: each run, the first red and green test runs, and anything that failed.</CardDescription>
+      </CardHeader>
+      <CardBody className="flex flex-col gap-5 text-sm">
+        {t.totals && <Totals totals={t.totals} />}
+        {entries.length > 0 && (
+          <ol className="flex flex-col gap-2" data-testid="job-timeline">
+            {entries.map((l, i) => {
+              const { title, notes } = timelineLabel(l);
+              const problem = isProblem(l);
+              const left = Math.min(((l.offsetMs ?? 0) / total) * 100, 99.25);
+              const width = Math.min(Math.max(0.75, ((l.durationMs ?? 0) / total) * 100), 100 - left);
+              return (
+                <li key={`${l.kind}-${i}`} className="flex flex-col gap-1" data-testid={`job-timeline-${l.kind}`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {l.offsetMs !== undefined && <span className="w-16 shrink-0 font-mono text-xs text-muted-foreground">+{seconds(l.offsetMs)}</span>}
+                    {l.url ? (
+                      <a className="auth-link" href={l.url} target="_blank" rel="noreferrer">
+                        {title} ↗
+                      </a>
+                    ) : (
+                      <span className="font-medium">{title}</span>
+                    )}
+                    {l.durationMs !== undefined && l.kind === 'agent' && <span className="text-muted-foreground">{seconds(l.durationMs)}</span>}
+                    {notes.map((n) => (
+                      <StatusBadge key={n} tone={problem ? 'warning' : 'neutral'}>
+                        {n}
+                      </StatusBadge>
+                    ))}
+                  </div>
+                  {l.offsetMs !== undefined && (
+                    <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted" aria-hidden="true">
+                      <div className={`absolute inset-y-0 rounded-full ${problem ? 'bg-warning-500' : 'bg-primary-500'}`} style={{ left: `${left}%`, width: `${width}%` }} />
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+function Totals({ totals }: { totals: JobTotals }) {
+  return (
+    <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-3 lg:grid-cols-5" data-testid="job-totals">
+      <Fact label="Agent runs">{totals.runs}</Fact>
+      <Fact label="Tokens in / out">
+        {tokens(totals.inputTokens)} / {tokens(totals.outputTokens)}
+      </Fact>
+      <Fact label="Reported cost">{totals.costUsd !== undefined ? `$${totals.costUsd.toFixed(2)}` : '—'}</Fact>
+      <Fact label="Tool calls">
+        {totals.toolCalls}
+        {totals.toolErrors ? ` (${totals.toolErrors} failed)` : ''}
+      </Fact>
+      <Fact label="Went in circles">{totals.thrashing ? 'Yes' : 'No'}</Fact>
+    </dl>
+  );
+}
+
+/** Where the job's trace went: its links in the destination, the conversation, and how the export went. */
+function Traces({ job, installationId }: { job: JobView; installationId: number }) {
   const t = job.telemetry;
   const [copied, setCopied] = useState(false);
-  if (!t) {
+  if (!t || t.local) {
     return (
       <Card data-testid="job-telemetry">
         <CardHeader>
-          <CardTitle>Agent timeline</CardTitle>
+          <CardTitle>Traces</CardTitle>
           <CardDescription>
             Send what the agents did (every model call and tool call, in order) to your tracing tool as OpenTelemetry.{' '}
             <Link className="auth-link" to={`/installations/${installationId}/telemetry`}>
@@ -218,11 +299,10 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
       // No clipboard: the id is on screen.
     }
   };
-  const links = t.links ?? [];
   return (
     <Card data-testid="job-telemetry">
       <CardHeader>
-        <CardTitle>Agent timeline</CardTitle>
+        <CardTitle>Traces</CardTitle>
         <CardDescription>
           This job's agents, as traced{t.destination ? ` in ${t.destination}` : ''}. The issue's conversation holds this job and every review and revision after it.
         </CardDescription>
@@ -235,14 +315,7 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
             </a>
           )}
           {!t.timelineUrl && t.conversationUrl && (
-            <a
-              className="auth-link font-semibold"
-              href={t.conversationUrl}
-              target="_blank"
-              rel="noreferrer"
-              data-testid="job-conversation-link"
-              title="Every span of the conversation, by agent."
-            >
+            <a className="auth-link font-semibold" href={t.conversationUrl} target="_blank" rel="noreferrer" data-testid="job-conversation-link" title="Every span of the conversation, by agent.">
               Open conversation ↗
             </a>
           )}
@@ -261,29 +334,6 @@ function AgentTimeline({ job, installationId }: { job: JobView; installationId: 
           )}
         </div>
         {!t.timelineUrl && t.conversationUrl && t.conversationHint && <p className="text-muted-foreground">{t.conversationHint}</p>}
-        {links.length > 0 && (
-          <div className="flex flex-col gap-2">
-            <h3 className="font-medium">Jump to</h3>
-            <ul className="flex flex-col gap-1.5" data-testid="job-trace-links">
-              {links.map((l, i) => {
-                const { title, notes } = traceLinkLabel(l);
-                const problem = l.kind === 'test_failed' || l.kind === 'verify_failed' || l.kind === 'step_failed' || l.failed || l.thrashing;
-                return (
-                  <li key={`${l.kind}-${i}`} className="flex flex-wrap items-center gap-2" data-testid={`job-trace-link-${l.kind}`}>
-                    <a className="auth-link" href={l.url} target="_blank" rel="noreferrer">
-                      {title} ↗
-                    </a>
-                    {notes.map((n) => (
-                      <StatusBadge key={n} tone={problem ? 'warning' : 'neutral'}>
-                        {n}
-                      </StatusBadge>
-                    ))}
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        )}
         <p className={t.failed > 0 ? 'text-warning-700 dark:text-warning-300' : 'text-muted-foreground'} data-testid="job-telemetry-count">
           {t.exported} of {t.spans} span{t.spans === 1 ? '' : 's'} sent{t.lastError ? ` (last error: ${t.lastError})` : ''} · trace <code>{t.traceId}</code>
         </p>

@@ -68,6 +68,13 @@ function setup({ captureContent = false, keys = [] } = {}) {
   return { dir, runsDir, clock, tracer, exporter, sent, write, step };
 }
 
+/** A mark without where it is in the job (offsetMs, durationMs), to compare the rest. */
+const withoutTiming = (m) => {
+  const out = { ...m };
+  delete out.offsetMs;
+  delete out.durationMs;
+  return out;
+};
 const byName = (spans, name) => spans.filter((s) => s.name === name);
 const one = (spans, name) => {
   const found = byName(spans, name);
@@ -275,7 +282,7 @@ describe('agent telemetry: Codex and the review loop', () => {
     expect(out.spans).toBe(3);
     // The finish names the conversation the spans went in, and links the failed step.
     expect(out.conversationId).toBe('delivery/d-9');
-    expect(out.marks).toEqual([{ kind: 'step_failed', spanId: one(spans, 'runner restore_state').spanId, step: 'runner_restore_state' }]);
+    expect(out.marks.map(withoutTiming)).toEqual([{ kind: 'step_failed', spanId: one(spans, 'runner restore_state').spanId, step: 'runner_restore_state' }]);
   });
 
   it('sends nothing for a job that ran no agent', async () => {
@@ -571,7 +578,7 @@ describe('agent telemetry: spans worth a link', () => {
     const tests = byName(spans, 'execute_tool Bash');
     const verify = byName(spans, 'execute_tool verify');
     expect(out.conversationId).toBe('octo/widgets#7');
-    expect(out.marks).toEqual([
+    expect(out.marks.map(withoutTiming)).toEqual([
       // The same npm test four times with no edit between: it thrashed, too.
       { kind: 'agent', spanId: agentSpanIdFor('run_1'), run: 'implement', agent: 'claude-opus', failed: true, thrashing: true },
       { kind: 'test_failed', spanId: tests[0].spanId, run: 'implement' },
@@ -580,6 +587,14 @@ describe('agent telemetry: spans worth a link', () => {
     ]);
     // Every mark names a span that was sent.
     for (const m of out.marks) expect(spans.some((s) => s.spanId === m.spanId), m.kind).toBe(true);
+    // Each is placed in the job: from its start, for how long, as the span was.
+    const root = one(spans, 'invoke_workflow updraft');
+    for (const m of out.marks) {
+      const span = spans.find((s) => s.spanId === m.spanId);
+      expect(m.offsetMs, m.kind).toBe(span.start - root.start);
+      expect(m.durationMs, m.kind).toBe(span.end - span.start);
+    }
+    expect(out.totals).toMatchObject({ runs: 1, toolCalls: 4, toolErrors: 2, thrashing: true, durationMs: root.end - root.start });
   });
 
   it('marks the first passing test run only on evidence that tests ran and passed', async () => {
@@ -608,7 +623,7 @@ describe('agent telemetry: spans worth a link', () => {
     const out = await tracer.stop({ outcome: 'failed', steps: [{ name: 'restore_state', start: at, end: at + 1, error: 'unreadable' }] });
     expect(out).toMatchObject({ exported: 0, conversationId: 'octo/widgets#7' });
     expect(out.failed).toBeGreaterThan(0);
-    expect(out.marks).toEqual([]);
+    expect(out.marks.map(withoutTiming)).toEqual([]);
   });
 
   it("marks a review's verdict, a run that thrashed, and a failed runner step", async () => {
@@ -624,7 +639,7 @@ describe('agent telemetry: spans worth a link', () => {
     await t.step('run_2', '---- end of agent output ----\noutcome: failed\n', 0);
     const at = t.clock.t;
     const out = await t.tracer.stop({ outcome: 'failed', steps: [{ name: 'state_wait', start: at, end: at + 10, error: 'timeout' }] });
-    expect(out.marks).toEqual([
+    expect(out.marks.map(withoutTiming)).toEqual([
       { kind: 'agent', spanId: agentSpanIdFor('run_1'), run: 'review', agent: 'claude-opus', verdict: 'changes-requested' },
       { kind: 'agent', spanId: agentSpanIdFor('run_2'), run: 'revision', agent: 'claude-opus', failed: true, thrashing: true },
       { kind: 'step_failed', spanId: one(t.exporter.spans, 'runner state_wait').spanId, step: 'runner_state_wait' },
