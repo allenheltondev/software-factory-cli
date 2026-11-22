@@ -78,6 +78,7 @@ RUN set -eu; . /opt/updraft/build.env; \
 # /usr/local/lib/kiro so nothing lands in root's and everything sits under /usr, the one tree the
 # job sandbox mounts (updraft-sandbox). Its binaries are linked into /usr/local/bin, and the build
 # fails unless kiro-cli runs and resolves to a file under /usr.
+COPY install-kiro-rpm.sh /opt/updraft/install-kiro-rpm.sh
 RUN set -eu; . /opt/updraft/build.env; \
     if [ -n "${KIRO_INSTALL_COMMAND:-}" ]; then \
       KH=/usr/local/lib/kiro; mkdir -p "$KH"; \

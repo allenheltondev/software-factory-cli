@@ -8,8 +8,10 @@ import type { ZipEntry } from './zip.js';
 export const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 export const IMAGE_DIR = join(repoRoot, 'deploy', 'aws-microvm', 'image');
 
-/** What the hosted image adds to image/build.env: both agents a tenant may enable. */
-export const CLOUD_BUILD_ENV = 'AGENT_PACKAGES="@anthropic-ai/claude-code @openai/codex"\n';
+/** Hosted ARM64 builds package Kiro alongside Claude and Codex. */
+export const CLOUD_BUILD_ENV = `AGENT_PACKAGES="@anthropic-ai/claude-code @openai/codex"
+KIRO_INSTALL_COMMAND="sh /opt/updraft/install-kiro-rpm.sh"
+`;
 
 /**
  * Text as the repository stores it (LF): a Windows checkout has CRLF, and the build sources
