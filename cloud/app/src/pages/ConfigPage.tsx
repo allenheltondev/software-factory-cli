@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router';
+import { AGENT_GUIDES, type AgentGuide } from '../lib/agentGuides';
 import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Input, Modal, Select, Skeleton, StatusBadge, TextArea } from '@readysetcloud/ui';
 import {
   api as defaultApi,
@@ -111,6 +112,8 @@ function AgentFields({
   path,
   title,
   offered,
+  installationId,
+  reviewer,
 }: {
   agent: ConsoleAgent;
   onChange: (a: ConsoleAgent) => void;
@@ -118,7 +121,11 @@ function AgentFields({
   path: string;
   title: string;
   offered: AgentAdapter[];
+  installationId: number;
+  reviewer?: { differs: boolean };
 }) {
+  // No setup help for an agent the deployment no longer offers: a saved selection stays visible, but its key cannot be added here.
+  const guide: AgentGuide | undefined = offered.includes(agent.adapter) ? AGENT_GUIDES[agent.adapter] : undefined;
   // The deployment's agents, and the one already chosen if it is not among them (published before).
   const choices = AGENTS.filter((a) => offered.includes(a.value) || a.value === agent.adapter);
   return (
@@ -145,6 +152,26 @@ function AgentFields({
         error={issuesAt(issues, `${path}.effort`)}
         onChange={(e) => onChange({ ...agent, effort: e.target.value || undefined })}
       />
+      {guide && (
+        <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm sm:col-span-3" data-testid={`agent-help-${path}`}>
+          <span>
+            {guide.credential} · {guide.billing}
+          </span>
+          <a className="auth-link" href={`/installations/${installationId}/keys`} target="_blank" rel="noreferrer">
+            Agent keys ↗
+          </a>
+          <a className="auth-link" href={guide.getKeyUrl} target="_blank" rel="noreferrer">
+            Get API key ↗
+          </a>
+          {guide.guides.map((g) => (
+            <a key={g.href} className="auth-link" href={g.href} target="_blank" rel="noreferrer">
+              {g.label} ↗
+            </a>
+          ))}
+          {reviewer?.differs && <span className="w-full text-muted-foreground">Different provider than the agent: needs its own key when review is on.</span>}
+          {guide.note && <span className="w-full text-muted-foreground">{guide.note}</span>}
+        </p>
+      )}
     </div>
   );
 }
@@ -198,6 +225,29 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
     setConfirmed(new Set());
     setGeneration((g) => g + 1);
   }, []);
+
+  // Back from adding a key in another tab: refresh which keys are set, and leave the draft alone.
+  useEffect(() => {
+    if (!valid) return;
+    let live = true;
+    let latest = 0;
+    const refresh = () => {
+      if (document.visibilityState !== 'visible') return;
+      // Only the newest request may write: a slower, older answer must not undo a newer one.
+      const mine = ++latest;
+      api.config(installationId).then(
+        (fresh) => live && mine === latest && setLoad((prev) => (prev.state === 'ok' ? { state: 'ok', view: { ...prev.view, agentKeys: fresh.agentKeys } } : prev)),
+        () => undefined,
+      );
+    };
+    document.addEventListener('visibilitychange', refresh);
+    window.addEventListener('focus', refresh);
+    return () => {
+      live = false;
+      document.removeEventListener('visibilitychange', refresh);
+      window.removeEventListener('focus', refresh);
+    };
+  }, [api, installationId, valid]);
 
   useEffect(() => {
     let live = true;
@@ -633,7 +683,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                       Remove
                     </Button>
                   </div>
-                  <AgentFields title="Agent" agent={w.agent} path={`${path}.agent`} issues={errors} offered={view.agents ?? DEFAULT_OFFERED} onChange={(agent) => updateWorkflow(name, { agent })} />
+                  <AgentFields title="Agent" installationId={installationId} agent={w.agent} path={`${path}.agent`} issues={errors} offered={view.agents ?? DEFAULT_OFFERED} onChange={(agent) => updateWorkflow(name, { agent })} />
                   <PromptField
                     label="Prompt"
                     value={w.prompt}
@@ -682,6 +732,8 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                     <div className="mt-4 flex flex-col gap-4">
                       <AgentFields
                         title="Reviewer"
+                        installationId={installationId}
+                        reviewer={{ differs: w.reviewer.adapter !== w.agent.adapter }}
                         agent={w.reviewer}
                         offered={view.agents ?? DEFAULT_OFFERED}
                         path={`${path}.reviewer`}

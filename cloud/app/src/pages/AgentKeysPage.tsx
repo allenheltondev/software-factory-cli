@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router';
 import { Alert, Button, Card, CardBody, CardHeader, CardTitle, PasswordInput, Skeleton, StatusBadge } from '@readysetcloud/ui';
 import { api as defaultApi, type AgentKeysView, type AgentKeyView, type ApiClient } from '../api/client';
 import { relativeTime } from '../lib/time';
+import { AGENT_GUIDES, type AgentGuide } from '../lib/agentGuides';
 
 type Load = { state: 'loading' } | { state: 'ok'; view: AgentKeysView } | { state: 'error'; message: string };
 type Api = Pick<ApiClient, 'agentKeys' | 'setAgentKey'>;
@@ -12,6 +13,7 @@ export interface Provider {
   company: string;
   placeholder: string;
   getKeyUrl: string;
+  guide?: AgentGuide;
   /** How to get a key, step by step; the last step is always pasting it here. */
   steps: ReactNode[];
   /** The provider can be asked whether a key works before it is saved. Kiro cannot: its first job tells. */
@@ -31,9 +33,10 @@ export const PROVIDERS: Record<string, Provider> = {
     agent: 'Claude',
     company: 'Anthropic',
     placeholder: 'sk-ant-…',
-    getKeyUrl: 'https://console.anthropic.com/settings/keys',
+    getKeyUrl: AGENT_GUIDES.claude.getKeyUrl,
+    guide: AGENT_GUIDES.claude,
     steps: [
-      <>Open {external('https://console.anthropic.com/settings/keys', 'API keys in the Anthropic Console')}.</>,
+      <>Open {external('https://platform.claude.com/settings/keys', 'API keys in the Claude Console')}.</>,
       <>
         Choose <strong>Create key</strong>, name it <strong>Updraft</strong>, and copy it.
       </>,
@@ -45,7 +48,8 @@ export const PROVIDERS: Record<string, Provider> = {
     agent: 'Codex',
     company: 'OpenAI',
     placeholder: 'sk-…',
-    getKeyUrl: 'https://platform.openai.com/api-keys',
+    getKeyUrl: AGENT_GUIDES.codex.getKeyUrl,
+    guide: AGENT_GUIDES.codex,
     steps: [
       <>Open {external('https://platform.openai.com/api-keys', 'API keys on the OpenAI platform')}.</>,
       <>
@@ -59,7 +63,8 @@ export const PROVIDERS: Record<string, Provider> = {
     agent: 'Kiro',
     company: 'Kiro',
     placeholder: 'Your Kiro API key',
-    getKeyUrl: 'https://kiro.dev/docs/cli/headless/',
+    getKeyUrl: AGENT_GUIDES.kiro.getKeyUrl,
+    guide: AGENT_GUIDES.kiro,
     steps: [
       <>
         Sign in to Kiro, open <strong>Account</strong>, then <strong>API keys</strong> ({external('https://kiro.dev/docs/cli/headless/', 'how')}). API keys need a Kiro Pro plan or
@@ -247,6 +252,18 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
       </CardHeader>
       <CardBody>
         <div className="flex flex-col gap-4">
+          {provider.guide && (
+            <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm" data-testid={`key-guide-${k.name}`}>
+              <a className="auth-link" href={provider.guide.getKeyUrl} target="_blank" rel="noreferrer">
+                Get API key ↗
+              </a>
+              {provider.guide.guides.map((g, i) => (
+                <a key={g.href} className="auth-link" href={g.href} target="_blank" rel="noreferrer">
+                  {i === 0 ? 'Setup guide' : g.label} ↗
+                </a>
+              ))}
+            </p>
+          )}
           {k.configured && (
             <div className="flex flex-col gap-1 text-sm">
               <p>
