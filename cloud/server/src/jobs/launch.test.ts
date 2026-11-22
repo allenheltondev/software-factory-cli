@@ -763,6 +763,14 @@ describe('the launcher', () => {
         expect(await store.getJob(review.jobId!)).toMatchObject({ label: 'implement', agentKeys: ['ANTHROPIC_API_KEY'] });
       });
 
+      it("checks the active version's keys, not the opening job's, once the workflow was republished", async () => {
+        // #52 was opened under version 1 by a workflow that ran Kiro; `updraft` runs Claude now.
+        await opened('updraft', 12, 52, ['KIRO_API_KEY']);
+        const result = await createLauncher(deps)(onIssue(12));
+        expect(result.disposition).toBe('launched');
+        expect(await store.getJob(result.jobId!)).toMatchObject({ agentKeys: ['ANTHROPIC_API_KEY'] });
+      });
+
       it("keeps the workflow across the loop's own jobs: the next event of the pull request finds it on the last one", async () => {
         await opened('updraft', 12, 52);
         const launch = createLauncher({ ...deps, now: () => NOW - 60_000 });
