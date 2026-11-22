@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideDispatch, decidePullRequestDispatch, dispatchRules, issueOfBranch } from './dispatch.js';
+import { decideDispatch, decidePullRequestDispatch, dispatchRules } from './dispatch.js';
 
 const compiled = {
   dispatch: { allowedActors: ['Pat', 'sam'] },
@@ -86,13 +86,6 @@ describe('decidePullRequestDispatch', () => {
     expect(code({ eventName: 'pull_request', action: 'synchronize', reviewState: undefined })).toBe('start');
     // A close ends the loop, whoever closes it.
     expect(code({ eventName: 'pull_request', action: 'closed', sender: 'someone-else', reviewState: undefined })).toBe('start');
-  });
-
-  it('reads the issue an Updraft branch was cut for', () => {
-    expect(issueOfBranch('updraft/issue-12-job_abc')).toBe(12);
-    expect(issueOfBranch('updraft/issue-12-job_abc-2')).toBe(12);
-    expect(issueOfBranch('updraft/other')).toBeNull();
-    expect(issueOfBranch(undefined)).toBeNull();
   });
 
   it('starts nothing for what leads to no work', () => {

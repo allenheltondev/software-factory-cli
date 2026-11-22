@@ -718,25 +718,53 @@ describe('the launcher', () => {
         await store.activateConfig(55, v as number);
       });
       const onIssue = (issue: number, over: Record<string, unknown> = {}, deliveryId = `pr-of-${issue}`) => prEvent({ pull_request: { number: 40 + issue, head: { ref: `updraft/issue-${issue}-job_abc` } }, ...over }, deliveryId);
+      // A finished issue job of `label` that opened pull request `pr`.
+      let n = 0;
+      const opened = async (label: string, issue: number, pr: number) => {
+        const jobId = `job_opened${String(++n).padStart(4, '0')}`;
+        await store.putJob({ jobId, tokenHash: 'x', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: `d-${jobId}`, eventName: 'issues', status: 'launched', createdAt: new Date(NOW + n).toISOString(), expiresAt: NOW + 3_600_000, label, issue });
+        await store.finishJob(jobId, 'succeeded', { at: NOW + n, detail: { prNumber: pr, prUrl: `https://github.com/acme/web/pull/${pr}` } });
+      };
 
       it("checks only that workflow's keys: a Codex workflow without its key does not hold up a Claude pull request", async () => {
-        const launch = createLauncher(deps);
-        expect((await launch(request())).disposition).toBe('launched'); // issue 12, label updraft (Claude)
-        const result = await launch(onIssue(12));
+        await opened('updraft', 12, 52);
+        const result = await createLauncher(deps)(onIssue(12));
         expect(result.disposition).toBe('launched');
         expect(await store.getJob(result.jobId!)).toMatchObject({ label: 'updraft', agentKeys: ['ANTHROPIC_API_KEY'], pullRequest: 52 });
       });
 
-      it("refuses an event of a Codex pull request while the Codex key is not set, naming the pull request", async () => {
-        // Issue 20's job ran the Codex workflow (its key was set then).
-        await store.putJob({ jobId: 'job_codexissue1', tokenHash: 'x', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: 'codex-issue', eventName: 'issues', status: 'finished', createdAt: new Date(NOW).toISOString(), expiresAt: NOW, label: 'codex', issue: 20 });
-        expect(await createLauncher(deps)(onIssue(20))).toMatchObject({ disposition: 'missing_key', message: 'CODEX_API_KEY is not set: add it under Agent keys' });
-        expect((await store.listRefusals(55, 5))[0]).toMatchObject({ issue: 60 });
+      it('matches the pull request itself, not its issue: one issue, two pull requests from two workflows', async () => {
+        // Issue 12 opened #52 with Claude, and later #53 with Codex: a review of #52 is Claude's.
+        await opened('updraft', 12, 52);
+        await opened('codex', 12, 53);
+        const launch = createLauncher(deps);
+        expect((await launch(onIssue(12))).disposition).toBe('launched');
+        expect(await launch(prEvent({ pull_request: { number: 53, head: { ref: 'updraft/issue-12-job_def' } } }, 'pr-53'))).toMatchObject({ disposition: 'missing_key', message: 'CODEX_API_KEY is not set: add it under Agent keys' });
+        expect((await store.listRefusals(55, 5))[0]).toMatchObject({ issue: 53 });
       });
 
-      it('needs no key to close, and leaves the keys to the job when the issue job is no longer kept', async () => {
+      it("keeps the workflow across the loop's own jobs: the next event of the pull request finds it on the last one", async () => {
+        await opened('updraft', 12, 52);
+        const launch = createLauncher({ ...deps, now: () => NOW - 60_000 });
+        const first = await launch(onIssue(12));
+        expect((await store.getJob(first.jobId!))?.label).toBe('updraft');
+        // The issue job's record is gone; the loop job still names the workflow.
+        const fresh = createMemoryStore();
+        await fresh.putTenantWithMember(tenant(), { installationId: 55, sub: 's', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
+        const active = (await store.getConfigVersion(55, (await store.getTenant(55))!.activeConfigVersion!))!;
+        const v = (await fresh.createConfigVersion(55, { sha256: 'k', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: active.dispatch! })) as number;
+        await fresh.markConfigReady(55, v);
+        await fresh.activateConfig(55, v);
+        await fresh.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+        await fresh.putJob((await store.getJob(first.jobId!))!);
+        const next = await createLauncher({ ...deps, store: fresh })(onIssue(12, {}, 'pr-again'));
+        expect(await fresh.getJob(next.jobId!)).toMatchObject({ label: 'updraft', agentKeys: ['ANTHROPIC_API_KEY'] });
+      });
+
+      it('needs no key to close, and leaves the keys to the job when no kept job opened the pull request', async () => {
         const launch = createLauncher(deps);
-        // Issue 30's job is not on record: nothing names its workflow, so no key holds it up.
+        // Only the issue is on record, not which pull request it opened: nothing names the workflow.
+        await store.putJob({ jobId: 'job_noprrecord', tokenHash: 'x', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: 'd-np', eventName: 'issues', status: 'launched', createdAt: new Date(NOW).toISOString(), expiresAt: NOW + 3_600_000, label: 'codex', issue: 30 });
         const unknown = await launch(onIssue(30));
         expect(unknown.disposition).toBe('launched');
         expect((await store.getJob(unknown.jobId!))?.agentKeys).toBeUndefined();

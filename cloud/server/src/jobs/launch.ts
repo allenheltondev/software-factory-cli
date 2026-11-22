@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import type { Job, Quotas, Store } from '../store/store.js';
-import { decideDispatch, decidePullRequestDispatch, issueOfBranch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
+import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
@@ -66,7 +66,7 @@ export const pullRequestLease = (repositoryId: number, number: number) => `pr-${
 export const COALESCE_CONFIRM_MS = 8 * 1000;
 const COALESCE_POLL_MS = 500;
 
-/** How many of the tenant's latest jobs are searched for the issue job that started a pull request. */
+/** How many of the tenant's latest jobs are searched for the job that opened a pull request. */
 const ORIGIN_LOOKUP_JOBS = 500;
 
 /** The Lambda-provided connectors: no inbound traffic, internet egress. */
@@ -240,22 +240,24 @@ export function createLauncher(deps: LaunchDeps) {
         log({ delivery: req.deliveryId, installationId: req.installationId, ignored: d.reason });
         return skip('not_dispatched', { reason: d.code, message: d.reason });
       }
-      // The workflow that started the pull request: the label of its issue's job (the branch is
-      // `updraft/issue-<n>-...`), while that job is kept. Its keys are the ones checked. A close runs
-      // no agent and needs none; a pull request whose origin is no longer known is checked by the
-      // job itself (run-event fails without the key, and says so on the job).
+      // The workflow that started the pull request: the label of the job that opened it (its finish
+      // recorded this pull request), or of an earlier job of this pull request's loop (which carries
+      // that label on), while one is kept. Only an exact match: one issue can have several pull
+      // requests, from different workflows. Its keys are the ones checked. A close runs no agent and
+      // needs none; a pull request whose origin is not known here is checked by the job itself
+      // (run-event fails without the key, and says so on the job).
       let keys: string[] | null = [];
       let label: string | undefined;
-      const issue = d.closing ? null : issueOfBranch(req.payload.pull_request?.head?.ref);
-      if (issue !== null) {
+      if (!d.closing) {
         const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS).catch(() => []);
-        const origin = recent.find((j) => j.repository.toLowerCase() === d.repository.toLowerCase() && j.issue === issue && typeof j.label === 'string');
+        const sameRepo = (j: { repository: string }) => j.repository.toLowerCase() === d.repository.toLowerCase();
+        const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
         if (origin?.label) {
           label = origin.label;
           const lower = origin.label.toLowerCase();
           keys = Object.hasOwn(d.keysByLabel, lower) ? d.keysByLabel[lower]! : [];
         } else {
-          log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job of issue #${issue} names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
+          log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
         }
       }
       decision = { repository: d.repository, repositoryId: d.repositoryId, keys, pullRequest: d.pullRequest, ...(label ? { label } : {}) };

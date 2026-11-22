@@ -130,11 +130,6 @@ export type PullRequestDecision =
     }
   | { start: false; reason: string; code: PullRequestRefusalCode };
 
-/** The issue an Updraft job branch was cut for: `updraft/issue-<n>-<job id>`. */
-export function issueOfBranch(branch: unknown): number | null {
-  const m = typeof branch === 'string' ? /^updraft\/issue-(\d{1,9})-/.exec(branch) : null;
-  return m ? Number(m[1]) : null;
-}
 
 /**
  * Whether a pull request delivery starts a job under these rules: the repository (name and id),
@@ -190,7 +185,7 @@ export function decidePullRequestDispatch(
     if (!actors.has(sender)) return { start: false, reason: 'the sender may not dispatch work', code: 'actor_not_allowed' };
   }
   // The event names no label: the keys are those of the workflow that started the pull request,
-  // which the launcher finds from the branch's issue. Never every workflow's: a Codex workflow
+  // which the launcher finds from the job that opened it. Never every workflow's: a Codex workflow
   // without its key must not hold up a Claude workflow's pull request.
   const keysByLabel: Record<string, string[] | null> = {};
   for (const t of repo.triggers) {
