@@ -1308,13 +1308,21 @@ apart, and a job does not start unless that has been shown in the same microVM.
   verify command gets none of the agent's variables. Each agent gets its own key, not the
   other agents'.
 - *A packet filter for the execution role.* Before anything of the job exists, the runner
-  installs an nftables table that rejects traffic from every user but root to the instance
+  installs nftables tables that drop traffic from every user but root to the instance
   metadata service (`169.254.169.254`, `fd00:ec2::254`), to the container-credential
   addresses (`169.254.170.2`, `169.254.170.23`, `fd00:ec2::23`), to any credential address
   the runner's own environment names, and to the lifecycle hook port on loopback. The match
   is on the socket owner's real uid, so it holds inside the sandbox's user namespace too.
   The runner's own SDK calls run as root and are not affected. `run-event` needs no AWS
   credentials.
+
+  There is one table per address family (`ip`, `ip6`), and the rules drop rather than
+  reject. A MicroVM's kernel has the `ip` family but not `inet` or `ip6`, and it has no
+  reject module. The `ip` table is required. Where the kernel has no `ip6` family, IPv6 is
+  not filtered, and the result says so (`isolation.checks.packetFilter.ipv6`). The
+  self-test below still has to show that no IPv6 credential address answers the job user.
+  In a MicroVM none answered, not even root. A connection the filter drops gets no answer
+  and times out.
 - *A check before every job.* After the state directory is filled and before `run-event`
   starts, the runner checks four things and starts nothing if any of them fails:
   1. it asks `updraft validate --json` (as the job user) what the config means, and refuses
@@ -1726,13 +1734,22 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
 43. **The packet filter in a MicroVM.** Seen: the guest kernel (6.1, `amzn2023.aarch64.microvm`)
     has nf_tables, `nftables` v1.0.4 installs under that name, and root may load nothing
     without `additionalOsCapabilities: ["ALL"]` (no `CAP_NET_ADMIN`; see [Lifecycle hooks](#lifecycle-hooks-image-and-runner)).
-    Assumed: that `ALL` grants `CAP_NET_ADMIN` (the API's documentation says only "additional
-    OS capabilities"), and that the kernel has the `inet` family, the output hook,
-    `meta skuid` and `reject`. The runner reads the table back after
-    installing it. The self-test checks from inside and outside the sandbox that the
-    credential addresses do not answer the job user. On a test host an address that answers
-    is caught (a local listener stood in for it); the rule itself has not been loaded
-    anywhere.
+    Seen in a MicroVM built with `ALL` (2026-11-22):
+    - **Capabilities:** `CapEff` is `000001ffffffffff`, so `CAP_NET_ADMIN` is there.
+    - **Supported:** the `ip` family, the output hook, `meta skuid`, `counter` and `drop`.
+    - **Not supported:** `inet` and `ip6` ("Operation not supported"), and every form of
+      `reject` ("No such file or directory").
+    - **IPv6 addresses:** `eth0` has a global IPv6 address, but neither `fd00:ec2::254` nor
+      `fd00:ec2::23` answered, even root.
+    - **The rules work:** with the `ip` table in place, the job user's connection to
+      `169.254.169.254:80` and to the hook port got no answer, while root's still did.
+    - **Don't turn IPv6 off:** writing `1` to `net.ipv6.conf.all.disable_ipv6` cut the
+      microVM's shell connection (`SHELL_INGRESS`). The filter doesn't do that.
+
+    Not known: whether a later kernel adds `ip6`. If it does, the runner installs that
+    table too. The runner reads each table back after installing it, and the self-test
+    checks from inside and outside the sandbox that the credential addresses don't answer
+    the job user.
 44. **Where a MicroVM's credentials come from.** The MicroVMs documentation names IAM
     credentials through IMDSv2 and no other address. The filter also blocks the ECS and EKS
     container-credential addresses and whatever `AWS_CONTAINER_CREDENTIALS_FULL_URI`,

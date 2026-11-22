@@ -112,35 +112,51 @@ export function credentialEndpoints(env = {}) {
 
 const TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,60}$/;
 
-/** One nftables rule per endpoint, and one for the hook port: reject for every uid but 0. */
-export function filterRules({ endpoints, hookPort }) {
-  const rules = endpoints.map((e) => ({
-    what: `${e.address}${e.port === undefined ? '' : ` port ${e.port}`}`,
-    // What `nft list` must show for the rule to count as present.
-    match: ['skuid != 0', `${e.family === 4 ? 'ip' : 'ip6'} daddr ${e.address}`, ...(e.port === undefined ? [] : [`dport ${e.port}`]), 'reject'],
-    text: `meta skuid != 0 ${e.family === 4 ? 'ip' : 'ip6'} daddr ${e.address}${e.port === undefined ? '' : ` tcp dport ${e.port}`} counter reject with icmpx type admin-prohibited`,
-  }));
+// What a Lambda MicroVM's kernel has (seen 2026-11-22, 6.1 amzn2023 aarch64 microvm): the `ip`
+// family, `meta skuid`, `counter` and `drop`. Not `inet` or `ip6` ("Operation not supported"),
+// and no reject module ("No such file or directory"). So the filter is one table per address
+// family, the IPv4 one required, and the rules drop: a connection from the job user to a
+// credential address gets no answer and times out. Where the kernel has no `ip6` family, IPv6
+// is not filtered, and the self-test must show that no IPv6 credential address answers.
+const FAMILIES = { 4: 'ip', 6: 'ip6' };
+
+/**
+ * One nftables rule per endpoint of the family, and one for the hook port on loopback: drop
+ * for every uid but 0. `family` is 4 (the `ip` table) or 6 (`ip6`).
+ */
+export function filterRules({ endpoints, hookPort, family = 4 }) {
+  const keyword = FAMILIES[family];
+  if (!keyword) throw new Error('the address family is not 4 or 6');
+  const rules = endpoints
+    .filter((e) => e.family === family)
+    .map((e) => ({
+      what: `${e.address}${e.port === undefined ? '' : ` port ${e.port}`}`,
+      // What `nft list` must show for the rule to count as present.
+      match: ['skuid != 0', `${keyword} daddr ${e.address}`, ...(e.port === undefined ? [] : [`dport ${e.port}`]), 'drop'],
+      text: `meta skuid != 0 ${keyword} daddr ${e.address}${e.port === undefined ? '' : ` tcp dport ${e.port}`} counter drop`,
+    }));
   if (hookPort !== undefined) {
     if (!Number.isInteger(hookPort) || hookPort < 1 || hookPort > 65535) throw new Error('the hook port is not a port number');
     // The lifecycle hooks are Lambda's to call (from outside); a local process that is not
     // root has no business there. /terminate would let a job stop itself.
     rules.push({
       what: `local port ${hookPort} (lifecycle hooks)`,
-      match: ['skuid != 0', 'oifname "lo"', `dport ${hookPort}`, 'reject'],
-      text: `meta skuid != 0 oifname "lo" tcp dport ${hookPort} counter reject with tcp reset`,
+      match: ['skuid != 0', 'oifname "lo"', `dport ${hookPort}`, 'drop'],
+      text: `meta skuid != 0 oifname "lo" tcp dport ${hookPort} counter drop`,
     });
   }
   return rules;
 }
 
-/** The whole table as one `nft -f` script: created, emptied and filled in one transaction. */
-export function filterRuleset({ table, endpoints, hookPort }) {
+/** One family's table as one `nft -f` script: created, emptied and filled in one transaction. */
+export function filterRuleset({ table, endpoints, hookPort, family = 4 }) {
   if (!TABLE_NAME.test(table)) throw new Error('the nftables table name is not usable');
-  const rules = filterRules({ endpoints, hookPort });
+  const rules = filterRules({ endpoints, hookPort, family });
+  const keyword = FAMILIES[family];
   return [
-    `table inet ${table}`,
-    `delete table inet ${table}`,
-    `table inet ${table} {`,
+    `table ${keyword} ${table}`,
+    `delete table ${keyword} ${table}`,
+    `table ${keyword} ${table} {`,
     '  chain output {',
     '    type filter hook output priority 0; policy accept;',
     ...rules.map((rule) => `    ${rule.text}`),
@@ -150,15 +166,22 @@ export function filterRuleset({ table, endpoints, hookPort }) {
   ].join('\n');
 }
 
-/** Which of the rules `nft list table` output does not show. Pure. */
-export function missingRules(listing, { endpoints, hookPort }) {
+/** Which of one family's rules `nft list table` output does not show. Pure. */
+export function missingRules(listing, { endpoints, hookPort, family = 4 }) {
   const text = String(listing);
-  if (!/hook output/.test(text)) return ['the table has no chain on the output hook'];
+  if (!/hook output/.test(text)) return [`the ${FAMILIES[family] ?? '?'} table has no chain on the output hook`];
   const lines = text.split('\n');
-  return filterRules({ endpoints, hookPort })
+  return filterRules({ endpoints, hookPort, family })
     .filter((rule) => !lines.some((line) => rule.match.every((part) => line.includes(part))))
-    .map((rule) => `no rule rejects non-root traffic to ${rule.what}`);
+    .map((rule) => `no rule drops non-root traffic to ${rule.what}`);
 }
+
+/** nft's answer when the kernel has no such family (or feature). */
+const NOT_SUPPORTED = /Operation not supported/;
+
+/** Said in the report when the kernel has no ip6 family (a Lambda MicroVM's does not). */
+export const IPV6_NOT_FILTERED =
+  'not filtered: this kernel has no ip6 nftables family; the self-test checks that no IPv6 credential address answers the job user';
 
 const CAP_NET_ADMIN = 12n;
 
@@ -203,35 +226,60 @@ export function createNftFilter({ endpoints, hookPort, table = 'updraft_isolatio
       return undefined;
     }
   };
+  // From a file only this user can read: nft does not take a script from a pipe it was handed
+  // as standard input by another program.
+  const load = (family) => {
+    let dir;
+    try {
+      dir = mkdtempSync(path.join(tmpdir(), 'updraft-nft-'));
+      const file = path.join(dir, `ruleset-${FAMILIES[family]}.nft`);
+      writeFileSync(file, filterRuleset({ table, endpoints, hookPort, family }), { mode: 0o600 });
+      return run(['-f', file]);
+    } catch (error) {
+      return { ok: false, problem: error?.message ?? String(error) };
+    } finally {
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  // Whether the ip6 table is in place: unknown until install, false where the kernel has none.
+  let ipv6 = { filtered: undefined, note: null };
   return {
     install() {
-      // From a file only this user can read: nft does not take a script from a pipe it was
-      // handed as standard input by another program.
-      let dir;
-      try {
-        dir = mkdtempSync(path.join(tmpdir(), 'updraft-nft-'));
-        const file = path.join(dir, 'ruleset.nft');
-        writeFileSync(file, filterRuleset({ table, endpoints, hookPort }), { mode: 0o600 });
-        const done = run(['-f', file]);
-        if (done.ok) return { ok: true };
+      const v4 = load(4);
+      if (!v4.ok) {
         const why = capabilityProblem();
-        return { ok: false, problem: `the packet filter could not be installed: ${done.problem}${why ? ` (${why})` : ''}` };
-      } catch (error) {
-        return { ok: false, problem: `the packet filter could not be installed: ${error?.message ?? error}` };
-      } finally {
-        if (dir) rmSync(dir, { recursive: true, force: true });
+        return { ok: false, problem: `the packet filter could not be installed: ${v4.problem}${why ? ` (${why})` : ''}` };
       }
+      const v6 = load(6);
+      if (v6.ok) {
+        ipv6 = { filtered: true, note: null };
+      } else if (NOT_SUPPORTED.test(v6.problem)) {
+        ipv6 = { filtered: false, note: IPV6_NOT_FILTERED };
+      } else {
+        return { ok: false, problem: `the IPv6 packet filter could not be installed: ${v6.problem}` };
+      }
+      return { ok: true };
     },
     check() {
-      const listed = run(['list', 'table', 'inet', table]);
-      if (!listed.ok) return { ok: false, problems: [`the packet filter table is not there: ${listed.problem}`] };
-      const problems = missingRules(listed.stdout, { endpoints, hookPort });
+      const problems = [];
+      const families = ipv6.filtered === false ? [4] : [4, 6];
+      for (const family of families) {
+        const listed = run(['list', 'table', FAMILIES[family], table]);
+        if (!listed.ok) problems.push(`the packet filter's ${FAMILIES[family]} table is not there: ${listed.problem}`);
+        else problems.push(...missingRules(listed.stdout, { endpoints, hookPort, family }));
+      }
       return { ok: problems.length === 0, problems };
     },
     remove() {
-      run(['delete', 'table', 'inet', table]);
+      for (const keyword of Object.values(FAMILIES)) run(['delete', 'table', keyword, table]);
     },
-    describe: () => ({ kind: 'nftables', table, endpoints: endpoints.map((e) => `${e.address}${e.port === undefined ? '' : `:${e.port}`}`), hookPort: hookPort ?? null }),
+    describe: () => ({
+      kind: 'nftables',
+      table,
+      endpoints: endpoints.map((e) => `${e.address}${e.port === undefined ? '' : `:${e.port}`}`),
+      hookPort: hookPort ?? null,
+      ipv6: ipv6.filtered === false ? ipv6.note : 'filtered',
+    }),
   };
 }
 
@@ -615,7 +663,8 @@ export async function beginIsolation(payload, deps) {
   const checked = iso.filter.check();
   if (!checked.ok) throw new IsolationError('packet filter', checked.problems);
   report.checks.packetFilter = iso.filter.describe?.() ?? 'installed';
-  deps.log(`isolation: packet filter installed (${iso.endpoints.length} credential endpoint(s)${iso.hookPort === undefined ? '' : `, hook port ${iso.hookPort}`}: rejected for every user but root)`);
+  const ipv6 = report.checks.packetFilter?.ipv6;
+  deps.log(`isolation: packet filter installed (${iso.endpoints.length} credential endpoint(s)${iso.hookPort === undefined ? '' : `, hook port ${iso.hookPort}`}: dropped for every user but root${ipv6 && ipv6 !== 'filtered' ? `; IPv6 ${ipv6}` : ''})`);
   return report;
 }
 
