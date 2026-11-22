@@ -720,9 +720,9 @@ describe('the launcher', () => {
       const onIssue = (issue: number, over: Record<string, unknown> = {}, deliveryId = `pr-of-${issue}`) => prEvent({ pull_request: { number: 40 + issue, head: { ref: `updraft/issue-${issue}-job_abc` } }, ...over }, deliveryId);
       // A finished issue job of `label` that opened pull request `pr`.
       let n = 0;
-      const opened = async (label: string, issue: number, pr: number) => {
+      const opened = async (label: string, issue: number, pr: number, agentKeys = [label === 'codex' ? 'CODEX_API_KEY' : 'ANTHROPIC_API_KEY']) => {
         const jobId = `job_opened${String(++n).padStart(4, '0')}`;
-        await store.putJob({ jobId, tokenHash: 'x', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: `d-${jobId}`, eventName: 'issues', status: 'launched', createdAt: new Date(NOW + n).toISOString(), expiresAt: NOW + 3_600_000, label, issue });
+        await store.putJob({ jobId, tokenHash: 'x', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: `d-${jobId}`, eventName: 'issues', status: 'launched', createdAt: new Date(NOW + n).toISOString(), expiresAt: NOW + 3_600_000, label, issue, agentKeys });
         await store.finishJob(jobId, 'succeeded', { at: NOW + n, detail: { prNumber: pr, prUrl: `https://github.com/acme/web/pull/${pr}` } });
       };
 
@@ -741,6 +741,26 @@ describe('the launcher', () => {
         expect((await launch(onIssue(12))).disposition).toBe('launched');
         expect(await launch(prEvent({ pull_request: { number: 53, head: { ref: 'updraft/issue-12-job_def' } } }, 'pr-53'))).toMatchObject({ disposition: 'missing_key', message: 'CODEX_API_KEY is not set: add it under Agent keys' });
         expect((await store.listRefusals(55, 5))[0]).toMatchObject({ issue: 53 });
+      });
+
+      it('takes the keys the opening job ran with when two workflows share its label, for different actors', async () => {
+        // `implement` routes pat to Claude and sam to Codex; only the Claude key is set.
+        const v = await store.createConfigVersion(55, { sha256: 's', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: dispatchRules(
+          { repositories: { 'acme/web': { id: 9, review: true, revise: true, workflows: [
+            { trigger: { label: 'implement' }, allowedActors: ['pat'], agent: 'claude' },
+            { trigger: { label: 'implement' }, allowedActors: ['sam'], agent: 'codex' },
+          ] } } },
+          { keysFor: (_repo, wf) => (wf.agent === 'codex' ? ['CODEX_API_KEY'] : ['ANTHROPIC_API_KEY']) },
+        ) });
+        await store.markConfigReady(55, v as number);
+        await store.activateConfig(55, v as number);
+        const launch = createLauncher(deps);
+        const issueJob = await launch(request({ label: { name: 'implement' } }, 'pat-issue'));
+        expect(issueJob.disposition).toBe('launched');
+        await store.finishJob(issueJob.jobId!, 'succeeded', { at: NOW, detail: { prNumber: 40, prUrl: 'https://github.com/acme/web/pull/40' } });
+        const review = await launch(prEvent({}, 'pat-review'));
+        expect(review.disposition).toBe('launched');
+        expect(await store.getJob(review.jobId!)).toMatchObject({ label: 'implement', agentKeys: ['ANTHROPIC_API_KEY'] });
       });
 
       it("keeps the workflow across the loop's own jobs: the next event of the pull request finds it on the last one", async () => {

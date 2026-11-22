@@ -125,7 +125,12 @@ export type PullRequestDecision =
       pullRequest: number;
       /** A close: it ends the loop and runs no agent, so it needs no key. */
       closing: boolean;
-      /** Per trigger label (lower-case): the keys its workflows can need. The launcher looks up the label that started the pull request. */
+      /**
+       * Per trigger label (lower-case): the keys of its workflow, when the label names one set of
+       * keys; null when workflows sharing it (for different actors) need different keys, or the
+       * version recorded none. The launcher's fallback, when the job that opened the pull request
+       * no longer says which keys it ran with.
+       */
       keysByLabel: Record<string, string[] | null>;
     }
   | { start: false; reason: string; code: PullRequestRefusalCode };
@@ -191,7 +196,10 @@ export function decidePullRequestDispatch(
   for (const t of repo.triggers) {
     const keys = t.keys ?? repo.keys;
     const before = keysByLabel[t.label];
-    keysByLabel[t.label] = before === null || keys === undefined ? null : [...new Set([...(before ?? []), ...keys])].sort();
+    const sorted = keys === undefined ? null : [...keys].sort();
+    const same = before !== undefined && before !== null && sorted !== null && before.length === sorted.length && before.every((k, i) => k === sorted[i]);
+    // Two workflows on one label with different keys: the label does not say which one it was.
+    keysByLabel[t.label] = before === undefined ? sorted : same ? before : null;
   }
   const closing = event.eventName === 'pull_request' && event.action === 'closed';
   return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, pullRequest: event.number, closing, keysByLabel };

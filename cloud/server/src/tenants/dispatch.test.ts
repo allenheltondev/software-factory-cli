@@ -81,6 +81,12 @@ describe('decidePullRequestDispatch', () => {
   it("starts a job for an allowed person's review on an Updraft pull request, with each workflow's keys by label to pick from", () => {
     expect(decide()).toEqual({ start: true, repository: 'Acme/Web', repositoryId: 9, pullRequest: 12, closing: false, keysByLabel: { updraft: ['ANTHROPIC_API_KEY'], docs: ['CODEX_API_KEY'] } });
     expect(decide({ eventName: 'pull_request', action: 'closed', reviewState: undefined })).toMatchObject({ start: true, closing: true });
+    // Two workflows on one label with different keys: the label names neither.
+    const shared = dispatchRules(
+      { repositories: { 'acme/web': { id: 9, revise: true, workflows: [{ trigger: { label: 'implement' }, allowedActors: ['pat'], agent: 'claude' }, { trigger: { label: 'implement' }, allowedActors: ['sam'], agent: 'codex' }] } } },
+      { keysFor: (_repo, wf) => (wf.agent === 'codex' ? ['CODEX_API_KEY'] : ['ANTHROPIC_API_KEY']) },
+    );
+    expect(decidePullRequestDispatch(shared, review())).toMatchObject({ start: true, keysByLabel: { implement: null } });
     expect(code({ reviewState: 'approved' })).toBe('start');
     expect(code({ action: 'dismissed', sender: 'writer' })).toBe('start');
     expect(code({ eventName: 'pull_request', action: 'synchronize', reviewState: undefined })).toBe('start');
