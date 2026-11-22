@@ -4,7 +4,13 @@
 #   ./deploy.sh            everything: stack, then config (if ./config/config.yaml exists), then image
 #   ./deploy.sh stack      build and deploy the SAM stack
 #   ./deploy.sh config     upload ./config/ to s3://<bucket>/config/
-#   ./deploy.sh image      package ./image/, create or update the MicroVM image, wait for the build
+#   ./deploy.sh image      package ./image/, create or update the MicroVM image, wait for the build,
+#                          then activate the new version (below). Jobs stay on the version they
+#                          ran until then: the stack's ImageVersion is pinned to it first
+#   ./deploy.sh activate <version>
+#                          check isolation on that image version in one microVM (the packet
+#                          filter and the sandbox self-test, as a job does them), and only if it
+#                          passes point jobs at it (the stack's ImageVersion). Also a rollback
 #   ./deploy.sh status     stack outputs, image state, microVMs of the image
 #   ./deploy.sh state info        what the shared state database in S3 is: size, date, versions
 #   ./deploy.sh state pull [dir]  download it (and the config) into dir, laid out as an Updraft
@@ -31,6 +37,7 @@
 #   REQUIRE_STATE_COMMANDS, ISOLATION_PACKAGES                   override image/build.env
 #   UPDRAFT_TARBALL   path of an `npm pack` tarball to install instead of UPDRAFT_SPEC
 #   BUILD_TIMEOUT_SECONDS  how long to wait for the image build      (default: 2400)
+#   CHECK_TIMEOUT_SECONDS  how long to wait for the isolation check   (default: 360)
 #   SAM_PARAMETER_OVERRIDES  extra template parameters, e.g.
 #                     "MaximumDurationSeconds=5400 TriggerLabels=ready"
 #   STATE_KEY         key of the shared state database             (default: state/state.db)
@@ -46,6 +53,8 @@ IMAGE_NAME="${IMAGE_NAME:-updraft-job}"
 IMAGE_ARCH="${IMAGE_ARCH:-ARM_64}"
 IMAGE_MEMORY_MIB="${IMAGE_MEMORY_MIB:-4096}"
 BUILD_TIMEOUT_SECONDS="${BUILD_TIMEOUT_SECONDS:-2400}"
+CHECK_TIMEOUT_SECONDS="${CHECK_TIMEOUT_SECONDS:-360}"
+CHECK_POLL_SECONDS="${CHECK_POLL_SECONDS:-5}"
 HOOK_PORT=9000
 
 die() { echo "deploy.sh: $*" >&2; exit 1; }
@@ -103,6 +112,149 @@ version_state() {
     --image-identifier "$IMAGE_NAME" --image-version "$1" --query state --output text
 }
 
+# A text answer from the CLI, with its "None" (nothing there) read as empty.
+none_is_empty() { [ "$1" = "None" ] && echo "" || echo "$1"; }
+
+stack_parameter() {
+  none_is_empty "$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='$1'].ParameterValue | [0]" --output text)"
+}
+
+# One variable of the launcher's environment: what it starts jobs with (template.yaml).
+launcher_env() {
+  local fn
+  fn="$(aws cloudformation describe-stack-resource --stack-name "$STACK_NAME" --logical-resource-id LauncherFunction \
+    --query StackResourceDetail.PhysicalResourceId --output text)" || die "stack $STACK_NAME has no launcher; run ./deploy.sh stack first"
+  none_is_empty "$(aws lambda get-function-configuration --function-name "$fn" --query "Environment.Variables.$1" --output text)"
+}
+
+# Points the launcher at one image version: the stack's ImageVersion parameter, with the
+# template and every other parameter as deployed. `sam deploy` (./deploy.sh stack) keeps it:
+# parameters it is not given keep their previous values.
+pin_image_version() {
+  local value="$1" keys k err
+  keys="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Parameters[].ParameterKey" --output text)"
+  local params=()
+  for k in $keys; do [ "$k" = "ImageVersion" ] || params+=("ParameterKey=$k,UsePreviousValue=true"); done
+  params+=("ParameterKey=ImageVersion,ParameterValue=$value")
+  err="$(mktemp)"
+  if ! aws cloudformation update-stack --stack-name "$STACK_NAME" --use-previous-template \
+      --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND --parameters "${params[@]}" >/dev/null 2>"$err"; then
+    if grep -q "No updates are to be performed" "$err"; then rm -f "$err"; return 0; fi
+    cat "$err" >&2
+    rm -f "$err"
+    die "could not set the stack's ImageVersion to $value"
+  fi
+  rm -f "$err"
+  aws cloudformation wait stack-update-complete --stack-name "$STACK_NAME" \
+    || die "the stack update that sets ImageVersion=$value did not complete; see the stack's events"
+}
+
+# Before a build: keep jobs on the version they run now. With ImageVersion empty the launcher
+# runs Lambda's latest active version, which a new version becomes as soon as it builds, before
+# it is checked. With no version yet, "none" makes the launcher refuse to start jobs (500)
+# until one has passed its check.
+hold_jobs_on_current_version() {
+  local pinned current
+  pinned="$(stack_parameter ImageVersion)"
+  if [ -n "$pinned" ]; then
+    say "jobs stay on image version $pinned until the new one has passed its isolation check"
+    return 0
+  fi
+  current="$(none_is_empty "$(aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_NAME" \
+    --query latestActiveImageVersion --output text 2>/dev/null || true)")"
+  if [ -n "$current" ]; then
+    say "pinning jobs to image version $current (the stack's ImageVersion) while the new one is built and checked"
+    pin_image_version "$current"
+  else
+    say "no image version has passed an isolation check yet: jobs are refused (ImageVersion=none) until one does"
+    pin_image_version none
+  fi
+}
+
+# The image check (run-hook payload version 3, image/runner/hooks.mjs): one microVM from the
+# version, with the jobs' execution role and egress, installs the packet filter and runs the
+# job's sandbox self-test, logs one ISOLATION CHECK line and starts nothing else. Returns 0 if
+# it passed; prints the line otherwise. The microVM is terminated here (and by its 15 minute
+# maximum duration if this script dies first).
+check_image_version() {
+  local version="$1" image_arn role egress log_group partition stamp check_id stream input microvm line state waited=0
+  image_arn="$(launcher_env IMAGE_ARN)"
+  role="$(launcher_env EXECUTION_ROLE_ARN)"
+  egress="$(launcher_env EGRESS_CONNECTOR_ARN)"
+  log_group="$(launcher_env MICROVM_LOG_GROUP)"
+  [ -n "$image_arn" ] && [ -n "$role" ] && [ -n "$egress" ] && [ -n "$log_group" ] || die "the launcher's environment lacks IMAGE_ARN, EXECUTION_ROLE_ARN, EGRESS_CONNECTOR_ARN or MICROVM_LOG_GROUP; run ./deploy.sh stack"
+  partition="$(echo "$image_arn" | cut -d: -f2)"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  check_id="image-check-$(echo "$stamp" | tr '[:upper:]' '[:lower:]')"
+  stream="isolation-check/$version/$stamp"
+  input="$(mktemp)"
+  cat > "$input" <<JSON
+{
+  "imageIdentifier": "$image_arn",
+  "imageVersion": "$version",
+  "executionRoleArn": "$role",
+  "ingressNetworkConnectors": [ "arn:$partition:lambda:$REGION:aws:network-connector:aws-network-connector:NO_INGRESS" ],
+  "egressNetworkConnectors": [ "$egress" ],
+  "maximumDurationInSeconds": 900,
+  "idlePolicy": { "maxIdleDurationSeconds": 900, "suspendedDurationSeconds": 0, "autoResumeEnabled": false },
+  "logging": { "cloudWatch": { "logGroup": "$log_group", "logStream": "$stream" } },
+  "runHookPayload": "{\"version\":3,\"checkId\":\"$check_id\"}",
+  "clientToken": "$check_id"
+}
+JSON
+  if ! microvm="$(aws lambda-microvms run-microvm --cli-input-json "file://$input" --query microvmId --output text)"; then
+    rm -f "$input"
+    die "could not start the isolation check's microVM"
+  fi
+  rm -f "$input"
+  microvm="$(none_is_empty "$microvm")"
+  [ -n "$microvm" ] || die "RunMicrovm returned no microVM id for the isolation check"
+  say "isolation check in microVM $microvm (log stream $stream)"
+  line=""
+  while :; do
+    sleep "$CHECK_POLL_SECONDS"
+    waited=$((waited + CHECK_POLL_SECONDS))
+    # State first: a microVM that reported and then ended is not one that ended without reporting.
+    state="$(aws lambda-microvms get-microvm --microvm-identifier "$microvm" --query state --output text 2>/dev/null || echo UNKNOWN)"
+    line="$(none_is_empty "$(aws logs get-log-events --log-group-name "$log_group" --log-stream-name "$stream" --start-from-head \
+      --query "events[?contains(message, 'ISOLATION CHECK ')].message | [0]" --output text 2>/dev/null || true)")"
+    [ -z "$line" ] || break
+    case "$state" in
+      TERMINATING|TERMINATED) line="the microVM ended ($state) before the check reported"; break ;;
+    esac
+    if [ "$waited" -ge "$CHECK_TIMEOUT_SECONDS" ]; then line="no ISOLATION CHECK line within ${CHECK_TIMEOUT_SECONDS}s"; break; fi
+  done
+  aws lambda-microvms terminate-microvm --microvm-identifier "$microvm" >/dev/null 2>&1 \
+    || echo "    could not terminate $microvm; its maximum duration (15 minutes) ends it" >&2
+  # The runner prints the report with "ok" first (checkImageIsolation in image/runner/job.mjs).
+  case "$line" in
+    *'ISOLATION CHECK {"ok":true,'*) return 0 ;;
+  esac
+  echo "    $line" >&2
+  return 1
+}
+
+# Points jobs at a built version, once it has passed the isolation check.
+activate_image_version() {
+  local version="${1:-}" state
+  need aws
+  [ -n "$version" ] || die "usage: ./deploy.sh activate <image version>   (./deploy.sh status lists the image)"
+  case "$version" in *[!A-Za-z0-9._-]*) die "not an image version: $version" ;; esac
+  state="$(version_state "$version" 2>/dev/null || echo UNKNOWN)"
+  [ "$state" = "SUCCESSFUL" ] || die "image version $version is $state, not SUCCESSFUL; nothing was changed"
+  if [ "$(launcher_env AGENT_ISOLATION)" = "disabled" ]; then
+    say "AgentIsolation=disabled: no isolation check (jobs do not need the boundary)"
+  else
+    say "checking isolation on image version $version in a microVM"
+    check_image_version "$version" \
+      || die "image version $version failed its isolation check (above); jobs stay on version $(stack_parameter ImageVersion). The check's log is in $(launcher_env MICROVM_LOG_GROUP), stream isolation-check/$version/..."
+    say "image version $version passed its isolation check"
+  fi
+  pin_image_version "$version"
+  say "jobs now run image version $version (the stack's ImageVersion)"
+}
+
 build_image() {
   need aws; need zip
   local bucket build_role log_group
@@ -110,6 +262,8 @@ build_image() {
   build_role="$(stack_output BuildRoleArn)"
   log_group="$(stack_output MicrovmLogGroup)"
   [ -n "$bucket" ] && [ "$bucket" != "None" ] || die "stack $STACK_NAME has no BucketName output; run ./deploy.sh stack first"
+
+  hold_jobs_on_current_version
 
   local stage
   stage="$(mktemp -d)"
@@ -216,14 +370,14 @@ JSON
     echo "    $state (${waited}s)"
   done
   say "image $IMAGE_NAME version $version is built"
-  aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_NAME" \
-    --query '{state: state, latestActiveImageVersion: latestActiveImageVersion, imageArn: imageArn}' --output table  || true
+  activate_image_version "$version"
 }
 
 show_status() {
   need aws
   aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
     --query 'Stacks[0].Outputs[].[OutputKey, OutputValue]' --output table
+  echo "jobs run image version: $(stack_parameter ImageVersion || true) (empty: the latest active one)"
   aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_NAME" \
     --query '{state: state, latestActiveImageVersion: latestActiveImageVersion, latestFailedImageVersion: latestFailedImageVersion}' \
     --output table || true
@@ -487,6 +641,7 @@ case "${1:-all}" in
   stack) deploy_stack ;;
   config) upload_config ;;
   image) build_image ;;
+  activate) activate_image_version "${2:-}" ;;
   status) show_status ;;
   state)
     case "${2:-}" in
@@ -497,6 +652,6 @@ case "${1:-all}" in
       *) die "usage: ./deploy.sh state info | state pull [dir] | state unsaved | state recover <delivery id> [attempt id]" ;;
     esac
     ;;
-  -h|--help|help) sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command: $1 (try --help)" ;;
 esac

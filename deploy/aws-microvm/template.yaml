@@ -16,7 +16,10 @@ Parameters:
   ImageVersion:
     Type: String
     Default: ''
-    Description: MicroVM image version to run. Empty runs the latest active version.
+    Description: >-
+      MicroVM image version jobs run. deploy.sh image and deploy.sh activate set it to each
+      version that passed its isolation check. Empty runs the latest active version, which a
+      new version becomes as soon as it builds, before anything has checked it.
   MaximumDurationSeconds:
     Type: Number
     Default: 14400

@@ -201,7 +201,25 @@ hard-coded.
 
    The script zips `image/`, uploads it to `s3://<bucket>/image/`, calls
    `create-microvm-image` (or `update-microvm-image` when the image exists) and polls the new
-   version until it is `SUCCESSFUL` or `FAILED`. Build logs are in the log group
+   version until it is `SUCCESSFUL` or `FAILED`. A version that builds doesn't reach jobs at
+   once:
+
+   - **Before the build**, the script pins the stack's `ImageVersion` to the version jobs run
+     now. Left empty, the launcher would run Lambda's latest active version, and a new
+     version becomes that the moment it builds. With no version yet, it pins `none`, so the
+     launcher refuses deliveries (500) until a version has passed its check.
+   - **After the build**, `./deploy.sh activate <version>` runs one microVM from the new
+     version with the jobs' execution role and egress. It installs the packet filter and runs
+     the same sandbox self-test a job runs (an image check, see
+     [The run-hook payload](#lifecycle-hooks-image-and-runner)). Only if that passes does it
+     set `ImageVersion` to the new version. A failed check prints the reasons and leaves
+     jobs where they were. With `AgentIsolation=disabled` there is no check.
+   - **Rollback:** `./deploy.sh activate <older version>` checks that version and points jobs
+     at it.
+
+   The pin is a stack update with the deployed template and every other parameter
+   unchanged. `./deploy.sh stack` keeps it, because `sam deploy` reuses the previous value of
+   a parameter it isn't given. Build logs are in the log group
    `/aws/lambda-microvms/<image-name>`. Other settings: `IMAGE_ARCH` (`ARM_64`), `IMAGE_MEMORY_MIB`
    (`4096`), `AGENT_PACKAGES` (Claude Code alone by default), `TOOL_PACKAGES`,
    `SYSTEM_PACKAGES`, `PYTHON_COMMAND`, `NODE_VERSION`, `REQUIRE_STATE_COMMANDS`,
@@ -236,7 +254,7 @@ Pass them through `SAM_PARAMETER_OVERRIDES="Key=Value ..."`.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `ImageName` | `updraft-job` | Name of the MicroVM image (set through `IMAGE_NAME`). The launcher runs `arn:<partition>:lambda:<region>:<account>:microvm-image:<ImageName>` |
-| `ImageVersion` | empty | Pin an image version. Empty runs the latest active version |
+| `ImageVersion` | empty | The image version jobs run. `./deploy.sh image` and `activate` set it to each version that passed its isolation check (step 4). Empty runs the latest active version, including one nothing has checked |
 | `MaximumDurationSeconds` | `14400` | Hard lifetime of a job's microVM (600 to 28,800). See [How long a run may take](#how-long-a-run-may-take) |
 | `WatchdogReserveSeconds` | `600` | The runner stops the job this long before the maximum duration, and uses that time for state sync, logs and the result |
 | `AcceptedEvents` | `issues` | Comma-separated webhook events that may start a microVM: `issues`, `pull_request_review`, `pull_request`. Set `issues,pull_request_review,pull_request` for the review loop |
@@ -903,6 +921,8 @@ What can go wrong, either way:
 | Result has `outcome: timed_out` | `run-event` did not stop at its own deadline and the watchdog killed it. Same remedy; also a bug worth reporting |
 | Result has `summaryMissing: true` | `run-event` did not print a JSON object as its last stdout line; `outcome` then reflects the exit code only |
 | Image build fails | Build logs in `/aws/lambda-microvms/<image-name>`; `deploy.sh` prints the version's `stateReason`. Reproduce with `docker build image/` |
+| `deploy.sh image` or `activate` says `failed its isolation check` | The version built, but a job's boundary does not hold on it; jobs stay on the version `ImageVersion` names. The reasons are printed (the same ones a job's `isolation.problems` would list, see the `isolation-not-enforced` row), and the check's log is the `isolation-check/<version>/...` stream. Fix the image and build again |
+| Every delivery shows `500` right after a first `deploy.sh image` | `ImageVersion` is `none`: no version has passed its isolation check yet. The script's output says why the check failed |
 
 The result document:
 
@@ -1176,7 +1196,8 @@ with stand-in files, and runs the same self-test a job runs (`checkImageIsolatio
 `image/runner/job.mjs`). It then removes both and logs one `ISOLATION CHECK {"ok": ...,
 "failedStep": ..., "problems": [...], "checks": {...}}` line. It reads nothing from S3, calls
 no broker, and does not terminate itself: whoever started it reads the line and terminates
-it. `deploy.sh` does not run the check yet.
+it. `./deploy.sh activate` runs it on the self-hosted stack, before it points `ImageVersion`
+at a version.
 
 ### Idle policy
 
@@ -1730,6 +1751,13 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
 47. **`updraft validate --json` in the image.** The runner needs an Updraft that has it; the
     published 0.1.0 does not. Without it every enforced job is refused at the config step,
     and the message says so.
+48. **Pinning the image version from `deploy.sh`.** Assumed: `update-stack
+    --use-previous-template` with `CAPABILITY_AUTO_EXPAND` re-applies this SAM template
+    unchanged. Also assumed: the launcher's next invocations see the new `IMAGE_VERSION`
+    within seconds, and `sam deploy` keeps the previous value of a parameter it isn't given.
+    The image check itself (payload version 3) has not yet run in a real microVM from this
+    script; it is the runner's job self-test, so it holds or fails as a job would.
+    `test/deploy-image.test.mjs` runs `activate` and the pin against a stand-in `aws`.
 
 ## Tests
 
@@ -1777,6 +1805,16 @@ the suite:
   the runtime, without the filter, with an uncontained agent or when the self-test reaches
   the key, and releases the delivery each time. It runs the job once the self-test passed,
   and with `disabled` as before, with the warning.
+- `deploy-image.test.mjs` (POSIX hosts with `bash`): `deploy.sh activate` and the start of
+  `deploy.sh image` against the same stand-in `aws`, with the stack, the launcher, the image
+  and the check microVM in a JSON file. Covered:
+  - a version reaches `ImageVersion` only after its check passed;
+  - the check microVM gets the jobs' role and egress, no ingress and a version 3 payload, and
+    is terminated;
+  - a failed, ended or silent check changes nothing, and neither does a version that hasn't
+    built;
+  - `AgentIsolation=disabled` skips the check;
+  - `image` pins jobs to the version they run (or `none`) before it builds anything.
 - `deploy-state.test.mjs` (POSIX hosts with `bash`): `deploy.sh state unsaved` and `state
   recover` run for real against a stand-in `aws` on `PATH` (`fake-aws.mjs`: a directory for
   the bucket, ETags, the two write conditions) and a stand-in `updraft` that records how the
