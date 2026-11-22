@@ -49,6 +49,9 @@ function setup({ captureContent = false, keys = [] } = {}) {
     async flush() {
       this.stats.exported = this.spans.length;
     },
+    accepted(spanId) {
+      return this.spans.some((s) => s.spanId === spanId);
+    },
     pending: () => 0,
   };
   const tracer = createAgentTracer({ runsDir, exporter, captureContent, redact: createRedactor(keys), now: () => clock.t, pollMs: 1e9, exportMs: 1e9 });
@@ -270,6 +273,9 @@ describe('agent telemetry: Codex and the review loop', () => {
     expect(one(spans, 'runner restore_state')).toMatchObject({ parentSpanId: root.spanId, error: true, errorMessage: 'state object unreadable' });
     expect(one(spans, 'runner isolation').error).toBe(false);
     expect(out.spans).toBe(3);
+    // The finish names the conversation the spans went in, and links the failed step.
+    expect(out.conversationId).toBe('delivery/d-9');
+    expect(out.marks).toEqual([{ kind: 'step_failed', spanId: one(spans, 'runner restore_state').spanId, step: 'runner_restore_state' }]);
   });
 
   it('sends nothing for a job that ran no agent', async () => {
@@ -576,6 +582,35 @@ describe('agent telemetry: spans worth a link', () => {
     for (const m of out.marks) expect(spans.some((s) => s.spanId === m.spanId), m.kind).toBe(true);
   });
 
+  it('marks the first passing test run only on evidence that tests ran and passed', async () => {
+    const t = setup();
+    await t.step('run_1', `${header()}\n`, 0);
+    await t.step('run_1', claude.stream(bash('t1', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(failedResult('t1', 'Exit code 1\n Tests  1 failed | 1 passed (2)')), 1000);
+    await t.step('run_1', claude.stream(bash('t2', 'npm test -- --help')), 1000);
+    await t.step('run_1', claude.stream(claude.toolResult('t2', 'Usage: vitest [options]')), 1000);
+    await t.step('run_1', claude.stream(bash('t3', 'npm test')), 1000);
+    await t.step('run_1', claude.stream(claude.toolResult('t3', ' Tests  2 passed (2)')), 1000);
+    await t.step('run_1', '---- end of agent output ----\noutcome: succeeded\n', 1000);
+    const out = await t.tracer.stop({ outcome: 'succeeded' });
+    const tests = byName(t.exporter.spans, 'execute_tool Bash');
+    expect(out.marks.find((m) => m.kind === 'test_green').spanId).toBe(tests[2].spanId);
+  });
+
+  it('links only spans Honeycomb accepted', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-telemetry-'));
+    const runsDir = path.join(dir, 'runs');
+    fs.mkdirSync(path.join(runsDir, 'run_1'), { recursive: true });
+    fs.writeFileSync(path.join(runsDir, 'run_1', 'run.log'), `${header()}\n${claude.stream(claude.success('ok'))}---- end of agent output ----\noutcome: succeeded\n`);
+    const exporter = createExporter({ endpoint: 'https://api.honeycomb.io', apiKey: 'k', resource: {}, fetch: async () => ({ ok: false, status: 401 }) });
+    const tracer = createAgentTracer({ runsDir, exporter, pollMs: 1e9, exportMs: 1e9 });
+    const at = Date.now();
+    const out = await tracer.stop({ outcome: 'failed', steps: [{ name: 'restore_state', start: at, end: at + 1, error: 'unreadable' }] });
+    expect(out).toMatchObject({ exported: 0, conversationId: 'octo/widgets#7' });
+    expect(out.failed).toBeGreaterThan(0);
+    expect(out.marks).toEqual([]);
+  });
+
   it("marks a review's verdict, a run that thrashed, and a failed runner step", async () => {
     const t = setup();
     await t.step('run_1', `${header({ kind: 'review' })}\n`, 0);
@@ -655,7 +690,7 @@ describe('agent telemetry: what leaves the microVM', () => {
     fs.writeFileSync(path.join(runsDir, 'run_c', 'run.log'), `${header({ runId: 'run_c' })}\n${claude.stream(claude.assistantText('fine'))}---- end of agent output ----\n`);
     fs.symlinkSync(path.join(outside, 'prompt.md'), path.join(runsDir, 'run_c', 'prompt.md'));
     const spans = [];
-    const exporter = { stats: { exported: 0, failed: 0, dropped: 0 }, push: (s) => spans.push(s), flush: async () => {}, pending: () => 0 };
+    const exporter = { stats: { exported: 0, failed: 0, dropped: 0 }, push: (s) => spans.push(s), flush: async () => {}, pending: () => 0, accepted: () => true };
     const logs = [];
     const tracer = createAgentTracer({ runsDir, confineTo: dir, exporter, captureContent: true, log: (m) => logs.push(m), pollMs: 1e9, exportMs: 1e9 });
     await tracer.poll();
@@ -675,7 +710,7 @@ describe('agent telemetry: what leaves the microVM', () => {
     fs.writeFileSync(path.join(runsDir, 'run_1', 'prompt.md'), 'p'.repeat(2 * 1024 * 1024));
     fs.writeFileSync(path.join(runsDir, 'run_1', 'run.log'), `${header()}\n`);
     const spans = [];
-    const exporter = { stats: { exported: 0, failed: 0, dropped: 0 }, push: (s) => spans.push(s), flush: async () => {}, pending: () => 0 };
+    const exporter = { stats: { exported: 0, failed: 0, dropped: 0 }, push: (s) => spans.push(s), flush: async () => {}, pending: () => 0, accepted: () => true };
     const tracer = createAgentTracer({ runsDir, confineTo: dir, exporter, captureContent: true, pollMs: 1e9, exportMs: 1e9 });
     await tracer.poll();
     await new Promise((r) => setTimeout(r, 20));
@@ -734,5 +769,17 @@ describe('the OTLP exporter', () => {
     await exporter.flush();
     expect(calls).toHaveLength(3);
     expect(exporter.stats).toMatchObject({ exported: 1, failed: 1, lastError: 'HTTP 401' });
+  });
+
+  it('says which spans Honeycomb accepted: not a queued one, nor one of a batch it refused', async () => {
+    const answers = [200, 401];
+    const exporter = createExporter({ endpoint: 'https://api.honeycomb.io', apiKey: 'k', resource: {}, fetch: async () => ({ ok: answers[0] === 200, status: answers.shift() }) });
+    exporter.push({ ...span, spanId: '1'.repeat(16) });
+    expect(exporter.accepted('1'.repeat(16))).toBe(false);
+    await exporter.flush();
+    expect(exporter.accepted('1'.repeat(16))).toBe(true);
+    exporter.push({ ...span, spanId: '2'.repeat(16) });
+    await exporter.flush();
+    expect(exporter.accepted('2'.repeat(16))).toBe(false);
   });
 });

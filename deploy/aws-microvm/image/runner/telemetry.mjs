@@ -148,6 +148,8 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
   // id, a URL). Content was redacted when it was recorded too; redacting twice changes nothing.
   const cleanResource = redactAttributes(resource ?? {}, redact);
   const stats = { exported: 0, failed: 0, dropped: 0, requests: 0, lastError: null, lastOkAt: null };
+  /** The span ids Honeycomb accepted (a 2xx for their batch): only those are worth a link. */
+  const accepted = new Set();
   let sending = Promise.resolve();
   const url = `${endpoint.replace(/\/+$/, '')}/v1/traces`;
 
@@ -163,6 +165,7 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
         });
         if (res.ok) {
           stats.exported += batch.length;
+          for (const span of batch) accepted.add(span.spanId);
           stats.lastOkAt = new Date(now()).toISOString();
           return;
         }
@@ -196,6 +199,8 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
       return sending;
     },
     pending: () => queue.length,
+    /** Whether Honeycomb accepted this span: false while it is queued, and when its batch failed or was dropped. */
+    accepted: (spanId) => accepted.has(spanId),
   };
 }
 
@@ -571,7 +576,10 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       if (span.error || (a['updraft.test.failed'] ?? 0) > 0) {
         sawRedTest = true;
         once('test_failed');
-      } else if (sawRedTest) once('test_green');
+      } else if (sawRedTest && (a['updraft.test.passed'] ?? 0) > 0) {
+        // Green only on evidence: tests ran and passed (a command that printed no result, such as --help, is not it).
+        once('test_green');
+      }
     } else if (span.error && a['gen_ai.agent.name'] === 'updraft' && typeof a['updraft.step'] === 'string') {
       once('step_failed', { step: a['updraft.step'] });
     }
@@ -1604,6 +1612,8 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
       clearInterval(exportTimer);
       /** The runner's own failed steps, as marks (each run's are in its trace's). */
       const runnerMarks = [];
+      /** The conversation the job's span was sent in, for the finish report. */
+      let sentConversationId;
       try {
         await schedulePoll();
         const at = now();
@@ -1614,6 +1624,7 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
         // still has its runner steps: sent under the job's span, in a conversation of the delivery.
         if (traces.length || runnerSteps.length) {
           const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? traces[0]?.conversationId ?? `delivery/${typeof deliveryId === 'string' && deliveryId ? deliveryId : traceId}`;
+          sentConversationId = conversationId;
           const loop = summary?.loop && typeof summary.loop === 'object' ? summary.loop : null;
           const failed = outcome !== 'succeeded';
           for (const step of runnerSteps) {
@@ -1688,17 +1699,23 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
         log(`agent telemetry: ${error?.message ?? error}`);
       }
       const conversations = [...new Set([...runs.values()].map((r) => r.trace.conversationId))];
-      // The issue's conversation (the one Agent Timeline lists), else the run's or the delivery's.
-      const traces = [...runs.values()].map((r) => r.trace);
-      const conversationId = traces.find((t) => t.header.issue !== undefined)?.conversationId ?? conversations[0];
-      const marks = [...traces.flatMap((t) => t.marks), ...runnerMarks]
-        .sort((x, y) => x.at - y.at)
-        .slice(0, MAX_MARKS_PER_JOB)
-        .map((m) => {
-          const out = { ...m };
-          delete out.at;
-          return out;
-        });
+      // The conversation the job's span went in: the issue's, else the run's or the delivery's.
+      const conversationId = sentConversationId;
+      // Only spans Honeycomb accepted: a link to one it never got would open the root instead.
+      let marks = [];
+      try {
+        marks = [...[...runs.values()].flatMap((r) => r.trace.marks), ...runnerMarks]
+          .filter((m) => exporter.accepted(m.spanId))
+          .sort((x, y) => x.at - y.at)
+          .slice(0, MAX_MARKS_PER_JOB)
+          .map((m) => {
+            const out = { ...m };
+            delete out.at;
+            return out;
+          });
+      } catch (error) {
+        log(`agent telemetry: ${error?.message ?? error}`);
+      }
       return {
         traceId,
         ...(conversationId ? { conversationId } : {}),

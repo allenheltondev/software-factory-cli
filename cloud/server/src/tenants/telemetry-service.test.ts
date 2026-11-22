@@ -342,6 +342,8 @@ describe('links to a trace', () => {
     ]);
     expect(telemetryOf({ traceId, conversationId: 'acme/web#12"><' })!.conversationId).toBeUndefined();
     expect(telemetryOf({ traceId, conversationId: 'delivery/d-1' })!.conversationId).toBe('delivery/d-1');
+    // A run of no issue is its own conversation, named by its job.
+    expect(telemetryOf({ traceId, conversationId: 'job_ev9001' })!.conversationId).toBe('job_ev9001');
     expect(telemetryOf({ traceId, marks: Array.from({ length: 50 }, () => ({ kind: 'agent', spanId: span })) })!.marks).toHaveLength(32);
   });
 
@@ -376,6 +378,9 @@ describe('links to a trace', () => {
     // The runner's conversation wins: a pull request's review job has no issue of its own.
     const review: JobSummary = { ...job, issue: undefined, detail: { telemetry: { ...job.detail!.telemetry!, conversationId: 'acme/web#3' } } };
     expect(jobView(review, full, { now }).telemetry?.conversationId).toBe('acme/web#3');
+    // A job of an issue that ran no agent sent its spans in the delivery's conversation: that is the one to link.
+    const early: JobSummary = { ...job, detail: { telemetry: { ...job.detail!.telemetry!, conversationId: 'delivery/d-1' } } };
+    expect(jobView(early, full, { now }).telemetry?.conversationUrl).toContain(encodeURIComponent('"value":"delivery/d-1"'));
     // Without settings (or the team's slug), nothing to link to, but the conversation id.
     expect(jobView(job).telemetry).toEqual({ traceId, conversationId: 'acme/web#12', spans: 9, exported: 9, failed: 0 });
   });

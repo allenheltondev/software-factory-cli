@@ -82,7 +82,7 @@ export interface JobTelemetryReport {
   startedAt?: string;
   /** A short code (HTTP 401, timeout, ...). */
   lastError?: string;
-  /** The conversation Agent Timeline groups the trace under: `owner/repo#issue`, or `delivery/<id>`. */
+  /** The conversation the job's spans were sent in: `owner/repo#issue`, `delivery/<id>`, or a run's own id. */
   conversationId?: string;
   /** Spans worth a link of their own (the runner's telemetry.mjs), in the order they started. */
   marks?: TelemetryMark[];
@@ -110,7 +110,8 @@ export interface TelemetryMark {
 }
 
 const MAX_MARKS = 32;
-const CONVERSATION_ID = /^(?:[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}#[1-9][0-9]{0,9}|delivery\/[A-Za-z0-9_.-]{1,128})$/;
+/** `owner/repo#issue`; `delivery/<id>` for a job that ran no agent; a run's own id (its job's) for a run of no issue. */
+const CONVERSATION_ID = /^(?:[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}#[1-9][0-9]{0,9}|delivery\/[A-Za-z0-9_.-]{1,128}|[A-Za-z0-9_.-]{1,128})$/;
 
 function markOf(raw: unknown): TelemetryMark | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
