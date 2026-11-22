@@ -46,6 +46,33 @@ describe('TelemetryPage', () => {
     expect(screen.getByTestId('telemetry-settings')).toBeInTheDocument();
   });
 
+  it('sets CloudWatch with an AWS region and an X-Ray API key, and shows where it sends', async () => {
+    const cloudwatch: TelemetryView = {
+      ...off,
+      provider: 'cloudwatch',
+      enabled: true,
+      keyConfigured: true,
+      aws: { region: 'us-west-2' },
+      otlp: { endpoint: 'https://xray.us-west-2.amazonaws.com', header: 'authorization', host: 'xray.us-west-2.amazonaws.com' },
+      key: { updatedAt: NOW, updatedBy: 'pat', type: 'cloudwatch' },
+    };
+    const setTelemetryKey = vi.fn().mockResolvedValue(cloudwatch);
+    show(fakeApi({ telemetry: vi.fn().mockResolvedValue(off), setTelemetryKey }));
+    await userEvent.click(await screen.findByRole('button', { name: 'CloudWatch' }));
+    await userEvent.type(screen.getByLabelText('AWS region'), 'oregon');
+    await userEvent.type(screen.getByLabelText('X-Ray API key'), 'Bearer AbCdEfGhIjKlMnOpQrStUv0123');
+    expect(screen.getByRole('button', { name: 'Check and save' })).toBeDisabled();
+    await userEvent.clear(screen.getByLabelText('AWS region'));
+    await userEvent.type(screen.getByLabelText('AWS region'), 'us-west-2');
+    await userEvent.click(screen.getByRole('button', { name: 'Check and save' }));
+    expect(setTelemetryKey).toHaveBeenCalledWith(55, { provider: 'cloudwatch', value: 'AbCdEfGhIjKlMnOpQrStUv0123', awsRegion: 'us-west-2' });
+    expect(await screen.findByTestId('telemetry-key-saved')).toHaveTextContent('CloudWatch accepted the key');
+    expect(screen.getByTestId('telemetry-destination')).toHaveTextContent('CloudWatch us-west-2');
+    expect(screen.getByTestId('telemetry-key-facts')).toHaveTextContent('us-west-2');
+    // No links to set: CloudWatch's are built in.
+    expect(screen.queryByTestId('telemetry-links')).not.toBeInTheDocument();
+  });
+
   it('sets any OTLP endpoint with the header its key goes in, then its links', async () => {
     const custom: TelemetryView = { ...off, provider: 'otlp', enabled: true, keyConfigured: true, otlp: { endpoint: 'https://otlp.example.com/otlp', header: 'authorization', host: 'otlp.example.com' }, key: { updatedAt: NOW, updatedBy: 'pat', type: 'otlp' } };
     const setTelemetryKey = vi.fn().mockResolvedValue(custom);

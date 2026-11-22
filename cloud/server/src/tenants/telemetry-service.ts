@@ -4,6 +4,10 @@ import { FlowError, type GitHubFlows } from '../flows/github.js';
 import type { Store, TelemetryExport, TelemetrySettings } from '../store/store.js';
 import { agentKeySecretName, type SecretsPort } from './agent-keys.js';
 import {
+  AWS_REGION,
+  CLOUDWATCH_KEY,
+  cloudWatchEndpoint,
+  cloudWatchTraceUrl,
   CONVERSATION_LINK_PLACEHOLDERS,
   TRACE_LINK_PLACEHOLDERS,
   checkOtlpEndpoint,
@@ -12,6 +16,7 @@ import {
   headerValueOk,
   linkTemplateProblem,
   parseOtlpEndpoint,
+  type OtlpCheck,
   type OtlpChecker,
 } from './otlp-destination.js';
 
@@ -82,8 +87,10 @@ export const checkHoneycombKey = (fetchFn: typeof fetch = fetch, timeoutMs = 800
   };
 
 export interface TelemetryView {
-  provider: 'honeycomb' | 'otlp';
+  provider: 'honeycomb' | 'cloudwatch' | 'otlp';
   enabled: boolean;
+  /** CloudWatch: the AWS region it sends to. */
+  aws?: { region: string };
   /** A custom destination: where it sends, and the header the key goes in (never the key). */
   otlp?: { endpoint: string; header: string; host: string };
   /** A custom destination's link templates. */
@@ -108,7 +115,8 @@ export function telemetryView(s: TelemetrySettings | null): TelemetryView {
   return {
     provider: t.provider,
     enabled: t.enabled && Boolean(t.key),
-    ...(t.provider === 'otlp' && t.otlp ? { otlp: { ...t.otlp, host: host && 'host' in host ? host.host : '' } } : {}),
+    ...(t.provider !== 'honeycomb' && t.otlp ? { otlp: { ...t.otlp, host: host && 'host' in host ? host.host : '' } } : {}),
+    ...(t.provider === 'cloudwatch' && t.aws ? { aws: t.aws } : {}),
     ...(t.links && (t.links.trace || t.links.conversation) ? { links: t.links } : {}),
     region: t.region,
     serviceName: t.serviceName,
@@ -122,7 +130,7 @@ export function telemetryView(s: TelemetrySettings | null): TelemetryView {
 }
 
 /** What a link is built from: the destination, and for a custom one its templates. */
-export type LinkSettings = Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> & Partial<Pick<TelemetrySettings, 'provider' | 'links'>>;
+export type LinkSettings = Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> & Partial<Pick<TelemetrySettings, 'provider' | 'links' | 'aws'>>;
 
 /** The trace's time range, UNIX seconds: a minute before it started, five after it ended (six hours when it has not). */
 function traceWindow(startedAt: string, finishedAt?: string): { start: number; end: number } | null {
@@ -143,6 +151,8 @@ export function traceUrl(s: LinkSettings | null, traceId: string, startedAt: str
   const w = traceWindow(startedAt, finishedAt);
   if (!w) return null;
   const span16 = spanId && /^[0-9a-f]{16}$/.test(spanId) ? spanId : undefined;
+  // CloudWatch: the trace in its console; it has no link to a span.
+  if (s.provider === 'cloudwatch') return spanId === undefined && s.aws ? cloudWatchTraceUrl(s.aws.region, traceId) : null;
   if (s.provider === 'otlp') {
     const template = s.links?.trace;
     if (!template || (spanId !== undefined && (!span16 || !template.includes('{span_id}')))) return null;
@@ -188,7 +198,8 @@ export function conversationUrl(s: LinkSettings | null, conversationId: string, 
   if (!s?.key || !conversationId) return null;
   const w = conversationWindow(startedAt, nowMs);
   if (!w) return null;
-  // A custom destination: its own template, when it has one.
+  // CloudWatch has no link to a search; a custom destination its own template, when it has one.
+  if (s.provider === 'cloudwatch') return null;
   if (s.provider === 'otlp') return s.links?.conversation ? fillTemplate(s.links.conversation, { conversation: conversationId, ...times(w), service: s.serviceName }) : null;
   if (!s.key.team) return null;
   const query = {
@@ -227,7 +238,7 @@ export function parseTimelineTemplate(raw: string | undefined): string | null {
 
 /** A conversation in Agent Timeline, from a template parseTimelineTemplate accepted. Null when the template needs a slug the key did not give. */
 export function timelineUrl(template: string | null, s: LinkSettings | null, conversationId: string, startedAt: string, nowMs: number): string | null {
-  if (!template || s?.provider === 'otlp' || !s?.key?.team || !conversationId) return null;
+  if (!template || (s?.provider && s.provider !== 'honeycomb') || !s?.key?.team || !conversationId) return null;
   const w = conversationWindow(startedAt, nowMs);
   if (!w) return null;
   const env = s.key.environment?.slug;
@@ -344,31 +355,41 @@ export function createTelemetryService({ store, github, secrets, check, checkOtl
    * endpoint with an empty export carrying the header, and saved in the same write as the key's
    * version. A destination never changes without its key, so a key is only sent where it was checked.
    */
-  async function setOtlpKey(caller: Caller, installationId: number, input: { value?: unknown; endpoint?: unknown; header?: unknown }): Promise<TelemetryView> {
+  /**
+   * Saves an endpoint-and-header destination with its key, after `judge` read the empty export's
+   * answer: the secret first, then the row naming its version, with the destination, under the lease.
+   */
+  async function saveEndpointKey(
+    caller: Caller,
+    installationId: number,
+    destination: { provider: 'otlp' | 'cloudwatch'; endpoint: { endpoint: string; tracesUrl: string; host: string }; header: string; value: string; aws?: { region: string } },
+    judge: (verdict: OtlpCheck) => string | null,
+  ): Promise<TelemetryView> {
     const ctx = await github.configContext(caller, installationId);
-    const parsed = parseOtlpEndpoint(input.endpoint);
-    if ('problem' in parsed) throw new FlowError('invalid_key', 400, `${parsed.problem}; nothing was changed`);
-    const header = typeof input.header === 'string' ? input.header.trim().toLowerCase() : '';
-    const headerProblem = headerNameProblem(header);
-    if (headerProblem) throw new FlowError('invalid_key', 400, `${headerProblem}; nothing was changed`);
-    const value = typeof input.value === 'string' ? input.value.trim() : '';
-    if (!headerValueOk(value)) throw new FlowError('invalid_key', 400, 'The header value is 8 to 4096 printable characters, on one line; nothing was changed');
+    const { provider, endpoint, header, value } = destination;
     const lease = await acquire(installationId);
     let done = false;
     try {
       // The value is never repeated, in any message.
-      const verdict = await checkOtlp({ tracesUrl: parsed.tracesUrl, host: parsed.host, header }, value);
-      if (verdict.result === 'invalid') throw new FlowError('invalid_key', 400, `${parsed.host} refused that key; nothing was changed`);
-      if (verdict.result === 'not_otlp') throw new FlowError('invalid_key', 400, `${parsed.host} answered HTTP ${verdict.status} to an empty OTLP/HTTP JSON export: is this its OTLP endpoint, and does it take JSON? Nothing was changed`);
-      if (verdict.result === 'unreachable') throw new FlowError('invalid_key', 400, `Could not check ${parsed.host}: ${verdict.reason}. Nothing was changed`);
+      const problem = judge(await checkOtlp({ tracesUrl: endpoint.tracesUrl, host: endpoint.host, header }, value));
+      if (problem) throw new FlowError('invalid_key', 400, problem);
       const tenant = await store.getTenant(installationId);
       if (!tenant || tenant.disabledReason === 'uninstalled') throw new FlowError('uninstalled', 409, 'This installation was uninstalled');
       const written = await secrets.put(telemetrySecretName(installationId), value, { 'updraft:installation': String(installationId), 'updraft:key': TELEMETRY_KEY_NAME });
-      const key = { updatedAt: at(), updatedBy: ctx.githubLogin, ...(written?.versionId ? { secretVersion: written.versionId } : {}), type: 'otlp' };
+      const key = { updatedAt: at(), updatedBy: ctx.githubLogin, ...(written?.versionId ? { secretVersion: written.versionId } : {}), type: provider };
       const view = await mutate(installationId, (latest) => {
         if (latest.keyChange?.id !== lease) throw lost();
-        const { keyChange: _lease, ...rest } = latest;
-        return { ...rest, provider: 'otlp', otlp: { endpoint: parsed.endpoint, header }, key, enabled: latest.key ? latest.enabled : true, updatedAt: at(), updatedBy: ctx.githubLogin };
+        const { keyChange: _lease, aws: _aws, ...rest } = latest;
+        return {
+          ...rest,
+          provider,
+          otlp: { endpoint: endpoint.endpoint, header },
+          ...(destination.aws ? { aws: destination.aws } : {}),
+          key,
+          enabled: latest.key ? latest.enabled : true,
+          updatedAt: at(),
+          updatedBy: ctx.githubLogin,
+        };
       });
       done = true;
       return view;
@@ -377,15 +398,63 @@ export function createTelemetryService({ store, github, secrets, check, checkOtl
     }
   }
 
+  /**
+   * A custom destination and its key, together: the endpoint and header are checked, then the
+   * endpoint with an empty export carrying the header, and saved in the same write as the key's
+   * version. A destination never changes without its key, so a key is only sent where it was checked.
+   */
+  async function setOtlpKey(caller: Caller, installationId: number, input: { value?: unknown; endpoint?: unknown; header?: unknown }): Promise<TelemetryView> {
+    const parsed = parseOtlpEndpoint(input.endpoint);
+    if ('problem' in parsed) throw new FlowError('invalid_key', 400, `${parsed.problem}; nothing was changed`);
+    const header = typeof input.header === 'string' ? input.header.trim().toLowerCase() : '';
+    const headerProblem = headerNameProblem(header);
+    if (headerProblem) throw new FlowError('invalid_key', 400, `${headerProblem}; nothing was changed`);
+    const value = typeof input.value === 'string' ? input.value.trim() : '';
+    if (!headerValueOk(value)) throw new FlowError('invalid_key', 400, 'The header value is 8 to 4096 printable characters, on one line; nothing was changed');
+    return saveEndpointKey(caller, installationId, { provider: 'otlp', endpoint: parsed, header, value }, (verdict) => {
+      if (verdict.result === 'invalid') return `${parsed.host} refused that key; nothing was changed`;
+      if (verdict.result === 'not_otlp') return `${parsed.host} answered HTTP ${verdict.status} to an empty OTLP/HTTP JSON export: is this its OTLP endpoint, and does it take JSON? Nothing was changed`;
+      if (verdict.result === 'unreachable') return `Could not check ${parsed.host}: ${verdict.reason}. Nothing was changed`;
+      return null;
+    });
+  }
+
+  /**
+   * CloudWatch: an AWS region and an X-Ray API key (its ServiceCredentialSecret), sent as
+   * `Authorization: Bearer <key>` to X-Ray's OTLP endpoint in the region. AWS checks the key before
+   * the body, so a 403 is the key and a 400 to the empty export is a key that got through, unless
+   * the answer says Transaction Search, which the endpoint needs, is off.
+   */
+  async function setCloudWatchKey(caller: Caller, installationId: number, input: { value?: unknown; awsRegion?: unknown }): Promise<TelemetryView> {
+    const region = typeof input.awsRegion === 'string' ? input.awsRegion.trim().toLowerCase() : '';
+    if (!AWS_REGION.test(region)) throw new FlowError('invalid_key', 400, 'The AWS region is a code such as us-east-1; nothing was changed');
+    const raw = typeof input.value === 'string' ? input.value.trim().replace(/^Bearer\s+/i, '') : '';
+    if (!CLOUDWATCH_KEY.test(raw)) throw new FlowError('invalid_key', 400, "That does not look like an X-Ray API key (the ServiceCredentialSecret, not the credential's id); nothing was changed");
+    const parsed = parseOtlpEndpoint(cloudWatchEndpoint(region));
+    if ('problem' in parsed) throw new FlowError('invalid_key', 400, `${parsed.problem}; nothing was changed`);
+    return saveEndpointKey(caller, installationId, { provider: 'cloudwatch', endpoint: parsed, header: 'authorization', value: `Bearer ${raw}`, aws: { region } }, (verdict) => {
+      if (verdict.result === 'invalid') {
+        return `CloudWatch (${region}) refused that key: is it the ServiceCredentialSecret of an X-Ray API key, with AWSXRayAPIKeyAccess, in this region? Nothing was changed`;
+      }
+      if (verdict.result === 'not_otlp' && verdict.status === 400 && /transaction search/i.test(verdict.detail ?? '')) {
+        return `CloudWatch (${region}) needs Transaction Search on before it takes traces: turn it on in CloudWatch, then save again. Nothing was changed`;
+      }
+      if (verdict.result === 'not_otlp' && verdict.status !== 400) return `CloudWatch (${region}) answered HTTP ${verdict.status}: are API keys for X-Ray available in this region? Nothing was changed`;
+      if (verdict.result === 'unreachable') return `Could not check CloudWatch (${region}): ${verdict.reason}. Nothing was changed`;
+      return null;
+    });
+  }
+
   return {
     async view(caller: Caller, installationId: number): Promise<TelemetryView> {
       await github.member(caller, installationId);
       return telemetryView(await store.getTelemetry(installationId));
     },
 
-    async setKey(caller: Caller, installationId: number, input: { provider?: unknown; value?: unknown; region?: unknown; endpoint?: unknown; header?: unknown }): Promise<TelemetryView> {
+    async setKey(caller: Caller, installationId: number, input: { provider?: unknown; value?: unknown; region?: unknown; awsRegion?: unknown; endpoint?: unknown; header?: unknown }): Promise<TelemetryView> {
       if (input.provider === 'otlp') return setOtlpKey(caller, installationId, input);
-      if (input.provider !== undefined && input.provider !== 'honeycomb') throw new FlowError('invalid_key', 400, '`provider` is honeycomb or otlp; nothing was changed');
+      if (input.provider === 'cloudwatch') return setCloudWatchKey(caller, installationId, input);
+      if (input.provider !== undefined && input.provider !== 'honeycomb') throw new FlowError('invalid_key', 400, '`provider` is honeycomb, cloudwatch or otlp; nothing was changed');
       const ctx = await github.configContext(caller, installationId);
       const value = typeof input.value === 'string' ? input.value.trim() : '';
       if (!KEY_SHAPE.test(value)) throw new FlowError('invalid_key', 400, 'That does not look like a Honeycomb API key; nothing was changed');
@@ -417,7 +486,7 @@ export function createTelemetryService({ store, github, secrets, check, checkOtl
         // turns sending on. Whether it sends, and with content, stay what the latest save said.
         const view = await mutate(installationId, (latest) => {
           if (latest.keyChange?.id !== lease) throw lost();
-          const { keyChange: _lease, otlp: _otlp, ...rest } = latest;
+          const { keyChange: _lease, otlp: _otlp, aws: _aws, ...rest } = latest;
           return { ...rest, provider: 'honeycomb', region, key, enabled: latest.key ? latest.enabled : true, updatedAt: at(), updatedBy: ctx.githubLogin };
         });
         done = true;

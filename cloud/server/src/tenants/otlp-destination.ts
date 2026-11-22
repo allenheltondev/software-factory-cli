@@ -93,7 +93,8 @@ export async function resolvesPublic(host: string, resolve: Resolver = resolveAl
   }
 }
 
-export type OtlpCheck = { result: 'valid' } | { result: 'invalid' } | { result: 'not_otlp'; status: number } | { result: 'unreachable'; reason: string };
+/** `detail`: the start of the answer's body, for a caller that knows what its endpoint says in it. */
+export type OtlpCheck = { result: 'valid' } | { result: 'invalid' } | { result: 'not_otlp'; status: number; detail?: string } | { result: 'unreachable'; reason: string };
 export type OtlpChecker = (destination: { tracesUrl: string; host: string; header: string }, value: string) => Promise<OtlpCheck>;
 
 /**
@@ -114,12 +115,31 @@ export const checkOtlpEndpoint = (fetchFn: typeof fetch = fetch, resolve: Resolv
       if (res.status === 401 || res.status === 403) return { result: 'invalid' };
       if (res.status >= 300 && res.status < 400) return { result: 'unreachable', reason: 'it answered with a redirect, which is never followed' };
       if (res.ok) return { result: 'valid' };
-      if ([400, 404, 405, 406, 415].includes(res.status)) return { result: 'not_otlp', status: res.status };
+      if ([400, 404, 405, 406, 415].includes(res.status)) {
+        const detail = typeof res.text === 'function' ? (await res.text().catch(() => '')).slice(0, 300) : '';
+        return { result: 'not_otlp', status: res.status, ...(detail ? { detail } : {}) };
+      }
       return { result: 'unreachable', reason: `it answered HTTP ${res.status}` };
     } catch (error) {
       return { result: 'unreachable', reason: (error as Error)?.name === 'TimeoutError' ? 'it did not answer in time' : 'it could not be reached' };
     }
   };
+
+/**
+ * CloudWatch: X-Ray's OTLP traces endpoint in an AWS region, which takes an X-Ray API key as
+ * `Authorization: Bearer <key>` (docs.aws.amazon.com/xray/latest/devguide/xray-opentelemetry-bearer-token.html).
+ */
+export const AWS_REGION = /^[a-z]{2}(?:-gov)?-[a-z]+-\d{1,2}$/;
+export const cloudWatchEndpoint = (region: string) => `https://xray.${region}.amazonaws.com`;
+/** An X-Ray API key (its ServiceCredentialSecret): no spaces; "Bearer " is added here. */
+export const CLOUDWATCH_KEY = /^[A-Za-z0-9+/=_.-]{16,512}$/;
+
+/**
+ * A trace in the CloudWatch console. AWS documents no link to a trace: this is the form its
+ * console uses today, with the trace id in X-Ray's form (1-<first 8 hex>-<the other 24>).
+ */
+export const cloudWatchTraceUrl = (region: string, traceId: string) =>
+  `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}#xray:traces/1-${traceId.slice(0, 8)}-${traceId.slice(8)}`;
 
 /**
  * A link template for a custom destination (`links.trace`, `links.conversation`): an https URL

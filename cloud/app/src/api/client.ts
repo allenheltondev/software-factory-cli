@@ -282,9 +282,12 @@ export interface JobTimelineEntry {
 }
 
 export type TelemetryRegion = 'us' | 'eu';
-export type TelemetryProvider = 'honeycomb' | 'otlp';
+export type TelemetryProvider = 'honeycomb' | 'cloudwatch' | 'otlp';
 /** The destination and its key, saved together: a custom endpoint never changes without its key. */
-export type TelemetryKeyInput = { provider?: 'honeycomb'; value: string; region: TelemetryRegion } | { provider: 'otlp'; value: string; endpoint: string; header: string };
+export type TelemetryKeyInput =
+  | { provider?: 'honeycomb'; value: string; region: TelemetryRegion }
+  | { provider: 'cloudwatch'; value: string; awsRegion: string }
+  | { provider: 'otlp'; value: string; endpoint: string; header: string };
 export interface TelemetryLinks {
   trace?: string;
   conversation?: string;
@@ -294,6 +297,8 @@ export interface TelemetryView {
   enabled: boolean;
   /** A custom destination: where it sends and the header the key goes in (never the key). */
   otlp?: { endpoint: string; header: string; host: string };
+  /** CloudWatch: the AWS region it sends to. */
+  aws?: { region: string };
   /** A custom destination's link templates. */
   links?: TelemetryLinks;
   region: TelemetryRegion;

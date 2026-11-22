@@ -26,6 +26,9 @@ type Load = { state: 'loading' } | { state: 'ok'; view: TelemetryView } | { stat
 
 const exact = (iso: string) => new Date(iso).toLocaleString();
 const KEYS_DOCS = 'https://docs.honeycomb.io/configure/environments/manage-api-keys/';
+const XRAY_KEYS_DOCS = 'https://docs.aws.amazon.com/xray/latest/devguide/xray-opentelemetry-bearer-token.html';
+const TRANSACTION_SEARCH_DOCS = 'https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Transaction-Search.html';
+const AWS_REGION = /^[a-z]{2}(?:-gov)?-[a-z]+-\d{1,2}$/;
 const TIMELINE_DOCS = 'https://docs.honeycomb.io/investigate/observe/agent-timeline';
 const GENAI_DOCS = 'https://github.com/open-telemetry/semantic-conventions-genai';
 const SERVICE_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
@@ -91,7 +94,10 @@ export function TelemetryPage({ api = defaultApi }: { api?: Api }) {
 }
 
 /** Where traces go, in words: "Honeycomb US", or a custom endpoint's host. */
-const destinationLabel = (view: TelemetryView) => (view.provider === 'otlp' ? (view.otlp?.host ?? 'OTLP endpoint') : `Honeycomb ${view.region.toUpperCase()}`);
+const destinationLabel = (view: TelemetryView) =>
+  view.provider === 'otlp' ? (view.otlp?.host ?? 'OTLP endpoint') : view.provider === 'cloudwatch' ? `CloudWatch ${view.aws?.region ?? ''}`.trim() : `Honeycomb ${view.region.toUpperCase()}`;
+/** Where the traces went, in a sentence: "Honeycomb", "CloudWatch", or a custom endpoint's host. */
+const destinationName = (view: TelemetryView) => (view.provider === 'otlp' ? (view.otlp?.host ?? 'the endpoint') : view.provider === 'cloudwatch' ? 'CloudWatch' : 'Honeycomb');
 
 function Hero({ view }: { view: TelemetryView }) {
   const state = !view.keyConfigured ? { label: 'Not set up', tone: 'neutral' as const } : view.enabled ? { label: 'Sending', tone: 'success' as const } : { label: 'Paused', tone: 'warning' as const };
@@ -167,7 +173,14 @@ function DestinationCard({ view, api, installationId, onSaved }: { view: Telemet
       <CardBody className="flex flex-col gap-4">
         {k && (
           <dl className="grid gap-3 text-sm sm:grid-cols-3" data-testid="telemetry-key-facts">
-            {view.provider === 'otlp' ? (
+            {view.provider === 'cloudwatch' ? (
+              <>
+                <Fact label="Region">{view.aws?.region ?? '—'}</Fact>
+                <Fact label="Endpoint">
+                  <span className="break-all">{view.otlp?.endpoint ?? '—'}</span>
+                </Fact>
+              </>
+            ) : view.provider === 'otlp' ? (
               <>
                 <Fact label="Endpoint" className="sm:col-span-3">
                   <span className="break-all">{view.otlp?.endpoint ?? '—'}</span>
@@ -191,7 +204,7 @@ function DestinationCard({ view, api, installationId, onSaved }: { view: Telemet
         )}
         {saved && !editing && (
           <p role="status" className="text-sm font-medium" data-testid="telemetry-key-saved">
-            ✓ {view.provider === 'otlp' ? `${view.otlp?.host ?? 'The endpoint'} accepted the key.` : 'Honeycomb accepted the key.'} The next job sends its traces there.
+            ✓ {destinationName(view).replace(/^the /, 'The ')} accepted the key. The next job sends its traces there.
           </p>
         )}
         {editing ? (
@@ -205,11 +218,14 @@ function DestinationCard({ view, api, installationId, onSaved }: { view: Telemet
               }}
               options={[
                 { value: 'honeycomb', label: 'Honeycomb' },
+                { value: 'cloudwatch', label: 'CloudWatch' },
                 { value: 'otlp', label: 'Any OTLP endpoint' },
               ]}
             />
             {provider === 'honeycomb' ? (
               <HoneycombForm view={view} busy={busy} replacing={Boolean(k)} onSubmit={(input) => void save(input)} onCancel={k ? () => setEditing(false) : undefined} />
+            ) : provider === 'cloudwatch' ? (
+              <CloudWatchForm view={view} busy={busy} replacing={Boolean(k)} onSubmit={(input) => void save(input)} onCancel={k ? () => setEditing(false) : undefined} />
             ) : (
               <OtlpForm view={view} busy={busy} replacing={Boolean(k)} onSubmit={(input) => void save(input)} onCancel={k ? () => setEditing(false) : undefined} />
             )}
@@ -286,8 +302,59 @@ function HoneycombForm({ view, busy, replacing, onSubmit, onCancel }: FormProps)
   );
 }
 
+function CloudWatchForm({ view, busy, replacing, onSubmit, onCancel }: FormProps) {
+  const [region, setRegion] = useState(view.aws?.region ?? '');
+  const [value, setValue] = useState('');
+  const code = region.trim().toLowerCase();
+  const regionProblem = code && !AWS_REGION.test(code) ? 'A region code, such as us-east-1.' : null;
+  const typed = value.trim().replace(/^Bearer\s+/i, '');
+  const keyProblem = typed && !/^[A-Za-z0-9+/=_.-]{16,512}$/.test(typed) ? "The key's ServiceCredentialSecret: letters, digits and + / = _ . -" : null;
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    if (code && typed && !regionProblem && !keyProblem) onSubmit({ provider: 'cloudwatch', value: typed, awsRegion: code });
+  };
+  return (
+    <form className="flex flex-col gap-3" onSubmit={submit} noValidate data-testid="telemetry-cloudwatch-form">
+      <p className="text-sm text-muted-foreground">
+        An X-Ray API key for an IAM user with <code>AWSXRayAPIKeyAccess</code>, in an account with{' '}
+        <a className="auth-link" href={TRANSACTION_SEARCH_DOCS} target="_blank" rel="noreferrer">
+          Transaction Search
+        </a>{' '}
+        on.{' '}
+        <a className="auth-link" href={XRAY_KEYS_DOCS} target="_blank" rel="noreferrer">
+          Create one ↗
+        </a>
+      </p>
+      <Input
+        label="AWS region"
+        placeholder="us-east-1"
+        autoComplete="off"
+        spellCheck={false}
+        value={region}
+        disabled={busy}
+        onChange={(e) => setRegion(e.target.value)}
+        {...(regionProblem ? { error: regionProblem } : {})}
+      />
+      <PasswordInput
+        label={replacing ? 'New API key' : 'X-Ray API key'}
+        autoComplete="off"
+        autoCapitalize="off"
+        spellCheck={false}
+        value={value}
+        disabled={busy}
+        onChange={(e) => setValue(e.target.value)}
+        {...(keyProblem ? { error: keyProblem } : { hint: "The ServiceCredentialSecret, not the credential's id." })}
+      />
+      <p role="status" className="text-sm" aria-live="polite">
+        {busy ? 'Checking the key with CloudWatch…' : ''}
+      </p>
+      <FormButtons busy={busy} disabled={!code || !typed || !!regionProblem || !!keyProblem} replacing={replacing} onCancel={onCancel} />
+    </form>
+  );
+}
+
 function OtlpForm({ view, busy, replacing, onSubmit, onCancel }: FormProps) {
-  const [endpoint, setEndpoint] = useState(view.otlp?.endpoint ?? '');
+  const [endpoint, setEndpoint] = useState(view.provider === 'otlp' ? (view.otlp?.endpoint ?? '') : '');
   const [header, setHeader] = useState(view.otlp?.header ?? 'authorization');
   const [value, setValue] = useState('');
   const url = endpoint.trim();
@@ -487,7 +554,7 @@ function SettingsCard({ view, api, installationId, onSaved }: { view: TelemetryV
 
 function LastExport({ view, installationId }: { view: TelemetryView; installationId: number }) {
   const e = view.lastExport;
-  const where = view.provider === 'otlp' ? (view.otlp?.host ?? 'the endpoint') : 'Honeycomb';
+  const where = destinationName(view);
   return (
     <Card data-testid="telemetry-last">
       <CardHeader>

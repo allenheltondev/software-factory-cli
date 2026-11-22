@@ -615,6 +615,21 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(harness.finishDetails[0].telemetry.local).toBeUndefined();
   });
 
+  it("sends to CloudWatch's X-Ray endpoint with the key as a bearer token", async () => {
+    const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'Bearer AbCdEfGhIjKlMnOpQrStUv0123' } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push({ url, init });
+      return { ok: true, status: 200 };
+    };
+    harness.deps.resolvesPublic = async () => true;
+    const cloudwatch = { ...telemetry, provider: 'cloudwatch', endpoint: 'https://xray.us-west-2.amazonaws.com', header: 'authorization' };
+    expect((await runJob(brokerRequest({ telemetry: cloudwatch }), harness.deps)).outcome).toBe('succeeded');
+    expect(posts[0].url).toBe('https://xray.us-west-2.amazonaws.com/v1/traces');
+    expect(posts[0].init.headers).toMatchObject({ authorization: 'Bearer AbCdEfGhIjKlMnOpQrStUv0123' });
+    expect(JSON.stringify(posts.map((p) => p.init.body))).not.toContain('AbCdEfGhIjKlMnOpQrStUv0123');
+  });
+
   it('sends nothing to a custom endpoint that resolves to a private address, or that is not one it sends to, and still reads the job', async () => {
     for (const [endpoint, publicHost] of [
       ['https://otlp.example.com', false],

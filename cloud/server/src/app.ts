@@ -48,7 +48,7 @@ import type { ConfigService, PublishOutcome } from './tenants/config-service.js'
  *   GET    /api/v1/installations/:id/telemetry           settings, whether a key is set, where it sends, the last export
  *   PUT    /api/v1/installations/:id/telemetry           { enabled?, serviceName?, captureContent?, links? }
  *   PUT    /api/v1/installations/:id/telemetry/key       { value, region } (Honeycomb: checked with /1/auth), or
- *                                                        { provider: 'otlp', value, endpoint, header } (an empty export), then saved
+ *                                                        { provider: 'otlp', value, endpoint, header } or { provider: 'cloudwatch', value, awsRegion } (an empty export), then saved
  *   DELETE /api/v1/installations/:id/telemetry/key       telemetry is off until a new key is set
  *
  * A tenant's insights (tenants/stats-service.ts), members only:

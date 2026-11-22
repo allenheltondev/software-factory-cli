@@ -236,8 +236,11 @@ export interface AgentKeyMeta {
  * region and team, or a custom OTLP endpoint and the header it goes in), and how the last export went.
  */
 export interface TelemetrySettings {
-  /** honeycomb: the Honeycomb preset. otlp: any OTLP/HTTP endpoint that takes JSON. */
-  provider: 'honeycomb' | 'otlp';
+  /**
+   * honeycomb: the Honeycomb preset. cloudwatch: the CloudWatch preset (X-Ray's OTLP endpoint in
+   * an AWS region, with an X-Ray API key). otlp: any OTLP/HTTP endpoint that takes JSON.
+   */
+  provider: 'honeycomb' | 'cloudwatch' | 'otlp';
   enabled: boolean;
   /** Honeycomb's region. */
   region: 'us' | 'eu';
@@ -247,6 +250,8 @@ export interface TelemetrySettings {
    * where it was checked.
    */
   otlp?: { endpoint: string; header: string };
+  /** CloudWatch: the AWS region its endpoint is in (`otlp` holds the endpoint itself). */
+  aws?: { region: string };
   /** A custom destination's link templates (tenants/otlp-destination.ts). */
   links?: { trace?: string; conversation?: string };
   /** `service.name`: the dataset traces land in. */

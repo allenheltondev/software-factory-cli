@@ -60,7 +60,8 @@ function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
   const otlp = i.otlp && typeof i.otlp === 'object' ? (i.otlp as Record<string, unknown>) : undefined;
   const links = i.links && typeof i.links === 'object' ? (i.links as Record<string, unknown>) : undefined;
   return {
-    provider: i.provider === 'otlp' ? 'otlp' : 'honeycomb',
+    provider: i.provider === 'otlp' ? 'otlp' : i.provider === 'cloudwatch' ? 'cloudwatch' : 'honeycomb',
+    ...(i.aws && typeof i.aws === 'object' && typeof (i.aws as Record<string, unknown>).region === 'string' ? { aws: { region: String((i.aws as Record<string, unknown>).region) } } : {}),
     enabled: i.enabled === true,
     region: i.region === 'eu' ? 'eu' : 'us',
     ...(otlp && typeof otlp.endpoint === 'string' && typeof otlp.header === 'string' ? { otlp: { endpoint: otlp.endpoint, header: otlp.header } } : {}),

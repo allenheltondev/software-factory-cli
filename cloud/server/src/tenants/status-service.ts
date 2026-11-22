@@ -157,6 +157,7 @@ export function missingPermissions(granted: Record<string, string> | undefined):
 
 /** Where a trace went, in words: Honeycomb, or a custom endpoint's host. */
 function destinationName(s: TelemetrySettings): string {
+  if (s.provider === 'cloudwatch') return 'CloudWatch';
   if (s.provider !== 'otlp' || !s.otlp) return 'Honeycomb';
   const parsed = parseOtlpEndpoint(s.otlp.endpoint);
   return 'host' in parsed ? parsed.host : 'your OTLP endpoint';
@@ -194,7 +195,7 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
       ...(url ? { traceUrl: url } : {}),
       ...(conversationId ? { conversationId } : {}),
       ...(sent ? { destination: destinationName(sent) } : {}),
-      ...(queryUrl ? { conversationUrl: queryUrl, ...(sent?.provider !== 'otlp' ? { conversationHint: 'In the results, select the conversation id to open it in Agent Timeline.' } : {}) } : {}),
+      ...(queryUrl ? { conversationUrl: queryUrl, ...(sent?.provider === 'honeycomb' ? { conversationHint: 'In the results, select the conversation id to open it in Agent Timeline.' } : {}) } : {}),
       ...(timeline ? { timelineUrl: timeline, timelineLabel: 'Open in Agent Timeline' } : {}),
       ...(entries.length ? { timeline: entries } : {}),
       ...(t.totals ? { totals: t.totals } : {}),

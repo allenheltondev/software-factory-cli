@@ -25,6 +25,34 @@ console's links: a [direct trace link](https://docs.honeycomb.io/investigate/col
 and a [shared query](https://docs.honeycomb.io/investigate/collaborate/share-query) for the
 conversation.
 
+### CloudWatch
+
+An AWS region and an X-Ray API key. The runner sends to X-Ray's
+[OTLP traces endpoint](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-OTLPEndpoint.html)
+in that region, `https://xray.<region>.amazonaws.com/v1/traces`, with the key as
+`Authorization: Bearer <key>`; it takes OTLP/HTTP with JSON. The traces are in CloudWatch's
+Transaction Search, where the `gen_ai.*` attributes, the service name and
+`gen_ai.conversation.id` can be searched and grouped. To set it up in AWS:
+
+1. Turn on [Transaction Search](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Transaction-Search.html)
+   in the account: the endpoint takes no traces without it.
+2. Give an IAM user the `AWSXRayAPIKeyAccess` managed policy, and create an
+   [X-Ray API key](https://docs.aws.amazon.com/xray/latest/devguide/xray-opentelemetry-bearer-token.html)
+   for it (IAM, the user, **Security credentials**, **API keys for AWS services**; or
+   `aws iam create-service-specific-credential --service-name xray.amazonaws.com`). Paste its
+   `ServiceCredentialSecret`, not the credential's id. API keys are not offered in every region.
+
+The check before saving is the same empty export as for any OTLP endpoint. AWS checks the key
+before it reads the body, so a 403 is a key it refused; a 400 to the empty export is taken as a
+key that got through, unless its answer says Transaction Search is off. The key is stored as
+`Bearer <key>`, and the runner treats CloudWatch as an OTLP endpoint and header (the rules and the
+public-address check apply as below).
+
+**View trace** opens the trace in the CloudWatch console,
+`https://<region>.console.aws.amazon.com/cloudwatch/home?region=<region>#xray:traces/1-<first 8 hex>-<other 24 hex>`
+(the trace id in X-Ray's form). AWS documents no link to a trace, so this is the form the console
+uses today, and can change. There is no link to a span or to a conversation's search.
+
 ### Any OTLP endpoint
 
 Any backend that takes OTLP/HTTP with JSON encoding: a hosted tracing service, or your own
@@ -380,14 +408,14 @@ path it can change without notice; the query link works either way.
 ## Security
 
 - The key is a Secrets Manager secret, `updraft/tenants/<id>/agent-keys/HONEYCOMB_API_KEY` (the
-  name from when Honeycomb was the only destination; a custom destination's header value is kept
-  there too). The API can create, replace and delete it, never read it. Only a job of the same tenant can read
+  name from when Honeycomb was the only destination; CloudWatch's key and a custom destination's
+  header value are kept there too). The API can create, replace and delete it, never read it. Only a job of the same tenant can read
   it, with the broker's tenant-scoped credentials.
 - The broker passes it to the runner as telemetry settings, never among the agent keys, so it is
   never in the job process's or an agent's environment. The runner reads it as root.
 - The key and where it sends always match. The settings record the Secrets Manager version the
   key was written as, in the same conditional write as its destination (Honeycomb's region and
-  team, or the custom endpoint and header), and the runner reads exactly that version. A
+  team, CloudWatch's region and endpoint, or the custom endpoint and header), and the runner reads exactly that version. A
   destination cannot change without the key being entered again, so no member can point a saved
   key at another server. Key changes take a two-minute lease on the settings, so a rotation and
   another rotation, or a removal, never overlap; a change that stops halfway leaves the settings

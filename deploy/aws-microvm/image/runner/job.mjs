@@ -822,12 +822,13 @@ async function telemetrySetup(payload, deps, log) {
 }
 
 /**
- * Where the job's telemetry goes: Honeycomb in its region, or a custom OTLP endpoint and the header
- * the key goes in. A custom one is checked again here, as the API did before saving it: HTTPS to a
+ * Where the job's telemetry goes: Honeycomb in its region, or an OTLP endpoint and the header the
+ * key goes in (CloudWatch's, or a custom one). A custom one is checked again here, as the API did before saving it: HTTPS to a
  * public DNS name, whose every address is public right now. Null, and nothing is sent, otherwise.
  */
 async function telemetryDestination(t, deps, log) {
-  if (t.provider !== 'otlp') {
+  // CloudWatch is an endpoint and a header too (X-Ray's, in its region), checked the same way.
+  if (t.provider !== 'otlp' && t.provider !== 'cloudwatch') {
     const endpoint = HONEYCOMB_ENDPOINTS[t.region] ?? null;
     return endpoint ? { endpoint, headerName: 'x-honeycomb-team', host: new URL(endpoint).host } : null;
   }

@@ -280,7 +280,7 @@ describe('a custom OTLP destination', () => {
       [{ ...otlp, header: 'x y' }, /header name/],
       [{ ...otlp, value: 'short' }, /header value/],
       [{ ...otlp, value: 'Bearer a\nb-injected-header' }, /header value/],
-      [{ ...otlp, provider: 'datadog' }, /honeycomb or otlp/],
+      [{ ...otlp, provider: 'datadog' }, /honeycomb, cloudwatch or otlp/],
     ] as const) {
       const { service, secrets, checkOtlp } = await setup();
       await expect(service.setKey(caller, 55, input), JSON.stringify(input)).rejects.toMatchObject({ status: 400, message: expect.stringMatching(message) });
@@ -349,6 +349,75 @@ describe('a custom OTLP destination', () => {
     // `update` cannot change where the key goes.
     await service.update(caller, 55, { otlp: { endpoint: 'https://evil.example.com' } } as never);
     expect((await store.getTelemetry(55))!.otlp?.endpoint).toBe('https://otlp.example.com/otlp');
+  });
+});
+
+describe('the CloudWatch destination', () => {
+  const XRAY_KEY = 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/=';
+
+  it("checks the region's X-Ray endpoint with the key as a bearer token, and saves the destination with it", async () => {
+    const { service, secrets, checkOtlp, store } = await setup();
+    const v = await service.setKey(caller, 55, { provider: 'cloudwatch', awsRegion: ' US-West-2 ', value: `Bearer ${XRAY_KEY}` });
+    expect(checkOtlp).toHaveBeenCalledWith({ tracesUrl: 'https://xray.us-west-2.amazonaws.com/v1/traces', host: 'xray.us-west-2.amazonaws.com', header: 'authorization' }, `Bearer ${XRAY_KEY}`);
+    expect(secrets.put).toHaveBeenCalledWith('updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', `Bearer ${XRAY_KEY}`, expect.anything());
+    expect(v).toMatchObject({ provider: 'cloudwatch', enabled: true, aws: { region: 'us-west-2' }, otlp: { endpoint: 'https://xray.us-west-2.amazonaws.com', header: 'authorization' }, key: { type: 'cloudwatch' } });
+    expect(JSON.stringify(v)).not.toContain(XRAY_KEY);
+    expect((await store.getTelemetry(55))).toMatchObject({ provider: 'cloudwatch', aws: { region: 'us-west-2' } });
+    // To another destination: the region goes with it.
+    const back = await service.setKey(caller, 55, { value: KEY, region: 'us' });
+    expect(back).not.toHaveProperty('aws');
+    expect(back).not.toHaveProperty('otlp');
+  });
+
+  it('reads the answer to the empty export the way AWS gives it', async () => {
+    for (const [verdict, outcome] of [
+      [{ result: 'valid' as const }, null],
+      // The key got through; the empty body did not.
+      [{ result: 'not_otlp' as const, status: 400, detail: 'Invalid request: no spans' }, null],
+      [{ result: 'not_otlp' as const, status: 400, detail: 'Transaction Search is not enabled for this account' }, /Transaction Search/],
+      [{ result: 'invalid' as const }, /ServiceCredentialSecret/],
+      [{ result: 'not_otlp' as const, status: 404 }, /available in this region/],
+      [{ result: 'unreachable' as const, reason: 'it did not answer in time' }, /did not answer/],
+    ] as const) {
+      const { service, secrets } = await setup(undefined, async () => verdict);
+      const out = service.setKey(caller, 55, { provider: 'cloudwatch', awsRegion: 'eu-west-1', value: XRAY_KEY });
+      if (outcome === null) await expect(out).resolves.toMatchObject({ provider: 'cloudwatch' });
+      else {
+        await expect(out).rejects.toMatchObject({ status: 400, message: expect.stringMatching(outcome) });
+        expect(secrets.put).not.toHaveBeenCalled();
+      }
+    }
+    for (const input of [
+      { provider: 'cloudwatch', awsRegion: 'oregon', value: XRAY_KEY },
+      { provider: 'cloudwatch', awsRegion: 'us-west-2', value: 'short' },
+      { provider: 'cloudwatch', awsRegion: 'us-west-2', value: 'has spaces in it ok' },
+    ]) {
+      const { service, checkOtlp } = await setup();
+      await expect(service.setKey(caller, 55, input)).rejects.toMatchObject({ status: 400 });
+      expect(checkOtlp).not.toHaveBeenCalled();
+    }
+  });
+
+  it('links a job to its trace in the CloudWatch console, and to no span or search', async () => {
+    const { service, store } = await setup();
+    await service.setKey(caller, 55, { provider: 'cloudwatch', awsRegion: 'us-east-1', value: XRAY_KEY });
+    const traceId = '6a1b2c3d' + 'ef'.repeat(12);
+    const job: JobSummary = {
+      jobId: 'job_x0000001',
+      repository: 'acme/web',
+      issue: 12,
+      createdAt: '2026-11-21T10:00:00.000Z',
+      finishedAt: '2026-11-21T10:20:00.000Z',
+      status: 'finished',
+      outcome: 'succeeded',
+      detail: { telemetry: { traceId, rootSpanId: 'ab'.repeat(8), spans: 9, exported: 9, failed: 0, startedAt: '2026-11-21T10:00:00.000Z', marks: [{ kind: 'agent', spanId: 'cd'.repeat(8) }] } },
+    };
+    const t = jobView(job, (await store.getTelemetry(55))!, { now: Date.parse('2026-11-22T10:00:00.000Z'), timelineTemplate: '{ui}/{team}/x?c={conversation}' }).telemetry!;
+    expect(t.destination).toBe('CloudWatch');
+    expect(t.traceUrl).toBe(`https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#xray:traces/1-6a1b2c3d-${'ef'.repeat(12)}`);
+    expect(t.timeline?.[0]).not.toHaveProperty('url');
+    expect(t).not.toHaveProperty('conversationUrl');
+    expect(t).not.toHaveProperty('timelineUrl');
   });
 });
 

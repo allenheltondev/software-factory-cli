@@ -132,6 +132,17 @@ describe('the job broker', () => {
     expect(out.ok && 'descriptor' in out && Object.values(out.descriptor.agentKeySecrets)).not.toContain('updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY');
   });
 
+  it('hands CloudWatch to the job as its endpoint and header, like a custom destination', async () => {
+    await store.putTelemetry(
+      55,
+      { provider: 'cloudwatch', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', aws: { region: 'us-west-2' }, otlp: { endpoint: 'https://xray.us-west-2.amazonaws.com', header: 'authorization' }, key: { updatedAt: '', updatedBy: 'pat' } },
+      0,
+    );
+    expect(await handle({ action: 'start', jobId: job.jobId, token })).toMatchObject({
+      descriptor: { telemetry: { provider: 'cloudwatch', endpoint: 'https://xray.us-west-2.amazonaws.com', header: 'authorization', secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY' } },
+    });
+  });
+
   it('keeps the trace a finish reports, and records how the export went', async () => {
     await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat' } }, 0);
     await handle({ action: 'start', jobId: job.jobId, token });
