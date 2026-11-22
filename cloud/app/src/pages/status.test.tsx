@@ -167,6 +167,29 @@ describe('InstallationPage (#71)', () => {
     expect(screen.queryByTestId('setup')).toBeNull();
   });
 
+  it("lists a pull request's review-loop job and its events by pull request, with why one started nothing", async () => {
+    const prJob = job({ jobId: 'job_pullreq001', issue: undefined, issueUrl: undefined, label: undefined, pullRequest: 40, prUrl: 'https://github.com/acme/web/pull/40', result: 'success', outcome: 'succeeded' });
+    const prDeliveries: Delivery[] = [
+      { at: NOW, deliveryId: 'p-3', event: 'pull_request_review', action: 'submitted', repository: 'acme/web', pullRequest: 40, sender: 'sam', disposition: 'filtered', reason: 'actor_not_allowed' },
+      { at: NOW, deliveryId: 'p-2', event: 'pull_request', action: 'synchronize', repository: 'acme/web', pullRequest: 40, disposition: 'coalesced' },
+      { at: NOW, deliveryId: 'p-1', event: 'pull_request_review', action: 'submitted', repository: 'acme/web', pullRequest: 40, disposition: 'filtered', reason: 'comment_review' },
+    ];
+    showInstallation(api({ jobs: vi.fn().mockResolvedValue({ jobs: [prJob] }), deliveries: vi.fn().mockResolvedValue({ deliveries: prDeliveries }) }), '/installations/55?tab=deliveries');
+    const list = await screen.findByTestId('delivery-list');
+    expect(within(list).getByTestId('delivery-p-3')).toHaveTextContent('acme/web#40');
+    expect(within(list).getByTestId('delivery-p-3')).toHaveTextContent('The person who reviewed or pushed may not start work.');
+    expect(within(list).getByTestId('delivery-p-2')).toHaveTextContent('Folded into the job for pull request #40, which sees it.');
+    expect(within(list).getByTestId('delivery-p-1')).toHaveTextContent('"Request changes" does');
+  });
+
+  it("names a review-loop job by its pull request in the jobs list", async () => {
+    const prJob = job({ jobId: 'job_pullreq001', issue: undefined, issueUrl: undefined, label: undefined, pullRequest: 40, prUrl: 'https://github.com/acme/web/pull/40', result: 'success', outcome: 'succeeded' });
+    showInstallation(api({ jobs: vi.fn().mockResolvedValue({ jobs: [prJob] }) }));
+    const row = await screen.findByTestId('job-job_pullreq001');
+    expect(within(row).getByRole('link', { name: 'acme/web#40' })).toHaveAttribute('href', '/installations/55/jobs/job_pullreq001');
+    expect(row).toHaveTextContent('Review loop');
+  });
+
   it('shows no checklist once every step jobs need is done, telemetry or not', async () => {
     showInstallation(api({ overview: vi.fn().mockResolvedValue(overview({ telemetry: { configured: false, enabled: false } })) }));
     await screen.findByTestId('installation-status');

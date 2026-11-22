@@ -10,7 +10,7 @@ import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
 import { createLauncher, internetEgressConnector, noIngressConnector, type Launcher } from './jobs/launch.js';
-import { quotasFromEnv, throttledComment } from './jobs/quotas.js';
+import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 
 /**
@@ -94,15 +94,15 @@ function launcher(): Launcher | undefined {
     },
     quotas: quotasFromEnv(env),
     killSwitch,
-    // The App's own token for that one repository, allowed only to write issues.
-    notifyThrottled: async ({ installationId, repository, repositoryId, issue, limit, quotas }) => {
+    // The App's own token for that one repository, allowed only to write issues (and a pull request's conversation).
+    notifyThrottled: async ({ installationId, repository, repositoryId, issue, pullRequest, limit, quotas }) => {
       const settings = await loadSettings();
       if (!settings) return;
       const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId, {
         repositoryIds: [repositoryId],
-        permissions: { issues: 'write' },
+        permissions: throttleCommentPermissions(pullRequest),
       });
-      await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas));
+      await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas, pullRequest));
     },
   });
 }

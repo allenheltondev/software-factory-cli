@@ -246,6 +246,14 @@ describe('status and diagnostics (#71)', () => {
       expect((await get('55/jobs/job_nobody00001')).status).toBe(404);
     });
 
+    it("links a pull request's job to that pull request, with no issue", async () => {
+      const { store, get } = await setup();
+      await store.putJob(job({ jobId: 'job_status0002', issue: undefined, pullRequest: 40, eventName: 'pull_request_review', deliveryId: 'd-2' }));
+      const listed = ((await get('55/jobs')).body.jobs as Record<string, unknown>[]).find((j) => j.jobId === 'job_status0002')!;
+      expect(listed).toMatchObject({ pullRequest: 40, prUrl: 'https://github.com/acme/web/pull/40' });
+      expect(listed).not.toHaveProperty('issueUrl');
+    });
+
     it("shows a job with the other recent jobs of its conversation, newest first", async () => {
       const { store, get } = await setup();
       const traceId = 'ab'.repeat(16);

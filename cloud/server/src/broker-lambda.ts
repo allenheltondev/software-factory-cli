@@ -6,7 +6,7 @@ import { createGitHubApi } from './github/client.js';
 import { appJwt } from './github/jwt.js';
 import { createSettingsLoader } from './github/settings.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
-import { throttledComment } from './jobs/quotas.js';
+import { throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 
 /**
@@ -59,15 +59,15 @@ const handle = createBroker({
       throw err;
     }
   },
-  // The App's own token for that one repository, allowed only to write issues.
-  async notifyThrottled({ installationId, repository, repositoryId, issue, limit, quotas }) {
+  // The App's own token for that one repository, allowed only to write issues (and a pull request's conversation).
+  async notifyThrottled({ installationId, repository, repositoryId, issue, pullRequest, limit, quotas }) {
     const settings = await loadSettings();
     if (!settings) return;
     const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId, {
       repositoryIds: [repositoryId],
-      permissions: { issues: 'write' },
+      permissions: throttleCommentPermissions(pullRequest),
     });
-    await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas));
+    await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas, pullRequest));
   },
 });
 

@@ -121,6 +121,8 @@ export interface JobSummary {
   jobId: string;
   repository: string;
   issue?: number;
+  /** The pull request whose event started it (its review loop). */
+  pullRequest?: number;
   label?: string;
   sender?: string;
   createdAt: string;
@@ -196,6 +198,7 @@ export interface Delivery {
   action?: string;
   repository?: string;
   issue?: number;
+  pullRequest?: number;
   label?: string;
   sender?: string;
   disposition: DeliveryDisposition;
@@ -209,6 +212,8 @@ export interface JobView {
   jobId: string;
   repository: string;
   issue?: number;
+  /** The pull request whose event started it (its review loop). */
+  pullRequest?: number;
   label?: string;
   sender?: string;
   createdAt: string;

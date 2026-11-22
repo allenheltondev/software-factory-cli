@@ -6,7 +6,7 @@ import { configPrefix } from '../tenants/paths.js';
 import { dispatchRules } from '../tenants/dispatch.js';
 import { createAdminService } from '../admin/admin.js';
 import { createReconciler } from './reconcile.js';
-import { createLauncher, PRELAUNCH_CLAIM_MS, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
+import { createLauncher, PR_COALESCE_MS, PRELAUNCH_CLAIM_MS, pullRequestLease, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
 
 // Relative to the real clock: the memory store judges a delivery claim's expiry by it.
 const NOW = Date.now();
@@ -635,6 +635,98 @@ describe('the launcher', () => {
         return { microvmId: 'mvm-0002' };
       };
       expect((await launch(request())).disposition).toBe('launched');
+    });
+  });
+
+  describe('pull request events (the review loop)', () => {
+    const loopRules = dispatchRules(
+      { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' } }] } } },
+      { keysFor: () => ['ANTHROPIC_API_KEY'] },
+    );
+    beforeEach(async () => {
+      const v = await store.createConfigVersion(55, { sha256: 'z', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: loopRules });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    });
+    const prEvent = (over: Record<string, unknown> = {}, deliveryId = 'pr-delivery-1', eventName = 'pull_request_review'): LaunchRequest => {
+      const payload = {
+        action: 'submitted',
+        pull_request: { number: 40, head: { ref: 'updraft/issue-12-abc' } },
+        review: { state: 'changes_requested' },
+        sender: { login: 'pat' },
+        repository: { id: 9, full_name: 'acme/web' },
+        ...over,
+      };
+      return { installationId: 55, deliveryId, eventName, appBot: 'updraft[bot]', body: JSON.stringify(payload), payload };
+    };
+
+    it("starts a job for a review asking for changes: the pull request on the job, the event's name, and a start after the lease", async () => {
+      const result = await createLauncher(deps)(prEvent());
+      expect(result).toMatchObject({ status: 202, disposition: 'launched' });
+      const job = (await store.getJob(result.jobId!))!;
+      expect(job).toMatchObject({ eventName: 'pull_request_review', pullRequest: 40, repository: 'acme/web', agentKeys: ['ANTHROPIC_API_KEY'] });
+      expect(job.issue).toBeUndefined();
+      expect(job.label).toBeUndefined();
+      const hook = JSON.parse(runs[0]!.runHookPayload) as { eventName: string; notBefore?: string };
+      expect(hook.eventName).toBe('pull_request_review');
+      expect(Date.parse(hook.notBefore!)).toBe(NOW + PR_COALESCE_MS + 1000);
+      expect(JSON.parse(events['tenants/55/events/pr-delivery-1/event.json']!)).toMatchObject({ review: { state: 'changes_requested' } });
+      const [summary] = await store.listRecentJobs(55, 5);
+      expect(summary).toMatchObject({ pullRequest: 40 });
+    });
+
+    it('folds the events of a pull request within the lease into its job, and starts the next one after it', async () => {
+      const early = createLauncher({ ...deps, now: () => NOW - 60_000 });
+      expect((await early(prEvent())).disposition).toBe('launched');
+      // That lease is over: the next event starts a job, and holds the pull request for a few seconds.
+      const launch = createLauncher(deps);
+      expect((await launch(prEvent({}, 'pr-delivery-2'))).disposition).toBe('launched');
+      expect(await launch(prEvent({ action: 'synchronize' }, 'pr-delivery-3', 'pull_request'))).toMatchObject({ status: 200, disposition: 'coalesced', message: expect.stringMatching(/#40/) });
+      expect(runs).toHaveLength(2);
+      // The coalesced delivery holds no claim: redelivered later, it starts a job of its own.
+      expect(await store.claimDelivery(55, 'pr-delivery-3', NOW + 1000, 'probe')).toBe(true);
+      // Another pull request is not held up.
+      expect((await launch(prEvent({ pull_request: { number: 41, head: { ref: 'updraft/issue-13-def' } } }, 'pr-delivery-4'))).disposition).toBe('launched');
+    });
+
+    it('gives the lease back when the launch fails, so a redelivery is not coalesced away', async () => {
+      runMicrovm = async () => {
+        throw Object.assign(new Error('nope'), { name: 'ServiceException' });
+      };
+      expect(await createLauncher(deps)(prEvent())).toMatchObject({ status: 500, disposition: 'launch_failed' });
+      expect(await store.claimDelivery(55, pullRequestLease(9, 40), NOW + 1000, 'probe')).toBe(true);
+    });
+
+    it('starts nothing for what the rules refuse, and says why', async () => {
+      const launch = createLauncher(deps);
+      expect(await launch(prEvent({ review: { state: 'commented' } }))).toMatchObject({ disposition: 'not_dispatched', reason: 'comment_review' });
+      expect(await launch(prEvent({ sender: { login: 'updraft[bot]' } }))).toMatchObject({ disposition: 'not_dispatched', reason: 'own_event' });
+      expect(await launch(prEvent({ pull_request: { number: 40, head: { ref: 'main' } } }))).toMatchObject({ disposition: 'not_dispatched', reason: 'not_updraft_pr' });
+      expect(await launch(prEvent({ action: 'opened' }, 'x', 'pull_request'))).toMatchObject({ disposition: 'ignored' });
+      expect(runs).toEqual([]);
+    });
+
+    it('refuses a pull request event while a key its repository needs is not set, naming the pull request', async () => {
+      const v = await store.createConfigVersion(55, { sha256: 'k', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: dispatchRules(
+        { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' } }] } } },
+        { keysFor: () => ['CODEX_API_KEY'] },
+      ) });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      expect(await createLauncher(deps)(prEvent())).toMatchObject({ disposition: 'missing_key' });
+      expect((await store.listRefusals(55, 5))[0]).toMatchObject({ issue: 40, reason: 'CODEX_API_KEY is not set: add it under Agent keys' });
+    });
+
+    it("comments on the pull request, in its own words, when a quota stops its event", async () => {
+      const notices: ThrottleNotice[] = [];
+      await store.setTenantLimits(55, { jobsPerDay: 1 });
+      const launch = createLauncher({ ...deps, notifyThrottled: async (n) => void notices.push(n) });
+      expect((await launch(request())).disposition).toBe('launched');
+      expect(await launch(prEvent())).toMatchObject({ disposition: 'throttled' });
+      expect(notices).toEqual([expect.objectContaining({ issue: 40, pullRequest: true, limit: 'jobs_per_day' })]);
+      // Its lease went with it: once there is room, the next event is not coalesced into nothing.
+      expect(await store.claimDelivery(55, pullRequestLease(9, 40), NOW + 1000, 'probe')).toBe(true);
     });
   });
 

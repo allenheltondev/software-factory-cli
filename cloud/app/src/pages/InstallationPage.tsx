@@ -322,8 +322,9 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
             <StatusBadge tone={r.tone}>{r.label}</StatusBadge>
             <Link className="auth-link font-medium" to={`${base}/jobs/${j.jobId}`}>
               {j.repository}
-              {j.issue !== undefined ? `#${j.issue}` : ''}
+              {j.issue !== undefined ? `#${j.issue}` : j.pullRequest !== undefined ? `#${j.pullRequest}` : ''}
             </Link>
+            {j.pullRequest !== undefined && <StatusBadge tone="neutral">Review loop</StatusBadge>}
             {j.prUrl && (
               <a className="auth-link text-sm" href={j.prUrl} target="_blank" rel="noreferrer">
                 Pull request ↗
@@ -401,7 +402,7 @@ function DeliveriesList({ deliveries, base }: { deliveries: Delivery[]; base: st
                   {d.repository && (
                     <span>
                       {d.repository}
-                      {d.issue !== undefined ? `#${d.issue}` : ''}
+                      {d.issue !== undefined ? `#${d.issue}` : d.pullRequest !== undefined ? `#${d.pullRequest}` : ''}
                     </span>
                   )}
                   {d.label && <code className="text-sm">{d.label}</code>}

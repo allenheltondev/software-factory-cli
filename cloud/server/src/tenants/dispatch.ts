@@ -12,7 +12,7 @@ import type { DispatchRules } from '../store/store.js';
  */
 
 type Workflow = { trigger?: { label?: unknown }; allowedActors?: unknown };
-type Repository = { id?: unknown; workflows?: unknown };
+type Repository = { id?: unknown; workflows?: unknown; review?: unknown; revise?: unknown };
 
 /** What a repository's dispatch rules need beyond the compiled config: whether it is paused. */
 export interface DispatchOptions {
@@ -48,15 +48,21 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
     const firstKeys = triggers[0]?.keys;
     const sharedKeys = firstKeys !== undefined && triggers.every((t) => same(t.keys, firstKeys));
     const stored = triggers.map(({ actors, keys, ...t }) => ({ ...t, ...(shared ? {} : { actors }), ...(sharedKeys || keys === undefined ? {} : { keys }) }));
+    // The review loop (the CLI's reviewSettings and reviseActive; Updraft Cloud always runs live
+    // and always publishes): whether events on the repository's pull requests can lead to work.
+    const review = repo.review === true || (typeof repo.review === 'object' && repo.review !== null && !Array.isArray(repo.review));
+    const revise = repo.revise === true;
     repositories[fullName.toLowerCase()] = {
       id: repo.id,
       ...(paused.has(fullName.toLowerCase()) ? { paused: true } : {}),
       ...(shared ? { actors: first } : {}),
       ...(sharedKeys ? { keys: firstKeys } : {}),
+      ...(review ? { review: true as const } : {}),
+      ...(revise ? { revise: true as const } : {}),
       triggers: stored,
     };
   }
-  return { repositories };
+  return { repositories, loop: true };
 }
 
 /**
@@ -92,4 +98,85 @@ export function decideDispatch(
   const keysOf = (t: { keys?: string[] }) => t.keys ?? repo.keys;
   const keys = allowed.every((t) => Array.isArray(keysOf(t))) ? [...new Set(allowed.flatMap((t) => keysOf(t)!))].sort() : null;
   return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, label: event.label, keys };
+}
+
+/**
+ * Pull request events that can lead to work, as `updraft run-event` handles them (the self-hosted
+ * launcher's filter, deploy/aws-microvm/launcher/lib/filter.mjs): a review that is not a comment
+ * review (a "Request changes" starts a revision; an approval or a dismissal can cancel one), a
+ * push (a new review), and a close (the pull request is no longer watched). Not `reopened`: a
+ * closed pull request is no longer watched, for good.
+ */
+export const PULL_REQUEST_ACTIONS: Readonly<Record<string, readonly string[]>> = {
+  pull_request_review: ['submitted', 'edited', 'dismissed'],
+  pull_request: ['synchronize', 'closed'],
+};
+
+/** Updraft's job branches are `updraft/issue-<n>-<job id>`: revisions and reviews only concern those. */
+export const UPDRAFT_BRANCH_PREFIX = 'updraft/';
+
+export type PullRequestRefusalCode = DispatchRefusalCode | 'event_not_accepted' | 'loop_off' | 'not_updraft_pr' | 'own_event' | 'comment_review';
+
+export type PullRequestDecision =
+  | { start: true; repository: string; repositoryId: number; pullRequest: number; keys: string[] | null }
+  | { start: false; reason: string; code: PullRequestRefusalCode };
+
+/**
+ * Whether a pull request delivery starts a job under these rules: the repository (name and id),
+ * not paused, with its review loop on for what the event can lead to (a review: revisions; a
+ * push: reviews; a close: either), on an Updraft branch, not the App's own doing (its reviewer's
+ * comment reviews, its revision pushes: the run that made them handles what follows), and, for a
+ * review or a push, by a login the repository allows. A close is anyone's: it ends the loop.
+ *
+ * As for issues, an optimisation and a guard on what is paid for, not the authority: run-event
+ * reads the pull request on GitHub and the state database, and decides again.
+ */
+export function decidePullRequestDispatch(
+  rules: DispatchRules | undefined,
+  event: {
+    eventName: string;
+    action: unknown;
+    repositoryFullName: unknown;
+    repositoryId: unknown;
+    sender: unknown;
+    number: unknown;
+    headRef: unknown;
+    reviewState?: unknown;
+  },
+  options: { appBot?: string } = {},
+): PullRequestDecision {
+  const actions = PULL_REQUEST_ACTIONS[event.eventName];
+  if (!actions || typeof event.action !== 'string' || !actions.includes(event.action)) {
+    return { start: false, reason: `${event.eventName}.${typeof event.action === 'string' ? event.action : '?'} leads to no work`, code: 'event_not_accepted' };
+  }
+  if (!rules) return { start: false, reason: 'the active config has no dispatch rules (publish it again)', code: 'no_rules' };
+  if (typeof event.repositoryFullName !== 'string' || typeof event.repositoryId !== 'number') return { start: false, reason: 'no repository in the event', code: 'unknown_repo' };
+  if (typeof event.number !== 'number' || !Number.isSafeInteger(event.number)) return { start: false, reason: 'no pull request in the event', code: 'event_not_accepted' };
+  const repository = event.repositoryFullName.toLowerCase();
+  const repo = rules.repositories[repository];
+  if (!repo || repo.id !== event.repositoryId) return { start: false, reason: 'the repository is not in the active config', code: 'unknown_repo' };
+  if (repo.paused) return { start: false, reason: 'the repository is paused', code: 'paused' };
+  if (!rules.loop) return { start: false, reason: 'the active config was published before pull request events started jobs: publish it again', code: 'loop_off' };
+  const review = event.eventName === 'pull_request_review';
+  const push = event.eventName === 'pull_request' && event.action === 'synchronize';
+  if (review && !repo.revise) return { start: false, reason: 'revisions are off for this repository', code: 'loop_off' };
+  if (push && !repo.review) return { start: false, reason: 'review is off for this repository', code: 'loop_off' };
+  if (!repo.review && !repo.revise) return { start: false, reason: 'review and revisions are off for this repository', code: 'loop_off' };
+  if (typeof event.headRef !== 'string' || !event.headRef.startsWith(UPDRAFT_BRANCH_PREFIX)) {
+    return { start: false, reason: 'the pull request is not on an Updraft branch', code: 'not_updraft_pr' };
+  }
+  const sender = typeof event.sender === 'string' ? event.sender.toLowerCase() : '';
+  if (options.appBot && sender === options.appBot.toLowerCase()) return { start: false, reason: "the App's own review or push: the run that made it handles what follows", code: 'own_event' };
+  if (review && typeof event.reviewState === 'string' && event.reviewState.toLowerCase() === 'commented') {
+    return { start: false, reason: 'a comment review starts nothing (only "Request changes" does)', code: 'comment_review' };
+  }
+  if (review || push) {
+    const actors = new Set([...(repo.actors ?? []), ...repo.triggers.flatMap((t) => t.actors ?? [])]);
+    if (!actors.has(sender)) return { start: false, reason: 'the sender may not dispatch work', code: 'actor_not_allowed' };
+  }
+  // The keys of every workflow of the repository: the event names no label, and the pull request
+  // may be any of theirs.
+  const keysOf = (t: { keys?: string[] }) => t.keys ?? repo.keys;
+  const keys = repo.triggers.every((t) => Array.isArray(keysOf(t))) ? [...new Set(repo.triggers.flatMap((t) => keysOf(t)!))].sort() : null;
+  return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, pullRequest: event.number, keys };
 }

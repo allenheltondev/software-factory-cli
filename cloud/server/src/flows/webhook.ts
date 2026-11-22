@@ -3,6 +3,7 @@ import { appJwt } from '../github/jwt.js';
 import { verifySignature } from '../github/signature.js';
 import type { LoadSettings } from '../github/settings.js';
 import { errorClassOf, type Launcher } from '../jobs/launch.js';
+import { PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
 import { deliveryFromLaunch, LIFECYCLE_EVENTS, type DeliveryEvent } from '../jobs/deliveries.js';
 import type { DeliveryRecord, Store } from '../store/store.js';
 
@@ -10,8 +11,8 @@ import type { DeliveryRecord, Store } from '../store/store.js';
  * The GitHub webhook (POST /api/webhooks/github, no authorizer: the HMAC is the authentication).
  *
  * Jobs (#68): `issues.labeled` goes to the multi-tenant launcher (jobs/launch.ts), which starts a
- * job when the tenant's active config says so. Pull request events are acknowledged without
- * action until the review loop comes to Updraft Cloud.
+ * job when the tenant's active config says so, and so do the events of the review loop:
+ * `pull_request_review` and `pull_request` (dispatch.ts PULL_REQUEST_ACTIONS says which actions).
  *
  *   installation.deleted     tenant uninstalled, finally: everything in its partition gets the
  *                            table TTL for 30 days on, and reads stop at once when they pass. A
@@ -85,6 +86,8 @@ export function createWebhookHandler({
       label?: { name?: unknown };
       sender?: { login?: unknown };
       issue?: { number?: unknown };
+      pull_request?: { number?: unknown; head?: { ref?: unknown } };
+      review?: { state?: unknown };
     };
     try {
       payload = JSON.parse(req.body) as typeof payload;
@@ -107,6 +110,7 @@ export function createWebhookHandler({
       ...(action ? { action: action.slice(0, 64) } : {}),
       ...(typeof payload.repository?.full_name === 'string' ? { repository: payload.repository.full_name.slice(0, 200) } : {}),
       ...(Number.isSafeInteger(payload.issue?.number) ? { issue: payload.issue!.number as number } : {}),
+      ...(Number.isSafeInteger(payload.pull_request?.number) ? { pullRequest: payload.pull_request!.number as number } : {}),
       ...(typeof payload.label?.name === 'string' ? { label: payload.label.name.slice(0, 100) } : {}),
       ...(typeof payload.sender?.login === 'string' ? { sender: payload.sender.login.slice(0, 100) } : {}),
     };
@@ -117,10 +121,11 @@ export function createWebhookHandler({
     };
 
     if (event === 'ping') return done('pong');
-    if (event === 'issues' && action === 'labeled' && validInstallation && launch) {
+    const launches = (event === 'issues' && action === 'labeled') || (Object.hasOwn(PULL_REQUEST_ACTIONS, event) && PULL_REQUEST_ACTIONS[event]!.includes(action));
+    if (launches && validInstallation && launch) {
       let result;
       try {
-        result = await launch({ installationId, deliveryId: delivery, body: req.body, payload });
+        result = await launch({ installationId, deliveryId: delivery, eventName: event, ...(settings.slug ? { appBot: `${settings.slug}[bot]` } : {}), body: req.body, payload });
       } catch (err) {
         // Failed before the launcher's own handling (the image version, the claim, the quota
         // reservation): listed for a known tenant, and still answered 500 so GitHub can redeliver.

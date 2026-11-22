@@ -205,12 +205,13 @@ export function createBroker(deps: BrokerDeps) {
   /** A job refused at start for a quota: recorded as throttled, with the comment on its issue once a day. */
   async function throttledAtStart(job: Job, limit: ThrottleNotice['limit']): Promise<void> {
     const at = now();
-    const notice = job.issue !== undefined ? { repositoryId: job.repositoryId, issue: job.issue, day: dayOf(at) } : undefined;
+    const number = job.issue ?? job.pullRequest;
+    const notice = number !== undefined ? { repositoryId: job.repositoryId, issue: number, day: dayOf(at) } : undefined;
     const first = await deps.store.recordThrottle(job.installationId, job.createdAt.slice(0, 7), notice);
     log({ jobId: job.jobId, installationId: job.installationId, throttled: limit, at: 'start' });
-    if (first && job.issue !== undefined && job.quotas && deps.notifyThrottled) {
+    if (first && number !== undefined && job.quotas && deps.notifyThrottled) {
       await deps
-        .notifyThrottled({ installationId: job.installationId, repository: job.repository, repositoryId: job.repositoryId, issue: job.issue, limit, quotas: job.quotas })
+        .notifyThrottled({ installationId: job.installationId, repository: job.repository, repositoryId: job.repositoryId, issue: number, ...(job.issue === undefined ? { pullRequest: true } : {}), limit, quotas: job.quotas })
         .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
     }
   }

@@ -67,13 +67,19 @@ const REASON: Record<string, string> = {
   jobs_per_day: 'The daily job limit was reached.',
   microvm_minutes: 'The monthly compute allowance was used up.',
   platform_concurrency: 'Updraft was at capacity.',
+  not_updraft_pr: 'The pull request is not one Updraft opened.',
+  own_event: "Updraft's own review or push: the job that made it handles what follows.",
+  comment_review: 'A comment review starts nothing; "Request changes" does.',
 };
 
 /** Why a delivery went the way it did, in words. */
 export function deliveryReason(d: Delivery): string {
   if (d.disposition === 'launched') return 'A job was started.';
   if (d.disposition === 'deduped') return 'A redelivery of a delivery that already has a job.';
-  if (d.disposition === 'coalesced') return 'Folded into another delivery’s job.';
+  if (d.disposition === 'coalesced') return d.pullRequest !== undefined ? `Folded into the job for pull request #${d.pullRequest}, which sees it.` : 'Folded into another delivery’s job.';
+  // A pull request's event: who reviewed or pushed, not who applied a label; and the loop's own words.
+  if (d.reason === 'actor_not_allowed' && d.event.startsWith('pull_request')) return 'The person who reviewed or pushed may not start work.';
+  if (d.reason === 'loop_off' && d.message) return d.message.charAt(0).toUpperCase() + d.message.slice(1) + '.';
   if (d.disposition === 'launch_failed') return d.errorClass === 'ReleasedByAdmin' ? 'Released by Updraft before it started.' : `The job could not be started (${d.errorClass ?? 'Error'}).`;
   if (d.reason === 'missing_key' && d.message) return d.message.charAt(0).toUpperCase() + d.message.slice(1) + '.';
   return (d.reason && REASON[d.reason]) ?? (d.message ? d.message.charAt(0).toUpperCase() + d.message.slice(1) + '.' : 'Nothing to do.');

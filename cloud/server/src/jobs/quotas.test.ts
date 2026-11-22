@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createKillSwitch, isEngagedValue } from './kill-switch.js';
-import { DEFAULT_QUOTAS, dayOf, limitProblems, monthOf, quotasFromEnv, tenantQuotas, throttledComment } from './quotas.js';
+import { DEFAULT_QUOTAS, dayOf, limitProblems, monthOf, quotasFromEnv, tenantQuotas, throttleCommentPermissions, throttledComment } from './quotas.js';
 
 describe('quotas', () => {
   it("reads the stack's defaults, falling back on anything that is not a positive whole number", () => {
@@ -40,6 +40,15 @@ describe('quotas', () => {
     expect(throttledComment('jobs_per_day', DEFAULT_QUOTAS)).toContain('its 20 Updraft jobs for today');
     expect(throttledComment('microvm_minutes', DEFAULT_QUOTAS)).toContain('1200 minutes');
     expect(throttledComment('platform_concurrency', DEFAULT_QUOTAS)).toContain('in a few minutes');
+  });
+
+  it("says on a pull request how to try its review or push again, with a token that may comment there", () => {
+    const pr = throttledComment('jobs_per_day', DEFAULT_QUOTAS, true);
+    expect(pr).toContain("did not act on this pull request's latest review or push");
+    expect(pr).toContain('submit the review again or push a commit');
+    expect(pr).not.toContain('label');
+    expect(throttleCommentPermissions(true)).toEqual({ issues: 'write', pull_requests: 'write' });
+    expect(throttleCommentPermissions()).toEqual({ issues: 'write' });
   });
 });
 
