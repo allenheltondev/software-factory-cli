@@ -3,7 +3,9 @@
 // DNS name that resolves only to public addresses, never an IP literal or an internal name, no
 // credentials, query or fragment in the URL; one header, not one the runner or fetch sets itself.
 
+import dns from 'node:dns';
 import { lookup } from 'node:dns/promises';
+import https from 'node:https';
 import { isIP } from 'node:net';
 
 const RESERVED_HEADERS = new Set(['host', 'content-type', 'content-length', 'connection', 'transfer-encoding', 'te', 'upgrade', 'expect', 'keep-alive', 'cookie', 'trailer']);
@@ -64,4 +66,56 @@ export async function resolvesPublic(host, resolve = async (h) => (await lookup(
   } catch {
     return false;
   }
+}
+
+/**
+ * A DNS lookup for net and tls that answers only with public addresses: the connection is made to
+ * the addresses it vetted, so a name that resolves differently by the time of the request still
+ * reaches no private one. The certificate is still checked against the host name.
+ */
+export function publicOnlyLookup(resolve = dns.lookup) {
+  return (hostname, options, callback) => {
+    const cb = typeof options === 'function' ? options : callback;
+    const opts = typeof options === 'function' ? {} : (options ?? {});
+    resolve(hostname, { ...opts, all: true, verbatim: true }, (error, addresses) => {
+      if (error) return cb(error);
+      const list = Array.isArray(addresses) ? addresses : [];
+      if (!list.length || !list.every((a) => isPublicAddress(a.address))) {
+        const refused = new Error(`${hostname} does not resolve only to public addresses`);
+        refused.code = 'ENOTPUBLIC';
+        return cb(refused);
+      }
+      if (opts.all) return cb(null, list);
+      return cb(null, list[0].address, list[0].family);
+    });
+  };
+}
+
+/**
+ * A fetch for a custom destination: HTTPS only, over the public-only lookup, never following a
+ * redirect (a 3xx is the answer), with the answer's body read up to 64 KiB. What the exporter
+ * needs of fetch: { ok, status, text() }.
+ */
+export function publicOnlyFetch({ lookup: lookupImpl = publicOnlyLookup(), request = https.request } = {}) {
+  return (url, init = {}) =>
+    new Promise((resolve, reject) => {
+      const target = new URL(url);
+      if (target.protocol !== 'https:') return reject(new Error('only https'));
+      const req = request(target, { method: init.method ?? 'GET', headers: init.headers ?? {}, lookup: lookupImpl, signal: init.signal }, (res) => {
+        const chunks = [];
+        let size = 0;
+        res.on('data', (chunk) => {
+          if (size < 65536) chunks.push(chunk);
+          size += chunk.length;
+        });
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8').slice(0, 65536);
+          resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, text: async () => body });
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      if (init.body !== undefined) req.write(init.body);
+      req.end();
+    });
 }

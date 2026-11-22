@@ -1,4 +1,4 @@
-import { loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
+import { destinationOf, loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import {
   DeleteCommand,
@@ -99,6 +99,7 @@ function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
             at: String(e.at ?? ''),
             jobId: String(e.jobId ?? ''),
             ...(typeof e.traceId === 'string' ? { traceId: e.traceId } : {}),
+            ...(destinationOf(e.destination) ? { destination: destinationOf(e.destination)! } : {}),
             spans: Number(e.spans) || 0,
             exported: Number(e.exported) || 0,
             failed: Number(e.failed) || 0,

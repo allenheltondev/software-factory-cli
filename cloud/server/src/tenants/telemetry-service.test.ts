@@ -6,7 +6,14 @@ import { createMemoryStore, type JobSummary, type Tenant } from '../store/store.
 import { jobView } from './status-service.js';
 import { telemetryOf } from '../jobs/lifecycle.js';
 import type { OtlpChecker } from './otlp-destination.js';
-import { checkHoneycombKey, conversationUrl, createTelemetryService, parseTimelineTemplate, timelineUrl, traceUrl, type HoneycombChecker } from './telemetry-service.js';
+import { checkHoneycombKey, conversationUrl, createTelemetryService, linkDestinationFor, parseTimelineTemplate, timelineUrl, traceUrl, type HoneycombChecker } from './telemetry-service.js';
+import type { TelemetrySettings } from '../store/store.js';
+
+/** A job as the broker records it: with the snapshot of the destination it was sent to. */
+function sentWith(job: JobSummary, settings: TelemetrySettings | null, sentTo: { provider: 'honeycomb' | 'cloudwatch' | 'otlp'; host: string }): JobSummary {
+  const destination = linkDestinationFor(settings, sentTo);
+  return { ...job, detail: { ...job.detail, telemetry: { ...job.detail!.telemetry!, sentTo, ...(destination ? { destination } : {}) } } };
+}
 
 const caller = { sub: 'u1' } as Caller;
 const KEY = 'hcaik_01j1824es7n4evcmv81cn392jbSECRETSECRETSECRETSECRET';
@@ -322,7 +329,8 @@ describe('a custom OTLP destination', () => {
       outcome: 'succeeded',
       detail: { telemetry: { traceId, rootSpanId: root, spans: 9, exported: 9, failed: 0, startedAt: '2026-11-21T10:00:00.000Z', marks: [{ kind: 'agent', spanId: span }] } },
     };
-    const t = jobView(job, settings, { now: Date.parse('2026-11-22T10:00:00.000Z'), timelineTemplate: '{ui}/{team}/x?c={conversation}' }).telemetry!;
+    const sentTo = { provider: 'otlp' as const, host: 'otlp.example.com' };
+    const t = jobView(sentWith(job, settings, sentTo), settings, { now: Date.parse('2026-11-22T10:00:00.000Z'), timelineTemplate: '{ui}/{team}/x?c={conversation}' }).telemetry!;
     expect(t.destination).toBe('otlp.example.com');
     expect(t.traceUrl).toBe(`https://ui.example.com/trace/${traceId}?span=${root}&from=1795255140000&to=1795256700000`);
     expect(t.timeline?.[0]?.url).toBe(`https://ui.example.com/trace/${traceId}?span=${span}&from=1795255140000&to=1795256700000`);
@@ -332,13 +340,13 @@ describe('a custom OTLP destination', () => {
     expect(t).not.toHaveProperty('timelineUrl');
     // A trace template without {span_id}: the trace, and no span links.
     await service.update(caller, 55, { links: { trace: 'https://ui.example.com/trace/{trace_id}', conversation: '' } });
-    const plain = jobView(job, (await store.getTelemetry(55))!).telemetry!;
+    const plain = jobView(sentWith(job, await store.getTelemetry(55), sentTo), null).telemetry!;
     expect(plain.traceUrl).toBe(`https://ui.example.com/trace/${traceId}`);
     expect(plain.timeline?.[0]).not.toHaveProperty('url');
     expect(plain).not.toHaveProperty('conversationUrl');
     // No templates: nothing to link to.
     await service.update(caller, 55, { links: {} });
-    expect(jobView(job, (await store.getTelemetry(55))!).telemetry).not.toHaveProperty('traceUrl');
+    expect(jobView(sentWith(job, await store.getTelemetry(55), sentTo), null).telemetry).not.toHaveProperty('traceUrl');
   });
 
   it('hands the job the endpoint and the header with the key, never one without the other', async () => {
@@ -412,12 +420,62 @@ describe('the CloudWatch destination', () => {
       outcome: 'succeeded',
       detail: { telemetry: { traceId, rootSpanId: 'ab'.repeat(8), spans: 9, exported: 9, failed: 0, startedAt: '2026-11-21T10:00:00.000Z', marks: [{ kind: 'agent', spanId: 'cd'.repeat(8) }] } },
     };
-    const t = jobView(job, (await store.getTelemetry(55))!, { now: Date.parse('2026-11-22T10:00:00.000Z'), timelineTemplate: '{ui}/{team}/x?c={conversation}' }).telemetry!;
+    const settings = (await store.getTelemetry(55))!;
+    const t = jobView(sentWith(job, settings, { provider: 'cloudwatch', host: 'xray.us-east-1.amazonaws.com' }), settings, { now: Date.parse('2026-11-22T10:00:00.000Z'), timelineTemplate: '{ui}/{team}/x?c={conversation}' }).telemetry!;
     expect(t.destination).toBe('CloudWatch');
     expect(t.traceUrl).toBe(`https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#xray:traces/1-6a1b2c3d-${'ef'.repeat(12)}`);
     expect(t.timeline?.[0]).not.toHaveProperty('url');
     expect(t).not.toHaveProperty('conversationUrl');
     expect(t).not.toHaveProperty('timelineUrl');
+  });
+});
+
+describe("a job's links stay with the destination that got its trace", () => {
+  const traceId = 'ab'.repeat(16);
+  const job: JobSummary = {
+    jobId: 'job_x0000001',
+    repository: 'acme/web',
+    issue: 12,
+    createdAt: '2026-11-21T10:00:00.000Z',
+    finishedAt: '2026-11-21T10:20:00.000Z',
+    status: 'finished',
+    outcome: 'succeeded',
+    detail: { telemetry: { traceId, spans: 9, exported: 9, failed: 0, startedAt: '2026-11-21T10:00:00.000Z', marks: [{ kind: 'agent', spanId: 'cd'.repeat(8) }, { kind: 'step_failed', spanId: 'ef'.repeat(8), sent: false }] } },
+  };
+
+  it('keeps a Honeycomb job linked to Honeycomb after the destination became CloudWatch, then a custom one', async () => {
+    const { service, store } = await setup();
+    await service.setKey(caller, 55, { value: KEY, region: 'us' });
+    const honeycombJob = sentWith(job, await store.getTelemetry(55), { provider: 'honeycomb', host: 'api.honeycomb.io' });
+    expect(honeycombJob.detail?.telemetry?.destination).toMatchObject({ provider: 'honeycomb', team: { slug: 'acme' } });
+    await service.setKey(caller, 55, { provider: 'cloudwatch', awsRegion: 'us-east-1', value: 'AbCdEfGhIjKlMnOpQrStUv0123' });
+    const now = await store.getTelemetry(55);
+    const t = jobView(honeycombJob, now, { now: Date.parse('2026-11-22T10:00:00.000Z') }).telemetry!;
+    expect(t.destination).toBe('Honeycomb');
+    expect(t.traceUrl).toMatch(/^https:\/\/ui\.honeycomb\.io\/acme\/environments\/production\/trace\?trace_id=/);
+    expect(t.conversationUrl).toMatch(/^https:\/\/ui\.honeycomb\.io\//);
+    // A moment whose span the destination did not accept: still on the timeline, never linked.
+    expect(t.timeline?.map((e) => [e.kind, Boolean(e.url)])).toEqual([
+      ['agent', true],
+      ['step_failed', false],
+    ]);
+    await service.setKey(caller, 55, { provider: 'otlp', endpoint: 'https://otlp.example.com', header: 'authorization', value: 'Bearer otlp-secret-token-value' });
+    await service.update(caller, 55, { links: { trace: 'https://ui.example.com/{trace_id}', conversation: 'https://ui.example.com/c?q={conversation}' } });
+    expect(jobView(honeycombJob, await store.getTelemetry(55)).telemetry!.traceUrl).toMatch(/ui\.honeycomb\.io/);
+  });
+
+  it('links nothing from settings that are not where the job sent, and old jobs from Honeycomb settings only', async () => {
+    const { service, store } = await setup();
+    await service.setKey(caller, 55, { value: KEY, region: 'us' });
+    const honeycomb = await store.getTelemetry(55);
+    // The runner sent to the EU while the settings say US: no snapshot, no links.
+    const elsewhere = sentWith(job, honeycomb, { provider: 'honeycomb', host: 'api.eu1.honeycomb.io' });
+    expect(elsewhere.detail?.telemetry?.destination).toBeUndefined();
+    expect(jobView(elsewhere, honeycomb).telemetry).not.toHaveProperty('traceUrl');
+    // A job from before snapshots: linked while the settings are Honeycomb's, and not after.
+    expect(jobView(job, honeycomb).telemetry?.traceUrl).toMatch(/ui\.honeycomb\.io/);
+    await service.setKey(caller, 55, { provider: 'cloudwatch', awsRegion: 'us-east-1', value: 'AbCdEfGhIjKlMnOpQrStUv0123' });
+    expect(jobView(job, await store.getTelemetry(55)).telemetry).not.toHaveProperty('traceUrl');
   });
 });
 

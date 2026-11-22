@@ -1,5 +1,7 @@
+import dns, { type LookupAddress } from 'node:dns';
 import { lookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
+import https from 'node:https';
+import { isIP, type LookupFunction } from 'node:net';
 
 /**
  * A custom telemetry destination: any OTLP/HTTP endpoint that takes JSON, with one header that
@@ -98,10 +100,57 @@ export type OtlpCheck = { result: 'valid' } | { result: 'invalid' } | { result: 
 export type OtlpChecker = (destination: { tracesUrl: string; host: string; header: string }, value: string) => Promise<OtlpCheck>;
 
 /**
+ * A DNS lookup for net and tls that answers only with public addresses: the connection is made to
+ * the addresses it vetted, so a name that resolves differently by the time of the request still
+ * reaches no private one. The certificate is still checked against the host name.
+ */
+export function publicOnlyLookup(resolve: typeof dns.lookup = dns.lookup): LookupFunction {
+  return ((hostname: string, options: dns.LookupOptions, callback: (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void) => {
+    resolve(hostname, { ...options, all: true, verbatim: true }, (error, addresses) => {
+      if (error) return callback(error, '');
+      const list = Array.isArray(addresses) ? addresses : [];
+      if (!list.length || !list.every((a) => isPublicAddress(a.address))) {
+        const refused: NodeJS.ErrnoException = new Error(`${hostname} does not resolve only to public addresses`);
+        refused.code = 'ENOTPUBLIC';
+        return callback(refused, '');
+      }
+      if (options?.all) return callback(null, list);
+      return callback(null, list[0]!.address, list[0]!.family);
+    });
+  }) as LookupFunction;
+}
+
+/** A fetch over the public-only lookup, HTTPS only, never following a redirect: what the check needs of fetch. */
+export function publicOnlyFetch(lookupImpl: LookupFunction = publicOnlyLookup()): typeof fetch {
+  return ((url: string, init: RequestInit = {}) =>
+    new Promise((resolve, reject) => {
+      const target = new URL(url);
+      if (target.protocol !== 'https:') return reject(new Error('only https'));
+      const req = https.request(target, { method: init.method ?? 'GET', headers: (init.headers ?? {}) as Record<string, string>, lookup: lookupImpl, ...(init.signal ? { signal: init.signal } : {}) }, (res) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on('data', (chunk: Buffer) => {
+          if (size < 65536) chunks.push(chunk);
+          size += chunk.length;
+        });
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8').slice(0, 65536);
+          const status = res.statusCode ?? 0;
+          resolve({ ok: status >= 200 && status < 300, status, text: async () => body } as Response);
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      if (typeof init.body === 'string') req.write(init.body);
+      req.end();
+    })) as typeof fetch;
+}
+
+/**
  * An empty export (`{"resourceSpans":[]}`) with the header: what any OTLP/HTTP receiver that takes
  * JSON accepts, and a receiver that wants a key refuses without it. Nothing is recorded by it.
  */
-export const checkOtlpEndpoint = (fetchFn: typeof fetch = fetch, resolve: Resolver = resolveAll, timeoutMs = 8000): OtlpChecker =>
+export const checkOtlpEndpoint = (fetchFn: typeof fetch = publicOnlyFetch(), resolve: Resolver = resolveAll, timeoutMs = 8000): OtlpChecker =>
   async ({ tracesUrl, host, header }, value) => {
     if (!(await resolvesPublic(host, resolve))) return { result: 'unreachable', reason: 'its name does not resolve to a public address' };
     try {

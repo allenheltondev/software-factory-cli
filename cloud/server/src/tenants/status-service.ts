@@ -7,7 +7,7 @@ import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { redact } from './redact.js';
 import type { TelemetryMarkKind, TelemetryTotals } from '../jobs/lifecycle.js';
 import { parseOtlpEndpoint } from './otlp-destination.js';
-import { conversationUrl, timelineUrl, traceUrl } from './telemetry-service.js';
+import { conversationUrl, linkSettingsForJob, timelineUrl, traceUrl, type LinkSettings } from './telemetry-service.js';
 
 /**
  * A tenant's status and diagnostics in the console (#71), for its members only:
@@ -155,12 +155,13 @@ export function missingPermissions(granted: Record<string, string> | undefined):
   return out;
 }
 
-/** Where a trace went, in words: Honeycomb, or a custom endpoint's host. */
-function destinationName(s: TelemetrySettings): string {
+/** Where a trace went, in words: Honeycomb, CloudWatch, or a custom endpoint's host. */
+function destinationName(s: LinkSettings & { otlp?: { endpoint: string } }, host?: string): string {
   if (s.provider === 'cloudwatch') return 'CloudWatch';
-  if (s.provider !== 'otlp' || !s.otlp) return 'Honeycomb';
-  const parsed = parseOtlpEndpoint(s.otlp.endpoint);
-  return 'host' in parsed ? parsed.host : 'your OTLP endpoint';
+  if (s.provider !== 'otlp') return 'Honeycomb';
+  if (host) return host;
+  const parsed = s.otlp ? parseOtlpEndpoint(s.otlp.endpoint) : null;
+  return parsed && 'host' in parsed ? parsed.host : 'your OTLP endpoint';
 }
 
 /**
@@ -178,23 +179,24 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
   const t = job.detail?.telemetry;
   if (t) {
     const startedAt = t.startedAt ?? job.createdAt;
-    // Links only to what reached the destination: nothing local, nothing from an export that sent nothing.
-    const sent = !t.local && t.exported > 0 ? telemetry : null;
+    // Links only to what reached the destination (nothing local, nothing from an export that sent
+    // nothing), and only to the destination it reached: the job's own snapshot of it.
+    const sent = !t.local && t.exported > 0 ? linkSettingsForJob(t.destination, t.sentTo, telemetry) : null;
     // A custom destination's trace link is its span link to the root, when its template wants a span.
     const url = traceUrl(sent, t.traceId, startedAt, job.finishedAt, sent?.provider === 'otlp' && sent.links?.trace?.includes('{span_id}') ? t.rootSpanId : undefined);
     const conversationId = conversationOf(job);
     const queryUrl = conversationId ? conversationUrl(sent, conversationId, startedAt, now) : null;
     const timeline = conversationId ? timelineUrl(timelineTemplate, sent, conversationId, startedAt, now) : null;
     const entries: JobTimelineEntry[] = (t.marks ?? []).map((m) => {
-      const { spanId, ...rest } = m;
-      const at = traceUrl(sent, t.traceId, startedAt, job.finishedAt, spanId);
+      const { spanId, sent: _sent, ...rest } = m;
+      const at = m.sent === false ? null : traceUrl(sent, t.traceId, startedAt, job.finishedAt, spanId);
       return { ...rest, ...(at ? { url: at } : {}) };
     });
     view.telemetry = {
       traceId: t.traceId,
       ...(url ? { traceUrl: url } : {}),
       ...(conversationId ? { conversationId } : {}),
-      ...(sent ? { destination: destinationName(sent) } : {}),
+      ...(sent ? { destination: destinationName(sent, t.destination?.host) } : {}),
       ...(queryUrl ? { conversationUrl: queryUrl, ...(sent?.provider === 'honeycomb' ? { conversationHint: 'In the results, select the conversation id to open it in Agent Timeline.' } : {}) } : {}),
       ...(timeline ? { timelineUrl: timeline, timelineLabel: 'Open in Agent Timeline' } : {}),
       ...(entries.length ? { timeline: entries } : {}),

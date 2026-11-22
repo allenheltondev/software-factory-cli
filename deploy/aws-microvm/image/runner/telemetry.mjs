@@ -167,7 +167,7 @@ async function rejectedSpans(res, size) {
  * endpoint itself when it ends in /v1/traces), with the key in `headerName` (`x-honeycomb-team` by
  * default) and any other `headers`. Never throws: a failure is counted and logged, and the job goes on.
  */
-export function createExporter({ endpoint, apiKey, headerName = 'x-honeycomb-team', headers: extraHeaders = {}, resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
+export function createExporter({ endpoint, tracesUrl = null, apiKey, headerName = 'x-honeycomb-team', headers: extraHeaders = {}, resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
   const queue = [];
   // The one way out: every string of every span, and of the resource, passes the job's redactor
   // here, whatever produced it (a span name, a tool or model name read from the transcript, an
@@ -177,9 +177,10 @@ export function createExporter({ endpoint, apiKey, headerName = 'x-honeycomb-tea
   /** The span ids the destination accepted (a 2xx for their batch): only those are worth a link. */
   const accepted = new Set();
   let sending = Promise.resolve();
-  // The base endpoint (OTEL_EXPORTER_OTLP_ENDPOINT's form), or the traces endpoint itself.
-  const base = endpoint.replace(/\/+$/, '');
-  const url = /\/v1\/traces$/.test(base) ? base : `${base}/v1/traces`;
+  // `tracesUrl`: the traces URL exactly (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT's form, or one already
+  // normalized). Else the base endpoint (OTEL_EXPORTER_OTLP_ENDPOINT's form) plus /v1/traces.
+  const base = (endpoint ?? '').replace(/\/+$/, '');
+  const url = tracesUrl ?? (/\/v1\/traces$/.test(base) ? base : `${base}/v1/traces`);
 
   async function post(batch) {
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1743,12 +1744,18 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
       // Only spans Honeycomb accepted: a link to one it never got would open the root instead.
       let marks = [];
       try {
+        // Every moment stays, for the console's own timeline; `sent: false` on one whose span the
+        // destination did not accept, so no link is made to it (it would open the root instead).
         marks = [...[...runs.values()].flatMap((r) => r.trace.marks), ...runnerMarks]
-          .filter((m) => exporter.accepted(m.spanId))
           .sort((x, y) => x.at - y.at)
           .slice(0, MAX_MARKS_PER_JOB)
           // When, from the job's start, and for how long: the console's own timeline of the job.
-          .map(({ at: start, end, ...m }) => ({ ...m, offsetMs: Math.max(0, Math.round(start - startedAt)), durationMs: Math.max(0, Math.round((end ?? start) - start)) }));
+          .map(({ at: start, end, ...m }) => ({
+            ...m,
+            offsetMs: Math.max(0, Math.round(start - startedAt)),
+            durationMs: Math.max(0, Math.round((end ?? start) - start)),
+            ...(exporter.local ? {} : { sent: exporter.accepted(m.spanId) === true }),
+          }));
       } catch (error) {
         log(`agent telemetry: ${error?.message ?? error}`);
       }

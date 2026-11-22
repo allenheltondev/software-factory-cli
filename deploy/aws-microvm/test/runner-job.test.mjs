@@ -626,6 +626,8 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     const cloudwatch = { ...telemetry, provider: 'cloudwatch', endpoint: 'https://xray.us-west-2.amazonaws.com', header: 'authorization' };
     expect((await runJob(brokerRequest({ telemetry: cloudwatch }), harness.deps)).outcome).toBe('succeeded');
     expect(posts[0].url).toBe('https://xray.us-west-2.amazonaws.com/v1/traces');
+    // Where it sent, for the broker to keep that destination's links with the job.
+    expect(harness.finishDetails[0].telemetry.sentTo).toEqual({ provider: 'cloudwatch', host: 'xray.us-west-2.amazonaws.com' });
     expect(posts[0].init.headers).toMatchObject({ authorization: 'Bearer AbCdEfGhIjKlMnOpQrStUv0123' });
     expect(JSON.stringify(posts.map((p) => p.init.body))).not.toContain('AbCdEfGhIjKlMnOpQrStUv0123');
   });

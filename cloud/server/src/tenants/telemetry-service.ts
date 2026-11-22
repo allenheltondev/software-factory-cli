@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows } from '../flows/github.js';
+import type { LinkDestination } from '../jobs/lifecycle.js';
 import type { Store, TelemetryExport, TelemetrySettings } from '../store/store.js';
 import { agentKeySecretName, type SecretsPort } from './agent-keys.js';
 import {
@@ -127,6 +128,53 @@ export function telemetryView(s: TelemetrySettings | null): TelemetryView {
     ...(t.provider === 'honeycomb' && t.key?.team ? { environmentUrl: environmentUrl(t) } : {}),
     ...(t.updatedAt ? { updatedAt: t.updatedAt, updatedBy: t.updatedBy } : {}),
   };
+}
+
+/**
+ * The installation's destination as link settings for a job, when it is where the runner says the
+ * job sent: Honeycomb's API host in its region, or the endpoint's host of CloudWatch or a custom
+ * destination. Null otherwise: a job sent somewhere else is not linked from today's settings.
+ */
+export function linkDestinationFor(s: TelemetrySettings | null, sentTo: { provider: string; host: string }): LinkDestination | null {
+  if (!s?.key || s.provider !== sentTo.provider) return null;
+  if (s.provider === 'honeycomb') {
+    if (new URL(HONEYCOMB_API[s.region]).host !== sentTo.host) return null;
+  } else {
+    const parsed = s.otlp ? parseOtlpEndpoint(s.otlp.endpoint) : null;
+    if (!parsed || !('host' in parsed) || parsed.host !== sentTo.host) return null;
+  }
+  return {
+    provider: s.provider,
+    region: s.region,
+    serviceName: s.serviceName,
+    ...(s.key.team ? { team: s.key.team } : {}),
+    ...(s.key.environment ? { environment: s.key.environment } : {}),
+    ...(s.provider === 'cloudwatch' && s.aws ? { aws: s.aws } : {}),
+    ...(s.provider === 'otlp' && s.links ? { links: s.links } : {}),
+    ...(s.provider !== 'honeycomb' ? { host: sentTo.host } : {}),
+  };
+}
+
+/** Link settings from a job's destination snapshot. */
+export function linkSettingsOf(d: LinkDestination): LinkSettings {
+  return {
+    provider: d.provider,
+    region: d.region,
+    serviceName: d.serviceName,
+    key: { updatedAt: '', updatedBy: '', ...(d.team ? { team: d.team } : {}), ...(d.environment ? { environment: d.environment } : {}) },
+    ...(d.aws ? { aws: d.aws } : {}),
+    ...(d.links ? { links: d.links } : {}),
+  };
+}
+
+/**
+ * What a job's links come from: its own destination snapshot; for a job from before snapshots
+ * (all sent to Honeycomb), the installation's settings while they are still Honeycomb's.
+ */
+export function linkSettingsForJob(snapshot: LinkDestination | undefined, sentTo: unknown, current: TelemetrySettings | null): LinkSettings | null {
+  if (snapshot) return linkSettingsOf(snapshot);
+  if (sentTo === undefined && current?.provider === 'honeycomb') return current;
+  return null;
 }
 
 /** What a link is built from: the destination, and for a custom one its templates. */
@@ -279,10 +327,13 @@ export const KEY_CHANGE_LEASE_MS = 2 * 60 * 1000;
 const NOT_OURS = new Error('not our lease');
 
 function withTraceUrl(s: TelemetrySettings, e: TelemetryExport): TelemetryExport & { traceUrl?: string } {
-  if (!e.traceId) return e;
+  const { destination, ...out } = e;
+  if (!out.traceId) return out;
+  // Linked where it was sent (its snapshot); an export from before snapshots, while the settings are still Honeycomb's.
+  const at = linkSettingsForJob(destination, destination ? 'snapshot' : undefined, s);
   // The export is recorded at the job's finish; a job runs a few hours at most.
-  const url = traceUrl(s, e.traceId, new Date(Date.parse(e.at) - 6 * HOUR_MS).toISOString(), e.at);
-  return url ? { ...e, traceUrl: url } : e;
+  const url = traceUrl(at, out.traceId, new Date(Date.parse(e.at) - 6 * HOUR_MS).toISOString(), e.at);
+  return url ? { ...out, traceUrl: url } : out;
 }
 
 function environmentUrl(s: TelemetrySettings): string {

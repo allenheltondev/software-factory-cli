@@ -46,6 +46,19 @@ describe('a trace per run', () => {
   const header = (runId: string, issue: number) =>
     [`updraft run ${runId}`, 'job: job_local1 (attempt 1)', 'repository: octo/widgets (id 42)', `issue: #${issue} Title`, 'agent: claude-opus (adapter claude)', '', '---- agent output (stdout and stderr) ----', ''].join('\n');
 
+  it('sends to OTEL_EXPORTER_OTLP_TRACES_ENDPOINT exactly, its own path and query kept', async () => {
+    const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-local-telemetry-'));
+    const urls: string[] = [];
+    const fetchFn = (async (url: string) => (urls.push(url), { ok: true, status: 200, text: async () => '' })) as unknown as typeof fetch;
+    const config = localTelemetryFromEnv({ OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'https://otlp.example.com/custom/traces?tenant=a' })!;
+    const trace = createLocalTelemetry(config, { runsDir, fetch: fetchFn, pollMs: 20 }).begin('run_a')!;
+    fs.mkdirSync(path.join(runsDir, 'run_a'));
+    fs.writeFileSync(path.join(runsDir, 'run_a', 'run.log'), `${header('run_a', 7)}---- end of agent output ----\noutcome: succeeded\n`);
+    await trace.end('succeeded');
+    expect(urls.length).toBeGreaterThan(0);
+    expect(new Set(urls)).toEqual(new Set(['https://otlp.example.com/custom/traces?tenant=a']));
+  });
+
   it("reads only its own run's log, and sends its spans with the headers, the key never in them", async () => {
     const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-local-telemetry-'));
     const write = (run: string, text: string) => {

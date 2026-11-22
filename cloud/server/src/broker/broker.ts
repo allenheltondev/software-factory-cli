@@ -10,7 +10,7 @@ import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../te
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
 // Not the whole telemetry service: only the secret's name.
-import { telemetrySecretName } from '../tenants/telemetry-service.js';
+import { linkDestinationFor, telemetrySecretName } from '../tenants/telemetry-service.js';
 
 /**
  * The job broker (#68, "Isolation between tenants"): what a job's microVM may have, handed out to
@@ -266,16 +266,34 @@ export function createBroker(deps: BrokerDeps) {
     // slots stay: the microVM may still be running (terminate frees them).
     if (action === 'finish') {
       const given = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
-      const recorded = (await deps.store.finishJob(job.jobId, given, { at: now(), detail: finishDetail(job, detail) })) ?? given;
+      const finished = finishDetail(job, detail);
+      // The links of the job's trace: the destination it was sent to, kept with the job, so a later
+      // change of destination never points it at another backend. Only when the installation's
+      // destination now is where the runner says it sent; best effort.
+      if (finished?.telemetry?.sentTo) {
+        const settings = await deps.store.getTelemetry(job.installationId).catch(() => null);
+        const destination = linkDestinationFor(settings, finished.telemetry.sentTo);
+        if (destination) finished.telemetry.destination = destination;
+      }
+      const recorded = (await deps.store.finishJob(job.jobId, given, { at: now(), detail: finished })) ?? given;
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
       if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
       // How the job's telemetry export went, for the settings page. Best effort, like the key's use.
-      const sent = finishDetail(job, detail)?.telemetry;
+      const sent = finished?.telemetry;
       // A job read only for the console (no destination) exported nothing to report.
       if (sent && !sent.local) {
         await deps.store
-          .recordTelemetryExport(job.installationId, { at: new Date(now()).toISOString(), jobId: job.jobId, traceId: sent.traceId, spans: sent.spans, exported: sent.exported, failed: sent.failed, ...(sent.lastError ? { lastError: sent.lastError } : {}) })
+          .recordTelemetryExport(job.installationId, {
+            at: new Date(now()).toISOString(),
+            jobId: job.jobId,
+            traceId: sent.traceId,
+            spans: sent.spans,
+            exported: sent.exported,
+            failed: sent.failed,
+            ...(sent.lastError ? { lastError: sent.lastError } : {}),
+            ...(sent.destination ? { destination: sent.destination } : {}),
+          })
           .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not record the telemetry export: ${(err as Error)?.name}` }));
       }
       // The key's "last used": this job ran with it (it started) and it worked or it did not.
@@ -399,7 +417,11 @@ export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFin
   const loop = loopOf(d.loop);
   if (loop) out.loop = loop;
   const telemetry = telemetryOf(d.telemetry);
-  if (telemetry) out.telemetry = telemetry;
+  if (telemetry) {
+    // The link settings are the broker's to set, from the installation's own: never the runner's.
+    delete telemetry.destination;
+    out.telemetry = telemetry;
+  }
   const steps = stepsOf(d.steps);
   if (steps) out.steps = steps;
   return Object.keys(out).length ? out : undefined;

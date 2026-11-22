@@ -108,7 +108,8 @@ export function createLocalTelemetry(config: LocalTelemetryConfig, deps: { runsD
     begin(runId) {
       try {
         const exporter = createExporter({
-          endpoint: config.tracesUrl,
+          // Exactly: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is the final URL, the base endpoint already has /v1/traces.
+          tracesUrl: config.tracesUrl,
           headers: config.headers,
           resource: { 'service.name': config.serviceName },
           redact,

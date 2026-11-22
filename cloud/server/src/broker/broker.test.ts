@@ -9,6 +9,7 @@ import type { AppSettings } from '../github/settings.js';
 import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
 import { createReconciler } from '../jobs/reconcile.js';
 import { createBroker, hashToken, JOB_PERMISSIONS, jobPaths, jobSessionPolicy, SESSION_SECONDS } from './broker.js';
+import { telemetryView } from '../tenants/telemetry-service.js';
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const SETTINGS: AppSettings = {
@@ -150,6 +151,29 @@ describe('the job broker', () => {
     await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { telemetry: { traceId, spans: 40, exported: 38, failed: 2, lastError: 'HTTP 503', startedAt: '2026-11-20T12:00:00.000Z' } } });
     expect((await store.getJobSummary(55, job.jobId))?.detail?.telemetry).toEqual({ traceId, spans: 40, exported: 38, failed: 2, lastError: 'HTTP 503', startedAt: '2026-11-20T12:00:00.000Z' });
     expect((await store.getTelemetry(55))?.lastExport).toMatchObject({ jobId: job.jobId, traceId, exported: 38, failed: 2, lastError: 'HTTP 503' });
+  });
+
+  it("keeps the links of the destination the job sent to, never the runner's own, and the settings page's too", async () => {
+    const honeycomb = { provider: 'honeycomb' as const, region: 'us' as const, serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat', team: { name: 'Acme', slug: 'acme' }, environment: { name: 'Prod', slug: 'prod' } } };
+    await store.putTelemetry(55, honeycomb, 0);
+    await handle({ action: 'start', jobId: job.jobId, token });
+    const traceId = 'ab'.repeat(16);
+    const planted = { provider: 'otlp', region: 'us', serviceName: 'updraft', links: { trace: 'https://evil.example.com/{trace_id}' } };
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { telemetry: { traceId, spans: 3, exported: 3, failed: 0, sentTo: { provider: 'honeycomb', host: 'api.honeycomb.io' }, destination: planted } } });
+    const kept = (await store.getJobSummary(55, job.jobId))?.detail?.telemetry;
+    expect(kept?.destination).toEqual({ provider: 'honeycomb', region: 'us', serviceName: 'updraft', team: { name: 'Acme', slug: 'acme' }, environment: { name: 'Prod', slug: 'prod' } });
+    expect((await store.getTelemetry(55))?.lastExport?.destination).toMatchObject({ provider: 'honeycomb', team: { slug: 'acme' } });
+    // The settings move to CloudWatch: the last export is still Honeycomb's trace, linked there.
+    const latest = (await store.getTelemetry(55))!;
+    expect(await store.putTelemetry(55, { ...latest, provider: 'cloudwatch', aws: { region: 'us-east-1' }, otlp: { endpoint: 'https://xray.us-east-1.amazonaws.com', header: 'authorization' } }, latest.version ?? 0)).toBe('stored');
+    expect(telemetryView(await store.getTelemetry(55)).lastExport?.traceUrl).toMatch(/^https:\/\/ui\.honeycomb\.io\/acme\//);
+  });
+
+  it('keeps no links when the runner sent somewhere the settings do not say', async () => {
+    await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat', team: { name: 'Acme', slug: 'acme' } } }, 0);
+    await handle({ action: 'start', jobId: job.jobId, token });
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { telemetry: { traceId: 'cd'.repeat(16), spans: 3, exported: 3, failed: 0, sentTo: { provider: 'cloudwatch', host: 'xray.us-east-1.amazonaws.com' } } } });
+    expect((await store.getJobSummary(55, job.jobId))?.detail?.telemetry?.destination).toBeUndefined();
   });
 
   it('keeps a local reading of the job for the console, and records no export for it', async () => {

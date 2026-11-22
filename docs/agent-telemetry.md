@@ -369,6 +369,16 @@ the job is given no trace id (so no later trace links to it), Claude Code's own 
 collected, and the settings page records no export. A job's links are only built from what
 reached a destination: none for a local job, or for one whose export sent nothing.
 
+The links are built from the destination the trace went to, not from today's settings. The
+runner reports where it sent (`sentTo`: the destination kind and host), and the broker keeps a
+snapshot of the installation's link settings with the job (`destination`: Honeycomb's region,
+team and environment, CloudWatch's region, or a custom destination's host and link templates;
+never a key), only when they are where the runner sent; it ignores any `destination` a runner
+reports itself. The settings page's last export keeps the same snapshot. So a job sent to
+Honeycomb still opens in Honeycomb after the installation moved to CloudWatch, and a trace id
+is never put into another backend's URL. A job from before snapshots (all of them Honeycomb's) is
+linked from the settings while they are still Honeycomb's, and not after.
+
 For Honeycomb, **View trace** is a
 [direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace) built from the
 key's team and environment slugs, and **Open conversation** a
@@ -383,10 +393,11 @@ link (below), **Open in Agent Timeline** shows instead.
 The runner reports these with the job's finish (`telemetry.marks`): a kind (`agent`,
 `test_failed`, `test_green`, `verify_failed`, `step_failed`), the span id, the run kind, and for an
 agent span its profile, verdict, and whether it failed or thrashed, and where it was in the job
-(`offsetMs` from the job's start, `durationMs`). Only spans the destination accepted
-(a 2xx for their batch that rejected none of it: an OTLP partial success counts its rejected spans
-as failed and confirms none of the batch, since it does not say which) are reported, so a link
-never opens the root span instead of one that was refused, dropped or still queued, and there are at most 8 per run and 32 per job. A test run counts
+(`offsetMs` from the job's start, `durationMs`). Every moment is reported, at most 8 per run
+and 32 per job, with `sent: false` on one whose span the destination did not accept (its batch
+got no 2xx, or an OTLP partial success, which counts its rejected spans as failed and confirms
+none of the batch, since it does not say which; or it was dropped or still queued). Such a moment
+is still on the job's timeline; it gets no link, which would open the root span instead. A test run counts
 as the first passing one only when its output showed tests that passed. It also reports the
 conversation id the job's span was sent in, so a review's job, which has no issue of its own, links
 to the issue's conversation, and a job that ran no agent to `delivery/<id>`. And the job's
@@ -424,12 +435,14 @@ path it can change without notice; the query link works either way.
   meanwhile can never be deleted with the old one.
 - Every setting change is a compare-and-set on the version it read, so an opt-out made while a
   key was being checked is never undone.
-- A custom endpoint is checked twice: by the API before it is saved (its rules, its name resolving
-  only to public addresses, an empty export answered 2xx, no redirect followed), and by the runner
-  before each job sends (the same rules, and the name resolving only to public addresses then).
-  Neither follows a redirect. The name is resolved again when the request is made, so a name
-  that changes what it resolves to between the check and the request is not caught; what it can
-  reach then is the tenant's own spans, with the tenant's own key.
+- A custom endpoint (and CloudWatch's) is checked twice: by the API before it is saved (its rules,
+  its name resolving only to public addresses, an empty export answered 2xx, no redirect
+  followed), and by the runner before each job sends (the same rules, and the name resolving only
+  to public addresses then). The connections themselves go only to public addresses: both the
+  API's check and the runner's export connect through `node:https` with a lookup that refuses an
+  answer with any address that is not public, so the address connected to is one that lookup
+  vetted, whatever the name answers later. The certificate is still checked against the host
+  name. Neither follows a redirect.
 - The key's value and each word of it (the token in `Bearer <token>`) are redacted from
   everything the runner sends, logs or uploads.
 - A failed export (the destination unreachable, the key revoked) is counted and reported; it never fails

@@ -5,6 +5,8 @@
  * back) so it can only ever hold short codes, counts and booleans.
  */
 
+import { CONVERSATION_LINK_PLACEHOLDERS, linkTemplateProblem, TRACE_LINK_PLACEHOLDERS } from '../tenants/otlp-destination.js';
+
 export const STEP_KINDS = ['implement', 'revision', 'review'] as const;
 export type StepKind = (typeof STEP_KINDS)[number];
 
@@ -92,6 +94,65 @@ export interface JobTelemetryReport {
   local?: true;
   /** What the job's runs added up to. */
   totals?: TelemetryTotals;
+  /** Where the runner sent the spans: its destination kind and host. */
+  sentTo?: { provider: 'honeycomb' | 'cloudwatch' | 'otlp'; host: string };
+  /**
+   * What links to the trace are built from: the installation's destination when the job finished,
+   * kept only when it is where the runner says it sent. Set by the broker, never by the runner.
+   */
+  destination?: LinkDestination;
+}
+
+/** A destination's link settings, as they were for one job: never a key, never a secret. */
+export interface LinkDestination {
+  provider: 'honeycomb' | 'cloudwatch' | 'otlp';
+  region: 'us' | 'eu';
+  serviceName: string;
+  team?: { name: string; slug: string };
+  environment?: { name: string; slug: string };
+  aws?: { region: string };
+  links?: { trace?: string; conversation?: string };
+  /** A custom destination's host, for its name in the console. */
+  host?: string;
+}
+
+const PROVIDERS = ['honeycomb', 'cloudwatch', 'otlp'] as const;
+const HOST = /^[a-z0-9.-]{1,253}(?::\d{1,5})?$/;
+const SLUG = /^[A-Za-z0-9_.-]{1,128}$/;
+
+function sentToOf(raw: unknown): JobTelemetryReport['sentTo'] {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.provider !== 'string' || !(PROVIDERS as readonly string[]).includes(r.provider) || typeof r.host !== 'string' || !HOST.test(r.host)) return undefined;
+  return { provider: r.provider as LinkDestination['provider'], host: r.host };
+}
+
+/** A destination snapshot as stored, with every field checked again. */
+export function destinationOf(raw: unknown): LinkDestination | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.provider !== 'string' || !(PROVIDERS as readonly string[]).includes(r.provider)) return undefined;
+  if (typeof r.serviceName !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(r.serviceName)) return undefined;
+  const named = (v: unknown) => {
+    const o = (v ?? {}) as Record<string, unknown>;
+    return typeof o.slug === 'string' && SLUG.test(o.slug) ? { name: String(o.name ?? o.slug).slice(0, 128), slug: o.slug } : undefined;
+  };
+  const out: LinkDestination = { provider: r.provider as LinkDestination['provider'], region: r.region === 'eu' ? 'eu' : 'us', serviceName: r.serviceName };
+  const team = named(r.team);
+  if (team) out.team = team;
+  const environment = named(r.environment);
+  if (environment) out.environment = environment;
+  const aws = r.aws as Record<string, unknown> | undefined;
+  if (aws && typeof aws.region === 'string' && /^[a-z]{2}(?:-gov)?-[a-z]+-\d{1,2}$/.test(aws.region)) out.aws = { region: aws.region };
+  const links = r.links as Record<string, unknown> | undefined;
+  if (links && typeof links === 'object') {
+    const kept: { trace?: string; conversation?: string } = {};
+    if (typeof links.trace === 'string' && !linkTemplateProblem(links.trace, TRACE_LINK_PLACEHOLDERS, 'trace_id')) kept.trace = links.trace;
+    if (typeof links.conversation === 'string' && !linkTemplateProblem(links.conversation, CONVERSATION_LINK_PLACEHOLDERS, 'conversation')) kept.conversation = links.conversation;
+    if (kept.trace || kept.conversation) out.links = kept;
+  }
+  if (typeof r.host === 'string' && HOST.test(r.host)) out.host = r.host;
+  return out;
 }
 
 export interface TelemetryTotals {
@@ -128,6 +189,8 @@ export interface TelemetryMark {
   /** When the span started, from the job's start, and how long it took. */
   offsetMs?: number;
   durationMs?: number;
+  /** false: the destination did not accept its span, so nothing links to it (it is still a moment of the job). */
+  sent?: boolean;
 }
 
 const MAX_MARKS = 32;
@@ -154,6 +217,7 @@ function markOf(raw: unknown): TelemetryMark | undefined {
   if (offsetMs !== undefined) out.offsetMs = offsetMs;
   const durationMs = count(m.durationMs, DAY_MS);
   if (durationMs !== undefined) out.durationMs = durationMs;
+  if (typeof m.sent === 'boolean') out.sent = m.sent;
   return out;
 }
 
@@ -191,6 +255,10 @@ export function telemetryOf(raw: unknown): JobTelemetryReport | undefined {
   }
   if (t.local === true) out.local = true;
   if (typeof t.rootSpanId === 'string' && /^[0-9a-f]{16}$/.test(t.rootSpanId)) out.rootSpanId = t.rootSpanId;
+  const sentTo = sentToOf(t.sentTo);
+  if (sentTo) out.sentTo = sentTo;
+  const destination = destinationOf(t.destination);
+  if (destination) out.destination = destination;
   const totals = totalsOf(t.totals);
   if (totals) out.totals = totals;
   return out;

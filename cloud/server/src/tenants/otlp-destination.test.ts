@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { checkOtlpEndpoint, fillTemplate, headerNameProblem, isPublicAddress, linkTemplateProblem, parseOtlpEndpoint, TRACE_LINK_PLACEHOLDERS } from './otlp-destination.js';
+import { checkOtlpEndpoint, fillTemplate, headerNameProblem, isPublicAddress, linkTemplateProblem, parseOtlpEndpoint, publicOnlyFetch, publicOnlyLookup, TRACE_LINK_PLACEHOLDERS } from './otlp-destination.js';
 
 const destination = { tracesUrl: 'https://otlp.example.com/v1/traces', host: 'otlp.example.com', header: 'authorization' };
 const publicDns = async () => ['52.1.2.3'];
@@ -29,6 +29,20 @@ describe('checkOtlpEndpoint', () => {
     const fetchFn = vi.fn();
     expect(await checkOtlpEndpoint(fetchFn as never, async () => ['52.1.2.3', '169.254.169.254'])(destination, 'Bearer abcdefgh')).toMatchObject({ result: 'unreachable', reason: expect.stringMatching(/public/) });
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
+describe('the connection to a custom endpoint', () => {
+  const resolveTo = (addresses: { address: string; family: number }[]) => ((_h: string, _o: unknown, cb: (e: null, a: typeof addresses) => void) => cb(null, addresses)) as never;
+
+  it('goes only to the public addresses its own lookup vetted, so the name cannot answer differently at connection time', async () => {
+    const lookupOnce = (fn: ReturnType<typeof publicOnlyLookup>, all: boolean) => new Promise<unknown[]>((resolve) => (fn as never as (h: string, o: object, cb: (...a: unknown[]) => void) => void)('otlp.example.com', { all }, (...a) => resolve(a)));
+    expect(await lookupOnce(publicOnlyLookup(resolveTo([{ address: '52.1.2.3', family: 4 }])), false)).toEqual([null, '52.1.2.3', 4]);
+    const [refused] = await lookupOnce(publicOnlyLookup(resolveTo([{ address: '52.1.2.3', family: 4 }, { address: '10.0.0.1', family: 4 }])), true);
+    expect(refused).toMatchObject({ code: 'ENOTPUBLIC' });
+    const send = publicOnlyFetch(publicOnlyLookup(resolveTo([{ address: '169.254.169.254', family: 4 }])));
+    await expect(send('https://otlp.example.com/v1/traces', { method: 'POST', body: '{}' })).rejects.toMatchObject({ code: 'ENOTPUBLIC' });
+    await expect(send('http://otlp.example.com/v1/traces')).rejects.toThrow(/https/);
   });
 });
 

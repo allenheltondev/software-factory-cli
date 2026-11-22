@@ -25,7 +25,7 @@ import {
 } from './state.mjs';
 import { claudeTelemetryEnv, createOtlpRelay } from './otlp-relay.mjs';
 import { HONEYCOMB_ENDPOINTS, createAgentTracer, createExporter, createLocalExporter } from './telemetry.mjs';
-import { headerNameOk, parseOtlpEndpoint, resolvesPublic } from './otlp-endpoint.mjs';
+import { headerNameOk, parseOtlpEndpoint, publicOnlyFetch, resolvesPublic } from './otlp-endpoint.mjs';
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
 const KEY_FILE = 'github-app.pem';
@@ -281,6 +281,8 @@ export async function runJob(request, deps) {
   // go there; without one, it still reads the run logs for the console's own view of the job.
   let tracer;
   let sending = false;
+  /** Where the spans went ({ provider, host }), for the broker to keep the links of that destination with the job. */
+  let sentTo;
   // The runner's own steps, timed for the trace (sent only when telemetry is on): isolation, the
   // state, the coalescing wait, each try of `updraft run-event` and each wait for newer state.
   const steps = [];
@@ -312,6 +314,7 @@ export async function runJob(request, deps) {
     // wherever it might appear (until the agents' keys are loaded, it and the shape-based rules).
     const telemetry = payload.version === 2 ? await telemetrySetup(payload, deps, log) : null;
     sending = Boolean(telemetry);
+    if (telemetry) sentTo = { provider: telemetry.provider, host: telemetry.host };
     if (!telemetry) {
       tracer = createAgentTracer({ startedAt, captureContent: false, redact: (text) => redact(text), log, now, exporter: createLocalExporter(), ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}) });
       tracer.start();
@@ -327,11 +330,13 @@ export async function runJob(request, deps) {
         now,
         exporter: createExporter({
           endpoint: telemetry.endpoint,
+          tracesUrl: telemetry.tracesUrl,
           apiKey: telemetry.apiKey,
           headerName: telemetry.headerName,
           redact: redactNow,
           resource: { 'service.name': telemetry.serviceName, 'updraft.delivery.id': payload.deliveryId, 'updraft.microvm.id': microvmId },
-          ...(deps.fetch ? { fetch: deps.fetch } : {}),
+          // A custom destination's connection goes only to the public addresses its name resolves to.
+          ...(deps.fetch ? { fetch: deps.fetch } : telemetry.publicOnly ? { fetch: publicOnlyFetch() } : {}),
           log,
           now,
         }),
@@ -507,6 +512,7 @@ export async function runJob(request, deps) {
       steps,
       budgetMs: deps.telemetryBudgetMs ?? (stopRequested ? 5_000 : 15_000),
     });
+    if (sentTo) result.telemetry.sentTo = sentTo;
     if (sending) log(`agent telemetry: ${result.telemetry.exported} of ${result.telemetry.spans} span(s) sent${result.telemetry.lastError ? ` (last error: ${result.telemetry.lastError})` : ''}`);
   }
 
@@ -745,6 +751,7 @@ export function finishDetail(result) {
       ...(t.marks?.length ? { marks: t.marks } : {}),
       ...(t.local ? { local: true } : {}),
       ...(t.rootSpanId ? { rootSpanId: t.rootSpanId } : {}),
+      ...(t.sentTo ? { sentTo: t.sentTo } : {}),
       ...(t.totals ? { totals: t.totals } : {}),
     };
   }
@@ -830,7 +837,7 @@ async function telemetryDestination(t, deps, log) {
   // CloudWatch is an endpoint and a header too (X-Ray's, in its region), checked the same way.
   if (t.provider !== 'otlp' && t.provider !== 'cloudwatch') {
     const endpoint = HONEYCOMB_ENDPOINTS[t.region] ?? null;
-    return endpoint ? { endpoint, headerName: 'x-honeycomb-team', host: new URL(endpoint).host } : null;
+    return endpoint ? { provider: 'honeycomb', endpoint, tracesUrl: `${endpoint}/v1/traces`, headerName: 'x-honeycomb-team', host: new URL(endpoint).host, publicOnly: false } : null;
   }
   const parsed = parseOtlpEndpoint(t.endpoint);
   if (!parsed || !headerNameOk(t.header)) {
@@ -841,7 +848,7 @@ async function telemetryDestination(t, deps, log) {
     log(`agent telemetry is on, but ${parsed.host} does not resolve only to public addresses; nothing is sent`);
     return null;
   }
-  return { endpoint: parsed.tracesUrl, headerName: t.header, host: parsed.host };
+  return { provider: t.provider, endpoint: parsed.endpoint, tracesUrl: parsed.tracesUrl, headerName: t.header, host: parsed.host, publicOnly: true };
 }
 
 /** The telemetry key, and each word of it (the token in "Bearer <token>"), for the redactor. */

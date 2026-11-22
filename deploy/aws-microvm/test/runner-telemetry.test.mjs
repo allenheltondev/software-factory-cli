@@ -68,11 +68,12 @@ function setup({ captureContent = false, keys = [] } = {}) {
   return { dir, runsDir, clock, tracer, exporter, sent, write, step };
 }
 
-/** A mark without where it is in the job (offsetMs, durationMs), to compare the rest. */
+/** A mark without where it is in the job (offsetMs, durationMs) and whether it was sent, to compare the rest. */
 const withoutTiming = (m) => {
   const out = { ...m };
   delete out.offsetMs;
   delete out.durationMs;
+  delete out.sent;
   return out;
 };
 const byName = (spans, name) => spans.filter((s) => s.name === name);
@@ -612,7 +613,7 @@ describe('agent telemetry: spans worth a link', () => {
     expect(out.marks.find((m) => m.kind === 'test_green').spanId).toBe(tests[2].spanId);
   });
 
-  it('links only spans Honeycomb accepted', async () => {
+  it('keeps every moment, and says which spans the destination did not accept', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-telemetry-'));
     const runsDir = path.join(dir, 'runs');
     fs.mkdirSync(path.join(runsDir, 'run_1'), { recursive: true });
@@ -623,7 +624,11 @@ describe('agent telemetry: spans worth a link', () => {
     const out = await tracer.stop({ outcome: 'failed', steps: [{ name: 'restore_state', start: at, end: at + 1, error: 'unreadable' }] });
     expect(out).toMatchObject({ exported: 0, conversationId: 'octo/widgets#7' });
     expect(out.failed).toBeGreaterThan(0);
-    expect(out.marks.map(withoutTiming)).toEqual([]);
+    // The console still shows them; it links none of them.
+    expect(out.marks.map((m) => [m.kind, m.sent]).sort()).toEqual([
+      ['agent', false],
+      ['step_failed', false],
+    ]);
   });
 
   it("marks a review's verdict, a run that thrashed, and a failed runner step", async () => {
@@ -784,6 +789,14 @@ describe('the OTLP exporter', () => {
     await exporter.flush();
     expect(calls).toHaveLength(3);
     expect(exporter.stats).toMatchObject({ exported: 1, failed: 1, lastError: 'HTTP 401' });
+  });
+
+  it('sends to an exact traces URL as given, a custom path kept', async () => {
+    const urls = [];
+    const exporter = createExporter({ tracesUrl: 'https://otlp.example.com/custom/traces', resource: {}, fetch: async (url) => (urls.push(url), { ok: true, status: 200 }) });
+    exporter.push(span);
+    await exporter.flush();
+    expect(urls).toEqual(['https://otlp.example.com/custom/traces']);
   });
 
   it('says which spans Honeycomb accepted: not a queued one, nor one of a batch it refused', async () => {

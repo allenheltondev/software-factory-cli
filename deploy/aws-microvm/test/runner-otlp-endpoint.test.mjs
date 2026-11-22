@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { headerNameOk, isPublicAddress, parseOtlpEndpoint, resolvesPublic } from '../image/runner/otlp-endpoint.mjs';
+import { headerNameOk, isPublicAddress, parseOtlpEndpoint, publicOnlyFetch, publicOnlyLookup, resolvesPublic } from '../image/runner/otlp-endpoint.mjs';
 
 describe('a custom OTLP endpoint, as the runner checks it', () => {
   it('sends to the base endpoint plus /v1/traces, or to a traces endpoint as given', () => {
@@ -35,5 +35,18 @@ describe('a custom OTLP endpoint, as the runner checks it', () => {
         throw new Error('ENOTFOUND');
       }),
     ).toBe(false);
+  });
+
+  it('connects only to the public addresses its lookup vetted, whatever the name resolves to later', async () => {
+    const resolveTo = (addresses) => (_h, _o, cb) => cb(null, addresses);
+    const answer = (lookupFn, opts) => new Promise((resolve) => lookupFn('otlp.example.com', opts, (...args) => resolve(args)));
+    expect(await answer(publicOnlyLookup(resolveTo([{ address: '52.1.2.3', family: 4 }])), {})).toEqual([null, '52.1.2.3', 4]);
+    expect(await answer(publicOnlyLookup(resolveTo([{ address: '52.1.2.3', family: 4 }])), { all: true })).toEqual([null, [{ address: '52.1.2.3', family: 4 }]]);
+    const [refused] = await answer(publicOnlyLookup(resolveTo([{ address: '52.1.2.3', family: 4 }, { address: '169.254.169.254', family: 4 }])), {});
+    expect(refused).toMatchObject({ code: 'ENOTPUBLIC' });
+    // The request itself goes through it: a private answer at connection time never connects.
+    const send = publicOnlyFetch({ lookup: publicOnlyLookup(resolveTo([{ address: '10.0.0.1', family: 4 }])) });
+    await expect(send('https://otlp.example.com/v1/traces', { method: 'POST', body: '{}' })).rejects.toMatchObject({ code: 'ENOTPUBLIC' });
+    await expect(send('http://otlp.example.com/v1/traces', { method: 'POST', body: '{}' })).rejects.toThrow(/https/);
   });
 });

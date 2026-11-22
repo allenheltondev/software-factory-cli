@@ -20,7 +20,7 @@
  * uninstalled, so DynamoDB deletes the tenant and its members once the retention has passed.
  */
 
-import type { JobLoop, JobStep, JobTelemetryReport } from '../jobs/lifecycle.js';
+import type { JobLoop, JobStep, JobTelemetryReport, LinkDestination } from '../jobs/lifecycle.js';
 
 export type OAuthKind = 'link' | 'install';
 
@@ -281,6 +281,8 @@ export interface TelemetryExport {
   at: string;
   jobId: string;
   traceId?: string;
+  /** The destination's link settings for this export (jobs/lifecycle.ts). */
+  destination?: LinkDestination;
   spans: number;
   exported: number;
   failed: number;

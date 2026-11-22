@@ -17,7 +17,10 @@ export interface Exporter {
 }
 
 export function createExporter(options: {
-  endpoint: string;
+  /** The base endpoint: /v1/traces is added. */
+  endpoint?: string;
+  /** The traces URL exactly, as given (wins over `endpoint`). */
+  tracesUrl?: string;
   apiKey?: string;
   headerName?: string;
   headers?: Record<string, string>;
