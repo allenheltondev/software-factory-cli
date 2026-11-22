@@ -1,8 +1,8 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { jobPaths } from '../broker/broker.js';
 import type { Store } from '../store/store.js';
 import { errorClassOf, type Launcher } from './launch.js';
-import { jobResult, retryable } from './status.js';
+import { notRetryableMessage, retryable } from './status.js';
 
 /**
  * Retrying a job from the console: the launcher runs the job's own event again.
@@ -58,6 +58,13 @@ export const isRetryRequest = (event: unknown): event is RetryRequest => {
  */
 export const retryDeliveryId = (jobId: string) => `retry-${createHash('sha256').update(jobId).digest('hex').slice(0, 32)}`;
 
+/**
+ * How long a request's claim on a job's retry lasts if it never ends it (the Lambda died): longer
+ * than a launch takes, which the webhook function bounds at 20 seconds.
+ */
+export const RESERVATION_MS = 2 * 60 * 1000;
+const RECORD_ATTEMPTS = 3;
+
 export interface RetryDeps {
   store: Store;
   launch: Launcher;
@@ -65,20 +72,19 @@ export interface RetryDeps {
   readEvent: (key: string) => Promise<string | null>;
   /** The platform App's own login (`<slug>[bot]`), as the webhook gives the launcher. */
   appBot?: () => Promise<string | undefined>;
+  now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
 }
 
-export function createRetryHandler({ store, launch, readEvent, appBot, log = (e) => console.log(JSON.stringify(e)) }: RetryDeps) {
+export function createRetryHandler({ store, launch, readEvent, appBot, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: RetryDeps) {
   const no = (status: number, code: RetryErrorCode, message: string): RetryResult => ({ ok: false, status, code, message });
 
   return async function retry({ updraftRetry: { installationId, jobId } }: RetryRequest): Promise<RetryResult> {
     const summary = await store.getJobSummary(installationId, jobId);
     // Another tenant's job is not found, however it was named.
     if (!summary) return no(404, 'not_found', 'There is no such job in this installation');
-    if (summary.retriedAs) return no(409, 'already_retried', 'This job was already retried');
-    if (!retryable(summary)) {
-      return no(409, 'not_retryable', jobResult(summary) === 'running' ? 'This job is still running' : 'This job did not end in a way that can be retried');
-    }
+    if (summary.retriedAs) return no(409, 'already_retried', notRetryableMessage(summary));
+    if (!retryable(summary)) return no(409, 'not_retryable', notRetryableMessage(summary));
     // The job's own record says which event it ran (its delivery, its config version): kept a week
     // past the job's end, the summary 30 days.
     const job = await store.getJob(jobId);
@@ -99,21 +105,41 @@ export function createRetryHandler({ store, launch, readEvent, appBot, log = (e)
       return no(410, 'event_gone', 'The event this job ran for cannot be read, so it cannot be run again. Apply the label again on GitHub instead');
     }
 
+    // The claim on this job's retry, before anything is launched: only one request launches at a
+    // time, and none once a job started. Two requests that both read the summary before either
+    // recorded anything meet here, and the second stops.
+    const token = randomUUID();
+    if (!(await store.reserveJobRetry(job, token, now(), now() + RESERVATION_MS))) return no(409, 'already_retried', 'This job is being retried, or was already');
+    const giveBack = () => store.releaseJobRetry(job, token).catch((err: unknown) => log({ installationId, jobId, warning: `could not give back the retry claim: ${(err as Error)?.name}` }));
+
     let result;
     try {
       const bot = await appBot?.();
       result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload, retry: true });
     } catch (err) {
       log({ installationId, jobId, error: 'retry failed before launching', name: errorClassOf(err) });
+      await giveBack();
       return no(500, 'launch_failed', 'The job could not be started; try again');
     }
     log({ installationId, jobId, retried: result.disposition, ...(result.jobId ? { newJobId: result.jobId } : {}) });
     if (result.disposition === 'launched' && result.jobId) {
       // On record for as long as the job is listed: the delivery's claim only lasts while a job
-      // holds it, and a failed one gives it up. Only now, so a retry that did not start can be tried again.
-      await store.markJobRetried(job, result.jobId).catch((err: unknown) => log({ installationId, jobId, warning: `could not record the retry: ${(err as Error)?.name}` }));
+      // holds it, and a failed one gives it up. Retried, since a job is running for this now; if
+      // it cannot be written the claim runs out by itself, and that is all that is lost.
+      let recorded = false;
+      for (let attempt = 1; attempt <= RECORD_ATTEMPTS && !recorded; attempt++) {
+        try {
+          recorded = await store.markJobRetried(job, token, result.jobId);
+          break;
+        } catch (err) {
+          log({ installationId, jobId, warning: `could not record the retry (attempt ${attempt}): ${(err as Error)?.name}` });
+        }
+      }
+      if (!recorded) log({ installationId, jobId, newJobId: result.jobId, warning: 'the retry started a job but is not on record; its claim will lapse' });
       return { ok: true, jobId: result.jobId };
     }
+    // Nothing started: the retry can be asked for again.
+    await giveBack();
     return no(...refusal(result));
   };
 }

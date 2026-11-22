@@ -270,10 +270,22 @@ describe('status and diagnostics (#71)', () => {
       const requestRetry = vi.fn();
       const { store, get, post } = await setup({ requestRetry });
       await failed(store);
-      await store.markJobRetried({ installationId: 55, createdAt: job().createdAt, jobId: 'job_status0001' }, 'job_new000001');
+      const key = { installationId: 55, createdAt: job().createdAt, jobId: 'job_status0001' };
+      await store.reserveJobRetry(key, 'tok', Date.now(), Date.now() + 60_000);
+      await store.markJobRetried(key, 'tok', 'job_new000001');
       const listed = ((await get('55/jobs')).body.jobs as Record<string, unknown>[])[0]!;
       expect(listed).toMatchObject({ retryable: false, retriedAs: 'job_new000001' });
       expect(await post('55/jobs/job_status0001/retry')).toMatchObject({ status: 409, body: { error: 'already_retried' } });
+      expect(requestRetry).not.toHaveBeenCalled();
+    });
+
+    it('does not offer a job of a pull request’s review loop', async () => {
+      const requestRetry = vi.fn();
+      const { store, get, post } = await setup({ requestRetry });
+      await store.putJob(job({ jobId: 'job_status0003', deliveryId: 'd-3', issue: undefined, pullRequest: 40, eventName: 'pull_request_review' }));
+      await store.finishJob('job_status0003', 'failed');
+      expect(((await get('55/jobs')).body.jobs as Record<string, unknown>[])[0]).toMatchObject({ retryable: false });
+      expect(await post('55/jobs/job_status0003/retry')).toMatchObject({ status: 409, body: { error: 'not_retryable', message: expect.stringContaining('review loop') } });
       expect(requestRetry).not.toHaveBeenCalled();
     });
 

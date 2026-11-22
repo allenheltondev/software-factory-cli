@@ -2,7 +2,7 @@ import { JOB_PERMISSIONS } from '../broker/broker.js';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows, type TenantSummary } from '../flows/github.js';
 import type { RetryResult } from '../jobs/retry.js';
-import { countBy, deliveryCounts, jobResult, retryable, type JobResult } from '../jobs/status.js';
+import { countBy, deliveryCounts, jobResult, notRetryableMessage, retryable, type JobResult } from '../jobs/status.js';
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from './agents.js';
@@ -393,10 +393,8 @@ export function createStatusService({ store, github, agentKeys, readLog, request
       await github.member(caller, installationId);
       const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
       if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
-      if (job.retriedAs) throw new FlowError('already_retried', 409, 'This job was already retried');
-      if (!retryable(job)) {
-        throw new FlowError('not_retryable', 409, jobResult(job) === 'running' ? 'This job is still running' : 'This job did not end in a way that can be retried');
-      }
+      if (job.retriedAs) throw new FlowError('already_retried', 409, notRetryableMessage(job));
+      if (!retryable(job)) throw new FlowError('not_retryable', 409, notRetryableMessage(job));
       if (!requestRetry) throw new FlowError('retry_unavailable', 503, 'Retrying is not available in this deployment');
       const out = await requestRetry(installationId, jobId);
       if (!out.ok) throw new FlowError(out.code, out.status, out.message);

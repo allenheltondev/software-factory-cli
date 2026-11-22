@@ -95,12 +95,24 @@ const RETRYABLE: ReadonlySet<JobResult> = new Set<JobResult>([
  * (success, nothing to do, superseded), nor waiting out a usage limit (deferred: running it again
  * only defers it again; the cooldown's end continues it).
  */
-export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs'>): boolean {
+export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs' | 'pullRequest'>): boolean {
   // A retry started a job for it already: that one is the one to look at (and to retry).
   if (job.retriedAs) return false;
+  // A job of a pull request's review loop (a revision, a review): the loop's own records decide
+  // what is left to do for it (the same change request or head is not queued twice), so running its
+  // event again finds nothing new. It starts again from GitHub: a push, or a review.
+  if (job.pullRequest !== undefined) return false;
   // A run another one beat to publishing is not a failure; `not_run` also covers a redelivery's.
   if (job.outcome === 'superseded') return false;
   return RETRYABLE.has(jobResult(job));
+}
+
+/** Why a job cannot be retried, in words, for the one that asked. */
+export function notRetryableMessage(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs' | 'pullRequest'>): string {
+  if (job.retriedAs) return 'This job was already retried';
+  if (jobResult(job) === 'running') return 'This job is still running';
+  if (job.pullRequest !== undefined) return 'A job of a pull request’s review loop cannot be retried here: push to the pull request, or review it again, on GitHub';
+  return 'This job did not end in a way that can be retried';
 }
 
 /** Counts of each value, for a summary row. */

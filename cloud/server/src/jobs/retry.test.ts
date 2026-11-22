@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { jobPaths } from '../broker/broker.js';
 import { createMemoryStore, type Job } from '../store/store.js';
 import type { Launcher, LaunchResult } from './launch.js';
-import { createRetryHandler, isRetryRequest, retryDeliveryId } from './retry.js';
+import { createRetryHandler, isRetryRequest, RESERVATION_MS, retryDeliveryId } from './retry.js';
 import { retryable } from './status.js';
 
 const EVENT = JSON.stringify({ action: 'labeled', label: { name: 'updraft' }, issue: { number: 12 }, repository: { id: 9, full_name: 'acme/web' }, sender: { login: 'pat' } });
@@ -22,15 +22,16 @@ const job = (over: Partial<Job> = {}): Job => ({
   ...over,
 });
 
-async function setup({ outcome = 'failed', launched = { status: 202, disposition: 'launched', jobId: 'job_new000001' } as LaunchResult, event = EVENT as string | null } = {}) {
+async function setup({ outcome = 'failed', launched = { status: 202, disposition: 'launched', jobId: 'job_new000001' } as LaunchResult, event = EVENT as string | null, jobOver = {} as Partial<Job> } = {}) {
   const store = createMemoryStore();
-  const j = job();
+  const j = job(jobOver);
   await store.putJob(j);
   if (outcome) await store.finishJob(j.jobId, outcome);
   const launch = vi.fn<Launcher>(async () => launched);
   const readEvent = vi.fn(async () => event);
-  const retry = createRetryHandler({ store, launch, readEvent, appBot: async () => 'updraft[bot]', log: () => {} });
-  return { store, launch, readEvent, retry, j };
+  const clock = { now: 1_000_000 };
+  const retry = createRetryHandler({ store, launch, readEvent, appBot: async () => 'updraft[bot]', now: () => clock.now, log: () => {} });
+  return { store, launch, readEvent, retry, j, clock };
 }
 const ask = (jobId = 'job_retry00001', installationId = 55) => ({ updraftRetry: { installationId, jobId } });
 
@@ -62,6 +63,60 @@ describe('retrying a job (jobs/retry.ts)', () => {
     // The launcher's claim is gone by now (a failed retry gives it up; a finished one's lapses): only the record stops it.
     expect(await retry(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
     expect(launch).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets only one of two overlapping requests launch, and the other is told it is being retried', async () => {
+    const { retry, launch, store, j } = await setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    launch.mockImplementationOnce(async () => {
+      await gate;
+      return { status: 202, disposition: 'launched', jobId: 'job_new000001' };
+    });
+    const first = retry(ask());
+    await vi.waitFor(() => expect(launch).toHaveBeenCalledTimes(1));
+    // Both read the summary before either recorded anything; the claim is what stops the second.
+    expect(await retry(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
+    expect(launch).toHaveBeenCalledTimes(1);
+    release();
+    expect(await first).toEqual({ ok: true, jobId: 'job_new000001' });
+    expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBe('job_new000001');
+  });
+
+  it('gives the claim back when the launch throws, so it can be asked for again', async () => {
+    const { retry, launch } = await setup();
+    launch.mockRejectedValueOnce(new Error('boom'));
+    expect(await retry(ask())).toMatchObject({ ok: false, status: 500 });
+    expect(await retry(ask())).toMatchObject({ ok: true });
+  });
+
+  it('takes the claim over once a request that died holding it has run out its time, and not before', async () => {
+    const { retry, launch, store, j, clock } = await setup();
+    // A Lambda that reserved the retry and never finished.
+    expect(await store.reserveJobRetry(j, 'dead-request', clock.now, clock.now + RESERVATION_MS)).toBe(true);
+    clock.now += RESERVATION_MS - 1;
+    expect(await retry(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
+    expect(launch).not.toHaveBeenCalled();
+    clock.now += 2;
+    expect(await retry(ask())).toMatchObject({ ok: true });
+    expect(launch).toHaveBeenCalledTimes(1);
+  });
+
+  it('still answers ok when a job started but the record of it could not be written, and says so in the log', async () => {
+    const { store, launch, j } = await setup();
+    const log = vi.fn();
+    const flaky = { ...store, markJobRetried: vi.fn(async () => { throw new Error('throttled'); }) } as typeof store;
+    const retry = createRetryHandler({ store: flaky, launch, readEvent: async () => EVENT, log });
+    expect(await retry(ask())).toEqual({ ok: true, jobId: 'job_new000001' });
+    expect(flaky.markJobRetried).toHaveBeenCalledTimes(3);
+    expect(log).toHaveBeenCalledWith(expect.objectContaining({ jobId: j.jobId, warning: expect.stringContaining('not on record') }));
+  });
+
+  it('does not retry a job of a pull request’s review loop, which it would find nothing new for', async () => {
+    const { retry, launch, store, j } = await setup({ jobOver: { issue: undefined, pullRequest: 40, eventName: 'pull_request_review' } });
+    expect(await retry(ask())).toMatchObject({ ok: false, status: 409, code: 'not_retryable', message: expect.stringContaining('review loop') });
+    expect(launch).not.toHaveBeenCalled();
+    expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBeUndefined();
   });
 
   it('answers the launcher’s duplicate (two requests at once) as already retried', async () => {
@@ -152,6 +207,8 @@ describe('which jobs can be retried', () => {
   const finished = (outcome: string, detail: object = {}) => ({ status: 'finished' as const, outcome, detail });
   it('offers it for work that did not finish, and not for the rest', () => {
     expect(retryable(finished('failed'))).toBe(true);
+    // Not a pull request's job.
+    expect(retryable({ ...finished('failed'), pullRequest: 40 })).toBe(false);
     expect(retryable(finished('failed', { verificationPassed: false }))).toBe(true);
     expect(retryable(finished('failed', { updraftOutcome: 'publish-failed' }))).toBe(true);
     expect(retryable(finished('timed_out'))).toBe(true);

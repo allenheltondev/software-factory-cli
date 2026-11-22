@@ -713,15 +713,50 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async markJobRetried(job, newJobId) {
+    async reserveJobRetry(job, token, now, until) {
       try {
         await client.send(
           new UpdateCommand({
             TableName: T,
             Key: jobSummaryKey(job),
-            UpdateExpression: 'SET retriedAs = :n',
-            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs)',
-            ExpressionAttributeValues: { ':n': newJobId },
+            UpdateExpression: 'SET retryReservedUntil = :until, retryToken = :token',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND (attribute_not_exists(retryReservedUntil) OR retryReservedUntil < :now)',
+            ExpressionAttributeValues: { ':until': until, ':token': token, ':now': now },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
+    async releaseJobRetry(job, token) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: jobSummaryKey(job),
+            UpdateExpression: 'REMOVE retryReservedUntil, retryToken',
+            ConditionExpression: 'retryToken = :token',
+            ExpressionAttributeValues: { ':token': token },
+          }),
+        );
+      } catch (err) {
+        // Not its holder any more (the claim ran out and another request has it), or the summary expired.
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+      }
+    },
+
+    async markJobRetried(job, token, newJobId) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: jobSummaryKey(job),
+            UpdateExpression: 'SET retriedAs = :n REMOVE retryReservedUntil, retryToken',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryToken = :token',
+            ExpressionAttributeValues: { ':n': newJobId, ':token': token },
           }),
         );
         return true;
