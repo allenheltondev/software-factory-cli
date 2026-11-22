@@ -32,9 +32,12 @@ export interface SecretsPort {
 const KEY_SHAPE: Record<string, RegExp> = {
   ANTHROPIC_API_KEY: /^sk-ant-[A-Za-z0-9_-]{20,}$/,
   CODEX_API_KEY: /^sk-[A-Za-z0-9_-]{20,}$/,
+  // Kiro documents no format: one token of key characters, and never another provider's key.
+  KIRO_API_KEY: /^(?!sk-)[A-Za-z0-9_.:+/=-]{20,512}$/,
 };
 
-const providerOf = (name: string) => (name === 'ANTHROPIC_API_KEY' ? 'Anthropic' : 'OpenAI');
+const PROVIDER: Record<string, string> = { ANTHROPIC_API_KEY: 'Anthropic', CODEX_API_KEY: 'OpenAI', KIRO_API_KEY: 'Kiro' };
+const providerOf = (name: string) => PROVIDER[name] ?? name;
 
 export type SetKeyResult = { ok: true; meta: AgentKeyMeta } | { ok: false; message: string };
 
@@ -56,6 +59,8 @@ export async function setAgentKey(
   const verdict = await deps.check(name, value);
   if (verdict === 'invalid') return { ok: false, message: `${providerOf(name)} rejected that key; nothing was changed` };
   if (verdict === 'unavailable') return { ok: false, message: `could not check the key with ${providerOf(name)} just now; nothing was changed, try again` };
+  // 'unchecked': the provider has no call to check a key with (Kiro). Saved on its shape; the
+  // first job that uses it tells, and the key's "last used" says how that went.
 
   const secretName = agentKeySecretName(installationId, name);
   await deps.secrets.put(secretName, value, { installationId: String(installationId), app: 'updraft-cloud' });

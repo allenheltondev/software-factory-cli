@@ -42,6 +42,19 @@ async function setup(verdict: KeyCheck = 'valid') {
 }
 
 describe('agent keys in the console (#70)', () => {
+  it('saves a Kiro key on its shape alone, since Kiro offers no call to check one, and refuses another provider\'s key there', async () => {
+    const { put, check, values } = await setup('unchecked');
+    const KIRO = 'ksk_abcdefghijklmnopqrstuvwxyz0123456789';
+    expect((await put('KIRO_API_KEY', ANTHROPIC)).status).toBe(400);
+    expect((await put('KIRO_API_KEY', OPENAI)).status).toBe(400);
+    expect((await put('KIRO_API_KEY', 'short')).status).toBe(400);
+    expect(check).not.toHaveBeenCalled();
+    const res = await put('KIRO_API_KEY', KIRO);
+    expect(res.status).toBe(200);
+    expect([...values.values()]).toContain(KIRO);
+    expect(await res.text()).not.toContain(KIRO);
+  });
+
   it('shows only configured, last rotated and last used, and never a value', async () => {
     const { app, put, store } = await setup();
     const res = await put('ANTHROPIC_API_KEY', ANTHROPIC);
@@ -52,6 +65,7 @@ describe('agent keys in the console (#70)', () => {
     expect(JSON.parse(text).keys).toEqual([
       { name: 'ANTHROPIC_API_KEY', configured: true, required: false, lastRotatedAt: '2026-11-21T00:00:00.000Z', lastRotatedBy: 'pat', lastUsed: { at: '2026-11-21T01:00:00.000Z', ok: true } },
       { name: 'CODEX_API_KEY', configured: false, required: false },
+      { name: 'KIRO_API_KEY', configured: false, required: false },
     ]);
     expect(text).not.toContain(ANTHROPIC);
     expect(await (await put('CODEX_API_KEY', OPENAI)).text()).not.toContain(OPENAI);
@@ -69,13 +83,17 @@ describe('agent keys in the console (#70)', () => {
     await store.markConfigReady(55, v as number);
     await store.activateConfig(55, v as number);
     const keys = ((await (await app.request('/api/v1/installations/55/agent-keys')).json()) as { keys: { name: string; required: boolean }[] }).keys;
-    expect(keys.map((k) => [k.name, k.required])).toEqual([['ANTHROPIC_API_KEY', true], ['CODEX_API_KEY', false]]);
+    expect(keys.map((k) => [k.name, k.required])).toEqual([
+      ['ANTHROPIC_API_KEY', true],
+      ['CODEX_API_KEY', false],
+      ['KIRO_API_KEY', false],
+    ]);
   });
 
   it('reads what a version from before key needs were recorded requires from its bundle, and shows every key required when it cannot tell', async () => {
     for (const [bundle, expected] of [
-      ['dispatch: { allowedActors: [pat] }\nagents:\n  codex: { adapter: codex }\npools:\n  p: { agents: [codex] }\nrepositories:\n  acme/web:\n    id: 9\n    workflows:\n      - { trigger: { label: updraft }, pool: p }\n', [false, true]],
-      [null, [true, true]],
+      ['dispatch: { allowedActors: [pat] }\nagents:\n  codex: { adapter: codex }\npools:\n  p: { agents: [codex] }\nrepositories:\n  acme/web:\n    id: 9\n    workflows:\n      - { trigger: { label: updraft }, pool: p }\n', [false, true, false]],
+      [null, [true, true, true]],
     ] as const) {
       const { store, service } = await setup();
       const v = await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: { repositories: { 'acme/web': { id: 9, actors: ['pat'], triggers: [{ label: 'updraft' }] } } } });
@@ -90,7 +108,7 @@ describe('agent keys in the console (#70)', () => {
       });
       expect((await withBundle.list(caller, 55)).keys.map((k) => k.required)).toEqual(expected);
       // Without a bundle reader: unknown, so every key.
-      expect((await service.list(caller, 55)).keys.map((k) => k.required)).toEqual([true, true]);
+      expect((await service.list(caller, 55)).keys.map((k) => k.required)).toEqual([true, true, true]);
     }
   });
 

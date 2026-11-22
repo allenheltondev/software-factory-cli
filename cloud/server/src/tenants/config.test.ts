@@ -79,8 +79,13 @@ describe('compileTenantConfig', () => {
   });
 
   it('rejects agents the image does not ship', () => {
-    expect(errorsOf(submission({ agents: { kiro: {} } }))).toEqual([expect.objectContaining({ path: 'agents.kiro', message: expect.stringMatching(/claude, codex/) })]);
-    expect(errorsOf(submission({ agents: { mine: { adapter: 'kiro' } } }))).toEqual([expect.objectContaining({ path: 'agents.mine.adapter' })]);
+    expect(errorsOf(submission({ agents: { gemini: {} } }))).toEqual([expect.objectContaining({ path: 'agents.gemini', message: expect.stringMatching(/claude, codex, kiro/) })]);
+    expect(errorsOf(submission({ agents: { mine: { adapter: 'gemini' } } }))).toEqual([expect.objectContaining({ path: 'agents.mine.adapter' })]);
+    // Kiro runs, in the sandbox, with its key the only one in its environment.
+    const kiro = compileTenantConfig(submission({ agents: { kiro: {} }, pools: { general: { agents: ['kiro'] } } }), PLATFORM, REPOS);
+    expect(kiro.ok ? null : kiro.errors).toBeNull();
+    expect(kiro).toMatchObject({ dispatch: { repositories: { 'acme/web': { keys: ['KIRO_API_KEY'] } } }, keys: [{ path: 'agents.kiro', key: 'KIRO_API_KEY' }] });
+    expect(kiro.ok && kiro.files['config.yaml']).toMatch(/env:\n\s+- KIRO_API_KEY/);
   });
 
   it('rejects repositories the installation cannot reach, and repository settings the platform owns', () => {

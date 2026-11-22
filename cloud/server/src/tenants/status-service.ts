@@ -114,8 +114,16 @@ export interface Overview {
     missingPermissions: MissingPermission[];
   };
   repositories: { fullName: string; htmlUrl?: string; private?: boolean; reachable: boolean; configured: boolean; paused: boolean }[];
-  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string };
+  config: {
+    activeVersion: number | null;
+    publishedAt?: string;
+    publishedBy?: string;
+    /** The labels that start a job, by repository (enabled repositories only; at most 10): what to try first. */
+    triggers?: { repository: string; label: string }[];
+  };
   keys: AgentKeyView[];
+  /** Whether traces are set up to go somewhere (a destination and its key), and are on. */
+  telemetry: { configured: boolean; enabled: boolean };
   /**
    * Counts over the last 30 days, or, when `window` says a list is not complete, over its latest
    * ACTIVITY_SAMPLE entries (running counts the latest jobs only).
@@ -242,12 +250,13 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
                 ? 'missing_permissions'
                 : 'active';
 
-      const [reachable, version, keys, deliveries, jobs] = await Promise.all([
+      const [reachable, version, keys, deliveries, jobs, telemetrySettings] = await Promise.all([
         status === 'uninstalled' || status === 'suspended' ? Promise.resolve([]) : github.repositories(caller, installationId).then((r) => r.repositories).catch(() => []),
         tenant.activeConfigVersion !== undefined ? store.getConfigVersion(installationId, tenant.activeConfigVersion) : Promise.resolve(null),
         agentKeys.list(caller, installationId).then((v) => v.keys),
         store.listDeliveries(installationId, ACTIVITY_SAMPLE + 1),
         store.listRecentJobs(installationId, ACTIVITY_SAMPLE + 1),
+        store.getTelemetry(installationId).catch(() => null),
       ]);
 
       const configured = version?.dispatch?.repositories ?? {};
@@ -267,12 +276,22 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
       deliveries.splice(ACTIVITY_SAMPLE);
       jobs.splice(ACTIVITY_SAMPLE);
       const results = jobs.map(jobResult);
+      // The labels that start a job, named as the installation reports the repository.
+      const triggers = Object.entries(configured)
+        .filter(([, c]) => !c.paused)
+        .flatMap(([name, c]) => c.triggers.map((t) => ({ repository: repos.get(name)?.fullName ?? name, label: t.label })))
+        .slice(0, 10);
       return {
         tenant: summary,
         installation: { status, checked, missingPermissions: missing },
         repositories: [...repos.values()].sort((a, b) => Number(b.configured) - Number(a.configured) || a.fullName.localeCompare(b.fullName)),
-        config: { activeVersion: tenant.activeConfigVersion ?? null, ...(version ? { publishedAt: version.publishedAt, publishedBy: version.publishedBy } : {}) },
+        config: {
+          activeVersion: tenant.activeConfigVersion ?? null,
+          ...(version ? { publishedAt: version.publishedAt, publishedBy: version.publishedBy } : {}),
+          ...(triggers.length ? { triggers } : {}),
+        },
         keys,
+        telemetry: { configured: Boolean(telemetrySettings?.key), enabled: Boolean(telemetrySettings?.key && telemetrySettings.enabled) },
         activity: {
           deliveries: deliveryCounts(deliveries),
           jobs: countBy(results.filter((r) => r !== 'running')),

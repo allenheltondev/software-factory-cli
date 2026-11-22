@@ -124,6 +124,24 @@ describe('status and diagnostics (#71)', () => {
       expect((body.keys as unknown[]).length).toBe(2);
     });
 
+    it('names the labels that start a job, of enabled repositories only, and whether traces are set up', async () => {
+      const { store, get } = await setup();
+      const v = await store.createConfigVersion(55, {
+        sha256: 'x',
+        files: ['config.yaml'],
+        publishedBy: 'pat',
+        publishedAt: '2026-11-20T10:00:00.000Z',
+        dispatch: { repositories: { 'acme/web': { id: 9, triggers: [{ label: 'updraft' }, { label: 'updraft:review' }] }, 'acme/docs': { id: 10, paused: true, triggers: [{ label: 'paused' }] } } },
+      });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      const first = (await get('55/overview')).body;
+      expect(first.config).toMatchObject({ triggers: [{ repository: 'acme/web', label: 'updraft' }, { repository: 'acme/web', label: 'updraft:review' }] });
+      expect(first.telemetry).toEqual({ configured: false, enabled: false });
+      await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat' } }, 0);
+      expect((await get('55/overview')).body.telemetry).toEqual({ configured: true, enabled: true });
+    });
+
     it('says when its counts are of the latest deliveries only, not all 30 days', async () => {
       const { store, get } = await setup();
       for (let n = 0; n <= ACTIVITY_SAMPLE; n++) await store.recordDelivery(55, { at: `2026-11-20T12:00:${String(n).padStart(4, '0')}Z`, deliveryId: `d-${n}`, event: 'issues', disposition: 'filtered', reason: 'not_trigger' });

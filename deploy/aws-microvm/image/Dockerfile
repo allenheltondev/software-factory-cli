@@ -74,6 +74,17 @@ RUN set -eu; . /opt/updraft/build.env; \
     if [ -n "${AGENT_PACKAGES}" ]; then npm install -g --no-fund --no-audit ${AGENT_PACKAGES}; fi; \
     npm cache clean --force >/dev/null 2>&1 || true
 
+# Kiro CLI (KIRO_INSTALL_COMMAND in build.env): Kiro's own installer, with its home in /opt/kiro
+# so nothing lands in root's, and its binaries linked into /usr/local/bin for the job user.
+RUN set -eu; . /opt/updraft/build.env; \
+    if [ -n "${KIRO_INSTALL_COMMAND:-}" ]; then \
+      mkdir -p /opt/kiro; \
+      HOME=/opt/kiro sh -c "${KIRO_INSTALL_COMMAND}"; \
+      for b in /opt/kiro/.local/bin/*; do if [ -e "$b" ]; then ln -sf "$b" /usr/local/bin/; fi; done; \
+      chmod -R a+rX /opt/kiro; \
+      kiro-cli --version || { echo "KIRO_INSTALL_COMMAND ran, but kiro-cli is not on the PATH" >&2; exit 1; }; \
+    fi
+
 # System packages for the repositories (SYSTEM_PACKAGES in build.env). Installed one at a time
 # so that a build with several unknown names reports all of them at once.
 RUN set -eu; . /opt/updraft/build.env; \

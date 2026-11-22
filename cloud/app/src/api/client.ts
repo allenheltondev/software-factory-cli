@@ -285,7 +285,8 @@ export type TelemetryRegion = 'us' | 'eu';
 export type TelemetryProvider = 'honeycomb' | 'cloudwatch' | 'otlp';
 /** The destination and its key, saved together: a custom endpoint never changes without its key. */
 export type TelemetryKeyInput =
-  | { provider?: 'honeycomb'; value: string; region: TelemetryRegion }
+  /** `auto`: the region is found from the key (the US, then the EU). */
+  | { provider?: 'honeycomb'; value: string; region: TelemetryRegion | 'auto' }
   | { provider: 'cloudwatch'; value: string; awsRegion: string }
   | { provider: 'otlp'; value: string; endpoint: string; header: string };
 export interface TelemetryLinks {
@@ -453,8 +454,10 @@ export interface Overview {
   tenant: TenantSummary;
   installation: { status: InstallationStatus; checked: boolean; missingPermissions: { name: string; needs: string; granted?: string }[] };
   repositories: { fullName: string; htmlUrl?: string; private?: boolean; reachable: boolean; configured: boolean; paused: boolean }[];
-  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string };
+  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string; triggers?: { repository: string; label: string }[] };
   keys: AgentKeyView[];
+  /** Whether traces are set up to go somewhere, and are on. Absent from an older API. */
+  telemetry?: { configured: boolean; enabled: boolean };
   activity: {
     /** Counts over 30 days, or of the latest entries when a list is not complete. */
     window: { deliveries: number; deliveriesComplete: boolean; jobs: number; jobsComplete: boolean };

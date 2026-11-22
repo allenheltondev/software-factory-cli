@@ -4,11 +4,14 @@
  * request's header, never in a URL, a log or a message.
  */
 
-export type KeyCheck = 'valid' | 'invalid' | 'unavailable';
+/** `unchecked`: the provider offers no call to check a key with; it is saved on its shape alone. */
+export type KeyCheck = 'valid' | 'invalid' | 'unavailable' | 'unchecked';
 export type KeyChecker = (name: string, value: string) => Promise<KeyCheck>;
 
 export const checkAgentKeyWithProvider = (fetchFn: typeof fetch = fetch, timeoutMs = 8000): KeyChecker =>
   async (name, value) => {
+    // Kiro documents no API to check a key against; its first job does.
+    if (name === 'KIRO_API_KEY') return 'unchecked';
     const request: { url: string; headers: Record<string, string> } | null =
       name === 'ANTHROPIC_API_KEY'
         ? { url: 'https://api.anthropic.com/v1/models?limit=1', headers: { 'x-api-key': value, 'anthropic-version': '2023-06-01' } }

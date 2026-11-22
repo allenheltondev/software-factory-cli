@@ -54,6 +54,18 @@ describe('agent telemetry settings', () => {
     expect((await service.setKey(caller, 55, { value: KEY })).enabled).toBe(false);
   });
 
+  it('finds the region itself: the US first, then the EU', async () => {
+    const regions: string[] = [];
+    const { service } = await setup(async (region) => {
+      regions.push(region);
+      return region === 'eu' ? { result: 'valid', auth: { type: 'ingest', canSend: true, team: { name: 'Acme', slug: 'acme' } } } : { result: 'invalid' };
+    });
+    expect(await service.setKey(caller, 55, { value: KEY, region: 'auto' })).toMatchObject({ region: 'eu', keyConfigured: true });
+    expect(regions).toEqual(['us', 'eu']);
+    const { service: nowhere } = await setup(async () => ({ result: 'invalid' }));
+    await expect(nowhere.setKey(caller, 55, { value: KEY, region: 'auto' })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/both the US and the EU/) });
+  });
+
   it('saves nothing for a key Honeycomb rejects, cannot reach, or one that cannot send events', async () => {
     for (const [check, message] of [
       [async () => ({ result: 'invalid' as const }), /rejected that key/],
