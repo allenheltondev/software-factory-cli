@@ -242,8 +242,9 @@ not redacted: they are what the content is.
 The runner reports these with the job's finish (`telemetry.marks`): a kind (`agent`,
 `test_failed`, `test_green`, `verify_failed`, `step_failed`), the span id, the run kind, and for an
 agent span its profile, verdict, and whether it failed or thrashed. Only spans Honeycomb accepted
-(a 2xx for their batch) are reported, so a link never opens the root span instead of one that was
-refused, dropped or still queued, and there are at most 8 per run and 32 per job. A test run counts
+(a 2xx for their batch that rejected none of it: an OTLP partial success counts its rejected spans
+as failed and confirms none of the batch, since it does not say which) are reported, so a link
+never opens the root span instead of one that was refused, dropped or still queued, and there are at most 8 per run and 32 per job. A test run counts
 as the first passing one only when its output showed tests that passed. It also reports the
 conversation id the job's span was sent in, so a review's job, which has no issue of its own, links
 to the issue's conversation, and a job that ran no agent to `delivery/<id>`. The broker keeps only marks of a known kind, with a 16-hex span id and plain
