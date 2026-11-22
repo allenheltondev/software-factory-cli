@@ -126,29 +126,24 @@ function AgentFields({ agent, onChange, issues, path, title, installationId, rev
         onChange={(e) => onChange({ ...agent, effort: e.target.value || undefined })}
       />
       {guide && (
-        <div className="text-sm sm:col-span-3" data-testid={`agent-help-${path}`}>
-          <p>
-            Updraft takes {guide.credential} for {guide.agent}. {guide.billing}{' '}
-            {reviewer?.differs && 'The reviewer uses a different provider than the agent, so it needs its own key when review is on. '}
-            <Link className="auth-link" to={`/installations/${installationId}/keys`}>
-              Agent keys
-            </Link>
-            {' · '}
-            <a className="auth-link" href={guide.getKeyUrl} target="_blank" rel="noreferrer">
-              Get API key ↗
+        <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm sm:col-span-3" data-testid={`agent-help-${path}`}>
+          <span>
+            {guide.credential} · {guide.billing}
+          </span>
+          <Link className="auth-link" to={`/installations/${installationId}/keys`}>
+            Agent keys
+          </Link>
+          <a className="auth-link" href={guide.getKeyUrl} target="_blank" rel="noreferrer">
+            Get API key ↗
+          </a>
+          {guide.guides.map((g) => (
+            <a key={g.href} className="auth-link" href={g.href} target="_blank" rel="noreferrer">
+              {g.label} ↗
             </a>
-            {guide.guides.map((g) => (
-              <span key={g.href}>
-                {' · '}
-                <a className="auth-link" href={g.href} target="_blank" rel="noreferrer">
-                  {g.label} ↗
-                </a>
-              </span>
-            ))}
-          </p>
-          <p className="text-muted-foreground">Create the key, save it under Agent keys, publish this workflow, then apply its issue label.</p>
-          {guide.note && <p className="text-muted-foreground">{guide.note}</p>}
-        </div>
+          ))}
+          {reviewer?.differs && <span className="w-full text-muted-foreground">Different provider than the agent: needs its own key when review is on.</span>}
+          {guide.note && <span className="w-full text-muted-foreground">{guide.note}</span>}
+        </p>
       )}
     </div>
   );

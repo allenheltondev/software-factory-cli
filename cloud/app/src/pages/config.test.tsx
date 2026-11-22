@@ -80,7 +80,7 @@ describe('InstallationPage', () => {
     expect(within(agent).getByRole('link', { name: 'Agent keys' })).toHaveAttribute('href', '/installations/55/keys');
     expect(within(agent).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://platform.claude.com/settings/keys');
     expect(within(agent).getByRole('link', { name: /Get your Claude API key/ })).toHaveAttribute('href', 'https://platform.claude.com/docs/en/get-api-key');
-    expect(agent).toHaveTextContent('Claude Console API key');
+    expect(agent).toHaveTextContent('Claude Console API key · API billing');
     const reviewer = screen.getByTestId('agent-help-workflows.implement.reviewer');
     expect(reviewer).toHaveTextContent('needs its own key');
     expect(within(reviewer).getByRole('link', { name: /OpenAI API key creation/ })).toHaveAttribute('href', 'https://developers.openai.com/api/docs/quickstart#create-and-export-an-api-key');

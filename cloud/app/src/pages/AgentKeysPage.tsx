@@ -171,13 +171,13 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
           <StatusBadge tone="neutral">{k.required ? 'Required by your configuration' : 'Optional'}</StatusBadge>
         </CardTitle>
         <CardDescription>
-          {provider.company} API key · <code>{k.name}</code>
+          {provider.guide?.credential ?? `${provider.company} API key`} · {provider.guide?.billing ? `${provider.guide.billing} · ` : ''}<code>{k.name}</code>
         </CardDescription>
       </CardHeader>
       <CardBody>
         <div className="flex flex-col gap-4">
           {provider.guide && (
-            <div className="flex flex-wrap items-center gap-3 text-sm" data-testid={`key-guide-${k.name}`}>
+            <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm" data-testid={`key-guide-${k.name}`}>
               <a className="auth-link" href={provider.guide.getKeyUrl} target="_blank" rel="noreferrer">
                 Get API key ↗
               </a>
@@ -186,10 +186,7 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
                   {i === 0 ? 'Setup guide' : g.label} ↗
                 </a>
               ))}
-              <span>
-                Updraft takes {provider.guide.credential}. {provider.guide.billing}
-              </span>
-            </div>
+            </p>
           )}
           {k.configured && (
             <div className="flex flex-col gap-1 text-sm">
