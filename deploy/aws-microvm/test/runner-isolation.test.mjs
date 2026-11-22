@@ -32,7 +32,7 @@ import {
   probeRunArgs,
   selfTest,
 } from '../image/runner/isolation.mjs';
-import { runJob } from '../image/runner/job.mjs';
+import { ISOLATION_CHECK_MARKER, checkImageIsolation, runJob } from '../image/runner/job.mjs';
 import { checkConfig } from '../../../src/commands/validate.ts';
 import { installRuntime, sandboxAvailability } from './sandbox-host.mjs';
 
@@ -527,4 +527,63 @@ describe.runIf(onLinuxLikeHost)('runJob with AgentIsolation enforced', { timeout
 it('IsolationError carries the step and the problems', () => {
   const error = new IsolationError('config', ['a', 'b']);
   expect(error).toMatchObject({ step: 'config', problems: ['a', 'b'], message: 'ISOLATION NOT ENFORCED (config): a; b' });
+});
+
+// ---------------------------------------------------------------------------
+// The image check (run-hook payload version 3): the build's proof before it activates a version
+// ---------------------------------------------------------------------------
+
+describe('checkImageIsolation', { timeout: 60_000 }, () => {
+  const checkDeps = (isolation) => {
+    const logs = [];
+    const stateRoot = path.join(root, 'jobs');
+    fs.mkdirSync(stateRoot, { recursive: true });
+    const removed = [];
+    const filter = { ...okFilter, ...(isolation.filter ?? {}), remove: () => removed.push('remove') };
+    return {
+      deps: { isolation: { ...isolation, filter }, stateRoot, jobUser: { home: path.join(root, 'home'), name: 'updraft' }, baseEnv: { PATH: process.env.PATH }, log: (line) => logs.push(line) },
+      logs,
+      removed,
+      stateRoot,
+    };
+  };
+  const base = (runtime) => ({ runtime, image: SANDBOX_IMAGE, nodePath: process.execPath, endpoints: [], connectTimeoutMs: 500, allowRunnerUser: true });
+  const logged = (logs) => {
+    const line = logs.find((l) => l.startsWith(ISOLATION_CHECK_MARKER));
+    return line ? JSON.parse(line.slice(ISOLATION_CHECK_MARKER.length)) : undefined;
+  };
+
+  it('fails at the packet filter, logs the reasons, and leaves nothing behind', async () => {
+    const h = checkDeps({ ...base(SANDBOX_RUNTIME), filter: { install: () => ({ ok: false, problem: `the packet filter could not be installed: nft exited 1 (${NO_NET_ADMIN_PROBLEM})` }) } });
+    const report = await checkImageIsolation(h.deps);
+    expect(report).toMatchObject({ ok: false, failedStep: 'packet filter', problems: [expect.stringContaining('CAP_NET_ADMIN')] });
+    expect(logged(h.logs)).toEqual(report);
+    expect(h.removed).toEqual(['remove']);
+    expect(fs.readdirSync(h.stateRoot)).toEqual([]);
+  });
+
+  it('fails when the runner was started without the sandbox runtime', async () => {
+    const logs = [];
+    const report = await checkImageIsolation({ stateRoot: root, jobUser: { home: root, name: 'updraft' }, log: (line) => logs.push(line) });
+    expect(report).toMatchObject({ ok: false, failedStep: 'setup' });
+    expect(logged(logs)).toEqual(report);
+  });
+
+  it.runIf(onLinuxLikeHost)('fails the self-test when the runtime is not a sandbox: the stand-in files can be read', async () => {
+    const h = checkDeps(base(passthroughRuntime()));
+    const report = await checkImageIsolation(h.deps);
+    expect(report).toMatchObject({ ok: false, failedStep: 'self-test' });
+    expect(report.problems.some((p) => /app-token\.json can be read inside the sandbox$/.test(p))).toBe(true);
+    expect(fs.readdirSync(h.stateRoot)).toEqual([]);
+  });
+
+  it.runIf(sandbox.usable)('passes in the sandbox runtime', async () => {
+    const runtime = installRuntime(path.join(root, 'runtime'));
+    const h = checkDeps(base(runtime.path));
+    const report = await checkImageIsolation(h.deps);
+    expect(report).toMatchObject({ ok: true, failedStep: null, problems: [] });
+    expect(report.checks.selfTest).toMatchObject({ sandboxStarts: true, packetFilter: 'in place' });
+    expect(logged(h.logs)).toEqual(report);
+    expect(fs.readdirSync(h.stateRoot)).toEqual([]);
+  });
 });

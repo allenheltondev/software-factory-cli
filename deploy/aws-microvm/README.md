@@ -1169,6 +1169,15 @@ the runner asks it to stop the microVM without running anything. A job that ends
 can ask before the launcher has recorded its microVM, so the runner keeps asking for about
 30 seconds (`terminateThroughBroker`). The maximum duration is the backstop if that fails too.
 
+Version 3 is an image check, not a job: `{ "version": 3, "checkId": "<id>" }`. Updraft
+Cloud's image build sends it to each new version before activating it (`cloud/README.md`,
+"The job image"). The runner installs the packet filter, fills a job-shaped state directory
+with stand-in files, and runs the same self-test a job runs (`checkImageIsolation` in
+`image/runner/job.mjs`). It then removes both and logs one `ISOLATION CHECK {"ok": ...,
+"failedStep": ..., "problems": [...], "checks": {...}}` line. It reads nothing from S3, calls
+no broker, and does not terminate itself: whoever started it reads the line and terminates
+it. `deploy.sh` does not run the check yet.
+
 ### Idle policy
 
 A microVM with no traffic on its endpoint counts as idle and is suspended after

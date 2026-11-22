@@ -23,6 +23,7 @@ import { repoRoot, toLf } from './job-image-context.js';
 export const IMAGE_INPUTS: readonly string[] = [
   'deploy/aws-microvm/image/',
   'cloud/server/scripts/build-job-image.ts',
+  'cloud/server/scripts/job-image-check.ts',
   'cloud/server/scripts/job-image-context.ts',
   'cloud/server/scripts/job-image-inputs.ts',
   'cloud/server/scripts/zip.ts',

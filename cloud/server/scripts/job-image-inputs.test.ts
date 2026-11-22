@@ -8,6 +8,7 @@ describe('the job image inputs', () => {
       'deploy/aws-microvm/image/runner/job.mjs',
       'deploy/aws-microvm/image/build.env',
       'cloud/server/scripts/build-job-image.ts',
+      'cloud/server/scripts/job-image-check.ts',
       'cloud/server/scripts/job-image-context.ts',
       'cloud/server/scripts/job-image-inputs.ts',
       'cloud/server/scripts/zip.ts',

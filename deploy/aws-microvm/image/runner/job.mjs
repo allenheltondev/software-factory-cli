@@ -10,7 +10,7 @@ import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { MAX_SECRET_BYTES, createRedactor, redactingWriter } from './redact.mjs';
-import { IsolationError, beginIsolation, isolationMode, verifyIsolation } from './isolation.mjs';
+import { IsolationError, beginIsolation, isolationMode, selfTest, verifyIsolation } from './isolation.mjs';
 import {
   DEFAULT_CHECKPOINT_SECONDS,
   REPORT_RESERVE_MS,
@@ -918,6 +918,52 @@ function summarizeCheckpoints(all) {
     for (const name of ['lastSavedAt', 'lastEtag', 'lastProblem']) total[name] = one[name] ?? total[name];
   }
   return total;
+}
+
+/** The log line an image check ends with; the image builds read the JSON after it. */
+export const ISOLATION_CHECK_MARKER = 'ISOLATION CHECK ';
+
+/**
+ * An image check (run-hook payload version 3): the boundary a job relies on, set up and proven
+ * in this microVM exactly as a job does it, with stand-ins for the job's files. Installs the
+ * packet filter (beginIsolation), fills a state directory like a version 2 job's with files of
+ * the same names, owners and modes, and runs the same self-test (selfTest). The tenant's config
+ * check is the one part not covered: there is no tenant. Removes the filter and the directory,
+ * logs `ISOLATION CHECK {json}` and resolves to the same object: { ok, failedStep, problems,
+ * checks }. Never throws.
+ */
+export async function checkImageIsolation(deps) {
+  const report = { ok: false, failedStep: null, problems: [], checks: {} };
+  let stateDir;
+  try {
+    const begun = await beginIsolation({ agentIsolation: 'enforced' }, deps);
+    report.checks = { ...begun.checks };
+    stateDir = await fs.mkdtemp(path.join(deps.stateRoot, 'check-'));
+    await fs.chmod(stateDir, 0o700);
+    const protectedFiles = [TOKEN_FILE, STATE_DB_FILE, CONFIG_FILE, EVENT_FILE].map((name) => path.join(stateDir, name));
+    for (const file of protectedFiles) await fs.writeFile(file, `stand-in for ${path.basename(file)}\n`, { mode: 0o600 });
+    if (deps.jobUser.uid !== undefined && deps.jobUser.gid !== undefined) await chownTree(stateDir, deps.jobUser.uid, deps.jobUser.gid);
+    const tested = await selfTest({ stateDir, protectedFiles }, deps);
+    report.checks.selfTest = tested.checks;
+    if (!tested.ok) {
+      report.failedStep = 'self-test';
+      report.problems = tested.problems;
+    } else {
+      report.ok = true;
+    }
+  } catch (error) {
+    report.failedStep = error instanceof IsolationError ? error.step : 'setup';
+    report.problems = error instanceof IsolationError ? error.problems : [`the check itself failed: ${error?.message ?? error}`];
+  } finally {
+    if (stateDir) await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+    try {
+      deps.isolation?.filter?.remove?.();
+    } catch {
+      // the microVM is thrown away after the check
+    }
+  }
+  deps.log(`${ISOLATION_CHECK_MARKER}${JSON.stringify(report)}`);
+  return report;
 }
 
 async function chownTree(target, uid, gid) {

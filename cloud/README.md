@@ -378,8 +378,13 @@ Jobs run the same image as the self-hosted stack (`deploy/aws-microvm/image/`), 
 1. packs the CLI (`npm pack` at the repository root);
 2. zips the build context, with LF line endings even from a Windows checkout;
 3. uploads it to `JobImageBucket`;
-4. creates or updates the `<stack>-job` MicroVM image and waits for the build;
-5. writes the version to `/updraft/<stack>/job-image-version`.
+4. creates or updates the `<stack>-job` MicroVM image, with `additionalOsCapabilities: ["ALL"]`, and waits for the build;
+5. runs one microVM from the new version to check isolation (`server/scripts/job-image-check.ts`), and stops if the check fails;
+6. writes the version to `/updraft/<stack>/job-image-version`.
+
+**The isolation check** is why a version that builds can still be refused. A `SUCCESSFUL` build only means the image answered its `/ready` hook. It says nothing about whether a job's boundary holds on that version. So the build starts a microVM from it with the jobs' execution role and an image-check run-hook payload (version 3). That payload names no tenant, broker or job token. The runner installs the packet filter and runs the same sandbox self-test a job runs, with stand-in files in a job-shaped state directory. It logs one `ISOLATION CHECK {...}` line and starts nothing else. The build reads that line from the `isolation-check/<version>/<stamp>` log stream, then terminates the microVM; a 15-minute maximum duration also covers a build that dies first. Only a passed check activates the version, so a failure leaves jobs on the version they had. The one job check this can't cover is the tenant's config: there is no tenant yet.
+
+The check's microVM counts against the account's MicroVM quota like a job's for a few minutes. It doesn't count against any tenant's quota.
 
 **Until that parameter exists, the launcher starts no jobs (`jobs_off`).** It reads the parameter at most once a minute, so a new build, or setting the parameter back to an earlier version, takes effect without a deploy.
 
@@ -393,7 +398,7 @@ The job builds only when the active version's fingerprint differs from the check
 
 A change to the rest of the CLI (`src/`) reaches jobs only with the next image built for one of those reasons, or a `build_image` run. Production activates a new build within a minute. To roll back, set the parameter to the previous version (`aws lambda-microvms list-microvm-image-versions --image-identifier updraft-cloud-job` lists them).
 
-**The deploy role needs these permissions** for the `image` job, in each account (Staging and Production), on top of what the stack deploy uses. `<account>` is that account's id. `lambda:CreateMicrovmImage` and `lambda:PassNetworkConnector` have no resource type in IAM, so they take `"Resource": "*"`. Creating is limited instead to an image tagged with this stack, which is how the build creates it:
+**The deploy role needs these permissions** for the `image` job, in each account (Staging and Production), on top of what the stack deploy uses. The isolation check needs the `RunMicrovm`, `GetMicrovm` and `TerminateMicrovm` statement, `iam:PassRole` on the execution role and `logs:GetLogEvents`. The launcher's own role scopes `RunMicrovm` the same way, to the image's ARN. A role without them fails the build before it activates anything. `<account>` is that account's id. `lambda:CreateMicrovmImage` and `lambda:PassNetworkConnector` have no resource type in IAM, so they take `"Resource": "*"`. Creating is limited instead to an image tagged with this stack, which is how the build creates it:
 
 ```json
 [
@@ -404,6 +409,12 @@ A change to the rest of the CLI (`src/`) reaches jobs only with the next image b
   { "Effect": "Allow", "Action": "lambda:PassNetworkConnector", "Resource": "*" },
   { "Effect": "Allow", "Action": "iam:PassRole", "Resource": "arn:aws:iam::<account>:role/updraft-cloud-MicrovmBuildRole-*",
     "Condition": { "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" } } },
+  { "Effect": "Allow", "Action": ["lambda:RunMicrovm", "lambda:GetMicrovm", "lambda:TerminateMicrovm"],
+    "Resource": "arn:aws:lambda:us-east-1:<account>:microvm-image:updraft-cloud-job" },
+  { "Effect": "Allow", "Action": "iam:PassRole", "Resource": "arn:aws:iam::<account>:role/updraft-cloud-MicrovmExecutionRole-*",
+    "Condition": { "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" } } },
+  { "Effect": "Allow", "Action": "logs:GetLogEvents",
+    "Resource": "arn:aws:logs:us-east-1:<account>:log-group:/aws/lambda-microvms/updraft-cloud-job:log-stream:isolation-check/*" },
   { "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::updraft-cloud-jobimagebucket-*/image/*" },
   { "Effect": "Allow", "Action": ["ssm:GetParameter", "ssm:PutParameter"], "Resource": "arn:aws:ssm:us-east-1:<account>:parameter/updraft/updraft-cloud/job-image-version" }
 ]

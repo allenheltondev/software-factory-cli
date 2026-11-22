@@ -9,10 +9,12 @@
 //   2. zips deploy/aws-microvm/image/ (the same image the self-hosted stack builds) with it
 //   3. uploads the zip to the stack's JobImageBucket and creates or updates the image
 //   4. waits for the version to build, and reports the reason if it fails
-//   5. writes the version to the stack's JobImageVersionParameter: the launcher starts jobs with
+//   5. runs one microVM from the version that proves a job's isolation holds on it (the packet
+//      filter loads, the sandbox self-test passes; job-image-check.ts), and fails if it does not
+//   6. writes the version to the stack's JobImageVersionParameter: the launcher starts jobs with
 //      it within a minute (--no-activate leaves the running version alone)
 //
-// Until step 5 has run once, the launcher starts no jobs at all.
+// Until step 6 has run once, the launcher starts no jobs at all.
 //
 // Each version records the fingerprint of what it was built from (job-image-inputs.ts) in its
 // description. --check builds nothing: it says whether the active version's fingerprint differs
@@ -24,6 +26,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
+import { CloudWatchLogsClient } from '@aws-sdk/client-cloudwatch-logs';
 import {
   CreateMicrovmImageCommand,
   GetMicrovmImageCommand,
@@ -36,6 +39,7 @@ import {
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { createAdminClients } from './admin-clients.js';
+import { checkImageVersionIsolation } from './job-image-check.js';
 import { buildContext, IMAGE_DIR, repoRoot } from './job-image-context.js';
 import { describeInputs, imageInputFingerprint, inputsFromDescription } from './job-image-inputs.js';
 import { zip } from './zip.js';
@@ -66,9 +70,10 @@ async function main() {
   const clients = createAdminClients(values.region);
   const region = await clients.s3.config.region();
   const microvms = new LambdaMicrovmsClient({ region });
+  const logs = new CloudWatchLogsClient({ region });
   const stack = await clients.cloudFormation.send(new DescribeStacksCommand({ StackName: values.stack }));
   const outputs = Object.fromEntries((stack.Stacks?.[0]?.Outputs ?? []).map((o) => [o.OutputKey ?? '', o.OutputValue ?? '']));
-  for (const name of ['JobImageName', 'JobImageArn', 'JobImageBucket', 'JobImageBuildRoleArn', 'JobImageVersionParameter', 'MicrovmLogGroup']) {
+  for (const name of ['JobImageName', 'JobImageArn', 'JobImageBucket', 'JobImageBuildRoleArn', 'JobImageVersionParameter', 'MicrovmLogGroup', 'MicrovmExecutionRoleArn']) {
     if (!outputs[name]) throw new Error(`stack ${values.stack} has no ${name} output; deploy it first`);
   }
   const imageName = outputs.JobImageName!;
@@ -143,6 +148,26 @@ reason=${reason}
       await new Promise((r) => setTimeout(r, 15_000));
     }
     console.log(`==> version ${version} is built`);
+
+    // SUCCESSFUL says only that /ready answered. Whether a job's boundary holds on this version
+    // (the packet filter loads, the sandbox self-test passes) shows only in a microVM run from
+    // it, so run one before any job can get this version (job-image-check.ts).
+    const check = await checkImageVersionIsolation({ microvms, logs }, {
+      imageArn,
+      version,
+      region,
+      partition: imageArn.split(':')[1] ?? 'aws',
+      executionRoleArn: outputs.MicrovmExecutionRoleArn!,
+      logGroup: outputs.MicrovmLogGroup!,
+      stamp,
+    });
+    if (!check.ok) {
+      throw new Error(
+        `version ${version} built, but its isolation check failed (${check.failedStep ?? 'no step'}): ${check.problems.join('; ') || 'no reason given'}. ` +
+          `Jobs keep their current version; the check's log is ${outputs.MicrovmLogGroup} stream ${check.logStream}`,
+      );
+    }
+    console.log(`==> version ${version} passed its isolation check (packet filter and sandbox self-test in a microVM)`);
 
     if (values['no-activate']) {
       console.log(`--no-activate: jobs keep their current version. To switch: aws ssm put-parameter --overwrite --type String --name ${outputs.JobImageVersionParameter} --value ${version}`);

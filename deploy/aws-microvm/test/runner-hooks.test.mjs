@@ -165,6 +165,16 @@ describe('parseRunRequest', () => {
     expect(parsed).toEqual({ microvmId: 'mvm-1', payload: payload() });
   });
 
+  it('takes an image check (version 3): a check id and nothing else', () => {
+    const body = (p) => ({ microvmId: 'mvm-1', runHookPayload: JSON.stringify(p) });
+    expect(parseRunRequest(body({ version: 3, checkId: 'image-check-20261122t190000z', broker: { jobToken: 'ignored' } }))).toEqual({
+      microvmId: 'mvm-1',
+      payload: { version: 3, checkId: 'image-check-20261122t190000z', deliveryId: 'image-check-20261122t190000z', eventName: 'isolation_check' },
+    });
+    expect(() => parseRunRequest(body({ version: 3 }))).toThrow('runHookPayload.checkId');
+    expect(() => parseRunRequest(body({ version: 3, checkId: '../x' }))).toThrow('runHookPayload.checkId');
+  });
+
   it('names the problem', () => {
     expect(() => parseRunRequest(null)).toThrow('not a JSON object');
     expect(() => parseRunRequest({ microvmId: 'mvm-1', runHookPayload: '{' })).toThrow('not JSON');
