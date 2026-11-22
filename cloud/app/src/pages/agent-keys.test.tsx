@@ -39,7 +39,12 @@ describe('AgentKeysPage', () => {
     const codex = screen.getByTestId('key-CODEX_API_KEY');
     expect(within(codex).getByText('Not set')).toBeInTheDocument();
     expect(within(codex).getByText('Optional')).toBeInTheDocument();
-    expect(within(codex).getByRole('link', { name: /Get a OpenAI key/ })).toHaveAttribute('href', 'https://platform.openai.com/api-keys');
+    expect(within(codex).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://platform.openai.com/api-keys');
+    expect(within(codex).getByRole('link', { name: /Setup guide/ })).toHaveAttribute('href', 'https://learn.chatgpt.com/docs/auth#sign-in-with-an-api-key');
+    expect(within(codex).getByRole('link', { name: /OpenAI API key creation/ })).toHaveAttribute('href', 'https://developers.openai.com/api/docs/quickstart#create-and-export-an-api-key');
+    // The guide stays when a key is already saved, for rotation.
+    expect(within(claude).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://platform.claude.com/settings/keys');
+    expect(within(claude).getByRole('link', { name: /Setup guide/ })).toHaveAttribute('href', 'https://platform.claude.com/docs/en/get-api-key');
     expect(screen.getByTestId('refusals')).toHaveTextContent('acme/web#3: CODEX_API_KEY is not set');
     expect(screen.getByTestId('keys-privacy')).toHaveTextContent('never shown again');
   });

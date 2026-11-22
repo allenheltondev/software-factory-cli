@@ -74,6 +74,20 @@ describe('helpers', () => {
 });
 
 describe('InstallationPage', () => {
+  it('links the selected agent and reviewer to their setup guides and the Agent keys page', async () => {
+    configPage(fakeApi({ config: async () => view() }));
+    const agent = await screen.findByTestId('agent-help-workflows.implement.agent');
+    expect(within(agent).getByRole('link', { name: 'Agent keys' })).toHaveAttribute('href', '/installations/55/keys');
+    expect(within(agent).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://platform.claude.com/settings/keys');
+    expect(within(agent).getByRole('link', { name: /Get your Claude API key/ })).toHaveAttribute('href', 'https://platform.claude.com/docs/en/get-api-key');
+    expect(agent).toHaveTextContent('Claude Console API key');
+    const reviewer = screen.getByTestId('agent-help-workflows.implement.reviewer');
+    expect(reviewer).toHaveTextContent('needs its own key');
+    expect(within(reviewer).getByRole('link', { name: /OpenAI API key creation/ })).toHaveAttribute('href', 'https://developers.openai.com/api/docs/quickstart#create-and-export-an-api-key');
+    // This deployment offers no Kiro, so no Kiro help appears.
+    expect(screen.queryByText(/Kiro/)).toBeNull();
+  });
+
   it('links an active installation to its configuration', async () => {
     const api = fakeApi({
       overview: vi.fn().mockResolvedValue({

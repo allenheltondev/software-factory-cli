@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router';
 import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, PasswordInput, Skeleton, StatusBadge } from '@readysetcloud/ui';
 import { api as defaultApi, type AgentKeysView, type AgentKeyView, type ApiClient } from '../api/client';
 import { relativeTime } from '../lib/time';
+import { AGENT_GUIDES, type AgentGuide } from '../lib/agentGuides';
 
 type Load = { state: 'loading' } | { state: 'ok'; view: AgentKeysView } | { state: 'error'; message: string };
 type Api = Pick<ApiClient, 'agentKeys' | 'setAgentKey'>;
@@ -12,6 +13,7 @@ interface Provider {
   company: string;
   placeholder: string;
   getKeyUrl: string;
+  guide?: AgentGuide;
   /** Says what is wrong with what was typed, before anything is sent; null when it looks right. The server decides for real. */
   problem: (value: string) => string | null;
 }
@@ -21,14 +23,16 @@ const PROVIDERS: Record<string, Provider> = {
     agent: 'Claude',
     company: 'Anthropic',
     placeholder: 'sk-ant-…',
-    getKeyUrl: 'https://console.anthropic.com/settings/keys',
+    getKeyUrl: AGENT_GUIDES.claude.getKeyUrl,
+    guide: AGENT_GUIDES.claude,
     problem: (v) => (v.startsWith('sk-ant-') ? null : v.startsWith('sk-') ? 'That looks like an OpenAI key. Anthropic keys start with sk-ant-.' : 'Anthropic keys start with sk-ant-.'),
   },
   CODEX_API_KEY: {
     agent: 'Codex',
     company: 'OpenAI',
     placeholder: 'sk-…',
-    getKeyUrl: 'https://platform.openai.com/api-keys',
+    getKeyUrl: AGENT_GUIDES.codex.getKeyUrl,
+    guide: AGENT_GUIDES.codex,
     problem: (v) => (v.startsWith('sk-ant-') ? 'That looks like an Anthropic key. Paste it under Claude instead.' : v.startsWith('sk-') ? null : 'OpenAI keys start with sk-.'),
   },
 };
@@ -126,7 +130,7 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [savedAt, setSavedAt] = useState(false);
   const input = useRef<HTMLInputElement>(null);
 
   const typed = value.trim();
@@ -147,7 +151,7 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
       // Gone from the page the moment it is saved.
       setValue('');
       setEditing(false);
-      setSavedAt(Date.now());
+      setSavedAt(true);
       onSaved(view);
     } catch (err) {
       // The typed value stays, so a typo or a transient failure is fixed in place, not retyped.
@@ -172,6 +176,21 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
       </CardHeader>
       <CardBody>
         <div className="flex flex-col gap-4">
+          {provider.guide && (
+            <div className="flex flex-wrap items-center gap-3 text-sm" data-testid={`key-guide-${k.name}`}>
+              <a className="auth-link" href={provider.guide.getKeyUrl} target="_blank" rel="noreferrer">
+                Get API key ↗
+              </a>
+              {provider.guide.guides.map((g, i) => (
+                <a key={g.href} className="auth-link" href={g.href} target="_blank" rel="noreferrer">
+                  {i === 0 ? 'Setup guide' : g.label} ↗
+                </a>
+              ))}
+              <span>
+                Updraft takes {provider.guide.credential}. {provider.guide.billing}
+              </span>
+            </div>
+          )}
           {k.configured && (
             <div className="flex flex-col gap-1 text-sm">
               <p>
@@ -194,7 +213,7 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
             </div>
           )}
 
-          {savedAt !== null && !showForm && (
+          {savedAt && !showForm && (
             <p role="status" className="text-sm font-medium" data-testid={`key-saved-${k.name}`}>
               ✓ {provider.company} accepted the key. Your next job will use it.
             </p>
@@ -243,11 +262,6 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
                     Cancel
                   </Button>
                 )}
-                {provider.getKeyUrl && (
-                  <a className="auth-link text-sm" href={provider.getKeyUrl} target="_blank" rel="noreferrer">
-                    Get a {provider.company} key ↗
-                  </a>
-                )}
               </div>
             </form>
           ) : (
@@ -255,7 +269,7 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
               <Button
                 variant="secondary"
                 onClick={() => {
-                  setSavedAt(null);
+                  setSavedAt(false);
                   setEditing(true);
                 }}
               >

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router';
+import { AGENT_GUIDES, type AgentGuide } from '../lib/agentGuides';
 import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Input, Modal, Select, Skeleton, StatusBadge, TextArea } from '@readysetcloud/ui';
 import {
   api as defaultApi,
@@ -98,7 +99,8 @@ function ParsedText({
   );
 }
 
-function AgentFields({ agent, onChange, issues, path, title }: { agent: ConsoleAgent; onChange: (a: ConsoleAgent) => void; issues: ConfigIssue[]; path: string; title: string }) {
+function AgentFields({ agent, onChange, issues, path, title, installationId, reviewer }: { agent: ConsoleAgent; onChange: (a: ConsoleAgent) => void; issues: ConfigIssue[]; path: string; title: string; installationId: number; reviewer?: { differs: boolean } }) {
+  const guide: AgentGuide | undefined = AGENT_GUIDES[agent.adapter];
   return (
     <div className="grid gap-4 sm:grid-cols-3">
       <Select label={title} value={agent.adapter} error={issuesAt(issues, `${path}.adapter`)} onChange={(e) => onChange({ ...agent, adapter: e.target.value as AgentAdapter })}>
@@ -123,6 +125,31 @@ function AgentFields({ agent, onChange, issues, path, title }: { agent: ConsoleA
         error={issuesAt(issues, `${path}.effort`)}
         onChange={(e) => onChange({ ...agent, effort: e.target.value || undefined })}
       />
+      {guide && (
+        <div className="text-sm sm:col-span-3" data-testid={`agent-help-${path}`}>
+          <p>
+            Updraft takes {guide.credential} for {guide.agent}. {guide.billing}{' '}
+            {reviewer?.differs && 'The reviewer uses a different provider than the agent, so it needs its own key when review is on. '}
+            <Link className="auth-link" to={`/installations/${installationId}/keys`}>
+              Agent keys
+            </Link>
+            {' · '}
+            <a className="auth-link" href={guide.getKeyUrl} target="_blank" rel="noreferrer">
+              Get API key ↗
+            </a>
+            {guide.guides.map((g) => (
+              <span key={g.href}>
+                {' · '}
+                <a className="auth-link" href={g.href} target="_blank" rel="noreferrer">
+                  {g.label} ↗
+                </a>
+              </span>
+            ))}
+          </p>
+          <p className="text-muted-foreground">Create the key, save it under Agent keys, publish this workflow, then apply its issue label.</p>
+          {guide.note && <p className="text-muted-foreground">{guide.note}</p>}
+        </div>
+      )}
     </div>
   );
 }
@@ -611,7 +638,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                       Remove
                     </Button>
                   </div>
-                  <AgentFields title="Agent" agent={w.agent} path={`${path}.agent`} issues={errors} onChange={(agent) => updateWorkflow(name, { agent })} />
+                  <AgentFields title="Agent" installationId={installationId} agent={w.agent} path={`${path}.agent`} issues={errors} onChange={(agent) => updateWorkflow(name, { agent })} />
                   <PromptField
                     label="Prompt"
                     value={w.prompt}
@@ -660,6 +687,8 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                     <div className="mt-4 flex flex-col gap-4">
                       <AgentFields
                         title="Reviewer"
+                        installationId={installationId}
+                        reviewer={{ differs: w.reviewer.adapter !== w.agent.adapter }}
                         agent={w.reviewer}
                         path={`${path}.reviewer`}
                         issues={errors}
