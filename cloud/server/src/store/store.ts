@@ -125,6 +125,7 @@ export interface JobSummary {
   jobId: string;
   repository: string;
   issue?: number;
+  pullRequest?: number;
   label?: string;
   sender?: string;
   createdAt: string;
@@ -177,6 +178,7 @@ export interface DeliveryRecord {
   action?: string;
   repository?: string;
   issue?: number;
+  pullRequest?: number;
   label?: string;
   sender?: string;
   disposition: 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched';
@@ -218,8 +220,12 @@ export interface DispatchRules {
    * refuses it while one is not set. Stored once on the repository when every trigger needs the
    * same, like `actors`. Absent everywhere on versions published before #70 (the launcher then
    * reads them from the bundle, key-needs.ts).
+   * `review`, `revise`: the repository's review loop is on, so events on its pull requests can
+   * start a job (a review asking for changes, a push, a close).
    */
-  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; keys?: string[]; triggers: { label: string; actors?: string[]; keys?: string[] }[] }>;
+  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; keys?: string[]; review?: true; revise?: true; triggers: { label: string; actors?: string[]; keys?: string[] }[] }>;
+  /** The rules record each repository's review loop (`review`, `revise`); absent on versions published before pull request events started jobs. */
+  loop?: true;
 }
 
 /** That an agent key is set (never its value, which lives only in Secrets Manager). */
@@ -351,6 +357,8 @@ export interface Job {
   telemetrySnapshot?: JobTelemetrySnapshot;
   /** The issue whose label started it, for an over-quota comment. */
   issue?: number;
+  /** The pull request whose event started it (a review, a push, a close): its review loop. */
+  pullRequest?: number;
   /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
   startedAt?: number;
   /**
@@ -625,6 +633,8 @@ export interface Store {
    * Nothing happens when there is no such claim, so it is safe to repeat.
    */
   releaseDelivery(installationId: number, deliveryId: string, jobId: string): Promise<void>;
+  /** Who holds a claim (a delivery's, or a pull request's coalescing lease) now: null when none, or it expired. Read strongly. */
+  getDeliveryClaim(installationId: number, deliveryId: string): Promise<{ jobId: string; expiresAt: number } | null>;
 }
 
 /**
@@ -984,6 +994,10 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const key = `${id}/${deliveryId}`;
       if (deliveries.get(key)?.jobId === jobId) deliveries.delete(key);
     },
+    async getDeliveryClaim(id, deliveryId) {
+      const c = deliveries.get(`${id}/${deliveryId}`);
+      return c && c.expiresAt > Date.now() ? { jobId: c.jobId, expiresAt: c.expiresAt } : null;
+    },
     async putAgentKeyMeta(id, meta) {
       const t = tenants.get(id);
       if (!t || t.disabledReason === 'uninstalled') return 'uninstalled';
@@ -1000,6 +1014,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
         jobId: job.jobId,
         repository: job.repository,
         ...(job.issue !== undefined ? { issue: job.issue } : {}),
+        ...(job.pullRequest !== undefined ? { pullRequest: job.pullRequest } : {}),
         ...(job.label ? { label: job.label } : {}),
         ...(job.sender ? { sender: job.sender } : {}),
         createdAt: job.createdAt,

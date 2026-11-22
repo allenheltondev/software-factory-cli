@@ -44,6 +44,7 @@ function toDelivery(i: Record<string, unknown>): DeliveryRecord {
     if (typeof v === 'string') d[k] = v;
   }
   if (typeof i.issue === 'number') d.issue = i.issue;
+  if (typeof i.pullRequest === 'number') d.pullRequest = i.pullRequest;
   return d;
 }
 
@@ -130,6 +131,7 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
     jobId: String(i.jobId),
     repository: String(i.repository),
     ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
+    ...(typeof i.pullRequest === 'number' ? { pullRequest: i.pullRequest } : {}),
     ...(typeof i.label === 'string' ? { label: i.label } : {}),
     ...(typeof i.sender === 'string' ? { sender: i.sender } : {}),
     createdAt: String(i.createdAt),
@@ -623,6 +625,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   jobId: job.jobId,
                   repository: job.repository,
                   ...(job.issue !== undefined ? { issue: job.issue } : {}),
+                  ...(job.pullRequest !== undefined ? { pullRequest: job.pullRequest } : {}),
                   ...(job.label ? { label: job.label } : {}),
                   ...(job.sender ? { sender: job.sender } : {}),
                   createdAt: job.createdAt,
@@ -682,6 +685,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(typeof i.reservedSeconds === 'number' ? { reservedSeconds: i.reservedSeconds } : {}),
         ...(i.quotas && typeof i.quotas === 'object' ? { quotas: i.quotas as Quotas } : {}),
         ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
+        ...(typeof i.pullRequest === 'number' ? { pullRequest: i.pullRequest } : {}),
         ...(Array.isArray(i.agentKeys) ? { agentKeys: (i.agentKeys as unknown[]).map(String) } : {}),
         ...(jobTelemetrySnapshotOf(i.telemetrySnapshot) ? { telemetrySnapshot: jobTelemetrySnapshotOf(i.telemetrySnapshot)! } : {}),
         ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
@@ -1605,6 +1609,14 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         throttledThisMonth: n(m.Item?.throttled),
         failedThisMonth: n(m.Item?.failed),
       };
+    },
+
+    async getDeliveryClaim(id, deliveryId) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: deliveryKey(id, deliveryId), ConsistentRead: true }));
+      const i = out.Item;
+      // Expired claims count as none (DynamoDB deletes them lazily), as claimDelivery treats them.
+      if (!i || typeof i.jobId !== 'string' || typeof i.ttl !== 'number' || i.ttl < Math.floor(Date.now() / 1000)) return null;
+      return { jobId: i.jobId, expiresAt: i.ttl * 1000 };
     },
 
     async releaseDelivery(id, deliveryId, jobId) {

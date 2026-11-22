@@ -29,7 +29,7 @@ So far it covers these phases:
 
 - **Status and diagnostics** ([#71](https://github.com/allenheltondev/software-factory-cli/issues/71)): each installation's page says whether it is working, and if not, why.
   - **Overview** (`GET /api/v1/installations/:id/overview`): the installation's status as GitHub has it now (active, suspended, missing permissions, disabled, uninstalled), the repositories it reaches and which are configured (and any configured one it no longer reaches), the active config version, the agent keys, and 30 days of activity in counts (or the latest 500 of each, which it says). What needs attention is listed with where to fix it. It also names the labels that start a job (`config.triggers`) and whether traces are set up (`telemetry`), for the console's **Get set up** checklist: the App and its permissions, its repositories, a published configuration, the keys of the agents it runs, traces (optional), and a first job, each with where to do it, the next one open. The checklist is shown until every step jobs need is done.
-  - **Deliveries** (`GET .../deliveries`): every webhook delivery for a tenant except the App's lifecycle events, kept 30 days, with one disposition (`server/src/jobs/deliveries.ts`): `filtered` with its reason (unknown_repo, paused, not_trigger, actor_not_allowed, event_not_accepted, and the tenant's or platform's state), `deduped`, `coalesced` (nothing produces it until pull request events are handled), `throttled` with the limit, `launch_failed` with the AWS error's class, or `launched` with its job.
+  - **Deliveries** (`GET .../deliveries`): every webhook delivery for a tenant except the App's lifecycle events, kept 30 days, with one disposition (`server/src/jobs/deliveries.ts`): `filtered` with its reason (unknown_repo, paused, not_trigger, actor_not_allowed, event_not_accepted, for pull request events loop_off, not_updraft_pr, own_event and comment_review, and the tenant's or platform's state), `deduped`, `coalesced` (a pull request event folded into the job another event of that pull request just started), `throttled` with the limit, `launch_failed` with the AWS error's class, or `launched` with its job.
   - **Jobs** (`GET .../jobs`, `.../jobs/:jobId`, which lists every kept attempt of the job's delivery, an earlier failed one before a redelivery included): status, issue and pull request links, config version, duration and how each ended (`server/src/jobs/status.ts`: success, nothing to do, canceled, superseded, deferred, agent failure, verify failure (of any job the run did, a revision included), publish failure, timeout, `state_not_saved`, ...). The runner reports its pull request, verification and uploaded logs at the broker's `finish`; the broker keeps only what checks out (a pull request of the job's own repository, known log names). Kept 30 days.
   - **Logs** (`GET .../jobs/:jobId/logs/:name`): the last MiB of `run.log` or `updraft.log`. The job is found in the caller's own tenant partition, so another tenant's log cannot be named; the text is redacted once more on the way out. The API reads `tenants/*/results/*` only, and cannot list the bucket, so S3 answers a missing log with 403: a log still there is always served, and a missing one is expired (410) past the stack's `ResultRetentionDays` (which the API gets too), or 502 within it.
   - **A microVM that ends without the job's finish** (stopped, crashed, out of time): reconciliation records the job as finished, `microvm_gone`, unless a finish got there first, so the console does not show it running.
@@ -95,7 +95,7 @@ browser ── https://updraft.readysetcloud.io ──> CloudFront (one distribu
   - **Existing installations:** linking also lists the installations you already own, such as one installed on GitHub directly or one whose install callback expired. You connect the ones you pick, within 10 minutes, through `POST /api/v1/github/connect/:id`.
   - **Access follows the identity:** a membership counts only while you're linked to the GitHub identity that earned it. Unlinking, or linking a different account, ends access; linking the same account again restores it.
   - **Tokens:** user tokens are used within the request and never stored.
-  - **The webhook:** `server/src/flows/webhook.ts` handles uninstall, suspend and unsuspend. Uninstall is final (a conditional write), and a repeated delete keeps the first deadline. GitHub can deliver events out of order, so for suspend and unsuspend the webhook asks GitHub for the installation's current state instead of trusting the event's order. A labeled issue goes to the launcher ("Jobs and the job broker" below). Pull request events are acknowledged without action for now.
+  - **The webhook:** `server/src/flows/webhook.ts` handles uninstall, suspend and unsuspend. Uninstall is final (a conditional write), and a repeated delete keeps the first deadline. GitHub can deliver events out of order, so for suspend and unsuspend the webhook asks GitHub for the installation's current state instead of trusting the event's order. A labeled issue goes to the launcher ("Starting jobs" below), and so do the review loop's pull request events ("Pull request events" below).
 
 | Path | What it is |
 | --- | --- |
@@ -303,7 +303,25 @@ Each of these that fails answers 200 with why (`no_tenant`, `tenant_inactive`, `
 
 **Failures:** if storing or launching fails, the webhook answers 500 so the delivery can be redelivered. It releases the claim and the quota reservation so the redelivery isn't refused, and retires the job record so its token is never served. A job that ends without a clean success also releases the claim when it reports `finish`, so redelivering the webhook is how a failed job is retried. A success without a summary counts as unconfirmed.
 
-`updraft run-event` in the microVM still makes the final decision, against GitHub and the same config. The launcher only makes sure no job starts that the config wouldn't allow. Pull request events (the review loop) aren't handled yet.
+`updraft run-event` in the microVM still makes the final decision, against GitHub and the same config. The launcher only makes sure no job starts that the config wouldn't allow.
+
+### Pull request events
+
+A job for a labeled issue runs the whole review loop it can in its microVM: the pull request, Updraft's own review, and revisions up to `maxRevisions`. What people do to that pull request afterwards starts further jobs, the same way as in the self-hosted stack ([deploy/aws-microvm/README.md](../deploy/aws-microvm/README.md#the-review-loop)). The launcher takes:
+
+| Event | Actions | Needs |
+| --- | --- | --- |
+| `pull_request_review` | `submitted`, `edited`, `dismissed` | revisions on for the repository; not a comment review (only "Request changes" starts a revision; an approval or a dismissal can cancel one); a reviewer who is an allowed actor |
+| `pull_request` | `synchronize` | review on for the repository; a pusher who is an allowed actor |
+| `pull_request` | `closed` | review or revisions on; anyone (it ends the loop) |
+
+Every one of them also needs the repository in the active version (name and id), not paused, a pull request on an Updraft branch (`updraft/`), and a sender other than the App itself (`<slug>[bot]`): its reviewer's comment reviews and its revision pushes are handled by the job that made them. **Keys.** The event names no label, so the launcher finds the workflow that started the pull request: the job that opened it (its finish recorded that pull request), or an earlier job of the same pull request's loop, which carries the label on. It matches the pull request, never just its issue, since one issue can have pull requests from different workflows. Only when that job ran the version that is active now: then the keys checked are the ones it was started with (two workflows can share a label for different actors, and the label alone doesn't say which ran), or, once its record is gone (it's kept a week past its run), the label's keys if the label names one workflow's. After a republish nothing here names the workflow for sure (its agent may have changed, or its label moved to another workflow), so the job checks for itself: the runner follows the workflow stored for the pull request. Only that workflow's keys are checked, so a Codex workflow without its key doesn't hold up a Claude workflow's pull request. A close runs no agent and needs no key. When no kept job (30 days) opened or worked on the pull request, nothing names the workflow, and the job checks for itself: `run-event` fails without the key and says so on the job. A version published before this records no review loop in its dispatch rules, so its pull request events start nothing (`loop_off`) until it's published again. Any other action (`opened`, `reopened`, ...) is listed as `event_not_accepted`.
+
+**Coalescing.** The first accepted event for a pull request claims it for 20 seconds (`pr-<repository id>-<number>`, a delivery claim with that expiry), and its job starts its run only after that (`notBefore` in the run-hook payload). Another event for the pull request within those seconds starts nothing and is listed as `coalesced`: the one job reads the pull request as GitHub has it then, so it sees every event folded into it. GitHub often sends a review and the push before it close together, and two jobs would each find the same review and run an agent on the same branch. Issues are never coalesced.
+- **Only once the covering job is launched.** An event that finds the claim taken waits (up to 8 seconds) for the job holding it to have its microVM recorded before it answers `coalesced`. A launch that fails or is throttled gives the claim back, and a waiting event then takes it and launches its own job, so no event is acknowledged for a job that never ran.
+- **Not confirmed in time:** the event answers 503 (`coalesce_unconfirmed`, listed as a failed launch), so GitHub shows the delivery failed and it can be redelivered.
+
+**Quotas** count these jobs like any other. Over one, the comment goes on the pull request ("submit the review again or push a commit"), once a day per pull request.
 
 ### Quotas and the kill switch
 
@@ -442,11 +460,12 @@ Still unconfirmed: the GitHub flows against real GitHub, which need a registered
 - "request user authorization during installation" returning `state` to the callback;
 - the Members permission letting a user token read its own org membership.
 
-Not run on AWS yet: the job path end to end. That covers:
+Not run on AWS yet: the job path end to end, pull request events included. That covers:
 - building the job image with `build-job-image`;
 - `RunMicrovm` from the launcher, with the Lambda-provided connectors;
 - the runner's broker calls, from a microVM under the execution role;
 - a labeled issue producing a pull request;
+- a person's "Request changes" review producing a revision, and coalescing against real GitHub event timing;
 - the quota transactions against DynamoDB itself, and the over-quota comment on a real issue;
 - publishing from the console against the real bucket and table, with the API function's narrowed S3 permissions.
 

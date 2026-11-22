@@ -73,7 +73,7 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
       <PageHero data-testid="job">
         <PageHeroTitle>
           {job.repository}
-          {job.issue !== undefined ? `#${job.issue}` : ''}
+          {job.issue !== undefined ? `#${job.issue}` : job.pullRequest !== undefined ? `#${job.pullRequest}` : ''}
         </PageHeroTitle>
         <PageHeroSubtitle data-testid="job-help">{r.help}</PageHeroSubtitle>
         <PageHeroChips>
@@ -81,6 +81,7 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
             {r.label}
           </PageHeroChip>
           {job.label && <PageHeroChip>Label {job.label}</PageHeroChip>}
+          {job.pullRequest !== undefined && <PageHeroChip>Pull request event</PageHeroChip>}
           {job.sender && <PageHeroChip>By @{job.sender}</PageHeroChip>}
         </PageHeroChips>
         <div className="mt-4 flex flex-wrap gap-3 text-sm">

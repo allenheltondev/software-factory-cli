@@ -24,15 +24,21 @@ import type { Job, QuotaLimit, Quotas, TenantLimits } from '../store/store.js';
  * comment a day saying why. Re-applying the label is how to try again.
  */
 
-/** An over-quota comment to post on the issue whose label started nothing. */
+/** An over-quota comment to post on the issue whose label started nothing, or the pull request whose event did. */
 export interface ThrottleNotice {
   installationId: number;
   repository: string;
   repositoryId: number;
+  /** The issue's number, or the pull request's (`pullRequest`). */
   issue: number;
+  /** The event was its pull request's (a review, a push): the comment says how to try again there. */
+  pullRequest?: boolean;
   limit: QuotaLimit;
   quotas: Quotas;
 }
+
+/** The installation token's permissions for an over-quota comment: a pull request's conversation needs pull_requests too. */
+export const throttleCommentPermissions = (pullRequest?: boolean): Record<string, 'write'> => (pullRequest ? { issues: 'write', pull_requests: 'write' } : { issues: 'write' });
 
 export const DEFAULT_QUOTAS: Quotas = {
   concurrentJobs: 1,
@@ -90,8 +96,8 @@ export function unusedTime(job: Job, now: number): { month: string; seconds: num
 export const dayOf = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 export const monthOf = (ms: number) => new Date(ms).toISOString().slice(0, 7);
 
-/** The comment on an issue whose label started nothing because of a quota. */
-export function throttledComment(limit: QuotaLimit, quotas: Quotas): string {
+/** The comment on an issue whose label started nothing because of a quota, or on a pull request whose event did not. */
+export function throttledComment(limit: QuotaLimit, quotas: Quotas, pullRequest = false): string {
   const why: Record<QuotaLimit, string> = {
     concurrent_jobs:
       quotas.concurrentJobs === 1
@@ -107,6 +113,15 @@ export function throttledComment(limit: QuotaLimit, quotas: Quotas): string {
     microvm_minutes: 'next month',
     platform_concurrency: 'in a few minutes',
   };
+  if (pullRequest) {
+    return [
+      `Updraft did not act on this pull request's latest review or push: ${why[limit]}.`,
+      '',
+      `To try again ${when[limit]}, submit the review again or push a commit.`,
+      '',
+      '<sub>Updraft posts this once a day per pull request.</sub>',
+    ].join('\n');
+  }
   return [
     `Updraft did not start a job for this label: ${why[limit]}.`,
     '',

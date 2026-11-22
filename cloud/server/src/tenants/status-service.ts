@@ -191,6 +191,8 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
   const view: JobView = { ...job, result: jobResult(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
   if (job.issue !== undefined) view.issueUrl = `https://github.com/${job.repository}/issues/${job.issue}`;
   if (job.detail?.prUrl) view.prUrl = job.detail.prUrl;
+  // A job of a pull request's event (its review loop): that pull request, whatever the run reported.
+  else if (job.pullRequest !== undefined) view.prUrl = `https://github.com/${job.repository}/pull/${job.pullRequest}`;
   const t = job.detail?.telemetry;
   if (t) {
     const startedAt = t.startedAt ?? job.createdAt;

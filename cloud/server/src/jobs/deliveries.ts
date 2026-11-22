@@ -5,12 +5,13 @@ import type { LaunchResult } from './launch.js';
  * What became of a tenant's webhook delivery, as the console lists it (#71): one disposition each.
  *
  *   filtered       nothing to do, with the reason: unknown_repo, paused, not_trigger,
- *                  actor_not_allowed, event_not_accepted, and the tenant's own state
+ *                  actor_not_allowed, event_not_accepted, for pull request events loop_off,
+ *                  not_updraft_pr, own_event and comment_review, and the tenant's own state
  *                  (tenant_inactive, no_config, no_rules, missing_key) or the platform's
  *                  (jobs_off, jobs_paused)
  *   deduped        a redelivery of a delivery that already has a job
- *   coalesced      folded into another delivery's job (pull request events, once Updraft Cloud
- *                  handles them; nothing produces it yet)
+ *   coalesced      folded into another delivery's job: a pull request event within a few
+ *                  seconds of one that started a job for the same pull request (launch.ts)
  *   throttled      over a quota; the reason is the limit
  *   launch_failed  the job could not be started; errorClass is the AWS error's class
  *   launched       a job was started; jobId is it
@@ -19,9 +20,9 @@ import type { LaunchResult } from './launch.js';
  * own lifecycle events (installation, installation_repositories).
  */
 
-export type DeliveryEvent = Pick<DeliveryRecord, 'at' | 'deliveryId' | 'event' | 'action' | 'repository' | 'issue' | 'label' | 'sender'>;
+export type DeliveryEvent = Pick<DeliveryRecord, 'at' | 'deliveryId' | 'event' | 'action' | 'repository' | 'issue' | 'pullRequest' | 'label' | 'sender'>;
 
-/** The record of an `issues` delivery the launcher handled; null when it is not one to record. */
+/** The record of a delivery the launcher handled (an issue's label, a pull request's event); null when it is not one to record. */
 export function deliveryFromLaunch(base: DeliveryEvent, result: LaunchResult): DeliveryRecord | null {
   const filtered = (reason: string, message?: string): DeliveryRecord => ({ ...base, disposition: 'filtered', reason, ...(message ? { message } : {}) });
   switch (result.disposition) {
@@ -43,6 +44,10 @@ export function deliveryFromLaunch(base: DeliveryEvent, result: LaunchResult): D
       return filtered('missing_key', result.message);
     case 'duplicate':
       return { ...base, disposition: 'deduped' };
+    case 'coalesce_unconfirmed':
+      return { ...base, disposition: 'launch_failed', errorClass: 'CoalesceUnconfirmed', ...(result.message ? { message: result.message } : {}) };
+    case 'coalesced':
+      return { ...base, disposition: 'coalesced', ...(result.message ? { message: result.message } : {}) };
     case 'throttled':
       return { ...base, disposition: 'throttled', ...(result.reason ? { reason: result.reason } : {}) };
     case 'launch_failed':

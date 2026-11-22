@@ -10,6 +10,7 @@ import { createWebhookHandler, RETENTION_MS } from './webhook.js';
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const SETTINGS = {
   appId: '1',
+  slug: 'updraft',
   privateKey: privateKey.export({ type: 'pkcs1', format: 'pem' }).toString(),
   webhookSecret: 'hook-secret',
 } as AppSettings;
@@ -210,6 +211,31 @@ describe('webhook', () => {
     // An event for no installation never reaches it.
     await deliver('issues', { action: 'labeled' });
     expect(calls).toHaveLength(2);
+  });
+
+  it("hands the review loop's pull request events to the launcher, with the event and the App's own login, and records them by pull request", async () => {
+    const calls: Parameters<Launcher>[0][] = [];
+    const launch: Launcher = async (req) => {
+      calls.push(req);
+      return calls.length === 1 ? { status: 202, disposition: 'launched', jobId: 'job_pr' } : { status: 200, disposition: 'coalesced', message: 'a job for pull request #40 starts in a few seconds' };
+    };
+    const { deliver, store } = await setup(undefined, launch);
+    const review = { action: 'submitted', installation: { id: 55 }, repository: { id: 9, full_name: 'acme/web' }, pull_request: { number: 40, head: { ref: 'updraft/issue-1-a' } }, review: { state: 'changes_requested' }, sender: { login: 'pat' } };
+    expect(await deliver('pull_request_review', review)).toEqual({ status: 202, body: { ok: true, disposition: 'launched' } });
+    expect(calls[0]).toMatchObject({ installationId: 55, eventName: 'pull_request_review', appBot: `${SETTINGS.slug}[bot]`, payload: { pull_request: { number: 40 } } });
+    await deliver('pull_request', { ...review, action: 'synchronize' });
+    // An action that leads to no work never reaches it.
+    await deliver('pull_request', { ...review, action: 'opened' });
+    expect(calls.map((c) => c.eventName)).toEqual(['pull_request_review', 'pull_request']);
+    const listed = (await store.listDeliveries(55, 10)).map((d) => [d.event, d.action, d.pullRequest, d.disposition]);
+    expect(listed).toHaveLength(3);
+    expect(listed).toEqual(
+      expect.arrayContaining([
+        ['pull_request', 'opened', 40, 'filtered'],
+        ['pull_request', 'synchronize', 40, 'coalesced'],
+        ['pull_request_review', 'submitted', 40, 'launched'],
+      ]),
+    );
   });
 
   it('rejects a signed body that is not JSON', async () => {

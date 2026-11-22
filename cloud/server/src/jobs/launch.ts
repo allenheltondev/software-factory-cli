@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import type { Job, Quotas, Store } from '../store/store.js';
-import { decideDispatch } from '../tenants/dispatch.js';
+import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
@@ -11,10 +11,13 @@ import { dayOf, monthOf, tenantQuotas, type ThrottleNotice } from './quotas.js';
 export type { ThrottleNotice } from './quotas.js';
 
 /**
- * The multi-tenant launcher (#68): what the webhook does with a tenant's `issues.labeled`.
+ * The multi-tenant launcher (#68): what the webhook does with a tenant's `issues.labeled`, and with
+ * the pull request events of its review loop (`pull_request_review`, `pull_request`).
  *
  *   1. the tenant: active, with an active config version
- *   2. that version's dispatch rules: the repository (name and id), a trigger label, an allowed actor
+ *   2. that version's dispatch rules: the repository (name and id), and for an issue a trigger
+ *      label and an allowed actor; for a pull request its loop on, an Updraft branch, not the App's
+ *      own doing, and an allowed actor for a review or a push (dispatch.ts)
  *   3. jobs are on: a MicroVM image version is published (the image build sets it), and the
  *      platform's kill switch is off (kill-switch.ts)
  *   4. deduplication: one job per delivery, per tenant. The launcher's claim is short
@@ -43,6 +46,28 @@ export const RUN_HOOK_PAYLOAD_VERSION = 2;
  * delivery whose launch never got a job running, starts the job again.
  */
 export const PRELAUNCH_CLAIM_MS = 5 * 60 * 1000;
+
+/**
+ * How long the first accepted event for a pull request holds it (`pr-<repository id>-<number>`):
+ * another event for it within this starts no job, and the job starts its run no earlier than the
+ * lease's end, so it sees every event folded into it (GitHub sends a review and the push before it
+ * close together; two jobs would each find the same review and run an agent on the same branch).
+ * The self-hosted launcher's PullRequestCoalesceSeconds, at its default.
+ */
+export const PR_COALESCE_MS = 20 * 1000;
+export const pullRequestLease = (repositoryId: number, number: number) => `pr-${repositoryId}-${number}`;
+
+/**
+ * How long an event that found a pull request's lease taken waits for the job holding it to be
+ * launched (its microVM recorded) before it calls itself covered. That launch may still fail; until
+ * it is confirmed, the event is not acknowledged as coalesced. Within the webhook Lambda's 20 s, with
+ * room for a launch of its own if the holder's fails.
+ */
+export const COALESCE_CONFIRM_MS = 8 * 1000;
+const COALESCE_POLL_MS = 500;
+
+/** How many of the tenant's latest jobs are searched for the job that opened a pull request. */
+const ORIGIN_LOOKUP_JOBS = 500;
 
 /** The Lambda-provided connectors: no inbound traffic, internet egress. */
 export const noIngressConnector = (partition: string, region: string) => `arn:${partition}:lambda:${region}:aws:network-connector:aws-network-connector:NO_INGRESS`;
@@ -96,18 +121,28 @@ export interface LaunchDeps {
   log?: (entry: Record<string, unknown>) => void;
   /** Retry pause for recording the microVM on the job. */
   retryDelayMs?: number;
+  /** How long a coalesced event waits for the launch covering it, and how often it looks (tests shorten them). */
+  coalesceConfirmMs?: number;
+  coalescePollMs?: number;
 }
 
 export interface LaunchRequest {
   installationId: number;
   deliveryId: string;
+  /** The X-GitHub-Event header. Absent: `issues`. */
+  eventName?: string;
+  /** The platform App's own login (`<slug>[bot]`): its reviews and pushes start nothing. */
+  appBot?: string;
   /** The webhook body exactly as GitHub sent it (the job reads it as its event). */
   body: string;
   payload: {
+    action?: unknown;
     repository?: { id?: unknown; full_name?: unknown };
     label?: { name?: unknown };
     sender?: { login?: unknown };
     issue?: { number?: unknown };
+    pull_request?: { number?: unknown; head?: { ref?: unknown } };
+    review?: { state?: unknown };
   };
 }
 
@@ -132,29 +167,112 @@ export function createLauncher(deps: LaunchDeps) {
   const s = deps.settings;
   const killSwitch = deps.killSwitch ?? OFF_SWITCH;
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * A pull request's lease: taken (`held`, this job launches), or another event's job holds it and
+   * is confirmed launched (`covered`: its run starts after the lease and sees this event), or that
+   * was not confirmed in time (`unconfirmed`). A holder whose launch fails gives the lease back,
+   * and this event takes it then, so it is never acknowledged for a job that does not exist.
+   */
+  async function takeOrJoin(installationId: number, lease: string, jobId: string): Promise<'held' | 'covered' | 'unconfirmed'> {
+    const pollMs = deps.coalescePollMs ?? COALESCE_POLL_MS;
+    const attempts = Math.max(1, Math.ceil((deps.coalesceConfirmMs ?? COALESCE_CONFIRM_MS) / pollMs));
+    for (let attempt = 0; attempt <= attempts; attempt++) {
+      if (attempt > 0) await sleep(pollMs);
+      if (await deps.store.claimDelivery(installationId, lease, now() + PR_COALESCE_MS, jobId)) return 'held';
+      const claim = await deps.store.getDeliveryClaim(installationId, lease);
+      if (!claim) continue; // given back (a failed launch) or just expired: take it next time round
+      const holder = await deps.store.getJob(claim.jobId);
+      if (holder && holder.status !== 'finished' && (holder.microvmId !== undefined || holder.startedAt !== undefined)) return 'covered';
+    }
+    return 'unconfirmed';
+  }
+
   return async function launch(req: LaunchRequest): Promise<LaunchResult> {
     const skip = (disposition: string, why: { reason?: string; message?: string } = {}): LaunchResult => ({ status: 200, disposition, ...why });
     if (!DELIVERY_ID.test(req.deliveryId)) return { status: 400, disposition: 'bad_delivery_id' };
-    if (!Number.isInteger(req.payload.issue?.number)) return skip('ignored');
+    const eventName = req.eventName ?? 'issues';
+    const isIssue = eventName === 'issues';
+    if (isIssue ? !Number.isInteger(req.payload.issue?.number) : !Object.hasOwn(PULL_REQUEST_ACTIONS, eventName)) return skip('ignored');
 
     // Strongly consistent, both: a delivery right after a publish sees the new active config (not
     // "no_config"), and one right after a republish or a suspend does not start a job under the
     // config or the status it replaced.
     const tenant = await deps.store.getTenant(req.installationId, { consistent: true });
     if (!tenant) return skip('no_tenant');
+    // A pull request action that leads to no work (opened, labeled, ...): before any more reads.
+    if (!isIssue && (typeof req.payload.action !== 'string' || !PULL_REQUEST_ACTIONS[eventName]!.includes(req.payload.action))) return skip('ignored');
     if (tenant.status !== 'active') return skip('tenant_inactive');
     if (tenant.activeConfigVersion === undefined) return skip('no_config');
     const config = await deps.store.getConfigVersion(req.installationId, tenant.activeConfigVersion, { consistent: true });
-    const decision = decideDispatch(config?.dispatch, {
-      repositoryFullName: req.payload.repository?.full_name,
-      repositoryId: req.payload.repository?.id,
-      label: req.payload.label?.name,
-      sender: req.payload.sender?.login,
-    });
-    if (!decision.start) {
-      log({ delivery: req.deliveryId, installationId: req.installationId, ignored: decision.reason });
-      return skip('not_dispatched', { reason: decision.code, message: decision.reason });
+    // What the job is for: an issue (its label) or a pull request (its review loop).
+    let decision: { repository: string; repositoryId: number; keys: string[] | null; label?: string; issue?: number; pullRequest?: number };
+    if (isIssue) {
+      const d = decideDispatch(config?.dispatch, {
+        repositoryFullName: req.payload.repository?.full_name,
+        repositoryId: req.payload.repository?.id,
+        label: req.payload.label?.name,
+        sender: req.payload.sender?.login,
+      });
+      if (!d.start) {
+        log({ delivery: req.deliveryId, installationId: req.installationId, ignored: d.reason });
+        return skip('not_dispatched', { reason: d.code, message: d.reason });
+      }
+      decision = { repository: d.repository, repositoryId: d.repositoryId, keys: d.keys, label: d.label, issue: req.payload.issue!.number as number };
+    } else {
+      const d = decidePullRequestDispatch(
+        config?.dispatch,
+        {
+          eventName,
+          action: req.payload.action,
+          repositoryFullName: req.payload.repository?.full_name,
+          repositoryId: req.payload.repository?.id,
+          sender: req.payload.sender?.login,
+          number: req.payload.pull_request?.number,
+          headRef: req.payload.pull_request?.head?.ref,
+          reviewState: req.payload.review?.state,
+        },
+        req.appBot ? { appBot: req.appBot } : {},
+      );
+      if (!d.start) {
+        if (d.code === 'event_not_accepted') return skip('ignored');
+        log({ delivery: req.deliveryId, installationId: req.installationId, ignored: d.reason });
+        return skip('not_dispatched', { reason: d.code, message: d.reason });
+      }
+      // The workflow that started the pull request: the label of the job that opened it (its finish
+      // recorded this pull request), or of an earlier job of this pull request's loop (which carries
+      // that label on), while one is kept. Only an exact match: one issue can have several pull
+      // requests, from different workflows. Its keys are the ones checked. A close runs no agent and
+      // needs none; a pull request whose origin is not known here is checked by the job itself
+      // (run-event fails without the key, and says so on the job).
+      let keys: string[] | null = [];
+      let label: string | undefined;
+      if (!d.closing) {
+        const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS).catch(() => []);
+        const sameRepo = (j: { repository: string }) => j.repository.toLowerCase() === d.repository.toLowerCase();
+        const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
+        if (origin?.label) {
+          label = origin.label;
+          // Only under the version active now, which this job runs: a republish may have changed
+          // the workflow's agent, or moved its label to another workflow, and then nothing here
+          // names the workflow; the runner follows the one stored for the pull request, and checks
+          // its key itself. Under the same version: the keys that job was started with (two
+          // workflows can share a label, for different actors), or, once its record is gone (it is
+          // kept a week past its run), the label's when the label names one workflow's.
+          if (origin.configVersion === tenant.activeConfigVersion) {
+            const record = await deps.store.getJob(origin.jobId).catch(() => null);
+            const lower = origin.label.toLowerCase();
+            keys = record ? (record.agentKeys ?? []) : Object.hasOwn(d.keysByLabel, lower) ? (d.keysByLabel[lower] ?? []) : [];
+          }
+        } else {
+          log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
+        }
+      }
+      decision = { repository: d.repository, repositoryId: d.repositoryId, keys, pullRequest: d.pullRequest, ...(label ? { label } : {}) };
     }
+    // The issue or pull request the job is for: refusals and over-quota comments name it.
+    const number = (decision.issue ?? decision.pullRequest)!;
 
     const imageVersion = await deps.imageVersion();
     if (!imageVersion) return skip('jobs_off');
@@ -169,7 +287,7 @@ export function createLauncher(deps: LaunchDeps) {
     // hold up this one. A version published before keys were recorded has them read from its
     // bundle; one whose bundle cannot tell is refused, not run without its keys checked.
     let needed = decision.keys;
-    if (needed === null) {
+    if (needed === null && isIssue) {
       needed = deps.bundleKeys
         ? await deps.bundleKeys.forEvent(req.installationId, tenant.activeConfigVersion, {
             repositoryFullName: req.payload.repository?.full_name,
@@ -179,7 +297,7 @@ export function createLauncher(deps: LaunchDeps) {
           })
         : null;
     }
-    const issueNumber = req.payload.issue!.number as number;
+    const issueNumber = number;
     const refuse = async (reason: string, detail: Record<string, unknown>) => {
       log({ delivery: req.deliveryId, installationId: req.installationId, repository: decision.repository, refused: 'missing_key', ...detail });
       await deps.store
@@ -210,6 +328,33 @@ export function createLauncher(deps: LaunchDeps) {
     // Short, until the job starts and holds it for its lifetime; released early (by this job only)
     // when it fails.
     if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + PRELAUNCH_CLAIM_MS, jobId))) return skip('duplicate');
+    // A pull request's events within PR_COALESCE_MS of one that started a job are that job's: it
+    // reads the pull request as it is once the lease is over. This delivery's claim is given up,
+    // so a redelivery after that starts a job of its own.
+    const lease = decision.pullRequest !== undefined ? pullRequestLease(decision.repositoryId, decision.pullRequest) : undefined;
+    const releaseClaims = async () => {
+      await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      if (lease) await deps.store.releaseDelivery(req.installationId, lease, jobId).catch(() => {});
+    };
+    let leaseAt = launchedAt;
+    if (lease) {
+      let covered: 'held' | 'covered' | 'unconfirmed';
+      try {
+        covered = await takeOrJoin(req.installationId, lease, jobId);
+      } catch (err) {
+        await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+        throw err;
+      }
+      if (covered !== 'held') await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      if (covered === 'covered') return skip('coalesced', { message: `a job for pull request #${decision.pullRequest} starts in a few seconds and will see this event` });
+      if (covered === 'unconfirmed') {
+        // Not acknowledged: GitHub shows the delivery failed, and redelivering it tries again.
+        log({ delivery: req.deliveryId, installationId: req.installationId, warning: `the job holding pull request #${decision.pullRequest} was not confirmed launched in time` });
+        return { status: 503, disposition: 'coalesce_unconfirmed', message: `a launch for pull request #${decision.pullRequest} was under way and not confirmed: redeliver this event` };
+      }
+      leaseAt = now();
+    }
+    const notBefore = lease ? leaseAt + PR_COALESCE_MS + 1000 : undefined;
 
     // The slots are held for the job's lifetime from the start, before its microVM exists: a launch
     // that later fails gives them back, and one that stops partway (its Lambda timed out) keeps
@@ -221,18 +366,18 @@ export function createLauncher(deps: LaunchDeps) {
     try {
       reserved = await deps.store.reserveJob({ installationId: req.installationId, jobId, holdUntil: launchedAt + durationMs, day, month, quotas });
     } catch (err) {
-      await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      await releaseClaims();
       throw err;
     }
     if (!reserved.ok) {
       // Not this delivery's to keep: re-applying the label (a new delivery) or redelivering it tries again.
-      await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
-      const issue = req.payload.issue!.number as number;
+      await releaseClaims();
+      const issue = number;
       const first = await deps.store.recordThrottle(req.installationId, month, { repositoryId: decision.repositoryId, issue, day });
       log({ delivery: req.deliveryId, installationId: req.installationId, repository: decision.repository, issue, throttled: reserved.limit });
       if (first && deps.notifyThrottled) {
         await deps
-          .notifyThrottled({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, issue, limit: reserved.limit, quotas })
+          .notifyThrottled({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, issue, limit: reserved.limit, quotas, ...(decision.pullRequest !== undefined ? { pullRequest: true } : {}) })
           .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
       }
       return skip('throttled', { reason: reserved.limit });
@@ -249,11 +394,11 @@ export function createLauncher(deps: LaunchDeps) {
       repositoryId: decision.repositoryId,
       configVersion: tenant.activeConfigVersion,
       deliveryId: req.deliveryId,
-      eventName: 'issues',
+      eventName,
       status: 'launched',
       createdAt: new Date(launchedAt).toISOString(),
       expiresAt: launchedAt + durationMs,
-      label: decision.label,
+      ...(decision.label ? { label: decision.label } : {}),
       ...(typeof sender === 'string' ? { sender } : {}),
       imageVersion,
       tenantSlot: reserved.tenantSlot,
@@ -261,7 +406,8 @@ export function createLauncher(deps: LaunchDeps) {
       reservedSeconds: s.maximumDurationSeconds,
       quotas,
       ...(needed.length ? { agentKeys: needed } : {}),
-      issue: req.payload.issue!.number as number,
+      ...(decision.issue !== undefined ? { issue: decision.issue } : {}),
+      ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}),
     };
 
     let recorded = false;
@@ -275,11 +421,11 @@ export function createLauncher(deps: LaunchDeps) {
       // never got this far.
       await deps.store.markLaunching(jobId);
       launching = true;
-      const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt }));
+      const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}) }));
       microvmId = out.microvmId;
     } catch (err) {
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: safeMessage(err) });
-      await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      await releaseClaims();
       await deps.store.cancelReservation(reservation, launching ? 'launching' : 'reserved').catch(() => {});
       // Nothing runs for this record; its token must not be served, and it needs no reconciling.
       let outcome: string | null = null;
@@ -324,12 +470,19 @@ export function errorClassOf(err: unknown): string {
   return typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : 'Error';
 }
 
-/** The run-hook payload: the broker and the job's token; the runner gets everything else from the broker. */
-export function runHookPayload(s: LaunchSettings, job: { jobId: string; token: string; deliveryId: string; launchedAt: number }) {
+type HookJob = { jobId: string; token: string; deliveryId: string; launchedAt: number; eventName?: string; notBefore?: number };
+
+/**
+ * The run-hook payload: the broker and the job's token; the runner gets everything else from the
+ * broker. `notBefore`: a pull request job's coalescing lease ends then, and the runner starts the
+ * run no earlier.
+ */
+export function runHookPayload(s: LaunchSettings, job: HookJob) {
   return {
     version: RUN_HOOK_PAYLOAD_VERSION,
     deliveryId: job.deliveryId,
-    eventName: 'issues',
+    eventName: job.eventName ?? 'issues',
+    ...(job.notBefore !== undefined ? { notBefore: new Date(job.notBefore).toISOString() } : {}),
     region: s.region,
     broker: { functionName: s.brokerFunctionName, jobId: job.jobId, jobToken: job.token },
     maximumDurationSeconds: s.maximumDurationSeconds,
@@ -339,7 +492,7 @@ export function runHookPayload(s: LaunchSettings, job: { jobId: string; token: s
   };
 }
 
-export function runMicrovmInput(s: LaunchSettings, imageVersion: string, job: { jobId: string; token: string; deliveryId: string; launchedAt: number }): RunMicrovmInput {
+export function runMicrovmInput(s: LaunchSettings, imageVersion: string, job: HookJob): RunMicrovmInput {
   return {
     imageIdentifier: s.imageArn,
     imageVersion,

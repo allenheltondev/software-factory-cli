@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideDispatch, dispatchRules } from './dispatch.js';
+import { decideDispatch, decidePullRequestDispatch, dispatchRules } from './dispatch.js';
 
 const compiled = {
   dispatch: { allowedActors: ['Pat', 'sam'] },
@@ -29,7 +29,96 @@ describe('dispatchRules', () => {
         // One list for every trigger: stored once.
         'acme/api': { id: 10, actors: ['pat', 'sam'], triggers: [{ label: 'updraft' }] },
       },
+      loop: true,
     });
+  });
+
+  it('records the review loop of each repository: review (true or its options) and revise', () => {
+    const rules = dispatchRules({
+      repositories: {
+        'acme/a': { id: 1, review: true, revise: true, workflows: [] },
+        'acme/b': { id: 2, review: { pool: 'reviewers' }, workflows: [] },
+        'acme/c': { id: 3, review: false, revise: false, workflows: [] },
+      },
+    });
+    expect(rules.repositories['acme/a']).toMatchObject({ review: true, revise: true });
+    expect(rules.repositories['acme/b']).toMatchObject({ review: true });
+    expect(rules.repositories['acme/b']).not.toHaveProperty('revise');
+    expect(rules.repositories['acme/c']).not.toHaveProperty('review');
+    expect(rules.loop).toBe(true);
+  });
+});
+
+describe('decidePullRequestDispatch', () => {
+  const rules = dispatchRules(
+    {
+      dispatch: { allowedActors: ['Pat'] },
+      repositories: {
+        'acme/web': { id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' } }, { trigger: { label: 'docs' }, allowedActors: ['writer'] }] },
+        'acme/review-only': { id: 10, review: true, workflows: [{ trigger: { label: 'updraft' } }] },
+        'acme/off': { id: 11, workflows: [{ trigger: { label: 'updraft' } }] },
+      },
+    },
+    { keysFor: (_repo, wf) => ((wf.trigger as { label: string }).label === 'docs' ? ['CODEX_API_KEY'] : ['ANTHROPIC_API_KEY']) },
+  );
+  const review = (over: Record<string, unknown> = {}) => ({
+    eventName: 'pull_request_review',
+    action: 'submitted',
+    repositoryFullName: 'Acme/Web',
+    repositoryId: 9,
+    sender: 'PAT',
+    number: 12,
+    headRef: 'updraft/issue-3-abc',
+    reviewState: 'changes_requested',
+    ...over,
+  });
+  const decide = (over: Record<string, unknown> = {}) => decidePullRequestDispatch(rules, review(over), { appBot: 'updraft[bot]' });
+  const code = (over: Record<string, unknown> = {}) => {
+    const d = decide(over);
+    return d.start ? 'start' : d.code;
+  };
+
+  it("starts a job for an allowed person's review on an Updraft pull request, with each workflow's keys by label to pick from", () => {
+    expect(decide()).toEqual({ start: true, repository: 'Acme/Web', repositoryId: 9, pullRequest: 12, closing: false, keysByLabel: { updraft: ['ANTHROPIC_API_KEY'], docs: ['CODEX_API_KEY'] } });
+    expect(decide({ eventName: 'pull_request', action: 'closed', reviewState: undefined })).toMatchObject({ start: true, closing: true });
+    // Two workflows on one label with different keys: the label names neither.
+    const shared = dispatchRules(
+      { repositories: { 'acme/web': { id: 9, revise: true, workflows: [{ trigger: { label: 'implement' }, allowedActors: ['pat'], agent: 'claude' }, { trigger: { label: 'implement' }, allowedActors: ['sam'], agent: 'codex' }] } } },
+      { keysFor: (_repo, wf) => (wf.agent === 'codex' ? ['CODEX_API_KEY'] : ['ANTHROPIC_API_KEY']) },
+    );
+    expect(decidePullRequestDispatch(shared, review())).toMatchObject({ start: true, keysByLabel: { implement: null } });
+    expect(code({ reviewState: 'approved' })).toBe('start');
+    expect(code({ action: 'dismissed', sender: 'writer' })).toBe('start');
+    expect(code({ eventName: 'pull_request', action: 'synchronize', reviewState: undefined })).toBe('start');
+    // A close ends the loop, whoever closes it.
+    expect(code({ eventName: 'pull_request', action: 'closed', sender: 'someone-else', reviewState: undefined })).toBe('start');
+  });
+
+  it('starts nothing for what leads to no work', () => {
+    expect(code({ action: 'opened' })).toBe('event_not_accepted');
+    expect(code({ eventName: 'pull_request', action: 'reopened' })).toBe('event_not_accepted');
+    expect(code({ eventName: 'issue_comment' })).toBe('event_not_accepted');
+    expect(code({ reviewState: 'commented' })).toBe('comment_review');
+    expect(code({ headRef: 'feature/mine' })).toBe('not_updraft_pr');
+    expect(code({ sender: 'Updraft[bot]' })).toBe('own_event');
+    expect(code({ sender: 'stranger' })).toBe('actor_not_allowed');
+    expect(code({ eventName: 'pull_request', action: 'synchronize', sender: 'stranger' })).toBe('actor_not_allowed');
+    expect(code({ repositoryId: 99 })).toBe('unknown_repo');
+    expect(code({ repositoryFullName: 'acme/gone' })).toBe('unknown_repo');
+  });
+
+  it('follows the repository loop: a review needs revisions, a push needs review, and neither starts anything with both off', () => {
+    expect(code({ repositoryFullName: 'acme/review-only', repositoryId: 10 })).toBe('loop_off');
+    expect(code({ repositoryFullName: 'acme/review-only', repositoryId: 10, eventName: 'pull_request', action: 'synchronize' })).toBe('start');
+    expect(code({ repositoryFullName: 'acme/off', repositoryId: 11, eventName: 'pull_request', action: 'closed' })).toBe('loop_off');
+  });
+
+  it('asks for a publish when the rules predate the loop, and honors a pause', () => {
+    const old = { repositories: { 'acme/web': { id: 9, actors: ['pat'], triggers: [{ label: 'updraft' }] } } };
+    const d = decidePullRequestDispatch(old, review());
+    expect(d).toMatchObject({ start: false, code: 'loop_off', reason: expect.stringMatching(/publish it again/) });
+    const paused = { ...rules, repositories: { 'acme/web': { ...rules.repositories['acme/web']!, paused: true as const } } };
+    expect(decidePullRequestDispatch(paused, review())).toMatchObject({ start: false, code: 'paused' });
   });
 });
 
