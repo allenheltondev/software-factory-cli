@@ -865,8 +865,13 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.listActiveJobs()).toEqual([
       { jobId: 'job_a00000001', installationId: 55, tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11', phase: 'reserved', reservedAt: expect.any(Number), expiresAt: LATER },
     ]);
+    // The launcher writes the job before it marks the launch; the mark is on the job too, so that
+    // the evidence outlives the active entry (which reconciliation deletes before it fails a job).
+    await store.putJob({ jobId: 'job_a00000001', tokenHash: 'ab', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: 'd-a', eventName: 'issues', status: 'launched', createdAt: '2026-11-20T12:00:00.000Z', expiresAt: LATER });
+    expect((await store.getJob('job_a00000001'))?.launchingAt).toBeUndefined();
     await store.markLaunching('job_a00000001');
     expect((await store.listActiveJobs())[0]?.phase).toBe('launching');
+    expect(typeof (await store.getJob('job_a00000001'))?.launchingAt).toBe('number');
     await expect(store.markLaunching('job_a00000001')).rejects.toThrow('no reservation to launch');
     expect(await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11' }, 'launching')).toBe('cancelled');
     expect(await store.listActiveJobs()).toEqual([]);

@@ -82,16 +82,24 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
 
   /**
    * What became of a launch that never said how it ended, from the job under the id its claim kept:
-   * `never` (no record, or its launch failed), `prelaunch` (a record, written before the microVM is
-   * asked for, and the reservation not yet marked launching: the launch may have died there, which
-   * the reconciler settles by failing it after five minutes, or still be under way) and `started`
-   * (RunMicrovm was reached: the job is listed, and reconciled, like any other).
+   *
+   *   never      no record, or its launch failed; or a record with no sign that a microVM was asked
+   *              for and its reservation gone (reconciliation cancels a reservation before it fails
+   *              the job, and once it is cancelled the launch can no longer proceed)
+   *   prelaunch  a record whose reservation is still `reserved`: the launch may have died before
+   *              RunMicrovm (reconciliation fails it after five minutes) or still be under way
+   *   started    its launch passed the point of no return: `launchingAt` on the job itself (written
+   *              with the reservation's phase), or a microVM or a start on record, or a
+   *              `launching` reservation (from before `launchingAt` existed)
+   *
+   * The reservation is read first: a launch that moves on after it can only add evidence to the job.
    */
   const childState = async (id: string): Promise<'never' | 'prelaunch' | 'started'> => {
+    const entry = (await store.listActiveJobs()).find((a) => a.jobId === id);
     const child = await store.getJob(id);
     if (!child || (child.status === 'finished' && child.outcome === 'launch_failed')) return 'never';
-    const entry = (await store.listActiveJobs()).find((a) => a.jobId === id);
-    return entry?.phase === 'reserved' ? 'prelaunch' : 'started';
+    if (child.launchingAt !== undefined || child.microvmId !== undefined || child.startedAt !== undefined || entry?.phase === 'launching') return 'started';
+    return entry?.phase === 'reserved' ? 'prelaunch' : 'never';
   };
 
   return async function retry({ updraftRetry: { installationId, jobId } }: RetryRequest): Promise<RetryResult> {

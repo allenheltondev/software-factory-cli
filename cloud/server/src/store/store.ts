@@ -364,6 +364,13 @@ export interface Job {
   /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
   startedAt?: number;
   /**
+   * Epoch ms when its launch passed the point of no return (markLaunching: RunMicrovm is asked for
+   * next), written in the same transaction as the reservation's phase. Its absence on a job that did
+   * not fail to launch means no microVM was asked for, once the reservation is gone (reconciliation
+   * cancels it): the active entry alone cannot say, since it is deleted before the job is failed.
+   */
+  launchingAt?: number;
+  /**
    * Epoch ms when its microVM was asked to stop (the broker's terminate, or a refused start):
    * nothing is served for it after, and it can never start, whatever its outcome says.
    */
@@ -940,6 +947,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const entry = active.get(jobId);
       if (!entry || entry.phase !== 'reserved') throw new Error(`job ${jobId} has no reservation to launch`);
       active.set(jobId, { ...entry, phase: 'launching' });
+      const j = jobs.get(jobId);
+      if (j) jobs.set(jobId, { ...j, launchingAt: Date.now() });
     },
     async listPlatformSlots() {
       const now = Date.now();

@@ -643,18 +643,35 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async markLaunching(jobId) {
+      // The phase and the job's own record of it, together: the active entry is deleted when the
+      // reservation is reclaimed, before the job is failed, so it cannot be the only evidence.
       try {
         await client.send(
-          new UpdateCommand({
-            TableName: T,
-            Key: activeKey(jobId),
-            UpdateExpression: 'SET phase = :launching',
-            ConditionExpression: 'phase = :reserved',
-            ExpressionAttributeValues: { ':launching': 'launching', ':reserved': 'reserved' },
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Update: {
+                  TableName: T,
+                  Key: activeKey(jobId),
+                  UpdateExpression: 'SET phase = :launching',
+                  ConditionExpression: 'phase = :reserved',
+                  ExpressionAttributeValues: { ':launching': 'launching', ':reserved': 'reserved' },
+                },
+              },
+              {
+                Update: {
+                  TableName: T,
+                  Key: { pk: `JOB#${jobId}`, sk: 'META' },
+                  UpdateExpression: 'SET launchingAt = :at',
+                  ConditionExpression: 'attribute_exists(pk)',
+                  ExpressionAttributeValues: { ':at': Date.now() },
+                },
+              },
+            ],
           }),
         );
       } catch (err) {
-        if (err instanceof ConditionalCheckFailedException) throw new Error(`job ${jobId} has no reservation to launch`, { cause: err });
+        if (err instanceof TransactionCanceledException) throw new Error(`job ${jobId} has no reservation to launch`, { cause: err });
         throw err;
       }
     },
@@ -690,6 +707,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(Array.isArray(i.agentKeys) ? { agentKeys: (i.agentKeys as unknown[]).map(String) } : {}),
         ...(jobTelemetrySnapshotOf(i.telemetrySnapshot) ? { telemetrySnapshot: jobTelemetrySnapshotOf(i.telemetrySnapshot)! } : {}),
         ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
+        ...(typeof i.launchingAt === 'number' ? { launchingAt: i.launchingAt } : {}),
         ...(typeof i.stopRequestedAt === 'number' ? { stopRequestedAt: i.stopRequestedAt } : {}),
         ...(typeof i.releasedAt === 'number' ? { releasedAt: i.releasedAt } : {}),
       };

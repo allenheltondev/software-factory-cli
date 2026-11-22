@@ -33,6 +33,14 @@ async function setup({ outcome = 'failed', launched = { status: 202, disposition
   const retry = createRetryHandler({ store, launch, readEvent, appBot: async () => 'updraft[bot]', now: () => clock.now, log: () => {} });
   return { store, launch, readEvent, retry, j, clock };
 }
+/** A child job as a launch leaves it: its record, its reservation, and (when asked) the mark that RunMicrovm is next. */
+async function child(store: Awaited<ReturnType<typeof setup>>['store'], id: string, deliveryId: string, { launching = true } = {}) {
+  await store.putJob(job({ jobId: id, deliveryId }));
+  const r = await store.reserveJob({ installationId: 55, jobId: id, holdUntil: Date.now() + 1e7, day: '2026-11-22', month: '2026-11', quotas: { concurrentJobs: 50, jobsPerDay: 500, microvmMinutesPerMonth: 6000, platformConcurrentJobs: 50 } });
+  if (!r.ok) throw new Error(r.limit);
+  if (launching) await store.markLaunching(id);
+  return r;
+}
 const ask = (jobId = 'job_retry00001', installationId = 55) => ({ updraftRetry: { installationId, jobId } });
 
 describe('retrying a job (jobs/retry.ts)', () => {
@@ -133,10 +141,10 @@ describe('retrying a job (jobs/retry.ts)', () => {
       const out = await first(ask());
       expect(out).toMatchObject({ ok: true });
       // The microVM was accepted: its job is on record under the id the claim kept.
-      const child = (launch.mock.calls[0]![0] as { jobId: string }).jobId;
-      await store.putJob(job({ jobId: child, deliveryId: retryDeliveryId(j.jobId) }));
+      const id = (launch.mock.calls[0]![0] as { jobId: string }).jobId;
+      await child(store, id, retryDeliveryId(j.jobId));
       const next = createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} });
-      return { store, launch, j, clock, child, next };
+      return { store, launch, j, clock, child: id, next };
     }
 
     it('records the job it started instead of launching another, once the claim has run out', async () => {
@@ -153,19 +161,42 @@ describe('retrying a job (jobs/retry.ts)', () => {
 
     it('waits while the earlier attempt’s job may not have reached launch, and records it once it did', async () => {
       const { store, launch, j, clock } = await setup();
-      const child = 'job_prelaunch0000001';
-      await store.putJob(job({ jobId: child, deliveryId: retryDeliveryId(j.jobId) }));
+      const id = 'job_prelaunch0000001';
       // The record is written, and the reservation is not yet marked launching: the launch may have died here.
-      await store.reserveJob({ installationId: 55, jobId: child, holdUntil: clock.now + 1e7, day: '2026-11-22', month: '2026-11', quotas: { concurrentJobs: 5, jobsPerDay: 50, microvmMinutesPerMonth: 600, platformConcurrentJobs: 50 } });
-      expect(await store.reserveJobRetry(j, 'dead', clock.now, clock.now + RESERVATION_MS, child)).toBe(true);
+      await child(store, id, retryDeliveryId(j.jobId), { launching: false });
+      expect(await store.reserveJobRetry(j, 'dead', clock.now, clock.now + RESERVATION_MS, id)).toBe(true);
       clock.now += RESERVATION_MS + 1;
       const next = createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} });
       expect(await next(ask())).toMatchObject({ ok: false, status: 409, code: 'retry_pending' });
       expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBeUndefined();
       expect(launch).not.toHaveBeenCalled();
       // The launch got as far as RunMicrovm after all.
-      await store.markLaunching(child);
-      expect(await next(ask())).toEqual({ ok: true, jobId: child });
+      await store.markLaunching(id);
+      expect(await next(ask())).toEqual({ ok: true, jobId: id });
+      expect(launch).not.toHaveBeenCalled();
+    });
+
+    it('launches afresh when the reconciler has taken the reservation but not yet failed the child (nothing was asked for)', async () => {
+      const { store, launch, j, clock } = await setup();
+      const id = 'job_reclaimed0000001';
+      const r = await child(store, id, retryDeliveryId(j.jobId), { launching: false });
+      // Reconciliation deletes the reservation first, and writes launch_failed to the job after.
+      expect(await store.cancelReservation({ installationId: 55, jobId: id, tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-22', month: '2026-11' }, 'reserved')).toBe('cancelled');
+      expect((await store.getJob(id))?.status).toBe('launched');
+      expect(await store.reserveJobRetry(j, 'dead', clock.now, clock.now + RESERVATION_MS, id)).toBe(true);
+      clock.now += RESERVATION_MS + 1;
+      expect(await createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} })(ask())).toMatchObject({ ok: true });
+      expect(launch).toHaveBeenCalledTimes(1);
+    });
+
+    it('records a child whose launch was marked even after its reservation is gone', async () => {
+      const { store, launch, j, clock } = await setup();
+      const id = 'job_launchedgone0001';
+      await child(store, id, retryDeliveryId(j.jobId));
+      await store.forgetActiveJob((await store.listActiveJobs()).find((a) => a.jobId === id)!);
+      expect(await store.reserveJobRetry(j, 'dead', clock.now, clock.now + RESERVATION_MS, id)).toBe(true);
+      clock.now += RESERVATION_MS + 1;
+      expect(await createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} })(ask())).toEqual({ ok: true, jobId: id });
       expect(launch).not.toHaveBeenCalled();
     });
 
@@ -182,9 +213,9 @@ describe('retrying a job (jobs/retry.ts)', () => {
 
     it('cannot take a claim over that runs out only after it was seen live, which would lose the child it kept', async () => {
       const { store, launch, j, clock } = await setup();
-      const child = 'job_startedchild0001';
-      await store.putJob(job({ jobId: child, deliveryId: retryDeliveryId(j.jobId) }));
-      expect(await store.reserveJobRetry(j, 'slow', clock.now, clock.now + 1000, child)).toBe(true);
+      const id = 'job_startedchild0001';
+      await child(store, id, retryDeliveryId(j.jobId));
+      expect(await store.reserveJobRetry(j, 'slow', clock.now, clock.now + 1000, id)).toBe(true);
       // The claim reads as live at this request's time, and runs out just after: the clock moves during the request.
       let calls = 0;
       const ticking = () => (calls++ === 0 ? clock.now + 999 : clock.now + 1001);
@@ -193,7 +224,7 @@ describe('retrying a job (jobs/retry.ts)', () => {
       expect(launch).not.toHaveBeenCalled();
       // Nothing was overwritten: the next request settles it from the child the claim kept.
       clock.now += 1001;
-      expect(await createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} })(ask())).toEqual({ ok: true, jobId: child });
+      expect(await createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} })(ask())).toEqual({ ok: true, jobId: id });
     });
 
     it('does not settle a claim another request has taken over since it was seen', async () => {
