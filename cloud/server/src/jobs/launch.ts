@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import type { Job, Quotas, Store } from '../store/store.js';
 import { decideDispatch } from '../tenants/dispatch.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
@@ -187,6 +188,14 @@ export function createLauncher(deps: LaunchDeps) {
       return skip('missing_key', { reason: 'missing_key', message: reason });
     };
     if (needed === null) return refuse('Updraft could not tell which agent keys this workflow needs: publish the configuration again', { unknown: true });
+    // An agent this deployment no longer runs (CloudAgents): a version published while it did
+    // names it, and its job would get no key. Refused with what to change.
+    const offered = new Set(Object.values(AGENT_KEY_ENV));
+    const retired = needed.filter((k) => !offered.has(k));
+    if (retired.length > 0) {
+      const agents = Object.entries(SUPPORTED_AGENT_KEY_ENV).filter(([, k]) => retired.includes(k)).map(([a]) => a);
+      return refuse(`This workflow runs ${agents.join(' and ')}, which Updraft Cloud no longer runs here: choose another agent in the configuration and publish it again`, { unavailable: agents });
+    }
     if (needed.length > 0) {
       const set = new Set((await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name));
       const missing = needed.filter((k) => !set.has(k));

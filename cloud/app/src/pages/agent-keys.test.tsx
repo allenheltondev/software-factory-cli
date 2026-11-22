@@ -29,16 +29,17 @@ describe('AgentKeysPage', () => {
   it('shows what a key is for, whether it works, and where the value is never shown', async () => {
     show(fakeApi({ agentKeys: async () => view({ refusals: [{ at: '2026-11-21T09:00:00.000Z', deliveryId: 'd', repository: 'acme/web', issue: 3, reason: 'CODEX_API_KEY is not set' }] }) }));
     const claude = await screen.findByTestId('key-ANTHROPIC_API_KEY');
-    expect(within(claude).getByText('Configured')).toBeInTheDocument();
-    expect(within(claude).getByText('Required by your configuration')).toBeInTheDocument();
+    expect(within(claude).getByText('Last job failed')).toBeInTheDocument();
+    expect(within(claude).getByText('Used by your configuration')).toBeInTheDocument();
     expect(within(claude).getByText(/Last rotated/)).toHaveTextContent('by pat');
-    expect(within(claude).getByText('Failed')).toBeInTheDocument();
     expect(screen.getByTestId('key-failed-ANTHROPIC_API_KEY')).toHaveTextContent('often not the key');
     // A key that is set shows no input until it is rotated.
     expect(within(claude).queryByLabelText('New key')).toBeNull();
-    const codex = screen.getByTestId('key-CODEX_API_KEY');
+    // An agent the configuration does not use waits under "Other agents", with the steps to get its key.
+    const codex = within(screen.getByTestId('other-agents')).getByTestId('key-CODEX_API_KEY');
     expect(within(codex).getByText('Not set')).toBeInTheDocument();
-    expect(within(codex).getByText('Optional')).toBeInTheDocument();
+    expect(within(codex).getByRole('link', { name: /API keys on the OpenAI platform/ })).toHaveAttribute('href', 'https://platform.openai.com/api-keys');
+    expect(within(codex).getByTestId('key-steps-CODEX_API_KEY')).toHaveTextContent('Paste it here.');
     expect(within(codex).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://platform.openai.com/api-keys');
     expect(within(codex).getByRole('link', { name: /Setup guide/ })).toHaveAttribute('href', 'https://learn.chatgpt.com/docs/auth#sign-in-with-an-api-key');
     expect(within(codex).getByRole('link', { name: /OpenAI API key creation/ })).toHaveAttribute('href', 'https://developers.openai.com/api/docs/quickstart#create-and-export-an-api-key');
@@ -49,9 +50,54 @@ describe('AgentKeysPage', () => {
     expect(screen.getByTestId('keys-privacy')).toHaveTextContent('never shown again');
   });
 
-  it('says up front when a required key is missing', async () => {
-    show(fakeApi({ agentKeys: async () => view({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: false, required: true }, { name: 'CODEX_API_KEY', configured: false, required: false }] }) }));
+  it('says up front when a required key is missing, puts it first with its steps, and says when all are set', async () => {
+    show(
+      fakeApi({
+        agentKeys: async () =>
+          view({ keys: [{ name: 'CODEX_API_KEY', configured: false, required: false }, { name: 'KIRO_API_KEY', configured: false, required: false }, { name: 'ANTHROPIC_API_KEY', configured: false, required: true }] }),
+      }),
+    );
     expect(await screen.findByTestId('keys-needed')).toHaveTextContent('Add your Anthropic key to start running jobs');
+    const cards = screen.getAllByTestId(/^key-[A-Z_]+$/);
+    expect(cards[0]).toHaveAttribute('data-testid', 'key-ANTHROPIC_API_KEY');
+    expect(screen.getByTestId('key-steps-ANTHROPIC_API_KEY')).toHaveTextContent('Create key');
+    expect(screen.getByTestId('other-agents')).toHaveTextContent('Other agents (Codex, Kiro)');
+  });
+
+  it('says so when every agent the configuration runs has its key', async () => {
+    show(fakeApi({ agentKeys: async () => view({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true, lastRotatedAt: '2026-11-20T10:00:00.000Z', lastUsed: { at: '2026-11-21T10:00:00.000Z', ok: true } }, { name: 'CODEX_API_KEY', configured: false, required: false }] }) }));
+    expect(await screen.findByTestId('keys-ready')).toHaveTextContent('Every agent your configuration runs has its key');
+    expect(within(screen.getByTestId('key-ANTHROPIC_API_KEY')).getByText('Working')).toBeInTheDocument();
+  });
+
+  it("guides a Kiro key, including the organization's admin step, and saves it without a provider check", async () => {
+    const calls: unknown[][] = [];
+    const user = userEvent.setup();
+    const kiro = { name: 'KIRO_API_KEY', configured: false, required: true };
+    show(
+      fakeApi({
+        agentKeys: async () => view({ keys: [kiro, { name: 'ANTHROPIC_API_KEY', configured: false, required: false }] }),
+        setAgentKey: async (...args) => {
+          calls.push(args);
+          return view({ keys: [{ ...kiro, configured: true, lastRotatedAt: new Date().toISOString(), lastRotatedBy: 'pat' }, { name: 'ANTHROPIC_API_KEY', configured: false, required: false }] });
+        },
+      }),
+    );
+    const card = await screen.findByTestId('key-KIRO_API_KEY');
+    expect(within(card).getByTestId('key-steps-KIRO_API_KEY')).toHaveTextContent('IAM Identity Center');
+    // The guide links are on the Kiro card too, and the unchecked-key messaging is kept.
+    expect(within(card).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://app.kiro.dev/');
+    expect(within(card).getByRole('link', { name: /Setup guide/ })).toHaveAttribute('href', 'https://kiro.dev/docs/getting-started/authentication/#generate-an-api-key');
+    expect(within(card).getByRole('link', { name: /Enable API keys for an organization/ })).toHaveAttribute('href', 'https://kiro.dev/docs/enterprise/governance/api-keys/');
+    const field = within(card).getByLabelText('Kiro API key');
+    await user.type(field, KEY);
+    expect(within(card).getByText(/looks like an Anthropic key/)).toBeInTheDocument();
+    await user.clear(field);
+    await user.type(field, 'kiro_abcdefghijklmnopqrstuvwxyz012345');
+    await user.click(within(card).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls).toEqual([[55, 'KIRO_API_KEY', 'kiro_abcdefghijklmnopqrstuvwxyz012345']]));
+    expect(await screen.findByTestId('key-saved-KIRO_API_KEY')).toHaveTextContent('Your next Kiro job will use it');
+    expect(within(screen.getByTestId('key-KIRO_API_KEY')).getByText(/the first job is the check/)).toBeInTheDocument();
   });
 
   it('catches a key pasted under the wrong provider before sending anything', async () => {

@@ -11,14 +11,13 @@ import {
   PageHero,
   PageHeroChip,
   PageHeroChips,
-  PageHeroSubtitle,
   PageHeroTitle,
   PasswordInput,
   SegmentedControl,
   Skeleton,
   StatusBadge,
 } from '@readysetcloud/ui';
-import { api as defaultApi, type ApiClient, type TelemetryKeyInput, type TelemetryProvider, type TelemetryRegion, type TelemetryView } from '../api/client';
+import { api as defaultApi, type ApiClient, type TelemetryKeyInput, type TelemetryProvider, type TelemetryView } from '../api/client';
 import { relativeTime } from '../lib/time';
 
 type Api = Pick<ApiClient, 'telemetry' | 'updateTelemetry' | 'setTelemetryKey' | 'removeTelemetryKey'>;
@@ -104,10 +103,6 @@ function Hero({ view }: { view: TelemetryView }) {
   return (
     <PageHero data-testid="telemetry">
       <PageHeroTitle>Agent telemetry</PageHeroTitle>
-      <PageHeroSubtitle>
-        See what your agents are doing: every model call, tool call and review round, in order, as OpenTelemetry traces in the tracing tool you already use. Each issue is one conversation, from the first
-        change through every review and revision.
-      </PageHeroSubtitle>
       <PageHeroChips>
         <PageHeroChip tone={state.tone} data-testid="telemetry-state">
           {state.label}
@@ -257,32 +252,30 @@ function DestinationCard({ view, api, installationId, onSaved }: { view: Telemet
 
 type FormProps = { view: TelemetryView; busy: boolean; replacing: boolean; onSubmit: (input: TelemetryKeyInput) => void; onCancel?: () => void };
 
-function HoneycombForm({ view, busy, replacing, onSubmit, onCancel }: FormProps) {
+function HoneycombForm({ busy, replacing, onSubmit, onCancel }: FormProps) {
   const [value, setValue] = useState('');
-  const [region, setRegion] = useState<TelemetryRegion>(view.region);
   const typed = value.trim();
   const problem = typed && !/^[A-Za-z0-9_-]{16,128}$/.test(typed) ? 'A Honeycomb key is letters, digits, dashes and underscores (an Ingest key starts with hcaik_ or hcxik_).' : null;
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    if (typed && !problem) onSubmit({ provider: 'honeycomb', value: typed, region });
+    // The region is the key's own: Honeycomb is asked in the US, then the EU.
+    if (typed && !problem) onSubmit({ provider: 'honeycomb', value: typed, region: 'auto' });
   };
   return (
     <form className="flex flex-col gap-3" onSubmit={submit} noValidate data-testid="telemetry-honeycomb-form">
-      <p className="text-sm text-muted-foreground">
-        An Ingest key for the Honeycomb environment the traces should go to.{' '}
-        <a className="auth-link" href={KEYS_DOCS} target="_blank" rel="noreferrer">
-          Create one ↗
-        </a>
-      </p>
-      <SegmentedControl<TelemetryRegion>
-        aria-label="Honeycomb region"
-        value={region}
-        onChange={setRegion}
-        options={[
-          { value: 'us', label: 'US (api.honeycomb.io)' },
-          { value: 'eu', label: 'EU (api.eu1.honeycomb.io)' },
-        ]}
-      />
+      <ol className="flex list-decimal flex-col gap-1.5 pl-5 text-sm" data-testid="telemetry-honeycomb-steps">
+        <li>
+          In Honeycomb, open the environment the traces should go to, then{' '}
+          <a className="auth-link" href={KEYS_DOCS} target="_blank" rel="noreferrer">
+            Environment settings, API Keys ↗
+          </a>
+          .
+        </li>
+        <li>
+          Create an <strong>Ingest key</strong> named <strong>Updraft</strong>, and copy it.
+        </li>
+        <li>Paste it here. Its region (US or EU) is found from the key.</li>
+      </ol>
       <PasswordInput
         label={replacing ? 'New key' : 'Ingest key'}
         autoComplete="off"
@@ -291,7 +284,7 @@ function HoneycombForm({ view, busy, replacing, onSubmit, onCancel }: FormProps)
         placeholder="hcaik_…"
         value={value}
         disabled={busy}
-        {...(problem ? { error: problem } : { hint: "Checked with Honeycomb's /1/auth, then stored as a secret." })}
+        {...(problem ? { error: problem } : { hint: 'Checked with Honeycomb, then stored as a secret.' })}
         onChange={(e) => setValue(e.target.value)}
       />
       <p role="status" className="text-sm" aria-live="polite">

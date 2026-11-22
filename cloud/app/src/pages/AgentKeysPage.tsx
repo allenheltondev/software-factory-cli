@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router';
-import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, PasswordInput, Skeleton, StatusBadge } from '@readysetcloud/ui';
+import { Alert, Button, Card, CardBody, CardHeader, CardTitle, PasswordInput, Skeleton, StatusBadge } from '@readysetcloud/ui';
 import { api as defaultApi, type AgentKeysView, type AgentKeyView, type ApiClient } from '../api/client';
 import { relativeTime } from '../lib/time';
 import { AGENT_GUIDES, type AgentGuide } from '../lib/agentGuides';
@@ -8,23 +8,40 @@ import { AGENT_GUIDES, type AgentGuide } from '../lib/agentGuides';
 type Load = { state: 'loading' } | { state: 'ok'; view: AgentKeysView } | { state: 'error'; message: string };
 type Api = Pick<ApiClient, 'agentKeys' | 'setAgentKey'>;
 
-interface Provider {
+export interface Provider {
   agent: string;
   company: string;
   placeholder: string;
   getKeyUrl: string;
   guide?: AgentGuide;
+  /** How to get a key, step by step; the last step is always pasting it here. */
+  steps: ReactNode[];
+  /** The provider can be asked whether a key works before it is saved. Kiro cannot: its first job tells. */
+  checkedOnSave: boolean;
   /** Says what is wrong with what was typed, before anything is sent; null when it looks right. The server decides for real. */
   problem: (value: string) => string | null;
 }
 
-const PROVIDERS: Record<string, Provider> = {
+const external = (href: string, text: string) => (
+  <a className="auth-link" href={href} target="_blank" rel="noreferrer">
+    {text} ↗
+  </a>
+);
+
+export const PROVIDERS: Record<string, Provider> = {
   ANTHROPIC_API_KEY: {
     agent: 'Claude',
     company: 'Anthropic',
     placeholder: 'sk-ant-…',
     getKeyUrl: AGENT_GUIDES.claude.getKeyUrl,
     guide: AGENT_GUIDES.claude,
+    steps: [
+      <>Open {external('https://platform.claude.com/settings/keys', 'API keys in the Claude Console')}.</>,
+      <>
+        Choose <strong>Create key</strong>, name it <strong>Updraft</strong>, and copy it.
+      </>,
+    ],
+    checkedOnSave: true,
     problem: (v) => (v.startsWith('sk-ant-') ? null : v.startsWith('sk-') ? 'That looks like an OpenAI key. Anthropic keys start with sk-ant-.' : 'Anthropic keys start with sk-ant-.'),
   },
   CODEX_API_KEY: {
@@ -33,19 +50,51 @@ const PROVIDERS: Record<string, Provider> = {
     placeholder: 'sk-…',
     getKeyUrl: AGENT_GUIDES.codex.getKeyUrl,
     guide: AGENT_GUIDES.codex,
+    steps: [
+      <>Open {external('https://platform.openai.com/api-keys', 'API keys on the OpenAI platform')}.</>,
+      <>
+        Choose <strong>Create new secret key</strong>, name it <strong>Updraft</strong>, and copy it.
+      </>,
+    ],
+    checkedOnSave: true,
     problem: (v) => (v.startsWith('sk-ant-') ? 'That looks like an Anthropic key. Paste it under Claude instead.' : v.startsWith('sk-') ? null : 'OpenAI keys start with sk-.'),
+  },
+  KIRO_API_KEY: {
+    agent: 'Kiro',
+    company: 'Kiro',
+    placeholder: 'Your Kiro API key',
+    getKeyUrl: AGENT_GUIDES.kiro.getKeyUrl,
+    guide: AGENT_GUIDES.kiro,
+    steps: [
+      <>
+        Sign in to Kiro, open <strong>Account</strong>, then <strong>API keys</strong> ({external('https://kiro.dev/docs/cli/headless/', 'how')}). API keys need a Kiro Pro plan or
+        above.
+      </>,
+      <>
+        Your organization signs in to Kiro through IAM Identity Center? An administrator turns on API keys first, in the AWS console under <strong>Kiro</strong>, then{' '}
+        <strong>Settings</strong>.
+      </>,
+      <>
+        Choose <strong>Create</strong>, name it <strong>Updraft</strong>, and copy it.
+      </>,
+    ],
+    checkedOnSave: false,
+    problem: (v) =>
+      v.startsWith('sk-ant-') ? 'That looks like an Anthropic key. Paste it under Claude instead.' : v.startsWith('sk-') ? 'That looks like an OpenAI key. Paste it under Codex instead.' : /\s/.test(v) ? 'A Kiro key has no spaces.' : v.length < 20 ? 'That is too short to be a Kiro key.' : null,
   },
 };
 
 const exact = (iso: string) => new Date(iso).toLocaleString();
+const providerOf = (k: AgentKeyView): Provider => PROVIDERS[k.name] ?? { agent: k.name, company: k.name, placeholder: '', getKeyUrl: '', steps: [], checkedOnSave: true, problem: () => null };
 
 /**
  * A tenant's agent keys: bring your own (#64).
  *
- * The page is built around three questions: do I need this key (a Required badge, from the active
- * config), is it working (when it was rotated, whether the last job that used it worked), and what
- * do I do about it (paste, rotate, or follow the link to get one). A value is typed in, sent once
- * and never shown again: no request returns one. Whatever is wrong is said next to the field.
+ * Built for getting set up in a minute: the agents the configuration runs come first, each with
+ * the steps to get its key and a field to paste it into, checked as it is typed and again with
+ * the provider. Agents the configuration does not use wait under "Other agents". Once a key is
+ * set, its card says whether it works (when it was rotated, how the last job that used it went).
+ * A value is typed in, sent once and never shown again: no request returns one.
  */
 export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
   const { id } = useParams();
@@ -66,20 +115,19 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
     };
   }, [api, installationId, valid]);
 
-  const missingRequired = load.state === 'ok' ? load.view.keys.filter((k) => k.required && !k.configured) : [];
+  const keys = load.state === 'ok' ? load.view.keys : [];
+  const missingRequired = keys.filter((k) => k.required && !k.configured);
+  // What to do first: the keys the configuration needs, then any key already set; the rest is optional.
+  const primary = keys.filter((k) => k.required || k.configured).sort((a, b) => Number(b.required) - Number(a.required));
+  const others = keys.filter((k) => !k.required && !k.configured);
+  const onSaved = (view: AgentKeysView) => setLoad({ state: 'ok', view });
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
       <Link className="auth-link" to={`/installations/${id}`}>
         ← Installation
       </Link>
-      <header className="flex flex-col gap-1">
-        <h1 className="text-2xl font-semibold">Agent keys</h1>
-        <p>
-          Updraft runs its coding agents with <strong>your own API keys</strong>, so the usage is on your account. Add the key for each agent you use; a job that needs a key
-          you have not added will not start.
-        </p>
-      </header>
+      <h1 className="text-2xl font-semibold">Agent keys</h1>
 
       {load.state === 'loading' && <Skeleton className="h-40" />}
       {load.state === 'error' && (
@@ -90,16 +138,41 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
 
       {load.state === 'ok' && (
         <>
-          {missingRequired.length > 0 && (
+          {missingRequired.length > 0 ? (
             <Alert variant="info" data-testid="keys-needed">
-              Add your {missingRequired.map((k) => PROVIDERS[k.name]?.company ?? k.name).join(' and ')} key to start running jobs: your configuration uses{' '}
+              Add your {missingRequired.map((k) => providerOf(k).company).join(' and ')} {missingRequired.length > 1 ? 'keys' : 'key'} to start running jobs: your configuration uses{' '}
               {missingRequired.length > 1 ? 'those agents' : 'that agent'}.
             </Alert>
+          ) : (
+            primary.length > 0 &&
+            primary.every((k) => k.configured) && (
+              <p role="status" className="font-medium" data-testid="keys-ready">
+                ✓ Every agent your configuration runs has its key.
+              </p>
+            )
+          )}
+          {primary.length === 0 && (
+            <p data-testid="keys-start">
+              Your jobs run on <strong>your own API keys</strong>, so the usage is on your account. Add the key of each agent you will use.
+            </p>
           )}
           <div className="flex flex-col gap-4" data-testid="agent-keys">
-            {load.view.keys.map((k) => (
-              <KeyCard key={k.name} keyView={k} installationId={installationId} api={api} onSaved={(view) => setLoad({ state: 'ok', view })} />
+            {primary.map((k) => (
+              <KeyCard key={k.name} keyView={k} installationId={installationId} api={api} onSaved={onSaved} />
             ))}
+            {others.length > 0 &&
+              (primary.length === 0 ? (
+                others.map((k) => <KeyCard key={k.name} keyView={k} installationId={installationId} api={api} onSaved={onSaved} />)
+              ) : (
+                <details className="rounded-lg border border-border p-4" data-testid="other-agents">
+                  <summary className="cursor-pointer font-medium">Other agents ({others.map((k) => providerOf(k).agent).join(', ')})</summary>
+                  <div className="mt-4 flex flex-col gap-4">
+                    {others.map((k) => (
+                      <KeyCard key={k.name} keyView={k} installationId={installationId} api={api} onSaved={onSaved} />
+                    ))}
+                  </div>
+                </details>
+              ))}
           </div>
           <p className="text-sm" data-testid="keys-privacy">
             🔒 Keys are write-only. Once saved, a key is never shown again, not even to you; it is stored encrypted and read only by your own jobs, and is removed when you
@@ -125,12 +198,12 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
 }
 
 function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentKeyView; installationId: number; api: Api; onSaved: (view: AgentKeysView) => void }) {
-  const provider = PROVIDERS[k.name] ?? { agent: k.name, company: k.name, placeholder: '', getKeyUrl: '', problem: () => null };
+  const provider = providerOf(k);
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [savedAt, setSavedAt] = useState(false);
+  const [saved, setSaved] = useState(false);
   const input = useRef<HTMLInputElement>(null);
 
   const typed = value.trim();
@@ -151,7 +224,7 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
       // Gone from the page the moment it is saved.
       setValue('');
       setEditing(false);
-      setSavedAt(true);
+      setSaved(true);
       onSaved(view);
     } catch (err) {
       // The typed value stays, so a typo or a transient failure is fixed in place, not retyped.
@@ -162,17 +235,20 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
     }
   }
 
+  const state = k.configured
+    ? k.lastUsed && !k.lastUsed.ok
+      ? { label: 'Last job failed', tone: 'warning' as const }
+      : { label: k.lastUsed ? 'Working' : 'Saved', tone: 'success' as const }
+    : { label: 'Not set', tone: k.required ? ('warning' as const) : ('neutral' as const) };
+
   return (
     <Card data-testid={`key-${k.name}`}>
       <CardHeader>
         <CardTitle className="flex flex-wrap items-center gap-2">
           {provider.agent}
-          <StatusBadge tone={k.configured ? 'success' : k.required ? 'warning' : 'neutral'}>{k.configured ? 'Configured' : 'Not set'}</StatusBadge>
-          <StatusBadge tone="neutral">{k.required ? 'Required by your configuration' : 'Optional'}</StatusBadge>
+          <StatusBadge tone={state.tone}>{state.label}</StatusBadge>
+          {k.required && <StatusBadge tone="neutral">Used by your configuration</StatusBadge>}
         </CardTitle>
-        <CardDescription>
-          {provider.guide?.credential ?? `${provider.company} API key`} · {provider.guide?.billing ? `${provider.guide.billing} · ` : ''}<code>{k.name}</code>
-        </CardDescription>
       </CardHeader>
       <CardBody>
         <div className="flex flex-col gap-4">
@@ -195,12 +271,11 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
                 {k.lastRotatedBy ? ` by ${k.lastRotatedBy}` : ''}.
               </p>
               {k.lastUsed ? (
-                <p className="flex flex-wrap items-center gap-2">
-                  Last used <span title={exact(k.lastUsed.at)}>{relativeTime(k.lastUsed.at)}</span>
-                  <StatusBadge tone={k.lastUsed.ok ? 'success' : 'error'}>{k.lastUsed.ok ? 'Worked' : 'Failed'}</StatusBadge>
+                <p>
+                  Last used <span title={exact(k.lastUsed.at)}>{relativeTime(k.lastUsed.at)}</span>.
                 </p>
               ) : (
-                <p>No job has used it yet.</p>
+                <p>{provider.checkedOnSave ? 'No job has used it yet.' : `No job has used it yet. ${provider.company} has no way to check a key ahead of time, so the first job is the check.`}</p>
               )}
               {k.lastUsed && !k.lastUsed.ok && (
                 <p data-testid={`key-failed-${k.name}`}>
@@ -210,14 +285,22 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
             </div>
           )}
 
-          {savedAt && !showForm && (
+          {saved && !showForm && (
             <p role="status" className="text-sm font-medium" data-testid={`key-saved-${k.name}`}>
-              ✓ {provider.company} accepted the key. Your next job will use it.
+              {provider.checkedOnSave ? `✓ ${provider.company} accepted the key. Your next job will use it.` : `✓ Saved. Your next ${provider.agent} job will use it, and this card will say how it went.`}
             </p>
           )}
 
           {showForm ? (
             <form className="flex flex-col gap-3" onSubmit={(e) => void save(e)} noValidate>
+              {!k.configured && provider.steps.length > 0 && (
+                <ol className="flex list-decimal flex-col gap-1.5 pl-5 text-sm" data-testid={`key-steps-${k.name}`}>
+                  {provider.steps.map((step, i) => (
+                    <li key={i}>{step}</li>
+                  ))}
+                  <li>Paste it here.</li>
+                </ol>
+              )}
               <PasswordInput
                 ref={input}
                 label={k.configured ? 'New key' : `${provider.company} API key`}
@@ -227,7 +310,7 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
                 placeholder={provider.placeholder}
                 value={value}
                 disabled={busy}
-                {...(problem ? { error: problem } : { hint: 'Pasted, checked with the provider, then never shown again.' })}
+                {...(problem ? { error: problem } : { hint: provider.checkedOnSave ? `Checked with ${provider.company}, then never shown again.` : 'Saved, then never shown again.' })}
                 onChange={(e) => {
                   setValue(e.target.value);
                   setError(null);
@@ -239,11 +322,11 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
                 </Alert>
               )}
               <p role="status" className="text-sm" aria-live="polite">
-                {busy ? `Checking the key with ${provider.company}…` : ''}
+                {busy ? (provider.checkedOnSave ? `Checking the key with ${provider.company}…` : 'Saving…') : ''}
               </p>
               <div className="flex flex-wrap items-center gap-3">
                 <Button type="submit" loading={busy} disabled={!typed || !!problem}>
-                  {k.configured ? 'Check and replace' : 'Check and save'}
+                  {provider.checkedOnSave ? (k.configured ? 'Check and replace' : 'Check and save') : k.configured ? 'Replace' : 'Save'}
                 </Button>
                 {k.configured && (
                   <Button
@@ -259,6 +342,11 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
                     Cancel
                   </Button>
                 )}
+                {k.configured && provider.getKeyUrl && (
+                  <a className="auth-link text-sm" href={provider.getKeyUrl} target="_blank" rel="noreferrer">
+                    Get a {provider.company} key ↗
+                  </a>
+                )}
               </div>
             </form>
           ) : (
@@ -266,7 +354,7 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
               <Button
                 variant="secondary"
                 onClick={() => {
-                  setSavedAt(false);
+                  setSaved(false);
                   setEditing(true);
                 }}
               >

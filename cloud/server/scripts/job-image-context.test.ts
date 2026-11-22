@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildContext, CLOUD_BUILD_ENV, IMAGE_DIR } from './job-image-context.js';
 
@@ -22,5 +24,12 @@ describe('the job image build context', () => {
     const env = entries.find((e) => e.path === 'build.env')!.data.toString('utf8');
     expect(env.endsWith(CLOUD_BUILD_ENV)).toBe(true);
     expect(env).toContain('AGENT_PACKAGES="@anthropic-ai/claude-code @openai/codex"');
+    expect(env).toContain('KIRO_INSTALL_COMMAND="sh /opt/updraft/install-kiro-rpm.sh"');
+    expect(paths).toContain('install-kiro-rpm.sh');
+  });
+
+  it('leaves the ARM64 Kiro installer off for self-hosted images', () => {
+    const defaults = readFileSync(join(IMAGE_DIR, 'build.env'), 'utf8');
+    expect(defaults.match(/^KIRO_INSTALL_COMMAND=.*$/gm)).toEqual(['KIRO_INSTALL_COMMAND=""']);
   });
 });

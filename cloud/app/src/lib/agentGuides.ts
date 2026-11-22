@@ -7,7 +7,7 @@ export interface GuideLink {
 export interface AgentGuide {
   agent: string;
   /** Updraft's key name for the credential; null when the deployment has no key slot for it. */
-  keyName: string | null;
+  keyName: string;
   /** The credential Updraft takes, in the provider's words. */
   credential: string;
   billing: string;
@@ -38,7 +38,7 @@ export const AGENT_GUIDES: Record<'claude' | 'codex' | 'kiro', AgentGuide> = {
   },
   kiro: {
     agent: 'Kiro',
-    keyName: null,
+    keyName: 'KIRO_API_KEY',
     credential: 'Kiro headless API key',
     billing: 'Kiro credits',
     getKeyUrl: 'https://app.kiro.dev/',

@@ -1,6 +1,6 @@
 import { parse } from 'yaml';
 import type { DispatchRules } from '../store/store.js';
-import { AGENT_KEY_ENV, type CloudAgent } from './agents.js';
+import { SUPPORTED_AGENT_KEY_ENV, type CloudAgent } from './agents.js';
 import { decideDispatch, dispatchRules } from './dispatch.js';
 
 /**
@@ -46,7 +46,8 @@ export function poolAgentKeys(compiled: { agents?: unknown; pools?: unknown }, p
     const agent = typeof name === 'string' ? agents[name] : undefined;
     if (!isObject(agent) || agent.enabled === false) continue;
     const adapter = (agent.adapter ?? name) as CloudAgent;
-    if (adapter in AGENT_KEY_ENV) out.push({ agent: name as string, key: AGENT_KEY_ENV[adapter] });
+    // Any agent a version may name, whatever this deployment offers now: it was valid when published.
+    if (adapter in SUPPORTED_AGENT_KEY_ENV) out.push({ agent: name as string, key: SUPPORTED_AGENT_KEY_ENV[adapter] });
   }
   return out;
 }

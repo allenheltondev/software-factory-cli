@@ -285,7 +285,8 @@ export type TelemetryRegion = 'us' | 'eu';
 export type TelemetryProvider = 'honeycomb' | 'cloudwatch' | 'otlp';
 /** The destination and its key, saved together: a custom endpoint never changes without its key. */
 export type TelemetryKeyInput =
-  | { provider?: 'honeycomb'; value: string; region: TelemetryRegion }
+  /** `auto`: the region is found from the key (the US, then the EU). */
+  | { provider?: 'honeycomb'; value: string; region: TelemetryRegion | 'auto' }
   | { provider: 'cloudwatch'; value: string; awsRegion: string }
   | { provider: 'otlp'; value: string; endpoint: string; header: string };
 export interface TelemetryLinks {
@@ -453,14 +454,23 @@ export interface Overview {
   tenant: TenantSummary;
   installation: { status: InstallationStatus; checked: boolean; missingPermissions: { name: string; needs: string; granted?: string }[] };
   repositories: { fullName: string; htmlUrl?: string; private?: boolean; reachable: boolean; configured: boolean; paused: boolean }[];
-  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string };
+  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string; triggers?: { repository: string; label: string }[];
+    /** Configured repositories GitHub now has under another id: publish again for them. */
+    replaced?: string[];
+    /** Agents the viewer's labels run that the deployment no longer runs. */
+    retiredAgents?: string[];
+  };
   keys: AgentKeyView[];
+  /** Whether traces are set up to go somewhere, and are on. Absent from an older API. */
+  telemetry?: { configured: boolean; enabled: boolean };
   activity: {
     /** Counts over 30 days, or of the latest entries when a list is not complete. */
     window: { deliveries: number; deliveriesComplete: boolean; jobs: number; jobsComplete: boolean };
     deliveries: Partial<Record<DeliveryDisposition, number>>;
     jobs: Partial<Record<JobResult, number>>;
     lastDeliveryAt?: string;
+    /** When the first job ever started (kept for good). */
+    firstJobAt?: string;
     running: number;
   };
 }
@@ -474,7 +484,7 @@ export interface JobLog {
 
 // A tenant's configuration (server/src/tenants/console.ts and config-service.ts).
 
-export type AgentAdapter = 'claude' | 'codex';
+export type AgentAdapter = 'claude' | 'codex' | 'kiro';
 export type MergeMethod = 'squash' | 'merge' | 'rebase';
 
 export interface ConsoleAgent {
@@ -529,6 +539,8 @@ export interface ConfigView {
   githubLogin: string;
   repositories: Repository[];
   agentKeys: Record<string, boolean>;
+  /** The agents this deployment runs: what the editor offers. Absent from an older API: Claude and Codex. */
+  agents?: AgentAdapter[];
   activeVersion: number | null;
   source: 'console' | 'tenant' | 'none';
   config: ConsoleConfig;

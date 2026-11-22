@@ -4,6 +4,7 @@ import { FlowError, type GitHubFlows, type TenantSummary } from '../flows/github
 import { countBy, deliveryCounts, jobResult, type JobResult } from '../jobs/status.js';
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from './agents.js';
 import { redact } from './redact.js';
 import type { TelemetryMarkKind, TelemetryTotals } from '../jobs/lifecycle.js';
 import { parseOtlpEndpoint } from './otlp-destination.js';
@@ -114,8 +115,20 @@ export interface Overview {
     missingPermissions: MissingPermission[];
   };
   repositories: { fullName: string; htmlUrl?: string; private?: boolean; reachable: boolean; configured: boolean; paused: boolean }[];
-  config: { activeVersion: number | null; publishedAt?: string; publishedBy?: string };
+  config: {
+    activeVersion: number | null;
+    publishedAt?: string;
+    publishedBy?: string;
+    /** The labels that start a job, by repository (enabled repositories only; at most 10): what to try first. */
+    triggers?: { repository: string; label: string }[];
+    /** Configured repositories GitHub now has under another id (recreated, or a new one by that name): the config must be published again for them. */
+    replaced?: string[];
+    /** Agents the viewer's labels run that this deployment no longer runs: those workflows need another agent. */
+    retiredAgents?: string[];
+  };
   keys: AgentKeyView[];
+  /** Whether traces are set up to go somewhere (a destination and its key), and are on. */
+  telemetry: { configured: boolean; enabled: boolean };
   /**
    * Counts over the last 30 days, or, when `window` says a list is not complete, over its latest
    * ACTIVITY_SAMPLE entries (running counts the latest jobs only).
@@ -125,6 +138,8 @@ export interface Overview {
     deliveries: Partial<Record<DeliveryRecord['disposition'], number>>;
     jobs: Partial<Record<JobResult, number>>;
     lastDeliveryAt?: string;
+    /** When the first job ever started: kept on the tenant, so it outlives the job records. */
+    firstJobAt?: string;
     running: number;
   };
 }
@@ -220,7 +235,7 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
 
   return {
     async overview(caller: Caller, installationId: number): Promise<Overview> {
-      const { tenant, summary } = await github.member(caller, installationId);
+      const { tenant, summary, githubLogin } = await github.member(caller, installationId);
       // GitHub's view first: suspended or gone there is what the tenant needs to know, even before our record has caught up.
       let checked = true;
       let gh: Awaited<ReturnType<typeof github.installation>> | undefined;
@@ -242,16 +257,18 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
                 ? 'missing_permissions'
                 : 'active';
 
-      const [reachable, version, keys, deliveries, jobs] = await Promise.all([
+      const [reachable, version, keys, deliveries, jobs, telemetrySettings] = await Promise.all([
         status === 'uninstalled' || status === 'suspended' ? Promise.resolve([]) : github.repositories(caller, installationId).then((r) => r.repositories).catch(() => []),
         tenant.activeConfigVersion !== undefined ? store.getConfigVersion(installationId, tenant.activeConfigVersion) : Promise.resolve(null),
         agentKeys.list(caller, installationId).then((v) => v.keys),
         store.listDeliveries(installationId, ACTIVITY_SAMPLE + 1),
         store.listRecentJobs(installationId, ACTIVITY_SAMPLE + 1),
+        store.getTelemetry(installationId).catch(() => null),
       ]);
 
       const configured = version?.dispatch?.repositories ?? {};
       const repos = new Map<string, Overview['repositories'][number]>();
+      const liveIds = new Map(reachable.map((r) => [r.fullName.toLowerCase(), r.id]));
       for (const r of reachable) {
         const c = configured[r.fullName.toLowerCase()];
         repos.set(r.fullName.toLowerCase(), { fullName: r.fullName, htmlUrl: r.htmlUrl, private: r.private, reachable: true, configured: Boolean(c), paused: Boolean(c?.paused) });
@@ -267,16 +284,63 @@ export function createStatusService({ store, github, agentKeys, readLog, resultR
       deliveries.splice(ACTIVITY_SAMPLE);
       jobs.splice(ACTIVITY_SAMPLE);
       const results = jobs.map(jobResult);
+      // A tenant whose first job started before the marker existed: seeded from the job records
+      // still kept (one the broker started has a duration), before they expire. Best effort.
+      let firstJobAt = tenant.firstJobAt;
+      if (!firstJobAt) {
+        const started = jobs.filter((j) => j.durationSeconds !== undefined).map((j) => j.createdAt).sort()[0];
+        if (started) {
+          firstJobAt = started;
+          await store.markFirstJob(installationId, started).catch((err: unknown) => log({ installationId, warning: `could not seed the first job: ${(err as Error)?.name}` }));
+        }
+      }
+      // The labels the viewer can start a job with: in a repository the installation reaches and
+      // is not paused, by the dispatch rules' own actor check, named as the installation reports
+      // the repository.
+      const viewer = githubLogin?.toLowerCase();
+      // Dispatch matches the published id too: a repository recreated under the same name is not the configured one.
+      const replaced = Object.entries(configured)
+        .filter(([name, c]) => liveIds.has(name) && liveIds.get(name) !== c.id)
+        .map(([name]) => repos.get(name)!.fullName)
+        .sort();
+      // The viewer's labels, then only those whose agents this deployment runs (the launcher
+      // refuses the others). A version from before keys were recorded: its keys are not known here.
+      const offered = new Set<string>(Object.values(AGENT_KEY_ENV));
+      const retired = new Set<string>();
+      const triggers = viewer
+        ? Object.entries(configured)
+            .filter(([name, c]) => !c.paused && repos.get(name)?.reachable && liveIds.get(name) === c.id)
+            .flatMap(([name, c]) =>
+              c.triggers
+                .filter((t) => (t.actors ?? c.actors ?? []).includes(viewer))
+                .filter((t) => {
+                  const off = (t.keys ?? c.keys ?? []).filter((k) => !offered.has(k));
+                  for (const k of off) for (const [agent, key] of Object.entries(SUPPORTED_AGENT_KEY_ENV)) if (key === k) retired.add(agent);
+                  return off.length === 0;
+                })
+                .map((t) => ({ repository: repos.get(name)!.fullName, label: t.label })),
+            )
+            .slice(0, 10)
+        : [];
+      const retiredAgents = triggers.length ? [] : [...retired].sort();
       return {
         tenant: summary,
         installation: { status, checked, missingPermissions: missing },
         repositories: [...repos.values()].sort((a, b) => Number(b.configured) - Number(a.configured) || a.fullName.localeCompare(b.fullName)),
-        config: { activeVersion: tenant.activeConfigVersion ?? null, ...(version ? { publishedAt: version.publishedAt, publishedBy: version.publishedBy } : {}) },
+        config: {
+          activeVersion: tenant.activeConfigVersion ?? null,
+          ...(version ? { publishedAt: version.publishedAt, publishedBy: version.publishedBy } : {}),
+          ...(triggers.length ? { triggers } : {}),
+          ...(replaced.length ? { replaced } : {}),
+          ...(retiredAgents.length ? { retiredAgents } : {}),
+        },
         keys,
+        telemetry: { configured: Boolean(telemetrySettings?.key), enabled: Boolean(telemetrySettings?.key && telemetrySettings.enabled) },
         activity: {
           deliveries: deliveryCounts(deliveries),
           jobs: countBy(results.filter((r) => r !== 'running')),
           ...(deliveries[0] ? { lastDeliveryAt: deliveries[0].at } : {}),
+          ...(firstJobAt ? { firstJobAt } : {}),
           running: results.filter((r) => r === 'running').length,
           window: { deliveries: deliveries.length, deliveriesComplete, jobs: jobs.length, jobsComplete },
         },

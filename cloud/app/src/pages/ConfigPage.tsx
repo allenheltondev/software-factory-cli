@@ -26,8 +26,11 @@ export const WORKFLOW_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const AGENTS: { value: AgentAdapter; label: string }[] = [
   { value: 'claude', label: 'Claude Code' },
   { value: 'codex', label: 'Codex' },
+  { value: 'kiro', label: 'Kiro' },
 ];
-const KEY_FOR: Record<AgentAdapter, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY' };
+const KEY_FOR: Record<AgentAdapter, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY' };
+/** What an API from before the deployment named its agents offers. */
+const DEFAULT_OFFERED: AgentAdapter[] = ['claude', 'codex'];
 const MERGE_METHODS: { value: MergeMethod; label: string }[] = [
   { value: 'squash', label: 'Squash and merge' },
   { value: 'merge', label: 'Merge commit' },
@@ -58,11 +61,14 @@ export function newRepository(workflow: string, login: string): ConsoleRepositor
   };
 }
 
-export function newWorkflow(prompts: ConfigView['defaults']['prompts']): ConsoleWorkflow {
+/** A new workflow's agents, from those the deployment runs: Claude writes when it can, another agent reviews when there is one. */
+export function newWorkflow(prompts: ConfigView['defaults']['prompts'], offered: readonly AgentAdapter[] = DEFAULT_OFFERED): ConsoleWorkflow {
+  const agent: AgentAdapter = offered.includes('claude') ? 'claude' : (offered[0] ?? 'claude');
+  const reviewer: AgentAdapter = offered.includes('codex') && agent !== 'codex' ? 'codex' : (offered.find((x) => x !== agent) ?? agent);
   return {
-    agent: { adapter: 'claude' },
+    agent: { adapter: agent },
     prompt: prompts.implement,
-    reviewer: { adapter: 'codex', prompt: prompts.review },
+    reviewer: { adapter: reviewer, prompt: prompts.review },
     revisePrompt: prompts.revise,
     verify: [],
   };
@@ -99,12 +105,32 @@ function ParsedText({
   );
 }
 
-function AgentFields({ agent, onChange, issues, path, title, installationId, reviewer }: { agent: ConsoleAgent; onChange: (a: ConsoleAgent) => void; issues: ConfigIssue[]; path: string; title: string; installationId: number; reviewer?: { differs: boolean } }) {
+function AgentFields({
+  agent,
+  onChange,
+  issues,
+  path,
+  title,
+  offered,
+  installationId,
+  reviewer,
+}: {
+  agent: ConsoleAgent;
+  onChange: (a: ConsoleAgent) => void;
+  issues: ConfigIssue[];
+  path: string;
+  title: string;
+  offered: AgentAdapter[];
+  installationId: number;
+  reviewer?: { differs: boolean };
+}) {
   const guide: AgentGuide | undefined = AGENT_GUIDES[agent.adapter];
+  // The deployment's agents, and the one already chosen if it is not among them (published before).
+  const choices = AGENTS.filter((a) => offered.includes(a.value) || a.value === agent.adapter);
   return (
     <div className="grid gap-4 sm:grid-cols-3">
       <Select label={title} value={agent.adapter} error={issuesAt(issues, `${path}.adapter`)} onChange={(e) => onChange({ ...agent, adapter: e.target.value as AgentAdapter })}>
-        {AGENTS.map((a) => (
+        {choices.map((a) => (
           <option key={a.value} value={a.value}>
             {a.label}
           </option>
@@ -130,9 +156,9 @@ function AgentFields({ agent, onChange, issues, path, title, installationId, rev
           <span>
             {guide.credential} · {guide.billing}
           </span>
-          <Link className="auth-link" to={`/installations/${installationId}/keys`}>
-            Agent keys
-          </Link>
+          <a className="auth-link" href={`/installations/${installationId}/keys`} target="_blank" rel="noreferrer">
+            Agent keys ↗
+          </a>
           <a className="auth-link" href={guide.getKeyUrl} target="_blank" rel="noreferrer">
             Get API key ↗
           </a>
@@ -198,6 +224,26 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
     setConfirmed(new Set());
     setGeneration((g) => g + 1);
   }, []);
+
+  // Back from adding a key in another tab: refresh which keys are set, and leave the draft alone.
+  useEffect(() => {
+    if (!valid) return;
+    let live = true;
+    const refresh = () => {
+      if (document.visibilityState !== 'visible') return;
+      api.config(installationId).then(
+        (fresh) => live && setLoad((prev) => (prev.state === 'ok' ? { state: 'ok', view: { ...prev.view, agentKeys: fresh.agentKeys } } : prev)),
+        () => undefined,
+      );
+    };
+    document.addEventListener('visibilitychange', refresh);
+    window.addEventListener('focus', refresh);
+    return () => {
+      live = false;
+      document.removeEventListener('visibilitychange', refresh);
+      window.removeEventListener('focus', refresh);
+    };
+  }, [api, installationId, valid]);
 
   useEffect(() => {
     let live = true;
@@ -274,7 +320,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
     if (config && Object.hasOwn(config.workflows, name)) return setWorkflowError('There is already a workflow with that name');
     setWorkflowError(undefined);
     setWorkflowName('');
-    edit({ ...config!, workflows: { ...config!.workflows, [name]: newWorkflow(prompts) } });
+    edit({ ...config!, workflows: { ...config!.workflows, [name]: newWorkflow(prompts, view.agents ?? DEFAULT_OFFERED) } });
   }
 
   const confirmAutoMerge = () => [...confirmed].some((r) => config.repositories[r]?.autoMerge !== undefined);
@@ -633,7 +679,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                       Remove
                     </Button>
                   </div>
-                  <AgentFields title="Agent" installationId={installationId} agent={w.agent} path={`${path}.agent`} issues={errors} onChange={(agent) => updateWorkflow(name, { agent })} />
+                  <AgentFields title="Agent" installationId={installationId} agent={w.agent} path={`${path}.agent`} issues={errors} offered={view.agents ?? DEFAULT_OFFERED} onChange={(agent) => updateWorkflow(name, { agent })} />
                   <PromptField
                     label="Prompt"
                     value={w.prompt}
@@ -685,6 +731,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                         installationId={installationId}
                         reviewer={{ differs: w.reviewer.adapter !== w.agent.adapter }}
                         agent={w.reviewer}
+                        offered={view.agents ?? DEFAULT_OFFERED}
                         path={`${path}.reviewer`}
                         issues={errors}
                         onChange={(a) => updateWorkflow(name, { reviewer: { ...a, prompt: w.reviewer.prompt } })}

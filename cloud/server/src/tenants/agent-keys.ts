@@ -1,6 +1,6 @@
 import type { AgentKeyMeta, Store } from '../store/store.js';
 // Not from config.ts: that pulls in the CLI's whole validator, which nothing here needs.
-import { AGENT_KEY_ENV } from './agents.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from './agents.js';
 import type { KeyChecker } from './key-check.js';
 
 /**
@@ -15,7 +15,13 @@ import type { KeyChecker } from './key-check.js';
  * key is set, when, and by whom (AgentKeyMeta in the table).
  */
 
+/** The keys this deployment asks for (its agents'). */
 export const AGENT_KEY_NAMES = Object.values(AGENT_KEY_ENV) as string[];
+/** Every key any deployment may have stored: what a job may be handed and an uninstall deletes, whatever is offered now. */
+/** Keys no provider call checks when saved (Kiro's): only a job that ran its agent says whether it works. */
+export const UNCHECKED_AGENT_KEYS: ReadonlySet<string> = new Set([SUPPORTED_AGENT_KEY_ENV.kiro]);
+
+export const ALL_AGENT_KEY_NAMES = Object.values(SUPPORTED_AGENT_KEY_ENV) as string[];
 /** Every key secret of a tenant starts with this (the uninstall cleanup deletes them by name). */
 export const agentKeySecretPrefix = (installationId: number) => `updraft/tenants/${installationId}/agent-keys/`;
 export const agentKeySecretName = (installationId: number, name: string) => `${agentKeySecretPrefix(installationId)}${name}`;
@@ -32,9 +38,12 @@ export interface SecretsPort {
 const KEY_SHAPE: Record<string, RegExp> = {
   ANTHROPIC_API_KEY: /^sk-ant-[A-Za-z0-9_-]{20,}$/,
   CODEX_API_KEY: /^sk-[A-Za-z0-9_-]{20,}$/,
+  // Kiro documents no format: one token of key characters, and never another provider's key.
+  KIRO_API_KEY: /^(?!sk-)[A-Za-z0-9_.:+/=-]{20,512}$/,
 };
 
-const providerOf = (name: string) => (name === 'ANTHROPIC_API_KEY' ? 'Anthropic' : 'OpenAI');
+const PROVIDER: Record<string, string> = { ANTHROPIC_API_KEY: 'Anthropic', CODEX_API_KEY: 'OpenAI', KIRO_API_KEY: 'Kiro' };
+const providerOf = (name: string) => PROVIDER[name] ?? name;
 
 export type SetKeyResult = { ok: true; meta: AgentKeyMeta } | { ok: false; message: string };
 
@@ -56,6 +65,8 @@ export async function setAgentKey(
   const verdict = await deps.check(name, value);
   if (verdict === 'invalid') return { ok: false, message: `${providerOf(name)} rejected that key; nothing was changed` };
   if (verdict === 'unavailable') return { ok: false, message: `could not check the key with ${providerOf(name)} just now; nothing was changed, try again` };
+  // 'unchecked': the provider has no call to check a key with (Kiro). Saved on its shape; the
+  // first job that uses it tells, and the key's "last used" says how that went.
 
   const secretName = agentKeySecretName(installationId, name);
   await deps.secrets.put(secretName, value, { installationId: String(installationId), app: 'updraft-cloud' });

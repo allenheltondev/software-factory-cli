@@ -16,8 +16,8 @@ outputs are recorded. Running Updraft yourself, the standard OpenTelemetry varia
 
 ### Honeycomb
 
-A Honeycomb Ingest key, checked with Honeycomb's `/1/auth` before it is saved, and the region (US
-or EU). The runner sends to `https://api.honeycomb.io/v1/traces` (or `api.eu1`) with the key in
+A Honeycomb Ingest key, checked with Honeycomb's `/1/auth` before it is saved. Its region (US or
+EU) is found from the key: the console asks the US first, then the EU (`region: "auto"`). The runner sends to `https://api.honeycomb.io/v1/traces` (or `api.eu1`) with the key in
 `x-honeycomb-team`; the service name is the dataset. Honeycomb's
 [Agent Timeline](https://docs.honeycomb.io/investigate/observe/agent-timeline), on every plan
 including the free one, shows each conversation. The key's team and environment slugs make the

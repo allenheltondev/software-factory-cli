@@ -254,6 +254,8 @@ describe('agent telemetry: Codex and the review loop', () => {
     expect(agents.map((a) => a.attributes['updraft.job.kind']).sort()).toEqual(['implement', 'revision']);
     expect(out.conversationIds).toEqual(['octo/widgets#7']);
     expect(out.runs.map((r) => r.kind)).toEqual(['implement', 'review', 'revision']);
+    // The agents that ran, whose keys the job used.
+    expect(out.adapters).toEqual(['claude', 'codex']);
   });
 
   it('times a line by when it was written, across polls, and ignores what is not a run', async () => {

@@ -77,7 +77,9 @@ describe('InstallationPage', () => {
   it('links the selected agent and reviewer to their setup guides and the Agent keys page', async () => {
     configPage(fakeApi({ config: async () => view() }));
     const agent = await screen.findByTestId('agent-help-workflows.implement.agent');
-    expect(within(agent).getByRole('link', { name: 'Agent keys' })).toHaveAttribute('href', '/installations/55/keys');
+    expect(within(agent).getByRole('link', { name: /Agent keys/ })).toHaveAttribute('href', '/installations/55/keys');
+    // It opens beside the editor, so an unpublished draft is not lost.
+    expect(within(agent).getByRole('link', { name: 'Agent keys ↗' })).toHaveAttribute('target', '_blank');
     expect(within(agent).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://platform.claude.com/settings/keys');
     expect(within(agent).getByRole('link', { name: /Get your Claude API key/ })).toHaveAttribute('href', 'https://platform.claude.com/docs/en/get-api-key');
     expect(agent).toHaveTextContent('Claude Console API key · API billing');
@@ -86,6 +88,28 @@ describe('InstallationPage', () => {
     expect(within(reviewer).getByRole('link', { name: /OpenAI API key creation/ })).toHaveAttribute('href', 'https://developers.openai.com/api/docs/quickstart#create-and-export-an-api-key');
     // This deployment offers no Kiro, so no Kiro help appears.
     expect(screen.queryByText(/Kiro/)).toBeNull();
+  });
+
+  it('shows Kiro help when the deployment offers Kiro and a workflow runs it', async () => {
+    const config = baseConfig();
+    config.workflows.implement!.agent = { adapter: 'kiro' };
+    configPage(fakeApi({ config: async () => view({ agents: ['claude', 'codex', 'kiro'], config, agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } }) }));
+    const agent = await screen.findByTestId('agent-help-workflows.implement.agent');
+    expect(agent).toHaveTextContent('Kiro headless API key · Kiro credits');
+    expect(within(agent).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://app.kiro.dev/');
+    expect(within(agent).getByRole('link', { name: /Generate a Kiro API key/ })).toHaveAttribute('href', 'https://kiro.dev/docs/getting-started/authentication/#generate-an-api-key');
+    expect(within(agent).getByRole('link', { name: /Enable API keys for an organization/ })).toHaveAttribute('href', 'https://kiro.dev/docs/enterprise/governance/api-keys/');
+  });
+
+  it('refreshes key status when the tab regains focus without touching the draft', async () => {
+    const config = vi.fn().mockResolvedValue(view({ agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } }));
+    configPage(fakeApi({ config }));
+    await addRepository();
+    expect(await screen.findByText(/Set ANTHROPIC_API_KEY before publishing/)).toBeInTheDocument();
+    config.mockResolvedValue(view({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true } }));
+    window.dispatchEvent(new Event('focus'));
+    await waitFor(() => expect(screen.queryByText(/before publishing/)).toBeNull());
+    expect(screen.getByTestId('repo-acme/web')).toBeInTheDocument();
   });
 
   it('links an active installation to its configuration', async () => {
@@ -271,6 +295,22 @@ describe('ConfigPage', () => {
     expect(screen.getByTestId('config-tenant-source')).toHaveTextContent('Version 7 was published with tenant-admin');
     expect(screen.getByTestId('config-readonly')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+  });
+
+  it("offers the deployment's agents, Kiro among them when it runs Kiro, and asks for a Kiro workflow's key", async () => {
+    const config = baseConfig();
+    config.workflows.implement!.agent = { adapter: 'kiro' };
+    config.repositories['acme/web'] = { enabled: true, triggers: [{ label: 'updraft', workflow: 'implement' }], allowedActors: ['pat'], publish: 'draft-pr', commentOnFailure: true, review: false, revise: false };
+    const { unmount } = configPage(fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } })) }));
+    const agent = (await screen.findAllByLabelText('Agent'))[0]!;
+    expect(within(agent).getAllByRole('option').map((o) => o.textContent)).toEqual(['Claude Code', 'Codex', 'Kiro']);
+    expect(agent).toHaveValue('kiro');
+    expect(screen.getByTestId('config-missing-keys')).toHaveTextContent('KIRO_API_KEY');
+    unmount();
+    // A deployment without Kiro does not offer it, unless a workflow already runs it.
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(view({ agents: ['claude', 'codex'] })) }));
+    const plain = (await screen.findAllByLabelText('Agent'))[0]!;
+    expect(within(plain).getAllByRole('option').map((o) => o.textContent)).toEqual(['Claude Code', 'Codex']);
   });
 
   it('adds a workflow with the packaged prompts, and resets an edited prompt', async () => {

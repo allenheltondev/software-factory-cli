@@ -22,6 +22,7 @@ import { api as defaultApi, type ApiClient, type Delivery, type DeliveryDisposit
 import { DISPOSITION, INSTALLATION, JOB_RESULT, deliveryReason, formatDuration, installationSettingsUrl } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
 import { LoopBadges } from '../components/lifecycle';
+import { SetupChecklist, setupComplete, setupSteps } from '../components/setup';
 
 type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'>;
 type Tab = 'jobs' | 'deliveries' | 'repositories';
@@ -138,6 +139,8 @@ function Loaded({
   const finished = Object.entries(overview.activity.jobs).reduce((n, [, v]) => n + (v ?? 0), 0);
   const succeeded = (overview.activity.jobs.success ?? 0) + (overview.activity.jobs.nothing_to_do ?? 0);
   const deliveryTotal = Object.values(overview.activity.deliveries).reduce((n, v) => n + (v ?? 0), 0);
+  const steps = setupSteps(overview, base);
+  const inSetup = !setupComplete(steps);
 
   return (
     <>
@@ -176,7 +179,9 @@ function Loaded({
         </div>
       </PageHero>
 
-      <Attention overview={overview} base={base} />
+      <SetupChecklist steps={steps} />
+
+      <Attention overview={overview} base={base} skip={inSetup ? SETUP_COVERS : NONE} />
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" data-testid="stats">
         <StatTile
@@ -226,8 +231,12 @@ function Loaded({
   );
 }
 
-/** What needs doing before jobs can run, each with where to do it. */
-function Attention({ overview, base }: { overview: Overview; base: string }) {
+/** While the setup checklist is shown, what it already says (the App, the config, the keys). */
+const SETUP_COVERS = new Set(['permissions', 'suspended', 'config', 'keys']);
+const NONE = new Set<string>();
+
+/** What needs doing before jobs can run, each with where to do it; `skip`: what the setup checklist already says. */
+function Attention({ overview, base, skip }: { overview: Overview; base: string; skip: Set<string> }) {
   const t = overview.tenant;
   const items: { id: string; text: ReactNode; action?: ReactNode }[] = [];
   const github = (label: string) => (
@@ -279,7 +288,8 @@ function Attention({ overview, base }: { overview: Overview; base: string }) {
       action: github('Choose repositories on GitHub'),
     });
   }
-  if (!items.length) return null;
+  const shown = items.filter((i) => !skip.has(i.id));
+  if (!shown.length) return null;
   return (
     <Card data-testid="attention">
       <CardHeader>
@@ -287,7 +297,7 @@ function Attention({ overview, base }: { overview: Overview; base: string }) {
       </CardHeader>
       <CardBody>
         <ul className="flex flex-col gap-3">
-          {items.map((i) => (
+          {shown.map((i) => (
             <li key={i.id} className="flex flex-wrap items-baseline justify-between gap-2" data-testid={`attention-${i.id}`}>
               <span>{i.text}</span>
               {i.action}
