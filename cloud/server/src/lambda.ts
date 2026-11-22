@@ -1,3 +1,4 @@
+import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
@@ -9,6 +10,7 @@ import { callerFromClaims, groupsFrom, type Claims } from './caller.js';
 import { createGitHubFlows } from './flows/github.js';
 import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
+import type { RetryRequest, RetryResult } from './jobs/retry.js';
 import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { createAgentKeyService } from './tenants/agent-key-service.js';
@@ -60,6 +62,19 @@ const objects: ObjectStore = {
 // A job's logs (tenants/status-service.ts): only their end, read with a range. The function's
 // role reaches tenants/*/results/* for this, read only.
 const readLog = createS3LogReader(s3, bucket);
+
+// Retrying a job (jobs/retry.ts): the webhook function holds the launcher's permissions, so this
+// one invokes it directly, and only for a job it has already checked the caller may retry.
+const retryFunction = process.env.WEBHOOK_FUNCTION_NAME ?? '';
+const lambda = retryFunction ? new LambdaClient({}) : undefined;
+const requestRetry = async (installationId: number, jobId: string): Promise<RetryResult> => {
+  const out = await lambda!.send(
+    new InvokeCommand({ FunctionName: retryFunction, InvocationType: 'RequestResponse', Payload: Buffer.from(JSON.stringify({ updraftRetry: { installationId, jobId } } satisfies RetryRequest)) }),
+  );
+  // A function error (a crash, a timeout) carries no result: not a retry that started.
+  if (out.FunctionError || !out.Payload) return { ok: false, status: 502, code: 'retry_failed', message: 'The job could not be started; try again' };
+  return JSON.parse(Buffer.from(out.Payload).toString('utf8')) as RetryResult;
+};
 
 const agentKeyService =
   store && github
@@ -114,6 +129,7 @@ const app = createApp({
           resultRetentionDays: Math.max(1, Number(process.env.RESULT_RETENTION_DAYS ?? 30) || 30),
           timelineTemplate,
           ...(bucket ? { readLog } : {}),
+          ...(retryFunction ? { requestRetry } : {}),
         }),
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         // Insights: the tenant's shared state database, read only (tenants/*/state/state.db).

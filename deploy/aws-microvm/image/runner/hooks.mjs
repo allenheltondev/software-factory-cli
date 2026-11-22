@@ -158,10 +158,13 @@ function parseBrokerPayload(payload) {
   }
   // Isolation is always enforced for a hosted job; a payload cannot turn it off.
   if (payload.agentIsolation !== undefined && payload.agentIsolation !== 'enforced') throw new Error('runHookPayload.agentIsolation must be enforced');
+  // Optional: a retry from the console, so run-event requeues the event's failed jobs first (--retry).
+  if (payload.retry !== undefined && payload.retry !== true) throw new Error('runHookPayload.retry is malformed');
   const launchedAt = text(payload.launchedAt, 'launchedAt');
   if (Number.isNaN(Date.parse(launchedAt))) throw new Error('runHookPayload.launchedAt is not a date');
   return {
     ...(payload.notBefore === undefined ? {} : { notBefore: payload.notBefore }),
+    ...(payload.retry === true ? { retry: true } : {}),
     ...optionalSeconds('stateCheckpointSeconds', 3600),
     ...optionalSeconds('statePendingWaitSeconds', 1800),
     agentIsolation: 'enforced',

@@ -227,6 +227,10 @@ export interface JobView {
   issueUrl?: string;
   prUrl?: string;
   logs: string[];
+  /** The job ended without finishing its work, and the console can run it again. */
+  retryable?: boolean;
+  /** The job a retry started for this one. */
+  retriedAs?: string;
   /** What the runner reported at the finish (as the broker checked it). */
   detail?: JobDetail;
   /** Its agents' trace in the installation's tracing tool, when telemetry was on. */
@@ -660,6 +664,9 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     deliveries: (installationId: number, limit = 100) => request<{ deliveries: Delivery[] }>(`/installations/${installationId}/deliveries?limit=${limit}`),
     jobs: (installationId: number, limit = 100) => request<{ jobs: JobView[] }>(`/installations/${installationId}/jobs?limit=${limit}`),
     job: (installationId: number, jobId: string) => request<{ job: JobView; deliveries: Delivery[]; conversation?: JobView[] }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}`),
+    /** Runs a job that did not finish its work again, as a new job (its id). Throws ApiError: `not_retryable`, `already_retried`, `throttled`, `event_gone`, ... (409, 410, 429). */
+    retryJob: (installationId: number, jobId: string) =>
+      request<{ jobId: string }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' }),
     /** The end of a log; throws ApiError `log_expired` (410) once it is past the retention. */
     jobLog: (installationId: number, jobId: string, name: string) =>
       request<JobLog>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/logs/${encodeURIComponent(name)}`),

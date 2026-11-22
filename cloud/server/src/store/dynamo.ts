@@ -134,6 +134,7 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
     ...(typeof i.pullRequest === 'number' ? { pullRequest: i.pullRequest } : {}),
     ...(typeof i.label === 'string' ? { label: i.label } : {}),
     ...(typeof i.sender === 'string' ? { sender: i.sender } : {}),
+    ...(typeof i.retriedAs === 'string' ? { retriedAs: i.retriedAs } : {}),
     createdAt: String(i.createdAt),
     status: i.status === 'finished' ? 'finished' : 'launched',
     ...(typeof i.outcome === 'string' ? { outcome: i.outcome } : {}),
@@ -642,18 +643,35 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async markLaunching(jobId) {
+      // The phase and the job's own record of it, together: the active entry is deleted when the
+      // reservation is reclaimed, before the job is failed, so it cannot be the only evidence.
       try {
         await client.send(
-          new UpdateCommand({
-            TableName: T,
-            Key: activeKey(jobId),
-            UpdateExpression: 'SET phase = :launching',
-            ConditionExpression: 'phase = :reserved',
-            ExpressionAttributeValues: { ':launching': 'launching', ':reserved': 'reserved' },
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Update: {
+                  TableName: T,
+                  Key: activeKey(jobId),
+                  UpdateExpression: 'SET phase = :launching',
+                  ConditionExpression: 'phase = :reserved',
+                  ExpressionAttributeValues: { ':launching': 'launching', ':reserved': 'reserved' },
+                },
+              },
+              {
+                Update: {
+                  TableName: T,
+                  Key: { pk: `JOB#${jobId}`, sk: 'META' },
+                  UpdateExpression: 'SET launchingAt = :at',
+                  ConditionExpression: 'attribute_exists(pk)',
+                  ExpressionAttributeValues: { ':at': Date.now() },
+                },
+              },
+            ],
           }),
         );
       } catch (err) {
-        if (err instanceof ConditionalCheckFailedException) throw new Error(`job ${jobId} has no reservation to launch`, { cause: err });
+        if (err instanceof TransactionCanceledException) throw new Error(`job ${jobId} has no reservation to launch`, { cause: err });
         throw err;
       }
     },
@@ -689,6 +707,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(Array.isArray(i.agentKeys) ? { agentKeys: (i.agentKeys as unknown[]).map(String) } : {}),
         ...(jobTelemetrySnapshotOf(i.telemetrySnapshot) ? { telemetrySnapshot: jobTelemetrySnapshotOf(i.telemetrySnapshot)! } : {}),
         ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
+        ...(typeof i.launchingAt === 'number' ? { launchingAt: i.launchingAt } : {}),
         ...(typeof i.stopRequestedAt === 'number' ? { stopRequestedAt: i.stopRequestedAt } : {}),
         ...(typeof i.releasedAt === 'number' ? { releasedAt: i.releasedAt } : {}),
       };
@@ -703,6 +722,84 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             UpdateExpression: 'SET microvmId = :id',
             ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(microvmId)',
             ExpressionAttributeValues: { ':id': microvmId },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
+    async getJobRetryClaim(job) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: jobSummaryKey(job), ConsistentRead: true }));
+      const i = out.Item;
+      if (!i || typeof i.retryReservedUntil !== 'number' || typeof i.retryChild !== 'string') return null;
+      return { until: i.retryReservedUntil, child: i.retryChild };
+    },
+
+    async reserveJobRetry(job, token, now, until, child) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: jobSummaryKey(job),
+            UpdateExpression: 'SET retryReservedUntil = :until, retryToken = :token, retryChild = :child',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND (attribute_not_exists(retryReservedUntil) OR retryReservedUntil < :now)',
+            ExpressionAttributeValues: { ':until': until, ':token': token, ':now': now, ':child': child },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
+    async settleJobRetry(job, child, now) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: jobSummaryKey(job),
+            UpdateExpression: 'SET retriedAs = :child REMOVE retryReservedUntil, retryToken, retryChild',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryChild = :child AND retryReservedUntil < :now',
+            ExpressionAttributeValues: { ':child': child, ':now': now },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
+    async releaseJobRetry(job, token) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: jobSummaryKey(job),
+            UpdateExpression: 'REMOVE retryReservedUntil, retryToken, retryChild',
+            ConditionExpression: 'retryToken = :token',
+            ExpressionAttributeValues: { ':token': token },
+          }),
+        );
+      } catch (err) {
+        // Not its holder any more (the claim ran out and another request has it), or the summary expired.
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+      }
+    },
+
+    async markJobRetried(job, token, newJobId) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: jobSummaryKey(job),
+            UpdateExpression: 'SET retriedAs = :n REMOVE retryReservedUntil, retryToken, retryChild',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryToken = :token',
+            ExpressionAttributeValues: { ':n': newJobId, ':token': token },
           }),
         );
         return true;

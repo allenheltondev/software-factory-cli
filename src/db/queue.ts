@@ -60,7 +60,8 @@ export const MAX_START_FAILURES = 3;
 export const CANCELED_BY_USER = 'canceled by user';
 
 const JOB_STATUSES: readonly JobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'interrupted', 'canceled'];
-const RETRYABLE: readonly JobStatus[] = ['failed', 'interrupted', 'canceled'];
+/** The statuses `updraft retry` takes (and run-event --retry). */
+export const RETRYABLE: readonly JobStatus[] = ['failed', 'interrupted', 'canceled'];
 
 /** Config maps are plain objects; never let a job's pool/agent name resolve to an Object.prototype member. */
 export function ownEntry<T>(map: Record<string, T>, key: string): T | undefined {

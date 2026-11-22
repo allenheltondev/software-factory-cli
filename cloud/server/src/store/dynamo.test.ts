@@ -52,6 +52,16 @@ function fakeTable() {
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(releasedAt)') return Boolean(item) && item!.releasedAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(firstJobAt)') return Boolean(item) && item!.firstJobAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(telemetrySnapshot)') return Boolean(item) && item!.telemetrySnapshot === undefined;
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND (attribute_not_exists(retryReservedUntil) OR retryReservedUntil < :now)') {
+      return Boolean(item) && item!.retriedAs === undefined && (item!.retryReservedUntil === undefined || (item!.retryReservedUntil as number) < (values[':now'] as number));
+    }
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryChild = :child AND retryReservedUntil < :now') {
+      return Boolean(item) && item!.retriedAs === undefined && item!.retryChild === values[':child'] && typeof item!.retryReservedUntil === 'number' && item!.retryReservedUntil < (values[':now'] as number);
+    }
+    if (expr === 'retryToken = :token') return Boolean(item) && item!.retryToken === values[':token'];
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryToken = :token') {
+      return Boolean(item) && item!.retriedAs === undefined && item!.retryToken === values[':token'];
+    }
     if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
       return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
     }
@@ -701,6 +711,36 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.setJobTelemetrySnapshot(first.jobId, { descriptor, links })).toBe(true);
     expect(await store.setJobTelemetrySnapshot(first.jobId, { descriptor: { ...descriptor, secretVersion: 'v-b' }, links: { ...links, team: { name: 'B', slug: 'team-b' } } })).toBe(false);
     expect((await store.getJob(first.jobId))?.telemetrySnapshot).toEqual({ descriptor, links });
+    // The retry a console request started for it, on its summary: set once.
+    expect(await store.getJobRetryClaim(first)).toBeNull();
+    expect(await store.reserveJobRetry(first, 'tok-a', 1000, 2000, 'job_child0000000001')).toBe(true);
+    // Kept with the claim, to find the job again if its holder never says how the launch ended.
+    expect(await store.getJobRetryClaim(first)).toEqual({ until: 2000, child: 'job_child0000000001' });
+    // One request at a time while it is held; the one that holds it can give it back, and nobody else.
+    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500, 'job_child0000000001')).toBe(false);
+    await store.releaseJobRetry(first, 'tok-b');
+    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500, 'job_child0000000001')).toBe(false);
+    await store.releaseJobRetry(first, 'tok-a');
+    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500, 'job_child0000000001')).toBe(true);
+    // A holder that died: its claim runs out, and the next request takes it. The late one cannot record.
+    expect(await store.reserveJobRetry(first, 'tok-c', 3000, 4000, 'job_child0000000001')).toBe(true);
+    expect(await store.markJobRetried(first, 'tok-b', 'job_new000009')).toBe(false);
+    expect(await store.markJobRetried(first, 'tok-c', 'job_new000001')).toBe(true);
+    expect(await store.markJobRetried(first, 'tok-c', 'job_new000002')).toBe(false);
+    expect(await store.getJobRetryClaim(first)).toBeNull();
+    // Settling a claim that ran out: the one observed (same child), and only past its time.
+    const settled = { ...first, jobId: 'job_settle0000000001', deliveryId: 'd-settle' };
+    await store.putJob(settled);
+    expect(await store.reserveJobRetry(settled, 'tok-s', 1000, 2000, 'job_child0000000002')).toBe(true);
+    expect(await store.settleJobRetry(settled, 'job_child0000000002', 2000)).toBe(false); // not run out yet
+    expect(await store.settleJobRetry(settled, 'job_other00000000003', 2500)).toBe(false); // not the claim that was seen
+    expect(await store.settleJobRetry(settled, 'job_child0000000002', 2500)).toBe(true);
+    expect((await store.getJobSummary(55, settled.jobId))?.retriedAs).toBe('job_child0000000002');
+    expect(await store.getJobRetryClaim(settled)).toBeNull();
+    expect(await store.settleJobRetry(settled, 'job_child0000000002', 9000)).toBe(false); // once
+    // Once a retry started a job, nobody reserves another.
+    expect(await store.reserveJobRetry(first, 'tok-d', 9000, 9500, 'job_child0000000001')).toBe(false);
+    expect((await store.getJobSummary(55, first.jobId))?.retriedAs).toBe('job_new000001');
 
     // A retried start: nothing more is charged.
     expect(await store.startJob(first, LATER)).toEqual({ result: 'already' });
@@ -825,8 +865,13 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.listActiveJobs()).toEqual([
       { jobId: 'job_a00000001', installationId: 55, tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11', phase: 'reserved', reservedAt: expect.any(Number), expiresAt: LATER },
     ]);
+    // The launcher writes the job before it marks the launch; the mark is on the job too, so that
+    // the evidence outlives the active entry (which reconciliation deletes before it fails a job).
+    await store.putJob({ jobId: 'job_a00000001', tokenHash: 'ab', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: 'd-a', eventName: 'issues', status: 'launched', createdAt: '2026-11-20T12:00:00.000Z', expiresAt: LATER });
+    expect((await store.getJob('job_a00000001'))?.launchingAt).toBeUndefined();
     await store.markLaunching('job_a00000001');
     expect((await store.listActiveJobs())[0]?.phase).toBe('launching');
+    expect(typeof (await store.getJob('job_a00000001'))?.launchingAt).toBe('number');
     await expect(store.markLaunching('job_a00000001')).rejects.toThrow('no reservation to launch');
     expect(await store.cancelReservation({ installationId: 55, jobId: 'job_a00000001', tenantSlot: r.tenantSlot, platformSlot: r.platformSlot, day: '2026-11-20', month: '2026-11' }, 'launching')).toBe('cancelled');
     expect(await store.listActiveJobs()).toEqual([]);

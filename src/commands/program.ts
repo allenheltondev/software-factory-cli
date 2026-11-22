@@ -134,6 +134,7 @@ export function buildProgram(opts: ProgramOptions): Command {
     .option('--delivery-id <id>', 'the X-GitHub-Delivery header, for the logs and the summary')
     .option('--deadline-minutes <n>', 'stop everything, a running agent included, after this many minutes')
     .option('--worker-git-credentials', "fetch with the worker's GitHub credentials even into a clone run-event did not create")
+    .option('--retry', "first requeue the event's failed, interrupted or canceled jobs in the state database, as 'updraft retry' does, so this run does them again")
     .option('--shared-state <file>', 'a copy of the shared state database kept fresher than the one this run started from; read before the last look, never written')
     .addOption(new Option('--json', 'print one JSON summary object on stdout'))
     .action((o: RunEventOptions) => exec((ctx) => handlers.runEvent(ctx, o)));

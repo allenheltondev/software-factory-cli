@@ -26,6 +26,7 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     jobs: vi.fn(),
     job: vi.fn(),
     jobLog: vi.fn(),
+    retryJob: vi.fn(),
     agentKeys: vi.fn(),
     telemetry: vi.fn(),
     updateTelemetry: vi.fn(),

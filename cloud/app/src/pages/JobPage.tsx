@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Link, useParams } from 'react-router';
+import { Link, useNavigate, useParams } from 'react-router';
 import { Alert, Button, Card, CardBody, CardHeader, CardTitle, EmptyState, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, SegmentedControl, Skeleton, StatusBadge } from '@readysetcloud/ui';
 import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog, type JobTimelineEntry, type JobTotals, type JobView } from '../api/client';
 import { DISPOSITION, JOB_RESULT, deliveryReason, formatBytes, formatDuration } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
 import { Lifecycle } from '../components/lifecycle';
 
-type JobApi = Pick<ApiClient, 'job' | 'jobLog'>;
+type JobApi = Pick<ApiClient, 'job' | 'jobLog'> & Partial<Pick<ApiClient, 'retryJob'>>;
 type Load = { state: 'loading' } | { state: 'ok'; job: JobView; deliveries: Delivery[]; conversation?: JobView[] } | { state: 'error'; message: string };
 type LogLoad = { state: 'loading' } | { state: 'ok'; log: JobLog } | { state: 'expired' } | { state: 'error'; message: string };
 
@@ -66,6 +66,51 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
   );
 }
 
+/** Run a job that did not finish its work again; the new job's page opens when it has started. */
+function Retry({ job, api, installationId }: { job: JobView; api: JobApi; installationId: number }) {
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (job.retriedAs) {
+    return (
+      <p className="mt-4 text-sm" data-testid="job-retried">
+        Retried as{' '}
+        <Link className="auth-link" to={`/installations/${installationId}/jobs/${job.retriedAs}`}>
+          {job.retriedAs}
+        </Link>
+      </p>
+    );
+  }
+  if (!job.retryable || !api.retryJob) return null;
+  const retry = api.retryJob;
+  const run = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const out = await retry(installationId, job.jobId);
+      void navigate(`/installations/${installationId}/jobs/${out.jobId}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not retry the job.');
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="mt-4 flex flex-col gap-2" data-testid="job-retry">
+      <div className="flex flex-wrap items-center gap-3">
+        <Button onClick={() => void run()} disabled={busy}>
+          {busy ? 'Retrying…' : 'Retry job'}
+        </Button>
+        <span className="text-sm">Runs the same event again as a new job, with the configuration active now.</span>
+      </div>
+      {error && (
+        <Alert variant="error" data-testid="job-retry-error">
+          {error}
+        </Alert>
+      )}
+    </div>
+  );
+}
+
 function Loaded({ job, deliveries, conversation, api, installationId }: { job: JobView; deliveries: Delivery[]; conversation: JobView[]; api: JobApi; installationId: number }) {
   const r = JOB_RESULT[job.result];
   return (
@@ -96,6 +141,7 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
             </a>
           )}
         </div>
+        <Retry key={job.jobId} job={job} api={api} installationId={installationId} />
       </PageHero>
 
       <Card>

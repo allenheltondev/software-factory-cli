@@ -141,6 +141,8 @@ export interface JobSummary {
   microvmId?: string;
   deliveryId?: string;
   detail?: JobFinishDetail;
+  /** The job a console retry started for this one (jobs/retry.ts); set once, kept as long as the summary. */
+  retriedAs?: string;
 }
 
 /**
@@ -362,6 +364,13 @@ export interface Job {
   /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
   startedAt?: number;
   /**
+   * Epoch ms when its launch passed the point of no return (markLaunching: RunMicrovm is asked for
+   * next), written in the same transaction as the reservation's phase. Its absence on a job that did
+   * not fail to launch means no microVM was asked for, once the reservation is gone (reconciliation
+   * cancels it): the active entry alone cannot say, since it is deleted before the job is failed.
+   */
+  launchingAt?: number;
+  /**
    * Epoch ms when its microVM was asked to stop (the broker's terminate, or a refused start):
    * nothing is served for it after, and it can never start, whatever its outcome says.
    */
@@ -555,6 +564,32 @@ export interface Store {
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
   /** The broker records what it handed the job for telemetry at its first `start`. Set once: false when it already was. */
   setJobTelemetrySnapshot(jobId: string, snapshot: JobTelemetrySnapshot): Promise<boolean>;
+  /**
+   * A console retry's claim on a job (jobs/retry.ts), taken before it launches anything: one
+   * request at a time, and none once a retry started a job. `child` is the id the job it is about
+   * to launch will have, kept with the claim so that a claim that ran out can be settled by looking
+   * for that job. False when another request holds it (until `until`, epoch ms: a Lambda that died
+   * holding it does not hold it for ever), a retry started a job already, or the job has no
+   * summary. `token` names the holder.
+   */
+  reserveJobRetry(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>, token: string, now: number, until: number, child: string): Promise<boolean>;
+  /** The claim on a job's retry as it stands (held or run out), for settling one whose holder never said how it ended. */
+  getJobRetryClaim(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>): Promise<{ until: number; child: string } | null>;
+  /**
+   * Settles a claim that ran out as a retry that started `child` (the id the claim kept), in one
+   * conditional write: the claim must still be the one observed (same child) and run out before
+   * `now`, so a claim another request has taken since, or extended, is left alone. False then, or
+   * when a retry was recorded already.
+   */
+  settleJobRetry(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>, child: string, now: number): Promise<boolean>;
+  /** Gives the claim back because no job started, so the retry can be asked for again. Only its holder's. */
+  releaseJobRetry(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>, token: string): Promise<void>;
+  /**
+   * The retry started `newJobId`: recorded on the summary for as long as it is kept (`retriedAs`),
+   * and the claim ends. Only the holder's, and once: false when it is not the holder (its claim ran
+   * out and another request took it) or one was recorded already.
+   */
+  markJobRetried(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>, token: string, newJobId: string): Promise<boolean>;
 
   /**
    * Deduplication: claims a tenant's webhook delivery unless an unexpired claim exists (false: a
@@ -684,7 +719,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const months = new Map<string, { jobs: number; seconds: number; throttled: number }>();
   const notices = new Set<string>();
   const active = new Map<string, ActiveJob>();
-  const summaries = new Map<string, JobSummary & { installationId: number }>();
+  const summaries = new Map<string, JobSummary & { installationId: number; retryReservedUntil?: number; retryToken?: string; retryChild?: string }>();
   const failed = new Map<string, number>();
   const month = (key: string) => months.get(key) ?? { jobs: 0, seconds: 0, throttled: 0 };
   const free = (key: string, now: number) => {
@@ -912,6 +947,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const entry = active.get(jobId);
       if (!entry || entry.phase !== 'reserved') throw new Error(`job ${jobId} has no reservation to launch`);
       active.set(jobId, { ...entry, phase: 'launching' });
+      const j = jobs.get(jobId);
+      if (j) jobs.set(jobId, { ...j, launchingAt: Date.now() });
     },
     async listPlatformSlots() {
       const now = Date.now();
@@ -1059,6 +1096,39 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const j = jobs.get(jobId);
       if (!j || j.microvmId !== undefined) return false;
       jobs.set(jobId, { ...j, microvmId });
+      return true;
+    },
+    async reserveJobRetry(job, token, now, until, child) {
+      const s = summaries.get(job.jobId);
+      if (!s || s.installationId !== job.installationId || s.retriedAs !== undefined) return false;
+      if (s.retryReservedUntil !== undefined && s.retryReservedUntil >= now) return false;
+      summaries.set(job.jobId, { ...s, retryReservedUntil: until, retryToken: token, retryChild: child });
+      return true;
+    },
+    async getJobRetryClaim(job) {
+      const s = summaries.get(job.jobId);
+      if (!s || s.installationId !== job.installationId || s.retryReservedUntil === undefined || s.retryChild === undefined) return null;
+      return { until: s.retryReservedUntil, child: s.retryChild };
+    },
+    async settleJobRetry(job, child, now) {
+      const s = summaries.get(job.jobId);
+      if (!s || s.installationId !== job.installationId || s.retriedAs !== undefined) return false;
+      if (s.retryChild !== child || s.retryReservedUntil === undefined || s.retryReservedUntil >= now) return false;
+      const { retryReservedUntil: _until, retryToken: _token, retryChild: _child, ...rest } = s;
+      summaries.set(job.jobId, { ...rest, retriedAs: child });
+      return true;
+    },
+    async releaseJobRetry(job, token) {
+      const s = summaries.get(job.jobId);
+      if (!s || s.installationId !== job.installationId || s.retryToken !== token) return;
+      const { retryReservedUntil: _until, retryToken: _token, retryChild: _child, ...rest } = s;
+      summaries.set(job.jobId, rest);
+    },
+    async markJobRetried(job, token, newJobId) {
+      const s = summaries.get(job.jobId);
+      if (!s || s.installationId !== job.installationId || s.retriedAs !== undefined || s.retryToken !== token) return false;
+      const { retryReservedUntil: _until, retryToken: _token, retryChild: _child, ...rest } = s;
+      summaries.set(job.jobId, { ...rest, retriedAs: newJobId });
       return true;
     },
     async setJobTelemetrySnapshot(jobId, snapshot) {

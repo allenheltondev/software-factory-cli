@@ -25,7 +25,7 @@ import { putHold, releaseHolds } from '../db/holds.js';
 import { cancelQueuedJob, commitPollBatch } from '../db/ingest.js';
 import { getLoopPr, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
 import { getPublication } from '../db/publications.js';
-import { getJob, latestRunOfJob, MAX_START_FAILURES } from '../db/queue.js';
+import { getJob, latestRunOfJob, MAX_START_FAILURES, RETRYABLE, retryJob } from '../db/queue.js';
 import { countRevisions, getRevisionPr, syncRevisionPrs } from '../db/revisions.js';
 import { ensureClone, githubCloneUrl, workerNetworkGit, type NetworkGit } from '../git/clone.js';
 import { listRemotes, runGit, selectRepoRemote, type GitOptions } from '../git/git.js';
@@ -77,6 +77,11 @@ export interface RunEventOptions {
   deadlineMinutes?: string;
   /** Fetch with the worker's GitHub credentials even into a clone run-event did not create. */
   workerGitCredentials?: boolean;
+  /**
+   * Requeue the event's jobs that failed, were interrupted or canceled before running it, as
+   * `updraft retry` does, so a delivery runs them again instead of ending as a duplicate.
+   */
+  retry?: boolean;
   /**
    * A copy of the shared state database that the caller keeps fresher than the one this run
    * started from. Read, never written, before each last look (run-event-shared-state.ts).
@@ -777,6 +782,21 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
           const found = getJob(openDb, j.id);
           return found ? [{ id: found.id, status: found.status, issueNumber: found.issueNumber }] : [];
         });
+        // --retry: what `updraft retry` does to each job that ended without its work, before the
+        // duplicate check below sees it. A job that cannot be requeued (held for a human) stays as it is.
+        if (opts.retry) {
+          known = known.map((k) => {
+            if (!(RETRYABLE as readonly string[]).includes(k.status)) return k;
+            try {
+              const requeued = retryJob(openDb, k.id, ctx.now);
+              log.info('requeued a job of the event', { job: k.id, was: k.status });
+              return { ...k, status: requeued.status };
+            } catch (err) {
+              log.warn('could not requeue a job of the event', { job: k.id, error: err instanceof Error ? err.message : String(err) });
+              return k;
+            }
+          });
+        }
       }
       if (known.length) {
         const openDb = stateDb();
