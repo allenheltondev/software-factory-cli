@@ -5,7 +5,6 @@ import {
   Button,
   Card,
   CardBody,
-  CardDescription,
   CardHeader,
   CardTitle,
   Input,
@@ -164,7 +163,6 @@ function DestinationCard({ view, api, installationId, onSaved }: { view: Telemet
     <Card data-testid="telemetry-key">
       <CardHeader>
         <CardTitle>Destination</CardTitle>
-        <CardDescription>Where each job's traces go, and the key they are sent with. Both are checked before they are saved, and the key is never shown again or given to an agent.</CardDescription>
       </CardHeader>
       <CardBody className="flex flex-col gap-4">
         {k && (
@@ -377,9 +375,6 @@ function LinksCard({ view, api, installationId, onSaved }: { view: TelemetryView
     <Card data-testid="telemetry-links">
       <CardHeader>
         <CardTitle>Links</CardTitle>
-        <CardDescription>
-          How to open a trace in your tool, so each job links to its trace, the moments in it, and its conversation. Optional: without them, the job page still shows what the agents did.
-        </CardDescription>
       </CardHeader>
       <CardBody>
         <form className="flex flex-col gap-3" onSubmit={(e) => void save(e)} noValidate>
@@ -437,10 +432,9 @@ function SettingsCard({ view, api, installationId, onSaved }: { view: TelemetryV
     <Card data-testid="telemetry-settings">
       <CardHeader>
         <CardTitle>What is sent</CardTitle>
-        <CardDescription>Changes apply to jobs that start after you save.</CardDescription>
       </CardHeader>
       <CardBody className="flex flex-col gap-5">
-        <Setting title="Sending" description="Paused keeps the key; jobs send nothing until you turn it back on.">
+        <Setting title="Sending">
           <SegmentedControl<'on' | 'off'>
             aria-label="Sending"
             value={view.enabled ? 'on' : 'off'}
@@ -451,14 +445,7 @@ function SettingsCard({ view, api, installationId, onSaved }: { view: TelemetryV
             ]}
           />
         </Setting>
-        <Setting
-          title="Content"
-          description={
-            view.captureContent
-              ? 'Prompts, model responses, and tool arguments and results are recorded, so a trace shows what was said, not just what happened. Keys and tokens are redacted first; code and issue text are not. Each field is cut at 16 KB.'
-              : 'Names, timing, token counts, tool names, errors and verify commands only. Turn on content to read the conversation itself.'
-          }
-        >
+        <Setting title="Content">
           <SegmentedControl<'meta' | 'content'>
             aria-label="Content"
             value={view.captureContent ? 'content' : 'meta'}
@@ -551,7 +538,9 @@ function HowItWorks() {
     <Card>
       <CardHeader>
         <CardTitle>How it works</CardTitle>
-        <CardDescription>
+      </CardHeader>
+      <CardBody>
+        <p className="mb-3 text-sm">
           The runner reads each agent's own transcript as it is written and sends{' '}
           <a className="auth-link" href={GENAI_DOCS} target="_blank" rel="noreferrer">
             OpenTelemetry GenAI
@@ -561,9 +550,7 @@ function HowItWorks() {
             Agent Timeline ↗
           </a>
           , for one).
-        </CardDescription>
-      </CardHeader>
-      <CardBody>
+        </p>
         <ul className="flex flex-col gap-1 font-mono text-xs" aria-label="The spans of a job">
           {tree.map(([span, what]) => (
             <li key={span} className="flex flex-wrap justify-between gap-x-3">
@@ -580,13 +567,10 @@ function HowItWorks() {
   );
 }
 
-function Setting({ title, description, children }: { title: string; description: string; children: ReactNode }) {
+function Setting({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div className="flex flex-col gap-2">
-      <div>
-        <h3 className="font-medium">{title}</h3>
-        <p className="text-sm text-muted-foreground">{description}</p>
-      </div>
+      <h3 className="font-medium">{title}</h3>
       {children}
     </div>
   );

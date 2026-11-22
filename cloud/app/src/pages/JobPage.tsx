@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router';
-import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, SegmentedControl, Skeleton, StatusBadge } from '@readysetcloud/ui';
+import { Alert, Button, Card, CardBody, CardHeader, CardTitle, EmptyState, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, SegmentedControl, Skeleton, StatusBadge } from '@readysetcloud/ui';
 import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog, type JobTimelineEntry, type JobTotals, type JobView } from '../api/client';
 import { DISPOSITION, JOB_RESULT, deliveryReason, formatBytes, formatDuration } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
@@ -129,7 +129,6 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
       <Card data-testid="job-lifecycle-card">
         <CardHeader>
           <CardTitle>Lifecycle</CardTitle>
-          <CardDescription>What the run did, in order: the change, each review and revision, and where the pull request ended up.</CardDescription>
         </CardHeader>
         <CardBody>
           <Lifecycle detail={job.detail} running={job.result === 'running'} />
@@ -146,7 +145,6 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
         <Card>
           <CardHeader>
             <CardTitle>Deliveries</CardTitle>
-            <CardDescription>The webhook deliveries for this job's event, oldest first. A redelivery from GitHub shows up here too.</CardDescription>
           </CardHeader>
           <CardBody>
             <ol className="flex flex-col gap-2" data-testid="job-deliveries">
@@ -218,7 +216,6 @@ function AgentWork({ job }: { job: JobView }) {
     <Card data-testid="job-work">
       <CardHeader>
         <CardTitle>What the agents did</CardTitle>
-        <CardDescription>Read from the agents' own transcripts as they worked: each run, the first red and green test runs, and anything that failed.</CardDescription>
       </CardHeader>
       <CardBody className="flex flex-col gap-5 text-sm">
         {t.totals && <Totals totals={t.totals} />}
@@ -291,13 +288,12 @@ function Traces({ job, installationId }: { job: JobView; installationId: number 
       <Card data-testid="job-telemetry">
         <CardHeader>
           <CardTitle>Traces</CardTitle>
-          <CardDescription>
-            Send what the agents did (every model call and tool call, in order) to your tracing tool as OpenTelemetry.{' '}
-            <Link className="auth-link" to={`/installations/${installationId}/telemetry`}>
-              Set up agent telemetry
-            </Link>
-          </CardDescription>
         </CardHeader>
+        <CardBody className="text-sm">
+          <Link className="auth-link font-semibold" to={`/installations/${installationId}/telemetry`}>
+            Set up agent telemetry
+          </Link>
+        </CardBody>
       </Card>
     );
   }
@@ -313,10 +309,7 @@ function Traces({ job, installationId }: { job: JobView; installationId: number 
   return (
     <Card data-testid="job-telemetry">
       <CardHeader>
-        <CardTitle>Traces</CardTitle>
-        <CardDescription>
-          This job's agents, as traced{t.destination ? ` in ${t.destination}` : ''}. The issue's conversation holds this job and every review and revision after it.
-        </CardDescription>
+        <CardTitle>Traces{t.destination ? ` in ${t.destination}` : ''}</CardTitle>
       </CardHeader>
       <CardBody className="flex flex-col gap-4 text-sm">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
@@ -326,7 +319,7 @@ function Traces({ job, installationId }: { job: JobView; installationId: number 
             </a>
           )}
           {!t.timelineUrl && t.conversationUrl && (
-            <a className="auth-link font-semibold" href={t.conversationUrl} target="_blank" rel="noreferrer" data-testid="job-conversation-link" title="Every span of the conversation, by agent.">
+            <a className="auth-link font-semibold" href={t.conversationUrl} target="_blank" rel="noreferrer" data-testid="job-conversation-link" title={t.conversationHint ?? 'Every span of the conversation, by agent'}>
               Open conversation ↗
             </a>
           )}
@@ -344,7 +337,6 @@ function Traces({ job, installationId }: { job: JobView; installationId: number 
             </span>
           )}
         </div>
-        {!t.timelineUrl && t.conversationUrl && t.conversationHint && <p className="text-muted-foreground">{t.conversationHint}</p>}
         <p className={t.failed > 0 ? 'text-warning-700 dark:text-warning-300' : 'text-muted-foreground'} data-testid="job-telemetry-count">
           {t.exported} of {t.spans} span{t.spans === 1 ? '' : 's'} sent{t.lastError ? ` (last error: ${t.lastError})` : ''} · trace <code>{t.traceId}</code>
         </p>
@@ -362,9 +354,6 @@ function Conversation({ job, others, installationId }: { job: JobView; others: J
     <Card data-testid="job-conversation-card">
       <CardHeader>
         <CardTitle>This conversation</CardTitle>
-        <CardDescription>
-          Every recent job of <code>{job.telemetry?.conversationId ?? `${job.repository}#${job.issue ?? ''}`}</code>, oldest first: the implementation, each review and revision.
-        </CardDescription>
       </CardHeader>
       <CardBody>
         <ol className="flex flex-col gap-2" data-testid="job-conversation-jobs">
@@ -478,10 +467,7 @@ function Logs({ job, api, installationId }: { job: JobView; api: JobApi; install
   return (
     <Card data-testid="job-logs">
       <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-col gap-1">
-          <CardTitle>Logs</CardTitle>
-          <CardDescription>Secrets are redacted before logs leave the job, and again before they are shown.</CardDescription>
-        </div>
+        <CardTitle>Logs</CardTitle>
         {names.length > 1 && <SegmentedControl aria-label="Log" value={name} onChange={setName} options={names.map((n) => ({ value: n, label: LOG_LABEL[n] ?? n }))} />}
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
