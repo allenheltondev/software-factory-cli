@@ -408,9 +408,9 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
     },
 
     /** A member's view of the tenant, or not_authorized (403): the check every tenant page makes, with no GitHub call. */
-    async member(caller: Caller, installationId: number): Promise<{ tenant: Tenant; summary: TenantSummary }> {
+    async member(caller: Caller, installationId: number): Promise<{ tenant: Tenant; summary: TenantSummary; githubLogin?: string }> {
       const { tenant, member } = await memberOf(caller, installationId);
-      return { tenant, summary: summarize(tenant, member) };
+      return { tenant, summary: summarize(tenant, member), githubLogin: member.githubLogin };
     },
 
     /**

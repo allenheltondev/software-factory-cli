@@ -653,9 +653,11 @@ Everything else is decided inside the microVM, by `run-event`, against the GitHu
 config and the state database: whether Updraft opened the pull request, whether the
 reviewer is an allowed actor, whether the review still stands.
 
-**Kiro as an agent.** Kiro is not an npm package, so `AGENT_PACKAGES` cannot install it: add
-a `RUN` step to `image/Dockerfile` that runs Kiro's own installer and leaves `kiro-cli` on
-the `PATH` of the job user, and enable `kiro` in the config. Its credential for headless use
+**Kiro as an agent.** Kiro is not an npm package, so `AGENT_PACKAGES` cannot install it: set
+`KIRO_INSTALL_COMMAND` in `image/build.env` to Kiro's own installer command. The build runs it
+with its home in `/usr/local/lib/kiro`, links what it installs into `/usr/local/bin` for the job
+user, and fails unless `kiro-cli --version` works and `kiro-cli` resolves under `/usr`, the tree
+the job sandbox mounts. Enable `kiro` in the config. Its credential for headless use
 is an API key in `KIRO_API_KEY` ([docs/agents/kiro.md](../../docs/agents/kiro.md)); add it to
 the agent-environment secret's JSON object like the others. A `kiro-cli login` session also
 works for headless runs on a workstation, but it expires and renewing it needs a person at a

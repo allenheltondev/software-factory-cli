@@ -1,4 +1,4 @@
-import { AGENT_KEY_ENV, type CloudAgent } from './agents.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, type CloudAgent } from './agents.js';
 import { CEILINGS, type ConfigIssue, type TenantSubmission } from './config.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 
@@ -117,15 +117,26 @@ const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/;
 const BRANCH = /^[^\s~^:?*[\\]+$/;
 const TOKEN = /^[A-Za-z0-9._:/-]+$/;
 
+/**
+ * The agents a new workflow starts with, from those this deployment runs: Claude writes when it
+ * can, and another agent reviews when there is one (a second opinion), else the same one.
+ */
+export function defaultAgents(offered: readonly CloudAgent[] = CONSOLE_AGENTS): { agent: CloudAgent; reviewer: CloudAgent } {
+  const agent = offered.includes('claude') ? 'claude' : (offered[0] ?? 'claude');
+  const reviewer = offered.includes('codex') && agent !== 'codex' ? 'codex' : (offered.find((a) => a !== agent) ?? agent);
+  return { agent, reviewer };
+}
+
 /** What a new tenant starts from: one workflow with the packaged prompts, and no repositories. */
 export function defaultConsoleConfig(): ConsoleConfig {
+  const { agent, reviewer } = defaultAgents();
   return {
     version: CONSOLE_VERSION,
     workflows: {
       implement: {
-        agent: { adapter: 'claude' },
+        agent: { adapter: agent },
         prompt: DEFAULT_PROMPTS.implement,
-        reviewer: { adapter: 'codex', prompt: DEFAULT_PROMPTS.review },
+        reviewer: { adapter: reviewer, prompt: DEFAULT_PROMPTS.review },
         revisePrompt: DEFAULT_PROMPTS.revise,
         verify: [],
       },
@@ -188,11 +199,15 @@ function agent(c: Check, path: string, v: unknown): ConsoleAgent {
     return { adapter: 'claude' };
   }
   only(c, path, v, path.endsWith('reviewer') ? ['adapter', 'model', 'effort', 'prompt'] : ['adapter', 'model', 'effort']);
+  // Any agent Updraft Cloud knows: a saved config that names one this deployment no longer runs
+  // (or a reviewer no repository uses) still loads. Whether it is offered is checked where it
+  // would run: the compiled config (config.ts) holds only the agents a repository uses.
   const adapter = v.adapter;
-  if (typeof adapter !== 'string' || !(CONSOLE_AGENTS as string[]).includes(adapter)) c.err(`${path}.adapter`, `one of ${CONSOLE_AGENTS.join(', ')}`);
+  const known = typeof adapter === 'string' && Object.hasOwn(SUPPORTED_AGENT_KEY_ENV, adapter);
+  if (!known) c.err(`${path}.adapter`, `one of ${CONSOLE_AGENTS.join(', ')}`);
   const model = text(c, `${path}.model`, v.model, { pattern: TOKEN, what: 'a model name: letters, digits, ".", "_", ":", "/" or "-"' });
   const effort = text(c, `${path}.effort`, v.effort, { pattern: TOKEN, what: 'an effort level, such as low, medium or high' });
-  return { adapter: (CONSOLE_AGENTS as string[]).includes(adapter as string) ? (adapter as CloudAgent) : 'claude', ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+  return { adapter: known ? (adapter as CloudAgent) : 'claude', ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
 }
 
 function logins(c: Check, path: string, v: unknown): string[] {
@@ -379,7 +394,10 @@ function usage(config: ConsoleConfig, which: 'all' | 'enabled') {
 export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): ConfigIssue[] {
   const out: ConfigIssue[] = [];
   const need = (path: string, adapter: CloudAgent) => {
-    const name = AGENT_KEY_ENV[adapter];
+    // An agent this deployment does not run: compiling it says so, with what to do instead;
+    // asking for its key first would send the tenant to a key the key page cannot take.
+    if (!CONSOLE_AGENTS.includes(adapter)) return;
+    const name = SUPPORTED_AGENT_KEY_ENV[adapter];
     if (!keys.has(name)) out.push({ path, message: `set the tenant's ${name} first: jobs run ${adapter} with your own key` });
   };
   for (const [name, u] of usage(config, 'enabled')) {

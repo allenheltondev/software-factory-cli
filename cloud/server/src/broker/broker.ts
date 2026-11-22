@@ -6,7 +6,8 @@ import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
 import { loopOf, stepsOf, telemetryOf, type JobTelemetryDescriptor, type JobTelemetrySnapshot } from '../jobs/lifecycle.js';
 import { isFailure, type Job, type JobFinishDetail, type Store, type TelemetrySettings } from '../store/store.js';
-import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
+import { AGENT_KEY_NAMES, UNCHECKED_AGENT_KEYS, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
+import { SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
 // Not the whole telemetry service: only the secret's name.
@@ -289,11 +290,15 @@ export function createBroker(deps: BrokerDeps) {
           })
           .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not record the telemetry export: ${(err as Error)?.name}` }));
       }
-      // The key's "last used": this job ran with it (it started) and it worked or it did not.
+      // The key's "last used": this job ran with it (it started, and its agent ran: the runner
+      // reports which did) and it worked or it did not. A runner that does not say: every key it
+      // was handed but an unchecked one (Kiro's), which is never shown working on a guess.
       // Best effort: a failure here must not fail the job's finish.
-      if (job.agentKeys?.length && job.startedAt !== undefined && (recorded === 'succeeded' || (isFailure(recorded) && recorded !== 'terminated'))) {
+      const ran = finished?.adapters ? new Set<string>(finished.adapters.map((a) => SUPPORTED_AGENT_KEY_ENV[a as keyof typeof SUPPORTED_AGENT_KEY_ENV])) : null;
+      const used = (job.agentKeys ?? []).filter((name) => (ran ? ran.has(name) : !UNCHECKED_AGENT_KEYS.has(name)));
+      if (used.length && job.startedAt !== undefined && (recorded === 'succeeded' || (isFailure(recorded) && recorded !== 'terminated'))) {
         const use = { at: new Date(now()).toISOString(), ok: recorded === 'succeeded', jobStartedAt: new Date(job.startedAt).toISOString() };
-        await Promise.all(job.agentKeys.map((name) => deps.store.recordAgentKeyUse(job.installationId, name, use))).catch((err: unknown) =>
+        await Promise.all(used.map((name) => deps.store.recordAgentKeyUse(job.installationId, name, use))).catch((err: unknown) =>
           log({ jobId: job.jobId, warning: `could not record the key use: ${(err as Error)?.name}` }),
         );
       }
@@ -323,6 +328,10 @@ export function createBroker(deps: BrokerDeps) {
         }
         return REFUSED;
       }
+      // Its first job: setup is done for good, whatever becomes of the job records later. Best effort.
+      if (started.result === 'started' || started.result === 'already') {
+        await deps.store.markFirstJob(job.installationId, new Date(now()).toISOString()).catch((err: unknown) => log({ jobId: job.jobId, warning: `could not mark the first job: ${(err as Error)?.name}` }));
+      }
     } else if (job.startedAt === undefined) {
       // Credentials and tokens only for a job whose start committed (its quota admission).
       return REFUSED;
@@ -336,6 +345,7 @@ export function createBroker(deps: BrokerDeps) {
       });
       // The tenant's key secrets by variable name; the runner reads them with the credentials (a
       // missing one is a key the tenant has not set).
+      // Only the agents this deployment runs (CloudAgents): one taken out of service gets no key.
       const agentKeySecrets = Object.fromEntries(AGENT_KEY_NAMES.map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
       // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
@@ -445,5 +455,6 @@ export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFin
   }
   const steps = stepsOf(d.steps);
   if (steps) out.steps = steps;
+  if (Array.isArray(d.adapters) && d.adapters.length <= 16) out.adapters = [...new Set(d.adapters.filter((a): a is string => typeof a === 'string' && Object.hasOwn(SUPPORTED_AGENT_KEY_ENV, a)))].sort();
   return Object.keys(out).length ? out : undefined;
 }

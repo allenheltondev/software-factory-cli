@@ -313,6 +313,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     if (item.disabledReason === 'suspended' || item.disabledReason === 'uninstalled') t.disabledReason = item.disabledReason;
     if (typeof item.deleteAfter === 'number') t.deleteAfter = item.deleteAfter;
     if (typeof item.activeConfigVersion === 'number') t.activeConfigVersion = item.activeConfigVersion;
+    if (typeof item.firstJobAt === 'string') t.firstJobAt = item.firstJobAt;
     if (typeof item.adminDisabledAt === 'string') {
       t.adminDisabled = {
         at: item.adminDisabledAt,
@@ -796,6 +797,22 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         for (const item of page.Items ?? []) await client.send(new DeleteCommand({ TableName: T, Key: { pk: item.pk, sk: item.sk } }));
         ExclusiveStartKey = page.LastEvaluatedKey;
       } while (ExclusiveStartKey);
+    },
+
+    async markFirstJob(id, at) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: tenantKey(id),
+            UpdateExpression: 'SET firstJobAt = :at',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(firstJobAt)',
+            ExpressionAttributeValues: { ':at': at },
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+      }
     },
 
     async setTenantLimits(id, limits) {

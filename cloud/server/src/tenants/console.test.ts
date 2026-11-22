@@ -79,7 +79,8 @@ describe('parseConsoleConfig', () => {
   });
 
   it('only lets agents the image ships run', () => {
-    expect(errorsOf(settings(undefined, { agent: { adapter: 'kiro' } }))).toEqual([expect.objectContaining({ path: 'workflows.implement.agent.adapter' })]);
+    expect(errorsOf(settings(undefined, { agent: { adapter: 'gemini' } }))).toEqual([expect.objectContaining({ path: 'workflows.implement.agent.adapter' })]);
+    expect(errorsOf(settings(undefined, { agent: { adapter: 'kiro' } }))).toEqual([]);
   });
 
   it('checks triggers: a known workflow, one label once', () => {

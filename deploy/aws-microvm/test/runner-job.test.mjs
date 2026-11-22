@@ -844,7 +844,9 @@ describe('finishDetail (#71)', () => {
       logs: ['updraft.log'],
       steps: [{ kind: 'revision', verificationPassed: false }],
     });
-    expect(finishDetail({ updraftOutcome: 'canceled', summary: {}, logs: [] })).toEqual({ updraftOutcome: 'canceled' });
+    expect(finishDetail({ updraftOutcome: 'canceled', summary: {}, logs: [] })).toEqual({ updraftOutcome: 'canceled', adapters: [] });
+    expect(finishDetail({ updraftOutcome: 'nothing-to-do', summary: {}, logs: [], telemetry: { traceId: 't', spans: 0, exported: 0, failed: 0 } })).toMatchObject({ adapters: [] });
+    expect(finishDetail({ summary: {}, logs: [], telemetry: { traceId: 't', spans: 1, exported: 1, failed: 0, adapters: ['codex'] } })).toMatchObject({ adapters: ['codex'] });
     expect(finishDetail({ updraftOutcome: 'succeeded', summary: { verification: { passed: true }, jobs: [{ verification: { passed: true } }] }, logs: [] })).toEqual({ updraftOutcome: 'succeeded', verificationPassed: true });
   });
 

@@ -100,11 +100,77 @@ describe('InstallationPage (#71)', () => {
       }),
     );
     expect(await screen.findByTestId('installation-status')).toHaveTextContent('Missing permissions');
-    expect(screen.getByTestId('attention-permissions')).toHaveTextContent('contents (read, needs write)');
-    expect(within(screen.getByTestId('attention-permissions')).getByRole('link')).toHaveAttribute('href', 'https://github.com/organizations/acme/settings/installations/55');
-    expect(within(screen.getByTestId('attention-config')).getByRole('link')).toHaveAttribute('href', '/installations/55/config');
-    expect(within(screen.getByTestId('attention-keys')).getByRole('link')).toHaveAttribute('href', '/installations/55/keys');
+    // Setting up: the checklist says what is left, step by step, each with where to do it.
+    const app = screen.getByTestId('setup-app');
+    expect(app).toHaveAttribute('aria-current', 'step');
+    expect(app).toHaveTextContent('contents (write)');
+    expect(within(app).getByRole('link', { name: /Review permissions/ })).toHaveAttribute('href', 'https://github.com/organizations/acme/settings/installations/55');
+    expect(within(screen.getByTestId('setup-config')).getByRole('link', { name: 'Configure' })).toHaveAttribute('href', '/installations/55/config');
+    expect(within(screen.getByTestId('setup-keys')).getByRole('link', { name: 'Add keys' })).toHaveAttribute('href', '/installations/55/keys');
+    // Needs attention keeps only what the checklist does not say.
+    expect(screen.queryByTestId('attention-permissions')).toBeNull();
+    expect(screen.queryByTestId('attention-config')).toBeNull();
     expect(screen.getByTestId('attention-unreachable')).toHaveTextContent('acme/gone');
+  });
+
+  it('walks a new installation to its first job, the next step open, and leaves once jobs can run', async () => {
+    const fresh = overview({
+      config: { activeVersion: 2, triggers: [{ repository: 'acme/web', label: 'updraft' }] },
+      keys: [
+        { name: 'ANTHROPIC_API_KEY', configured: false, required: true },
+        { name: 'KIRO_API_KEY', configured: false, required: false },
+      ],
+      telemetry: { configured: false, enabled: false },
+      activity: { window: { deliveries: 0, deliveriesComplete: true, jobs: 0, jobsComplete: true }, deliveries: {}, jobs: {}, running: 0 },
+    });
+    const { unmount } = showInstallation(api({ overview: vi.fn().mockResolvedValue(fresh), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    expect(await screen.findByTestId('setup-progress')).toHaveTextContent('3 of 5 done');
+    const keys = screen.getByTestId('setup-keys');
+    expect(keys).toHaveAttribute('aria-current', 'step');
+    expect(keys).toHaveTextContent('Your configuration runs Claude: add its key.');
+    expect(screen.getByTestId('setup-telemetry')).toHaveTextContent('Optional');
+    expect(within(screen.getByTestId('setup-first-job')).getByRole('link', { name: /Open its issues/ })).toHaveAttribute('href', 'https://github.com/acme/web/issues');
+    unmount();
+    // Keys in, then the first job: the next step says which label to add, where.
+    showInstallation(
+      api({
+        overview: vi.fn().mockResolvedValue({ ...fresh, keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }] }),
+        jobs: vi.fn().mockResolvedValue({ jobs: [] }),
+        deliveries: vi.fn().mockResolvedValue({ deliveries: [] }),
+      }),
+    );
+    const first = await screen.findByTestId('setup-first-job');
+    expect(first).toHaveAttribute('aria-current', 'step');
+    expect(first).toHaveTextContent('Add the label updraft to an issue in acme/web.');
+  });
+
+  it("sends the first job to the configuration when no label there is the viewer's to apply, and counts a first job after its record is gone", async () => {
+    const ready = overview({
+      config: { activeVersion: 2 },
+      keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }],
+      telemetry: { configured: false, enabled: false },
+      activity: { window: { deliveries: 0, deliveriesComplete: true, jobs: 0, jobsComplete: true }, deliveries: {}, jobs: {}, running: 0 },
+    });
+    const { unmount } = showInstallation(api({ overview: vi.fn().mockResolvedValue(ready), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    const first = await screen.findByTestId('setup-first-job');
+    expect(first).toHaveTextContent('add your GitHub login to the allowed actors');
+    expect(within(first).getByRole('link', { name: 'Edit configuration' })).toHaveAttribute('href', '/installations/55/config');
+    unmount();
+    const again = showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, config: { activeVersion: 2, replaced: ['acme/web'] } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    expect(await screen.findByTestId('setup-first-job')).toHaveTextContent('acme/web was recreated on GitHub since the configuration was published: publish it again.');
+    again.unmount();
+    const retired = showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, config: { activeVersion: 2, retiredAgents: ['kiro'] } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    expect(await screen.findByTestId('setup-first-job')).toHaveTextContent('Your workflows run Kiro, which Updraft Cloud no longer runs here: choose another agent and publish again.');
+    retired.unmount();
+    showInstallation(api({ overview: vi.fn().mockResolvedValue({ ...ready, activity: { ...ready.activity, firstJobAt: '2026-10-01T00:00:00.000Z' } }), jobs: vi.fn().mockResolvedValue({ jobs: [] }), deliveries: vi.fn().mockResolvedValue({ deliveries: [] }) }));
+    await screen.findByTestId('installation-status');
+    expect(screen.queryByTestId('setup')).toBeNull();
+  });
+
+  it('shows no checklist once every step jobs need is done, telemetry or not', async () => {
+    showInstallation(api({ overview: vi.fn().mockResolvedValue(overview({ telemetry: { configured: false, enabled: false } })) }));
+    await screen.findByTestId('installation-status');
+    expect(screen.queryByTestId('setup')).toBeNull();
   });
 
   it('lists deliveries with what became of each, and filters to the problems', async () => {

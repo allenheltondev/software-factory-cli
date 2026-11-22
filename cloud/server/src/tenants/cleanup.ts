@@ -1,5 +1,5 @@
 import type { CleanupEntry, Store } from '../store/store.js';
-import { AGENT_KEY_NAMES, agentKeySecretName, type SecretsPort } from './agent-keys.js';
+import { ALL_AGENT_KEY_NAMES, agentKeySecretName, type SecretsPort } from './agent-keys.js';
 
 /**
  * The uninstall retention deadline (#64: "uninstalling disables the tenant, and its data is
@@ -57,7 +57,7 @@ export async function runCleanup(deps: CleanupDeps): Promise<CleanupReport> {
 async function cleanTenant(entry: CleanupEntry, deps: CleanupDeps): Promise<void> {
   const keys = await deps.listObjects(tenantPrefix(entry.installationId));
   for (let i = 0; i < keys.length; i += 1000) await deps.deleteObjects(keys.slice(i, i + 1000));
-  for (const name of AGENT_KEY_NAMES) await deps.secrets.remove(agentKeySecretName(entry.installationId, name));
+  for (const name of ALL_AGENT_KEY_NAMES) await deps.secrets.remove(agentKeySecretName(entry.installationId, name));
   // And any table row an interrupted uninstall sweep left without a TTL.
   await deps.store.purgeTenantPartition(entry.installationId);
 }

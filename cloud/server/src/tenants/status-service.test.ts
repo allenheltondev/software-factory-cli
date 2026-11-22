@@ -52,7 +52,7 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
   const member = async (_c: Caller, id: number) => {
     if (id !== 55) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
     const t = (await store.getTenant(55))!;
-    return { tenant: t, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: t.status, role: 'owner' as const } };
+    return { tenant: t, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: t.status, role: 'owner' as const }, githubLogin: 'Pat' };
   };
   const clock = { now: Date.now() };
   const service = createStatusService({
@@ -122,6 +122,55 @@ describe('status and diagnostics (#71)', () => {
         { fullName: 'acme/docs', htmlUrl: 'https://github.com/acme/docs', private: false, reachable: true, configured: false, paused: false },
       ]);
       expect((body.keys as unknown[]).length).toBe(2);
+    });
+
+    it("names only the labels the viewer may apply, in repositories the installation reaches, and whether traces are set up", async () => {
+      const { store, get } = await setup();
+      const v = await store.createConfigVersion(55, {
+        sha256: 'x',
+        files: ['config.yaml'],
+        publishedBy: 'pat',
+        publishedAt: '2026-11-20T10:00:00.000Z',
+        dispatch: {
+          repositories: {
+            'acme/web': { id: 9, actors: ['pat'], triggers: [{ label: 'updraft' }, { label: 'updraft:review' }, { label: 'others', actors: ['sam'] }] },
+            'acme/docs': { id: 10, paused: true, actors: ['pat'], triggers: [{ label: 'paused' }] },
+            'acme/api': { id: 12, triggers: [{ label: 'theirs', actors: ['sam'] }] },
+            'acme/gone': { id: 13, actors: ['pat'], triggers: [{ label: 'unreachable' }] },
+          },
+        },
+      });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      const first = (await get('55/overview')).body;
+      expect((first.config as { triggers?: unknown }).triggers).toEqual([{ repository: 'acme/web', label: 'updraft' }, { repository: 'acme/web', label: 'updraft:review' }]);
+      expect(first.config).not.toHaveProperty('replaced');
+      expect(first.telemetry).toEqual({ configured: false, enabled: false });
+      expect(first.activity).not.toHaveProperty('firstJobAt');
+      await store.markFirstJob(55, '2026-11-20T11:00:00.000Z');
+      expect((await get('55/overview')).body.activity).toMatchObject({ firstJobAt: '2026-11-20T11:00:00.000Z' });
+      await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat' } }, 0);
+      expect((await get('55/overview')).body.telemetry).toEqual({ configured: true, enabled: true });
+    });
+
+    it('seeds the first-job marker from a started job the records still keep, so it outlives them', async () => {
+      const { store, get } = await setup();
+      const j = job({ jobId: 'job_seed00001', createdAt: '2026-11-19T09:00:00.000Z' });
+      await store.putJob(j);
+      await store.startJob(j, j.expiresAt);
+      await store.finishJob(j.jobId, 'succeeded', { at: Date.now() });
+      expect((await get('55/overview')).body.activity).toMatchObject({ firstJobAt: '2026-11-19T09:00:00.000Z' });
+      expect((await store.getTenant(55))?.firstJobAt).toBe('2026-11-19T09:00:00.000Z');
+    });
+
+    it('suggests no label in a repository GitHub now has under another id, and says it needs publishing again', async () => {
+      const { store, get } = await setup();
+      const v = await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 'pat', publishedAt: '', dispatch: { repositories: { 'acme/web': { id: 99, actors: ['pat'], triggers: [{ label: 'updraft' }] } } } });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      const { body } = await get('55/overview');
+      expect(body.config).toMatchObject({ replaced: ['acme/web'] });
+      expect(body.config).not.toHaveProperty('triggers');
     });
 
     it('says when its counts are of the latest deliveries only, not all 30 days', async () => {

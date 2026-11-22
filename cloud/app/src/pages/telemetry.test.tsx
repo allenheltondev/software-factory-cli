@@ -29,15 +29,16 @@ function show(api: ReturnType<typeof fakeApi>) {
 }
 
 describe('TelemetryPage', () => {
-  it('asks for a key first, checks it in the chosen region, and shows where it goes', async () => {
+  it('asks for a key first, finds its region itself, and shows where it goes', async () => {
     const setTelemetryKey = vi.fn().mockResolvedValue(on);
     show(fakeApi({ telemetry: vi.fn().mockResolvedValue(off), setTelemetryKey }));
     expect(await screen.findByTestId('telemetry-state')).toHaveTextContent('Not set up');
     expect(screen.queryByTestId('telemetry-settings')).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: /^EU/ }));
+    // No region to choose: the key says where it is from.
+    expect(screen.queryByRole('button', { name: /^EU/ })).toBeNull();
     await userEvent.type(screen.getByLabelText('Ingest key'), 'hcaik_01j1824es7n4evcmv81cn392jbsecret');
     await userEvent.click(screen.getByRole('button', { name: 'Check and save' }));
-    expect(setTelemetryKey).toHaveBeenCalledWith(55, { provider: 'honeycomb', value: 'hcaik_01j1824es7n4evcmv81cn392jbsecret', region: 'eu' });
+    expect(setTelemetryKey).toHaveBeenCalledWith(55, { provider: 'honeycomb', value: 'hcaik_01j1824es7n4evcmv81cn392jbsecret', region: 'auto' });
     expect(await screen.findByTestId('telemetry-key-saved')).toHaveTextContent('Honeycomb accepted the key');
     expect(screen.getByTestId('telemetry-state')).toHaveTextContent('Sending');
     expect(screen.getByTestId('telemetry-key-facts')).toHaveTextContent('Acme');

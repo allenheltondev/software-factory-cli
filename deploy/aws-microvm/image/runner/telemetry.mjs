@@ -543,7 +543,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   const tools = new Map();
   /** Codex: the open turn's chat span. */
   let turn = null;
-  const summary = { runId: null, kind: null, agent: null, chats: 0, tools: 0, toolErrors: 0, inputTokens: 0, outputTokens: 0, outcome: null, costUsd: null, review: null, change: null };
+  const summary = { runId: null, kind: null, agent: null, adapter: null, chats: 0, tools: 0, toolErrors: 0, inputTokens: 0, outputTokens: 0, outcome: null, costUsd: null, review: null, change: null };
   /** When the run's first line was read: its preparation (prompt, worktree) starts then. */
   let firstAt = null;
   let prepareSpan = null;
@@ -685,7 +685,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       links: (h.follows ?? []).map((f) => ({ traceId: f.traceId, spanId: agentSpanIdFor(f.runId), attributes: { 'updraft.link.relation': f.relation, 'updraft.run.id': f.runId } })),
     };
     contexts.set('', { span: agentSpan, name: h.agent ?? 'agent', last: at, chat: null, pendingInput: [] });
-    Object.assign(summary, { runId: h.runId ?? null, kind: h.kind, agent: h.agent ?? null });
+    Object.assign(summary, { runId: h.runId ?? null, kind: h.kind, agent: h.agent ?? null, adapter: h.adapter ?? null });
     if (captureContent && readPrompt) {
       readPrompt()
         .then((prompt) => {
@@ -1762,6 +1762,7 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
       // The job's totals, for the console without any destination: what every run cost and did.
       const runSummaries = [...runs.values()].map((r) => r.trace.summary);
       const costs = runSummaries.filter((r) => typeof r.costUsd === 'number');
+      const adapters = [...new Set(runSummaries.map((r) => r.adapter).filter((a) => typeof a === 'string' && a !== ''))].sort();
       const totals = {
         runs: runSummaries.length,
         inputTokens: runSummaries.reduce((n, r) => n + (r.inputTokens ?? 0), 0),
@@ -1782,6 +1783,10 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
         conversationIds: conversations,
         marks,
         runs: [...runs.values()].map((r) => r.trace.summary),
+        // The adapters that ran (whose keys the job used), when every run was read and named one:
+        // past MAX_RUNS some were not, and none read may mean the logs were not, so the broker
+        // then counts every key it handed out.
+        ...(adapters.length && runs.size < MAX_RUNS ? { adapters } : {}),
         spans: stats.spans,
         exported: exporter.stats.exported,
         failed: exporter.stats.failed + exporter.stats.dropped + exporter.pending(),

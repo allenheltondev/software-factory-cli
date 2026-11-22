@@ -103,6 +103,17 @@ describe('the job broker', () => {
     expect(JSON.stringify(policy)).not.toContain('tenants/55/config/2/');
   });
 
+  it("marks the tenant's first job when a job starts, once", async () => {
+    expect((await store.getTenant(55))?.firstJobAt).toBeUndefined();
+    await handle({ action: 'start', jobId: job.jobId, token });
+    const at = (await store.getTenant(55))?.firstJobAt;
+    expect(at).toBe(new Date(NOW).toISOString());
+    clock = NOW + 60_000;
+    await handle({ action: 'start', jobId: job.jobId, token });
+    expect((await store.getTenant(55))?.firstJobAt).toBe(at);
+    expect((await store.getTenant(66))?.firstJobAt).toBeUndefined();
+  });
+
   it('hands the job its telemetry settings at start, never as an agent key, and the same in every later answer', async () => {
     const base = { provider: 'honeycomb' as const, region: 'eu' as const, serviceName: 'factory', captureContent: true, updatedAt: '', updatedBy: 'pat' };
     await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }, 0);
@@ -186,6 +197,30 @@ describe('the job broker', () => {
     expect(await handle({ action: 'start', jobId: job.jobId, token })).toMatchObject({
       descriptor: { telemetry: { provider: 'cloudwatch', endpoint: 'https://xray.us-west-2.amazonaws.com', header: 'authorization', secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY' } },
     });
+  });
+
+  it("records a key's use only for the agents that ran, and every key when the runner does not say", async () => {
+    const both = { ...job, agentKeys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] };
+    await store.putJob(both);
+    for (const name of ['ANTHROPIC_API_KEY', 'CODEX_API_KEY']) await store.putAgentKeyMeta(55, { name, updatedAt: new Date(NOW - 60_000).toISOString(), updatedBy: 'pat' });
+    await handle({ action: 'start', jobId: job.jobId, token });
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed', detail: { adapters: ['claude', 'gemini'] } });
+    const used = async () => Object.fromEntries((await store.listAgentKeyMeta(55)).map((k) => [k.name, k.lastUsedAt !== undefined]));
+    expect(await used()).toEqual({ ANTHROPIC_API_KEY: true, CODEX_API_KEY: false });
+    expect((await store.getJobSummary(55, job.jobId))?.detail?.adapters).toEqual(['claude']);
+    // A runner from before the report: every key the job was handed counts, but an unchecked one.
+    await store.putAgentKeyMeta(55, { name: 'KIRO_API_KEY', updatedAt: new Date(NOW - 60_000).toISOString(), updatedBy: 'pat' });
+    const older = { ...both, jobId: 'job_abc12346', deliveryId: 'd-2', agentKeys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY', 'KIRO_API_KEY'] };
+    await store.putJob(older);
+    await handle({ action: 'start', jobId: older.jobId, token });
+    await handle({ action: 'finish', jobId: older.jobId, token, outcome: 'succeeded' });
+    expect(await used()).toEqual({ ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false });
+    // A job that ran no agent: none of its keys.
+    const noop = { ...older, jobId: 'job_abc12347', deliveryId: 'd-3' };
+    await store.putJob(noop);
+    await handle({ action: 'start', jobId: noop.jobId, token });
+    await handle({ action: 'finish', jobId: noop.jobId, token, outcome: 'succeeded', detail: { updraftOutcome: 'nothing-to-do', adapters: [] } });
+    expect(await used()).toEqual({ ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false });
   });
 
   it('keeps the trace a finish reports, and records how the export went', async () => {

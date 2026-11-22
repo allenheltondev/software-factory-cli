@@ -525,11 +525,23 @@ export function createTelemetryService({ store, github, secrets, check, checkOtl
       const lease = await acquire(installationId);
       let done = false;
       try {
-        const region: Region = input.region === 'eu' ? 'eu' : input.region === 'us' ? 'us' : (await current(installationId)).region;
+        // `auto`: the key says where it is from. Asked in the US first, then the EU whenever the US
+        // did not accept it (rejected, or could not be asked); a key is known in one only.
+        const auto = input.region === 'auto';
+        let region: Region = input.region === 'eu' ? 'eu' : input.region === 'us' ? 'us' : auto ? 'us' : (await current(installationId)).region;
         // The value is never repeated, in any message.
-        const verdict = await check(region, value);
-        if (verdict.result === 'invalid') throw new FlowError('invalid_key', 400, `Honeycomb (${region.toUpperCase()}) rejected that key; nothing was changed. Is it for the other region?`);
-        if (verdict.result === 'unavailable') throw new FlowError('invalid_key', 400, 'Could not check the key with Honeycomb just now; nothing was changed, try again');
+        let verdict = await check(region, value);
+        let unavailable = verdict.result === 'unavailable';
+        if (auto && verdict.result !== 'valid') {
+          region = 'eu';
+          verdict = await check(region, value);
+          unavailable ||= verdict.result === 'unavailable';
+        }
+        if (verdict.result !== 'valid') {
+          // Neither region accepted it: only a rejection by every region it was asked in says the key is wrong.
+          if (unavailable) throw new FlowError('invalid_key', 400, 'Could not check the key with Honeycomb just now; nothing was changed, try again');
+          throw new FlowError('invalid_key', 400, auto ? 'Honeycomb rejected that key in both the US and the EU; nothing was changed' : `Honeycomb (${region.toUpperCase()}) rejected that key; nothing was changed. Is it for the other region?`);
+        }
         if (!verdict.auth.canSend) throw new FlowError('invalid_key', 400, 'That key cannot send events. Use an Ingest key (Environment settings → API Keys in Honeycomb); nothing was changed');
         const tenant = await store.getTenant(installationId);
         if (!tenant || tenant.disabledReason === 'uninstalled') throw new FlowError('uninstalled', 409, 'This installation was uninstalled');

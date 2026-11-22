@@ -4,7 +4,8 @@ import type { GitHubRepository } from '../github/client.js';
 import type { ConfigVersion, Store } from '../store/store.js';
 import { AGENT_KEY_NAMES } from './agent-keys.js';
 import { CEILINGS, compileTenantConfig, type ConfigIssue, type TenantSubmission } from './config.js';
-import { CONSOLE_LIMITS, defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission, type ConsoleConfig } from './console.js';
+import { CONSOLE_AGENTS, CONSOLE_LIMITS, defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission, type ConsoleConfig } from './console.js';
+import type { CloudAgent } from './agents.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 import { configPrefix, SOURCE_FILE } from './paths.js';
 import { publishTenantConfig, type ConfigSource } from './publish.js';
@@ -60,6 +61,8 @@ export interface ConfigView {
   repositories: GitHubRepository[];
   /** Which agent keys are set (never their values). */
   agentKeys: Record<string, boolean>;
+  /** The agents this deployment runs (CLOUD_AGENTS): what the editor offers. */
+  agents: CloudAgent[];
   activeVersion: number | null;
   /**
    * What the active version was written as: `console` (its settings are `config`), `tenant` (a
@@ -216,6 +219,7 @@ export function createConfigService({ store, github, objects, now = () => Date.n
         githubLogin: ctx.githubLogin,
         repositories: ctx.repositories,
         agentKeys: Object.fromEntries(AGENT_KEY_NAMES.map((n) => [n, keys.has(n)])),
+        agents: [...CONSOLE_AGENTS],
         activeVersion: active ?? null,
         source: kind,
         config,
