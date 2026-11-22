@@ -24,6 +24,37 @@ console's links: a [direct trace link](https://docs.honeycomb.io/investigate/col
 and a [shared query](https://docs.honeycomb.io/investigate/collaborate/share-query) for the
 conversation.
 
+### Any OTLP endpoint
+
+Any backend that takes OTLP/HTTP with JSON encoding: a hosted tracing service, or your own
+OpenTelemetry Collector on a public HTTPS address (which can then forward anywhere, in any
+encoding). Three things, saved together:
+
+- **The endpoint**, the base OTLP endpoint as in `OTEL_EXPORTER_OTLP_ENDPOINT`: the runner sends
+  to it plus `/v1/traces`, or to the endpoint itself when it already ends with `/v1/traces`. It
+  must be `https://` to a public DNS name: no IP address, no single-label or internal name
+  (`.internal`, `.local`, `.lan`, ...), no credentials, query string or fragment.
+- **The header** the key goes in (`authorization`, `x-api-key`, ...): not one the runner sets
+  itself (`content-type`, `host`, `content-length`, ...) or a `proxy-` one.
+- **Its value**, whole: `Bearer <token>`, `Basic <base64>`, or a bare key.
+
+Before saving, the API sends the endpoint an empty export (`{"resourceSpans":[]}`) with the
+header: a receiver that takes OTLP/HTTP JSON accepts it and records nothing; 401 or 403 means the
+key was refused, and 400, 404, 405, 406 or 415 that this is not an OTLP/HTTP JSON endpoint. Nothing
+is saved unless it answered 2xx. The endpoint's name must resolve only to public addresses, and a
+redirect is never followed.
+
+**Links** are optional templates, so each job's page links into your tool:
+
+- **Trace link**, naming `{trace_id}`, and also `{span_id}` for the moments in it (the job's own
+  trace link then opens at its root span), `{start}` and `{end}` in UNIX seconds, `{start_ms}` and
+  `{end_ms}` in milliseconds (a minute before the job to five minutes after it), and `{service}`.
+- **Conversation link**, naming `{conversation}`, with the same times (a week before the job to a
+  week after it, or now) and `{service}`: every trace of one issue.
+
+Each is an `https://` URL whose host is written out; every value filled in is URL-encoded. Without
+them, the job page still shows what the agents did, and the jobs list links nowhere.
+
 ## How it works
 
 Nothing is installed in, or asked of, an agent. The microVM's runner (root) already has what it
@@ -317,19 +348,30 @@ path it can change without notice; the query link works either way.
 
 ## Security
 
-- The key is a Secrets Manager secret, `updraft/tenants/<id>/agent-keys/HONEYCOMB_API_KEY`. The
-  API can create, replace and delete it, never read it. Only a job of the same tenant can read
+- The key is a Secrets Manager secret, `updraft/tenants/<id>/agent-keys/HONEYCOMB_API_KEY` (the
+  name from when Honeycomb was the only destination; a custom destination's header value is kept
+  there too). The API can create, replace and delete it, never read it. Only a job of the same tenant can read
   it, with the broker's tenant-scoped credentials.
 - The broker passes it to the runner as telemetry settings, never among the agent keys, so it is
   never in the job process's or an agent's environment. The runner reads it as root.
 - The key and where it sends always match. The settings record the Secrets Manager version the
-  key was written as, in the same conditional write as its region and team, and the runner reads
-  exactly that version. Key changes take a two-minute lease on the settings, so a rotation and
+  key was written as, in the same conditional write as its destination (Honeycomb's region and
+  team, or the custom endpoint and header), and the runner reads exactly that version. A
+  destination cannot change without the key being entered again, so no member can point a saved
+  key at another server. Key changes take a two-minute lease on the settings, so a rotation and
   another rotation, or a removal, never overlap; a change that stops halfway leaves the settings
   naming the previous version, which Secrets Manager keeps. A removal clears the settings first
   and deletes the secret second, holding the lease until the delete is done, so a new key saved
   meanwhile can never be deleted with the old one.
 - Every setting change is a compare-and-set on the version it read, so an opt-out made while a
   key was being checked is never undone.
+- A custom endpoint is checked twice: by the API before it is saved (its rules, its name resolving
+  only to public addresses, an empty export answered 2xx, no redirect followed), and by the runner
+  before each job sends (the same rules, and the name resolving only to public addresses then).
+  Neither follows a redirect. The name is resolved again when the request is made, so a name
+  that changes what it resolves to between the check and the request is not caught; what it can
+  reach then is the tenant's own spans, with the tenant's own key.
+- The key's value and each word of it (the token in `Bearer <token>`) are redacted from
+  everything the runner sends, logs or uploads.
 - A failed export (the destination unreachable, the key revoked) is counted and reported; it never fails
   the job.

@@ -57,10 +57,21 @@ function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
   const e = i.lastExport && typeof i.lastExport === 'object' ? (i.lastExport as Record<string, unknown>) : undefined;
   const team = named(key?.team);
   const environment = named(key?.environment);
+  const otlp = i.otlp && typeof i.otlp === 'object' ? (i.otlp as Record<string, unknown>) : undefined;
+  const links = i.links && typeof i.links === 'object' ? (i.links as Record<string, unknown>) : undefined;
   return {
-    provider: 'honeycomb',
+    provider: i.provider === 'otlp' ? 'otlp' : 'honeycomb',
     enabled: i.enabled === true,
     region: i.region === 'eu' ? 'eu' : 'us',
+    ...(otlp && typeof otlp.endpoint === 'string' && typeof otlp.header === 'string' ? { otlp: { endpoint: otlp.endpoint, header: otlp.header } } : {}),
+    ...(links
+      ? {
+          links: {
+            ...(typeof links.trace === 'string' ? { trace: links.trace } : {}),
+            ...(typeof links.conversation === 'string' ? { conversation: links.conversation } : {}),
+          },
+        }
+      : {}),
     serviceName: typeof i.serviceName === 'string' ? i.serviceName : 'updraft',
     captureContent: i.captureContent === true,
     updatedAt: String(i.updatedAt ?? ''),

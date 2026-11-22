@@ -166,17 +166,19 @@ async function rejectedSpans(res, size) {
  * Sends finished spans in batches (OTLP/HTTP, JSON encoding) to `<endpoint>/v1/traces` with the
  * `x-honeycomb-team` header. Never throws: a failure is counted and logged, and the job goes on.
  */
-export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
+export function createExporter({ endpoint, apiKey, headerName = 'x-honeycomb-team', resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
   const queue = [];
   // The one way out: every string of every span, and of the resource, passes the job's redactor
   // here, whatever produced it (a span name, a tool or model name read from the transcript, an
   // id, a URL). Content was redacted when it was recorded too; redacting twice changes nothing.
   const cleanResource = redactAttributes(resource ?? {}, redact);
   const stats = { exported: 0, failed: 0, dropped: 0, requests: 0, lastError: null, lastOkAt: null };
-  /** The span ids Honeycomb accepted (a 2xx for their batch): only those are worth a link. */
+  /** The span ids the destination accepted (a 2xx for their batch): only those are worth a link. */
   const accepted = new Set();
   let sending = Promise.resolve();
-  const url = `${endpoint.replace(/\/+$/, '')}/v1/traces`;
+  // The base endpoint (OTEL_EXPORTER_OTLP_ENDPOINT's form), or the traces endpoint itself.
+  const base = endpoint.replace(/\/+$/, '');
+  const url = /\/v1\/traces$/.test(base) ? base : `${base}/v1/traces`;
 
   async function post(batch) {
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -184,8 +186,10 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
         stats.requests += 1;
         const res = await fetchImpl(url, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-honeycomb-team': apiKey },
+          headers: { 'content-type': 'application/json', [headerName]: apiKey },
           body: JSON.stringify(otlpRequest(batch, cleanResource)),
+          // A redirect is an answer, never followed: the key goes only where it was checked.
+          redirect: 'manual',
           signal: AbortSignal.timeout(timeoutMs),
         });
         if (res.ok) {
@@ -1760,6 +1764,7 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
       };
       return {
         traceId,
+        rootSpanId,
         // Read for the console only, sent nowhere (createLocalExporter): no link can open it.
         ...(exporter.local ? { local: true } : {}),
         totals,

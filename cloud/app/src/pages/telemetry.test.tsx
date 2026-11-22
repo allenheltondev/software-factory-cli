@@ -37,13 +37,37 @@ describe('TelemetryPage', () => {
     await userEvent.click(screen.getByRole('button', { name: /^EU/ }));
     await userEvent.type(screen.getByLabelText('Ingest key'), 'hcaik_01j1824es7n4evcmv81cn392jbsecret');
     await userEvent.click(screen.getByRole('button', { name: 'Check and save' }));
-    expect(setTelemetryKey).toHaveBeenCalledWith(55, 'hcaik_01j1824es7n4evcmv81cn392jbsecret', 'eu');
+    expect(setTelemetryKey).toHaveBeenCalledWith(55, { provider: 'honeycomb', value: 'hcaik_01j1824es7n4evcmv81cn392jbsecret', region: 'eu' });
     expect(await screen.findByTestId('telemetry-key-saved')).toHaveTextContent('Honeycomb accepted the key');
     expect(screen.getByTestId('telemetry-state')).toHaveTextContent('Sending');
     expect(screen.getByTestId('telemetry-key-facts')).toHaveTextContent('Acme');
     expect(screen.getByTestId('telemetry-key-facts')).toHaveTextContent('Production');
     expect(screen.getByTestId('telemetry-open')).toHaveAttribute('href', 'https://ui-eu1.honeycomb.io/acme/environments/production');
     expect(screen.getByTestId('telemetry-settings')).toBeInTheDocument();
+  });
+
+  it('sets any OTLP endpoint with the header its key goes in, then its links', async () => {
+    const custom: TelemetryView = { ...off, provider: 'otlp', enabled: true, keyConfigured: true, otlp: { endpoint: 'https://otlp.example.com/otlp', header: 'authorization', host: 'otlp.example.com' }, key: { updatedAt: NOW, updatedBy: 'pat', type: 'otlp' } };
+    const setTelemetryKey = vi.fn().mockResolvedValue(custom);
+    const updateTelemetry = vi.fn().mockImplementation(async (_id: number, input: Partial<TelemetryView>) => ({ ...custom, ...input }));
+    show(fakeApi({ telemetry: vi.fn().mockResolvedValue(off), setTelemetryKey, updateTelemetry }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Any OTLP endpoint' }));
+    expect(screen.queryByLabelText('Ingest key')).not.toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('OTLP endpoint'), 'http://otlp.example.com');
+    await userEvent.type(screen.getByLabelText('Header value'), 'Bearer otlp-secret-token');
+    expect(screen.getByRole('button', { name: 'Check and save' })).toBeDisabled();
+    await userEvent.clear(screen.getByLabelText('OTLP endpoint'));
+    await userEvent.type(screen.getByLabelText('OTLP endpoint'), 'https://otlp.example.com/otlp');
+    await userEvent.click(screen.getByRole('button', { name: 'Check and save' }));
+    expect(setTelemetryKey).toHaveBeenCalledWith(55, { provider: 'otlp', value: 'Bearer otlp-secret-token', endpoint: 'https://otlp.example.com/otlp', header: 'authorization' });
+    expect(await screen.findByTestId('telemetry-key-saved')).toHaveTextContent('otlp.example.com accepted the key');
+    expect(screen.getByTestId('telemetry-destination')).toHaveTextContent('otlp.example.com');
+    expect(screen.getByTestId('telemetry-key-facts')).toHaveTextContent('https://otlp.example.com/otlp');
+    expect(screen.queryByTestId('telemetry-open')).not.toBeInTheDocument();
+    // Its links: templates the console fills in.
+    await userEvent.type(screen.getByLabelText('Trace link'), 'https://ui.example.com/t/{{trace_id}');
+    await userEvent.click(screen.getByRole('button', { name: 'Save links' }));
+    expect(updateTelemetry).toHaveBeenCalledWith(55, { links: { trace: 'https://ui.example.com/t/{trace_id}', conversation: '' } });
   });
 
   it("says why Honeycomb refused a key, and stops a value that cannot be one before sending it", async () => {
@@ -197,11 +221,11 @@ describe('the job page links to its trace', () => {
     expect(totals).toHaveTextContent('$1.23');
     expect(totals).toHaveTextContent('41 (3 failed)');
     const timeline = screen.getByTestId('job-timeline');
-    expect(timeline).toHaveTextContent('+5 s');
+    expect(timeline).toHaveTextContent('+0:05');
     expect(timeline).toHaveTextContent('Implementation · claude-opus');
     expect(timeline).toHaveTextContent('5 min');
     expect(timeline).toHaveTextContent('went in circles');
-    expect(timeline).toHaveTextContent('+1 min 5 s');
+    expect(timeline).toHaveTextContent('+1:05');
     expect(screen.queryByRole('link', { name: /First failing test run/ })).not.toBeInTheDocument();
     // Nothing went anywhere: no trace link, no count of spans sent, an offer to set it up.
     expect(screen.queryByTestId('job-trace-link')).not.toBeInTheDocument();

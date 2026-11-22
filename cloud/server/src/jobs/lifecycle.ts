@@ -82,6 +82,8 @@ export interface JobTelemetryReport {
   startedAt?: string;
   /** A short code (HTTP 401, timeout, ...). */
   lastError?: string;
+  /** The job's root span (invoke_workflow updraft): a custom destination's trace link opens at it. */
+  rootSpanId?: string;
   /** The conversation the job's spans were sent in: `owner/repo#issue`, `delivery/<id>`, or a run's own id. */
   conversationId?: string;
   /** Spans worth a link of their own (the runner's telemetry.mjs), in the order they started. */
@@ -188,6 +190,7 @@ export function telemetryOf(raw: unknown): JobTelemetryReport | undefined {
     if (marks.length) out.marks = marks;
   }
   if (t.local === true) out.local = true;
+  if (typeof t.rootSpanId === 'string' && /^[0-9a-f]{16}$/.test(t.rootSpanId)) out.rootSpanId = t.rootSpanId;
   const totals = totalsOf(t.totals);
   if (totals) out.totals = totals;
   return out;

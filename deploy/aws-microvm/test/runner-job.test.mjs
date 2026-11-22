@@ -587,6 +587,50 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(Object.keys(record.env).filter((k) => k.startsWith('OTEL_') || k === 'CLAUDE_CODE_ENABLE_TELEMETRY')).toEqual([]);
   });
 
+  it('sends to a custom OTLP endpoint with the key in its header, redacted, and never follows a redirect', async () => {
+    const secret = 'Bearer otlp-secret-token-value-123';
+    const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': secret } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push({ url, init });
+      return { ok: true, status: 200 };
+    };
+    const resolved = [];
+    harness.deps.resolvesPublic = async (host) => {
+      resolved.push(host);
+      return true;
+    };
+    const otlp = { ...telemetry, provider: 'otlp', endpoint: 'https://otlp.example.com/otlp', header: 'authorization' };
+    expect((await runJob(brokerRequest({ telemetry: otlp }), harness.deps)).outcome).toBe('succeeded');
+    expect(resolved).toEqual(['otlp.example.com']);
+    expect(posts.length).toBeGreaterThan(0);
+    expect(posts[0].url).toBe('https://otlp.example.com/otlp/v1/traces');
+    expect(posts[0].init.headers).toMatchObject({ authorization: secret });
+    expect(posts[0].init.headers).not.toHaveProperty('x-honeycomb-team');
+    expect(posts[0].init.redirect).toBe('manual');
+    // Neither the whole value nor its token is in what was sent or logged.
+    const out = JSON.stringify(posts.map((p) => p.init.body)) + JSON.stringify(harness.finishDetails);
+    expect(out).not.toContain('otlp-secret-token-value-123');
+    expect(harness.finishDetails[0].telemetry).toMatchObject({ exported: expect.any(Number) });
+    expect(harness.finishDetails[0].telemetry.local).toBeUndefined();
+  });
+
+  it('sends nothing to a custom endpoint that resolves to a private address, or that is not one it sends to, and still reads the job', async () => {
+    for (const [endpoint, publicHost] of [
+      ['https://otlp.example.com', false],
+      ['http://otlp.example.com', true],
+      ['https://10.0.0.5', true],
+    ]) {
+      const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'Bearer otlp-secret-token-value-123' } });
+      harness.deps.fetch = async () => {
+        throw new Error('must not be called');
+      };
+      harness.deps.resolvesPublic = async () => publicHost;
+      expect((await runJob(brokerRequest({ telemetry: { ...telemetry, provider: 'otlp', endpoint, header: 'authorization' } }), harness.deps)).outcome).toBe('succeeded');
+      expect(harness.finishDetails[0].telemetry, endpoint).toMatchObject({ local: true });
+    }
+  });
+
   it('reads exactly the secret version the settings name', async () => {
     const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
     harness.deps.fetch = async () => ({ ok: true, status: 200 });

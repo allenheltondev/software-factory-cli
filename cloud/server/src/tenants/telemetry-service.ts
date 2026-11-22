@@ -3,18 +3,31 @@ import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows } from '../flows/github.js';
 import type { Store, TelemetryExport, TelemetrySettings } from '../store/store.js';
 import { agentKeySecretName, type SecretsPort } from './agent-keys.js';
+import {
+  CONVERSATION_LINK_PLACEHOLDERS,
+  TRACE_LINK_PLACEHOLDERS,
+  checkOtlpEndpoint,
+  fillTemplate,
+  headerNameProblem,
+  headerValueOk,
+  linkTemplateProblem,
+  parseOtlpEndpoint,
+  type OtlpChecker,
+} from './otlp-destination.js';
 
 /**
  * A tenant's agent telemetry in the console: jobs send traces of what their agents did, in the
- * OpenTelemetry GenAI semantic conventions, to the tenant's own Honeycomb, where Agent Timeline
- * shows each issue's implement run, reviews and revisions as one conversation.
+ * OpenTelemetry GenAI semantic conventions, to the tenant's own tracing tool: the Honeycomb preset,
+ * or any OTLP/HTTP endpoint that takes JSON (tenants/otlp-destination.ts).
  *
- *   view          the settings, whether a key is set (never the key), the Honeycomb team and
- *                 environment it belongs to, and how the last job's export went
- *   setKey        a Honeycomb ingest key (or a configuration key that may send events), checked
- *                 with Honeycomb's /1/auth before it is saved, in the region given. Saving the
- *                 first key turns telemetry on
- *   update        on or off, the service name (dataset), and whether content is recorded
+ *   view          the settings, whether a key is set (never the key), where it sends (Honeycomb's
+ *                 team and environment, or the endpoint and header), and how the last export went
+ *   setKey        the destination and its key, together. Honeycomb: an ingest key (or a
+ *                 configuration key that may send events), checked with /1/auth in the region
+ *                 given. OTLP: an endpoint, a header and its value, checked with an empty export.
+ *                 Saving the first key turns telemetry on
+ *   update        on or off, the service name, whether content is recorded, and a custom
+ *                 destination's link templates
  *   removeKey     deletes the key; telemetry is off until a new one is set
  *
  * The key is a secret like an agent key (`updraft/tenants/<id>/agent-keys/HONEYCOMB_API_KEY`), so
@@ -69,8 +82,12 @@ export const checkHoneycombKey = (fetchFn: typeof fetch = fetch, timeoutMs = 800
   };
 
 export interface TelemetryView {
-  provider: 'honeycomb';
+  provider: 'honeycomb' | 'otlp';
   enabled: boolean;
+  /** A custom destination: where it sends, and the header the key goes in (never the key). */
+  otlp?: { endpoint: string; header: string; host: string };
+  /** A custom destination's link templates. */
+  links?: { trace?: string; conversation?: string };
   region: Region;
   serviceName: string;
   captureContent: boolean;
@@ -87,34 +104,57 @@ export const DEFAULT_TELEMETRY: Omit<TelemetrySettings, 'updatedAt' | 'updatedBy
 
 export function telemetryView(s: TelemetrySettings | null): TelemetryView {
   const t = s ?? { ...DEFAULT_TELEMETRY, updatedAt: '', updatedBy: '' };
+  const host = t.otlp ? parseOtlpEndpoint(t.otlp.endpoint) : null;
   return {
-    provider: 'honeycomb',
+    provider: t.provider,
     enabled: t.enabled && Boolean(t.key),
+    ...(t.provider === 'otlp' && t.otlp ? { otlp: { ...t.otlp, host: host && 'host' in host ? host.host : '' } } : {}),
+    ...(t.links && (t.links.trace || t.links.conversation) ? { links: t.links } : {}),
     region: t.region,
     serviceName: t.serviceName,
     captureContent: t.captureContent,
     keyConfigured: Boolean(t.key),
     ...(t.key ? { key: (({ secretVersion: _v, ...k }) => k)(t.key) } : {}),
     ...(t.lastExport ? { lastExport: withTraceUrl(t, t.lastExport) } : {}),
-    ...(t.key?.team ? { environmentUrl: environmentUrl(t) } : {}),
+    ...(t.provider === 'honeycomb' && t.key?.team ? { environmentUrl: environmentUrl(t) } : {}),
     ...(t.updatedAt ? { updatedAt: t.updatedAt, updatedBy: t.updatedBy } : {}),
   };
 }
 
-/**
- * A link to a job's trace in Honeycomb: `<ui>/<team>/environments/<env>/trace?trace_id=...` with
- * the time range around it, or the Classic form with the dataset. With `spanId`, the trace opens
- * at that span (Honeycomb opens the root when it is not in the trace). Null without the slugs.
- */
-export function traceUrl(s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> | null, traceId: string, startedAt: string, finishedAt?: string, spanId?: string): string | null {
-  if (!s?.key?.team || !/^[0-9a-f]{32}$/.test(traceId)) return null;
+/** What a link is built from: the destination, and for a custom one its templates. */
+export type LinkSettings = Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> & Partial<Pick<TelemetrySettings, 'provider' | 'links'>>;
+
+/** The trace's time range, UNIX seconds: a minute before it started, five after it ended (six hours when it has not). */
+function traceWindow(startedAt: string, finishedAt?: string): { start: number; end: number } | null {
   const start = Math.floor(Date.parse(startedAt) / 1000);
   if (!Number.isFinite(start)) return null;
   const end = finishedAt && Number.isFinite(Date.parse(finishedAt)) ? Math.ceil(Date.parse(finishedAt) / 1000) : start + 6 * 3600;
-  const span = spanId && /^[0-9a-f]{16}$/.test(spanId) ? `&span=${spanId}` : '';
-  const q = `trace?trace_id=${traceId}${span}&trace_start_ts=${start - 60}&trace_end_ts=${end + 300}`;
+  return { start: start - 60, end: end + 300 };
+}
+
+/**
+ * A link to a job's trace. Honeycomb: `<ui>/<team>/environments/<env>/trace?trace_id=...` with the
+ * time range around it, or the Classic form with the dataset; with `spanId`, the trace opens at
+ * that span (Honeycomb opens the root when it is not in the trace); null without the slugs. A
+ * custom destination: its `links.trace` template; a span link only when it names {span_id}.
+ */
+export function traceUrl(s: LinkSettings | null, traceId: string, startedAt: string, finishedAt?: string, spanId?: string): string | null {
+  if (!s?.key || !/^[0-9a-f]{32}$/.test(traceId)) return null;
+  const w = traceWindow(startedAt, finishedAt);
+  if (!w) return null;
+  const span16 = spanId && /^[0-9a-f]{16}$/.test(spanId) ? spanId : undefined;
+  if (s.provider === 'otlp') {
+    const template = s.links?.trace;
+    if (!template || (spanId !== undefined && (!span16 || !template.includes('{span_id}')))) return null;
+    return fillTemplate(template, { trace_id: traceId, span_id: span16 ?? '', ...times(w), service: s.serviceName });
+  }
+  if (!s.key.team) return null;
+  const span = span16 ? `&span=${span16}` : '';
+  const q = `trace?trace_id=${traceId}${span}&trace_start_ts=${w.start}&trace_end_ts=${w.end}`;
   return `${place(s)}/${q}`;
 }
+
+const times = (w: { start: number; end: number }) => ({ start: String(w.start), end: String(w.end), start_ms: String(w.start * 1000), end_ms: String(w.end * 1000) });
 
 /** The environment (or, Classic, the dataset) a link is in: `<ui>/<team>/environments/<env>` or `<ui>/<team>/datasets/<dataset>`. */
 function place(s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'>): string {
@@ -144,10 +184,13 @@ function conversationWindow(startedAt: string, nowMs: number): { start: number; 
  * `gen_ai.conversation.id`, broken down by agent. Selecting the conversation id in the results
  * opens it in Agent Timeline. Null without the team's slug.
  */
-export function conversationUrl(s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> | null, conversationId: string, startedAt: string, nowMs: number): string | null {
-  if (!s?.key?.team || !conversationId) return null;
+export function conversationUrl(s: LinkSettings | null, conversationId: string, startedAt: string, nowMs: number): string | null {
+  if (!s?.key || !conversationId) return null;
   const w = conversationWindow(startedAt, nowMs);
   if (!w) return null;
+  // A custom destination: its own template, when it has one.
+  if (s.provider === 'otlp') return s.links?.conversation ? fillTemplate(s.links.conversation, { conversation: conversationId, ...times(w), service: s.serviceName }) : null;
+  if (!s.key.team) return null;
   const query = {
     start_time: w.start,
     end_time: w.end,
@@ -183,8 +226,8 @@ export function parseTimelineTemplate(raw: string | undefined): string | null {
 }
 
 /** A conversation in Agent Timeline, from a template parseTimelineTemplate accepted. Null when the template needs a slug the key did not give. */
-export function timelineUrl(template: string | null, s: Pick<TelemetrySettings, 'region' | 'serviceName' | 'key'> | null, conversationId: string, startedAt: string, nowMs: number): string | null {
-  if (!template || !s?.key?.team || !conversationId) return null;
+export function timelineUrl(template: string | null, s: LinkSettings | null, conversationId: string, startedAt: string, nowMs: number): string | null {
+  if (!template || s?.provider === 'otlp' || !s?.key?.team || !conversationId) return null;
   const w = conversationWindow(startedAt, nowMs);
   if (!w) return null;
   const env = s.key.environment?.slug;
@@ -199,6 +242,24 @@ export function timelineUrl(template: string | null, s: Pick<TelemetrySettings, 
     end: String(w.end),
   };
   return template.replace(/\{([a-z]+)\}/g, (_, name: string) => values[name] ?? '');
+}
+
+/** `links` for a custom destination: each template checked, an empty one cleared. */
+function linksOf(raw: unknown): { trace?: string; conversation?: string } {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new FlowError('invalid_settings', 400, '`links` is { trace?, conversation? }');
+  const r = raw as Record<string, unknown>;
+  const out: { trace?: string; conversation?: string } = {};
+  for (const [name, allowed, required] of [
+    ['trace', TRACE_LINK_PLACEHOLDERS, 'trace_id'],
+    ['conversation', CONVERSATION_LINK_PLACEHOLDERS, 'conversation'],
+  ] as const) {
+    const v = r[name];
+    if (v === undefined || v === null || v === '') continue;
+    const problem = linkTemplateProblem(v, allowed, required);
+    if (problem) throw new FlowError('invalid_settings', 400, `The ${name} link: ${problem}`);
+    out[name] = v as string;
+  }
+  return out;
 }
 
 const HOUR_MS = 3600 * 1000;
@@ -224,10 +285,12 @@ export interface TelemetryServiceDeps {
   github: Pick<GitHubFlows, 'configContext' | 'member'>;
   secrets: SecretsPort;
   check: HoneycombChecker;
+  /** A custom destination's check: an empty export with the header. */
+  checkOtlp?: OtlpChecker;
   now?: () => number;
 }
 
-export function createTelemetryService({ store, github, secrets, check, now = Date.now }: TelemetryServiceDeps) {
+export function createTelemetryService({ store, github, secrets, check, checkOtlp = checkOtlpEndpoint(), now = Date.now }: TelemetryServiceDeps) {
   const at = () => new Date(now()).toISOString();
   const current = async (installationId: number): Promise<TelemetrySettings> =>
     (await store.getTelemetry(installationId)) ?? { ...DEFAULT_TELEMETRY, updatedAt: '', updatedBy: '' };
@@ -254,7 +317,7 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
     const id = randomUUID();
     await mutate(installationId, (latest) => {
       if (latest.keyChange && latest.keyChange.until > now()) {
-        throw new FlowError('invalid_settings', 409, 'Another change to the Honeycomb key is under way; try again in a moment');
+        throw new FlowError('invalid_settings', 409, 'Another change to the telemetry key is under way; try again in a moment');
       }
       return { ...latest, keyChange: { id, until: now() + KEY_CHANGE_LEASE_MS } };
     });
@@ -276,13 +339,53 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
 
   const lost = () => new FlowError('invalid_settings', 409, 'The key change took too long and another one may have started; check the key and try again');
 
+  /**
+   * A custom destination and its key, together: the endpoint and header are checked, then the
+   * endpoint with an empty export carrying the header, and saved in the same write as the key's
+   * version. A destination never changes without its key, so a key is only sent where it was checked.
+   */
+  async function setOtlpKey(caller: Caller, installationId: number, input: { value?: unknown; endpoint?: unknown; header?: unknown }): Promise<TelemetryView> {
+    const ctx = await github.configContext(caller, installationId);
+    const parsed = parseOtlpEndpoint(input.endpoint);
+    if ('problem' in parsed) throw new FlowError('invalid_key', 400, `${parsed.problem}; nothing was changed`);
+    const header = typeof input.header === 'string' ? input.header.trim().toLowerCase() : '';
+    const headerProblem = headerNameProblem(header);
+    if (headerProblem) throw new FlowError('invalid_key', 400, `${headerProblem}; nothing was changed`);
+    const value = typeof input.value === 'string' ? input.value.trim() : '';
+    if (!headerValueOk(value)) throw new FlowError('invalid_key', 400, 'The header value is 8 to 4096 printable characters, on one line; nothing was changed');
+    const lease = await acquire(installationId);
+    let done = false;
+    try {
+      // The value is never repeated, in any message.
+      const verdict = await checkOtlp({ tracesUrl: parsed.tracesUrl, host: parsed.host, header }, value);
+      if (verdict.result === 'invalid') throw new FlowError('invalid_key', 400, `${parsed.host} refused that key; nothing was changed`);
+      if (verdict.result === 'not_otlp') throw new FlowError('invalid_key', 400, `${parsed.host} answered HTTP ${verdict.status} to an empty OTLP/HTTP JSON export: is this its OTLP endpoint, and does it take JSON? Nothing was changed`);
+      if (verdict.result === 'unreachable') throw new FlowError('invalid_key', 400, `Could not check ${parsed.host}: ${verdict.reason}. Nothing was changed`);
+      const tenant = await store.getTenant(installationId);
+      if (!tenant || tenant.disabledReason === 'uninstalled') throw new FlowError('uninstalled', 409, 'This installation was uninstalled');
+      const written = await secrets.put(telemetrySecretName(installationId), value, { 'updraft:installation': String(installationId), 'updraft:key': TELEMETRY_KEY_NAME });
+      const key = { updatedAt: at(), updatedBy: ctx.githubLogin, ...(written?.versionId ? { secretVersion: written.versionId } : {}), type: 'otlp' };
+      const view = await mutate(installationId, (latest) => {
+        if (latest.keyChange?.id !== lease) throw lost();
+        const { keyChange: _lease, ...rest } = latest;
+        return { ...rest, provider: 'otlp', otlp: { endpoint: parsed.endpoint, header }, key, enabled: latest.key ? latest.enabled : true, updatedAt: at(), updatedBy: ctx.githubLogin };
+      });
+      done = true;
+      return view;
+    } finally {
+      if (!done) await release(installationId, lease);
+    }
+  }
+
   return {
     async view(caller: Caller, installationId: number): Promise<TelemetryView> {
       await github.member(caller, installationId);
       return telemetryView(await store.getTelemetry(installationId));
     },
 
-    async setKey(caller: Caller, installationId: number, input: { value?: unknown; region?: unknown }): Promise<TelemetryView> {
+    async setKey(caller: Caller, installationId: number, input: { provider?: unknown; value?: unknown; region?: unknown; endpoint?: unknown; header?: unknown }): Promise<TelemetryView> {
+      if (input.provider === 'otlp') return setOtlpKey(caller, installationId, input);
+      if (input.provider !== undefined && input.provider !== 'honeycomb') throw new FlowError('invalid_key', 400, '`provider` is honeycomb or otlp; nothing was changed');
       const ctx = await github.configContext(caller, installationId);
       const value = typeof input.value === 'string' ? input.value.trim() : '';
       if (!KEY_SHAPE.test(value)) throw new FlowError('invalid_key', 400, 'That does not look like a Honeycomb API key; nothing was changed');
@@ -314,8 +417,8 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
         // turns sending on. Whether it sends, and with content, stay what the latest save said.
         const view = await mutate(installationId, (latest) => {
           if (latest.keyChange?.id !== lease) throw lost();
-          const { keyChange: _lease, ...rest } = latest;
-          return { ...rest, region, key, enabled: latest.key ? latest.enabled : true, updatedAt: at(), updatedBy: ctx.githubLogin };
+          const { keyChange: _lease, otlp: _otlp, ...rest } = latest;
+          return { ...rest, provider: 'honeycomb', region, key, enabled: latest.key ? latest.enabled : true, updatedAt: at(), updatedBy: ctx.githubLogin };
         });
         done = true;
         return view;
@@ -324,17 +427,19 @@ export function createTelemetryService({ store, github, secrets, check, now = Da
       }
     },
 
-    async update(caller: Caller, installationId: number, input: { enabled?: unknown; serviceName?: unknown; captureContent?: unknown }): Promise<TelemetryView> {
+    async update(caller: Caller, installationId: number, input: { enabled?: unknown; serviceName?: unknown; captureContent?: unknown; links?: unknown }): Promise<TelemetryView> {
       const ctx = await github.configContext(caller, installationId);
       if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new FlowError('invalid_settings', 400, '`enabled` is true or false');
       if (input.serviceName !== undefined && (typeof input.serviceName !== 'string' || !SERVICE_NAME.test(input.serviceName))) {
         throw new FlowError('invalid_settings', 400, 'The service name is 1 to 64 letters, digits, dots, dashes or underscores');
       }
       if (input.captureContent !== undefined && typeof input.captureContent !== 'boolean') throw new FlowError('invalid_settings', 400, '`captureContent` is true or false');
+      const links = input.links === undefined ? undefined : linksOf(input.links);
       return mutate(installationId, (latest) => {
-        if (input.enabled === true && !latest.key) throw new FlowError('invalid_settings', 400, 'Add a Honeycomb key before turning telemetry on');
+        if (input.enabled === true && !latest.key) throw new FlowError('invalid_settings', 400, 'Add a destination and its key before turning telemetry on');
         return {
           ...latest,
+          ...(links !== undefined ? { links } : {}),
           ...(input.enabled !== undefined ? { enabled: input.enabled as boolean } : {}),
           ...(input.serviceName !== undefined ? { serviceName: input.serviceName as string } : {}),
           ...(input.captureContent !== undefined ? { captureContent: input.captureContent as boolean } : {}),

@@ -231,13 +231,24 @@ export interface AgentKeyMeta {
 
 /**
  * A tenant's agent telemetry (tenants/telemetry-service.ts): where jobs send traces of what their
- * agents did. The key itself is a secret (`agent-keys/HONEYCOMB_API_KEY`); this holds only that
- * it is set, which Honeycomb team and environment it belongs to, and how the last export went.
+ * agents did. The key itself is a secret (`agent-keys/HONEYCOMB_API_KEY`, the name from when
+ * Honeycomb was the only destination); this holds only that it is set, where it sends (Honeycomb's
+ * region and team, or a custom OTLP endpoint and the header it goes in), and how the last export went.
  */
 export interface TelemetrySettings {
-  provider: 'honeycomb';
+  /** honeycomb: the Honeycomb preset. otlp: any OTLP/HTTP endpoint that takes JSON. */
+  provider: 'honeycomb' | 'otlp';
   enabled: boolean;
+  /** Honeycomb's region. */
   region: 'us' | 'eu';
+  /**
+   * A custom destination: where the runner sends and the header the key goes in. Saved with the
+   * key, in the same write: a change of either needs the key again, so a key is only ever sent
+   * where it was checked.
+   */
+  otlp?: { endpoint: string; header: string };
+  /** A custom destination's link templates (tenants/otlp-destination.ts). */
+  links?: { trace?: string; conversation?: string };
   /** `service.name`: the dataset traces land in. */
   serviceName: string;
   /** Record prompts, model output and tool arguments and results (redacted). */

@@ -45,9 +45,10 @@ import type { ConfigService, PublishOutcome } from './tenants/config-service.js'
  *   GET    /api/v1/installations/:id/jobs/:jobId/logs/:name     the end of updraft.log or run.log
  *
  * A tenant's agent telemetry (tenants/telemetry-service.ts), members only. The key is write-only:
- *   GET    /api/v1/installations/:id/telemetry           settings, whether a key is set, its team and environment, the last export
- *   PUT    /api/v1/installations/:id/telemetry           { enabled?, serviceName?, captureContent? }
- *   PUT    /api/v1/installations/:id/telemetry/key       { value, region }: checked with Honeycomb's /1/auth, then saved
+ *   GET    /api/v1/installations/:id/telemetry           settings, whether a key is set, where it sends, the last export
+ *   PUT    /api/v1/installations/:id/telemetry           { enabled?, serviceName?, captureContent?, links? }
+ *   PUT    /api/v1/installations/:id/telemetry/key       { value, region } (Honeycomb: checked with /1/auth), or
+ *                                                        { provider: 'otlp', value, endpoint, header } (an empty export), then saved
  *   DELETE /api/v1/installations/:id/telemetry/key       telemetry is off until a new key is set
  *
  * A tenant's insights (tenants/stats-service.ts), members only:

@@ -25,6 +25,7 @@ import {
 } from './state.mjs';
 import { claudeTelemetryEnv, createOtlpRelay } from './otlp-relay.mjs';
 import { HONEYCOMB_ENDPOINTS, createAgentTracer, createExporter, createLocalExporter } from './telemetry.mjs';
+import { headerNameOk, parseOtlpEndpoint, resolvesPublic } from './otlp-endpoint.mjs';
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
 const KEY_FILE = 'github-app.pem';
@@ -315,7 +316,7 @@ export async function runJob(request, deps) {
       tracer = createAgentTracer({ startedAt, captureContent: false, redact: (text) => redact(text), log, now, exporter: createLocalExporter(), ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}) });
       tracer.start();
     } else {
-      redact = createRedactor([telemetry.apiKey]);
+      redact = createRedactor(telemetrySecrets(telemetry));
       // Through `redact` as it is when a span leaves: the agents' keys join it below.
       const redactNow = (text) => redact(text);
       tracer = createAgentTracer({
@@ -327,6 +328,7 @@ export async function runJob(request, deps) {
         exporter: createExporter({
           endpoint: telemetry.endpoint,
           apiKey: telemetry.apiKey,
+          headerName: telemetry.headerName,
           redact: redactNow,
           resource: { 'service.name': telemetry.serviceName, 'updraft.delivery.id': payload.deliveryId, 'updraft.microvm.id': microvmId },
           ...(deps.fetch ? { fetch: deps.fetch } : {}),
@@ -336,7 +338,7 @@ export async function runJob(request, deps) {
         ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}),
       });
       tracer.start();
-      log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.endpoint}${telemetry.captureContent ? ', with content' : ''}`);
+      log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.host}${telemetry.captureContent ? ', with content' : ''}`);
     }
     const { stateDir, state } = await timed('restore_state', {}, async (step) => {
       const prepared = await prepare(payload, deps);
@@ -390,7 +392,7 @@ export async function runJob(request, deps) {
     // The agents' keys, read once for every try. From here, nothing the runner forwards or
     // keeps (the log stream, the uploaded logs, the result) carries a value of them.
     const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
-    redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? [telemetry.apiKey] : [])]);
+    redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? telemetrySecrets(telemetry) : [])]);
     // Claude Code's own events only go somewhere with a destination.
     if (sending) ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
     for (;;) {
@@ -742,6 +744,7 @@ export function finishDetail(result) {
       ...(t.conversationId ? { conversationId: t.conversationId } : {}),
       ...(t.marks?.length ? { marks: t.marks } : {}),
       ...(t.local ? { local: true } : {}),
+      ...(t.rootSpanId ? { rootSpanId: t.rootSpanId } : {}),
       ...(t.totals ? { totals: t.totals } : {}),
     };
   }
@@ -795,8 +798,8 @@ async function startAgentEventRelay(tracer, log) {
 async function telemetrySetup(payload, deps, log) {
   const t = payload.telemetry;
   if (!t || typeof t !== 'object' || typeof t.secret !== 'string') return null;
-  const endpoint = HONEYCOMB_ENDPOINTS[t.region] ?? null;
-  if (!endpoint) return null;
+  const destination = await telemetryDestination(t, deps, log);
+  if (!destination) return null;
   try {
     // The version the tenant's settings name: the key is the one checked for this region and
     // team, whatever was written to the secret since. Settings from before versions: the current.
@@ -808,7 +811,7 @@ async function telemetrySetup(payload, deps, log) {
     }
     return {
       apiKey,
-      endpoint,
+      ...destination,
       serviceName: typeof t.serviceName === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(t.serviceName) ? t.serviceName : 'updraft',
       captureContent: t.captureContent === true,
     };
@@ -816,6 +819,34 @@ async function telemetrySetup(payload, deps, log) {
     log(`agent telemetry is on, but its key could not be read (${error?.name ?? 'error'}); nothing is sent`);
     return null;
   }
+}
+
+/**
+ * Where the job's telemetry goes: Honeycomb in its region, or a custom OTLP endpoint and the header
+ * the key goes in. A custom one is checked again here, as the API did before saving it: HTTPS to a
+ * public DNS name, whose every address is public right now. Null, and nothing is sent, otherwise.
+ */
+async function telemetryDestination(t, deps, log) {
+  if (t.provider !== 'otlp') {
+    const endpoint = HONEYCOMB_ENDPOINTS[t.region] ?? null;
+    return endpoint ? { endpoint, headerName: 'x-honeycomb-team', host: new URL(endpoint).host } : null;
+  }
+  const parsed = parseOtlpEndpoint(t.endpoint);
+  if (!parsed || !headerNameOk(t.header)) {
+    log('agent telemetry is on, but its endpoint or header is not one the runner sends to; nothing is sent');
+    return null;
+  }
+  if (!(await (deps.resolvesPublic ?? resolvesPublic)(parsed.host))) {
+    log(`agent telemetry is on, but ${parsed.host} does not resolve only to public addresses; nothing is sent`);
+    return null;
+  }
+  return { endpoint: parsed.tracesUrl, headerName: t.header, host: parsed.host };
+}
+
+/** The telemetry key, and each word of it (the token in "Bearer <token>"), for the redactor. */
+function telemetrySecrets(telemetry) {
+  const words = telemetry.apiKey.split(/\s+/).filter((w) => w.length >= 8 && w !== telemetry.apiKey);
+  return [telemetry.apiKey, ...words];
 }
 
 /**

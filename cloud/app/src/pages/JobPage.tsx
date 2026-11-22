@@ -194,6 +194,14 @@ export function timelineLabel(l: JobTimelineEntry): { title: string; notes: stri
 
 const isProblem = (l: JobTimelineEntry) => l.kind === 'test_failed' || l.kind === 'verify_failed' || l.kind === 'step_failed' || Boolean(l.failed) || Boolean(l.thrashing);
 const seconds = (ms: number) => formatDuration(Math.round(ms / 1000));
+/** A time in the job, compactly: 0:08, 4:10, 1:02:30. */
+export const clock = (ms: number) => {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = String(total % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+};
 const tokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1000)}k` : n.toLocaleString());
 
 /**
@@ -219,12 +227,15 @@ function AgentWork({ job }: { job: JobView }) {
             {entries.map((l, i) => {
               const { title, notes } = timelineLabel(l);
               const problem = isProblem(l);
+              const bar = problem ? 'bg-warning-500' : l.kind === 'test_green' ? 'bg-success-500' : 'bg-primary-500';
               const left = Math.min(((l.offsetMs ?? 0) / total) * 100, 99.25);
               const width = Math.min(Math.max(0.75, ((l.durationMs ?? 0) / total) * 100), 100 - left);
               return (
-                <li key={`${l.kind}-${i}`} className="flex flex-col gap-1" data-testid={`job-timeline-${l.kind}`}>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {l.offsetMs !== undefined && <span className="w-16 shrink-0 font-mono text-xs text-muted-foreground">+{seconds(l.offsetMs)}</span>}
+                <li key={`${l.kind}-${i}`} className="grid grid-cols-[3.5rem_1fr] items-baseline gap-x-2 gap-y-1" data-testid={`job-timeline-${l.kind}`}>
+                  <span className="whitespace-nowrap font-mono text-xs text-muted-foreground" title={l.offsetMs !== undefined ? `${seconds(l.offsetMs)} into the job` : undefined}>
+                    {l.offsetMs !== undefined ? `+${clock(l.offsetMs)}` : ''}
+                  </span>
+                  <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
                     {l.url ? (
                       <a className="auth-link" href={l.url} target="_blank" rel="noreferrer">
                         {title} ↗
@@ -240,8 +251,8 @@ function AgentWork({ job }: { job: JobView }) {
                     ))}
                   </div>
                   {l.offsetMs !== undefined && (
-                    <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted" aria-hidden="true">
-                      <div className={`absolute inset-y-0 rounded-full ${problem ? 'bg-warning-500' : 'bg-primary-500'}`} style={{ left: `${left}%`, width: `${width}%` }} />
+                    <div className="relative col-start-2 h-1.5 w-full overflow-hidden rounded-full bg-muted" aria-hidden="true">
+                      <div className={`absolute inset-y-0 rounded-full ${bar}`} style={{ left: `${left}%`, width: `${width}%` }} />
                     </div>
                   )}
                 </li>
@@ -256,7 +267,7 @@ function AgentWork({ job }: { job: JobView }) {
 
 function Totals({ totals }: { totals: JobTotals }) {
   return (
-    <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-3 lg:grid-cols-5" data-testid="job-totals">
+    <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3 lg:grid-cols-5" data-testid="job-totals">
       <Fact label="Agent runs">{totals.runs}</Fact>
       <Fact label="Tokens in / out">
         {tokens(totals.inputTokens)} / {tokens(totals.outputTokens)}

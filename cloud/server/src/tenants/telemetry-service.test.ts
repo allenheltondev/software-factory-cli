@@ -5,13 +5,17 @@ import { FlowError } from '../flows/github.js';
 import { createMemoryStore, type JobSummary, type Tenant } from '../store/store.js';
 import { jobView } from './status-service.js';
 import { telemetryOf } from '../jobs/lifecycle.js';
+import type { OtlpChecker } from './otlp-destination.js';
 import { checkHoneycombKey, conversationUrl, createTelemetryService, parseTimelineTemplate, timelineUrl, traceUrl, type HoneycombChecker } from './telemetry-service.js';
 
 const caller = { sub: 'u1' } as Caller;
 const KEY = 'hcaik_01j1824es7n4evcmv81cn392jbSECRETSECRETSECRETSECRET';
 const tenant: Tenant = { installationId: 55, accountId: 900, accountLogin: 'acme', accountType: 'Organization', status: 'active', createdAt: '', createdBy: 's' };
 
-async function setup(check: HoneycombChecker = async () => ({ result: 'valid', auth: { type: 'ingest', canSend: true, team: { name: 'Acme', slug: 'acme' }, environment: { name: 'Production', slug: 'production' } } })) {
+async function setup(
+  check: HoneycombChecker = async () => ({ result: 'valid', auth: { type: 'ingest', canSend: true, team: { name: 'Acme', slug: 'acme' }, environment: { name: 'Production', slug: 'production' } } }),
+  otlpCheck: OtlpChecker = async () => ({ result: 'valid' }),
+) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant, { installationId: 55, sub: 'u1', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
   const secrets = { put: vi.fn().mockResolvedValue(undefined), remove: vi.fn().mockResolvedValue(undefined) };
@@ -20,8 +24,9 @@ async function setup(check: HoneycombChecker = async () => ({ result: 'valid', a
     return { githubLogin: 'pat' } as never;
   };
   const checker = vi.fn(check);
-  const service = createTelemetryService({ store, github: { configContext: allow, member: allow }, secrets, check: checker, now: () => Date.UTC(2026, 10, 21) });
-  return { store, secrets, service, checker };
+  const checkOtlp = vi.fn(otlpCheck);
+  const service = createTelemetryService({ store, github: { configContext: allow, member: allow }, secrets, check: checker, checkOtlp, now: () => Date.UTC(2026, 10, 21) });
+  return { store, secrets, service, checker, checkOtlp };
 }
 
 describe('agent telemetry settings', () => {
@@ -243,6 +248,107 @@ describe('agent telemetry settings', () => {
     expect(((await upd.json()) as { captureContent: boolean }).captureContent).toBe(true);
     expect((await app.request('/api/v1/installations/55/telemetry/key', { method: 'DELETE' })).status).toBe(200);
     expect((await app.request('/api/v1/installations/56/telemetry')).status).toBe(403);
+  });
+});
+
+describe('a custom OTLP destination', () => {
+  const TOKEN = 'Bearer otlp-secret-token-value-123';
+  const otlp = { provider: 'otlp', endpoint: 'https://otlp.example.com/otlp/', header: 'Authorization', value: ` ${TOKEN} ` };
+
+  it('checks the endpoint with the header before saving the key, and saves the destination with it', async () => {
+    const { service, secrets, checkOtlp, checker } = await setup();
+    const v = await service.setKey(caller, 55, otlp);
+    expect(checker).not.toHaveBeenCalled();
+    expect(checkOtlp).toHaveBeenCalledWith({ tracesUrl: 'https://otlp.example.com/otlp/v1/traces', host: 'otlp.example.com', header: 'authorization' }, TOKEN);
+    expect(secrets.put).toHaveBeenCalledWith('updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', TOKEN, expect.anything());
+    expect(v).toMatchObject({ provider: 'otlp', enabled: true, keyConfigured: true, otlp: { endpoint: 'https://otlp.example.com/otlp', header: 'authorization', host: 'otlp.example.com' }, key: { type: 'otlp' } });
+    expect(v).not.toHaveProperty('environmentUrl');
+    expect(JSON.stringify(v)).not.toContain('otlp-secret-token-value-123');
+    // Back to Honeycomb: the custom destination is gone with its key.
+    const back = await service.setKey(caller, 55, { value: KEY, region: 'us' });
+    expect(back.provider).toBe('honeycomb');
+    expect(back).not.toHaveProperty('otlp');
+  });
+
+  it('saves nothing for an endpoint, header or value it cannot send to, or one the endpoint refuses', async () => {
+    for (const [input, message] of [
+      [{ ...otlp, endpoint: 'http://otlp.example.com' }, /https/],
+      [{ ...otlp, endpoint: 'https://169.254.169.254' }, /not an IP address/],
+      [{ ...otlp, endpoint: 'https://collector.internal' }, /public DNS name/],
+      [{ ...otlp, endpoint: 'https://otlp.example.com?key=1' }, /query string/],
+      [{ ...otlp, header: 'host' }, /cannot carry the key/],
+      [{ ...otlp, header: 'x y' }, /header name/],
+      [{ ...otlp, value: 'short' }, /header value/],
+      [{ ...otlp, value: 'Bearer a\nb-injected-header' }, /header value/],
+      [{ ...otlp, provider: 'datadog' }, /honeycomb or otlp/],
+    ] as const) {
+      const { service, secrets, checkOtlp } = await setup();
+      await expect(service.setKey(caller, 55, input), JSON.stringify(input)).rejects.toMatchObject({ status: 400, message: expect.stringMatching(message) });
+      expect(checkOtlp).not.toHaveBeenCalled();
+      expect(secrets.put).not.toHaveBeenCalled();
+    }
+    for (const [verdict, message] of [
+      [{ result: 'invalid' as const }, /refused that key/],
+      [{ result: 'not_otlp' as const, status: 415 }, /HTTP 415.*JSON/],
+      [{ result: 'unreachable' as const, reason: 'its name does not resolve to a public address' }, /public address/],
+    ] as const) {
+      const { service, secrets, store } = await setup(undefined, async () => verdict);
+      await expect(service.setKey(caller, 55, otlp)).rejects.toMatchObject({ status: 400, message: expect.stringMatching(message) });
+      expect(secrets.put).not.toHaveBeenCalled();
+      expect((await store.getTelemetry(55))?.keyChange).toBeUndefined();
+    }
+  });
+
+  it("links with the destination's own templates: the trace at a span or its root, and the conversation", async () => {
+    const { service, store } = await setup();
+    await service.setKey(caller, 55, otlp);
+    await expect(service.update(caller, 55, { links: { trace: 'https://ui.example.com/t/{trace}' } })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/not a placeholder/) });
+    await expect(service.update(caller, 55, { links: { trace: 'javascript:alert(1)//{trace_id}' } })).rejects.toMatchObject({ status: 400 });
+    await expect(service.update(caller, 55, { links: { trace: 'https://{service}.example.com/{trace_id}' } })).rejects.toMatchObject({ status: 400 });
+    await expect(service.update(caller, 55, { links: { conversation: 'https://ui.example.com/c' } })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/\{conversation\}/) });
+    const v = await service.update(caller, 55, { links: { trace: 'https://ui.example.com/trace/{trace_id}?span={span_id}&from={start_ms}&to={end_ms}', conversation: 'https://ui.example.com/search?q=gen_ai.conversation.id%3D{conversation}&svc={service}' } });
+    expect(v.links).toEqual({ trace: expect.stringContaining('{trace_id}'), conversation: expect.stringContaining('{conversation}') });
+    const settings = (await store.getTelemetry(55))!;
+    const traceId = 'ab'.repeat(16);
+    const span = 'cd'.repeat(8);
+    const root = 'ef'.repeat(8);
+    const job: JobSummary = {
+      jobId: 'job_x0000001',
+      repository: 'acme/web',
+      issue: 12,
+      createdAt: '2026-11-21T10:00:00.000Z',
+      finishedAt: '2026-11-21T10:20:00.000Z',
+      status: 'finished',
+      outcome: 'succeeded',
+      detail: { telemetry: { traceId, rootSpanId: root, spans: 9, exported: 9, failed: 0, startedAt: '2026-11-21T10:00:00.000Z', marks: [{ kind: 'agent', spanId: span }] } },
+    };
+    const t = jobView(job, settings, { now: Date.parse('2026-11-22T10:00:00.000Z'), timelineTemplate: '{ui}/{team}/x?c={conversation}' }).telemetry!;
+    expect(t.destination).toBe('otlp.example.com');
+    expect(t.traceUrl).toBe(`https://ui.example.com/trace/${traceId}?span=${root}&from=1795255140000&to=1795256700000`);
+    expect(t.timeline?.[0]?.url).toBe(`https://ui.example.com/trace/${traceId}?span=${span}&from=1795255140000&to=1795256700000`);
+    expect(t.conversationUrl).toBe('https://ui.example.com/search?q=gen_ai.conversation.id%3Dacme%2Fweb%2312&svc=updraft');
+    // The Honeycomb-only parts: no hint, no Agent Timeline template.
+    expect(t).not.toHaveProperty('conversationHint');
+    expect(t).not.toHaveProperty('timelineUrl');
+    // A trace template without {span_id}: the trace, and no span links.
+    await service.update(caller, 55, { links: { trace: 'https://ui.example.com/trace/{trace_id}', conversation: '' } });
+    const plain = jobView(job, (await store.getTelemetry(55))!).telemetry!;
+    expect(plain.traceUrl).toBe(`https://ui.example.com/trace/${traceId}`);
+    expect(plain.timeline?.[0]).not.toHaveProperty('url');
+    expect(plain).not.toHaveProperty('conversationUrl');
+    // No templates: nothing to link to.
+    await service.update(caller, 55, { links: {} });
+    expect(jobView(job, (await store.getTelemetry(55))!).telemetry).not.toHaveProperty('traceUrl');
+  });
+
+  it('hands the job the endpoint and the header with the key, never one without the other', async () => {
+    const { service, store } = await setup();
+    await service.setKey(caller, 55, otlp);
+    const t = (await store.getTelemetry(55))!;
+    expect(t).toMatchObject({ provider: 'otlp', otlp: { endpoint: 'https://otlp.example.com/otlp', header: 'authorization' } });
+    // `update` cannot change where the key goes.
+    await service.update(caller, 55, { otlp: { endpoint: 'https://evil.example.com' } } as never);
+    expect((await store.getTelemetry(55))!.otlp?.endpoint).toBe('https://otlp.example.com/otlp');
   });
 });
 

@@ -113,7 +113,12 @@ export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersio
 
 /** Where a job sends its agent telemetry (the runner's telemetry.mjs), when the tenant turned it on. */
 export interface JobTelemetry {
+  /** honeycomb (the default, for runners from before custom destinations), or otlp. */
+  provider?: 'honeycomb' | 'otlp';
   region: 'us' | 'eu';
+  /** otlp: where to send, and the header the key goes in, as saved with the key's version. */
+  endpoint?: string;
+  header?: string;
   /** The key's secret, which the job's credentials can read (it is under the agent-keys prefix). */
   secret: string;
   serviceName: string;
@@ -325,8 +330,9 @@ export function createBroker(deps: BrokerDeps) {
       // telemetry key is the runner's alone. A failed read only means no telemetry for this job.
       const t = await deps.store.getTelemetry(job.installationId).catch(() => null);
       const telemetry: JobTelemetry | undefined =
-        t?.enabled && t.key
+        t?.enabled && t.key && (t.provider !== 'otlp' || t.otlp)
           ? {
+              ...(t.provider === 'otlp' && t.otlp ? { provider: 'otlp' as const, endpoint: t.otlp.endpoint, header: t.otlp.header } : {}),
               region: t.region,
               secret: telemetrySecretName(job.installationId),
               serviceName: t.serviceName,

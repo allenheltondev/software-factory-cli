@@ -429,6 +429,11 @@ describe('dynamo store: review fixes on #78', () => {
     expect(await store.getTelemetry(55)).toMatchObject({ version: 2, captureContent: true });
     await store.recordTelemetryExport(55, { at: 't', jobId: 'job_1', spans: 3, exported: 3, failed: 0 });
     expect((await store.getTelemetry(55))?.lastExport).toMatchObject({ jobId: 'job_1', exported: 3 });
+    // A custom destination and its link templates come back as written.
+    const otlp = { ...settings, provider: 'otlp' as const, otlp: { endpoint: 'https://otlp.example.com', header: 'authorization' }, links: { trace: 'https://ui.example.com/{trace_id}' } };
+    expect(await store.putTelemetry(55, otlp, 2)).toBe('stored');
+    expect(await store.getTelemetry(55)).toMatchObject({ provider: 'otlp', otlp: otlp.otlp, links: otlp.links });
+    await store.putTelemetry(55, settings, 3);
     await store.markUninstalled(55, DEADLINE);
     expect(await store.putTelemetry(55, settings, 2)).toBe('uninstalled');
   });

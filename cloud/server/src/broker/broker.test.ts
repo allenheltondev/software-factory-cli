@@ -119,6 +119,19 @@ describe('the job broker', () => {
     expect(off.ok && 'descriptor' in off && off.descriptor.telemetry).toBeFalsy();
   });
 
+  it('hands a custom destination to the job as saved with its key: endpoint and header, the same secret', async () => {
+    await store.putTelemetry(
+      55,
+      { provider: 'otlp', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', otlp: { endpoint: 'https://otlp.example.com', header: 'authorization' }, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } },
+      0,
+    );
+    const out = await handle({ action: 'start', jobId: job.jobId, token });
+    expect(out).toMatchObject({
+      descriptor: { telemetry: { provider: 'otlp', endpoint: 'https://otlp.example.com', header: 'authorization', secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } },
+    });
+    expect(out.ok && 'descriptor' in out && Object.values(out.descriptor.agentKeySecrets)).not.toContain('updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY');
+  });
+
   it('keeps the trace a finish reports, and records how the export went', async () => {
     await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat' } }, 0);
     await handle({ action: 'start', jobId: job.jobId, token });

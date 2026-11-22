@@ -282,9 +282,20 @@ export interface JobTimelineEntry {
 }
 
 export type TelemetryRegion = 'us' | 'eu';
+export type TelemetryProvider = 'honeycomb' | 'otlp';
+/** The destination and its key, saved together: a custom endpoint never changes without its key. */
+export type TelemetryKeyInput = { provider?: 'honeycomb'; value: string; region: TelemetryRegion } | { provider: 'otlp'; value: string; endpoint: string; header: string };
+export interface TelemetryLinks {
+  trace?: string;
+  conversation?: string;
+}
 export interface TelemetryView {
-  provider: 'honeycomb';
+  provider: TelemetryProvider;
   enabled: boolean;
+  /** A custom destination: where it sends and the header the key goes in (never the key). */
+  otlp?: { endpoint: string; header: string; host: string };
+  /** A custom destination's link templates. */
+  links?: TelemetryLinks;
   region: TelemetryRegion;
   serviceName: string;
   captureContent: boolean;
@@ -631,11 +642,11 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     jobLog: (installationId: number, jobId: string, name: string) =>
       request<JobLog>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/logs/${encodeURIComponent(name)}`),
     telemetry: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry`),
-    updateTelemetry: (installationId: number, input: { enabled?: boolean; serviceName?: string; captureContent?: boolean }) =>
+    updateTelemetry: (installationId: number, input: { enabled?: boolean; serviceName?: string; captureContent?: boolean; links?: TelemetryLinks }) =>
       request<TelemetryView>(`/installations/${installationId}/telemetry`, { method: 'PUT', body: JSON.stringify(input) }),
     /** The key is sent once and never comes back. */
-    setTelemetryKey: (installationId: number, value: string, region: TelemetryRegion) =>
-      request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify({ value, region }) }),
+    setTelemetryKey: (installationId: number, input: TelemetryKeyInput) =>
+      request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify(input) }),
     removeTelemetryKey: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'DELETE' }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */

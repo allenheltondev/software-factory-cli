@@ -6,6 +6,7 @@ import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../st
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { redact } from './redact.js';
 import type { TelemetryMarkKind, TelemetryTotals } from '../jobs/lifecycle.js';
+import { parseOtlpEndpoint } from './otlp-destination.js';
 import { conversationUrl, timelineUrl, traceUrl } from './telemetry-service.js';
 
 /**
@@ -154,6 +155,13 @@ export function missingPermissions(granted: Record<string, string> | undefined):
   return out;
 }
 
+/** Where a trace went, in words: Honeycomb, or a custom endpoint's host. */
+function destinationName(s: TelemetrySettings): string {
+  if (s.provider !== 'otlp' || !s.otlp) return 'Honeycomb';
+  const parsed = parseOtlpEndpoint(s.otlp.endpoint);
+  return 'host' in parsed ? parsed.host : 'your OTLP endpoint';
+}
+
 /**
  * The conversation Agent Timeline groups a job's traces under: what its runner reported, else
  * `owner/repo#issue` for a job of an issue (the runner's telemetry.mjs names it the same way).
@@ -171,7 +179,8 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
     const startedAt = t.startedAt ?? job.createdAt;
     // Links only to what reached the destination: nothing local, nothing from an export that sent nothing.
     const sent = !t.local && t.exported > 0 ? telemetry : null;
-    const url = traceUrl(sent, t.traceId, startedAt, job.finishedAt);
+    // A custom destination's trace link is its span link to the root, when its template wants a span.
+    const url = traceUrl(sent, t.traceId, startedAt, job.finishedAt, sent?.provider === 'otlp' && sent.links?.trace?.includes('{span_id}') ? t.rootSpanId : undefined);
     const conversationId = conversationOf(job);
     const queryUrl = conversationId ? conversationUrl(sent, conversationId, startedAt, now) : null;
     const timeline = conversationId ? timelineUrl(timelineTemplate, sent, conversationId, startedAt, now) : null;
@@ -184,8 +193,8 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
       traceId: t.traceId,
       ...(url ? { traceUrl: url } : {}),
       ...(conversationId ? { conversationId } : {}),
-      ...(sent ? { destination: 'Honeycomb' } : {}),
-      ...(queryUrl ? { conversationUrl: queryUrl, conversationHint: 'In the results, select the conversation id to open it in Agent Timeline.' } : {}),
+      ...(sent ? { destination: destinationName(sent) } : {}),
+      ...(queryUrl ? { conversationUrl: queryUrl, ...(sent?.provider !== 'otlp' ? { conversationHint: 'In the results, select the conversation id to open it in Agent Timeline.' } : {}) } : {}),
       ...(timeline ? { timelineUrl: timeline, timelineLabel: 'Open in Agent Timeline' } : {}),
       ...(entries.length ? { timeline: entries } : {}),
       ...(t.totals ? { totals: t.totals } : {}),
