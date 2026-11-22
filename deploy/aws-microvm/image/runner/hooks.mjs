@@ -14,6 +14,13 @@ export const HOOK_BASE_PATH = '/aws/lambda-microvms/runtime/v1';
 export const PAYLOAD_VERSION = 1;
 /** Updraft Cloud's payload: the job's broker instead of the job's data (parseBrokerPayload). */
 export const BROKER_PAYLOAD_VERSION = 2;
+/**
+ * An image check, not a job: install the packet filter and run the sandbox self-test in this
+ * microVM, print the outcome (ISOLATION CHECK line) and start nothing. The image builds start
+ * one from each new version before they activate it, so a version on which the boundary does
+ * not hold never runs a job (checkImageIsolation in job.mjs).
+ */
+export const ISOLATION_CHECK_PAYLOAD_VERSION = 3;
 
 const MAX_BODY_BYTES = 64 * 1024; // the run hook payload is at most 16 KB
 const DELIVERY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
@@ -46,8 +53,13 @@ export function parseRunRequest(body) {
     throw new Error('runHookPayload is not a JSON object');
   }
   if (payload.version === BROKER_PAYLOAD_VERSION) return { microvmId, payload: parseBrokerPayload(payload) };
+  if (payload.version === ISOLATION_CHECK_PAYLOAD_VERSION) {
+    if (typeof payload.checkId !== 'string' || !DELIVERY_ID_PATTERN.test(payload.checkId)) throw new Error('runHookPayload.checkId is missing or malformed');
+    // deliveryId and eventName only name the check in the log lines a job would write.
+    return { microvmId, payload: { version: ISOLATION_CHECK_PAYLOAD_VERSION, checkId: payload.checkId, deliveryId: payload.checkId, eventName: 'isolation_check' } };
+  }
   if (payload.version !== PAYLOAD_VERSION) {
-    throw new Error(`runHookPayload version ${JSON.stringify(payload.version)} is not ${PAYLOAD_VERSION} or ${BROKER_PAYLOAD_VERSION}; rebuild the image or redeploy the launcher`);
+    throw new Error(`runHookPayload version ${JSON.stringify(payload.version)} is not ${PAYLOAD_VERSION}, ${BROKER_PAYLOAD_VERSION} or ${ISOLATION_CHECK_PAYLOAD_VERSION}; rebuild the image or redeploy the launcher`);
   }
   const text = (name, pattern) => {
     const value = payload[name];

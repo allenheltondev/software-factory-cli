@@ -16,12 +16,16 @@ import { CONTAINER_HOME as UPDRAFT_CONTAINER_HOME, buildContainerRunArgs } from 
 import {
   CONTAINER_HOME,
   DEFAULT_CREDENTIAL_ENDPOINTS,
+  IPV6_NOT_FILTERED,
   IsolationError,
+  NO_NET_ADMIN_PROBLEM,
   SANDBOX_IMAGE,
   SANDBOX_RUNTIME,
   checkAgentConfig,
   createNftFilter,
+  hasNetAdmin,
   credentialEndpoints,
+  filterRules,
   filterRuleset,
   isolationMode,
   judgeProbe,
@@ -30,7 +34,7 @@ import {
   probeRunArgs,
   selfTest,
 } from '../image/runner/isolation.mjs';
-import { runJob } from '../image/runner/job.mjs';
+import { ISOLATION_CHECK_MARKER, checkImageIsolation, runJob } from '../image/runner/job.mjs';
 import { checkConfig } from '../../../src/commands/validate.ts';
 import { installRuntime, sandboxAvailability } from './sandbox-host.mjs';
 
@@ -74,46 +78,118 @@ describe('credential endpoints', () => {
 describe('the packet filter', () => {
   const endpoints = [parseEndpoint('169.254.169.254'), parseEndpoint('[fd00:ec2::254]:80')];
 
-  it('rejects every user but root, for each endpoint and the hook port, in one table', () => {
-    const ruleset = filterRuleset({ table: 'updraft_isolation', endpoints, hookPort: 9000 });
-    expect(ruleset).toContain('type filter hook output priority 0; policy accept;');
-    expect(ruleset).toContain('meta skuid != 0 ip daddr 169.254.169.254 counter reject');
-    expect(ruleset).toContain('meta skuid != 0 ip6 daddr fd00:ec2::254 tcp dport 80 counter reject');
-    expect(ruleset).toContain('meta skuid != 0 oifname "lo" tcp dport 9000 counter reject with tcp reset');
+  it('drops for every user but root, one table per address family, each endpoint in its own family', () => {
+    const v4 = filterRuleset({ table: 'updraft_isolation', endpoints, hookPort: 9000, family: 4 });
+    expect(v4).toContain('type filter hook output priority 0; policy accept;');
+    expect(v4).toContain('meta skuid != 0 ip daddr 169.254.169.254 counter drop');
+    expect(v4).toContain('meta skuid != 0 oifname "lo" tcp dport 9000 counter drop');
+    expect(v4).not.toContain('fd00:ec2::254');
+    // What a MicroVM's kernel lacks: the inet family and a reject module.
+    expect(v4).not.toMatch(/\binet\b|reject/);
+    const v6 = filterRuleset({ table: 'updraft_isolation', endpoints, hookPort: 9000, family: 6 });
+    expect(v6).toContain('table ip6 updraft_isolation {');
+    expect(v6).toContain('meta skuid != 0 ip6 daddr fd00:ec2::254 tcp dport 80 counter drop');
+    expect(v6).toContain('meta skuid != 0 oifname "lo" tcp dport 9000 counter drop');
+    expect(v6).not.toContain('169.254.169.254');
     // Replaced as a whole, so a second job in the same microVM does not stack rules.
-    expect(ruleset.indexOf('delete table inet updraft_isolation')).toBeLessThan(ruleset.indexOf('table inet updraft_isolation {'));
+    expect(v4.indexOf('delete table ip updraft_isolation')).toBeLessThan(v4.indexOf('table ip updraft_isolation {'));
     expect(() => filterRuleset({ table: 'x; flush ruleset', endpoints, hookPort: 9000 })).toThrow('table name');
+    expect(() => filterRules({ endpoints, family: 5 })).toThrow('address family');
   });
 
   it('reads back what nft lists, and names each missing rule', () => {
-    const listing = filterRuleset({ table: 't', endpoints, hookPort: 9000 });
-    expect(missingRules(listing, { endpoints, hookPort: 9000 })).toEqual([]);
+    const listing = filterRuleset({ table: 't', endpoints, hookPort: 9000, family: 4 });
+    expect(missingRules(listing, { endpoints, hookPort: 9000, family: 4 })).toEqual([]);
     const withoutHook = listing.split('\n').filter((line) => !line.includes('dport 9000')).join('\n');
-    expect(missingRules(withoutHook, { endpoints, hookPort: 9000 })).toEqual(['no rule rejects non-root traffic to local port 9000 (lifecycle hooks)']);
-    expect(missingRules('table inet t {\n}', { endpoints, hookPort: 9000 })).toEqual(['the table has no chain on the output hook']);
+    expect(missingRules(withoutHook, { endpoints, hookPort: 9000, family: 4 })).toEqual(['no rule drops non-root traffic to local port 9000 (lifecycle hooks)']);
+    expect(missingRules('table ip t {\n}', { endpoints, hookPort: 9000, family: 4 })).toEqual(['the ip table has no chain on the output hook']);
+    // What nft lists for a rule (priority by name, the counter's numbers) still matches.
+    const real = 'table ip t {\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t\tmeta skuid != 0 ip daddr 169.254.169.254 counter packets 2 bytes 120 drop\n\t\tmeta skuid != 0 oifname "lo" tcp dport 9000 counter packets 2 bytes 120 drop\n\t}\n}\n';
+    expect(missingRules(real, { endpoints, hookPort: 9000, family: 4 })).toEqual([]);
   });
 
-  it('installs from a file with nft -f and checks with nft list', () => {
+  /** nft as a MicroVM has it: the ip family; ip6 and inet "Operation not supported". */
+  function fakeNft({ ip6 = false } = {}) {
     const calls = [];
-    let installed = '';
+    const tables = {};
     const spawnSync = (cmd, args) => {
-      calls.push([cmd, ...args]);
+      calls.push(args.join(' '));
       if (args[0] === '-f') {
-        installed = fs.readFileSync(args[1], 'utf8');
+        const script = fs.readFileSync(args[1], 'utf8');
+        const family = /^table (\S+) /.exec(script)[1];
+        if (family !== 'ip' && !(family === 'ip6' && ip6)) return { status: 1, stdout: '', stderr: `${args[1]}:1:1-29: Error: Could not process rule: Operation not supported\nmore` };
+        tables[family] = script;
         return { status: 0, stdout: '', stderr: '' };
       }
-      return { status: 0, stdout: installed, stderr: '' };
+      if (args[0] === 'list') return tables[args[2]] ? { status: 0, stdout: tables[args[2]], stderr: '' } : { status: 1, stdout: '', stderr: 'Error: No such file or directory' };
+      if (args[0] === 'delete') delete tables[args[2]];
+      return { status: 0, stdout: '', stderr: '' };
     };
-    const filter = createNftFilter({ endpoints, hookPort: 9000, spawnSync });
+    return { spawnSync, calls, tables };
+  }
+
+  it('installs the ip table, and the ip6 one where the kernel has that family', () => {
+    const both = fakeNft({ ip6: true });
+    const filter = createNftFilter({ endpoints, hookPort: 9000, spawnSync: both.spawnSync });
     expect(filter.install()).toEqual({ ok: true });
     expect(filter.check()).toEqual({ ok: true, problems: [] });
-    expect(calls.map((c) => c[1])).toEqual(['-f', 'list']);
-    // The ruleset file is gone again.
-    expect(fs.existsSync(calls[0][2])).toBe(false);
+    expect(filter.describe()).toMatchObject({ kind: 'nftables', ipv6: 'filtered' });
+    expect(both.calls.filter((c) => c.startsWith('list'))).toEqual(['list table ip updraft_isolation', 'list table ip6 updraft_isolation']);
+    // The ruleset files are gone again.
+    for (const call of both.calls.filter((c) => c.startsWith('-f'))) expect(fs.existsSync(call.slice(3))).toBe(false);
+    filter.remove();
+    expect(both.tables).toEqual({});
+  });
 
-    const broken = createNftFilter({ endpoints, hookPort: 9000, spawnSync: () => ({ status: 1, stdout: '', stderr: 'Error: Could not process rule: Operation not supported\nmore' }) });
-    expect(broken.install()).toEqual({ ok: false, problem: 'the packet filter could not be installed: Error: Could not process rule: Operation not supported' });
+  it('on a kernel without ip6 (a MicroVM), installs the ip table and says IPv6 is left to the self-test', () => {
+    const v4only = fakeNft();
+    const filter = createNftFilter({ endpoints, hookPort: 9000, spawnSync: v4only.spawnSync });
+    expect(filter.install()).toEqual({ ok: true });
+    expect(filter.check()).toEqual({ ok: true, problems: [] });
+    expect(filter.describe().ipv6).toBe(IPV6_NOT_FILTERED);
+    expect(v4only.calls.filter((c) => c.startsWith('list'))).toEqual(['list table ip updraft_isolation']);
+    // A missing ip table is still a missing filter.
+    delete v4only.tables.ip;
+    expect(filter.check()).toMatchObject({ ok: false, problems: [expect.stringMatching(/^the packet filter's ip table is not there/)] });
+  });
+
+  it('fails when the ip table cannot be installed, or the ip6 one fails for another reason', () => {
+    const broken = createNftFilter({ endpoints, hookPort: 9000, readStatus: () => '', spawnSync: () => ({ status: 1, stdout: '', stderr: 'Error: Could not process rule: No such file or directory\nmore' }) });
+    expect(broken.install()).toEqual({ ok: false, problem: 'the packet filter could not be installed: Error: Could not process rule: No such file or directory' });
     expect(broken.check().ok).toBe(false);
+
+    const v6broken = createNftFilter({
+      endpoints,
+      hookPort: 9000,
+      spawnSync: (cmd, args) => (args[0] === '-f' && fs.readFileSync(args[1], 'utf8').startsWith('table ip6') ? { status: 1, stdout: '', stderr: 'Error: syntax error' } : { status: 0, stdout: '', stderr: '' }),
+    });
+    expect(v6broken.install()).toEqual({ ok: false, problem: 'the IPv6 packet filter could not be installed: Error: syntax error' });
+  });
+
+  // What a MicroVM image built without additionalOsCapabilities showed: root, the
+  // container-default capability set, and `nft -f` exiting 1 with nothing on stderr.
+  const MICROVM_DEFAULT_STATUS = 'Name:\tnode\nUid:\t0\t0\t0\t0\nCapInh:\t0000000000000000\nCapPrm:\t00000000a80425fb\nCapEff:\t00000000a80425fb\nCapBnd:\t00000000a80425fb\n';
+
+  it('reads CAP_NET_ADMIN from a /proc status text', () => {
+    expect(hasNetAdmin(MICROVM_DEFAULT_STATUS)).toBe(false);
+    expect(hasNetAdmin('CapEff:\t000001ffffffffff\n')).toBe(true);
+    expect(hasNetAdmin('CapEff:\t0000000000001000\n')).toBe(true);
+    expect(hasNetAdmin('Name:\tnode\n')).toBeUndefined();
+  });
+
+  it('says CAP_NET_ADMIN is missing when nft fails silently without it', () => {
+    const silent = () => ({ status: 1, stdout: '', stderr: '' });
+    const filter = createNftFilter({ endpoints, hookPort: 9000, spawnSync: silent, readStatus: () => MICROVM_DEFAULT_STATUS });
+    expect(filter.install()).toEqual({ ok: false, problem: `the packet filter could not be installed: nft exited 1 (${NO_NET_ADMIN_PROBLEM})` });
+    // With the capability, or with no status to read, the failure is reported as it came.
+    for (const readStatus of [() => 'CapEff:\t000001ffffffffff\n', () => { throw new Error('no /proc'); }]) {
+      expect(createNftFilter({ endpoints, hookPort: 9000, spawnSync: silent, readStatus }).install()).toEqual({ ok: false, problem: 'the packet filter could not be installed: nft exited 1' });
+    }
+  });
+
+  it('falls back to what nft printed on stdout when stderr is empty', () => {
+    const filter = createNftFilter({ endpoints, hookPort: 9000, readStatus: () => '', spawnSync: () => ({ status: 1, stdout: 'Operation not permitted (you must be root)\n', stderr: '' }) });
+    expect(filter.install()).toEqual({ ok: false, problem: 'the packet filter could not be installed: Operation not permitted (you must be root)' });
   });
 });
 
@@ -311,10 +387,10 @@ describe.runIf(onLinuxLikeHost)('the self-test, against a runtime that is not a 
   });
 
   it('fails when the packet filter is not in place, before anything else is believed', async () => {
-    const filter = { ...okFilter, check: () => ({ ok: false, problems: ['no rule rejects non-root traffic to 169.254.169.254'] }) };
+    const filter = { ...okFilter, check: () => ({ ok: false, problems: ['no rule drops non-root traffic to 169.254.169.254'] }) };
     const { target, deps } = isolationDeps({ runtime: passthroughRuntime(), filter });
     const tested = await selfTest(target, deps);
-    expect(tested.problems[0]).toBe('no rule rejects non-root traffic to 169.254.169.254');
+    expect(tested.problems[0]).toBe('no rule drops non-root traffic to 169.254.169.254');
     expect(tested.checks.packetFilter).toBe('missing');
   });
 });
@@ -499,4 +575,63 @@ describe.runIf(onLinuxLikeHost)('runJob with AgentIsolation enforced', { timeout
 it('IsolationError carries the step and the problems', () => {
   const error = new IsolationError('config', ['a', 'b']);
   expect(error).toMatchObject({ step: 'config', problems: ['a', 'b'], message: 'ISOLATION NOT ENFORCED (config): a; b' });
+});
+
+// ---------------------------------------------------------------------------
+// The image check (run-hook payload version 3): the build's proof before it activates a version
+// ---------------------------------------------------------------------------
+
+describe('checkImageIsolation', { timeout: 60_000 }, () => {
+  const checkDeps = (isolation) => {
+    const logs = [];
+    const stateRoot = path.join(root, 'jobs');
+    fs.mkdirSync(stateRoot, { recursive: true });
+    const removed = [];
+    const filter = { ...okFilter, ...(isolation.filter ?? {}), remove: () => removed.push('remove') };
+    return {
+      deps: { isolation: { ...isolation, filter }, stateRoot, jobUser: { home: path.join(root, 'home'), name: 'updraft' }, baseEnv: { PATH: process.env.PATH }, log: (line) => logs.push(line) },
+      logs,
+      removed,
+      stateRoot,
+    };
+  };
+  const base = (runtime) => ({ runtime, image: SANDBOX_IMAGE, nodePath: process.execPath, endpoints: [], connectTimeoutMs: 500, allowRunnerUser: true });
+  const logged = (logs) => {
+    const line = logs.find((l) => l.startsWith(ISOLATION_CHECK_MARKER));
+    return line ? JSON.parse(line.slice(ISOLATION_CHECK_MARKER.length)) : undefined;
+  };
+
+  it('fails at the packet filter, logs the reasons, and leaves nothing behind', async () => {
+    const h = checkDeps({ ...base(SANDBOX_RUNTIME), filter: { install: () => ({ ok: false, problem: `the packet filter could not be installed: nft exited 1 (${NO_NET_ADMIN_PROBLEM})` }) } });
+    const report = await checkImageIsolation(h.deps);
+    expect(report).toMatchObject({ ok: false, failedStep: 'packet filter', problems: [expect.stringContaining('CAP_NET_ADMIN')] });
+    expect(logged(h.logs)).toEqual(report);
+    expect(h.removed).toEqual(['remove']);
+    expect(fs.readdirSync(h.stateRoot)).toEqual([]);
+  });
+
+  it('fails when the runner was started without the sandbox runtime', async () => {
+    const logs = [];
+    const report = await checkImageIsolation({ stateRoot: root, jobUser: { home: root, name: 'updraft' }, log: (line) => logs.push(line) });
+    expect(report).toMatchObject({ ok: false, failedStep: 'setup' });
+    expect(logged(logs)).toEqual(report);
+  });
+
+  it.runIf(onLinuxLikeHost)('fails the self-test when the runtime is not a sandbox: the stand-in files can be read', async () => {
+    const h = checkDeps(base(passthroughRuntime()));
+    const report = await checkImageIsolation(h.deps);
+    expect(report).toMatchObject({ ok: false, failedStep: 'self-test' });
+    expect(report.problems.some((p) => /app-token\.json can be read inside the sandbox$/.test(p))).toBe(true);
+    expect(fs.readdirSync(h.stateRoot)).toEqual([]);
+  });
+
+  it.runIf(sandbox.usable)('passes in the sandbox runtime', async () => {
+    const runtime = installRuntime(path.join(root, 'runtime'));
+    const h = checkDeps(base(runtime.path));
+    const report = await checkImageIsolation(h.deps);
+    expect(report).toMatchObject({ ok: true, failedStep: null, problems: [] });
+    expect(report.checks.selfTest).toMatchObject({ sandboxStarts: true, packetFilter: 'in place' });
+    expect(logged(h.logs)).toEqual(report);
+    expect(fs.readdirSync(h.stateRoot)).toEqual([]);
+  });
 });

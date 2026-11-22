@@ -3,9 +3,9 @@
 import os from 'node:os';
 import { createAwsDeps } from './aws.mjs';
 import { abandonBrokerJob, createBrokerClient, startBrokerJob } from './broker.mjs';
-import { BROKER_PAYLOAD_VERSION, parseRunRequest } from './hooks.mjs';
+import { BROKER_PAYLOAD_VERSION, ISOLATION_CHECK_PAYLOAD_VERSION, parseRunRequest } from './hooks.mjs';
 import { SANDBOX_IMAGE, SANDBOX_RUNTIME, createNftFilter, credentialEndpoints } from './isolation.mjs';
-import { runJob } from './job.mjs';
+import { checkImageIsolation, runJob } from './job.mjs';
 
 const log = (message) => console.log(`[runner] ${message}`);
 
@@ -62,6 +62,16 @@ async function main() {
     isolation = { setupProblem: error?.message ?? String(error) };
   }
 
+  const stateRoot = process.env.UPDRAFT_STATE_ROOT ?? '/var/lib/updraft-jobs';
+
+  // Version 3: an image check, not a job (hooks.mjs). Whoever started it reads the result from
+  // the log and terminates the microVM.
+  if (request.payload.version === ISOLATION_CHECK_PAYLOAD_VERSION) {
+    const report = await checkImageIsolation({ isolation, stateRoot, jobUser, baseEnv: process.env, log });
+    process.exitCode = report.ok ? 0 : 1;
+    return;
+  }
+
   // Version 2 (Updraft Cloud): the job's data and its credentials come from the job broker, and
   // reach only this tenant's; the execution role reaches no tenant's data itself.
   let job = { request, aws: createAwsDeps(request.payload.region) };
@@ -85,7 +95,7 @@ async function main() {
   const result = await runJob(job.request, {
     ...job.aws,
     isolation,
-    stateRoot: process.env.UPDRAFT_STATE_ROOT ?? '/var/lib/updraft-jobs',
+    stateRoot,
     updraftCommand: [process.env.UPDRAFT_COMMAND ?? 'updraft'],
     jobUser,
     baseEnv: process.env,

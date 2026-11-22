@@ -201,7 +201,25 @@ hard-coded.
 
    The script zips `image/`, uploads it to `s3://<bucket>/image/`, calls
    `create-microvm-image` (or `update-microvm-image` when the image exists) and polls the new
-   version until it is `SUCCESSFUL` or `FAILED`. Build logs are in the log group
+   version until it is `SUCCESSFUL` or `FAILED`. A version that builds doesn't reach jobs at
+   once:
+
+   - **Before the build**, the script pins the stack's `ImageVersion` to the version jobs run
+     now. Left empty, the launcher would run Lambda's latest active version, and a new
+     version becomes that the moment it builds. With no version yet, it pins `none`, so the
+     launcher refuses deliveries (500) until a version has passed its check.
+   - **After the build**, `./deploy.sh activate <version>` runs one microVM from the new
+     version with the jobs' execution role and egress. It installs the packet filter and runs
+     the same sandbox self-test a job runs (an image check, see
+     [The run-hook payload](#lifecycle-hooks-image-and-runner)). Only if that passes does it
+     set `ImageVersion` to the new version. A failed check prints the reasons and leaves
+     jobs where they were. With `AgentIsolation=disabled` there is no check.
+   - **Rollback:** `./deploy.sh activate <older version>` checks that version and points jobs
+     at it.
+
+   The pin is a stack update with the deployed template and every other parameter
+   unchanged. `./deploy.sh stack` keeps it, because `sam deploy` reuses the previous value of
+   a parameter it isn't given. Build logs are in the log group
    `/aws/lambda-microvms/<image-name>`. Other settings: `IMAGE_ARCH` (`ARM_64`), `IMAGE_MEMORY_MIB`
    (`4096`), `AGENT_PACKAGES` (Claude Code alone by default), `TOOL_PACKAGES`,
    `SYSTEM_PACKAGES`, `PYTHON_COMMAND`, `NODE_VERSION`, `REQUIRE_STATE_COMMANDS`,
@@ -236,7 +254,7 @@ Pass them through `SAM_PARAMETER_OVERRIDES="Key=Value ..."`.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `ImageName` | `updraft-job` | Name of the MicroVM image (set through `IMAGE_NAME`). The launcher runs `arn:<partition>:lambda:<region>:<account>:microvm-image:<ImageName>` |
-| `ImageVersion` | empty | Pin an image version. Empty runs the latest active version |
+| `ImageVersion` | empty | The image version jobs run. `./deploy.sh image` and `activate` set it to each version that passed its isolation check (step 4). Empty runs the latest active version, including one nothing has checked |
 | `MaximumDurationSeconds` | `14400` | Hard lifetime of a job's microVM (600 to 28,800). See [How long a run may take](#how-long-a-run-may-take) |
 | `WatchdogReserveSeconds` | `600` | The runner stops the job this long before the maximum duration, and uses that time for state sync, logs and the result |
 | `AcceptedEvents` | `issues` | Comma-separated webhook events that may start a microVM: `issues`, `pull_request_review`, `pull_request`. Set `issues,pull_request_review,pull_request` for the review loop |
@@ -889,7 +907,7 @@ What can go wrong, either way:
 | Delivery shows `500` | The launcher's log group (`LauncherLogGroup` output). Each line is JSON with the `deliveryId`. Typical causes: the image does not exist or has no active version (`ResourceNotFoundException`), the account's MicroVM memory quota is used up (`ServiceQuotaExceededException`), a missing permission, a rejected parameter (`ValidationException`, see [Idle policy](#idle-policy)) |
 | Delivery shows `429` or `503` | HTTP API throttling (`WebhookRateLimit`) |
 | `202`, but no result object | The microVM's log stream in `/aws/lambda-microvms/<image-name>`. `aws lambda-microvms get-microvm --microvm-identifier <id>` shows `state` and `stateReason`. A microVM whose `/run` hook fails or times out is terminated without ever running |
-| Result has `errorCode: isolation-not-enforced` | The job was not started because the boundary around agents could not be shown to hold. `isolation.failedStep` is `setup`, `packet filter`, `config` or `self-test`, and `isolation.problems` lists each reason: an agent without the sandbox `container` block or with `triage` configured (fix the config), `nft` or `bwrap` missing or refused by the kernel (see "What is not verified"), a file of the state directory readable inside the sandbox, or a credential address that answered. The delivery record is released, so a redelivery tries again once it is fixed. `AgentIsolation=disabled` skips all of this, see [Security model](#security-model) |
+| Result has `errorCode: isolation-not-enforced` | The job was not started because the boundary around agents could not be shown to hold. `isolation.failedStep` is `setup`, `packet filter`, `config` or `self-test`, and `isolation.problems` lists each reason: an agent without the sandbox `container` block or with `triage` configured (fix the config), the runner without `CAP_NET_ADMIN` (the problem says so; an image version built without `additionalOsCapabilities`, rebuild it), `nft` or `bwrap` missing or refused by the kernel (see "What is not verified"), a file of the state directory readable inside the sandbox, or a credential address that answered. The delivery record is released, so a redelivery tries again once it is fixed. `AgentIsolation=disabled` skips all of this, see [Security model](#security-model) |
 | Result has `outcome: runner_error` | `error` says which step failed: reading the event or config from S3, a secret that is empty or not a PEM key, no `config.yaml`, a shared state object that is not a SQLite database (restore an earlier version, see [Shared state](#shared-state)), Updraft not startable |
 | Result has `outcome: state_not_saved` (`state.sync.saved: false` with a `notSavedReason`) | The job ran (`jobOutcome` says how it went), but what it changed in the state database since its last checkpoint was not saved; the log has a `STATE NOT SAVED` line. The run's database is kept as the backup `state.unsaved.manifestKey` names (when `state.unsaved.complete` is true); [When state is not saved](#when-state-is-not-saved) says how to merge it or restore from GitHub. `notSavedCode` is `merge-failed` (`updraft state merge` exited non-zero; its last output is in the reason), `newer-schema` (the image's Updraft is older than the shared database; rebuild the image), `merged-database-unreadable` or `merged-database-refused` (the merged file failed a check), `attempts-exhausted` (four attempts each lost to another microVM), `timed-out` or `no-time` (the microVM was at its end; raise `WatchdogReserveSeconds` or `MaximumDurationSeconds`), `shared-database-unreadable` (the object in S3 is damaged; restore a version), `no-run-database`, `merge-report-missing`. [Concurrency model](#concurrency-model) says what the missing history means |
 | Result has `outcome: failed`, `exitCode: 6`, `updraftOutcome: state-pending` | A pull request event arrived before the state of the run that opened the pull request did, and it did not arrive within `StatePendingWaitSeconds` (`state.pending`). Redeliver the delivery once that run has saved state (its first checkpoint is enough); if that run is gone, redeliver the pull request's `issues` delivery first. See [A pull request the state does not know yet](#a-pull-request-the-state-does-not-know-yet) |
@@ -903,6 +921,8 @@ What can go wrong, either way:
 | Result has `outcome: timed_out` | `run-event` did not stop at its own deadline and the watchdog killed it. Same remedy; also a bug worth reporting |
 | Result has `summaryMissing: true` | `run-event` did not print a JSON object as its last stdout line; `outcome` then reflects the exit code only |
 | Image build fails | Build logs in `/aws/lambda-microvms/<image-name>`; `deploy.sh` prints the version's `stateReason`. Reproduce with `docker build image/` |
+| `deploy.sh image` or `activate` says `failed its isolation check` | The version built, but a job's boundary does not hold on it; jobs stay on the version `ImageVersion` names. The reasons are printed (the same ones a job's `isolation.problems` would list, see the `isolation-not-enforced` row), and the check's log is the `isolation-check/<version>/...` stream. Fix the image and build again |
+| Every delivery shows `500` right after a first `deploy.sh image` | `ImageVersion` is `none`: no version has passed its isolation check yet. The script's output says why the check failed |
 
 The result document:
 
@@ -1169,6 +1189,16 @@ the runner asks it to stop the microVM without running anything. A job that ends
 can ask before the launcher has recorded its microVM, so the runner keeps asking for about
 30 seconds (`terminateThroughBroker`). The maximum duration is the backstop if that fails too.
 
+Version 3 is an image check, not a job: `{ "version": 3, "checkId": "<id>" }`. Updraft
+Cloud's image build sends it to each new version before activating it (`cloud/README.md`,
+"The job image"). The runner installs the packet filter, fills a job-shaped state directory
+with stand-in files, and runs the same self-test a job runs (`checkImageIsolation` in
+`image/runner/job.mjs`). It then removes both and logs one `ISOLATION CHECK {"ok": ...,
+"failedStep": ..., "problems": [...], "checks": {...}}` line. It reads nothing from S3, calls
+no broker, and does not terminate itself: whoever started it reads the line and terminates
+it. `./deploy.sh activate` runs it on the self-hosted stack, before it points `ImageVersion`
+at a version.
+
 ### Idle policy
 
 A microVM with no traffic on its endpoint counts as idle and is suspended after
@@ -1215,6 +1245,15 @@ The 60 second ceiling for the runtime hooks and 3,600 for the build hooks are fr
 CloudFormation Template Reference for `AWS::Lambda::MicrovmImage` (`MicrovmHooks`,
 `MicrovmImageHooks`); `runTimeoutInSeconds` is also named on
 `microvms-integrations-claude-managed-agents.html`.
+
+The image is also created with `"additionalOsCapabilities": ["ALL"]`. Without it, root in a
+microVM has only the container-default capability set (`CapEff` `00000000a80425fb`: no
+`CAP_NET_ADMIN`, no `CAP_SYS_ADMIN`), nftables refuses every change, and with
+`AgentIsolation=enforced` every job is refused at the packet filter step. Seen in a real
+microVM on 2026-11-22: `nft list tables` printed `Operation not permitted (you must be root)`
+to a root shell, and `nft -f` exited 1 and printed nothing. Only root gains the extra
+capabilities; the job user and the sandbox do not. `update-microvm-image` builds a version
+from the request alone, so the field is sent on every update too.
 
 Other calls: `TerminateMicrovm({ microvmIdentifier })` from the runner
 (`microvms-launching.html`, "Terminating a MicroVM"); `create-microvm-image`,
@@ -1269,13 +1308,21 @@ apart, and a job does not start unless that has been shown in the same microVM.
   verify command gets none of the agent's variables. Each agent gets its own key, not the
   other agents'.
 - *A packet filter for the execution role.* Before anything of the job exists, the runner
-  installs an nftables table that rejects traffic from every user but root to the instance
+  installs nftables tables that drop traffic from every user but root to the instance
   metadata service (`169.254.169.254`, `fd00:ec2::254`), to the container-credential
   addresses (`169.254.170.2`, `169.254.170.23`, `fd00:ec2::23`), to any credential address
   the runner's own environment names, and to the lifecycle hook port on loopback. The match
   is on the socket owner's real uid, so it holds inside the sandbox's user namespace too.
   The runner's own SDK calls run as root and are not affected. `run-event` needs no AWS
   credentials.
+
+  There is one table per address family (`ip`, `ip6`), and the rules drop rather than
+  reject. A MicroVM's kernel has the `ip` family but not `inet` or `ip6`, and it has no
+  reject module. The `ip` table is required. Where the kernel has no `ip6` family, IPv6 is
+  not filtered, and the result says so (`isolation.checks.packetFilter.ipv6`). The
+  self-test below still has to show that no IPv6 credential address answers the job user.
+  In a MicroVM none answered, not even root. A connection the filter drops gets no answer
+  and times out.
 - *A check before every job.* After the state directory is filled and before `run-event`
   starts, the runner checks four things and starts nothing if any of them fails:
   1. it asks `updraft validate --json` (as the job user) what the config means, and refuses
@@ -1684,13 +1731,25 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
     and whether Amazon Linux 2023 packages bubblewrap under the name `bubblewrap`. If either
     fails, the self-test fails and every enforced job is refused with the reason. The image
     build fails if the package does not exist.
-43. **The packet filter in a MicroVM.** Assumed: that the guest kernel has nf_tables with the
-    `inet` family, the output hook and `meta skuid`; that the runner, as root, may load a
-    table; and that `nftables` is the package's name. The runner reads the table back after
-    installing it. The self-test checks from inside and outside the sandbox that the
-    credential addresses do not answer the job user. On a test host an address that answers
-    is caught (a local listener stood in for it); the rule itself has not been loaded
-    anywhere.
+43. **The packet filter in a MicroVM.** Seen: the guest kernel (6.1, `amzn2023.aarch64.microvm`)
+    has nf_tables, `nftables` v1.0.4 installs under that name, and root may load nothing
+    without `additionalOsCapabilities: ["ALL"]` (no `CAP_NET_ADMIN`; see [Lifecycle hooks](#lifecycle-hooks-image-and-runner)).
+    Seen in a MicroVM built with `ALL` (2026-11-22):
+    - **Capabilities:** `CapEff` is `000001ffffffffff`, so `CAP_NET_ADMIN` is there.
+    - **Supported:** the `ip` family, the output hook, `meta skuid`, `counter` and `drop`.
+    - **Not supported:** `inet` and `ip6` ("Operation not supported"), and every form of
+      `reject` ("No such file or directory").
+    - **IPv6 addresses:** `eth0` has a global IPv6 address, but neither `fd00:ec2::254` nor
+      `fd00:ec2::23` answered, even root.
+    - **The rules work:** with the `ip` table in place, the job user's connection to
+      `169.254.169.254:80` and to the hook port got no answer, while root's still did.
+    - **Don't turn IPv6 off:** writing `1` to `net.ipv6.conf.all.disable_ipv6` cut the
+      microVM's shell connection (`SHELL_INGRESS`). The filter doesn't do that.
+
+    Not known: whether a later kernel adds `ip6`. If it does, the runner installs that
+    table too. The runner reads each table back after installing it, and the self-test
+    checks from inside and outside the sandbox that the credential addresses don't answer
+    the job user.
 44. **Where a MicroVM's credentials come from.** The MicroVMs documentation names IAM
     credentials through IMDSv2 and no other address. The filter also blocks the ECS and EKS
     container-credential addresses and whatever `AWS_CONTAINER_CREDENTIALS_FULL_URI`,
@@ -1709,6 +1768,13 @@ the specific points taken on trust or inferred, each to be confirmed on the firs
 47. **`updraft validate --json` in the image.** The runner needs an Updraft that has it; the
     published 0.1.0 does not. Without it every enforced job is refused at the config step,
     and the message says so.
+48. **Pinning the image version from `deploy.sh`.** Assumed: `update-stack
+    --use-previous-template` with `CAPABILITY_AUTO_EXPAND` re-applies this SAM template
+    unchanged. Also assumed: the launcher's next invocations see the new `IMAGE_VERSION`
+    within seconds, and `sam deploy` keeps the previous value of a parameter it isn't given.
+    The image check itself (payload version 3) has not yet run in a real microVM from this
+    script; it is the runner's job self-test, so it holds or fails as a job would.
+    `test/deploy-image.test.mjs` runs `activate` and the pin against a stand-in `aws`.
 
 ## Tests
 
@@ -1756,6 +1822,16 @@ the suite:
   the runtime, without the filter, with an uncontained agent or when the self-test reaches
   the key, and releases the delivery each time. It runs the job once the self-test passed,
   and with `disabled` as before, with the warning.
+- `deploy-image.test.mjs` (POSIX hosts with `bash`): `deploy.sh activate` and the start of
+  `deploy.sh image` against the same stand-in `aws`, with the stack, the launcher, the image
+  and the check microVM in a JSON file. Covered:
+  - a version reaches `ImageVersion` only after its check passed;
+  - the check microVM gets the jobs' role and egress, no ingress and a version 3 payload, and
+    is terminated;
+  - a failed, ended or silent check changes nothing, and neither does a version that hasn't
+    built;
+  - `AgentIsolation=disabled` skips the check;
+  - `image` pins jobs to the version they run (or `none`) before it builds anything.
 - `deploy-state.test.mjs` (POSIX hosts with `bash`): `deploy.sh state unsaved` and `state
   recover` run for real against a stand-in `aws` on `PATH` (`fake-aws.mjs`: a directory for
   the bucket, ETags, the two write conditions) and a stand-in `updraft` that records how the
