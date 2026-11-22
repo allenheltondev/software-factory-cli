@@ -40,6 +40,7 @@ export type RetryErrorCode =
   | 'jobs_off'
   | 'coalesced'
   | 'launch_failed'
+  | 'retry_pending'
   | 'retry_failed';
 
 export type RetryResult =
@@ -80,13 +81,17 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
   const no = (status: number, code: RetryErrorCode, message: string): RetryResult => ({ ok: false, status, code, message });
 
   /**
-   * Whether a job was started under this id: its record is there and the launch did not fail. A
-   * record is written before the microVM is asked for, so one may exist for a launch that died
-   * right after; that job is then listed (and reconciled) like any other, and is the retry.
+   * What became of a launch that never said how it ended, from the job under the id its claim kept:
+   * `never` (no record, or its launch failed), `prelaunch` (a record, written before the microVM is
+   * asked for, and the reservation not yet marked launching: the launch may have died there, which
+   * the reconciler settles by failing it after five minutes, or still be under way) and `started`
+   * (RunMicrovm was reached: the job is listed, and reconciled, like any other).
    */
-  const started = async (id: string) => {
+  const childState = async (id: string): Promise<'never' | 'prelaunch' | 'started'> => {
     const child = await store.getJob(id);
-    return child !== null && !(child.status === 'finished' && child.outcome === 'launch_failed');
+    if (!child || (child.status === 'finished' && child.outcome === 'launch_failed')) return 'never';
+    const entry = (await store.listActiveJobs()).find((a) => a.jobId === id);
+    return entry?.phase === 'reserved' ? 'prelaunch' : 'started';
   };
 
   return async function retry({ updraftRetry: { installationId, jobId } }: RetryRequest): Promise<RetryResult> {
@@ -115,23 +120,34 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
       return no(410, 'event_gone', 'The event this job ran for cannot be read, so it cannot be run again. Apply the label again on GitHub instead');
     }
 
+    // One reading of the clock for everything below: a claim seen live is live for the write that
+    // would take it, so one that runs out in between cannot be overwritten with another child's id.
+    const at = now();
     // A claim that ran out with its holder never having said how it ended (the Lambda died, or the
     // record of a launch could not be written): settled before anything else is launched. The
     // child's id was kept with the claim, so whether a job was started for it can be told.
     const stale = await store.getJobRetryClaim(job);
-    const token = randomUUID();
-    if (stale && stale.until < now() && (await started(stale.child))) {
-      if (!(await store.reserveJobRetry(job, token, now(), now() + RESERVATION_MS, stale.child))) return no(409, 'already_retried', 'This job is being retried, or was already');
-      await store.markJobRetried(job, token, stale.child);
-      log({ installationId, jobId, newJobId: stale.child, recovered: true });
-      return { ok: true, jobId: stale.child };
+    if (stale && stale.until < at) {
+      const state = await childState(stale.child);
+      if (state === 'prelaunch') {
+        return no(409, 'retry_pending', 'An earlier retry of this job is still being settled; try again in a few minutes');
+      }
+      if (state === 'started') {
+        // Recorded in the one conditional write that checks it is still the claim seen: another
+        // request that has taken it since, or one that settled it, leaves this one nothing to do.
+        if (!(await store.settleJobRetry(job, stale.child, at))) return no(409, 'already_retried', 'This job is being retried, or was already');
+        log({ installationId, jobId, newJobId: stale.child, recovered: true });
+        return { ok: true, jobId: stale.child };
+      }
+      // Never launched (no record, or its launch failed): this request launches afresh.
     }
 
     // The claim on this job's retry, before anything is launched: only one request launches at a
     // time, and none once a job started. Two requests that both read the summary before either
     // recorded anything meet here, and the second stops. It names the job about to be launched.
+    const token = randomUUID();
     const child = newJobId();
-    if (!(await store.reserveJobRetry(job, token, now(), now() + RESERVATION_MS, child))) return no(409, 'already_retried', 'This job is being retried, or was already');
+    if (!(await store.reserveJobRetry(job, token, at, at + RESERVATION_MS, child))) return no(409, 'already_retried', 'This job is being retried, or was already');
     const giveBack = () => store.releaseJobRetry(job, token).catch((err: unknown) => log({ installationId, jobId, warning: `could not give back the retry claim: ${(err as Error)?.name}` }));
 
     let result;

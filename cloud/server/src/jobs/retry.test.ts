@@ -151,6 +151,61 @@ describe('retrying a job (jobs/retry.ts)', () => {
       expect(await next(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
     });
 
+    it('waits while the earlier attempt’s job may not have reached launch, and records it once it did', async () => {
+      const { store, launch, j, clock } = await setup();
+      const child = 'job_prelaunch0000001';
+      await store.putJob(job({ jobId: child, deliveryId: retryDeliveryId(j.jobId) }));
+      // The record is written, and the reservation is not yet marked launching: the launch may have died here.
+      await store.reserveJob({ installationId: 55, jobId: child, holdUntil: clock.now + 1e7, day: '2026-11-22', month: '2026-11', quotas: { concurrentJobs: 5, jobsPerDay: 50, microvmMinutesPerMonth: 600, platformConcurrentJobs: 50 } });
+      expect(await store.reserveJobRetry(j, 'dead', clock.now, clock.now + RESERVATION_MS, child)).toBe(true);
+      clock.now += RESERVATION_MS + 1;
+      const next = createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} });
+      expect(await next(ask())).toMatchObject({ ok: false, status: 409, code: 'retry_pending' });
+      expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBeUndefined();
+      expect(launch).not.toHaveBeenCalled();
+      // The launch got as far as RunMicrovm after all.
+      await store.markLaunching(child);
+      expect(await next(ask())).toEqual({ ok: true, jobId: child });
+      expect(launch).not.toHaveBeenCalled();
+    });
+
+    it('launches afresh once the reconciler has failed a child that never launched', async () => {
+      const { store, launch, j, clock } = await setup();
+      const child = 'job_prelaunch0000002';
+      await store.putJob(job({ jobId: child, deliveryId: retryDeliveryId(j.jobId) }));
+      await store.finishJob(child, 'launch_failed');
+      expect(await store.reserveJobRetry(j, 'dead', clock.now, clock.now + RESERVATION_MS, child)).toBe(true);
+      clock.now += RESERVATION_MS + 1;
+      expect(await createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} })(ask())).toMatchObject({ ok: true });
+      expect(launch).toHaveBeenCalledTimes(1);
+    });
+
+    it('cannot take a claim over that runs out only after it was seen live, which would lose the child it kept', async () => {
+      const { store, launch, j, clock } = await setup();
+      const child = 'job_startedchild0001';
+      await store.putJob(job({ jobId: child, deliveryId: retryDeliveryId(j.jobId) }));
+      expect(await store.reserveJobRetry(j, 'slow', clock.now, clock.now + 1000, child)).toBe(true);
+      // The claim reads as live at this request's time, and runs out just after: the clock moves during the request.
+      let calls = 0;
+      const ticking = () => (calls++ === 0 ? clock.now + 999 : clock.now + 1001);
+      const racing = createRetryHandler({ store, launch, readEvent: async () => EVENT, now: ticking, log: () => {} });
+      expect(await racing(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
+      expect(launch).not.toHaveBeenCalled();
+      // Nothing was overwritten: the next request settles it from the child the claim kept.
+      clock.now += 1001;
+      expect(await createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} })(ask())).toEqual({ ok: true, jobId: child });
+    });
+
+    it('does not settle a claim another request has taken over since it was seen', async () => {
+      const { store, j, clock } = await setup();
+      expect(await store.reserveJobRetry(j, 'a', clock.now, clock.now + 1000, 'job_childone00000001')).toBe(true);
+      clock.now += 2000;
+      // Another request takes it over with a child of its own before this one's settle.
+      expect(await store.reserveJobRetry(j, 'b', clock.now, clock.now + 1000, 'job_childtwo00000001')).toBe(true);
+      expect(await store.settleJobRetry(j, 'job_childone00000001', clock.now)).toBe(false);
+      expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBeUndefined();
+    });
+
     it('launches again when the earlier attempt never created a job', async () => {
       const { store, launch, j, clock } = await setup();
       // A Lambda that claimed the retry, and died before anything was written for its job.

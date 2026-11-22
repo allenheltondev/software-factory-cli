@@ -55,6 +55,9 @@ function fakeTable() {
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND (attribute_not_exists(retryReservedUntil) OR retryReservedUntil < :now)') {
       return Boolean(item) && item!.retriedAs === undefined && (item!.retryReservedUntil === undefined || (item!.retryReservedUntil as number) < (values[':now'] as number));
     }
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryChild = :child AND retryReservedUntil < :now') {
+      return Boolean(item) && item!.retriedAs === undefined && item!.retryChild === values[':child'] && typeof item!.retryReservedUntil === 'number' && item!.retryReservedUntil < (values[':now'] as number);
+    }
     if (expr === 'retryToken = :token') return Boolean(item) && item!.retryToken === values[':token'];
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryToken = :token') {
       return Boolean(item) && item!.retriedAs === undefined && item!.retryToken === values[':token'];
@@ -725,6 +728,16 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.markJobRetried(first, 'tok-c', 'job_new000001')).toBe(true);
     expect(await store.markJobRetried(first, 'tok-c', 'job_new000002')).toBe(false);
     expect(await store.getJobRetryClaim(first)).toBeNull();
+    // Settling a claim that ran out: the one observed (same child), and only past its time.
+    const settled = { ...first, jobId: 'job_settle0000000001', deliveryId: 'd-settle' };
+    await store.putJob(settled);
+    expect(await store.reserveJobRetry(settled, 'tok-s', 1000, 2000, 'job_child0000000002')).toBe(true);
+    expect(await store.settleJobRetry(settled, 'job_child0000000002', 2000)).toBe(false); // not run out yet
+    expect(await store.settleJobRetry(settled, 'job_other00000000003', 2500)).toBe(false); // not the claim that was seen
+    expect(await store.settleJobRetry(settled, 'job_child0000000002', 2500)).toBe(true);
+    expect((await store.getJobSummary(55, settled.jobId))?.retriedAs).toBe('job_child0000000002');
+    expect(await store.getJobRetryClaim(settled)).toBeNull();
+    expect(await store.settleJobRetry(settled, 'job_child0000000002', 9000)).toBe(false); // once
     // Once a retry started a job, nobody reserves another.
     expect(await store.reserveJobRetry(first, 'tok-d', 9000, 9500, 'job_child0000000001')).toBe(false);
     expect((await store.getJobSummary(55, first.jobId))?.retriedAs).toBe('job_new000001');

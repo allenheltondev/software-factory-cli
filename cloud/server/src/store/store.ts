@@ -568,6 +568,13 @@ export interface Store {
   reserveJobRetry(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>, token: string, now: number, until: number, child: string): Promise<boolean>;
   /** The claim on a job's retry as it stands (held or run out), for settling one whose holder never said how it ended. */
   getJobRetryClaim(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>): Promise<{ until: number; child: string } | null>;
+  /**
+   * Settles a claim that ran out as a retry that started `child` (the id the claim kept), in one
+   * conditional write: the claim must still be the one observed (same child) and run out before
+   * `now`, so a claim another request has taken since, or extended, is left alone. False then, or
+   * when a retry was recorded already.
+   */
+  settleJobRetry(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>, child: string, now: number): Promise<boolean>;
   /** Gives the claim back because no job started, so the retry can be asked for again. Only its holder's. */
   releaseJobRetry(job: Pick<Job, 'installationId' | 'createdAt' | 'jobId'>, token: string): Promise<void>;
   /**
@@ -1093,6 +1100,14 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const s = summaries.get(job.jobId);
       if (!s || s.installationId !== job.installationId || s.retryReservedUntil === undefined || s.retryChild === undefined) return null;
       return { until: s.retryReservedUntil, child: s.retryChild };
+    },
+    async settleJobRetry(job, child, now) {
+      const s = summaries.get(job.jobId);
+      if (!s || s.installationId !== job.installationId || s.retriedAs !== undefined) return false;
+      if (s.retryChild !== child || s.retryReservedUntil === undefined || s.retryReservedUntil >= now) return false;
+      const { retryReservedUntil: _until, retryToken: _token, retryChild: _child, ...rest } = s;
+      summaries.set(job.jobId, { ...rest, retriedAs: child });
+      return true;
     },
     async releaseJobRetry(job, token) {
       const s = summaries.get(job.jobId);

@@ -738,6 +738,24 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
+    async settleJobRetry(job, child, now) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: jobSummaryKey(job),
+            UpdateExpression: 'SET retriedAs = :child REMOVE retryReservedUntil, retryToken, retryChild',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryChild = :child AND retryReservedUntil < :now',
+            ExpressionAttributeValues: { ':child': child, ':now': now },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
     async releaseJobRetry(job, token) {
       try {
         await client.send(
