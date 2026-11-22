@@ -4,13 +4,13 @@ import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
-import { loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
-import { isFailure, type Job, type JobFinishDetail, type Store } from '../store/store.js';
+import { loopOf, stepsOf, telemetryOf, type JobTelemetryDescriptor, type JobTelemetrySnapshot } from '../jobs/lifecycle.js';
+import { isFailure, type Job, type JobFinishDetail, type Store, type TelemetrySettings } from '../store/store.js';
 import { AGENT_KEY_NAMES, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
 // Not the whole telemetry service: only the secret's name.
-import { telemetrySecretName } from '../tenants/telemetry-service.js';
+import { linkDestinationFor, linkDestinationOf, sentToMatches, telemetrySecretName } from '../tenants/telemetry-service.js';
 
 /**
  * The job broker (#68, "Isolation between tenants"): what a job's microVM may have, handed out to
@@ -112,15 +112,7 @@ export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersio
 }
 
 /** Where a job sends its agent telemetry (the runner's telemetry.mjs), when the tenant turned it on. */
-export interface JobTelemetry {
-  region: 'us' | 'eu';
-  /** The key's secret, which the job's credentials can read (it is under the agent-keys prefix). */
-  secret: string;
-  serviceName: string;
-  captureContent: boolean;
-  /** The secret's version that holds the key the settings were checked with; the runner reads exactly it. */
-  secretVersion?: string;
-}
+export type JobTelemetry = JobTelemetryDescriptor;
 
 export const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 
@@ -261,15 +253,40 @@ export function createBroker(deps: BrokerDeps) {
     // slots stay: the microVM may still be running (terminate frees them).
     if (action === 'finish') {
       const given = typeof outcome === 'string' && OUTCOME.test(outcome) ? outcome : 'unknown';
-      const recorded = (await deps.store.finishJob(job.jobId, given, { at: now(), detail: finishDetail(job, detail) })) ?? given;
+      const finished = finishDetail(job, detail);
+      // The links of the job's trace: the destination its descriptor named at `start` (taken with
+      // the key's version then), so no change made since, of the destination or of the key's team,
+      // points it at another backend. Only when it is where the runner says it sent. A job started
+      // before that snapshot existed: the installation's destination now, when it matches.
+      if (finished?.telemetry?.sentTo) {
+        const sentTo = finished.telemetry.sentTo;
+        const snapshot = job.telemetrySnapshot;
+        const destination = snapshot
+          ? snapshot.links && sentToMatches(snapshot.links, sentTo)
+            ? snapshot.links
+            : null
+          : linkDestinationFor(await deps.store.getTelemetry(job.installationId).catch(() => null), sentTo);
+        if (destination) finished.telemetry.destination = destination;
+      }
+      const recorded = (await deps.store.finishJob(job.jobId, given, { at: now(), detail: finished })) ?? given;
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
       if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
       // How the job's telemetry export went, for the settings page. Best effort, like the key's use.
-      const sent = finishDetail(job, detail)?.telemetry;
-      if (sent) {
+      const sent = finished?.telemetry;
+      // A job read only for the console (no destination) exported nothing to report.
+      if (sent && !sent.local) {
         await deps.store
-          .recordTelemetryExport(job.installationId, { at: new Date(now()).toISOString(), jobId: job.jobId, traceId: sent.traceId, spans: sent.spans, exported: sent.exported, failed: sent.failed, ...(sent.lastError ? { lastError: sent.lastError } : {}) })
+          .recordTelemetryExport(job.installationId, {
+            at: new Date(now()).toISOString(),
+            jobId: job.jobId,
+            traceId: sent.traceId,
+            spans: sent.spans,
+            exported: sent.exported,
+            failed: sent.failed,
+            ...(sent.lastError ? { lastError: sent.lastError } : {}),
+            ...(sent.destination ? { destination: sent.destination } : {}),
+          })
           .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not record the telemetry export: ${(err as Error)?.name}` }));
       }
       // The key's "last used": this job ran with it (it started) and it worked or it did not.
@@ -321,19 +338,33 @@ export function createBroker(deps: BrokerDeps) {
       // missing one is a key the tenant has not set).
       const agentKeySecrets = Object.fromEntries(AGENT_KEY_NAMES.map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
-      // telemetry key is the runner's alone. A failed read only means no telemetry for this job.
-      const t = await deps.store.getTelemetry(job.installationId).catch(() => null);
-      const telemetry: JobTelemetry | undefined =
-        t?.enabled && t.key
-          ? {
-              region: t.region,
-              secret: telemetrySecretName(job.installationId),
-              serviceName: t.serviceName,
-              captureContent: t.captureContent,
-              ...(t.key.secretVersion ? { secretVersion: t.key.secretVersion } : {}),
-            }
-          : undefined;
-      return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
+      // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
+      // and keeps it with the job with that destination's link settings: every later `start` (a
+      // replay) or `credentials` answer hands out the same, so the key version the runner reads and
+      // the links its trace gets never part. A job started before that record existed: the settings now.
+      let snapshot = job.telemetrySnapshot;
+      if (!snapshot) {
+        const fresh = telemetrySnapshotNow(await deps.store.getTelemetry(job.installationId).catch(() => null), job.installationId);
+        snapshot = fresh;
+        if (action === 'start' && fresh.descriptor) {
+          const stored = await deps.store.setJobTelemetrySnapshot(job.jobId, fresh).catch((err: unknown) => {
+            log({ jobId: job.jobId, warning: `could not record the telemetry snapshot; the job sends no telemetry: ${(err as Error)?.name}` });
+            return null;
+          });
+          // Another `start` recorded it first: its record is the job's. Unreadable, or not written at
+          // all: no destination for this job (it keeps its own timeline), never one its links would
+          // not match.
+          if (stored === false) snapshot = (await deps.store.getJob(job.jobId).catch(() => null))?.telemetrySnapshot ?? {};
+          else if (stored === null) snapshot = {};
+        } else if (action === 'start') {
+          // Off at start: recorded too, so a later answer never turns it on. Best effort: without it,
+          // a later answer reads the settings, which a job with no destination ignores (the runner
+          // reads its key only at start).
+          await deps.store.setJobTelemetrySnapshot(job.jobId, fresh).catch(() => null);
+        }
+      }
+      const telemetry = snapshot.descriptor;
+            return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
     }
 
     // github-token: a token for this job's repository only, as the CLI reads it (token-file-auth.ts).
@@ -372,6 +403,21 @@ const LOG_NAMES = new Set(['updraft.log', 'run.log']);
  * tenant, so a pull request link must be one of the job's own repository, and anything else is
  * a short code, a boolean, a count or a known log name (the loop and the steps: jobs/lifecycle.ts).
  */
+/** What the installation's settings hand a job for telemetry now: the descriptor (none: off) and its link settings. */
+function telemetrySnapshotNow(t: TelemetrySettings | null, installationId: number): JobTelemetrySnapshot {
+  if (!t?.enabled || !t.key || (t.provider !== 'honeycomb' && !t.otlp)) return {};
+  const descriptor: JobTelemetryDescriptor = {
+    ...(t.provider !== 'honeycomb' && t.otlp ? { provider: t.provider, endpoint: t.otlp.endpoint, header: t.otlp.header } : {}),
+    region: t.region,
+    secret: telemetrySecretName(installationId),
+    serviceName: t.serviceName,
+    captureContent: t.captureContent,
+    ...(t.key.secretVersion ? { secretVersion: t.key.secretVersion } : {}),
+  };
+  const links = linkDestinationOf(t);
+  return { descriptor, ...(links ? { links } : {}) };
+}
+
 export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFinishDetail | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
   const d = raw as Record<string, unknown>;
@@ -392,7 +438,11 @@ export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFin
   const loop = loopOf(d.loop);
   if (loop) out.loop = loop;
   const telemetry = telemetryOf(d.telemetry);
-  if (telemetry) out.telemetry = telemetry;
+  if (telemetry) {
+    // The link settings are the broker's to set, from the installation's own: never the runner's.
+    delete telemetry.destination;
+    out.telemetry = telemetry;
+  }
   const steps = stepsOf(d.steps);
   if (steps) out.steps = steps;
   return Object.keys(out).length ? out : undefined;

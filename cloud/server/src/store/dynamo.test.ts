@@ -50,6 +50,7 @@ function fakeTable() {
     }
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(stopRequestedAt)') return Boolean(item) && item!.stopRequestedAt === undefined;
     if (expr === 'attribute_exists(pk) AND attribute_not_exists(releasedAt)') return Boolean(item) && item!.releasedAt === undefined;
+    if (expr === 'attribute_exists(pk) AND attribute_not_exists(telemetrySnapshot)') return Boolean(item) && item!.telemetrySnapshot === undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job OR #ttl < :now') {
       return !item || item.jobId === values[':job'] || (item.ttl as number) < (values[':now'] as number);
     }
@@ -429,6 +430,11 @@ describe('dynamo store: review fixes on #78', () => {
     expect(await store.getTelemetry(55)).toMatchObject({ version: 2, captureContent: true });
     await store.recordTelemetryExport(55, { at: 't', jobId: 'job_1', spans: 3, exported: 3, failed: 0 });
     expect((await store.getTelemetry(55))?.lastExport).toMatchObject({ jobId: 'job_1', exported: 3 });
+    // A custom destination and its link templates come back as written.
+    const otlp = { ...settings, provider: 'otlp' as const, otlp: { endpoint: 'https://otlp.example.com', header: 'authorization' }, links: { trace: 'https://ui.example.com/{trace_id}' } };
+    expect(await store.putTelemetry(55, otlp, 2)).toBe('stored');
+    expect(await store.getTelemetry(55)).toMatchObject({ provider: 'otlp', otlp: otlp.otlp, links: otlp.links });
+    await store.putTelemetry(55, settings, 3);
     await store.markUninstalled(55, DEADLINE);
     expect(await store.putTelemetry(55, settings, 2)).toBe('uninstalled');
   });
@@ -678,6 +684,12 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(table.items.get(`TENANT#55|${MONTH}`)?.seconds).toBe(10800);
     expect(typeof (await store.getJob(first.jobId))?.startedAt).toBe('number');
     expect(await store.claimDelivery(55, 'd-1', LATER, 'job_second001')).toBe(false);
+    // The broker's snapshot of the telemetry destination it handed the job: set once, read back checked.
+    const links = { provider: 'honeycomb' as const, region: 'us' as const, serviceName: 'updraft', team: { name: 'A', slug: 'team-a' } };
+    const descriptor = { region: 'us' as const, secret: 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY', serviceName: 'updraft', captureContent: false, secretVersion: 'v-a' };
+    expect(await store.setJobTelemetrySnapshot(first.jobId, { descriptor, links })).toBe(true);
+    expect(await store.setJobTelemetrySnapshot(first.jobId, { descriptor: { ...descriptor, secretVersion: 'v-b' }, links: { ...links, team: { name: 'B', slug: 'team-b' } } })).toBe(false);
+    expect((await store.getJob(first.jobId))?.telemetrySnapshot).toEqual({ descriptor, links });
 
     // A retried start: nothing more is charged.
     expect(await store.startJob(first, LATER)).toEqual({ result: 'already' });

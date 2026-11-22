@@ -20,7 +20,7 @@
  * uninstalled, so DynamoDB deletes the tenant and its members once the retention has passed.
  */
 
-import type { JobLoop, JobStep, JobTelemetryReport } from '../jobs/lifecycle.js';
+import type { JobLoop, JobStep, JobTelemetryReport, JobTelemetrySnapshot, LinkDestination } from '../jobs/lifecycle.js';
 
 export type OAuthKind = 'link' | 'install';
 
@@ -231,13 +231,29 @@ export interface AgentKeyMeta {
 
 /**
  * A tenant's agent telemetry (tenants/telemetry-service.ts): where jobs send traces of what their
- * agents did. The key itself is a secret (`agent-keys/HONEYCOMB_API_KEY`); this holds only that
- * it is set, which Honeycomb team and environment it belongs to, and how the last export went.
+ * agents did. The key itself is a secret (`agent-keys/HONEYCOMB_API_KEY`, the name from when
+ * Honeycomb was the only destination); this holds only that it is set, where it sends (Honeycomb's
+ * region and team, or a custom OTLP endpoint and the header it goes in), and how the last export went.
  */
 export interface TelemetrySettings {
-  provider: 'honeycomb';
+  /**
+   * honeycomb: the Honeycomb preset. cloudwatch: the CloudWatch preset (X-Ray's OTLP endpoint in
+   * an AWS region, with an X-Ray API key). otlp: any OTLP/HTTP endpoint that takes JSON.
+   */
+  provider: 'honeycomb' | 'cloudwatch' | 'otlp';
   enabled: boolean;
+  /** Honeycomb's region. */
   region: 'us' | 'eu';
+  /**
+   * A custom destination: where the runner sends and the header the key goes in. Saved with the
+   * key, in the same write: a change of either needs the key again, so a key is only ever sent
+   * where it was checked.
+   */
+  otlp?: { endpoint: string; header: string };
+  /** CloudWatch: the AWS region its endpoint is in (`otlp` holds the endpoint itself). */
+  aws?: { region: string };
+  /** A custom destination's link templates (tenants/otlp-destination.ts). */
+  links?: { trace?: string; conversation?: string };
   /** `service.name`: the dataset traces land in. */
   serviceName: string;
   /** Record prompts, model output and tool arguments and results (redacted). */
@@ -265,6 +281,8 @@ export interface TelemetryExport {
   at: string;
   jobId: string;
   traceId?: string;
+  /** The destination's link settings for this export (jobs/lifecycle.ts). */
+  destination?: LinkDestination;
   spans: number;
   exported: number;
   failed: number;
@@ -322,6 +340,11 @@ export interface Job {
   quotas?: Quotas;
   /** The agent keys (variable names) this job needs; at finish each is marked used, OK or failed. */
   agentKeys?: string[];
+  /**
+   * What its first `start` handed it for telemetry, and that destination's link settings (never a
+   * key): every later `start` or `credentials` answer is the same, and its trace is linked from it.
+   */
+  telemetrySnapshot?: JobTelemetrySnapshot;
   /** The issue whose label started it, for an over-quota comment. */
   issue?: number;
   /** Epoch ms when the broker's `start` committed it (startJob): nothing else is served before. */
@@ -516,6 +539,8 @@ export interface Store {
   finishJob(jobId: string, outcome: string, finish?: { at: number; detail?: JobFinishDetail }): Promise<string | null>;
   /** The launcher records the job's microVM. Set once: false when the job is unknown or already has one. */
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
+  /** The broker records what it handed the job for telemetry at its first `start`. Set once: false when it already was. */
+  setJobTelemetrySnapshot(jobId: string, snapshot: JobTelemetrySnapshot): Promise<boolean>;
 
   /**
    * Deduplication: claims a tenant's webhook delivery unless an unexpired claim exists (false: a
@@ -1009,6 +1034,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const j = jobs.get(jobId);
       if (!j || j.microvmId !== undefined) return false;
       jobs.set(jobId, { ...j, microvmId });
+      return true;
+    },
+    async setJobTelemetrySnapshot(jobId, snapshot) {
+      const j = jobs.get(jobId);
+      if (!j || j.telemetrySnapshot !== undefined) return false;
+      jobs.set(jobId, { ...j, telemetrySnapshot: structuredClone(snapshot) });
       return true;
     },
     async purgeTenantPartition(id) {

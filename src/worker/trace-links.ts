@@ -1,4 +1,4 @@
-// Agent telemetry links (docs/agent-timeline.md, "Across jobs"): each job is its own trace, in its
+// Agent telemetry links (docs/agent-telemetry.md, "Across jobs"): each job is its own trace, in its
 // own microVM, so a revision's trace cannot know the trace of the review it answers unless it is
 // written down. The runner gives `updraft run-event` its trace id (UPDRAFT_TRACE_ID); the worker
 // records it with each run it starts, in `meta` (merged into the shared state like any row), and

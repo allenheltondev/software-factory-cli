@@ -587,6 +587,67 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(Object.keys(record.env).filter((k) => k.startsWith('OTEL_') || k === 'CLAUDE_CODE_ENABLE_TELEMETRY')).toEqual([]);
   });
 
+  it('sends to a custom OTLP endpoint with the key in its header, redacted, and never follows a redirect', async () => {
+    const secret = 'Bearer otlp-secret-token-value-123';
+    const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': secret } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push({ url, init });
+      return { ok: true, status: 200 };
+    };
+    const resolved = [];
+    harness.deps.resolvesPublic = async (host) => {
+      resolved.push(host);
+      return true;
+    };
+    const otlp = { ...telemetry, provider: 'otlp', endpoint: 'https://otlp.example.com/otlp', header: 'authorization' };
+    expect((await runJob(brokerRequest({ telemetry: otlp }), harness.deps)).outcome).toBe('succeeded');
+    expect(resolved).toEqual(['otlp.example.com']);
+    expect(posts.length).toBeGreaterThan(0);
+    expect(posts[0].url).toBe('https://otlp.example.com/otlp/v1/traces');
+    expect(posts[0].init.headers).toMatchObject({ authorization: secret });
+    expect(posts[0].init.headers).not.toHaveProperty('x-honeycomb-team');
+    expect(posts[0].init.redirect).toBe('manual');
+    // Neither the whole value nor its token is in what was sent or logged.
+    const out = JSON.stringify(posts.map((p) => p.init.body)) + JSON.stringify(harness.finishDetails);
+    expect(out).not.toContain('otlp-secret-token-value-123');
+    expect(harness.finishDetails[0].telemetry).toMatchObject({ exported: expect.any(Number) });
+    expect(harness.finishDetails[0].telemetry.local).toBeUndefined();
+  });
+
+  it("sends to CloudWatch's X-Ray endpoint with the key as a bearer token", async () => {
+    const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'Bearer AbCdEfGhIjKlMnOpQrStUv0123' } });
+    const posts = [];
+    harness.deps.fetch = async (url, init) => {
+      posts.push({ url, init });
+      return { ok: true, status: 200 };
+    };
+    harness.deps.resolvesPublic = async () => true;
+    const cloudwatch = { ...telemetry, provider: 'cloudwatch', endpoint: 'https://xray.us-west-2.amazonaws.com', header: 'authorization' };
+    expect((await runJob(brokerRequest({ telemetry: cloudwatch }), harness.deps)).outcome).toBe('succeeded');
+    expect(posts[0].url).toBe('https://xray.us-west-2.amazonaws.com/v1/traces');
+    // Where it sent, for the broker to keep that destination's links with the job.
+    expect(harness.finishDetails[0].telemetry.sentTo).toEqual({ provider: 'cloudwatch', host: 'xray.us-west-2.amazonaws.com' });
+    expect(posts[0].init.headers).toMatchObject({ authorization: 'Bearer AbCdEfGhIjKlMnOpQrStUv0123' });
+    expect(JSON.stringify(posts.map((p) => p.init.body))).not.toContain('AbCdEfGhIjKlMnOpQrStUv0123');
+  });
+
+  it('sends nothing to a custom endpoint that resolves to a private address, or that is not one it sends to, and still reads the job', async () => {
+    for (const [endpoint, publicHost] of [
+      ['https://otlp.example.com', false],
+      ['http://otlp.example.com', true],
+      ['https://10.0.0.5', true],
+    ]) {
+      const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'Bearer otlp-secret-token-value-123' } });
+      harness.deps.fetch = async () => {
+        throw new Error('must not be called');
+      };
+      harness.deps.resolvesPublic = async () => publicHost;
+      expect((await runJob(brokerRequest({ telemetry: { ...telemetry, provider: 'otlp', endpoint, header: 'authorization' } }), harness.deps)).outcome).toBe('succeeded');
+      expect(harness.finishDetails[0].telemetry, endpoint).toMatchObject({ local: true });
+    }
+  });
+
   it('reads exactly the secret version the settings name', async () => {
     const harness = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
     harness.deps.fetch = async () => ({ ok: true, status: 200 });
@@ -600,7 +661,11 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
       throw new Error('must not be called');
     };
     expect((await runJob(brokerRequest({ telemetry }), noKey.deps)).outcome).toBe('succeeded');
-    expect(noKey.finishDetails[0].telemetry).toBeUndefined();
+    // Nothing sent, but the console still gets its own view of the job: marks and totals, marked local.
+    expect(noKey.finishDetails[0].telemetry).toMatchObject({ local: true, exported: 0, totals: { runs: 1, toolCalls: expect.any(Number) } });
+    // And the job has no trace id to record: there is no trace anywhere to link to.
+    const env = fs.readFileSync(recordFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l).env ?? {});
+    expect(env.some((e) => 'UPDRAFT_TRACE_ID' in e)).toBe(false);
 
     const down = brokerDeps('telemetry', { secrets: { 'updraft/tenants/55/agent-keys/HONEYCOMB_API_KEY': 'hcaik_01honeycombsecretvalue' } });
     down.deps.fetch = async () => ({ ok: false, status: 401 });
@@ -618,7 +683,7 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2 (job broker)', () => {
     const result = await runJob(brokerRequest(), deps);
     expect(result.outcome).toBe('succeeded');
     // What the console shows of the job (#71): the pull request and the logs, as names.
-    expect(harness.finishDetails).toEqual([{ updraftOutcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logs: ['updraft.log', 'run.log'] }]);
+    expect(harness.finishDetails).toEqual([{ updraftOutcome: 'succeeded', prUrl: 'https://github.com/o/r/pull/7', logs: ['updraft.log', 'run.log'], telemetry: expect.objectContaining({ local: true }) }]);
 
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(record.keyMode).toBeNull();

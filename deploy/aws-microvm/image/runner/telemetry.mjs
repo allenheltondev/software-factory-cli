@@ -138,6 +138,15 @@ export function otlpRequest(spans, resource) {
 }
 
 /**
+ * An exporter that sends nothing: with no destination, the tracer still reads the run logs for
+ * the console's own view of the job (its marks and totals), and every span stays here.
+ */
+export function createLocalExporter() {
+  const stats = { exported: 0, failed: 0, dropped: 0, requests: 0, lastError: null, lastOkAt: null };
+  return { stats, local: true, push() {}, flush: async () => {}, pending: () => 0, accepted: () => true };
+}
+
+/**
  * How many spans of a 200 answer's batch the receiver rejected: OTLP's partial success
  * (`{"partialSuccess":{"rejectedSpans":"<n>"}}`, an int64 as a string in JSON). 0 for an empty or
  * unreadable body; at most the batch.
@@ -154,20 +163,24 @@ async function rejectedSpans(res, size) {
 }
 
 /**
- * Sends finished spans in batches (OTLP/HTTP, JSON encoding) to `<endpoint>/v1/traces` with the
- * `x-honeycomb-team` header. Never throws: a failure is counted and logged, and the job goes on.
+ * Sends finished spans in batches (OTLP/HTTP, JSON encoding) to `<endpoint>/v1/traces` (or to the
+ * endpoint itself when it ends in /v1/traces), with the key in `headerName` (`x-honeycomb-team` by
+ * default) and any other `headers`. Never throws: a failure is counted and logged, and the job goes on.
  */
-export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
+export function createExporter({ endpoint, tracesUrl = null, apiKey, headerName = 'x-honeycomb-team', headers: extraHeaders = {}, resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
   const queue = [];
   // The one way out: every string of every span, and of the resource, passes the job's redactor
   // here, whatever produced it (a span name, a tool or model name read from the transcript, an
   // id, a URL). Content was redacted when it was recorded too; redacting twice changes nothing.
   const cleanResource = redactAttributes(resource ?? {}, redact);
   const stats = { exported: 0, failed: 0, dropped: 0, requests: 0, lastError: null, lastOkAt: null };
-  /** The span ids Honeycomb accepted (a 2xx for their batch): only those are worth a link. */
+  /** The span ids the destination accepted (a 2xx for their batch): only those are worth a link. */
   const accepted = new Set();
   let sending = Promise.resolve();
-  const url = `${endpoint.replace(/\/+$/, '')}/v1/traces`;
+  // `tracesUrl`: the traces URL exactly (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT's form, or one already
+  // normalized). Else the base endpoint (OTEL_EXPORTER_OTLP_ENDPOINT's form) plus /v1/traces.
+  const base = (endpoint ?? '').replace(/\/+$/, '');
+  const url = tracesUrl ?? (/\/v1\/traces$/.test(base) ? base : `${base}/v1/traces`);
 
   async function post(batch) {
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -175,8 +188,10 @@ export function createExporter({ endpoint, apiKey, resource, redact = (t) => t, 
         stats.requests += 1;
         const res = await fetchImpl(url, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-honeycomb-team': apiKey },
+          headers: { ...extraHeaders, 'content-type': 'application/json', ...(apiKey ? { [headerName]: apiKey } : {}) },
           body: JSON.stringify(otlpRequest(batch, cleanResource)),
+          // A redirect is an answer, never followed: the key goes only where it was checked.
+          redirect: 'manual',
           signal: AbortSignal.timeout(timeoutMs),
         });
         if (res.ok) {
@@ -578,7 +593,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   function noteMark(span) {
     const a = span.attributes ?? {};
     const add = (kind, extra = {}) => {
-      if (marks.length < MAX_MARKS_PER_RUN) marks.push({ kind, spanId: span.spanId, at: span.start, ...(h.kind ? { run: h.kind } : {}), ...extra });
+      if (marks.length < MAX_MARKS_PER_RUN) marks.push({ kind, spanId: span.spanId, at: span.start, end: span.end, ...(h.kind ? { run: h.kind } : {}), ...extra });
     };
     const once = (kind, extra) => {
       if (marked.has(kind)) return;
@@ -1417,7 +1432,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
  * reads what is left, ends the job's root span with what the summary says, and sends the rest
  * within `budgetMs`. Never throws.
  */
-export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: givenConfineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs, startedAt: jobStartedAt, traceId: givenTraceId }) {
+export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: givenConfineTo = null, onlyRun = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs, startedAt: jobStartedAt, traceId: givenTraceId }) {
   const traceId = typeof givenTraceId === 'string' && /^[0-9a-f]{32}$/.test(givenTraceId) ? givenTraceId : newTraceId();
   const rootSpanId = newSpanId();
   // The job's start (before the tracer existed: isolation, the state, the coalescing wait), when the runner knows it.
@@ -1537,6 +1552,8 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
     }
     for (const name of names.sort()) {
       if (!/^[A-Za-z0-9_-]{1,80}$/.test(name)) continue;
+      // One run's own trace (the local CLI's tracer, a trace per run): the others are not in it.
+      if (onlyRun !== null && name !== onlyRun) continue;
       let entry = runs.get(name);
       if (!entry) {
         if (runs.size >= MAX_RUNS) continue;
@@ -1652,7 +1669,7 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
           const failed = outcome !== 'succeeded';
           for (const step of runnerSteps) {
             const spanId = newSpanId();
-            if (step.error) runnerMarks.push({ kind: 'step_failed', spanId, at: step.start, step: `runner_${step.name}` });
+            if (step.error) runnerMarks.push({ kind: 'step_failed', spanId, at: step.start, end: typeof step.end === 'number' ? step.end : at, step: `runner_${step.name}` });
             emit({
               traceId,
               spanId,
@@ -1727,20 +1744,40 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
       // Only spans Honeycomb accepted: a link to one it never got would open the root instead.
       let marks = [];
       try {
+        // Every moment stays, for the console's own timeline; `sent: false` on one whose span the
+        // destination did not accept, so no link is made to it (it would open the root instead).
         marks = [...[...runs.values()].flatMap((r) => r.trace.marks), ...runnerMarks]
-          .filter((m) => exporter.accepted(m.spanId))
           .sort((x, y) => x.at - y.at)
           .slice(0, MAX_MARKS_PER_JOB)
-          .map((m) => {
-            const out = { ...m };
-            delete out.at;
-            return out;
-          });
+          // When, from the job's start, and for how long: the console's own timeline of the job.
+          .map(({ at: start, end, ...m }) => ({
+            ...m,
+            offsetMs: Math.max(0, Math.round(start - startedAt)),
+            durationMs: Math.max(0, Math.round((end ?? start) - start)),
+            ...(exporter.local ? {} : { sent: exporter.accepted(m.spanId) === true }),
+          }));
       } catch (error) {
         log(`agent telemetry: ${error?.message ?? error}`);
       }
+      // The job's totals, for the console without any destination: what every run cost and did.
+      const runSummaries = [...runs.values()].map((r) => r.trace.summary);
+      const costs = runSummaries.filter((r) => typeof r.costUsd === 'number');
+      const totals = {
+        runs: runSummaries.length,
+        inputTokens: runSummaries.reduce((n, r) => n + (r.inputTokens ?? 0), 0),
+        outputTokens: runSummaries.reduce((n, r) => n + (r.outputTokens ?? 0), 0),
+        ...(costs.length ? { costUsd: Math.round(costs.reduce((n, r) => n + r.costUsd, 0) * 10_000) / 10_000 } : {}),
+        toolCalls: runSummaries.reduce((n, r) => n + (r.tools ?? 0), 0),
+        toolErrors: runSummaries.reduce((n, r) => n + (r.toolErrors ?? 0), 0),
+        thrashing: runSummaries.some((r) => r.thrashing),
+        durationMs: Math.max(0, Math.round(now() - startedAt)),
+      };
       return {
         traceId,
+        rootSpanId,
+        // Read for the console only, sent nowhere (createLocalExporter): no link can open it.
+        ...(exporter.local ? { local: true } : {}),
+        totals,
         ...(conversationId ? { conversationId } : {}),
         conversationIds: conversations,
         marks,

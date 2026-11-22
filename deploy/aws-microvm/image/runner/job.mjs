@@ -24,7 +24,8 @@ import {
   waitForStateChange,
 } from './state.mjs';
 import { claudeTelemetryEnv, createOtlpRelay } from './otlp-relay.mjs';
-import { HONEYCOMB_ENDPOINTS, createAgentTracer, createExporter } from './telemetry.mjs';
+import { HONEYCOMB_ENDPOINTS, createAgentTracer, createExporter, createLocalExporter } from './telemetry.mjs';
+import { headerNameOk, parseOtlpEndpoint, publicOnlyFetch, resolvesPublic } from './otlp-endpoint.mjs';
 
 /** File names the runner writes into the state directory. Config objects may not use them. */
 const KEY_FILE = 'github-app.pem';
@@ -276,8 +277,12 @@ export async function runJob(request, deps) {
   });
 
   let stateDirForLogs;
-  // Agent telemetry (telemetry.mjs), when the tenant set it up: started with the job process.
+  // Agent telemetry (telemetry.mjs): started with the job process. With a destination its spans
+  // go there; without one, it still reads the run logs for the console's own view of the job.
   let tracer;
+  let sending = false;
+  /** Where the spans went ({ provider, host }), for the broker to keep the links of that destination with the job. */
+  let sentTo;
   // The runner's own steps, timed for the trace (sent only when telemetry is on): isolation, the
   // state, the coalescing wait, each try of `updraft run-event` and each wait for newer state.
   const steps = [];
@@ -308,8 +313,13 @@ export async function runJob(request, deps) {
     // runner's own, like the token: it is never in the job's environment, and it is redacted
     // wherever it might appear (until the agents' keys are loaded, it and the shape-based rules).
     const telemetry = payload.version === 2 ? await telemetrySetup(payload, deps, log) : null;
-    if (telemetry) {
-      redact = createRedactor([telemetry.apiKey]);
+    sending = Boolean(telemetry);
+    if (telemetry) sentTo = { provider: telemetry.provider, host: telemetry.host };
+    if (!telemetry) {
+      tracer = createAgentTracer({ startedAt, captureContent: false, redact: (text) => redact(text), log, now, exporter: createLocalExporter(), ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}) });
+      tracer.start();
+    } else {
+      redact = createRedactor(telemetrySecrets(telemetry));
       // Through `redact` as it is when a span leaves: the agents' keys join it below.
       const redactNow = (text) => redact(text);
       tracer = createAgentTracer({
@@ -320,17 +330,20 @@ export async function runJob(request, deps) {
         now,
         exporter: createExporter({
           endpoint: telemetry.endpoint,
+          tracesUrl: telemetry.tracesUrl,
           apiKey: telemetry.apiKey,
+          headerName: telemetry.headerName,
           redact: redactNow,
           resource: { 'service.name': telemetry.serviceName, 'updraft.delivery.id': payload.deliveryId, 'updraft.microvm.id': microvmId },
-          ...(deps.fetch ? { fetch: deps.fetch } : {}),
+          // A custom destination's connection goes only to the public addresses its name resolves to.
+          ...(deps.fetch ? { fetch: deps.fetch } : telemetry.publicOnly ? { fetch: publicOnlyFetch() } : {}),
           log,
           now,
         }),
         ...(deps.telemetryPollMs ? { pollMs: deps.telemetryPollMs } : {}),
       });
       tracer.start();
-      log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.endpoint}${telemetry.captureContent ? ', with content' : ''}`);
+      log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.host}${telemetry.captureContent ? ', with content' : ''}`);
     }
     const { stateDir, state } = await timed('restore_state', {}, async (step) => {
       const prepared = await prepare(payload, deps);
@@ -384,8 +397,9 @@ export async function runJob(request, deps) {
     // The agents' keys, read once for every try. From here, nothing the runner forwards or
     // keeps (the log stream, the uploaded logs, the result) carries a value of them.
     const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
-    redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? [telemetry.apiKey] : [])]);
-    if (tracer) ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
+    redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? telemetrySecrets(telemetry) : [])]);
+    // Claude Code's own events only go somewhere with a destination.
+    if (sending) ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
     for (;;) {
       // Checkpoints: what the run records (the pull request it opened, above all) reaches the
       // shared database while it runs, not only at its end. Stopped before anything else
@@ -400,7 +414,7 @@ export async function runJob(request, deps) {
       checkpointer?.start();
       try {
         run = await timed('run_event', { 'updraft.run_event.try': pending.tries + 1, 'updraft.run_event.deadline_minutes': deadlineNow }, async (step) => {
-          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: tracer?.traceId, agentTelemetryEnv }, { agentEnv, redact }, (stop) => {
+          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: sending ? tracer?.traceId : undefined, agentTelemetryEnv }, { agentEnv, redact }, (stop) => {
             stopChild = stop;
             if (stopRequested) stop();
           });
@@ -498,7 +512,8 @@ export async function runJob(request, deps) {
       steps,
       budgetMs: deps.telemetryBudgetMs ?? (stopRequested ? 5_000 : 15_000),
     });
-    log(`agent telemetry: ${result.telemetry.exported} of ${result.telemetry.spans} span(s) sent${result.telemetry.lastError ? ` (last error: ${result.telemetry.lastError})` : ''}`);
+    if (sentTo) result.telemetry.sentTo = sentTo;
+    if (sending) log(`agent telemetry: ${result.telemetry.exported} of ${result.telemetry.spans} span(s) sent${result.telemetry.lastError ? ` (last error: ${result.telemetry.lastError})` : ''}`);
   }
 
   // Save what the run changed in the shared state, whatever the job's outcome: a failed run
@@ -734,6 +749,10 @@ export function finishDetail(result) {
       // Where the links on the job's page go: its conversation, and spans worth opening at.
       ...(t.conversationId ? { conversationId: t.conversationId } : {}),
       ...(t.marks?.length ? { marks: t.marks } : {}),
+      ...(t.local ? { local: true } : {}),
+      ...(t.rootSpanId ? { rootSpanId: t.rootSpanId } : {}),
+      ...(t.sentTo ? { sentTo: t.sentTo } : {}),
+      ...(t.totals ? { totals: t.totals } : {}),
     };
   }
   // The lifecycle (the console's job timeline): where the review loop left the pull request, and
@@ -786,8 +805,8 @@ async function startAgentEventRelay(tracer, log) {
 async function telemetrySetup(payload, deps, log) {
   const t = payload.telemetry;
   if (!t || typeof t !== 'object' || typeof t.secret !== 'string') return null;
-  const endpoint = HONEYCOMB_ENDPOINTS[t.region] ?? null;
-  if (!endpoint) return null;
+  const destination = await telemetryDestination(t, deps, log);
+  if (!destination) return null;
   try {
     // The version the tenant's settings name: the key is the one checked for this region and
     // team, whatever was written to the secret since. Settings from before versions: the current.
@@ -799,7 +818,7 @@ async function telemetrySetup(payload, deps, log) {
     }
     return {
       apiKey,
-      endpoint,
+      ...destination,
       serviceName: typeof t.serviceName === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(t.serviceName) ? t.serviceName : 'updraft',
       captureContent: t.captureContent === true,
     };
@@ -807,6 +826,35 @@ async function telemetrySetup(payload, deps, log) {
     log(`agent telemetry is on, but its key could not be read (${error?.name ?? 'error'}); nothing is sent`);
     return null;
   }
+}
+
+/**
+ * Where the job's telemetry goes: Honeycomb in its region, or an OTLP endpoint and the header the
+ * key goes in (CloudWatch's, or a custom one). A custom one is checked again here, as the API did before saving it: HTTPS to a
+ * public DNS name, whose every address is public right now. Null, and nothing is sent, otherwise.
+ */
+async function telemetryDestination(t, deps, log) {
+  // CloudWatch is an endpoint and a header too (X-Ray's, in its region), checked the same way.
+  if (t.provider !== 'otlp' && t.provider !== 'cloudwatch') {
+    const endpoint = HONEYCOMB_ENDPOINTS[t.region] ?? null;
+    return endpoint ? { provider: 'honeycomb', endpoint, tracesUrl: `${endpoint}/v1/traces`, headerName: 'x-honeycomb-team', host: new URL(endpoint).host, publicOnly: false } : null;
+  }
+  const parsed = parseOtlpEndpoint(t.endpoint);
+  if (!parsed || !headerNameOk(t.header)) {
+    log('agent telemetry is on, but its endpoint or header is not one the runner sends to; nothing is sent');
+    return null;
+  }
+  if (!(await (deps.resolvesPublic ?? resolvesPublic)(parsed.host))) {
+    log(`agent telemetry is on, but ${parsed.host} does not resolve only to public addresses; nothing is sent`);
+    return null;
+  }
+  return { provider: t.provider, endpoint: parsed.endpoint, tracesUrl: parsed.tracesUrl, headerName: t.header, host: parsed.host, publicOnly: true };
+}
+
+/** The telemetry key, and each word of it (the token in "Bearer <token>"), for the redactor. */
+function telemetrySecrets(telemetry) {
+  const words = telemetry.apiKey.split(/\s+/).filter((w) => w.length >= 8 && w !== telemetry.apiKey);
+  return [telemetry.apiKey, ...words];
 }
 
 /**

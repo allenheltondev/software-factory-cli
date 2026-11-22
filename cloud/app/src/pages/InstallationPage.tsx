@@ -331,7 +331,7 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
                 href={j.telemetry.timelineUrl ?? j.telemetry.conversationUrl}
                 target="_blank"
                 rel="noreferrer"
-                title={j.telemetry.timelineUrl ? 'The issue in Agent Timeline' : "Every span of the issue's conversation, by agent; select its id to open it in Agent Timeline"}
+                title="Every job of this issue: its implementation, reviews and revisions"
                 data-testid={`job-conversation-${j.jobId}`}
               >
                 Conversation ↗

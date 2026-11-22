@@ -100,6 +100,8 @@ function baseDeps(db: Db, over: Partial<DaemonDeps> = {}): DaemonDeps & { contro
     processControl: noProcesses,
     hostname: 'host-a',
     pid: 5000,
+    // Not from the test runner's environment.
+    telemetry: null,
     ...over,
     controller,
   };
@@ -312,6 +314,42 @@ describe('runDaemon', () => {
       { agent: 'claude', outcome: 'start_failed' },
       { agent: 'kiro', outcome: 'succeeded' },
     ]);
+  });
+
+  it('traces each run locally: its own trace, recorded with it, ended after the run is recorded and published', async () => {
+    const db = openDatabase(':memory:');
+    const events: string[] = [];
+    let n = 0;
+    const telemetry = {
+      begin: (runId: string) => {
+        const traceId = String(++n).padStart(32, '0');
+        events.push(`begin ${runId}`);
+        return { traceId, end: async (outcome: string) => void events.push(`end ${runId} ${outcome} ${getRun(db, runId)?.outcome}`) };
+      },
+    };
+    const publisher = { afterRun: async (runId: string) => void events.push(`publish ${runId}`), retryDue: async () => {}, sweepUnpublished: async () => {} };
+    const deps = baseDeps(db, { telemetry, publisher, executor: { name: 'ok', execute: async (): Promise<ExecutionResult> => ({ outcome: 'succeeded' }) } });
+    const job = insertJob(db);
+    const done = runDaemon(deps);
+    await vi.waitFor(() => expect(events.some((e) => e.startsWith('end'))).toBe(true));
+    deps.controller.abort();
+    await done;
+    const run = db.prepare('SELECT id FROM runs WHERE job_id = ?').get(job) as { id: string };
+    expect(events).toEqual([`begin ${run.id}`, `publish ${run.id}`, `end ${run.id} succeeded succeeded`]);
+    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get(`trace:${run.id}`) as { value: string }).value).toBe('1'.padStart(32, '0'));
+
+    // In the microVM the runner traces the job: no local trace, the runner's id recorded.
+    const db2 = openDatabase(':memory:');
+    const begun: string[] = [];
+    const deps2 = baseDeps(db2, { traceId: 'ab'.repeat(16), telemetry: { begin: (id: string) => (begun.push(id), null) } });
+    const job2 = insertJob(db2);
+    const done2 = runDaemon(deps2);
+    await vi.waitFor(() => expect(getJob(db2, job2)?.status).toBe('succeeded'));
+    deps2.controller.abort();
+    await done2;
+    const run2 = db2.prepare('SELECT id FROM runs WHERE job_id = ?').get(job2) as { id: string };
+    expect(begun).toEqual([]);
+    expect((db2.prepare('SELECT value FROM meta WHERE key = ?').get(`trace:${run2.id}`) as { value: string }).value).toBe('ab'.repeat(16));
   });
 
   it('hands only succeeded runs to the publisher, after recording them, and retries due publications after each poll', async () => {

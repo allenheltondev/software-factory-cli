@@ -224,7 +224,7 @@ export interface JobView {
   logs: string[];
   /** What the runner reported at the finish (as the broker checked it). */
   detail?: JobDetail;
-  /** Its agents' trace in the installation's Honeycomb, when telemetry was on. */
+  /** Its agents' trace in the installation's tracing tool, when telemetry was on. */
   telemetry?: JobTelemetry;
 }
 
@@ -232,22 +232,46 @@ export interface JobTelemetry {
   traceId: string;
   traceUrl?: string;
   conversationId?: string;
-  /** The conversation's spans in Honeycomb's query builder; selecting the conversation id there opens Agent Timeline. */
+  /** Where the traces went, by name (Honeycomb, or the host of a custom OTLP endpoint). */
+  destination?: string;
+  /** The conversation's spans, in the destination's own search. */
   conversationUrl?: string;
-  /** The conversation in Agent Timeline itself, when the deployment knows how to link to it. */
+  /** What to do there, when it takes a step (Honeycomb: select the id to open Agent Timeline). */
+  conversationHint?: string;
+  /** The conversation in the destination's conversation view itself, when the deployment knows how to link to it. */
   timelineUrl?: string;
-  /** Spans worth opening the trace at. */
-  links?: JobTraceLink[];
+  /** That link's words (Honeycomb: "Open in Agent Timeline"). */
+  timelineLabel?: string;
+  /** The job's moments, in order, each where it was in the job; with a link to its span when it was sent. */
+  timeline?: JobTimelineEntry[];
+  /** What the job's runs added up to. */
+  totals?: JobTotals;
+  /** Nothing was sent (no destination): the timeline and totals are the runner's own reading. */
+  local?: boolean;
   spans: number;
   exported: number;
   failed: number;
   lastError?: string;
 }
 
-export type JobTraceLinkKind = 'agent' | 'test_failed' | 'test_green' | 'verify_failed' | 'step_failed';
-export interface JobTraceLink {
-  kind: JobTraceLinkKind;
-  url: string;
+export interface JobTotals {
+  runs: number;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd?: number;
+  toolCalls: number;
+  toolErrors: number;
+  thrashing: boolean;
+  durationMs: number;
+}
+
+export type JobTimelineKind = 'agent' | 'test_failed' | 'test_green' | 'verify_failed' | 'step_failed';
+export interface JobTimelineEntry {
+  kind: JobTimelineKind;
+  /** The trace opened at this span, when it was sent and the destination has links. */
+  url?: string;
+  offsetMs?: number;
+  durationMs?: number;
   /** implement, review, revision */
   run?: string;
   agent?: string;
@@ -258,9 +282,25 @@ export interface JobTraceLink {
 }
 
 export type TelemetryRegion = 'us' | 'eu';
+export type TelemetryProvider = 'honeycomb' | 'cloudwatch' | 'otlp';
+/** The destination and its key, saved together: a custom endpoint never changes without its key. */
+export type TelemetryKeyInput =
+  | { provider?: 'honeycomb'; value: string; region: TelemetryRegion }
+  | { provider: 'cloudwatch'; value: string; awsRegion: string }
+  | { provider: 'otlp'; value: string; endpoint: string; header: string };
+export interface TelemetryLinks {
+  trace?: string;
+  conversation?: string;
+}
 export interface TelemetryView {
-  provider: 'honeycomb';
+  provider: TelemetryProvider;
   enabled: boolean;
+  /** A custom destination: where it sends and the header the key goes in (never the key). */
+  otlp?: { endpoint: string; header: string; host: string };
+  /** CloudWatch: the AWS region it sends to. */
+  aws?: { region: string };
+  /** A custom destination's link templates. */
+  links?: TelemetryLinks;
   region: TelemetryRegion;
   serviceName: string;
   captureContent: boolean;
@@ -607,11 +647,11 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     jobLog: (installationId: number, jobId: string, name: string) =>
       request<JobLog>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/logs/${encodeURIComponent(name)}`),
     telemetry: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry`),
-    updateTelemetry: (installationId: number, input: { enabled?: boolean; serviceName?: string; captureContent?: boolean }) =>
+    updateTelemetry: (installationId: number, input: { enabled?: boolean; serviceName?: string; captureContent?: boolean; links?: TelemetryLinks }) =>
       request<TelemetryView>(`/installations/${installationId}/telemetry`, { method: 'PUT', body: JSON.stringify(input) }),
     /** The key is sent once and never comes back. */
-    setTelemetryKey: (installationId: number, value: string, region: TelemetryRegion) =>
-      request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify({ value, region }) }),
+    setTelemetryKey: (installationId: number, input: TelemetryKeyInput) =>
+      request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify(input) }),
     removeTelemetryKey: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'DELETE' }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */

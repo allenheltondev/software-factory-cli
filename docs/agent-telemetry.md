@@ -1,14 +1,118 @@
-# Agent telemetry: Updraft in Honeycomb's Agent Timeline
+# Agent telemetry
 
-Updraft Cloud can send what each job's agents did to the tenant's own Honeycomb, as OpenTelemetry
-traces in the [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai).
-[Agent Timeline](https://docs.honeycomb.io/investigate/observe/agent-timeline) then shows every
-model call, tool call, verification and review round in order, for one issue at a time.
+Updraft Cloud can send what each job's agents did to the tenant's own tracing tool, as
+OpenTelemetry traces in the [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai):
+every model call, tool call, verification and review round, in order, with one issue's jobs as
+one conversation. Any backend that accepts OTLP/HTTP can store them; one that reads the GenAI
+conventions also shows them as an agent conversation.
 
-It is set up per installation in the console, under **Agent telemetry**: a Honeycomb Ingest key
-(checked with Honeycomb's `/1/auth` before it is saved), the region (US or EU), the service name
-(the dataset), and whether prompts and outputs are recorded. Agent Timeline is on every Honeycomb
-plan, the free one included.
+In Updraft Cloud it is set up per installation in the console, under **Agent telemetry**: where
+the traces go (see [Destinations](#destinations)), the service name, and whether prompts and
+outputs are recorded. Running Updraft yourself, the standard OpenTelemetry variables turn it on
+(see [Running it yourself](#running-it-yourself)). Without any of it, the job page still shows what the runner saw (see
+[What the console shows](#what-the-console-shows)).
+
+## Destinations
+
+### Honeycomb
+
+A Honeycomb Ingest key, checked with Honeycomb's `/1/auth` before it is saved, and the region (US
+or EU). The runner sends to `https://api.honeycomb.io/v1/traces` (or `api.eu1`) with the key in
+`x-honeycomb-team`; the service name is the dataset. Honeycomb's
+[Agent Timeline](https://docs.honeycomb.io/investigate/observe/agent-timeline), on every plan
+including the free one, shows each conversation. The key's team and environment slugs make the
+console's links: a [direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace)
+and a [shared query](https://docs.honeycomb.io/investigate/collaborate/share-query) for the
+conversation.
+
+### CloudWatch
+
+An AWS region and an X-Ray API key. The runner sends to X-Ray's
+[OTLP traces endpoint](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-OTLPEndpoint.html)
+in that region, `https://xray.<region>.amazonaws.com/v1/traces`, with the key as
+`Authorization: Bearer <key>`; it takes OTLP/HTTP with JSON. The traces are in CloudWatch's
+Transaction Search, where the `gen_ai.*` attributes, the service name and
+`gen_ai.conversation.id` can be searched and grouped. To set it up in AWS:
+
+1. Turn on [Transaction Search](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Transaction-Search.html)
+   in the account: the endpoint takes no traces without it.
+2. Give an IAM user the `AWSXRayAPIKeyAccess` managed policy, and create an
+   [X-Ray API key](https://docs.aws.amazon.com/xray/latest/devguide/xray-opentelemetry-bearer-token.html)
+   for it (IAM, the user, **Security credentials**, **API keys for AWS services**; or
+   `aws iam create-service-specific-credential --service-name xray.amazonaws.com`). Paste its
+   `ServiceCredentialSecret`, not the credential's id. API keys are not offered in every region.
+
+The check before saving is the same empty export as for any OTLP endpoint. AWS checks the key
+before it reads the body, so a 403 is a key it refused; a 400 to the empty export is taken as a
+key that got through, unless its answer says Transaction Search is off. The key is stored as
+`Bearer <key>`, and the runner treats CloudWatch as an OTLP endpoint and header (the rules and the
+public-address check apply as below).
+
+**View trace** opens the trace in the CloudWatch console,
+`https://<region>.console.aws.amazon.com/cloudwatch/home?region=<region>#xray:traces/1-<first 8 hex>-<other 24 hex>`
+(the trace id in X-Ray's form). AWS documents no link to a trace, so this is the form the console
+uses today, and can change. There is no link to a span or to a conversation's search.
+
+### Any OTLP endpoint
+
+Any backend that takes OTLP/HTTP with JSON encoding: a hosted tracing service, or your own
+OpenTelemetry Collector on a public HTTPS address (which can then forward anywhere, in any
+encoding). Three things, saved together:
+
+- **The endpoint**, the base OTLP endpoint as in `OTEL_EXPORTER_OTLP_ENDPOINT`: the runner sends
+  to it plus `/v1/traces`, or to the endpoint itself when it already ends with `/v1/traces`. It
+  must be `https://` to a public DNS name: no IP address, no single-label or internal name
+  (`.internal`, `.local`, `.lan`, ...), no credentials, query string or fragment.
+- **The header** the key goes in (`authorization`, `x-api-key`, ...): not one the runner sets
+  itself (`content-type`, `host`, `content-length`, ...) or a `proxy-` one.
+- **Its value**, whole: `Bearer <token>`, `Basic <base64>`, or a bare key.
+
+Before saving, the API sends the endpoint an empty export (`{"resourceSpans":[]}`) with the
+header: a receiver that takes OTLP/HTTP JSON accepts it and records nothing; 401 or 403 means the
+key was refused, and 400, 404, 405, 406 or 415 that this is not an OTLP/HTTP JSON endpoint. Nothing
+is saved unless it answered 2xx. The endpoint's name must resolve only to public addresses, and a
+redirect is never followed.
+
+**Links** are optional templates, so each job's page links into your tool:
+
+- **Trace link**, naming `{trace_id}`, and also `{span_id}` for the moments in it (the job's own
+  trace link then opens at its root span), `{start}` and `{end}` in UNIX seconds, `{start_ms}` and
+  `{end_ms}` in milliseconds (a minute before the job to five minutes after it), and `{service}`.
+- **Conversation link**, naming `{conversation}`, with the same times (a week before the job to a
+  week after it, or now) and `{service}`: every trace of one issue.
+
+Each is an `https://` URL whose host is written out; every value filled in is URL-encoded. Without
+them, the job page still shows what the agents did, and the jobs list links nowhere.
+
+### Running it yourself
+
+`updraft start` and `updraft run-event` send the same spans, from the same tracer, when the
+standard OpenTelemetry exporter variables name an endpoint:
+
+| Variable | What it does |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | The base endpoint; spans go to it plus `/v1/traces` (`http://localhost:4318` for a local Collector) |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | The traces endpoint itself, used as given (wins over the one above) |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | `key=value,key2=value2`, values URL-encoded (`authorization=Bearer%20<token>`); the traces ones win |
+| `OTEL_SERVICE_NAME`, or `service.name` in `OTEL_RESOURCE_ATTRIBUTES` | The service name (default `updraft`) |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` | Records prompts and outputs, as **Prompts and outputs** does in the console |
+| `OTEL_SDK_DISABLED=true`, or `OTEL_TRACES_EXPORTER` without `otlp` | Turns it off |
+
+Only OTLP/HTTP with JSON is spoken: with `OTEL_EXPORTER_OTLP_PROTOCOL` (or the traces one) set to
+anything but `http/json`, nothing is sent and the worker says so. Left unset, JSON is sent, which
+an OpenTelemetry Collector's OTLP receiver and most backends' OTLP/HTTP endpoints accept.
+
+Each run is its own trace, from the moment the worker claims it until it is recorded and
+published (or commented on), so Updraft's own steps are in it. Its trace id is recorded with the
+run, so a later run's trace links to it as in [Across jobs](#across-jobs). The header values, and
+each word of them, are redacted from every span. Plain `http://` is allowed here, for a Collector
+on your own machine or network. Inside Updraft Cloud's microVM the runner traces the job itself,
+so the worker there sends nothing of its own.
+
+The tracer is the runner's: `src/telemetry/runner/` holds copies of
+`deploy/aws-microvm/image/runner/telemetry.mjs`, `telemetry-detail.mjs` and `redact.mjs`, kept
+identical by `test/telemetry-copy.test.ts` (`node scripts/copy-telemetry.mjs --sync` refreshes
+them), and the build copies them into `dist/`.
 
 ## How it works
 
@@ -22,13 +126,12 @@ needs: every run's `run.log`, which holds
 
 The runner (`deploy/aws-microvm/image/runner/telemetry.mjs`) tails those files every 500 ms while
 the job runs, so each event is timed when it is written. It turns them into spans and sends
-finished ones every few seconds over OTLP/HTTP (JSON) to `https://api.honeycomb.io/v1/traces`
-(or `api.eu1`), with the key in `x-honeycomb-team`. No collector and no SDK are involved.
+finished ones every few seconds over OTLP/HTTP (JSON) to the destination. No collector and no SDK
+are involved.
 
 Claude Code can also export OpenTelemetry itself, but its spans are named `claude_code.*` and need a
 Collector `transform` processor to carry agent names, span names and token usage in the GenAI
-conventions (Honeycomb's [Instrumenting AI Agents](https://docs.honeycomb.io/send-data/use-cases/agents)
-shows the configuration). Reading the transcripts gives the same shape for Codex too, with none
+conventions. Reading the transcripts gives the same shape for Codex too, with none
 of that.
 
 ## The spans
@@ -55,29 +158,29 @@ invoke_workflow updraft                 the job; agent "updraft"
 | `execute_tool verify` | `execute_tool` | internal | `updraft.verify.command`, `updraft.verify.index`, `updraft.tool.exit_code` |
 
 Every span carries `gen_ai.conversation.id`, which is `<owner>/<repo>#<issue>`, and
-`gen_ai.agent.name`. Agent Timeline groups traces into a conversation by the first and spans into
-lanes by the second, so one issue's implement run, each review, and each revision, over however
+`gen_ai.agent.name`. A tool that reads the conventions (Honeycomb's Agent Timeline, for one) groups
+traces into a conversation by the first and spans into lanes by the second, so one issue's implement run, each review, and each revision, over however
 many webhook events and microVMs, read as one conversation, with the coding agent, the reviewing
 agent and Updraft itself each in its own lane.
 
-Details that follow the conventions and Honeycomb's cost calculation:
+Details that follow the conventions:
 
 - **Input tokens include the cache.** Anthropic reports `input_tokens` without cache reads and
   writes; the conventions' `gen_ai.usage.input_tokens` includes them, so Updraft adds them up.
   OpenAI's count already includes cached tokens and is sent as is. With the model and provider on
-  the span, Honeycomb estimates each call's cost at ingest.
+  the span, a backend that prices models (Honeycomb does) can estimate each call's cost.
 - **One `chat` span per model response.** Claude Code streams each content block of a response as
   its own event, with the same message id; they are one span. It starts when the agent got the
   previous tool results back (or started), and ends when the response's last block arrived. A
   Codex turn has no per-call breakdown, so it is one `chat` span with the turn's usage.
 - **The calling agent emits `invoke_agent`.** A Claude Code subagent is an `execute_tool Task`
   span with an `invoke_agent <profile>/<subagent_type>` span under it; the subagent's own model and
-  tool calls carry its own agent name, as Honeycomb recommends for multi-agent workflows.
+  tool calls carry its own agent name, as the conventions suggest for multi-agent workflows.
 - **Failures are span errors.** A tool result marked `is_error`, a Codex command that exited
   non-zero or an MCP call that failed, an agent run that did not succeed, a verify command that
   failed, and a job that did not succeed: each sets the span's status to error with `error.type`.
-- **Nothing is sampled.** Honeycomb recommends against sampling GenAI telemetry, and the runner
-  sends every span (up to 20,000 per run).
+- **Nothing is sampled.** A sampled conversation has holes in it, so the runner sends every span
+  (up to 20,000 per run).
 
 ## Structural detail
 
@@ -208,47 +311,108 @@ Off by default. With **Prompts and outputs** on, spans also carry:
 - `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result` on `execute_tool`;
 - `gen_ai.agent.description` on a subagent.
 
-Every value is redacted with the job's own keys (the agent keys and the Honeycomb key) and with
+Every value is redacted with the job's own keys (the agent keys and the destination's key) and with
 patterns for anything shaped like a provider key, bearer token or key header, then cut to
 16 KB. A JSON value is cut inside its strings, so it stays valid JSON. Code and issue text are
 not redacted: they are what the content is.
 
+## The contract
+
+What a destination, a query, a board or an alert can rely on, whichever tool reads it:
+
+- **Span names and kinds**: `invoke_workflow updraft`, `invoke_agent <profile>`,
+  `invoke_agent <profile>/<subagent type>`, `chat <model>`, `execute_tool <tool>`,
+  `execute_tool verify`, `invoke_workflow verify`, `updraft <step>` and `runner <step>`, in the tree
+  under [The spans](#the-spans), one trace per job.
+- **The GenAI attributes** in the tables above, with the conventions' meaning:
+  `gen_ai.conversation.id` (`<owner>/<repo>#<issue>`, `delivery/<id>` for a job that ran no agent,
+  or a run's job id for a run of no issue), `gen_ai.agent.name`, `gen_ai.operation.name`, the
+  model, provider, token and tool attributes.
+- **The `updraft.*` attributes** in [Structural detail](#structural-detail) and
+  [How the agent worked](#how-the-agent-worked): names, types and units (counts, `_ms`
+  milliseconds, `_usd` dollars, ratios between 0 and 1) stay as documented.
+- **Span links between jobs** (`updraft.link.relation`) and the derived `invoke_agent` span id of
+  a run, so a later trace can always link to an earlier run.
+- **The finish report's marks and totals** ([Spans worth a link](#spans-worth-a-link)): kinds and
+  fields as documented.
+
+Changes are additive: a new attribute or span event can appear, and an existing one keeps its
+name, type and meaning. Renaming or removing one is a breaking change and is called out in the
+release notes. Content attributes (`gen_ai.input.messages`, `gen_ai.output.messages`,
+`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`) are only there with content on, and their
+values follow the conventions' JSON message format, cut at 16 KB. Resource attributes are
+`service.name` (the service name setting), `updraft.delivery.id` and `updraft.microvm.id`.
+
 ## What the console shows
 
-- **Agent telemetry** (`/installations/:id/telemetry`): the key (never its value), the Honeycomb
-  team and environment it belongs to, sending on or paused, content on or off, the service name,
-  and the last job's export: how many spans got there, the last error, and a link to its trace.
+- **Agent telemetry** (`/installations/:id/telemetry`): where traces go and the key (never its
+  value), sending on or paused, content on or off, the service name, and the last job's export:
+  how many spans got there, the last error, and a link to its trace.
 - **Each job's page**:
-  - **View trace in Honeycomb**, a
-    [direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace) built from the
-    team and environment slugs.
-  - **Open conversation**, the conversation's spans in Honeycomb's query builder, a
-    [shared query](https://docs.honeycomb.io/investigate/collaborate/share-query):
-    `gen_ai.conversation.id = <owner/repo#issue>`, broken down by conversation and agent, with a span
-    count and a trace count, from a week before the job to a week after it (or now). Selecting the
-    conversation id in the results opens it in Agent Timeline. If the deployment sets an Agent
-    Timeline link (below), **Open in Agent Timeline** shows instead.
-  - **Jump to**: the trace opened at a span (`&span=<span id>`) for each run's `invoke_agent` span
-    (with its review verdict, and whether it failed or went in circles), the first failing test run,
-    the first passing one after it, the first failed verify command, and the first failed Updraft
-    or runner step.
+  - **What the agents did**, with or without a destination: the job's totals (agent runs, tokens in
+    and out, the cost the agent CLIs reported, tool calls and how many failed, whether a run went
+    in circles) and its moments in order, each at its time from the job's start on a bar the
+    length of the job: each run's agent (with its review verdict, and whether it failed or went in
+    circles), the first failing test run, the first passing one after it, the first failed verify
+    command, and the first failed Updraft or runner step. When the trace was sent somewhere with
+    links, each moment opens the trace at its span.
+  - **Traces**, when the trace was sent: **View trace**, **Open conversation** (the conversation's
+    spans in the destination's search), and the conversation id to copy. With no destination, an
+    offer to set one up.
   - **This conversation**: the other recent jobs of the same conversation (the implementation, each
     review and revision), each with its trace.
-  - The conversation id, to copy into AI Ecosystem → Conversations.
 - **The jobs list**: a **Trace** and a **Conversation** link on each job that sent telemetry.
+
+With no destination, the runner still reads the run logs as the job runs, with an exporter that
+sends nothing (`createLocalExporter`): the finish reports the marks and totals with `local: true`,
+the job is given no trace id (so no later trace links to it), Claude Code's own events are not
+collected, and the settings page records no export. A job's links are only built from what
+reached a destination: none for a local job, or for one whose export sent nothing.
+
+The links are built from the destination the trace went to, not from today's settings. A job's
+first `start` decides its telemetry from the settings then and records it on the job, once
+(`telemetrySnapshot`): the descriptor with the key's version (or none, when telemetry was off),
+and that destination's link settings (Honeycomb's region, team and environment, CloudWatch's
+region, or a custom destination's host and link templates; never a key). Every later `start` (a
+replay) and `credentials` answer hands out that same descriptor, so the key version the runner
+reads and the links its trace gets never part. If that record cannot be written, or another `start` wrote it and it
+cannot be read back, the job is handed no descriptor: it keeps its own timeline and sends nothing,
+rather than send somewhere its links could not follow. The runner
+reports where it sent (`sentTo`: the destination kind and host), and at finish the broker keeps
+that snapshot with the job's report (`destination`) when it is where the runner sent, so no change
+made during the job (another destination, or a same-region key of another Honeycomb team) is
+what the trace is linked from. It ignores any `destination` a runner reports itself. A job started
+before the snapshot existed is linked from the installation's destination at finish, when that
+matches. The settings page's last export keeps the same snapshot. So a job sent to
+Honeycomb still opens in Honeycomb after the installation moved to CloudWatch, and a trace id
+is never put into another backend's URL. A job from before snapshots (all of them Honeycomb's) is
+linked from the settings while they are still Honeycomb's, and not after.
+
+For Honeycomb, **View trace** is a
+[direct trace link](https://docs.honeycomb.io/investigate/collaborate/share-trace) built from the
+key's team and environment slugs, and **Open conversation** a
+[shared query](https://docs.honeycomb.io/investigate/collaborate/share-query):
+`gen_ai.conversation.id = <owner/repo#issue>`, broken down by conversation and agent, with a span
+count and a trace count, from a week before the job to a week after it (or now). Selecting the
+conversation id in the results opens it in Agent Timeline. If the deployment sets an Agent Timeline
+link (below), **Open in Agent Timeline** shows instead.
 
 ### Spans worth a link
 
 The runner reports these with the job's finish (`telemetry.marks`): a kind (`agent`,
 `test_failed`, `test_green`, `verify_failed`, `step_failed`), the span id, the run kind, and for an
-agent span its profile, verdict, and whether it failed or thrashed. Only spans Honeycomb accepted
-(a 2xx for their batch that rejected none of it: an OTLP partial success counts its rejected spans
-as failed and confirms none of the batch, since it does not say which) are reported, so a link
-never opens the root span instead of one that was refused, dropped or still queued, and there are at most 8 per run and 32 per job. A test run counts
+agent span its profile, verdict, and whether it failed or thrashed, and where it was in the job
+(`offsetMs` from the job's start, `durationMs`). Every moment is reported, at most 8 per run
+and 32 per job, with `sent: false` on one whose span the destination did not accept (its batch
+got no 2xx, or an OTLP partial success, which counts its rejected spans as failed and confirms
+none of the batch, since it does not say which; or it was dropped or still queued). Such a moment
+is still on the job's timeline; it gets no link, which would open the root span instead. A test run counts
 as the first passing one only when its output showed tests that passed. It also reports the
 conversation id the job's span was sent in, so a review's job, which has no issue of its own, links
-to the issue's conversation, and a job that ran no agent to `delivery/<id>`. The broker keeps only marks of a known kind, with a 16-hex span id and plain
-words.
+to the issue's conversation, and a job that ran no agent to `delivery/<id>`. And the job's
+`totals`: `runs`, `inputTokens`, `outputTokens`, `costUsd` (when an agent CLI reported a cost),
+`toolCalls`, `toolErrors`, `thrashing` and `durationMs`. The broker keeps only marks of a known
+kind, with a 16-hex span id, plain words and counts, and totals as counts.
 
 ### A link into Agent Timeline itself
 
@@ -263,19 +427,32 @@ path it can change without notice; the query link works either way.
 
 ## Security
 
-- The key is a Secrets Manager secret, `updraft/tenants/<id>/agent-keys/HONEYCOMB_API_KEY`. The
-  API can create, replace and delete it, never read it. Only a job of the same tenant can read
+- The key is a Secrets Manager secret, `updraft/tenants/<id>/agent-keys/HONEYCOMB_API_KEY` (the
+  name from when Honeycomb was the only destination; CloudWatch's key and a custom destination's
+  header value are kept there too). The API can create, replace and delete it, never read it. Only a job of the same tenant can read
   it, with the broker's tenant-scoped credentials.
 - The broker passes it to the runner as telemetry settings, never among the agent keys, so it is
   never in the job process's or an agent's environment. The runner reads it as root.
 - The key and where it sends always match. The settings record the Secrets Manager version the
-  key was written as, in the same conditional write as its region and team, and the runner reads
-  exactly that version. Key changes take a two-minute lease on the settings, so a rotation and
+  key was written as, in the same conditional write as its destination (Honeycomb's region and
+  team, CloudWatch's region and endpoint, or the custom endpoint and header), and the runner reads exactly that version. A
+  destination cannot change without the key being entered again, so no member can point a saved
+  key at another server. Key changes take a two-minute lease on the settings, so a rotation and
   another rotation, or a removal, never overlap; a change that stops halfway leaves the settings
   naming the previous version, which Secrets Manager keeps. A removal clears the settings first
   and deletes the secret second, holding the lease until the delete is done, so a new key saved
   meanwhile can never be deleted with the old one.
 - Every setting change is a compare-and-set on the version it read, so an opt-out made while a
   key was being checked is never undone.
-- A failed export (Honeycomb unreachable, the key revoked) is counted and reported; it never fails
+- A custom endpoint (and CloudWatch's) is checked twice: by the API before it is saved (its rules,
+  its name resolving only to public addresses, an empty export answered 2xx, no redirect
+  followed), and by the runner before each job sends (the same rules, and the name resolving only
+  to public addresses then). The connections themselves go only to public addresses: both the
+  API's check and the runner's export connect through `node:https` with a lookup that refuses an
+  answer with any address that is not public, so the address connected to is one that lookup
+  vetted, whatever the name answers later. The certificate is still checked against the host
+  name. Neither follows a redirect.
+- The key's value and each word of it (the token in `Bearer <token>`) are redacted from
+  everything the runner sends, logs or uploads.
+- A failed export (the destination unreachable, the key revoked) is counted and reported; it never fails
   the job.

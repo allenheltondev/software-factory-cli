@@ -5,8 +5,9 @@ import { countBy, deliveryCounts, jobResult, type JobResult } from '../jobs/stat
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { redact } from './redact.js';
-import type { TelemetryMarkKind } from '../jobs/lifecycle.js';
-import { conversationUrl, timelineUrl, traceUrl } from './telemetry-service.js';
+import type { TelemetryMarkKind, TelemetryTotals } from '../jobs/lifecycle.js';
+import { parseOtlpEndpoint } from './otlp-destination.js';
+import { conversationUrl, linkSettingsForJob, timelineUrl, traceUrl, type LinkSettings } from './telemetry-service.js';
 
 /**
  * A tenant's status and diagnostics in the console (#71), for its members only:
@@ -60,21 +61,36 @@ export interface JobTelemetryView {
   traceId: string;
   traceUrl?: string;
   conversationId?: string;
-  /** The conversation's spans in Honeycomb's query builder, by agent; from there, Agent Timeline. */
+  /** Where the traces went, by name: the link's destination, for the console's words. */
+  destination?: string;
+  /** The conversation's spans, in the destination's own search. */
   conversationUrl?: string;
-  /** The conversation in Agent Timeline itself, when the deployment set HONEYCOMB_TIMELINE_URL. */
+  /** What to do there, when it takes a step. */
+  conversationHint?: string;
+  /** The conversation in the destination's conversation view itself (Honeycomb: when the deployment set HONEYCOMB_TIMELINE_URL). */
   timelineUrl?: string;
-  /** Spans worth opening the trace at: each run's agent, the first red and green test runs, a failed verify or step. */
-  links?: JobTraceLink[];
+  timelineLabel?: string;
+  /**
+   * The job's moments, in order: each run's agent, the first red and green test runs, a failed
+   * verify command or step, each where it was in the job, with a link to its span when it was sent.
+   */
+  timeline?: JobTimelineEntry[];
+  /** What the job's runs added up to. */
+  totals?: TelemetryTotals;
+  /** Nothing was sent (no destination): the timeline and totals are the runner's own reading. */
+  local?: boolean;
   spans: number;
   exported: number;
   failed: number;
   lastError?: string;
 }
 
-export interface JobTraceLink {
+export interface JobTimelineEntry {
   kind: TelemetryMarkKind;
-  url: string;
+  /** The trace opened at this span, when it was sent and the destination has links. */
+  url?: string;
+  offsetMs?: number;
+  durationMs?: number;
   run?: string;
   agent?: string;
   failed?: boolean;
@@ -139,6 +155,15 @@ export function missingPermissions(granted: Record<string, string> | undefined):
   return out;
 }
 
+/** Where a trace went, in words: Honeycomb, CloudWatch, or a custom endpoint's host. */
+function destinationName(s: LinkSettings & { otlp?: { endpoint: string } }, host?: string): string {
+  if (s.provider === 'cloudwatch') return 'CloudWatch';
+  if (s.provider !== 'otlp') return 'Honeycomb';
+  if (host) return host;
+  const parsed = s.otlp ? parseOtlpEndpoint(s.otlp.endpoint) : null;
+  return parsed && 'host' in parsed ? parsed.host : 'your OTLP endpoint';
+}
+
 /**
  * The conversation Agent Timeline groups a job's traces under: what its runner reported, else
  * `owner/repo#issue` for a job of an issue (the runner's telemetry.mjs names it the same way).
@@ -154,22 +179,29 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
   const t = job.detail?.telemetry;
   if (t) {
     const startedAt = t.startedAt ?? job.createdAt;
-    const url = traceUrl(telemetry, t.traceId, startedAt, job.finishedAt);
+    // Links only to what reached the destination (nothing local, nothing from an export that sent
+    // nothing), and only to the destination it reached: the job's own snapshot of it.
+    const sent = !t.local && t.exported > 0 ? linkSettingsForJob(t.destination, t.sentTo, telemetry) : null;
+    // A custom destination's trace link is its span link to the root, when its template wants a span.
+    const url = traceUrl(sent, t.traceId, startedAt, job.finishedAt, sent?.provider === 'otlp' && sent.links?.trace?.includes('{span_id}') ? t.rootSpanId : undefined);
     const conversationId = conversationOf(job);
-    const queryUrl = conversationId ? conversationUrl(telemetry, conversationId, startedAt, now) : null;
-    const timeline = conversationId ? timelineUrl(timelineTemplate, telemetry, conversationId, startedAt, now) : null;
-    const links: JobTraceLink[] = [];
-    for (const m of t.marks ?? []) {
-      const at = traceUrl(telemetry, t.traceId, startedAt, job.finishedAt, m.spanId);
-      if (at) links.push({ ...(({ spanId: _s, ...rest }) => rest)(m), url: at });
-    }
+    const queryUrl = conversationId ? conversationUrl(sent, conversationId, startedAt, now) : null;
+    const timeline = conversationId ? timelineUrl(timelineTemplate, sent, conversationId, startedAt, now) : null;
+    const entries: JobTimelineEntry[] = (t.marks ?? []).map((m) => {
+      const { spanId, sent: _sent, ...rest } = m;
+      const at = m.sent === false ? null : traceUrl(sent, t.traceId, startedAt, job.finishedAt, spanId);
+      return { ...rest, ...(at ? { url: at } : {}) };
+    });
     view.telemetry = {
       traceId: t.traceId,
       ...(url ? { traceUrl: url } : {}),
       ...(conversationId ? { conversationId } : {}),
-      ...(queryUrl ? { conversationUrl: queryUrl } : {}),
-      ...(timeline ? { timelineUrl: timeline } : {}),
-      ...(links.length ? { links } : {}),
+      ...(sent ? { destination: destinationName(sent, t.destination?.host) } : {}),
+      ...(queryUrl ? { conversationUrl: queryUrl, ...(sent?.provider === 'honeycomb' ? { conversationHint: 'In the results, select the conversation id to open it in Agent Timeline.' } : {}) } : {}),
+      ...(timeline ? { timelineUrl: timeline, timelineLabel: 'Open in Agent Timeline' } : {}),
+      ...(entries.length ? { timeline: entries } : {}),
+      ...(t.totals ? { totals: t.totals } : {}),
+      ...(t.local ? { local: true } : {}),
       spans: t.spans,
       exported: t.exported,
       failed: t.failed,

@@ -1,4 +1,4 @@
-import { loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
+import { destinationOf, jobTelemetrySnapshotOf, loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import {
   DeleteCommand,
@@ -57,10 +57,22 @@ function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
   const e = i.lastExport && typeof i.lastExport === 'object' ? (i.lastExport as Record<string, unknown>) : undefined;
   const team = named(key?.team);
   const environment = named(key?.environment);
+  const otlp = i.otlp && typeof i.otlp === 'object' ? (i.otlp as Record<string, unknown>) : undefined;
+  const links = i.links && typeof i.links === 'object' ? (i.links as Record<string, unknown>) : undefined;
   return {
-    provider: 'honeycomb',
+    provider: i.provider === 'otlp' ? 'otlp' : i.provider === 'cloudwatch' ? 'cloudwatch' : 'honeycomb',
+    ...(i.aws && typeof i.aws === 'object' && typeof (i.aws as Record<string, unknown>).region === 'string' ? { aws: { region: String((i.aws as Record<string, unknown>).region) } } : {}),
     enabled: i.enabled === true,
     region: i.region === 'eu' ? 'eu' : 'us',
+    ...(otlp && typeof otlp.endpoint === 'string' && typeof otlp.header === 'string' ? { otlp: { endpoint: otlp.endpoint, header: otlp.header } } : {}),
+    ...(links
+      ? {
+          links: {
+            ...(typeof links.trace === 'string' ? { trace: links.trace } : {}),
+            ...(typeof links.conversation === 'string' ? { conversation: links.conversation } : {}),
+          },
+        }
+      : {}),
     serviceName: typeof i.serviceName === 'string' ? i.serviceName : 'updraft',
     captureContent: i.captureContent === true,
     updatedAt: String(i.updatedAt ?? ''),
@@ -87,6 +99,7 @@ function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
             at: String(e.at ?? ''),
             jobId: String(e.jobId ?? ''),
             ...(typeof e.traceId === 'string' ? { traceId: e.traceId } : {}),
+            ...(destinationOf(e.destination) ? { destination: destinationOf(e.destination)! } : {}),
             spans: Number(e.spans) || 0,
             exported: Number(e.exported) || 0,
             failed: Number(e.failed) || 0,
@@ -669,6 +682,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(i.quotas && typeof i.quotas === 'object' ? { quotas: i.quotas as Quotas } : {}),
         ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
         ...(Array.isArray(i.agentKeys) ? { agentKeys: (i.agentKeys as unknown[]).map(String) } : {}),
+        ...(jobTelemetrySnapshotOf(i.telemetrySnapshot) ? { telemetrySnapshot: jobTelemetrySnapshotOf(i.telemetrySnapshot)! } : {}),
         ...(typeof i.startedAt === 'number' ? { startedAt: i.startedAt } : {}),
         ...(typeof i.stopRequestedAt === 'number' ? { stopRequestedAt: i.stopRequestedAt } : {}),
         ...(typeof i.releasedAt === 'number' ? { releasedAt: i.releasedAt } : {}),
@@ -684,6 +698,24 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             UpdateExpression: 'SET microvmId = :id',
             ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(microvmId)',
             ExpressionAttributeValues: { ':id': microvmId },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
+    async setJobTelemetrySnapshot(jobId, snapshot) {
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: { pk: `JOB#${jobId}`, sk: 'META' },
+            UpdateExpression: 'SET telemetrySnapshot = :s',
+            ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(telemetrySnapshot)',
+            ExpressionAttributeValues: { ':s': snapshot },
           }),
         );
         return true;
