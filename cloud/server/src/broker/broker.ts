@@ -346,13 +346,21 @@ export function createBroker(deps: BrokerDeps) {
       if (!snapshot) {
         const fresh = telemetrySnapshotNow(await deps.store.getTelemetry(job.installationId).catch(() => null), job.installationId);
         snapshot = fresh;
-        if (action === 'start') {
+        if (action === 'start' && fresh.descriptor) {
           const stored = await deps.store.setJobTelemetrySnapshot(job.jobId, fresh).catch((err: unknown) => {
-            log({ jobId: job.jobId, warning: `could not record the telemetry snapshot: ${(err as Error)?.name}` });
+            log({ jobId: job.jobId, warning: `could not record the telemetry snapshot; the job sends no telemetry: ${(err as Error)?.name}` });
             return null;
           });
-          // Another `start` recorded it first: its record is the job's.
-          if (stored === false) snapshot = (await deps.store.getJob(job.jobId))?.telemetrySnapshot ?? fresh;
+          // Another `start` recorded it first: its record is the job's. Unreadable, or not written at
+          // all: no destination for this job (it keeps its own timeline), never one its links would
+          // not match.
+          if (stored === false) snapshot = (await deps.store.getJob(job.jobId).catch(() => null))?.telemetrySnapshot ?? {};
+          else if (stored === null) snapshot = {};
+        } else if (action === 'start') {
+          // Off at start: recorded too, so a later answer never turns it on. Best effort: without it,
+          // a later answer reads the settings, which a job with no destination ignores (the runner
+          // reads its key only at start).
+          await deps.store.setJobTelemetrySnapshot(job.jobId, fresh).catch(() => null);
         }
       }
       const telemetry = snapshot.descriptor;

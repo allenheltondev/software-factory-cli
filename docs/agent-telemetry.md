@@ -375,7 +375,9 @@ first `start` decides its telemetry from the settings then and records it on the
 and that destination's link settings (Honeycomb's region, team and environment, CloudWatch's
 region, or a custom destination's host and link templates; never a key). Every later `start` (a
 replay) and `credentials` answer hands out that same descriptor, so the key version the runner
-reads and the links its trace gets never part. The runner
+reads and the links its trace gets never part. If that record cannot be written, or another `start` wrote it and it
+cannot be read back, the job is handed no descriptor: it keeps its own timeline and sends nothing,
+rather than send somewhere its links could not follow. The runner
 reports where it sent (`sentTo`: the destination kind and host), and at finish the broker keeps
 that snapshot with the job's report (`destination`) when it is where the runner sent, so no change
 made during the job (another destination, or a same-region key of another Honeycomb team) is

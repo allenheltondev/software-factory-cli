@@ -130,6 +130,28 @@ describe('the job broker', () => {
     }
   });
 
+  it('sends no telemetry when the job\'s record of it cannot be saved, and links nothing from later settings', async () => {
+    const teamA = { provider: 'honeycomb' as const, region: 'us' as const, serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-00000000000a', team: { name: 'A', slug: 'team-a' } } };
+    await store.putTelemetry(55, teamA, 0);
+    const failing = vi.spyOn(store, 'setJobTelemetrySnapshot').mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+    const out = await handle({ action: 'start', jobId: job.jobId, token });
+    expect(out.ok && 'descriptor' in out && out.descriptor.telemetry).toBeFalsy();
+    failing.mockRestore();
+    await store.putTelemetry(55, { ...teamA, key: { ...teamA.key, secretVersion: 'a1b2c3d4-0000-4000-8000-00000000000b', team: { name: 'B', slug: 'team-b' } } }, 1);
+    // The runner had no destination: a local reading, no export to record, nothing linked.
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { telemetry: { traceId: 'ab'.repeat(16), spans: 3, exported: 0, failed: 0, local: true } } });
+    expect((await store.getJobSummary(55, job.jobId))?.detail?.telemetry?.destination).toBeUndefined();
+    expect((await store.getTelemetry(55))?.lastExport).toBeUndefined();
+  });
+
+  it('sends no telemetry when another start recorded it first and that record cannot be read back', async () => {
+    await store.putTelemetry(55, { provider: 'honeycomb', region: 'us', serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat', team: { name: 'A', slug: 'team-a' } } }, 0);
+    const lost = vi.spyOn(store, 'setJobTelemetrySnapshot').mockResolvedValue(false);
+    const out = await handle({ action: 'start', jobId: job.jobId, token });
+    expect(out.ok && 'descriptor' in out && out.descriptor.telemetry).toBeFalsy();
+    lost.mockRestore();
+  });
+
   it('answers a replayed start with the descriptor and links of the first: the key version the runner reads is the one its trace is linked from', async () => {
     const teamA = { provider: 'honeycomb' as const, region: 'us' as const, serviceName: 'updraft', captureContent: false, enabled: true, updatedAt: '', updatedBy: 'pat', key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-00000000000a', team: { name: 'A', slug: 'team-a' } } };
     await store.putTelemetry(55, teamA, 0);
