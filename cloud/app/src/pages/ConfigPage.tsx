@@ -124,7 +124,8 @@ function AgentFields({
   installationId: number;
   reviewer?: { differs: boolean };
 }) {
-  const guide: AgentGuide | undefined = AGENT_GUIDES[agent.adapter];
+  // No setup help for an agent the deployment no longer offers: a saved selection stays visible, but its key cannot be added here.
+  const guide: AgentGuide | undefined = offered.includes(agent.adapter) ? AGENT_GUIDES[agent.adapter] : undefined;
   // The deployment's agents, and the one already chosen if it is not among them (published before).
   const choices = AGENTS.filter((a) => offered.includes(a.value) || a.value === agent.adapter);
   return (
@@ -229,10 +230,13 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
   useEffect(() => {
     if (!valid) return;
     let live = true;
+    let latest = 0;
     const refresh = () => {
       if (document.visibilityState !== 'visible') return;
+      // Only the newest request may write: a slower, older answer must not undo a newer one.
+      const mine = ++latest;
       api.config(installationId).then(
-        (fresh) => live && setLoad((prev) => (prev.state === 'ok' ? { state: 'ok', view: { ...prev.view, agentKeys: fresh.agentKeys } } : prev)),
+        (fresh) => live && mine === latest && setLoad((prev) => (prev.state === 'ok' ? { state: 'ok', view: { ...prev.view, agentKeys: fresh.agentKeys } } : prev)),
         () => undefined,
       );
     };

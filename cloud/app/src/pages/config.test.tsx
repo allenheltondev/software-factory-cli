@@ -112,6 +112,31 @@ describe('InstallationPage', () => {
     expect(screen.getByTestId('repo-acme/web')).toBeInTheDocument();
   });
 
+  it('shows no setup help for a saved agent the deployment no longer offers', async () => {
+    const config = baseConfig();
+    config.workflows.implement!.agent = { adapter: 'kiro' };
+    configPage(fakeApi({ config: async () => view({ agents: ['claude', 'codex'], config }) }));
+    expect(await screen.findByLabelText('Agent')).toHaveValue('kiro');
+    expect(screen.queryByTestId('agent-help-workflows.implement.agent')).toBeNull();
+    expect(screen.getByTestId('agent-help-workflows.implement.reviewer')).toBeInTheDocument();
+  });
+
+  it('ignores a slower, older key-status refresh', async () => {
+    const config = vi.fn().mockResolvedValue(view({ agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } }));
+    configPage(fakeApi({ config }));
+    await addRepository();
+    expect(await screen.findByText(/Set ANTHROPIC_API_KEY before publishing/)).toBeInTheDocument();
+    let releaseOld!: () => void;
+    config.mockImplementationOnce(() => new Promise((res) => { releaseOld = () => res(view({ agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } })); }));
+    window.dispatchEvent(new Event('focus'));
+    config.mockResolvedValueOnce(view({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true } }));
+    window.dispatchEvent(new Event('focus'));
+    await waitFor(() => expect(screen.queryByText(/before publishing/)).toBeNull());
+    releaseOld();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText(/before publishing/)).toBeNull();
+  });
+
   it('links an active installation to its configuration', async () => {
     const api = fakeApi({
       overview: vi.fn().mockResolvedValue({
