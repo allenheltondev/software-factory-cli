@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { jobPaths } from '../broker/broker.js';
 import type { Store } from '../store/store.js';
-import { errorClassOf, type Launcher } from './launch.js';
+import { errorClassOf, newJobId, type Launcher } from './launch.js';
 import { notRetryableMessage, retryable } from './status.js';
 
 /**
@@ -79,6 +79,16 @@ export interface RetryDeps {
 export function createRetryHandler({ store, launch, readEvent, appBot, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: RetryDeps) {
   const no = (status: number, code: RetryErrorCode, message: string): RetryResult => ({ ok: false, status, code, message });
 
+  /**
+   * Whether a job was started under this id: its record is there and the launch did not fail. A
+   * record is written before the microVM is asked for, so one may exist for a launch that died
+   * right after; that job is then listed (and reconciled) like any other, and is the retry.
+   */
+  const started = async (id: string) => {
+    const child = await store.getJob(id);
+    return child !== null && !(child.status === 'finished' && child.outcome === 'launch_failed');
+  };
+
   return async function retry({ updraftRetry: { installationId, jobId } }: RetryRequest): Promise<RetryResult> {
     const summary = await store.getJobSummary(installationId, jobId);
     // Another tenant's job is not found, however it was named.
@@ -105,17 +115,29 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
       return no(410, 'event_gone', 'The event this job ran for cannot be read, so it cannot be run again. Apply the label again on GitHub instead');
     }
 
+    // A claim that ran out with its holder never having said how it ended (the Lambda died, or the
+    // record of a launch could not be written): settled before anything else is launched. The
+    // child's id was kept with the claim, so whether a job was started for it can be told.
+    const stale = await store.getJobRetryClaim(job);
+    const token = randomUUID();
+    if (stale && stale.until < now() && (await started(stale.child))) {
+      if (!(await store.reserveJobRetry(job, token, now(), now() + RESERVATION_MS, stale.child))) return no(409, 'already_retried', 'This job is being retried, or was already');
+      await store.markJobRetried(job, token, stale.child);
+      log({ installationId, jobId, newJobId: stale.child, recovered: true });
+      return { ok: true, jobId: stale.child };
+    }
+
     // The claim on this job's retry, before anything is launched: only one request launches at a
     // time, and none once a job started. Two requests that both read the summary before either
-    // recorded anything meet here, and the second stops.
-    const token = randomUUID();
-    if (!(await store.reserveJobRetry(job, token, now(), now() + RESERVATION_MS))) return no(409, 'already_retried', 'This job is being retried, or was already');
+    // recorded anything meet here, and the second stops. It names the job about to be launched.
+    const child = newJobId();
+    if (!(await store.reserveJobRetry(job, token, now(), now() + RESERVATION_MS, child))) return no(409, 'already_retried', 'This job is being retried, or was already');
     const giveBack = () => store.releaseJobRetry(job, token).catch((err: unknown) => log({ installationId, jobId, warning: `could not give back the retry claim: ${(err as Error)?.name}` }));
 
     let result;
     try {
       const bot = await appBot?.();
-      result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload, retry: true });
+      result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload, retry: true, jobId: child });
     } catch (err) {
       log({ installationId, jobId, error: 'retry failed before launching', name: errorClassOf(err) });
       await giveBack();
@@ -124,8 +146,9 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
     log({ installationId, jobId, retried: result.disposition, ...(result.jobId ? { newJobId: result.jobId } : {}) });
     if (result.disposition === 'launched' && result.jobId) {
       // On record for as long as the job is listed: the delivery's claim only lasts while a job
-      // holds it, and a failed one gives it up. Retried, since a job is running for this now; if
-      // it cannot be written the claim runs out by itself, and that is all that is lost.
+      // holds it, and a failed one gives it up. Retried, since a job is running for this now. If it
+      // still cannot be written, the claim keeps the child's id: the next request finds the job
+      // under it once the claim has run out, and records it then instead of launching another.
       let recorded = false;
       for (let attempt = 1; attempt <= RECORD_ATTEMPTS && !recorded; attempt++) {
         try {
@@ -135,7 +158,7 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
           log({ installationId, jobId, warning: `could not record the retry (attempt ${attempt}): ${(err as Error)?.name}` });
         }
       }
-      if (!recorded) log({ installationId, jobId, newJobId: result.jobId, warning: 'the retry started a job but is not on record; its claim will lapse' });
+      if (!recorded) log({ installationId, jobId, newJobId: result.jobId, warning: 'the retry started a job but is not on record; the next request will settle it from the claim' });
       return { ok: true, jobId: result.jobId };
     }
     // Nothing started: the retry can be asked for again.

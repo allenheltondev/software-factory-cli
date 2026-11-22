@@ -709,20 +709,24 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.setJobTelemetrySnapshot(first.jobId, { descriptor: { ...descriptor, secretVersion: 'v-b' }, links: { ...links, team: { name: 'B', slug: 'team-b' } } })).toBe(false);
     expect((await store.getJob(first.jobId))?.telemetrySnapshot).toEqual({ descriptor, links });
     // The retry a console request started for it, on its summary: set once.
-    expect(await store.reserveJobRetry(first, 'tok-a', 1000, 2000)).toBe(true);
+    expect(await store.getJobRetryClaim(first)).toBeNull();
+    expect(await store.reserveJobRetry(first, 'tok-a', 1000, 2000, 'job_child0000000001')).toBe(true);
+    // Kept with the claim, to find the job again if its holder never says how the launch ended.
+    expect(await store.getJobRetryClaim(first)).toEqual({ until: 2000, child: 'job_child0000000001' });
     // One request at a time while it is held; the one that holds it can give it back, and nobody else.
-    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500)).toBe(false);
+    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500, 'job_child0000000001')).toBe(false);
     await store.releaseJobRetry(first, 'tok-b');
-    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500)).toBe(false);
+    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500, 'job_child0000000001')).toBe(false);
     await store.releaseJobRetry(first, 'tok-a');
-    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500)).toBe(true);
+    expect(await store.reserveJobRetry(first, 'tok-b', 1500, 2500, 'job_child0000000001')).toBe(true);
     // A holder that died: its claim runs out, and the next request takes it. The late one cannot record.
-    expect(await store.reserveJobRetry(first, 'tok-c', 3000, 4000)).toBe(true);
+    expect(await store.reserveJobRetry(first, 'tok-c', 3000, 4000, 'job_child0000000001')).toBe(true);
     expect(await store.markJobRetried(first, 'tok-b', 'job_new000009')).toBe(false);
     expect(await store.markJobRetried(first, 'tok-c', 'job_new000001')).toBe(true);
     expect(await store.markJobRetried(first, 'tok-c', 'job_new000002')).toBe(false);
+    expect(await store.getJobRetryClaim(first)).toBeNull();
     // Once a retry started a job, nobody reserves another.
-    expect(await store.reserveJobRetry(first, 'tok-d', 9000, 9500)).toBe(false);
+    expect(await store.reserveJobRetry(first, 'tok-d', 9000, 9500, 'job_child0000000001')).toBe(false);
     expect((await store.getJobSummary(55, first.jobId))?.retriedAs).toBe('job_new000001');
 
     // A retried start: nothing more is charged.

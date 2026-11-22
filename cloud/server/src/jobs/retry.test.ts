@@ -47,6 +47,8 @@ describe('retrying a job (jobs/retry.ts)', () => {
       appBot: 'updraft[bot]',
       body: EVENT,
       payload: JSON.parse(EVENT),
+      // The id it was recorded under before the launch.
+      jobId: expect.stringMatching(/^job_[A-Za-z0-9_-]{16}$/),
       // The job requeues the event's failed job in the shared state before it runs.
       retry: true,
     });
@@ -93,7 +95,7 @@ describe('retrying a job (jobs/retry.ts)', () => {
   it('takes the claim over once a request that died holding it has run out its time, and not before', async () => {
     const { retry, launch, store, j, clock } = await setup();
     // A Lambda that reserved the retry and never finished.
-    expect(await store.reserveJobRetry(j, 'dead-request', clock.now, clock.now + RESERVATION_MS)).toBe(true);
+    expect(await store.reserveJobRetry(j, 'dead-request', clock.now, clock.now + RESERVATION_MS, 'job_never0000000001')).toBe(true);
     clock.now += RESERVATION_MS - 1;
     expect(await retry(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
     expect(launch).not.toHaveBeenCalled();
@@ -110,6 +112,63 @@ describe('retrying a job (jobs/retry.ts)', () => {
     expect(await retry(ask())).toEqual({ ok: true, jobId: 'job_new000001' });
     expect(flaky.markJobRetried).toHaveBeenCalledTimes(3);
     expect(log).toHaveBeenCalledWith(expect.objectContaining({ jobId: j.jobId, warning: expect.stringContaining('not on record') }));
+  });
+
+  it('refuses a job that failed in publishing, with what to do instead', async () => {
+    const { store, launch } = await setup({ outcome: '' });
+    const failed = job({ jobId: 'job_publish0001', deliveryId: 'd-pub' });
+    await store.putJob(failed);
+    await store.finishJob(failed.jobId, 'failed', { at: Date.now(), detail: { updraftOutcome: 'publish-failed' } });
+    const retry = createRetryHandler({ store, launch, readEvent: async () => EVENT, log: () => {} });
+    expect(await retry(ask('job_publish0001'))).toMatchObject({ ok: false, status: 409, code: 'not_retryable', message: expect.stringContaining('only publishing it failed') });
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  describe('when a request never said how its launch ended', () => {
+    /** A retry whose job started but whose record failed to be written, and the clock past its claim. */
+    async function unrecorded() {
+      const { store, launch, j, clock } = await setup();
+      const flaky = { ...store, markJobRetried: vi.fn(async () => { throw new Error('throttled'); }) } as typeof store;
+      const first = createRetryHandler({ store: flaky, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} });
+      const out = await first(ask());
+      expect(out).toMatchObject({ ok: true });
+      // The microVM was accepted: its job is on record under the id the claim kept.
+      const child = (launch.mock.calls[0]![0] as { jobId: string }).jobId;
+      await store.putJob(job({ jobId: child, deliveryId: retryDeliveryId(j.jobId) }));
+      const next = createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} });
+      return { store, launch, j, clock, child, next };
+    }
+
+    it('records the job it started instead of launching another, once the claim has run out', async () => {
+      const { store, launch, j, clock, child, next } = await unrecorded();
+      // Still held: nobody takes it.
+      expect(await next(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
+      clock.now += RESERVATION_MS + 1;
+      expect(await next(ask())).toEqual({ ok: true, jobId: child });
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBe(child);
+      // And now it is on record: a further request is refused.
+      expect(await next(ask())).toMatchObject({ ok: false, status: 409, code: 'already_retried' });
+    });
+
+    it('launches again when the earlier attempt never created a job', async () => {
+      const { store, launch, j, clock } = await setup();
+      // A Lambda that claimed the retry, and died before anything was written for its job.
+      expect(await store.reserveJobRetry(j, 'dead', clock.now, clock.now + RESERVATION_MS, 'job_neverwrote00001')).toBe(true);
+      clock.now += RESERVATION_MS + 1;
+      expect(await createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} })(ask())).toMatchObject({ ok: true });
+      expect(launch).toHaveBeenCalledTimes(1);
+    });
+
+    it('launches again when the earlier attempt’s job failed to launch', async () => {
+      const { store, launch, j, clock } = await setup();
+      await store.putJob(job({ jobId: 'job_failedlaunch001', deliveryId: 'd-x' }));
+      await store.finishJob('job_failedlaunch001', 'launch_failed');
+      expect(await store.reserveJobRetry(j, 'dead', clock.now, clock.now + RESERVATION_MS, 'job_failedlaunch001')).toBe(true);
+      clock.now += RESERVATION_MS + 1;
+      expect(await createRetryHandler({ store, launch, readEvent: async () => EVENT, now: () => clock.now, log: () => {} })(ask())).toMatchObject({ ok: true });
+      expect(launch).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('does not retry a job of a pull request’s review loop, which it would find nothing new for', async () => {
@@ -210,7 +269,8 @@ describe('which jobs can be retried', () => {
     // Not a pull request's job.
     expect(retryable({ ...finished('failed'), pullRequest: 40 })).toBe(false);
     expect(retryable(finished('failed', { verificationPassed: false }))).toBe(true);
-    expect(retryable(finished('failed', { updraftOutcome: 'publish-failed' }))).toBe(true);
+    // Not a publication that failed after the agent succeeded: the CLI's job is succeeded, which --retry skips.
+    expect(retryable(finished('failed', { updraftOutcome: 'publish-failed' }))).toBe(false);
     expect(retryable(finished('timed_out'))).toBe(true);
     expect(retryable(finished('microvm_gone'))).toBe(true);
     expect(retryable(finished('runner_error'))).toBe(true);

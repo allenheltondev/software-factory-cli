@@ -713,15 +713,22 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
-    async reserveJobRetry(job, token, now, until) {
+    async getJobRetryClaim(job) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: jobSummaryKey(job), ConsistentRead: true }));
+      const i = out.Item;
+      if (!i || typeof i.retryReservedUntil !== 'number' || typeof i.retryChild !== 'string') return null;
+      return { until: i.retryReservedUntil, child: i.retryChild };
+    },
+
+    async reserveJobRetry(job, token, now, until, child) {
       try {
         await client.send(
           new UpdateCommand({
             TableName: T,
             Key: jobSummaryKey(job),
-            UpdateExpression: 'SET retryReservedUntil = :until, retryToken = :token',
+            UpdateExpression: 'SET retryReservedUntil = :until, retryToken = :token, retryChild = :child',
             ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND (attribute_not_exists(retryReservedUntil) OR retryReservedUntil < :now)',
-            ExpressionAttributeValues: { ':until': until, ':token': token, ':now': now },
+            ExpressionAttributeValues: { ':until': until, ':token': token, ':now': now, ':child': child },
           }),
         );
         return true;
@@ -737,7 +744,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           new UpdateCommand({
             TableName: T,
             Key: jobSummaryKey(job),
-            UpdateExpression: 'REMOVE retryReservedUntil, retryToken',
+            UpdateExpression: 'REMOVE retryReservedUntil, retryToken, retryChild',
             ConditionExpression: 'retryToken = :token',
             ExpressionAttributeValues: { ':token': token },
           }),
@@ -754,7 +761,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           new UpdateCommand({
             TableName: T,
             Key: jobSummaryKey(job),
-            UpdateExpression: 'SET retriedAs = :n REMOVE retryReservedUntil, retryToken',
+            UpdateExpression: 'SET retriedAs = :n REMOVE retryReservedUntil, retryToken, retryChild',
             ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryToken = :token',
             ExpressionAttributeValues: { ':n': newJobId, ':token': token },
           }),

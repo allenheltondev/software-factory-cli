@@ -271,7 +271,7 @@ describe('status and diagnostics (#71)', () => {
       const { store, get, post } = await setup({ requestRetry });
       await failed(store);
       const key = { installationId: 55, createdAt: job().createdAt, jobId: 'job_status0001' };
-      await store.reserveJobRetry(key, 'tok', Date.now(), Date.now() + 60_000);
+      await store.reserveJobRetry(key, 'tok', Date.now(), Date.now() + 60_000, 'job_new000001');
       await store.markJobRetried(key, 'tok', 'job_new000001');
       const listed = ((await get('55/jobs')).body.jobs as Record<string, unknown>[])[0]!;
       expect(listed).toMatchObject({ retryable: false, retriedAs: 'job_new000001' });

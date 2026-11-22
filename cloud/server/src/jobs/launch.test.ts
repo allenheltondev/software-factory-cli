@@ -137,6 +137,14 @@ describe('the launcher', () => {
     expect(JSON.parse(runs[0]!.runHookPayload)).toMatchObject({ retry: true });
   });
 
+  it('gives the job the id its caller chose, and refuses one that is not an id', async () => {
+    const chosen = await createLauncher(deps)({ ...request(), jobId: 'job_chosenid00000001' });
+    expect(chosen).toMatchObject({ status: 202, jobId: 'job_chosenid00000001' });
+    expect(await store.getJob('job_chosenid00000001')).not.toBeNull();
+    expect(await createLauncher(deps)({ ...request(undefined, 'delivery-2'), jobId: '../../etc' })).toMatchObject({ status: 400, disposition: 'bad_job_id' });
+    expect(runs).toHaveLength(1);
+  });
+
   it('gives the job to the broker: the token from the run hook starts it and stops its own microVM', async () => {
     const result = await createLauncher(deps)(request());
     const { jobToken } = (JSON.parse(runs[0]!.runHookPayload) as { broker: { jobToken: string } }).broker;

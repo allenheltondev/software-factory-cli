@@ -137,6 +137,11 @@ export interface LaunchRequest {
   body: string;
   /** A retry from the console (jobs/retry.ts): the job requeues the event's failed jobs in the shared state before it runs. */
   retry?: boolean;
+  /**
+   * The id the job is to have (newJobId), for a caller that must record it before the launch, to
+   * find the job again if it never hears how the launch ended. Absent: the launcher chooses.
+   */
+  jobId?: string;
   payload: {
     action?: unknown;
     repository?: { id?: unknown; full_name?: unknown };
@@ -162,6 +167,10 @@ export interface LaunchResult {
 
 // A GitHub delivery id is a GUID; it becomes part of an S3 key, so nothing else is accepted.
 const DELIVERY_ID = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+const JOB_ID = /^job_[A-Za-z0-9_-]{16}$/;
+
+/** A new job's id: what the launcher gives a job, and what a caller that chooses it must give. */
+export const newJobId = () => `job_${randomBytes(12).toString('base64url')}`;
 
 export function createLauncher(deps: LaunchDeps) {
   const now = deps.now ?? Date.now;
@@ -194,6 +203,7 @@ export function createLauncher(deps: LaunchDeps) {
   return async function launch(req: LaunchRequest): Promise<LaunchResult> {
     const skip = (disposition: string, why: { reason?: string; message?: string } = {}): LaunchResult => ({ status: 200, disposition, ...why });
     if (!DELIVERY_ID.test(req.deliveryId)) return { status: 400, disposition: 'bad_delivery_id' };
+    if (req.jobId !== undefined && !JOB_ID.test(req.jobId)) return { status: 400, disposition: 'bad_job_id' };
     const eventName = req.eventName ?? 'issues';
     const isIssue = eventName === 'issues';
     if (isIssue ? !Number.isInteger(req.payload.issue?.number) : !Object.hasOwn(PULL_REQUEST_ACTIONS, eventName)) return skip('ignored');
@@ -326,7 +336,7 @@ export function createLauncher(deps: LaunchDeps) {
 
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
-    const jobId = `job_${randomBytes(12).toString('base64url')}`;
+    const jobId = req.jobId ?? newJobId();
     // Short, until the job starts and holds it for its lifetime; released early (by this job only)
     // when it fails.
     if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + PRELAUNCH_CLAIM_MS, jobId))) return skip('duplicate');

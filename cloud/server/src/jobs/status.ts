@@ -81,7 +81,6 @@ const RETRYABLE: ReadonlySet<JobResult> = new Set<JobResult>([
   'canceled',
   'agent_failure',
   'verify_failure',
-  'publish_failure',
   'timeout',
   'state_not_saved',
   'terminated',
@@ -93,7 +92,9 @@ const RETRYABLE: ReadonlySet<JobResult> = new Set<JobResult>([
 /**
  * Whether the console offers a retry: the job ended, and not with work done or a better run's
  * (success, nothing to do, superseded), nor waiting out a usage limit (deferred: running it again
- * only defers it again; the cooldown's end continues it).
+ * only defers it again; the cooldown's end continues it), nor a publication that failed after the
+ * agent succeeded (its job is `succeeded` in the shared state, so the event would end as a
+ * duplicate and publish nothing: `updraft run-event --retry` requeues only failed work).
  */
 export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs' | 'pullRequest'>): boolean {
   // A retry started a job for it already: that one is the one to look at (and to retry).
@@ -111,6 +112,7 @@ export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' 
 export function notRetryableMessage(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs' | 'pullRequest'>): string {
   if (job.retriedAs) return 'This job was already retried';
   if (jobResult(job) === 'running') return 'This job is still running';
+  if (jobResult(job) === 'publish_failure') return 'The agent’s work succeeded and only publishing it failed, so running the event again would not publish it: check the App can push and open pull requests, then apply the label again on GitHub';
   if (job.pullRequest !== undefined) return 'A job of a pull request’s review loop cannot be retried here: push to the pull request, or review it again, on GitHub';
   return 'This job did not end in a way that can be retried';
 }
