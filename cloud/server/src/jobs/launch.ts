@@ -254,15 +254,17 @@ export function createLauncher(deps: LaunchDeps) {
         const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
         if (origin?.label) {
           label = origin.label;
-          // The keys that job was started with are its workflow's own (two workflows can share a
-          // label, for different actors), but only under the version active now: this job runs
-          // that version, and a republish may have changed the workflow's agent. Otherwise (its
-          // record is kept a week past its run) the active version's keys for the label, when the
-          // label names one workflow's, else the job checks for itself.
-          const record = await deps.store.getJob(origin.jobId).catch(() => null);
-          const lower = origin.label.toLowerCase();
-          const current = Object.hasOwn(d.keysByLabel, lower) ? (d.keysByLabel[lower] ?? []) : [];
-          keys = record && record.configVersion === tenant.activeConfigVersion ? (record.agentKeys ?? []) : current;
+          // Only under the version active now, which this job runs: a republish may have changed
+          // the workflow's agent, or moved its label to another workflow, and then nothing here
+          // names the workflow; the runner follows the one stored for the pull request, and checks
+          // its key itself. Under the same version: the keys that job was started with (two
+          // workflows can share a label, for different actors), or, once its record is gone (it is
+          // kept a week past its run), the label's when the label names one workflow's.
+          if (origin.configVersion === tenant.activeConfigVersion) {
+            const record = await deps.store.getJob(origin.jobId).catch(() => null);
+            const lower = origin.label.toLowerCase();
+            keys = record ? (record.agentKeys ?? []) : Object.hasOwn(d.keysByLabel, lower) ? (d.keysByLabel[lower] ?? []) : [];
+          }
         } else {
           log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
         }

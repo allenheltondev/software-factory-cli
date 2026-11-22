@@ -720,9 +720,11 @@ describe('the launcher', () => {
       const onIssue = (issue: number, over: Record<string, unknown> = {}, deliveryId = `pr-of-${issue}`) => prEvent({ pull_request: { number: 40 + issue, head: { ref: `updraft/issue-${issue}-job_abc` } }, ...over }, deliveryId);
       // A finished issue job of `label` that opened pull request `pr`.
       let n = 0;
-      const opened = async (label: string, issue: number, pr: number, agentKeys = [label === 'codex' ? 'CODEX_API_KEY' : 'ANTHROPIC_API_KEY']) => {
+      // Under the active version, unless `version` says it was an earlier one.
+      const opened = async (label: string, issue: number, pr: number, agentKeys = [label === 'codex' ? 'CODEX_API_KEY' : 'ANTHROPIC_API_KEY'], version?: number) => {
         const jobId = `job_opened${String(++n).padStart(4, '0')}`;
-        await store.putJob({ jobId, tokenHash: 'x', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: `d-${jobId}`, eventName: 'issues', status: 'launched', createdAt: new Date(NOW + n).toISOString(), expiresAt: NOW + 3_600_000, label, issue, agentKeys });
+        const configVersion = version ?? (await store.getTenant(55))!.activeConfigVersion!;
+        await store.putJob({ jobId, tokenHash: 'x', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion, deliveryId: `d-${jobId}`, eventName: 'issues', status: 'launched', createdAt: new Date(NOW + n).toISOString(), expiresAt: NOW + 3_600_000, label, issue, agentKeys });
         await store.finishJob(jobId, 'succeeded', { at: NOW + n, detail: { prNumber: pr, prUrl: `https://github.com/acme/web/pull/${pr}` } });
       };
 
@@ -763,12 +765,18 @@ describe('the launcher', () => {
         expect(await store.getJob(review.jobId!)).toMatchObject({ label: 'implement', agentKeys: ['ANTHROPIC_API_KEY'] });
       });
 
-      it("checks the active version's keys, not the opening job's, once the workflow was republished", async () => {
+      it('leaves the keys to the job once the configuration was republished: neither the old keys nor the label decide', async () => {
         // #52 was opened under version 1 by a workflow that ran Kiro; `updraft` runs Claude now.
-        await opened('updraft', 12, 52, ['KIRO_API_KEY']);
-        const result = await createLauncher(deps)(onIssue(12));
-        expect(result.disposition).toBe('launched');
-        expect(await store.getJob(result.jobId!)).toMatchObject({ agentKeys: ['ANTHROPIC_API_KEY'] });
+        await opened('updraft', 12, 52, ['KIRO_API_KEY'], 1);
+        const republished = await createLauncher(deps)(onIssue(12));
+        expect(republished.disposition).toBe('launched');
+        expect((await store.getJob(republished.jobId!))?.agentKeys).toBeUndefined();
+        // #53's workflow moved to another label, and `codex` (once its) is now a Codex workflow
+        // whose key is not set: the old label does not hold #53 up.
+        await opened('codex', 13, 53, ['ANTHROPIC_API_KEY'], 1);
+        const relabeled = await createLauncher(deps)(onIssue(13));
+        expect(relabeled.disposition).toBe('launched');
+        expect((await store.getJob(relabeled.jobId!))?.agentKeys).toBeUndefined();
       });
 
       it("keeps the workflow across the loop's own jobs: the next event of the pull request finds it on the last one", async () => {
@@ -784,7 +792,8 @@ describe('the launcher', () => {
         await fresh.markConfigReady(55, v);
         await fresh.activateConfig(55, v);
         await fresh.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat' });
-        await fresh.putJob((await store.getJob(first.jobId!))!);
+        // Its version there is the fresh store's active one (versions are numbered per store).
+        await fresh.putJob({ ...(await store.getJob(first.jobId!))!, configVersion: v });
         const next = await createLauncher({ ...deps, store: fresh })(onIssue(12, {}, 'pr-again'));
         expect(await fresh.getJob(next.jobId!)).toMatchObject({ label: 'updraft', agentKeys: ['ANTHROPIC_API_KEY'] });
       });
