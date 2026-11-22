@@ -163,10 +163,11 @@ async function rejectedSpans(res, size) {
 }
 
 /**
- * Sends finished spans in batches (OTLP/HTTP, JSON encoding) to `<endpoint>/v1/traces` with the
- * `x-honeycomb-team` header. Never throws: a failure is counted and logged, and the job goes on.
+ * Sends finished spans in batches (OTLP/HTTP, JSON encoding) to `<endpoint>/v1/traces` (or to the
+ * endpoint itself when it ends in /v1/traces), with the key in `headerName` (`x-honeycomb-team` by
+ * default) and any other `headers`. Never throws: a failure is counted and logged, and the job goes on.
  */
-export function createExporter({ endpoint, apiKey, headerName = 'x-honeycomb-team', resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
+export function createExporter({ endpoint, apiKey, headerName = 'x-honeycomb-team', headers: extraHeaders = {}, resource, redact = (t) => t, fetch: fetchImpl = globalThis.fetch, log = () => {}, timeoutMs = 10_000, now = Date.now }) {
   const queue = [];
   // The one way out: every string of every span, and of the resource, passes the job's redactor
   // here, whatever produced it (a span name, a tool or model name read from the transcript, an
@@ -186,7 +187,7 @@ export function createExporter({ endpoint, apiKey, headerName = 'x-honeycomb-tea
         stats.requests += 1;
         const res = await fetchImpl(url, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', [headerName]: apiKey },
+          headers: { ...extraHeaders, 'content-type': 'application/json', ...(apiKey ? { [headerName]: apiKey } : {}) },
           body: JSON.stringify(otlpRequest(batch, cleanResource)),
           // A redirect is an answer, never followed: the key goes only where it was checked.
           redirect: 'manual',
@@ -1430,7 +1431,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
  * reads what is left, ends the job's root span with what the summary says, and sends the rest
  * within `budgetMs`. Never throws.
  */
-export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: givenConfineTo = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs, startedAt: jobStartedAt, traceId: givenTraceId }) {
+export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: givenConfineTo = null, onlyRun = null, exporter, captureContent = false, redact = (t) => t, now = Date.now, log = () => {}, pollMs = TELEMETRY_POLL_MS, exportMs = EXPORT_INTERVAL_MS, fsImpl = fs, startedAt: jobStartedAt, traceId: givenTraceId }) {
   const traceId = typeof givenTraceId === 'string' && /^[0-9a-f]{32}$/.test(givenTraceId) ? givenTraceId : newTraceId();
   const rootSpanId = newSpanId();
   // The job's start (before the tracer existed: isolation, the state, the coalescing wait), when the runner knows it.
@@ -1550,6 +1551,8 @@ export function createAgentTracer({ runsDir: givenRunsDir = null, confineTo: giv
     }
     for (const name of names.sort()) {
       if (!/^[A-Za-z0-9_-]{1,80}$/.test(name)) continue;
+      // One run's own trace (the local CLI's tracer, a trace per run): the others are not in it.
+      if (onlyRun !== null && name !== onlyRun) continue;
       let entry = runs.get(name);
       if (!entry) {
         if (runs.size >= MAX_RUNS) continue;

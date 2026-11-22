@@ -1,5 +1,6 @@
 // OWNER: queue/worker workstream. The long-running worker behind `updraft start`.
 import { followedRuns, recordRunTrace, traceIdFrom, type FollowedRun } from './trace-links.js';
+import { createLocalTelemetry, localTelemetryFromEnv, type RunTelemetry, type RunTrace } from '../telemetry/local.js';
 import { hostname as osHostname } from 'node:os';
 import type { UpdraftConfig } from '../config/schema.js';
 import { findRepoConfig } from './executor.js';
@@ -91,6 +92,11 @@ export interface DaemonDeps {
    * runner). Recorded with each run, so later runs' traces can link to it. Absent: nothing is recorded.
    */
   traceId?: string | null;
+  /**
+   * Agent telemetry of the local CLI (telemetry/local.ts, from OTEL_EXPORTER_OTLP_*): a trace per
+   * run, recorded with it like the runner's. Not used when `traceId` is set: the runner traces then.
+   */
+  telemetry?: RunTelemetry | null;
   config: UpdraftConfig;
   paths: UpdraftPaths;
   log: Logger;
@@ -222,6 +228,17 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const pollMs = deps.timing?.pollMs ?? config.pollIntervalSeconds * 1000;
   const log = deps.log.child({ workerId });
   const traceId = deps.traceId === undefined ? traceIdFrom(process.env) : deps.traceId;
+  // Local telemetry from OTEL_EXPORTER_OTLP_*, unless the caller decided (null: none).
+  const telemetryLog = log.child({ component: 'telemetry' });
+  const telemetry: RunTelemetry | null =
+    deps.telemetry !== undefined
+      ? deps.telemetry
+      : (() => {
+          const found = localTelemetryFromEnv(process.env, (m) => telemetryLog.warn(m));
+          if (!found) return null;
+          telemetryLog.info('sending agent telemetry', { to: new URL(found.tracesUrl).host, content: found.captureContent });
+          return createLocalTelemetry(found, { runsDir: paths.runsDir, log: (line) => telemetryLog.info(line) });
+        })();
 
   const safeRecordError = (scope: string, msg: string, extra: { jobId?: string; repoFullName?: string } = {}) => {
     try {
@@ -259,9 +276,13 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
     const controller = new AbortController();
     const runLog = log.child({ runId: run.id, jobId: job.id, agent: run.agent });
     let follows: FollowedRun[] = [];
-    if (traceId) {
+    // The run's own trace when the CLI traces locally; the microVM's when the runner does.
+    let runTrace: RunTrace | null = null;
+    if (!traceId && telemetry) runTrace = telemetry.begin(run.id);
+    const runTraceId = traceId ?? runTrace?.traceId;
+    if (runTraceId) {
       try {
-        recordRunTrace(db, run.id, traceId);
+        recordRunTrace(db, run.id, runTraceId);
         follows = followedRuns(db, job, run.id);
       } catch (err) {
         runLog.warn('could not record the run trace', { error: message(err) });
@@ -341,6 +362,8 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       if (finished && !policyRequeued && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.failureCommenter) {
         await deps.failureCommenter.afterRun(run.id, controller.signal);
       }
+      // After publishing and commenting, so the trace has Updraft's own steps too.
+      if (runTrace) await runTrace.end(finished?.outcome ?? result.outcome);
     })().finally(() => {
       inFlight.delete(run.id);
       wake.notify();

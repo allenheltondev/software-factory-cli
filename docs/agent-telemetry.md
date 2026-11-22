@@ -6,9 +6,10 @@ every model call, tool call, verification and review round, in order, with one i
 one conversation. Any backend that accepts OTLP/HTTP can store them; one that reads the GenAI
 conventions also shows them as an agent conversation.
 
-It is set up per installation in the console, under **Agent telemetry**: where the traces go
-(see [Destinations](#destinations)), the service name, and whether prompts and outputs are
-recorded. Without any of it, the job page still shows what the runner saw (see
+In Updraft Cloud it is set up per installation in the console, under **Agent telemetry**: where
+the traces go (see [Destinations](#destinations)), the service name, and whether prompts and
+outputs are recorded. Running Updraft yourself, the standard OpenTelemetry variables turn it on
+(see [Running it yourself](#running-it-yourself)). Without any of it, the job page still shows what the runner saw (see
 [What the console shows](#what-the-console-shows)).
 
 ## Destinations
@@ -54,6 +55,36 @@ redirect is never followed.
 
 Each is an `https://` URL whose host is written out; every value filled in is URL-encoded. Without
 them, the job page still shows what the agents did, and the jobs list links nowhere.
+
+### Running it yourself
+
+`updraft start` and `updraft run-event` send the same spans, from the same tracer, when the
+standard OpenTelemetry exporter variables name an endpoint:
+
+| Variable | What it does |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | The base endpoint; spans go to it plus `/v1/traces` (`http://localhost:4318` for a local Collector) |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | The traces endpoint itself, used as given (wins over the one above) |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | `key=value,key2=value2`, values URL-encoded (`authorization=Bearer%20<token>`); the traces ones win |
+| `OTEL_SERVICE_NAME`, or `service.name` in `OTEL_RESOURCE_ATTRIBUTES` | The service name (default `updraft`) |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` | Records prompts and outputs, as **Prompts and outputs** does in the console |
+| `OTEL_SDK_DISABLED=true`, or `OTEL_TRACES_EXPORTER` without `otlp` | Turns it off |
+
+Only OTLP/HTTP with JSON is spoken: with `OTEL_EXPORTER_OTLP_PROTOCOL` (or the traces one) set to
+anything but `http/json`, nothing is sent and the worker says so. Left unset, JSON is sent, which
+an OpenTelemetry Collector's OTLP receiver and most backends' OTLP/HTTP endpoints accept.
+
+Each run is its own trace, from the moment the worker claims it until it is recorded and
+published (or commented on), so Updraft's own steps are in it. Its trace id is recorded with the
+run, so a later run's trace links to it as in [Across jobs](#across-jobs). The header values, and
+each word of them, are redacted from every span. Plain `http://` is allowed here, for a Collector
+on your own machine or network. Inside Updraft Cloud's microVM the runner traces the job itself,
+so the worker there sends nothing of its own.
+
+The tracer is the runner's: `src/telemetry/runner/` holds copies of
+`deploy/aws-microvm/image/runner/telemetry.mjs`, `telemetry-detail.mjs` and `redact.mjs`, kept
+identical by `test/telemetry-copy.test.ts` (`node scripts/copy-telemetry.mjs --sync` refreshes
+them), and the build copies them into `dist/`.
 
 ## How it works
 
