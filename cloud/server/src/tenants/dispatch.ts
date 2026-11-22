@@ -118,8 +118,23 @@ export const UPDRAFT_BRANCH_PREFIX = 'updraft/';
 export type PullRequestRefusalCode = DispatchRefusalCode | 'event_not_accepted' | 'loop_off' | 'not_updraft_pr' | 'own_event' | 'comment_review';
 
 export type PullRequestDecision =
-  | { start: true; repository: string; repositoryId: number; pullRequest: number; keys: string[] | null }
+  | {
+      start: true;
+      repository: string;
+      repositoryId: number;
+      pullRequest: number;
+      /** A close: it ends the loop and runs no agent, so it needs no key. */
+      closing: boolean;
+      /** Per trigger label (lower-case): the keys its workflows can need. The launcher looks up the label that started the pull request. */
+      keysByLabel: Record<string, string[] | null>;
+    }
   | { start: false; reason: string; code: PullRequestRefusalCode };
+
+/** The issue an Updraft job branch was cut for: `updraft/issue-<n>-<job id>`. */
+export function issueOfBranch(branch: unknown): number | null {
+  const m = typeof branch === 'string' ? /^updraft\/issue-(\d{1,9})-/.exec(branch) : null;
+  return m ? Number(m[1]) : null;
+}
 
 /**
  * Whether a pull request delivery starts a job under these rules: the repository (name and id),
@@ -174,9 +189,15 @@ export function decidePullRequestDispatch(
     const actors = new Set([...(repo.actors ?? []), ...repo.triggers.flatMap((t) => t.actors ?? [])]);
     if (!actors.has(sender)) return { start: false, reason: 'the sender may not dispatch work', code: 'actor_not_allowed' };
   }
-  // The keys of every workflow of the repository: the event names no label, and the pull request
-  // may be any of theirs.
-  const keysOf = (t: { keys?: string[] }) => t.keys ?? repo.keys;
-  const keys = repo.triggers.every((t) => Array.isArray(keysOf(t))) ? [...new Set(repo.triggers.flatMap((t) => keysOf(t)!))].sort() : null;
-  return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, pullRequest: event.number, keys };
+  // The event names no label: the keys are those of the workflow that started the pull request,
+  // which the launcher finds from the branch's issue. Never every workflow's: a Codex workflow
+  // without its key must not hold up a Claude workflow's pull request.
+  const keysByLabel: Record<string, string[] | null> = {};
+  for (const t of repo.triggers) {
+    const keys = t.keys ?? repo.keys;
+    const before = keysByLabel[t.label];
+    keysByLabel[t.label] = before === null || keys === undefined ? null : [...new Set([...(before ?? []), ...keys])].sort();
+  }
+  const closing = event.eventName === 'pull_request' && event.action === 'closed';
+  return { start: true, repository: event.repositoryFullName, repositoryId: event.repositoryId, pullRequest: event.number, closing, keysByLabel };
 }

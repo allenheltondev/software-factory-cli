@@ -44,6 +44,8 @@ export function deliveryFromLaunch(base: DeliveryEvent, result: LaunchResult): D
       return filtered('missing_key', result.message);
     case 'duplicate':
       return { ...base, disposition: 'deduped' };
+    case 'coalesce_unconfirmed':
+      return { ...base, disposition: 'launch_failed', errorClass: 'CoalesceUnconfirmed', ...(result.message ? { message: result.message } : {}) };
     case 'coalesced':
       return { ...base, disposition: 'coalesced', ...(result.message ? { message: result.message } : {}) };
     case 'throttled':

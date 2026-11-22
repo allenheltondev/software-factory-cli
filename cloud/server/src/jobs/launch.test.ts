@@ -665,7 +665,7 @@ describe('the launcher', () => {
       const result = await createLauncher(deps)(prEvent());
       expect(result).toMatchObject({ status: 202, disposition: 'launched' });
       const job = (await store.getJob(result.jobId!))!;
-      expect(job).toMatchObject({ eventName: 'pull_request_review', pullRequest: 40, repository: 'acme/web', agentKeys: ['ANTHROPIC_API_KEY'] });
+      expect(job).toMatchObject({ eventName: 'pull_request_review', pullRequest: 40, repository: 'acme/web' });
       expect(job.issue).toBeUndefined();
       expect(job.label).toBeUndefined();
       const hook = JSON.parse(runs[0]!.runHookPayload) as { eventName: string; notBefore?: string };
@@ -707,15 +707,71 @@ describe('the launcher', () => {
       expect(runs).toEqual([]);
     });
 
-    it('refuses a pull request event while a key its repository needs is not set, naming the pull request', async () => {
-      const v = await store.createConfigVersion(55, { sha256: 'k', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: dispatchRules(
-        { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' } }] } } },
-        { keysFor: () => ['CODEX_API_KEY'] },
-      ) });
-      await store.markConfigReady(55, v as number);
-      await store.activateConfig(55, v as number);
-      expect(await createLauncher(deps)(prEvent())).toMatchObject({ disposition: 'missing_key' });
-      expect((await store.listRefusals(55, 5))[0]).toMatchObject({ issue: 40, reason: 'CODEX_API_KEY is not set: add it under Agent keys' });
+    describe("the keys of the workflow that started the pull request", () => {
+      // Claude on `updraft`, Codex on `codex`; only the Anthropic key is set.
+      beforeEach(async () => {
+        const v = await store.createConfigVersion(55, { sha256: 'k', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: dispatchRules(
+          { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' } }, { trigger: { label: 'codex' } }] } } },
+          { keysFor: (_repo, wf) => ((wf.trigger as { label: string }).label === 'codex' ? ['CODEX_API_KEY'] : ['ANTHROPIC_API_KEY']) },
+        ) });
+        await store.markConfigReady(55, v as number);
+        await store.activateConfig(55, v as number);
+      });
+      const onIssue = (issue: number, over: Record<string, unknown> = {}, deliveryId = `pr-of-${issue}`) => prEvent({ pull_request: { number: 40 + issue, head: { ref: `updraft/issue-${issue}-job_abc` } }, ...over }, deliveryId);
+
+      it("checks only that workflow's keys: a Codex workflow without its key does not hold up a Claude pull request", async () => {
+        const launch = createLauncher(deps);
+        expect((await launch(request())).disposition).toBe('launched'); // issue 12, label updraft (Claude)
+        const result = await launch(onIssue(12));
+        expect(result.disposition).toBe('launched');
+        expect(await store.getJob(result.jobId!)).toMatchObject({ label: 'updraft', agentKeys: ['ANTHROPIC_API_KEY'], pullRequest: 52 });
+      });
+
+      it("refuses an event of a Codex pull request while the Codex key is not set, naming the pull request", async () => {
+        // Issue 20's job ran the Codex workflow (its key was set then).
+        await store.putJob({ jobId: 'job_codexissue1', tokenHash: 'x', installationId: 55, repository: 'acme/web', repositoryId: 9, configVersion: 1, deliveryId: 'codex-issue', eventName: 'issues', status: 'finished', createdAt: new Date(NOW).toISOString(), expiresAt: NOW, label: 'codex', issue: 20 });
+        expect(await createLauncher(deps)(onIssue(20))).toMatchObject({ disposition: 'missing_key', message: 'CODEX_API_KEY is not set: add it under Agent keys' });
+        expect((await store.listRefusals(55, 5))[0]).toMatchObject({ issue: 60 });
+      });
+
+      it('needs no key to close, and leaves the keys to the job when the issue job is no longer kept', async () => {
+        const launch = createLauncher(deps);
+        // Issue 30's job is not on record: nothing names its workflow, so no key holds it up.
+        const unknown = await launch(onIssue(30));
+        expect(unknown.disposition).toBe('launched');
+        expect((await store.getJob(unknown.jobId!))?.agentKeys).toBeUndefined();
+        const close = await launch({ ...onIssue(32, { action: 'closed' }, 'close-32'), eventName: 'pull_request' });
+        expect(close.disposition).toBe('launched');
+        expect((await store.getJob(close.jobId!))?.agentKeys).toBeUndefined();
+      });
+    });
+
+    describe('an event that finds the pull request held', () => {
+      const lease = pullRequestLease(9, 40);
+      const quick = { coalesceConfirmMs: 5, coalescePollMs: 1 };
+
+      it('is not acknowledged while the job holding it is not confirmed launched: 503, and it can be redelivered', async () => {
+        await store.claimDelivery(55, lease, NOW + PR_COALESCE_MS, 'job_ghost');
+        const result = await createLauncher({ ...deps, ...quick })(prEvent());
+        expect(result).toMatchObject({ status: 503, disposition: 'coalesce_unconfirmed' });
+        expect(runs).toEqual([]);
+        expect(await store.claimDelivery(55, 'pr-delivery-1', NOW + 1000, 'probe')).toBe(true);
+      });
+
+      it("takes the pull request over when the holder's launch fails and gives it back, and launches itself", async () => {
+        await store.claimDelivery(55, lease, NOW + PR_COALESCE_MS, 'job_ghost');
+        const read = store.getDeliveryClaim.bind(store);
+        let looks = 0;
+        store.getDeliveryClaim = async (id, key) => {
+          // The holder's launch fails after a look or two, and it gives the lease back.
+          if (++looks === 2) await store.releaseDelivery(55, lease, 'job_ghost');
+          return read(id, key);
+        };
+        const result = await createLauncher({ ...deps, ...quick, coalesceConfirmMs: 50 })(prEvent());
+        expect(result.disposition).toBe('launched');
+        expect(runs).toHaveLength(1);
+        expect((await store.getDeliveryClaim(55, lease))?.jobId).toBe(result.jobId);
+      });
     });
 
     it("comments on the pull request, in its own words, when a quota stops its event", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideDispatch, decidePullRequestDispatch, dispatchRules } from './dispatch.js';
+import { decideDispatch, decidePullRequestDispatch, dispatchRules, issueOfBranch } from './dispatch.js';
 
 const compiled = {
   dispatch: { allowedActors: ['Pat', 'sam'] },
@@ -78,13 +78,21 @@ describe('decidePullRequestDispatch', () => {
     return d.start ? 'start' : d.code;
   };
 
-  it("starts a job for an allowed person's review on an Updraft pull request, with the keys of every workflow of the repository", () => {
-    expect(decide()).toEqual({ start: true, repository: 'Acme/Web', repositoryId: 9, pullRequest: 12, keys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] });
+  it("starts a job for an allowed person's review on an Updraft pull request, with each workflow's keys by label to pick from", () => {
+    expect(decide()).toEqual({ start: true, repository: 'Acme/Web', repositoryId: 9, pullRequest: 12, closing: false, keysByLabel: { updraft: ['ANTHROPIC_API_KEY'], docs: ['CODEX_API_KEY'] } });
+    expect(decide({ eventName: 'pull_request', action: 'closed', reviewState: undefined })).toMatchObject({ start: true, closing: true });
     expect(code({ reviewState: 'approved' })).toBe('start');
     expect(code({ action: 'dismissed', sender: 'writer' })).toBe('start');
     expect(code({ eventName: 'pull_request', action: 'synchronize', reviewState: undefined })).toBe('start');
     // A close ends the loop, whoever closes it.
     expect(code({ eventName: 'pull_request', action: 'closed', sender: 'someone-else', reviewState: undefined })).toBe('start');
+  });
+
+  it('reads the issue an Updraft branch was cut for', () => {
+    expect(issueOfBranch('updraft/issue-12-job_abc')).toBe(12);
+    expect(issueOfBranch('updraft/issue-12-job_abc-2')).toBe(12);
+    expect(issueOfBranch('updraft/other')).toBeNull();
+    expect(issueOfBranch(undefined)).toBeNull();
   });
 
   it('starts nothing for what leads to no work', () => {

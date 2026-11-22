@@ -1611,6 +1611,14 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       };
     },
 
+    async getDeliveryClaim(id, deliveryId) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: deliveryKey(id, deliveryId), ConsistentRead: true }));
+      const i = out.Item;
+      // Expired claims count as none (DynamoDB deletes them lazily), as claimDelivery treats them.
+      if (!i || typeof i.jobId !== 'string' || typeof i.ttl !== 'number' || i.ttl < Math.floor(Date.now() / 1000)) return null;
+      return { jobId: i.jobId, expiresAt: i.ttl * 1000 };
+    },
+
     async releaseDelivery(id, deliveryId, jobId) {
       // Only the holder's: a redelivery's claim (another job) stays, and no claim is no-op.
       try {

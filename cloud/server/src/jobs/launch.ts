@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import type { Job, Quotas, Store } from '../store/store.js';
-import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
+import { decideDispatch, decidePullRequestDispatch, issueOfBranch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
@@ -57,6 +57,18 @@ export const PRELAUNCH_CLAIM_MS = 5 * 60 * 1000;
 export const PR_COALESCE_MS = 20 * 1000;
 export const pullRequestLease = (repositoryId: number, number: number) => `pr-${repositoryId}-${number}`;
 
+/**
+ * How long an event that found a pull request's lease taken waits for the job holding it to be
+ * launched (its microVM recorded) before it calls itself covered. That launch may still fail; until
+ * it is confirmed, the event is not acknowledged as coalesced. Within the webhook Lambda's 20 s, with
+ * room for a launch of its own if the holder's fails.
+ */
+export const COALESCE_CONFIRM_MS = 8 * 1000;
+const COALESCE_POLL_MS = 500;
+
+/** How many of the tenant's latest jobs are searched for the issue job that started a pull request. */
+const ORIGIN_LOOKUP_JOBS = 500;
+
 /** The Lambda-provided connectors: no inbound traffic, internet egress. */
 export const noIngressConnector = (partition: string, region: string) => `arn:${partition}:lambda:${region}:aws:network-connector:aws-network-connector:NO_INGRESS`;
 export const internetEgressConnector = (partition: string, region: string) =>
@@ -109,6 +121,9 @@ export interface LaunchDeps {
   log?: (entry: Record<string, unknown>) => void;
   /** Retry pause for recording the microVM on the job. */
   retryDelayMs?: number;
+  /** How long a coalesced event waits for the launch covering it, and how often it looks (tests shorten them). */
+  coalesceConfirmMs?: number;
+  coalescePollMs?: number;
 }
 
 export interface LaunchRequest {
@@ -151,6 +166,28 @@ export function createLauncher(deps: LaunchDeps) {
   const log = deps.log ?? ((entry) => console.log(JSON.stringify(entry)));
   const s = deps.settings;
   const killSwitch = deps.killSwitch ?? OFF_SWITCH;
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * A pull request's lease: taken (`held`, this job launches), or another event's job holds it and
+   * is confirmed launched (`covered`: its run starts after the lease and sees this event), or that
+   * was not confirmed in time (`unconfirmed`). A holder whose launch fails gives the lease back,
+   * and this event takes it then, so it is never acknowledged for a job that does not exist.
+   */
+  async function takeOrJoin(installationId: number, lease: string, jobId: string): Promise<'held' | 'covered' | 'unconfirmed'> {
+    const pollMs = deps.coalescePollMs ?? COALESCE_POLL_MS;
+    const attempts = Math.max(1, Math.ceil((deps.coalesceConfirmMs ?? COALESCE_CONFIRM_MS) / pollMs));
+    for (let attempt = 0; attempt <= attempts; attempt++) {
+      if (attempt > 0) await sleep(pollMs);
+      if (await deps.store.claimDelivery(installationId, lease, now() + PR_COALESCE_MS, jobId)) return 'held';
+      const claim = await deps.store.getDeliveryClaim(installationId, lease);
+      if (!claim) continue; // given back (a failed launch) or just expired: take it next time round
+      const holder = await deps.store.getJob(claim.jobId);
+      if (holder && holder.status !== 'finished' && (holder.microvmId !== undefined || holder.startedAt !== undefined)) return 'covered';
+    }
+    return 'unconfirmed';
+  }
 
   return async function launch(req: LaunchRequest): Promise<LaunchResult> {
     const skip = (disposition: string, why: { reason?: string; message?: string } = {}): LaunchResult => ({ status: 200, disposition, ...why });
@@ -203,7 +240,25 @@ export function createLauncher(deps: LaunchDeps) {
         log({ delivery: req.deliveryId, installationId: req.installationId, ignored: d.reason });
         return skip('not_dispatched', { reason: d.code, message: d.reason });
       }
-      decision = { repository: d.repository, repositoryId: d.repositoryId, keys: d.keys, pullRequest: d.pullRequest };
+      // The workflow that started the pull request: the label of its issue's job (the branch is
+      // `updraft/issue-<n>-...`), while that job is kept. Its keys are the ones checked. A close runs
+      // no agent and needs none; a pull request whose origin is no longer known is checked by the
+      // job itself (run-event fails without the key, and says so on the job).
+      let keys: string[] | null = [];
+      let label: string | undefined;
+      const issue = d.closing ? null : issueOfBranch(req.payload.pull_request?.head?.ref);
+      if (issue !== null) {
+        const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS).catch(() => []);
+        const origin = recent.find((j) => j.repository.toLowerCase() === d.repository.toLowerCase() && j.issue === issue && typeof j.label === 'string');
+        if (origin?.label) {
+          label = origin.label;
+          const lower = origin.label.toLowerCase();
+          keys = Object.hasOwn(d.keysByLabel, lower) ? d.keysByLabel[lower]! : [];
+        } else {
+          log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job of issue #${issue} names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
+        }
+      }
+      decision = { repository: d.repository, repositoryId: d.repositoryId, keys, pullRequest: d.pullRequest, ...(label ? { label } : {}) };
     }
     // The issue or pull request the job is for: refusals and over-quota comments name it.
     const number = (decision.issue ?? decision.pullRequest)!;
@@ -270,20 +325,25 @@ export function createLauncher(deps: LaunchDeps) {
       await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
       if (lease) await deps.store.releaseDelivery(req.installationId, lease, jobId).catch(() => {});
     };
+    let leaseAt = launchedAt;
     if (lease) {
-      let held: boolean;
+      let covered: 'held' | 'covered' | 'unconfirmed';
       try {
-        held = await deps.store.claimDelivery(req.installationId, lease, launchedAt + PR_COALESCE_MS, jobId);
+        covered = await takeOrJoin(req.installationId, lease, jobId);
       } catch (err) {
         await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
         throw err;
       }
-      if (!held) {
-        await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
-        return skip('coalesced', { message: `a job for pull request #${decision.pullRequest} starts in a few seconds and will see this event` });
+      if (covered !== 'held') await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
+      if (covered === 'covered') return skip('coalesced', { message: `a job for pull request #${decision.pullRequest} starts in a few seconds and will see this event` });
+      if (covered === 'unconfirmed') {
+        // Not acknowledged: GitHub shows the delivery failed, and redelivering it tries again.
+        log({ delivery: req.deliveryId, installationId: req.installationId, warning: `the job holding pull request #${decision.pullRequest} was not confirmed launched in time` });
+        return { status: 503, disposition: 'coalesce_unconfirmed', message: `a launch for pull request #${decision.pullRequest} was under way and not confirmed: redeliver this event` };
       }
+      leaseAt = now();
     }
-    const notBefore = lease ? launchedAt + PR_COALESCE_MS + 1000 : undefined;
+    const notBefore = lease ? leaseAt + PR_COALESCE_MS + 1000 : undefined;
 
     // The slots are held for the job's lifetime from the start, before its microVM exists: a launch
     // that later fails gives them back, and one that stops partway (its Lambda timed out) keeps

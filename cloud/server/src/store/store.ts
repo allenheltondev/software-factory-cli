@@ -633,6 +633,8 @@ export interface Store {
    * Nothing happens when there is no such claim, so it is safe to repeat.
    */
   releaseDelivery(installationId: number, deliveryId: string, jobId: string): Promise<void>;
+  /** Who holds a claim (a delivery's, or a pull request's coalescing lease) now: null when none, or it expired. Read strongly. */
+  getDeliveryClaim(installationId: number, deliveryId: string): Promise<{ jobId: string; expiresAt: number } | null>;
 }
 
 /**
@@ -991,6 +993,10 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async releaseDelivery(id, deliveryId, jobId) {
       const key = `${id}/${deliveryId}`;
       if (deliveries.get(key)?.jobId === jobId) deliveries.delete(key);
+    },
+    async getDeliveryClaim(id, deliveryId) {
+      const c = deliveries.get(`${id}/${deliveryId}`);
+      return c && c.expiresAt > Date.now() ? { jobId: c.jobId, expiresAt: c.expiresAt } : null;
     },
     async putAgentKeyMeta(id, meta) {
       const t = tenants.get(id);
