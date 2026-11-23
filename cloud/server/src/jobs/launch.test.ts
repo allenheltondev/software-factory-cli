@@ -696,6 +696,16 @@ describe('the launcher', () => {
         expect(await createLauncher(deps)(prEvent())).toMatchObject({ reason: 'native_mode_disabled' });
         expect(runs).toEqual([]);
       });
+      it('propagates origin list failures without acknowledging or claiming the delivery', async () => {
+        const list = store.listRecentJobs.bind(store);
+        store.listRecentJobs = async () => { throw new Error('temporary DynamoDB list failure'); };
+        await expect(createLauncher(deps)(prEvent())).rejects.toThrow('temporary DynamoDB list failure');
+        expect(runs).toEqual([]);
+        expect(await store.getDeliveryClaim(55, 'pr-delivery-1')).toBeNull();
+        expect(await store.getDeliveryClaim(55, pullRequestLease(9, 40))).toBeNull();
+        store.listRecentJobs = list;
+        expect(await createLauncher(deps)(prEvent())).toMatchObject({ reason: 'native_mode_disabled' });
+      });
       it('propagates origin read failures before claiming delivery or charging API usage', async () => {
         const getJob = store.getJob.bind(store);
         store.getJob = async (id) => {

@@ -1,3 +1,5 @@
+import { createLauncher, pullRequestLease } from '../jobs/launch.js';
+import { dispatchRules } from '../tenants/dispatch.js';
 import { createNativeModeStore, createNativeStore, type Worker } from '../native/store.js';
 import { createNativeSettingsService } from '../native/settings.js';
 import type { GitHubFlows } from '../flows/github.js';
@@ -6,7 +8,7 @@ import { ConditionalCheckFailedException, TransactionCanceledException } from '@
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { describe, expect, it } from 'vitest';
 import { createDynamoStore } from './dynamo.js';
-import type { Job, Member, Quotas, Tenant } from './store.js';
+import { NativeEnqueueRejectedError, type Job, type Member, type Quotas, type Tenant } from './store.js';
 
 /**
  * The real DynamoDB store against a stand-in document client: an in-memory table that understands
@@ -1214,10 +1216,67 @@ describe('native mode changes and dispatch transactions', () => {
   it('rejects a delayed native enqueue after switching to API mode without writing any job rows', async () => {
     const { table, store, mode, api } = await setup();
     await api.update({ sub: 'member' }, 55, false);
-    await expect(store.putJob(job)).rejects.toThrow();
+    await expect(store.putJob(job)).rejects.toBeInstanceOf(NativeEnqueueRejectedError);
     expect(await mode.enabled(55, route.workerId)).toBe(false);
     expect(await store.getJob(job.jobId)).toBeNull();
     expect([...table.items.values()].some((i) => i.jobId === job.jobId)).toBe(false);
+  });
+
+  it.each(['issues', 'pull_request_review'] as const)('releases claims and quotas after a mode race and accepts immediate %s redelivery', async (eventName) => {
+    const { store, workers, mode, api } = await setup();
+    await store.putTenantWithMember(tenant, member('sub-a'));
+    const version = await store.createConfigVersion(55, { sha256: 'x', files: [], publishedBy: 'sub-a', publishedAt: '',
+      dispatch: dispatchRules({ dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': {
+        id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' } }],
+      } } }, { keysFor: () => ['ANTHROPIC_API_KEY'] }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    if (eventName === 'pull_request_review') {
+      await store.putJob({ ...job, configVersion: version as number, label: 'updraft' });
+      await store.finishJob(job.jobId, 'succeeded', { at: Date.now(), detail: { prNumber: 40 } });
+      await workers.dequeue(55, route.workerId, job.jobId);
+    }
+    let switchDuringLaunch = true;
+    const launch = createLauncher({ store, native: { route,
+      enabled: () => mode.enabled(55, route.workerId),
+      secret: async () => 'worker-control-credential-01234567890123456789',
+    }, settings: { region: 'us-east-1', bucket: 'bucket', imageArn: 'byok-image', executionRoleArn: 'role',
+      ingressConnectorArn: 'in', egressConnectorArn: 'out', logGroup: 'log', brokerFunctionName: 'broker',
+      maximumDurationSeconds: 10800, watchdogReserveSeconds: 600 },
+      imageVersion: async () => '3', quotas: QUOTAS, log: () => {},
+      runMicrovm: async () => { throw new Error('must not fall back to API execution'); },
+      putEvent: async () => {
+        if (switchDuringLaunch) {
+          switchDuringLaunch = false;
+          await api.update({ sub: 'member' }, 55, false);
+        }
+      },
+    });
+    const request = { installationId: 55, deliveryId: 'mode-race-delivery', eventName, body: '{}',
+      payload: { action: eventName === 'issues' ? 'labeled' : 'submitted',
+        issue: { number: 12 }, label: { name: 'updraft' }, review: { state: 'changes_requested' },
+        pull_request: { number: 40, head: { ref: 'updraft/issue-12-abc' } },
+        sender: { login: 'pat' }, repository: { id: 9, full_name: 'acme/web' } },
+    };
+    const result = await launch(request);
+    expect(result).toMatchObject({ status: 503, disposition: 'launch_failed', errorClass: 'NativeEnqueueRejectedError' });
+    expect(await store.getJob(result.jobId!)).toBeNull();
+    expect(await store.getDeliveryClaim(55, request.deliveryId)).toBeNull();
+    expect(await store.getDeliveryClaim(55, pullRequestLease(9, 40))).toBeNull();
+    expect(await store.listActiveJobs()).toEqual([]);
+    const day = new Date().toISOString().slice(0, 10);
+    expect(await store.getUsage(55, day, day.slice(0, 7))).toMatchObject({ jobsToday: 0, jobsThisMonth: 0, microvmSecondsThisMonth: 0 });
+    await api.update({ sub: 'member' }, 55, true);
+    expect(await launch(request)).toMatchObject({ status: 202, disposition: 'launched' });
+    expect(await store.listActiveJobs()).toHaveLength(1);
+  });
+  it('does not classify an earlier committed native job as a definitively rejected enqueue', async () => {
+    const { table, store, api } = await setup();
+    await api.update({ sub: 'member' }, 55, false);
+    // A lost successful response may precede an SDK retry after mode disable.
+    table.items.set('JOB#' + job.jobId + '|META', { pk: 'JOB#' + job.jobId, sk: 'META', ...job });
+    await expect(store.putJob(job)).rejects.toBeInstanceOf(TransactionCanceledException);
+    expect(await store.getJob(job.jobId)).toMatchObject({ jobId: job.jobId });
   });
   it('keeps settlement busy and prevents switching until it completes', async () => {
     const { worker, workers, api } = await setup();

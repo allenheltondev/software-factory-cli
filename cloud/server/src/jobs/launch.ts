@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { matchesNativeRoute, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
 import { hashToken, jobPaths } from '../broker/broker.js';
-import type { Job, Quotas, Store } from '../store/store.js';
+import { NativeEnqueueRejectedError, type Job, type Quotas, type Store } from '../store/store.js';
 import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
@@ -264,7 +264,7 @@ export function createLauncher(deps: LaunchDeps) {
       let keys: string[] | null = [];
       let label: string | undefined;
       {
-        const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS).catch(() => []);
+        const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS);
         const sameRepo = (j: { repository: string }) => j.repository.toLowerCase() === d.repository.toLowerCase();
         const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
         const originJob = origin ? await deps.store.getJob(origin.jobId) : null;
@@ -458,6 +458,12 @@ export function createLauncher(deps: LaunchDeps) {
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) }));
       microvmId = out.microvmId;
     } catch (err) {
+      if (native && !recorded && err instanceof NativeEnqueueRejectedError) {
+        // The mode condition rolled back the enqueue: nothing can execute this reservation.
+        await deps.store.cancelReservation(reservation, 'reserved');
+        await releaseClaims();
+        return { status: 503, disposition: 'launch_failed', jobId, errorClass: errorClassOf(err) };
+      }
       // An ambiguous transaction may already have queued this job. Keep its full-duration
       // delivery claim and quota reservation; reconciliation retires it without a duplicate.
       if (native) return { status: 503, disposition: 'launch_failed', jobId, errorClass: errorClassOf(err) };

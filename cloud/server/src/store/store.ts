@@ -22,6 +22,14 @@
 
 import type { JobLoop, JobStep, JobTelemetryReport, JobTelemetrySnapshot, LinkDestination } from '../jobs/lifecycle.js';
 
+/** The native enqueue transaction was definitively rolled back because its mode was disabled. */
+export class NativeEnqueueRejectedError extends Error {
+  constructor(cause: unknown) {
+    super('Native subscription mode changed before the job was queued', { cause });
+    this.name = 'NativeEnqueueRejectedError';
+  }
+}
+
 export type OAuthKind = 'link' | 'install';
 
 export interface OAuthState {

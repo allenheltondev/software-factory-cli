@@ -94,6 +94,19 @@ describe('native worker Cloud dispatch', () => {
     expect(row?.active?.jobId).toBe(job.jobId);
     expect(await control.handle(input('poll'))).toMatchObject({ ok: false });
   });
+  it.each([false, true])('retains native claims on an ambiguous enqueue (committed: %s)', async (committed) => {
+    const putJob = store.putJob.bind(store);
+    vi.spyOn(store, 'putJob').mockImplementationOnce(async (job) => {
+      if (committed) await putJob(job);
+      throw new Error('DynamoDB response lost');
+    });
+    const result = await launch(request());
+    expect(result).toMatchObject({ status: 503, disposition: 'launch_failed' });
+    expect(await store.getDeliveryClaim(55, 'delivery-1')).toMatchObject({ jobId: result.jobId });
+    expect(await store.listActiveJobs()).toHaveLength(1);
+    expect(Boolean(await store.getJob(result.jobId!))).toBe(committed);
+    expect(await launch(request())).toMatchObject({ disposition: 'duplicate' });
+  });
   it('owns no delivery or quota when secret retrieval fails, and permits immediate redelivery', async () => {
     loadSecret.mockRejectedValueOnce(new Error('Secrets Manager unavailable'));
     const claim = vi.spyOn(store, 'claimDelivery');
