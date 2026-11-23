@@ -42,8 +42,8 @@ export function createRoutineService({ store, rules, secrets, github, now = Date
       await github.configContext(caller, installationId);
       if (!/^[a-f0-9]{32}$/.test(id)) throw new FlowError('not_found', 404, 'No such routine route');
       if (!await rules.get(installationId, id)) throw new FlowError('not_found', 404, 'No such routine route');
-      await rules.remove(installationId, id);
       await secrets.remove(routineSecretName(installationId, id));
+      await rules.remove(installationId, id);
       return { rules: await rules.list(installationId) };
     },
   };

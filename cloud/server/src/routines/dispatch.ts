@@ -38,7 +38,7 @@ export async function fireRoutine(rule: RoutineRule, token: string, context: str
 export function createRoutineDispatcher({ store, rules, readToken, fetchImpl = fetch, now = Date.now, notifyRun }:
   { store: Pick<Store, 'getTenant' | 'claimDelivery'>; rules: Pick<RoutineRuleStore, 'get'>;
     readToken: (name: string) => Promise<string | null>; fetchImpl?: typeof fetch; now?: () => number;
-    notifyRun?: (installationId: number, repository: string, issue: number, url: string) => Promise<void> }): RoutineDispatcher {
+    notifyRun?: (installationId: number, repository: string, repositoryId: number, issue: number, url: string) => Promise<void> }): RoutineDispatcher {
   return async ({ installationId, deliveryId, eventName, payload }) => {
     if (eventName !== 'issues' || payload.action !== 'labeled') return null;
     const repositoryId = payload.repository?.id, repository = payload.repository?.full_name;
@@ -66,7 +66,7 @@ export function createRoutineDispatcher({ store, rules, readToken, fetchImpl = f
     try {
       const result = await fireRoutine(rule, token, context, fetchImpl);
       if (result.kind === 'created') {
-        if (notifyRun) await notifyRun(installationId, repository, issue as number, result.sessionUrl).catch(() => {});
+        if (notifyRun) await notifyRun(installationId, repository, repositoryId as number, issue as number, result.sessionUrl).catch(() => {});
         return { disposition: 'routine_triggered', status: 200, message: result.sessionUrl };
       }
       if (result.kind === 'rejected') return { disposition: 'routine_failed', status: 200, reason: `anthropic_http_${result.status}` };

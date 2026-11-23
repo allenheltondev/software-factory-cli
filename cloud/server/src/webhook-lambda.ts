@@ -121,11 +121,11 @@ const handleWebhook = createWebhookHandler({
   routines: createRoutineDispatcher({
     store, rules: createDynamoRoutineRuleStore(env.TABLE_NAME ?? ''),
     readToken: async (name) => (await secrets.send(new GetSecretValueCommand({ SecretId: name }))).SecretString ?? null,
-    notifyRun: async (installationId, repository, issue, sessionUrl) => {
+    notifyRun: async (installationId, repository, repositoryId, issue, sessionUrl) => {
       const settings = await loadSettings();
       if (!settings) return;
       const token = (await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId,
-        { permissions: { issues: 'write' } })).token;
+        { repositoryIds: [repositoryId], permissions: { issues: 'write' } })).token;
       await github.createIssueComment(token, repository, issue, `Claude Code scheduled task started: ${sessionUrl}`);
     },
   }),
