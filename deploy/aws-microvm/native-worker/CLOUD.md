@@ -76,7 +76,9 @@ still apply. Local regression tests are not evidence of an AWS subscription exec
    of one; it retains the classic sandbox for other adapters. Triage is refused. Non-Claude
    workflows still need their API keys. An unrecognized PR origin in this test repository is
    refused instead of being routed to BYOK. Keep the original job history for the whole test.
-8. From `cloud/`, run:
+8. Open **Agent keys → Configure Claude Code subscription** in the Updraft app. After the worker reports `connected`, choose **Use subscription**. The saved Anthropic API key remains in place for other routes. A newly provisioned route defaults to **API-key mode** until you explicitly enable the subscription. The app will refuse switching while a native job is active or queued. You can change back to API mode when the worker is idle; unfinished subscription PRs are not silently switched to API billing.
+
+9. From `cloud/`, run:
 
    ```sh
    npx tsx server/scripts/native-worker.ts status route.json BROKER_NAME us-east-1
