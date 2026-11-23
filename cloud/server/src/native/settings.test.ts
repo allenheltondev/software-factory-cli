@@ -95,7 +95,7 @@ describe('Claude subscription mode in the installation app', () => {
   it('does not expose a route or permit changes to an installation without a pinned worker', async () => {
     const service = createNativeSettingsService({ github, mode, workers });
     expect(await service.view(caller, 99)).toEqual({ configured: false, enabled: false, worker: null });
-    await expect(service.update(caller, 99, true)).rejects.toThrow('not provisioned');
+    await expect(service.update(caller, 99, true)).rejects.toThrow('is provisioned for this installation');
     expect(enabled).toBe(false);
   });
 });
