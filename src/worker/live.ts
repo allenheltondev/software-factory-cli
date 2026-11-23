@@ -30,6 +30,7 @@ import {
   type AgentInvocation,
 } from '../agents/adapters/registry.js';
 import { agentProfile, describeProfile, effectiveArgs } from '../agents/profile.js';
+import { checkNativeClaudeAuth, type NativeAuthRunner } from '../agents/native-claude-auth.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { renderPrompt, renderRevisionPrompt, type IssueContext } from '../agents/prompt.js';
 import { dependencyMergedSection, dependencyProtocolSection, MAX_DEPENDENCY_WAITS, readDependency } from '../agents/dependency.js';
@@ -96,6 +97,8 @@ export interface LiveExecutorOptions {
   env?: NodeJS.ProcessEnv;
   /** Find the agent CLI. Defaults to discovery's lookup (or agents.<name>.command). */
   locate?: (adapter: string, agent: AgentConfig, opts: { env: NodeJS.ProcessEnv; configDir: string }) => LocatedLaunch;
+  /** Injectable official Claude CLI subscription auth probe for opted-in agent jobs. */
+  nativeClaudeAuth?: NativeAuthRunner;
   /** POSIX: SIGTERM-to-SIGKILL grace when stopping the agent's process group. */
   killGraceMs?: number;
   /** Reads a pid's OS start time (see processStartTime). */
@@ -712,6 +715,19 @@ export class LiveExecutor implements Executor {
       const why = `${run.agent} cannot start: ${located.problem ?? 'agent CLI not found'}`;
       await log([`error: ${why}`, 'outcome: start_failed']);
       throw new StartFailedError(why);
+    }
+
+    // Subscription workers check native auth before each implementation, review or revision.
+    // This guards against API-key fallback, but does not isolate tool subprocess credentials.
+    if (agentCfg.authentication === 'native-claude') {
+      if (adapterName !== 'claude' || agentCfg.container) {
+        throw new StartFailedError('native-claude authentication requires a host-native Claude Code CLI');
+      }
+      const auth = await checkNativeClaudeAuth(located.launch, lookup.env, this.opts.nativeClaudeAuth, ctx.now());
+      if (auth.state !== 'connected') {
+        await log([`native subscription preflight: ${auth.state} (${auth.reason})`, 'outcome: start_failed']);
+        throw new StartFailedError(`native Claude subscription not ready: ${auth.reason}; sign in directly on this worker with "claude auth login"`);
+      }
     }
 
     // Who the agent commits as, when that is the GitHub App's bot. Asked before the worktree

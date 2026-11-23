@@ -4,7 +4,7 @@ This is the first stage of [issue #100](https://github.com/allenheltondev/softwa
 
 ## Current status
 
-- **Implemented in this stage:** read-only, sanitized subscription status via `updraft native-claude-auth [--json]`. It runs the installed `claude auth status` under the worker's normal environment. Only `connected`, `login_required`, `expired`, `wrong_method`, or `unknown` and a fixed reason leave the process. The command never reads, copies or forwards credential files, auth codes or stdout.
+- **Implemented in this stage:** read-only, sanitized subscription status via `updraft native-claude-auth [--json]` and opt-in `agents.<name>.authentication: native-claude` to check direct subscription sign-in before **every** Claude run (including implementation, review and revision). It runs the installed `claude auth status` under the worker's normal environment. Only `connected`, `login_required`, `expired`, `wrong_method`, or `unknown` and a fixed reason leave the process. The command never reads, copies or forwards credential files, auth codes or stdout.
 - **Already available:** `updraft start` and `updraft run-event` can use the official Claude Code adapter and retain implementation, review, revision and merge.
 - **Not implemented yet:** a managed persistent worker lifecycle, tenant-scoped registration and heartbeat, GitHub webhook dispatch to these workers, terminal onboarding in the Updraft console, and proof that agent tool subprocesses cannot read Claude's native credentials. **Do not enable this as a production, multi-tenant hosted subscription feature yet.**
 - **Not a Routines integration:** the work must continue through Updraft's own orchestration.
@@ -30,7 +30,17 @@ Use a **dedicated machine or VM per subscribing end user**, not a shared shell o
 
    Complete the **Anthropic-hosted** browser login from that terminal. If sign-in requires a code, enter it *in the Claude CLI terminal only*. Never type the code or token into Updraft.
 3. Exit the terminal, reconnect as the **same worker user** with the **same `CLAUDE_CONFIG_DIR`**, and rerun `updraft native-claude-auth --json`. Restart the VM and repeat. Confirm `connected` after both; use `claude auth status` directly for troubleshooting.
-4. With your existing Updraft config and GitHub credentials on that same machine, `updraft start` can process labeled issues and its configured review loop, or `updraft run-event --event-file ...` can run a single webhook event. **Do this only with trusted code during the prototype.** These commands do not establish safe tool isolation.
+4. Configure `authentication: native-claude` on the Claude agent in your Updraft YAML config, then run `updraft validate`. For example:
+
+   ```yaml
+   agents:
+     claude:
+       enabled: true
+       authentication: native-claude
+   ```
+
+   This opts every run by that agent (including review and revision) into the fail-closed subscription check. It does **not** make the worker safe for untrusted repositories. The config validator currently rejects this option for containerized agents because native credential isolation remains unresolved.
+5. With your existing Updraft config and GitHub credentials on that same machine, `updraft start` can process labeled issues and its configured review loop, or `updraft run-event --event-file ...` can run a single webhook event. **Do this only with trusted code during the prototype.** These commands do not establish safe tool isolation.
 
    For persistent operation on Linux, Updraft already ships a [systemd user launcher](background-operation.md#linux-systemd---user). **The systemd service must have the same `CLAUDE_CONFIG_DIR` as the terminal where you signed in**. For example, add this path (not a token) to the launcher's private `~/.updraft/worker.env`:
 
@@ -44,7 +54,7 @@ Use a **dedicated machine or VM per subscribing end user**, not a shared shell o
    ```
 
    Configure the launcher before the restart and use the same non-root account and PATH as the login. Do not put the native Claude auth directory under Updraft's shared-state folder. The systemd `EnvironmentFile` points to a directory only; it must not contain a Claude subscription token.
-5. To revoke sign-in, use `claude auth logout` directly on the worker. Remove the dedicated worker disk when terminating the worker under your own data-retention policy.
+6. To revoke sign-in, use `claude auth logout` directly on the worker. Remove the dedicated worker disk when terminating the worker under your own data-retention policy.
 
 The status command intentionally returns no path, account identifier, token, auth method override value, or raw error, making it suitable for eventual UI telemetry. A `connected` state is only a signal that Claude considers its own login usable now. It does **not** prove execution security or that Anthropic has approved the particular hosted use case.
 

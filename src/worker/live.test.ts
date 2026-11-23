@@ -486,6 +486,64 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
     return { ...s, record };
   }
 
+  it('refuses native subscription jobs before checkout on API auth or signed-out status', async () => {
+    for (const [status, expected] of [
+      [{ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'api_key' }) }, 'not_subscription'],
+      [{ code: 1, stdout: JSON.stringify({ loggedIn: false, authMethod: 'none' }) }, 'sign_in_required'],
+    ] as const) {
+      const { paths, config, db } = claudeSetup([init(), success('ok')], {});
+      config.agents.claude!.authentication = 'native-claude';
+      insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+      const c = claim(db, config, paths);
+      const run = vi.fn(async () => status);
+      const guarded = new LiveExecutor({
+        locate: () => ({ path: FAKE_CLAUDE, launch: { file: process.execPath, args: [FAKE_CLAUDE] } }),
+        nativeClaudeAuth: run,
+      });
+      const err = await guarded.execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(StartFailedError);
+      expect((err as Error).message).toContain(expected);
+      expect(run).toHaveBeenCalledOnce();
+      expect(existsSync(join(worktreesRoot(paths), '42', c.job.id))).toBe(false);
+      expect(readFileSync(c.run.logPath!, 'utf8')).toContain('outcome: start_failed');
+    }
+  });
+
+  it('runs the normal Claude adapter after a successful native subscription check', async () => {
+    const { paths, config, db } = claudeSetup([init(), success('Completed')], { FAKE_CLAUDE_COMMIT: '1' });
+    config.agents.claude!.authentication = 'native-claude';
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    const run = vi.fn(async () => ({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) }));
+    const guarded = new LiveExecutor({
+      locate: () => ({ path: FAKE_CLAUDE, launch: { file: process.execPath, args: [FAKE_CLAUDE] } }),
+      nativeClaudeAuth: run,
+    });
+    markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+    const result = await guarded.execute(c, context(db, config, paths, c.run.id));
+    expect(run).toHaveBeenCalledOnce();
+    expect(result.outcome).toBe('succeeded');
+    expect(result.summary?.commitCount).toBe(1);
+  });
+
+  it('rejects subscription token injection without reading the CLI status', async () => {
+    const { paths, config, db } = claudeSetup([init(), success('ok')], {});
+    config.agents.claude!.authentication = 'native-claude';
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    const run = vi.fn();
+    const guarded = new LiveExecutor({
+      env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: 'NEVER_LOG_ME' },
+      locate: () => ({ path: FAKE_CLAUDE, launch: { file: process.execPath, args: [FAKE_CLAUDE] } }),
+      nativeClaudeAuth: run,
+    });
+    const err = await guarded.execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StartFailedError);
+    expect((err as Error).message).toContain('auth_override_present');
+    expect(run).not.toHaveBeenCalled();
+    expect(readFileSync(c.run.logPath!, 'utf8')).not.toContain('NEVER_LOG_ME');
+  });
+
   it('runs claude -p with the prompt on stdin; the final message lands in the run summary', async () => {
     const final = '## Summary\n- Added the roster page.\n- `npm test` passed.';
     const { paths, config, db, record } = claudeSetup([init(), assistantText(final), success(final)], { FAKE_CLAUDE_COMMIT: '1' });

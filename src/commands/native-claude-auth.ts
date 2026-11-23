@@ -1,23 +1,6 @@
-import { execFile } from 'node:child_process';
-import type { LaunchSpec } from '../agents/discovery.js';
-import { hasClaudeAuthOverride, nativeClaudeAuthFromStatus, type NativeClaudeAuthStatus, type NativeClaudeStatusResponse } from '../agents/native-claude-auth.js';
+import { checkNativeClaudeAuth, hasClaudeAuthOverride, defaultNativeAuthRunner, type NativeAuthRunner, type NativeClaudeAuthStatus } from '../agents/native-claude-auth.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
-
-/** The official Claude CLI sees exactly the worker's own environment and config directory. */
-export type NativeAuthRunner = (launch: LaunchSpec, env: NodeJS.ProcessEnv) => Promise<NativeClaudeStatusResponse>;
-
-export const defaultNativeAuthRunner: NativeAuthRunner = (launch, env) =>
-  new Promise((resolve) => {
-    execFile(
-      launch.file,
-      [...launch.args, 'auth', 'status'],
-      { env, encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 65_536 },
-      (error, stdout) => {
-        resolve({ code: error ? (typeof error.code === 'number' ? error.code : null) : 0, stdout });
-      },
-    );
-  });
 
 /**
  * Updraft intentionally does not offer a Claude sign-in form or OAuth-code forwarding.
@@ -36,7 +19,7 @@ export async function nativeClaudeAuthCommand(
       const agents = await ctx.discoverAgents({ adapters: ['claude'], env: ctx.env });
       const launch = agents.find((a) => a.adapter === 'claude' && a.installed && a.runnable === 'yes')?.launch;
       status = launch
-        ? nativeClaudeAuthFromStatus(await run(launch, ctx.env), ctx.env, ctx.now())
+        ? await checkNativeClaudeAuth(launch, ctx.env, run, ctx.now())
         : { state: 'unknown', reason: 'cli_missing' };
     } catch {
       // Never show a subprocess error: it can contain a sensitive CLI URL, path or account.

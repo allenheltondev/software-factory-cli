@@ -80,6 +80,8 @@ export const agentSchema = z.strictObject({
   model: z.string().optional(),
   /** Live mode: reasoning effort, mapped to the adapter's own option (see docs/agents/profiles.md). */
   effort: z.string().optional(),
+  /** Opt in to CLI-managed subscription authentication; checked before every Claude run. */
+  authentication: z.enum(['default', 'native-claude']).optional(),
   /** Live mode: environment variables set for the agent process, on top of the worker's environment. */
   env: z.record(envName, z.string()).optional(),
   /** Live mode: run this agent in a container. `env` above is then set inside the container. */

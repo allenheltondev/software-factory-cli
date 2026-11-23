@@ -1,3 +1,6 @@
+import { execFile } from 'node:child_process';
+import type { LaunchSpec } from './discovery.js';
+
 /**
  * Read-only native Claude Code subscription authentication probe for dedicated persistent workers.
  *
@@ -80,4 +83,34 @@ export function nativeClaudeAuthFromStatus(
     if (end <= nowMs) return { state: 'expired', reason: 'login_expired' };
   }
   return { state: 'connected', reason: 'native_subscription' };
+}
+
+/** Official CLI read-only status probe; nothing from stderr is returned. */
+export type NativeAuthRunner = (launch: LaunchSpec, env: NodeJS.ProcessEnv) => Promise<NativeClaudeStatusResponse>;
+
+export const defaultNativeAuthRunner: NativeAuthRunner = (launch, env) =>
+  new Promise((resolve) => {
+    execFile(
+      launch.file,
+      [...launch.args, 'auth', 'status'],
+      { env, encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 65_536 },
+      (error, stdout) => {
+        resolve({ code: error ? (typeof error.code === 'number' ? error.code : null) : 0, stdout });
+      },
+    );
+  });
+
+/** Fail closed on all probe errors, including malformed outputs. */
+export async function checkNativeClaudeAuth(
+  launch: LaunchSpec,
+  env: NodeJS.ProcessEnv,
+  run: NativeAuthRunner = defaultNativeAuthRunner,
+  nowMs = Date.now(),
+): Promise<NativeClaudeAuthStatus> {
+  if (hasClaudeAuthOverride(env)) return { state: 'wrong_method', reason: 'auth_override_present' };
+  try {
+    return nativeClaudeAuthFromStatus(await run(launch, env), env, nowMs);
+  } catch {
+    return { state: 'unknown', reason: 'status_unavailable' };
+  }
 }
