@@ -518,7 +518,7 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
     config.agents.claude!.authentication = 'native-claude';
     insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
     const c = claim(db, config, paths);
-    const run = vi.fn(async () => ({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) }));
+    const run = vi.fn(async (_launch: unknown, _env: NodeJS.ProcessEnv) => ({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) }));
     const guarded = new LiveExecutor({
       locate: () => ({ path: FAKE_CLAUDE, launch: { file: process.execPath, args: [FAKE_CLAUDE] } }),
       nativeClaudeAuth: run,
@@ -1246,7 +1246,7 @@ describe('LiveExecutor: a revision job', { timeout: 120_000 }, () => {
 
   it('checks native Claude auth for revision runs before creating a revision worktree', async () => {
     const { f, paths, config, db } = setup();
-    writeFileSync(join(paths.configDir, 'prompts', 'revise.md'), 'Address review. Commit your work.\\n');
+    writeFileSync(join(paths.configDir, 'prompts', 'revise.md'), 'Address review. Commit your work.\n');
     config.actions['implement-issue']!.revisePrompt = './prompts/revise.md';
     config.agents.claude!.authentication = 'native-claude';
     revisionJob(db, f);
@@ -1261,7 +1261,7 @@ describe('LiveExecutor: a revision job', { timeout: 120_000 }, () => {
 
   it('runs a native-authenticated revision through the same existing pipeline', async () => {
     const { f, paths, config, db } = setup();
-    writeFileSync(join(paths.configDir, 'prompts', 'revise.md'), 'Address review. Commit your work.\\n');
+    writeFileSync(join(paths.configDir, 'prompts', 'revise.md'), 'Address review. Commit your work.\n');
     config.actions['implement-issue']!.revisePrompt = './prompts/revise.md';
     config.agents.claude!.authentication = 'native-claude';
     revisionJob(db, f);
