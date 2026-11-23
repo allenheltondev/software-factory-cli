@@ -3,6 +3,7 @@ import { DeleteObjectsCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/c
 import { DeleteSecretCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { createReconciler } from './jobs/reconcile.js';
 import { createDynamoStore } from './store/dynamo.js';
+import { nativeAws } from './native/aws.js';
 import { runCleanup } from './tenants/cleanup.js';
 import { expireResults } from './tenants/results-retention.js';
 
@@ -23,6 +24,7 @@ const microvms = new LambdaMicrovmsClient({});
 
 const reconcile = createReconciler({
   store,
+  native: nativeAws(store).control,
   async microvmState(microvmId) {
     try {
       return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }))).state ?? 'UNKNOWN';

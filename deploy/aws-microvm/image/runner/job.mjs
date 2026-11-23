@@ -350,6 +350,7 @@ export async function runJob(request, deps) {
     }
     const { stateDir, state } = await timed('restore_state', {}, async (step) => {
       const prepared = await prepare(payload, deps);
+      if (deps.configureJob) await deps.configureJob(prepared.stateDir);
       step.attributes = { 'updraft.state.restored': Boolean(prepared.state) };
       return prepared;
     });

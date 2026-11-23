@@ -6,6 +6,7 @@ import { abandonBrokerJob, createBrokerClient, startBrokerJob } from './broker.m
 import { BROKER_PAYLOAD_VERSION, ISOLATION_CHECK_PAYLOAD_VERSION, parseRunRequest } from './hooks.mjs';
 import { SANDBOX_IMAGE, SANDBOX_RUNTIME, createNftFilter, credentialEndpoints } from './isolation.mjs';
 import { checkImageIsolation, runJob } from './job.mjs';
+import { configureNativeJob } from './native-config.mjs';
 
 const log = (message) => console.log(`[runner] ${message}`);
 
@@ -18,13 +19,17 @@ function integerFrom(name) {
 }
 
 async function main() {
+  const nativeWorker = process.env.UPDRAFT_NATIVE_WORKER === '1';
+  delete process.env.UPDRAFT_NATIVE_WORKER;
   // server.mjs validated this already; parsing again keeps this file usable on its own.
   const raw = JSON.parse(process.env.UPDRAFT_RUN_REQUEST ?? 'null');
   const request = parseRunRequest({ microvmId: raw?.microvmId, runHookPayload: JSON.stringify(raw?.payload ?? null) });
   delete process.env.UPDRAFT_RUN_REQUEST;
 
   const stopListeners = [];
+  let stopRequested = false;
   process.on('SIGTERM', () => {
+    stopRequested = true;
     for (const listener of stopListeners) listener();
   });
 
@@ -57,6 +62,7 @@ async function main() {
       endpoints,
       hookPort,
       filter: createNftFilter({ endpoints, hookPort }),
+      nativeWorker,
     };
   } catch (error) {
     isolation = { setupProblem: error?.message ?? String(error) };
@@ -94,6 +100,7 @@ async function main() {
 
   const result = await runJob(job.request, {
     ...job.aws,
+    ...(nativeWorker ? { configureJob: configureNativeJob } : {}),
     isolation,
     stateRoot,
     updraftCommand: [process.env.UPDRAFT_COMMAND ?? 'updraft'],
@@ -101,7 +108,7 @@ async function main() {
     baseEnv: process.env,
     log,
     logStream: process.stdout,
-    onStop: (listener) => stopListeners.push(listener),
+    onStop: (listener) => { stopListeners.push(listener); if (stopRequested) listener(); },
   });
   process.exitCode = result.outcome === 'succeeded' ? 0 : 1;
 }

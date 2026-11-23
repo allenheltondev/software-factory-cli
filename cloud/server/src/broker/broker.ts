@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { NATIVE_SLOT_HOLD_UNTIL } from '../native/route.js';
 import type { GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
@@ -11,7 +12,7 @@ import { SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
 // Not the whole telemetry service: only the secret's name.
-import { linkDestinationFor, linkDestinationOf, sentToMatches, telemetrySecretName } from '../tenants/telemetry-service.js';
+import { linkDestinationFor, linkDestinationOf, sentToMatches, telemetrySecretName, TELEMETRY_KEY_NAME } from '../tenants/telemetry-service.js';
 
 /**
  * The job broker (#68, "Isolation between tenants"): what a job's microVM may have, handed out to
@@ -91,7 +92,7 @@ export interface PolicyContext {
  * The session policy for one job. AWS intersects it with the data role's own policy, so the
  * credentials can never reach more than this, whatever the role allows.
  */
-export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersion' | 'deliveryId'>, ctx: PolicyContext) {
+export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersion' | 'deliveryId' | 'native' | 'agentKeys'>, ctx: PolicyContext) {
   const p = jobPaths(job);
   const bucketArn = `arn:${ctx.partition}:s3:::${ctx.bucket}`;
   const statePrefix = p.stateKey.slice(0, p.stateKey.lastIndexOf('/') + 1);
@@ -106,9 +107,11 @@ export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersio
       {
         Effect: 'Allow',
         Action: 'secretsmanager:GetSecretValue',
-        Resource: `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretPrefix(job.installationId)}*`,
+        Resource: job.native
+          ? (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY').map((k) => `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretName(job.installationId, k)}-*`)
+          : `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretPrefix(job.installationId)}*`,
       },
-    ],
+    ].filter((statement) => !Array.isArray(statement.Resource) || statement.Resource.length > 0),
   };
 }
 
@@ -126,6 +129,7 @@ export interface ScopedCredentials {
 }
 
 export interface BrokerDeps {
+  native?: { canServe(job: Job): Promise<boolean>; complete(job: Job): Promise<boolean> };
   store: Store;
   loadSettings: LoadSettings;
   github: Pick<GitHubApi, 'createInstallationToken' | 'getBotUser'>;
@@ -180,6 +184,7 @@ export function createBroker(deps: BrokerDeps) {
 
   /** Whether a verified job may still be served. */
   async function servable(job: Job): Promise<boolean> {
+    if (job.native && (!deps.native || !await deps.native.canServe(job))) return false;
     if (job.status === 'finished' || job.stopRequestedAt !== undefined || now() > job.expiresAt) return false;
     // Strongly consistent, like the job: a suspend or uninstall that has committed stops the next
     // request, rather than one that happens to read a stale replica.
@@ -233,6 +238,7 @@ export function createBroker(deps: BrokerDeps) {
       // Retired first, whatever its outcome: a job being stopped is served nothing more, and a
       // delayed start can never admit it.
       await deps.store.markStopping(job.jobId);
+      if (job.native) return deps.native && await deps.native.complete(job) ? { ok: true, terminated: true } : { ok: false, error: 'unavailable' };
       if (!job.microvmId) return { ok: false, error: 'unavailable' };
       await deps.terminateMicrovm(job.microvmId);
       // The job's quota capacity follows its microVM, not its outcome: freed (and its unused time
@@ -314,7 +320,7 @@ export function createBroker(deps: BrokerDeps) {
     // does start holds them for as long as it may run; if another job holds one by now (a
     // redelivery's, or another launch in its slot), that one runs, not this.
     if (action === 'start') {
-      const started = await deps.store.startJob(job, job.expiresAt);
+      const started = await deps.store.startJob(job, job.native ? NATIVE_SLOT_HOLD_UNTIL : job.expiresAt);
       if (started.result === 'retired') return REFUSED;
       if (started.result === 'superseded' || started.result === 'throttled') {
         // It is served nothing and charged nothing, but its microVM is running: the slots it still
@@ -339,15 +345,10 @@ export function createBroker(deps: BrokerDeps) {
     }
 
     if (action === 'start' || action === 'credentials') {
-      const credentials = await deps.assumeRole({
-        sessionName: `job-${job.jobId}`.slice(0, 64),
-        policy: JSON.stringify(jobSessionPolicy(job, deps.policy)),
-        durationSeconds: SESSION_SECONDS,
-      });
       // The tenant's key secrets by variable name; the runner reads them with the credentials (a
       // missing one is a key the tenant has not set).
       // Only the agents this deployment runs (CloudAgents): one taken out of service gets no key.
-      const agentKeySecrets = Object.fromEntries(AGENT_KEY_NAMES.map((name) => [name, agentKeySecretName(job.installationId, name)]));
+      const agentKeySecrets = Object.fromEntries((job.native ? (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY') : AGENT_KEY_NAMES).map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
       // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
       // and keeps it with the job with that destination's link settings: every later `start` (a
@@ -375,6 +376,11 @@ export function createBroker(deps: BrokerDeps) {
         }
       }
       const telemetry = snapshot.descriptor;
+      const credentials = await deps.assumeRole({
+        sessionName: `job-${job.jobId}`.slice(0, 64),
+        policy: JSON.stringify(jobSessionPolicy(job.native && telemetry ? { ...job, agentKeys: [...(job.agentKeys ?? []), TELEMETRY_KEY_NAME] } : job, deps.policy)),
+        durationSeconds: SESSION_SECONDS,
+      });
             return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
     }
 

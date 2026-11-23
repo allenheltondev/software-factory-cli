@@ -32,10 +32,12 @@ export const MICROVM_GONE_OUTCOME = 'microvm_gone';
 export function createReconciler({
   store,
   microvmState,
+  native,
   now = Date.now,
   log = (entry) => console.log(JSON.stringify(entry)),
 }: {
   store: Store;
+  native?: { reconcile(job: import('../store/store.js').Job): Promise<boolean> };
   /** lambda:GetMicrovm: the state, or null when Lambda has no such microVM. */
   microvmState: (microvmId: string) => Promise<string | null>;
   now?: () => number;
@@ -48,6 +50,12 @@ export function createReconciler({
     for (const entry of await store.listActiveJobs()) {
       const { jobId } = entry;
       try {
+        const nativeJob = await store.getJob(jobId);
+        if (nativeJob?.native) {
+          if (!native) throw new Error('native worker reconciliation is not configured');
+          if (await native.reconcile(nativeJob)) released.push(jobId); else held++;
+          continue;
+        }
         if (entry.phase === 'reserved') {
           // The launch may still be under way; past this, it stopped before RunMicrovm.
           if (now() - entry.reservedAt < RESERVATION_RECLAIM_MS) continue;

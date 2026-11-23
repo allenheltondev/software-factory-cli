@@ -242,6 +242,22 @@ async function seeded() {
   return { table, store, memberTtls };
 }
 
+describe('dynamo store: native queue admission', () => {
+  it('atomically records the job, summary and queue entry and retains unresolved native evidence', async () => {
+    const { store, table } = await seeded();
+    const job: Job = { jobId: 'job_native00000001', tokenHash: 'hash-only', installationId: 55, repository: 'acme/web', repositoryId: 9,
+      configVersion: 1, deliveryId: 'd-native', eventName: 'issues', status: 'launched', createdAt: '2026-11-23T00:00:00Z', expiresAt: DEADLINE,
+      native: { workerId: 'test-worker', notBefore: 1234, retry: true } };
+    await store.putJob(job);
+    expect(await store.getJob(job.jobId)).toMatchObject({ native: job.native });
+    expect(table.items.get('NATIVE#55#test-worker|QUEUE#job_native00000001')).toMatchObject({ jobId: job.jobId });
+    expect(table.items.get('JOB#job_native00000001|META')!.ttl).toBeGreaterThan(250_000_000_000);
+    expect(await store.getJobSummary(55, job.jobId)).not.toHaveProperty('tokenHash');
+    await expect(store.putJob({ ...job, native: { workerId: 'different-worker' } })).rejects.toThrow();
+    expect(table.items.has('NATIVE#55#different-worker|QUEUE#job_native00000001')).toBe(false);
+  });
+});
+
 describe('dynamo store: uninstall', () => {
   it('marks the tenant and gives every row in its partition the TTL', async () => {
     const { store, table, memberTtls } = await seeded();

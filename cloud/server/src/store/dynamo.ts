@@ -1,4 +1,6 @@
 import { destinationOf, jobTelemetrySnapshotOf, loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
+import { nativePartition } from '../native/store.js';
+import { NATIVE_SLOT_HOLD_UNTIL } from '../native/route.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import {
   DeleteCommand,
@@ -614,7 +616,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             {
               Put: {
                 TableName: T,
-                Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 },
+                Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil((job.native ? NATIVE_SLOT_HOLD_UNTIL : job.expiresAt) / 1000) + 7 * 24 * 3600 },
                 ConditionExpression: 'attribute_not_exists(pk)',
               },
             },
@@ -637,6 +639,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                 },
               },
             },
+            ...(job.native ? [{ Put: { TableName: T, Item: { pk: nativePartition(job.installationId, job.native.workerId),
+              sk: `QUEUE#${job.jobId}`, jobId: job.jobId, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 } } }] : []),
           ],
         }),
       );
@@ -684,6 +688,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       return {
         jobId: String(i.jobId),
         tokenHash: String(i.tokenHash),
+        ...(i.native ? { native: i.native as Job['native'] } : {}),
         installationId: Number(i.installationId),
         repository: String(i.repository),
         repositoryId: Number(i.repositoryId),

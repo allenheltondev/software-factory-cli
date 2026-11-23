@@ -6,17 +6,20 @@ import path from 'node:path';
 import { loadConfig } from './policy.mjs';
 import { startService } from './service.mjs';
 import { startProbe } from './probe.mjs';
+import { cloudConfig, startCloudWorker } from './cloud.mjs';
 
 export function bootPayload(text) {
   const p = JSON.parse(text);
-  if (!p || Object.keys(p).sort().join(',') !== 'accessPointId,fileSystemId' ||
+  if (!p || Object.keys(p).filter((k) => k !== 'cloud').sort().join(',') !== 'accessPointId,fileSystemId' ||
       !/^fs-[a-f0-9]{8,40}$/.test(p.fileSystemId) || !/^fsap-[a-f0-9]{8,40}$/.test(p.accessPointId)) throw new Error('invalid storage references');
+  if (p.cloud !== undefined) cloudConfig(p.cloud);
   return p;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let service;
   let probe;
+  let cloud;
   let terminating = false;
   let started = false;
   let pending = false;
@@ -36,16 +39,22 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
             body += chunk;
             if (Buffer.byteLength(body) > 16384) throw new Error('oversized lifecycle request');
           }
-          const { fileSystemId, accessPointId } = bootPayload(JSON.parse(body).runHookPayload);
+          const lifecycle = JSON.parse(body);
+          const { fileSystemId, accessPointId, cloud: cloudSettings } = bootPayload(lifecycle.runHookPayload);
           await new Promise((resolve, reject) => execFile('/bin/sh', ['/opt/updraft/native-worker/mount-home.sh', fileSystemId, accessPointId],
             { timeout: 45000, maxBuffer: 65536 }, (error) => error ? reject(error) : resolve()));
           const config = loadConfig('/etc/updraft-native-worker.json');
           service = await startService(config);
           try { probe = await startProbe(config); }
           catch (error) { await service.close(); throw error; }
+          if (cloudSettings) {
+            try { cloud = await startCloudWorker(cloudSettings, lifecycle.microvmId, service); }
+            catch (error) { await probe.close(); await service.close(); throw error; }
+          }
           probe.child.once('exit', () => {
             if (!terminating) {
               console.error('Native worker probe listener exited; worker is unavailable.');
+              void cloud?.close();
               void service.close();
             }
           });
@@ -56,6 +65,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       }
       if (route === '/aws/lambda-microvms/runtime/v1/terminate') {
         terminating = true;
+        await cloud?.close();
         await probe?.close();
         await service?.close();
         response.writeHead(200).end();
