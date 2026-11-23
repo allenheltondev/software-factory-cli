@@ -29,7 +29,9 @@ try {
   fs.mkdirSync(`${fixture}/image/sandbox`, { recursive: true });
   fs.copyFileSync(path.resolve(source, '../image/sandbox/updraft-sandbox.mjs'), `${fixture}/image/sandbox/updraft-sandbox.mjs`);
   fs.copyFileSync(path.resolve(source, '../../../dist/agents/native-claude-auth.js'), `${fixture}/auth.mjs`);
-  // Code copied from a developer checkout may have group-writable modes; harden the installation.
+  // Copies may retain checkout ownership as well as group-writable modes. Model a real
+  // root installation explicitly, before creating the separately owned data directories.
+  execFileSync('/bin/chown', ['-R', 'root:root', fixture]);
   execFileSync('/bin/chmod', ['-R', 'go-w', fixture]);
   const { startService, assertEfsMount, identityCommand } = await import(pathToFileURL(`${fixture}/native-worker/service.mjs`).href);
   const { frames, send } = await import(pathToFileURL(`${fixture}/native-worker/protocol.mjs`).href);
