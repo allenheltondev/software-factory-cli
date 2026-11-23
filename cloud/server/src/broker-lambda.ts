@@ -1,3 +1,4 @@
+import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import { AssumeRoleCommand, STSClient } from '@aws-sdk/client-sts';
@@ -28,7 +29,9 @@ const killSwitch = createKillSwitch({ read: async () => {
   try { return (await ssm.send(new GetParameterCommand({ Name: process.env.KILL_SWITCH_PARAMETER || KILL_SWITCH_PARAMETER }))).Parameter?.Value ?? null; }
   catch (e) { if (e instanceof ParameterNotFound) return null; throw e; }
 } });
-const native = nativeAws(store, () => killSwitch.engaged()).control;
+const nativeWorker = nativeAws(store, () => killSwitch.engaged());
+const native = nativeWorker.control;
+const webhook = new LambdaClient({});
 const handle = createBroker({
   store,
   native,
@@ -72,7 +75,22 @@ const handle = createBroker({
 
 export async function handler(event: unknown) {
   try {
-    if (event && typeof event === 'object' && (event as { action?: unknown }).action === 'worker') return await native.handle(event);
+    if (event && typeof event === 'object' && (event as { action?: unknown }).action === 'worker') {
+      const result = await native.handle(event);
+      const message = event as { workerId?: string; auth?: string; op?: string };
+      const id = Number(/^managed-([1-9]\d*)$/.exec(message.workerId ?? '')?.[1]);
+      const sessions = nativeWorker.managed?.sessions;
+      if (result.ok === true && message.op === 'poll' && message.auth === 'connected' && Number.isSafeInteger(id) &&
+          sessions && process.env.CLAUDE_WEBHOOK_PARAMETER) {
+        try {
+          if (!(await sessions.pending(id)).length) return result;
+          const name = (await ssm.send(new GetParameterCommand({ Name: process.env.CLAUDE_WEBHOOK_PARAMETER }))).Parameter?.Value;
+          if (name) await webhook.send(new InvokeCommand({ FunctionName: name, InvocationType: 'Event',
+            Payload: Buffer.from(JSON.stringify({ action: 'resumeClaude', installationId: id })) }));
+        } catch { console.error('Could not schedule a waiting Claude job; the next worker poll retries'); }
+      }
+      return result;
+    }
     return await handle(event);
   } catch (err) {
     // Never the details: they could carry a token or a credential.

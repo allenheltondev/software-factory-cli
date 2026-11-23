@@ -131,6 +131,7 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
   }
   return {
     jobId: String(i.jobId),
+    ...(i.executionMode === 'subscription' || i.executionMode === 'standard' ? { executionMode: i.executionMode } : {}),
     repository: String(i.repository),
     ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
     ...(typeof i.pullRequest === 'number' ? { pullRequest: i.pullRequest } : {}),
@@ -626,6 +627,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   TableName: T,
                   Item: {
                     ...jobSummaryKey(job),
+                    executionMode: job.native ? 'subscription' : 'standard',
                     jobId: job.jobId,
                     repository: job.repository,
                     ...(job.issue !== undefined ? { issue: job.issue } : {}),
@@ -645,9 +647,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
               ...(job.native ? [{ Update: {
                 TableName: T, Key: { pk: nativePartition(job.installationId, job.native.workerId), sk: 'MODE' },
                 UpdateExpression: 'ADD revision :one',
-                ConditionExpression: '#enabled = :enabled',
+                ConditionExpression: job.native.routingVersion === undefined ? '#enabled = :enabled'
+                  : job.native.routingVersion === 0 ? '#enabled = :enabled AND (attribute_not_exists(routingVersion) OR routingVersion = :routingVersion)'
+                    : '#enabled = :enabled AND routingVersion = :routingVersion',
                 ExpressionAttributeNames: { '#enabled': 'enabled' },
-                ExpressionAttributeValues: { ':one': 1, ':enabled': true },
+                ExpressionAttributeValues: { ':one': 1, ':enabled': true,
+                  ...(job.native.routingVersion !== undefined ? { ':routingVersion': job.native.routingVersion } : {}) },
               } }, { Put: { TableName: T, Item: { pk: nativePartition(job.installationId, job.native.workerId),
                 sk: `QUEUE#${job.jobId}`, jobId: job.jobId, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 } } }] : []),
             ],

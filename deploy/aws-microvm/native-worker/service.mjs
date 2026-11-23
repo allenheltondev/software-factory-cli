@@ -47,6 +47,17 @@ export function assertEfsMount(c) {
   if (['nfs', 'nfs4'].includes(parentType)) throw new Error('credential mount parent must enforce local permissions');
 }
 
+export function assertEphemeralHome(c) {
+  const parent = path.dirname(c.credentialHome);
+  const mount = execFileSync('/usr/bin/findmnt', ['--noheadings', '--output', 'FSTYPE,OPTIONS', '--mountpoint', parent], { encoding: 'utf8' }).trim();
+  const [type, options] = mount.split(/\s+/);
+  if (type !== 'tmpfs' || !['nosuid', 'nodev', 'noexec'].every((option) => options?.split(',').includes(option))) {
+    throw new Error('disposable Claude home requires a private tmpfs mount');
+  }
+  const homeMount = execFileSync('/usr/bin/findmnt', ['--noheadings', '--output', 'TARGET', '--target', c.credentialHome], { encoding: 'utf8' }).trim();
+  if (homeMount !== parent) throw new Error('unexpected mount inside the disposable Claude home');
+}
+
 export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe = assertEfsMount) {
   if (process.platform !== 'linux' || process.getuid() !== 0) throw new Error('native worker supervisor requires Linux root');
   process.umask(0o077);
@@ -72,7 +83,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     UPDRAFT_SANDBOX_CONFIG: c.sandboxConfig, UPDRAFT_SANDBOX_RUNTIME_DIR: sandboxState };
   const track = (child) => { children.add(child); child.once('close', () => children.delete(child)); return child; };
   const sandboxChild = (args) => track(startAs(c.workerUid, c.workerGid, process.execPath, [sandbox, ...args], { env: sandboxEnv, stdio: ['pipe', 'pipe', 'pipe'] }));
-  // NFS-backed flock serializes replacement workers against the same durable login.
+  // The credential home lock excludes a second supervisor in either storage mode.
   // This file contains no credentials. Never use an expiring directory lock that can
   // strand a login after termination, or permit two refresh-token writers after expiry.
   const lease = spawn('/usr/bin/flock', ['--nonblock', `${c.credentialHome}/.updraft-worker.lock`,

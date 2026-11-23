@@ -1,3 +1,4 @@
+import type { NativeTrigger } from './route.js';
 import { ConditionalCheckFailedException, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, DeleteCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -51,12 +52,19 @@ export function createNativeStore(table: string, db = DynamoDBDocumentClient.fro
 }
 
 
+export interface NativeMode {
+  enabled: boolean;
+  revision: number;
+  routingVersion?: number;
+  triggers?: NativeTrigger[];
+}
+
 /** Per-installation API key/subscription choice, not part of the worker's heartbeat row. */
 export interface NativeModeStore {
   enabled(installationId: number, workerId: string): Promise<boolean>;
-  snapshot(installationId: number, workerId: string): Promise<{ enabled: boolean; revision: number }>;
+  snapshot(installationId: number, workerId: string): Promise<NativeMode>;
   /** Commit only if neither dispatch nor the worker changed since the idle checks. */
-  setEnabled(installationId: number, workerId: string, enabled: boolean, expected: { revision: number; workerVersion: number | null }): Promise<boolean>;
+  setEnabled(installationId: number, workerId: string, enabled: boolean, expected: { revision: number; workerVersion: number | null; routingVersion?: number; triggers?: NativeTrigger[] }): Promise<boolean>;
 }
 
 export function createNativeModeStore(
@@ -66,7 +74,11 @@ export function createNativeModeStore(
   const key = (installationId: number, workerId: string) => ({ pk: nativePartition(installationId, workerId), sk: 'MODE' });
   async function snapshot(installationId: number, workerId: string) {
     const { Item } = await db.send(new GetCommand({ TableName: table, Key: key(installationId, workerId), ConsistentRead: true }));
-    return { enabled: Item?.enabled === true, revision: Number(Item?.revision ?? 0) };
+    return {
+      enabled: Item?.enabled === true, revision: Number(Item?.revision ?? 0),
+      routingVersion: Number(Item?.routingVersion ?? 0),
+      ...(Array.isArray(Item?.triggers) ? { triggers: Item.triggers as NativeTrigger[] } : {}),
+    };
   }
   return {
     snapshot,
@@ -76,7 +88,9 @@ export function createNativeModeStore(
         await db.send(new TransactWriteCommand({ TransactItems: [
           { Put: {
             TableName: table,
-            Item: { ...key(installationId, workerId), enabled, revision: expected.revision + 1, updatedAt: new Date().toISOString() },
+            Item: { ...key(installationId, workerId), enabled, revision: expected.revision + 1,
+              routingVersion: (expected.routingVersion ?? 0) + 1,
+              ...(expected.triggers ? { triggers: expected.triggers } : {}), updatedAt: new Date().toISOString() },
             ConditionExpression: expected.revision === 0 ? 'attribute_not_exists(revision) OR revision = :revision' : 'revision = :revision',
             ExpressionAttributeValues: { ':revision': expected.revision },
           } },

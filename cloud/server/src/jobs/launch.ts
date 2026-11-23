@@ -1,5 +1,7 @@
+import { waitingId } from '../native/sessions.js';
+import type { NativeMode } from '../native/store.js';
 import { randomBytes } from 'node:crypto';
-import { matchesNativeRoute, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
+import { legacyNativeTriggers, sameNativeRepository, sameNativeTrigger, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import { NativeEnqueueRejectedError, type Job, type Quotas, type Store } from '../store/store.js';
 import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
@@ -103,8 +105,19 @@ export interface RunMicrovmInput {
   clientToken: string;
 }
 
+export interface NativeLaunch {
+  route: NativeRoute;
+  secret(): Promise<string>;
+  enabled?(): Promise<boolean>;
+  mode?(): Promise<NativeMode>;
+  ready?(): Promise<boolean>;
+}
+
 export interface LaunchDeps {
-  native?: { route: NativeRoute; secret(): Promise<string>; enabled?(): Promise<boolean> };
+  native?: NativeLaunch;
+  resolveNative?(installationId: number): Promise<NativeLaunch | undefined>;
+  parkedClaude?(request: LaunchRequest): Promise<string | undefined>;
+  waitForClaude?(request: LaunchRequest, repository: string, repositoryId: number, issue: number): Promise<string>;
   store: Store;
   settings: LaunchSettings;
   /** The published image version; null while jobs are off (no image built yet). */
@@ -139,6 +152,8 @@ export interface LaunchRequest {
   body: string;
   /** A retry from the console (jobs/retry.ts): the job requeues the event's failed jobs in the shared state before it runs. */
   retry?: boolean;
+  retryRuntime?: { workerId?: string };
+  resumeClaude?: boolean;
   /**
    * The id the job is to have (newJobId), for a caller that must record it before the launch, to
    * find the job again if it never hears how the launch ended. Absent: the launcher chooses.
@@ -222,7 +237,10 @@ export function createLauncher(deps: LaunchDeps) {
     const config = await deps.store.getConfigVersion(req.installationId, tenant.activeConfigVersion, { consistent: true });
     // What the job is for: an issue (its label) or a pull request (its review loop).
     let decision: { repository: string; repositoryId: number; keys: string[] | null; label?: string; issue?: number; pullRequest?: number };
-    let nativeOrigin = false;
+    const binding = deps.native?.route.installationId === req.installationId ? deps.native : await deps.resolveNative?.(req.installationId);
+    const mode = await binding?.mode?.();
+    const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
+    let workerId = req.retryRuntime?.workerId;
     if (isIssue) {
       const d = decideDispatch(config?.dispatch, {
         repositoryFullName: req.payload.repository?.full_name,
@@ -269,10 +287,10 @@ export function createLauncher(deps: LaunchDeps) {
         const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
         const originJob = origin ? await deps.store.getJob(origin.jobId) : null;
         // A failed read is retryable; a missing record is unknown, never evidence of API origin.
-        if (origin && !originJob && deps.native && matchesNativeRoute(deps.native.route, req.installationId, { ...d, label: origin.label })) {
-          return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this test repository pull request runtime' });
+        if (!originJob && (mode?.triggers !== undefined || triggers.some((t) => sameNativeRepository(t, d)))) {
+          return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this pull request runtime' });
         }
-        nativeOrigin = Boolean(originJob?.native);
+        workerId = originJob?.native?.workerId ?? workerId;
         if (origin?.label) {
           label = origin.label;
           // Only under the version active now, which this job runs: a republish may have changed
@@ -294,20 +312,28 @@ export function createLauncher(deps: LaunchDeps) {
     // The issue or pull request the job is for: refusals and over-quota comments name it.
     const number = (decision.issue ?? decision.pullRequest)!;
 
-    const candidate = deps.native && matchesNativeRoute(deps.native.route, req.installationId, decision) ? deps.native : undefined;
-    const native = candidate && (await candidate.enabled?.() ?? true) ? candidate : undefined;
-    // A subscription-originated review must not switch to API billing mid-workflow.
-    if (!isIssue && nativeOrigin && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'The subscription worker is disabled; reconnect it to continue this PR' });
-    // Without a kept origin we cannot distinguish this test repository's subscription PR
-    // from a BYOK workflow. Refuse rather than send its review/close to another runtime.
-    if (!isIssue && !decision.label && deps.native?.route.installationId === req.installationId && deps.native.route.repositoryId === decision.repositoryId) {
-      return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this test repository pull request workflow' });
-    }
+    const selected = isIssue && !req.retryRuntime && (mode?.triggers === undefined || decision.keys?.includes('ANTHROPIC_API_KEY')) && triggers.some((t) => sameNativeTrigger(t, decision));
+    const candidate = binding && (selected || workerId === binding.route.workerId) ? binding : undefined;
+    const native = candidate && (mode?.enabled ?? await candidate.enabled?.() ?? true) ? candidate : undefined;
+    if (req.resumeClaude && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'This workflow no longer uses Claude subscription routing' });
+    if (workerId && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'The subscription worker is disabled; reconnect it to continue this job' });
     const imageVersion = native?.route.imageVersion ?? await deps.imageVersion();
     if (!imageVersion) return skip('jobs_off');
     if (await killSwitch.engaged()) {
       log({ delivery: req.deliveryId, installationId: req.installationId, ignored: 'the kill switch is on' });
       return skip('kill_switch');
+    }
+
+    if (binding?.route.workerId.startsWith('managed-') && !req.resumeClaude && !req.retry) {
+      const jobId = await deps.parkedClaude?.(req);
+      if (jobId) return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Open the Claude sign-in request for this delivery', jobId };
+    }
+    if (native?.ready && !await native.ready()) {
+      if (native.route.workerId.startsWith('managed-') && decision.issue !== undefined && !req.resumeClaude && !req.retry && deps.waitForClaude) {
+        const jobId = await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue);
+        return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Waiting for Claude subscription sign-in', jobId };
+      }
+      return skip('not_dispatched', { reason: 'native_worker_unavailable', message: 'The Claude subscription worker is offline or needs sign-in. Reconnect it before retrying this delivery.' });
     }
 
     // Bring your own key (#64): the agents this trigger's workflows run need their keys set.
@@ -354,7 +380,9 @@ export function createLauncher(deps: LaunchDeps) {
 
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
-    const jobId = req.jobId ?? newJobId();
+    const jobId = req.jobId ?? (isIssue && native?.route.workerId.startsWith('managed-')
+      ? waitingId(req.installationId, req.deliveryId)
+      : newJobId());
     // Secret retrieval can fail transiently. Do it before claiming a delivery or quota,
     // so a failure leaves the event immediately retryable and owns no capacity.
     const token = native ? nativeJobToken(await native.secret(), jobId) : randomBytes(32).toString('base64url');
@@ -427,7 +455,7 @@ export function createLauncher(deps: LaunchDeps) {
       configVersion: tenant.activeConfigVersion,
       deliveryId: req.deliveryId,
       eventName,
-      ...(native ? { native: { workerId: native.route.workerId, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) } } : {}),
+      ...(native ? { native: { workerId: native.route.workerId, ...(native.route.generation ? { generation: native.route.generation } : {}), ...(mode?.routingVersion !== undefined ? { routingVersion: mode.routingVersion } : {}), ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) } } : {}),
       status: 'launched',
       createdAt: new Date(launchedAt).toISOString(),
       expiresAt: launchedAt + durationMs,

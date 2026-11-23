@@ -1,3 +1,4 @@
+import { waitingId } from '../native/sessions.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type DispatchRules, type Tenant } from '../store/store.js';
@@ -76,6 +77,69 @@ describe('the launcher', () => {
       log: () => {},
       retryDelayMs: 1,
     };
+  });
+
+  it('routes a console-selected Claude trigger without a stack repository and refuses offline fallback', async () => {
+    const version = await store.createConfigVersion(55, { sha256: 'y', files: [], publishedBy: 's', publishedAt: '',
+      dispatch: dispatchRules({ dispatch: { allowedActors: ['pat'] }, repositories: {
+        'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] },
+        'acme/docs': { id: 10, workflows: [{ trigger: { label: 'updraft' } }] },
+      } }, { keysFor: () => ['ANTHROPIC_API_KEY'] }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    const ready = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    deps.native = {
+      route: { installationId: 55, workerId: 'worker-1', microvmId: 'mvm-native', imageVersion: '7',
+        controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/test-abcdef' },
+      secret: async () => 'worker-control-credential-01234567890123456789',
+      mode: async () => ({ enabled: true, revision: 2, routingVersion: 1,
+        triggers: [{ repositoryId: 10, repository: 'acme/docs', label: 'updraft' }] }),
+      ready,
+    };
+    const launch = createLauncher(deps);
+    const event = request({ repository: { id: 10, full_name: 'acme/docs' } });
+    expect(await launch(event)).toMatchObject({ reason: 'native_worker_unavailable' });
+    const result = await launch(event);
+    expect(result).toMatchObject({ status: 202, disposition: 'launched' });
+    expect(await store.getJob(result.jobId!)).toMatchObject({ native: { workerId: 'worker-1', routingVersion: 1 } });
+    expect(await launch(request({}, 'unselected-delivery'))).toMatchObject({ reason: 'missing_key' });
+    expect(runs).toEqual([]);
+  });
+
+  it('parks a managed issue without reserving runtime, then resumes the same delivery on its own worker', async () => {
+    const config = dispatchRules({
+      dispatch: { allowedActors: ['pat'] },
+      repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
+    }, { keysFor: () => ['ANTHROPIC_API_KEY'] });
+    const version = await store.createConfigVersion(55, { sha256: 'park', files: [], publishedBy: 's', publishedAt: '', dispatch: config });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    const id = waitingId(55, 'delivery-1');
+    let connected = false;
+    let parked = false;
+    deps.resolveNative = async (tenantId) => tenantId === 55 ? {
+      route: { installationId: 55, workerId: 'managed-55', microvmId: 'mvm-native', imageVersion: '7', generation: 'session-a',
+        controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/root' },
+      secret: async () => 'scoped-worker-secret-01234567890',
+      mode: async () => ({ enabled: true, revision: 1, triggers: [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }] }),
+      ready: async () => connected,
+    } : undefined;
+    deps.waitForClaude = vi.fn(async () => { parked = true; return id; });
+    deps.parkedClaude = async () => parked ? id : undefined;
+    const reserve = vi.spyOn(store, 'reserveJob');
+    const launch = createLauncher(deps);
+    const event = request();
+    expect(await launch(event)).toMatchObject({ status: 202, reason: 'native_waiting_for_sign_in', jobId: id });
+    expect(await launch(event)).toMatchObject({ reason: 'native_waiting_for_sign_in', jobId: id });
+    expect(deps.waitForClaude).toHaveBeenCalledOnce();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(await store.getDeliveryClaim(55, event.deliveryId)).toBeNull();
+    connected = true;
+    expect(await launch(event)).toMatchObject({ reason: 'native_waiting_for_sign_in' });
+    expect(await launch({ ...event, resumeClaude: true, jobId: id })).toMatchObject({ disposition: 'launched', jobId: id });
+    expect(await store.getJob(id)).toMatchObject({ native: { workerId: 'managed-55', generation: 'session-a' } });
+    expect(reserve).toHaveBeenCalledOnce();
+    expect(runs).toEqual([]);
   });
 
   it('starts a job: the event under its tenant, a pinned job record, a version 2 run hook, and its microVM recorded', async () => {

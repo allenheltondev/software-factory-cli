@@ -59,6 +59,7 @@ describe('retrying a job (jobs/retry.ts)', () => {
       jobId: expect.stringMatching(/^job_[A-Za-z0-9_-]{16}$/),
       // The job requeues the event's failed job in the shared state before it runs.
       retry: true,
+      retryRuntime: {},
     });
     // The retry is on the original job: it is not offered again.
     expect((await store.getJobSummary(55, j.jobId))?.retriedAs).toBe('job_new000001');

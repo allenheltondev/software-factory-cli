@@ -4,14 +4,20 @@ import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { loadConfig } from './policy.mjs';
-import { startService } from './service.mjs';
+import { assertEphemeralHome, startService } from './service.mjs';
+import { startBrowserLogin } from './browser-login.mjs';
 import { startProbe } from './probe.mjs';
 import { cloudConfig, startCloudWorker } from './cloud.mjs';
 
 export function bootPayload(text) {
   const p = JSON.parse(text);
-  if (!p || Object.keys(p).filter((k) => k !== 'cloud').sort().join(',') !== 'accessPointId,fileSystemId' ||
-      !/^fs-[a-f0-9]{8,40}$/.test(p.fileSystemId) || !/^fsap-[a-f0-9]{8,40}$/.test(p.accessPointId)) throw new Error('invalid storage references');
+  if (!p || typeof p !== 'object') throw new Error('invalid storage references');
+  const fields = Object.keys(p).filter((key) => key !== 'cloud').sort().join(',');
+  const ephemeral = fields === 'storage' && p.storage === 'ephemeral';
+  const efs = fields === 'accessPointId,fileSystemId' &&
+    typeof p.fileSystemId === 'string' && /^fs-[a-f0-9]{8,40}$/.test(p.fileSystemId) &&
+    typeof p.accessPointId === 'string' && /^fsap-[a-f0-9]{8,40}$/.test(p.accessPointId);
+  if (!ephemeral && !efs) throw new Error('invalid storage references');
   if (p.cloud !== undefined) cloudConfig(p.cloud);
   return p;
 }
@@ -19,6 +25,7 @@ export function bootPayload(text) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let service;
   let probe;
+  let login;
   let cloud;
   let terminating = false;
   let started = false;
@@ -40,17 +47,24 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
             if (Buffer.byteLength(body) > 16384) throw new Error('oversized lifecycle request');
           }
           const lifecycle = JSON.parse(body);
-          const { fileSystemId, accessPointId, cloud: cloudSettings } = bootPayload(lifecycle.runHookPayload);
-          await new Promise((resolve, reject) => execFile('/bin/sh', ['/opt/updraft/native-worker/mount-home.sh', fileSystemId, accessPointId],
+          const { storage, fileSystemId, accessPointId, cloud: cloudSettings } = bootPayload(lifecycle.runHookPayload);
+          const ephemeral = storage === 'ephemeral';
+          const storageArgs = ephemeral ? ['--ephemeral'] : [fileSystemId, accessPointId];
+          await new Promise((resolve, reject) => execFile('/bin/sh', ['/opt/updraft/native-worker/mount-home.sh', ...storageArgs],
             { timeout: 45000, maxBuffer: 65536 }, (error) => error ? reject(error) : resolve()));
           const config = loadConfig('/etc/updraft-native-worker.json');
-          service = await startService(config);
-          try { probe = await startProbe(config); }
-          catch (error) { await service.close(); throw error; }
+          service = await startService(config, undefined, ephemeral ? assertEphemeralHome : undefined);
+          try {
+            probe = await startProbe(config);
+            if (ephemeral && cloudSettings) login = await startBrowserLogin(config);
+          } catch (error) { await probe?.close(); await service.close(); throw error; }
           if (cloudSettings) {
             try { cloud = await startCloudWorker(cloudSettings, lifecycle.microvmId, service); }
-            catch (error) { await probe.close(); await service.close(); throw error; }
+            catch (error) { login?.kill(); await probe.close(); await service.close(); throw error; }
           }
+          login?.once('exit', () => {
+            if (!terminating) { void cloud?.close(); void service.close(); }
+          });
           probe.child.once('exit', () => {
             if (!terminating) {
               console.error('Native worker probe listener exited; worker is unavailable.');
@@ -66,6 +80,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       if (route === '/aws/lambda-microvms/runtime/v1/terminate') {
         terminating = true;
         await cloud?.close();
+        login?.kill();
         await probe?.close();
         await service?.close();
         response.writeHead(200).end();
