@@ -464,6 +464,11 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:DeleteSecret
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/tenants/*
+            # ListSecrets does not support resource-level permissions; enumerate only the
+            # target tenant's named routine-trigger prefix in cleanup-lambda.ts.
+            - Effect: Allow
+              Action: secretsmanager:ListSecrets
+              Resource: '*'
             # Quota reconciliation: a job's capacity is freed once its microVM shows TERMINATED.
             - Effect: Allow
               Action: lambda:GetMicrovm
