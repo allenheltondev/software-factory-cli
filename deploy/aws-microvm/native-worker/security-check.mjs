@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Destructive only to a fresh /opt test fixture. Requires Linux root + bubblewrap.
+// Destructive only to a fresh /var/lib test fixture. Requires Linux root + bubblewrap.
 // Exercises the real supervisor, MCP transport, Unix accounts and namespace sandbox.
 // The Claude stand-in uses ONLY synthetic credentials. No user auth files are read.
 import assert from 'node:assert/strict';
@@ -12,7 +12,9 @@ import { randomUUID } from 'node:crypto';
 
 if (process.platform !== 'linux' || process.getuid() !== 0) throw new Error('Run this security check as Linux root; it must not be skipped');
 const source = path.dirname(fileURLToPath(import.meta.url));
-const fixture = fs.mkdtempSync('/opt/updraft-native-security-');
+// Hosted CI runners make /opt writable to the runner. Keep the installation beneath a
+// genuinely root-owned ancestor instead of weakening the production ownership check.
+const fixture = fs.mkdtempSync('/var/lib/updraft-native-security-');
 const marker = `synthetic-secret-${randomUUID()}`;
 const results = [];
 let service;
