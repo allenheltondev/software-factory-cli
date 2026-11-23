@@ -61,7 +61,7 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
           {load.message}
         </Alert>
       )}
-      {load.state === 'ok' && <Loaded job={load.job} deliveries={load.deliveries} conversation={load.conversation ?? []} api={api} installationId={installationId} />}
+      {load.state === 'ok' && <Loaded key={load.job.jobId} job={load.job} deliveries={load.deliveries} conversation={load.conversation ?? []} api={api} installationId={installationId} />}
     </div>
   );
 }
@@ -113,6 +113,9 @@ function Retry({ job, api, installationId }: { job: JobView; api: JobApi; instal
 
 function Loaded({ job, deliveries, conversation, api, installationId }: { job: JobView; deliveries: Delivery[]; conversation: JobView[]; api: JobApi; installationId: number }) {
   const r = JOB_RESULT[job.result];
+  const names = [...job.logs].sort((a, b) => (a === 'run.log' ? -1 : b === 'run.log' ? 1 : a.localeCompare(b)));
+  const [selectedLog, setSelectedLog] = useState<string>();
+  const logName = selectedLog && names.includes(selectedLog) ? selectedLog : (names[0] ?? '');
   return (
     <>
       <PageHero data-testid="job">
@@ -130,6 +133,11 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
           {job.sender && <PageHeroChip>By @{job.sender}</PageHeroChip>}
         </PageHeroChips>
         <div className="mt-4 flex flex-wrap gap-3 text-sm">
+          {job.logs.length > 0 && (
+            <a className="auth-link font-semibold" href="#job-logs" onClick={() => setSelectedLog(names[0])}>
+              {job.logs.includes('run.log') ? 'View run log' : 'View logs'}
+            </a>
+          )}
           {job.issueUrl && (
             <a className="auth-link" href={job.issueUrl} target="_blank" rel="noreferrer">
               Issue ↗
@@ -173,6 +181,8 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
         </CardBody>
       </Card>
 
+      {job.logs.length > 0 && <Logs job={job} api={api} installationId={installationId} names={names} name={logName} onSelect={setSelectedLog} />}
+
       <Card data-testid="job-lifecycle-card">
         <CardHeader>
           <CardTitle>Lifecycle</CardTitle>
@@ -207,7 +217,7 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
         </Card>
       )}
 
-      <Logs job={job} api={api} installationId={installationId} />
+      {job.logs.length === 0 && <Logs job={job} api={api} installationId={installationId} names={names} name={logName} onSelect={setSelectedLog} />}
     </>
   );
 }
@@ -443,10 +453,14 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
 
 const LOG_LABEL: Record<string, string> = { 'run.log': 'Agent transcript', 'updraft.log': 'Updraft log' };
 
-function Logs({ job, api, installationId }: { job: JobView; api: JobApi; installationId: number }) {
-  // The agent's transcript first: that is where a failure usually shows.
-  const names = [...job.logs].sort((a, b) => (a === 'run.log' ? -1 : b === 'run.log' ? 1 : a.localeCompare(b)));
-  const [name, setName] = useState(names[0] ?? '');
+function Logs({ job, api, installationId, names, name, onSelect }: {
+  job: JobView;
+  api: JobApi;
+  installationId: number;
+  names: string[];
+  name: string;
+  onSelect: (name: string) => void;
+}) {
   // Which log the loaded state is for: another one selected is loading until its answer arrives.
   const [loaded, setLoaded] = useState<{ name: string; load: LogLoad } | null>(null);
   const log: LogLoad = loaded && loaded.name === name ? loaded.load : { state: 'loading' };
@@ -512,10 +526,10 @@ function Logs({ job, api, installationId }: { job: JobView; api: JobApi; install
   };
 
   return (
-    <Card data-testid="job-logs">
+    <Card id="job-logs" tabIndex={-1} className="scroll-mt-20" data-testid="job-logs">
       <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <CardTitle>Logs</CardTitle>
-        {names.length > 1 && <SegmentedControl aria-label="Log" value={name} onChange={setName} options={names.map((n) => ({ value: n, label: LOG_LABEL[n] ?? n }))} />}
+        {names.length > 1 && <SegmentedControl aria-label="Log" value={name} onChange={onSelect} options={names.map((n) => ({ value: n, label: LOG_LABEL[n] ?? n }))} />}
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
         {log.state === 'loading' && <Skeleton className="h-64" data-testid="log-loading" />}

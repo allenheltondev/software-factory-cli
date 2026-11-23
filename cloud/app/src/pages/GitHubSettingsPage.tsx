@@ -14,7 +14,7 @@ import {
 } from '@readysetcloud/ui';
 import { api as defaultApi, type ApiClient, type GitHubStatus, type Me, type TenantSummary } from '../api/client';
 
-type DashboardApi = Pick<ApiClient, 'me' | 'githubStatus' | 'startLink' | 'unlink' | 'startInstall'>;
+type GitHubSettingsApi = Pick<ApiClient, 'me' | 'githubStatus' | 'startLink' | 'unlink' | 'startInstall'>;
 
 type Load = { state: 'loading' } | { state: 'ok'; me: Me; github: GitHubStatus } | { state: 'error' };
 
@@ -30,11 +30,10 @@ export function tenantStatusLabel(t: Pick<TenantSummary, 'status' | 'disabledRea
 }
 
 /**
- * The first page after sign-in: who you are, your linked GitHub identity, and the installations
- * of the Updraft App you manage. Linking and installing leave for github.com and come back to
+ * Manage your GitHub identity and Updraft App installations. Linking and installing leave for github.com and come back to
  * /github/callback.
  */
-export function DashboardPage({ api = defaultApi, go = leave }: { api?: DashboardApi; go?: Go }) {
+export function GitHubSettingsPage({ api = defaultApi, go = leave }: { api?: GitHubSettingsApi; go?: Go }) {
   const [load, setLoad] = useState<Load>({ state: 'loading' });
   const [busy, setBusy] = useState<'link' | 'install' | 'unlink' | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -81,21 +80,21 @@ export function DashboardPage({ api = defaultApi, go = leave }: { api?: Dashboar
     <div className="flex flex-col gap-6">
       <header className="flex flex-col gap-1">
         <h1 className="text-2xl font-semibold">
-          {load.state === 'ok' && load.me.name ? `Welcome, ${load.me.name}` : 'Welcome to Updraft'}
+          GitHub settings
         </h1>
         <p className="text-muted-foreground">
-          Label a GitHub issue and Updraft hands it to a coding agent that opens a draft pull request.
+          Connect your GitHub account and manage where Updraft can run.
         </p>
       </header>
 
-      {load.state === 'loading' && <Skeleton className="h-24" data-testid="dashboard-loading" />}
+      {load.state === 'loading' && <Skeleton className="h-24" data-testid="github-settings-loading" />}
       {load.state === 'error' && (
-        <Alert variant="error" data-testid="dashboard-error">
+        <Alert variant="error" data-testid="github-settings-error">
           Updraft could not load your account. Reload the page to try again.
         </Alert>
       )}
       {actionError && (
-        <Alert variant="error" data-testid="dashboard-action-error">
+        <Alert variant="error" data-testid="github-settings-action-error">
           {actionError}
         </Alert>
       )}
@@ -107,7 +106,7 @@ export function DashboardPage({ api = defaultApi, go = leave }: { api?: Dashboar
       )}
 
       {load.state === 'ok' && load.github.configured && (
-        <Card data-testid="dashboard-ready">
+        <Card data-testid="github-settings-ready">
           <CardHeader>
             <CardTitle>GitHub</CardTitle>
             <CardDescription>

@@ -74,7 +74,7 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
     };
   }, [refresh, valid]);
 
-  const running = load.state === 'ok' ? load.overview.activity.running : 0;
+  const running = tab !== 'repositories' && load.state === 'ok' ? load.overview.activity.running : 0;
   useEffect(() => {
     if (!running) return;
     const timer = setInterval(() => void refresh(), refreshMs);
@@ -83,9 +83,6 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
 
   return (
     <div className="flex flex-col gap-6">
-      <Link className="auth-link" to="/">
-        ← Dashboard
-      </Link>
       {load.state === 'loading' && (
         <div className="flex flex-col gap-4" data-testid="installation-loading">
           <Skeleton className="h-32" />
@@ -102,35 +99,61 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
         </Alert>
       )}
       {load.state === 'ok' && (
-        <Loaded
-          load={load}
-          tab={tab}
-          onTab={(t) => setParams(t === 'jobs' ? {} : { tab: t }, { replace: true })}
-          onRefresh={() => void refresh()}
-          refreshing={refreshing}
-          checkedAt={checkedAt}
-        />
+        tab === 'repositories' ? (
+          <RepositoryView overview={load.overview} onRefresh={() => void refresh()} refreshing={refreshing} />
+        ) : (
+          <ActivityView
+            overview={load.overview}
+            jobs={load.jobs}
+            deliveries={load.deliveries}
+            tab={tab}
+            onTab={(t) => setParams(t === 'jobs' ? {} : { tab: t }, { replace: true })}
+            onRefresh={() => void refresh()}
+            refreshing={refreshing}
+            checkedAt={checkedAt}
+          />
+        )
       )}
     </div>
   );
 }
 
-function Loaded({
-  load,
-  tab,
-  onTab,
-  onRefresh,
-  refreshing,
-  checkedAt,
-}: {
-  load: Extract<Load, { state: 'ok' }>;
-  tab: Tab;
-  onTab: (t: Tab) => void;
+function RepositoryView({ overview, onRefresh, refreshing }: { overview: Overview; onRefresh: () => void; refreshing: boolean }) {
+  const base = `/installations/${overview.tenant.installationId}`;
+  return (
+    <>
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold">Repositories</h1>
+          <p className="text-muted-foreground">{overview.tenant.accountLogin}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <a className="auth-link text-sm" href={installationSettingsUrl(overview.tenant)} target="_blank" rel="noreferrer">
+            Manage GitHub access ↗
+          </a>
+          <Button variant="ghost" onClick={onRefresh} loading={refreshing} aria-label="Refresh repositories">
+            Refresh
+          </Button>
+        </div>
+      </header>
+      <Card>
+        <CardBody>
+          <RepositoriesList repositories={overview.repositories} base={base} />
+        </CardBody>
+      </Card>
+    </>
+  );
+}
+
+function ActivityView({
+  overview, jobs, deliveries, tab, onTab, onRefresh, refreshing, checkedAt,
+}: Omit<Extract<Load, { state: 'ok' }>, 'state'> & {
+  tab: Exclude<Tab, 'repositories'>;
+  onTab: (tab: Exclude<Tab, 'repositories'>) => void;
   onRefresh: () => void;
   refreshing: boolean;
   checkedAt: number | null;
 }) {
-  const { overview, jobs, deliveries } = load;
   const t = overview.tenant;
   const status = INSTALLATION[overview.installation.status];
   const base = `/installations/${t.installationId}`;
@@ -141,6 +164,8 @@ function Loaded({
   const deliveryTotal = Object.values(overview.activity.deliveries).reduce((n, v) => n + (v ?? 0), 0);
   const steps = setupSteps(overview, base);
   const inSetup = !setupComplete(steps);
+  const runningJobs = jobs.filter((job) => job.result === 'running');
+  const recentJobs = jobs.filter((job) => job.result !== 'running');
 
   return (
     <>
@@ -155,21 +180,6 @@ function Loaded({
           {overview.activity.running > 0 && <PageHeroChip tone="primary">{overview.activity.running === 1 ? '1 job running' : `${overview.activity.running} jobs running`}</PageHeroChip>}
         </PageHeroChips>
         <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
-          <Link className="auth-link font-semibold" to={`${base}/insights`} data-testid="insights-link">
-            Insights
-          </Link>
-          <Link className="auth-link" to={`${base}/config`} data-testid="configure-link">
-            Configure
-          </Link>
-          <Link className="auth-link" to={`${base}/keys`} data-testid="keys-link">
-            Agent keys
-          </Link>
-          <Link className="auth-link" to={`${base}/routines`} data-testid="routines-link">
-            Claude scheduled tasks
-          </Link>
-          <Link className="auth-link" to={`${base}/telemetry`} data-testid="telemetry-link">
-            Agent telemetry
-          </Link>
           <a className="auth-link" href={installationSettingsUrl(t)} target="_blank" rel="noreferrer">
             Installation on GitHub ↗
           </a>
@@ -182,9 +192,41 @@ function Loaded({
         </div>
       </PageHero>
 
+      <Attention overview={overview} base={base} skip={inSetup ? SETUP_COVERS : NONE} />
+
       <SetupChecklist steps={steps} />
 
-      <Attention overview={overview} base={base} skip={inSetup ? SETUP_COVERS : NONE} />
+      {runningJobs.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Running jobs</CardTitle>
+          </CardHeader>
+          <CardBody>
+            <JobsList jobs={runningJobs} base={base} />
+          </CardBody>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
+          <CardTitle>Recent activity</CardTitle>
+          <SegmentedControl<Exclude<Tab, 'repositories'>>
+            aria-label="Show"
+            value={tab}
+            onChange={onTab}
+            options={[
+              { value: 'jobs', label: `Jobs (${recentJobs.length})` },
+              { value: 'deliveries', label: `Deliveries (${deliveries.length})` },
+            ]}
+          />
+        </CardHeader>
+        <CardBody>
+          {tab === 'jobs' && (recentJobs.length === 0 && runningJobs.length > 0
+            ? <EmptyState title="No finished jobs yet" description="Running jobs appear above until they finish." />
+            : <JobsList jobs={recentJobs} base={base} />)}
+          {tab === 'deliveries' && <DeliveriesList deliveries={deliveries} base={base} />}
+        </CardBody>
+      </Card>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" data-testid="stats">
         <StatTile
@@ -209,27 +251,6 @@ function Loaded({
           meta={finished === 0 ? `${deliveryTotal} deliveries, no jobs finished yet` : `succeeded, of ${finished} finished`}
         />
       </div>
-
-      <Card>
-        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-          <CardTitle>Activity</CardTitle>
-          <SegmentedControl<Tab>
-            aria-label="Show"
-            value={tab}
-            onChange={onTab}
-            options={[
-              { value: 'jobs', label: `Jobs (${jobs.length})` },
-              { value: 'deliveries', label: `Deliveries (${deliveries.length})` },
-              { value: 'repositories', label: `Repositories (${overview.repositories.length})` },
-            ]}
-          />
-        </CardHeader>
-        <CardBody>
-          {tab === 'jobs' && <JobsList jobs={jobs} base={base} />}
-          {tab === 'deliveries' && <DeliveriesList deliveries={deliveries} base={base} />}
-          {tab === 'repositories' && <RepositoriesList repositories={overview.repositories} base={base} />}
-        </CardBody>
-      </Card>
     </>
   );
 }
@@ -317,7 +338,7 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
     return <EmptyState title="No jobs yet" description="Label an issue in a configured repository with one of its trigger labels, and the job shows up here." />;
   }
   return (
-    <ul className="flex flex-col divide-y divide-border" data-testid="job-list">
+    <ul className="flex flex-col divide-y divide-border" aria-label="Jobs">
       {jobs.map((j) => {
         const r = JOB_RESULT[j.result];
         return (
@@ -328,6 +349,11 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
               {j.issue !== undefined ? `#${j.issue}` : j.pullRequest !== undefined ? `#${j.pullRequest}` : ''}
             </Link>
             {j.pullRequest !== undefined && <StatusBadge tone="neutral">Review loop</StatusBadge>}
+            {j.issueUrl && (
+              <a className="auth-link text-sm" href={j.issueUrl} target="_blank" rel="noreferrer">
+                Issue ↗
+              </a>
+            )}
             {j.prUrl && (
               <a className="auth-link text-sm" href={j.prUrl} target="_blank" rel="noreferrer">
                 Pull request ↗

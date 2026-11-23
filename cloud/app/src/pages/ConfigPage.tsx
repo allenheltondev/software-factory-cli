@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { Alert, Button, Modal, Skeleton, StatusBadge } from '@readysetcloud/ui';
 import { api as defaultApi, ApiError, ConfigInvalidError, type ApiClient, type ConfigIssue, type ConfigView, type ConsoleConfig } from '../api/client';
-import { tenantStatusLabel } from './DashboardPage';
+import { tenantStatusLabel } from './GitHubSettingsPage';
 import { ConfigEditor } from './config/Editor';
 import { AGENT_LABEL, KEY_FOR, keysNeeded, sectionOf, type Section } from './config/model';
 import { isSimple, SimpleConfig, simpleBlockers } from './config/Simple';
@@ -363,7 +363,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                   </span>
                 ) : (
                   <span data-testid="draft-state" className={dirty && activeVersion !== null ? 'font-medium' : 'text-muted-foreground'}>
-                    {activeVersion === null ? 'Ready to publish' : dirty ? 'Unsaved changes' : `Version ${activeVersion} is active`}
+                    {activeVersion === null ? 'Draft · no live version' : dirty ? `Unsaved changes · version ${activeVersion} is live` : `Version ${activeVersion} is active`}
                   </span>
                 )}
               </span>

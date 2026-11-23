@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router';
-import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Modal, Skeleton, StatusBadge } from '@readysetcloud/ui';
+import { Alert, Button, Card, CardBody, EmptyState, Modal, Skeleton, StatusBadge } from '@readysetcloud/ui';
 import { api as defaultApi, ApiError, ConfigInvalidError, type ApiClient, type VersionSummary } from '../api/client';
 import { hasChanges, lineDiff, type DiffLine } from '../lib/diff';
 
@@ -95,6 +95,10 @@ export function ConfigHistoryPage({ api = defaultApi }: { api?: HistoryApi }) {
       <Link className="auth-link" to={`/installations/${installationId}/config`}>
         ← Configuration
       </Link>
+      <header>
+        <h1 className="text-2xl font-semibold">Version history</h1>
+        <p className="text-muted-foreground">Re-activating a version publishes a copy. Running jobs keep the version they started with.</p>
+      </header>
       {load.state === 'loading' && <Skeleton className="h-24" />}
       {load.state === 'error' && (
         <Alert variant="error" data-testid="history-error">
@@ -114,13 +118,6 @@ export function ConfigHistoryPage({ api = defaultApi }: { api?: HistoryApi }) {
 
       {load.state === 'ok' && (
         <Card>
-          <CardHeader>
-            <CardTitle>Version history</CardTitle>
-            <CardDescription>
-              Every published version, newest first. Re-activating one publishes a copy of it as a new version; a running job keeps the version it
-              started with.
-            </CardDescription>
-          </CardHeader>
           <CardBody>
             {load.versions.length === 0 ? (
               <EmptyState title="Nothing published yet" description="Versions appear here once you publish the configuration." />

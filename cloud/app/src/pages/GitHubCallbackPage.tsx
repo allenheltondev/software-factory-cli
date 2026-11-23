@@ -85,7 +85,7 @@ export function GitHubCallbackPage({ api = defaultApi }: { api?: Pick<ApiClient,
   const [input] = useState(() => callbackInput(location.search));
   const sent = useRef(false);
   const [view, setView] = useState<View>(() =>
-    input.state ? { state: 'working' } : { state: 'error', message: 'This link did not come from Updraft. Start again from the dashboard.' },
+    input.state ? { state: 'working' } : { state: 'error', message: 'This link did not come from Updraft. Start again from GitHub settings.' },
   );
 
   useEffect(() => {
@@ -126,7 +126,7 @@ export function GitHubCallbackPage({ api = defaultApi }: { api?: Pick<ApiClient,
           <Alert variant="success" data-testid="callback-installed">
             Connected {view.result.accountLogin}.{' '}
             <Link className="auth-link" to={`/installations/${view.result.installationId}`}>
-              See its repositories
+              Open installation
             </Link>
           </Alert>
         )}
@@ -136,8 +136,8 @@ export function GitHubCallbackPage({ api = defaultApi }: { api?: Pick<ApiClient,
           </Alert>
         )}
         {view.state !== 'working' && (
-          <Link className="auth-link" to="/">
-            Back to the dashboard
+          <Link className="auth-link" to="/settings/github">
+            Back to GitHub settings
           </Link>
         )}
       </CardBody>
