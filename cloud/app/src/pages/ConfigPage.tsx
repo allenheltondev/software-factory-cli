@@ -245,6 +245,16 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
           Version {view.activeVersion} was published with tenant-admin. The editor starts from the defaults, and publishing from here replaces it.
         </Alert>
       )}
+      {(view.notices ?? []).length > 0 && (
+        <Alert variant="info" data-testid="config-notices">
+          <p className="font-medium">These settings were made with an earlier version of this page. Check before you publish:</p>
+          <ul className="mt-2 list-disc pl-5">
+            {view.notices!.map((n) => (
+              <li key={n}>{n}</li>
+            ))}
+          </ul>
+        </Alert>
+      )}
       {conflict && (
         <Alert variant="info" data-testid="config-conflict">
           <div className="flex flex-wrap items-center justify-between gap-2">

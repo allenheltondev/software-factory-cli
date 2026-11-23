@@ -181,8 +181,13 @@ describe('the simple page', () => {
   });
 
   it('shows an agent without a key disabled, says why, and takes the key from its info icon', async () => {
+    // As the server starts a new installation: Codex, without its key, is on the roster and in no pool.
+    const config = baseConfig();
+    config.agents.codex!.enabled = false;
+    config.pools = { builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } };
+    config.workflows.implement!.review.allowSameAgent = true;
     const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: true, required: true }], refusals: [] });
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(2) });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(1) });
     configPage(api);
     const codex = await screen.findByTestId('coding-codex');
     for (const row of [codex, screen.getByTestId('review-codex')]) {
@@ -195,8 +200,6 @@ describe('the simple page', () => {
     expect(screen.queryByText('No key')).toBeNull();
     const info = within(codex).getByRole('button', { name: 'Why Codex cannot be used' });
     expect(info).toHaveAccessibleDescription('Add your OpenAI Platform API key to use Codex. Click to add it.');
-    // The draft no longer runs Codex, so nothing blocks a publish.
-    expect(screen.queryByTestId('blockers')).toBeNull();
 
     await userEvent.click(info);
     await userEvent.type(within(codex).getByLabelText(/OpenAI Platform API key/), 'sk-proj-abc');
@@ -205,21 +208,43 @@ describe('the simple page', () => {
     // With its key, Codex codes and reviews, as the defaults have it.
     await waitFor(() => expect(within(codex).getByRole('checkbox', { name: 'Codex' })).toBeChecked());
     expect(within(screen.getByTestId('review-codex')).getByRole('checkbox', { name: 'Codex' })).toBeChecked();
-    expect(within(codex).queryByTestId('inline-key-codex')).toBeNull();
-    // Back to exactly what is published: nothing to publish.
-    expect(screen.getByTestId('draft-state')).toHaveTextContent('Version 1 is active');
-    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
-  });
-
-  it('publishes without an agent whose key is missing', async () => {
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), publishConfig: publishedOk(1) });
-    configPage(api);
-    await userEvent.click(await screen.findByRole('checkbox', { name: 'Work in acme/web' }));
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Work in acme/web' }));
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     const sent = sentConfig(api);
-    expect(sent.agents.codex).toEqual({ adapter: 'codex', enabled: false });
-    expect(sent.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } });
-    expect(sent.workflows.implement!.review.allowSameAgent).toBe(true);
+    expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['claude', 'codex'] } });
+    expect(sent.workflows.implement!.review.allowSameAgent).toBe(false);
+  });
+
+  it('never changes a published review policy because a key went missing: the person adds it back or unticks it', async () => {
+    // Codex builds; Claude is the only reviewer; Claude's key has been deleted since.
+    const config = withRepo();
+    config.pools = { builders: { agents: ['codex'] }, reviewers: { agents: ['claude'] } };
+    config.workflows.implement!.review.allowSameAgent = true;
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config, agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } })), publishConfig: publishedOk(2) });
+    configPage(api);
+    const claude = await screen.findByTestId('review-claude');
+    const box = within(claude).getByRole('checkbox', { name: 'Claude Code' });
+    expect(box).toBeChecked();
+    expect(box).toBeEnabled();
+    expect(within(claude).getByRole('button', { name: 'Why Claude Code cannot be used' })).toHaveAccessibleDescription(/was removed. Add it again, or untick Claude Code/);
+    // Nothing in the draft changed by itself; the bar says what the person has to decide.
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Add the key for Claude Code, or untick it.');
+
+    // An unrelated edit cannot be published while the reviewer has no key.
+    await userEvent.type(within(screen.getByTestId('repo-acme/web')).getByLabelText('Checks'), 'npm test');
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Add the key for Claude Code, or untick it.');
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+
+    // Turning review off is the person's choice, and then it publishes.
+    await userEvent.click(box);
+    expect(screen.getByText(/No review: pull requests wait for a person/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).workflows.implement!.review.enabled).toBe(false);
+  });
+
+  it('shows what an upgrade from the first console could not keep', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ notices: ["acme/web ran implement and docs with different checks. It now has one list, implement's: check it before you publish."] })) }));
+    expect(await screen.findByTestId('config-notices')).toHaveTextContent('acme/web ran implement and docs with different checks');
   });
 
   it('changes an agent model, and keeps repository extras behind its settings', async () => {

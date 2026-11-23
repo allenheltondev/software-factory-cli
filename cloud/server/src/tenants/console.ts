@@ -36,8 +36,16 @@ import { DEFAULT_PROMPTS } from './default-prompts.js';
  * Names have no "." in them, so `W.2` can never be another workflow's action.
  *
  * Version 1 settings (one agent and one reviewer per workflow, labels and actors per repository)
- * are upgraded on read (`upgradeV1`), so a version published with them loads in the editor and
- * re-activates as it ran.
+ * are upgraded on read (`upgradeV1`) for the editor. Re-activating a version published with them
+ * compiles them with the version 1 compiler instead (console-v1.ts), exactly as they ran.
+ *
+ * Jobs and pull requests already in flight keep references into the config they started under:
+ * a job and a pull request store their workflow id (`<action>:<label>` unless set), action and
+ * pool, and a revision runs with the action and pool of the job that opened the pull request.
+ * So an upgraded configuration stays compatible with them once published (`legacy`): each
+ * repository workflow keeps its version 1 id, each workflow's own action keeps its name and, for
+ * the first repository that runs it, its verify commands, and the version 1 pool names resolve
+ * to the pools that replaced them.
  */
 
 export const CONSOLE_VERSION = 2;
@@ -137,6 +145,14 @@ export interface ConsoleRepository {
   autoMerge?: ConsoleAutoMerge;
 }
 
+/** What an upgrade from version 1 keeps resolvable for work in flight (see the top of this file). */
+export interface ConsoleLegacy {
+  /** A version 1 pool name (`W`, `W.review`) -> the pool that replaced it. */
+  pools: Record<string, string>;
+  /** A workflow -> the version 1 workflow (action) it came from: its workflow ids are `<that>:<label>`. */
+  workflows: Record<string, string>;
+}
+
 export interface ConsoleConfig {
   version: typeof CONSOLE_VERSION;
   agents: Record<string, ConsoleAgent>;
@@ -146,6 +162,8 @@ export interface ConsoleConfig {
   workflows: Record<string, ConsoleWorkflow>;
   /** By OWNER/REPO. */
   repositories: Record<string, ConsoleRepository>;
+  /** Present only on settings upgraded from version 1. */
+  legacy?: ConsoleLegacy;
 }
 
 /** Agent, pool and workflow names. */
@@ -157,6 +175,8 @@ const REPO_NAME = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/;
 const BRANCH = /^[^\s~^:?*[\\]+$/;
 const TOKEN = /^[A-Za-z0-9._:/-]+$/;
+/** A CLI pool, agent or action name (version 1 names have "." in them). */
+const CLI_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export const BUILDERS = 'builders';
 export const REVIEWERS = 'reviewers';
@@ -167,12 +187,15 @@ export const REVIEWERS = 'reviewers';
  * `updraft`, whose pull requests the reviewers review and the builders revise. With a single
  * agent, it may review its own work (there is no other).
  */
-export function defaultConsoleConfig(options: { offered?: readonly CloudAgent[]; login?: string } = {}): ConsoleConfig {
+export function defaultConsoleConfig(options: { offered?: readonly CloudAgent[]; login?: string; keys?: ReadonlySet<string> } = {}): ConsoleConfig {
   const offered = options.offered?.length ? options.offered : CONSOLE_AGENTS.length ? CONSOLE_AGENTS : (['claude'] as CloudAgent[]);
-  const names = [...offered];
+  // With the tenant's keys known, the pools start with the agents that can run: one without its
+  // key is on the roster, off, until the key is added.
+  const runs = (a: CloudAgent) => !options.keys || options.keys.has(SUPPORTED_AGENT_KEY_ENV[a]);
+  const names = offered.filter(runs);
   return {
     version: CONSOLE_VERSION,
-    agents: Object.fromEntries(names.map((a) => [a, { adapter: a, enabled: true }])),
+    agents: Object.fromEntries(offered.map((a) => [a, { adapter: a, enabled: runs(a) }])),
     pools: { [BUILDERS]: { agents: [...names] }, [REVIEWERS]: { agents: [...names] } },
     allowedActors: options.login ? [options.login] : [],
     workflows: {
@@ -287,7 +310,28 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
   const c: Check = { errors: [], err: (path, message) => c.errors.push({ path, message }) };
   if (!isObject(input)) return { ok: false, errors: [{ path: '(root)', message: 'the settings must be a mapping' }] };
   const raw = input.version === 1 ? upgradeV1(input) : input;
-  only(c, '', raw, ['version', 'agents', 'pools', 'allowedActors', 'workflows', 'repositories']);
+  only(c, '', raw, ['version', 'agents', 'pools', 'allowedActors', 'workflows', 'repositories', 'legacy']);
+  let legacy: ConsoleLegacy | undefined;
+  if (raw.legacy !== undefined) {
+    const l = isObject(raw.legacy) ? raw.legacy : {};
+    if (!isObject(raw.legacy)) c.err('legacy', 'must be a mapping');
+    only(c, 'legacy', l, ['pools', 'workflows']);
+    const map = (key: 'pools' | 'workflows') => {
+      const v = l[key];
+      if (v === undefined) return {};
+      if (!isObject(v)) {
+        c.err(`legacy.${key}`, 'must be a mapping');
+        return {};
+      }
+      const out: Record<string, string> = {};
+      for (const [k, to] of Object.entries(v)) {
+        if (!CLI_NAME.test(k) || typeof to !== 'string' || !CLI_NAME.test(to)) c.err(`legacy.${key}.${k}`, 'not a name');
+        else out[k] = to;
+      }
+      return out;
+    };
+    legacy = { pools: map('pools'), workflows: map('workflows') };
+  }
   if (raw.version !== CONSOLE_VERSION) c.err('version', `must be ${CONSOLE_VERSION}`);
 
   // Agents.
@@ -354,7 +398,10 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
   else {
     const list = Object.entries(raw.workflows);
     if (list.length === 0) c.err('workflows', 'add at least one workflow');
-    if (list.length > CONSOLE_LIMITS.workflows) c.err('workflows', `at most ${CONSOLE_LIMITS.workflows} workflows`);
+    // A workflow an upgrade split off a version 1 one (on another label, or with other review
+    // settings) does not count: the version 1 settings were within their own limits.
+    const split = (n: string) => legacy?.workflows[n] !== undefined && legacy.workflows[n] !== n;
+    if (list.filter(([n]) => !split(n)).length > CONSOLE_LIMITS.workflows) c.err('workflows', `at most ${CONSOLE_LIMITS.workflows} workflows`);
     for (const [name, w] of list) {
       const path = `workflows.${name}`;
       if (!NAME.test(name)) c.err(path, `a workflow name is ${NAME_RULE}`);
@@ -478,7 +525,7 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
   }
 
   if (c.errors.length) return { ok: false, errors: c.errors };
-  const config: ConsoleConfig = { version: CONSOLE_VERSION, agents, pools, allowedActors, workflows, repositories };
+  const config: ConsoleConfig = { version: CONSOLE_VERSION, agents, pools, allowedActors, workflows, repositories, ...(legacy ? { legacy } : {}) };
   checkMeaning(config, c);
   if (c.errors.length) return { ok: false, errors: c.errors };
   return { ok: true, config };
@@ -565,6 +612,8 @@ function upgradeV1(raw: Record<string, unknown>): Record<string, unknown> {
   };
   const pools: Record<string, { agents: string[] }> = {};
   const byPool = new Map<string, string>();
+  const legacyPools: Record<string, string> = {};
+  const legacyWorkflows: Record<string, string> = {};
   const poolFor = (role: 'builders' | 'reviewers', agent: string) => {
     const key = `${role}\0${agent}`;
     const hit = byPool.get(key);
@@ -579,10 +628,14 @@ function upgradeV1(raw: Record<string, unknown>): Record<string, unknown> {
   const workflows: Record<string, Record<string, unknown>> = {};
   const groups = new Map<string, string>();
   const taken = (n: string) => Object.hasOwn(workflows, n) || Object.hasOwn(v1Workflows, n);
-  const build = (w: Record<string, unknown>, label: string, review: boolean, revise: boolean, maxRevisions: unknown) => {
+  const build = (v1Name: string, name: string, w: Record<string, unknown>, label: string, review: boolean, revise: boolean, maxRevisions: unknown) => {
     const builder = agentFor(w.agent);
     const reviewerAgent = agentFor(w.reviewer);
     const reviewer = isObject(w.reviewer) ? w.reviewer : {};
+    // The version 1 pools of this workflow, as stored by its jobs and pull requests.
+    legacyPools[v1Name] = poolFor('builders', builder);
+    legacyPools[`${v1Name}.review`] = poolFor('reviewers', reviewerAgent);
+    legacyWorkflows[name] = v1Name;
     return {
       label,
       pool: poolFor('builders', builder),
@@ -615,7 +668,7 @@ function upgradeV1(raw: Record<string, unknown>): Record<string, unknown> {
       if (!name) {
         name = [...groups.keys()].some((k) => JSON.parse(k)[0] === t.workflow) ? unique(t.workflow, taken) : t.workflow;
         groups.set(key, name);
-        workflows[name] = build(w, typeof t.label === 'string' ? t.label : '', r.review === true, r.revise === true, r.maxRevisions);
+        workflows[name] = build(t.workflow, name, w, typeof t.label === 'string' ? t.label : '', r.review === true, r.revise === true, r.maxRevisions);
       }
       if (!runs.includes(name)) runs.push(name);
     }
@@ -640,9 +693,9 @@ function upgradeV1(raw: Record<string, unknown>): Record<string, unknown> {
     if (Object.hasOwn(workflows, name) || !isObject(w)) continue;
     if ([...groups.keys()].some((k) => JSON.parse(k)[0] === name)) continue;
     const labels = new Set(Object.values(workflows).map((x) => String(x.label).toLowerCase()));
-    workflows[name] = build(w, labels.has('updraft') ? name : 'updraft', false, false, undefined);
+    workflows[name] = build(name, name, w, labels.has('updraft') ? name : 'updraft', false, false, undefined);
   }
-  return { version: CONSOLE_VERSION, agents, pools, allowedActors: actors ?? [], workflows, repositories };
+  return { version: CONSOLE_VERSION, agents, pools, allowedActors: actors ?? [], workflows, repositories, legacy: { pools: legacyPools, workflows: legacyWorkflows } };
 }
 
 /** What each enabled repository's workflows can start: pools, and whether they review. */
@@ -679,31 +732,72 @@ export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): C
   return out;
 }
 
-/** The compiled action of each workflow and repository: `W` without verify commands, `W.2`, ... with. */
+/** One compiled action: whose prompts it runs, the repository whose verify commands it carries. */
+interface ActionSpec {
+  /** The workflow it belongs to: its prompt and time limit, and where an issue about it is shown. */
+  workflow: string;
+  /** The first repository whose verify commands it carries; absent when none does. */
+  repo?: string;
+  verify: string[];
+  verifyTimeoutMinutes?: number;
+  /** The workflow whose review prompt it carries, when one that uses it reviews. */
+  reviewFrom?: string;
+  /** The workflow whose revision prompt it carries, when one that uses it revises. */
+  reviseFrom?: string;
+  /** The version 1 name it shares with the workflows split from it (legacy), else the workflow's. */
+  base: string;
+}
+
+/**
+ * The compiled actions, and which one each repository's workflow runs. A workflow's action is
+ * named after it; a repository whose verify commands differ from the first one's gets an action
+ * of its own (`W.2`, ...).
+ *
+ * An upgraded workflow runs the action named after the version 1 workflow it came from (its
+ * `base`), and so do the workflows split from it, as long as what they run is the same (prompts,
+ * time limit, verify commands): the version 1 workflow id is `<action>:<label>`, and the jobs and
+ * pull requests opened under it stored that id and that action. Review and revision prompts only
+ * need to agree among the workflows that use them.
+ */
 function actionLayout(config: ConsoleConfig) {
-  const byKey = new Map<string, string>();
-  /** action -> the workflow, and the first repository whose verify commands it carries. */
-  const actions = new Map<string, { workflow: string; repo?: string; verify: string[]; verifyTimeoutMinutes?: number }>();
+  const actions = new Map<string, ActionSpec>();
   const of = new Map<string, string>();
-  for (const name of Object.keys(config.workflows)) actions.set(name, { workflow: name, verify: [] });
-  for (const [fullName, r] of Object.entries(config.repositories)) {
-    for (const w of r.workflows) {
-      if (!r.verify.length) {
-        of.set(`${fullName}\0${w}`, w);
-        continue;
-      }
-      const key = JSON.stringify([w, r.verify, r.verifyTimeoutMinutes ?? null]);
-      let action = byKey.get(key);
-      if (!action) {
+  const baseOf = (n: string) => config.legacy?.workflows[n] ?? n;
+
+  const fits = (a: ActionSpec, n: string, verify: string[], verifyTimeoutMinutes: number | undefined) => {
+    const w = config.workflows[n]!;
+    const owner = config.workflows[a.workflow]!;
+    if (a.base !== baseOf(n) || owner.prompt !== w.prompt || owner.timeoutMinutes !== w.timeoutMinutes) return false;
+    if (JSON.stringify(a.verify) !== JSON.stringify(verify) || a.verifyTimeoutMinutes !== verifyTimeoutMinutes) return false;
+    if (w.review.enabled && a.reviewFrom && config.workflows[a.reviewFrom]!.review.prompt !== w.review.prompt) return false;
+    if (w.revise.enabled && a.reviseFrom && config.workflows[a.reviseFrom]!.revise.prompt !== w.revise.prompt) return false;
+    return true;
+  };
+  const place = (n: string, repo: string | undefined, verify: string[], verifyTimeoutMinutes: number | undefined): string => {
+    const w = config.workflows[n]!;
+    let name = [...actions.keys()].find((k) => fits(actions.get(k)!, n, verify, verifyTimeoutMinutes));
+    if (!name) {
+      const base = baseOf(n);
+      if (!actions.has(base)) name = base;
+      else if (!actions.has(n)) name = n;
+      else {
         let i = 2;
-        while (actions.has(`${w}.${i}`)) i++;
-        action = `${w}.${i}`;
-        byKey.set(key, action);
-        actions.set(action, { workflow: w, repo: fullName, verify: r.verify, ...(r.verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes: r.verifyTimeoutMinutes } : {}) });
+        while (actions.has(`${n}.${i}`)) i++;
+        name = `${n}.${i}`;
       }
-      of.set(`${fullName}\0${w}`, action);
+      actions.set(name, { workflow: n, ...(repo && verify.length ? { repo } : {}), verify, ...(verify.length && verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes } : {}), base });
     }
+    const a = actions.get(name)!;
+    if (w.review.enabled) a.reviewFrom ??= n;
+    if (w.revise.enabled) a.reviseFrom ??= n;
+    return name;
+  };
+
+  for (const [fullName, r] of Object.entries(config.repositories)) {
+    for (const n of r.workflows) if (config.workflows[n]) of.set(`${fullName}\0${n}`, place(n, fullName, r.verify, r.verifyTimeoutMinutes));
   }
+  // A workflow no repository runs still has its action (an unused one, as before).
+  for (const n of Object.keys(config.workflows)) if (![...actions.values()].some((a) => a.workflow === n)) place(n, undefined, [], undefined);
   return { actions, actionOf: (repo: string, workflow: string) => of.get(`${repo}\0${workflow}`) ?? workflow };
 }
 
@@ -722,6 +816,11 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
     if (w.review.enabled) routed.add(w.review.pool);
   }
   for (const [name, p] of Object.entries(config.pools)) if (routed.has(name)) pools[name] = { agents: [...p.agents] };
+  // The version 1 pool names, for jobs and pull requests that stored them: each resolves to the
+  // agents of the pool that replaced it (when that pool is still there and nothing took its name).
+  for (const [old, now] of Object.entries(config.legacy?.pools ?? {})) {
+    if (!Object.hasOwn(pools, old) && !Object.hasOwn(config.pools, old) && config.pools[now]) pools[old] = { agents: [...config.pools[now]!.agents] };
+  }
   const pooled = new Set(Object.values(pools as Record<string, { agents: string[] }>).flatMap((p) => p.agents));
   for (const [name, a] of Object.entries(config.agents)) {
     if (!pooled.has(name)) continue;
@@ -741,8 +840,8 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
       ...(a.verify.length ? { verify: [...a.verify] } : {}),
       ...(w.timeoutMinutes !== undefined ? { timeoutMinutes: w.timeoutMinutes } : {}),
       ...(a.verify.length && a.verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes: a.verifyTimeoutMinutes } : {}),
-      ...(w.review.enabled ? { reviewPrompt: `./prompts/${a.workflow}.review.md` } : {}),
-      ...(w.revise.enabled ? { revisePrompt: `./prompts/${a.workflow}.revise.md` } : {}),
+      ...(a.reviewFrom ? { reviewPrompt: `./prompts/${a.reviewFrom}.review.md` } : {}),
+      ...(a.reviseFrom ? { revisePrompt: `./prompts/${a.reviseFrom}.revise.md` } : {}),
     };
   }
 
@@ -773,6 +872,10 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
       workflows: r.workflows.map((n) => {
         const w = config.workflows[n]!;
         return {
+          // A workflow of its own has a stable id (its name), so a job or pull request finds it
+          // whatever action the repository's verify commands put it in. An upgraded one keeps the
+          // version 1 id, `<action>:<label>`, which its action name preserves (actionLayout).
+          ...(config.legacy?.workflows[n] === undefined ? { id: n } : {}),
           trigger: { event: 'issue.labeled', label: w.label },
           action: layout.actionOf(fullName, n),
           pool: w.pool,
@@ -841,4 +944,23 @@ export function toConsolePath(path: string, config: ConsoleConfig): string {
   }
   if (path.startsWith('dispatch.allowedActors')) return 'allowedActors';
   return path;
+}
+
+/**
+ * What upgrading version 1 settings cannot keep as it was, in words for the editor: a repository
+ * that ran workflows with different verify commands now has one list, the first workflow's.
+ * (Re-activating the version itself keeps them: it compiles with the version 1 compiler.)
+ */
+export function upgradeNotes(raw: unknown): string[] {
+  if (!isObject(raw) || raw.version !== 1 || !isObject(raw.repositories) || !isObject(raw.workflows)) return [];
+  const wfs = raw.workflows;
+  const out: string[] = [];
+  for (const [fullName, r] of Object.entries(raw.repositories)) {
+    if (!isObject(r) || !Array.isArray(r.triggers)) continue;
+    const used = [...new Set(r.triggers.map((t) => (isObject(t) && typeof t.workflow === 'string' ? t.workflow : '')).filter((n) => isObject(wfs[n])))];
+    const verify = (n: string) => JSON.stringify([(wfs[n] as Record<string, unknown>).verify ?? [], (wfs[n] as Record<string, unknown>).verifyTimeoutMinutes ?? null]);
+    const differs = used.filter((n) => verify(n) !== verify(used[0]!));
+    if (differs.length) out.push(`${fullName} ran ${[used[0], ...differs].join(' and ')} with different checks. It now has one list, ${used[0]}'s: check it before you publish.`);
+  }
+  return out;
 }

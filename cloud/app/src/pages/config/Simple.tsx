@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { useId, useState } from 'react';
 import { Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Input, Select } from '@readysetcloud/ui';
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepository, ConsoleWorkflow } from '../../api/client';
 import { AGENT_GUIDES } from '../../lib/agentGuides';
@@ -47,9 +47,12 @@ export function simpleBlockers(config: ConsoleConfig, view: ConfigView): string[
   if (!w?.label.trim()) out.push('Choose the label that starts work.');
   if (config.allowedActors.length === 0) out.push('Name at least one person who can add it.');
   if (Object.keys(config.repositories).length === 0) out.push('Turn on at least one repository.');
-  // An agent without a key cannot be ticked (the page unticks it), so it never blocks a publish.
-  const usable = (a: string) => config.agents[a]?.enabled && (view.agents ?? DEFAULT_OFFERED).includes(config.agents[a]!.adapter) && view.agentKeys[KEY_FOR[config.agents[a]!.adapter]];
-  if (!(config.pools[CODING]?.agents ?? []).some(usable)) out.push('Choose at least one coding agent.');
+  const on = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
+  if (on(CODING).length === 0) out.push('Choose at least one coding agent.');
+  // An agent the configuration still runs whose key was removed: the person puts the key back or
+  // unticks it. The page never changes that for them (a review policy would change unseen).
+  const keyless = [...new Set([...on(CODING), ...(w?.review.enabled ? on(REVIEW) : [])])].filter((a) => !view.agentKeys[KEY_FOR[config.agents[a]!.adapter]]);
+  if (keyless.length) out.push(`Add the key for ${keyless.map((a) => AGENT_LABEL[config.agents[a]!.adapter]).join(' and ')}, or untick it.`);
   return out;
 }
 
@@ -71,10 +74,10 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
   /** An agent can be ticked only once its key is set (and Updraft Cloud still runs it). */
   const usable = (a: string) => offered(a as AgentAdapter) && keySet(a as AgentAdapter);
   const ticked = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
-  const coding = ticked(CODING).filter(usable);
-  const review = w.review.enabled ? ticked(REVIEW).filter(usable) : [];
-  // An agent without a key shows unticked: the draft says the same, so it is never published on.
-  const keyless = [...ticked(CODING), ...(w.review.enabled ? ticked(REVIEW) : [])].filter((a) => !usable(a)).join(',');
+  // As saved, whether or not the key is set: a ticked agent without its key stays ticked (and can
+  // be unticked), so a missing key never changes what is published without the person seeing it.
+  const coding = ticked(CODING);
+  const review = w.review.enabled ? ticked(REVIEW) : [];
 
   const setWorkflow = (p: Partial<ConsoleWorkflow>) => onChange({ ...config, workflows: { [wfName]: { ...w, ...p } } });
 
@@ -106,17 +109,11 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
     setRepo(name, next);
   };
 
-  useEffect(() => {
-    if (keyless) setTeam(coding, review);
-    // Only when the set of agents without a key changes; setTeam reads the current draft.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [keyless]);
-
-  /** A key was saved from a row: the agent can now code and review, as the defaults have it. */
+  /** A key was saved from a row: an agent that was in neither list now codes and reviews, as the defaults have it. */
   const keySaved = (a: AgentAdapter) => (keys: Record<string, boolean>) => {
     onKeys(keys);
     setKeyOpen(null);
-    if (keys[KEY_FOR[a]]) setTeam([...new Set([...coding, a])], [...new Set([...review, a])]);
+    if (keys[KEY_FOR[a]] && !coding.includes(a) && !review.includes(a)) setTeam([...coding, a], [...review, a]);
   };
 
   /** The agent's label, and for one that cannot be ticked, why, and where its key goes. */
@@ -124,13 +121,19 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
     const id = `${list}:${a}`;
     return (
       <div className="flex items-center gap-2">
-        <Check checked={on} disabled={!usable(a)} onChange={onToggle}>
+        <Check checked={on} disabled={!usable(a) && !on} onChange={onToggle}>
           <span className="font-medium">{AGENT_LABEL[a]}</span>
         </Check>
         {!usable(a) && (
           <InfoTip
             label={`Why ${AGENT_LABEL[a]} cannot be used`}
-            text={offered(a) ? `Add your ${AGENT_GUIDES[a].credential} to use ${AGENT_LABEL[a]}. Click to add it.` : `Updraft Cloud no longer runs ${AGENT_LABEL[a]}.`}
+            text={
+              !offered(a)
+                ? `Updraft Cloud no longer runs ${AGENT_LABEL[a]}.${on ? ' Untick it.' : ''}`
+                : on
+                  ? `${AGENT_LABEL[a]}'s ${AGENT_GUIDES[a].credential} was removed. Add it again, or untick ${AGENT_LABEL[a]}. Click to add it.`
+                  : `Add your ${AGENT_GUIDES[a].credential} to use ${AGENT_LABEL[a]}. Click to add it.`
+            }
             hidden={keyOpen === id}
             onClick={offered(a) ? () => setKeyOpen(keyOpen === id ? null : id) : undefined}
           />

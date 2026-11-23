@@ -1,7 +1,9 @@
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { compileTenantConfig } from './config.js';
-import { defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission, type ConsoleConfig } from './console.js';
+import { workflowId } from '../../../../src/config/schema.js';
+import { defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission, upgradeNotes, type ConsoleConfig } from './console.js';
+import * as v1 from './console-v1.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 
 const repo = (over: Record<string, unknown> = {}) => ({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [], ...over });
@@ -65,7 +67,7 @@ describe('compiling', () => {
     expect(yaml.repositories['acme/web']).toMatchObject({ id: 99, publish: 'draft-pr', checkoutPath: './clones/web', review: true, revise: true });
     expect(yaml.repositories['acme/web']?.autoMerge).toBeUndefined();
     expect(yaml.repositories['acme/web']?.workflows).toEqual([
-      { trigger: { event: 'issue.labeled', label: 'updraft' }, action: 'implement', pool: 'builders', allowedActors: ['pat'], reviewPool: 'reviewers' },
+      { id: 'implement', trigger: { event: 'issue.labeled', label: 'updraft' }, action: 'implement', pool: 'builders', allowedActors: ['pat'], reviewPool: 'reviewers' },
     ]);
     expect(yaml.actions.implement).toEqual({ prompt: './prompts/implement.md', reviewPrompt: './prompts/implement.review.md', revisePrompt: './prompts/implement.revise.md' });
     expect(r.files['prompts/implement.md']).toBe(DEFAULT_PROMPTS.implement);
@@ -96,16 +98,17 @@ describe('compiling', () => {
     expect(r.keys).toEqual([{ path: 'agents.claude', key: 'ANTHROPIC_API_KEY' }]);
   });
 
-  it('gives a repository its own verify commands, in an action of their own', () => {
-    const config = ok(settings({ 'acme/web': repo({ verify: ['npm test'], verifyTimeoutMinutes: 20 }), 'acme/api': repo() }));
-    const r = compile(config);
+  it('gives each set of verify commands an action of its own, the first in the workflow\'s own, with one workflow id', () => {
+    const config = ok(settings({ 'acme/web': repo({ verify: ['npm test'], verifyTimeoutMinutes: 20 }), 'acme/api': repo(), 'acme/docs': repo({ verify: ['npm test'], verifyTimeoutMinutes: 20 }) }));
+    const r = compile(config, new Map([['acme/web', 99], ['acme/api', 100], ['acme/docs', 101]]));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const yaml = yamlOf(r.files);
-    expect(yaml.actions['implement.2']).toMatchObject({ prompt: './prompts/implement.md', verify: ['npm test'], verifyTimeoutMinutes: 20 });
-    expect(yaml.actions.implement).not.toHaveProperty('verify');
-    expect(yaml.repositories['acme/web']?.workflows[0]?.action).toBe('implement.2');
-    expect(yaml.repositories['acme/api']?.workflows[0]?.action).toBe('implement');
+    expect(yaml.actions.implement).toMatchObject({ prompt: './prompts/implement.md', verify: ['npm test'], verifyTimeoutMinutes: 20 });
+    expect(yaml.actions['implement.2']).not.toHaveProperty('verify');
+    expect(yaml.repositories['acme/web']?.workflows[0]).toMatchObject({ id: 'implement', action: 'implement' });
+    expect(yaml.repositories['acme/api']?.workflows[0]).toMatchObject({ id: 'implement', action: 'implement.2' });
+    expect(yaml.repositories['acme/docs']?.workflows[0]).toMatchObject({ id: 'implement', action: 'implement' });
   });
 
   it('uses the installation\'s allowed actors unless a repository names its own', () => {
@@ -245,6 +248,7 @@ describe('settings from the first console (version 1)', () => {
         },
       },
       repositories: { 'acme/web': { enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm test'], autoMerge: { method: 'squash' } } },
+      legacy: { pools: { implement: 'builders', 'implement.review': 'reviewers' }, workflows: { implement: 'implement' } },
     });
     expect(compile(config).ok).toBe(true);
   });
@@ -268,6 +272,75 @@ describe('settings from the first console (version 1)', () => {
     expect(config.agents).toEqual({ claude: { adapter: 'claude', enabled: true } });
     expect(config.workflows.implement!.review).toMatchObject({ pool: 'reviewers', allowSameAgent: true });
     expect(config.pools.reviewers).toEqual({ agents: ['claude'] });
+  });
+});
+
+describe('work in flight across the upgrade from version 1 (#98 review)', () => {
+  const v1Doc = (repos: Record<string, unknown>, docsVerify: string[] = []) => ({
+    version: 1,
+    workflows: {
+      implement: { agent: { adapter: 'claude' }, prompt: '# Build', reviewer: { adapter: 'codex', prompt: '# Review' }, revisePrompt: '# Revise', verify: ['npm test'] },
+      docs: { agent: { adapter: 'codex' }, prompt: '# Docs', reviewer: { adapter: 'claude', prompt: '# Review docs' }, revisePrompt: '# Revise docs', verify: docsVerify },
+    },
+    repositories: repos,
+  });
+  const v1Repo = (triggers: { label: string; workflow: string }[], over: Record<string, unknown> = {}) => ({ enabled: true, triggers, allowedActors: ['pat'], publish: 'draft-pr', commentOnFailure: true, review: false, revise: false, ...over });
+  const ids = new Map([['acme/web', 99], ['acme/api', 100], ['acme/new', 101]]);
+  const compiled = (sub: ReturnType<typeof toTenantSubmission>) => {
+    const r = compileTenantConfig(sub, { appId: 4242 }, ids);
+    if (!r.ok) throw new Error(JSON.stringify(r.errors));
+    return yamlOf(r.files) as Compiled & { pools: Record<string, { agents: string[] }>; agents: Record<string, { adapter?: string }> };
+  };
+  /** What a job or pull request opened under a config stored: per repository, workflow id, action and pools. */
+  const stored = (yaml: ReturnType<typeof compiled>) =>
+    Object.entries(yaml.repositories).flatMap(([repo, r]) =>
+      r.workflows.map((wf) => ({ repo, id: workflowId(wf as Parameters<typeof workflowId>[0]), action: wf.action as string, pool: wf.pool as string, reviewPool: wf.reviewPool as string | undefined })),
+    );
+  const adapters = (yaml: ReturnType<typeof compiled>, pool: string) => yaml.pools[pool]!.agents.map((a) => yaml.agents[a]!.adapter ?? a).sort();
+
+  it('a job or pull request opened under version 1 finds its workflow, action and pools once the upgraded settings are published, and after an unrelated edit', () => {
+    const doc = v1Doc({
+      'acme/web': v1Repo([{ label: 'updraft', workflow: 'implement' }], { review: true, revise: true }),
+      'acme/api': v1Repo([{ label: 'go', workflow: 'implement' }, { label: 'docs', workflow: 'docs' }]),
+      // Two workflows in one repository with the same checks: one list holds them (the case with
+      // different checks is the next-but-one test's).
+    }, ['npm test']);
+    const parsedV1 = v1.parseConsoleConfig(doc);
+    if (!parsedV1.ok) throw new Error('v1 did not parse');
+    const before = compiled(v1.toTenantSubmission(parsedV1.config));
+    const upgraded = ok(doc);
+    // An unrelated edit: another repository, with checks of its own, and a paused one.
+    const edited = ok({ ...upgraded, repositories: { ...upgraded.repositories, 'acme/api': { ...upgraded.repositories['acme/api']!, enabled: false }, 'acme/new': repo({ workflows: ['implement'], verify: ['make check'] }) } });
+
+    for (const config of [upgraded, edited]) {
+      const after = compiled(toTenantSubmission(config));
+      for (const ref of stored(before)) {
+        // As the poller looks up a pull request's workflow (reviews.ts), and a job its action and pool.
+        const wf = after.repositories[ref.repo]!.workflows.find((x) => workflowId(x as Parameters<typeof workflowId>[0]) === ref.id);
+        expect(wf, `${ref.repo} ${ref.id}`).toBeDefined();
+        expect(after.actions[ref.action], ref.action).toEqual(expect.objectContaining({ verify: (before.actions[ref.action] as { verify?: string[] }).verify ?? undefined }));
+        expect(adapters(after, ref.pool), ref.pool).toEqual(adapters(before, ref.pool));
+        if (ref.reviewPool) expect(adapters(after, ref.reviewPool), ref.reviewPool).toEqual(adapters(before, ref.reviewPool));
+      }
+    }
+    expect(stored(before).map((r) => r.id).sort()).toEqual(['docs:docs', 'implement:go', 'implement:updraft']);
+  });
+
+  it('keeps version 1 settings that split into more workflows than the editor allows loadable and publishable', () => {
+    const repos = Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`acme/r${i}`, v1Repo([{ label: `label-${i}`, workflow: 'implement' }])]));
+    const config = ok(v1Doc(repos));
+    expect(Object.keys(config.workflows)).toHaveLength(22);
+    const r = compileTenantConfig(toTenantSubmission(config), { appId: 4242 }, new Map(Object.keys(repos).map((n, i) => [n, 500 + i])));
+    expect(r.ok).toBe(true);
+    // A new workflow of the tenant's own still counts against the limit.
+    const more = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`new-${i}`, { ...config.workflows.implement!, label: `n${i}` }]));
+    expect(errorsOf({ ...config, workflows: { ...config.workflows, ...more } })).toEqual([expect.objectContaining({ path: 'workflows', message: expect.stringMatching(/at most 20/) })]);
+  });
+
+  it('says when a repository ran workflows with different checks, which the upgrade folds into one list', () => {
+    const doc = v1Doc({ 'acme/api': v1Repo([{ label: 'docs', workflow: 'docs' }, { label: 'go', workflow: 'implement' }]), 'acme/web': v1Repo([{ label: 'go', workflow: 'implement' }]) });
+    expect(upgradeNotes(doc)).toEqual([expect.stringMatching(/^acme\/api ran docs and implement with different checks. It now has one list, docs's/)]);
+    expect(upgradeNotes(settings())).toEqual([]);
   });
 });
 
@@ -306,7 +379,7 @@ describe('toConsolePath', () => {
     ['actions.implement.reviewPrompt', 'workflows.implement.review.prompt'],
     ['actions.implement.revisePrompt', 'workflows.implement.revise.prompt'],
     ['actions.implement.timeoutMinutes', 'workflows.implement.timeoutMinutes'],
-    ['actions.implement.2.verify.0', 'repositories.acme/web.site.verify.0'],
+    ['actions.implement.verify.0', 'repositories.acme/web.site.verify.0'],
     ['actions.implement.2.timeoutMinutes', 'workflows.implement.timeoutMinutes'],
     ['prompts/implement.revise.md', 'workflows.implement.revise.prompt'],
     ['repositories.acme/web.site.workflows.0.trigger.label', 'workflows.implement.label'],

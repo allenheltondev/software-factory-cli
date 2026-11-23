@@ -136,9 +136,9 @@ describe('loading the editor', () => {
     expect(body).toMatchObject({
       config: {
         version: 2,
-        // Every agent the deployment offers (this one runs all three), in both pools.
-        agents: { claude: { adapter: 'claude', enabled: true }, codex: { adapter: 'codex', enabled: true }, kiro: { adapter: 'kiro', enabled: true } },
-        pools: { builders: { agents: ['claude', 'codex', 'kiro'] }, reviewers: { agents: ['claude', 'codex', 'kiro'] } },
+        // Every agent the deployment offers (this one runs all three); those with a key in both pools.
+        agents: { claude: { adapter: 'claude', enabled: true }, codex: { adapter: 'codex', enabled: true }, kiro: { adapter: 'kiro', enabled: false } },
+        pools: { builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['claude', 'codex'] } },
         allowedActors: ['pat'],
         workflows: { implement: { label: 'updraft', pool: 'builders', prompt: defaults.prompts.implement, review: { enabled: true, pool: 'reviewers', allowSameAgent: false }, revise: { enabled: true } } },
         repositories: {},
@@ -469,6 +469,36 @@ describe('history', () => {
     // Only the enabled agent its pool can start: the disabled spare needs nothing.
     expect(res).toMatchObject({ status: 400, body: { error: 'invalid_config', errors: [{ path: 'agents.claude', message: expect.stringMatching(/ANTHROPIC_API_KEY/) }] } });
     expect((await store.getTenant(77))?.activeConfigVersion).toBe(2);
+  });
+
+  it('re-activates a version the first console published exactly as it ran, and the editor says what its upgrade folds together', async () => {
+    const v1 = {
+      version: 1,
+      workflows: {
+        implement: { agent: { adapter: 'claude' }, prompt: '# Build', reviewer: { adapter: 'codex', prompt: '# Review' }, revisePrompt: '# Revise', verify: [] },
+        docs: { agent: { adapter: 'codex' }, prompt: '# Docs', reviewer: { adapter: 'claude', prompt: '# R' }, revisePrompt: '# V', verify: ['npm test'] },
+      },
+      repositories: {
+        'acme/web': { enabled: true, triggers: [{ label: 'go', workflow: 'implement' }, { label: 'docs', workflow: 'docs' }], allowedActors: ['pat'], publish: 'draft-pr', commentOnFailure: true, review: true, revise: false },
+      },
+    };
+    const n = (await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml', SOURCE_FILE], publishedBy: 'pat', publishedAt: '2026-11-19T00:00:00.000Z' })) as number;
+    objects.set(`${configPrefix(55, n)}${SOURCE_FILE}`, JSON.stringify({ format: 'console', config: v1 }));
+    await store.markConfigReady(55, n);
+    await store.activateConfig(55, n);
+
+    const loaded = await call(PAT, 'GET', '/installations/55/config');
+    expect(loaded.body.notices).toEqual([expect.stringMatching(/acme\/web ran implement and docs with different checks/)]);
+
+    await publish(settings(), { baseVersion: 1 });
+    const res = await call(PAT, 'POST', '/installations/55/config/versions/1/reactivate', {});
+    expect(res).toMatchObject({ status: 200, body: { version: 3 } });
+    const yaml = parse(objects.get(`${configPrefix(55, 3)}config.yaml`) ?? '') as { actions: Record<string, { verify?: string[] }>; pools: Record<string, unknown>; repositories: Record<string, { workflows: { action: string; pool: string }[] }> };
+    // Each workflow keeps its own checks, pools and action, as version 1 compiled them.
+    expect(yaml.actions.implement?.verify).toBeUndefined();
+    expect(yaml.actions.docs?.verify).toEqual(['npm test']);
+    expect(Object.keys(yaml.pools).sort()).toEqual(['docs', 'docs.review', 'implement', 'implement.review']);
+    expect(yaml.repositories['acme/web']?.workflows.map((w) => [w.action, w.pool])).toEqual([['implement', 'implement'], ['docs', 'docs']]);
   });
 
   it('a version published before versions kept their source cannot be re-activated', async () => {

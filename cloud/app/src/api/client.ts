@@ -542,6 +542,8 @@ export interface ConsoleConfig {
   allowedActors: string[];
   workflows: Record<string, ConsoleWorkflow>;
   repositories: Record<string, ConsoleRepository>;
+  /** Settings upgraded from the first console: names kept for work in flight. The editor passes it on unchanged. */
+  legacy?: { pools: Record<string, string>; workflows: Record<string, string> };
 }
 
 export interface ConfigIssue {
@@ -559,6 +561,8 @@ export interface ConfigView {
   activeVersion: number | null;
   source: 'console' | 'tenant' | 'none';
   config: ConsoleConfig;
+  /** What upgrading the active version's settings could not keep as it was. Absent from an older API. */
+  notices?: string[];
   defaults: { prompts: { implement: string; review: string; revise: string } };
   limits: {
     ceilings: { timeoutMinutes: number; verifyTimeoutMinutes: number; autoMergeWaitMinutes: number; maxRevisions: number };
