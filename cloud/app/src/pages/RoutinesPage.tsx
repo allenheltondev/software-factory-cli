@@ -20,7 +20,7 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!valid) { setLoad({ state: 'error', message: 'Invalid installation' }); return; }
+    if (!valid) return;
     let live = true;
     void Promise.all([api.routines(installationId), api.repositories(installationId)]).then(
       ([routines, repos]) => {
@@ -58,6 +58,8 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
     } catch (err) { setError(err instanceof Error ? err.message : 'Could not remove routine route'); }
     finally { setBusy(false); }
   }
+
+  if (!valid) return <Alert variant="error">Invalid installation</Alert>;
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
