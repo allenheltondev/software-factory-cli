@@ -109,8 +109,9 @@ prove authenticated model behavior. CI includes a separate Linux security job wi
    `ALL`; enable ready/run/terminate hooks on port 9000, run timeout 60 seconds. Do **not**
    configure automatic suspension or suspend/resume hooks for this experiment. Existing
    `deploy.sh image`, the BYOK image and Cloud dispatch remain unchanged.
-5. Launch with the dedicated role, VPC egress connector, the provider's authenticated direct
-   shell access, and a run-hook payload containing only these references:
+5. Launch with the dedicated role, VPC egress connector, `SHELL_INGRESS` for direct operator
+   shell access, and HTTPS application ingress for the probe on port 8080. These are distinct
+   ingress capabilities. Pass a run-hook payload containing only these references:
 
    ```json
    {"fileSystemId":"fs-REPLACE","accessPointId":"fsap-REPLACE"}
@@ -121,14 +122,19 @@ prove authenticated model behavior. CI includes a separate Linux security job wi
    mount/IAM/tooling/namespace failure returns 503 with no local-storage fallback. Compatibility
    of `amazon-efs-utils` with MicroVM role credentials, DNS, capabilities and VPC connectors is
    **unverified** and must be established on AWS. Do not route production events here.
+   Before `/run` returns success it also starts `probe.mjs` as the unprivileged worker UID/GID
+   with cleared groups, a fresh environment and a parent-death signal. This fixed-response
+   HTTP listener serves `GET /` and `HEAD /` on **8080**; it has no job controls, repository
+   execution, filesystem reads or auth-state reporting. Startup failure prevents successful
+   initialization. Unexpected listener exit stops the supervisor; termination stops both.
 
 ### Keep the privileged lifecycle port private
 
 Port **9000** accepts root lifecycle operations, including the EFS mount. It must never be
-included in an operator-terminal, customer or application endpoint token's `allowedPorts`.
+included in a customer or application endpoint token's `allowedPorts`.
 Do not use `allPorts` or broad ranges. The provider's lifecycle calls are separate from
 application endpoint access; an ingress connector alone does not prove the hook is private.
-Limit who can mint endpoint tokens through IAM, and issue every non-lifecycle token using
+Limit who can mint endpoint tokens through IAM, and issue every application token using
 the operator-side helper, which rejects port 9000, ranges and `allPorts` before invoking AWS:
 
 ```sh
@@ -137,8 +143,8 @@ node deploy/aws-microvm/native-worker/endpoint-token.mjs mvm-REPLACE '[{"port":8
 node deploy/aws-microvm/native-worker/endpoint-token.mjs --verify https://REPLACE-ENDPOINT 8080 endpoint-token.json
 ```
 
-Replace 8080 with the actual approved terminal/application port, never 9000. The provisioning
-probe first establishes access on that port with the same token, then requires gateway
+Port 8080 is the included unprivileged HTTP probe, not an operator terminal. The provisioning
+probe first establishes access to that listener with the same token, then requires gateway
 denial (401/403) for a harmless empty POST to the run hook on 9000. An expired token or a hook
 response such as 409/503 fails the probe. Run it against **every** issued application token
 and deployed ingress configuration before giving access to users; keep the token file private
@@ -146,6 +152,21 @@ and delete it when done. Do not print it in logs. Direct AWS token issuance can 
 helper, so IAM token issuers remain trusted. Real gateway enforcement remains a live gate.
 
 ## Direct sign-in and Updraft execution
+
+Shell access is separate from port-scoped application tokens. Launch the MicroVM with the
+AWS-managed **`SHELL_INGRESS`** connector and obtain a shell token through its separate API:
+
+```sh
+umask 077
+aws lambda-microvms create-microvm-shell-auth-token \
+  --microvm-identifier mvm-REPLACE --expiration-in-minutes 15 > shell-token.json
+```
+
+Use the provider's [shell access workflow](https://docs.aws.amazon.com/lambda/latest/dg/microvms-troubleshooting.html)
+to connect, with IAM permission `lambda:CreateMicrovmShellAuthToken`. Application tokens created
+by `endpoint-token.mjs` do not grant shell access; shell tokens cannot substitute for the
+8080/9000 application-port verification. Keep both token types private and out of logs.
+See [AWS shell token security](https://docs.aws.amazon.com/lambda/latest/dg/microvms-security.html#microvms-shell-access-tokens).
 
 From a direct operator terminal on the worker, run the unmodified official CLI:
 
@@ -194,7 +215,7 @@ dispatch, SSH server or custom login UI is added by this prototype.
 
 ## Live acceptance checklist — all still pending
 
-- Provision application/terminal tokens with explicit allowed ports excluding 9000 and run
+- Provision application tokens with explicit allowed ports excluding 9000 and run
   the deployed endpoint probe for each token/ingress configuration. The permitted port must
   respond and the privileged hook port must be denied by the gateway.
 

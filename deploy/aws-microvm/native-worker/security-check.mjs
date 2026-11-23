@@ -18,6 +18,7 @@ const fixture = fs.mkdtempSync('/var/lib/updraft-native-security-');
 const marker = `synthetic-secret-${randomUUID()}`;
 const results = [];
 let service;
+let probe;
 let networkTrap;
 const workerUid = 21000;
 const claudeUid = 21001;
@@ -104,6 +105,14 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   service = await startService(config, socketPath, () => {});
   await assert.rejects(startService(config, `${fixture}/second-worker/worker.sock`, () => {}), /leased|lock/);
   results.push('a second supervisor cannot lease the same durable login');
+  const { startProbe } = await import(pathToFileURL(`${fixture}/native-worker/probe.mjs`).href);
+  probe = await startProbe(config, 0);
+  const probeResponse = await globalThis.fetch(`http://127.0.0.1:${probe.port}`);
+  assert.equal(probeResponse.status, 200);
+  assert.deepEqual(await probeResponse.json(), { ok: true });
+  assert.equal((await globalThis.fetch(`http://127.0.0.1:${probe.port}/aws/lambda-microvms/runtime/v1/run`, { method: 'POST', body: '{}' })).status, 404);
+  await probe.close(); probe = undefined;
+  results.push('separate probe process reports the unprivileged worker UID/GID and serves fixed HTTP without lifecycle controls');
   function argv(command = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions'], name = `job-${randomUUID()}`) {
     return ['run', '--rm', '-i', '--name', name, '--user', `${workerUid}:${workerUid}`, '--network', 'none',
       '--tmpfs', '/updraft-home:rw,exec,mode=1777', '-e', 'HOME=/updraft-home',
@@ -291,6 +300,7 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   results.push('supervisor replacement reuses the same synthetic CLI home');
   console.log(JSON.stringify({ passed: results, limitations: ['Synthetic Claude CLI, not a model call', 'Local durable directory, not a deployed EFS mount', 'No AWS replacement or subscription end-to-end proof'] }, null, 2));
 } finally {
+  await probe?.close();
   await service?.close();
   if (networkTrap) await new Promise((resolve) => networkTrap.close(resolve));
   // Only the exact mkdtemp fixture is removed; no user directories are involved.

@@ -11,6 +11,7 @@ import { containInvocation } from '../../../src/worker/container.ts';
 import { commitIdentityEnv } from '../../../src/github/credentials.ts';
 import { containerSchema } from '../../../src/config/schema.ts';
 import { createGitFixture } from '../../../test/git-fixtures.ts';
+import { createProbeServer, PROBE_PORT } from '../native-worker/probe.mjs';
 
 describe('native Claude worker policy', () => {
   it.skipIf(process.platform === 'win32')('accepts actual commitAsApp containInvocation arguments without adding identity to Claude', () => {
@@ -133,6 +134,25 @@ describe('privileged worker framing', () => {
 });
 
 describe('native worker endpoint provisioning', () => {
+  it('provides the sample application port with only a fixed HTTP probe, never lifecycle controls', async () => {
+    expect(PROBE_PORT).toBe(8080);
+    const server = createProbeServer();
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    try {
+      const response = await globalThis.fetch(origin);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ok: true });
+      expect(await (await globalThis.fetch(origin, { method: 'HEAD' })).text()).toBe('');
+      expect((await globalThis.fetch(origin, { method: 'POST' })).status).toBe(405);
+      expect((await globalThis.fetch(`${origin}/aws/lambda-microvms/runtime/v1/run`, { method: 'POST', body: '{}' })).status).toBe(404);
+      // Contact the included real listener for the valid-token leg. Gateway denial remains
+      // simulated here; a 401 on the permitted leg must still fail the provisioning proof.
+      await verifyHookPort('https://worker.example/', 'scoped-token', PROBE_PORT, async (_url, options) =>
+        options.headers['X-aws-proxy-port'] === String(PROBE_PORT) ? globalThis.fetch(origin) : { status: 403 });
+    } finally { await new Promise((resolve) => server.close(resolve)); }
+  });
+
   it('issues tokens only for explicit non-lifecycle ports', () => {
     expect(tokenArgs('mvm-test-123', [{ port: 8080 }])).toContain('[{"port":8080}]');
     for (const ports of [[], [{ allPorts: {} }], [{ range: { startPort: 8999, endPort: 9001 } }], [{ port: 9000 }], [{ port: 8080, allPorts: {} }], [{ port: '8080' }]]) {

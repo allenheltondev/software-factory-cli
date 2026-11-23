@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { loadConfig } from './policy.mjs';
 import { startService } from './service.mjs';
+import { startProbe } from './probe.mjs';
 
 export function bootPayload(text) {
   const p = JSON.parse(text);
@@ -15,6 +16,8 @@ export function bootPayload(text) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let service;
+  let probe;
+  let terminating = false;
   let started = false;
   let pending = false;
   // Privileged provider lifecycle interface. Application endpoint tokens MUST exclude
@@ -36,13 +39,24 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
           const { fileSystemId, accessPointId } = bootPayload(JSON.parse(body).runHookPayload);
           await new Promise((resolve, reject) => execFile('/bin/sh', ['/opt/updraft/native-worker/mount-home.sh', fileSystemId, accessPointId],
             { timeout: 45000, maxBuffer: 65536 }, (error) => error ? reject(error) : resolve()));
-          service = await startService(loadConfig('/etc/updraft-native-worker.json'));
+          const config = loadConfig('/etc/updraft-native-worker.json');
+          service = await startService(config);
+          try { probe = await startProbe(config); }
+          catch (error) { await service.close(); throw error; }
+          probe.child.once('exit', () => {
+            if (!terminating) {
+              console.error('Native worker probe listener exited; worker is unavailable.');
+              void service.close();
+            }
+          });
           started = true;
           response.writeHead(200).end();
         } finally { pending = false; }
         return;
       }
       if (route === '/aws/lambda-microvms/runtime/v1/terminate') {
+        terminating = true;
+        await probe?.close();
         await service?.close();
         response.writeHead(200).end();
         return;
