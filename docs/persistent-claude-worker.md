@@ -4,7 +4,7 @@ This is the first stage of [issue #100](https://github.com/allenheltondev/softwa
 
 ## Current status
 
-- **Implemented in this stage:** read-only, sanitized subscription status via `updraft native-claude-auth [--json]` and opt-in `agents.<name>.authentication: native-claude` to check direct subscription sign-in before **every** Claude run (including implementation, review and revision). It runs the installed `claude auth status` under the worker's normal environment. Only `connected`, `login_required`, `expired`, `wrong_method`, or `unknown` and a fixed reason leave the process. The command never reads, copies or forwards credential files, auth codes or stdout.
+- **Implemented in this stage:** read-only, sanitized subscription status via `updraft native-auth --claude [--json]` and opt-in `agents.<name>.authentication: native-claude` to check direct subscription sign-in before **every** Claude run (including implementation, review and revision). It runs the installed `claude auth status` under the worker's normal environment. Only `connected`, `login_required`, `expired`, `wrong_method`, or `unknown` and a fixed reason leave the process. The command never reads, copies or forwards credential files, auth codes or stdout.
 - **Already available:** `updraft start` and `updraft run-event` can use the official Claude Code adapter and retain implementation, review, revision and merge.
 - **Not implemented yet:** a managed persistent worker lifecycle, tenant-scoped registration and heartbeat, GitHub webhook dispatch to these workers, terminal onboarding in the Updraft console, and proof that agent tool subprocesses cannot read Claude's native credentials. **Do not enable this as a production, multi-tenant hosted subscription feature yet.**
 - **Not a Routines integration:** the work must continue through Updraft's own orchestration.
@@ -25,11 +25,11 @@ Use a **dedicated machine or VM per subscribing end user**, not a shared shell o
    unset ANTHROPIC_BASE_URL ANTHROPIC_PROFILE
    unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
    claude auth login
-   updraft native-claude-auth --json
+   updraft native-auth --claude --json
    ```
 
    Complete the **Anthropic-hosted** browser login from that terminal. If sign-in requires a code, enter it *in the Claude CLI terminal only*. Never type the code or token into Updraft.
-3. Exit the terminal, reconnect as the **same worker user** with the **same `CLAUDE_CONFIG_DIR`**, and rerun `updraft native-claude-auth --json`. Restart the VM and repeat. Confirm `connected` after both; use `claude auth status` directly for troubleshooting.
+3. Exit the terminal, reconnect as the **same worker user** with the **same `CLAUDE_CONFIG_DIR`**, and rerun `updraft native-auth --claude --json`. Restart the VM and repeat. Confirm `connected` after both; use `claude auth status` directly for troubleshooting.
 4. Configure `authentication: native-claude` on the Claude agent in your Updraft YAML config, then run `updraft validate`. For example:
 
    ```yaml
