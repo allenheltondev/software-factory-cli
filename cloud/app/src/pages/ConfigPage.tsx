@@ -352,7 +352,9 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                     To publish: {blockers.join(' ')}
                   </span>
                 ) : (
-                  <span data-testid="draft-state">{dirty ? <StatusBadge tone="warning">Unsaved changes</StatusBadge> : activeVersion === null ? 'Ready to publish' : `Version ${activeVersion} is active`}</span>
+                  <span data-testid="draft-state" className={dirty && activeVersion !== null ? 'font-medium' : 'text-muted-foreground'}>
+                    {activeVersion === null ? 'Ready to publish' : dirty ? 'Unsaved changes' : `Version ${activeVersion} is active`}
+                  </span>
                 )}
               </span>
               <div className="flex shrink-0 justify-end gap-2">

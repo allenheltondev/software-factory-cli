@@ -1,6 +1,7 @@
-import { useState } from 'react';
-import { Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Input, Select, StatusBadge } from '@readysetcloud/ui';
+import { useEffect, useId, useState } from 'react';
+import { Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Input, Select } from '@readysetcloud/ui';
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepository, ConsoleWorkflow } from '../../api/client';
+import { AGENT_GUIDES } from '../../lib/agentGuides';
 import { installationSettingsUrl } from '../../lib/diagnostics';
 import { AutoMerge } from './Editor';
 import { Check, FieldError, ParsedText, PromptField } from './fields';
@@ -46,10 +47,9 @@ export function simpleBlockers(config: ConsoleConfig, view: ConfigView): string[
   if (!w?.label.trim()) out.push('Choose the label that starts work.');
   if (config.allowedActors.length === 0) out.push('Name at least one person who can add it.');
   if (Object.keys(config.repositories).length === 0) out.push('Turn on at least one repository.');
-  const used = new Set([...(config.pools[CODING]?.agents ?? []), ...(w?.review.enabled ? (config.pools[REVIEW]?.agents ?? []) : [])].filter((a) => config.agents[a]?.enabled));
-  if (![...(config.pools[CODING]?.agents ?? [])].some((a) => config.agents[a]?.enabled)) out.push('Choose at least one coding agent.');
-  const keyless = [...used].filter((a) => !view.agentKeys[KEY_FOR[config.agents[a]!.adapter]]);
-  if (keyless.length) out.push(`Add a key for ${keyless.map((a) => AGENT_LABEL[config.agents[a]!.adapter]).join(' and ')}, or untick it.`);
+  // An agent without a key cannot be ticked (the page unticks it), so it never blocks a publish.
+  const usable = (a: string) => config.agents[a]?.enabled && (view.agents ?? DEFAULT_OFFERED).includes(config.agents[a]!.adapter) && view.agentKeys[KEY_FOR[config.agents[a]!.adapter]];
+  if (!(config.pools[CODING]?.agents ?? []).some(usable)) out.push('Choose at least one coding agent.');
   return out;
 }
 
@@ -65,8 +65,16 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
   const prompts = view.defaults.prompts;
   const ceilings = view.limits.ceilings;
   const adapters = [...new Set<AgentAdapter>([...(view.agents ?? DEFAULT_OFFERED), ...Object.values(config.agents).map((a) => a.adapter)])];
-  const coding = (config.pools[CODING]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
-  const review = w.review.enabled ? (config.pools[REVIEW]?.agents ?? []).filter((a) => config.agents[a]?.enabled) : [];
+  const [keyOpen, setKeyOpen] = useState<string | null>(null);
+  const keySet = (a: AgentAdapter) => view.agentKeys[KEY_FOR[a]] === true;
+  const offered = (a: AgentAdapter) => (view.agents ?? DEFAULT_OFFERED).includes(a);
+  /** An agent can be ticked only once its key is set (and Updraft Cloud still runs it). */
+  const usable = (a: string) => offered(a as AgentAdapter) && keySet(a as AgentAdapter);
+  const ticked = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
+  const coding = ticked(CODING).filter(usable);
+  const review = w.review.enabled ? ticked(REVIEW).filter(usable) : [];
+  // An agent without a key shows unticked: the draft says the same, so it is never published on.
+  const keyless = [...ticked(CODING), ...(w.review.enabled ? ticked(REVIEW) : [])].filter((a) => !usable(a)).join(',');
 
   const setWorkflow = (p: Partial<ConsoleWorkflow>) => onChange({ ...config, workflows: { [wfName]: { ...w, ...p } } });
 
@@ -98,10 +106,40 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
     setRepo(name, next);
   };
 
-  const keySet = (a: AgentAdapter) => view.agentKeys[KEY_FOR[a]] === true;
-  const offered = (a: AgentAdapter) => (view.agents ?? DEFAULT_OFFERED).includes(a);
-  const badge = (a: AgentAdapter, used: boolean) =>
-    !offered(a) ? <StatusBadge tone="error">Not offered here</StatusBadge> : keySet(a) ? <StatusBadge tone="success">Key set</StatusBadge> : <StatusBadge tone={used ? 'warning' : 'neutral'}>No key</StatusBadge>;
+  useEffect(() => {
+    if (keyless) setTeam(coding, review);
+    // Only when the set of agents without a key changes; setTeam reads the current draft.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keyless]);
+
+  /** A key was saved from a row: the agent can now code and review, as the defaults have it. */
+  const keySaved = (a: AgentAdapter) => (keys: Record<string, boolean>) => {
+    onKeys(keys);
+    setKeyOpen(null);
+    if (keys[KEY_FOR[a]]) setTeam([...new Set([...coding, a])], [...new Set([...review, a])]);
+  };
+
+  /** The agent's label, and for one that cannot be ticked, why, and where its key goes. */
+  const agentLine = (a: AgentAdapter, list: 'coding' | 'review', on: boolean, onToggle: (v: boolean) => void) => {
+    const id = `${list}:${a}`;
+    return (
+      <div className="flex items-center gap-2">
+        <Check checked={on} disabled={!usable(a)} onChange={onToggle}>
+          <span className="font-medium">{AGENT_LABEL[a]}</span>
+        </Check>
+        {!usable(a) && (
+          <InfoTip
+            label={`Why ${AGENT_LABEL[a]} cannot be used`}
+            text={offered(a) ? `Add your ${AGENT_GUIDES[a].credential} to use ${AGENT_LABEL[a]}. Click to add it.` : `Updraft Cloud no longer runs ${AGENT_LABEL[a]}.`}
+            hidden={keyOpen === id}
+            onClick={offered(a) ? () => setKeyOpen(keyOpen === id ? null : id) : undefined}
+          />
+        )}
+      </div>
+    );
+  };
+  const keyForm = (a: AgentAdapter, list: 'coding' | 'review') =>
+    keyOpen === `${list}:${a}` && !keySet(a) ? <InlineKey adapter={a} installationId={installationId} api={keyApi} onSaved={keySaved(a)} /> : null;
 
   const reachable = new Set(view.repositories.map((r) => r.fullName.toLowerCase()));
   const rows = [...view.repositories.map((r) => r.fullName), ...Object.keys(config.repositories).filter((n) => !reachable.has(n.toLowerCase()))];
@@ -151,8 +189,8 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                   <label className="flex items-center gap-2 font-medium sm:pb-2">
                     <input type="checkbox" className="h-4 w-4 shrink-0" aria-label={`Work in ${name}`} checked={!!repo} onChange={(e) => setRepo(name, e.target.checked ? newRepository([wfName]) : null)} />
                     {name}
-                    {repo && !repo.enabled && <StatusBadge tone="warning">Paused</StatusBadge>}
-                    {!reachable.has(name.toLowerCase()) && <StatusBadge tone="error">No access</StatusBadge>}
+                    {repo && !repo.enabled && <span className="text-sm font-normal text-muted-foreground">paused</span>}
+                    {!reachable.has(name.toLowerCase()) && <span className="text-sm font-normal text-error">the App can no longer reach it</span>}
                   </label>
                   {repo && (
                     <>
@@ -166,7 +204,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                           onChange={(e) => patchRepo(name, { verify: e.target.value.trim() ? [e.target.value] : [] })}
                         />
                       </div>
-                      <Button variant="ghost" size="sm" type="button" className="sm:mb-1" aria-expanded={open} aria-label={`Settings for ${name}`} onClick={() => setSettingsOpen(open ? null : name)}>
+                      <Button variant="ghost" size="sm" type="button" className="justify-self-start sm:mb-1" aria-expanded={open} aria-label={`Settings for ${name}`} onClick={() => setSettingsOpen(open ? null : name)}>
                         {open ? 'Close settings' : 'Settings'}
                       </Button>
                     </>
@@ -233,12 +271,9 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
             return (
               <div key={a} className="flex flex-col gap-3 py-3" data-testid={`coding-${a}`}>
                 <div className="flex flex-wrap items-center gap-3">
-                  <Check checked={on} disabled={on && coding.length === 1} onChange={(v) => setTeam(v ? [...coding, a] : coding.filter((x) => x !== a), review)}>
-                    <span className="font-medium">{AGENT_LABEL[a]}</span>
-                  </Check>
-                  {badge(a, on || review.includes(a))}
+                  {agentLine(a, 'coding', on, (v) => setTeam(v ? [...coding, a] : coding.filter((x) => x !== a), review))}
                   {agent?.model && <span className="font-mono text-sm text-muted-foreground">{agent.model}</span>}
-                  {agent && (
+                  {agent && usable(a) && (
                     <button type="button" className="ml-auto text-xs text-muted-foreground underline-offset-2 hover:underline" onClick={() => setModelOpen(modelOpen === a ? null : a)}>
                       {modelOpen === a ? 'Done' : 'Change model'}
                     </button>
@@ -250,7 +285,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                     <Input label="Reasoning effort" hint="For example low, medium or high" list="effort-levels" value={agent.effort ?? ''} error={issuesAt(errors, `agents.${a}.effort`)} onChange={(e) => onChange({ ...config, agents: { ...config.agents, [a]: { ...agent, effort: e.target.value || undefined } } })} />
                   </div>
                 )}
-                {on && offered(a) && !keySet(a) && <InlineKey adapter={a} installationId={installationId} api={keyApi} onSaved={onKeys} />}
+                {keyForm(a, 'coding')}
                 <FieldError message={issuesAt(errors.filter((e) => e.path === `agents.${a}` || e.path === `agents.${a}.adapter`), `agents.${a}`)} />
               </div>
             );
@@ -268,21 +303,15 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
             const on = review.includes(a);
             return (
               <div key={a} className="flex flex-col gap-3 py-3" data-testid={`review-${a}`}>
-                <div className="flex flex-wrap items-center gap-3">
-                  <Check checked={on} onChange={(v) => setTeam(coding, v ? [...review, a] : review.filter((x) => x !== a))}>
-                    <span className="font-medium">{AGENT_LABEL[a]}</span>
-                  </Check>
-                  {/* The key is shown with the coding agents; here only for an agent that only reviews. */}
-                  {!coding.includes(a) && badge(a, on)}
-                </div>
-                {on && !coding.includes(a) && offered(a) && !keySet(a) && <InlineKey adapter={a} installationId={installationId} api={keyApi} onSaved={onKeys} />}
+                {agentLine(a, 'review', on, (v) => setTeam(coding, v ? [...review, a] : review.filter((x) => x !== a)))}
+                {keyForm(a, 'review')}
               </div>
             );
           })}
         </CardBody>
         <CardBody className="flex flex-col gap-2 border-t border-border bg-muted/30">
           {selfReview && <p className="text-sm text-muted-foreground">{AGENT_LABEL[config.agents[review[0]!]!.adapter]} reviews its own work when it wrote the code. Tick a second review agent for a second opinion.</p>}
-            {!w.review.enabled && <p className="text-sm text-muted-foreground">No review: pull requests wait for a person.</p>}
+          {!w.review.enabled && <p className="text-sm text-muted-foreground">No review: pull requests wait for a person.</p>}
           <Check checked={w.revise.enabled} onChange={(enabled) => setWorkflow({ revise: { ...w.revise, enabled } })}>
             Coding agents make the changes {w.review.enabled ? 'a review asks for' : 'your people ask for in a review'}
           </Check>
@@ -340,5 +369,26 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
         </div>
       </details>
     </div>
+  );
+}
+
+/** An info icon with a tooltip, shown on hover and on focus (so a tap shows it too); clicking it may act. */
+function InfoTip({ label, text, onClick, hidden }: { label: string; text: string; onClick?: () => void; hidden?: boolean }) {
+  const id = useId();
+  return (
+    <span className="group relative inline-flex">
+      <button type="button" aria-label={label} aria-describedby={id} onClick={onClick} className="inline-flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500">
+        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className="h-4 w-4">
+          <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.25v3.25a.75.75 0 0 0 1.5 0V9.75A.75.75 0 0 0 10 9H9Z" clipRule="evenodd" />
+        </svg>
+      </button>
+      <span
+        role="tooltip"
+        id={id}
+        className={`pointer-events-none absolute bottom-full left-0 z-20 mb-2 w-64 rounded-md ${hidden ? 'hidden' : ''} bg-foreground px-3 py-2 text-xs leading-snug text-background opacity-0 shadow-lg transition-opacity group-hover:opacity-100 group-focus-within:opacity-100`}
+      >
+        {text}
+      </span>
+    </span>
   );
 }

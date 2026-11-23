@@ -28,6 +28,12 @@ const baseConfig = (): ConsoleConfig => ({
   },
   repositories: {},
 });
+/** More than the simple page shows (a pool of its own): it opens in the full editor. */
+const beyondSimple = (): ConsoleConfig => {
+  const config = withRepo();
+  config.pools.fast = { agents: ['claude'] };
+  return config;
+};
 const withRepo = (config = baseConfig()): ConsoleConfig => ({ ...config, repositories: { 'acme/web': { enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [] } } });
 
 const view = (over: Partial<ConfigView> = {}): ConfigView => ({
@@ -162,8 +168,11 @@ describe('the simple page', () => {
     await userEvent.click(within(screen.getByTestId('review-codex')).getByRole('checkbox'));
     expect(screen.getByText(/No review: pull requests wait for a person/)).toBeInTheDocument();
     await userEvent.click(within(screen.getByTestId('coding-codex')).getByRole('checkbox'));
-    // The last coding agent cannot be unticked.
-    expect(within(screen.getByTestId('coding-claude')).getByRole('checkbox')).toBeDisabled();
+    // Unticking the last coding agent is allowed, and the bar says it must be put back.
+    await userEvent.click(within(screen.getByTestId('coding-claude')).getByRole('checkbox'));
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Choose at least one coding agent.');
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    await userEvent.click(within(screen.getByTestId('coding-claude')).getByRole('checkbox'));
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     sent = sentConfig(api, 1);
     expect(sent.pools).toEqual({ builders: { agents: ['claude'] } });
@@ -171,19 +180,46 @@ describe('the simple page', () => {
     expect(sent.workflows.implement!.review.enabled).toBe(false);
   });
 
-  it('takes a missing key in place, or the agent is unticked', async () => {
+  it('shows an agent without a key disabled, says why, and takes the key from its info icon', async () => {
     const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: true, required: true }], refusals: [] });
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(2) });
     configPage(api);
     const codex = await screen.findByTestId('coding-codex');
-    expect(screen.getByTestId('blockers')).toHaveTextContent('Add a key for Codex, or untick it.');
-    // Shown once, under coding, not again under review.
-    expect(within(screen.getByTestId('review-codex')).queryByTestId('inline-key-codex')).toBeNull();
+    for (const row of [codex, screen.getByTestId('review-codex')]) {
+      const box = within(row).getByRole('checkbox', { name: 'Codex' });
+      expect(box).toBeDisabled();
+      expect(box).not.toBeChecked();
+    }
+    // No chips: the tooltip says what to do.
+    expect(screen.queryByText('Key set')).toBeNull();
+    expect(screen.queryByText('No key')).toBeNull();
+    const info = within(codex).getByRole('button', { name: 'Why Codex cannot be used' });
+    expect(info).toHaveAccessibleDescription('Add your OpenAI Platform API key to use Codex. Click to add it.');
+    // The draft no longer runs Codex, so nothing blocks a publish.
+    expect(screen.queryByTestId('blockers')).toBeNull();
+
+    await userEvent.click(info);
     await userEvent.type(within(codex).getByLabelText(/OpenAI Platform API key/), 'sk-proj-abc');
     await userEvent.click(within(codex).getByRole('button', { name: 'Save key' }));
     expect(setAgentKey).toHaveBeenCalledWith(55, 'CODEX_API_KEY', 'sk-proj-abc');
-    await waitFor(() => expect(screen.queryByTestId('blockers')).toBeNull());
-    expect(within(codex).getByText('Key set')).toBeInTheDocument();
+    // With its key, Codex codes and reviews, as the defaults have it.
+    await waitFor(() => expect(within(codex).getByRole('checkbox', { name: 'Codex' })).toBeChecked());
+    expect(within(screen.getByTestId('review-codex')).getByRole('checkbox', { name: 'Codex' })).toBeChecked();
+    expect(within(codex).queryByTestId('inline-key-codex')).toBeNull();
+    // Back to exactly what is published: nothing to publish.
+    expect(screen.getByTestId('draft-state')).toHaveTextContent('Version 1 is active');
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+  });
+
+  it('publishes without an agent whose key is missing', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), publishConfig: publishedOk(1) });
+    configPage(api);
+    await userEvent.click(await screen.findByRole('checkbox', { name: 'Work in acme/web' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const sent = sentConfig(api);
+    expect(sent.agents.codex).toEqual({ adapter: 'codex', enabled: false });
+    expect(sent.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } });
+    expect(sent.workflows.implement!.review.allowSameAgent).toBe(true);
   });
 
   it('changes an agent model, and keeps repository extras behind its settings', async () => {
@@ -197,7 +233,7 @@ describe('the simple page', () => {
     await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
     await userEvent.selectOptions(within(web).getByLabelText('Open pull requests as'), 'pr');
     await userEvent.click(within(web).getByRole('checkbox', { name: /Pause/ }));
-    expect(web).toHaveTextContent('Paused');
+    expect(web).toHaveTextContent(/paused/);
     await userEvent.click(within(web).getByRole('checkbox', { name: /Only some people/ }));
     await userEvent.clear(within(web).getByLabelText('Who can add the label here'));
     await userEvent.type(within(web).getByLabelText('Who can add the label here'), 'sam');
@@ -311,9 +347,8 @@ describe('the full editor', () => {
 
   it('adds an agent to every pool, edits pool members, and takes a missing key in place', async () => {
     const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: true, required: true }], refusals: [] });
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(2) });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(2) });
     configPage(api);
-    await openFull();
     expect(await screen.findByTestId('config-missing-keys')).toHaveTextContent('codex (Codex) needs a key before you publish');
     await userEvent.click(screen.getByRole('button', { name: 'Go to agents' }));
 
@@ -332,13 +367,12 @@ describe('the full editor', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     const sent = sentConfig(api);
     expect(sent.agents['claude-2']).toEqual({ adapter: 'claude', model: 'claude-haiku-5-5', enabled: true });
-    expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex', 'claude-2'] }, reviewers: { agents: ['claude', 'codex'] } });
+    expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex', 'claude-2'] }, reviewers: { agents: ['claude', 'codex'] }, fast: { agents: ['claude', 'claude-2'] } });
   });
 
   it('turns an agent off instead of adding its key', async () => {
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })) });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })) });
     configPage(api);
-    await openFull();
     await userEvent.click(await screen.findByRole('button', { name: 'Go to agents' }));
     await userEvent.click(within(screen.getByTestId('agent-codex')).getByRole('checkbox', { name: 'On' }));
     expect(screen.queryByTestId('config-missing-keys')).toBeNull();
@@ -346,12 +380,11 @@ describe('the full editor', () => {
   });
 
   it('refreshes key status when the tab regains focus without touching the draft', async () => {
-    const config = vi.fn().mockResolvedValue(published({ agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } }));
+    const config = vi.fn().mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } }));
     configPage(fakeApi({ config }));
-    await openFull();
     expect(await screen.findByTestId('config-missing-keys')).toBeInTheDocument();
     await userEvent.click(within(screen.getByTestId('repo-acme/api')).getByRole('checkbox', { name: 'Work in acme/api' }));
-    config.mockResolvedValue(published({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true } }));
+    config.mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true } }));
     window.dispatchEvent(new Event('focus'));
     await waitFor(() => expect(screen.queryByTestId('config-missing-keys')).toBeNull());
     expect(within(screen.getByTestId('repo-acme/api')).getByRole('checkbox', { name: 'Work in acme/api' })).toBeChecked();
