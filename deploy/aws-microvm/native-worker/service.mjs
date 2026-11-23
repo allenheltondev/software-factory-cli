@@ -1,5 +1,5 @@
 // Root supervisor; the official CLI and every repository command run without root.
-// Single tenant, one job at a time. No cloud registration or dispatch in this prototype.
+// Single tenant, one agent at a time. Optional root Cloud dispatch lives in cloud.mjs.
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
@@ -92,12 +92,13 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     await ended;
   };
 
-  async function auth(cwd, sessionChildren) {
+  async function auth(cwd, sessionChildren, readiness = false) {
     // Even the status probe never starts in a repository or loads its settings/helpers.
     const result = await captureAs(c.claudeUid, c.claudeGid, c.claude,
       ['--restricted', '--setting-sources', '', 'auth', 'status'], { cwd, env: environment },
       (child) => { sessionChildren.add(child); child.once('close', () => sessionChildren.delete(child)); return track(child); });
     const status = nativeClaudeAuthFromStatus(result, environment);
+    if (readiness) return status.state === 'login_required' ? 'auth-required' : ['connected', 'expired'].includes(status.state) ? status.state : 'unavailable';
     if (status.state !== 'connected') throw new Error(`native Claude subscription unavailable (${status.reason})`);
   }
 
@@ -276,6 +277,13 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     throw error;
   }
   return {
+    async authStatus() {
+      const cwd = fs.mkdtempSync(`${scratch}/status-`);
+      fs.chownSync(cwd, c.claudeUid, c.claudeGid);
+      try { return await auth(cwd, new Set(), true); }
+      catch { return 'unavailable'; }
+      finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+    },
     async close() {
       const ended = [...children].map((child) => new Promise((resolve) => child.once('close', resolve)));
       for (const client of clients) client.destroy();

@@ -103,6 +103,7 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   const socketPath = '/run/updraft-native/worker.sock';
   // Only this in-process test injects storage validation. The production CLI has no bypass flag.
   service = await startService(config, socketPath, () => {});
+  assert.equal(await service.authStatus(), 'connected');
   await assert.rejects(startService(config, `${fixture}/second-worker/worker.sock`, () => {}), /leased|lock/);
   results.push('a second supervisor cannot lease the same durable login');
   const { startProbe } = await import(pathToFileURL(`${fixture}/native-worker/probe.mjs`).href);
@@ -224,12 +225,13 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
     { loggedIn: false, authMethod: 'none', secret: marker },
     { loggedIn: true, authMethod: 'claude.ai', loginExpiresAt: '2000-01-01T00:00:00Z', secret: marker }]) {
     setStatus(status);
+    assert.equal(await service.authStatus(), status.authMethod === 'api_key' ? 'unavailable' : status.loggedIn ? 'expired' : 'auth-required');
     const refused = await native(['touch should-not-exist']);
     assert.equal(refused.code, 125);
     assert(!refused.output.includes(marker));
     assert(!fs.existsSync(`${work}/should-not-exist`));
   }
-  results.push('API auth, signed-out and expired login fail closed without raw status output');
+  results.push('API auth, signed-out and expired login fail closed; Cloud readiness returns only sanitized states');
   setStatus({ loggedIn: true, authMethod: 'claude.ai' });
   const later = `${work}/orphan-ran`;
   await request(argv(['/bin/sh', '-c', `echo started; sleep 2; touch ${quote(later)}`]), '', (text, socket) => { if (text.includes('started')) socket.destroy(); });

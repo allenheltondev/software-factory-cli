@@ -13,6 +13,7 @@ import { createLauncher, internetEgressConnector, noIngressConnector, type Launc
 import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
+import { nativeAws } from './native/aws.js';
 
 /**
  * The GitHub webhook's Lambda entry point (dist/webhook.mjs): POST /api/webhooks/github, a route
@@ -64,6 +65,7 @@ function launcher(): Launcher | undefined {
   const partition = env.PARTITION ?? 'aws';
   return createLauncher({
     store,
+    native: nativeAws(store).launch,
     settings: {
       region,
       bucket: env.TENANT_BUCKET ?? '',

@@ -57,6 +57,8 @@ export function jobResult(job: Pick<JobSummary, 'status' | 'outcome' | 'detail'>
       return 'agent_failure';
     case 'timed_out':
       return 'timeout';
+    case 'canceled':
+      return 'canceled';
     case 'microvm_gone':
       return 'terminated';
     case 'state_not_saved':

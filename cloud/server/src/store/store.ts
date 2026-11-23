@@ -316,6 +316,8 @@ export interface DispatchRefusal {
  * what this record pins: the tenant, the repository and the config version.
  */
 export interface Job {
+  /** Opt-in persistent subscription worker; never dispatched to RunMicrovm. */
+  native?: { workerId: string; notBefore?: number; retry?: boolean };
   jobId: string;
   /** sha256 hex of the job token; the token itself is only ever in the run-hook payload. */
   tokenHash: string;

@@ -1,0 +1,26 @@
+import { readFile } from 'node:fs/promises';
+import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
+import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { nativeRoute } from '../src/native/route.js';
+
+// Operator tooling only. The route file contains references, never a Claude credential.
+// Run from cloud/: npx tsx server/scripts/native-worker.ts status route.json BROKER REGION
+async function main() {
+  const [op, file, broker, region, jobId] = process.argv.slice(2);
+  if (!['status', 'cancel'].includes(op ?? '') || !file || !broker || !region || (op === 'cancel' && !/^job_[\w-]{16}$/.test(jobId ?? ''))) {
+    throw new Error('usage: native-worker.ts status|cancel ROUTE.json BROKER REGION [JOB_ID]');
+  }
+  const route = nativeRoute(await readFile(file, 'utf8'));
+  if (!route) throw new Error('a native worker test route is required');
+  const secrets = new SecretsManagerClient({ region });
+  const token = (await secrets.send(new GetSecretValueCommand({ SecretId: route.controlSecretArn }))).SecretString;
+  if (!token || token.length < 32) throw new Error('worker control credential unavailable');
+  const lambda = new LambdaClient({ region });
+  const response = await lambda.send(new InvokeCommand({ FunctionName: broker,
+    Payload: Buffer.from(JSON.stringify({ action: 'worker', op, workerId: route.workerId, token, ...(jobId ? { jobId } : {}) })) }));
+  if (response.FunctionError) throw new Error('worker broker unavailable');
+  const result = JSON.parse(Buffer.from(response.Payload ?? []).toString('utf8'));
+  if (!result?.ok) throw new Error('worker broker refused operation');
+  console.log(JSON.stringify(result, null, 2));
+}
+main().catch((error) => { console.error(error instanceof Error && error.message.startsWith('usage:') ? error.message : 'Native worker operation failed; check operator permissions and route references.'); process.exitCode = 1; });

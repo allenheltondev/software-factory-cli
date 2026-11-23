@@ -8,6 +8,7 @@ import { createSettingsLoader } from './github/settings.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
+import { nativeAws } from './native/aws.js';
 
 /**
  * The job broker's Lambda entry point (dist/broker.mjs, BrokerFunction). Invoked directly
@@ -22,8 +23,15 @@ const roleArn = process.env.JOB_DATA_ROLE_ARN ?? '';
 const github = createGitHubApi();
 const loadSettings = createSettingsLoader();
 
+const store = createDynamoStore(process.env.TABLE_NAME ?? '');
+const killSwitch = createKillSwitch({ read: async () => {
+  try { return (await ssm.send(new GetParameterCommand({ Name: process.env.KILL_SWITCH_PARAMETER || KILL_SWITCH_PARAMETER }))).Parameter?.Value ?? null; }
+  catch (e) { if (e instanceof ParameterNotFound) return null; throw e; }
+} });
+const native = nativeAws(store, () => killSwitch.engaged()).control;
 const handle = createBroker({
-  store: createDynamoStore(process.env.TABLE_NAME ?? ''),
+  store,
+  native,
   loadSettings,
   github,
   policy: {
@@ -32,16 +40,7 @@ const handle = createBroker({
     region: process.env.AWS_REGION ?? '',
     accountId: process.env.ACCOUNT_ID ?? '',
   },
-  killSwitch: createKillSwitch({
-    read: async () => {
-      try {
-        return (await ssm.send(new GetParameterCommand({ Name: process.env.KILL_SWITCH_PARAMETER || KILL_SWITCH_PARAMETER }))).Parameter?.Value ?? null;
-      } catch (err) {
-        if (err instanceof ParameterNotFound) return null;
-        throw err;
-      }
-    },
-  }),
+  killSwitch,
   async assumeRole({ sessionName, policy, durationSeconds }) {
     const out = await sts.send(new AssumeRoleCommand({ RoleArn: roleArn, RoleSessionName: sessionName, Policy: policy, DurationSeconds: durationSeconds }));
     const c = out.Credentials;
@@ -73,6 +72,7 @@ const handle = createBroker({
 
 export async function handler(event: unknown) {
   try {
+    if (event && typeof event === 'object' && (event as { action?: unknown }).action === 'worker') return await native.handle(event);
     return await handle(event);
   } catch (err) {
     // Never the details: they could carry a token or a credential.

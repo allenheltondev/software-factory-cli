@@ -28,4 +28,4 @@ agents:
 # Both profiles use ONE login, with a global single-job lock in the supervisor.
 # Use them in the existing implementation and reviewer pools; keep your existing actions,
 # verify commands, publication and revision policy. All clones/worktrees must be under
-# /var/lib/updraft-jobs. There is no Cloud dispatch integration in this proof.
+# /var/lib/updraft-jobs. Cloud test routing is opt-in; see CLOUD.md.

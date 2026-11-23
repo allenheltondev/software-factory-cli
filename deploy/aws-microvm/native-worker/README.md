@@ -50,8 +50,9 @@ recovery remains a live acceptance test. Children have cleared supplementary gro
 no-new-privileges and parent-death signals; disconnect/stop/shutdown cancels their execution.
 
 The trust boundary includes root, the kernel, root-owned installation/configuration and the
-official CLI. The experiment does not enable Cloud dispatch or protect source code from model
-requests authorized by the job. Networking for repository code is disabled: bake dependencies
+official CLI. Cloud dispatch remains disabled by default; [CLOUD.md](CLOUD.md) describes the
+operator-only #104 test route. The boundary does not protect source code from model requests
+authorized by the job. Networking for repository code is disabled: bake dependencies
 and tools into the image. Triage, background jobs, arbitrary agent flags, alternate adapters,
 suspend/resume and sharing this storage between tenants are outside this proof.
 Prompts are limited to 512 KiB, each tool command to 120 seconds/256 KiB output, and each
@@ -211,8 +212,8 @@ resolves only those names and sends their values only into repository tool/verif
 never the credential-owning CLI. Other overrides, including Git config/SSH helpers, remain
 forbidden. Keep the existing GitHub App commit identity configuration.
 Do not introduce a host-native agent or host verification wrapper. Existing narrow/read-only
-git mounts protect metadata that host git would later obey. No Cloud registration, heartbeat,
-dispatch, SSH server or custom login UI is added by this prototype.
+git mounts protect metadata that host git would later obey. The optional Cloud worker control
+loop is documented separately in [CLOUD.md](CLOUD.md); no SSH server or custom login UI is added.
 
 ## Live acceptance checklist — all still pending
 
@@ -233,8 +234,8 @@ dispatch, SSH server or custom login UI is added by this prototype.
 - Expired/revoked login fails without API billing fallback. Cancellation/worker termination
   leaves no executing model/tool subprocess.
 
-Any failed item leaves the proof incomplete. Registration, leasing/dispatch and setup UI follow
-only after these pass.
+Any failed item leaves the proof incomplete. The opt-in [Cloud integration](CLOUD.md) stays a
+development test path until these pass; production routing and setup UI remain gated.
 
 Sources: [MicroVM lifecycle](https://docs.aws.amazon.com/lambda/latest/dg/microvms-launching.html),
 [mount capabilities](https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html#microvms-images-os-capabilities),
