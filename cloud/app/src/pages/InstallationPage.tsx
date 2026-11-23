@@ -164,6 +164,9 @@ function Loaded({
           <Link className="auth-link" to={`${base}/keys`} data-testid="keys-link">
             Agent keys
           </Link>
+          <Link className="auth-link" to={`${base}/routines`} data-testid="routines-link">
+            Claude scheduled tasks
+          </Link>
           <Link className="auth-link" to={`${base}/telemetry`} data-testid="telemetry-link">
             Agent telemetry
           </Link>

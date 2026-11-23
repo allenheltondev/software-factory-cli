@@ -1,4 +1,4 @@
-import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, keyOrAlternatives, type CloudAgent } from './agents.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, type CloudAgent } from './agents.js';
 import { CEILINGS, type ConfigIssue, type TenantSubmission } from './config.js';
 
 /**
@@ -365,7 +365,7 @@ export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): C
     // asking for its key first would send the tenant to a key the key page cannot take.
     if (!CONSOLE_AGENTS.includes(adapter)) return;
     const name = SUPPORTED_AGENT_KEY_ENV[adapter];
-    if (!keys.has(name)) out.push({ path, message: `set the tenant's ${keyOrAlternatives(adapter)} first: jobs run ${adapter} with your own key` });
+    if (!keys.has(name)) out.push({ path, message: `set the tenant's ${name} first: jobs run ${adapter} with your own key` });
   };
   for (const [name, u] of usage(config, 'enabled')) {
     const w = config.workflows[name];

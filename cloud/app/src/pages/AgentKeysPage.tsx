@@ -20,10 +20,6 @@ export interface Provider {
   checkedOnSave: boolean;
   /** Says what is wrong with what was typed, before anything is sent; null when it looks right. The server decides for real. */
   problem: (value: string) => string | null;
-  /** The field's label; `<company> API key` when absent. */
-  inputLabel?: string;
-  /** The card's title when an agent has more than one way to sign in; the agent's name when absent. */
-  title?: string;
 }
 
 const external = (href: string, text: string) => (
@@ -35,7 +31,6 @@ const external = (href: string, text: string) => (
 export const PROVIDERS: Record<string, Provider> = {
   ANTHROPIC_API_KEY: {
     agent: 'Claude',
-    title: 'Claude: API key',
     company: 'Anthropic',
     placeholder: 'sk-ant-…',
     getKeyUrl: AGENT_GUIDES.claude.getKeyUrl,
@@ -47,36 +42,7 @@ export const PROVIDERS: Record<string, Provider> = {
       </>,
     ],
     checkedOnSave: true,
-    problem: (v) =>
-      v.startsWith('sk-ant-oat')
-        ? 'That is a Claude subscription token. Paste it under Claude: subscription instead.'
-        : v.startsWith('sk-ant-')
-          ? null
-          : v.startsWith('sk-')
-            ? 'That looks like an OpenAI key. Anthropic keys start with sk-ant-.'
-            : 'Anthropic keys start with sk-ant-.',
-  },
-  // Claude on a Claude Pro or Max subscription instead of API credits: what `claude setup-token` prints.
-  CLAUDE_CODE_OAUTH_TOKEN: {
-    agent: 'Claude',
-    title: 'Claude: subscription',
-    company: 'Anthropic',
-    placeholder: 'sk-ant-oat01-…',
-    getKeyUrl: '',
-    inputLabel: 'Claude subscription token',
-    steps: [
-      <>
-        On your own computer, with Claude Code installed, run <code>claude setup-token</code>.
-      </>,
-      <>Sign in with the Claude account whose subscription jobs should use, and copy the token it prints.</>,
-    ],
-    checkedOnSave: false,
-    problem: (v) =>
-      v.startsWith('sk-ant-oat')
-        ? null
-        : v.startsWith('sk-ant-')
-          ? 'That is an Anthropic API key. Paste it under Claude: API key instead.'
-          : 'A subscription token from claude setup-token starts with sk-ant-oat.',
+    problem: (v) => (v.startsWith('sk-ant-') ? null : v.startsWith('sk-') ? 'That looks like an OpenAI key. Anthropic keys start with sk-ant-.' : 'Anthropic keys start with sk-ant-.'),
   },
   CODEX_API_KEY: {
     agent: 'Codex',
@@ -151,24 +117,9 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
 
   const keys = load.state === 'ok' ? load.view.keys : [];
   const missingRequired = keys.filter((k) => k.required && !k.configured);
-  // What to do first: the keys the configuration needs, then any key already set; the rest is
-  // optional. A key that can stand in for one shown (a Claude subscription token) is shown with it.
-  const first = (k: AgentKeyView) => k.required || k.configured;
-  // A key and its stand-in are shown together: whichever of the two is needed or set brings the other.
-  const partner = (k: AgentKeyView, o: AgentKeyView) => o.name === k.alternativeTo || o.alternativeTo === k.name;
-  const shown = (k: AgentKeyView): boolean => first(k) || keys.some((o) => partner(k, o) && first(o));
-  const primary = keys.filter(shown).sort((a, b) => Number(b.required) - Number(a.required));
-  const others = keys.filter((k) => !shown(k));
-  // An API key whose stand-in is set is not handed to jobs: the stand-in is used instead.
-  const standingIn = new Set(keys.filter((k) => k.alternativeTo && k.configured).map((k) => k.alternativeTo!));
-  const noteFor = (k: AgentKeyView): string | undefined =>
-    k.alternativeTo
-      ? k.configured
-        ? 'Jobs run on your subscription, not API credits, while this is set.'
-        : 'Run jobs on your Claude Pro or Max subscription instead of API credits. Once set, jobs use it instead of the API key.'
-      : standingIn.has(k.name) && k.configured
-        ? 'Not used while your Claude subscription token is set: jobs use the subscription first.'
-        : undefined;
+  // What to do first: the keys the configuration needs, then any key already set; the rest is optional.
+  const primary = keys.filter((k) => k.required || k.configured).sort((a, b) => Number(b.required) - Number(a.required));
+  const others = keys.filter((k) => !k.required && !k.configured);
   const onSaved = (view: AgentKeysView) => setLoad({ state: 'ok', view });
 
   return (
@@ -194,7 +145,7 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
             </Alert>
           ) : (
             primary.length > 0 &&
-            primary.every((k) => k.configured || !k.required) && (
+            primary.every((k) => k.configured) && (
               <p role="status" className="font-medium" data-testid="keys-ready">
                 ✓ Every agent your configuration runs has its key.
               </p>
@@ -207,17 +158,17 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
           )}
           <div className="flex flex-col gap-4" data-testid="agent-keys">
             {primary.map((k) => (
-              <KeyCard key={k.name} keyView={k} note={noteFor(k)} installationId={installationId} api={api} onSaved={onSaved} />
+              <KeyCard key={k.name} keyView={k} installationId={installationId} api={api} onSaved={onSaved} />
             ))}
             {others.length > 0 &&
               (primary.length === 0 ? (
-                others.map((k) => <KeyCard key={k.name} keyView={k} note={noteFor(k)} installationId={installationId} api={api} onSaved={onSaved} />)
+                others.map((k) => <KeyCard key={k.name} keyView={k} installationId={installationId} api={api} onSaved={onSaved} />)
               ) : (
                 <details className="rounded-lg border border-border p-4" data-testid="other-agents">
-                  <summary className="cursor-pointer font-medium">Other agents ({[...new Set(others.map((k) => providerOf(k).agent))].join(', ')})</summary>
+                  <summary className="cursor-pointer font-medium">Other agents ({others.map((k) => providerOf(k).agent).join(', ')})</summary>
                   <div className="mt-4 flex flex-col gap-4">
                     {others.map((k) => (
-                      <KeyCard key={k.name} keyView={k} note={noteFor(k)} installationId={installationId} api={api} onSaved={onSaved} />
+                      <KeyCard key={k.name} keyView={k} installationId={installationId} api={api} onSaved={onSaved} />
                     ))}
                   </div>
                 </details>
@@ -246,7 +197,7 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
   );
 }
 
-function KeyCard({ keyView: k, note, installationId, api, onSaved }: { keyView: AgentKeyView; note?: string; installationId: number; api: Api; onSaved: (view: AgentKeysView) => void }) {
+function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentKeyView; installationId: number; api: Api; onSaved: (view: AgentKeysView) => void }) {
   const provider = providerOf(k);
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
@@ -294,18 +245,13 @@ function KeyCard({ keyView: k, note, installationId, api, onSaved }: { keyView: 
     <Card data-testid={`key-${k.name}`}>
       <CardHeader>
         <CardTitle className="flex flex-wrap items-center gap-2">
-          {provider.title ?? provider.agent}
+          {provider.agent}
           <StatusBadge tone={state.tone}>{state.label}</StatusBadge>
           {k.required && <StatusBadge tone="neutral">Used by your configuration</StatusBadge>}
         </CardTitle>
       </CardHeader>
       <CardBody>
         <div className="flex flex-col gap-4">
-          {note && (
-            <p className="text-sm" data-testid={`key-note-${k.name}`}>
-              {note}
-            </p>
-          )}
           {provider.guide && (
             <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm" data-testid={`key-guide-${k.name}`}>
               <a className="auth-link" href={provider.guide.getKeyUrl} target="_blank" rel="noreferrer">
@@ -357,7 +303,7 @@ function KeyCard({ keyView: k, note, installationId, api, onSaved }: { keyView: 
               )}
               <PasswordInput
                 ref={input}
-                label={k.configured ? 'New key' : (provider.inputLabel ?? `${provider.company} API key`)}
+                label={k.configured ? 'New key' : `${provider.company} API key`}
                 autoComplete="off"
                 autoCapitalize="off"
                 spellCheck={false}

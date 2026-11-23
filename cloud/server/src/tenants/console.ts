@@ -1,4 +1,4 @@
-import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, keyOrAlternatives, type CloudAgent } from './agents.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, type CloudAgent } from './agents.js';
 import { CEILINGS, type ConfigIssue, type TenantSubmission } from './config.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 
@@ -740,7 +740,7 @@ export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): C
     // An agent this deployment does not run: compiling it says so, with what to do instead.
     if (!CONSOLE_AGENTS.includes(adapter)) continue;
     const key = SUPPORTED_AGENT_KEY_ENV[adapter];
-    if (!keys.has(key)) out.push({ path: `agents.${name}`, message: `add your ${keyOrAlternatives(adapter)}, or turn this agent off: jobs run ${adapter} with your own key` });
+    if (!keys.has(key)) out.push({ path: `agents.${name}`, message: `add your ${key}, or turn this agent off: jobs run ${adapter} with your own key` });
   }
   return out;
 }

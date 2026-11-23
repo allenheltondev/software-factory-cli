@@ -5,9 +5,9 @@ import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
 import { loopOf, stepsOf, telemetryOf, type JobTelemetryDescriptor, type JobTelemetrySnapshot } from '../jobs/lifecycle.js';
-import { isFailure, type Job, type JobClaudeSignIn, type JobFinishDetail, type Store, type TelemetrySettings } from '../store/store.js';
-import { AGENT_KEY_NAMES, UNCHECKED_AGENT_KEYS, agentKeySecretName, agentKeySecretPrefix, setAgentKey, type SecretsPort } from '../tenants/agent-keys.js';
-import { SUPPORTED_AGENT_KEY_ENV, alternativeTo, keysUsedFor } from '../tenants/agents.js';
+import { isFailure, type Job, type JobFinishDetail, type Store, type TelemetrySettings } from '../store/store.js';
+import { AGENT_KEY_NAMES, UNCHECKED_AGENT_KEYS, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
+import { SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
 // Not the whole telemetry service: only the secret's name.
@@ -137,10 +137,6 @@ export interface BrokerDeps {
   microvmState(microvmId: string): Promise<string | null>;
   /** Posts the over-quota comment for a job refused at start (once a day per issue). */
   notifyThrottled?: (notice: ThrottleNotice) => Promise<void>;
-  /** Posts on the job's issue that a member needs to sign in to Claude (`needed`), or that it failed. */
-  notifyClaudeSignIn?: (notice: ClaudeSignInNotice) => Promise<void>;
-  /** Writes an agent-key secret: the token a job's Claude sign-in got. Absent: sign-in tokens cannot be saved. */
-  secrets?: SecretsPort;
   /** Pause between looks at a microVM that was asked to stop. */
   stopCheckDelayMs?: number;
   log?: (entry: Record<string, unknown>) => void;
@@ -150,32 +146,14 @@ export interface BrokerDeps {
   now?: () => number;
 }
 
-/** What the broker posts about a job's Claude sign-in, on the issue (or pull request) the job is for. */
-export interface ClaudeSignInNotice {
-  kind: 'needed' | 'failed';
-  installationId: number;
-  jobId: string;
-  repository: string;
-  repositoryId: number;
-  issue: number;
-  pullRequest?: number;
-  reason?: string;
-}
-
 export type BrokerResponse =
-  | { ok: true; descriptor: JobPaths & { bucket: string; region: string; agentKeySecrets: Record<string, string>; telemetry?: JobTelemetry; claudeSignIn?: true }; credentials: ScopedCredentials }
-  | { ok: true; signIn: JobClaudeSignIn['state'] }
-  | { ok: true; code: string }
-  | { ok: true; waiting: true }
+  | { ok: true; descriptor: JobPaths & { bucket: string; region: string; agentKeySecrets: Record<string, string>; telemetry?: JobTelemetry }; credentials: ScopedCredentials }
   | { ok: true; tokenFile: Record<string, unknown> }
   | { ok: true; finished: true }
   | { ok: true; terminated: true }
   | { ok: false; error: 'refused' | 'bad_request' | 'unavailable' };
 
 const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
-/** What `claude setup-token` prints to sign in with (claude-sign-in.mjs reads it the same way). */
-const CLAUDE_SIGN_IN_URL = /^https:\/\/claude\.ai\/oauth\/authorize\?[A-Za-z0-9._~%&=+/-]+$/;
-const SIGN_IN_ACTIONS = new Set(['claude-sign-in-url', 'claude-sign-in-code', 'claude-sign-in-token', 'claude-sign-in-failed']);
 const OUTCOME = /^[a-z_]{1,40}$/;
 const REFUSED: BrokerResponse = { ok: false, error: 'refused' };
 /** A job that started after a redelivery's job had taken its delivery's claim: it never runs. */
@@ -188,34 +166,6 @@ export function createBroker(deps: BrokerDeps) {
   const killSwitch = deps.killSwitch ?? OFF_SWITCH;
   const log = deps.log ?? ((entry) => console.log(JSON.stringify(entry)));
   const bots = new Map<string, { id: number; login: string }>();
-
-  /**
-   * The agent key names a job of this tenant is handed (the runner skips one that is not set):
-   * every one this deployment offers, but an API key whose stand-in is set (a Claude subscription
-   * token, which Claude Code then uses instead of API credits).
-   */
-  async function handedKeys(installationId: number): Promise<string[]> {
-    const metas = await deps.store.listAgentKeyMeta(installationId);
-    // A key its provider refused (an expired subscription token) is as good as not set.
-    const rejected = new Set(metas.filter((k) => k.rejectedAt).map((k) => k.name));
-    const usable = metas.filter((k) => !k.rejectedAt).map((k) => k.name);
-    const replaced = new Set(usable.map(alternativeTo).filter((k): k is string => k !== undefined));
-    return AGENT_KEY_NAMES.filter((name) => !replaced.has(name) && !rejected.has(name));
-  }
-
-  /**
-   * Whether this job signs in to Claude before it runs: the launcher started it for that, and
-   * there is still no usable Claude credential (another job may have signed in since). One that
-   * no longer needs to is marked done. When the keys cannot be read, it signs in.
-   */
-  async function signInNeeded(job: Job): Promise<boolean> {
-    if (job.claudeSignIn?.state !== 'starting') return false;
-    const metas = await deps.store.listAgentKeyMeta(job.installationId).catch(() => null);
-    const usable = metas?.some((k) => !k.rejectedAt && (k.name === SUPPORTED_AGENT_KEY_ENV.claude || alternativeTo(k.name) === SUPPORTED_AGENT_KEY_ENV.claude));
-    if (!usable) return true;
-    await deps.store.updateClaudeSignIn(job.jobId, ['starting'], { state: 'done', at: new Date(now()).toISOString(), reason: 'a Claude credential was set before the job started' });
-    return false;
-  }
 
   /** The job, if the token is its token; else null. */
   async function verify(jobId: unknown, token: unknown): Promise<Job | null> {
@@ -266,72 +216,10 @@ export function createBroker(deps: BrokerDeps) {
     }
   }
 
-  /** Posts about a job's sign-in on its issue. Best effort: the console shows the sign-in either way. */
-  async function notifySignIn(job: Job, kind: ClaudeSignInNotice['kind'], reason?: string): Promise<void> {
-    const issue = job.issue ?? job.pullRequest;
-    if (!deps.notifyClaudeSignIn || issue === undefined) return;
-    await deps
-      .notifyClaudeSignIn({ kind, installationId: job.installationId, jobId: job.jobId, repository: job.repository, repositoryId: job.repositoryId, issue, ...(job.pullRequest !== undefined ? { pullRequest: job.pullRequest } : {}), ...(reason ? { reason } : {}) })
-      .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not post about the Claude sign-in: ${(err as Error)?.name}` }));
-  }
-
-  /**
-   * A job's Claude subscription sign-in (the runner's claude-sign-in.mjs), only for a job the
-   * launcher started for one. The runner reports the URL (members are asked on the issue, and
-   * open it from the console), asks for the code a member gave there (handed once), hands back the
-   * token `claude setup-token` printed (saved as the tenant's CLAUDE_CODE_OAUTH_TOKEN, as the
-   * Agent keys page saves one), or says why it failed.
-   */
-  async function claudeSignIn(job: Job, action: string, r: { url: unknown; value: unknown; reason: unknown }): Promise<BrokerResponse> {
-    const current = job.claudeSignIn;
-    if (!current) return REFUSED;
-    const at = new Date(now()).toISOString();
-    const by = current.by ? { by: current.by } : {};
-    switch (action) {
-      case 'claude-sign-in-url': {
-        if (typeof r.url !== 'string' || r.url.length > 2048 || !CLAUDE_SIGN_IN_URL.test(r.url)) return { ok: false, error: 'bad_request' };
-        if (!(await deps.store.updateClaudeSignIn(job.jobId, ['starting'], { state: 'waiting', at, url: r.url }))) return REFUSED;
-        await notifySignIn(job, 'needed');
-        return { ok: true, signIn: 'waiting' };
-      }
-      case 'claude-sign-in-code': {
-        if (current.state === 'code' && current.code) {
-          // Handed once: the runner types it into `setup-token`, and it is gone from the record.
-          if (await deps.store.updateClaudeSignIn(job.jobId, ['code'], { state: 'exchanging', at, ...by })) return { ok: true, code: current.code };
-          return { ok: true, waiting: true };
-        }
-        return current.state === 'waiting' ? { ok: true, waiting: true } : REFUSED;
-      }
-      case 'claude-sign-in-token': {
-        if (current.state !== 'exchanging' || typeof r.value !== 'string') return REFUSED;
-        if (!deps.secrets) return { ok: false, error: 'unavailable' };
-        // As the Agent keys page saves one, on its shape: no provider call checks a subscription token.
-        const saved = await setAgentKey(
-          { installationId: job.installationId, name: 'CLAUDE_CODE_OAUTH_TOKEN', value: r.value, updatedBy: current.by ?? 'Claude sign-in' },
-          { secrets: deps.secrets, store: deps.store, check: async () => 'unchecked', now },
-        );
-        if (!saved.ok) {
-          await deps.store.updateClaudeSignIn(job.jobId, ['exchanging'], { state: 'failed', at, reason: 'the token Claude gave could not be saved', ...by });
-          await notifySignIn(job, 'failed', 'the token Claude gave could not be saved');
-          return { ok: false, error: 'bad_request' };
-        }
-        await deps.store.updateClaudeSignIn(job.jobId, ['exchanging'], { state: 'done', at, ...by });
-        return { ok: true, signIn: 'done' };
-      }
-      default: {
-        // claude-sign-in-failed. Printable text only, and never anything shaped like a token.
-        const said = typeof r.reason === 'string' ? r.reason.replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted]').replace(/[^ -~]/g, ' ').trim().slice(0, 300) : '';
-        const why = said || 'the sign-in did not finish';
-        if (await deps.store.updateClaudeSignIn(job.jobId, ['starting', 'waiting', 'code', 'exchanging'], { state: 'failed', at, reason: why, ...by })) await notifySignIn(job, 'failed', why);
-        return { ok: true, signIn: 'failed' };
-      }
-    }
-  }
-
   return async function handle(request: unknown): Promise<BrokerResponse> {
     if (typeof request !== 'object' || request === null) return { ok: false, error: 'bad_request' };
-    const { action, jobId, token, outcome, detail, url, value, reason } = request as Record<string, unknown>;
-    if (action !== 'start' && action !== 'credentials' && action !== 'github-token' && action !== 'finish' && action !== 'terminate' && !SIGN_IN_ACTIONS.has(action as string)) {
+    const { action, jobId, token, outcome, detail } = request as Record<string, unknown>;
+    if (action !== 'start' && action !== 'credentials' && action !== 'github-token' && action !== 'finish' && action !== 'terminate') {
       return { ok: false, error: 'bad_request' };
     }
     const job = await verify(jobId, token);
@@ -408,26 +296,11 @@ export function createBroker(deps: BrokerDeps) {
       // was handed but an unchecked one (Kiro's), which is never shown working on a guess.
       // Best effort: a failure here must not fail the job's finish.
       const ran = finished?.adapters ? new Set<string>(finished.adapters.map((a) => SUPPORTED_AGENT_KEY_ENV[a as keyof typeof SUPPORTED_AGENT_KEY_ENV])) : null;
-      // The job's needs name an agent's API key; the key it was handed for one may be a stand-in
-      // (a Claude subscription token: handedKeys), and that is the one whose use is recorded.
-      const handed = await handedKeys(job.installationId).catch(() => null);
-      const needs = (job.agentKeys ?? []).filter((name) => (ran ? ran.has(name) : true));
-      const used = (handed ? keysUsedFor(needs, handed) : needs).filter((name) => ran || !UNCHECKED_AGENT_KEYS.has(name));
+      const used = (job.agentKeys ?? []).filter((name) => (ran ? ran.has(name) : !UNCHECKED_AGENT_KEYS.has(name)));
       if (used.length && job.startedAt !== undefined && (recorded === 'succeeded' || (isFailure(recorded) && recorded !== 'terminated'))) {
         const use = { at: new Date(now()).toISOString(), ok: recorded === 'succeeded', jobStartedAt: new Date(job.startedAt).toISOString() };
         await Promise.all(used.map((name) => deps.store.recordAgentKeyUse(job.installationId, name, use))).catch((err: unknown) =>
           log({ jobId: job.jobId, warning: `could not record the key use: ${(err as Error)?.name}` }),
-        );
-      }
-      // Claude refused the subscription token the job was handed (expired, revoked): the next job
-      // signs in again rather than failing the same way. Whether or not the runner said which
-      // agents ran: a refused credential is what it reports. Only a token: an API key was checked
-      // on save, and its failed use says enough.
-      if (finished?.authFailed && handed && job.startedAt !== undefined && recorded !== 'succeeded') {
-        const tokens = keysUsedFor(job.agentKeys ?? [], handed).filter((name) => alternativeTo(name) !== undefined);
-        const at = { at: new Date(now()).toISOString(), jobStartedAt: new Date(job.startedAt).toISOString() };
-        await Promise.all(tokens.map((name) => deps.store.markAgentKeyRejected(job.installationId, name, at))).catch((err: unknown) =>
-          log({ jobId: job.jobId, warning: `could not mark the token rejected: ${(err as Error)?.name}` }),
         );
       }
       return { ok: true, finished: true };
@@ -465,8 +338,6 @@ export function createBroker(deps: BrokerDeps) {
       return REFUSED;
     }
 
-    if (SIGN_IN_ACTIONS.has(action as string)) return claudeSignIn(job, action as string, { url, value, reason });
-
     if (action === 'start' || action === 'credentials') {
       const credentials = await deps.assumeRole({
         sessionName: `job-${job.jobId}`.slice(0, 64),
@@ -476,11 +347,7 @@ export function createBroker(deps: BrokerDeps) {
       // The tenant's key secrets by variable name; the runner reads them with the credentials (a
       // missing one is a key the tenant has not set).
       // Only the agents this deployment runs (CloudAgents): one taken out of service gets no key.
-      // A Claude subscription token, when set, is handed instead of ANTHROPIC_API_KEY, so Claude
-      // Code bills the subscription. If the tenant's keys cannot be listed, every name is handed:
-      // the runner skips the ones not set.
-      const handed = (await handedKeys(job.installationId).catch(() => null)) ?? AGENT_KEY_NAMES;
-      const agentKeySecrets = Object.fromEntries(handed.map((name) => [name, agentKeySecretName(job.installationId, name)]));
+      const agentKeySecrets = Object.fromEntries(AGENT_KEY_NAMES.map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
       // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
       // and keeps it with the job with that destination's link settings: every later `start` (a
@@ -508,7 +375,7 @@ export function createBroker(deps: BrokerDeps) {
         }
       }
       const telemetry = snapshot.descriptor;
-            return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}), ...((await signInNeeded(job)) ? { claudeSignIn: true as const } : {}) }, credentials };
+            return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
     }
 
     // github-token: a token for this job's repository only, as the CLI reads it (token-file-auth.ts).
@@ -589,7 +456,6 @@ export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFin
   }
   const steps = stepsOf(d.steps);
   if (steps) out.steps = steps;
-  if (d.authFailed === true) out.authFailed = true;
   if (Array.isArray(d.adapters) && d.adapters.length <= 16) out.adapters = [...new Set(d.adapters.filter((a): a is string => typeof a === 'string' && Object.hasOwn(SUPPORTED_AGENT_KEY_ENV, a)))].sort();
   return Object.keys(out).length ? out : undefined;
 }

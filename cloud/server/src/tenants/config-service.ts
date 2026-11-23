@@ -6,7 +6,7 @@ import { AGENT_KEY_NAMES } from './agent-keys.js';
 import { CEILINGS, compileTenantConfig, type ConfigIssue, type TenantSubmission } from './config.js';
 import { CONSOLE_AGENTS, CONSOLE_LIMITS, defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission, upgradeNotes, type ConsoleConfig } from './console.js';
 import * as v1 from './console-v1.js';
-import { keysMet, type CloudAgent } from './agents.js';
+import type { CloudAgent } from './agents.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 import { configPrefix, SOURCE_FILE } from './paths.js';
 import { publishTenantConfig, type ConfigSource } from './publish.js';
@@ -121,12 +121,8 @@ export function createConfigService({ store, github, objects, now = () => Date.n
     return null;
   }
 
-  /**
-   * The key needs the tenant's keys meet: what is set, plus Claude's API key when a Claude
-   * subscription token stands in for it. Every check and view here compares with this.
-   */
   async function keysSet(installationId: number): Promise<Set<string>> {
-    return keysMet((await store.listAgentKeyMeta(installationId)).map((k) => k.name));
+    return new Set((await store.listAgentKeyMeta(installationId)).map((k) => k.name));
   }
 
   const repositoryIds = (ctx: ConfigContext) => new Map(ctx.repositories.map((r) => [r.fullName.toLowerCase(), r.id]));
@@ -249,7 +245,6 @@ export function createConfigService({ store, github, objects, now = () => Date.n
         tenant: ctx.summary,
         githubLogin: ctx.githubLogin,
         repositories: ctx.repositories,
-        // Met, not merely set: ANTHROPIC_API_KEY is true when a Claude subscription token stands in for it.
         agentKeys: Object.fromEntries(AGENT_KEY_NAMES.map((n) => [n, keys.has(n)])),
         agents: [...CONSOLE_AGENTS],
         activeVersion: active ?? null,

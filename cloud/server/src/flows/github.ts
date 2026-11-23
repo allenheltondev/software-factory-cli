@@ -53,9 +53,6 @@ export type FlowErrorCode =
   // Agent telemetry (tenants/telemetry-service.ts).
   | 'invalid_settings'
   | 'state_too_large'
-  // A job's Claude sign-in (tenants/claude-sign-in-service.ts).
-  | 'invalid_code'
-  | 'sign_in_closed'
   // The admin view (admin/admin.ts).
   | 'not_found'
   | 'uninstalled'
@@ -70,7 +67,8 @@ export type FlowErrorCode =
   | 'log_expired'
   | 'log_unavailable'
   // Agent keys (tenants/agent-key-service.ts).
-  | 'invalid_key';
+  | 'invalid_key'
+  | 'invalid_routine';
 
 export class FlowError extends Error {
   readonly code: FlowErrorCode;

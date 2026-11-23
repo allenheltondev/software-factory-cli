@@ -26,6 +26,7 @@ export interface CleanupDeps {
   /** Deletes these keys (at most 1000 per call). */
   deleteObjects(keys: string[]): Promise<void>;
   secrets: Pick<SecretsPort, 'remove'>;
+  routineSecretNames?: (installationId: number) => Promise<string[]>;
   now?: () => number;
   log?: (message: string) => void;
 }
@@ -58,6 +59,7 @@ async function cleanTenant(entry: CleanupEntry, deps: CleanupDeps): Promise<void
   const keys = await deps.listObjects(tenantPrefix(entry.installationId));
   for (let i = 0; i < keys.length; i += 1000) await deps.deleteObjects(keys.slice(i, i + 1000));
   for (const name of ALL_AGENT_KEY_NAMES) await deps.secrets.remove(agentKeySecretName(entry.installationId, name));
+  for (const name of (await deps.routineSecretNames?.(entry.installationId)) ?? []) await deps.secrets.remove(name);
   // And any table row an interrupted uninstall sweep left without a TTL.
   await deps.store.purgeTenantPartition(entry.installationId);
 }

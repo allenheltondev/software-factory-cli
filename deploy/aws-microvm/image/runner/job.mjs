@@ -10,7 +10,6 @@ import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { MAX_SECRET_BYTES, createRedactor, redactingWriter } from './redact.mjs';
-import { claudeSignIn } from './claude-sign-in.mjs';
 import { IsolationError, beginIsolation, isolationMode, selfTest, verifyIsolation } from './isolation.mjs';
 import {
   DEFAULT_CHECKPOINT_SECONDS,
@@ -402,19 +401,6 @@ export async function runJob(request, deps) {
     // keeps (the log stream, the uploaded logs, the result) carries a value of them.
     const agentEnv = payload.version === 2 ? await brokerAgentEnv(payload, deps) : parseAgentEnv(await deps.getSecret(payload.secrets.agentEnv));
     redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? telemetrySecrets(telemetry) : [])]);
-    // No Claude credential (Updraft Cloud): sign in with a member's Claude subscription first
-    // (claude-sign-in.mjs). Waiting for them comes out of the job's time, so it is measured again.
-    if (payload.claudeSignIn && !agentEnv.CLAUDE_CODE_OAUTH_TOKEN && deps.claudeSignIn) {
-      const signed = await timed('claude_sign_in', {}, () => claudeSignIn({ ...deps, log, stopped: () => stopRequested }, deps.claudeSignInOptions ?? {}));
-      if (!signed.ok) throw Object.assign(new Error(`Claude sign-in failed: ${signed.reason}`), { code: 'claude-sign-in' });
-      agentEnv.CLAUDE_CODE_OAUTH_TOKEN = signed.token;
-      // The subscription, not API credits (the broker hands one or the other, never both).
-      delete agentEnv.ANTHROPIC_API_KEY;
-      redact = createRedactor([...secretValues(payload, agentEnv), ...(telemetry ? telemetrySecrets(telemetry) : [])]);
-      budget = watchdogBudgetMs(payload, now());
-      deadlineNow = deps.deadlineMinutes ?? deadlineMinutes(budget);
-      if (budget <= 0 || deadlineNow < 1) throw new Error('no time left before the microVM reaches its maximum duration (the sign-in took it)');
-    }
     // Claude Code's own events only go somewhere with a destination.
     if (sending) ({ relay, env: agentTelemetryEnv } = await startAgentEventRelay(tracer, log));
     for (;;) {
@@ -507,12 +493,6 @@ export async function runJob(request, deps) {
   } catch (error) {
     result.outcome = stopRequested ? 'terminated' : 'runner_error';
     result.error = error instanceof Error ? error.message : String(error);
-    if (error?.code === 'claude-sign-in' && !stopRequested) {
-      // Nothing was started: no member signed in, or Claude refused the code. The broker said so
-      // on the issue; applying the label again starts a new sign-in.
-      result.outcome = 'failed';
-      result.errorCode = 'claude-sign-in';
-    }
     if (error instanceof IsolationError) {
       // A failure of its own kind: nothing was started, and nothing may be until it is fixed.
       result.outcome = 'runner_error';
@@ -751,23 +731,9 @@ function startTokenRefresh(stateDir, deps) {
 /** run-event outcomes of a job that ran no agent: it used none of its keys. */
 const NO_AGENT_OUTCOMES = new Set(['nothing-to-do', 'canceled', 'superseded', 'deferred', 'not-started']);
 
-/**
- * Whether the run failed because an agent's provider refused its credential: an expired or
- * revoked Claude subscription token, a revoked key. Claude Code reports it as an API status 401
- * or an authentication error (`claude reported an error (API status 401) ...`). Pure.
- */
-export function agentAuthFailed(result) {
-  const summary = result?.summary;
-  if (!summary || typeof summary !== 'object') return false;
-  const jobs = [summary, ...(Array.isArray(summary.jobs) ? summary.jobs : []), ...(Array.isArray(summary.followOnJobs) ? summary.followOnJobs : [])];
-  const said = jobs.flatMap((j) => [j?.error, j?.message]).filter((t) => typeof t === 'string');
-  return said.some((t) => /API status 401|authentication_error|OAuth token (?:has )?expired|invalid (?:x-api-key|bearer token|api key)|Please run \/login/i.test(t));
-}
-
 export function finishDetail(result) {
   const detail = {};
   if (typeof result.updraftOutcome === 'string') detail.updraftOutcome = result.updraftOutcome;
-  if (agentAuthFailed(result)) detail.authFailed = true;
   // A job that ran no agent says so (none), whatever the tracer read.
   if (NO_AGENT_OUTCOMES.has(result.updraftOutcome) && !result.telemetry?.adapters?.length) detail.adapters = [];
   // Every job the run did (the event's own, more of them, and what followed: a reviewer run, a

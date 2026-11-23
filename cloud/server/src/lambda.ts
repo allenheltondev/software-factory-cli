@@ -6,6 +6,8 @@ import { handle } from 'hono/aws-lambda';
 import { adminAccess, DEFAULT_ADMIN_GROUP } from './admin/access.js';
 import { createAdminService } from './admin/admin.js';
 import { createApp } from './app.js';
+import { createRoutineService } from './routines/service.js';
+import { createDynamoRoutineRuleStore } from './routines/rules.js';
 import { callerFromClaims, groupsFrom, type Claims } from './caller.js';
 import { createGitHubFlows } from './flows/github.js';
 import { createGitHubApi } from './github/client.js';
@@ -13,7 +15,6 @@ import { createSettingsLoader } from './github/settings.js';
 import type { RetryRequest, RetryResult } from './jobs/retry.js';
 import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
-import { createClaudeSignInService } from './tenants/claude-sign-in-service.js';
 import { createAgentKeyService } from './tenants/agent-key-service.js';
 import { createSecretsManagerPort } from './tenants/secrets-manager.js';
 import { checkAgentKeyWithProvider } from './tenants/key-check.js';
@@ -123,7 +124,7 @@ const app = createApp({
     ? {
         github,
         agentKeys: agentKeyService,
-        claudeSignIn: createClaudeSignInService({ store, github }),
+        routines: createRoutineService({ store, github, rules: createDynamoRoutineRuleStore(tableName), secrets: createSecretsManagerPort() }),
         status: createStatusService({
           store,
           github,

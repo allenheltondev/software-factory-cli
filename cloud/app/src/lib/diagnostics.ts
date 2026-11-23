@@ -49,6 +49,9 @@ export const DISPOSITION: Record<DeliveryDisposition, { label: string; tone: Ton
   coalesced: { label: 'Coalesced', tone: 'neutral' },
   throttled: { label: 'Throttled', tone: 'warning' },
   launch_failed: { label: 'Launch failed', tone: 'error' },
+  routine_triggered: { label: 'Claude task started', tone: 'success' },
+  routine_failed: { label: 'Claude task refused', tone: 'error' },
+  routine_unknown: { label: 'Claude task uncertain', tone: 'warning' },
 };
 
 const REASON: Record<string, string> = {

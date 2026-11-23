@@ -73,17 +73,6 @@ describe('the job broker', () => {
     handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, terminateMicrovm, microvmState, stopCheckDelayMs: 1, policy: POLICY, now: () => clock });
   });
 
-  it("hands a Claude subscription token instead of ANTHROPIC_API_KEY when both are set, and every other offered name as before", async () => {
-    await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: '', updatedBy: 'pat' });
-    await store.putAgentKeyMeta(55, { name: 'CLAUDE_CODE_OAUTH_TOKEN', updatedAt: '', updatedBy: 'pat' });
-    const r = (await handle({ action: 'start', jobId: job.jobId, token })) as { descriptor: { agentKeySecrets: Record<string, string> } };
-    expect(r.descriptor.agentKeySecrets).toMatchObject({
-      CLAUDE_CODE_OAUTH_TOKEN: 'updraft/tenants/55/agent-keys/CLAUDE_CODE_OAUTH_TOKEN',
-      CODEX_API_KEY: 'updraft/tenants/55/agent-keys/CODEX_API_KEY',
-    });
-    expect(r.descriptor.agentKeySecrets).not.toHaveProperty('ANTHROPIC_API_KEY');
-  });
-
   it('starts a job: its descriptor and credentials limited to its own tenant, event, config version and results', async () => {
     const r = await handle({ action: 'start', jobId: job.jobId, token });
     expect(r).toMatchObject({

@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import type { Job, Quotas, Store } from '../store/store.js';
 import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
-import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, alternativeTo, keyOrAlternatives, keysMet, keysToHand, keysUsedFor, type CloudAgent } from '../tenants/agents.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
@@ -105,11 +105,6 @@ export interface RunMicrovmInput {
 export interface LaunchDeps {
   store: Store;
   settings: LaunchSettings;
-  /**
-   * false: a workflow whose Claude has no credential is refused (add a key), not started to sign
-   * in with a member's Claude subscription. Default on.
-   */
-  claudeSignIn?: boolean;
   /** The published image version; null while jobs are off (no image built yet). */
   imageVersion: () => Promise<string | null>;
   putEvent: (key: string, body: string) => Promise<void>;
@@ -331,35 +326,11 @@ export function createLauncher(deps: LaunchDeps) {
       const agents = Object.entries(SUPPORTED_AGENT_KEY_ENV).filter(([, k]) => retired.includes(k)).map(([a]) => a);
       return refuse(`This workflow runs ${agents.join(' and ')}, which Updraft Cloud no longer runs here: choose another agent in the configuration and publish it again`, { unavailable: agents });
     }
-    // No Claude credential at all: the job signs in with a member's Claude subscription first
-    // (the runner's claude-sign-in.mjs), rather than being refused for want of a key.
-    let claudeSignIn = false;
     if (needed.length > 0) {
-      // A key its provider refused (an expired subscription token) is as good as not set.
-      const set = (await deps.store.listAgentKeyMeta(req.installationId)).filter((k) => !k.rejectedAt).map((k) => k.name);
-      // A Claude subscription token meets the need for ANTHROPIC_API_KEY (agents.ts, keysMet).
-      const met = keysMet(set);
-      let missing = needed.filter((k) => !met.has(k));
-      if (missing.includes(SUPPORTED_AGENT_KEY_ENV.claude) && deps.claudeSignIn !== false) {
-        claudeSignIn = true;
-        missing = missing.filter((k) => k !== SUPPORTED_AGENT_KEY_ENV.claude);
-      }
+      const set = new Set((await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name));
+      const missing = needed.filter((k) => !set.has(k));
       if (missing.length > 0) {
-        const named = missing.map((k) => {
-          const agent = (Object.keys(SUPPORTED_AGENT_KEY_ENV) as CloudAgent[]).find((a) => SUPPORTED_AGENT_KEY_ENV[a] === k);
-          return agent ? keyOrAlternatives(agent) : k;
-        });
-        return refuse(`${named.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not set: add ${missing.length > 1 ? 'them' : 'it'} under Agent keys`, { missing });
-      }
-      // The job would use a stand-in (the token) that a version published before it existed does
-      // not pass into the sandbox: its agent would start signed out. Refused with what to do.
-      const standIns = claudeSignIn ? ['CLAUDE_CODE_OAUTH_TOKEN'] : keysUsedFor(needed, keysToHand(set)).filter((k) => alternativeTo(k) !== undefined);
-      if (standIns.length > 0 && deps.bundleKeys) {
-        const env = await deps.bundleKeys.agentEnv(req.installationId, tenant.activeConfigVersion).catch(() => null);
-        const unpassed = env ? standIns.filter((k) => !env.has(k)) : [];
-        if (unpassed.length > 0) {
-          return refuse(`Your configuration was published before ${unpassed.join(' and ')} could be used: publish it again (nothing needs to change) for jobs to use it`, { republish: unpassed });
-        }
+        return refuse(`${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not set: add ${missing.length > 1 ? 'them' : 'it'} under Agent keys`, { missing });
       }
     }
 
@@ -447,7 +418,6 @@ export function createLauncher(deps: LaunchDeps) {
       reservedSeconds: s.maximumDurationSeconds,
       quotas,
       ...(needed.length ? { agentKeys: needed } : {}),
-      ...(claudeSignIn ? { claudeSignIn: { state: 'starting' as const, at: new Date(launchedAt).toISOString() } } : {}),
       ...(decision.issue !== undefined ? { issue: decision.issue } : {}),
       ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}),
     };

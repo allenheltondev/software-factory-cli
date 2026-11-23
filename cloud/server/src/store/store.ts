@@ -167,11 +167,6 @@ export interface JobFinishDetail {
   telemetry?: JobTelemetryReport;
   /** The agent adapters that ran (claude, codex, kiro): whose keys the job used. Absent: not known. */
   adapters?: string[];
-  /**
-   * An agent's provider refused its credential (an expired or revoked Claude subscription token,
-   * say): the key it ran with is marked rejected, and the next job signs in again.
-   */
-  authFailed?: boolean;
 }
 
 /**
@@ -188,7 +183,7 @@ export interface DeliveryRecord {
   pullRequest?: number;
   label?: string;
   sender?: string;
-  disposition: 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched';
+  disposition: 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
   reason?: string;
   message?: string;
   /** launch_failed: the AWS error's class (its name), never its message. */
@@ -244,35 +239,6 @@ export interface AgentKeyMeta {
   /** The last job that ran with this key, and whether it worked. Cleared when the key is rotated. */
   lastUsedAt?: string;
   lastUsedOk?: boolean;
-  /**
-   * When a job that ran with this key was refused by its provider (an expired or revoked Claude
-   * subscription token): the launcher treats the key as not set, so the next job signs in again.
-   * Cleared when the key is set again.
-   */
-  rejectedAt?: string;
-}
-
-/**
- * A job's Claude subscription sign-in (the runner's claude-sign-in.mjs), for a job the launcher
- * started with no Claude credential. The runner reports the sign-in URL; a member of the
- * installation opens it from the console and gives the code; the runner takes it, and saves the
- * token `claude setup-token` printed through the broker.
- */
-export interface JobClaudeSignIn {
-  /**
-   * starting: no URL yet. waiting: for a member's code. code: given, not yet taken by the runner.
-   * exchanging: taken. done: the token is saved. failed: see `reason`.
-   */
-  state: 'starting' | 'waiting' | 'code' | 'exchanging' | 'done' | 'failed';
-  /** When it last changed (ISO). */
-  at: string;
-  /** The claude.ai sign-in URL `setup-token` printed: shown only to members, in the console. */
-  url?: string;
-  /** The code a member gave: kept only until the runner takes it. */
-  code?: string;
-  /** The GitHub login of the member who gave the code. */
-  by?: string;
-  reason?: string;
 }
 
 /**
@@ -411,8 +377,6 @@ export interface Job {
   stopRequestedAt?: number;
   /** Epoch ms when its slots and unused time were given back (releaseJob), once Lambda showed its microVM terminated. */
   releasedAt?: number;
-  /** Started with no Claude credential: it signs in with a member's Claude subscription first. */
-  claudeSignIn?: JobClaudeSignIn;
 }
 
 /** What the broker's `start` did (Store.startJob). */
@@ -550,8 +514,6 @@ export interface Store {
    * Records the outcome of a job that used the key. Nothing when the key is not set, or was
    * rotated after `jobStartedAt` (ISO): the job ran with the value before.
    */
-  /** Marks a key rejected by its provider, only if it was not set again since the job started (as recordAgentKeyUse). */
-  markAgentKeyRejected(installationId: number, name: string, at: { at: string; jobStartedAt: string }): Promise<void>;
   recordAgentKeyUse(installationId: number, name: string, use: { at: string; ok: boolean; jobStartedAt: string }): Promise<void>;
   getTelemetry(installationId: number): Promise<TelemetrySettings | null>;
   /**
@@ -602,8 +564,6 @@ export interface Store {
   attachMicrovm(jobId: string, microvmId: string): Promise<boolean>;
   /** The broker records what it handed the job for telemetry at its first `start`. Set once: false when it already was. */
   setJobTelemetrySnapshot(jobId: string, snapshot: JobTelemetrySnapshot): Promise<boolean>;
-  /** Moves a job's Claude sign-in on, only from one of the states named: false when it was in none (or the job is gone). */
-  updateClaudeSignIn(jobId: string, from: readonly JobClaudeSignIn['state'][], next: JobClaudeSignIn): Promise<boolean>;
   /**
    * A console retry's claim on a job (jobs/retry.ts), taken before it launches anything: one
    * request at a time, and none once a retry started a job. `child` is the id the job it is about
@@ -1177,12 +1137,6 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       jobs.set(jobId, { ...j, telemetrySnapshot: structuredClone(snapshot) });
       return true;
     },
-    async updateClaudeSignIn(jobId, from, next) {
-      const j = jobs.get(jobId);
-      if (!j?.claudeSignIn || !from.includes(j.claudeSignIn.state)) return false;
-      jobs.set(jobId, { ...j, claudeSignIn: structuredClone(next) });
-      return true;
-    },
     async purgeTenantPartition(id) {
       tenants.delete(id);
       for (const [k, m] of members) if (m.installationId === id) members.delete(k);
@@ -1199,10 +1153,6 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async recordAgentKeyUse(id, name, use) {
       const k = keys.get(`${id}/${name}`);
       if (k && k.updatedAt <= use.jobStartedAt) keys.set(`${id}/${name}`, { ...k, lastUsedAt: use.at, lastUsedOk: use.ok });
-    },
-    async markAgentKeyRejected(id, name, at) {
-      const k = keys.get(`${id}/${name}`);
-      if (k && k.updatedAt <= at.jobStartedAt) keys.set(`${id}/${name}`, { ...k, rejectedAt: at.at });
     },
     async recordRefusal(id, r) {
       refusals.push({ id, r: { ...r } });

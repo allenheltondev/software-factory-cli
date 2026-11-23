@@ -74,22 +74,6 @@ export function rulesFromBundle(configYaml: string, paused: ReadonlySet<string> 
   }
 }
 
-/** The variables a `config.yaml`'s agents pass into the sandbox; null when it cannot be read as a config. */
-export function agentEnvFromBundle(configYaml: string): Set<string> | null {
-  try {
-    const compiled = parse(configYaml) as unknown;
-    if (!isObject(compiled)) return null;
-    const out = new Set<string>();
-    for (const agent of Object.values(isObject(compiled.agents) ? compiled.agents : {})) {
-      const env = isObject(agent) && isObject(agent.container) ? agent.container.env : undefined;
-      if (Array.isArray(env)) for (const name of env) if (typeof name === 'string') out.add(name);
-    }
-    return out;
-  } catch {
-    return null;
-  }
-}
-
 /** Reads one object of the tenant bucket: its text, or null when there is none. */
 export type ReadObject = (key: string) => Promise<string | null>;
 
@@ -125,15 +109,6 @@ export function createBundleKeys(read: ReadObject, configPrefixOf: (installation
       const text = await load(installationId, version);
       const rules = text === null ? null : rulesFromBundle(text, paused);
       return rules ? keysOfRules(rules) : null;
-    },
-    /**
-     * Every variable the version's agents pass into the sandbox (agents.<name>.container.env):
-     * a version published before a Claude subscription token could be used passes only the API
-     * key. null when the bundle cannot tell.
-     */
-    async agentEnv(installationId: number, version: number): Promise<Set<string> | null> {
-      const text = await load(installationId, version);
-      return text === null ? null : agentEnvFromBundle(text);
     },
   };
 }

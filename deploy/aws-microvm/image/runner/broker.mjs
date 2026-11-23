@@ -99,16 +99,6 @@ export function createBrokerClient(broker, options = {}) {
     finish: (outcome, detail) => call('finish', detail ? { outcome, detail } : { outcome }),
     /** Stops this job's microVM (the one the launcher recorded); works after finish too. */
     terminate: () => call('terminate'),
-    /**
-     * Claude subscription sign-in (claude-sign-in.mjs), for a job the launcher started with no
-     * Claude credential: the sign-in URL (the broker asks a member for the code, on the issue),
-     * the code once a member has given one (`{ code }`, or `{ waiting: true }`), the token
-     * `claude setup-token` printed (saved as the tenant's CLAUDE_CODE_OAUTH_TOKEN), or why it failed.
-     */
-    claudeSignInUrl: (url) => call('claude-sign-in-url', { url }),
-    claudeSignInCode: () => call('claude-sign-in-code'),
-    claudeSignInToken: (value) => call('claude-sign-in-token', { value }),
-    claudeSignInFailed: (reason) => call('claude-sign-in-failed', { reason }),
   };
 }
 
@@ -159,8 +149,6 @@ export async function startBrokerJob(payload, { client, createAwsDeps, now = Dat
     resultKeyPrefix: d.resultKeyPrefix,
     stateKey: d.stateKey,
     agentKeySecrets: d.agentKeySecrets ?? {},
-    // No Claude credential is set: sign in with a Claude subscription before the job (claude-sign-in.mjs).
-    ...(d.claudeSignIn === true ? { claudeSignIn: true } : {}),
     // The tenant's agent telemetry (telemetry.mjs), when it is on: where to, and the key's secret.
     ...(d.telemetry && typeof d.telemetry === 'object' ? { telemetry: d.telemetry } : {}),
   };
@@ -168,15 +156,6 @@ export async function startBrokerJob(payload, { client, createAwsDeps, now = Dat
     ...createAwsDeps(payload.region, { credentials: brokerCredentialProvider(client, started.credentials, { now }) }),
     githubToken: () => client.githubToken(),
     finishJob: (outcome, detail) => client.finish(outcome, detail),
-    claudeSignIn: {
-      url: (url) => client.claudeSignInUrl(url),
-      code: async () => {
-        const answer = await client.claudeSignInCode();
-        return typeof answer.code === 'string' && answer.code !== '' ? answer.code : null;
-      },
-      token: (value) => client.claudeSignInToken(value),
-      failed: (reason) => client.claudeSignInFailed(reason),
-    },
     // A job that fails while preparing can end before the launcher has recorded its microVM.
     terminate: () => terminateThroughBroker(client, terminateOptions),
   };

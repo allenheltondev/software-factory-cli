@@ -116,8 +116,7 @@ describe('a published version that runs an agent taken out of service', () => {
       policy: { bucket: 'b', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
     } as never);
     const out = (await broker({ action: 'start', jobId: 'job_abc12345', token })) as { descriptor?: { agentKeySecrets?: Record<string, string> } };
-    // Claude's API key, and the Claude subscription token that can stand in for it.
-    expect(Object.keys(out.descriptor?.agentKeySecrets ?? {})).toEqual(['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
+    expect(Object.keys(out.descriptor?.agentKeySecrets ?? {})).toEqual(['ANTHROPIC_API_KEY']);
   });
 });
 

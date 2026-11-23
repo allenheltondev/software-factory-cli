@@ -2,7 +2,6 @@ import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows } from '../flows/github.js';
 import type { DispatchRefusal, Store } from '../store/store.js';
 import { AGENT_KEY_NAMES, setAgentKey, type SecretsPort } from './agent-keys.js';
-import { alternativeTo } from './agents.js';
 import type { KeyChecker } from './key-check.js';
 import { keysOfRules, type BundleKeys } from './key-needs.js';
 
@@ -15,16 +14,8 @@ import { keysOfRules, type BundleKeys } from './key-needs.js';
 export interface AgentKeyView {
   name: string;
   configured: boolean;
-  /**
-   * The active config runs an agent that needs this key, and nothing set stands in for it:
-   * without it no job starts. An API key a Claude subscription token stands in for is not.
-   */
+  /** The active config runs an agent that needs this key: without it no job starts. */
   required: boolean;
-  /**
-   * Set for a key that can be used instead of another (CLAUDE_CODE_OAUTH_TOKEN: ANTHROPIC_API_KEY).
-   * Never required itself; once set, jobs use it and not the other (a Claude subscription before API credits).
-   */
-  alternativeTo?: string;
   lastRotatedAt?: string;
   lastRotatedBy?: string;
   /** Absent until a job has used the key. */
@@ -64,20 +55,14 @@ export function createAgentKeyService({ store, github, secrets, check, bundleKey
     const [metas, refusals, tenant] = await Promise.all([store.listAgentKeyMeta(installationId), store.listRefusals(installationId, 10), store.getTenant(installationId, { consistent: true })]);
     const needed = new Set(await requiredKeys(installationId, tenant?.activeConfigVersion));
     const byName = new Map(metas.map((m) => [m.name, m]));
-    // What an alternative that is set stands in for: that need is met without its own key.
-    const standIns = new Set([...byName.keys()].map(alternativeTo).filter((k): k is string => k !== undefined));
     return {
       keys: AGENT_KEY_NAMES.map((name) => {
         const m = byName.get(name);
-        const alt = alternativeTo(name);
-        const required = !alt && needed.has(name) && !standIns.has(name);
-        const about = alt ? { alternativeTo: alt } : {};
-        if (!m) return { name, configured: false, required, ...about };
+        if (!m) return { name, configured: false, required: needed.has(name) };
         return {
           name,
           configured: true,
-          required,
-          ...about,
+          required: needed.has(name),
           lastRotatedAt: m.updatedAt,
           lastRotatedBy: m.updatedBy,
           ...(m.lastUsedAt ? { lastUsed: { at: m.lastUsedAt, ok: m.lastUsedOk === true } } : {}),

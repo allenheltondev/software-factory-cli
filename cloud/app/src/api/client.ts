@@ -157,27 +157,24 @@ export interface AdminOverview {
 export interface AgentKeyView {
   name: string;
   configured: boolean;
-  /** The active config runs an agent that needs it, and nothing set stands in for it. */
+  /** The active config runs an agent that needs it. */
   required: boolean;
-  /** A key that can be used instead of this other one (CLAUDE_CODE_OAUTH_TOKEN for ANTHROPIC_API_KEY); once set, jobs use it. */
-  alternativeTo?: string;
   lastRotatedAt?: string;
   lastRotatedBy?: string;
   lastUsed?: { at: string; ok: boolean };
 }
 
-/** A job's Claude subscription sign-in (the console's ClaudeSignInPage). */
-export interface ClaudeSignInView {
-  state: 'starting' | 'waiting' | 'code' | 'exchanging' | 'done' | 'failed';
+/** Public metadata only: routine trigger tokens are never returned. */
+export interface RoutineRule {
+  id: string;
+  repositoryId: number;
   repository: string;
-  issue?: number;
-  pullRequest?: number;
-  /** The claude.ai sign-in link, while the job waits for a code. */
-  url?: string;
-  waitsUntil?: string;
-  by?: string;
-  reason?: string;
+  label: string;
+  url: string;
+  updatedAt: string;
+  updatedBy: string;
 }
+export interface RoutinesView { rules: RoutineRule[]; }
 
 export interface AgentKeysView {
   keys: AgentKeyView[];
@@ -187,7 +184,7 @@ export interface AgentKeysView {
 // A tenant's status and diagnostics (server/src/tenants/status-service.ts).
 
 export type InstallationStatus = 'active' | 'suspended' | 'missing_permissions' | 'disabled' | 'uninstalled';
-export type DeliveryDisposition = 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched';
+export type DeliveryDisposition = 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
 export type JobResult =
   | 'running'
   | 'success'
@@ -702,11 +699,13 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     setTelemetryKey: (installationId: number, input: TelemetryKeyInput) =>
       request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify(input) }),
     removeTelemetryKey: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'DELETE' }),
+    routines: (installationId: number) => request<RoutinesView>(`/installations/${installationId}/routines`),
+    setRoutine: (installationId: number, input: { repositoryId: number; label: string; url: string; token: string }) =>
+      request<RoutinesView>(`/installations/${installationId}/routines`, { method: 'PUT', body: JSON.stringify(input) }),
+    removeRoutine: (installationId: number, ruleId: string) =>
+      request<RoutinesView>(`/installations/${installationId}/routines/${encodeURIComponent(ruleId)}`, { method: 'DELETE' }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */
-    claudeSignIn: (installationId: number, jobId: string) => request<ClaudeSignInView>(`/installations/${installationId}/claude-sign-in/${encodeURIComponent(jobId)}`),
-    submitClaudeSignInCode: (installationId: number, jobId: string, code: string) =>
-      request<ClaudeSignInView>(`/installations/${installationId}/claude-sign-in/${encodeURIComponent(jobId)}`, { method: 'POST', body: JSON.stringify({ code }) }),
     setAgentKey: (installationId: number, name: string, value: string) =>
       request<AgentKeysView>(`/installations/${installationId}/agent-keys/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ value }) }),
     adminTenants: () => request<AdminOverview>('/admin/tenants'),

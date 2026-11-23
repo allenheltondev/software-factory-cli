@@ -4,7 +4,6 @@ import { compileTenantConfig } from './config.js';
 import { workflowId } from '../../../../src/config/schema.js';
 import { defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission, upgradeNotes, type ConsoleConfig } from './console.js';
 import * as v1 from './console-v1.js';
-import { keysMet } from './agents.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 
 const repo = (over: Record<string, unknown> = {}) => ({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [], ...over });
@@ -433,12 +432,10 @@ describe('missingKeys', () => {
   it('needs the key of every agent that is on in a pool an enabled repository can start', () => {
     const config = ok(settings());
     expect(missingKeys(config, new Set())).toEqual([
-      expect.objectContaining({ path: 'agents.claude', message: expect.stringMatching(/ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, or turn this agent off/) }),
+      expect.objectContaining({ path: 'agents.claude', message: expect.stringMatching(/ANTHROPIC_API_KEY, or turn this agent off/) }),
       expect.objectContaining({ path: 'agents.codex', message: expect.stringMatching(/CODEX_API_KEY/) }),
     ]);
     expect(missingKeys(config, new Set(['ANTHROPIC_API_KEY', 'CODEX_API_KEY']))).toEqual([]);
-    // A Claude subscription token meets Claude's need once the set is read as what it meets (keysMet).
-    expect(missingKeys(config, keysMet(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_API_KEY']))).toEqual([]);
   });
 
   it('a paused repository needs no key, nor an agent that is off', () => {

@@ -1189,19 +1189,6 @@ the runner asks it to stop the microVM without running anything. A job that ends
 can ask before the launcher has recorded its microVM, so the runner keeps asking for about
 30 seconds (`terminateThroughBroker`). The maximum duration is the backstop if that fails too.
 
-A version 2 job whose descriptor has `claudeSignIn: true` (Updraft Cloud: the installation has
-no working Claude credential) signs in to Claude before `run-event`, in
-`image/runner/claude-sign-in.mjs`:
-- It runs `claude setup-token` as the job user, under `script` (a pseudo-terminal), with a
-  throwaway home and none of the runner's environment.
-- It hands the sign-in URL to the broker, polls the broker for the code a member gave in the
-  console, and types it in.
-- It hands the token printed to the broker, which saves it for the tenant, and runs the job with
-  it instead of `ANTHROPIC_API_KEY`. The token is redacted like every agent key and never logged.
-- Waiting for the member comes out of the job's time.
-- A finished job whose summary shows Claude refused its credential (API status 401, "Please run
-  /login") reports `authFailed: true` in its finish detail.
-
 Version 3 is an image check, not a job: `{ "version": 3, "checkId": "<id>" }`. Updraft
 Cloud's image build sends it to each new version before activating it (`cloud/README.md`,
 "The job image"). The runner installs the packet filter, fills a job-shaped state directory

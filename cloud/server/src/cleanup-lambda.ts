@@ -4,6 +4,7 @@ import { DeleteSecretCommand, SecretsManagerClient } from '@aws-sdk/client-secre
 import { createReconciler } from './jobs/reconcile.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { runCleanup } from './tenants/cleanup.js';
+import { createDynamoRoutineRuleStore, routineSecretName } from './routines/rules.js';
 import { expireResults } from './tenants/results-retention.js';
 
 /**
@@ -89,6 +90,7 @@ async function cleanupTenants(): Promise<{ cleaned: number[]; failed: number }> 
       const out = await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true } }));
       if (out.Errors?.length) throw new Error(`could not delete ${out.Errors.length} object(s), e.g. ${out.Errors[0]?.Key}: ${out.Errors[0]?.Code}`);
     },
+    routineSecretNames: async (id) => (await createDynamoRoutineRuleStore(process.env.TABLE_NAME ?? '').list(id)).map((r) => routineSecretName(id, r.id)),
     secrets: {
       async remove(name) {
         try {
