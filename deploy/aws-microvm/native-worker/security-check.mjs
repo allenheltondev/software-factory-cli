@@ -54,7 +54,7 @@ try {
     credentialHome, workRoot, claude: `${fixture}/claude`, sandboxConfig: `${fixture}/sandbox.json`, authModule: `${fixture}/auth.mjs` };
   fs.writeFileSync(config.sandboxConfig, JSON.stringify({ image: 'native-claude-worker' }), { mode: 0o644 });
   // This fake verifies the CLI launch contract and drives the REAL MCP tool bridge.
-  fs.writeFileSync(config.claude, `#!/usr/bin/env node
+  fs.writeFileSync(config.claude, `#!${process.execPath}
 const fs = require('fs'), cp = require('child_process'), rl = require('readline');
 const args = process.argv.slice(2);
 function required(flag, value) { const i=args.indexOf(flag); if(i<0 || (value!==undefined && args[i+1]!==value)) process.exit(91); }

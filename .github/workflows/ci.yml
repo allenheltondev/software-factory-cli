@@ -128,6 +128,10 @@ jobs:
           if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          # Hosted images also leave /usr/local/bin writable. The production supervisor
+          # correctly rejects a trusted executable under such an ancestor.
+          sudo chown root:root /usr/local /usr/local/bin
+          sudo chmod go-w /usr/local /usr/local/bin
           sudo install -o root -g root -m 0755 "$(command -v node)" /usr/local/bin/updraft-security-node
       - name: Attack the real supervisor and MCP sandbox (no skips)
         run: sudo /usr/local/bin/updraft-security-node deploy/aws-microvm/native-worker/security-check.mjs
