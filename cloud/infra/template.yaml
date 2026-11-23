@@ -297,6 +297,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref UpdraftTable
+          NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           # Tenant config bundles: the console publishes them (tenants/config-service.ts).
           TENANT_BUCKET: !Ref TenantBucket
           USER_POOL_ID: !Ref AuthUserPoolId

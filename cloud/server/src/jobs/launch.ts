@@ -104,7 +104,7 @@ export interface RunMicrovmInput {
 }
 
 export interface LaunchDeps {
-  native?: { route: NativeRoute; secret(): Promise<string> };
+  native?: { route: NativeRoute; secret(): Promise<string>; enabled?(): Promise<boolean> };
   store: Store;
   settings: LaunchSettings;
   /** The published image version; null while jobs are off (no image built yet). */
@@ -222,6 +222,7 @@ export function createLauncher(deps: LaunchDeps) {
     const config = await deps.store.getConfigVersion(req.installationId, tenant.activeConfigVersion, { consistent: true });
     // What the job is for: an issue (its label) or a pull request (its review loop).
     let decision: { repository: string; repositoryId: number; keys: string[] | null; label?: string; issue?: number; pullRequest?: number };
+    let nativeOrigin = false;
     if (isIssue) {
       const d = decideDispatch(config?.dispatch, {
         repositoryFullName: req.payload.repository?.full_name,
@@ -266,6 +267,8 @@ export function createLauncher(deps: LaunchDeps) {
         const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS).catch(() => []);
         const sameRepo = (j: { repository: string }) => j.repository.toLowerCase() === d.repository.toLowerCase();
         const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
+        const originJob = origin ? await deps.store.getJob(origin.jobId).catch(() => null) : null;
+        nativeOrigin = Boolean(originJob?.native);
         if (origin?.label) {
           label = origin.label;
           // Only under the version active now, which this job runs: a republish may have changed
@@ -275,9 +278,8 @@ export function createLauncher(deps: LaunchDeps) {
           // workflows can share a label, for different actors), or, once its record is gone (it is
           // kept a week past its run), the label's when the label names one workflow's.
           if (!d.closing && origin.configVersion === tenant.activeConfigVersion) {
-            const record = await deps.store.getJob(origin.jobId).catch(() => null);
             const lower = origin.label.toLowerCase();
-            keys = record ? (record.agentKeys ?? []) : Object.hasOwn(d.keysByLabel, lower) ? (d.keysByLabel[lower] ?? []) : [];
+            keys = originJob ? (originJob.agentKeys ?? []) : Object.hasOwn(d.keysByLabel, lower) ? (d.keysByLabel[lower] ?? []) : [];
           }
         } else {
           log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
@@ -288,7 +290,10 @@ export function createLauncher(deps: LaunchDeps) {
     // The issue or pull request the job is for: refusals and over-quota comments name it.
     const number = (decision.issue ?? decision.pullRequest)!;
 
-    const native = deps.native && matchesNativeRoute(deps.native.route, req.installationId, decision) ? deps.native : undefined;
+    const candidate = deps.native && matchesNativeRoute(deps.native.route, req.installationId, decision) ? deps.native : undefined;
+    const native = candidate && (await candidate.enabled?.() ?? true) ? candidate : undefined;
+    // A subscription-originated review must not switch to API billing mid-workflow.
+    if (!isIssue && nativeOrigin && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'The subscription worker is disabled; reconnect it to continue this PR' });
     // Without a kept origin we cannot distinguish this test repository's subscription PR
     // from a BYOK workflow. Refuse rather than send its review/close to another runtime.
     if (!isIssue && !decision.label && deps.native?.route.installationId === req.installationId && deps.native.route.repositoryId === decision.repositoryId) {

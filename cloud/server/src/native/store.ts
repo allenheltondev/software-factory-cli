@@ -49,3 +49,26 @@ export function createNativeStore(table: string, db = DynamoDBDocumentClient.fro
     async dequeue(id, worker, jobId) { await db.send(new DeleteCommand({ TableName: table, Key: { pk: nativePartition(id, worker), sk: `QUEUE#${jobId}` } })); },
   };
 }
+
+
+/** Per-installation API key/subscription choice, not part of the worker's heartbeat row. */
+export interface NativeModeStore {
+  enabled(installationId: number, workerId: string): Promise<boolean>;
+  setEnabled(installationId: number, workerId: string, enabled: boolean): Promise<void>;
+}
+
+export function createNativeModeStore(
+  table: string,
+  db = DynamoDBDocumentClient.from(new DynamoDBClient({}), { marshallOptions: { removeUndefinedValues: true } }),
+): NativeModeStore {
+  const key = (installationId: number, workerId: string) => ({ pk: nativePartition(installationId, workerId), sk: 'MODE' });
+  return {
+    async enabled(installationId, workerId) {
+      const { Item } = await db.send(new GetCommand({ TableName: table, Key: key(installationId, workerId), ConsistentRead: true }));
+      return Item?.enabled === true;
+    },
+    async setEnabled(installationId, workerId, enabled) {
+      await db.send(new PutCommand({ TableName: table, Item: { ...key(installationId, workerId), enabled, updatedAt: new Date().toISOString() } }));
+    },
+  };
+}
