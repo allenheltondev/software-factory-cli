@@ -68,6 +68,11 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
           'use execution.mode prepare-only, or disable the agent',
       });
     }
+    if (agent.authentication === 'native-claude') {
+      if (adapter !== 'claude') errors.push({ path: `agents.${agentName}.authentication`, message: 'native-claude authentication requires the Claude adapter' });
+      if (agent.container) errors.push({ path: `agents.${agentName}.authentication`, message: 'native-claude authentication is unsupported with containerized agents until credential isolation is proven' });
+      if (config.execution.mode !== 'live') warnings.push({ path: `agents.${agentName}.authentication`, message: 'native-claude authentication is checked only in live mode' });
+    }
     for (const problem of agentProfile(adapter, agent).problems) {
       errors.push({ path: `agents.${agentName}`, message: problem });
     }

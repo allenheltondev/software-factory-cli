@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { parse } from 'yaml';
 import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { jobBranchName, jobWorktreePath } from '../git/worktree.js';
 import { decideFailureHandling } from '../worker/failure-policy.js';
@@ -83,6 +85,31 @@ function finish(db: Db, config: UpdraftConfig, c: Claim, result: Result, at = T0
 }
 
 describe('shared subscription capacity groups', () => {
+  it.each([1, 2])('serializes the native-worker example profiles even with global concurrency %i', (globalLimit) => {
+    const example = configSchema.pick({ maxConcurrent: true, agents: true, capacity: true }).parse(
+      parse(readFileSync(new URL('../../deploy/aws-microvm/native-worker/updraft.example.yaml', import.meta.url), 'utf8')),
+    );
+    expect(example.maxConcurrent).toBe(1);
+    const config = makeConfig({ ...example, maxConcurrent: globalLimit,
+      pools: { std: { agents: ['claude'] }, only: { agents: ['claude-review'] }, deep: { agents: ['claude-review'] } } });
+    const db = openDatabase(':memory:');
+    try {
+      const one = insertJob(db, { pool: 'std' });
+      const two = insertJob(db, { pool: 'only' });
+      const first = claimAt(db, config)!;
+      expect(first.job.id).toBe(one);
+      expect(first.run.agent).toBe('claude');
+      expect(claimAt(db, config)).toBeNull();
+      expect(getJob(db, two)).toMatchObject({ status: 'queued', attempts: 0 });
+      finishRun(db, first.run.id, { outcome: 'succeeded', now: () => T0 });
+      const second = claimAt(db, config)!;
+      expect(second.job.id).toBe(two);
+      expect(second.run.agent).toBe('claude-review');
+      finishRun(db, second.run.id, { outcome: 'succeeded', now: () => T0 });
+      expect(getJob(db, two)?.status).toBe('succeeded');
+    } finally { db.close(); }
+  });
+
   it('lets two profiles in one group run at most the group budget at once', () => {
     const db = openDatabase(':memory:');
     const config = makeConfig();

@@ -181,6 +181,21 @@ export interface AgentKeysView {
   refusals: { at: string; deliveryId: string; repository: string; issue: number; reason: string }[];
 }
 
+// Native Claude subscription mode never exposes Claude CLI credentials.
+export interface NativeClaudeView {
+  configured: boolean;
+  enabled: boolean;
+  repository?: string;
+  labels?: string[];
+  worker: null | {
+    status: 'connected' | 'auth-required' | 'expired' | 'unavailable' | 'offline';
+    online: boolean;
+    busy: boolean;
+    lastHeartbeatAt: string;
+    workerVersion: string;
+  };
+}
+
 // A tenant's status and diagnostics (server/src/tenants/status-service.ts).
 
 export type InstallationStatus = 'active' | 'suspended' | 'missing_permissions' | 'disabled' | 'uninstalled';
@@ -704,6 +719,9 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
       request<RoutinesView>(`/installations/${installationId}/routines`, { method: 'PUT', body: JSON.stringify(input) }),
     removeRoutine: (installationId: number, ruleId: string) =>
       request<RoutinesView>(`/installations/${installationId}/routines/${encodeURIComponent(ruleId)}`, { method: 'DELETE' }),
+    nativeClaude: (installationId: number) => request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription'),
+    setNativeClaudeMode: (installationId: number, enabled: boolean) =>
+      request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { method: 'PUT', body: JSON.stringify({ enabled }) }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */
     setAgentKey: (installationId: number, name: string, value: string) =>

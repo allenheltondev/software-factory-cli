@@ -12,6 +12,7 @@ import type { StatusService } from './tenants/status-service.js';
 import type { StatsService } from './tenants/stats-service.js';
 import type { TelemetryService } from './tenants/telemetry-service.js';
 import type { ConfigService, PublishOutcome } from './tenants/config-service.js';
+import type { NativeSettingsService } from './native/settings.js';
 
 /**
  * The API, mounted at /api because CloudFront forwards `/api/*` paths to API Gateway unchanged.
@@ -79,6 +80,7 @@ export interface AppOptions {
   config?: ConfigService;
   agentKeys?: AgentKeyService;
   routines?: RoutineService;
+  nativeClaude?: NativeSettingsService;
   status?: StatusService;
   stats?: StatsService;
   telemetry?: TelemetryService;
@@ -95,7 +97,7 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** Who did it, for the admin's actions: their email, else their sub. */
 const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
 
-export function createApp({ resolveCaller, github, admin, config, agentKeys, routines, status, stats, telemetry, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
+export function createApp({ resolveCaller, github, admin, config, agentKeys, routines, nativeClaude, status, stats, telemetry, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -305,6 +307,24 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
     app.delete('/v1/installations/:id/routines/:ruleId', async (c) => {
       const id = positive(c.req.param('id'));
       return id ? c.json(await routines.remove(c.get('caller'), id, c.req.param('ruleId'))) : c.json({ error: 'not_found' }, 404);
+    });
+  }
+
+  if (nativeClaude) {
+    const positive = (raw: string) => {
+      const n = Number(raw);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    };
+    app.get('/v1/installations/:id/claude-subscription', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await nativeClaude.view(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.put('/v1/installations/:id/claude-subscription', async (c) => {
+      const id = positive(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      const input = (await c.req.json().catch(() => null)) as { enabled?: unknown } | null;
+      if (!input || typeof input.enabled !== 'boolean' || Object.keys(input).join(',') !== 'enabled') return c.json({ error: 'bad_request' }, 400);
+      return c.json(await nativeClaude.update(c.get('caller'), id, input.enabled));
     });
   }
 

@@ -10,6 +10,7 @@ import { InstallationsPage } from './pages/InstallationsPage';
 import { GitHubCallbackPage } from './pages/GitHubCallbackPage';
 import { AgentKeysPage } from './pages/AgentKeysPage';
 import { RoutinesPage } from './pages/RoutinesPage';
+import { NativeClaudePage } from './pages/NativeClaudePage';
 import { JobPage } from './pages/JobPage';
 import { AdminPage } from './pages/AdminPage';
 import { AdminTenantPage } from './pages/AdminTenantPage';
@@ -59,6 +60,7 @@ export function App({ api }: { api?: ApiClient }) {
           <Route path="installations/:id/jobs/:jobId" element={<JobPage api={api} />} />
           <Route path="installations/:id/keys" element={<AgentKeysPage api={api} />} />
           <Route path="installations/:id/routines" element={<RoutinesPage api={api} />} />
+          <Route path="installations/:id/claude" element={<NativeClaudePage api={api} />} />
           <Route path="installations/:id/config" element={<ConfigPage api={api} />} />
           <Route path="installations/:id/config/history" element={<ConfigHistoryPage api={api} />} />
           <Route path="admin" element={<AdminPage api={api} />} />

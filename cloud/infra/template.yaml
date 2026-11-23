@@ -7,6 +7,20 @@ Description: >
   app client to that pool).
 
 Parameters:
+  NativeWorkerRoute:
+    Type: String
+    Default: ''
+    Description: Operator-only JSON test route for issue 104. Empty disables subscription dispatch.
+  NativeWorkerImageArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[^:]+:lambda:[^:]+:[0-9]{12}:microvm-image:.+$'
+    Description: Dedicated native test image ARN; never the shared BYOK image.
+  NativeWorkerControlSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:updraft/native-workers/.+$'
+    Description: Root worker control credential under updraft/native-workers/; never Claude credentials.
   AuthUserPoolId:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /readysetcloud/auth/user-pool-id
@@ -105,7 +119,21 @@ Parameters:
     Default: ''
     Description: Route 53 hosted zone that holds AppDomainName's parent domain.
 
+Rules:
+  NativeWorkerReferences:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref NativeWorkerRoute, '']
+          - !And
+            - !Not [!Equals [!Ref NativeWorkerImageArn, '']]
+            - !Not [!Equals [!Ref NativeWorkerControlSecretArn, '']]
+        AssertDescription: Enabling the native test route requires its dedicated image and control secret ARNs.
+
 Conditions:
+  NativeWorkerEnabled: !And
+    - !Not [!Equals [!Ref NativeWorkerRoute, '']]
+    - !Not [!Equals [!Ref NativeWorkerImageArn, '']]
+    - !Not [!Equals [!Ref NativeWorkerControlSecretArn, '']]
   DeployCustomDomain: !And
     - !Not [!Equals [!Ref AppDomainName, '']]
     - !Not [!Equals [!Ref AppHostedZoneId, '']]
@@ -269,6 +297,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref UpdraftTable
+          NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           # Tenant config bundles: the console publishes them (tenants/config-service.ts).
           TENANT_BUCKET: !Ref TenantBucket
           USER_POOL_ID: !Ref AuthUserPoolId
@@ -369,6 +398,7 @@ Resources:
           JOB_IMAGE_ARN: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
           JOB_IMAGE_VERSION_PARAMETER: !Sub /updraft/${AWS::StackName}/job-image-version
           EXECUTION_ROLE_ARN: !GetAtt MicrovmExecutionRole.Arn
+          NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           BROKER_FUNCTION_NAME: !Ref BrokerFunction
           MICROVM_LOG_GROUP: !Ref MicrovmLogGroup
           # Agent timeouts are capped at 120 minutes and verify at 30 (tenants/config.ts).
@@ -388,6 +418,13 @@ Resources:
             ParameterName: updraft/app/*
         - SSMParameterReadPolicy:
             ParameterName: !Sub updraft/${AWS::StackName}/job-image-version
+        - !If
+          - NativeWorkerEnabled
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref NativeWorkerControlSecretArn
+          - !Ref AWS::NoValue
         - SSMParameterReadPolicy:
             ParameterName: updraft/kill-switch
         - Statement:
@@ -447,6 +484,7 @@ Resources:
           TABLE_NAME: !Ref UpdraftTable
           TENANT_BUCKET: !Ref TenantBucket
           RESULT_RETENTION_DAYS: !Ref ResultRetentionDays
+          NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - DynamoDBCrudPolicy:
@@ -470,6 +508,12 @@ Resources:
               Action: secretsmanager:ListSecrets
               Resource: '*'
             # Quota reconciliation: a job's capacity is freed once its microVM shows TERMINATED.
+            - !If
+              - NativeWorkerEnabled
+              - Effect: Allow
+                Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
+                Resource: !Ref NativeWorkerImageArn
+              - !Ref AWS::NoValue
             - Effect: Allow
               Action: lambda:GetMicrovm
               Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
@@ -571,6 +615,7 @@ Resources:
                     dynamodb:LeadingKeys:
                       - 'JOB#*'
                       - 'TENANT#*'
+                      - 'NATIVE#*'
               # A delivery's claim and a job's quota slots (the tenant's and the platform's): a
               # started job holds them for its lifetime (start, conditional PutItems in one
               # transaction with its microVM time), and finish frees them (conditional DeleteItems).
@@ -585,6 +630,25 @@ Resources:
                       - 'DELIVERY#*'
                       - 'TENANT#*'
                       - 'PLATFORM#*'
+                      - 'NATIVE#*'
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt UpdraftTable.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: ['NATIVE#*']
+              - !If
+                - NativeWorkerEnabled
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref NativeWorkerControlSecretArn
+                - !Ref AWS::NoValue
+              - !If
+                - NativeWorkerEnabled
+                - Effect: Allow
+                  Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
+                  Resource: !Ref NativeWorkerImageArn
+                - !Ref AWS::NoValue
               # The kill switch: while it is on, nothing but finish and terminate is served.
               - Effect: Allow
                 Action: ssm:GetParameter
@@ -666,6 +730,7 @@ Resources:
           TABLE_NAME: !Ref UpdraftTable
           TENANT_BUCKET: !Ref TenantBucket
           JOB_DATA_ROLE_ARN: !GetAtt JobDataRole.Arn
+          NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           PARTITION: !Ref AWS::Partition
           ACCOUNT_ID: !Ref AWS::AccountId
           KILL_SWITCH_PARAMETER: /updraft/kill-switch

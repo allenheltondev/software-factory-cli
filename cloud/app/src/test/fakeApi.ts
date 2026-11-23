@@ -31,6 +31,8 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     routines: vi.fn(),
     setRoutine: vi.fn(),
     removeRoutine: vi.fn(),
+    nativeClaude: vi.fn(),
+    setNativeClaudeMode: vi.fn(),
     telemetry: vi.fn(),
     updateTelemetry: vi.fn(),
     setTelemetryKey: vi.fn(),

@@ -128,6 +128,7 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
         ← Installation
       </Link>
       <h1 className="text-2xl font-semibold">Agent keys</h1>
+      <Link className="auth-link" to={'/installations/' + id + '/claude'}>Configure Claude Code subscription →</Link>
 
       {load.state === 'loading' && <Skeleton className="h-40" />}
       {load.state === 'error' && (

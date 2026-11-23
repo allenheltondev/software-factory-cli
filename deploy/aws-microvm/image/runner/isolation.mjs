@@ -296,7 +296,7 @@ export function createNftFilter({ endpoints, hookPort, table = 'updraft_isolatio
  * escalation can all pick agents, and an enabled agent without a container is one edit away
  * from running on the host.
  */
-export function checkAgentConfig(config, { runtime = SANDBOX_RUNTIME, image = SANDBOX_IMAGE } = {}) {
+export function checkAgentConfig(config, { runtime = SANDBOX_RUNTIME, image = SANDBOX_IMAGE, nativeWorker = false } = {}) {
   const problems = [];
   if (config === null || typeof config !== 'object') return ['the validated config is missing'];
   const agents = config.agents && typeof config.agents === 'object' ? config.agents : {};
@@ -310,8 +310,15 @@ export function checkAgentConfig(config, { runtime = SANDBOX_RUNTIME, image = SA
       problems.push(`${at} has no container block: it would run as the job user, next to the GitHub App key and the state database (give it container: { image: ${image}, runtime: ${runtime}, env: [<its key variable>] }, or enabled: false)`);
       continue;
     }
-    if (container.runtime !== runtime) problems.push(`${at}.container.runtime is ${JSON.stringify(container.runtime)}, not ${runtime}`);
-    if (container.image !== image) problems.push(`${at}.container.image is ${JSON.stringify(container.image)}, not ${image}`);
+    const native = nativeWorker && (agent.adapter ?? name) === 'claude';
+    const requiredRuntime = native ? '/opt/updraft/bin/updraft-native-worker' : runtime;
+    const requiredImage = native ? 'native-claude-worker' : image;
+    if (container.runtime !== requiredRuntime) problems.push(`${at}.container.runtime is ${JSON.stringify(container.runtime)}, not ${requiredRuntime}`);
+    if (container.image !== requiredImage) problems.push(`${at}.container.image is ${JSON.stringify(container.image)}, not ${requiredImage}`);
+    if (native && (config.maxConcurrent !== 1 || agent.maxConcurrent !== 1 || agent.capacityGroup !== 'native-claude-worker' ||
+        config.capacity?.groups?.['native-claude-worker']?.maxConcurrent !== 1 || container.network !== 'none' || (container.env?.length ?? 0) > 0)) {
+      problems.push(`${at} must use the native worker's single slot, empty environment and no network`);
+    }
     // The runtime refuses what it does not know, but --mount and -e are flags it knows:
     // extra arguments could bind the state directory in or pass the caller's variables on.
     if (Array.isArray(container.args) && container.args.length > 0) problems.push(`${at}.container.args is set; extra runtime arguments can widen the sandbox and are not allowed here`);
@@ -691,7 +698,7 @@ export async function verifyIsolation(report, { stateDir, protectedFiles }, deps
     const errors = Array.isArray(answer.errors) ? answer.errors.map((e) => `${e?.path ? `${e.path}: ` : ''}${e?.message ?? ''}`).slice(0, 10) : [];
     fail('config', [`the config is not valid${errors.length ? `: ${errors.join('; ')}` : ''}`]);
   }
-  const configProblems = checkAgentConfig(answer.config, { runtime: iso.runtime, image: iso.image });
+  const configProblems = checkAgentConfig(answer.config, { runtime: iso.runtime, image: iso.image, nativeWorker: iso.nativeWorker });
   if (configProblems.length) fail('config', configProblems);
   report.checks.config = { agents: Object.entries(answer.config.agents ?? {}).filter(([, agent]) => agent?.enabled !== false).map(([name]) => name), runtime: iso.runtime };
 

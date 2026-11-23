@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
+import { matchesNativeRoute, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
 import { hashToken, jobPaths } from '../broker/broker.js';
-import type { Job, Quotas, Store } from '../store/store.js';
+import { NativeEnqueueRejectedError, type Job, type Quotas, type Store } from '../store/store.js';
 import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
@@ -103,6 +104,7 @@ export interface RunMicrovmInput {
 }
 
 export interface LaunchDeps {
+  native?: { route: NativeRoute; secret(): Promise<string>; enabled?(): Promise<boolean> };
   store: Store;
   settings: LaunchSettings;
   /** The published image version; null while jobs are off (no image built yet). */
@@ -195,7 +197,7 @@ export function createLauncher(deps: LaunchDeps) {
       const claim = await deps.store.getDeliveryClaim(installationId, lease);
       if (!claim) continue; // given back (a failed launch) or just expired: take it next time round
       const holder = await deps.store.getJob(claim.jobId);
-      if (holder && holder.status !== 'finished' && (holder.microvmId !== undefined || holder.startedAt !== undefined)) return 'covered';
+      if (holder && holder.status !== 'finished' && (holder.microvmId !== undefined || holder.startedAt !== undefined || holder.native !== undefined)) return 'covered';
     }
     return 'unconfirmed';
   }
@@ -220,6 +222,7 @@ export function createLauncher(deps: LaunchDeps) {
     const config = await deps.store.getConfigVersion(req.installationId, tenant.activeConfigVersion, { consistent: true });
     // What the job is for: an issue (its label) or a pull request (its review loop).
     let decision: { repository: string; repositoryId: number; keys: string[] | null; label?: string; issue?: number; pullRequest?: number };
+    let nativeOrigin = false;
     if (isIssue) {
       const d = decideDispatch(config?.dispatch, {
         repositoryFullName: req.payload.repository?.full_name,
@@ -260,10 +263,16 @@ export function createLauncher(deps: LaunchDeps) {
       // (run-event fails without the key, and says so on the job).
       let keys: string[] | null = [];
       let label: string | undefined;
-      if (!d.closing) {
-        const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS).catch(() => []);
+      {
+        const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS);
         const sameRepo = (j: { repository: string }) => j.repository.toLowerCase() === d.repository.toLowerCase();
         const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
+        const originJob = origin ? await deps.store.getJob(origin.jobId) : null;
+        // A failed read is retryable; a missing record is unknown, never evidence of API origin.
+        if (origin && !originJob && deps.native && matchesNativeRoute(deps.native.route, req.installationId, { ...d, label: origin.label })) {
+          return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this test repository pull request runtime' });
+        }
+        nativeOrigin = Boolean(originJob?.native);
         if (origin?.label) {
           label = origin.label;
           // Only under the version active now, which this job runs: a republish may have changed
@@ -272,10 +281,9 @@ export function createLauncher(deps: LaunchDeps) {
           // its key itself. Under the same version: the keys that job was started with (two
           // workflows can share a label, for different actors), or, once its record is gone (it is
           // kept a week past its run), the label's when the label names one workflow's.
-          if (origin.configVersion === tenant.activeConfigVersion) {
-            const record = await deps.store.getJob(origin.jobId).catch(() => null);
+          if (!d.closing && origin.configVersion === tenant.activeConfigVersion) {
             const lower = origin.label.toLowerCase();
-            keys = record ? (record.agentKeys ?? []) : Object.hasOwn(d.keysByLabel, lower) ? (d.keysByLabel[lower] ?? []) : [];
+            keys = originJob ? (originJob.agentKeys ?? []) : Object.hasOwn(d.keysByLabel, lower) ? (d.keysByLabel[lower] ?? []) : [];
           }
         } else {
           log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
@@ -286,7 +294,16 @@ export function createLauncher(deps: LaunchDeps) {
     // The issue or pull request the job is for: refusals and over-quota comments name it.
     const number = (decision.issue ?? decision.pullRequest)!;
 
-    const imageVersion = await deps.imageVersion();
+    const candidate = deps.native && matchesNativeRoute(deps.native.route, req.installationId, decision) ? deps.native : undefined;
+    const native = candidate && (await candidate.enabled?.() ?? true) ? candidate : undefined;
+    // A subscription-originated review must not switch to API billing mid-workflow.
+    if (!isIssue && nativeOrigin && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'The subscription worker is disabled; reconnect it to continue this PR' });
+    // Without a kept origin we cannot distinguish this test repository's subscription PR
+    // from a BYOK workflow. Refuse rather than send its review/close to another runtime.
+    if (!isIssue && !decision.label && deps.native?.route.installationId === req.installationId && deps.native.route.repositoryId === decision.repositoryId) {
+      return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this test repository pull request workflow' });
+    }
+    const imageVersion = native?.route.imageVersion ?? await deps.imageVersion();
     if (!imageVersion) return skip('jobs_off');
     if (await killSwitch.engaged()) {
       log({ delivery: req.deliveryId, installationId: req.installationId, ignored: 'the kill switch is on' });
@@ -320,6 +337,7 @@ export function createLauncher(deps: LaunchDeps) {
     if (needed === null) return refuse('Updraft could not tell which agent keys this workflow needs: publish the configuration again', { unknown: true });
     // An agent this deployment no longer runs (CloudAgents): a version published while it did
     // names it, and its job would get no key. Refused with what to change.
+    if (native) needed = needed.filter((k) => k !== 'ANTHROPIC_API_KEY');
     const offered = new Set(Object.values(AGENT_KEY_ENV));
     const retired = needed.filter((k) => !offered.has(k));
     if (retired.length > 0) {
@@ -337,9 +355,12 @@ export function createLauncher(deps: LaunchDeps) {
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
     const jobId = req.jobId ?? newJobId();
+    // Secret retrieval can fail transiently. Do it before claiming a delivery or quota,
+    // so a failure leaves the event immediately retryable and owns no capacity.
+    const token = native ? nativeJobToken(await native.secret(), jobId) : randomBytes(32).toString('base64url');
     // Short, until the job starts and holds it for its lifetime; released early (by this job only)
     // when it fails.
-    if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + PRELAUNCH_CLAIM_MS, jobId))) return skip('duplicate');
+    if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + (native ? durationMs : PRELAUNCH_CLAIM_MS), jobId))) return skip('duplicate');
     // A pull request's events within PR_COALESCE_MS of one that started a job are that job's: it
     // reads the pull request as it is once the lease is over. This delivery's claim is given up,
     // so a redelivery after that starts a job of its own.
@@ -376,7 +397,7 @@ export function createLauncher(deps: LaunchDeps) {
     const month = monthOf(launchedAt);
     let reserved;
     try {
-      reserved = await deps.store.reserveJob({ installationId: req.installationId, jobId, holdUntil: launchedAt + durationMs, day, month, quotas });
+      reserved = await deps.store.reserveJob({ installationId: req.installationId, jobId, holdUntil: native ? NATIVE_SLOT_HOLD_UNTIL : launchedAt + durationMs, day, month, quotas });
     } catch (err) {
       await releaseClaims();
       throw err;
@@ -396,7 +417,6 @@ export function createLauncher(deps: LaunchDeps) {
     }
     const reservation = { installationId: req.installationId, jobId, tenantSlot: reserved.tenantSlot, platformSlot: reserved.platformSlot, day, month };
 
-    const token = randomBytes(32).toString('base64url');
     const sender = req.payload.sender?.login;
     const job: Job = {
       jobId,
@@ -407,6 +427,7 @@ export function createLauncher(deps: LaunchDeps) {
       configVersion: tenant.activeConfigVersion,
       deliveryId: req.deliveryId,
       eventName,
+      ...(native ? { native: { workerId: native.route.workerId, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) } } : {}),
       status: 'launched',
       createdAt: new Date(launchedAt).toISOString(),
       expiresAt: launchedAt + durationMs,
@@ -433,9 +454,19 @@ export function createLauncher(deps: LaunchDeps) {
       // never got this far.
       await deps.store.markLaunching(jobId);
       launching = true;
+      if (native) return { status: 202, disposition: 'launched', jobId };
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) }));
       microvmId = out.microvmId;
     } catch (err) {
+      if (native && !recorded && err instanceof NativeEnqueueRejectedError) {
+        // The mode condition rolled back the enqueue: nothing can execute this reservation.
+        await deps.store.cancelReservation(reservation, 'reserved');
+        await releaseClaims();
+        return { status: 503, disposition: 'launch_failed', jobId, errorClass: errorClassOf(err) };
+      }
+      // An ambiguous transaction may already have queued this job. Keep its full-duration
+      // delivery claim and quota reservation; reconciliation retires it without a duplicate.
+      if (native) return { status: 503, disposition: 'launch_failed', jobId, errorClass: errorClassOf(err) };
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: safeMessage(err) });
       await releaseClaims();
       await deps.store.cancelReservation(reservation, launching ? 'launching' : 'reserved').catch(() => {});
