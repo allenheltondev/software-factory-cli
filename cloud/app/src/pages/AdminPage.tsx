@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router';
 import { Alert, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Skeleton, StatTile, StatusBadge } from '@readysetcloud/ui';
 import { ApiError, api as defaultApi, type AdminOverview, type ApiClient } from '../api/client';
-import { tenantStatusLabel } from './DashboardPage';
+import { tenantStatusLabel } from './GitHubSettingsPage';
 
 type Load = { state: 'loading' } | { state: 'ok'; overview: AdminOverview } | { state: 'forbidden' } | { state: 'error'; message: string };
 
@@ -38,6 +38,16 @@ export function AdminPage({ api = defaultApi }: { api?: Pick<ApiClient, 'adminTe
     };
   }, [api]);
 
+  const tenants = load.state === 'ok' ? load.overview.tenants : [];
+  const needsAttention = (tenant: AdminOverview['tenants'][number]) =>
+    tenant.status === 'active' && (
+      tenant.usage.failedThisMonth > 0 ||
+      tenant.usage.throttledThisMonth > 0 ||
+      tenant.usage.jobsToday >= tenant.quotas.jobsPerDay ||
+      minutes(tenant.usage.microvmSecondsThisMonth) >= tenant.quotas.microvmMinutesPerMonth
+    );
+  const orderedTenants = [...tenants].sort((a, b) => Number(needsAttention(b)) - Number(needsAttention(a)));
+
   return (
     <div className="flex flex-col gap-6">
       <header className="flex flex-col gap-1">
@@ -69,7 +79,7 @@ export function AdminPage({ api = defaultApi }: { api?: Pick<ApiClient, 'adminTe
           <Card>
             <CardHeader>
               <CardTitle>Tenants</CardTitle>
-              <CardDescription>Open one to see its jobs, change its quotas, or disable it.</CardDescription>
+              <CardDescription>Tenants with failures, throttling, or exhausted quotas appear first.</CardDescription>
             </CardHeader>
             <CardBody>
               {load.overview.tenants.length === 0 ? (
@@ -88,7 +98,7 @@ export function AdminPage({ api = defaultApi }: { api?: Pick<ApiClient, 'adminTe
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
-                      {load.overview.tenants.map((t) => {
+                      {orderedTenants.map((t) => {
                         const s = tenantStatusLabel(t);
                         return (
                           <tr key={t.installationId}>
@@ -100,6 +110,7 @@ export function AdminPage({ api = defaultApi }: { api?: Pick<ApiClient, 'adminTe
                             </td>
                             <td className="py-2 pr-4">
                               <StatusBadge tone={s.tone}>{s.label}</StatusBadge>
+                              {needsAttention(t) && <span className="block pt-1 text-xs font-medium">Needs attention</span>}
                             </td>
                             <td className="py-2 pr-4">
                               {t.usage.jobsToday} / {t.quotas.jobsPerDay}

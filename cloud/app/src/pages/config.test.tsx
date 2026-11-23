@@ -1,8 +1,10 @@
 import { render, screen, waitFor, within } from '@testing-library/react';
+import { AuthProvider, configureAuth } from '@readysetcloud/ui/auth';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError, ConfigInvalidError, type ConfigView, type ConsoleConfig, type VersionSummary } from '../api/client';
+import { AppLayout } from '../layout/AppLayout';
 import { fakeApi } from '../test/fakeApi';
 import { ConfigHistoryPage, diffFiles } from './ConfigHistoryPage';
 import { ConfigPage, issuesAt, parseLogins } from './ConfigPage';
@@ -107,9 +109,11 @@ describe('helpers', () => {
   });
 });
 
-describe('InstallationPage', () => {
-  it('links an active installation to its configuration', async () => {
+describe('Installation navigation', () => {
+  it('links an active installation to its configuration from the sidebar', async () => {
+    configureAuth({ region: 'us-east-1', clientId: 'test-client', sharedCookieDomain: '' });
     const api = fakeApi({
+      githubStatus: vi.fn().mockResolvedValue({ configured: true, tenants: [view().tenant] }),
       overview: vi.fn().mockResolvedValue({
         tenant: view().tenant,
         installation: { status: 'active', checked: true, missingPermissions: [] },
@@ -121,8 +125,20 @@ describe('InstallationPage', () => {
       jobs: vi.fn().mockResolvedValue({ jobs: [] }),
       deliveries: vi.fn().mockResolvedValue({ deliveries: [] }),
     });
-    at('/installations/55', <InstallationPage api={api} />, '/installations/:id');
-    expect(await screen.findByTestId('configure-link')).toHaveAttribute('href', '/installations/55/config');
+    render(
+      <AuthProvider>
+        <MemoryRouter initialEntries={['/installations/55']}>
+          <Routes>
+            <Route element={<AppLayout api={api} />}>
+              <Route path="/installations/:id" element={<InstallationPage api={api} />} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+    const sidebar = screen.getByRole('navigation', { name: 'Primary navigation' });
+    const configuration = await within(sidebar).findByRole('link', { name: 'Configuration' });
+    expect(configuration).toHaveAttribute('href', '/installations/55/config');
   });
 });
 

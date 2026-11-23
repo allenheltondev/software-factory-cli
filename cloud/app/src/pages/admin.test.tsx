@@ -43,8 +43,8 @@ function at(path: string, element: React.ReactNode, route: string) {
 
 describe('navItems', () => {
   it('adds the admin link for admins only', () => {
-    expect(navItems('/').map((i) => i.id)).toEqual(['dashboard']);
-    expect(navItems('/admin/tenants/55', true)).toEqual([expect.objectContaining({ id: 'dashboard', active: false }), expect.objectContaining({ id: 'admin', active: true })]);
+    expect(navItems('/', '').map((i) => i.id)).toEqual(['installations', 'github']);
+    expect(navItems('/admin/tenants/55', '', undefined, true).filter((item) => item.active)).toEqual([expect.objectContaining({ id: 'admin' })]);
   });
 });
 
@@ -52,7 +52,7 @@ describe('AdminPage', () => {
   it('lists every tenant with its usage against its quotas', async () => {
     const api = fakeApi({
       adminTenants: vi.fn().mockResolvedValue({
-        tenants: [detail(), { ...detail(), installationId: 66, accountLogin: 'zeta', status: 'disabled', disabledReason: 'admin' }],
+        tenants: [{ ...detail(), installationId: 66, accountLogin: 'zeta', status: 'disabled', disabledReason: 'admin' }, detail()],
         platform: { activeJobs: 1, platformConcurrentJobs: 20 },
       }),
     });
@@ -62,6 +62,7 @@ describe('AdminPage', () => {
     expect(rows).toHaveLength(2);
     expect(within(rows[0]!).getByRole('link', { name: 'acme' })).toHaveAttribute('href', '/admin/tenants/55');
     // 3601 seconds is 61 minutes, rounded up as the quota counts them.
+    expect(rows[0]!).toHaveTextContent('Needs attention');
     expect(rows[0]!).toHaveTextContent('3 / 20');
     expect(rows[0]!).toHaveTextContent('61 / 1200');
     expect(within(rows[1]!).getByText('Disabled')).toBeInTheDocument();

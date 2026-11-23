@@ -5,7 +5,8 @@ import type { ApiClient } from './api/client';
 import { ForgotPasswordPage, LoginPage, SignUpPage } from './auth/AuthScreens';
 import { RequireSignIn } from './auth/RequireSignIn';
 import { AppLayout } from './layout/AppLayout';
-import { DashboardPage } from './pages/DashboardPage';
+import { GitHubSettingsPage } from './pages/GitHubSettingsPage';
+import { InstallationsPage } from './pages/InstallationsPage';
 import { GitHubCallbackPage } from './pages/GitHubCallbackPage';
 import { AgentKeysPage } from './pages/AgentKeysPage';
 import { JobPage } from './pages/JobPage';
@@ -24,7 +25,7 @@ function NotFoundPage() {
       description="There is nothing at this address."
       action={
         <Link className="auth-link" to="/">
-          Back to the dashboard
+          Back to Updraft
         </Link>
       }
     />
@@ -47,7 +48,9 @@ export function App({ api }: { api?: ApiClient }) {
             </RequireSignIn>
           }
         >
-          <Route index element={<DashboardPage api={api} />} />
+          <Route index element={<InstallationsPage home />} />
+          <Route path="installations" element={<InstallationsPage />} />
+          <Route path="settings/github" element={<GitHubSettingsPage api={api} />} />
           <Route path="github/callback" element={<GitHubCallbackPage api={api} />} />
           <Route path="installations/:id" element={<InstallationPage api={api} />} />
           <Route path="installations/:id/insights" element={<InsightsPage api={api} />} />
