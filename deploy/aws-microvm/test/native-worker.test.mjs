@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, claudeArgs, claudeEnv, checkInventory, validateRun, resolveRunEnvironment } from '../native-worker/policy.mjs';
-import { frames } from '../native-worker/protocol.mjs';
+import { frames, readPrompt } from '../native-worker/protocol.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
 import { endpointPorts, tokenArgs, verifyHookPort } from '../native-worker/endpoint-token.mjs';
 import { containInvocation } from '../../../src/worker/container.ts';
@@ -102,6 +102,22 @@ describe('native Claude worker policy', () => {
 });
 
 describe('privileged worker framing', () => {
+  it('preserves a UTF-8 prompt when every byte arrives in a separate chunk', async () => {
+    const text = 'Implement café 😀 漢字 and keep naïve names intact.';
+    async function* chunks() { for (const byte of Buffer.from(text, 'utf8')) yield Buffer.from([byte]); }
+    expect(await readPrompt(chunks())).toBe(text);
+  });
+
+  it('limits raw prompt bytes without reducing the accepted limit for Unicode', async () => {
+    const limit = MAX_FRAME / 4;
+    async function* chunks(extra = false) {
+      yield Buffer.alloc(limit - 4, 97);
+      for (const byte of Buffer.from('😀')) yield Buffer.from([byte]);
+      if (extra) yield Buffer.from('a');
+    }
+    expect(Buffer.byteLength(await readPrompt(chunks()))).toBe(limit);
+    await expect(readPrompt(chunks(true))).rejects.toThrow('prototype limit');
+  });
   it('parses fragmented messages and rejects oversized and malformed input', () => {
     const stream = new PassThrough();
     const received = [];

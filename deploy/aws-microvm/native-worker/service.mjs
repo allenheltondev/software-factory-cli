@@ -139,10 +139,12 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     let initialized = false;
     let failed = false;
     const tools = net.createServer((socket) => {
+      if (failed || client.destroyed) { socket.destroy(); return; }
       toolClients.add(socket);
       socket.on('error', () => socket.destroy());
       socket.once('close', () => toolClients.delete(socket));
       frames(socket, (request) => {
+        if (failed || client.destroyed) { socket.destroy(); return; }
         const reply = (result) => send(socket, { jsonrpc: '2.0', id: request.id, result });
         if (request.jsonrpc !== '2.0') { socket.destroy(); return; }
         if (request.method === 'notifications/initialized' || request.method === 'notifications/cancelled') return;
@@ -167,6 +169,8 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       const config = JSON.stringify({ mcpServers: { updraft: { command: process.execPath, args: [path.join(here, 'mcp.mjs'), toolSocket] } } });
       const args = claudeArgs(run.command.slice(1), config);
       await new Promise((resolve, reject) => { tools.once('error', reject); tools.listen(toolSocket, resolve); });
+      // Cancellation can arrive while the socket starts, before a child exists to kill.
+      if (client.destroyed || failed) return 125;
       fs.chownSync(toolSocket, c.claudeUid, c.claudeGid);
       fs.chmodSync(toolSocket, 0o600);
       child = track(startAs(c.claudeUid, c.claudeGid, c.claude, args,
@@ -175,6 +179,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       // Gate all output and tool calls on the official CLI's advertised tool inventory.
       // Refuse built-in Read/Bash/Agent/etc even if a future CLI changes flag behavior.
       frames(child.stdout, (event) => {
+        if (failed || client.destroyed) return;
         try {
           if (!initialized) {
             if (!checkInventory(event)) return;

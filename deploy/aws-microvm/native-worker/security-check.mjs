@@ -68,6 +68,7 @@ required('--tools',''); required('--strict-mcp-config'); required('--disable-sla
 required('--settings','{"disableAllHooks":true}'); required('--permission-mode','default');
 if(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.NODE_OPTIONS ||
   ['GIT_AUTHOR_NAME','GIT_AUTHOR_EMAIL','GIT_COMMITTER_NAME','GIT_COMMITTER_EMAIL'].some(name=>process.env[name]!==undefined)) process.exit(92);
+fs.writeFileSync(process.env.HOME+'/session-launched','synthetic launch marker');
 let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',async()=>{
   const spec=JSON.parse(prompt);
   console.log(JSON.stringify({type:'system',subtype:'init',tools: spec.badInventory ? ['mcp__updraft__exec','Read'] : ['mcp__updraft__exec']}));
@@ -108,9 +109,10 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
       '--tmpfs', '/updraft-home:rw,exec,mode=1777', '-e', 'HOME=/updraft-home',
       '--mount', `type=bind,source=${work},target=${work}`, '--workdir', work, 'native-claude-worker', ...command];
   }
-  function request(args, prompt = '', onOutput) {
+  function request(args, prompt = '', onOutput, onClient) {
     return new Promise((resolve, reject) => {
       const client = net.createConnection(socketPath);
+      onClient?.(client);
       let output = '';
       let done = false;
       client.on('error', reject);
@@ -225,6 +227,63 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   await pause(2500);
   assert(!fs.existsSync(later));
   results.push('disconnected client cancels sandbox descendants');
+  // Hold the actual Unix socket's listen callback across cancellation. Observe the
+  // server-side close event, rather than sleeping and hoping the race was exercised.
+  for (const mode of ['disconnect', 'stop']) {
+    const name = `cancel-startup-${mode}`;
+    const launchMarker = `${credentialHome}/session-launched`;
+    const commandMarker = `${work}/canceled-${mode}-ran`;
+    fs.rmSync(launchMarker, { force: true });
+    const originalListen = net.Server.prototype.listen;
+    const originalEmit = net.Server.prototype.emit;
+    let ready;
+    let resume;
+    let serverClosed;
+    let serverClient;
+    let client;
+    const listening = new Promise((resolve) => { ready = resolve; });
+    const gate = new Promise((resolve) => { resume = resolve; });
+    const closed = new Promise((resolve) => { serverClosed = resolve; });
+    const bounded = async (promise) => {
+      let timer;
+      try {
+        return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('startup cancellation regression timed out')), 5000); })]);
+      } finally { clearTimeout(timer); }
+    };
+    net.Server.prototype.listen = function (...args) {
+      if (typeof args[0] === 'string' && args[0].endsWith('/tools.sock')) {
+        const callback = args.pop();
+        args.push(() => { ready(); void gate.then(callback); });
+      }
+      return originalListen.apply(this, args);
+    };
+    net.Server.prototype.emit = function (event, ...args) {
+      if (event === 'connection' && this.address() === socketPath && !serverClient) {
+        serverClient = args[0];
+        serverClient.once('close', serverClosed);
+      }
+      return originalEmit.call(this, event, ...args);
+    };
+    const pending = request(argv(undefined, name), JSON.stringify({ commands: [`touch ${quote(commandMarker)}`] }), undefined, (socket) => { client = socket; });
+    try {
+      await bounded(listening);
+      if (mode === 'disconnect') { client.destroy(); await bounded(closed); }
+      else assert.equal((await request(['stop', name])).code, 0);
+      resume();
+      assert.equal((await bounded(pending)).code, 125);
+      await bounded((async () => {
+        while ((await request(['container', 'inspect', name])).code === 0) await pause(10);
+      })());
+      assert(!fs.existsSync(launchMarker), 'Claude launched after cancellation during socket startup');
+      assert(!fs.existsSync(commandMarker), 'repository command executed after startup cancellation');
+    } finally {
+      resume();
+      net.Server.prototype.listen = originalListen;
+      net.Server.prototype.emit = originalEmit;
+      client?.destroy();
+    }
+  }
+  results.push('disconnect and stop during MCP socket startup prevent Claude launch and repository execution');
   await service.close(); service = undefined;
   service = await startService(config, socketPath, () => {});
   assert.equal((await native(['test -f answer.js'])).code, 0);

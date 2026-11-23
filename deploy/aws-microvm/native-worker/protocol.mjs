@@ -1,5 +1,18 @@
 import { MAX_FRAME } from './policy.mjs';
 
+// Preserve multibyte UTF-8 characters split across pipe reads. Limit raw bytes before
+// retaining a chunk, then decode the complete bounded prompt once.
+export async function readPrompt(stream) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of stream) {
+    bytes += chunk.length;
+    if (bytes > MAX_FRAME / 4) throw new Error('prompt exceeds prototype limit');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, bytes).toString('utf8');
+}
+
 export function send(stream, frame) {
   if (stream.writableLength > MAX_FRAME) { stream.destroy(); return; }
   if (!stream.destroyed && stream.writable) stream.write(`${JSON.stringify(frame)}\n`);
