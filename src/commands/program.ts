@@ -1,6 +1,7 @@
 import { Command, Option } from 'commander';
 import { addCommand, type AddOptions } from './add.js';
 import { agentsCommand, type AgentsOptions } from './agents.js';
+import { nativeClaudeAuthCommand } from './native-claude-auth.js';
 import { cancelCommand } from './cancel.js';
 import { cleanCommand } from './clean.js';
 import { configureCommand } from './configure.js';
@@ -33,6 +34,7 @@ export interface Handlers {
   doctor(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   retry(ctx: CommandContext, jobId: string): Promise<number>;
   agents(ctx: CommandContext, opts: AgentsOptions): Promise<number>;
+  nativeClaudeAuth(ctx: CommandContext, opts: { json?: boolean }): Promise<number>;
   clean(ctx: CommandContext, opts: { dryRun?: boolean; olderThan?: string }): Promise<number>;
   publish(ctx: CommandContext, runId: string): Promise<number>;
   reviews(ctx: CommandContext, opts: ReviewsOptions): Promise<number>;
@@ -54,6 +56,7 @@ export const defaultHandlers: Handlers = {
   doctor: (ctx, opts) => doctorCommand(ctx, opts),
   retry: (ctx, jobId) => retryCommand(ctx, jobId),
   agents: agentsCommand,
+  nativeClaudeAuth: nativeClaudeAuthCommand,
   clean: (ctx, opts) => cleanCommand(ctx, opts),
   publish: (ctx, runId) => publishCommand(ctx, runId),
   reviews: (ctx, opts) => reviewsCommand(ctx, opts),
@@ -181,6 +184,12 @@ export function buildProgram(opts: ProgramOptions): Command {
     .addOption(new Option('--json', 'machine-readable output'))
     .addOption(new Option('--deep', 'also send one trivial headless prompt to each usable agent (uses tokens)'))
     .action((o: AgentsOptions) => exec((ctx) => handlers.agents(ctx, o)));
+
+  program
+    .command('native-claude-auth')
+    .description('Read-only native Claude Code subscription sign-in status on a persistent worker (never prints credentials)')
+    .addOption(new Option('--json', 'machine-readable fixed state and reason; no account data'))
+    .action((o: { json?: boolean }) => exec((ctx) => handlers.nativeClaudeAuth(ctx, o)));
 
   program
     .command('retry')
