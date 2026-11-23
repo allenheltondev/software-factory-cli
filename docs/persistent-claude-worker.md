@@ -31,6 +31,19 @@ Use a **dedicated machine or VM per subscribing end user**, not a shared shell o
    Complete the **Anthropic-hosted** browser login from that terminal. If sign-in requires a code, enter it *in the Claude CLI terminal only*. Never type the code or token into Updraft.
 3. Exit the terminal, reconnect as the **same worker user** with the **same `CLAUDE_CONFIG_DIR`**, and rerun `updraft native-claude-auth --json`. Restart the VM and repeat. Confirm `connected` after both; use `claude auth status` directly for troubleshooting.
 4. With your existing Updraft config and GitHub credentials on that same machine, `updraft start` can process labeled issues and its configured review loop, or `updraft run-event --event-file ...` can run a single webhook event. **Do this only with trusted code during the prototype.** These commands do not establish safe tool isolation.
+
+   For persistent operation on Linux, Updraft already ships a [systemd user launcher](background-operation.md#linux-systemd---user). **The systemd service must have the same `CLAUDE_CONFIG_DIR` as the terminal where you signed in**. For example, add this path (not a token) to the launcher's private `~/.updraft/worker.env`:
+
+   ```sh
+   mkdir -p "$HOME/.updraft"
+   chmod 700 "$HOME/.updraft"
+   printf 'CLAUDE_CONFIG_DIR=%s\n' "$HOME/.claude-updraft" >> "$HOME/.updraft/worker.env"
+   chmod 600 "$HOME/.updraft/worker.env"
+   # Install the existing launcher using its documented commands, then restart:
+   systemctl --user restart updraft
+   ```
+
+   Configure the launcher before the restart and use the same non-root account and PATH as the login. Do not put the native Claude auth directory under Updraft's shared-state folder. The systemd `EnvironmentFile` points to a directory only; it must not contain a Claude subscription token.
 5. To revoke sign-in, use `claude auth logout` directly on the worker. Remove the dedicated worker disk when terminating the worker under your own data-retention policy.
 
 The status command intentionally returns no path, account identifier, token, auth method override value, or raw error, making it suitable for eventual UI telemetry. A `connected` state is only a signal that Claude considers its own login usable now. It does **not** prove execution security or that Anthropic has approved the particular hosted use case.
@@ -39,7 +52,7 @@ The status command intentionally returns no path, account identifier, token, aut
 
 1. **License:** Anthropic's [legal and compliance documentation](https://code.claude.com/docs/en/legal-and-compliance) requires Commercial Terms for products offering Claude Code in hosted sandboxes, unmodified binaries, each user's direct authentication and no intermediary of subscriber traffic or subscription credentials. Obtain written confirmation for Updraft's hosting and access design before offering it commercially.
 2. **Authentication ownership:** Claude alone manages `CLAUDE_CONFIG_DIR` and associated credential storage. Updraft must never mount that directory into its control plane, S3 shared state, job payload, Secrets Manager, logs, or a different tenant's worker. UI sign-in, OAuth callbacks, `claude setup-token` collection and `CLAUDE_CODE_OAUTH_TOKEN` relay are prohibited.
-3. **Tool isolation, blocking:** Current `updraft start` with a host-native Claude process runs its tools as the same OS user and can read that user's credentials. Current containerized Updraft agents use a *temporary* HOME and receive no persisted auth. Simply mounting the persistent HOME into an agent sandbox would expose credentials to Bash, Read and potentially hostile repository commands. **A working shell/tool isolation design plus hostile-repo tests is required before enabling subscription workers for untrusted code or multi-tenant use.**
+3. **Tool isolation, blocking:** Current `updraft start` with a host-native Claude process runs its tools as the same OS user and can read that user's credentials. Current containerized Updraft agents use a *temporary* HOME and receive no persisted auth. Simply mounting the persistent HOME into an agent sandbox would expose credentials to Bash, Read and potentially hostile repository commands. **A working shell/tool isolation design plus hostile-repo tests is required before enabling subscription workers for untrusted code or multi-tenant use.** Anthropic now supports [`sandbox.credentials`](https://code.claude.com/docs/en/sandboxing#protect-credentials), `sandbox.failIfUnavailable`, and `allowUnsandboxedCommands: false` to protect **sandboxed shell commands**. However, Anthropic documents that Read/Edit/Write, MCP servers, hooks and other CLI-launched processes can run **outside** the Bash sandbox, so this alone cannot satisfy the hosted security gate. A future worker proof must enforce restrictions on *all* tools and processes, keep the CLI itself unmodified, and test that nothing escapes into a credential-bearing home.
 4. **Durability:** AWS Lambda MicroVMs have an eight-hour maximum lifetime. A per-job MicroVM cannot keep the native login across days; use a separate persistent, encrypted user-isolated worker, or prove a secure architecture that preserves *CLI-owned* auth without Updraft collecting credentials.
 5. **Broker transport:** Add tenant-scoped worker registration, outbound polling/heartbeat, job leases, cancellation, retry and teardown. A job must dispatch to exactly one backend. Reuse `updraft run-event` and all review/revision/merge state. Never give a worker access to another tenant's app credentials, job state or files.
 
