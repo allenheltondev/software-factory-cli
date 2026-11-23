@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Experimental per-tenant durable Claude CLI home for Lambda MicroVMs (no EC2)
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetA:
+    Type: AWS::EC2::Subnet::Id
+    Description: First private subnet; must be in VpcId and a different AZ from SubnetB
+  SubnetB:
+    Type: AWS::EC2::Subnet::Id
+  ConnectorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group on the customer-managed MicroVM VPC egress connector
+  WorkerRoleArn:
+    Type: String
+    AllowedPattern: 'arn:[^:]+:iam::[0-9]{12}:role/.+'
+    Description: Dedicated tenant execution role; do not reuse the cloud shared-state role
+Resources:
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NFS only from the native worker VPC connector
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ConnectorSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref ConnectorSecurityGroup
+  CredentialFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      BackupPolicy:
+        Status: ENABLED
+      FileSystemPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 'elasticfilesystem:Client*'
+            Resource: '*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Effect: Deny
+            Principal: '*'
+            Action: 'elasticfilesystem:Client*'
+            Resource: '*'
+            Condition:
+              'Null':
+                elasticfilesystem:AccessPointArn: 'true'
+          - Effect: Deny
+            Principal: '*'
+            Action: 'elasticfilesystem:Client*'
+            Resource: '*'
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn: !Ref WorkerRoleArn
+          - Effect: Allow
+            Principal:
+              AWS: !Ref WorkerRoleArn
+            Action: [elasticfilesystem:ClientMount, elasticfilesystem:ClientWrite]
+            Resource: '*'
+            Condition:
+              Bool:
+                elasticfilesystem:AccessedViaMountTarget: 'true'
+              'Null':
+                # This filesystem belongs to ONE tenant. Never permit a root-filesystem mount.
+                # A reference to the access point here would create a dependency cycle.
+                elasticfilesystem:AccessPointArn: 'false'
+      FileSystemTags:
+        - Key: Purpose
+          Value: updraft-native-claude-proof
+  CredentialAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref CredentialFileSystem
+      PosixUser:
+        Uid: '1001'
+        Gid: '1001'
+      RootDirectory:
+        Path: /claude-home
+        CreationInfo:
+          OwnerUid: '1001'
+          OwnerGid: '1001'
+          Permissions: '0700'
+  MountA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref CredentialFileSystem
+      SubnetId: !Ref SubnetA
+      SecurityGroups: [!Ref EfsSecurityGroup]
+  MountB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref CredentialFileSystem
+      SubnetId: !Ref SubnetB
+      SecurityGroups: [!Ref EfsSecurityGroup]
+Outputs:
+  FileSystemId:
+    Value: !Ref CredentialFileSystem
+  AccessPointId:
+    Value: !Ref CredentialAccessPoint
+  AccessPointArn:
+    Value: !GetAtt CredentialAccessPoint.Arn

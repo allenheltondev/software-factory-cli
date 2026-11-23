@@ -1,0 +1,11 @@
+{
+  "workerUid": 1000,
+  "workerGid": 1000,
+  "claudeUid": 1001,
+  "claudeGid": 1001,
+  "credentialHome": "/var/lib/updraft-native-auth/home",
+  "workRoot": "/var/lib/updraft-jobs",
+  "claude": "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+  "sandboxConfig": "/etc/updraft-native-sandbox.json",
+  "authModule": "/usr/local/lib/node_modules/@allenheltondev/updraft/dist/agents/native-claude-auth.js"
+}
