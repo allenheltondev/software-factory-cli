@@ -346,6 +346,9 @@ export function createLauncher(deps: LaunchDeps) {
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
     const jobId = req.jobId ?? newJobId();
+    // Secret retrieval can fail transiently. Do it before claiming a delivery or quota,
+    // so a failure leaves the event immediately retryable and owns no capacity.
+    const token = native ? nativeJobToken(await native.secret(), jobId) : randomBytes(32).toString('base64url');
     // Short, until the job starts and holds it for its lifetime; released early (by this job only)
     // when it fails.
     if (!(await deps.store.claimDelivery(req.installationId, req.deliveryId, launchedAt + (native ? durationMs : PRELAUNCH_CLAIM_MS), jobId))) return skip('duplicate');
@@ -405,7 +408,6 @@ export function createLauncher(deps: LaunchDeps) {
     }
     const reservation = { installationId: req.installationId, jobId, tenantSlot: reserved.tenantSlot, platformSlot: reserved.platformSlot, day, month };
 
-    const token = native ? nativeJobToken(await native.secret(), jobId) : randomBytes(32).toString('base64url');
     const sender = req.payload.sender?.login;
     const job: Job = {
       jobId,

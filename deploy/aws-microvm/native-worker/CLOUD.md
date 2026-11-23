@@ -119,7 +119,10 @@ records likewise retain the evidence required to fence safely. Idle-worker billi
 per-job minute ledger; do not use this development route as a production billing model.
 
 On normal job completion the broker releases that job's slot and worker lease without stopping
-the persistent VM. Cancellation marks queued work terminal or tells an active runner to stop;
+the persistent VM. It first conditionally replaces the active lease with a durable settlement
+marker, then releases quota, and clears the marker only after release succeeds. The marker
+blocks polling and lets completion retries, reconciliation or the dispatcher's settlement check
+recover partial failures without reviving the old assignment. Cancellation marks queued work terminal or tells an active runner to stop;
 its deadline is not renewed while cancellation is pending. If stopping cannot be confirmed,
 lease expiry takes the physical-fencing path. Drain all jobs and terminate the worker before
 rotating the control secret, disabling/removing the route or removing its IAM permissions.

@@ -31,8 +31,8 @@ export function createNativeControl(d: NativeControlDeps) {
       await d.terminateMicrovm(w.microvmId);
       if (!isTerminated(await d.microvmState(w.microvmId))) return false;
     }
-    if (w.active) {
-      const job = await d.store.getJob(w.active.jobId);
+    if (w.active || w.settling) {
+      const job = await d.store.getJob((w.active ?? w.settling)!.jobId);
       if (job) {
         await d.store.markStopping(job.jobId);
         await d.store.finishJob(job.jobId, 'microvm_gone', { at: now() });
@@ -50,17 +50,30 @@ export function createNativeControl(d: NativeControlDeps) {
   async function complete(job: Job): Promise<boolean> {
     if (!job.native) return false;
     const w = await d.workers.get(job.installationId, job.native.workerId);
+    if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
     if (!w || w.active?.jobId !== job.jobId) return job.releasedAt !== undefined;
     // Only the trusted runner's completed job can release a healthy persistent worker.
     if (job.status !== 'finished' || w.fenced || w.active.until <= now()) { await fence(w); return false; }
+    const next = { ...w, version: w.version + 1, settling: { jobId: job.jobId } };
+    delete next.active;
+    // A failed/ambiguous CAS must not free capacity. Once this transition commits,
+    // the assignment can never be served again and no new job can be polled yet.
+    if (!await d.workers.put(next, w.version)) return false;
+    return finishSettlement(next, job);
+  }
+  async function finishSettlement(w: Worker, job: Job): Promise<boolean> {
+    if (job.status !== 'finished' || w.settling?.jobId !== job.jobId) return false;
+    // Retain the durable marker through partial failures. Completion retries and
+    // reconciliation can repeat releaseJob safely, then make the worker available.
     await d.store.releaseJob(job, unusedTime(job, now()));
     const next = { ...w, version: w.version + 1 };
-    delete next.active;
+    delete next.settling;
     return d.workers.put(next, w.version);
   }
   async function reconcile(job: Job): Promise<boolean> {
     if (!job.native) return false;
     const w = await d.workers.get(job.installationId, job.native.workerId);
+    if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
     if (w?.active?.jobId === job.jobId) {
       if (w.fenced || w.active.until <= now() || job.expiresAt <= now()) return fence(w);
       await d.store.holdSlots(job, NATIVE_SLOT_HOLD_UNTIL);
@@ -92,7 +105,7 @@ export function createNativeControl(d: NativeControlDeps) {
     if (p.op === 'status') {
       const w = await d.workers.get(r.installationId, r.workerId);
       return { ok: true, worker: w ? { workerId: w.workerId, installationId: w.installationId, auth: w.auth, heartbeatAt: w.heartbeatAt,
-        busy: !!w.active, jobId: w.active?.jobId, fenced: !!w.fenced, imageVersion: w.imageVersion, workerVersion: w.workerVersion } : null };
+        busy: !!(w.active || w.settling), jobId: (w.active ?? w.settling)?.jobId, fenced: !!w.fenced, imageVersion: w.imageVersion, workerVersion: w.workerVersion } : null };
     }
     if (p.op === 'cancel') {
       const job = typeof p.jobId === 'string' ? await d.store.getJob(p.jobId) : null;
@@ -122,6 +135,15 @@ export function createNativeControl(d: NativeControlDeps) {
     }
     const tenant = await d.store.getTenant(r.installationId, { consistent: true });
     const disabled = tenant?.status !== 'active' || await d.disabled();
+    if (w.settling) {
+      // A heartbeat must not resurrect the retired lease or race its final clear.
+      // A runner that exited during settlement can have its dispatcher finish it.
+      if (p.op === 'settled') {
+        const job = await d.store.getJob(w.settling.jobId);
+        if (job && await finishSettlement(w, job)) return { ok: true, busy: false };
+      }
+      return { ok: true, busy: true, cancel: false };
+    }
     if (w.active) {
       if (p.op === 'poll' || p.op === 'register' || p.op === 'settled') return refused;
       const job = await d.store.getJob(w.active.jobId);

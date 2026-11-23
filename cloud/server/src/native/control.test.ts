@@ -26,11 +26,13 @@ describe('native worker Cloud dispatch', () => {
   let launch: ReturnType<typeof createLauncher>;
   const runMicrovm = vi.fn();
   const terminateMicrovm = vi.fn();
+  const loadSecret = vi.fn<() => Promise<string>>();
   const input = (op: string, extra = {}) => ({ action: 'worker', op, workerId: route.workerId, token: secret, session: 'session-0123456789', microvmId: route.microvmId, auth: 'connected', imageVersion: route.imageVersion, workerVersion: '104', ...extra });
   beforeEach(async () => {
     clock = Date.now(); disabled = false; state = 'RUNNING'; row = null;
     runMicrovm.mockReset().mockResolvedValue({ microvmId: 'mvm-byok' });
     terminateMicrovm.mockReset().mockResolvedValue(undefined);
+    loadSecret.mockReset().mockResolvedValue(secret);
     store = createMemoryStore();
     await store.putTenantWithMember({ installationId: 55, accountId: 900, accountLogin: 'acme', accountType: 'Organization', status: 'active', createdAt: '', createdBy: 's' },
       { installationId: 55, sub: 's', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
@@ -49,7 +51,7 @@ describe('native worker Cloud dispatch', () => {
       async dequeue() {},
     };
     control = createNativeControl({ store, workers, route, secret: async () => secret, settings, terminateMicrovm, microvmState: async () => state, disabled: async () => disabled, now: () => clock });
-    launch = createLauncher({ store, settings, native: { route, secret: async () => secret }, imageVersion: async () => null,
+    launch = createLauncher({ store, settings, native: { route, secret: loadSecret }, imageVersion: async () => null,
       putEvent: async () => {}, runMicrovm, quotas: { concurrentJobs: 10, platformConcurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 100_000 }, now: () => clock, log: () => {} });
   });
   const queued = async () => (await store.getJob((await launch(request())).jobId!))!;
@@ -75,6 +77,19 @@ describe('native worker Cloud dispatch', () => {
     expect(responses.filter((r) => r.request)).toHaveLength(1);
     expect(row?.active?.jobId).toBe(job.jobId);
     expect(await control.handle(input('poll'))).toMatchObject({ ok: false });
+  });
+  it('owns no delivery or quota when secret retrieval fails, and permits immediate redelivery', async () => {
+    loadSecret.mockRejectedValueOnce(new Error('Secrets Manager unavailable'));
+    const claim = vi.spyOn(store, 'claimDelivery');
+    const reserve = vi.spyOn(store, 'reserveJob');
+    await expect(launch(request())).rejects.toThrow('Secrets Manager unavailable');
+    expect(claim).not.toHaveBeenCalled(); expect(reserve).not.toHaveBeenCalled();
+    expect(await store.getDeliveryClaim(55, 'delivery-1')).toBeNull();
+    expect(await store.listActiveJobs()).toEqual([]);
+    expect(await store.listRecentJobs(55, 10)).toEqual([]);
+    expect(await launch(request())).toMatchObject({ status: 202, disposition: 'launched' });
+    expect(await store.listActiveJobs()).toHaveLength(1);
+    expect(runMicrovm).not.toHaveBeenCalled();
   });
   it('preserves key checks when the route does not select this workflow', async () => {
     const other = createLauncher({ store, settings, native: { route: { ...route, labels: ['other'] }, secret: async () => secret }, imageVersion: async () => '3',
@@ -141,6 +156,79 @@ describe('native worker Cloud dispatch', () => {
     expect((await store.listRecentJobs(55, 10))[0]).toMatchObject({ status: 'finished', outcome: 'succeeded', detail: { prNumber: 18 } });
     expect(await store.listActiveJobs()).toHaveLength(0);
     expect(await control.canServe(job)).toBe(false);
+  });
+  it('retains quota on a settlement CAS conflict with a heartbeat, then settles on retry', async () => {
+    const job = await assigned();
+    await store.finishJob(job.jobId, 'succeeded');
+    const finished = (await store.getJob(job.jobId))!;
+    const release = vi.spyOn(store, 'releaseJob');
+    const put = workers.put;
+    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      expect(next.settling?.jobId).toBe(job.jobId);
+      expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true });
+      return put(next, previous);
+    });
+    expect(await control.complete(finished)).toBe(false);
+    expect(release).not.toHaveBeenCalled();
+    expect(row?.active?.jobId).toBe(job.jobId);
+    expect(row?.settling).toBeUndefined();
+    expect((await store.listActiveJobs()).map((j) => j.jobId)).toContain(job.jobId);
+    expect(await store.reserveJob({ installationId: 55, jobId: 'job_competing00001', holdUntil: clock + 1000,
+      day: new Date(clock).toISOString().slice(0, 10), month: new Date(clock).toISOString().slice(0, 7),
+      quotas: { concurrentJobs: 1, platformConcurrentJobs: 1, jobsPerDay: 100, microvmMinutesPerMonth: 100_000 } })).toMatchObject({ ok: false });
+    expect(await control.complete(finished)).toBe(true);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(row?.active).toBeUndefined(); expect(row?.settling).toBeUndefined();
+    expect(await store.listActiveJobs()).toEqual([]);
+  });
+  it('keeps a durable settlement marker across a release failure, blocks polling, and reconciles it', async () => {
+    const job = await assigned();
+    await store.finishJob(job.jobId, 'succeeded');
+    const finished = (await store.getJob(job.jobId))!;
+    const release = vi.spyOn(store, 'releaseJob').mockImplementationOnce(async () => {
+      expect(row?.active).toBeUndefined();
+      expect(row?.settling?.jobId).toBe(job.jobId);
+      throw new Error('DynamoDB unavailable');
+    });
+    await expect(control.complete(finished)).rejects.toThrow('DynamoDB unavailable');
+    expect(await control.canServe(job)).toBe(false);
+    expect((await store.listActiveJobs()).map((j) => j.jobId)).toContain(job.jobId);
+    await launch(request('delivery-2'));
+    const version = row!.version;
+    expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true, busy: true });
+    expect(row?.version).toBe(version);
+    expect(await control.handle(input('poll'))).toMatchObject({ ok: true, busy: true });
+    expect(row?.settling?.jobId).toBe(job.jobId);
+    expect(await control.reconcile(finished)).toBe(true);
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(row?.settling).toBeUndefined();
+    expect((await store.listActiveJobs()).map((j) => j.jobId)).not.toContain(job.jobId);
+    expect(await control.handle(input('poll'))).toMatchObject({ ok: true, request: { payload: { deliveryId: 'delivery-2' } } });
+    expect(terminateMicrovm).not.toHaveBeenCalled();
+  });
+  it('recovers an ambiguous settlement write and a failed final clear without resurrecting the lease', async () => {
+    const job = await assigned();
+    await store.finishJob(job.jobId, 'succeeded');
+    const finished = (await store.getJob(job.jobId))!;
+    const release = vi.spyOn(store, 'releaseJob');
+    const put = workers.put;
+    const writes = vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      expect(await put(next, previous)).toBe(true);
+      throw new Error('settlement response lost');
+    });
+    await expect(control.complete(finished)).rejects.toThrow('settlement response lost');
+    expect(release).not.toHaveBeenCalled();
+    expect(row?.active).toBeUndefined(); expect(row?.settling?.jobId).toBe(job.jobId);
+    writes.mockResolvedValueOnce(false);
+    expect(await control.complete(finished)).toBe(false);
+    expect(row?.settling?.jobId).toBe(job.jobId);
+    expect(await control.canServe(job)).toBe(false);
+    // A dispatcher whose runner exited can finish the retained marker after release committed.
+    expect(await control.handle(input('settled'))).toMatchObject({ ok: true, busy: false });
+    expect(row?.settling).toBeUndefined(); expect(row?.active).toBeUndefined();
+    expect(await store.listActiveJobs()).toEqual([]);
+    expect(await control.complete((await store.getJob(job.jobId))!)).toBe(true);
+    expect(terminateMicrovm).not.toHaveBeenCalled();
   });
   it('never grants the job access to the worker secret or Anthropic key, while retaining another required key', () => {
     const policy = jobSessionPolicy({ installationId: 55, configVersion: 1, deliveryId: 'd', native: { workerId: route.workerId }, agentKeys: ['CODEX_API_KEY', 'ANTHROPIC_API_KEY'] } as Job,

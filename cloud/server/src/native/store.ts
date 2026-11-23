@@ -14,6 +14,8 @@ export interface Worker {
   auth: AuthState;
   heartbeatAt: number;
   active?: { jobId: string; until: number };
+  /** Active lease durably retired; blocks dispatch until quota release is confirmed. */
+  settling?: { jobId: string };
   fenced?: boolean;
 }
 export interface NativeStore {
