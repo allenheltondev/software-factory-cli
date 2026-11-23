@@ -20,15 +20,13 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
   const { id } = useParams();
   const installationId = Number(id);
   const valid = Number.isSafeInteger(installationId) && installationId > 0;
-  const [load, setLoad] = useState<Load>({ state: 'loading' });
+  const [fetched, setLoad] = useState<Load>({ state: 'loading' });
+  const load: Load = valid ? fetched : { state: 'error', message: 'There is no installation at this address.' };
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!valid) {
-      setLoad({ state: 'error', message: 'There is no installation at this address.' });
-      return;
-    }
+    if (!valid) return;
     let live = true;
     void api.nativeClaude(installationId).then(
       (view) => { if (live) setLoad({ state: 'ok', view }); },
