@@ -442,6 +442,9 @@ function DeliveriesList({ deliveries, base }: { deliveries: Delivery[]; base: st
                 </div>
                 <div className="flex flex-wrap items-center gap-3 text-sm">
                   <span>{deliveryReason(d)}</span>
+                  {d.jobId && d.reason === 'native_waiting_for_sign_in' && (
+                    <Link className="auth-link" to={`${base}/claude?request=${encodeURIComponent(d.jobId)}`}>Open Claude sign-in request</Link>
+                  )}
                   {d.jobId && d.disposition === 'launched' && (
                     <Link className="auth-link" to={`${base}/jobs/${d.jobId}`}>
                       View job

@@ -160,7 +160,7 @@ export function createNativeControl(d: NativeControlDeps) {
       const job = await d.store.getJob(id);
       if (!job || job.status === 'finished' || job.expiresAt <= now()) { await d.workers.dequeue(r.installationId, r.workerId, id); continue; }
       if (!job.native || job.native.workerId !== r.workerId || job.installationId !== r.installationId || job.microvmId || !job.launchingAt ||
-          job.repositoryId !== r.repositoryId || job.repository.toLowerCase() !== r.repository.toLowerCase() || job.imageVersion !== r.imageVersion) continue;
+          job.imageVersion !== r.imageVersion || job.native.generation !== r.generation) continue;
       const token = nativeJobToken(secret, job.jobId);
       if (hashToken(token) !== job.tokenHash) return refused; // rotated control key: drain before rotation
       if (!await save(w, { active: { jobId: id, until: Math.min(job.expiresAt, now() + WORKER_LEASE_MS) } })) return refused;

@@ -130,6 +130,7 @@ export interface Usage {
 
 /** A job as the admin view lists it: what started it and how it ended. */
 export interface JobSummary {
+  executionMode?: 'subscription' | 'standard';
   jobId: string;
   repository: string;
   issue?: number;
@@ -325,7 +326,7 @@ export interface DispatchRefusal {
  */
 export interface Job {
   /** Opt-in persistent subscription worker; never dispatched to RunMicrovm. */
-  native?: { workerId: string; notBefore?: number; retry?: boolean };
+  native?: { workerId: string; generation?: string; routingVersion?: number; notBefore?: number; retry?: boolean };
   jobId: string;
   /** sha256 hex of the job token; the token itself is only ever in the run-hook payload. */
   tokenHash: string;

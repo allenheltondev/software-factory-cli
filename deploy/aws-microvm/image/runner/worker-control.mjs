@@ -4,7 +4,7 @@ export async function workerControl(config) {
   const { SecretsManagerClient, GetSecretValueCommand } = await import('@aws-sdk/client-secrets-manager');
   const lambda = new LambdaClient({ region: config.region });
   const secrets = new SecretsManagerClient({ region: config.region });
-  const token = (await secrets.send(new GetSecretValueCommand({ SecretId: config.controlSecretArn }))).SecretString;
+  const token = config.controlToken ?? (await secrets.send(new GetSecretValueCommand({ SecretId: config.controlSecretArn }))).SecretString;
   if (!token || token.length < 32 || token.length > 256) throw new Error('worker control credential unavailable');
   return async (body) => {
     const out = await lambda.send(new InvokeCommand({ FunctionName: config.brokerFunctionName,

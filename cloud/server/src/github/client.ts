@@ -76,6 +76,7 @@ export interface GitHubApi {
   /** The App's bot user (`<slug>[bot]`), read with any token. */
   getBotUser(token: string, slug: string): Promise<GitHubUser>;
   listInstallationRepositories(installationToken: string): Promise<GitHubRepository[]>;
+  issueState?(installationToken: string, repository: string, issue: number): Promise<{ open: boolean; labels: string[] }>;
   /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
   createIssueComment(installationToken: string, repository: string, issue: number, body: string): Promise<void>;
 }
@@ -174,6 +175,15 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       const login = `${slug}[bot]`;
       const u = await json<Json>(await call(`/users/${encodeURIComponent(login)}`, token), 'GET /users/<bot>');
       return { id: Number(u.id), login: String(u.login ?? login) };
+    },
+
+    async issueState(token, repository, issue) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue}`;
+      const out = await json<Json>(await call(path, token), 'GET /repos/issues');
+      const labels = Array.isArray(out.labels) ? out.labels.flatMap((label: unknown) =>
+        label && typeof label === 'object' && 'name' in label && typeof label.name === 'string' ? [label.name] : []) : [];
+      return { open: out.state === 'open', labels };
     },
 
     async createIssueComment(token, repository, issue, body) {

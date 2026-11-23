@@ -170,7 +170,31 @@ export interface AgentKeysView {
 }
 
 // Native Claude subscription mode never exposes Claude CLI credentials.
+export interface NativeClaudeTrigger {
+  repositoryId: number;
+  repository: string;
+  label: string;
+}
+
+export interface NativeClaudeLoginGrant {
+  expiresAt?: string;
+  url: string;
+  token: string;
+  port: number;
+}
+
+export interface ClaudeWaitingRequest {
+  status: 'waiting' | 'started' | 'canceled' | 'expired';
+  expiresAt: string;
+  jobId?: string;
+  reason?: string;
+}
+
 export interface NativeClaudeView {
+  managed?: boolean;
+  browserLogin?: boolean;
+  triggers?: NativeClaudeTrigger[];
+  availableTriggers?: NativeClaudeTrigger[];
   configured: boolean;
   enabled: boolean;
   repository?: string;
@@ -224,6 +248,7 @@ export interface Delivery {
 }
 
 export interface JobView {
+  executionMode?: 'subscription' | 'standard';
   jobId: string;
   repository: string;
   issue?: number;
@@ -702,9 +727,15 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     setTelemetryKey: (installationId: number, input: TelemetryKeyInput) =>
       request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify(input) }),
     removeTelemetryKey: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'DELETE' }),
+    nativeClaudeWaiting: (installationId: number, id: string) =>
+      request<ClaudeWaitingRequest>(`/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}`),
+    nativeClaudeStart: (installationId: number, id: string) =>
+      request<NativeClaudeView>(`/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}/start`, { method: 'POST' }),
+    nativeClaudeLogin: (installationId: number) =>
+      request<NativeClaudeLoginGrant>(`/installations/${installationId}/claude-subscription/login`, { method: 'POST' }),
     nativeClaude: (installationId: number) => request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription'),
-    setNativeClaudeMode: (installationId: number, enabled: boolean) =>
-      request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { method: 'PUT', body: JSON.stringify({ enabled }) }),
+    setNativeClaudeMode: (installationId: number, enabled: boolean, triggers?: NativeClaudeTrigger[]) =>
+      request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { method: 'PUT', body: JSON.stringify({ enabled, triggers }) }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */
     setAgentKey: (installationId: number, name: string, value: string) =>
