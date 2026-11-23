@@ -3,11 +3,42 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { IMAGE, TOOL, MAX_FRAME, claudeArgs, claudeEnv, checkInventory, validateRun } from '../native-worker/policy.mjs';
+import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, claudeArgs, claudeEnv, checkInventory, validateRun, resolveRunEnvironment } from '../native-worker/policy.mjs';
 import { frames } from '../native-worker/protocol.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
+import { endpointPorts, tokenArgs, verifyHookPort } from '../native-worker/endpoint-token.mjs';
+import { containInvocation } from '../../../src/worker/container.ts';
+import { commitIdentityEnv } from '../../../src/github/credentials.ts';
+import { containerSchema } from '../../../src/config/schema.ts';
+import { createGitFixture } from '../../../test/git-fixtures.ts';
 
 describe('native Claude worker policy', () => {
+  it.skipIf(process.platform === 'win32')('accepts actual commitAsApp containInvocation arguments without adding identity to Claude', () => {
+    const f = createGitFixture();
+    try {
+      const worktree = path.join(f.root, 'job');
+      f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'identity-proof', worktree, 'HEAD');
+      const env = commitIdentityEnv({ name: 'updraft[bot]', email: '42+updraft[bot]@users.noreply.github.com' });
+      const wrapped = containInvocation({ invocation: { file: 'claude', args: ['-p'], promptVia: 'stdin' },
+        container: containerSchema.parse({ image: IMAGE, network: 'none' }), runtime: '/runtime', runId: 'identity-proof',
+        worktree, promptFile: path.join(f.root, 'prompt.md'), agentEnv: env, user: '1000:1000' });
+      const args = resolveRunEnvironment(wrapped.invocation.args, env);
+      const run = validateRun(args.slice(1), { workRoot: fs.realpathSync(f.root), workerUid: 1000, workerGid: 1000 });
+      expect(run.env.filter((entry) => GIT_IDENTITY.includes(entry.name))).toEqual(Object.entries(env).map(([name, value]) => ({ name, value })));
+      for (const name of GIT_IDENTITY) expect(claudeEnv({ credentialHome: '/private' })[name]).toBeUndefined();
+    } finally { f.cleanup(); }
+  });
+  it('resolves only explicit Git identity fields from the runtime client environment', () => {
+    const args = ['run', '--rm', '--name', 'test', '-e', 'HOME=/updraft-home', ...GIT_IDENTITY.flatMap((name) => ['-e', name]), IMAGE, 'claude', '-p'];
+    const env = Object.fromEntries(GIT_IDENTITY.map((name) => [name, name.endsWith('EMAIL') ? '42+updraft[bot]@users.noreply.github.com' : 'updraft[bot]']));
+    const resolved = resolveRunEnvironment(args, { ...env, ANTHROPIC_API_KEY: 'do-not-forward', NODE_OPTIONS: 'do-not-forward' });
+    for (const name of GIT_IDENTITY) expect(resolved).toContain(`${name}=${env[name]}`);
+    expect(resolved.join(' ')).not.toContain('do-not-forward');
+    expect(() => resolveRunEnvironment(args, {})).toThrow();
+    for (const name of ['ANTHROPIC_API_KEY', 'NODE_OPTIONS', 'GIT_CONFIG_COUNT', 'GIT_SSH_COMMAND', 'CLAUDE_CONFIG_DIR']) {
+      expect(() => resolveRunEnvironment(['run', '--rm', '--name', 'test', '-e', name, IMAGE, 'claude'], { [name]: 'unsafe' })).toThrow();
+    }
+  });
   it('accepts only EFS identifiers in the lifecycle payload, never credentials or commands', () => {
     const payload = { fileSystemId: 'fs-0123456789abcdef0', accessPointId: 'fsap-0123456789abcdef0' };
     expect(bootPayload(JSON.stringify(payload))).toEqual(payload);
@@ -82,5 +113,29 @@ describe('privileged worker framing', () => {
     expect(failures).toBe(1);
     stream.write('a'.repeat(MAX_FRAME + 1));
     expect(failures).toBe(2);
+  });
+});
+
+describe('native worker endpoint provisioning', () => {
+  it('issues tokens only for explicit non-lifecycle ports', () => {
+    expect(tokenArgs('mvm-test-123', [{ port: 8080 }])).toContain('[{"port":8080}]');
+    for (const ports of [[], [{ allPorts: {} }], [{ range: { startPort: 8999, endPort: 9001 } }], [{ port: 9000 }], [{ port: 8080, allPorts: {} }], [{ port: '8080' }]]) {
+      expect(() => endpointPorts(ports)).toThrow();
+    }
+  });
+
+  it('requires permitted-port access and then gateway denial of the privileged hook', async () => {
+    const calls = [];
+    const probe = async (url, options) => {
+      calls.push({ url, options });
+      return { status: calls.length === 1 ? 404 : 403 };
+    };
+    await verifyHookPort('https://worker.example/', 'endpoint-token', 8080, probe);
+    expect(calls[0].options.headers['X-aws-proxy-port']).toBe('8080');
+    expect(calls[1].options.headers['X-aws-proxy-port']).toBe('9000');
+    expect(calls[1].options.body).toBe('{}');
+    await expect(verifyHookPort('https://worker.example/', 'bad-token', 8080, async () => ({ status: 401 }))).rejects.toThrow('permitted');
+    let count = 0;
+    await expect(verifyHookPort('https://worker.example/', 'endpoint-token', 8080, async () => ({ status: ++count === 1 ? 200 : 503 }))).rejects.toThrow('reachable');
   });
 });

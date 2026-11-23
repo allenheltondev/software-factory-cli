@@ -17,6 +17,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   let service;
   let started = false;
   let pending = false;
+  // Privileged provider lifecycle interface. Application endpoint tokens MUST exclude
+  // port 9000; use endpoint-token.mjs and its deployed gateway probe when provisioning.
   const server = http.createServer((request, response) => {
     void (async () => {
       const route = request.url;

@@ -1,10 +1,16 @@
 # Merge these agent definitions into your existing live Updraft configuration.
 # The prototype runtime enforces native subscription auth itself before EVERY Claude launch.
 # Do not set authentication: native-claude here: the general container guard remains intact.
+maxConcurrent: 1
+capacity:
+  groups:
+    native-claude-worker:
+      maxConcurrent: 1
 agents:
   claude:
     adapter: claude
     maxConcurrent: 1
+    capacityGroup: native-claude-worker
     command: claude
     container:
       image: native-claude-worker
@@ -13,6 +19,7 @@ agents:
   claude-review:
     adapter: claude
     maxConcurrent: 1
+    capacityGroup: native-claude-worker
     command: claude
     container:
       image: native-claude-worker

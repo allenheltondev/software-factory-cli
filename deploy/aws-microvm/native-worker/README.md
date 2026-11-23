@@ -122,6 +122,29 @@ prove authenticated model behavior. CI includes a separate Linux security job wi
    of `amazon-efs-utils` with MicroVM role credentials, DNS, capabilities and VPC connectors is
    **unverified** and must be established on AWS. Do not route production events here.
 
+### Keep the privileged lifecycle port private
+
+Port **9000** accepts root lifecycle operations, including the EFS mount. It must never be
+included in an operator-terminal, customer or application endpoint token's `allowedPorts`.
+Do not use `allPorts` or broad ranges. The provider's lifecycle calls are separate from
+application endpoint access; an ingress connector alone does not prove the hook is private.
+Limit who can mint endpoint tokens through IAM, and issue every non-lifecycle token using
+the operator-side helper, which rejects port 9000, ranges and `allPorts` before invoking AWS:
+
+```sh
+umask 077
+node deploy/aws-microvm/native-worker/endpoint-token.mjs mvm-REPLACE '[{"port":8080}]' > endpoint-token.json
+node deploy/aws-microvm/native-worker/endpoint-token.mjs --verify https://REPLACE-ENDPOINT 8080 endpoint-token.json
+```
+
+Replace 8080 with the actual approved terminal/application port, never 9000. The provisioning
+probe first establishes access on that port with the same token, then requires gateway
+denial (401/403) for a harmless empty POST to the run hook on 9000. An expired token or a hook
+response such as 409/503 fails the probe. Run it against **every** issued application token
+and deployed ingress configuration before giving access to users; keep the token file private
+and delete it when done. Do not print it in logs. Direct AWS token issuance can bypass this
+helper, so IAM token issuers remain trusted. Real gateway enforcement remains a live gate.
+
 ## Direct sign-in and Updraft execution
 
 From a direct operator terminal on the worker, run the unmodified official CLI:
@@ -144,6 +167,14 @@ settings. Do not set `authentication: native-claude` on these container profiles
 container guard remains intact. This **specific runtime** applies the same native subscription
 classifier before every real Claude launch; no other container receives an exception.
 
+**Merge the scheduling settings too:** set global `maxConcurrent: 1`, add the
+`native-claude-worker` capacity group with `maxConcurrent: 1`, and assign **every** profile
+using this supervisor to it. Per-profile limits alone do not serialize implementation and
+review jobs. If an existing configuration needs a higher global limit for unrelated work,
+retain the shared one-slot group on all native-worker profiles. Use one Updraft state database
+and scheduler per supervisor; independent schedulers are unsupported. The supervisor's busy
+refusal is a defensive check, not a queue: a misconfigured concurrent caller still fails.
+
 Run Updraft as UID/GID 1000. Put clones (`checkoutPath`) and `UPDRAFT_HOME` beneath
 `/var/lib/updraft-jobs`, giving that account ownership of its clone/control/state directories.
 Generated worktrees then stay within the allowed root. Keep the existing GitHub App credentials
@@ -151,12 +182,21 @@ and configuration. Run `updraft validate`, `updraft doctor`, then the existing
 `updraft run-event --event-file ... --event-name issues --delivery-id ... --json`.
 Implementation, verify, PR creation, review and revision use the existing state machine.
 
-Every agent must use the prototype runtime, `network: none`, and empty agent/container env.
+Every agent must use the prototype runtime and `network: none`. Keep custom agent/container
+env empty. The four non-secret `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and
+`GIT_COMMITTER_EMAIL` fields injected by `github.app.commitAsApp` are supported: the client
+resolves only those names and sends their values only into repository tool/verify sandboxes,
+never the credential-owning CLI. Other overrides, including Git config/SSH helpers, remain
+forbidden. Keep the existing GitHub App commit identity configuration.
 Do not introduce a host-native agent or host verification wrapper. Existing narrow/read-only
 git mounts protect metadata that host git would later obey. No Cloud registration, heartbeat,
 dispatch, SSH server or custom login UI is added by this prototype.
 
 ## Live acceptance checklist — all still pending
+
+- Provision application/terminal tokens with explicit allowed ports excluding 9000 and run
+  the deployed endpoint probe for each token/ingress configuration. The permitted port must
+  respond and the privileged hook port must be denied by the gateway.
 
 - Real MicroVM mounts EFS; UID 1000 cannot traverse its private **local** parent, and tool/verify
   commands cannot read a synthetic canary, inspect Claude, reach NFS or obtain AWS credentials.

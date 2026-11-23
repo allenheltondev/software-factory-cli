@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // The docker-shaped runtime used by Updraft. No subscription files or secrets pass here.
 import net from 'node:net';
-import { DEFAULT_SOCKET, MAX_FRAME } from './policy.mjs';
+import { DEFAULT_SOCKET, MAX_FRAME, resolveRunEnvironment } from './policy.mjs';
 import { frames, send } from './protocol.mjs';
 
-const args = process.argv.slice(2);
+const args = resolveRunEnvironment(process.argv.slice(2), process.env);
 const socket = net.createConnection(DEFAULT_SOCKET);
 let finished = false;
 socket.on('error', () => { process.stderr.write('Native worker unavailable.\n'); process.exitCode = 125; });

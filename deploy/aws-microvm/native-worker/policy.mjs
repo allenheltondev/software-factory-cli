@@ -7,6 +7,36 @@ export const IMAGE = 'native-claude-worker';
 export const TOOL = 'mcp__updraft__exec';
 export const MAX_FRAME = 2 * 1024 * 1024;
 export const DEFAULT_SOCKET = '/run/updraft-native/worker.sock';
+export const GIT_IDENTITY = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+
+function checkEnvironment(entry) {
+  if (entry.name === 'HOME' && entry.value === '/updraft-home') return;
+  if (GIT_IDENTITY.includes(entry.name) && typeof entry.value === 'string' && entry.value.length <= 1024 && !/[\0\r\n]/.test(entry.value)) return;
+  throw new Error('agent environment overrides are forbidden or unresolved');
+}
+
+// Updraft forwards App commit identity by NAME. Resolve only these non-secret fields in
+// the runtime client; the root service must never inherit the worker's whole environment.
+export function resolveRunEnvironment(argv, env) {
+  if (argv[0] !== 'run') return argv;
+  const run = parseRunArgs(argv.slice(1));
+  const out = [...argv];
+  const imageIndex = argv.length - run.command.length - 1;
+  for (let i = 1; i < imageIndex; i++) {
+    let index;
+    let prefix = '';
+    if (out[i] === '-e' || out[i] === '--env') index = ++i;
+    else if (out[i].startsWith('--env=')) { index = i; prefix = '--env='; }
+    else continue;
+    const text = out[index].slice(prefix.length);
+    const equals = text.indexOf('=');
+    const name = equals < 0 ? text : text.slice(0, equals);
+    const value = equals < 0 && GIT_IDENTITY.includes(name) ? env[name] : equals < 0 ? undefined : text.slice(equals + 1);
+    checkEnvironment({ name, value });
+    out[index] = `${prefix}${name}=${value}`;
+  }
+  return out;
+}
 
 export function inside(child, parent) {
   return child.startsWith(`${parent}/`);
@@ -17,7 +47,7 @@ export function validateRun(argv, config) {
   const run = parseRunArgs(argv);
   if (run.image !== IMAGE || run.network !== 'none') throw new Error('native worker requires its image and network: none');
   if (run.user !== `${config.workerUid}:${config.workerGid}`) throw new Error('unexpected job identity');
-  if (run.env.some((e) => e.name !== 'HOME' || e.value !== '/updraft-home')) throw new Error('agent environment overrides are forbidden');
+  run.env.forEach(checkEnvironment);
   if (run.tmpfs.length !== 1 || run.tmpfs[0].path !== '/updraft-home') throw new Error('unexpected temporary mounts');
   // `updraft doctor` probes the executable without a repository mount or working directory.
   if (run.command.length === 2 && run.command[0] === 'claude' && run.command[1] === '--version' && !run.workdir && !run.mounts.length) return run;
