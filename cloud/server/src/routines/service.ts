@@ -15,10 +15,12 @@ export function createRoutineService({ store, rules, secrets, github, now = Date
     },
     async set(caller: Caller, installationId: number, raw: unknown) {
       const ctx = await github.configContext(caller, installationId);
+      const tenant = await store.getTenant(installationId, { consistent: true });
+      if (!tenant || tenant.disabledReason === 'uninstalled') throw new FlowError('tenant_disabled', 409, 'The installation is unavailable');
       const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
       const repo = ctx.repositories.find((r) => r.id === body.repositoryId);
       const label = typeof body.label === 'string' ? routineLabel(body.label) : '';
-      if (!repo || label.length < 1 || label.length > 80 || !/^[^\x00-\x1f\x7f]+$/.test(label) ||
+      if (!repo || label.length < 1 || label.length > 80 || Array.from(label).some((ch) => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127) ||
           !validRoutineUrl(body.url) || !validRoutineToken(body.token))
         throw new FlowError('invalid_routine', 400, 'Choose an installed repository and label, then paste the API trigger URL and token from Claude Code scheduled tasks');
       const id = routineId(repo.id, label);
