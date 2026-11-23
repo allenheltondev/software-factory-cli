@@ -91,7 +91,7 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
                         <div className="font-medium">{r.repository} · {r.label}</div>
                         <div className="break-all text-xs text-muted-foreground">{r.url}</div>
                       </div>
-                      <Button variant="outline" disabled={busy} onClick={() => void remove(r.id)}>Remove</Button>
+                      <Button variant="secondary" disabled={busy} onClick={() => void remove(r.id)}>Remove</Button>
                     </li>
                   ))}
                 </ul>
