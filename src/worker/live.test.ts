@@ -488,7 +488,7 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
 
   it('refuses native subscription jobs before checkout on API auth or signed-out status', async () => {
     for (const [status, expected, hint] of [
-      [{ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'api_key' }) }, 'not_subscription', 'different authentication method'],
+      [{ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'api_key' }) }, 'not_subscription', 'not verifiably subscription-only'],
       [{ code: 1, stdout: JSON.stringify({ loggedIn: false, authMethod: 'none' }) }, 'sign_in_required', 'Sign in directly'],
       [{ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', loginExpiresAt: '2020-01-01T00:00:00Z' }) }, 'login_expired', 'login expired'],
       [{ code: null, stdout: 'sensitive error output' }, 'status_unavailable', 'Cannot verify'],

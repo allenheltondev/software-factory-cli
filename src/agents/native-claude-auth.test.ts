@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -67,12 +67,15 @@ describe('native Claude subscription status, without inspecting credentials', ()
   it('uses the requested working directory when invoking the official CLI', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'updraft-native-auth-'));
     try {
+      // Resolve the working directory by reading a file from it. Comparing path strings
+      // is unreliable on Windows (short paths) and macOS (/var symlinks).
+      writeFileSync(join(cwd, 'native-auth-cwd-marker'), 'correct worktree');
       const run = await defaultNativeAuthRunner(
-        { file: process.execPath, args: ['-e', 'process.stdout.write(process.cwd())'] },
+        { file: process.execPath, args: ['-e', 'process.stdout.write(require("node:fs").readFileSync("native-auth-cwd-marker", "utf8"))'] },
         { PATH: process.env.PATH },
         cwd,
       );
-      expect(run).toEqual({ code: 0, stdout: realpathSync(cwd) });
+      expect(run).toEqual({ code: 0, stdout: 'correct worktree' });
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
