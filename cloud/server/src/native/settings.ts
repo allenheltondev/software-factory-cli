@@ -47,6 +47,9 @@ export function createNativeSettingsService(d: {
       if (worker?.active) {
         throw new FlowError('invalid_settings', 409, 'Wait for the current subscription job to finish before changing authentication mode');
       }
+      if (!enabled && (await d.workers.queued(r.installationId, r.workerId)).length > 0) {
+        throw new FlowError('invalid_settings', 409, 'Wait for queued subscription jobs to finish or expire before switching to API keys');
+      }
       if (enabled && (!worker || worker.fenced || worker.auth !== 'connected' || now() - worker.heartbeatAt > 60_000)) {
         throw new FlowError('invalid_settings', 409, 'Sign in directly to Claude on the worker and ensure it is connected before enabling subscription jobs');
       }
