@@ -164,7 +164,7 @@ describe('native worker endpoint provisioning', () => {
     const calls = [];
     const probe = async (url, options) => {
       calls.push({ url, options });
-      return { status: calls.length === 1 ? 404 : 403 };
+      return new globalThis.Response(calls.length === 1 ? '{"ok":true}\n' : '', { status: calls.length === 1 ? 200 : 403 });
     };
     await verifyHookPort('https://worker.example/', 'endpoint-token', 8080, probe);
     expect(calls[0].options.headers['X-aws-proxy-port']).toBe('8080');
@@ -172,6 +172,29 @@ describe('native worker endpoint provisioning', () => {
     expect(calls[1].options.body).toBe('{}');
     await expect(verifyHookPort('https://worker.example/', 'bad-token', 8080, async () => ({ status: 401 }))).rejects.toThrow('permitted');
     let count = 0;
-    await expect(verifyHookPort('https://worker.example/', 'endpoint-token', 8080, async () => ({ status: ++count === 1 ? 200 : 503 }))).rejects.toThrow('reachable');
+    await expect(verifyHookPort('https://worker.example/', 'endpoint-token', 8080, async () => {
+      const status = ++count === 1 ? 200 : 503;
+      return new globalThis.Response(status === 200 ? '{"ok":true}' : '', { status });
+    })).rejects.toThrow('reachable');
   });
+
+  it.each([404, 405, 429, 401, 403, 500])('rejects HTTP %i before attempting hook-port verification', async (status) => {
+    let calls = 0;
+    await expect(verifyHookPort('https://worker.example/', 'endpoint-token', 8080, async () => {
+      calls++;
+      return new globalThis.Response('{"ok":true}', { status });
+    })).rejects.toThrow('permitted');
+    expect(calls).toBe(1);
+  });
+
+  it.each(['<html>error</html>', 'not json', 'null', '[]', '{"ok":false}', '{"ok":"true"}', '{}', '{"ok":true,"other":1}', ' '.repeat(129)])(
+    'rejects an incorrect or oversized HTTP 200 probe body: %s', async (body) => {
+      let calls = 0;
+      await expect(verifyHookPort('https://worker.example/', 'endpoint-token', 8080, async () => {
+        calls++;
+        return new globalThis.Response(body, { status: 200 });
+      })).rejects.toThrow('probe response');
+      expect(calls).toBe(1);
+    },
+  );
 });

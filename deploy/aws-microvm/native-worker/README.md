@@ -144,7 +144,8 @@ node deploy/aws-microvm/native-worker/endpoint-token.mjs --verify https://REPLAC
 ```
 
 Port 8080 is the included unprivileged HTTP probe, not an operator terminal. The provisioning
-probe first establishes access to that listener with the same token, then requires gateway
+probe first requires HTTP 200 and exactly the fixed JSON object `{"ok":true}` from that
+listener with the same token (with a 128-byte response limit), then requires gateway
 denial (401/403) for a harmless empty POST to the run hook on 9000. An expired token or a hook
 response such as 409/503 fails the probe. Run it against **every** issued application token
 and deployed ingress configuration before giving access to users; keep the token file private

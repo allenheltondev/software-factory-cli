@@ -32,8 +32,23 @@ export async function verifyHookPort(endpoint, token, applicationPort, fetcher =
   const options = { redirect: 'error', signal: globalThis.AbortSignal.timeout(10000) };
   // A denied/expired token proves nothing. First establish access on the granted port.
   const application = await fetcher(url.origin, { ...options, headers: headers(applicationPort) });
-  await application.body?.cancel();
-  if (application.status < 200 || application.status >= 500 || [401, 403].includes(application.status)) throw new Error('cannot establish access to the permitted application port');
+  if (application.status !== 200) {
+    await application.body?.cancel();
+    throw new Error('cannot establish access to the permitted application port');
+  }
+  // Identify the included probe, rather than accepting an unrelated service/error page.
+  // Its fixed JSON is tiny; bound the response before buffering or parsing it.
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of application.body ?? []) {
+    bytes += chunk.byteLength;
+    if (bytes > 128) throw new Error('permitted port returned an oversized probe response');
+    chunks.push(Buffer.from(chunk));
+  }
+  let payload;
+  try { payload = JSON.parse(Buffer.concat(chunks, bytes).toString('utf8')); }
+  catch { throw new Error('permitted port did not return the expected probe response'); }
+  if (!payload || Object.keys(payload).join(',') !== 'ok' || payload.ok !== true) throw new Error('permitted port did not return the expected probe response');
   // Empty payload cannot mount storage even if the hook was accidentally exposed.
   const hook = await fetcher(`${url.origin}/aws/lambda-microvms/runtime/v1/run`, {
     ...options, method: 'POST', headers: { ...headers(HOOK_PORT), 'Content-Type': 'application/json' }, body: '{}',
