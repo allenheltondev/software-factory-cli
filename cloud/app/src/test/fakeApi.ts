@@ -28,6 +28,8 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     jobLog: vi.fn(),
     retryJob: vi.fn(),
     agentKeys: vi.fn(),
+    nativeClaude: vi.fn(),
+    setNativeClaudeMode: vi.fn(),
     telemetry: vi.fn(),
     updateTelemetry: vi.fn(),
     setTelemetryKey: vi.fn(),
