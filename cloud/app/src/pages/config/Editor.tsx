@@ -228,7 +228,7 @@ function RepositoriesSection({ config, onChange, view, errors, onAskAutoMerge, g
   );
 }
 
-function AutoMerge({ name, repo, reviewed, errors, ceiling, patch, onAsk }: { name: string; repo: ConsoleRepository; reviewed: boolean; errors: ConfigIssue[]; ceiling: number; patch: (p: Partial<ConsoleRepository>) => void; onAsk: () => void }) {
+export function AutoMerge({ name, repo, reviewed, errors, ceiling, patch, onAsk }: { name: string; repo: ConsoleRepository; reviewed: boolean; errors: ConfigIssue[]; ceiling: number; patch: (p: Partial<ConsoleRepository>) => void; onAsk: () => void }) {
   const path = `repositories.${name}.autoMerge`;
   return (
     <div className="flex flex-col gap-2">

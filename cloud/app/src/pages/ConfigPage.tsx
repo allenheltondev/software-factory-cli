@@ -5,7 +5,7 @@ import { api as defaultApi, ApiError, ConfigInvalidError, type ApiClient, type C
 import { tenantStatusLabel } from './DashboardPage';
 import { ConfigEditor } from './config/Editor';
 import { AGENT_LABEL, KEY_FOR, keysNeeded, sectionOf, type Section } from './config/model';
-import { SetupWizard } from './config/Wizard';
+import { isSimple, SimpleConfig, simpleBlockers } from './config/Simple';
 
 export { issuesAt, parseLogins } from './config/model';
 
@@ -16,13 +16,11 @@ type Busy = 'preview' | 'publish' | null;
 const message = (err: unknown) => (err instanceof Error ? err.message : 'Something went wrong; try again.');
 const SECTION_NAME: Record<Section, string> = { repositories: 'Repositories', workflows: 'Workflows', agents: 'Agents and pools' };
 
-/** Nothing published, nothing configured: the guided first run. */
-const firstRun = (view: ConfigView) => view.activeVersion === null && view.source === 'none' && Object.keys(view.config.repositories).length === 0;
-
 /**
- * A tenant's configuration: the guided first run when nothing is published yet, else the full
- * editor (repositories, workflows, agents and pools), with a publish bar that says what is
- * unsaved and what is wrong, and where.
+ * A tenant's configuration: one short page (the label, the repositories, coding agents and
+ * review agents) for the first setup and every change after, and the full editor (workflows,
+ * named pools, agents) for configurations that need more. A publish bar says what is unsaved,
+ * what still blocks a publish, and what the server refused, and where.
  */
 export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
   const { id } = useParams();
@@ -34,7 +32,9 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
   /** The draft as last loaded or published: what "unsaved changes" compares with. */
   const [saved, setSaved] = useState<string>('');
   const [activeVersion, setActiveVersion] = useState<number | null>(null);
-  const [mode, setMode] = useState<'wizard' | 'editor'>('editor');
+  const [mode, setMode] = useState<'simple' | 'full'>('simple');
+  /** Published from nothing here: the repositories and label to try first. */
+  const [firstPublish, setFirstPublish] = useState<{ label: string; repositories: string[] } | null>(null);
   const [section, setSection] = useState<Section>('repositories');
   const [busy, setBusy] = useState<Busy>(null);
   const [errors, setErrors] = useState<ConfigIssue[]>([]);
@@ -55,7 +55,8 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
     setConfig(view.config);
     setSaved(JSON.stringify(view.config));
     setActiveVersion(view.activeVersion);
-    setMode(firstRun(view) ? 'wizard' : 'editor');
+    setMode(isSimple(view.config) ? 'simple' : 'full');
+    setFirstPublish(null);
     setErrors([]);
     setWarnings([]);
     setYaml(null);
@@ -167,6 +168,10 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
     setNotice(null);
     try {
       const out = await api.publishConfig(installationId, { config: config!, baseVersion: activeVersion, ...(confirm ? { confirmAutoMerge: true } : {}) });
+      if (activeVersion === null) {
+        const w = Object.values(config!.workflows)[0];
+        setFirstPublish({ label: w?.label ?? '', repositories: Object.keys(config!.repositories) });
+      }
       setActiveVersion(out.version);
       setSaved(JSON.stringify(config));
       setErrors([]);
@@ -192,6 +197,8 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
 
   const status = tenantStatusLabel(view.tenant);
   const shared = { config, onChange: edit, view, installationId, keyApi: api, onKeys: setKeys };
+  const simple = mode === 'simple' && isSimple(config);
+  const blockers = simple ? simpleBlockers(config, view) : [];
 
   return (
     <div className="flex flex-col gap-6" data-testid="config-page">
@@ -207,18 +214,25 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
           <h1 className="flex items-center gap-2 text-2xl font-semibold">
-            {mode === 'wizard' ? 'Set up Updraft' : 'Configuration'}
+            {activeVersion === null ? 'Set up Updraft' : 'Configuration'}
             <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
           </h1>
           <p className="text-muted-foreground" data-testid="active-version">
             {view.tenant.accountLogin} · {activeVersion === null ? 'nothing published yet' : `version ${activeVersion} is active`}
           </p>
         </div>
-        {mode === 'editor' && (
-          <Link className="auth-link" to={`/installations/${installationId}/config/history`}>
-            Version history
-          </Link>
-        )}
+        <span className="flex flex-wrap gap-4">
+          {!simple && isSimple(config) && (
+            <button type="button" className="auth-link" onClick={() => setMode('simple')}>
+              Simple view
+            </button>
+          )}
+          {activeVersion !== null && (
+            <Link className="auth-link" to={`/installations/${installationId}/config/history`}>
+              Version history
+            </Link>
+          )}
+        </span>
       </header>
 
       {readOnly && (
@@ -247,9 +261,9 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
         </Alert>
       )}
 
-      {mode === 'wizard' ? (
-        <fieldset disabled={readOnly} className="min-w-0">
-          <SetupWizard {...shared} errors={errors} publishing={busy === 'publish'} onPublish={() => publish()} onSkip={() => setMode('editor')} />
+      {simple ? (
+        <fieldset disabled={readOnly} className="flex min-w-0 flex-col gap-6">
+          <SimpleConfig {...shared} errors={errors} generation={generation} onAskAutoMerge={setConfirming} onOpenFull={() => setMode('full')} />
         </fieldset>
       ) : (
         <>
@@ -268,6 +282,8 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
           <fieldset disabled={readOnly} className="flex min-w-0 flex-col gap-6">
             <ConfigEditor {...shared} errors={errors} generation={generation} section={section} onSection={setSection} onAskAutoMerge={setConfirming} />
           </fieldset>
+        </>
+      )}
 
           {yaml !== null && (
             <pre className="max-h-[32rem] overflow-auto rounded-lg border border-border bg-muted p-4 font-mono text-xs" data-testid="config-yaml" aria-label="Generated config.yaml">
@@ -279,7 +295,28 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
             {notice && (
               <Alert variant="success" data-testid="config-published">
                 {notice}
+                {firstPublish && (
+                  <span className="mt-1 block" data-testid="first-publish">
+                    Try it: add the label <code>{firstPublish.label}</code> to an issue in{' '}
+                    {firstPublish.repositories.map((r, i) => (
+                      <span key={r}>
+                        {i > 0 && ', '}
+                        <a className="auth-link font-semibold" href={`https://github.com/${r}/issues`} target="_blank" rel="noreferrer">
+                          {r} ↗
+                        </a>
+                      </span>
+                    ))}
+                    .
+                  </span>
+                )}
               </Alert>
+            )}
+            {blockers.length > 0 && (
+              <ul className="list-disc pl-5 text-sm text-muted-foreground" data-testid="blockers">
+                {blockers.map((b) => (
+                  <li key={b}>{b}</li>
+                ))}
+              </ul>
             )}
             {errors.length > 0 && (
               <Alert variant="error" data-testid="config-errors">
@@ -287,10 +324,16 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                 <ul className="mt-2 list-disc pl-5">
                   {errors.map((e, i) => (
                     <li key={i}>
-                      <button type="button" className="auth-link text-left" onClick={() => setSection(sectionOf(e.path))}>
-                        {SECTION_NAME[sectionOf(e.path)]}
-                      </button>
-                      : <code>{e.path}</code>: {e.message}
+                      {simple ? (
+                        e.message
+                      ) : (
+                        <>
+                          <button type="button" className="auth-link text-left" onClick={() => setSection(sectionOf(e.path))}>
+                            {SECTION_NAME[sectionOf(e.path)]}
+                          </button>
+                          : <code>{e.path}</code>: {e.message}
+                        </>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -312,17 +355,15 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                 {dirty ? <StatusBadge tone="warning">Unsaved changes</StatusBadge> : activeVersion === null ? 'Nothing published yet' : `Version ${activeVersion} is active`}
               </span>
               <div className="flex flex-wrap gap-2">
-                <Button variant="ghost" type="button" loading={busy === 'preview'} disabled={busy !== null} onClick={() => (yaml !== null ? setYaml(null) : void preview())}>
-                  {yaml !== null ? 'Hide generated config' : 'Check and show generated config'}
+                <Button variant="ghost" size="sm" type="button" loading={busy === 'preview'} disabled={busy !== null} onClick={() => (yaml !== null ? setYaml(null) : void preview())}>
+                  {yaml !== null ? 'Hide config' : 'View config'}
                 </Button>
-                <Button type="button" loading={busy === 'publish'} disabled={busy !== null || readOnly || (!dirty && activeVersion !== null)} onClick={() => void publish()}>
+                <Button type="button" loading={busy === 'publish'} disabled={busy !== null || readOnly || blockers.length > 0 || (!dirty && activeVersion !== null)} onClick={() => void publish()}>
                   Publish
                 </Button>
               </div>
             </div>
           </div>
-        </>
-      )}
 
       <Modal open={confirming !== null} onClose={() => setConfirming(null)} aria-label="Turn on auto-merge">
         <div className="flex flex-col gap-4 p-6">
