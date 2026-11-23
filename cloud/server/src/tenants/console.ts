@@ -166,6 +166,13 @@ export interface ConsoleConfig {
   legacy?: ConsoleLegacy;
 }
 
+/**
+ * The roster and pools an upgrade from version 1 can need: v1 allowed 20 workflows, each with its
+ * own agent and reviewer (so up to 40 distinct profiles, each in a pool of one). Settings that
+ * carry `legacy` get these limits, so a valid v1 configuration always loads and publishes.
+ */
+export const LEGACY_LIMITS = { agents: 2 * CONSOLE_LIMITS.workflows, pools: 2 * CONSOLE_LIMITS.workflows } as const;
+
 /** Agent, pool and workflow names. */
 export const NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 export const WORKFLOW_NAME = NAME;
@@ -340,7 +347,8 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
   else {
     const list = Object.entries(raw.agents);
     if (list.length === 0) c.err('agents', 'add at least one agent');
-    if (list.length > CONSOLE_LIMITS.agents) c.err('agents', `at most ${CONSOLE_LIMITS.agents} agents`);
+    const max = legacy ? LEGACY_LIMITS.agents : CONSOLE_LIMITS.agents;
+    if (list.length > max) c.err('agents', `at most ${max} agents`);
     for (const [name, v] of list) {
       const path = `agents.${name}`;
       if (!NAME.test(name)) c.err(path, `an agent name is ${NAME_RULE}`);
@@ -370,7 +378,8 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
   else {
     const list = Object.entries(raw.pools);
     if (list.length === 0) c.err('pools', 'add at least one pool');
-    if (list.length > CONSOLE_LIMITS.pools) c.err('pools', `at most ${CONSOLE_LIMITS.pools} pools`);
+    const max = legacy ? LEGACY_LIMITS.pools : CONSOLE_LIMITS.pools;
+    if (list.length > max) c.err('pools', `at most ${max} pools`);
     for (const [name, v] of list) {
       const path = `pools.${name}`;
       if (!NAME.test(name)) c.err(path, `a pool name is ${NAME_RULE}`);
@@ -593,16 +602,20 @@ function upgradeV1(raw: Record<string, unknown>): Record<string, unknown> {
   const v1Workflows = isObject(raw.workflows) ? raw.workflows : {};
   const v1Repos = isObject(raw.repositories) ? raw.repositories : {};
   const agents: Record<string, Record<string, unknown>> = {};
+  // Per role: v1 gave every workflow a builder (`W`) and a reviewer (`W.review`) of its own, so
+  // a reviewer with the builder's very profile was still another agent. Keeping the roles apart
+  // keeps that: such a reviewer is a second agent with the same profile, and nobody gains a
+  // self-review v1 did not allow (allowSameAgent stays off).
   const byProfile = new Map<string, string>();
   const unique = (base: string, taken: (n: string) => boolean) => {
     const stem = base.slice(0, 36) || 'x';
     if (!taken(stem)) return stem;
     for (let i = 2; ; i++) if (!taken(`${stem}-${i}`)) return `${stem}-${i}`;
   };
-  const agentFor = (a: unknown): string => {
+  const agentFor = (a: unknown, role: 'builder' | 'reviewer'): string => {
     const o = isObject(a) ? a : {};
     const adapter = typeof o.adapter === 'string' ? o.adapter : 'claude';
-    const key = JSON.stringify([adapter, o.model ?? null, o.effort ?? null]);
+    const key = JSON.stringify([role, adapter, o.model ?? null, o.effort ?? null]);
     const hit = byProfile.get(key);
     if (hit) return hit;
     const name = unique(adapter.toLowerCase().replace(/[^a-z0-9-]/g, '-'), (n) => Object.hasOwn(agents, n));
@@ -629,8 +642,8 @@ function upgradeV1(raw: Record<string, unknown>): Record<string, unknown> {
   const groups = new Map<string, string>();
   const taken = (n: string) => Object.hasOwn(workflows, n) || Object.hasOwn(v1Workflows, n);
   const build = (v1Name: string, name: string, w: Record<string, unknown>, label: string, review: boolean, revise: boolean, maxRevisions: unknown) => {
-    const builder = agentFor(w.agent);
-    const reviewerAgent = agentFor(w.reviewer);
+    const builder = agentFor(w.agent, 'builder');
+    const reviewerAgent = agentFor(w.reviewer, 'reviewer');
     const reviewer = isObject(w.reviewer) ? w.reviewer : {};
     // The version 1 pools of this workflow, as stored by its jobs and pull requests.
     legacyPools[v1Name] = poolFor('builders', builder);
@@ -641,7 +654,7 @@ function upgradeV1(raw: Record<string, unknown>): Record<string, unknown> {
       pool: poolFor('builders', builder),
       prompt: w.prompt,
       ...(w.timeoutMinutes !== undefined ? { timeoutMinutes: w.timeoutMinutes } : {}),
-      review: { enabled: review, pool: poolFor('reviewers', reviewerAgent), prompt: reviewer.prompt ?? DEFAULT_PROMPTS.review, allowSameAgent: reviewerAgent === builder },
+      review: { enabled: review, pool: poolFor('reviewers', reviewerAgent), prompt: reviewer.prompt ?? DEFAULT_PROMPTS.review, allowSameAgent: false },
       revise: { enabled: revise, prompt: w.revisePrompt ?? DEFAULT_PROMPTS.revise, ...(revise && maxRevisions !== undefined ? { maxRevisions } : {}) },
     };
   };
@@ -827,21 +840,29 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
     agents[name] = { adapter: a.adapter, ...(a.model ? { model: a.model } : {}), ...(a.effort ? { effort: a.effort } : {}), ...(a.enabled ? {} : { enabled: false }) };
   }
 
-  for (const [name, w] of Object.entries(config.workflows)) {
-    prompts[`${name}.md`] = w.prompt;
-    if (w.review.enabled) prompts[`${name}.review.md`] = w.review.prompt;
-    if (w.revise.enabled) prompts[`${name}.revise.md`] = w.revise.prompt;
-  }
+  // Only the prompt files an action references, and one file for identical text (a workflow
+  // split by an upgrade shares its prompts with the others), so the file count stays what it was.
+  const byText = new Map<string, string>();
+  const file = (kind: '' | '.review' | '.revise', workflow: string, text: string) => {
+    const key = `${kind}\0${text}`;
+    let name = byText.get(key);
+    if (!name) {
+      name = `${workflow}${kind}.md`;
+      byText.set(key, name);
+      prompts[name] = text;
+    }
+    return `./prompts/${name}`;
+  };
   const layout = actionLayout(config);
   for (const [action, a] of layout.actions) {
     const w = config.workflows[a.workflow]!;
     actions[action] = {
-      prompt: `./prompts/${a.workflow}.md`,
+      prompt: file('', a.workflow, w.prompt),
       ...(a.verify.length ? { verify: [...a.verify] } : {}),
       ...(w.timeoutMinutes !== undefined ? { timeoutMinutes: w.timeoutMinutes } : {}),
       ...(a.verify.length && a.verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes: a.verifyTimeoutMinutes } : {}),
-      ...(a.reviewFrom ? { reviewPrompt: `./prompts/${a.reviewFrom}.review.md` } : {}),
-      ...(a.reviseFrom ? { revisePrompt: `./prompts/${a.reviseFrom}.revise.md` } : {}),
+      ...(a.reviewFrom ? { reviewPrompt: file('.review', a.reviewFrom, config.workflows[a.reviewFrom]!.review.prompt) } : {}),
+      ...(a.reviseFrom ? { revisePrompt: file('.revise', a.reviseFrom, config.workflows[a.reviseFrom]!.revise.prompt) } : {}),
     };
   }
 

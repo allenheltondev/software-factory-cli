@@ -230,7 +230,16 @@ export function createConfigService({ store, github, objects, now = () => Date.n
         if (parsed.ok) {
           config = parsed.config;
           notices = upgradeNotes(source.config);
-        } else kind = 'none';
+        } else {
+          // Never a silent fallback: the editor starts from the defaults, and says why. The
+          // version itself still runs, and re-activates as it was.
+          notices = [
+            `Version ${active} could not be opened in this editor (${parsed.errors
+              .slice(0, 3)
+              .map((e) => `${e.path}: ${e.message}`)
+              .join('; ')}${parsed.errors.length > 3 ? '; ...' : ''}). The editor starts from the defaults, and publishing from here replaces it.`,
+          ];
+        }
       }
       return {
         tenant: ctx.summary,

@@ -267,11 +267,45 @@ describe('settings from the first console (version 1)', () => {
     expect(compile(config).ok).toBe(true);
   });
 
-  it('a reviewer the same as the agent shares it, allowed to review its own work as before', () => {
+  it('a reviewer with the builder\'s very profile stays another agent, as in version 1, so no new self-review is allowed', () => {
     const config = ok(v1({ 'acme/web': v1Repo({ review: true }) }, { implement: { agent: { adapter: 'claude' }, prompt: '# B', reviewer: { adapter: 'claude', prompt: '# R' }, revisePrompt: '# V', verify: [] } }));
-    expect(config.agents).toEqual({ claude: { adapter: 'claude', enabled: true } });
-    expect(config.workflows.implement!.review).toMatchObject({ pool: 'reviewers', allowSameAgent: true });
-    expect(config.pools.reviewers).toEqual({ agents: ['claude'] });
+    expect(config.agents).toEqual({ claude: { adapter: 'claude', enabled: true }, 'claude-2': { adapter: 'claude', enabled: true } });
+    expect(config.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['claude-2'] } });
+    expect(config.workflows.implement!.review).toMatchObject({ pool: 'reviewers', allowSameAgent: false });
+    expect(compile(config).ok).toBe(true);
+  });
+
+  it('loads a repository that reviewed one workflow with the builder\'s profile and another with a different one', () => {
+    const config = ok(
+      v1(
+        { 'acme/web': v1Repo({ review: true, triggers: [{ label: 'a', workflow: 'implement' }, { label: 'b', workflow: 'docs' }] }) },
+        {
+          implement: { agent: { adapter: 'claude' }, prompt: '# B', reviewer: { adapter: 'claude', prompt: '# R' }, revisePrompt: '# V', verify: [] },
+          docs: { agent: { adapter: 'claude' }, prompt: '# D', reviewer: { adapter: 'codex', prompt: '# R' }, revisePrompt: '# V', verify: [] },
+        },
+      ),
+    );
+    expect(Object.values(config.workflows).map((w) => w.review.allowSameAgent)).toEqual([false, false]);
+    expect(compile(config).ok).toBe(true);
+  });
+
+  it('loads seven reviewed workflows with fourteen distinct models', () => {
+    const workflows = Object.fromEntries(
+      Array.from({ length: 7 }, (_, i) => [`w${i}`, { agent: { adapter: 'claude', model: `build-${i}` }, prompt: '# B', reviewer: { adapter: 'codex', model: `review-${i}` }, revisePrompt: '# V', verify: [] }]),
+    );
+    for (const w of Object.values(workflows)) (w.reviewer as Record<string, unknown>).prompt = '# R';
+    const config = ok({ version: 1, workflows, repositories: { 'acme/web': v1Repo({ review: true, triggers: Object.keys(workflows).map((w) => ({ label: w, workflow: w })) }) } });
+    expect(Object.keys(config.agents)).toHaveLength(14);
+    expect(compile(config).ok).toBe(true);
+  });
+
+  it('a workflow split over 21 labels with review and revision publishes its three prompt files once', () => {
+    const repos = Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`acme/r${i}`, v1Repo({ review: true, revise: true, triggers: [{ label: `l${i}`, workflow: 'implement' }] })]));
+    const config = ok(v1(repos));
+    const r = compileTenantConfig(toTenantSubmission(config), { appId: 4242 }, new Map(Object.keys(repos).map((n, i) => [n, 700 + i])));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(Object.keys(r.files).filter((f) => f.startsWith('prompts/')).sort()).toEqual(['prompts/implement.md', 'prompts/implement.review.md', 'prompts/implement.revise.md']);
   });
 });
 

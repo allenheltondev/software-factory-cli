@@ -146,6 +146,16 @@ describe('loading the editor', () => {
     });
   });
 
+  it('says when the active version cannot be opened in the editor, instead of quietly showing defaults', async () => {
+    const n = (await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml', SOURCE_FILE], publishedBy: 'pat', publishedAt: '2026-11-19T00:00:00.000Z' })) as number;
+    objects.set(`${configPrefix(55, n)}${SOURCE_FILE}`, JSON.stringify({ format: 'console', config: { version: 2, agents: {}, pools: {}, workflows: {}, repositories: {} } }));
+    await store.markConfigReady(55, n);
+    await store.activateConfig(55, n);
+    const { body } = await call(PAT, 'GET', '/installations/55/config');
+    expect(body).toMatchObject({ source: 'console', activeVersion: 1 });
+    expect(body.notices).toEqual([expect.stringMatching(/^Version 1 could not be opened in this editor \(agents: add at least one agent.*The editor starts from the defaults/)]);
+  });
+
   it('loads a version published with the first console settings, upgraded to pools', async () => {
     const v1 = {
       version: 1,
