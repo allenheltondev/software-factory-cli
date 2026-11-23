@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultNativeAuthRunner, hasClaudeAuthOverride, nativeClaudeAuthFromStatus, nativeClaudeAuthHint } from './native-claude-auth.js';
 
@@ -14,6 +17,11 @@ describe('native Claude subscription status, without inspecting credentials', ()
   it('requires a login when the official CLI reports signed out', () => {
     expect(nativeClaudeAuthFromStatus(response({ loggedIn: false, authMethod: 'none' }, 1), {}, now))
       .toEqual({ state: 'login_required', reason: 'sign_in_required' });
+  });
+
+  it('accepts an active CLI-reported login when the optional expiry field is absent', () => {
+    expect(nativeClaudeAuthFromStatus(response({ loggedIn: true, authMethod: 'claude.ai' }), {}, now))
+      .toEqual({ state: 'connected', reason: 'native_subscription' });
   });
 
   it('requires a fresh login if the expiry has passed', () => {
@@ -44,14 +52,30 @@ describe('native Claude subscription status, without inspecting credentials', ()
     expect(nativeClaudeAuthHint('auth_override_present')).toContain('Remove it');
     expect(nativeClaudeAuthHint('status_unavailable')).toContain('claude auth status');
     expect(nativeClaudeAuthHint('status_unavailable')).not.toContain('Sign in directly');
+    expect(nativeClaudeAuthHint('not_subscription')).toContain('apiKeyHelper');
+    expect(nativeClaudeAuthHint('not_subscription')).toContain('job worktree');
   });
 
-  it('uses a resolved executable and launch prefix without a shell, including Windows-compatible Node shims', async () => {
+  it('passes auth status args to a resolved Node executable without a shell', async () => {
     const run = await defaultNativeAuthRunner(
       { file: process.execPath, args: ['-e', 'process.stdout.write(process.argv.slice(1).join(","))'] },
       { PATH: process.env.PATH },
     );
     expect(run).toEqual({ code: 0, stdout: 'auth,status' });
+  });
+
+  it('uses the requested working directory when invoking the official CLI', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'updraft-native-auth-'));
+    try {
+      const run = await defaultNativeAuthRunner(
+        { file: process.execPath, args: ['-e', 'process.stdout.write(process.cwd())'] },
+        { PATH: process.env.PATH },
+        cwd,
+      );
+      expect(run).toEqual({ code: 0, stdout: cwd });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it('fails closed on unavailable, inconsistent or malformed status', () => {

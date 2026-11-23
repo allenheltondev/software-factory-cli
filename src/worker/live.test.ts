@@ -518,7 +518,7 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
     config.agents.claude!.authentication = 'native-claude';
     insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
     const c = claim(db, config, paths);
-    const run = vi.fn(async (_launch: unknown, _env: NodeJS.ProcessEnv) => ({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) }));
+    const run = vi.fn(async (_launch: unknown, _env: NodeJS.ProcessEnv, _cwd?: string) => ({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) }));
     const guarded = new LiveExecutor({
       locate: () => ({ path: FAKE_CLAUDE, launch: { file: process.execPath, args: [FAKE_CLAUDE] } }),
       nativeClaudeAuth: run,
@@ -526,9 +526,11 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
     markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
     const result = await guarded.execute(c, context(db, config, paths, c.run.id));
     expect(run).toHaveBeenCalledTimes(2);
-    // Both preflight and launch probe use the same launch; the second sees the final
-    // environment passed to Claude, including the adapter's worktree/run settings.
+    // The early probe runs without a worktree; the final probe receives the exact
+    // agent launch environment and the checked-out job worktree as its working dir.
+    expect(run.mock.calls[0]).toHaveLength(2);
     expect(run.mock.calls[1]![1]).toMatchObject({ FAKE_CLAUDE_COMMIT: '1' });
+    expect(run.mock.calls[1]![2]).toBe(join(worktreesRoot(paths), '42', c.job.id));
     expect(result.outcome).toBe('succeeded');
     expect(result.summary?.commitCount).toBe(1);
   });

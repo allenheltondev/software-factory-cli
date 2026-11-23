@@ -816,11 +816,11 @@ export class LiveExecutor implements Executor {
       throw new StartFailedError(`adapter ${adapterName} could not build the agent command: ${message(err)}`, { cause: err });
     }
     const agentEnv = mergeEnv(baseEnv, invocation.env, commitEnv, agentCfg.env);
-    // Check the exact environment that the CLI will receive. The early check prevents
-    // unnecessary worktrees on bad sign-in; this final one catches values introduced by
-    // adapter invocation, commit identity, or a login changing during checkout.
+    // Check the exact environment and working directory that the CLI will receive. The
+    // early check prevents unnecessary worktrees on bad sign-in; this final one catches
+    // project-local auth settings, adapter/commit env changes, and login changes during checkout.
     if (agentCfg.authentication === 'native-claude') {
-      const finalAuth = await checkNativeClaudeAuth(located.launch, agentEnv, this.opts.nativeClaudeAuth, ctx.now());
+      const finalAuth = await checkNativeClaudeAuth(located.launch, agentEnv, this.opts.nativeClaudeAuth, ctx.now(), prepared.worktreePath);
       if (finalAuth.state !== 'connected') {
         await log([`native subscription launch check: ${finalAuth.state} (${finalAuth.reason})`, 'outcome: start_failed']);
         throw new StartFailedError(`native Claude subscription not ready at launch: ${finalAuth.reason}. ${nativeClaudeAuthHint(finalAuth.reason)}`);

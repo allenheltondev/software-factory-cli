@@ -89,15 +89,18 @@ export function nativeClaudeAuthFromStatus(
   return { state: 'connected', reason: 'native_subscription' };
 }
 
-/** Official CLI read-only status probe; nothing from stderr is returned. */
-export type NativeAuthRunner = (launch: LaunchSpec, env: NodeJS.ProcessEnv) => Promise<NativeClaudeStatusResponse>;
+/** Official CLI read-only status probe; nothing from stderr is returned.
+ * The final pre-launch probe uses the same working directory as the agent, so project
+ * settings that affect authentication are considered by the official CLI.
+ */
+export type NativeAuthRunner = (launch: LaunchSpec, env: NodeJS.ProcessEnv, cwd?: string) => Promise<NativeClaudeStatusResponse>;
 
-export const defaultNativeAuthRunner: NativeAuthRunner = (launch, env) =>
+export const defaultNativeAuthRunner: NativeAuthRunner = (launch, env, cwd) =>
   new Promise((resolve) => {
     execFile(
       launch.file,
       [...launch.args, 'auth', 'status'],
-      { env, encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 65_536 },
+      { env, ...(cwd ? { cwd } : {}), encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 65_536 },
       (error, stdout) => {
         resolve({ code: error ? (typeof error.code === 'number' ? error.code : null) : 0, stdout });
       },
@@ -110,10 +113,11 @@ export async function checkNativeClaudeAuth(
   env: NodeJS.ProcessEnv,
   run: NativeAuthRunner = defaultNativeAuthRunner,
   nowMs = Date.now(),
+  cwd?: string,
 ): Promise<NativeClaudeAuthStatus> {
   if (hasClaudeAuthOverride(env)) return { state: 'wrong_method', reason: 'auth_override_present' };
   try {
-    return nativeClaudeAuthFromStatus(await run(launch, env), env, nowMs);
+    return nativeClaudeAuthFromStatus(await (cwd ? run(launch, env, cwd) : run(launch, env)), env, nowMs);
   } catch {
     return { state: 'unknown', reason: 'status_unavailable' };
   }
@@ -126,7 +130,7 @@ export function nativeClaudeAuthHint(reason: NativeClaudeAuthReason): string {
     sign_in_required: 'Sign in directly on this worker with "claude auth login".',
     login_expired: 'Claude login expired. Run "claude auth login" on this worker again.',
     auth_override_present: 'An API credential, OAuth token override or provider override is set. Remove it before using native subscription login.',
-    not_subscription: 'Claude is using a different authentication method. Run "claude auth login" on this worker with subscription sign-in.',
+    not_subscription: 'Claude authentication is not verifiably subscription-only. Remove conflicting API keys, apiKeyHelper or provider settings, then check "claude auth status" from the job worktree. Sign in with "claude auth login" if needed.',
     cli_missing: 'Install the official Claude Code CLI in the worker environment.',
     status_unavailable: 'Cannot verify the official CLI login. Update Claude Code and run "claude auth status" interactively.',
   };
