@@ -5,7 +5,7 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { fakeApi } from '../test/fakeApi';
-import { DashboardPage, tenantStatusLabel } from './DashboardPage';
+import { GitHubSettingsPage, tenantStatusLabel } from './GitHubSettingsPage';
 import { callbackInput, GitHubCallbackPage } from './GitHubCallbackPage';
 
 function Where() {
@@ -13,10 +13,10 @@ function Where() {
   return <output data-testid="where">{`${l.pathname}${l.search}`}</output>;
 }
 
-describe('DashboardPage', () => {
+describe('GitHubSettingsPage', () => {
   it('says when the GitHub App is not set up yet', async () => {
     const api = fakeApi({ githubStatus: vi.fn().mockResolvedValue({ configured: false, linked: null, tenants: [] }) });
-    render(<DashboardPage api={api} />);
+    render(<GitHubSettingsPage api={api} />);
     expect(await screen.findByTestId('github-not-configured')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /connect github/i })).not.toBeInTheDocument();
   });
@@ -24,7 +24,7 @@ describe('DashboardPage', () => {
   it('starts linking and sends the browser to GitHub', async () => {
     const api = fakeApi();
     const go = vi.fn();
-    render(<DashboardPage api={api} go={go} />);
+    render(<GitHubSettingsPage api={api} go={go} />);
     await userEvent.click(await screen.findByRole('button', { name: /connect github/i }));
     await waitFor(() => expect(go).toHaveBeenCalledWith('https://github.com/login/oauth/authorize?state=s'));
     expect(api.startLink).toHaveBeenCalledOnce();
@@ -44,7 +44,7 @@ describe('DashboardPage', () => {
     const go = vi.fn();
     render(
       <MemoryRouter>
-        <DashboardPage api={api} go={go} />
+        <GitHubSettingsPage api={api} go={go} />
       </MemoryRouter>,
     );
     const list = await screen.findByTestId('tenant-list');
@@ -57,9 +57,9 @@ describe('DashboardPage', () => {
 
   it('shows the server\'s message when starting fails', async () => {
     const api = fakeApi({ startLink: vi.fn().mockRejectedValue(new ApiError(503, 'github_app_not_configured', 'Not registered yet')) });
-    render(<DashboardPage api={api} go={vi.fn()} />);
+    render(<GitHubSettingsPage api={api} go={vi.fn()} />);
     await userEvent.click(await screen.findByRole('button', { name: /connect github/i }));
-    expect(await screen.findByTestId('dashboard-action-error')).toHaveTextContent('Not registered yet');
+    expect(await screen.findByTestId('github-settings-action-error')).toHaveTextContent('Not registered yet');
   });
 
   it('labels tenant states', () => {

@@ -81,6 +81,20 @@ describe('InstallationPage (#71)', () => {
     expect(within(screen.getByTestId('job-job_abcdefgh02')).getByRole('link', { name: /conversation/i })).toHaveAttribute('href', 'https://ui.honeycomb.io/q');
   });
 
+  it('puts running jobs above recent results without repeating them', async () => {
+    showInstallation(api({
+      jobs: vi.fn().mockResolvedValue({
+        jobs: [job(), job({ jobId: 'job_running', status: 'launched', result: 'running' })],
+      }),
+    }));
+    const running = await screen.findByTestId('job-job_running');
+    const recent = screen.getByTestId('job-job_abcdefgh01');
+    expect(screen.getByText('Running jobs')).toBeInTheDocument();
+    expect(screen.getByText('Recent activity')).toBeInTheDocument();
+    expect(running.compareDocumentPosition(recent) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByTestId('job-job_running')).toHaveLength(1);
+  });
+
   it('says when its counts are of the latest jobs, not all 30 days', async () => {
     showInstallation(api({ overview: vi.fn().mockResolvedValue(overview({ activity: { ...overview().activity, window: { deliveries: 500, deliveriesComplete: false, jobs: 500, jobsComplete: false } } })) }));
     expect(await screen.findByTestId('stats')).toHaveTextContent('Latest 500 jobs');
@@ -263,6 +277,10 @@ describe('JobPage (#71)', () => {
     expect(jobLog).toHaveBeenCalledWith(55, 'job_abcdefgh01', 'run.log');
     await userEvent.click(screen.getByText('Updraft log'));
     await waitFor(() => expect(screen.getByTestId('log-text')).toHaveTextContent('updraft.log contents'));
+    const logLink = screen.getByRole('link', { name: 'View run log' });
+    expect(logLink).toHaveAttribute('href', '#job-logs');
+    await userEvent.click(logLink);
+    await waitFor(() => expect(screen.getByTestId('log-text')).toHaveTextContent('run.log contents'));
   });
 
   it('says when a log was cut to its end, and when it has expired', async () => {

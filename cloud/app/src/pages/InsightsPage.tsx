@@ -206,6 +206,7 @@ function Loaded({
       ) : (
         <>
           <Headline s={s} report={report} />
+          <Friction s={s} />
           <Trends s={s} report={report} />
           <div className="grid gap-6 lg:grid-cols-2">
             <ReviewLoop s={s} />
@@ -214,10 +215,7 @@ function Loaded({
           {!repo && <Repositories rows={repoRows(report, configured)} onPick={(r) => onChange({ repo: r })} />}
           <CodingModels s={s} />
           <ReviewModels s={s} />
-          <div className="grid gap-6 lg:grid-cols-2">
-            <Timing s={s} />
-            <Friction s={s} />
-          </div>
+          <Timing s={s} />
           <p className="text-xs text-muted-foreground" data-testid="insights-footnote">
             {report.facts.total} recorded facts in this window{report.facts.backfilled ? `, ${report.facts.backfilled} of them reconstructed from older history` : ''}. Numbers are{' '}
             <code>updraft stats</code> over this installation's shared state, so they read the same as on the command line. Models are the ones configured for each agent, not

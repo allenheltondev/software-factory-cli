@@ -18,7 +18,7 @@ import {
 } from '@readysetcloud/ui';
 import { api as defaultApi, type AdminActiveJob, type AdminTenantDetail, type ApiClient, type TenantLimits } from '../api/client';
 import { adminLoadError, Forbidden, minutes } from './AdminPage';
-import { tenantStatusLabel } from './DashboardPage';
+import { tenantStatusLabel } from './GitHubSettingsPage';
 
 type AdminTenantApi = Pick<ApiClient, 'adminTenant' | 'adminDisable' | 'adminEnable' | 'adminSetLimits' | 'adminReleaseJob'>;
 type Load = { state: 'loading' } | { state: 'ok'; tenant: AdminTenantDetail } | { state: 'forbidden' } | { state: 'error'; message: string };

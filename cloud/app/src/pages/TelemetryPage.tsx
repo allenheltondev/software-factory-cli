@@ -75,14 +75,16 @@ export function TelemetryPage({ api = defaultApi }: { api?: Api }) {
       {load.state === 'ok' && (
         <>
           <Hero view={load.view} />
-          <div className="grid gap-6 lg:grid-cols-[3fr_2fr]">
-            <div className="flex flex-col gap-6">
+          <div className="grid items-start gap-6 lg:grid-cols-[3fr_2fr] lg:grid-rows-[auto_1fr]">
+            <div className="lg:col-start-2 lg:row-start-1">
+              <LastExport view={load.view} installationId={installationId} />
+            </div>
+            <div className="flex flex-col gap-6 lg:col-start-1 lg:row-span-2 lg:row-start-1">
               <DestinationCard view={load.view} api={api} installationId={installationId} onSaved={set} />
               {load.view.keyConfigured && load.view.provider === 'otlp' && <LinksCard view={load.view} api={api} installationId={installationId} onSaved={set} />}
               {load.view.keyConfigured && <SettingsCard view={load.view} api={api} installationId={installationId} onSaved={set} />}
             </div>
-            <div className="flex flex-col gap-6">
-              <LastExport view={load.view} installationId={installationId} />
+            <div className="lg:col-start-2 lg:row-start-2">
               <HowItWorks />
             </div>
           </div>
