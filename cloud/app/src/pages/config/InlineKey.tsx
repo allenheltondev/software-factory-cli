@@ -45,25 +45,25 @@ export function InlineKey({ adapter, installationId, api, onSaved }: { adapter: 
       <div className="flex flex-wrap items-end gap-2">
         <div className="min-w-0 flex-1">
           <PasswordInput
-            label={`${guide.agent}: ${guide.credential}`}
+            label={guide.credential}
             autoComplete="off"
             spellCheck={false}
             placeholder={provider?.placeholder}
             value={value}
             onChange={(e) => setValue(e.target.value)}
-            {...(error ? { error } : problem ? { error: problem } : { hint: provider?.checkedOnSave === false ? 'Saved, then never shown again.' : `Checked with ${provider?.company ?? 'the provider'}, then never shown again.` })}
+            {...(error ? { error } : problem ? { error: problem } : {})}
           />
         </div>
         <Button type="submit" loading={busy} disabled={!typed || !!problem}>
           Save key
         </Button>
       </div>
-      <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+      <p className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        <span>{provider?.checkedOnSave === false ? 'Saved, then never shown again.' : `Checked with ${provider?.company ?? 'the provider'}, then never shown again.`}</span>
         <a className="auth-link" href={guide.getKeyUrl} target="_blank" rel="noreferrer">
           Get a key ↗
         </a>
-        <span className="text-muted-foreground">{guide.billing}</span>
-        {guide.note && <span className="w-full text-muted-foreground">{guide.note}</span>}
+        {guide.note && <span className="w-full">{guide.note}</span>}
       </p>
     </form>
   );

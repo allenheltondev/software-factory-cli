@@ -149,7 +149,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
               <section key={`${name}-${generation}`} className="flex flex-col gap-3 py-3" data-testid={`repo-${name}`} aria-label={name}>
                 <div className={repo ? 'grid gap-3 sm:grid-cols-[14rem_1fr_auto] sm:items-end' : 'flex'}>
                   <label className="flex items-center gap-2 font-medium sm:pb-2">
-                    <input type="checkbox" aria-label={`Work in ${name}`} checked={!!repo} onChange={(e) => setRepo(name, e.target.checked ? newRepository([wfName]) : null)} />
+                    <input type="checkbox" className="h-4 w-4 shrink-0" aria-label={`Work in ${name}`} checked={!!repo} onChange={(e) => setRepo(name, e.target.checked ? newRepository([wfName]) : null)} />
                     {name}
                     {repo && !repo.enabled && <StatusBadge tone="warning">Paused</StatusBadge>}
                     {!reachable.has(name.toLowerCase()) && <StatusBadge tone="error">No access</StatusBadge>}
@@ -166,8 +166,8 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                           onChange={(e) => patchRepo(name, { verify: e.target.value.trim() ? [e.target.value] : [] })}
                         />
                       </div>
-                      <Button variant="ghost" size="sm" type="button" aria-expanded={open} aria-label={`Settings for ${name}`} onClick={() => setSettingsOpen(open ? null : name)}>
-                        ⚙ Settings
+                      <Button variant="ghost" size="sm" type="button" className="sm:mb-1" aria-expanded={open} aria-label={`Settings for ${name}`} onClick={() => setSettingsOpen(open ? null : name)}>
+                        {open ? 'Close settings' : 'Settings'}
                       </Button>
                     </>
                   )}
@@ -193,8 +193,8 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                         onChange={(e) => patchRepo(name, { verifyTimeoutMinutes: numberOrUndefined(e.target.value) })}
                       />
                     </div>
-                    <Check checked={repo.enabled} onChange={(enabled) => patchRepo(name, { enabled })}>
-                      Start work here (untick to pause without losing the settings)
+                    <Check checked={!repo.enabled} onChange={(paused) => patchRepo(name, { enabled: !paused })}>
+                      Pause: start no new work here, and keep the settings
                     </Check>
                     <Check checked={repo.commentOnFailure} onChange={(commentOnFailure) => patchRepo(name, { commentOnFailure })}>
                       Comment on the issue when a run fails
@@ -224,7 +224,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
       <Card>
         <CardHeader>
           <CardTitle>Coding agents</CardTitle>
-          <CardDescription>They take turns picking up issues and writing the code, each with your own API key.</CardDescription>
+          <CardDescription>They take turns picking up issues and writing the code. Each runs with your own API key.</CardDescription>
         </CardHeader>
         <CardBody className="flex flex-col divide-y divide-border" data-testid="coding-agents">
           {adapters.map((a) => {
@@ -239,8 +239,8 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                   {badge(a, on || review.includes(a))}
                   {agent?.model && <span className="font-mono text-sm text-muted-foreground">{agent.model}</span>}
                   {agent && (
-                    <button type="button" className="auth-link ml-auto text-sm" onClick={() => setModelOpen(modelOpen === a ? null : a)}>
-                      Change model
+                    <button type="button" className="ml-auto text-xs text-muted-foreground underline-offset-2 hover:underline" onClick={() => setModelOpen(modelOpen === a ? null : a)}>
+                      {modelOpen === a ? 'Done' : 'Change model'}
                     </button>
                   )}
                 </div>
@@ -261,7 +261,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
       <Card>
         <CardHeader>
           <CardTitle>Review agents</CardTitle>
-          <CardDescription>One of them reviews every pull request, never the agent that wrote it, and approves it or asks for changes. Tick none to skip review.</CardDescription>
+          <CardDescription>Each pull request gets one of them, never the agent that wrote it. Tick none to skip review.</CardDescription>
         </CardHeader>
         <CardBody className="flex flex-col divide-y divide-border" data-testid="review-agents">
           {adapters.map((a) => {
@@ -272,24 +272,27 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                   <Check checked={on} onChange={(v) => setTeam(coding, v ? [...review, a] : review.filter((x) => x !== a))}>
                     <span className="font-medium">{AGENT_LABEL[a]}</span>
                   </Check>
-                  {badge(a, on || coding.includes(a))}
+                  {/* The key is shown with the coding agents; here only for an agent that only reviews. */}
+                  {!coding.includes(a) && badge(a, on)}
                 </div>
                 {on && !coding.includes(a) && offered(a) && !keySet(a) && <InlineKey adapter={a} installationId={installationId} api={keyApi} onSaved={onKeys} />}
               </div>
             );
           })}
-          <div className="flex flex-col gap-2 pt-3">
-            {selfReview && <p className="text-sm text-muted-foreground">{AGENT_LABEL[config.agents[review[0]!]!.adapter]} reviews its own work when it wrote the code. Tick a second review agent for a second opinion.</p>}
+        </CardBody>
+        <CardBody className="flex flex-col gap-2 border-t border-border bg-muted/30">
+          {selfReview && <p className="text-sm text-muted-foreground">{AGENT_LABEL[config.agents[review[0]!]!.adapter]} reviews its own work when it wrote the code. Tick a second review agent for a second opinion.</p>}
             {!w.review.enabled && <p className="text-sm text-muted-foreground">No review: pull requests wait for a person.</p>}
-            <Check checked={w.revise.enabled} onChange={(enabled) => setWorkflow({ revise: { ...w.revise, enabled } })}>
-              Coding agents make the changes {w.review.enabled ? 'a review asks for' : 'your people ask for in a review'}
-            </Check>
-          </div>
+          <Check checked={w.revise.enabled} onChange={(enabled) => setWorkflow({ revise: { ...w.revise, enabled } })}>
+            Coding agents make the changes {w.review.enabled ? 'a review asks for' : 'your people ask for in a review'}
+          </Check>
         </CardBody>
       </Card>
 
       <details className="rounded-lg border border-border p-4" open={errors.some((e) => /\.(prompt|timeoutMinutes|maxRevisions)/.test(e.path)) || undefined}>
-        <summary className="cursor-pointer font-medium">Advanced: prompts, revision rounds, time limit, more labels</summary>
+        <summary className="cursor-pointer text-sm font-medium">
+          Advanced <span className="font-normal text-muted-foreground">· prompts, revision rounds, time limit, more labels</span>
+        </summary>
         <div className="mt-4 flex flex-col gap-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Input

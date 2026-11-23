@@ -196,7 +196,7 @@ describe('the simple page', () => {
     expect(within(web).queryByLabelText('Base branch')).toBeNull();
     await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
     await userEvent.selectOptions(within(web).getByLabelText('Open pull requests as'), 'pr');
-    await userEvent.click(within(web).getByRole('checkbox', { name: /Start work here/ }));
+    await userEvent.click(within(web).getByRole('checkbox', { name: /Pause/ }));
     expect(web).toHaveTextContent('Paused');
     await userEvent.click(within(web).getByRole('checkbox', { name: /Only some people/ }));
     await userEvent.clear(within(web).getByLabelText('Who can add the label here'));
@@ -222,7 +222,7 @@ describe('the simple page', () => {
   it('keeps prompts and limits under Advanced, and resets an edited prompt', async () => {
     const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);
-    await userEvent.click(await screen.findByText(/Advanced: prompts/));
+    await userEvent.click(await screen.findByText(/prompts, revision rounds/));
     const prompt = screen.getByLabelText('Coding prompt');
     await userEvent.type(prompt, ' more');
     await userEvent.click(screen.getByRole('button', { name: 'Reset to the packaged prompt' }));
@@ -244,7 +244,7 @@ describe('the simple page', () => {
 
 /** From the simple page to the full editor. */
 async function openFull() {
-  await userEvent.click(await screen.findByText(/Advanced: prompts/));
+  await userEvent.click(await screen.findByText(/prompts, revision rounds/));
   await userEvent.click(screen.getByRole('button', { name: 'Open the full editor' }));
 }
 

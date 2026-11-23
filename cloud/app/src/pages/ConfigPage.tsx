@@ -215,7 +215,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
         <div className="flex flex-col gap-1">
           <h1 className="flex items-center gap-2 text-2xl font-semibold">
             {activeVersion === null ? 'Set up Updraft' : 'Configuration'}
-            <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
+            {view.tenant.status !== 'active' && <StatusBadge tone={status.tone}>{status.label}</StatusBadge>}
           </h1>
           <p className="text-muted-foreground" data-testid="active-version">
             {view.tenant.accountLogin} · {activeVersion === null ? 'nothing published yet' : `version ${activeVersion} is active`}
@@ -311,13 +311,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                 )}
               </Alert>
             )}
-            {blockers.length > 0 && (
-              <ul className="list-disc pl-5 text-sm text-muted-foreground" data-testid="blockers">
-                {blockers.map((b) => (
-                  <li key={b}>{b}</li>
-                ))}
-              </ul>
-            )}
+
             {errors.length > 0 && (
               <Alert variant="error" data-testid="config-errors">
                 <p className="font-medium">Nothing was published. Fix these first:</p>
@@ -350,11 +344,18 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                 </ul>
               </Alert>
             )}
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="text-sm" data-testid="draft-state">
-                {dirty ? <StatusBadge tone="warning">Unsaved changes</StatusBadge> : activeVersion === null ? 'Nothing published yet' : `Version ${activeVersion} is active`}
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <span className="min-w-0 text-sm">
+                {/* What still blocks a publish says more than the state, so it takes its place. */}
+                {blockers.length > 0 ? (
+                  <span className="text-muted-foreground" data-testid="blockers">
+                    To publish: {blockers.join(' ')}
+                  </span>
+                ) : (
+                  <span data-testid="draft-state">{dirty ? <StatusBadge tone="warning">Unsaved changes</StatusBadge> : activeVersion === null ? 'Ready to publish' : `Version ${activeVersion} is active`}</span>
+                )}
               </span>
-              <div className="flex flex-wrap gap-2">
+              <div className="flex shrink-0 justify-end gap-2">
                 <Button variant="ghost" size="sm" type="button" loading={busy === 'preview'} disabled={busy !== null} onClick={() => (yaml !== null ? setYaml(null) : void preview())}>
                   {yaml !== null ? 'Hide config' : 'View config'}
                 </Button>
