@@ -28,6 +28,12 @@ function fakeTable() {
 
   function condition(expr: string | undefined, item: Item | undefined, values: Values = {}): boolean {
     if (!expr) return true;
+    if (expr === '#enabled = :enabled AND routingVersion = :routingVersion') {
+      return item?.enabled === values[':enabled'] && item?.routingVersion === values[':routingVersion'];
+    }
+    if (expr === '#enabled = :enabled AND (attribute_not_exists(routingVersion) OR routingVersion = :routingVersion)') {
+      return item?.enabled === values[':enabled'] && (item?.routingVersion === undefined || item.routingVersion === values[':routingVersion']);
+    }
     if (expr === '#enabled = :enabled') return item?.enabled === values[':enabled'];
     if (expr === 'revision = :revision') return item?.revision === values[':revision'];
     if (expr === 'attribute_not_exists(revision) OR revision = :revision') return item?.revision === undefined || item.revision === values[':revision'];
@@ -1270,6 +1276,18 @@ describe('native mode changes and dispatch transactions', () => {
     expect(await launch(request)).toMatchObject({ status: 202, disposition: 'launched' });
     expect(await store.listActiveJobs()).toHaveLength(1);
   });
+  it('rejects an enqueue that read an older routing selection even while subscription mode stays enabled', async () => {
+    const { store, mode, worker } = await setup();
+    const snapshot = await mode.snapshot(55, route.workerId);
+    expect(await mode.setEnabled(55, route.workerId, true, {
+      ...snapshot, workerVersion: worker.version,
+      triggers: [{ repositoryId: 10, repository: 'acme/other', label: 'updraft' }],
+    })).toBe(true);
+    await expect(store.putJob({ ...job, native: { workerId: route.workerId, routingVersion: snapshot.routingVersion } })).rejects.toBeInstanceOf(NativeEnqueueRejectedError);
+    expect(await store.getJob(job.jobId)).toBeNull();
+    expect((await mode.snapshot(55, route.workerId)).triggers?.[0]?.repositoryId).toBe(10);
+  });
+
   it('does not classify an earlier committed native job as a definitively rejected enqueue', async () => {
     const { table, store, api } = await setup();
     await api.update({ sub: 'member' }, 55, false);
@@ -1288,7 +1306,7 @@ describe('native mode changes and dispatch transactions', () => {
     const { table, mode, worker } = await setup();
     table.items.set('NATIVE#55#worker-1|MODE', { pk: 'NATIVE#55#worker-1', sk: 'MODE', enabled: true });
     const snapshot = await mode.snapshot(55, route.workerId);
-    expect(snapshot).toEqual({ enabled: true, revision: 0 });
+    expect(snapshot).toEqual({ enabled: true, revision: 0, routingVersion: 0 });
     const expected = { revision: snapshot.revision, workerVersion: worker.version };
     expect(await mode.setEnabled(55, route.workerId, false, expected)).toBe(true);
     expect(await mode.setEnabled(55, route.workerId, true, expected)).toBe(false);

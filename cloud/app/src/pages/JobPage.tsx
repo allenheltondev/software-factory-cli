@@ -128,6 +128,7 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
           <PageHeroChip tone={r.tone} data-testid="job-result">
             {r.label}
           </PageHeroChip>
+          {job.executionMode && <PageHeroChip>{job.executionMode === 'subscription' ? 'Claude subscription' : 'Standard worker'}</PageHeroChip>}
           {job.label && <PageHeroChip>Label {job.label}</PageHeroChip>}
           {job.pullRequest !== undefined && <PageHeroChip>Pull request event</PageHeroChip>}
           {job.sender && <PageHeroChip>By @{job.sender}</PageHeroChip>}

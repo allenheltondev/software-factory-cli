@@ -1,15 +1,16 @@
+import { waitingId } from './native/sessions.js';
 import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { createWebhookHandler } from './flows/webhook.js';
-import { createGitHubApi } from './github/client.js';
+import { createGitHubApi, GitHubError } from './github/client.js';
 import { appJwt } from './github/jwt.js';
 import { createSettingsLoader } from './github/settings.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
-import { createLauncher, internetEgressConnector, noIngressConnector, type Launcher } from './jobs/launch.js';
+import { createLauncher, internetEgressConnector, noIngressConnector, type Launcher, type LaunchRequest } from './jobs/launch.js';
 import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
@@ -59,13 +60,42 @@ async function imageVersion(): Promise<string | null> {
   return value;
 }
 
+const nativeWorker = nativeAws(store);
+
 function launcher(): Launcher | undefined {
   if (!env.JOB_IMAGE_ARN || !env.BROKER_FUNCTION_NAME) return undefined;
   const region = env.AWS_REGION ?? '';
   const partition = env.PARTITION ?? 'aws';
   return createLauncher({
     store,
-    native: nativeAws(store).launch,
+    native: nativeWorker.launch,
+    resolveNative: nativeWorker.resolveNative,
+    ...(nativeWorker.managed ? {
+      async parkedClaude(request) {
+        const id = waitingId(request.installationId, request.deliveryId);
+        return (await nativeWorker.managed!.sessions.get(request.installationId, id))?.id;
+      },
+      async waitForClaude(request, repository, repositoryId, issue) {
+        const { installationId, deliveryId, eventName, appBot } = request;
+        const id = waitingId(installationId, deliveryId);
+        const eventKey = `tenants/${installationId}/events/claude-wait/${id}.json`;
+        await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: eventKey, Body: request.body, Tagging: 'updraft-retention=claude-wait' }));
+        const waiting = await nativeWorker.managed!.sessions.park({ installationId, deliveryId, eventName, appBot }, eventKey);
+        if (waiting.created && env.CLAUDE_CONSOLE_ORIGIN) {
+          try {
+            const settings = await loadSettings();
+            if (settings) {
+              const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId,
+                { repositoryIds: [repositoryId], permissions: { issues: 'write' } });
+              const url = new URL(`/installations/${installationId}/claude?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN);
+              await github.createIssueComment(token, repository, issue,
+                `This Updraft job is waiting for Claude subscription sign-in. [Open the waiting job in Updraft](${url.href}). An installation owner can sign in once and the job will resume automatically.`);
+            }
+          } catch (error) { console.error(JSON.stringify({ claudeWaiting: 'issue comment failed', name: (error as Error)?.name })); }
+        }
+        return waiting.id;
+      },
+    } : {}),
     settings: {
       region,
       bucket: env.TENANT_BUCKET ?? '',
@@ -140,7 +170,59 @@ const retryJob = launch
     })
   : undefined;
 
-export async function handler(event: APIGatewayProxyEvent | RetryRequest): Promise<APIGatewayProxyResult | RetryResult> {
+async function resumeClaude(installationId: number) {
+  const sessions = nativeWorker.managed?.sessions;
+  if (!sessions || !launch) return;
+  for (const pending of await sessions.pending(installationId)) {
+    const key = `tenants/${installationId}/events/claude-wait/${pending.id}.json`;
+    if (pending.eventKey !== key || pending.request.installationId !== installationId) continue;
+    const existing = await store.getJob(pending.id);
+    if (existing) {
+      await sessions.finish(installationId, pending.id, 'started', existing.jobId);
+      continue;
+    }
+    const out = await s3.send(new GetObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key }));
+    const body = await out.Body?.transformToString('utf8');
+    if (!body) throw new Error('Waiting job event unavailable');
+    const payload = JSON.parse(body) as LaunchRequest['payload'];
+    const repository = payload.repository?.full_name;
+    const repositoryId = payload.repository?.id;
+    const issue = payload.issue?.number;
+    const label = payload.label?.name;
+    if (typeof repository !== 'string' || typeof repositoryId !== 'number' || typeof issue !== 'number' || typeof label !== 'string') {
+      await sessions.finish(installationId, pending.id, 'canceled', 'The original issue or label is unavailable.');
+      continue;
+    }
+    const settings = await loadSettings();
+    if (!settings || !github.issueState) throw new Error('GitHub issue status is unavailable');
+    let current;
+    try {
+      const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId,
+        { repositoryIds: [repositoryId], permissions: { issues: 'read' } });
+      current = await github.issueState(token, repository, issue);
+    } catch (error) {
+      if (!(error instanceof GitHubError) || error.status !== 404) throw error;
+      await sessions.finish(installationId, pending.id, 'canceled', 'The issue or repository is no longer accessible.');
+      continue;
+    }
+    if (!current.open || !current.labels.some((name) => name.toLowerCase() === label.toLowerCase())) {
+      await sessions.finish(installationId, pending.id, 'canceled', 'The issue was closed or its start label was removed.');
+      continue;
+    }
+    const result = await launch({ ...pending.request, body, payload, jobId: pending.id, resumeClaude: true });
+    if (result.disposition === 'launched' && result.jobId) await sessions.finish(installationId, pending.id, 'started', result.jobId);
+    else if (['not_dispatched', 'tenant_inactive', 'no_config', 'missing_key'].includes(result.disposition) &&
+      result.reason !== 'native_worker_unavailable') {
+      await sessions.finish(installationId, pending.id, 'canceled', result.message ?? 'This job is no longer eligible to start. Check the installation configuration.');
+    }
+  }
+}
+
+export async function handler(event: APIGatewayProxyEvent | RetryRequest | { action: 'resumeClaude'; installationId: number }): Promise<APIGatewayProxyResult | RetryResult | void> {
+  if ('action' in event) {
+    if (event.action === 'resumeClaude' && Number.isSafeInteger(event.installationId) && event.installationId > 0) await resumeClaude(event.installationId);
+    return;
+  }
   if (isRetryRequest(event)) {
     return retryJob ? retryJob(event) : { ok: false, status: 503, code: 'jobs_off', message: 'Jobs are not configured' };
   }

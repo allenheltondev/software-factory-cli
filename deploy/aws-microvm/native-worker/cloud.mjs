@@ -3,11 +3,11 @@ import { spawn } from 'node:child_process';
 import { setTimeout as pause } from 'node:timers/promises';
 
 export function cloudConfig(c) {
-  if (!c || Object.keys(c).sort().join(',') !== 'brokerFunctionName,controlSecretArn,imageVersion,region,workerId,workerVersion' ||
+  if (!c || !['brokerFunctionName,controlSecretArn,imageVersion,region,workerId,workerVersion', 'brokerFunctionName,controlToken,imageVersion,region,workerId,workerVersion'].includes(Object.keys(c).sort().join(',')) ||
       typeof c.workerId !== 'string' || !/^[\w-]{1,64}$/.test(c.workerId) || typeof c.workerVersion !== 'string' || !/^[\w.-]{1,64}$/.test(c.workerVersion) ||
       typeof c.imageVersion !== 'string' || !/^[\w.-]{1,64}$/.test(c.imageVersion) || typeof c.region !== 'string' || !/^[\w-]+-\d$/.test(c.region) ||
       typeof c.brokerFunctionName !== 'string' || !/^[\w:-]{1,200}$/.test(c.brokerFunctionName) ||
-      typeof c.controlSecretArn !== 'string' || !/^arn:[\w-]+:secretsmanager:[\w-]+:\d{12}:secret:updraft\/native-workers\//.test(c.controlSecretArn)) throw new Error('invalid cloud worker configuration');
+      !(typeof c.controlToken === 'string' ? /^[A-Za-z0-9_-]{43}$/.test(c.controlToken) : typeof c.controlSecretArn === 'string' && /^arn:[\w-]+:secretsmanager:[\w-]+:\d{12}:secret:updraft\/native-workers\//.test(c.controlSecretArn))) throw new Error('invalid cloud worker configuration');
   return c;
 }
 

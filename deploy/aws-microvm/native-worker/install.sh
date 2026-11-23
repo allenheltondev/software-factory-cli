@@ -15,6 +15,7 @@ fi
 [ "$(id -u updraft-claude)" = 1001 ] && [ "$(id -g updraft-claude)" = 1001 ] || exit 1
 mkdir -p /opt/updraft/native-worker /opt/updraft/image/sandbox /opt/updraft/bin /var/lib/updraft-jobs
 cp "$here"/*.mjs /opt/updraft/native-worker/
+npm install --prefix /opt/updraft/native-worker --no-save --package-lock=false --ignore-scripts ws@8.23.0
 cp "$here/mount-home.sh" /opt/updraft/native-worker/
 cp "$here/../image/sandbox/updraft-sandbox.mjs" /opt/updraft/image/sandbox/
 cp "$here/worker.example.json" /etc/updraft-native-worker.json

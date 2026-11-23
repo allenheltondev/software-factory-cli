@@ -7,10 +7,24 @@ Description: >
   app client to that pool).
 
 Parameters:
+  ManagedClaudeImageName:
+    Type: String
+    Default: updraft-native-claude
+    AllowedPattern: '^[A-Za-z0-9_-]+$'
+    Description: Name of the dedicated disposable Claude worker image.
+  ManagedClaudeImageVersion:
+    Type: String
+    Default: ''
+    Description: Built, live-verified browser-login image version. A nonempty value enables tenant-managed Claude sessions.
   NativeWorkerRoute:
     Type: String
     Default: ''
-    Description: Operator-only JSON test route for issue 104. Empty disables subscription dispatch.
+    Description: Operator-only JSON worker binding. Published triggers are selected in the console. Empty disables subscription dispatch.
+  NativeWorkerBrowserSignIn:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable browser sign-in only for a validated disposable worker image and binding.
   NativeWorkerImageArn:
     Type: String
     Default: ''
@@ -120,6 +134,12 @@ Parameters:
     Description: Route 53 hosted zone that holds AppDomainName's parent domain.
 
 Rules:
+  ManagedClaudeReferences:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref ManagedClaudeImageVersion, '']
+          - !Not [!Equals [!Ref AppDomainName, '']]
+        AssertDescription: Managed Claude requires a public console domain for GitHub issue links.
   NativeWorkerReferences:
     Assertions:
       - Assert: !Or
@@ -130,6 +150,10 @@ Rules:
         AssertDescription: Enabling the native test route requires its dedicated image and control secret ARNs.
 
 Conditions:
+  ManagedClaude: !Not [!Equals [!Ref ManagedClaudeImageVersion, '']]
+  NativeWorkerBrowserLogin: !And
+    - !Condition NativeWorkerEnabled
+    - !Equals [!Ref NativeWorkerBrowserSignIn, 'true']
   NativeWorkerEnabled: !And
     - !Not [!Equals [!Ref NativeWorkerRoute, '']]
     - !Not [!Equals [!Ref NativeWorkerImageArn, '']]
@@ -150,6 +174,43 @@ Globals:
     Tracing: Active
 
 Resources:
+  ManagedClaudeControlSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: ManagedClaude
+    Properties:
+      Description: Root key for deriving disposable per-session broker credentials
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  ManagedClaudeExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: ManagedClaude
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker-broker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt BrokerFunction.Arn
+
+  ManagedClaudeWebhookName:
+    Type: AWS::SSM::Parameter
+    Condition: ManagedClaude
+    Properties:
+      Name: !Sub /updraft/${AWS::StackName}/claude-webhook
+      Type: String
+      Value: !Ref WebhookFunction
+
   # ---------------------------------------------------------------------------
   # Data: one table, generic keys and two overloaded GSIs so tenants, members, config versions,
   # deliveries and jobs (#67-#71) fit without a table replacement. Retained on stack delete.
@@ -298,6 +359,12 @@ Resources:
         Variables:
           TABLE_NAME: !Ref UpdraftTable
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
+          NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
+          NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
+          NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
+          NATIVE_MANAGED_ROLE_ARN: !If [ManagedClaude, !GetAtt ManagedClaudeExecutionRole.Arn, ""]
+          BROKER_FUNCTION_NAME: !Ref BrokerFunction
+          NATIVE_WORKER_LOGIN_IMAGE_ARN: !If [NativeWorkerBrowserLogin, !Ref NativeWorkerImageArn, ""]
           # Tenant config bundles: the console publishes them (tenants/config-service.ts).
           TENANT_BUCKET: !Ref TenantBucket
           USER_POOL_ID: !Ref AuthUserPoolId
@@ -317,8 +384,31 @@ Resources:
           WEBHOOK_FUNCTION_NAME: !Ref WebhookFunction
           NODE_OPTIONS: --enable-source-maps
       Policies:
+        - !If
+          - ManagedClaude
+          - Statement:
+              - Effect: Allow
+                Action: [lambda:GetMicrovm, lambda:RunMicrovm, lambda:CreateMicrovmAuthToken]
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
+              - Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt ManagedClaudeExecutionRole.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ManagedClaudeControlSecret
+          - !Ref AWS::NoValue
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
+        - !If
+          - NativeWorkerBrowserLogin
+          - Statement:
+              - Effect: Allow
+                Action: [lambda:GetMicrovm, lambda:CreateMicrovmAuthToken]
+                Resource: !Ref NativeWorkerImageArn
+          - !Ref AWS::NoValue
         # Only this one function, and only to run a retry the API has already authorized.
         - LambdaInvokePolicy:
             FunctionName: !Ref WebhookFunction
@@ -391,6 +481,10 @@ Resources:
           JOB_IMAGE_VERSION_PARAMETER: !Sub /updraft/${AWS::StackName}/job-image-version
           EXECUTION_ROLE_ARN: !GetAtt MicrovmExecutionRole.Arn
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
+          NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
+          NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
+          NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
+          CLAUDE_CONSOLE_ORIGIN: !If [ManagedClaude, !Sub 'https://${AppDomainName}', ""]
           BROKER_FUNCTION_NAME: !Ref BrokerFunction
           MICROVM_LOG_GROUP: !Ref MicrovmLogGroup
           # Agent timeouts are capped at 120 minutes and verify at 30 (tenants/config.ts).
@@ -404,6 +498,16 @@ Resources:
           KILL_SWITCH_PARAMETER: /updraft/kill-switch
           NODE_OPTIONS: --enable-source-maps
       Policies:
+        - !If
+          - ManagedClaude
+          - Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ManagedClaudeControlSecret
+              - Effect: Allow
+                Action: s3:PutObjectTagging
+                Resource: !Sub ${TenantBucket.Arn}/tenants/*/events/claude-wait/*
+          - !Ref AWS::NoValue
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
         - SSMParameterReadPolicy:
@@ -476,6 +580,13 @@ Resources:
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           NODE_OPTIONS: --enable-source-maps
       Policies:
+        - !If
+          - ManagedClaude
+          - Statement:
+              - Effect: Allow
+                Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
+          - !Ref AWS::NoValue
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
         - Statement:
@@ -539,6 +650,14 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireClaudeSignInEvents
+            Status: Enabled
+            TagFilters:
+              - Key: updraft-retention
+                Value: claude-wait
+            ExpirationInDays: 2
       # Object ownership is left at S3's default for new buckets (bucket owner enforced, ACLs off).
 
   TenantBucketPolicy:
@@ -620,7 +739,7 @@ Resources:
                 Resource: !GetAtt UpdraftTable.Arn
                 Condition:
                   ForAllValues:StringLike:
-                    dynamodb:LeadingKeys: ['NATIVE#*']
+                    dynamodb:LeadingKeys: !If [ManagedClaude, ['NATIVE#*', 'TENANT#*'], ['NATIVE#*']]
               - !If
                 - NativeWorkerEnabled
                 - Effect: Allow
@@ -632,6 +751,30 @@ Resources:
                 - Effect: Allow
                   Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
                   Resource: !Ref NativeWorkerImageArn
+                - !Ref AWS::NoValue
+              - !If
+                - ManagedClaude
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref ManagedClaudeControlSecret
+                - !Ref AWS::NoValue
+              - !If
+                - ManagedClaude
+                - Effect: Allow
+                  Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
+                  Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
+                - !Ref AWS::NoValue
+              - !If
+                - ManagedClaude
+                - Effect: Allow
+                  Action: ssm:GetParameter
+                  Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/updraft/${AWS::StackName}/claude-webhook
+                - !Ref AWS::NoValue
+              - !If
+                - ManagedClaude
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-WebhookFunction-*
                 - !Ref AWS::NoValue
               # The kill switch: while it is on, nothing but finish and terminate is served.
               - Effect: Allow
@@ -715,6 +858,10 @@ Resources:
           TENANT_BUCKET: !Ref TenantBucket
           JOB_DATA_ROLE_ARN: !GetAtt JobDataRole.Arn
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
+          NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
+          NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
+          NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
+          CLAUDE_WEBHOOK_PARAMETER: !If [ManagedClaude, !Sub '/updraft/${AWS::StackName}/claude-webhook', ""]
           PARTITION: !Ref AWS::Partition
           ACCOUNT_ID: !Ref AWS::AccountId
           KILL_SWITCH_PARAMETER: /updraft/kill-switch

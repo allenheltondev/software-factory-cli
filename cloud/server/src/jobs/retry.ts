@@ -161,7 +161,7 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
     let result;
     try {
       const bot = await appBot?.();
-      result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload, retry: true, jobId: child });
+      result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload, retry: true, retryRuntime: { ...(job.native ? { workerId: job.native.workerId } : {}) }, jobId: child });
     } catch (err) {
       log({ installationId, jobId, error: 'retry failed before launching', name: errorClassOf(err) });
       await giveBack();

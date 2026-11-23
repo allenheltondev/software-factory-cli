@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { attachLogin, loginUrl } from '../native-worker/browser-login.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,6 +14,43 @@ import { commitIdentityEnv } from '../../../src/github/credentials.ts';
 import { containerSchema } from '../../../src/config/schema.ts';
 import { createGitFixture } from '../../../test/git-fixtures.ts';
 import { createProbeServer, PROBE_PORT } from '../native-worker/probe.mjs';
+
+describe('disposable worker browser login', () => {
+  it('accepts only the official authorization endpoint', () => {
+    expect(loginUrl('Continue: https://claude.ai/oauth/authorize?state=sample')).toBe('https://claude.ai/oauth/authorize?state=sample');
+    for (const url of ['https://claude.ai.evil.test/oauth/authorize', 'https://claude.ai/setup', 'http://claude.ai/oauth/authorize']) {
+      expect(loginUrl(url)).toBeUndefined();
+    }
+  });
+
+  it('passes a single code only to the official CLI and reports sanitized readiness', async () => {
+    const socket = Object.assign(new EventEmitter(), { readyState: 1, close: vi.fn(), send: vi.fn() });
+    const stdin = Object.assign(new EventEmitter(), { end: vi.fn() });
+    const child = Object.assign(new EventEmitter(), { stdin, stdout: new PassThrough(), stderr: new PassThrough() });
+    const launch = vi.fn(() => child);
+    const status = vi.fn().mockResolvedValueOnce('login_required').mockResolvedValueOnce('connected');
+    const disconnect = attachLogin(socket, { claude: '/trusted/claude', credentialHome: '/private/home' }, status, launch);
+    try {
+      await vi.waitFor(() => expect(launch).toHaveBeenCalledWith('/trusted/claude',
+        ['--restricted', '--setting-sources', '', 'auth', 'login', '--claudeai'], expect.anything()));
+      child.stdout.write('unrelated output\nhttps://claude.ai/oauth/authorize?state=sample\nPaste code here if prompted >');
+      expect(socket.send).toHaveBeenCalledExactlyOnceWith(JSON.stringify({ url: 'https://claude.ai/oauth/authorize?state=sample' }));
+      socket.emit('message', Buffer.from('synthetic-code'), false);
+      expect(stdin.end).toHaveBeenCalledExactlyOnceWith('synthetic-code\n');
+      child.emit('close', 0);
+      await vi.waitFor(() => expect(socket.send).toHaveBeenLastCalledWith(JSON.stringify({ status: 'connected' })));
+      expect(socket.close).toHaveBeenCalledOnce();
+    } finally { disconnect(); }
+  });
+
+  it('does not launch an interactive command after the CLI is connected', async () => {
+    const socket = Object.assign(new EventEmitter(), { readyState: 1, close: vi.fn(), send: vi.fn() });
+    const launch = vi.fn();
+    attachLogin(socket, { credentialHome: '/private/home' }, async () => 'connected', launch);
+    await vi.waitFor(() => expect(socket.close).toHaveBeenCalledOnce());
+    expect(launch).not.toHaveBeenCalled();
+  });
+});
 
 describe('native Claude worker policy', () => {
   it.skipIf(process.platform === 'win32')('accepts actual commitAsApp containInvocation arguments without adding identity to Claude', () => {
@@ -43,6 +82,9 @@ describe('native Claude worker policy', () => {
   it('accepts only EFS identifiers in the lifecycle payload, never credentials or commands', () => {
     const payload = { fileSystemId: 'fs-0123456789abcdef0', accessPointId: 'fsap-0123456789abcdef0' };
     expect(bootPayload(JSON.stringify(payload))).toEqual(payload);
+    expect(bootPayload('{"storage":"ephemeral"}')).toEqual({ storage: 'ephemeral' });
+    expect(() => bootPayload(JSON.stringify({ ...payload, storage: 'ephemeral' }))).toThrow();
+    expect(() => bootPayload('{"storage":"host-directory"}')).toThrow();
     for (const value of [{ ...payload, token: 'secret' }, { ...payload, fileSystemId: 'fs-1234,other=unsafe' }, {}, null]) {
       expect(() => bootPayload(JSON.stringify(value))).toThrow();
     }

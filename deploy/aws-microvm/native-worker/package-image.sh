@@ -21,7 +21,7 @@ RUN set -eu; PM="$(command -v dnf || command -v microdnf)"; \
 COPY native-worker/ /tmp/native-worker/
 COPY sandbox/ /tmp/image/sandbox/
 RUN sh /tmp/native-worker/install.sh && rm -rf /tmp/native-worker /tmp/image
-EXPOSE 8080
+EXPOSE 8080 8081
 ENTRYPOINT ["node", "/opt/updraft/native-worker/hooks.mjs"]
 DOCKER
 echo 'Prepared native worker context. Supply a current Updraft tarball in vendor/ before building.'

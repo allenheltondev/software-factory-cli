@@ -1,12 +1,65 @@
 # Cloud test route (issue #104)
 
 This opt-in development path connects the dedicated subscription image to the existing Cloud
-webhook, broker and `run-event` runner. It is **disabled by default**, single tenant, single
-repository, one pinned worker and one execution slot. No customer setup UI or production fleet
-management is included. The #100 commercial gate and #103's live security/subscription gates
+webhook, broker and `run-event` runner. It is **disabled by default**, single installation, one pinned worker and one execution slot. The console manages workflow routing after operator provisioning. Production fleet
+management is outside this pilot. The #100 commercial gate and #103's live security/subscription gates
 still apply. Local regression tests are not evidence of an AWS subscription execution.
 
-## Provision and connect
+## Tenant-managed disposable sessions
+
+After testing the dedicated browser-login image in AWS, set `ManagedClaudeImageName` and
+`ManagedClaudeImageVersion` on the Cloud stack. Leave the version empty on stacks where
+this flow is disabled. From `cloud/`, pass `MANAGED_CLAUDE_IMAGE_NAME` and
+`MANAGED_CLAUDE_IMAGE_VERSION` to `make deploy-backend` to set the parameters.
+CloudFormation creates a broker-only execution role, an application
+control key, and the reference that lets the broker wake the webhook Lambda. The installation
+owns the saved trigger selection, one current session binding, and its waiting delivery
+records. The worker receives a session-scoped broker credential at boot. Claude credentials
+stay in a private tmpfs on the worker.
+
+Select published Claude triggers in **Configuration → Claude subscription routing**.
+A labeled issue for a selected trigger waits until that installation has a signed-in worker.
+The GitHub App posts an authenticated deep link once per delivery. The same link is available
+on the installation's Deliveries view. The owner starts sign-in from that link. Cloud starts
+or reuses the installation's MicroVM, then opens the private browser sign-in panel.
+When the worker reports connected, waiting jobs resume without a second label event. Cloud
+checks that the issue is open, the label is present, and the active configuration still
+authorizes the action. Waiting requests expire in 24 hours and hold no worker slots or job
+runtime quota. A new worker receives a different control credential and has to sign in again.
+
+For live acceptance, use two test installations. Verify a member can see their own waiting
+request, only the owner can start sign-in, and another installation cannot view or start it.
+Repeat the webhook and open two sign-in tabs, then confirm one comment, one worker, and one
+job. Verify the lifecycle-port denial and repository credential isolation before enabling
+the image version in Production. Complete a real GitHub job, let the session expire, and
+confirm the next labeled issue waits for a fresh login without API billing.
+
+## Disposable browser sign-in pilot
+
+A disposable image supports `{"storage":"ephemeral","cloud":{...}}`. It mounts a private
+tmpfs for the Claude home and refuses a disk-backed fallback. No EFS or VPC connector is
+required. The session ends when the VM terminates, at most eight hours after launch.
+
+After building the dedicated image and provisioning its scoped broker execution role and
+control secret, use `npx tsx server/scripts/native-worker.ts launch plan.json BROKER REGION`
+from `cloud/`. The plan contains `installationId`, `workerId`, `imageArn`, `imageVersion`,
+`executionRoleArn`, `controlSecretArn`, and a unique `session` identifier (8–64 letters,
+numbers, underscores, or hyphens). Reuse the identifier only when retrying the same launch.
+For a replacement, supply `previousMicrovmId` and a new session identifier. Start a fresh
+session only after the old worker has drained and its termination is confirmed. The launcher
+prints the non-secret `NativeWorkerRoute` value. Set it on the Cloud stack alongside the
+existing image and secret references and `NativeWorkerBrowserSignIn=true`.
+
+The owner opens **Configuration → Claude subscription routing → Sign in to Claude**. An
+opaque-origin browser frame connects directly to port 8081 with a five-minute AWS grant. It
+runs only the official subscription login command and shows only its official sign-in link.
+The authorization code goes directly from the frame to the worker. Updraft's API receives
+only normal worker readiness. Confirm the deployed gateway strips AWS WebSocket subprotocols
+and that a port-8081 grant denies the lifecycle port. Do this and the authenticated
+isolation check in a controlled pilot before enabling the production switch. The console
+does not provision or rotate the MicroVM binding.
+
+## Provision the older EFS-backed proof
 
 1. Follow [README.md](README.md) to build the separate native image, create the tenant's EFS
    access point, grant its dedicated execution role EFS access, configure VPC/internet egress,
@@ -53,14 +106,11 @@ still apply. Local regression tests are not evidence of an AWS subscription exec
    a job. If provisioning takes longer or the loop reports that it stopped, terminate this VM
    and repeat with a replacement; never restart an uncertain dispatcher session in place.
 
-7. Save `route.json` with references only:
+7. Save `route.json` with the worker binding only:
 
    ```json
    {
      "installationId": 55,
-     "repositoryId": 9,
-     "repository": "acme/test-repo",
-     "labels": ["updraft-native-test"],
      "workerId": "native-test-1",
      "microvmId": "YOUR_MICROVM_ID",
      "imageVersion": "YOUR_NATIVE_IMAGE_VERSION",
@@ -74,9 +124,9 @@ still apply. Local regression tests are not evidence of an AWS subscription exec
    publish its ordinary workflows. The native runner replaces **every enabled Claude profile**
    with the native runtime, empty container environment, no network, and shared capacity group
    of one; it retains the classic sandbox for other adapters. Triage is refused. Non-Claude
-   workflows still need their API keys. An unrecognized PR origin in this test repository is
+   workflows still need their API keys. An unrecognized PR origin in an installation with console-managed routing is
    refused instead of being routed to BYOK. Keep the original job history for the whole test.
-8. Open **Agent keys → Configure Claude Code subscription** in the Updraft app. After the worker reports `connected`, choose **Use subscription**. The saved Anthropic API key remains in place for other routes. A newly provisioned route defaults to **API-key mode** until you explicitly enable the subscription. The app will refuse switching while a native job is active or queued. You can change back to API mode when the worker is idle; unfinished subscription PRs are not silently switched to API billing.
+8. Open **Agent keys → Configure Claude Code subscription** in the Updraft app. After the worker reports `connected`, select the published repository and label combinations that should use the worker, then choose **Use subscription**. After initial provisioning, change this selection from **Configuration → Claude subscription routing** without a stack update. The saved Anthropic API key remains in place for other routes. A newly provisioned route defaults to **API-key mode** until you explicitly enable the subscription. The app will refuse switching while a native job is active or queued. You can change back to API mode when the worker is idle; unfinished subscription PRs are not silently switched to API billing.
 
 9. From `cloud/`, run:
 

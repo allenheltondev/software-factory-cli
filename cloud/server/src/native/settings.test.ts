@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Caller } from '../caller.js';
 import type { GitHubFlows } from '../flows/github.js';
 import { createNativeSettingsService } from './settings.js';
-import type { NativeRoute } from './route.js';
+import { nativeRoute, type NativeRoute } from './route.js';
 import type { NativeModeStore, NativeStore, Worker } from './store.js';
 
 const route: NativeRoute = {
@@ -91,6 +91,62 @@ describe('Claude subscription mode in the installation app', () => {
     queued = ['job_queued0000001'];
     await expect(api.update(caller, 55, false)).rejects.toThrow('queued subscription jobs');
     expect(enabled).toBe(true);
+  });
+
+  it('accepts a worker binding without a repo and validates routing against published Claude triggers', async () => {
+    const { repository, repositoryId, labels, ...binding } = route;
+    expect(nativeRoute(JSON.stringify(binding))).toEqual(binding);
+    const trigger = { repository: repository!, repositoryId: repositoryId!, label: labels![0]! };
+    const tenant = { installationId: 55, activeConfigVersion: 3, status: 'active' };
+    member.mockResolvedValueOnce({ tenant });
+    configContext.mockResolvedValue({ tenant, repositories: [{ id: repositoryId }] });
+    const getConfigVersion = vi.fn().mockResolvedValue({ dispatch: { repositories: {
+      [repository!]: { id: repositoryId, keys: ['ANTHROPIC_API_KEY'], triggers: [{ label: trigger.label }] },
+      'acme/other': { id: 10, keys: ['CODEX_API_KEY'], triggers: [{ label: trigger.label }] },
+    } } });
+    const save = vi.spyOn(mode, 'setEnabled');
+    const service = createNativeSettingsService({ github, route: binding, mode, workers, store: { getConfigVersion }, now: () => now });
+    expect(await service.view(caller, 55)).toMatchObject({ triggers: [], availableTriggers: [trigger] });
+    await expect(service.update(caller, 55, true, [{ ...trigger, repositoryId: 10 }])).rejects.toThrow('reachable repositories');
+    await service.update(caller, 55, true, [trigger]);
+    expect(save).toHaveBeenCalledWith(55, 'worker-1', true, expect.objectContaining({ triggers: [trigger] }));
+    configContext.mockResolvedValue({});
+  });
+
+  it('only gives an owner a browser grant for an idle, pinned worker waiting for login', async () => {
+    const loginGrant = vi.fn().mockResolvedValue({ url: 'wss://worker.on.aws/claude-login', token: 'sample', port: 8081 });
+    const service = createNativeSettingsService({ github, route, mode, workers, loginGrant, now: () => now });
+    const tenant = { status: 'active' };
+    member.mockResolvedValueOnce({ tenant, summary: { role: 'member' } });
+    await expect(service.login(caller, 55)).rejects.toThrow('Only installation owners');
+    member.mockResolvedValueOnce({ tenant, summary: { role: 'owner' } });
+    await expect(service.login(caller, 55)).rejects.toThrow('ready for sign-in');
+    worker!.auth = 'auth-required';
+    member.mockResolvedValueOnce({ tenant, summary: { role: 'owner' } });
+    await expect(service.login(caller, 55)).resolves.toMatchObject({ port: 8081 });
+    expect(loginGrant).toHaveBeenCalledOnce();
+  });
+
+  it('only starts a waiting request for an active installation owner in that installation', async () => {
+    const requestId = 'job_' + 'a'.repeat(16);
+    const get = vi.fn(async (id: number, request: string) => id === 55 && request === requestId ? {
+      id: requestId, request: { installationId: 55, deliveryId: 'delivery' }, eventKey: 'event.json',
+      status: 'waiting' as const, expiresAt: now + 60_000,
+    } : undefined);
+    const start = vi.fn().mockResolvedValue(undefined);
+    const service = createNativeSettingsService({ github, mode, workers, now: () => now, managed: {
+      route: async (id) => ({ ...route, installationId: id, workerId: `managed-${id}`, microvmId: 'mvm-pending' }),
+      start, sessions: { get }, grant: () => undefined,
+    } });
+    enabled = true;
+    const tenant = { status: 'active' };
+    member.mockResolvedValueOnce({ tenant, summary: { role: 'member' } });
+    await expect(service.start(caller, 55, requestId)).rejects.toThrow('Only an installation owner');
+    member.mockResolvedValueOnce({ tenant, summary: { role: 'owner' } });
+    await expect(service.start(caller, 56, requestId)).rejects.toThrow('does not have an active Claude sign-in request');
+    member.mockResolvedValueOnce({ tenant, summary: { role: 'owner' } });
+    await expect(service.start(caller, 55, requestId)).resolves.toMatchObject({ managed: true });
+    expect(start).toHaveBeenCalledExactlyOnceWith(55);
   });
 
   it('does not expose a route or permit changes to an installation without a pinned worker', async () => {

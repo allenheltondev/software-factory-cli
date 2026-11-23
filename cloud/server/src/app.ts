@@ -1,3 +1,4 @@
+import type { NativeTrigger } from './native/route.js';
 import { Hono, type Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { AdminAccess } from './admin/access.js';
@@ -295,12 +296,36 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, nat
       const id = positive(c.req.param('id'));
       return id ? c.json(await nativeClaude.view(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
     });
+    app.get('/v1/installations/:id/claude-subscription/requests/:requestId', async (c) => {
+      const id = positive(c.req.param('id'));
+      const requestId = c.req.param('requestId');
+      if (!id || !/^job_[A-Za-z0-9_-]{16}$/.test(requestId)) return c.json({ error: 'not_found' }, 404);
+      return c.json(await nativeClaude.waiting(c.get('caller'), id, requestId));
+    });
+    app.post('/v1/installations/:id/claude-subscription/requests/:requestId/start', async (c) => {
+      const id = positive(c.req.param('id'));
+      const requestId = c.req.param('requestId');
+      if (!id || !/^job_[A-Za-z0-9_-]{16}$/.test(requestId)) return c.json({ error: 'not_found' }, 404);
+      return c.json(await nativeClaude.start(c.get('caller'), id, requestId));
+    });
+    app.post('/v1/installations/:id/claude-subscription/login', async (c) => {
+      const id = positive(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      c.header('Cache-Control', 'no-store');
+      return c.json(await nativeClaude.login(c.get('caller'), id));
+    });
     app.put('/v1/installations/:id/claude-subscription', async (c) => {
       const id = positive(c.req.param('id'));
       if (!id) return c.json({ error: 'not_found' }, 404);
-      const input = (await c.req.json().catch(() => null)) as { enabled?: unknown } | null;
-      if (!input || typeof input.enabled !== 'boolean' || Object.keys(input).join(',') !== 'enabled') return c.json({ error: 'bad_request' }, 400);
-      return c.json(await nativeClaude.update(c.get('caller'), id, input.enabled));
+      const input = (await c.req.json().catch(() => null)) as { enabled?: unknown; triggers?: unknown } | null;
+      if (!input || typeof input.enabled !== 'boolean' || Object.keys(input).some((key) => key !== 'enabled' && key !== 'triggers')) return c.json({ error: 'bad_request' }, 400);
+      const triggers = input.triggers;
+      if (triggers !== undefined && (!Array.isArray(triggers) || triggers.length > 200 || triggers.some((t) =>
+        !t || typeof t !== 'object' || Object.keys(t).sort().join(',') !== 'label,repository,repositoryId' ||
+        !Number.isSafeInteger(t.repositoryId) || t.repositoryId <= 0 ||
+        typeof t.repository !== 'string' || t.repository.length > 256 || !/^[\w.-]+\/[\w.-]+$/.test(t.repository) ||
+        typeof t.label !== 'string' || !t.label.trim() || t.label.length > 100))) return c.json({ error: 'bad_request' }, 400);
+      return c.json(await nativeClaude.update(c.get('caller'), id, input.enabled, triggers as NativeTrigger[] | undefined));
     });
   }
 

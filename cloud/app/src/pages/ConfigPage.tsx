@@ -222,6 +222,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
           </p>
         </div>
         <span className="flex flex-wrap gap-4">
+          <Link className="auth-link" to={`/installations/${installationId}/claude`}>Claude subscription routing</Link>
           {!simple && isSimple(config) && (
             <button type="button" className="auth-link" onClick={() => setMode('simple')}>
               Simple view

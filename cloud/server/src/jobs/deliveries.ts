@@ -35,6 +35,9 @@ export function deliveryFromLaunch(base: DeliveryEvent, result: LaunchResult): D
     case 'no_config':
       return filtered(result.disposition);
     case 'not_dispatched':
+      if (result.reason === 'native_waiting_for_sign_in' && result.jobId) {
+        return { ...filtered(result.reason, result.message), jobId: result.jobId };
+      }
       return filtered(result.reason ?? 'not_trigger', result.message);
     case 'jobs_off':
       return filtered('jobs_off');

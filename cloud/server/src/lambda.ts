@@ -13,6 +13,8 @@ import { createSettingsLoader } from './github/settings.js';
 import type { RetryRequest, RetryResult } from './jobs/retry.js';
 import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
+import { managedClaude } from './native/managed.js';
+import { browserLoginGrant } from './native/browser-login.js';
 import { nativeRoute } from './native/route.js';
 import { createNativeModeStore, createNativeStore } from './native/store.js';
 import { createNativeSettingsService } from './native/settings.js';
@@ -39,6 +41,7 @@ const clientId = process.env.USER_POOL_CLIENT_ID ?? '';
 if (!clientId) console.error('USER_POOL_CLIENT_ID is not set; every /api/v1 request will be refused');
 const userPoolId = process.env.USER_POOL_ID ?? '';
 const verifier = userPoolId && clientId ? CognitoJwtVerifier.create({ userPoolId, clientId, tokenUse: 'id' }) : null;
+const managedWorker = managedClaude();
 const tableName = process.env.TABLE_NAME ?? '';
 const store = tableName ? createDynamoStore(tableName) : undefined;
 const github = store ? createGitHubFlows({ store, github: createGitHubApi(), loadSettings: createSettingsLoader() }) : undefined;
@@ -125,7 +128,10 @@ const app = createApp({
     ? {
         github,
         agentKeys: agentKeyService,
-        nativeClaude: createNativeSettingsService({ github, route: nativeRoute(process.env.NATIVE_WORKER_ROUTE),
+        nativeClaude: createNativeSettingsService({ github, store,
+          ...(managedWorker ? { managed: { ...managedWorker, grant: (route) => browserLoginGrant(managedWorker.imageArn, route) } } : {}),
+          route: nativeRoute(process.env.NATIVE_WORKER_ROUTE),
+          loginGrant: browserLoginGrant(process.env.NATIVE_WORKER_LOGIN_IMAGE_ARN ?? '', nativeRoute(process.env.NATIVE_WORKER_ROUTE)),
           mode: createNativeModeStore(tableName), workers: createNativeStore(tableName) }),
         status: createStatusService({
           store,
