@@ -76,7 +76,11 @@ export function trustedFile(file) {
   let current = path.resolve(file);
   while (true) {
     const s = fs.lstatSync(current);
-    if (s.isSymbolicLink() || s.uid !== 0 || (s.mode & 0o022)) throw new Error('worker installation must be root-owned and not writable by other users');
+    if (s.isSymbolicLink() || s.uid !== 0 || (s.mode & 0o022)) {
+      // Installation paths/permissions only, never auth-file contents. Public entrypoints
+      // still return a fixed startup error; this detail makes test/install failures actionable.
+      throw new Error(`worker installation must be root-owned and not writable by other users: ${current} (uid ${s.uid}, mode ${(s.mode & 0o777).toString(8)})`);
+    }
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;
