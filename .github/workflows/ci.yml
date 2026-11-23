@@ -105,6 +105,33 @@ jobs:
           cat "$RUNNER_TEMP/unit/updraft.service"
           systemd-analyze verify "$RUNNER_TEMP/unit/updraft.service"
 
+  native-worker-security:
+    name: native worker credential isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Install namespace test prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y bubblewrap
+          # Ubuntu's AppArmor policy otherwise blocks unprivileged namespace creation.
+          # This changes only the disposable CI runner, never the production worker.
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo install -o root -g root -m 0755 "$(command -v node)" /usr/local/bin/updraft-security-node
+      - name: Attack the real supervisor and MCP sandbox (no skips)
+        run: sudo /usr/local/bin/updraft-security-node deploy/aws-microvm/native-worker/security-check.mjs
+
   # The workflow files themselves. A workflow that does not parse never runs, and nothing else
   # fails for it (a reusable one fails only when it is called, in the deploy). actionlint parses
   # each file and checks its keys, expressions, job needs and action inputs. Its shellcheck and

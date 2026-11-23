@@ -1,0 +1,24 @@
+# Merge these agent definitions into your existing live Updraft configuration.
+# The prototype runtime enforces native subscription auth itself before EVERY Claude launch.
+# Do not set authentication: native-claude here: the general container guard remains intact.
+agents:
+  claude:
+    adapter: claude
+    maxConcurrent: 1
+    command: claude
+    container:
+      image: native-claude-worker
+      runtime: /opt/updraft/bin/updraft-native-worker
+      network: none
+  claude-review:
+    adapter: claude
+    maxConcurrent: 1
+    command: claude
+    container:
+      image: native-claude-worker
+      runtime: /opt/updraft/bin/updraft-native-worker
+      network: none
+# Both profiles use ONE login, with a global single-job lock in the supervisor.
+# Use them in the existing implementation and reviewer pools; keep your existing actions,
+# verify commands, publication and revision policy. All clones/worktrees must be under
+# /var/lib/updraft-jobs. There is no Cloud dispatch integration in this proof.

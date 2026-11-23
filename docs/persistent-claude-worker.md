@@ -1,5 +1,9 @@
 # Persistent Claude Code worker: native subscription proof (#100)
 
+The next experiment is the [EFS-backed Lambda MicroVM worker](../deploy/aws-microvm/native-worker/README.md).
+It separates the credential-owning CLI from repository tools and verification, with Linux
+adversarial checks. Live EFS persistence and authenticated end-to-end execution remain unverified.
+
 This is the first stage of [issue #100](https://github.com/allenheltondev/software-factory-cli/issues/100). It preserves Updraft's existing issue -> agent -> verification -> PR -> review -> revision -> merge pipeline and tests direct sign-in to the **unmodified official Claude Code CLI**.
 
 ## Current status
