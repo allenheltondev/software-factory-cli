@@ -189,7 +189,9 @@ describe('renderReviews', () => {
   });
 });
 
-describe('reviewsCommand', () => {
+// Each test builds a state database and reads it back through the command: seconds on a slow
+// Windows runner, past the default 5 s (as the other command suites allow for).
+describe('reviewsCommand', { timeout: 60_000 }, () => {
   /** A context with a config, and (unless `db` is false) a real state database at `schema`. */
   function setup(o: { db?: boolean; schema?: number; reviewers?: string[] } = {}) {
     const { api } = scenario();
