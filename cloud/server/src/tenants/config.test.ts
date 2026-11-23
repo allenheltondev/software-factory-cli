@@ -37,7 +37,7 @@ describe('compileTenantConfig', () => {
       execution: { mode: 'live' },
       maxConcurrent: 1,
       github: { app: { appId: 4242, tokenFile: TOKEN_FILE, commitAsApp: true } },
-      agents: { claude: { model: 'sonnet', maxConcurrent: 1, container: { ...SANDBOX_CONTAINER, env: ['ANTHROPIC_API_KEY'] } } },
+      agents: { claude: { model: 'sonnet', maxConcurrent: 1, container: { ...SANDBOX_CONTAINER, env: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'] } } },
       repositories: { 'acme/web': { id: 99, checkoutPath: './clones/web', publish: 'draft-pr' } },
     });
     expect(config.github.app.privateKeyPath).toBeUndefined();
@@ -45,7 +45,7 @@ describe('compileTenantConfig', () => {
     expect(r.sha256).toBe(bundleHash(r.files));
   });
 
-  it('gives each agent only its own key', () => {
+  it('gives each agent only its own key (for Claude: its API key or a subscription token)', () => {
     const r = compileTenantConfig(
       submission({ agents: { claude: {}, codex: {} }, pools: { general: { agents: ['claude'] }, reviewers: { agents: ['codex'] } } }),
       PLATFORM,
@@ -54,7 +54,7 @@ describe('compileTenantConfig', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const agents = (parse(r.files['config.yaml']!) as { agents: Record<string, { container: { env: string[] } }> }).agents;
-    expect(agents.claude!.container.env).toEqual(['ANTHROPIC_API_KEY']);
+    expect(agents.claude!.container.env).toEqual(['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
     expect(agents.codex!.container.env).toEqual(['CODEX_API_KEY']);
   });
 

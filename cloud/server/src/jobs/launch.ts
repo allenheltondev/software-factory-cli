@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import type { Job, Quotas, Store } from '../store/store.js';
 import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
-import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
+import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, alternativeTo, keyOrAlternatives, keysMet, keysToHand, keysUsedFor, type CloudAgent } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
@@ -327,10 +327,26 @@ export function createLauncher(deps: LaunchDeps) {
       return refuse(`This workflow runs ${agents.join(' and ')}, which Updraft Cloud no longer runs here: choose another agent in the configuration and publish it again`, { unavailable: agents });
     }
     if (needed.length > 0) {
-      const set = new Set((await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name));
-      const missing = needed.filter((k) => !set.has(k));
+      const set = (await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name);
+      // A Claude subscription token meets the need for ANTHROPIC_API_KEY (agents.ts, keysMet).
+      const met = keysMet(set);
+      const missing = needed.filter((k) => !met.has(k));
       if (missing.length > 0) {
-        return refuse(`${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not set: add ${missing.length > 1 ? 'them' : 'it'} under Agent keys`, { missing });
+        const named = missing.map((k) => {
+          const agent = (Object.keys(SUPPORTED_AGENT_KEY_ENV) as CloudAgent[]).find((a) => SUPPORTED_AGENT_KEY_ENV[a] === k);
+          return agent ? keyOrAlternatives(agent) : k;
+        });
+        return refuse(`${named.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not set: add ${missing.length > 1 ? 'them' : 'it'} under Agent keys`, { missing });
+      }
+      // The job would use a stand-in (the token) that a version published before it existed does
+      // not pass into the sandbox: its agent would start signed out. Refused with what to do.
+      const standIns = keysUsedFor(needed, keysToHand(set)).filter((k) => alternativeTo(k) !== undefined);
+      if (standIns.length > 0 && deps.bundleKeys) {
+        const env = await deps.bundleKeys.agentEnv(req.installationId, tenant.activeConfigVersion).catch(() => null);
+        const unpassed = env ? standIns.filter((k) => !env.has(k)) : [];
+        if (unpassed.length > 0) {
+          return refuse(`Your configuration was published before ${unpassed.join(' and ')} could be used: publish it again (nothing needs to change) for jobs to use it`, { republish: unpassed });
+        }
       }
     }
 

@@ -42,6 +42,45 @@ async function setup(verdict: KeyCheck = 'valid') {
 }
 
 describe('agent keys in the console (#70)', () => {
+  const SUBSCRIPTION = 'sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789';
+
+  it('saves a Claude subscription token on its shape, and sends each Claude credential to its own field', async () => {
+    const { put, check, values } = await setup('unchecked');
+    // The other field's value: refused, with where it goes, never repeated.
+    const swapped = await put('ANTHROPIC_API_KEY', SUBSCRIPTION);
+    expect(swapped.status).toBe(400);
+    const text = await swapped.text();
+    expect(text).toMatch(/subscription token.*CLAUDE_CODE_OAUTH_TOKEN/);
+    expect(text).not.toContain(SUBSCRIPTION);
+    expect(await (await put('CLAUDE_CODE_OAUTH_TOKEN', ANTHROPIC)).text()).toMatch(/Anthropic API key: set it as ANTHROPIC_API_KEY/);
+    expect(check).not.toHaveBeenCalled();
+    expect((await put('CLAUDE_CODE_OAUTH_TOKEN', SUBSCRIPTION)).status).toBe(200);
+    expect([...values.values()]).toContain(SUBSCRIPTION);
+  });
+
+  it("does not ask for Claude's API key while a subscription token stands in for it", async () => {
+    const { app, store, put } = await setup('unchecked');
+    const v = await store.createConfigVersion(55, {
+      sha256: 'x',
+      files: ['config.yaml'],
+      publishedBy: 's',
+      publishedAt: '',
+      dispatch: { repositories: { 'acme/web': { id: 9, actors: ['pat'], triggers: [{ label: 'updraft', keys: ['ANTHROPIC_API_KEY'] }] } } },
+    });
+    await store.markConfigReady(55, v as number);
+    await store.activateConfig(55, v as number);
+    const list = async () => ((await (await app.request('/api/v1/installations/55/agent-keys')).json()) as { keys: { name: string; required: boolean; configured: boolean; alternativeTo?: string }[] }).keys;
+    expect((await list()).slice(0, 2)).toEqual([
+      { name: 'ANTHROPIC_API_KEY', configured: false, required: true },
+      { name: 'CLAUDE_CODE_OAUTH_TOKEN', configured: false, required: false, alternativeTo: 'ANTHROPIC_API_KEY' },
+    ]);
+    await put('CLAUDE_CODE_OAUTH_TOKEN', SUBSCRIPTION);
+    expect((await list()).slice(0, 2)).toMatchObject([
+      { name: 'ANTHROPIC_API_KEY', configured: false, required: false },
+      { name: 'CLAUDE_CODE_OAUTH_TOKEN', configured: true, required: false, alternativeTo: 'ANTHROPIC_API_KEY' },
+    ]);
+  });
+
   it('saves a Kiro key on its shape alone, since Kiro offers no call to check one, and refuses another provider\'s key there', async () => {
     const { put, check, values } = await setup('unchecked');
     const KIRO = 'ksk_abcdefghijklmnopqrstuvwxyz0123456789';
@@ -64,6 +103,7 @@ describe('agent keys in the console (#70)', () => {
     const text = await list.text();
     expect(JSON.parse(text).keys).toEqual([
       { name: 'ANTHROPIC_API_KEY', configured: true, required: false, lastRotatedAt: '2026-11-21T00:00:00.000Z', lastRotatedBy: 'pat', lastUsed: { at: '2026-11-21T01:00:00.000Z', ok: true } },
+      { name: 'CLAUDE_CODE_OAUTH_TOKEN', configured: false, required: false, alternativeTo: 'ANTHROPIC_API_KEY' },
       { name: 'CODEX_API_KEY', configured: false, required: false },
       { name: 'KIRO_API_KEY', configured: false, required: false },
     ]);
@@ -85,6 +125,7 @@ describe('agent keys in the console (#70)', () => {
     const keys = ((await (await app.request('/api/v1/installations/55/agent-keys')).json()) as { keys: { name: string; required: boolean }[] }).keys;
     expect(keys.map((k) => [k.name, k.required])).toEqual([
       ['ANTHROPIC_API_KEY', true],
+      ['CLAUDE_CODE_OAUTH_TOKEN', false],
       ['CODEX_API_KEY', false],
       ['KIRO_API_KEY', false],
     ]);
@@ -92,8 +133,8 @@ describe('agent keys in the console (#70)', () => {
 
   it('reads what a version from before key needs were recorded requires from its bundle, and shows every key required when it cannot tell', async () => {
     for (const [bundle, expected] of [
-      ['dispatch: { allowedActors: [pat] }\nagents:\n  codex: { adapter: codex }\npools:\n  p: { agents: [codex] }\nrepositories:\n  acme/web:\n    id: 9\n    workflows:\n      - { trigger: { label: updraft }, pool: p }\n', [false, true, false]],
-      [null, [true, true, true]],
+      ['dispatch: { allowedActors: [pat] }\nagents:\n  codex: { adapter: codex }\npools:\n  p: { agents: [codex] }\nrepositories:\n  acme/web:\n    id: 9\n    workflows:\n      - { trigger: { label: updraft }, pool: p }\n', [false, false, true, false]],
+      [null, [true, false, true, true]],
     ] as const) {
       const { store, service } = await setup();
       const v = await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: { repositories: { 'acme/web': { id: 9, actors: ['pat'], triggers: [{ label: 'updraft' }] } } } });
@@ -108,7 +149,7 @@ describe('agent keys in the console (#70)', () => {
       });
       expect((await withBundle.list(caller, 55)).keys.map((k) => k.required)).toEqual(expected);
       // Without a bundle reader: unknown, so every key.
-      expect((await service.list(caller, 55)).keys.map((k) => k.required)).toEqual([true, true, true]);
+      expect((await service.list(caller, 55)).keys.map((k) => k.required)).toEqual([true, false, true, true]);
     }
   });
 

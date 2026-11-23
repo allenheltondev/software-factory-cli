@@ -26,6 +26,54 @@ const show = (api: ReturnType<typeof fakeApi>) =>
   );
 
 describe('AgentKeysPage', () => {
+  const TOKEN = 'sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789';
+
+  it('offers a Claude subscription token next to the API key Claude needs, with how to get one', async () => {
+    show(
+      fakeApi({
+        agentKeys: async () =>
+          view({
+            keys: [
+              { name: 'ANTHROPIC_API_KEY', configured: false, required: true },
+              { name: 'CLAUDE_CODE_OAUTH_TOKEN', configured: false, required: false, alternativeTo: 'ANTHROPIC_API_KEY' },
+              { name: 'CODEX_API_KEY', configured: false, required: false },
+            ],
+          }),
+      }),
+    );
+    const token = await screen.findByTestId('key-CLAUDE_CODE_OAUTH_TOKEN');
+    // Shown with the API key it stands in for, not under "Other agents".
+    expect(within(screen.getByTestId('other-agents')).queryByTestId('key-CLAUDE_CODE_OAUTH_TOKEN')).toBeNull();
+    expect(token).toHaveTextContent('Claude: subscription');
+    expect(screen.getByTestId('key-ANTHROPIC_API_KEY')).toHaveTextContent('Claude: API key');
+    expect(screen.getByTestId('key-note-CLAUDE_CODE_OAUTH_TOKEN')).toHaveTextContent('instead of API credits');
+    expect(within(token).getByTestId('key-steps-CLAUDE_CODE_OAUTH_TOKEN')).toHaveTextContent('claude setup-token');
+    // Each Claude credential is sent to its own field before anything is saved.
+    await userEvent.type(within(token).getByLabelText('Claude subscription token'), KEY);
+    expect(within(token).getByText(/That is an Anthropic API key/)).toBeInTheDocument();
+    const apiKey = screen.getByTestId('key-ANTHROPIC_API_KEY');
+    await userEvent.type(within(apiKey).getByLabelText('Anthropic API key'), TOKEN);
+    expect(within(apiKey).getByText(/That is a Claude subscription token/)).toBeInTheDocument();
+  });
+
+  it('says which of the two Claude credentials jobs use once the token is set', async () => {
+    show(
+      fakeApi({
+        agentKeys: async () =>
+          view({
+            keys: [
+              { name: 'ANTHROPIC_API_KEY', configured: true, required: false, lastRotatedAt: '2026-11-20T10:00:00.000Z' },
+              { name: 'CLAUDE_CODE_OAUTH_TOKEN', configured: true, required: false, alternativeTo: 'ANTHROPIC_API_KEY', lastRotatedAt: '2026-11-21T10:00:00.000Z' },
+            ],
+          }),
+      }),
+    );
+    expect(await screen.findByTestId('key-note-CLAUDE_CODE_OAUTH_TOKEN')).toHaveTextContent('Jobs run on your subscription, not API credits');
+    expect(screen.getByTestId('key-note-ANTHROPIC_API_KEY')).toHaveTextContent('Not used while your Claude subscription token is set');
+    // No provider call checks a subscription token: its first job does, and the card says so.
+    expect(screen.getByTestId('key-CLAUDE_CODE_OAUTH_TOKEN')).toHaveTextContent('the first job is the check');
+  });
+
   it('shows what a key is for, whether it works, and where the value is never shown', async () => {
     show(fakeApi({ agentKeys: async () => view({ refusals: [{ at: '2026-11-21T09:00:00.000Z', deliveryId: 'd', repository: 'acme/web', issue: 3, reason: 'CODEX_API_KEY is not set' }] }) }));
     const claude = await screen.findByTestId('key-ANTHROPIC_API_KEY');

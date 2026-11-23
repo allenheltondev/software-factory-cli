@@ -188,7 +188,7 @@ describe('the launcher', () => {
       { keysFor: () => keys },
     ));
     const setKey = (name: string) => store.putAgentKeyMeta(55, { name, updatedAt: '2000-01-01T00:00:00.000Z', updatedBy: 'pat' });
-    const finishWith = async (jobId: string, token: string, outcome: string) => {
+    const finishWith = async (jobId: string, token: string, outcome: string, detail?: Record<string, unknown>) => {
       const broker = createBroker({
         store,
         loadSettings: async () => null,
@@ -200,7 +200,7 @@ describe('the launcher', () => {
         now: () => NOW,
       });
       await broker({ action: 'start', jobId, token });
-      await broker({ action: 'finish', jobId, token, outcome });
+      await broker({ action: 'finish', jobId, token, outcome, ...(detail ? { detail } : {}) });
     };
 
     it('refuses to dispatch when the workflow\'s agent has no key, and records why', async () => {
@@ -210,7 +210,7 @@ describe('the launcher', () => {
       expect(runs).toEqual([]);
       expect(events).toEqual({});
       const [refusal] = await store.listRefusals(55, 5);
-      expect(refusal).toMatchObject({ repository: 'acme/web', issue: 12, deliveryId: 'delivery-1', reason: 'ANTHROPIC_API_KEY is not set: add it under Agent keys' });
+      expect(refusal).toMatchObject({ repository: 'acme/web', issue: 12, deliveryId: 'delivery-1', reason: 'ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is not set: add it under Agent keys' });
       // Nothing was claimed, so setting the key and redelivering starts the job.
       await store.putAgentKeyMeta(55, { name: 'ANTHROPIC_API_KEY', updatedAt: 't', updatedBy: 'pat' });
       expect(await createLauncher(deps)(request())).toMatchObject({ status: 202, disposition: 'launched' });
@@ -253,7 +253,7 @@ describe('the launcher', () => {
         const { reads, bundleKeys } = reader(bundle(v));
         const launch = createLauncher({ ...deps, bundleKeys });
         expect(await launch(request())).toMatchObject({ status: 200, disposition: 'missing_key' });
-        expect((await store.listRefusals(55, 1))[0]?.reason).toBe('ANTHROPIC_API_KEY is not set: add it under Agent keys');
+        expect((await store.listRefusals(55, 1))[0]?.reason).toBe('ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is not set: add it under Agent keys');
         await setKey('ANTHROPIC_API_KEY');
         const result = await launch(request({}, 'delivery-2'));
         expect(result).toMatchObject({ status: 202, disposition: 'launched' });
@@ -279,6 +279,45 @@ describe('the launcher', () => {
       const { jobToken } = (JSON.parse(runs[0]!.runHookPayload) as { broker: { jobToken: string } }).broker;
       await finishWith(result.jobId!, jobToken, 'failed');
       expect(await store.listAgentKeyMeta(55)).toEqual([{ name: 'ANTHROPIC_API_KEY', updatedAt: '2000-01-01T00:00:00.000Z', updatedBy: 'pat', lastUsedAt: new Date(NOW).toISOString(), lastUsedOk: false }]);
+    });
+
+    describe('a Claude subscription token (CLAUDE_CODE_OAUTH_TOKEN)', () => {
+      // A version's config.yaml as compileTenantConfig writes it: what its agents pass into the sandbox.
+      const bundleWith = (version: number, env: string[]) => ({ [`tenants/55/config/${version}/config.yaml`]: `agents:
+  claude:
+    adapter: claude
+    container: { env: [${env.join(', ')}] }
+` });
+      const readerOf = (objects: Record<string, string>) => createBundleKeys(async (key) => objects[key] ?? null, configPrefix);
+
+      it("meets the need for Claude's API key: the job starts, its needs still name ANTHROPIC_API_KEY, and the token is handed and marked used", async () => {
+        const v = await withKeys(['ANTHROPIC_API_KEY']);
+        await setKey('CLAUDE_CODE_OAUTH_TOKEN');
+        await setKey('ANTHROPIC_API_KEY');
+        const result = await createLauncher({ ...deps, bundleKeys: readerOf(bundleWith(v, ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'])) })(request());
+        expect(result).toMatchObject({ status: 202, disposition: 'launched' });
+        expect((await store.getJob(result.jobId!))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
+        const { jobToken } = (JSON.parse(runs[0]!.runHookPayload) as { broker: { jobToken: string } }).broker;
+        // The runner says which agents ran: a token no provider call checked is marked only then.
+        await finishWith(result.jobId!, jobToken, 'succeeded', { adapters: ['claude'] });
+        // The subscription was used, not the API key: only the token's "last used" moved.
+        const metas = Object.fromEntries((await store.listAgentKeyMeta(55)).map((m) => [m.name, m]));
+        expect(metas.CLAUDE_CODE_OAUTH_TOKEN).toMatchObject({ lastUsedAt: new Date(NOW).toISOString(), lastUsedOk: true });
+        expect(metas.ANTHROPIC_API_KEY?.lastUsedAt).toBeUndefined();
+      });
+
+      it('is refused, with what to do, under a version published before its agents could pass it into the sandbox', async () => {
+        const v = await withKeys(['ANTHROPIC_API_KEY']);
+        await setKey('CLAUDE_CODE_OAUTH_TOKEN');
+        expect(await createLauncher({ ...deps, bundleKeys: readerOf(bundleWith(v, ['ANTHROPIC_API_KEY'])) })(request())).toMatchObject({ status: 200, disposition: 'missing_key' });
+        expect((await store.listRefusals(55, 1))[0]?.reason).toBe('Your configuration was published before CLAUDE_CODE_OAUTH_TOKEN could be used: publish it again (nothing needs to change) for jobs to use it');
+        expect(runs).toEqual([]);
+        // With the API key set too it is still the token that would be handed, so still refused.
+        await setKey('ANTHROPIC_API_KEY');
+        expect(await createLauncher({ ...deps, bundleKeys: readerOf(bundleWith(v, ['ANTHROPIC_API_KEY'])) })(request({}, 'delivery-2'))).toMatchObject({ disposition: 'missing_key' });
+        // A bundle that cannot be read is not a reason to refuse: the need is met.
+        expect(await createLauncher({ ...deps, bundleKeys: readerOf({}) })(request({}, 'delivery-3'))).toMatchObject({ status: 202, disposition: 'launched' });
+      });
     });
   });
 

@@ -268,7 +268,7 @@ describe('preview', () => {
     await store.putAgentKeyMeta(77, { name: 'CODEX_API_KEY', updatedAt: t.createdAt, updatedBy: 'ivy' });
     const { body } = await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/preview', { config: settings({ 'globex/app': repo() }) });
     // Claude is in both pools; Codex's key is set. Turning Claude off is the other way out.
-    expect(body.errors).toEqual([expect.objectContaining({ path: 'agents.claude', message: expect.stringMatching(/ANTHROPIC_API_KEY, or turn this agent off/) })]);
+    expect(body.errors).toEqual([expect.objectContaining({ path: 'agents.claude', message: expect.stringMatching(/ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, or turn this agent off/) })]);
     const off = settings({ 'globex/app': repo() }, { review: { ...settings().workflows.implement.review, allowSameAgent: true } });
     const claudeOff = { ...off, allowedActors: ['ivy'], agents: { ...off.agents, claude: { adapter: 'claude', enabled: false } } };
     expect((await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/preview', { config: claudeOff })).body).toMatchObject({ ok: true });

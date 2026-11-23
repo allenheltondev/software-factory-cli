@@ -7,7 +7,7 @@ import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/qu
 import { loopOf, stepsOf, telemetryOf, type JobTelemetryDescriptor, type JobTelemetrySnapshot } from '../jobs/lifecycle.js';
 import { isFailure, type Job, type JobFinishDetail, type Store, type TelemetrySettings } from '../store/store.js';
 import { AGENT_KEY_NAMES, UNCHECKED_AGENT_KEYS, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
-import { SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
+import { SUPPORTED_AGENT_KEY_ENV, alternativeTo, keysUsedFor } from '../tenants/agents.js';
 // Not from publish.ts, which pulls in the CLI's validator.
 import { configPrefix } from '../tenants/paths.js';
 // Not the whole telemetry service: only the secret's name.
@@ -167,6 +167,17 @@ export function createBroker(deps: BrokerDeps) {
   const log = deps.log ?? ((entry) => console.log(JSON.stringify(entry)));
   const bots = new Map<string, { id: number; login: string }>();
 
+  /**
+   * The agent key names a job of this tenant is handed (the runner skips one that is not set):
+   * every one this deployment offers, but an API key whose stand-in is set (a Claude subscription
+   * token, which Claude Code then uses instead of API credits).
+   */
+  async function handedKeys(installationId: number): Promise<string[]> {
+    const set = (await deps.store.listAgentKeyMeta(installationId)).map((k) => k.name);
+    const replaced = new Set(set.map(alternativeTo).filter((k): k is string => k !== undefined));
+    return AGENT_KEY_NAMES.filter((name) => !replaced.has(name));
+  }
+
   /** The job, if the token is its token; else null. */
   async function verify(jobId: unknown, token: unknown): Promise<Job | null> {
     if (typeof jobId !== 'string' || !JOB_ID.test(jobId) || typeof token !== 'string' || token.length < 32 || token.length > 256) return null;
@@ -296,7 +307,11 @@ export function createBroker(deps: BrokerDeps) {
       // was handed but an unchecked one (Kiro's), which is never shown working on a guess.
       // Best effort: a failure here must not fail the job's finish.
       const ran = finished?.adapters ? new Set<string>(finished.adapters.map((a) => SUPPORTED_AGENT_KEY_ENV[a as keyof typeof SUPPORTED_AGENT_KEY_ENV])) : null;
-      const used = (job.agentKeys ?? []).filter((name) => (ran ? ran.has(name) : !UNCHECKED_AGENT_KEYS.has(name)));
+      // The job's needs name an agent's API key; the key it was handed for one may be a stand-in
+      // (a Claude subscription token: handedKeys), and that is the one whose use is recorded.
+      const handed = await handedKeys(job.installationId).catch(() => null);
+      const needs = (job.agentKeys ?? []).filter((name) => (ran ? ran.has(name) : true));
+      const used = (handed ? keysUsedFor(needs, handed) : needs).filter((name) => ran || !UNCHECKED_AGENT_KEYS.has(name));
       if (used.length && job.startedAt !== undefined && (recorded === 'succeeded' || (isFailure(recorded) && recorded !== 'terminated'))) {
         const use = { at: new Date(now()).toISOString(), ok: recorded === 'succeeded', jobStartedAt: new Date(job.startedAt).toISOString() };
         await Promise.all(used.map((name) => deps.store.recordAgentKeyUse(job.installationId, name, use))).catch((err: unknown) =>
@@ -347,7 +362,11 @@ export function createBroker(deps: BrokerDeps) {
       // The tenant's key secrets by variable name; the runner reads them with the credentials (a
       // missing one is a key the tenant has not set).
       // Only the agents this deployment runs (CloudAgents): one taken out of service gets no key.
-      const agentKeySecrets = Object.fromEntries(AGENT_KEY_NAMES.map((name) => [name, agentKeySecretName(job.installationId, name)]));
+      // A Claude subscription token, when set, is handed instead of ANTHROPIC_API_KEY, so Claude
+      // Code bills the subscription. If the tenant's keys cannot be listed, every name is handed:
+      // the runner skips the ones not set.
+      const handed = (await handedKeys(job.installationId).catch(() => null)) ?? AGENT_KEY_NAMES;
+      const agentKeySecrets = Object.fromEntries(handed.map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
       // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
       // and keeps it with the job with that destination's link settings: every later `start` (a

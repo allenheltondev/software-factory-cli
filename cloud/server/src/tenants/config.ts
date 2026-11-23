@@ -29,7 +29,7 @@ import { dispatchRules } from './dispatch.js';
  * here is one the job accepts.
  */
 
-import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV, type CloudAgent } from './agents.js';
+import { AGENT_KEY_ENV, agentKeyVariables, type CloudAgent } from './agents.js';
 
 export { AGENT_KEY_ENV, type CloudAgent };
 
@@ -144,7 +144,9 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
         agents[name] = {
           ...value,
           maxConcurrent: 1,
-          container: { ...SANDBOX_CONTAINER, env: [SUPPORTED_AGENT_KEY_ENV[adapter as CloudAgent]] },
+          // Every variable the agent's key may come in (a Claude subscription token too): Updraft
+          // passes into the sandbox only the ones the job was handed.
+          container: { ...SANDBOX_CONTAINER, env: agentKeyVariables(adapter as CloudAgent) },
         };
       }
     }

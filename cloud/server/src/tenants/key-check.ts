@@ -10,8 +10,9 @@ export type KeyChecker = (name: string, value: string) => Promise<KeyCheck>;
 
 export const checkAgentKeyWithProvider = (fetchFn: typeof fetch = fetch, timeoutMs = 8000): KeyChecker =>
   async (name, value) => {
-    // Kiro documents no API to check a key against; its first job does.
-    if (name === 'KIRO_API_KEY') return 'unchecked';
+    // Kiro documents no API to check a key against; its first job does. A Claude subscription
+    // token is taken by Anthropic's API only as Claude Code sends it: its first job tells too.
+    if (name === 'KIRO_API_KEY' || name === 'CLAUDE_CODE_OAUTH_TOKEN') return 'unchecked';
     const request: { url: string; headers: Record<string, string> } | null =
       name === 'ANTHROPIC_API_KEY'
         ? { url: 'https://api.anthropic.com/v1/models?limit=1', headers: { 'x-api-key': value, 'anthropic-version': '2023-06-01' } }

@@ -157,8 +157,10 @@ export interface AdminOverview {
 export interface AgentKeyView {
   name: string;
   configured: boolean;
-  /** The active config runs an agent that needs it. */
+  /** The active config runs an agent that needs it, and nothing set stands in for it. */
   required: boolean;
+  /** A key that can be used instead of this other one (CLAUDE_CODE_OAUTH_TOKEN for ANTHROPIC_API_KEY); once set, jobs use it. */
+  alternativeTo?: string;
   lastRotatedAt?: string;
   lastRotatedBy?: string;
   lastUsed?: { at: string; ok: boolean };
