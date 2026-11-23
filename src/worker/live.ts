@@ -30,7 +30,7 @@ import {
   type AgentInvocation,
 } from '../agents/adapters/registry.js';
 import { agentProfile, describeProfile, effectiveArgs } from '../agents/profile.js';
-import { checkNativeClaudeAuth, type NativeAuthRunner } from '../agents/native-claude-auth.js';
+import { checkNativeClaudeAuth, nativeClaudeAuthHint, type NativeAuthRunner } from '../agents/native-claude-auth.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { renderPrompt, renderRevisionPrompt, type IssueContext } from '../agents/prompt.js';
 import { dependencyMergedSection, dependencyProtocolSection, MAX_DEPENDENCY_WAITS, readDependency } from '../agents/dependency.js';
@@ -717,7 +717,7 @@ export class LiveExecutor implements Executor {
       throw new StartFailedError(why);
     }
 
-    // Subscription workers check native auth before each implementation, review or revision.
+    // Subscription workers check native auth at the start of each implementation, review or revision.
     // This guards against API-key fallback, but does not isolate tool subprocess credentials.
     if (agentCfg.authentication === 'native-claude') {
       if (adapterName !== 'claude' || agentCfg.container) {
@@ -726,7 +726,7 @@ export class LiveExecutor implements Executor {
       const auth = await checkNativeClaudeAuth(located.launch, lookup.env, this.opts.nativeClaudeAuth, ctx.now());
       if (auth.state !== 'connected') {
         await log([`native subscription preflight: ${auth.state} (${auth.reason})`, 'outcome: start_failed']);
-        throw new StartFailedError(`native Claude subscription not ready: ${auth.reason}; sign in directly on this worker with "claude auth login"`);
+        throw new StartFailedError(`native Claude subscription not ready: ${auth.reason}. ${nativeClaudeAuthHint(auth.reason)}`);
       }
     }
 
@@ -816,6 +816,16 @@ export class LiveExecutor implements Executor {
       throw new StartFailedError(`adapter ${adapterName} could not build the agent command: ${message(err)}`, { cause: err });
     }
     const agentEnv = mergeEnv(baseEnv, invocation.env, commitEnv, agentCfg.env);
+    // Check the exact environment that the CLI will receive. The early check prevents
+    // unnecessary worktrees on bad sign-in; this final one catches values introduced by
+    // adapter invocation, commit identity, or a login changing during checkout.
+    if (agentCfg.authentication === 'native-claude') {
+      const finalAuth = await checkNativeClaudeAuth(located.launch, agentEnv, this.opts.nativeClaudeAuth, ctx.now());
+      if (finalAuth.state !== 'connected') {
+        await log([`native subscription launch check: ${finalAuth.state} (${finalAuth.reason})`, 'outcome: start_failed']);
+        throw new StartFailedError(`native Claude subscription not ready at launch: ${finalAuth.reason}. ${nativeClaudeAuthHint(finalAuth.reason)}`);
+      }
+    }
     const timeoutMs = Math.round(timeoutMinutes * 60_000);
     // Containerized: the same command, started by the runtime client inside a container that
     // sees only the worktree and what git needs. agentEnv stays the client's environment; the

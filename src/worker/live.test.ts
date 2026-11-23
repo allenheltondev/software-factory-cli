@@ -487,9 +487,11 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
   }
 
   it('refuses native subscription jobs before checkout on API auth or signed-out status', async () => {
-    for (const [status, expected] of [
-      [{ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'api_key' }) }, 'not_subscription'],
-      [{ code: 1, stdout: JSON.stringify({ loggedIn: false, authMethod: 'none' }) }, 'sign_in_required'],
+    for (const [status, expected, hint] of [
+      [{ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'api_key' }) }, 'not_subscription', 'different authentication method'],
+      [{ code: 1, stdout: JSON.stringify({ loggedIn: false, authMethod: 'none' }) }, 'sign_in_required', 'Sign in directly'],
+      [{ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', loginExpiresAt: '2020-01-01T00:00:00Z' }) }, 'login_expired', 'login expired'],
+      [{ code: null, stdout: 'sensitive error output' }, 'status_unavailable', 'Cannot verify'],
     ] as const) {
       const { paths, config, db } = claudeSetup([init(), success('ok')], {});
       config.agents.claude!.authentication = 'native-claude';
@@ -503,6 +505,8 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
       const err = await guarded.execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(StartFailedError);
       expect((err as Error).message).toContain(expected);
+      expect((err as Error).message).toMatch(new RegExp(hint, 'i'));
+      expect((err as Error).message).not.toContain('sensitive error output');
       expect(run).toHaveBeenCalledOnce();
       expect(existsSync(join(worktreesRoot(paths), '42', c.job.id))).toBe(false);
       expect(readFileSync(c.run.logPath!, 'utf8')).toContain('outcome: start_failed');
@@ -521,9 +525,58 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
     });
     markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
     const result = await guarded.execute(c, context(db, config, paths, c.run.id));
-    expect(run).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledTimes(2);
+    // Both preflight and launch probe use the same launch; the second sees the final
+    // environment passed to Claude, including the adapter's worktree/run settings.
+    expect(run.mock.calls[1]![1]).toMatchObject({ FAKE_CLAUDE_COMMIT: '1' });
     expect(result.outcome).toBe('succeeded');
     expect(result.summary?.commitCount).toBe(1);
+  });
+
+  it('stops an agent when its login disappears between checkout and the final launch', async () => {
+    const { paths, config, db, record } = claudeSetup([init(), success('ok')], {});
+    config.agents.claude!.authentication = 'native-claude';
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    const check = vi.fn()
+      .mockResolvedValueOnce({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) })
+      .mockResolvedValueOnce({ code: 1, stdout: JSON.stringify({ loggedIn: false, authMethod: 'none' }) });
+    const guarded = new LiveExecutor({
+      locate: () => ({ path: FAKE_CLAUDE, launch: { file: process.execPath, args: [FAKE_CLAUDE] } }),
+      nativeClaudeAuth: check,
+    });
+    const err = await guarded.execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StartFailedError);
+    expect((err as Error).message).toContain('not ready at launch: sign_in_required');
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(existsSync(join(worktreesRoot(paths), '42', c.job.id))).toBe(true);
+    expect(existsSync(record)).toBe(false);
+    expect(getRun(db, c.run.id)?.pid).toBeNull();
+  });
+
+  it('rejects auth overrides introduced by the adapter only after its invocation is built', async () => {
+    const { paths, config, db, record } = claudeSetup([init(), success('ok')], {});
+    config.agents.claude!.authentication = 'native-claude';
+    restores.push(registerAdapter({
+      ...claudeAdapter,
+      buildInvocation: (req) => {
+        const invocation = claudeAdapter.buildInvocation(req);
+        return { ...invocation, env: { ...invocation.env, ANTHROPIC_API_KEY: 'SECRET_FROM_ADAPTER' } };
+      },
+    }));
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+    const c = claim(db, config, paths);
+    const check = vi.fn(async () => ({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) }));
+    const guarded = new LiveExecutor({
+      locate: () => ({ path: FAKE_CLAUDE, launch: { file: process.execPath, args: [FAKE_CLAUDE] } }),
+      nativeClaudeAuth: check,
+    });
+    const err = await guarded.execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StartFailedError);
+    expect((err as Error).message).toContain('auth_override_present');
+    expect(check).toHaveBeenCalledOnce(); // final check rejects before starting status CLI
+    expect(existsSync(record)).toBe(false);
+    expect(readFileSync(c.run.logPath!, 'utf8')).not.toContain('SECRET_FROM_ADAPTER');
   });
 
   it('rejects subscription token injection without reading the CLI status', async () => {
@@ -1189,6 +1242,35 @@ describe('LiveExecutor: a revision job', { timeout: 120_000 }, () => {
     expect(log).toContain('pull request: #100 https://github.com/octo/widgets/pull/100');
     expect(log).toContain(`base: ${PR_BRANCH} at ${head} (the head of pull request #100; only a fast-forward from this commit is pushed)`);
     expect(log).toContain("issue body: withheld from the agent (issue #7's body was edited by mallory)");
+  });
+
+  it('checks native Claude auth for revision runs before creating a revision worktree', async () => {
+    const { f, paths, config, db } = setup();
+    writeFileSync(join(paths.configDir, 'prompts', 'revise.md'), 'Address review. Commit your work.\\n');
+    config.actions['implement-issue']!.revisePrompt = './prompts/revise.md';
+    config.agents.claude!.authentication = 'native-claude';
+    revisionJob(db, f);
+    const c = claim(db, config, paths);
+    const check = vi.fn(async () => ({ code: 0, stdout: 'unparseable cli status' }));
+    const err = await new LiveExecutor({ nativeClaudeAuth: check }).execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StartFailedError);
+    expect((err as Error).message).toContain('status_unavailable');
+    expect(check).toHaveBeenCalledOnce();
+    expect(existsSync(join(worktreesRoot(paths), '42', c.job.id))).toBe(false);
+  });
+
+  it('runs a native-authenticated revision through the same existing pipeline', async () => {
+    const { f, paths, config, db } = setup();
+    writeFileSync(join(paths.configDir, 'prompts', 'revise.md'), 'Address review. Commit your work.\\n');
+    config.actions['implement-issue']!.revisePrompt = './prompts/revise.md';
+    config.agents.claude!.authentication = 'native-claude';
+    revisionJob(db, f);
+    const c = claim(db, config, paths);
+    const check = vi.fn(async () => ({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) }));
+    const result = await new LiveExecutor({ nativeClaudeAuth: check }).execute(c, context(db, config, paths, c.run.id));
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(result.outcome).toBe('succeeded');
+    expect(result.summary?.commitCount).toBe(1);
   });
 
   it('fails, without touching the clone, when the action has no revisePrompt', async () => {

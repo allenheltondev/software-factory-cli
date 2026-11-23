@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hasClaudeAuthOverride, nativeClaudeAuthFromStatus } from './native-claude-auth.js';
+import { defaultNativeAuthRunner, hasClaudeAuthOverride, nativeClaudeAuthFromStatus, nativeClaudeAuthHint } from './native-claude-auth.js';
 
 const now = Date.parse('2026-11-23T12:00:00Z');
 const response = (status: Record<string, unknown>, code = 0) => ({ code, stdout: JSON.stringify(status) });
@@ -33,6 +33,26 @@ describe('native Claude subscription status, without inspecting credentials', ()
         .toEqual({ state: 'wrong_method', reason: 'auth_override_present' });
     },
   );
+
+  it('rejects conflicting API-key source even when CLI claims a native session', () => {
+    expect(nativeClaudeAuthFromStatus(response({ ...signedIn, apiKeySource: 'apiKeyHelper' }), {}, now))
+      .toEqual({ state: 'wrong_method', reason: 'not_subscription' });
+  });
+
+  it('has specific hints for auth, expiry and unavailable probes', () => {
+    expect(nativeClaudeAuthHint('sign_in_required')).toContain('claude auth login');
+    expect(nativeClaudeAuthHint('auth_override_present')).toContain('Remove it');
+    expect(nativeClaudeAuthHint('status_unavailable')).toContain('claude auth status');
+    expect(nativeClaudeAuthHint('status_unavailable')).not.toContain('Sign in directly');
+  });
+
+  it('uses a resolved executable and launch prefix without a shell, including Windows-compatible Node shims', async () => {
+    const run = await defaultNativeAuthRunner(
+      { file: process.execPath, args: ['-e', 'process.stdout.write(process.argv.slice(1).join(","))'] },
+      { PATH: process.env.PATH },
+    );
+    expect(run).toEqual({ code: 0, stdout: 'auth,status' });
+  });
 
   it('fails closed on unavailable, inconsistent or malformed status', () => {
     for (const sample of [

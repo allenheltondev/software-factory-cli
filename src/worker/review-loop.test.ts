@@ -8,6 +8,7 @@ import { hostname } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeAdapter } from '../../test/fake-adapter.js';
+import type { NativeAuthRunner } from '../agents/native-claude-auth.js';
 import { FakeLoopGitHub } from '../../test/fake-loop-github.js';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
@@ -106,7 +107,7 @@ function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[] }
 
 const remoteHead = (f: GitFixture, branch: string) => f.git(f.root, 'ls-remote', f.remoteDir, `refs/heads/${branch}`).split(/\s+/)[0] ?? '';
 
-function start(s: ReturnType<typeof setup>) {
+function start(s: ReturnType<typeof setup>, executorOptions: { nativeClaudeAuth?: NativeAuthRunner } = {}) {
   const { db, config, paths, gh } = s;
   const api = gh.api;
   const controller = new AbortController();
@@ -126,7 +127,7 @@ function start(s: ReturnType<typeof setup>) {
     paths,
     log: silentLogger,
     signal: controller.signal,
-    executor: createExecutor(config),
+    executor: createExecutor(config, executorOptions),
     poll: () => pollOnce({ db, api, config, log: silentLogger }),
     checkDispatchable: (job) => checkJobDispatchable({ api, config }, job),
     publisher: createReviewLoopPublisher(deps, createRevisionPublisher(deps, createPublisher(deps))),
@@ -144,6 +145,28 @@ function start(s: ReturnType<typeof setup>) {
 const jobsOf = (db: Db): Job[] => (db.prepare('SELECT id FROM jobs ORDER BY created_at, rowid').all() as { id: string }[]).map((r) => getJob(db, r.id)!);
 
 describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
+  it('checks native subscription auth before starting a review job', async () => {
+    const s = setup({ repo: { autoMerge: undefined } });
+    // A reviewer profile can use any supported adapter. Route it through the same
+    // Claude native subscription guard without changing the GitHub review workflow.
+    s.config.agents.codex!.adapter = 'claude';
+    s.config.agents.codex!.authentication = 'native-claude';
+    const check = vi.fn(async () => ({ code: 1, stdout: JSON.stringify({ loggedIn: false, authMethod: 'none' }) }));
+    const worker = start(s, { nativeClaudeAuth: check });
+    try {
+      await vi.waitFor(() => {
+        const review = jobsOf(s.db).find((j) => j.envelope.type === 'pull_request.review');
+        expect(review?.status).toBe('failed');
+      }, { timeout: 150_000, interval: 100 });
+    } finally {
+      await worker.stop();
+    }
+    const review = jobsOf(s.db).find((j) => j.envelope.type === 'pull_request.review')!;
+    expect(check).toHaveBeenCalled();
+    expect(review.statusReason).toContain('sign_in_required');
+    expect(s.gh.merges).toEqual([]);
+  });
+
   it('publishes, reviews, revises, reviews again, marks the PR ready and merges exactly the reviewed commit', async () => {
     const s = setup();
     const { f, paths, db, gh, jobId, prBranch } = s;

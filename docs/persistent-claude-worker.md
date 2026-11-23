@@ -4,7 +4,7 @@ This is the first stage of [issue #100](https://github.com/allenheltondev/softwa
 
 ## Current status
 
-- **Implemented in this stage:** read-only, sanitized subscription status via `updraft native-auth --claude [--json]` and opt-in `agents.<name>.authentication: native-claude` to check direct subscription sign-in before **every** Claude run (including implementation, review and revision). It runs the installed `claude auth status` under the worker's normal environment. Only `connected`, `login_required`, `expired`, `wrong_method`, or `unknown` and a fixed reason leave the process. The command never reads, copies or forwards credential files, auth codes or stdout.
+- **Implemented in this stage:** read-only, sanitized subscription status via `updraft native-auth --claude [--json]` and opt-in `agents.<name>.authentication: native-claude` to check direct subscription sign-in at the start of **every** Claude run (including implementation, review and revision). It runs the installed `claude auth status` under the worker's normal environment. Only `connected`, `login_required`, `expired`, `wrong_method`, or `unknown` and a fixed reason leave the process. The command never reads, copies or forwards credential files, auth codes or stdout.
 - **Already available:** `updraft start` and `updraft run-event` can use the official Claude Code adapter and retain implementation, review, revision and merge.
 - **Not implemented yet:** a managed persistent worker lifecycle, tenant-scoped registration and heartbeat, GitHub webhook dispatch to these workers, terminal onboarding in the Updraft console, and proof that agent tool subprocesses cannot read Claude's native credentials. **Do not enable this as a production, multi-tenant hosted subscription feature yet.**
 - **Not a Routines integration:** the work must continue through Updraft's own orchestration.
@@ -39,7 +39,7 @@ Use a **dedicated machine or VM per subscribing end user**, not a shared shell o
        authentication: native-claude
    ```
 
-   This opts every run by that agent (including review and revision) into the fail-closed subscription check. It does **not** make the worker safe for untrusted repositories. The config validator currently rejects this option for containerized agents because native credential isolation remains unresolved.
+   This opts every run by that agent (including review and revision) into fail-closed subscription checks before checkout and again immediately before launching the CLI with its final environment. It does **not** make the worker safe for untrusted repositories. The config validator currently rejects this option for containerized agents because native credential isolation remains unresolved.
 5. With your existing Updraft config and GitHub credentials on that same machine, `updraft start` can process labeled issues and its configured review loop, or `updraft run-event --event-file ...` can run a single webhook event. **Do this only with trusted code during the prototype.** These commands do not establish safe tool isolation.
 
    For persistent operation on Linux, Updraft already ships a [systemd user launcher](background-operation.md#linux-systemd---user). **The systemd service must have the same `CLAUDE_CONFIG_DIR` as the terminal where you signed in**. For example, add this path (not a token) to the launcher's private `~/.updraft/worker.env`:
@@ -56,7 +56,15 @@ Use a **dedicated machine or VM per subscribing end user**, not a shared shell o
    Configure the launcher before the restart and use the same non-root account and PATH as the login. Do not put the native Claude auth directory under Updraft's shared-state folder. The systemd `EnvironmentFile` points to a directory only; it must not contain a Claude subscription token.
 6. To revoke sign-in, use `claude auth logout` directly on the worker. Remove the dedicated worker disk when terminating the worker under your own data-retention policy.
 
-The status command intentionally returns no path, account identifier, token, auth method override value, or raw error, making it suitable for eventual UI telemetry. A `connected` state is only a signal that Claude considers its own login usable now. It does **not** prove execution security or that Anthropic has approved the particular hosted use case.
+The status command intentionally returns no path, account identifier, token, auth method override value, or raw error, making it suitable for eventual UI telemetry. The preflight is a point-in-time check: if native login expires or is revoked *during* an agent run, the official Claude CLI is responsible for reporting the resulting execution error. Updraft does not continuously monitor or kill an already-running agent on a login-state change. A `connected` state is only a signal that Claude considers its own login usable now. It does **not** prove execution security or that Anthropic has approved the particular hosted use case.
+
+## Native authentication probe contract
+
+The status JSON parsing was verified in the existing CLI discovery implementation against **Claude Code v2.1.289**, including `loggedIn` and `authMethod` and the `api_key` method observed when `ANTHROPIC_API_KEY` was configured. The optional `loginExpiresAt` field is parsed when present; **its absence does not imply a non-expiring session** and never bypasses the official CLI's own authentication checks. The official [CLI reference](https://code.claude.com/docs/en/cli-reference) documents `claude auth status`. The current PR includes mocked classification and OS CI tests; a live end-to-end `claude auth login` experiment and any changed fields in future CLI versions must be verified on the persistent worker.
+
+The classifier accepts only `authMethod: "claude.ai"` and rejects `api_key`, `api_key_helper`, `oauth_token`, and any conflicting `apiKeySource`. This relies on the official CLI to accurately report its active auth method. It does not inspect `apiKeyHelper` in CLI-owned settings or guarantee that unrelated subprocesses or workspace settings cannot change auth behavior. That remains part of the hostile-repository isolation proof.
+
+On Windows, Updraft's CLI discovery resolves recognized npm `.cmd` shims to a direct Node launch target before running the status command. Unsupported shims fail closed. The command does not spawn a `.cmd` with `shell: true`.
 
 ## Security and commercial release gates
 

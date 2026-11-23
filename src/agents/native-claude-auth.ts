@@ -73,7 +73,11 @@ export function nativeClaudeAuthFromStatus(
 
   if (data.loggedIn === false && response.code === 1) return { state: 'login_required', reason: 'sign_in_required' };
   if (data.loggedIn !== true || response.code !== 0) return { state: 'unknown', reason: 'status_unavailable' };
-  if (data.authMethod !== 'claude.ai') return { state: 'wrong_method', reason: 'not_subscription' };
+  // The official CLI also reports apiKeySource for provider/API-key sign-in. An explicit
+  // key source alongside claude.ai is ambiguous, so fail closed rather than assume billing.
+  if (data.authMethod !== 'claude.ai' || (typeof data.apiKeySource === 'string' && data.apiKeySource !== '')) {
+    return { state: 'wrong_method', reason: 'not_subscription' };
+  }
 
   const expiry = data.loginExpiresAt;
   if (expiry !== undefined && expiry !== null) {
@@ -113,4 +117,18 @@ export async function checkNativeClaudeAuth(
   } catch {
     return { state: 'unknown', reason: 'status_unavailable' };
   }
+}
+
+/** Human-facing guidance shared by the CLI and failed worker jobs. Never interpolate raw CLI output. */
+export function nativeClaudeAuthHint(reason: NativeClaudeAuthReason): string {
+  const hints: Record<NativeClaudeAuthReason, string> = {
+    native_subscription: 'Native Claude subscription login is active.',
+    sign_in_required: 'Sign in directly on this worker with "claude auth login".',
+    login_expired: 'Claude login expired. Run "claude auth login" on this worker again.',
+    auth_override_present: 'An API credential, OAuth token override or provider override is set. Remove it before using native subscription login.',
+    not_subscription: 'Claude is using a different authentication method. Run "claude auth login" on this worker with subscription sign-in.',
+    cli_missing: 'Install the official Claude Code CLI in the worker environment.',
+    status_unavailable: 'Cannot verify the official CLI login. Update Claude Code and run "claude auth status" interactively.',
+  };
+  return hints[reason];
 }

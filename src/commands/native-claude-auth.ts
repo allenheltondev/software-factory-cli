@@ -1,4 +1,4 @@
-import { checkNativeClaudeAuth, hasClaudeAuthOverride, defaultNativeAuthRunner, type NativeAuthRunner, type NativeClaudeAuthStatus } from '../agents/native-claude-auth.js';
+import { checkNativeClaudeAuth, hasClaudeAuthOverride, nativeClaudeAuthHint, defaultNativeAuthRunner, type NativeAuthRunner, type NativeClaudeAuthStatus } from '../agents/native-claude-auth.js';
 import { println, type CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 
@@ -30,17 +30,8 @@ export async function nativeClaudeAuthCommand(
   if (options.json) {
     println(ctx.out, JSON.stringify({ provider: 'claude', auth: 'native_subscription', ...status }));
   } else {
-    const hints: Record<NativeClaudeAuthStatus['reason'], string> = {
-      native_subscription: 'Native Claude subscription login is active.',
-      sign_in_required: 'Sign in directly on this worker with "claude auth login".',
-      login_expired: 'Claude login expired. Run "claude auth login" on this worker again.',
-      auth_override_present: 'An API credential, OAuth token override or provider override is set. Remove it before using native subscription login.',
-      not_subscription: 'Claude is using a different authentication method. Run "claude auth login" on this worker with subscription sign-in.',
-      cli_missing: 'Install the official Claude Code CLI in the worker environment.',
-      status_unavailable: 'Cannot verify the official CLI login. Update Claude Code and run "claude auth status" interactively.',
-    };
     println(ctx.out, `Claude subscription: ${status.state} (${status.reason})`);
-    println(ctx.out, hints[status.reason]);
+    println(ctx.out, nativeClaudeAuthHint(status.reason));
   }
   return status.state === 'connected' ? EXIT.OK : EXIT.FAILURE;
 }
