@@ -56,7 +56,7 @@ describe('Claude Code scheduled-task API triggers', () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       type: 'routine_fire', claude_code_session_url: 'https://claude.ai/code/session_01ABC',
     }), { status: 200 }));
-    const notifyRun = vi.fn();
+    const notifyRun = vi.fn().mockResolvedValue(undefined);
     const route = createRoutineDispatcher({
       rules,
       store: {
