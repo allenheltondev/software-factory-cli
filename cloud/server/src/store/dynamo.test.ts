@@ -1,3 +1,7 @@
+import { createNativeModeStore, createNativeStore, type Worker } from '../native/store.js';
+import { createNativeSettingsService } from '../native/settings.js';
+import type { GitHubFlows } from '../flows/github.js';
+import type { NativeRoute } from '../native/route.js';
 import { ConditionalCheckFailedException, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { describe, expect, it } from 'vitest';
@@ -22,6 +26,13 @@ function fakeTable() {
 
   function condition(expr: string | undefined, item: Item | undefined, values: Values = {}): boolean {
     if (!expr) return true;
+    if (expr === '#enabled = :enabled') return item?.enabled === values[':enabled'];
+    if (expr === 'revision = :revision') return item?.revision === values[':revision'];
+    if (expr === 'attribute_not_exists(revision) OR revision = :revision') return item?.revision === undefined || item.revision === values[':revision'];
+    if (expr === '#v = :v') return item?.version === values[':v'];
+    if (expr === '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling)') {
+      return item?.version === values[':v'] && !item?.active && !item?.settling;
+    }
     if (expr === 'attribute_not_exists(pk)') return !item;
     if (expr === 'attribute_exists(pk)') return Boolean(item);
     if (
@@ -159,8 +170,8 @@ function fakeTable() {
             const pk = values?.[':pk'];
             return { Items: [...items.values()].filter((i) => i.GSI1PK === pk && String(i.GSI1SK).startsWith(String(values?.[':prefix']))) };
           }
-          const pk = values?.[':pk'];
-          const prefix = String(input.KeyConditionExpression).includes('begins_with(sk, :prefix)') ? String(values?.[':prefix']) : '';
+          const pk = values?.[':pk'] ?? values?.[':p'];
+          const prefix = values?.[':q'] !== undefined ? String(values[':q']) : String(input.KeyConditionExpression).includes('begins_with(sk, :prefix)') ? String(values?.[':prefix']) : '';
           const until = String(input.KeyConditionExpression).includes('sk <= :until') ? String(values?.[':until']) : null;
           const between = String(input.KeyConditionExpression).includes('sk BETWEEN :from AND :to') ? [String(values?.[':from']), String(values?.[':to'])] : null;
           let found = [...items.values()]
@@ -248,6 +259,7 @@ describe('dynamo store: native queue admission', () => {
     const job: Job = { jobId: 'job_native00000001', tokenHash: 'hash-only', installationId: 55, repository: 'acme/web', repositoryId: 9,
       configVersion: 1, deliveryId: 'd-native', eventName: 'issues', status: 'launched', createdAt: '2026-11-23T00:00:00Z', expiresAt: DEADLINE,
       native: { workerId: 'test-worker', notBefore: 1234, retry: true } };
+    table.items.set('NATIVE#55#test-worker|MODE', { pk: 'NATIVE#55#test-worker', sk: 'MODE', enabled: true });
     await store.putJob(job);
     expect(await store.getJob(job.jobId)).toMatchObject({ native: job.native });
     expect(table.items.get('NATIVE#55#test-worker|QUEUE#job_native00000001')).toMatchObject({ jobId: job.jobId });
@@ -1149,5 +1161,78 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     table.hideFromEventual('TENANT#55|CONFIG#0000000001');
     expect(await store.getConfigVersion(55, 1)).toBeNull();
     expect((await store.getConfigVersion(55, 1, { consistent: true }))?.version).toBe(1);
+  });
+});
+
+describe('native mode changes and dispatch transactions', () => {
+  const route: NativeRoute = { installationId: 55, repositoryId: 9, repository: 'acme/web',
+    labels: ['updraft'], workerId: 'worker-1', microvmId: 'mvm-native', imageVersion: '7',
+    controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/test-abcdef' };
+  const job: Job = { jobId: 'job_native00000002', installationId: 55, repositoryId: 9,
+    repository: 'acme/web', tokenHash: 'abc', configVersion: 1, deliveryId: 'delivery-1',
+    eventName: 'issues', status: 'launched', createdAt: tenant.createdAt, expiresAt: DEADLINE,
+    native: { workerId: route.workerId } };
+  async function setup() {
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
+    const workers = createNativeStore('T', table.client);
+    const mode = createNativeModeStore('T', table.client);
+    const worker: Worker = { installationId: 55, workerId: route.workerId, microvmId: route.microvmId,
+      session: 'session-0123456789', imageVersion: '7', workerVersion: '104', version: 1,
+      auth: 'connected', heartbeatAt: Date.now() };
+    await workers.put(worker, null);
+    const github = { member: async () => ({}), configContext: async () => ({}) } as unknown as Pick<GitHubFlows, 'member' | 'configContext'>;
+    const api = createNativeSettingsService({ github, route, mode, workers });
+    await api.update({ sub: 'member' }, 55, true);
+    return { table, store, workers, mode, worker, api };
+  }
+  it('refuses a switch when a poll claims and dequeues the job during the idle checks', async () => {
+    const { store, workers, mode, worker, api } = await setup();
+    await store.putJob(job);
+    const query = workers.queued;
+    workers.queued = async (...args) => {
+      await workers.put({ ...worker, version: worker.version + 1, active: { jobId: job.jobId, until: DEADLINE } }, worker.version);
+      await workers.dequeue(55, route.workerId, job.jobId);
+      return query(...args);
+    };
+    await expect(api.update({ sub: 'member' }, 55, false)).rejects.toThrow('changed');
+    expect(await mode.enabled(55, route.workerId)).toBe(true);
+    expect((await workers.get(55, route.workerId))?.active?.jobId).toBe(job.jobId);
+  });
+  it('refuses a switch when a launch queues a job after the empty queue read', async () => {
+    const { store, workers, mode, api } = await setup();
+    const query = workers.queued;
+    workers.queued = async (...args) => {
+      const ids = await query(...args);
+      await store.putJob(job);
+      return ids;
+    };
+    await expect(api.update({ sub: 'member' }, 55, false)).rejects.toThrow('changed');
+    expect(await mode.enabled(55, route.workerId)).toBe(true);
+    expect(await query(55, route.workerId)).toEqual([job.jobId]);
+  });
+  it('rejects a delayed native enqueue after switching to API mode without writing any job rows', async () => {
+    const { table, store, mode, api } = await setup();
+    await api.update({ sub: 'member' }, 55, false);
+    await expect(store.putJob(job)).rejects.toThrow();
+    expect(await mode.enabled(55, route.workerId)).toBe(false);
+    expect(await store.getJob(job.jobId)).toBeNull();
+    expect([...table.items.values()].some((i) => i.jobId === job.jobId)).toBe(false);
+  });
+  it('keeps settlement busy and prevents switching until it completes', async () => {
+    const { worker, workers, api } = await setup();
+    await workers.put({ ...worker, version: 2, settling: { jobId: job.jobId } }, worker.version);
+    expect((await api.view({ sub: 'member' }, 55)).worker?.busy).toBe(true);
+    await expect(api.update({ sub: 'member' }, 55, false)).rejects.toThrow('current subscription job');
+  });
+  it('supports the original mode row without a revision and rejects stale mode writes', async () => {
+    const { table, mode, worker } = await setup();
+    table.items.set('NATIVE#55#worker-1|MODE', { pk: 'NATIVE#55#worker-1', sk: 'MODE', enabled: true });
+    const snapshot = await mode.snapshot(55, route.workerId);
+    expect(snapshot).toEqual({ enabled: true, revision: 0 });
+    const expected = { revision: snapshot.revision, workerVersion: worker.version };
+    expect(await mode.setEnabled(55, route.workerId, false, expected)).toBe(true);
+    expect(await mode.setEnabled(55, route.workerId, true, expected)).toBe(false);
+    expect(await mode.enabled(55, route.workerId)).toBe(false);
   });
 });

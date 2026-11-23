@@ -267,7 +267,11 @@ export function createLauncher(deps: LaunchDeps) {
         const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS).catch(() => []);
         const sameRepo = (j: { repository: string }) => j.repository.toLowerCase() === d.repository.toLowerCase();
         const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
-        const originJob = origin ? await deps.store.getJob(origin.jobId).catch(() => null) : null;
+        const originJob = origin ? await deps.store.getJob(origin.jobId) : null;
+        // A failed read is retryable; a missing record is unknown, never evidence of API origin.
+        if (origin && !originJob && deps.native && matchesNativeRoute(deps.native.route, req.installationId, { ...d, label: origin.label })) {
+          return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this test repository pull request runtime' });
+        }
         nativeOrigin = Boolean(originJob?.native);
         if (origin?.label) {
           label = origin.label;

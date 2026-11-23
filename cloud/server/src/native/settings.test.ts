@@ -41,7 +41,8 @@ describe('Claude subscription mode in the installation app', () => {
     };
     mode = {
       enabled: async () => enabled,
-      setEnabled: async (_, __, next) => { enabled = next; },
+      snapshot: async () => ({ enabled, revision: 0 }),
+      setEnabled: async (_, __, next) => { enabled = next; return true; },
     };
     workers = {
       async get() { return worker; },

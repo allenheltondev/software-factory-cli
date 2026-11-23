@@ -639,7 +639,15 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                 },
               },
             },
-            ...(job.native ? [{ Put: { TableName: T, Item: { pk: nativePartition(job.installationId, job.native.workerId),
+            // Serialize enqueues with mode changes, including launches that read the old
+            // mode before a switch. The revision fences the settings service's queue read.
+            ...(job.native ? [{ Update: {
+              TableName: T, Key: { pk: nativePartition(job.installationId, job.native.workerId), sk: 'MODE' },
+              UpdateExpression: 'ADD revision :one',
+              ConditionExpression: '#enabled = :enabled',
+              ExpressionAttributeNames: { '#enabled': 'enabled' },
+              ExpressionAttributeValues: { ':one': 1, ':enabled': true },
+            } }, { Put: { TableName: T, Item: { pk: nativePartition(job.installationId, job.native.workerId),
               sk: `QUEUE#${job.jobId}`, jobId: job.jobId, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 } } }] : []),
           ],
         }),

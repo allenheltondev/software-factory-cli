@@ -675,6 +675,47 @@ describe('the launcher', () => {
       return { installationId: 55, deliveryId, eventName, appBot: 'updraft[bot]', body: JSON.stringify(payload), payload };
     };
 
+
+    describe('subscription PR origin safety', () => {
+      let subscriptionEnabled: boolean;
+      let originId: string;
+      beforeEach(async () => {
+        subscriptionEnabled = true;
+        deps.native = {
+          route: { installationId: 55, repositoryId: 9, repository: 'acme/web',
+            labels: ['updraft'], workerId: 'worker-1', microvmId: 'mvm-native', imageVersion: '7',
+            controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/test-abcdef' },
+          secret: async () => 'worker-control-credential-01234567890123456789',
+          enabled: async () => subscriptionEnabled,
+        };
+        originId = (await createLauncher(deps)(request())).jobId!;
+        await store.finishJob(originId, 'succeeded', { at: NOW, detail: { prNumber: 40 } });
+        subscriptionEnabled = false;
+      });
+      it('refuses API fallback for a subscription-originated PR after disabling the mode', async () => {
+        expect(await createLauncher(deps)(prEvent())).toMatchObject({ reason: 'native_mode_disabled' });
+        expect(runs).toEqual([]);
+      });
+      it('propagates origin read failures before claiming delivery or charging API usage', async () => {
+        const getJob = store.getJob.bind(store);
+        store.getJob = async (id) => {
+          if (id === originId) throw new Error('temporary DynamoDB failure');
+          return getJob(id);
+        };
+        await expect(createLauncher(deps)(prEvent())).rejects.toThrow('temporary DynamoDB failure');
+        expect(runs).toEqual([]);
+        expect(await store.getDeliveryClaim(55, 'pr-delivery-1')).toBeNull();
+        store.getJob = getJob;
+        expect(await createLauncher(deps)(prEvent())).toMatchObject({ reason: 'native_mode_disabled' });
+      });
+      it('refuses API fallback when only the origin summary remains', async () => {
+        const getJob = store.getJob.bind(store);
+        store.getJob = async (id) => id === originId ? null : getJob(id);
+        expect(await createLauncher(deps)(prEvent())).toMatchObject({ reason: 'native_workflow_unknown' });
+        expect(runs).toEqual([]);
+      });
+    });
+
     it("starts a job for a review asking for changes: the pull request on the job, the event's name, and a start after the lease", async () => {
       const result = await createLauncher(deps)(prEvent());
       expect(result).toMatchObject({ status: 202, disposition: 'launched' });

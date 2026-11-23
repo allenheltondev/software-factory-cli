@@ -29,7 +29,7 @@ export function createNativeSettingsService(d: {
       worker: worker ? {
         status: stale ? 'offline' : worker.auth,
         online: !stale,
-        busy: !!worker.active,
+        busy: !!(worker.active || worker.settling),
         lastHeartbeatAt: new Date(worker.heartbeatAt).toISOString(),
         workerVersion: worker.workerVersion,
       } : null,
@@ -43,8 +43,10 @@ export function createNativeSettingsService(d: {
       if (!r || r.installationId !== installationId) {
         throw new FlowError('invalid_settings', 409, 'No Claude subscription worker is provisioned for this installation');
       }
+      // Read the dispatch revision first: any enqueue after this invalidates the commit.
+      const mode = await d.mode.snapshot(r.installationId, r.workerId);
       const worker = await d.workers.get(r.installationId, r.workerId);
-      if (worker?.active) {
+      if (worker?.active || worker?.settling) {
         throw new FlowError('invalid_settings', 409, 'Wait for the current subscription job to finish before changing authentication mode');
       }
       if (!enabled && (await d.workers.queued(r.installationId, r.workerId)).length > 0) {
@@ -53,7 +55,9 @@ export function createNativeSettingsService(d: {
       if (enabled && (!worker || worker.fenced || worker.auth !== 'connected' || now() - worker.heartbeatAt > 60_000)) {
         throw new FlowError('invalid_settings', 409, 'Sign in directly to Claude on the worker and ensure it is connected before enabling subscription jobs');
       }
-      await d.mode.setEnabled(r.installationId, r.workerId, enabled);
+      if (!await d.mode.setEnabled(r.installationId, r.workerId, enabled, { revision: mode.revision, workerVersion: worker?.version ?? null })) {
+        throw new FlowError('invalid_settings', 409, 'Worker or queued jobs changed; refresh the status and try again');
+      }
       return view(caller, installationId);
     },
   };
