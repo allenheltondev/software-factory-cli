@@ -52,7 +52,7 @@ describe('native worker Cloud dispatch', () => {
       async dequeue() {},
     };
     control = createNativeControl({ store, workers, route, secret: async () => secret, settings, terminateMicrovm, microvmState: async () => state, disabled: async () => disabled, enabled: async () => subscriptionEnabled, now: () => clock });
-    launch = createLauncher({ store, settings, native: { route, secret: loadSecret, enabled: async () => subscriptionEnabled }, imageVersion: async () => null,
+    launch = createLauncher({ store, settings, native: { route, secret: loadSecret, enabled: async () => subscriptionEnabled }, imageVersion: async () => '3',
       putEvent: async () => {}, runMicrovm, quotas: { concurrentJobs: 10, platformConcurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 100_000 }, now: () => clock, log: () => {} });
   });
   const queued = async () => (await store.getJob((await launch(request())).jobId!))!;
