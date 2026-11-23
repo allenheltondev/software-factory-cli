@@ -3,30 +3,45 @@ import { CEILINGS, type ConfigIssue, type TenantSubmission } from './config.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 
 /**
- * A tenant's settings as the console edits them (#69): repositories and workflows, in the terms
- * the browser shows, not the CLI's. `toTenantSubmission` turns them into an ordinary tenant config
- * (config.ts), which is compiled and validated with the worker's own `validateConfig` like any
- * other, so nothing here is a second definition of what a valid config is. What this file adds:
+ * A tenant's settings as the console edits them (#69), in the terms the browser shows, not the
+ * CLI's. `toTenantSubmission` turns them into an ordinary tenant config (config.ts), which is
+ * compiled and validated with the worker's own `validateConfig` like any other, so nothing here
+ * is a second definition of what a valid config is.
  *
- *   - the shape of the console's settings, checked strictly (an unknown field is an error);
- *   - Updraft Cloud's own rules: counts and sizes (CONSOLE_LIMITS), allowed actors never empty,
- *     auto-merge only with review, and an agent only when the tenant has set its API key;
- *   - mapping a compiled config's error paths back to the field the person edited.
+ * The model (version 2):
  *
- * Compiled, one workflow `W` is:
+ *   agents          the installation's roster: a provider, a model and an effort, on or off
+ *   pools           named groups of agents that take turns (round robin); a new installation
+ *                   starts with `builders` and `reviewers`, each holding every agent offered
+ *   allowedActors   who may start work by labeling an issue, for every repository that names
+ *                   no list of its own
+ *   workflows       a label starts the workflow's builder pool with its prompt; its pull
+ *                   requests are reviewed by a reviewer pool (or not), and revised (or not)
+ *   repositories    which workflows run where, and what is the repository's own: its verify
+ *                   commands, base branch, how it publishes, auto-merge
  *
- *   agents.W            the workflow's agent (adapter, model, effort)
- *   agents.W.review     its reviewer, when a repository that runs it has review on
- *   pools.W, pools.W.review   one agent each
- *   actions.W           prompt ./prompts/W.md, verify commands and timeouts, and
- *                       reviewPrompt ./prompts/W.review.md, revisePrompt ./prompts/W.revise.md
- *                       when a repository that runs it reviews or revises
+ * Compiled:
  *
- * and each repository's triggers become its `workflows`, each with the repository's allowed
- * actors. A workflow name has no "." in it, so `W.review` can never be another workflow's name.
+ *   agents.A, pools.P            as written (only agents some pool holds)
+ *   actions.W                    the workflow's prompt and time limit, with reviewPrompt
+ *                                ./prompts/W.review.md and revisePrompt ./prompts/W.revise.md
+ *                                when it reviews or revises
+ *   actions.W.2, W.3, ...        the same, with a repository's verify commands (one per distinct
+ *                                set of commands)
+ *   repositories.R.workflows     one per workflow it runs: its label, pool, reviewPool and the
+ *                                repository's (or the installation's) allowed actors
+ *   repositories.R.review/revise from its workflows, which must agree: the CLI reviews and revises
+ *                                per repository
+ *
+ * Names have no "." in them, so `W.2` can never be another workflow's action.
+ *
+ * Version 1 settings (one agent and one reviewer per workflow, labels and actors per repository)
+ * are upgraded on read (`upgradeV1`), so a version published with them loads in the editor and
+ * re-activates as it ran.
  */
 
-export const CONSOLE_VERSION = 1;
+export const CONSOLE_VERSION = 2;
+/** The agents this deployment runs. */
 export const CONSOLE_AGENTS = Object.keys(AGENT_KEY_ENV) as CloudAgent[];
 export const MERGE_METHODS = ['squash', 'merge', 'rebase'] as const;
 export type MergeMethod = (typeof MERGE_METHODS)[number];
@@ -34,9 +49,12 @@ export const PUBLISH_MODES = ['draft-pr', 'pr'] as const;
 
 /** Updraft Cloud's limits on what one tenant configures (the quotas on a config, not on jobs). */
 export const CONSOLE_LIMITS = {
+  agents: 12,
+  pools: 20,
+  agentsPerPool: 12,
   workflows: 20,
   repositories: 100,
-  triggersPerRepository: 10,
+  workflowsPerRepository: 10,
   allowedActors: 50,
   verifyCommands: 20,
   verifyCommandLength: 2000,
@@ -53,28 +71,44 @@ export interface ConsoleAgent {
   model?: string;
   /** Reasoning effort, checked against the CLI's profile rules. */
   effort?: string;
+  /** false: never chosen, and its key is not needed. */
+  enabled: boolean;
+}
+
+export interface ConsolePool {
+  /** Names of roster agents, taken in turn. */
+  agents: string[];
+}
+
+export interface ConsoleReview {
+  enabled: boolean;
+  /** The pool reviewer runs are taken from. */
+  pool: string;
+  /** Markdown: what the reviewer does with the pull request. */
+  prompt: string;
+  /** Let the agent that wrote the code review it when the pool has no other agent. */
+  allowSameAgent: boolean;
+}
+
+export interface ConsoleRevise {
+  enabled: boolean;
+  /** Markdown: what the agent does with a review that requested changes. */
+  prompt: string;
+  /** Revision rounds per pull request (CLI default 3). */
+  maxRevisions?: number;
 }
 
 export interface ConsoleWorkflow {
-  agent: ConsoleAgent;
+  /** The issue label that starts it. */
+  label: string;
+  /** The pool the work is taken from. */
+  pool: string;
   /** Markdown: what the agent does with the issue. */
   prompt: string;
-  /** The agent that reviews the pull request, in repositories with review on, and how. */
-  reviewer: ConsoleAgent & { prompt: string };
-  /** Markdown: what the agent does with a review that requested changes, in repositories with revise on. */
-  revisePrompt: string;
-  /** Shell commands run in the sandbox after the agent, in order; the first that fails fails the run. */
-  verify: string[];
   /** Agent time limit, minutes (CLI default 60). */
   timeoutMinutes?: number;
-  /** All verify commands together, minutes (CLI default 15). */
-  verifyTimeoutMinutes?: number;
-}
-
-export interface ConsoleTrigger {
-  /** The issue label that starts the workflow. */
-  label: string;
-  workflow: string;
+  review: ConsoleReview;
+  revise: ConsoleRevise;
 }
 
 export interface ConsoleAutoMerge {
@@ -88,57 +122,66 @@ export interface ConsoleAutoMerge {
 export interface ConsoleRepository {
   /** false: paused. It stays configured, and no labeled issue starts a job. */
   enabled: boolean;
-  triggers: ConsoleTrigger[];
-  /** GitHub logins whose labels start work, and whose change requests are acted on. Never empty. */
-  allowedActors: string[];
+  /** The workflows whose labels start work here. */
+  workflows: string[];
+  /** Absent: the installation's allowedActors. */
+  allowedActors?: string[];
   baseBranch?: string;
   publish: (typeof PUBLISH_MODES)[number];
   commentOnFailure: boolean;
-  /** A second agent reviews every pull request Updraft opens. */
-  review: boolean;
-  /** Changes requested by an allowed actor are made by the agent. */
-  revise: boolean;
-  maxRevisions?: number;
+  /** Shell commands run in the sandbox after the agent, in order; the first that fails fails the run. */
+  verify: string[];
+  /** All verify commands together, minutes (CLI default 15). */
+  verifyTimeoutMinutes?: number;
   /** Absent: off. Turning it on takes an explicit confirmation (config-service.ts). */
   autoMerge?: ConsoleAutoMerge;
 }
 
 export interface ConsoleConfig {
   version: typeof CONSOLE_VERSION;
+  agents: Record<string, ConsoleAgent>;
+  pools: Record<string, ConsolePool>;
+  /** GitHub logins whose labels start work, and whose change requests are acted on. */
+  allowedActors: string[];
   workflows: Record<string, ConsoleWorkflow>;
   /** By OWNER/REPO. */
   repositories: Record<string, ConsoleRepository>;
 }
 
-export const WORKFLOW_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
+/** Agent, pool and workflow names. */
+export const NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
+export const WORKFLOW_NAME = NAME;
+const NAME_RULE = 'lower-case letters, digits and "-", at most 40';
 const REPO_NAME = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 /** A GitHub login, or an App's bot (`name[bot]`). */
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/;
 const BRANCH = /^[^\s~^:?*[\\]+$/;
 const TOKEN = /^[A-Za-z0-9._:/-]+$/;
 
-/**
- * The agents a new workflow starts with, from those this deployment runs: Claude writes when it
- * can, and another agent reviews when there is one (a second opinion), else the same one.
- */
-export function defaultAgents(offered: readonly CloudAgent[] = CONSOLE_AGENTS): { agent: CloudAgent; reviewer: CloudAgent } {
-  const agent = offered.includes('claude') ? 'claude' : (offered[0] ?? 'claude');
-  const reviewer = offered.includes('codex') && agent !== 'codex' ? 'codex' : (offered.find((a) => a !== agent) ?? agent);
-  return { agent, reviewer };
-}
+export const BUILDERS = 'builders';
+export const REVIEWERS = 'reviewers';
 
-/** What a new tenant starts from: one workflow with the packaged prompts, and no repositories. */
-export function defaultConsoleConfig(): ConsoleConfig {
-  const { agent, reviewer } = defaultAgents();
+/**
+ * What a new tenant starts from: an agent for every one this deployment offers, a `builders`
+ * and a `reviewers` pool that each hold all of them, and one workflow, `implement`, on the label
+ * `updraft`, whose pull requests the reviewers review and the builders revise. With a single
+ * agent, it may review its own work (there is no other).
+ */
+export function defaultConsoleConfig(options: { offered?: readonly CloudAgent[]; login?: string } = {}): ConsoleConfig {
+  const offered = options.offered?.length ? options.offered : CONSOLE_AGENTS.length ? CONSOLE_AGENTS : (['claude'] as CloudAgent[]);
+  const names = [...offered];
   return {
     version: CONSOLE_VERSION,
+    agents: Object.fromEntries(names.map((a) => [a, { adapter: a, enabled: true }])),
+    pools: { [BUILDERS]: { agents: [...names] }, [REVIEWERS]: { agents: [...names] } },
+    allowedActors: options.login ? [options.login] : [],
     workflows: {
       implement: {
-        agent: { adapter: agent },
+        label: 'updraft',
+        pool: BUILDERS,
         prompt: DEFAULT_PROMPTS.implement,
-        reviewer: { adapter: reviewer, prompt: DEFAULT_PROMPTS.review },
-        revisePrompt: DEFAULT_PROMPTS.revise,
-        verify: [],
+        review: { enabled: true, pool: REVIEWERS, prompt: DEFAULT_PROMPTS.review, allowSameAgent: names.length < 2 },
+        revise: { enabled: true, prompt: DEFAULT_PROMPTS.revise },
       },
     },
     repositories: {},
@@ -184,6 +227,15 @@ function minutes(c: Check, path: string, v: unknown, max: number): number | unde
   return v;
 }
 
+function count(c: Check, path: string, v: unknown, max: number): number | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > max) {
+    c.err(path, `a whole number from 1 to ${max}`);
+    return undefined;
+  }
+  return v;
+}
+
 function prompt(c: Check, path: string, v: unknown): string {
   if (typeof v !== 'string' || v.trim() === '') {
     c.err(path, 'required: the prompt tells the agent what to do');
@@ -191,23 +243,6 @@ function prompt(c: Check, path: string, v: unknown): string {
   }
   if (Buffer.byteLength(v, 'utf8') > CONSOLE_LIMITS.promptBytes) c.err(path, `larger than ${CONSOLE_LIMITS.promptBytes / 1024} KiB`);
   return v;
-}
-
-function agent(c: Check, path: string, v: unknown): ConsoleAgent {
-  if (!isObject(v)) {
-    c.err(path, 'must be a mapping');
-    return { adapter: 'claude' };
-  }
-  only(c, path, v, path.endsWith('reviewer') ? ['adapter', 'model', 'effort', 'prompt'] : ['adapter', 'model', 'effort']);
-  // Any agent Updraft Cloud knows: a saved config that names one this deployment no longer runs
-  // (or a reviewer no repository uses) still loads. Whether it is offered is checked where it
-  // would run: the compiled config (config.ts) holds only the agents a repository uses.
-  const adapter = v.adapter;
-  const known = typeof adapter === 'string' && Object.hasOwn(SUPPORTED_AGENT_KEY_ENV, adapter);
-  if (!known) c.err(`${path}.adapter`, `one of ${CONSOLE_AGENTS.join(', ')}`);
-  const model = text(c, `${path}.model`, v.model, { pattern: TOKEN, what: 'a model name: letters, digits, ".", "_", ":", "/" or "-"' });
-  const effort = text(c, `${path}.effort`, v.effort, { pattern: TOKEN, what: 'an effort level, such as low, medium or high' });
-  return { adapter: known ? (adapter as CloudAgent) : 'claude', ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
 }
 
 function logins(c: Check, path: string, v: unknown): string[] {
@@ -224,108 +259,183 @@ function logins(c: Check, path: string, v: unknown): string[] {
       out.push(login);
     }
   });
+  if (out.length > CONSOLE_LIMITS.allowedActors) c.err(path, `at most ${CONSOLE_LIMITS.allowedActors} logins`);
+  return out;
+}
+
+function names(c: Check, path: string, v: unknown, known: Record<string, unknown> | undefined, what: string, max: number): string[] {
+  if (!Array.isArray(v)) {
+    c.err(path, `must be a list of ${what} names`);
+    return [];
+  }
+  if (v.length > max) c.err(path, `at most ${max}`);
+  const out: string[] = [];
+  v.forEach((n, i) => {
+    if (typeof n !== 'string' || n === '') return void c.err(`${path}.${i}`, `a ${what} name`);
+    if (known && !Object.hasOwn(known, n)) return void c.err(`${path}.${i}`, `there is no ${what} "${n}"`);
+    if (!out.includes(n)) out.push(n);
+  });
   return out;
 }
 
 /**
  * Checks the shape of the console's settings, and returns them normalized (trimmed, defaults
- * filled, duplicates dropped). Every problem is reported, with the path of the field.
+ * filled, duplicates dropped). Every problem is reported, with the path of the field. Version 1
+ * settings are upgraded first.
  */
-export function parseConsoleConfig(raw: unknown): { ok: true; config: ConsoleConfig } | { ok: false; errors: ConfigIssue[] } {
+export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleConfig } | { ok: false; errors: ConfigIssue[] } {
   const c: Check = { errors: [], err: (path, message) => c.errors.push({ path, message }) };
-  if (!isObject(raw)) return { ok: false, errors: [{ path: '(root)', message: 'the settings must be a mapping' }] };
-  only(c, '', raw, ['version', 'workflows', 'repositories']);
+  if (!isObject(input)) return { ok: false, errors: [{ path: '(root)', message: 'the settings must be a mapping' }] };
+  const raw = input.version === 1 ? upgradeV1(input) : input;
+  only(c, '', raw, ['version', 'agents', 'pools', 'allowedActors', 'workflows', 'repositories']);
   if (raw.version !== CONSOLE_VERSION) c.err('version', `must be ${CONSOLE_VERSION}`);
 
+  // Agents.
+  const agents: Record<string, ConsoleAgent> = {};
+  if (!isObject(raw.agents)) c.err('agents', 'must be a mapping');
+  else {
+    const list = Object.entries(raw.agents);
+    if (list.length === 0) c.err('agents', 'add at least one agent');
+    if (list.length > CONSOLE_LIMITS.agents) c.err('agents', `at most ${CONSOLE_LIMITS.agents} agents`);
+    for (const [name, v] of list) {
+      const path = `agents.${name}`;
+      if (!NAME.test(name)) c.err(path, `an agent name is ${NAME_RULE}`);
+      if (!isObject(v)) {
+        c.err(path, 'must be a mapping');
+        continue;
+      }
+      only(c, path, v, ['adapter', 'model', 'effort', 'enabled']);
+      // Any agent Updraft Cloud knows: a saved config that names one this deployment no longer
+      // runs still loads. Whether it is offered is checked where it would run (config.ts).
+      const known = typeof v.adapter === 'string' && Object.hasOwn(SUPPORTED_AGENT_KEY_ENV, v.adapter);
+      if (!known) c.err(`${path}.adapter`, `one of ${Object.keys(SUPPORTED_AGENT_KEY_ENV).join(', ')}`);
+      const model = text(c, `${path}.model`, v.model, { pattern: TOKEN, what: 'a model name: letters, digits, ".", "_", ":", "/" or "-"' });
+      const effort = text(c, `${path}.effort`, v.effort, { pattern: TOKEN, what: 'an effort level, such as low, medium or high' });
+      agents[name] = {
+        adapter: known ? (v.adapter as CloudAgent) : 'claude',
+        ...(model ? { model } : {}),
+        ...(effort ? { effort } : {}),
+        enabled: bool(c, `${path}.enabled`, v.enabled, true),
+      };
+    }
+  }
+
+  // Pools.
+  const pools: Record<string, ConsolePool> = {};
+  if (!isObject(raw.pools)) c.err('pools', 'must be a mapping');
+  else {
+    const list = Object.entries(raw.pools);
+    if (list.length === 0) c.err('pools', 'add at least one pool');
+    if (list.length > CONSOLE_LIMITS.pools) c.err('pools', `at most ${CONSOLE_LIMITS.pools} pools`);
+    for (const [name, v] of list) {
+      const path = `pools.${name}`;
+      if (!NAME.test(name)) c.err(path, `a pool name is ${NAME_RULE}`);
+      if (!isObject(v)) {
+        c.err(path, 'must be a mapping');
+        continue;
+      }
+      only(c, path, v, ['agents']);
+      const members = names(c, `${path}.agents`, v.agents, isObject(raw.agents) ? raw.agents : undefined, 'agent', CONSOLE_LIMITS.agentsPerPool);
+      if (Array.isArray(v.agents) && v.agents.length === 0) c.err(`${path}.agents`, 'add at least one agent');
+      pools[name] = { agents: members };
+    }
+  }
+
+  const allowedActors = raw.allowedActors === undefined ? [] : logins(c, 'allowedActors', raw.allowedActors);
+
+  // Workflows.
   const workflows: Record<string, ConsoleWorkflow> = {};
+  const poolKnown = (path: string, v: unknown, required: boolean): string => {
+    const p = text(c, path, v, { required, max: 40 });
+    if (p && required && isObject(raw.pools) && !Object.hasOwn(raw.pools, p)) c.err(path, `there is no pool "${p}"`);
+    return p ?? '';
+  };
   if (!isObject(raw.workflows)) c.err('workflows', 'must be a mapping');
   else {
-    const names = Object.keys(raw.workflows);
-    if (names.length === 0) c.err('workflows', 'add at least one workflow');
-    if (names.length > CONSOLE_LIMITS.workflows) c.err('workflows', `at most ${CONSOLE_LIMITS.workflows} workflows`);
-    for (const [name, w] of Object.entries(raw.workflows)) {
+    const list = Object.entries(raw.workflows);
+    if (list.length === 0) c.err('workflows', 'add at least one workflow');
+    if (list.length > CONSOLE_LIMITS.workflows) c.err('workflows', `at most ${CONSOLE_LIMITS.workflows} workflows`);
+    for (const [name, w] of list) {
       const path = `workflows.${name}`;
-      if (!WORKFLOW_NAME.test(name)) c.err(path, 'a workflow name is lower-case letters, digits and "-", at most 40');
+      if (!NAME.test(name)) c.err(path, `a workflow name is ${NAME_RULE}`);
       if (!isObject(w)) {
         c.err(path, 'must be a mapping');
         continue;
       }
-      only(c, path, w, ['agent', 'prompt', 'reviewer', 'revisePrompt', 'verify', 'timeoutMinutes', 'verifyTimeoutMinutes']);
-      const reviewer = isObject(w.reviewer) ? w.reviewer : undefined;
+      only(c, path, w, ['label', 'pool', 'prompt', 'timeoutMinutes', 'review', 'revise']);
+      const label = text(c, `${path}.label`, w.label, { required: true, max: CONSOLE_LIMITS.labelLength }) ?? '';
+      const pool = poolKnown(`${path}.pool`, w.pool, true);
+      const timeoutMinutes = minutes(c, `${path}.timeoutMinutes`, w.timeoutMinutes, CEILINGS.timeoutMinutes);
+
+      const rv = isObject(w.review) ? w.review : {};
+      if (!isObject(w.review)) c.err(`${path}.review`, 'must be a mapping');
+      only(c, `${path}.review`, rv, ['enabled', 'pool', 'prompt', 'allowSameAgent']);
+      const reviewOn = bool(c, `${path}.review.enabled`, rv.enabled, false);
+      const review: ConsoleReview = {
+        enabled: reviewOn,
+        pool: poolKnown(`${path}.review.pool`, rv.pool, reviewOn),
+        prompt: reviewOn ? prompt(c, `${path}.review.prompt`, rv.prompt) : typeof rv.prompt === 'string' && rv.prompt.trim() ? rv.prompt : DEFAULT_PROMPTS.review,
+        allowSameAgent: bool(c, `${path}.review.allowSameAgent`, rv.allowSameAgent, false),
+      };
+
+      const rs = isObject(w.revise) ? w.revise : {};
+      if (!isObject(w.revise)) c.err(`${path}.revise`, 'must be a mapping');
+      only(c, `${path}.revise`, rs, ['enabled', 'prompt', 'maxRevisions']);
+      const reviseOn = bool(c, `${path}.revise.enabled`, rs.enabled, false);
+      const maxRevisions = count(c, `${path}.revise.maxRevisions`, rs.maxRevisions, CEILINGS.maxRevisions);
+      const revise: ConsoleRevise = {
+        enabled: reviseOn,
+        prompt: reviseOn ? prompt(c, `${path}.revise.prompt`, rs.prompt) : typeof rs.prompt === 'string' && rs.prompt.trim() ? rs.prompt : DEFAULT_PROMPTS.revise,
+        ...(maxRevisions !== undefined ? { maxRevisions } : {}),
+      };
+
+      workflows[name] = { label, pool, prompt: prompt(c, `${path}.prompt`, w.prompt), ...(timeoutMinutes !== undefined ? { timeoutMinutes } : {}), review, revise };
+    }
+  }
+
+  // Repositories.
+  const repositories: Record<string, ConsoleRepository> = {};
+  if (!isObject(raw.repositories)) c.err('repositories', 'must be a mapping');
+  else {
+    const list = Object.entries(raw.repositories);
+    if (list.length > CONSOLE_LIMITS.repositories) c.err('repositories', `at most ${CONSOLE_LIMITS.repositories} repositories`);
+    const seen = new Set<string>();
+    for (const [fullName, r] of list) {
+      const path = `repositories.${fullName}`;
+      if (!REPO_NAME.test(fullName)) c.err(path, 'expected OWNER/REPO');
+      if (seen.has(fullName.toLowerCase())) c.err(path, 'listed twice');
+      seen.add(fullName.toLowerCase());
+      if (!isObject(r)) {
+        c.err(path, 'must be a mapping');
+        continue;
+      }
+      only(c, path, r, ['enabled', 'workflows', 'allowedActors', 'baseBranch', 'publish', 'commentOnFailure', 'verify', 'verifyTimeoutMinutes', 'autoMerge']);
+
+      const runs = names(c, `${path}.workflows`, r.workflows, isObject(raw.workflows) ? raw.workflows : undefined, 'workflow', CONSOLE_LIMITS.workflowsPerRepository);
+      if (Array.isArray(r.workflows) && r.workflows.length === 0) c.err(`${path}.workflows`, 'choose at least one workflow: its label is how an issue starts work here');
+
+      let actors: string[] | undefined;
+      if (r.allowedActors !== undefined && r.allowedActors !== null) {
+        actors = logins(c, `${path}.allowedActors`, r.allowedActors);
+        if (Array.isArray(r.allowedActors) && actors.length === 0) c.err(`${path}.allowedActors`, 'name at least one GitHub login, or use the installation\'s list');
+      }
+
+      const publish = r.publish ?? 'draft-pr';
+      if (!(PUBLISH_MODES as readonly unknown[]).includes(publish)) c.err(`${path}.publish`, 'draft-pr or pr');
+      const baseBranch = text(c, `${path}.baseBranch`, r.baseBranch, { max: 255, pattern: BRANCH, what: 'a branch name' });
+
       const verify: string[] = [];
-      if (w.verify !== undefined && !Array.isArray(w.verify)) c.err(`${path}.verify`, 'must be a list of commands');
-      else if (Array.isArray(w.verify)) {
-        if (w.verify.length > CONSOLE_LIMITS.verifyCommands) c.err(`${path}.verify`, `at most ${CONSOLE_LIMITS.verifyCommands} commands`);
-        w.verify.forEach((cmd, i) => {
+      if (r.verify !== undefined && !Array.isArray(r.verify)) c.err(`${path}.verify`, 'must be a list of commands');
+      else if (Array.isArray(r.verify)) {
+        if (r.verify.length > CONSOLE_LIMITS.verifyCommands) c.err(`${path}.verify`, `at most ${CONSOLE_LIMITS.verifyCommands} commands`);
+        r.verify.forEach((cmd, i) => {
           if (typeof cmd !== 'string' || cmd.trim() === '') return void c.err(`${path}.verify.${i}`, 'a command must not be empty');
           if (/[\r\n\0]/.test(cmd)) return void c.err(`${path}.verify.${i}`, 'one line per command');
           if (cmd.length > CONSOLE_LIMITS.verifyCommandLength) return void c.err(`${path}.verify.${i}`, `at most ${CONSOLE_LIMITS.verifyCommandLength} characters`);
           verify.push(cmd.trim());
         });
       }
-      const timeoutMinutes = minutes(c, `${path}.timeoutMinutes`, w.timeoutMinutes, CEILINGS.timeoutMinutes);
-      const verifyTimeoutMinutes = minutes(c, `${path}.verifyTimeoutMinutes`, w.verifyTimeoutMinutes, CEILINGS.verifyTimeoutMinutes);
-      workflows[name] = {
-        agent: agent(c, `${path}.agent`, w.agent),
-        prompt: prompt(c, `${path}.prompt`, w.prompt),
-        reviewer: { ...agent(c, `${path}.reviewer`, w.reviewer), prompt: prompt(c, `${path}.reviewer.prompt`, reviewer?.prompt) },
-        revisePrompt: prompt(c, `${path}.revisePrompt`, w.revisePrompt),
-        verify,
-        ...(timeoutMinutes !== undefined ? { timeoutMinutes } : {}),
-        ...(verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes } : {}),
-      };
-    }
-  }
-
-  const repositories: Record<string, ConsoleRepository> = {};
-  if (!isObject(raw.repositories)) c.err('repositories', 'must be a mapping');
-  else {
-    const names = Object.keys(raw.repositories);
-    if (names.length > CONSOLE_LIMITS.repositories) c.err('repositories', `at most ${CONSOLE_LIMITS.repositories} repositories`);
-    const seenRepos = new Set<string>();
-    for (const [fullName, r] of Object.entries(raw.repositories)) {
-      const path = `repositories.${fullName}`;
-      if (!REPO_NAME.test(fullName)) c.err(path, 'expected OWNER/REPO');
-      if (seenRepos.has(fullName.toLowerCase())) c.err(path, 'listed twice');
-      seenRepos.add(fullName.toLowerCase());
-      if (!isObject(r)) {
-        c.err(path, 'must be a mapping');
-        continue;
-      }
-      only(c, path, r, ['enabled', 'triggers', 'allowedActors', 'baseBranch', 'publish', 'commentOnFailure', 'review', 'revise', 'maxRevisions', 'autoMerge']);
-
-      const triggers: ConsoleTrigger[] = [];
-      if (!Array.isArray(r.triggers)) c.err(`${path}.triggers`, 'must be a list');
-      else {
-        if (r.triggers.length === 0) c.err(`${path}.triggers`, 'add a trigger label: it is how an issue starts a workflow');
-        if (r.triggers.length > CONSOLE_LIMITS.triggersPerRepository) c.err(`${path}.triggers`, `at most ${CONSOLE_LIMITS.triggersPerRepository} triggers`);
-        const labels = new Set<string>();
-        r.triggers.forEach((t, i) => {
-          const tp = `${path}.triggers.${i}`;
-          if (!isObject(t)) return void c.err(tp, 'must be a mapping');
-          only(c, tp, t, ['label', 'workflow']);
-          const label = text(c, `${tp}.label`, t.label, { required: true, max: CONSOLE_LIMITS.labelLength });
-          const workflow = text(c, `${tp}.workflow`, t.workflow, { required: true });
-          if (label && labels.has(label.toLowerCase())) c.err(`${tp}.label`, 'another trigger of this repository has this label');
-          if (label) labels.add(label.toLowerCase());
-          if (workflow && isObject(raw.workflows) && !Object.hasOwn(raw.workflows, workflow)) c.err(`${tp}.workflow`, `there is no workflow "${workflow}"`);
-          if (label && workflow) triggers.push({ label, workflow });
-        });
-      }
-
-      const allowedActors = logins(c, `${path}.allowedActors`, r.allowedActors);
-      if (Array.isArray(r.allowedActors) && allowedActors.length === 0) c.err(`${path}.allowedActors`, 'name at least one GitHub login who may start work by labeling an issue');
-      if (allowedActors.length > CONSOLE_LIMITS.allowedActors) c.err(`${path}.allowedActors`, `at most ${CONSOLE_LIMITS.allowedActors} logins`);
-
-      const publish = r.publish ?? 'draft-pr';
-      if (!(PUBLISH_MODES as readonly unknown[]).includes(publish)) c.err(`${path}.publish`, 'draft-pr or pr');
-      const baseBranch = text(c, `${path}.baseBranch`, r.baseBranch, { max: 255, pattern: BRANCH, what: 'a branch name' });
-      const review = bool(c, `${path}.review`, r.review, false);
-      const revise = bool(c, `${path}.revise`, r.revise, false);
-      const maxRevisions = r.maxRevisions === undefined || r.maxRevisions === null || r.maxRevisions === '' ? undefined : r.maxRevisions;
-      if (maxRevisions !== undefined && (typeof maxRevisions !== 'number' || !Number.isInteger(maxRevisions) || maxRevisions < 1 || maxRevisions > CEILINGS.maxRevisions)) {
-        c.err(`${path}.maxRevisions`, `a whole number from 1 to ${CEILINGS.maxRevisions}`);
-      }
+      const verifyTimeoutMinutes = minutes(c, `${path}.verifyTimeoutMinutes`, r.verifyTimeoutMinutes, CEILINGS.verifyTimeoutMinutes);
 
       let autoMerge: ConsoleAutoMerge | undefined;
       if (r.autoMerge !== undefined && r.autoMerge !== null) {
@@ -344,7 +454,6 @@ export function parseConsoleConfig(raw: unknown): { ok: true; config: ConsoleCon
               requiredChecks = r.autoMerge.requiredChecks.map((n, i) => text(c, `${ap}.requiredChecks.${i}`, n, { required: true, max: 255 })).filter((n): n is string => n !== undefined);
             }
           }
-          if (!review) c.err(ap, 'turn on review first: Updraft only merges a pull request its own reviewer found ready');
           autoMerge = {
             method: method as MergeMethod,
             ...(waitMinutes !== undefined ? { waitMinutes } : {}),
@@ -355,102 +464,305 @@ export function parseConsoleConfig(raw: unknown): { ok: true; config: ConsoleCon
 
       repositories[fullName] = {
         enabled: bool(c, `${path}.enabled`, r.enabled, true),
-        triggers,
-        allowedActors,
+        workflows: runs,
+        ...(actors ? { allowedActors: actors } : {}),
         ...(baseBranch ? { baseBranch } : {}),
         publish: publish as ConsoleRepository['publish'],
         commentOnFailure: bool(c, `${path}.commentOnFailure`, r.commentOnFailure, true),
-        review,
-        revise,
-        ...(revise && maxRevisions !== undefined ? { maxRevisions: maxRevisions as number } : {}),
+        verify,
+        ...(verify.length && verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes } : {}),
         ...(autoMerge ? { autoMerge } : {}),
       };
     }
-    if (names.length === 0) c.err('repositories', 'add at least one repository');
+    if (list.length === 0) c.err('repositories', 'add at least one repository');
   }
 
   if (c.errors.length) return { ok: false, errors: c.errors };
-  return { ok: true, config: { version: CONSOLE_VERSION, workflows, repositories } };
+  const config: ConsoleConfig = { version: CONSOLE_VERSION, agents, pools, allowedActors, workflows, repositories };
+  checkMeaning(config, c);
+  if (c.errors.length) return { ok: false, errors: c.errors };
+  return { ok: true, config };
 }
 
-/** Which workflows each role of an agent is needed for: by an enabled repository, reviewing or revising. */
-function usage(config: ConsoleConfig, which: 'all' | 'enabled') {
-  const used = new Map<string, { runs: boolean; review: boolean; revise: boolean }>();
-  for (const repo of Object.values(config.repositories)) {
-    if (which === 'enabled' && !repo.enabled) continue;
-    for (const t of repo.triggers) {
-      const u = used.get(t.workflow) ?? { runs: false, review: false, revise: false };
-      used.set(t.workflow, { runs: true, review: u.review || repo.review, revise: u.revise || repo.revise });
+/** The rules that read across sections: what a repository's workflows share, and pools that can run. */
+function checkMeaning(config: ConsoleConfig, c: Check) {
+  const enabledIn = (pool: string) => (config.pools[pool]?.agents ?? []).filter((a) => config.agents[a]?.enabled);
+  const running = new Set<string>();
+  let needActors = false;
+
+  for (const [fullName, r] of Object.entries(config.repositories)) {
+    const path = `repositories.${fullName}`;
+    const wfs = r.workflows.map((n) => [n, config.workflows[n]!] as const);
+    if (!r.allowedActors && config.allowedActors.length === 0) needActors = true;
+
+    const labels = new Map<string, string>();
+    for (const [n, w] of wfs) {
+      const prior = labels.get(w.label.toLowerCase());
+      if (prior) c.err(`${path}.workflows`, `${prior} and ${n} both start on the label "${w.label}": a repository's workflows need labels of their own`);
+      labels.set(w.label.toLowerCase(), n);
+    }
+
+    // The CLI reviews and revises per repository, so the workflows that run here must agree.
+    const policy = ([, w]: (typeof wfs)[number]) =>
+      JSON.stringify([w.review.enabled, w.review.enabled && w.review.allowSameAgent, w.revise.enabled, w.revise.enabled ? (w.revise.maxRevisions ?? null) : null]);
+    const differs = wfs.find((x) => policy(x) !== policy(wfs[0]!));
+    if (differs) {
+      c.err(`${path}.workflows`, `${wfs[0]![0]} and ${differs[0]} handle pull requests differently: the workflows of one repository must agree on review, revision and revision rounds`);
+    }
+    const reviewed = wfs.some(([, w]) => w.review.enabled);
+    if (r.autoMerge && !reviewed) c.err(`${path}.autoMerge`, 'turn on review in its workflow first: Updraft only merges a pull request its own reviewer found ready');
+
+    if (r.enabled) {
+      for (const [, w] of wfs) {
+        running.add(w.pool);
+        if (w.review.enabled) running.add(w.review.pool);
+      }
     }
   }
-  return used;
+
+  if (needActors) c.err('allowedActors', 'name at least one GitHub login who may start work by labeling an issue');
+  for (const pool of running) {
+    if (config.pools[pool] && enabledIn(pool).length === 0) c.err(`pools.${pool}`, 'every agent in this pool is off: turn one on, or add another');
+  }
+
+  for (const [name, w] of Object.entries(config.workflows)) {
+    if (!w.review.enabled || w.review.allowSameAgent) continue;
+    const builders = enabledIn(w.pool);
+    const reviewers = enabledIn(w.review.pool);
+    // A reviewer is never the agent that wrote the code: some builder must have another reviewer.
+    if (reviewers.length && builders.some((b) => reviewers.every((r) => r === b))) {
+      c.err(
+        `workflows.${name}.review.pool`,
+        reviewers.length === 1
+          ? `${reviewers[0]} would review its own work: add another agent to ${w.review.pool}, or allow an agent to review its own work`
+          : `an agent of ${w.pool} has no one else in ${w.review.pool} to review it`,
+      );
+    }
+  }
 }
 
-/**
- * Updraft Cloud's rule for agents: every agent an enabled repository can start needs its API key
- * set first (bring your own key, #64), or the job would fail in the microVM. `keys` are the names
- * of the tenant's keys that are set (never their values).
- */
-export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): ConfigIssue[] {
-  const out: ConfigIssue[] = [];
-  const need = (path: string, adapter: CloudAgent) => {
-    // An agent this deployment does not run: compiling it says so, with what to do instead;
-    // asking for its key first would send the tenant to a key the key page cannot take.
-    if (!CONSOLE_AGENTS.includes(adapter)) return;
-    const name = SUPPORTED_AGENT_KEY_ENV[adapter];
-    if (!keys.has(name)) out.push({ path, message: `set the tenant's ${name} first: jobs run ${adapter} with your own key` });
+/** Agents and pools a version 1 setting used, under readable names. */
+function upgradeV1(raw: Record<string, unknown>): Record<string, unknown> {
+  const v1Workflows = isObject(raw.workflows) ? raw.workflows : {};
+  const v1Repos = isObject(raw.repositories) ? raw.repositories : {};
+  const agents: Record<string, Record<string, unknown>> = {};
+  const byProfile = new Map<string, string>();
+  const unique = (base: string, taken: (n: string) => boolean) => {
+    const stem = base.slice(0, 36) || 'x';
+    if (!taken(stem)) return stem;
+    for (let i = 2; ; i++) if (!taken(`${stem}-${i}`)) return `${stem}-${i}`;
   };
-  for (const [name, u] of usage(config, 'enabled')) {
-    const w = config.workflows[name];
-    if (!w) continue;
-    need(`workflows.${name}.agent.adapter`, w.agent.adapter);
-    if (u.review) need(`workflows.${name}.reviewer.adapter`, w.reviewer.adapter);
+  const agentFor = (a: unknown): string => {
+    const o = isObject(a) ? a : {};
+    const adapter = typeof o.adapter === 'string' ? o.adapter : 'claude';
+    const key = JSON.stringify([adapter, o.model ?? null, o.effort ?? null]);
+    const hit = byProfile.get(key);
+    if (hit) return hit;
+    const name = unique(adapter.toLowerCase().replace(/[^a-z0-9-]/g, '-'), (n) => Object.hasOwn(agents, n));
+    agents[name] = { adapter, ...(o.model !== undefined ? { model: o.model } : {}), ...(o.effort !== undefined ? { effort: o.effort } : {}), enabled: true };
+    byProfile.set(key, name);
+    return name;
+  };
+  const pools: Record<string, { agents: string[] }> = {};
+  const byPool = new Map<string, string>();
+  const poolFor = (role: 'builders' | 'reviewers', agent: string) => {
+    const key = `${role}\0${agent}`;
+    const hit = byPool.get(key);
+    if (hit) return hit;
+    const name = unique(role, (n) => Object.hasOwn(pools, n));
+    pools[name] = { agents: [agent] };
+    byPool.set(key, name);
+    return name;
+  };
+
+  // A v1 workflow becomes one v2 workflow per label and pull-request handling the repositories gave it.
+  const workflows: Record<string, Record<string, unknown>> = {};
+  const groups = new Map<string, string>();
+  const taken = (n: string) => Object.hasOwn(workflows, n) || Object.hasOwn(v1Workflows, n);
+  const build = (w: Record<string, unknown>, label: string, review: boolean, revise: boolean, maxRevisions: unknown) => {
+    const builder = agentFor(w.agent);
+    const reviewerAgent = agentFor(w.reviewer);
+    const reviewer = isObject(w.reviewer) ? w.reviewer : {};
+    return {
+      label,
+      pool: poolFor('builders', builder),
+      prompt: w.prompt,
+      ...(w.timeoutMinutes !== undefined ? { timeoutMinutes: w.timeoutMinutes } : {}),
+      review: { enabled: review, pool: poolFor('reviewers', reviewerAgent), prompt: reviewer.prompt ?? DEFAULT_PROMPTS.review, allowSameAgent: reviewerAgent === builder },
+      revise: { enabled: revise, prompt: w.revisePrompt ?? DEFAULT_PROMPTS.revise, ...(revise && maxRevisions !== undefined ? { maxRevisions } : {}) },
+    };
+  };
+
+  const repositories: Record<string, Record<string, unknown>> = {};
+  let actors: unknown[] | undefined;
+  for (const [fullName, r] of Object.entries(v1Repos)) {
+    if (!isObject(r)) {
+      repositories[fullName] = r as Record<string, unknown>;
+      continue;
+    }
+    const runs: string[] = [];
+    let verifyFrom: Record<string, unknown> | undefined;
+    for (const t of Array.isArray(r.triggers) ? r.triggers : []) {
+      if (!isObject(t) || typeof t.workflow !== 'string') continue;
+      const w = v1Workflows[t.workflow];
+      if (!isObject(w)) {
+        runs.push(t.workflow);
+        continue;
+      }
+      verifyFrom ??= w;
+      const key = JSON.stringify([t.workflow, t.label, r.review === true, r.revise === true, r.revise === true ? (r.maxRevisions ?? null) : null]);
+      let name = groups.get(key);
+      if (!name) {
+        name = [...groups.keys()].some((k) => JSON.parse(k)[0] === t.workflow) ? unique(t.workflow, taken) : t.workflow;
+        groups.set(key, name);
+        workflows[name] = build(w, typeof t.label === 'string' ? t.label : '', r.review === true, r.revise === true, r.maxRevisions);
+      }
+      if (!runs.includes(name)) runs.push(name);
+    }
+    const repoActors = Array.isArray(r.allowedActors) ? r.allowedActors : [];
+    actors ??= repoActors;
+    const same = repoActors.length === actors.length && repoActors.every((a, i) => String(a).toLowerCase() === String(actors![i]).toLowerCase());
+    repositories[fullName] = {
+      ...(r.enabled !== undefined ? { enabled: r.enabled } : {}),
+      workflows: runs,
+      ...(same ? {} : { allowedActors: repoActors }),
+      ...(r.baseBranch !== undefined ? { baseBranch: r.baseBranch } : {}),
+      ...(r.publish !== undefined ? { publish: r.publish } : {}),
+      ...(r.commentOnFailure !== undefined ? { commentOnFailure: r.commentOnFailure } : {}),
+      // Verify commands move to the repository; one that ran two workflows keeps the first one's.
+      verify: Array.isArray(verifyFrom?.verify) ? verifyFrom.verify : [],
+      ...(verifyFrom?.verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes: verifyFrom.verifyTimeoutMinutes } : {}),
+      ...(r.autoMerge !== undefined ? { autoMerge: r.autoMerge } : {}),
+    };
+  }
+  // Workflows no repository ran: kept, on a label of their own.
+  for (const [name, w] of Object.entries(v1Workflows)) {
+    if (Object.hasOwn(workflows, name) || !isObject(w)) continue;
+    if ([...groups.keys()].some((k) => JSON.parse(k)[0] === name)) continue;
+    const labels = new Set(Object.values(workflows).map((x) => String(x.label).toLowerCase()));
+    workflows[name] = build(w, labels.has('updraft') ? name : 'updraft', false, false, undefined);
+  }
+  return { version: CONSOLE_VERSION, agents, pools, allowedActors: actors ?? [], workflows, repositories };
+}
+
+/** What each enabled repository's workflows can start: pools, and whether they review. */
+function usedPools(config: ConsoleConfig): Set<string> {
+  const out = new Set<string>();
+  for (const r of Object.values(config.repositories)) {
+    if (!r.enabled) continue;
+    for (const n of r.workflows) {
+      const w = config.workflows[n];
+      if (!w) continue;
+      out.add(w.pool);
+      if (w.review.enabled) out.add(w.review.pool);
+    }
   }
   return out;
 }
 
+/**
+ * Updraft Cloud's rule for agents: every agent an enabled repository can start needs its API key
+ * set first (bring your own key, #64), or the job would fail in the microVM. An agent that is off
+ * needs none. `keys` are the names of the tenant's keys that are set (never their values).
+ */
+export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): ConfigIssue[] {
+  const agents = new Set<string>();
+  for (const p of usedPools(config)) for (const a of config.pools[p]?.agents ?? []) if (config.agents[a]?.enabled) agents.add(a);
+  const out: ConfigIssue[] = [];
+  for (const name of [...agents].sort()) {
+    const { adapter } = config.agents[name]!;
+    // An agent this deployment does not run: compiling it says so, with what to do instead.
+    if (!CONSOLE_AGENTS.includes(adapter)) continue;
+    const key = SUPPORTED_AGENT_KEY_ENV[adapter];
+    if (!keys.has(key)) out.push({ path: `agents.${name}`, message: `add your ${key}, or turn this agent off: jobs run ${adapter} with your own key` });
+  }
+  return out;
+}
+
+/** The compiled action of each workflow and repository: `W` without verify commands, `W.2`, ... with. */
+function actionLayout(config: ConsoleConfig) {
+  const byKey = new Map<string, string>();
+  /** action -> the workflow, and the first repository whose verify commands it carries. */
+  const actions = new Map<string, { workflow: string; repo?: string; verify: string[]; verifyTimeoutMinutes?: number }>();
+  const of = new Map<string, string>();
+  for (const name of Object.keys(config.workflows)) actions.set(name, { workflow: name, verify: [] });
+  for (const [fullName, r] of Object.entries(config.repositories)) {
+    for (const w of r.workflows) {
+      if (!r.verify.length) {
+        of.set(`${fullName}\0${w}`, w);
+        continue;
+      }
+      const key = JSON.stringify([w, r.verify, r.verifyTimeoutMinutes ?? null]);
+      let action = byKey.get(key);
+      if (!action) {
+        let i = 2;
+        while (actions.has(`${w}.${i}`)) i++;
+        action = `${w}.${i}`;
+        byKey.set(key, action);
+        actions.set(action, { workflow: w, repo: fullName, verify: r.verify, ...(r.verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes: r.verifyTimeoutMinutes } : {}) });
+      }
+      of.set(`${fullName}\0${w}`, action);
+    }
+  }
+  return { actions, actionOf: (repo: string, workflow: string) => of.get(`${repo}\0${workflow}`) ?? workflow };
+}
+
 /** The console's settings as an ordinary tenant config document and its prompt files (config.ts). */
 export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
-  const used = usage(config, 'all');
   const agents: Record<string, unknown> = {};
   const pools: Record<string, unknown> = {};
   const actions: Record<string, unknown> = {};
   const prompts: Record<string, string> = {};
-  const profile = (a: ConsoleAgent) => ({ adapter: a.adapter, ...(a.model ? { model: a.model } : {}), ...(a.effort ? { effort: a.effort } : {}) });
+
+  // Only the pools a workflow routes to, and the agents they hold: what no job can start is not
+  // compiled, so it is not checked either (a saved agent this deployment no longer runs, say).
+  const routed = new Set<string>();
+  for (const w of Object.values(config.workflows)) {
+    routed.add(w.pool);
+    if (w.review.enabled) routed.add(w.review.pool);
+  }
+  for (const [name, p] of Object.entries(config.pools)) if (routed.has(name)) pools[name] = { agents: [...p.agents] };
+  const pooled = new Set(Object.values(pools as Record<string, { agents: string[] }>).flatMap((p) => p.agents));
+  for (const [name, a] of Object.entries(config.agents)) {
+    if (!pooled.has(name)) continue;
+    agents[name] = { adapter: a.adapter, ...(a.model ? { model: a.model } : {}), ...(a.effort ? { effort: a.effort } : {}), ...(a.enabled ? {} : { enabled: false }) };
+  }
 
   for (const [name, w] of Object.entries(config.workflows)) {
-    const u = used.get(name) ?? { runs: false, review: false, revise: false };
-    agents[name] = profile(w.agent);
-    pools[name] = { agents: [name] };
     prompts[`${name}.md`] = w.prompt;
-    const action: Record<string, unknown> = { prompt: `./prompts/${name}.md` };
-    if (w.verify.length) action.verify = [...w.verify];
-    if (w.timeoutMinutes !== undefined) action.timeoutMinutes = w.timeoutMinutes;
-    if (w.verify.length && w.verifyTimeoutMinutes !== undefined) action.verifyTimeoutMinutes = w.verifyTimeoutMinutes;
-    if (u.review) {
-      agents[`${name}.review`] = profile(w.reviewer);
-      pools[`${name}.review`] = { agents: [`${name}.review`] };
-      prompts[`${name}.review.md`] = w.reviewer.prompt;
-      action.reviewPrompt = `./prompts/${name}.review.md`;
-    }
-    if (u.revise) {
-      prompts[`${name}.revise.md`] = w.revisePrompt;
-      action.revisePrompt = `./prompts/${name}.revise.md`;
-    }
-    actions[name] = action;
+    if (w.review.enabled) prompts[`${name}.review.md`] = w.review.prompt;
+    if (w.revise.enabled) prompts[`${name}.revise.md`] = w.revise.prompt;
+  }
+  const layout = actionLayout(config);
+  for (const [action, a] of layout.actions) {
+    const w = config.workflows[a.workflow]!;
+    actions[action] = {
+      prompt: `./prompts/${a.workflow}.md`,
+      ...(a.verify.length ? { verify: [...a.verify] } : {}),
+      ...(w.timeoutMinutes !== undefined ? { timeoutMinutes: w.timeoutMinutes } : {}),
+      ...(a.verify.length && a.verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes: a.verifyTimeoutMinutes } : {}),
+      ...(w.review.enabled ? { reviewPrompt: `./prompts/${a.workflow}.review.md` } : {}),
+      ...(w.revise.enabled ? { revisePrompt: `./prompts/${a.workflow}.revise.md` } : {}),
+    };
   }
 
   const repositories: Record<string, unknown> = {};
   const everyone = new Map<string, string>();
+  for (const a of config.allowedActors) everyone.set(a.toLowerCase(), a);
   for (const [fullName, r] of Object.entries(config.repositories)) {
-    for (const a of r.allowedActors) if (!everyone.has(a.toLowerCase())) everyone.set(a.toLowerCase(), a);
+    const actors = r.allowedActors ?? config.allowedActors;
+    for (const a of actors) if (!everyone.has(a.toLowerCase())) everyone.set(a.toLowerCase(), a);
+    // The workflows of a repository agree on these (checkMeaning): the first one speaks for all.
+    const first = config.workflows[r.workflows[0] ?? ''];
+    const review = first?.review.enabled ? (first.review.allowSameAgent ? { allowSameAgent: true } : true) : undefined;
+    const revise = first?.revise.enabled ? { revise: true, ...(first.revise.maxRevisions !== undefined ? { maxRevisions: first.revise.maxRevisions } : {}) } : {};
     repositories[fullName] = {
       ...(r.enabled ? {} : { paused: true }),
       ...(r.baseBranch ? { baseBranch: r.baseBranch } : {}),
       publish: r.publish,
       commentOnFailure: r.commentOnFailure,
-      ...(r.review ? { review: true } : {}),
-      ...(r.revise ? { revise: true, ...(r.maxRevisions !== undefined ? { maxRevisions: r.maxRevisions } : {}) } : {}),
+      ...(review !== undefined ? { review } : {}),
+      ...revise,
       ...(r.autoMerge
         ? {
             autoMerge: r.autoMerge.method,
@@ -458,13 +770,16 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
             ...(r.autoMerge.requiredChecks?.length ? { autoMergeRequiredChecks: [...r.autoMerge.requiredChecks] } : {}),
           }
         : {}),
-      workflows: r.triggers.map((t) => ({
-        trigger: { event: 'issue.labeled', label: t.label },
-        action: t.workflow,
-        pool: t.workflow,
-        allowedActors: [...r.allowedActors],
-        ...(r.review ? { reviewPool: `${t.workflow}.review` } : {}),
-      })),
+      workflows: r.workflows.map((n) => {
+        const w = config.workflows[n]!;
+        return {
+          trigger: { event: 'issue.labeled', label: w.label },
+          action: layout.actionOf(fullName, n),
+          pool: w.pool,
+          allowedActors: [...actors],
+          ...(w.review.enabled ? { reviewPool: w.review.pool } : {}),
+        };
+      }),
     };
   }
 
@@ -480,43 +795,50 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
  * show it where the person typed. A path it does not recognize is returned as it is.
  */
 export function toConsolePath(path: string, config: ConsoleConfig): string {
-  const workflows = Object.keys(config.workflows).sort((a, b) => b.length - a.length);
-  const repos = Object.keys(config.repositories).sort((a, b) => b.length - a.length);
   const rest = (p: string, prefix: string) => (p === prefix ? '' : p.startsWith(`${prefix}.`) ? p.slice(prefix.length + 1) : null);
   const join = (...parts: string[]) => parts.filter((p) => p !== '').join('.');
+  let r: string | null;
 
-  for (const w of workflows) {
-    const base = `workflows.${w}`;
-    let r: string | null;
-    if ((r = rest(path, `agents.${w}.review`)) !== null) return join(base, 'reviewer', r);
-    if ((r = rest(path, `agents.${w}`)) !== null) return join(base, 'agent', r);
-    if (rest(path, `pools.${w}.review`) !== null) return join(base, 'reviewer');
-    if (rest(path, `pools.${w}`) !== null) return join(base, 'agent');
-    if ((r = rest(path, `actions.${w}`)) !== null) {
-      if (r === 'reviewPrompt') return join(base, 'reviewer', 'prompt');
-      return join(base, r);
-    }
-    if (path === `prompts/${w}.md` || path === `prompts.${w}.md`) return join(base, 'prompt');
-    if (path === `prompts/${w}.review.md` || path === `prompts.${w}.review.md`) return join(base, 'reviewer', 'prompt');
-    if (path === `prompts/${w}.revise.md` || path === `prompts.${w}.revise.md`) return join(base, 'revisePrompt');
+  const layout = actionLayout(config);
+  const actionNames = [...layout.actions.keys()].sort((a, b) => b.length - a.length);
+  for (const action of actionNames) {
+    if ((r = rest(path, `actions.${action}`)) === null) continue;
+    const a = layout.actions.get(action)!;
+    const base = `workflows.${a.workflow}`;
+    if (a.repo && (r.startsWith('verify') || r.startsWith('verifyTimeoutMinutes'))) return join(`repositories.${a.repo}`, r);
+    if (r === 'reviewPrompt') return join(base, 'review', 'prompt');
+    if (r === 'revisePrompt') return join(base, 'revise', 'prompt');
+    return join(base, r);
   }
+  const workflows = Object.keys(config.workflows).sort((a, b) => b.length - a.length);
+  for (const w of workflows) {
+    const file = /^prompts[/.](.*)$/.exec(path)?.[1];
+    if (file === `${w}.md`) return `workflows.${w}.prompt`;
+    if (file === `${w}.review.md`) return `workflows.${w}.review.prompt`;
+    if (file === `${w}.revise.md`) return `workflows.${w}.revise.prompt`;
+  }
+
+  const repos = Object.keys(config.repositories).sort((a, b) => b.length - a.length);
   for (const repo of repos) {
-    const r = rest(path, `repositories.${repo}`);
-    if (r === null) continue;
+    if ((r = rest(path, `repositories.${repo}`)) === null) continue;
     const base = `repositories.${repo}`;
+    const settings = config.repositories[repo]!;
     const m = /^workflows\.(\d+)(?:\.(.*))?$/.exec(r);
     if (m) {
+      const wf = settings.workflows[Number(m[1])];
       const tail = m[2] ?? '';
-      if (tail.startsWith('allowedActors')) return join(base, tail);
-      if (tail.startsWith('trigger.label')) return join(base, 'triggers', m[1]!, 'label');
-      if (tail === 'action' || tail === 'pool') return join(base, 'triggers', m[1]!, 'workflow');
-      return join(base, 'triggers', m[1]!);
+      if (tail.startsWith('allowedActors')) return settings.allowedActors ? join(base, tail) : tail;
+      if (wf && tail.startsWith('trigger.label')) return `workflows.${wf}.label`;
+      if (wf && tail === 'pool') return `workflows.${wf}.pool`;
+      if (wf && tail === 'reviewPool') return `workflows.${wf}.review.pool`;
+      return join(base, 'workflows');
     }
+    if (r.startsWith('review') || r.startsWith('revise') || r.startsWith('maxRevisions')) return join(base, 'workflows');
     if (r.startsWith('autoMergeWaitMinutes')) return join(base, 'autoMerge', 'waitMinutes');
     if (r.startsWith('autoMergeRequiredChecks')) return join(base, 'autoMerge', r.replace(/^autoMergeRequiredChecks/, 'requiredChecks'));
     if (r === 'paused') return join(base, 'enabled');
     return join(base, r);
   }
-  if (path.startsWith('dispatch.allowedActors')) return 'repositories';
+  if (path.startsWith('dispatch.allowedActors')) return 'allowedActors';
   return path;
 }

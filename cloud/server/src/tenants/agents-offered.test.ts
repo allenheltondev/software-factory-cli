@@ -15,12 +15,18 @@ const { createBroker, hashToken } = await import('../broker/broker.js');
 const { CONSOLE_AGENTS, defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission } = await import('./console.js');
 const { createStatusService } = await import('./status-service.js');
 
-const repo = (over: Record<string, unknown> = {}) => ({ enabled: true, triggers: [{ label: 'updraft', workflow: 'implement' }], allowedActors: ['pat'], publish: 'draft-pr', commentOnFailure: true, review: false, revise: false, ...over });
 const REPOS = new Map([['acme/web', 9]]);
+/** One builder and one reviewer agent, each in a pool of its own. */
 const withAgents = (agent: string, reviewer: string, review = false) => {
-  const d = defaultConsoleConfig();
+  const d = defaultConsoleConfig({ login: 'pat' });
   const w = d.workflows.implement!;
-  return { ...d, workflows: { implement: { ...w, agent: { adapter: agent }, reviewer: { ...w.reviewer, adapter: reviewer } } }, repositories: { 'acme/web': repo({ review }) } };
+  return {
+    ...d,
+    agents: { writer: { adapter: agent, enabled: true }, checker: { adapter: reviewer, enabled: true } },
+    pools: { builders: { agents: ['writer'] }, reviewers: { agents: ['checker'] } },
+    workflows: { implement: { ...w, review: { ...w.review, enabled: review, allowSameAgent: true }, revise: { ...w.revise, enabled: false } } },
+    repositories: { 'acme/web': { enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [] } },
+  };
 };
 const compileErrors = (raw: unknown) => {
   const parsed = parseConsoleConfig(raw);
@@ -30,17 +36,20 @@ const compileErrors = (raw: unknown) => {
 };
 
 describe('agents this deployment does not run', () => {
-  it('starts a new workflow with the agents it runs: Claude writes and reviews', () => {
+  it('starts with the agents it runs: Claude alone builds and reviews, and may review its own work', () => {
     expect(CONSOLE_AGENTS).toEqual(['claude']);
-    const w = defaultConsoleConfig().workflows.implement!;
-    expect([w.agent.adapter, w.reviewer.adapter]).toEqual(['claude', 'claude']);
-    expect(compileErrors(withAgents('claude', 'claude', true))).toEqual([]);
+    const d = defaultConsoleConfig({ login: 'pat' });
+    expect(d.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } });
+    expect(d.workflows.implement!.review.allowSameAgent).toBe(true);
+    expect(compileErrors({ ...d, repositories: { 'acme/web': { enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [] } } })).toEqual([]);
   });
 
   it('still loads a saved config that names an agent it no longer runs, and refuses to publish one that would run it', () => {
     const saved = withAgents('kiro', 'codex');
     expect(parseConsoleConfig(saved).ok).toBe(true);
-    expect(compileErrors(saved)).toEqual([expect.objectContaining({ path: 'workflows.implement.agent.adapter', message: expect.stringMatching(/not an agent Updraft Cloud runs \(claude\)/) })]);
+    // The reviewer is in no pool a job routes to while review is off: only the builder is refused.
+    expect(compileErrors(saved)).toEqual([expect.objectContaining({ path: 'agents.writer.adapter', message: expect.stringMatching(/not an agent Updraft Cloud runs \(claude\)/) })]);
+    expect(compileErrors(withAgents('claude', 'codex', true))).toEqual([expect.objectContaining({ path: 'agents.checker.adapter' })]);
   });
 
   it('asks for no key of an agent it does not run: compiling says to choose another', () => {
@@ -49,9 +58,12 @@ describe('agents this deployment does not run', () => {
     expect(missingKeys(parsed.config, new Set())).toEqual([]);
   });
 
-  it('ignores a reviewer no repository uses', () => {
-    expect(compileErrors(withAgents('claude', 'codex', false))).toEqual([]);
-    expect(compileErrors(withAgents('claude', 'codex', true))).toEqual([expect.objectContaining({ path: 'workflows.implement.reviewer.adapter' })]);
+  it('an agent that is off is not compiled into any job, wherever it is offered', () => {
+    const saved = withAgents('claude', 'codex');
+    const off = { ...saved, agents: { ...saved.agents, checker: { adapter: 'codex', enabled: false } }, pools: { ...saved.pools, builders: { agents: ['writer'] } } };
+    const parsed = parseConsoleConfig(off);
+    if (!parsed.ok) throw new Error(JSON.stringify(parsed.errors));
+    expect(missingKeys(parsed.config, new Set(['ANTHROPIC_API_KEY']))).toEqual([]);
   });
 });
 

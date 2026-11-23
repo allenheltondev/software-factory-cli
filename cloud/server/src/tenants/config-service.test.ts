@@ -57,17 +57,12 @@ const github: GitHubApi = {
   createIssueComment: async () => {},
 };
 
-const repo = (over: Record<string, unknown> = {}) => ({
-  enabled: true,
-  triggers: [{ label: 'updraft', workflow: 'implement' }],
-  allowedActors: ['pat'],
-  publish: 'draft-pr',
-  commentOnFailure: true,
-  review: false,
-  revise: false,
-  ...over,
-});
-const settings = (repos: Record<string, unknown> = { 'acme/web': repo() }) => ({ ...defaultConsoleConfig(), repositories: repos });
+const repo = (over: Record<string, unknown> = {}) => ({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [], ...over });
+/** The defaults a new installation starts from (builders and reviewers hold Claude and Codex), with these repositories. */
+const settings = (repos: Record<string, unknown> = { 'acme/web': repo() }, workflow: Record<string, unknown> = {}) => {
+  const d = defaultConsoleConfig({ offered: ['claude', 'codex'], login: 'pat' });
+  return { ...d, workflows: { implement: { ...d.workflows.implement!, ...workflow } }, repositories: repos };
+};
 
 let store: Store;
 let objects: Map<string, string>;
@@ -138,7 +133,52 @@ describe('loading the editor', () => {
     expect(body).toMatchObject({ githubLogin: 'pat', activeVersion: null, source: 'none', agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true } });
     expect(body.repositories?.map((r) => r.fullName)).toEqual(['acme/api', 'acme/web']);
     const defaults = body.defaults as { prompts: { implement: string } };
-    expect(body).toMatchObject({ config: { workflows: { implement: { prompt: defaults.prompts.implement } } } });
+    expect(body).toMatchObject({
+      config: {
+        version: 2,
+        // Every agent the deployment offers (this one runs all three), in both pools.
+        agents: { claude: { adapter: 'claude', enabled: true }, codex: { adapter: 'codex', enabled: true }, kiro: { adapter: 'kiro', enabled: true } },
+        pools: { builders: { agents: ['claude', 'codex', 'kiro'] }, reviewers: { agents: ['claude', 'codex', 'kiro'] } },
+        allowedActors: ['pat'],
+        workflows: { implement: { label: 'updraft', pool: 'builders', prompt: defaults.prompts.implement, review: { enabled: true, pool: 'reviewers', allowSameAgent: false }, revise: { enabled: true } } },
+        repositories: {},
+      },
+    });
+  });
+
+  it('loads a version published with the first console settings, upgraded to pools', async () => {
+    const v1 = {
+      version: 1,
+      workflows: {
+        implement: {
+          agent: { adapter: 'claude', model: 'opus' },
+          prompt: '# Build',
+          reviewer: { adapter: 'codex', prompt: '# Review' },
+          revisePrompt: '# Revise',
+          verify: ['npm test'],
+        },
+      },
+      repositories: {
+        'acme/web': { enabled: true, triggers: [{ label: 'go', workflow: 'implement' }], allowedActors: ['pat'], publish: 'pr', commentOnFailure: true, review: true, revise: false },
+      },
+    };
+    // Stored as the first console stored its settings.
+    const n = (await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml', SOURCE_FILE], publishedBy: 'pat', publishedAt: '2026-11-19T00:00:00.000Z' })) as number;
+    objects.set(`${configPrefix(55, n)}${SOURCE_FILE}`, JSON.stringify({ format: 'console', config: v1 }));
+    await store.markConfigReady(55, n);
+    await store.activateConfig(55, n);
+    const { body } = await call(PAT, 'GET', '/installations/55/config');
+    expect(body).toMatchObject({
+      source: 'console',
+      config: {
+        version: 2,
+        agents: { claude: { adapter: 'claude', model: 'opus' }, codex: { adapter: 'codex' } },
+        pools: { builders: { agents: ['claude'] }, reviewers: { agents: ['codex'] } },
+        allowedActors: ['pat'],
+        workflows: { implement: { label: 'go', pool: 'builders', prompt: '# Build', review: { enabled: true, pool: 'reviewers', prompt: '# Review' }, revise: { enabled: false } } },
+        repositories: { 'acme/web': { workflows: ['implement'], publish: 'pr', verify: ['npm test'] } },
+      },
+    });
   });
 
   it('loads what was published last', async () => {
@@ -217,12 +257,16 @@ describe('preview', () => {
     await store.putTenantWithMember(t, { installationId: 77, sub: 'sub-ivy', role: 'owner', githubUserId: 3, githubLogin: 'ivy', addedAt: t.createdAt });
     await store.putAgentKeyMeta(77, { name: 'CODEX_API_KEY', updatedAt: t.createdAt, updatedBy: 'ivy' });
     const { body } = await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/preview', { config: settings({ 'globex/app': repo() }) });
-    expect(body.errors).toEqual([expect.objectContaining({ path: 'workflows.implement.agent.adapter', message: expect.stringMatching(/ANTHROPIC_API_KEY/) })]);
+    // Claude is in both pools; Codex's key is set. Turning Claude off is the other way out.
+    expect(body.errors).toEqual([expect.objectContaining({ path: 'agents.claude', message: expect.stringMatching(/ANTHROPIC_API_KEY, or turn this agent off/) })]);
+    const off = settings({ 'globex/app': repo() }, { review: { ...settings().workflows.implement.review, allowSameAgent: true } });
+    const claudeOff = { ...off, allowedActors: ['ivy'], agents: { ...off.agents, claude: { adapter: 'claude', enabled: false } } };
+    expect((await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/preview', { config: claudeOff })).body).toMatchObject({ ok: true });
   });
 
   it('says which repositories would turn auto-merge on', async () => {
     const { body } = await call(PAT, 'POST', '/installations/55/config/preview', {
-      config: settings({ 'acme/web': repo({ review: true, autoMerge: { method: 'squash' } }) }),
+      config: settings({ 'acme/web': repo({ autoMerge: { method: 'squash' } }) }),
     });
     expect(body).toMatchObject({ ok: true, autoMergeTurnedOn: ['acme/web'] });
   });
@@ -232,24 +276,31 @@ describe('publishing', () => {
   it('uploads the bundle to config/<n+1>/ and then activates it, recording who published it', async () => {
     const res = await publish(settings(), { baseVersion: null });
     expect(res).toMatchObject({ status: 200, body: { ok: true, version: 1 } });
-    expect([...objects.keys()].sort()).toEqual([`${configPrefix(55, 1)}config.yaml`, `${configPrefix(55, 1)}prompts/implement.md`, `${configPrefix(55, 1)}${SOURCE_FILE}`]);
+    expect([...objects.keys()].sort()).toEqual([
+      `${configPrefix(55, 1)}config.yaml`,
+      `${configPrefix(55, 1)}prompts/implement.md`,
+      `${configPrefix(55, 1)}prompts/implement.review.md`,
+      `${configPrefix(55, 1)}prompts/implement.revise.md`,
+      `${configPrefix(55, 1)}${SOURCE_FILE}`,
+    ]);
     expect((await store.getTenant(55))?.activeConfigVersion).toBe(1);
     expect(await store.getConfigVersion(55, 1)).toMatchObject({ status: 'ready', publishedBy: 'pat', publishedAt: new Date(NOW).toISOString() });
   });
 
   it('an invalid config is refused and the active version is kept', async () => {
     await publish(settings(), { baseVersion: null });
-    const res = await publish(settings({ 'acme/web': repo({ triggers: [] }) }), { baseVersion: 1 });
-    expect(res).toMatchObject({ status: 400, body: { error: 'invalid_config', errors: [expect.objectContaining({ path: 'repositories.acme/web.triggers' })] } });
+    const res = await publish(settings({ 'acme/web': repo({ workflows: [] }) }), { baseVersion: 1 });
+    expect(res).toMatchObject({ status: 400, body: { error: 'invalid_config', errors: [expect.objectContaining({ path: 'repositories.acme/web.workflows' })] } });
     expect((await store.getTenant(55))?.activeConfigVersion).toBe(1);
     expect(await store.listConfigVersions(55)).toHaveLength(1);
   });
 
   it('tenant input for platform-enforced fields is refused, never overridden', async () => {
-    const config = { ...settings(), workflows: { implement: { ...defaultConsoleConfig().workflows.implement, agent: { adapter: 'claude', env: { X: '1' } } } } };
+    const base = settings();
+    const config = { ...base, agents: { ...base.agents, claude: { adapter: 'claude', enabled: true, env: { X: '1' } } } };
     const res = await publish(config, { baseVersion: null });
     expect(res.status).toBe(400);
-    expect(res.body.errors).toEqual([expect.objectContaining({ path: 'workflows.implement.agent.env' })]);
+    expect(res.body.errors).toEqual([expect.objectContaining({ path: 'agents.claude.env' })]);
     expect((await store.getTenant(55))?.activeConfigVersion).toBeUndefined();
   });
 
@@ -287,7 +338,7 @@ describe('publishing', () => {
   });
 
   it('turning auto-merge on takes an explicit confirmation; keeping it on does not', async () => {
-    const on = settings({ 'acme/web': repo({ review: true, autoMerge: { method: 'squash' } }) });
+    const on = settings({ 'acme/web': repo({ autoMerge: { method: 'squash' } }) });
     expect(await publish(on, { baseVersion: null })).toMatchObject({ status: 409, body: { error: 'auto_merge_unconfirmed' } });
     expect((await store.getTenant(55))?.activeConfigVersion).toBeUndefined();
     expect(await publish(on, { baseVersion: null, confirmAutoMerge: true })).toMatchObject({ status: 200, body: { version: 1 } });
@@ -303,7 +354,7 @@ describe('publishing', () => {
     await publish(settings({ 'acme/web': repo({ enabled: false }) }), { baseVersion: 1 });
     expect(decideDispatch(await rules(), event)).toMatchObject({ start: false, reason: 'the repository is paused' });
 
-    await publish(settings({ 'acme/web': repo({ triggers: [{ label: 'go', workflow: 'implement' }], allowedActors: ['sam'] }) }), { baseVersion: 2 });
+    await publish(settings({ 'acme/web': repo({ allowedActors: ['sam'] }) }, { label: 'go' }), { baseVersion: 2 });
     expect(decideDispatch(await rules(), event)).toMatchObject({ start: false, reason: 'the label is not a trigger' });
     expect(decideDispatch(await rules(), { ...event, label: 'go' })).toMatchObject({ start: false, reason: 'the sender may not dispatch work' });
     expect(decideDispatch(await rules(), { ...event, label: 'go', sender: 'Sam' })).toMatchObject({ start: true });
@@ -331,7 +382,7 @@ describe('history', () => {
     const list = await call(PAT, 'GET', '/installations/55/config/versions');
     expect(list.body).toMatchObject({ activeVersion: 2, versions: [{ version: 2, active: true, publishedBy: 'pat' }, { version: 1, active: false }] });
     const one = await call(PAT, 'GET', '/installations/55/config/versions/1');
-    expect(Object.keys(one.body.files ?? {}).sort()).toEqual(['config.yaml', 'prompts/implement.md']);
+    expect(Object.keys(one.body.files ?? {}).sort()).toEqual(['config.yaml', 'prompts/implement.md', 'prompts/implement.review.md', 'prompts/implement.revise.md']);
     expect((await call(PAT, 'GET', '/installations/55/config/versions/9')).status).toBe(404);
     // A version whose upload never finished: listed as pending, with no files read.
     await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 'pat', publishedAt: '2026-11-20T00:00:00.000Z' });
@@ -351,7 +402,7 @@ describe('history', () => {
   });
 
   it('re-activating a version that turns auto-merge on asks for the confirmation again', async () => {
-    await publish(settings({ 'acme/web': repo({ review: true, autoMerge: { method: 'squash' } }) }), { baseVersion: null, confirmAutoMerge: true });
+    await publish(settings({ 'acme/web': repo({ autoMerge: { method: 'squash' } }) }), { baseVersion: null, confirmAutoMerge: true });
     await publish(settings(), { baseVersion: 1 });
     expect(await call(PAT, 'POST', '/installations/55/config/versions/1/reactivate', {})).toMatchObject({ status: 409, body: { error: 'auto_merge_unconfirmed' } });
     expect(await call(PAT, 'POST', '/installations/55/config/versions/1/reactivate', { confirmAutoMerge: true })).toMatchObject({ status: 200, body: { version: 3 } });
@@ -410,12 +461,8 @@ describe('history', () => {
       { store, putObject: async (k, b) => void objects.set(k, b), now: () => NOW },
     );
     expect(adminVersion).toMatchObject({ ok: true, version: 1 });
-    const defaults = defaultConsoleConfig();
-    const codexOnly = {
-      ...defaults,
-      workflows: { implement: { ...defaults.workflows.implement!, agent: { adapter: 'codex' } } },
-      repositories: { 'globex/app': repo({ allowedActors: ['ivy'] }) },
-    };
+    const defaults = defaultConsoleConfig({ offered: ['codex'], login: 'ivy' });
+    const codexOnly = { ...defaults, repositories: { 'globex/app': repo() } };
     expect(await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/publish', { config: codexOnly, baseVersion: 1 })).toMatchObject({ status: 200, body: { version: 2 } });
 
     const res = await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/versions/1/reactivate', {});

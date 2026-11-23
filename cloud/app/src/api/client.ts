@@ -500,40 +500,46 @@ export interface ConsoleAgent {
   adapter: AgentAdapter;
   model?: string;
   effort?: string;
+  /** false: never chosen, and its key is not needed. */
+  enabled: boolean;
+}
+
+export interface ConsolePool {
+  /** Roster agent names, taken in turn. */
+  agents: string[];
 }
 
 export interface ConsoleWorkflow {
-  agent: ConsoleAgent;
-  prompt: string;
-  reviewer: ConsoleAgent & { prompt: string };
-  revisePrompt: string;
-  verify: string[];
-  timeoutMinutes?: number;
-  verifyTimeoutMinutes?: number;
-}
-
-export interface ConsoleTrigger {
+  /** The issue label that starts it. */
   label: string;
-  workflow: string;
+  /** The pool that does the work. */
+  pool: string;
+  prompt: string;
+  timeoutMinutes?: number;
+  review: { enabled: boolean; pool: string; prompt: string; allowSameAgent: boolean };
+  revise: { enabled: boolean; prompt: string; maxRevisions?: number };
 }
 
 export interface ConsoleRepository {
   /** false: paused. */
   enabled: boolean;
-  triggers: ConsoleTrigger[];
-  allowedActors: string[];
+  workflows: string[];
+  /** Absent: the installation's list. */
+  allowedActors?: string[];
   baseBranch?: string;
   publish: 'draft-pr' | 'pr';
   commentOnFailure: boolean;
-  review: boolean;
-  revise: boolean;
-  maxRevisions?: number;
+  verify: string[];
+  verifyTimeoutMinutes?: number;
   /** Absent: off. */
   autoMerge?: { method: MergeMethod; waitMinutes?: number; requiredChecks?: string[] };
 }
 
 export interface ConsoleConfig {
-  version: 1;
+  version: 2;
+  agents: Record<string, ConsoleAgent>;
+  pools: Record<string, ConsolePool>;
+  allowedActors: string[];
   workflows: Record<string, ConsoleWorkflow>;
   repositories: Record<string, ConsoleRepository>;
 }

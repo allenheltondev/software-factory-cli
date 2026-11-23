@@ -55,7 +55,7 @@ export interface VersionSummary {
 
 export interface ConfigView {
   tenant: TenantSummary;
-  /** The caller's GitHub login: the allowed actor a new repository starts with. */
+  /** The caller's GitHub login: the allowed actor a new configuration starts with. */
   githubLogin: string;
   /** What the installation reaches: the repositories that can be configured. */
   repositories: GitHubRepository[];
@@ -207,7 +207,7 @@ export function createConfigService({ store, github, objects, now = () => Date.n
       const ctx = await github.configContext(caller, installationId);
       const active = ctx.tenant.activeConfigVersion;
       const [source, keys] = await Promise.all([activeSource(installationId, active), keysSet(installationId)]);
-      let config = defaultConsoleConfig();
+      let config = defaultConsoleConfig({ offered: CONSOLE_AGENTS, login: ctx.githubLogin });
       let kind: ConfigView['source'] = source?.format ?? 'none';
       if (source?.format === 'console') {
         const parsed = parseConsoleConfig(source.config);
