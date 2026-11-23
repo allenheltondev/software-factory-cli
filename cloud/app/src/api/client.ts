@@ -166,6 +166,19 @@ export interface AgentKeyView {
   lastUsed?: { at: string; ok: boolean };
 }
 
+/** A job's Claude subscription sign-in (the console's ClaudeSignInPage). */
+export interface ClaudeSignInView {
+  state: 'starting' | 'waiting' | 'code' | 'exchanging' | 'done' | 'failed';
+  repository: string;
+  issue?: number;
+  pullRequest?: number;
+  /** The claude.ai sign-in link, while the job waits for a code. */
+  url?: string;
+  waitsUntil?: string;
+  by?: string;
+  reason?: string;
+}
+
 export interface AgentKeysView {
   keys: AgentKeyView[];
   refusals: { at: string; deliveryId: string; repository: string; issue: number; reason: string }[];
@@ -691,6 +704,9 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     removeTelemetryKey: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'DELETE' }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */
+    claudeSignIn: (installationId: number, jobId: string) => request<ClaudeSignInView>(`/installations/${installationId}/claude-sign-in/${encodeURIComponent(jobId)}`),
+    submitClaudeSignInCode: (installationId: number, jobId: string, code: string) =>
+      request<ClaudeSignInView>(`/installations/${installationId}/claude-sign-in/${encodeURIComponent(jobId)}`, { method: 'POST', body: JSON.stringify({ code }) }),
     setAgentKey: (installationId: number, name: string, value: string) =>
       request<AgentKeysView>(`/installations/${installationId}/agent-keys/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ value }) }),
     adminTenants: () => request<AdminOverview>('/admin/tenants'),

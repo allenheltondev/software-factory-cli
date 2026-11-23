@@ -53,6 +53,9 @@ export type FlowErrorCode =
   // Agent telemetry (tenants/telemetry-service.ts).
   | 'invalid_settings'
   | 'state_too_large'
+  // A job's Claude sign-in (tenants/claude-sign-in-service.ts).
+  | 'invalid_code'
+  | 'sign_in_closed'
   // The admin view (admin/admin.ts).
   | 'not_found'
   | 'uninstalled'

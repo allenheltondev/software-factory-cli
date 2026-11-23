@@ -6,6 +6,7 @@ import type { Caller } from './caller.js';
 import { safeMessage } from './tenants/redact.js';
 import { FlowError, type GitHubFlows } from './flows/github.js';
 import type { TenantLimits } from './store/store.js';
+import type { ClaudeSignInService } from './tenants/claude-sign-in-service.js';
 import type { AgentKeyService } from './tenants/agent-key-service.js';
 import type { StatusService } from './tenants/status-service.js';
 import type { StatsService } from './tenants/stats-service.js';
@@ -77,6 +78,8 @@ export interface AppOptions {
   admin?: { access: AdminAccess; service: AdminService };
   config?: ConfigService;
   agentKeys?: AgentKeyService;
+  /** A job's Claude subscription sign-in: its page and the code a member gives there. */
+  claudeSignIn?: ClaudeSignInService;
   status?: StatusService;
   stats?: StatsService;
   telemetry?: TelemetryService;
@@ -93,7 +96,7 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** Who did it, for the admin's actions: their email, else their sub. */
 const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
 
-export function createApp({ resolveCaller, github, admin, config, agentKeys, status, stats, telemetry, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
+export function createApp({ resolveCaller, github, admin, config, agentKeys, claudeSignIn, status, stats, telemetry, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -281,6 +284,30 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, sta
         return c.json({ error: 'bad_request' }, 400);
       }
       return c.json(await agentKeys.set(c.get('caller'), id, c.req.param('name'), value));
+    });
+  }
+
+  if (claudeSignIn) {
+    const positive = (raw: string) => {
+      const n = Number(raw);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    };
+    // A job's Claude sign-in: where it stands and the claude.ai link (GET), the code (POST).
+    app.get('/v1/installations/:id/claude-sign-in/:jobId', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await claudeSignIn.get(c.get('caller'), id, c.req.param('jobId'))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.post('/v1/installations/:id/claude-sign-in/:jobId', async (c) => {
+      const id = positive(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      if (Number(c.req.header('content-length') ?? 0) > 4096) return c.json({ error: 'too_large' }, 413);
+      let code: unknown;
+      try {
+        code = ((await c.req.json()) as { code?: unknown }).code;
+      } catch {
+        return c.json({ error: 'bad_request' }, 400);
+      }
+      return c.json(await claudeSignIn.submit(c.get('caller'), id, c.req.param('jobId'), code));
     });
   }
 

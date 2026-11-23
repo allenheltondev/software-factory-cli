@@ -543,12 +543,14 @@ Resources:
             Statement:
               # Jobs and their tenants only: read a job and its tenant, mark a job started or
               # finished, count its microVM time in the tenant's usage, and check a job is not
-              # released before holding its slots.
+              # released before holding its slots. Query: a tenant's agent keys (which to hand a
+              # job: a Claude subscription token instead of the API key, never a rejected one).
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
                   - dynamodb:UpdateItem
                   - dynamodb:ConditionCheckItem
+                  - dynamodb:Query
                 Resource: !GetAtt UpdraftTable.Arn
                 Condition:
                   ForAllValues:StringLike:
@@ -580,6 +582,16 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/app/*
+              # The token a job's Claude sign-in got (claude-sign-in actions), saved as the tenant's
+              # CLAUDE_CODE_OAUTH_TOKEN: written only, and only that key (DeleteSecret: undoing a
+              # write that lost a race with the uninstall).
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:TagResource
+                  - secretsmanager:DeleteSecret
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:updraft/tenants/*/agent-keys/CLAUDE_CODE_OAUTH_TOKEN*
               # A job's own microVM, the one the launcher recorded for it (the terminate action),
               # and its state: the job's quota slots are freed once it is seen stopping.
               - Effect: Allow

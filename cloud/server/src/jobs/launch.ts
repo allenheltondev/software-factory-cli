@@ -105,6 +105,11 @@ export interface RunMicrovmInput {
 export interface LaunchDeps {
   store: Store;
   settings: LaunchSettings;
+  /**
+   * false: a workflow whose Claude has no credential is refused (add a key), not started to sign
+   * in with a member's Claude subscription. Default on.
+   */
+  claudeSignIn?: boolean;
   /** The published image version; null while jobs are off (no image built yet). */
   imageVersion: () => Promise<string | null>;
   putEvent: (key: string, body: string) => Promise<void>;
@@ -326,11 +331,19 @@ export function createLauncher(deps: LaunchDeps) {
       const agents = Object.entries(SUPPORTED_AGENT_KEY_ENV).filter(([, k]) => retired.includes(k)).map(([a]) => a);
       return refuse(`This workflow runs ${agents.join(' and ')}, which Updraft Cloud no longer runs here: choose another agent in the configuration and publish it again`, { unavailable: agents });
     }
+    // No Claude credential at all: the job signs in with a member's Claude subscription first
+    // (the runner's claude-sign-in.mjs), rather than being refused for want of a key.
+    let claudeSignIn = false;
     if (needed.length > 0) {
-      const set = (await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name);
+      // A key its provider refused (an expired subscription token) is as good as not set.
+      const set = (await deps.store.listAgentKeyMeta(req.installationId)).filter((k) => !k.rejectedAt).map((k) => k.name);
       // A Claude subscription token meets the need for ANTHROPIC_API_KEY (agents.ts, keysMet).
       const met = keysMet(set);
-      const missing = needed.filter((k) => !met.has(k));
+      let missing = needed.filter((k) => !met.has(k));
+      if (missing.includes(SUPPORTED_AGENT_KEY_ENV.claude) && deps.claudeSignIn !== false) {
+        claudeSignIn = true;
+        missing = missing.filter((k) => k !== SUPPORTED_AGENT_KEY_ENV.claude);
+      }
       if (missing.length > 0) {
         const named = missing.map((k) => {
           const agent = (Object.keys(SUPPORTED_AGENT_KEY_ENV) as CloudAgent[]).find((a) => SUPPORTED_AGENT_KEY_ENV[a] === k);
@@ -340,7 +353,7 @@ export function createLauncher(deps: LaunchDeps) {
       }
       // The job would use a stand-in (the token) that a version published before it existed does
       // not pass into the sandbox: its agent would start signed out. Refused with what to do.
-      const standIns = keysUsedFor(needed, keysToHand(set)).filter((k) => alternativeTo(k) !== undefined);
+      const standIns = claudeSignIn ? ['CLAUDE_CODE_OAUTH_TOKEN'] : keysUsedFor(needed, keysToHand(set)).filter((k) => alternativeTo(k) !== undefined);
       if (standIns.length > 0 && deps.bundleKeys) {
         const env = await deps.bundleKeys.agentEnv(req.installationId, tenant.activeConfigVersion).catch(() => null);
         const unpassed = env ? standIns.filter((k) => !env.has(k)) : [];
@@ -434,6 +447,7 @@ export function createLauncher(deps: LaunchDeps) {
       reservedSeconds: s.maximumDurationSeconds,
       quotas,
       ...(needed.length ? { agentKeys: needed } : {}),
+      ...(claudeSignIn ? { claudeSignIn: { state: 'starting' as const, at: new Date(launchedAt).toISOString() } } : {}),
       ...(decision.issue !== undefined ? { issue: decision.issue } : {}),
       ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}),
     };

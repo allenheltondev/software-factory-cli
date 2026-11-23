@@ -21,6 +21,7 @@ import type {
   GitHubLink,
   InstallationOffer,
   Job,
+  JobClaudeSignIn,
   JobFinishDetail,
   JobSummary,
   Member,
@@ -109,6 +110,17 @@ function toTelemetry(i: Record<string, unknown>): TelemetrySettings {
         }
       : {}),
   };
+}
+
+const SIGN_IN_STATES: readonly JobClaudeSignIn['state'][] = ['starting', 'waiting', 'code', 'exchanging', 'done', 'failed'];
+
+/** A job's Claude sign-in as stored, or undefined when there is none or it is not one. */
+function claudeSignInOf(v: unknown): JobClaudeSignIn | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const o = v as Record<string, unknown>;
+  if (!SIGN_IN_STATES.includes(o.state as JobClaudeSignIn['state']) || typeof o.at !== 'string') return undefined;
+  const text = (k: string) => (typeof o[k] === 'string' ? { [k]: o[k] as string } : {});
+  return { state: o.state as JobClaudeSignIn['state'], at: o.at, ...text('url'), ...text('code'), ...text('by'), ...text('reason') };
 }
 
 function toJobSummary(i: Record<string, unknown>): JobSummary {
@@ -710,6 +722,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         ...(typeof i.launchingAt === 'number' ? { launchingAt: i.launchingAt } : {}),
         ...(typeof i.stopRequestedAt === 'number' ? { stopRequestedAt: i.stopRequestedAt } : {}),
         ...(typeof i.releasedAt === 'number' ? { releasedAt: i.releasedAt } : {}),
+        ...(claudeSignInOf(i.claudeSignIn) ? { claudeSignIn: claudeSignInOf(i.claudeSignIn)! } : {}),
       };
     },
 
@@ -800,6 +813,27 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             UpdateExpression: 'SET retriedAs = :n REMOVE retryReservedUntil, retryToken, retryChild',
             ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(retriedAs) AND retryToken = :token',
             ExpressionAttributeValues: { ':n': newJobId, ':token': token },
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        return false;
+      }
+    },
+
+    async updateClaudeSignIn(jobId, from, next) {
+      if (from.length === 0) return false;
+      const states = Object.fromEntries(from.map((st, n) => [`:from${n}`, st]));
+      try {
+        await client.send(
+          new UpdateCommand({
+            TableName: T,
+            Key: { pk: `JOB#${jobId}`, sk: 'META' },
+            UpdateExpression: 'SET claudeSignIn = :next',
+            ConditionExpression: `attribute_exists(pk) AND claudeSignIn.#state IN (${Object.keys(states).join(', ')})`,
+            ExpressionAttributeNames: { '#state': 'state' },
+            ExpressionAttributeValues: { ':next': next, ...states },
           }),
         );
         return true;
@@ -1846,8 +1880,20 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           updatedAt: String(i.updatedAt),
           updatedBy: String(i.updatedBy),
           ...(typeof i.lastUsedAt === 'string' ? { lastUsedAt: i.lastUsedAt, lastUsedOk: i.lastUsedOk === true } : {}),
+          ...(typeof i.rejectedAt === 'string' ? { rejectedAt: i.rejectedAt } : {}),
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
+    },
+
+    async markAgentKeyRejected(id, name, at) {
+      // As recordAgentKeyUse: only the value the job could have read.
+      await tryUpdate({
+        TableName: T,
+        Key: { pk: `TENANT#${id}`, sk: `KEY#${name}` },
+        UpdateExpression: 'SET rejectedAt = :at',
+        ConditionExpression: 'attribute_exists(pk) AND updatedAt <= :started',
+        ExpressionAttributeValues: { ':at': at.at, ':started': at.jobStartedAt },
+      });
     },
 
     async recordAgentKeyUse(id, name, use) {
