@@ -77,6 +77,9 @@ const REASON: Record<string, string> = {
 
 /** Why a delivery went the way it did, in words. */
 export function deliveryReason(d: Delivery): string {
+  if (d.disposition === 'routine_triggered') return 'An Anthropic-hosted Claude Code scheduled task was started.';
+  if (d.disposition === 'routine_failed') return d.reason === 'trigger_token_unavailable' ? 'The routine trigger token is unavailable; reconnect the route.' : `Anthropic refused the trigger (${d.reason ?? 'unknown reason'}). Check the task and its API trigger.`;
+  if (d.disposition === 'routine_unknown') return 'The request may have started a Claude task. Check Claude Code sessions before reapplying the label.';
   if (d.disposition === 'launched') return 'A job was started.';
   if (d.disposition === 'deduped') return 'A redelivery of a delivery that already has a job.';
   if (d.disposition === 'coalesced') return d.pullRequest !== undefined ? `Folded into the job for pull request #${d.pullRequest}, which sees it.` : 'Folded into another delivery’s job.';
