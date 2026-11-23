@@ -21,6 +21,7 @@ describe('native worker Cloud dispatch', () => {
   let workers: NativeStore;
   let clock: number;
   let disabled: boolean;
+  let subscriptionEnabled: boolean;
   let state: string;
   let control: ReturnType<typeof createNativeControl>;
   let launch: ReturnType<typeof createLauncher>;
@@ -29,7 +30,7 @@ describe('native worker Cloud dispatch', () => {
   const loadSecret = vi.fn<() => Promise<string>>();
   const input = (op: string, extra = {}) => ({ action: 'worker', op, workerId: route.workerId, token: secret, session: 'session-0123456789', microvmId: route.microvmId, auth: 'connected', imageVersion: route.imageVersion, workerVersion: '104', ...extra });
   beforeEach(async () => {
-    clock = Date.now(); disabled = false; state = 'RUNNING'; row = null;
+    clock = Date.now(); disabled = false; subscriptionEnabled = true; state = 'RUNNING'; row = null;
     runMicrovm.mockReset().mockResolvedValue({ microvmId: 'mvm-byok' });
     terminateMicrovm.mockReset().mockResolvedValue(undefined);
     loadSecret.mockReset().mockResolvedValue(secret);
@@ -50,8 +51,8 @@ describe('native worker Cloud dispatch', () => {
       },
       async dequeue() {},
     };
-    control = createNativeControl({ store, workers, route, secret: async () => secret, settings, terminateMicrovm, microvmState: async () => state, disabled: async () => disabled, now: () => clock });
-    launch = createLauncher({ store, settings, native: { route, secret: loadSecret }, imageVersion: async () => null,
+    control = createNativeControl({ store, workers, route, secret: async () => secret, settings, terminateMicrovm, microvmState: async () => state, disabled: async () => disabled, enabled: async () => subscriptionEnabled, now: () => clock });
+    launch = createLauncher({ store, settings, native: { route, secret: loadSecret, enabled: async () => subscriptionEnabled }, imageVersion: async () => null,
       putEvent: async () => {}, runMicrovm, quotas: { concurrentJobs: 10, platformConcurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 100_000 }, now: () => clock, log: () => {} });
   });
   const queued = async () => (await store.getJob((await launch(request())).jobId!))!;
@@ -66,6 +67,21 @@ describe('native worker Cloud dispatch', () => {
     expect(nativeRoute('')).toBeUndefined();
     expect(nativeRoute(JSON.stringify(route))).toEqual(route);
     expect(() => nativeRoute(JSON.stringify({ ...route, controlSecretArn: 'claude-token' }))).toThrow();
+  });
+  it('switches between API-key and subscription routing without deleting keys or bypassing polling controls', async () => {
+    subscriptionEnabled = false;
+    expect(await launch(request())).toMatchObject({ disposition: 'missing_key' });
+    expect(runMicrovm).not.toHaveBeenCalled();
+    subscriptionEnabled = true;
+    const job = await queued();
+    await control.handle(input('register'));
+    subscriptionEnabled = false;
+    expect(await control.handle(input('poll'))).toMatchObject({ ok: true, busy: false });
+    subscriptionEnabled = true;
+    expect(await control.handle(input('poll'))).toHaveProperty('request');
+    subscriptionEnabled = false;
+    expect(await control.handle(input('heartbeat'))).toMatchObject({ cancel: true });
+    expect((await store.getJob(job.jobId))?.native?.workerId).toBe(route.workerId);
   });
   it('queues without an API key or BYOK image, deduplicates deliveries and claims once across concurrent polls', async () => {
     const job = await queued();
