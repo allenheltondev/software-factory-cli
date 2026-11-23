@@ -7,16 +7,34 @@ import { fakeApi } from '../test/fakeApi';
 import { ConfigHistoryPage, diffFiles } from './ConfigHistoryPage';
 import { ConfigPage, issuesAt, parseLogins } from './ConfigPage';
 import { InstallationPage } from './InstallationPage';
+import { keysNeeded, workflowConflict } from './config/model';
 
 const PROMPTS = { implement: '# Implement the issue', review: '# Review the PR', revise: '# Revise the PR' };
 
+/** What the server starts a new installation from: Claude and Codex in builders and reviewers. */
 const baseConfig = (): ConsoleConfig => ({
-  version: 1,
+  version: 2,
+  agents: { claude: { adapter: 'claude', enabled: true }, codex: { adapter: 'codex', enabled: true } },
+  pools: { builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['claude', 'codex'] } },
+  allowedActors: ['pat'],
   workflows: {
-    implement: { agent: { adapter: 'claude' }, prompt: PROMPTS.implement, reviewer: { adapter: 'codex', prompt: PROMPTS.review }, revisePrompt: PROMPTS.revise, verify: [] },
+    implement: {
+      label: 'updraft',
+      pool: 'builders',
+      prompt: PROMPTS.implement,
+      review: { enabled: true, pool: 'reviewers', prompt: PROMPTS.review, allowSameAgent: false },
+      revise: { enabled: true, prompt: PROMPTS.revise },
+    },
   },
   repositories: {},
 });
+/** More than the simple page shows (a pool of its own): it opens in the full editor. */
+const beyondSimple = (): ConsoleConfig => {
+  const config = withRepo();
+  config.pools.fast = { agents: ['claude'] };
+  return config;
+};
+const withRepo = (config = baseConfig()): ConsoleConfig => ({ ...config, repositories: { 'acme/web': { enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [] } } });
 
 const view = (over: Partial<ConfigView> = {}): ConfigView => ({
   tenant: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: 'active', role: 'owner' },
@@ -26,6 +44,7 @@ const view = (over: Partial<ConfigView> = {}): ConfigView => ({
     { id: 10, fullName: 'acme/api', private: false, htmlUrl: 'https://github.com/acme/api' },
   ],
   agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true },
+  agents: ['claude', 'codex'],
   activeVersion: null,
   source: 'none',
   config: baseConfig(),
@@ -33,6 +52,8 @@ const view = (over: Partial<ConfigView> = {}): ConfigView => ({
   limits: { ceilings: { timeoutMinutes: 120, verifyTimeoutMinutes: 30, autoMergeWaitMinutes: 120, maxRevisions: 5 }, console: {} },
   ...over,
 });
+/** A configuration that was published: the editor, not the guide. */
+const published = (over: Partial<ConfigView> = {}) => view({ activeVersion: 1, source: 'console', config: withRepo(), ...over });
 
 function at(path: string, element: React.ReactNode, route: string) {
   return render(
@@ -45,12 +66,8 @@ function at(path: string, element: React.ReactNode, route: string) {
 }
 
 const configPage = (api: ReturnType<typeof fakeApi>) => at('/installations/55/config', <ConfigPage api={api} />, '/installations/:id/config');
-
-async function addRepository(name = 'acme/web') {
-  await userEvent.selectOptions(await screen.findByLabelText('Add a repository'), name);
-  await userEvent.click(screen.getByRole('button', { name: 'Add' }));
-  return screen.getByTestId(`repo-${name}`);
-}
+const publishedOk = (version = 2) => vi.fn().mockResolvedValue({ ok: true, version, yaml: 'version: 1\n', warnings: [] });
+const sentConfig = (api: ReturnType<typeof fakeApi>, call = 0) => (api.publishConfig as ReturnType<typeof vi.fn>).mock.calls[call]![1].config as ConsoleConfig;
 
 describe('helpers', () => {
   it('parses logins from commas and spaces, and finds issues at a field or inside it', () => {
@@ -71,72 +88,26 @@ describe('helpers', () => {
       ['prompts/old.md', 'removed'],
     ]);
   });
+
+  it('knows which keys the agents of enabled repositories need, and skips agents that are off', () => {
+    const config = withRepo();
+    expect(keysNeeded(config, { ANTHROPIC_API_KEY: true })).toMatchObject({ needed: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'], missing: ['CODEX_API_KEY'] });
+    config.agents.codex!.enabled = false;
+    expect(keysNeeded(config, { ANTHROPIC_API_KEY: true }).missing).toEqual([]);
+  });
+
+  it('finds workflows of one repository that clash', () => {
+    const config = withRepo();
+    config.workflows.docs = { ...config.workflows.implement!, label: 'Updraft' };
+    const repo = { ...config.repositories['acme/web']!, workflows: ['implement', 'docs'] };
+    expect(workflowConflict(config, repo)).toMatch(/both start on the label/);
+    config.workflows.docs.label = 'docs';
+    config.workflows.docs.review = { ...config.workflows.docs.review, enabled: false };
+    expect(workflowConflict(config, repo)).toMatch(/review or revise pull requests differently/);
+  });
 });
 
 describe('InstallationPage', () => {
-  it('links the selected agent and reviewer to their setup guides and the Agent keys page', async () => {
-    configPage(fakeApi({ config: async () => view() }));
-    const agent = await screen.findByTestId('agent-help-workflows.implement.agent');
-    expect(within(agent).getByRole('link', { name: /Agent keys/ })).toHaveAttribute('href', '/installations/55/keys');
-    // It opens beside the editor, so an unpublished draft is not lost.
-    expect(within(agent).getByRole('link', { name: 'Agent keys ↗' })).toHaveAttribute('target', '_blank');
-    expect(within(agent).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://platform.claude.com/settings/keys');
-    expect(within(agent).getByRole('link', { name: /Get your Claude API key/ })).toHaveAttribute('href', 'https://platform.claude.com/docs/en/get-api-key');
-    expect(agent).toHaveTextContent('Claude Console API key · API billing');
-    const reviewer = screen.getByTestId('agent-help-workflows.implement.reviewer');
-    expect(reviewer).toHaveTextContent('needs its own key');
-    expect(within(reviewer).getByRole('link', { name: /OpenAI API key creation/ })).toHaveAttribute('href', 'https://developers.openai.com/api/docs/quickstart#create-and-export-an-api-key');
-    // This deployment offers no Kiro, so no Kiro help appears.
-    expect(screen.queryByText(/Kiro/)).toBeNull();
-  });
-
-  it('shows Kiro help when the deployment offers Kiro and a workflow runs it', async () => {
-    const config = baseConfig();
-    config.workflows.implement!.agent = { adapter: 'kiro' };
-    configPage(fakeApi({ config: async () => view({ agents: ['claude', 'codex', 'kiro'], config, agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } }) }));
-    const agent = await screen.findByTestId('agent-help-workflows.implement.agent');
-    expect(agent).toHaveTextContent('Kiro headless API key · Kiro credits');
-    expect(within(agent).getByRole('link', { name: /Get API key/ })).toHaveAttribute('href', 'https://app.kiro.dev/');
-    expect(within(agent).getByRole('link', { name: /Generate a Kiro API key/ })).toHaveAttribute('href', 'https://kiro.dev/docs/getting-started/authentication/#generate-an-api-key');
-    expect(within(agent).getByRole('link', { name: /Enable API keys for an organization/ })).toHaveAttribute('href', 'https://kiro.dev/docs/enterprise/governance/api-keys/');
-  });
-
-  it('refreshes key status when the tab regains focus without touching the draft', async () => {
-    const config = vi.fn().mockResolvedValue(view({ agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } }));
-    configPage(fakeApi({ config }));
-    await addRepository();
-    expect(await screen.findByText(/Set ANTHROPIC_API_KEY before publishing/)).toBeInTheDocument();
-    config.mockResolvedValue(view({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true } }));
-    window.dispatchEvent(new Event('focus'));
-    await waitFor(() => expect(screen.queryByText(/before publishing/)).toBeNull());
-    expect(screen.getByTestId('repo-acme/web')).toBeInTheDocument();
-  });
-
-  it('shows no setup help for a saved agent the deployment no longer offers', async () => {
-    const config = baseConfig();
-    config.workflows.implement!.agent = { adapter: 'kiro' };
-    configPage(fakeApi({ config: async () => view({ agents: ['claude', 'codex'], config }) }));
-    expect(await screen.findByLabelText('Agent')).toHaveValue('kiro');
-    expect(screen.queryByTestId('agent-help-workflows.implement.agent')).toBeNull();
-    expect(screen.getByTestId('agent-help-workflows.implement.reviewer')).toBeInTheDocument();
-  });
-
-  it('ignores a slower, older key-status refresh', async () => {
-    const config = vi.fn().mockResolvedValue(view({ agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } }));
-    configPage(fakeApi({ config }));
-    await addRepository();
-    expect(await screen.findByText(/Set ANTHROPIC_API_KEY before publishing/)).toBeInTheDocument();
-    let releaseOld!: () => void;
-    config.mockImplementationOnce(() => new Promise((res) => { releaseOld = () => res(view({ agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } })); }));
-    window.dispatchEvent(new Event('focus'));
-    config.mockResolvedValueOnce(view({ agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true } }));
-    window.dispatchEvent(new Event('focus'));
-    await waitFor(() => expect(screen.queryByText(/before publishing/)).toBeNull());
-    releaseOld();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(screen.queryByText(/before publishing/)).toBeNull();
-  });
-
   it('links an active installation to its configuration', async () => {
     const api = fakeApi({
       overview: vi.fn().mockResolvedValue({
@@ -155,204 +126,406 @@ describe('InstallationPage', () => {
   });
 });
 
-describe('ConfigPage', () => {
-  it('adds a repository with the linked login as its allowed actor, and publishes it from the active version', async () => {
-    const api = fakeApi({
-      config: vi.fn().mockResolvedValue(view({ activeVersion: 3, source: 'console' })),
-      publishConfig: vi.fn().mockResolvedValueOnce({ ok: true, version: 4, yaml: 'version: 1\n', warnings: [] }).mockResolvedValueOnce({ ok: true, version: 5, yaml: 'version: 1\n', warnings: [] }),
-    });
+
+describe('the simple page', () => {
+  it('sets up from nothing: one repository, both agents coding and reviewing, and shows where to try it', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(view()), publishConfig: publishedOk(1) });
     configPage(api);
-    const repo = await addRepository();
-    expect(within(repo).getByLabelText('Allowed actors')).toHaveValue('pat');
-    expect(within(repo).getByLabelText('Label 1')).toHaveValue('updraft');
-    expect(within(repo).getByLabelText('Publish as')).toHaveValue('draft-pr');
-    expect(within(repo).getByLabelText(/auto-merge/i)).not.toBeChecked();
+    expect(await screen.findByTestId('simple-config')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /Set up Updraft/ })).toBeInTheDocument();
+    const publish = screen.getByRole('button', { name: 'Publish' });
+    expect(publish).toBeDisabled();
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Turn on at least one repository.');
+    expect(within(screen.getByTestId('coding-claude')).getByRole('checkbox')).toBeChecked();
+    expect(within(screen.getByTestId('coding-codex')).getByRole('checkbox')).toBeChecked();
+    expect(within(screen.getByTestId('review-claude')).getByRole('checkbox')).toBeChecked();
+    expect(within(screen.getByTestId('review-codex')).getByRole('checkbox')).toBeChecked();
 
-    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
-    await waitFor(() => expect(api.publishConfig).toHaveBeenCalledTimes(1));
-    const sent = vi.mocked(api.publishConfig).mock.calls[0]!;
-    expect(sent[0]).toBe(55);
-    expect(sent[1].baseVersion).toBe(3);
-    expect(sent[1].confirmAutoMerge).toBeUndefined();
-    expect(sent[1].config.repositories['acme/web']).toEqual({
-      enabled: true,
-      triggers: [{ label: 'updraft', workflow: 'implement' }],
-      allowedActors: ['pat'],
-      publish: 'draft-pr',
-      commentOnFailure: true,
-      review: false,
-      revise: false,
-    });
-    expect(await screen.findByTestId('config-published')).toHaveTextContent('Published version 4');
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Work in acme/web' }));
+    await userEvent.type(within(screen.getByTestId('repo-acme/web')).getByLabelText('Checks'), 'npm ci && npm test');
+    expect(screen.queryByTestId('blockers')).toBeNull();
+    await userEvent.click(publish);
 
-    // The next publish is based on the version just published.
-    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
-    await waitFor(() => expect(api.publishConfig).toHaveBeenCalledTimes(2));
-    expect(vi.mocked(api.publishConfig).mock.calls[1]![1].baseVersion).toBe(4);
+    expect(api.publishConfig).toHaveBeenCalledWith(55, { config: expect.any(Object), baseVersion: null });
+    const sent = sentConfig(api);
+    expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['claude', 'codex'] } });
+    expect(sent.repositories['acme/web']).toEqual({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm ci && npm test'] });
+    const first = await screen.findByTestId('first-publish');
+    expect(first).toHaveTextContent('add the label updraft to an issue in acme/web');
+    expect(within(first).getByRole('link', { name: /acme\/web/ })).toHaveAttribute('href', 'https://github.com/acme/web/issues');
   });
 
-  it('flags an empty allowed-actor list and will not publish it', async () => {
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(view()) });
+  it('ticks coding and review agents separately; no review agent means no review, one reviews its own work', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);
-    const repo = await addRepository();
-    await userEvent.clear(within(repo).getByLabelText('Allowed actors'));
-    expect(within(repo).getByText('Name at least one GitHub login')).toBeInTheDocument();
-    expect(screen.getByTestId('config-empty-actors')).toHaveTextContent('acme/web');
+    await userEvent.click(within(await screen.findByTestId('review-claude')).getByRole('checkbox'));
+    expect(screen.getByText(/Codex reviews its own work when it wrote the code/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    let sent = sentConfig(api);
+    expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['codex'] } });
+    expect(sent.workflows.implement!.review).toMatchObject({ enabled: true, pool: 'reviewers', allowSameAgent: true });
+
+    await userEvent.click(within(screen.getByTestId('review-codex')).getByRole('checkbox'));
+    expect(screen.getByText(/No review: pull requests wait for a person/)).toBeInTheDocument();
+    await userEvent.click(within(screen.getByTestId('coding-codex')).getByRole('checkbox'));
+    // Unticking the last coding agent is allowed, and the bar says it must be put back.
+    await userEvent.click(within(screen.getByTestId('coding-claude')).getByRole('checkbox'));
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Choose at least one coding agent.');
     expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    await userEvent.click(within(screen.getByTestId('coding-claude')).getByRole('checkbox'));
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    sent = sentConfig(api, 1);
+    expect(sent.pools).toEqual({ builders: { agents: ['claude'] } });
+    expect(sent.agents.codex).toEqual({ adapter: 'codex', enabled: false });
+    expect(sent.workflows.implement!.review.enabled).toBe(false);
   });
 
-  it('pauses a repository', async () => {
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(view()), publishConfig: vi.fn().mockResolvedValue({ ok: true, version: 1, yaml: '', warnings: [] }) });
+  it('shows an agent without a key disabled, says why, and takes the key from its info icon', async () => {
+    // As the server starts a new installation: Codex, without its key, is on the roster and in no pool.
+    const config = baseConfig();
+    config.agents.codex!.enabled = false;
+    config.pools = { builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } };
+    config.workflows.implement!.review.allowSameAgent = true;
+    const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: true, required: true }], refusals: [] });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(1) });
     configPage(api);
-    const repo = await addRepository();
-    await userEvent.click(within(repo).getByRole('button', { name: 'Pause' }));
-    expect(within(repo).getByText('Paused')).toBeInTheDocument();
+    const codex = await screen.findByTestId('coding-codex');
+    for (const row of [codex, screen.getByTestId('review-codex')]) {
+      const box = within(row).getByRole('checkbox', { name: 'Codex' });
+      expect(box).toBeDisabled();
+      expect(box).not.toBeChecked();
+    }
+    // No chips: the tooltip says what to do.
+    expect(screen.queryByText('Key set')).toBeNull();
+    expect(screen.queryByText('No key')).toBeNull();
+    const info = within(codex).getByRole('button', { name: 'Why Codex cannot be used' });
+    expect(info).toHaveAccessibleDescription('Add your OpenAI Platform API key to use Codex. Click to add it.');
+
+    await userEvent.click(info);
+    await userEvent.type(within(codex).getByLabelText(/OpenAI Platform API key/), 'sk-proj-abc');
+    await userEvent.click(within(codex).getByRole('button', { name: 'Save key' }));
+    expect(setAgentKey).toHaveBeenCalledWith(55, 'CODEX_API_KEY', 'sk-proj-abc');
+    // With its key, Codex codes and reviews, as the defaults have it.
+    await waitFor(() => expect(within(codex).getByRole('checkbox', { name: 'Codex' })).toBeChecked());
+    expect(within(screen.getByTestId('review-codex')).getByRole('checkbox', { name: 'Codex' })).toBeChecked();
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Work in acme/web' }));
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
-    await waitFor(() => expect(vi.mocked(api.publishConfig).mock.calls[0]![1].config.repositories['acme/web']!.enabled).toBe(false));
+    const sent = sentConfig(api);
+    expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['claude', 'codex'] } });
+    expect(sent.workflows.implement!.review.allowSameAgent).toBe(false);
+  });
+
+  it('never changes a published review policy because a key went missing: the person adds it back or unticks it', async () => {
+    // Codex builds; Claude is the only reviewer; Claude's key has been deleted since.
+    const config = withRepo();
+    config.pools = { builders: { agents: ['codex'] }, reviewers: { agents: ['claude'] } };
+    config.workflows.implement!.review.allowSameAgent = true;
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config, agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } })), publishConfig: publishedOk(2) });
+    configPage(api);
+    const claude = await screen.findByTestId('review-claude');
+    const box = within(claude).getByRole('checkbox', { name: 'Claude Code' });
+    expect(box).toBeChecked();
+    expect(box).toBeEnabled();
+    expect(within(claude).getByRole('button', { name: 'Why Claude Code cannot be used' })).toHaveAccessibleDescription(/was removed. Add it again, or untick Claude Code/);
+    // Nothing in the draft changed by itself; the bar says what the person has to decide.
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Add the key for Claude Code, or untick it.');
+
+    // An unrelated edit cannot be published while the reviewer has no key.
+    await userEvent.type(within(screen.getByTestId('repo-acme/web')).getByLabelText('Checks'), 'npm test');
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Add the key for Claude Code, or untick it.');
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+
+    // Turning review off is the person's choice, and then it publishes.
+    await userEvent.click(box);
+    expect(screen.getByText(/No review: pull requests wait for a person/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).workflows.implement!.review.enabled).toBe(false);
+  });
+
+  it('shows what an upgrade from the first console could not keep', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ notices: ["acme/web ran implement and docs with different checks. It now has one list, implement's: check it before you publish."] })) }));
+    expect(await screen.findByTestId('config-notices')).toHaveTextContent('acme/web ran implement and docs with different checks');
+  });
+
+  it('changes an agent model, and keeps repository extras behind its settings', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
+    configPage(api);
+    const claude = await screen.findByTestId('coding-claude');
+    await userEvent.click(within(claude).getByRole('button', { name: 'Change model' }));
+    await userEvent.type(within(claude).getByLabelText('Model'), 'claude-opus-5-5');
+    const web = screen.getByTestId('repo-acme/web');
+    expect(within(web).queryByLabelText('Base branch')).toBeNull();
+    await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
+    await userEvent.selectOptions(within(web).getByLabelText('Open pull requests as'), 'pr');
+    await userEvent.click(within(web).getByRole('checkbox', { name: /Pause/ }));
+    expect(web).toHaveTextContent(/paused/);
+    await userEvent.click(within(web).getByRole('checkbox', { name: /Only some people/ }));
+    await userEvent.clear(within(web).getByLabelText('Who can add the label here'));
+    await userEvent.type(within(web).getByLabelText('Who can add the label here'), 'sam');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const sent = sentConfig(api);
+    expect(sent.agents.claude).toEqual({ adapter: 'claude', model: 'claude-opus-5-5', enabled: true });
+    expect(sent.repositories['acme/web']).toMatchObject({ publish: 'pr', enabled: false, allowedActors: ['sam'] });
   });
 
   it('turns auto-merge on only after the confirmation, and says so when publishing', async () => {
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(view()), publishConfig: vi.fn().mockResolvedValue({ ok: true, version: 1, yaml: '', warnings: [] }) });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);
-    const repo = await addRepository();
-    const autoMerge = within(repo).getByLabelText(/auto-merge/i);
-    expect(autoMerge).toBeDisabled(); // needs review first
-    await userEvent.click(within(repo).getByLabelText(/^Review/));
-    await userEvent.click(autoMerge);
-    let dialog = await screen.findByRole('dialog');
-    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
-    expect(within(repo).getByLabelText(/auto-merge/i)).not.toBeChecked();
+    const web = await screen.findByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
+    await userEvent.click(within(web).getByRole('checkbox', { name: /Auto-merge/ }));
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: /I understand/ }));
+    expect(within(web).getByLabelText('Merge method')).toHaveValue('squash');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(api.publishConfig).toHaveBeenCalledWith(55, expect.objectContaining({ confirmAutoMerge: true }));
+  });
 
-    await userEvent.click(within(repo).getByLabelText(/auto-merge/i));
-    dialog = await screen.findByRole('dialog');
-    expect(dialog).toHaveTextContent('without a person approving');
-    await userEvent.click(within(dialog).getByRole('button', { name: /I understand/ }));
-    expect(within(repo).getByLabelText(/auto-merge/i)).toBeChecked();
-    expect(within(repo).getByLabelText('Merge method')).toHaveValue('squash');
+  it('keeps prompts and limits under Advanced, and resets an edited prompt', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
+    configPage(api);
+    await userEvent.click(await screen.findByText(/prompts, revision rounds/));
+    const prompt = screen.getByLabelText('Coding prompt');
+    await userEvent.type(prompt, ' more');
+    await userEvent.click(screen.getByRole('button', { name: 'Reset to the packaged prompt' }));
+    expect(screen.getByLabelText('Coding prompt')).toHaveValue(PROMPTS.implement);
+    await userEvent.type(screen.getByLabelText('Revision rounds per pull request'), '2');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).workflows.implement!.revise).toEqual({ enabled: true, prompt: PROMPTS.revise, maxRevisions: 2 });
+  });
+
+  it('shows a configuration with more than one label or custom pools in the full editor', async () => {
+    const config = withRepo();
+    config.pools.fast = { agents: ['claude'] };
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config })) }));
+    expect(await screen.findByRole('button', { name: 'Workflows' })).toBeInTheDocument();
+    expect(screen.queryByTestId('simple-config')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Simple view' })).toBeNull();
+  });
+});
+
+/** From the simple page to the full editor. */
+async function openFull() {
+  await userEvent.click(await screen.findByText(/prompts, revision rounds/));
+  await userEvent.click(screen.getByRole('button', { name: 'Open the full editor' }));
+}
+
+describe('the full editor', () => {
+  it('turns a repository on with the first workflow, and publishes from the active version', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
+    configPage(api);
+    await openFull();
+    const publish = await screen.findByRole('button', { name: 'Publish' });
+    // Nothing changed since version 1.
+    expect(publish).toBeDisabled();
+    await userEvent.click(within(screen.getByTestId('repo-acme/api')).getByRole('checkbox', { name: 'Work in acme/api' }));
+    expect(screen.getByTestId('draft-state')).toHaveTextContent('Unsaved changes');
+    const api_ = screen.getByTestId('repo-acme/api');
+    await userEvent.type(within(api_).getByLabelText('Verify commands'), 'npm test');
+    await userEvent.click(publish);
+    expect(api.publishConfig).toHaveBeenCalledWith(55, { config: expect.any(Object), baseVersion: 1 });
+    expect(sentConfig(api).repositories['acme/api']).toEqual({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm test'] });
+    expect(await screen.findByTestId('config-published')).toHaveTextContent('Published version 2');
+    expect(screen.getByTestId('draft-state')).toHaveTextContent('Version 2 is active');
+  });
+
+  it('pauses a repository, and gives it its own allowed actors', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
+    configPage(api);
+    await openFull();
+    const web = await screen.findByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('button', { name: 'Pause' }));
+    expect(web).toHaveTextContent('Paused');
+    await userEvent.click(within(web).getByRole('checkbox', { name: /different list of people/ }));
+    const actors = within(web).getByLabelText('Allowed actors in this repository');
+    expect(actors).toHaveValue('pat');
+    await userEvent.clear(actors);
+    await userEvent.type(actors, 'sam, @lee');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).repositories['acme/web']).toMatchObject({ enabled: false, allowedActors: ['sam', 'lee'] });
+  });
+
+  it('chooses the pools a workflow builds and reviews with, and turns review off', async () => {
+    const config = withRepo();
+    config.pools.fast = { agents: ['claude'] };
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig: publishedOk(2) });
+    configPage(api);
+    await userEvent.click(await screen.findByRole('button', { name: 'Workflows' }));
+    const wf = screen.getByTestId('workflow-implement');
+    expect(wf).toHaveTextContent('Runs in acme/web');
+    await userEvent.selectOptions(within(wf).getByLabelText('Built by'), 'fast');
+    await userEvent.click(within(wf).getByTestId('review-implement'));
+    expect(within(wf).queryByLabelText('Reviewed by')).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).workflows.implement).toMatchObject({ pool: 'fast', review: { enabled: false, pool: 'reviewers' } });
+  });
+
+  it('says when an agent could only review its own work', async () => {
+    const config = withRepo();
+    config.pools = { builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } };
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config })) }));
+    await openFull();
+    await userEvent.click(await screen.findByRole('button', { name: 'Workflows' }));
+    expect(screen.getByText(/would only ever review its own work/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('checkbox', { name: /review its own work when no other/ }));
+    expect(screen.queryByText(/would only ever review its own work/)).toBeNull();
+  });
+
+  it('adds an agent to every pool, edits pool members, and takes a missing key in place', async () => {
+    const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: true, required: true }], refusals: [] });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(2) });
+    configPage(api);
+    expect(await screen.findByTestId('config-missing-keys')).toHaveTextContent('codex (Codex) needs a key before you publish');
+    await userEvent.click(screen.getByRole('button', { name: 'Go to agents' }));
+
+    await userEvent.selectOptions(screen.getByLabelText('Add an agent'), 'claude');
+    await userEvent.click(screen.getByRole('button', { name: 'Add agent' }));
+    const second = screen.getByTestId('agent-claude-2');
+    await userEvent.type(within(second).getByLabelText('Model'), 'claude-haiku-5-5');
+    expect(within(screen.getByTestId('pool-builders')).getByRole('checkbox', { name: 'claude-2' })).toBeChecked();
+    await userEvent.click(within(screen.getByTestId('pool-reviewers')).getByRole('checkbox', { name: 'claude-2' }));
+
+    const codex = screen.getByTestId('agent-codex');
+    await userEvent.type(within(codex).getByLabelText(/OpenAI Platform API key/), 'sk-proj-abc');
+    await userEvent.click(within(codex).getByRole('button', { name: 'Save key' }));
+    await waitFor(() => expect(screen.queryByTestId('config-missing-keys')).toBeNull());
 
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
-    await waitFor(() => expect(api.publishConfig).toHaveBeenCalled());
-    const [, input] = vi.mocked(api.publishConfig).mock.calls[0]!;
-    expect(input.confirmAutoMerge).toBe(true);
-    expect(input.config.repositories['acme/web']!.autoMerge).toEqual({ method: 'squash' });
+    const sent = sentConfig(api);
+    expect(sent.agents['claude-2']).toEqual({ adapter: 'claude', model: 'claude-haiku-5-5', enabled: true });
+    expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex', 'claude-2'] }, reviewers: { agents: ['claude', 'codex'] }, fast: { agents: ['claude', 'claude-2'] } });
+  });
+
+  it('turns an agent off instead of adding its key', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })) });
+    configPage(api);
+    await userEvent.click(await screen.findByRole('button', { name: 'Go to agents' }));
+    await userEvent.click(within(screen.getByTestId('agent-codex')).getByRole('checkbox', { name: 'On' }));
+    expect(screen.queryByTestId('config-missing-keys')).toBeNull();
+    expect(within(screen.getByTestId('agent-codex')).queryByTestId('inline-key-codex')).toBeNull();
+  });
+
+  it('refreshes key status when the tab regains focus without touching the draft', async () => {
+    const config = vi.fn().mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true } }));
+    configPage(fakeApi({ config }));
+    expect(await screen.findByTestId('config-missing-keys')).toBeInTheDocument();
+    await userEvent.click(within(screen.getByTestId('repo-acme/api')).getByRole('checkbox', { name: 'Work in acme/api' }));
+    config.mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true } }));
+    window.dispatchEvent(new Event('focus'));
+    await waitFor(() => expect(screen.queryByTestId('config-missing-keys')).toBeNull());
+    expect(within(screen.getByTestId('repo-acme/api')).getByRole('checkbox', { name: 'Work in acme/api' })).toBeChecked();
+  });
+
+  it('turns auto-merge on only after the confirmation, and says so when publishing', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
+    configPage(api);
+    await openFull();
+    const web = await screen.findByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('checkbox', { name: /Auto-merge/ }));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: /I understand/ }));
+    expect(within(web).getByLabelText('Merge method')).toHaveValue('squash');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(api.publishConfig).toHaveBeenCalledWith(55, expect.objectContaining({ confirmAutoMerge: true }));
+  });
+
+  it('offers no auto-merge where no workflow reviews', async () => {
+    const config = withRepo();
+    config.workflows.implement!.review.enabled = false;
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config })) }));
+    await openFull();
+    const web = await screen.findByTestId('repo-acme/web');
+    expect(within(web).getByRole('checkbox', { name: /Auto-merge/ })).toBeDisabled();
   });
 
   it('asks again when the server wants the auto-merge confirmation, and resends with it', async () => {
-    const config = baseConfig();
-    config.repositories['acme/web'] = { enabled: true, triggers: [{ label: 'updraft', workflow: 'implement' }], allowedActors: ['pat'], publish: 'draft-pr', commentOnFailure: true, review: true, revise: false, autoMerge: { method: 'merge' } };
-    const api = fakeApi({
-      config: vi.fn().mockResolvedValue(view({ config })),
-      publishConfig: vi
-        .fn()
-        .mockRejectedValueOnce(new ApiError(409, 'auto_merge_unconfirmed', 'Confirm turning on auto-merge for acme/web'))
-        .mockResolvedValueOnce({ ok: true, version: 2, yaml: '', warnings: [] }),
-    });
+    const publishConfig = vi.fn().mockRejectedValueOnce(new ApiError(409, 'auto_merge_unconfirmed', 'Confirm turning on auto-merge for acme/web')).mockResolvedValueOnce({ ok: true, version: 2, yaml: '', warnings: [] });
+    const config = withRepo();
+    config.repositories['acme/web']!.autoMerge = { method: 'squash' };
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig });
     configPage(api);
-    await userEvent.click(await screen.findByRole('button', { name: 'Publish' }));
+    await openFull();
+    await userEvent.click(within(await screen.findByTestId('repo-acme/web')).getByRole('button', { name: 'Pause' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     const dialog = await screen.findByRole('dialog');
     expect(dialog).toHaveTextContent('Confirm turning on auto-merge for acme/web');
     await userEvent.click(within(dialog).getByRole('button', { name: /I understand/ }));
-    await waitFor(() => expect(api.publishConfig).toHaveBeenCalledTimes(2));
-    expect(vi.mocked(api.publishConfig).mock.calls[1]![1].confirmAutoMerge).toBe(true);
-    expect(await screen.findByTestId('config-published')).toHaveTextContent('version 2');
+    await waitFor(() => expect(publishConfig).toHaveBeenLastCalledWith(55, expect.objectContaining({ confirmAutoMerge: true })));
   });
 
-  it('previews the generated YAML read-only', async () => {
-    const api = fakeApi({
-      config: vi.fn().mockResolvedValue(view()),
-      previewConfig: vi.fn().mockResolvedValue({ ok: true, yaml: 'version: 1\nexecution:\n  mode: live\n', warnings: [{ path: 'repositories.acme/web.review', message: 'revise is off' }], autoMergeTurnedOn: [] }),
-    });
-    configPage(api);
-    await addRepository();
-    await userEvent.click(screen.getByRole('button', { name: 'Preview' }));
+  it('checks the draft and shows the generated YAML, and hides it again', async () => {
+    const previewConfig = vi.fn().mockResolvedValue({ ok: true, yaml: 'version: 1\nexecution:\n  mode: live\n', warnings: [], autoMergeTurnedOn: [] });
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published()), previewConfig }));
+    await openFull();
+    await userEvent.click(await screen.findByRole('button', { name: 'View config' }));
     expect(await screen.findByTestId('config-yaml')).toHaveTextContent('mode: live');
-    expect(screen.getByTestId('config-yaml').tagName).toBe('PRE');
-    expect(screen.getByTestId('config-warnings')).toHaveTextContent('revise is off');
-    expect(api.publishConfig).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Hide config' }));
+    expect(screen.queryByTestId('config-yaml')).toBeNull();
   });
 
-  it('lists every problem of a refused publish, and shows each at its field', async () => {
-    const api = fakeApi({
-      config: vi.fn().mockResolvedValue(view()),
-      publishConfig: vi.fn().mockRejectedValue(
-        new ConfigInvalidError(
-          [
-            { path: 'workflows.implement.agent.effort', message: 'claude does not accept that effort' },
-            { path: 'repositories.acme/web.triggers.0.label', message: 'required' },
-          ],
-          [],
-        ),
+  it('lists every problem of a refused publish, opens the section of the first, and shows each at its field', async () => {
+    const publishConfig = vi.fn().mockRejectedValue(
+      new ConfigInvalidError(
+        [
+          { path: 'agents.codex.model', message: 'not a model codex knows' },
+          { path: 'repositories.acme/web.verify.0', message: 'a command must not be empty' },
+        ],
+        [],
       ),
-    });
-    configPage(api);
-    await addRepository();
+    );
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig }));
+    await openFull();
+    await userEvent.click(within(await screen.findByTestId('repo-acme/web')).getByRole('button', { name: 'Pause' }));
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     const list = await screen.findByTestId('config-errors');
-    expect(list).toHaveTextContent('Nothing was published');
-    expect(list).toHaveTextContent('workflows.implement.agent.effort');
-    expect(within(screen.getByTestId('workflow-implement')).getByText('claude does not accept that effort')).toBeInTheDocument();
+    expect(list).toHaveTextContent('agents.codex.model: not a model codex knows');
+    expect(screen.getByRole('button', { name: 'Agents and pools (1)' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Repositories (1)' })).toBeInTheDocument();
+    expect(within(screen.getByTestId('agent-codex')).getByText('not a model codex knows')).toBeInTheDocument();
+    await userEvent.click(within(list).getByRole('button', { name: 'Repositories' }));
+    expect(within(screen.getByTestId('repo-acme/web')).getByText('a command must not be empty')).toBeInTheDocument();
   });
 
   it('says when someone else published meanwhile, and reloads', async () => {
-    const api = fakeApi({
-      config: vi.fn().mockResolvedValueOnce(view({ activeVersion: 1 })).mockResolvedValueOnce(view({ activeVersion: 2 })),
-      publishConfig: vi.fn().mockRejectedValue(new ApiError(409, 'config_changed', 'Version 2 was published since you started editing')),
-    });
-    configPage(api);
-    await addRepository();
+    const config = vi.fn().mockResolvedValue(published());
+    const publishConfig = vi.fn().mockRejectedValue(new ApiError(409, 'config_changed', 'Version 2 was published since you started editing'));
+    configPage(fakeApi({ config, publishConfig }));
+    await openFull();
+    await userEvent.click(within(await screen.findByTestId('repo-acme/web')).getByRole('button', { name: 'Pause' }));
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
-    const conflict = await screen.findByTestId('config-conflict');
-    expect(conflict).toHaveTextContent('Version 2 was published');
-    await userEvent.click(within(conflict).getByRole('button', { name: 'Reload' }));
-    expect(await screen.findByTestId('active-version')).toHaveTextContent('version 2 is active');
+    expect(await screen.findByTestId('config-conflict')).toHaveTextContent('Version 2 was published');
+    config.mockResolvedValue(published({ activeVersion: 2 }));
+    await userEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    await waitFor(() => expect(screen.getByTestId('active-version')).toHaveTextContent('version 2 is active'));
+    expect(screen.queryByTestId('config-conflict')).toBeNull();
   });
 
-  it('warns about missing keys and about a version tenant-admin published; a disabled tenant is read-only', async () => {
-    const config = baseConfig();
-    config.repositories['acme/web'] = { enabled: true, triggers: [{ label: 'updraft', workflow: 'implement' }], allowedActors: ['pat'], publish: 'draft-pr', commentOnFailure: true, review: false, revise: false };
-    const api = fakeApi({
-      config: vi.fn().mockResolvedValue(
-        view({ config, source: 'tenant', activeVersion: 7, agentKeys: { ANTHROPIC_API_KEY: false, CODEX_API_KEY: true }, tenant: { ...view().tenant, status: 'disabled', disabledReason: 'suspended' } }),
-      ),
-    });
-    configPage(api);
-    expect(await screen.findByTestId('config-missing-keys')).toHaveTextContent('ANTHROPIC_API_KEY');
-    expect(screen.getByTestId('config-tenant-source')).toHaveTextContent('Version 7 was published with tenant-admin');
+  it('warns about a version tenant-admin published; a disabled tenant is read-only', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(view({ source: 'tenant', activeVersion: 3, tenant: { ...view().tenant, status: 'disabled' } })) }));
+    expect(await screen.findByTestId('config-tenant-source')).toHaveTextContent('Version 3 was published with tenant-admin');
     expect(screen.getByTestId('config-readonly')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
   });
 
-  it("offers the deployment's agents, Kiro among them when it runs Kiro, and asks for a Kiro workflow's key", async () => {
-    const config = baseConfig();
-    config.workflows.implement!.agent = { adapter: 'kiro' };
-    config.repositories['acme/web'] = { enabled: true, triggers: [{ label: 'updraft', workflow: 'implement' }], allowedActors: ['pat'], publish: 'draft-pr', commentOnFailure: true, review: false, revise: false };
-    const { unmount } = configPage(fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } })) }));
-    const agent = (await screen.findAllByLabelText('Agent'))[0]!;
-    expect(within(agent).getAllByRole('option').map((o) => o.textContent)).toEqual(['Claude Code', 'Codex', 'Kiro']);
-    expect(agent).toHaveValue('kiro');
-    expect(screen.getByTestId('config-missing-keys')).toHaveTextContent('KIRO_API_KEY');
-    unmount();
-    // A deployment without Kiro does not offer it, unless a workflow already runs it.
-    configPage(fakeApi({ config: vi.fn().mockResolvedValue(view({ agents: ['claude', 'codex'] })) }));
-    const plain = (await screen.findAllByLabelText('Agent'))[0]!;
-    expect(within(plain).getAllByRole('option').map((o) => o.textContent)).toEqual(['Claude Code', 'Codex']);
-  });
-
-  it('adds a workflow with the packaged prompts, and resets an edited prompt', async () => {
-    const api = fakeApi({ config: vi.fn().mockResolvedValue(view()) });
+  it('adds a workflow with the packaged prompts on a label of its own, and resets an edited prompt', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);
-    await userEvent.type(await screen.findByLabelText('New workflow name'), 'Bad Name');
+    await openFull();
+    await userEvent.click(await screen.findByRole('button', { name: 'Workflows' }));
+    await userEvent.type(screen.getByLabelText('New workflow name'), 'Docs!');
     await userEvent.click(screen.getByRole('button', { name: 'Add workflow' }));
     expect(screen.getByText(/Lower-case letters/)).toBeInTheDocument();
     await userEvent.clear(screen.getByLabelText('New workflow name'));
     await userEvent.type(screen.getByLabelText('New workflow name'), 'docs');
     await userEvent.click(screen.getByRole('button', { name: 'Add workflow' }));
     const docs = screen.getByTestId('workflow-docs');
-    const prompt = within(docs).getByLabelText('Prompt');
+    expect(within(docs).getByLabelText('Label')).toHaveValue('updraft:docs');
+    expect(within(docs).getByLabelText('Built by')).toHaveValue('builders');
+    expect(within(docs).getByLabelText('Reviewed by')).toHaveValue('reviewers');
+    const prompt = within(docs).getByLabelText('Build prompt');
     expect(prompt).toHaveValue(PROMPTS.implement);
     await userEvent.type(prompt, ' more');
-    await userEvent.click(within(docs).getAllByRole('button', { name: 'Reset to the packaged prompt' })[0]!);
-    expect(within(docs).getByLabelText('Prompt')).toHaveValue(PROMPTS.implement);
+    await userEvent.click(within(docs).getByRole('button', { name: 'Reset to the packaged prompt' }));
+    expect(within(docs).getByLabelText('Build prompt')).toHaveValue(PROMPTS.implement);
   });
 });
 

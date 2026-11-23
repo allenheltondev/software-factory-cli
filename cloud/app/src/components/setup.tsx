@@ -62,7 +62,7 @@ export function setupSteps(overview: Overview, base: string): SetupStep[] {
       id: 'config',
       title: 'Choose what runs, and where',
       done: hasConfig,
-      detail: reachable.length > 0 ? `Pick the repositories, the label that starts a job, and the agent that does it.` : undefined,
+      detail: reachable.length > 0 ? `Pick the repositories, the agents that build and review, and the label that starts a job.` : undefined,
       action: (
         <Link className={linkClass} to={`${base}/config`}>
           Configure
@@ -114,7 +114,7 @@ export function setupSteps(overview: Overview, base: string): SetupStep[] {
                 ? `${overview.config.replaced.join(', ')} ${overview.config.replaced.length > 1 ? 'were' : 'was'} recreated on GitHub since the configuration was published: publish it again.`
                 : overview.config.retiredAgents?.length
                   ? `Your workflows run ${agents(overview.config.retiredAgents.map((a) => KEY_OF[a] ?? a))}, which Updraft Cloud no longer runs here: choose another agent and publish again.`
-                  : 'No label you can apply starts a job: add your GitHub login to the allowed actors of a workflow in a repository the App reaches.',
+                  : 'No label you can apply starts a job: add your GitHub login to the allowed actors, for a repository the App reaches.',
               action: (
                 <Link className={linkClass} to={`${base}/config`}>
                   Edit configuration

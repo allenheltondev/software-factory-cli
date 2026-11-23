@@ -4,7 +4,8 @@ import type { GitHubRepository } from '../github/client.js';
 import type { ConfigVersion, Store } from '../store/store.js';
 import { AGENT_KEY_NAMES } from './agent-keys.js';
 import { CEILINGS, compileTenantConfig, type ConfigIssue, type TenantSubmission } from './config.js';
-import { CONSOLE_AGENTS, CONSOLE_LIMITS, defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission, type ConsoleConfig } from './console.js';
+import { CONSOLE_AGENTS, CONSOLE_LIMITS, defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission, upgradeNotes, type ConsoleConfig } from './console.js';
+import * as v1 from './console-v1.js';
 import type { CloudAgent } from './agents.js';
 import { DEFAULT_PROMPTS } from './default-prompts.js';
 import { configPrefix, SOURCE_FILE } from './paths.js';
@@ -55,7 +56,7 @@ export interface VersionSummary {
 
 export interface ConfigView {
   tenant: TenantSummary;
-  /** The caller's GitHub login: the allowed actor a new repository starts with. */
+  /** The caller's GitHub login: the allowed actor a new configuration starts with. */
   githubLogin: string;
   /** What the installation reaches: the repositories that can be configured. */
   repositories: GitHubRepository[];
@@ -71,6 +72,8 @@ export interface ConfigView {
    */
   source: 'console' | 'tenant' | 'none';
   config: ConsoleConfig;
+  /** What upgrading the active version's settings to the current editor could not keep as it was. */
+  notices: string[];
   defaults: { prompts: typeof DEFAULT_PROMPTS };
   limits: { ceilings: typeof CEILINGS; console: typeof CONSOLE_LIMITS };
 }
@@ -128,7 +131,18 @@ export function createConfigService({ store, github, objects, now = () => Date.n
   async function compile(ctx: ConfigContext, source: ConfigSource, prompts: Record<string, string> | null): Promise<{ ok: true; compiled: Compiled } | { ok: false; errors: ConfigIssue[]; warnings: ConfigIssue[] }> {
     let submission: TenantSubmission;
     let consoleConfig: ConsoleConfig | null = null;
-    if (source.format === 'console') {
+    let v1Config: v1.ConsoleConfig | null = null;
+    if (source.format === 'console' && isObject(source.config) && source.config.version === 1) {
+      // A version the first console published, being re-activated: compiled by the compiler it was
+      // published with, so its actions, pools and workflow ids are exactly what its jobs stored.
+      const parsed = v1.parseConsoleConfig(source.config);
+      if (!parsed.ok) return { ok: false, errors: parsed.errors, warnings: [] };
+      v1Config = parsed.config;
+      const keyErrors = v1.missingKeys(parsed.config, await keysSet(ctx.tenant.installationId));
+      if (keyErrors.length) return { ok: false, errors: keyErrors, warnings: [] };
+      submission = v1.toTenantSubmission(parsed.config);
+      source = { format: 'console', config: parsed.config };
+    } else if (source.format === 'console') {
       const parsed = parseConsoleConfig(source.config);
       if (!parsed.ok) return { ok: false, errors: parsed.errors, warnings: [] };
       consoleConfig = parsed.config;
@@ -140,7 +154,8 @@ export function createConfigService({ store, github, objects, now = () => Date.n
       submission = { config: source.config, prompts: prompts ?? {} };
     }
     const result = compileTenantConfig(submission, { appId: ctx.appId }, repositoryIds(ctx));
-    const map = (issues: ConfigIssue[]) => (consoleConfig ? issues.map((i) => ({ ...i, path: toConsolePath(i.path, consoleConfig) })) : issues);
+    const map = (issues: ConfigIssue[]) =>
+      consoleConfig ? issues.map((i) => ({ ...i, path: toConsolePath(i.path, consoleConfig) })) : v1Config ? issues.map((i) => ({ ...i, path: v1.toConsolePath(i.path, v1Config) })) : issues;
     if (!result.ok) return { ok: false, errors: map(result.errors), warnings: [] };
     // Whatever it was written as (a tenant-admin version being re-activated included): every agent
     // an enabled repository can start needs its key set now, or its jobs would fail.
@@ -207,12 +222,24 @@ export function createConfigService({ store, github, objects, now = () => Date.n
       const ctx = await github.configContext(caller, installationId);
       const active = ctx.tenant.activeConfigVersion;
       const [source, keys] = await Promise.all([activeSource(installationId, active), keysSet(installationId)]);
-      let config = defaultConsoleConfig();
-      let kind: ConfigView['source'] = source?.format ?? 'none';
+      let config = defaultConsoleConfig({ offered: CONSOLE_AGENTS, login: ctx.githubLogin, keys });
+      const kind: ConfigView['source'] = source?.format ?? 'none';
+      let notices: string[] = [];
       if (source?.format === 'console') {
         const parsed = parseConsoleConfig(source.config);
-        if (parsed.ok) config = parsed.config;
-        else kind = 'none';
+        if (parsed.ok) {
+          config = parsed.config;
+          notices = upgradeNotes(source.config);
+        } else {
+          // Never a silent fallback: the editor starts from the defaults, and says why. The
+          // version itself still runs, and re-activates as it was.
+          notices = [
+            `Version ${active} could not be opened in this editor (${parsed.errors
+              .slice(0, 3)
+              .map((e) => `${e.path}: ${e.message}`)
+              .join('; ')}${parsed.errors.length > 3 ? '; ...' : ''}). The editor starts from the defaults, and publishing from here replaces it.`,
+          ];
+        }
       }
       return {
         tenant: ctx.summary,
@@ -223,6 +250,7 @@ export function createConfigService({ store, github, objects, now = () => Date.n
         activeVersion: active ?? null,
         source: kind,
         config,
+        notices,
         defaults: { prompts: DEFAULT_PROMPTS },
         limits: { ceilings: CEILINGS, console: CONSOLE_LIMITS },
       };
