@@ -100,7 +100,7 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
       )}
       {load.state === 'ok' && (
         tab === 'repositories' ? (
-          <RepositoryView overview={load.overview} />
+          <RepositoryView overview={load.overview} onRefresh={() => void refresh()} refreshing={refreshing} />
         ) : (
           <ActivityView
             overview={load.overview}
@@ -118,7 +118,7 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
   );
 }
 
-function RepositoryView({ overview }: { overview: Overview }) {
+function RepositoryView({ overview, onRefresh, refreshing }: { overview: Overview; onRefresh: () => void; refreshing: boolean }) {
   const base = `/installations/${overview.tenant.installationId}`;
   return (
     <>
@@ -127,9 +127,14 @@ function RepositoryView({ overview }: { overview: Overview }) {
           <h1 className="text-2xl font-semibold">Repositories</h1>
           <p className="text-muted-foreground">{overview.tenant.accountLogin}</p>
         </div>
-        <a className="auth-link text-sm" href={installationSettingsUrl(overview.tenant)} target="_blank" rel="noreferrer">
-          Manage GitHub access ↗
-        </a>
+        <div className="flex flex-wrap items-center gap-3">
+          <a className="auth-link text-sm" href={installationSettingsUrl(overview.tenant)} target="_blank" rel="noreferrer">
+            Manage GitHub access ↗
+          </a>
+          <Button variant="ghost" onClick={onRefresh} loading={refreshing} aria-label="Refresh repositories">
+            Refresh
+          </Button>
+        </div>
       </header>
       <Card>
         <CardBody>

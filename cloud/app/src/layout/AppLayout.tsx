@@ -50,13 +50,28 @@ function lastInstallation(account: string): string | null {
   }
 }
 
-export function AppLayout({ api = defaultApi }: { api?: Pick<ApiClient, 'me' | 'githubStatus'> }) {
-  const { user, signOut } = useAuth();
+type LayoutApi = Pick<ApiClient, 'me' | 'githubStatus'>;
+
+export function AppLayout({ api = defaultApi }: { api?: LayoutApi }) {
+  const auth = useAuth();
+  const { pathname } = useLocation();
+  const account = typeof auth.user?.sub === 'string' ? auth.user.sub : undefined;
+  const managingGitHub = pathname === '/settings/github' || pathname === '/github/callback';
+
+  // Returning from GitHub management starts with a fresh installation list.
+  return <ConsoleLayout key={JSON.stringify([account, managingGitHub])} api={api} auth={auth} account={account} managingGitHub={managingGitHub} />;
+}
+
+function ConsoleLayout({ api, auth, account, managingGitHub }: {
+  api: LayoutApi;
+  auth: ReturnType<typeof useAuth>;
+  account: string | undefined;
+  managingGitHub: boolean;
+}) {
+  const { user, signOut } = auth;
   const navigate = useNavigate();
   const { pathname, search } = useLocation();
-  const account = typeof user?.sub === 'string' ? user.sub : undefined;
   const id = /^\/installations\/(\d+)(?:\/|$)/.exec(pathname)?.[1];
-  const managingGitHub = pathname === '/settings/github' || pathname === '/github/callback';
   const [admin, setAdmin] = useState(false);
   const [installations, setInstallations] = useState<Installations>({ state: 'loading' });
 
@@ -72,11 +87,7 @@ export function AppLayout({ api = defaultApi }: { api?: Pick<ApiClient, 'me' | '
   }, [api, account]);
 
   useEffect(() => {
-    // Connection changes happen in these screens. Refresh before showing the picker again.
-    if (managingGitHub) {
-      setInstallations({ state: 'loading' });
-      return;
-    }
+    if (managingGitHub) return;
     let live = true;
     void api.githubStatus().then(
       (github) => live && setInstallations({ state: 'ready', github }),

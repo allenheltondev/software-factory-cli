@@ -95,6 +95,18 @@ describe('InstallationPage (#71)', () => {
     expect(screen.getAllByTestId('job-job_running')).toHaveLength(1);
   });
 
+  it('refreshes repository access without leaving the repositories view', async () => {
+    const initial = overview();
+    const overviewRequest = vi.fn()
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce({ ...initial, repositories: initial.repositories.slice(0, 1) });
+    showInstallation(api({ overview: overviewRequest }), '/installations/55?tab=repositories');
+    expect(await screen.findByRole('link', { name: 'acme/docs' })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh repositories' }));
+    await waitFor(() => expect(screen.queryByRole('link', { name: 'acme/docs' })).not.toBeInTheDocument());
+    expect(screen.getByRole('heading', { name: 'Repositories' })).toBeInTheDocument();
+  });
+
   it('says when its counts are of the latest jobs, not all 30 days', async () => {
     showInstallation(api({ overview: vi.fn().mockResolvedValue(overview({ activity: { ...overview().activity, window: { deliveries: 500, deliveriesComplete: false, jobs: 500, jobsComplete: false } } })) }));
     expect(await screen.findByTestId('stats')).toHaveTextContent('Latest 500 jobs');
