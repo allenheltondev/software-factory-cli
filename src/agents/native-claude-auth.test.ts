@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -72,7 +72,7 @@ describe('native Claude subscription status, without inspecting credentials', ()
         { PATH: process.env.PATH },
         cwd,
       );
-      expect(run).toEqual({ code: 0, stdout: cwd });
+      expect(run).toEqual({ code: 0, stdout: realpathSync(cwd) });
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
