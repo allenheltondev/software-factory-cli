@@ -223,7 +223,7 @@ export function createConfigService({ store, github, objects, now = () => Date.n
       const active = ctx.tenant.activeConfigVersion;
       const [source, keys] = await Promise.all([activeSource(installationId, active), keysSet(installationId)]);
       let config = defaultConsoleConfig({ offered: CONSOLE_AGENTS, login: ctx.githubLogin, keys });
-      let kind: ConfigView['source'] = source?.format ?? 'none';
+      const kind: ConfigView['source'] = source?.format ?? 'none';
       let notices: string[] = [];
       if (source?.format === 'console') {
         const parsed = parseConsoleConfig(source.config);
