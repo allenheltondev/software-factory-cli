@@ -1,5 +1,5 @@
-import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
+import { ConditionalCheckFailedException, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, DeleteCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 
 export type AuthState = 'connected' | 'auth-required' | 'expired' | 'unavailable';
@@ -47,5 +47,52 @@ export function createNativeStore(table: string, db = DynamoDBDocumentClient.fro
       return (Items ?? []).map((i) => String(i.jobId));
     },
     async dequeue(id, worker, jobId) { await db.send(new DeleteCommand({ TableName: table, Key: { pk: nativePartition(id, worker), sk: `QUEUE#${jobId}` } })); },
+  };
+}
+
+
+/** Per-installation API key/subscription choice, not part of the worker's heartbeat row. */
+export interface NativeModeStore {
+  enabled(installationId: number, workerId: string): Promise<boolean>;
+  snapshot(installationId: number, workerId: string): Promise<{ enabled: boolean; revision: number }>;
+  /** Commit only if neither dispatch nor the worker changed since the idle checks. */
+  setEnabled(installationId: number, workerId: string, enabled: boolean, expected: { revision: number; workerVersion: number | null }): Promise<boolean>;
+}
+
+export function createNativeModeStore(
+  table: string,
+  db = DynamoDBDocumentClient.from(new DynamoDBClient({}), { marshallOptions: { removeUndefinedValues: true } }),
+): NativeModeStore {
+  const key = (installationId: number, workerId: string) => ({ pk: nativePartition(installationId, workerId), sk: 'MODE' });
+  async function snapshot(installationId: number, workerId: string) {
+    const { Item } = await db.send(new GetCommand({ TableName: table, Key: key(installationId, workerId), ConsistentRead: true }));
+    return { enabled: Item?.enabled === true, revision: Number(Item?.revision ?? 0) };
+  }
+  return {
+    snapshot,
+    async enabled(installationId, workerId) { return (await snapshot(installationId, workerId)).enabled; },
+    async setEnabled(installationId, workerId, enabled, expected) {
+      try {
+        await db.send(new TransactWriteCommand({ TransactItems: [
+          { Put: {
+            TableName: table,
+            Item: { ...key(installationId, workerId), enabled, revision: expected.revision + 1, updatedAt: new Date().toISOString() },
+            ConditionExpression: expected.revision === 0 ? 'attribute_not_exists(revision) OR revision = :revision' : 'revision = :revision',
+            ExpressionAttributeValues: { ':revision': expected.revision },
+          } },
+          { ConditionCheck: {
+            TableName: table, Key: { pk: nativePartition(installationId, workerId), sk: 'WORKER' },
+            ConditionExpression: expected.workerVersion === null ? 'attribute_not_exists(pk)' : '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling)',
+            ...(expected.workerVersion === null ? {} : {
+              ExpressionAttributeNames: { '#v': 'version' }, ExpressionAttributeValues: { ':v': expected.workerVersion },
+            }),
+          } },
+        ] }));
+        return true;
+      } catch (e) {
+        if (e instanceof TransactionCanceledException && e.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return false;
+        throw e;
+      }
+    },
   };
 }

@@ -33,7 +33,7 @@ import type {
   Tenant,
   TenantLimits,
 } from './store.js';
-import { finishFields, isFailure } from './store.js';
+import { finishFields, isFailure, NativeEnqueueRejectedError } from './store.js';
 
 const DAY_SECONDS = 24 * 3600;
 const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
@@ -610,40 +610,58 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     async putJob(job) {
       // A week after the job may last, the record goes; nothing is served for it by then anyway.
       // Its summary in the tenant's partition (the admin view) stays 30 days.
-      await client.send(
-        new TransactWriteCommand({
-          TransactItems: [
-            {
-              Put: {
-                TableName: T,
-                Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil((job.native ? NATIVE_SLOT_HOLD_UNTIL : job.expiresAt) / 1000) + 7 * 24 * 3600 },
-                ConditionExpression: 'attribute_not_exists(pk)',
-              },
-            },
-            {
-              Put: {
-                TableName: T,
-                Item: {
-                  ...jobSummaryKey(job),
-                  jobId: job.jobId,
-                  repository: job.repository,
-                  ...(job.issue !== undefined ? { issue: job.issue } : {}),
-                  ...(job.pullRequest !== undefined ? { pullRequest: job.pullRequest } : {}),
-                  ...(job.label ? { label: job.label } : {}),
-                  ...(job.sender ? { sender: job.sender } : {}),
-                  createdAt: job.createdAt,
-                  status: job.status,
-                  configVersion: job.configVersion,
-                  deliveryId: job.deliveryId,
-                  ttl: usageTtl(30),
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Put: {
+                  TableName: T,
+                  Item: { pk: `JOB#${job.jobId}`, sk: 'META', ...job, ttl: Math.ceil((job.native ? NATIVE_SLOT_HOLD_UNTIL : job.expiresAt) / 1000) + 7 * 24 * 3600 },
+                  ConditionExpression: 'attribute_not_exists(pk)',
                 },
               },
-            },
-            ...(job.native ? [{ Put: { TableName: T, Item: { pk: nativePartition(job.installationId, job.native.workerId),
-              sk: `QUEUE#${job.jobId}`, jobId: job.jobId, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 } } }] : []),
-          ],
-        }),
-      );
+              {
+                Put: {
+                  TableName: T,
+                  Item: {
+                    ...jobSummaryKey(job),
+                    jobId: job.jobId,
+                    repository: job.repository,
+                    ...(job.issue !== undefined ? { issue: job.issue } : {}),
+                    ...(job.pullRequest !== undefined ? { pullRequest: job.pullRequest } : {}),
+                    ...(job.label ? { label: job.label } : {}),
+                    ...(job.sender ? { sender: job.sender } : {}),
+                    createdAt: job.createdAt,
+                    status: job.status,
+                    configVersion: job.configVersion,
+                    deliveryId: job.deliveryId,
+                    ttl: usageTtl(30),
+                  },
+                },
+              },
+              // Serialize enqueues with mode changes, including launches that read the old
+              // mode before a switch. The revision fences the settings service's queue read.
+              ...(job.native ? [{ Update: {
+                TableName: T, Key: { pk: nativePartition(job.installationId, job.native.workerId), sk: 'MODE' },
+                UpdateExpression: 'ADD revision :one',
+                ConditionExpression: '#enabled = :enabled',
+                ExpressionAttributeNames: { '#enabled': 'enabled' },
+                ExpressionAttributeValues: { ':one': 1, ':enabled': true },
+              } }, { Put: { TableName: T, Item: { pk: nativePartition(job.installationId, job.native.workerId),
+                sk: `QUEUE#${job.jobId}`, jobId: job.jobId, ttl: Math.ceil(job.expiresAt / 1000) + 7 * 24 * 3600 } } }] : []),
+            ],
+          }),
+        );
+      } catch (err) {
+        // A missing job plus a failed mode condition proves this enqueue never committed.
+        // A duplicate job could be an earlier ambiguous success, so it must retain its claim.
+        if (job.native && err instanceof TransactionCanceledException &&
+            err.CancellationReasons?.[0]?.Code === 'None' && cancelledAt(err, 2)) {
+          throw new NativeEnqueueRejectedError(err);
+        }
+        throw err;
+      }
     },
 
     async markLaunching(jobId) {

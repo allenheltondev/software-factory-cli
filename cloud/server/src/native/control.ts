@@ -17,6 +17,7 @@ export interface NativeControlDeps {
   terminateMicrovm(id: string): Promise<void>;
   microvmState(id: string): Promise<string | null>;
   disabled(): Promise<boolean>;
+  enabled?(): Promise<boolean>;
   now?: () => number;
 }
 
@@ -134,7 +135,7 @@ export function createNativeControl(d: NativeControlDeps) {
       if (!await d.workers.put(w, null)) return refused;
     }
     const tenant = await d.store.getTenant(r.installationId, { consistent: true });
-    const disabled = tenant?.status !== 'active' || await d.disabled();
+    const disabled = tenant?.status !== 'active' || await d.disabled() || (d.enabled ? !await d.enabled() : false);
     if (w.settling) {
       // A heartbeat must not resurrect the retired lease or race its final clear.
       // A runner that exited during settlement can have its dispatcher finish it.

@@ -3,12 +3,14 @@ import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-sec
 import type { Store } from '../store/store.js';
 import { createNativeControl } from './control.js';
 import { nativeRoute } from './route.js';
-import { createNativeStore } from './store.js';
+import { createNativeModeStore, createNativeStore } from './store.js';
 
 /** No native route is enabled unless the operator explicitly supplies the test route. */
 export function nativeAws(store: Store, disabled: () => Promise<boolean> = async () => false) {
   const e = process.env;
   const route = nativeRoute(e.NATIVE_WORKER_ROUTE);
+  const mode = createNativeModeStore(e.TABLE_NAME ?? '');
+  const enabled = async () => !!route && mode.enabled(route.installationId, route.workerId);
   const secrets = new SecretsManagerClient({});
   const microvms = new LambdaMicrovmsClient({});
   const secret = async () => {
@@ -17,7 +19,7 @@ export function nativeAws(store: Store, disabled: () => Promise<boolean> = async
     if (!value || value.length < 32 || value.length > 256) throw new Error('invalid worker control credential');
     return value;
   };
-  const control = createNativeControl({ store, workers: createNativeStore(e.TABLE_NAME ?? ''), route, secret, disabled,
+  const control = createNativeControl({ store, workers: createNativeStore(e.TABLE_NAME ?? ''), route, secret, disabled, enabled,
     settings: { region: e.AWS_REGION ?? '', bucket: e.TENANT_BUCKET ?? '', imageArn: '', executionRoleArn: '', ingressConnectorArn: '', egressConnectorArn: '', logGroup: '',
       brokerFunctionName: e.BROKER_FUNCTION_NAME ?? e.AWS_LAMBDA_FUNCTION_NAME ?? '', maximumDurationSeconds: Number(e.MAX_DURATION_SECONDS ?? 10800), watchdogReserveSeconds: Number(e.WATCHDOG_RESERVE_SECONDS ?? 600) },
     async terminateMicrovm(id) { await microvms.send(new TerminateMicrovmCommand({ microvmIdentifier: id })); },
@@ -26,5 +28,5 @@ export function nativeAws(store: Store, disabled: () => Promise<boolean> = async
       catch (e) { if (e instanceof ResourceNotFoundException) return null; throw e; }
     },
   });
-  return { control, launch: route ? { route, secret } : undefined };
+  return { control, launch: route ? { route, secret, enabled } : undefined };
 }
