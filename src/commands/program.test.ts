@@ -144,6 +144,16 @@ describe('commander wiring', () => {
     expect(codes).toEqual([0, 0]);
   });
 
+  it('routes native-auth --claude --json to the sanitized provider probe', async () => {
+    const nativeAuth = vi.fn(async () => 0);
+    const { parse, codes } = setup({ nativeAuth });
+    await parse('native-auth', '--claude', '--json');
+    expect(nativeAuth).toHaveBeenCalledWith(expect.anything(), { claude: true, json: true });
+    await parse('native-auth', '--claude');
+    expect(nativeAuth).toHaveBeenLastCalledWith(expect.anything(), { claude: true });
+    expect(codes).toEqual([0, 0]);
+  });
+
   it('parses agents --json --deep', async () => {
     const agents = vi.fn(async (_ctx: unknown, _o: { json?: boolean; deep?: boolean }) => 0);
     const { parse } = setup({ agents });

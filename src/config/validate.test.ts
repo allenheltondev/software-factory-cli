@@ -9,6 +9,21 @@ import { fakeAdapter } from '../../test/fake-adapter.js';
 const example = () => parse(readFileSync(new URL('../../examples/config.yaml', import.meta.url), 'utf8'));
 
 describe('validateConfig', () => {
+  it('native subscription auth requires a host-native Claude adapter', () => {
+    const cfg = example();
+    cfg.agents.claude = { enabled: true, authentication: 'native-claude' };
+    expect(validateConfig(cfg).ok).toBe(true);
+    cfg.agents.claude.container = { image: 'example/claude:latest' };
+    const contained = validateConfig(cfg);
+    expect(contained.ok).toBe(false);
+    if (!contained.ok) expect(contained.errors).toContainEqual({ path: 'agents.claude.authentication', message: expect.stringMatching(/credential isolation/) });
+    delete cfg.agents.claude.container;
+    cfg.agents.claude.adapter = 'kiro';
+    const wrong = validateConfig(cfg);
+    expect(wrong.ok).toBe(false);
+    if (!wrong.ok) expect(wrong.errors).toContainEqual({ path: 'agents.claude.authentication', message: expect.stringMatching(/Claude adapter/) });
+  });
+
   it('accepts the shipped example and applies defaults', () => {
     const r = validateConfig(example());
     expect(r.ok).toBe(true);
