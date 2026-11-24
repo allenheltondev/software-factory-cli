@@ -20,7 +20,8 @@
 import { followsLines } from './trace-links.js';
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
-import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { consumeVibeUsage, VIBE_EXPORT_PREFIX } from '../agents/vibe-usage.js';
 import { dirname, join, resolve } from 'node:path';
 import {
   getAdapter,
@@ -847,6 +848,10 @@ export class LiveExecutor implements Executor {
         if (text.trim()) await log(['', '---- agent stderr ----', text.replace(/\r?\n$/, '')]);
         return text;
       })());
+    const vibeReport = adapterName === 'vibe'
+      ? await mkdtemp(join(runDir, VIBE_EXPORT_PREFIX)).catch(() => undefined)
+      : undefined;
+    if (vibeReport) invocation.args.splice(-1, 0, '--output-dir', vibeReport);
     if (agentCfg.container && containerReady?.runtime) {
       try {
         contained = {
@@ -858,11 +863,13 @@ export class LiveExecutor implements Executor {
             runId: run.id,
             worktree: prepared.worktreePath,
             promptFile,
+            ...(vibeReport ? { vibeReportDir: vibeReport } : {}),
             agentEnv: commitEnv ? { ...commitEnv, ...agentCfg.env } : agentCfg.env,
             readOnlyGit: review !== null,
           }),
         };
       } catch (err) {
+        if (vibeReport) await consumeVibeUsage(vibeReport, ctx.log);
         await log([`checkout: ${prepared.worktreePath}`]);
         return fail('failed', `could not set up the container for ${run.agent}: ${message(err)}`);
       }
@@ -898,6 +905,7 @@ export class LiveExecutor implements Executor {
     const startedAt = ctx.now();
     let identity: Promise<void> = Promise.resolve();
     let agentRun: AgentRun;
+    let vibeUsage: string | undefined;
     const killGraceMs = this.opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     const box = contained;
     if (box) {
@@ -946,6 +954,7 @@ export class LiveExecutor implements Executor {
         await forceRemoveContainer(box.runtime, box.name, agentEnv);
         untrackContainer(box.name);
       }
+      if (vibeReport) vibeUsage = await consumeVibeUsage(vibeReport, ctx.log);
     }
     const seconds = Math.round((ctx.now() - startedAt) / 1000);
     await identity; // never record anything for this run after it is finished
@@ -997,6 +1006,7 @@ export class LiveExecutor implements Executor {
 
     await log([
       '---- end of agent output ----',
+      ...(vibeUsage ? [vibeUsage] : []),
       `exit: ${agentRun.code !== null ? `code ${agentRun.code}` : `signal ${agentRun.signal ?? 'unknown'}`} after ${seconds}s` +
         (agentRun.stopped ? ` (stopped by the worker: ${agentRun.stopped})` : ''),
       ...(agentRun.leftovers ? ['note: processes the agent left running in its process group were stopped'] : []),
@@ -1036,7 +1046,7 @@ export class LiveExecutor implements Executor {
         ...(box && agentCfg.container
           ? {
               contain: (command: VerifyCommand, index: number) => {
-                const verifyMounts = box.mounts.filter((m) => m.path !== promptFile);
+                const verifyMounts = box.mounts.filter((m) => m.path !== promptFile && m.path !== vibeReport);
                 // Inside the container it is always a POSIX shell, whatever the host is.
                 const inner = verifyInvocation(command, 'linux');
                 const name = containerName(run.id, `verify-${index + 1}`);

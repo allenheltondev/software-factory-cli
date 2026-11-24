@@ -141,8 +141,13 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
           if (key in PLATFORM_AGENT_KEYS) err(`${path}.${key}`, `not set by tenants: ${PLATFORM_AGENT_KEYS[key]}`);
           else if (!AGENT_KEYS.has(key)) err(`${path}.${key}`, 'not a setting Updraft Cloud accepts for an agent');
         }
+        if (adapter === 'vibe' && value.model !== undefined &&
+            (typeof value.model !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value.model))) {
+          err(`${path}.model`, 'enter a Mistral API model ID');
+        }
         agents[name] = {
           ...value,
+          ...(adapter === 'vibe' && value.model === undefined ? { model: 'mistral-medium-latest' } : {}),
           maxConcurrent: 1,
           container: { ...SANDBOX_CONTAINER, env: [SUPPORTED_AGENT_KEY_ENV[adapter as CloudAgent]] },
         };

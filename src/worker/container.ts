@@ -376,6 +376,8 @@ export function containInvocation(o: {
   worktree: string;
   /** Mounted read-only when the adapter passes the prompt by path. */
   promptFile: string;
+  /** Dedicated writable directory for a Vibe report. Never mount the surrounding run logs. */
+  vibeReportDir?: string;
   /** agents.<name>.env */
   agentEnv?: Record<string, string>;
   /** `uid:gid`; defaults to the worker's own. */
@@ -387,6 +389,7 @@ export function containInvocation(o: {
   const name = containerName(o.runId);
   const mounts = worktreeMounts(o.worktree, { readOnlyGit: o.readOnlyGit === true });
   if (inv.promptVia === 'file-arg') mounts.push({ path: o.promptFile, readOnly: true });
+  if (o.vibeReportDir) mounts.push({ path: o.vibeReportDir, readOnly: false });
   const envNames = [...new Set([...o.container.env, ...Object.keys(inv.env ?? {}), ...Object.keys(o.agentEnv ?? {})])];
   const args = buildContainerRunArgs(
     { file: inv.file, args: inv.args },

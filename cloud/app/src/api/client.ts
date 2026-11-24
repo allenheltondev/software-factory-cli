@@ -545,7 +545,7 @@ export interface JobLog {
 
 // A tenant's configuration (server/src/tenants/console.ts and config-service.ts).
 
-export type AgentAdapter = 'claude' | 'codex' | 'kiro';
+export type AgentAdapter = 'claude' | 'codex' | 'kiro' | 'vibe';
 export type MergeMethod = 'squash' | 'merge' | 'rebase';
 
 export interface ConsoleAgent {

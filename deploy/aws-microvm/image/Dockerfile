@@ -111,6 +111,15 @@ RUN set -eu; . /opt/updraft/build.env; \
       python3 -m pip install --no-cache-dir "uv==${UV_VERSION}"; uv --version; \
     fi
 
+COPY hosted-vibe.py /opt/updraft/hosted-vibe.py
+RUN set -eu; . /opt/updraft/build.env; \
+    if [ -n "${VIBE_VERSION:-}" ]; then \
+      python3 -m venv /usr/local/lib/updraft-vibe; \
+      /usr/local/lib/updraft-vibe/bin/pip install --no-cache-dir "mistral-vibe==${VIBE_VERSION}"; \
+      install -m 0755 /opt/updraft/hosted-vibe.py /usr/local/bin/vibe; \
+      vibe --version; \
+    fi
+
 # Toolchain for the repositories the agents work on (TOOL_PACKAGES in build.env), on PATH for
 # the agent and for the verify commands alike.
 RUN set -eu; . /opt/updraft/build.env; \

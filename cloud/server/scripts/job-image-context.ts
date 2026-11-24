@@ -11,6 +11,7 @@ export const IMAGE_DIR = join(repoRoot, 'deploy', 'aws-microvm', 'image');
 /** Hosted ARM64 builds package Kiro alongside Claude and Codex. */
 export const CLOUD_BUILD_ENV = `AGENT_PACKAGES="@anthropic-ai/claude-code @openai/codex"
 KIRO_INSTALL_COMMAND="sh /opt/updraft/install-kiro-rpm.sh"
+VIBE_VERSION="3.1.4"
 `;
 
 /**

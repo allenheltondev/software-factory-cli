@@ -16,7 +16,7 @@ export interface AgentGuide {
   note?: string;
 }
 
-export const AGENT_GUIDES: Record<'claude' | 'codex' | 'kiro', AgentGuide> = {
+export const AGENT_GUIDES: Record<'claude' | 'codex' | 'kiro' | 'vibe', AgentGuide> = {
   claude: {
     agent: 'Claude Code',
     keyName: 'ANTHROPIC_API_KEY',
@@ -47,5 +47,13 @@ export const AGENT_GUIDES: Record<'claude' | 'codex' | 'kiro', AgentGuide> = {
       { label: 'Enable API keys for an organization', href: 'https://kiro.dev/docs/enterprise/governance/api-keys/' },
     ],
     note: 'Needs a Pro, Pro+, Pro Max or Power plan; on a managed organization an admin may need to enable API keys first.',
+  },
+  vibe: {
+    agent: 'Mistral Vibe',
+    keyName: 'MISTRAL_API_KEY',
+    credential: 'Mistral Studio API key',
+    billing: 'Mistral API billing',
+    getKeyUrl: 'https://console.mistral.ai/',
+    guides: [{ label: 'Create a Mistral API key', href: 'https://docs.mistral.ai/getting-started/quickstarts/studio/activate-and-generate-api-key' }],
   },
 };

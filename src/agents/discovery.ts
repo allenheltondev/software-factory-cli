@@ -329,6 +329,23 @@ export const AGENT_SPECS: Record<AdapterName, AgentSpec> = {
     // https://kiro.dev/docs/cli/headless/
     deepArgs: ['chat', '--no-interactive', DEEP_PROMPT],
   },
+  vibe: {
+    adapter: 'vibe',
+    name: 'Mistral Vibe',
+    command: 'vibe',
+    authRunsCli: false,
+    async auth({ probes }) {
+      return probes.env.MISTRAL_API_KEY
+        ? { signedIn: 'yes', auth: 'MISTRAL_API_KEY is set' }
+        : { signedIn: 'unknown', auth: 'Vibe manages sign-in or local provider settings' };
+    },
+    platform: {
+      os: { darwin: { label: 'macOS' }, win32: { label: 'Windows' }, linux: { label: 'Linux' } },
+      arch: null,
+      source: 'https://docs.mistral.ai/vibe/code/cli/install-setup',
+    },
+    deepArgs: ['--prompt', DEEP_PROMPT, '--max-turns', '1', '--disabled-tools', '*'],
+  },
 };
 
 export function isKnownAdapter(name: string): name is AdapterName {
