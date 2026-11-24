@@ -4,6 +4,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import * as claude from '../../test/claude-stream.js';
 import { consumeVibeUsage } from '../agents/vibe-usage.js';
+import { silentLogger } from '../util/log.js';
 import { createLocalTelemetry, localTelemetryFromEnv, parseHeaders } from './local.js';
 
 describe('local agent telemetry from the OTEL_EXPORTER_OTLP_* variables', () => {
@@ -61,7 +62,7 @@ describe('a trace per run', () => {
         config: { private: 'never-export-this' },
         subagents: [{ usage: { input_tokens: 3, output_tokens: 1, cached_input_tokens: 0 }, steps: 1, cost_usd: 0 }],
       }));
-      const usage = await consumeVibeUsage(reportDir);
+      const usage = await consumeVibeUsage(reportDir, silentLogger);
       expect(fs.existsSync(reportDir)).toBe(false);
       const posts: string[] = [];
       const fetchFn = (async (_url: string, init: RequestInit) => {

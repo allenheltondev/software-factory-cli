@@ -2,6 +2,7 @@
 import { followedRuns, recordRunTrace, traceIdFrom, type FollowedRun } from './trace-links.js';
 import { createLocalTelemetry, localTelemetryFromEnv, type RunTelemetry, type RunTrace } from '../telemetry/local.js';
 import { hostname as osHostname } from 'node:os';
+import { recoverVibeExports } from '../agents/vibe-usage.js';
 import type { UpdraftConfig } from '../config/schema.js';
 import { findRepoConfig } from './executor.js';
 import { recordError, type Db } from '../db/database.js';
@@ -529,7 +530,10 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
   const cancelTimer = setInterval(checkCancelRequests, cancelCheckMs);
   try {
     // With `scope`, open runs in the database belong to other machines: nothing to reconcile.
-    if (!deps.scope) await reconcileInterruptedRuns(db, { hostname, processControl, containers, log, now });
+    if (!deps.scope) {
+      await reconcileInterruptedRuns(db, { hostname, processControl, containers, log, now });
+      await recoverVibeExports(paths.runsDir, (runId) => Boolean(getRun(db, runId)?.endedAt), log);
+    }
 
     // Record when publish was turned on or off per repository (the config has no history), then
     // publish succeeded runs a previous worker stopped before publishing, if they ended since.

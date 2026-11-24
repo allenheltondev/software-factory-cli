@@ -45,3 +45,6 @@ Host runs record Vibe's reported input, output and cached tokens, model steps,
 and estimated cost when available. With local OpenTelemetry enabled, they appear
 on the agent-run span. Vibe can report cost as zero for an unpriced model, so
 use your Mistral account for actual credit charges.
+Updraft removes the temporary export and its journal copies after the run. If
+cleanup fails, the worker logs the directory and retries on startup once the run
+is closed.
