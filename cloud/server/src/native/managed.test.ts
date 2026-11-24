@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { GetMicrovmCommand, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { managedClaude } from './managed.js';
+import { createClaudeAdmission, IDLE_MS, STARTUP_MS } from './admission.js';
+import { admissionFixture } from './admission-fixture.js';
+import type { Worker } from './store.js';
 import type { ManagedSession } from './sessions.js';
 const mocks = vi.hoisted(() => ({
   vm: vi.fn(),
@@ -9,6 +12,10 @@ const mocks = vi.hoisted(() => ({
   reserve: vi.fn(),
   bind: vi.fn(),
   worker: vi.fn(),
+  retire: vi.fn(),
+  ready: vi.fn(),
+  queued: vi.fn(),
+  parameter: vi.fn(),
 }));
 vi.mock('@aws-sdk/client-lambda-microvms', async (original) => ({
   ...(await original<typeof import('@aws-sdk/client-lambda-microvms')>()),
@@ -22,11 +29,26 @@ vi.mock('@aws-sdk/client-secrets-manager', async (original) => ({
     send = mocks.secret;
   },
 }));
+vi.mock('@aws-sdk/client-ssm', async (original) => ({
+  ...(await original<typeof import('@aws-sdk/client-ssm')>()),
+  SSMClient: class {
+    send = mocks.parameter;
+  },
+}));
 vi.mock('./sessions.js', () => ({
   managedWorkerId: (id: number) => `managed-${id}`,
-  createClaudeSessions: () => ({ session: mocks.session, requestSession: mocks.reserve, bind: mocks.bind }),
+  createClaudeSessions: () => ({
+    session: mocks.session,
+    requestSession: mocks.reserve,
+    bind: mocks.bind,
+    retire: mocks.retire,
+    ready: mocks.ready,
+  }),
 }));
-vi.mock('./store.js', () => ({ createNativeStore: () => ({ get: mocks.worker }) }));
+vi.mock('./store.js', () => ({
+  createNativeStore: () => ({ get: mocks.worker, queued: mocks.queued }),
+  createNativeModeStore: () => ({ snapshot: async () => ({ enabled: false, revision: 0, routingVersion: 0 }) }),
+}));
 const env = {
   NATIVE_MANAGED_IMAGE_ARN: 'arn:aws:lambda:us-east-1:123:image/test',
   NATIVE_MANAGED_IMAGE_VERSION: '10',
@@ -37,13 +59,36 @@ const env = {
 };
 describe('managed connection reservation', () => {
   let current: ManagedSession | undefined;
+  let row: Worker | null;
+  let clock: number;
+  let disabled: boolean;
+  let admission: ReturnType<typeof createClaudeAdmission>;
+  const managed = () => managedClaude(env, { admission, disabled: async () => disabled, now: () => clock })!;
   beforeEach(() => {
     vi.clearAllMocks();
     current = undefined;
+    row = null;
+    clock = Date.now();
+    disabled = false;
+    admission = createClaudeAdmission('test', admissionFixture().db);
+    mocks.retire.mockImplementation(async () => {
+      if (current) current.retiring = true;
+      return true;
+    });
+    mocks.ready.mockImplementation(async () => {
+      if (current) current.readyAt = clock;
+    });
+    mocks.queued.mockResolvedValue([]);
     mocks.session.mockImplementation(async () => (current ? { ...current } : undefined));
     mocks.reserve.mockImplementation(async (_id, previous) => {
       if (previous?.generation !== current?.generation) return undefined;
-      current = { generation: 'fixture-generation', imageVersion: '10', requestedAt: Date.now() };
+      current = {
+        generation: 'fixture-generation-' + (current?.generation ?? 'initial'),
+        imageVersion: '10',
+        requestedAt: clock,
+        startupDeadline: clock + STARTUP_MS,
+        admissionRequired: true,
+      };
       return { ...current };
     });
     mocks.bind.mockImplementation(async (_id, generation, microvmId) => {
@@ -51,24 +96,26 @@ describe('managed connection reservation', () => {
       current.microvmId = microvmId;
     });
     mocks.secret.mockResolvedValue({ SecretString: 'fixture-control-root-'.repeat(3) });
-    mocks.worker.mockResolvedValue(null);
+    mocks.worker.mockImplementation(async () => row);
     mocks.vm.mockImplementation(async (command) =>
       command instanceof RunMicrovmCommand ? { microvmId: 'mvm-fixture' } : { state: 'RUNNING' },
     );
   });
   it('uses the same generation and bounded lifetime for concurrent connect requests', async () => {
-    await Promise.all([managedClaude(env)!.start(55), managedClaude(env)!.start(55)]);
+    await Promise.all([managed().start(55), managed().start(55)]);
     const launches = mocks.vm.mock.calls
       .map(([command]) => command)
       .filter((command) => command instanceof RunMicrovmCommand);
     expect(launches.length).toBeGreaterThan(0);
-    expect(new Set(launches.map((command) => command.input.clientToken))).toEqual(new Set(['fixture-generation']));
+    expect(new Set(launches.map((command) => command.input.clientToken))).toEqual(
+      new Set(['fixture-generation-initial']),
+    );
     expect(launches.every((command) => command.input.maximumDurationInSeconds === 8 * 60 * 60)).toBe(true);
     expect(current?.microvmId).toBe('mvm-fixture');
   });
   it('reuses a healthy worker without reserving or launching another environment', async () => {
     current = { generation: 'existing', imageVersion: '10', requestedAt: Date.now(), microvmId: 'mvm-existing' };
-    await managedClaude(env)!.start(55);
+    await managed().start(55);
     expect(mocks.reserve).not.toHaveBeenCalled();
     expect(mocks.vm).toHaveBeenCalledOnce();
     expect(mocks.vm.mock.calls[0]![0]).toBeInstanceOf(GetMicrovmCommand);
@@ -76,8 +123,171 @@ describe('managed connection reservation', () => {
   it('does not replace a fenced worker until that exact VM stops', async () => {
     current = { generation: 'existing', imageVersion: '9', requestedAt: Date.now(), microvmId: 'mvm-existing' };
     mocks.worker.mockResolvedValue({ fenced: true, microvmId: 'mvm-existing' });
-    await expect(managedClaude(env)!.start(55)).rejects.toThrow('previous worker to stop');
+    await expect(managed().start(55)).rejects.toThrow('previous worker to stop');
     expect(mocks.reserve).not.toHaveBeenCalled();
     expect(mocks.secret).not.toHaveBeenCalled();
+  });
+  it('rejects service-disabled admission without reserving capacity or launching', async () => {
+    disabled = true;
+    await expect(managed().start(55)).rejects.toThrow('paused by an operator');
+    expect(mocks.reserve).not.toHaveBeenCalled();
+    expect(mocks.vm).not.toHaveBeenCalled();
+    expect(await admission.list()).toHaveLength(0);
+  });
+  it('releases a pre-launch secret failure after sealing its generation', async () => {
+    mocks.secret.mockRejectedValue(new Error('secret unavailable'));
+    await expect(managed().start(55)).rejects.toThrow('secret unavailable');
+    expect(mocks.retire).toHaveBeenCalledOnce();
+    expect(mocks.vm).not.toHaveBeenCalled();
+    expect(await admission.list()).toHaveLength(0);
+    expect(current?.retiring).toBe(true);
+  });
+  it('retains an uncertain launch until replay discovers and confirms termination of the exact VM', async () => {
+    let lost = true;
+    let stopped = false;
+    mocks.vm.mockImplementation(async (command) => {
+      if (command instanceof RunMicrovmCommand) {
+        if (lost) {
+          lost = false;
+          throw Error('response lost');
+        }
+        return { microvmId: 'mvm-uncertain' };
+      }
+      if (command.constructor.name === 'TerminateMicrovmCommand') {
+        stopped = true;
+        return {};
+      }
+      return { state: stopped ? 'TERMINATED' : 'RUNNING' };
+    });
+    await expect(managed().start(55)).rejects.toThrow('response lost');
+    expect(await admission.list()).toHaveLength(1);
+    clock += STARTUP_MS + 1;
+    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(stopped).toBe(true);
+    expect(await admission.list()).toHaveLength(0);
+    const launches = mocks.vm.mock.calls
+      .map(([command]) => command)
+      .filter((command) => command instanceof RunMicrovmCommand);
+    expect(new Set(launches.map((command) => command.input.clientToken)).size).toBe(1);
+  });
+  it.each(['missing', 'unavailable'])(
+    'times out a %s worker, fences before stopping, then reconnects',
+    async (auth) => {
+      let stopped = false;
+      mocks.vm.mockImplementation(async (command) => {
+        if (command instanceof RunMicrovmCommand) return { microvmId: stopped ? 'mvm-replacement' : 'mvm-fixture' };
+        if (command.constructor.name === 'TerminateMicrovmCommand') {
+          stopped = true;
+          return {};
+        }
+        return { state: stopped ? 'TERMINATED' : 'RUNNING' };
+      });
+      await managed().start(55);
+      if (auth === 'unavailable')
+        row = {
+          installationId: 55,
+          workerId: 'managed-55',
+          microvmId: 'mvm-fixture',
+          imageVersion: '10',
+          workerVersion: 'test',
+          version: 1,
+          session: 'worker-session-123456',
+          heartbeatAt: clock,
+          auth: 'unavailable',
+        };
+      expect(await managed().lifecycle(55)).toMatchObject({ preparing: true, startupFailed: false });
+      clock += STARTUP_MS + 1;
+      expect(await managed().lifecycle(55)).toMatchObject({ preparing: false, startupFailed: true });
+      expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+      expect(mocks.retire).toHaveBeenCalledWith(
+        55,
+        expect.objectContaining({ generation: 'fixture-generation-initial' }),
+        expect.objectContaining({ revision: 0 }),
+        auth === 'missing' ? null : expect.objectContaining({ auth: 'unavailable' }),
+      );
+      await managed().start(55);
+      expect(current?.microvmId).toBe('mvm-replacement');
+    },
+  );
+  it('stops no VM and retains its admission when the generation fence loses a registration or enqueue race', async () => {
+    await managed().start(55);
+    mocks.retire.mockResolvedValue(false);
+    await expect(managed().retire(55, current!.generation)).rejects.toThrow('work changed');
+    expect(mocks.vm.mock.calls.some(([command]) => command.constructor.name === 'TerminateMicrovmCommand')).toBe(false);
+    expect(await admission.list()).toHaveLength(1);
+  });
+  it('never retires active or queued work during startup or idle cleanup', async () => {
+    await managed().start(55);
+    clock += STARTUP_MS + 1;
+    mocks.queued.mockResolvedValue(['job-queued']);
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    await expect(managed().retire(55, current!.generation)).rejects.toThrow('queued Claude jobs');
+    expect(mocks.retire).not.toHaveBeenCalled();
+    expect(await admission.list()).toHaveLength(1);
+  });
+  it.each(['on', 'unreadable'])('fails closed when the platform SSM switch is %s', async (value) => {
+    if (value === 'on') mocks.parameter.mockResolvedValue({ Parameter: { Value: 'on' } });
+    else mocks.parameter.mockRejectedValue(Error('SSM read unavailable'));
+    const worker = managedClaude(env, { admission, now: () => clock })!;
+    await expect(worker.start(55)).rejects.toThrow('paused by an operator');
+    expect(mocks.parameter).toHaveBeenCalledOnce();
+    expect(mocks.vm).not.toHaveBeenCalled();
+    expect(await admission.list()).toHaveLength(0);
+  });
+  it('cleans up idle connected environments before the eight-hour maximum', async () => {
+    let state = 'RUNNING';
+    mocks.vm.mockImplementation(async (command) => {
+      if (command instanceof RunMicrovmCommand) return { microvmId: 'mvm-fixture' };
+      if (command.constructor.name === 'TerminateMicrovmCommand') {
+        state = 'TERMINATED';
+        return {};
+      }
+      return { state };
+    });
+    await managed().start(55);
+    row = {
+      installationId: 55,
+      workerId: 'managed-55',
+      microvmId: 'mvm-fixture',
+      imageVersion: '10',
+      workerVersion: 'test',
+      version: 1,
+      session: 'worker-session-123456',
+      heartbeatAt: clock,
+      auth: 'connected',
+    };
+    await managed().lifecycle(55);
+    clock += IDLE_MS - 1;
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    clock += 2;
+    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(await admission.list()).toHaveLength(0);
+    expect(state).toBe('TERMINATED');
+  });
+  it('retains capacity while a stop is uncertain and releases it only after confirmed termination', async () => {
+    await managed().start(55);
+    mocks.vm.mockResolvedValue({ state: 'UNKNOWN' });
+    expect(await managed().retire(55, current!.generation)).toBe(false);
+    expect(await admission.list()).toHaveLength(1);
+    mocks.vm.mockResolvedValue({ state: 'TERMINATED' });
+    expect(await managed().retire(55, current!.generation)).toBe(true);
+    expect(await admission.list()).toHaveLength(0);
+  });
+
+  it('cannot launch a retired generation after another request replaces its session', async () => {
+    const launching = admission.launching.bind(admission);
+    vi.spyOn(admission, 'launching').mockImplementation(async (generation) => {
+      await launching(generation);
+      current = { ...current!, generation: 'replacement-generation' };
+    });
+    await expect(managed().start(55)).rejects.toThrow('environment is retiring');
+    expect(mocks.vm).not.toHaveBeenCalled();
+  });
+  it('cannot bypass platform admission by replaying a pre-budget unbound generation', async () => {
+    current = { generation: 'legacy-generation', imageVersion: '9', requestedAt: clock - STARTUP_MS - 1 };
+    await Promise.all([1, 2, 3, 4].map((id) => admission.reserve(id, `occupied-${id}`, clock)));
+    await expect(managed().retire(55, current.generation)).rejects.toThrow('capacity is full');
+    expect(mocks.vm).not.toHaveBeenCalled();
+    expect(await admission.list()).toHaveLength(4);
   });
 });

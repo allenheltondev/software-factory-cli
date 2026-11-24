@@ -46,7 +46,7 @@ describe('guided Claude connection', () => {
     const user = userEvent.setup();
     let current: NativeClaudeView = { ...ready, triggers: [], worker: null };
     const nativeClaudeStart = vi.fn(async () => {
-      current = { ...current, worker: { ...ready.worker!, status: 'auth-required' } };
+      current = { ...current, worker: { ...(current.worker ?? ready.worker!), status: 'auth-required' } };
       return current;
     });
     const nativeClaudeLogin = vi.fn().mockResolvedValue(grant);
@@ -70,10 +70,19 @@ describe('guided Claude connection', () => {
     expect(screen.getByText(/Verifying your connection with your environment/)).toBeInTheDocument();
     current = { ...current, worker: { ...ready.worker!, generation: 'other' } };
     await focus();
-    expect(screen.getByTitle('Private Claude sign-in')).toBeInTheDocument();
-    current = { ...current, worker: ready.worker };
+    expect(screen.queryByTitle('Private Claude sign-in')).not.toBeInTheDocument();
+    expect(screen.getByText(/environment changed during sign-in/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Reconnect Claude' })).toBeEnabled();
+    expect(screen.queryByText('Your account is connected but no workflows use it yet.')).not.toBeInTheDocument();
+    nativeClaudeLogin.mockResolvedValue({ ...grant, generation: 'other' });
+    await user.click(screen.getByRole('button', { name: 'Reconnect Claude' }));
     await focus();
-    await waitFor(() => expect(screen.queryByTitle('Private Claude sign-in')).not.toBeInTheDocument());
+    await screen.findByTitle('Private Claude sign-in');
+    current = { ...current, worker: { ...ready.worker!, generation: 'other' } };
+    await focus();
+    await waitFor(() =>
+      expect(screen.getByText('Your account is connected but no workflows use it yet.')).toBeInTheDocument(),
+    );
     expect(setNativeClaudeMode).not.toHaveBeenCalled();
   });
   it('saves routing separately without enabling subscription billing', async () => {
@@ -212,6 +221,90 @@ describe('guided Claude connection', () => {
       state: { connectClaude: true },
     });
     await waitFor(() => expect(nativeClaudeStart).toHaveBeenCalledExactlyOnceWith(55));
+    await focus();
+    expect(await screen.findByTitle('Private Claude sign-in')).toBeInTheDocument();
+    expect(nativeClaudeLogin).toHaveBeenCalledOnce();
+  });
+  it('keeps the exact active authorization frame across a transient status failure', async () => {
+    const user = userEvent.setup();
+    const current = { ...ready, worker: { ...ready.worker!, status: 'auth-required' as const } };
+    let fail = false;
+    const nativeClaude = vi.fn(async () => {
+      if (fail) throw Error('temporary network failure');
+      return current;
+    });
+    const nativeClaudeLogin = vi.fn().mockResolvedValue(grant);
+    show(fakeApi({ nativeClaude, nativeClaudeStart: async () => current, nativeClaudeLogin }));
+    await user.click(await screen.findByRole('button', { name: 'Reconnect Claude' }));
+    await focus();
+    const frame = await screen.findByTitle('Private Claude sign-in');
+    const document = frame.getAttribute('srcdoc');
+    fail = true;
+    await focus();
+    expect(screen.getByText(/temporary network failure/)).toBeInTheDocument();
+    fail = false;
+    await focus();
+    expect(screen.getByTitle('Private Claude sign-in')).toBe(frame);
+    expect(frame.getAttribute('srcdoc')).toBe(document);
+    expect(nativeClaudeLogin).toHaveBeenCalledOnce();
+  });
+  it('ignores an in-flight start result after the owner cancels the wizard', async () => {
+    const user = userEvent.setup();
+    const current: NativeClaudeView = { ...ready, worker: null };
+    let resolve!: (value: NativeClaudeView) => void;
+    const nativeClaudeStart = vi.fn(
+      () =>
+        new Promise<NativeClaudeView>((done) => {
+          resolve = done;
+        }),
+    );
+    const nativeClaudeLogin = vi.fn().mockResolvedValue(grant);
+    show(fakeApi({ nativeClaude: async () => current, nativeClaudeStart, nativeClaudeLogin }));
+    await user.click(await screen.findByRole('button', { name: 'Connect Claude account' }));
+    await user.click(screen.getByRole('button', { name: 'Cancel sign-in' }));
+    await act(async () => resolve({ ...ready, worker: { ...ready.worker!, status: 'auth-required' } }));
+    await focus();
+    expect(screen.getByRole('button', { name: 'Connect Claude account' })).toBeEnabled();
+    expect(screen.queryByTitle('Private Claude sign-in')).not.toBeInTheDocument();
+    expect(nativeClaudeLogin).not.toHaveBeenCalled();
+  });
+  it('offers actionable admission throttling and permits an explicit retry', async () => {
+    const user = userEvent.setup();
+    const current: NativeClaudeView = { ...ready, worker: null };
+    const nativeClaudeStart = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error('Claude environment capacity is full. Try connecting again after an environment finishes.'),
+      )
+      .mockResolvedValue(current);
+    show(fakeApi({ nativeClaude: async () => current, nativeClaudeStart }));
+    await user.click(await screen.findByRole('button', { name: 'Connect Claude account' }));
+    expect(await screen.findByText(/capacity is full/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Connect Claude account' }));
+    expect(nativeClaudeStart).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('Preparing your environment…')).toBeInTheDocument();
+  });
+  it('leaves preparation on a backend startup failure and safely reconnects to a new environment', async () => {
+    const user = userEvent.setup();
+    let current: NativeClaudeView = { ...ready, worker: null, preparing: true };
+    const nativeClaudeStart = vi.fn(async () => {
+      if (current.recovery?.state === 'stopped')
+        current = { ...ready, worker: { ...ready.worker!, status: 'auth-required', generation: 'replacement' } };
+      return current;
+    });
+    const nativeClaudeRestart = vi.fn(async () => {
+      current = { ...current, recovery: { state: 'stopped' } };
+      return current;
+    });
+    const nativeClaudeLogin = vi.fn().mockResolvedValue({ ...grant, generation: 'replacement' });
+    show(fakeApi({ nativeClaude: async () => current, nativeClaudeStart, nativeClaudeRestart, nativeClaudeLogin }));
+    await screen.findByText('Preparing your environment…');
+    current = { ...current, preparing: false, startupFailed: true, recovery: { state: 'required' } };
+    await focus();
+    expect(await screen.findByText(/environment did not become ready/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Reconnect Claude' }));
+    expect(nativeClaudeRestart).toHaveBeenCalledOnce();
+    await focus();
     await focus();
     expect(await screen.findByTitle('Private Claude sign-in')).toBeInTheDocument();
     expect(nativeClaudeLogin).toHaveBeenCalledOnce();

@@ -207,6 +207,7 @@ export interface ClaudeWaitingRequest {
 export interface NativeClaudeView {
   /** A reserved session is booting; readiness still requires its live heartbeat. */
   preparing?: boolean;
+  startupFailed?: boolean;
   sessionExpiresAt?: string;
   recovery?: { state: 'required' | 'stopping' | 'stopped' };
   managed?: boolean;

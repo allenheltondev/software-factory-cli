@@ -14,6 +14,7 @@ export interface Worker {
   workerVersion: string;
   auth: AuthState;
   heartbeatAt: number;
+  lastWorkAt?: number;
   active?: { jobId: string; until: number };
   /** Active lease durably retired; blocks dispatch until quota release is confirmed. */
   settling?: { jobId: string };

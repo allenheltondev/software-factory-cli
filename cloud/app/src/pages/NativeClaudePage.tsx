@@ -58,6 +58,10 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
   const title = useRef<HTMLHeadingElement>(null);
   const restoreFocus = useRef(false);
   const flow = useRef(false);
+  const mutationPending = useRef(false);
+  const canceled = useRef(false);
+  const recoveryRequested = useRef(false);
+  const [generationChanged, setGenerationChanged] = useState(false);
   const grantRequested = useRef(false);
   const generation = useRef<string | undefined>(undefined);
   useEffect(() => {
@@ -89,11 +93,13 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
           restored = true;
           if (
             next.owner &&
+            !canceled.current &&
             ((next.managed && connectRequested) ||
               next.preparing ||
               (next.upgrade ?? next.recovery)?.state === 'stopping')
           ) {
             flow.current = true;
+            recoveryRequested.current = Boolean(connectRequested && next.startupFailed);
             setPhase('preparing');
             try {
               const replacement = next.upgrade ?? next.recovery;
@@ -109,6 +115,11 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
           }
         }
 
+        // Consume entry intent before opening a grant: replacing router state cancels this effect.
+        if (connectRequested) {
+          void navigate({ pathname: location.pathname, search: location.search }, { replace: true, state: null });
+          return;
+        }
         if (requestId && !requestMissing) {
           try {
             const waiting = await api.nativeClaudeWaiting(installationId, requestId, controller.signal);
@@ -120,9 +131,28 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
             if (live) setError('Could not load the waiting job. You can still connect your Claude account.');
           }
         }
-        if (flow.current && (next.upgrade ?? next.recovery)?.state === 'stopped') {
+        if (!next.startupFailed) recoveryRequested.current = false;
+        if (flow.current && next.startupFailed && !recoveryRequested.current) {
+          flow.current = false;
+          grantRequested.current = false;
+          setLoginPage(undefined);
+          setPhase('idle');
+        } else if (
+          flow.current &&
+          !mutationPending.current &&
+          generation.current &&
+          next.worker?.generation &&
+          next.worker.generation !== generation.current
+        ) {
+          flow.current = false;
+          grantRequested.current = false;
+          setLoginPage(undefined);
+          setPhase('idle');
+          setGenerationChanged(true);
+          setError('Your Claude environment changed during sign-in. Reconnect Claude to continue.');
+        } else if (flow.current && !mutationPending.current && (next.upgrade ?? next.recovery)?.state === 'stopped') {
           await api.nativeClaudeStart(installationId);
-        } else if (flow.current && !next.upgrade && !next.recovery && next.worker?.online) {
+        } else if (flow.current && !mutationPending.current && !next.upgrade && !next.recovery && next.worker?.online) {
           if (
             next.worker.status === 'connected' &&
             (!generation.current || generation.current === next.worker.generation)
@@ -133,8 +163,14 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
           } else if (['auth-required', 'expired'].includes(next.worker.status) && !grantRequested.current) {
             grantRequested.current = true;
             generation.current = next.worker.generation;
-            const grant = await api.nativeClaudeLogin(installationId, controller.signal);
-            if (!live || !flow.current || version !== revision.current) return;
+            const grant = await api.nativeClaudeLogin(installationId, controller.signal).catch((err) => {
+              if (live && version === revision.current) grantRequested.current = false;
+              throw err;
+            });
+            if (!live || !flow.current || version !== revision.current) {
+              if (!live && version === revision.current) grantRequested.current = false;
+              return;
+            }
             generation.current = grant.generation ?? generation.current;
             setLoginPage(
               claudeLoginFrame(
@@ -151,15 +187,13 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
         }
         failures = 0;
         setPollError(undefined);
-        // Consume the explicit entry action so a later reload only restores status.
-        if (connectRequested) void navigate({ pathname: location.pathname, search: location.search }, { replace: true, state: null });
       } catch (err) {
         if (live) {
-          grantRequested.current = false;
           terminal = err instanceof ApiError && [401, 403, 404].includes(err.status);
           if (terminal) {
             flow.current = false;
             setPhase('idle');
+            setLoginPage(undefined);
           }
           failures++;
           setPollError(
@@ -207,6 +241,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
       }
       if (event.data.result === 'connected') setPhase('verifying');
       else if (['expired', 'failed'].includes(event.data.result)) {
+        grantRequested.current = false;
         flow.current = false;
         setPhase('idle');
         setLoginPage(undefined);
@@ -217,7 +252,11 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
     return () => window.removeEventListener('message', receive);
   }, []);
   async function connect() {
-    revision.current++;
+    const version = ++revision.current;
+    mutationPending.current = true;
+    canceled.current = false;
+    recoveryRequested.current = Boolean(view?.startupFailed);
+    setGenerationChanged(false);
     setError(undefined);
     setPhase('preparing');
     setLoginPage(undefined);
@@ -227,15 +266,19 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
     try {
       const replacement = view?.upgrade ?? view?.recovery;
       if (replacement?.state === 'stopping') return;
-      setView(
+      const updated =
         replacement?.state === 'required'
           ? await api.nativeClaudeRestart(installationId)
-          : await api.nativeClaudeStart(installationId),
-      );
+          : await api.nativeClaudeStart(installationId);
+      if (version === revision.current) setView(updated);
     } catch (err) {
-      flow.current = false;
-      setPhase('idle');
-      setError(err instanceof Error ? err.message : 'Could not connect. Try again.');
+      if (version === revision.current) {
+        flow.current = false;
+        setPhase('idle');
+        setError(err instanceof Error ? err.message : 'Could not connect. Try again.');
+      }
+    } finally {
+      if (version === revision.current) mutationPending.current = false;
     }
   }
   async function choose(enabled: boolean, triggers?: NativeClaudeTrigger[]) {
@@ -252,6 +295,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
     }
   }
   const ready =
+    !generationChanged &&
     !view?.upgrade &&
     !view?.recovery &&
     view?.worker?.online === true &&
@@ -297,8 +341,8 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                     {ready ? 'Connected' : 'Connection required'}
                   </StatusBadge>
                   <p className="text-sm text-muted-foreground">
-                    Connecting starts a temporary dedicated environment for up to eight hours. Your API key stays saved.
-                    Enable subscription routing separately below.
+                    Connecting starts a temporary dedicated environment for up to eight hours. Idle environments close
+                    after 15 minutes. Your API key stays saved. Enable subscription routing separately below.
                   </p>
                   {view.sessionExpiresAt && (
                     <p className="text-sm text-muted-foreground">
@@ -336,11 +380,16 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                       <Button disabled={Boolean(view.worker?.busy)} onClick={() => void connect()}>
                         {view.upgrade
                           ? 'Update and reconnect'
-                          : view.worker
+                          : view.worker || view.startupFailed
                             ? 'Reconnect Claude'
                             : 'Connect Claude account'}
                       </Button>
                     </div>
+                  )}
+                  {view.startupFailed && (
+                    <Alert variant="error">
+                      Your Claude environment did not become ready. Reconnect Claude to replace it safely.
+                    </Alert>
                   )}
                   {view.worker?.busy && !ready && (
                     <p role="status">Wait for the current job to finish before reconnecting.</p>
@@ -393,6 +442,8 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                       variant="ghost"
                       onClick={() => {
                         revision.current++;
+                        canceled.current = true;
+                        mutationPending.current = false;
                         flow.current = false;
                         setLoginPage(undefined);
                         setPhase('idle');

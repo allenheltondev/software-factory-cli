@@ -582,6 +582,8 @@ Resources:
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref ManagedClaudeControlSecret
           - !Ref AWS::NoValue
+        - SSMParameterReadPolicy:
+            ParameterName: updraft/kill-switch
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
         - !If
@@ -785,15 +787,33 @@ Resources:
           TENANT_BUCKET: !Ref TenantBucket
           RESULT_RETENTION_DAYS: !Ref ResultRetentionDays
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
+          NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
+          NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
+          NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
+          NATIVE_MANAGED_ROLE_ARN: !If [ManagedClaude, !GetAtt ManagedClaudeExecutionRole.Arn, ""]
+          NATIVE_MANAGED_LOG_GROUP: !If [ManagedClaude, !Ref MicrovmLogGroup, ""]
+          BROKER_FUNCTION_NAME: !Ref BrokerFunction
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - !If
           - ManagedClaude
           - Statement:
               - Effect: Allow
-                Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
+                Action: [lambda:GetMicrovm, lambda:RunMicrovm, lambda:TerminateMicrovm]
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
+              # Replay a lost launch response with the same generation token, then retire that VM.
+              - Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt ManagedClaudeExecutionRole.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ManagedClaudeControlSecret
           - !Ref AWS::NoValue
+        - SSMParameterReadPolicy:
+            ParameterName: updraft/kill-switch
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
         - Statement:

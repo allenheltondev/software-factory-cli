@@ -16,6 +16,8 @@ export function createNativeSettingsService(d: {
     imageVersion?: string;
     stop?(microvmId: string): Promise<void>;
     vmState?(id: number): Promise<string | null>;
+    lifecycle?(id: number): Promise<{ preparing: boolean; startupFailed: boolean; retiring: boolean }>;
+    retire?(id: number, generation: string): Promise<boolean>;
     sessions: Pick<ClaudeSessions, 'get'> & Partial<Pick<ClaudeSessions, 'pending' | 'session'>>;
     grant(route: NativeRoute): (() => Promise<{ url: string; token: string; port: number; expiresAt?: string }>) | undefined;
   };
@@ -63,13 +65,15 @@ export function createNativeSettingsService(d: {
       upgradeOf(r), managed?.sessions.pending?.(installationId), managed?.sessions.session?.(installationId),
       worker ? d.workers.queued(r.installationId, r.workerId) : Promise.resolve([]),
     ]);
-    const recovering = !upgrade && managed && worker?.microvmId === r.microvmId && (worker.fenced || worker.auth === 'expired' || stale);
+    const lifecycle = await managed?.lifecycle?.(installationId);
+    const recovering = lifecycle?.startupFailed || lifecycle?.retiring || !upgrade && managed && worker?.microvmId === r.microvmId && (worker.fenced || worker.auth === 'expired' || stale);
     const awaitingWorker = !upgrade && !recovering && managed && session && (!worker || worker.microvmId !== r.microvmId || worker.auth === 'unavailable');
     const vm = recovering || awaitingWorker ? await managed?.vmState?.(installationId) : undefined;
-    const preparing = Boolean(awaitingWorker && (!session.microvmId || (vm !== null && vm !== 'TERMINATED' && vm !== 'TERMINATING')));
-    const recovery = recovering ? { state: replacementState(vm) } : undefined;
+    const preparing = lifecycle?.preparing ?? Boolean(awaitingWorker && (!session.microvmId || (vm !== null && vm !== 'TERMINATED' && vm !== 'TERMINATING')));
+    const recovery = recovering ? { state: lifecycle?.startupFailed && !lifecycle.retiring ? 'required' as const : lifecycle?.retiring && vm !== null && vm !== 'TERMINATED' ? 'stopping' as const : replacementState(vm) } : undefined;
     return {
       preparing,
+      startupFailed: lifecycle?.startupFailed ?? false,
       ...(recovery ? { recovery } : {}),
       ...(session?.microvmId === r.microvmId ? { sessionExpiresAt: new Date(session.requestedAt + 8 * 60 * 60_000).toISOString() } : {}),
       ...(upgrade ? { upgrade } : {}),
@@ -140,9 +144,15 @@ export function createNativeSettingsService(d: {
         throw new FlowError('invalid_settings', 409, 'This installation has no Claude worker to restart');
       }
       const upgrade = await upgradeOf(r);
+      const lifecycle = await d.managed.lifecycle?.(installationId);
       const previous = await d.workers.get(r.installationId, r.workerId);
-      if (!upgrade && (!previous || previous.microvmId !== r.microvmId || (!previous.fenced && previous.auth !== 'expired' && now() - previous.heartbeatAt <= 60_000))) {
+      if (!upgrade && !lifecycle?.startupFailed && !lifecycle?.retiring && (!previous || previous.microvmId !== r.microvmId || (!previous.fenced && previous.auth !== 'expired' && now() - previous.heartbeatAt <= 60_000))) {
         throw new FlowError('invalid_settings', 409, 'The Claude worker is already up to date and healthy');
+      }
+      const session = await d.managed.sessions.session?.(installationId);
+      if (d.managed.retire && session) {
+        await d.managed.retire(installationId, session.generation);
+        return view(caller, installationId);
       }
       const state = upgrade?.state ?? replacementState(await d.managed.vmState?.(installationId));
       if (state === 'required') {

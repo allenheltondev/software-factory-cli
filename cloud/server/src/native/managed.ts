@@ -1,14 +1,25 @@
 import { createHmac } from 'node:crypto';
-import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException, RunMicrovmCommand, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
+import {
+  GetMicrovmCommand,
+  LambdaMicrovmsClient,
+  ResourceNotFoundException,
+  RunMicrovmCommand,
+  TerminateMicrovmCommand,
+} from '@aws-sdk/client-lambda-microvms';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
+import { createKillSwitch, KILL_SWITCH_PARAMETER } from '../jobs/kill-switch.js';
+import { createClaudeAdmission, IDLE_MS, SESSION_SECONDS, STARTUP_MS, type ClaudeAdmission } from './admission.js';
+import type { ManagedSession } from './sessions.js';
 import { FlowError } from '../flows/github.js';
 import type { NativeRoute } from './route.js';
 import { createClaudeSessions, managedWorkerId } from './sessions.js';
-import { createNativeStore } from './store.js';
+import { createNativeModeStore, createNativeStore } from './store.js';
 
-const MAX_SECONDS = 8 * 60 * 60;
-
-export function managedClaude(env = process.env) {
+export function managedClaude(
+  env = process.env,
+  options: { disabled?: () => Promise<boolean>; now?: () => number; admission?: ClaudeAdmission } = {},
+) {
   const imageArn = env.NATIVE_MANAGED_IMAGE_ARN;
   const imageVersion = env.NATIVE_MANAGED_IMAGE_VERSION;
   const executionRoleArn = env.NATIVE_MANAGED_ROLE_ARN;
@@ -18,60 +29,274 @@ export function managedClaude(env = process.env) {
 
   const sessions = createClaudeSessions(env.TABLE_NAME ?? '');
   const workers = createNativeStore(env.TABLE_NAME ?? '');
+  const mode = createNativeModeStore(env.TABLE_NAME ?? '');
+  const admission = options.admission ?? createClaudeAdmission(env.TABLE_NAME ?? '');
+  const now = options.now ?? Date.now;
+  const ssm = new SSMClient({});
+  const killSwitch = createKillSwitch({
+    now,
+    read: async () => {
+      try {
+        return (
+          (await ssm.send(new GetParameterCommand({ Name: env.KILL_SWITCH_PARAMETER || KILL_SWITCH_PARAMETER })))
+            .Parameter?.Value ?? null
+        );
+      } catch (err) {
+        if (err instanceof ParameterNotFound) return null;
+        throw err;
+      }
+    },
+  });
+  const disabled = options.disabled ?? (() => killSwitch.engaged());
   const microvms = new LambdaMicrovmsClient({});
   const secrets = new SecretsManagerClient({});
   const base = (installationId: number): NativeRoute => ({
-    installationId, imageVersion, workerId: managedWorkerId(installationId), microvmId: 'mvm-pending', controlSecretArn,
+    installationId,
+    imageVersion,
+    workerId: managedWorkerId(installationId),
+    microvmId: 'mvm-pending',
+    controlSecretArn,
   });
 
   async function secret(installationId: number, generation: string) {
     const root = (await secrets.send(new GetSecretValueCommand({ SecretId: controlSecretArn }))).SecretString;
     if (!root || root.length < 32) throw new Error('Managed worker control secret unavailable');
-    return createHmac('sha256', root).update(JSON.stringify(['updraft-worker', installationId, generation])).digest('base64url');
+    return createHmac('sha256', root)
+      .update(JSON.stringify(['updraft-worker', installationId, generation]))
+      .digest('base64url');
   }
 
   async function route(id: number): Promise<NativeRoute> {
     const session = await sessions.session(id);
-    return { ...base(id), ...(session?.microvmId ? { microvmId: session.microvmId, generation: session.generation, imageVersion: session.imageVersion } : {}) };
+    return {
+      ...base(id),
+      ...(session?.microvmId && !session.retiring
+        ? { microvmId: session.microvmId, generation: session.generation, imageVersion: session.imageVersion }
+        : {}),
+    };
+  }
+
+  async function launch(session: ManagedSession, id: number, preparedToken?: string) {
+    const region = env.AWS_REGION ?? '';
+    const brokerFunctionName = env.BROKER_FUNCTION_NAME;
+    if (!executionRoleArn || !brokerFunctionName || !region)
+      throw new Error('Managed worker launch configuration is incomplete');
+    const partition = imageArn!.split(':')[1];
+    const connector = `arn:${partition}:lambda:${region}:aws:network-connector:aws-network-connector:`;
+    const token = preparedToken ?? (await secret(id, session.generation));
+    const result = await microvms.send(
+      new RunMicrovmCommand({
+        clientToken: session.generation,
+        imageIdentifier: imageArn,
+        imageVersion: session.imageVersion,
+        executionRoleArn,
+        maximumDurationInSeconds: SESSION_SECONDS,
+        ...(logGroup ? { logging: { cloudWatch: { logGroup } } } : {}),
+        ingressNetworkConnectors: [connector + 'HTTP_INGRESS'],
+        egressNetworkConnectors: [connector + 'INTERNET_EGRESS'],
+        runHookPayload: JSON.stringify({
+          storage: 'ephemeral',
+          cloud: {
+            region,
+            brokerFunctionName,
+            workerId: managedWorkerId(id),
+            imageVersion: session.imageVersion,
+            workerVersion: 'tenant-browser-1',
+            controlToken: token,
+          },
+        }),
+      }),
+    );
+    if (!result.microvmId) throw new Error('Managed worker launch returned no VM');
+    return result.microvmId;
+  }
+
+  async function stateOf(microvmId: string): Promise<string | null> {
+    try {
+      return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }))).state ?? 'UNKNOWN';
+    } catch (err) {
+      if (err instanceof ResourceNotFoundException) return null;
+      throw err;
+    }
+  }
+  async function lifecycle(id: number) {
+    const session = await sessions.session(id);
+    if (!session) return { preparing: false, startupFailed: false, retiring: false };
+    const lease = await admission.get(session.generation);
+    const worker = await workers.get(id, managedWorkerId(id));
+    const ready =
+      !!worker &&
+      worker.microvmId === session.microvmId &&
+      ['auth-required', 'connected', 'expired'].includes(worker.auth);
+    if (ready && !session.retiring && !session.readyAt) {
+      await sessions.ready(id, session.generation, now());
+      if (lease) await admission.touch(session.generation, now());
+    }
+    const startupFailed =
+      !session.readyAt && !ready && now() >= (session.startupDeadline ?? session.requestedAt + STARTUP_MS);
+    return {
+      preparing: !!lease && !session.retiring && !startupFailed && !session.readyAt && !ready,
+      startupFailed,
+      retiring: session.retiring === true,
+    };
+  }
+
+  /** Session + mode + worker fencing is atomic, even when the worker never registered. */
+  async function retire(id: number, generation: string): Promise<boolean> {
+    const session = await sessions.session(id);
+    if (!session || session.generation !== generation) return false;
+    if (!session.retiring) {
+      const snapshot = await mode.snapshot(id, managedWorkerId(id));
+      const worker = await workers.get(id, managedWorkerId(id));
+      if (worker?.active || worker?.settling || (await workers.queued(id, managedWorkerId(id))).length) {
+        throw new FlowError(
+          'invalid_settings',
+          409,
+          'Wait for active, settling, and queued Claude jobs to finish before reconnecting.',
+        );
+      }
+      if (!(await sessions.retire(id, session, snapshot, worker))) {
+        throw new FlowError(
+          'invalid_settings',
+          409,
+          'The Claude environment or its work changed. Try reconnecting again.',
+        );
+      }
+    }
+    let lease = await admission.get(generation);
+    // Adopt pre-budget unbound generations before any recovery replay can create compute.
+    if (!lease && !session.microvmId && !session.admissionRequired) {
+      await admission.reserve(id, generation, now());
+      await admission.launching(generation);
+      lease = await admission.get(generation);
+    }
+    await admission.retiring(generation);
+    let vm = session.microvmId ?? lease?.microvmId;
+    // A durable launch marker means AWS might have accepted an invocation whose response was lost.
+    // Replay the SAME client token to discover that VM; never free capacity on a timeout/absent row.
+    if (!vm && (lease?.mayHaveLaunched || !session.admissionRequired)) {
+      vm = await launch(session, id);
+      if (lease) await admission.bind(generation, vm);
+    }
+    if (vm) {
+      const state = await stateOf(vm);
+      if (state !== null && state !== 'TERMINATED') {
+        await stop(vm);
+        if (!['TERMINATED', null].includes(await stateOf(vm))) return false;
+      }
+    }
+    await admission.release(generation);
+    return true;
   }
 
   async function start(id: number) {
-    const region = env.AWS_REGION ?? '';
-    if (!executionRoleArn) throw new Error('Managed worker execution role is unavailable');
-    const brokerFunctionName = env.BROKER_FUNCTION_NAME;
-    if (!brokerFunctionName || !region) throw new Error('Managed worker launch configuration is incomplete');
+    if (await disabled())
+      throw new FlowError(
+        'throttled',
+        503,
+        'Claude connections are temporarily paused by an operator. Try again later.',
+      );
+    if (!executionRoleArn || !env.BROKER_FUNCTION_NAME || !env.AWS_REGION)
+      throw new FlowError('invalid_settings', 409, 'Claude launch configuration is incomplete. Contact an operator.');
     let session = await sessions.session(id);
-    if (session?.microvmId) {
-      try {
-        const vm = await microvms.send(new GetMicrovmCommand({ microvmIdentifier: session.microvmId }));
-        if (vm.state !== 'TERMINATED') {
-          const worker = await workers.get(id, managedWorkerId(id));
-          if (!worker?.fenced || worker.microvmId !== session.microvmId) return;
-          throw new FlowError('invalid_settings', 409, 'Wait for the previous worker to stop before starting another session');
-        }
-      } catch (error) { if (!(error instanceof ResourceNotFoundException)) throw error; }
+    if (
+      session &&
+      (session.retiring ||
+        (!session.microvmId && now() >= (session.startupDeadline ?? session.requestedAt + STARTUP_MS)))
+    ) {
+      if (!(await retire(id, session.generation)))
+        throw new FlowError('invalid_settings', 409, 'The previous Claude environment is stopping. Try again shortly.');
+      session = { ...session, retiring: true };
+    } else if (session?.microvmId) {
+      const state = await stateOf(session.microvmId);
+      if (state !== null && state !== 'TERMINATED') {
+        const worker = await workers.get(id, managedWorkerId(id));
+        if (worker?.fenced && worker.microvmId === session.microvmId)
+          throw new FlowError(
+            'invalid_settings',
+            409,
+            'Wait for the previous worker to stop before starting another session',
+          );
+        if ((await lifecycle(id)).startupFailed)
+          throw new FlowError(
+            'invalid_settings',
+            409,
+            'This Claude environment did not become ready. Reconnect Claude to replace it safely.',
+          );
+        await admission.reserve(id, session.generation, now());
+        await admission.bind(session.generation, session.microvmId);
+        return;
+      }
+      await admission.release(session.generation);
     }
-    if (!session || session.microvmId) {
-      const reserved = await sessions.requestSession(id, session, imageVersion!);
-      session = reserved ?? await sessions.session(id);
-      if (!session || session.microvmId) return;
+    if (!session || session.microvmId || session.retiring) {
+      const reserved = await sessions.requestSession(id, session, imageVersion!, now());
+      session = reserved ?? (await sessions.session(id));
+      if (!session || session.microvmId || session.retiring) return;
     }
-    const partition = imageArn!.split(':')[1];
-    const connector = `arn:${partition}:lambda:${region}:aws:network-connector:aws-network-connector:`;
-    const token = await secret(id, session.generation);
-    const result = await microvms.send(new RunMicrovmCommand({
-      clientToken: session.generation, imageIdentifier: imageArn, imageVersion: session.imageVersion, executionRoleArn,
-      maximumDurationInSeconds: MAX_SECONDS,
-      ...(logGroup ? { logging: { cloudWatch: { logGroup } } } : {}),
-      ingressNetworkConnectors: [connector + 'HTTP_INGRESS'], egressNetworkConnectors: [connector + 'INTERNET_EGRESS'],
-      runHookPayload: JSON.stringify({ storage: 'ephemeral', cloud: {
-        region, brokerFunctionName, workerId: managedWorkerId(id), imageVersion: session.imageVersion, workerVersion: 'tenant-browser-1', controlToken: token,
-      } }),
-    }));
-    if (!result.microvmId) throw new Error('Managed worker launch returned no VM');
-    await sessions.bind(id, session.generation, result.microvmId);
+    await admission.reserve(id, session.generation, now());
+    // Fetch the secret before the launch marker. Failure here can be sealed/released without a VM.
+    let token: string;
+    try {
+      token = await secret(id, session.generation);
+    } catch (err) {
+      await retire(id, session.generation);
+      throw err;
+    }
+    await admission.launching(session.generation);
+    const current = await sessions.session(id);
+    if (!current || current.generation !== session.generation || current.retiring)
+      throw new FlowError('invalid_settings', 409, 'This Claude environment is retiring. Try again shortly.');
+    const vm = await launch(session, id, token);
+    await admission.bind(session.generation, vm);
+    await sessions.bind(id, session.generation, vm);
   }
 
+  /** Called on the existing five-minute reconciliation schedule, not just while a console is open. */
+  async function reconcile() {
+    let failed = 0;
+    let released = 0;
+    const paused = await disabled();
+    for (const lease of await admission.list()) {
+      try {
+        const session = await sessions.session(lease.installationId);
+        if (!session || session.generation !== lease.generation) {
+          // A legacy/replaced generation is still charged until its exact VM is known to be gone.
+          if (lease.microvmId && ['TERMINATED', null].includes(await stateOf(lease.microvmId))) {
+            await admission.release(lease.generation);
+            released++;
+          } else failed++;
+          continue;
+        }
+        const worker = await workers.get(lease.installationId, managedWorkerId(lease.installationId));
+        if (
+          worker?.active ||
+          worker?.settling ||
+          (await workers.queued(lease.installationId, managedWorkerId(lease.installationId))).length
+        ) {
+          await admission.touch(lease.generation, now());
+          continue;
+        }
+        const state = session.microvmId ? await stateOf(session.microvmId) : undefined;
+        const lifecycleState = await lifecycle(lease.installationId);
+        if (
+          paused ||
+          session.retiring ||
+          lease.retiring ||
+          state === null ||
+          state === 'TERMINATED' ||
+          lifecycleState.startupFailed ||
+          now() >= Math.max(lease.idleAt, (worker?.lastWorkAt ?? 0) + IDLE_MS) ||
+          now() >= session.requestedAt + SESSION_SECONDS * 1000
+        ) {
+          if (await retire(lease.installationId, lease.generation)) released++;
+        }
+      } catch {
+        failed++;
+      }
+    }
+    return { released, failed };
+  }
   /** The state of the installation's current session VM, or null when it has none or it is gone. */
   async function vmState(id: number): Promise<string | null> {
     const session = await sessions.session(id);
@@ -96,5 +321,18 @@ export function managedClaude(env = process.env) {
     }
   }
 
-  return { route, start, stop, vmState, sessions, imageArn, imageVersion, secret };
+  return {
+    route,
+    start,
+    stop,
+    vmState,
+    lifecycle,
+    retire,
+    reconcile,
+    disabled,
+    sessions,
+    imageArn,
+    imageVersion,
+    secret,
+  };
 }

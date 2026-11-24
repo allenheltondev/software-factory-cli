@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { ConditionalCheckFailedException, DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { nativePartition, type NativeMode, type Worker } from './store.js';
+import { STARTUP_MS } from './admission.js';
 import type { LaunchRequest } from '../jobs/launch.js';
 
 export interface ManagedSession {
@@ -8,6 +10,10 @@ export interface ManagedSession {
   imageVersion: string;
   microvmId?: string;
   requestedAt: number;
+  startupDeadline?: number;
+  readyAt?: number;
+  retiring?: boolean;
+  admissionRequired?: boolean;
 }
 
 export interface WaitingClaudeJob {
@@ -39,7 +45,7 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
   return {
     session: (id: number) => read<ManagedSession>(sessionKey(id)),
     async requestSession(id: number, previous: ManagedSession | undefined, imageVersion: string, now = Date.now()) {
-      const session: ManagedSession = { generation: randomUUID(), imageVersion, requestedAt: now };
+      const session: ManagedSession = { generation: randomUUID(), imageVersion, requestedAt: now, startupDeadline: now + STARTUP_MS, admissionRequired: true };
       const won = await putIf({ TableName: table, Item: { ...sessionKey(id), ...session },
         ConditionExpression: previous ? 'generation = :g' : 'attribute_not_exists(pk)',
         ...(previous ? { ExpressionAttributeValues: { ':g': previous.generation } } : {}) });
@@ -48,8 +54,40 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
     async bind(id: number, generation: string, microvmId: string) {
       await db.send(new UpdateCommand({ TableName: table, Key: sessionKey(id),
         UpdateExpression: 'SET microvmId = :vm',
-        ConditionExpression: 'generation = :g AND (attribute_not_exists(microvmId) OR microvmId = :vm)',
+        ConditionExpression: 'generation = :g AND attribute_not_exists(retiring) AND (attribute_not_exists(microvmId) OR microvmId = :vm)',
         ExpressionAttributeValues: { ':vm': microvmId, ':g': generation } }));
+    },
+    async ready(id: number, generation: string, now = Date.now()) {
+      try {
+        await db.send(new UpdateCommand({ TableName: table, Key: sessionKey(id),
+          UpdateExpression: 'SET readyAt = if_not_exists(readyAt, :now)',
+          ConditionExpression: 'generation = :g AND attribute_not_exists(retiring)',
+          ExpressionAttributeValues: { ':g': generation, ':now': now } }));
+      } catch (err) { if (!(err instanceof ConditionalCheckFailedException)) throw err; }
+    },
+    /** Seal the exact generation AND its dispatch revision, including a missing worker row. */
+    async retire(id: number, session: ManagedSession, mode: NativeMode, worker: Worker | null) {
+      const fenced: Worker = { ...(worker ?? { version: 0, installationId: id, workerId: managedWorkerId(id), session: session.generation,
+        imageVersion: session.imageVersion, workerVersion: 'unregistered', auth: 'unavailable', heartbeatAt: 0 }),
+        microvmId: session.microvmId ?? 'mvm-pending', version: (worker?.version ?? 0) + 1, fenced: true };
+      try {
+        await db.send(new TransactWriteCommand({ TransactItems: [
+          { Update: { TableName: table, Key: sessionKey(id), UpdateExpression: 'SET retiring = :yes',
+            ConditionExpression: 'generation = :g AND attribute_not_exists(retiring)',
+            ExpressionAttributeValues: { ':g': session.generation, ':yes': true } } },
+          { Update: { TableName: table, Key: { pk: nativePartition(id, managedWorkerId(id)), sk: 'MODE' },
+            UpdateExpression: 'SET revision = :next, routingVersion = :routing',
+            ConditionExpression: mode.revision === 0 ? 'attribute_not_exists(revision) OR revision = :revision' : 'revision = :revision',
+            ExpressionAttributeValues: { ':revision': mode.revision, ':next': mode.revision + 1, ':routing': (mode.routingVersion ?? 0) + 1 } } },
+          { Put: { TableName: table, Item: { pk: nativePartition(id, managedWorkerId(id)), sk: 'WORKER', ...fenced },
+            ConditionExpression: worker ? '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling)' : 'attribute_not_exists(pk)',
+            ...(worker ? { ExpressionAttributeNames: { '#v': 'version' }, ExpressionAttributeValues: { ':v': worker.version } } : {}) } },
+        ] }));
+        return true;
+      } catch (err) {
+        if (err instanceof TransactionCanceledException && err.CancellationReasons?.some(reason => reason.Code === 'ConditionalCheckFailed')) return false;
+        throw err;
+      }
     },
     async park(request: WaitingClaudeJob['request'], eventKey: string, now = Date.now()) {
       const id = waitingId(request.installationId, request.deliveryId);

@@ -22,9 +22,10 @@ const secrets = new SecretsManagerClient({});
 const store = createDynamoStore(process.env.TABLE_NAME ?? '');
 const microvms = new LambdaMicrovmsClient({});
 
+const nativeWorker = nativeAws(store);
 const reconcile = createReconciler({
   store,
-  native: nativeAws(store).control,
+  native: nativeWorker.control,
   async microvmState(microvmId) {
     try {
       return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: microvmId }))).state ?? 'UNKNOWN';
@@ -38,9 +39,11 @@ const reconcile = createReconciler({
 export async function handler(event?: { task?: unknown }): Promise<unknown> {
   if (event?.task === 'reconcile') {
     const report = await reconcile();
+    const sessions = await nativeWorker.managed?.reconcile();
+    if (sessions?.failed) throw new Error(`Claude session reconciliation failed for ${sessions.failed} session(s)`);
     // The next run (five minutes on) retries what failed; fail this one so alarms see it.
     if (report.failed > 0) throw new Error(`reconciliation failed for ${report.failed} job(s)`);
-    return report;
+    return { ...report, sessions };
   }
   // Both run whatever the other did; a failure of either fails the run (retried, alarmed) at the end.
   let report: Awaited<ReturnType<typeof cleanupTenants>> | undefined;
