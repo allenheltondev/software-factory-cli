@@ -142,6 +142,35 @@ async function expectDead(...pids: number[]) {
 const valuesOf = (args: string[], flag: string) => args.flatMap((a, i) => (a === flag ? [args[i + 1]!] : []));
 
 describe.skipIf(process.platform === 'win32')('LiveExecutor with agents.<name>.container (fake runtime)', { timeout: 120_000 }, () => {
+  it('collects a contained Vibe export and keeps it out of successful verification', async () => {
+    const { paths, config, db, runtime } = setup();
+    config.agents.claude!.adapter = 'vibe';
+    config.actions['implement-issue']!.verify = [['true']];
+    const script = [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const report = process.argv[process.argv.indexOf('--output-dir') + 1];",
+      "fs.writeFileSync(path.join(report, 'export.json'), JSON.stringify({ schema_version: 1, steps: 1 }));",
+    ].join('\n');
+    restores.push(registerAdapter({
+      name: 'vibe',
+      buildInvocation: ({ launch }) => ({ file: launch.file, args: ['-e', script, '--', '--prompt'], promptVia: 'stdin' }),
+    }));
+
+    const c = claim(db, config, paths);
+    const result = await new LiveExecutor({ env: workerEnv(), locate: noHostLookup }).execute(c, context(db, config, paths, c.run.id));
+
+    expect(result.outcome).toBe('succeeded');
+    const [agent, verify] = runtime.callsOf('run');
+    const report = valuesOf(agent!.argv, '--output-dir')[0]!;
+    expect(valuesOf(agent!.argv, '--mount')).toContain(`type=bind,source=${report},target=${report}`);
+    expect(valuesOf(verify!.argv, '--mount').join('\n')).not.toContain(report);
+    expect(existsSync(report)).toBe(false);
+    const log = readFileSync(c.run.logPath!, 'utf8');
+    expect(log).toContain('vibe usage: {"modelSteps":1}');
+    expect(log).toMatch(/---- verify 1\/1:[\s\S]*exit: code 0/);
+  });
+
   it('starts the agent through the runtime, in the worktree, with only the named variables; the commit lands on the job branch', async () => {
     const { f, paths, config, db, runtime } = setup();
     const c = claim(db, config, paths);

@@ -177,6 +177,23 @@ metadata. They exclude log contents and trace payloads. Changes within v1 are ad
 Consumers should deduplicate delivery attempts using `stack`, `tenantId` and `jobId`.
 A later metadata update to an already finished job does not create a finish event.
 
+### Mistral API pilot
+
+The hosted job image packages Mistral Vibe. After the new image is active in Staging, add
+`vibe` to the existing comma-separated `CLOUD_AGENTS` variable in the Staging GitHub environment
+and run the Cloud deployment. A deployment without this variable keeps its stack settings.
+
+1. Open the test installation's **Agent keys** and save a Mistral Studio API key.
+2. Add **Mistral Vibe** to a pool used by a published workflow. Enter an API model ID
+   such as `mistral-large-4-0` if your account has access, or use the default `mistral-medium-latest`.
+3. Apply the start label to a fresh issue. Confirm a successful verification and PR, then
+   compare the trace's input, output and cache tokens with Mistral Studio's usage.
+
+Vibe uses the official Mistral API for hosted jobs. The sandbox receives the resolved
+installation key and has a dedicated writable directory for its usage export. Updraft reads
+numeric totals and removes the export and copied journals. An unpriced model can report zero
+estimated cost. Mistral Studio records billed usage and applied credits.
+
 ### One-time setup
 
 1. **AWS accounts.** Staging and Production are separate accounts, and both need rsc-core deployed. The template reads `/readysetcloud/auth/user-pool-id` and `/readysetcloud/auth/user-pool-arn` from SSM.

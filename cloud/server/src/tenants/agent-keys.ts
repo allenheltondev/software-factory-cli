@@ -40,9 +40,10 @@ const KEY_SHAPE: Record<string, RegExp> = {
   CODEX_API_KEY: /^sk-[A-Za-z0-9_-]{20,}$/,
   // Kiro documents no format: one token of key characters, and never another provider's key.
   KIRO_API_KEY: /^(?!sk-)[A-Za-z0-9_.:+/=-]{20,512}$/,
+  MISTRAL_API_KEY: /^[A-Za-z0-9_.-]{20,512}$/,
 };
 
-const PROVIDER: Record<string, string> = { ANTHROPIC_API_KEY: 'Anthropic', CODEX_API_KEY: 'OpenAI', KIRO_API_KEY: 'Kiro' };
+const PROVIDER: Record<string, string> = { ANTHROPIC_API_KEY: 'Anthropic', CODEX_API_KEY: 'OpenAI', KIRO_API_KEY: 'Kiro', MISTRAL_API_KEY: 'Mistral' };
 const providerOf = (name: string) => PROVIDER[name] ?? name;
 
 export type SetKeyResult = { ok: true; meta: AgentKeyMeta } | { ok: false; message: string };

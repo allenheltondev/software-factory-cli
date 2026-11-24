@@ -537,8 +537,8 @@ function AgentsSection({ config, onChange, view, errors, installationId, keyApi,
                 </div>
                 <FieldError message={issuesAt(errors.filter((e) => e.path === path || e.path === `${path}.adapter` || e.path === `${path}.enabled`), path)} />
                 <div className="grid gap-4 sm:grid-cols-2">
-                  <Input label="Model" hint="Empty: the agent's default" value={a.model ?? ''} error={issuesAt(errors, `${path}.model`)} onChange={(e) => patchAgent(name, { model: e.target.value || undefined })} />
-                  <Input label="Reasoning effort" hint="For example low, medium or high" list="effort-levels" value={a.effort ?? ''} error={issuesAt(errors, `${path}.effort`)} onChange={(e) => patchAgent(name, { effort: e.target.value || undefined })} />
+                  <Input label="Model" hint={a.adapter === 'vibe' ? 'Mistral API model ID. Default: mistral-medium-latest' : "Empty: the agent's default"} value={a.model ?? ''} error={issuesAt(errors, `${path}.model`)} onChange={(e) => patchAgent(name, { model: e.target.value || undefined })} />
+                  {a.adapter !== 'vibe' && <Input label="Reasoning effort" hint="For example low, medium or high" list="effort-levels" value={a.effort ?? ''} error={issuesAt(errors, `${path}.effort`)} onChange={(e) => patchAgent(name, { effort: e.target.value || undefined })} />}
                 </div>
                 {isOffered && a.enabled && !keySet && <InlineKey adapter={a.adapter} installationId={installationId} api={keyApi} onSaved={onKeys} />}
               </section>
