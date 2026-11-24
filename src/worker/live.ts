@@ -1046,7 +1046,7 @@ export class LiveExecutor implements Executor {
         ...(box && agentCfg.container
           ? {
               contain: (command: VerifyCommand, index: number) => {
-                const verifyMounts = box.mounts.filter((m) => m.path !== promptFile);
+                const verifyMounts = box.mounts.filter((m) => m.path !== promptFile && m.path !== vibeReport);
                 // Inside the container it is always a POSIX shell, whatever the host is.
                 const inner = verifyInvocation(command, 'linux');
                 const name = containerName(run.id, `verify-${index + 1}`);
