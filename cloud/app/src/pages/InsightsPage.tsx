@@ -436,7 +436,7 @@ function CodingModels({ s }: { s: StatsSection }) {
         <CardTitle>Models at writing code</CardTitle>
         <CardDescription>
           Implement jobs by the model of the run that ended them. Success counts succeeded against failed; the band is the 95% interval, wide while a sample is small. Review-ready is of the pull
-          requests each model opened that the reviewer has looked at.
+          requests each model opened that the reviewer has looked at. Response models are available while job summaries are retained for 30 days. Older runs use the configured model.
         </CardDescription>
       </CardHeader>
       <CardBody>

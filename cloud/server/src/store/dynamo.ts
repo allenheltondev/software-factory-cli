@@ -859,54 +859,40 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async finishJob(jobId, outcome, finish) {
+      const key = { pk: `JOB#${jobId}`, sk: 'META' };
+      const read = async () => (await client.send(new GetCommand({ TableName: T, Key: key, ConsistentRead: true }))).Item;
+      const job = await read();
+      if (!job) return null;
+      if (job.status === 'finished') return typeof job.outcome === 'string' ? job.outcome : null;
+      if (typeof job.installationId !== 'number' || typeof job.createdAt !== 'string') throw new Error('job metadata lacks a summary key');
+      const summary = jobSummaryKey({ installationId: job.installationId, createdAt: job.createdAt, jobId });
       try {
-        const out = await client.send(
-          new UpdateCommand({
-            TableName: T,
-            Key: { pk: `JOB#${jobId}`, sk: 'META' },
-            UpdateExpression: 'SET #status = :finished, outcome = :outcome',
-            ConditionExpression: 'attribute_exists(pk) AND #status <> :finished',
-            ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: { ':finished': 'finished', ':outcome': outcome },
-            ReturnValues: 'ALL_NEW',
-          }),
-        );
-        // The first outcome, on the job's summary and in the month's failures. For the admin view
-        // only, so a failure here is logged, never the finish's.
-        const job = out.Attributes;
-        if (job && typeof job.installationId === 'number' && typeof job.createdAt === 'string') {
-          const summary = jobSummaryKey({ installationId: job.installationId, createdAt: job.createdAt, jobId });
-          await client
-            .send(
-              new TransactWriteCommand({
-                TransactItems: [
-                  {
-                    Update: summaryFinish(summary, outcome, finishFields({ ...(typeof job.startedAt === 'number' ? { startedAt: job.startedAt } : {}), ...(typeof job.microvmId === 'string' ? { microvmId: job.microvmId } : {}) }, finish)),
-                  },
-                  ...(isFailure(outcome)
-                    ? [
-                        {
-                          Update: {
-                            TableName: T,
-                            Key: monthKey(job.installationId, job.createdAt.slice(0, 7)),
-                            UpdateExpression: 'ADD failed :one SET #ttl = if_not_exists(#ttl, :ttl)',
-                            ExpressionAttributeNames: { '#ttl': 'ttl' },
-                            ExpressionAttributeValues: { ':one': 1, ':ttl': usageTtl(400) },
-                          },
-                        },
-                      ]
-                    : []),
-                ],
-              }),
-            )
-            .catch((err: unknown) => console.log(JSON.stringify({ jobId, warning: `could not record the outcome on the job's summary: ${(err as Error)?.name}` })));
-        }
+        await client.send(new TransactWriteCommand({
+          TransactItems: [
+            { Update: {
+              ...summaryFinish(key, outcome, {}),
+              ConditionExpression: 'attribute_exists(pk) AND #status <> :finished',
+            } },
+            { Update: summaryFinish(summary, outcome, finishFields({
+              startedAt: typeof job.startedAt === 'number' ? job.startedAt : undefined,
+              microvmId: typeof job.microvmId === 'string' ? job.microvmId : undefined,
+            }, finish)) },
+            ...(isFailure(outcome) ? [{ Update: {
+              TableName: T,
+              Key: monthKey(job.installationId, job.createdAt.slice(0, 7)),
+              UpdateExpression: 'ADD failed :one SET #ttl = if_not_exists(#ttl, :ttl)',
+              ExpressionAttributeNames: { '#ttl': 'ttl' },
+              ExpressionAttributeValues: { ':one': 1, ':ttl': usageTtl(400) },
+            } }] : []),
+          ],
+        }));
         return outcome;
       } catch (err) {
-        if (!(err instanceof ConditionalCheckFailedException)) throw err;
-        // Already finished (or never recorded): the first outcome stands.
-        const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' }, ConsistentRead: true }));
-        return typeof out.Item?.outcome === 'string' ? out.Item.outcome : null;
+        if (!(err instanceof TransactionCanceledException)) throw err;
+        const current = await read();
+        if (!current) return null;
+        if (current.status === 'finished' && typeof current.outcome === 'string') return current.outcome;
+        throw err;
       }
     },
 
@@ -1690,10 +1676,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
               Update: {
                 TableName: T,
                 Key: jobSummaryKey(retire.job),
-                UpdateExpression: 'SET #status = :finished, outcome = if_not_exists(outcome, :outcome)',
+                UpdateExpression: 'SET #status = :finished, outcome = if_not_exists(outcome, :outcome), finishedAt = if_not_exists(finishedAt, :finishedAt)',
                 ConditionExpression: 'attribute_exists(pk)',
                 ExpressionAttributeNames: { '#status': 'status' },
-                ExpressionAttributeValues: { ':finished': 'finished', ':outcome': retire.outcome },
+                ExpressionAttributeValues: { ':finished': 'finished', ':outcome': retire.outcome, ':finishedAt': new Date().toISOString() },
               },
             },
           ]

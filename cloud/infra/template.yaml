@@ -197,7 +197,7 @@ Resources:
     Type: AWS::Events::EventBus
     Condition: DeployJobFinishedEvents
     Properties:
-      Name: updraft-events
+      Name: !Sub ${AWS::StackName}-events
 
   JobEventsBusName:
     Type: AWS::SSM::Parameter

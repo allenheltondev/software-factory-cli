@@ -701,8 +701,7 @@ export interface CleanupEntry {
 }
 
 /** The fields a finish adds to a job's summary: when, how long it ran, its microVM, and what it reported. */
-export function finishFields(job: Pick<Job, 'startedAt' | 'microvmId'>, finish?: { at: number; detail?: JobFinishDetail }): Partial<JobSummary> {
-  if (!finish) return {};
+export function finishFields(job: Pick<Job, 'startedAt' | 'microvmId'>, finish: { at: number; detail?: JobFinishDetail } = { at: Date.now() }): Partial<JobSummary> {
   return {
     finishedAt: new Date(finish.at).toISOString(),
     ...(job.startedAt !== undefined ? { durationSeconds: Math.max(0, Math.round((finish.at - job.startedAt) / 1000)) } : {}),
@@ -1023,7 +1022,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
         const outcome = j.outcome ?? retire.outcome;
         jobs.set(j.jobId, { ...j, status: 'finished', outcome, stopRequestedAt: j.stopRequestedAt ?? Date.now() });
         const s = summaries.get(j.jobId);
-        if (s) summaries.set(j.jobId, { ...s, status: 'finished', outcome: s.outcome ?? outcome });
+        if (s) summaries.set(j.jobId, { ...s, status: 'finished', outcome: s.outcome ?? outcome, finishedAt: s.finishedAt ?? new Date().toISOString() });
       }
       const dayKey = `${r.installationId}/${r.day}`;
       days.set(dayKey, Math.max(0, (days.get(dayKey) ?? 0) - 1));
