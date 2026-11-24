@@ -1,4 +1,5 @@
 import { destinationOf, jobTelemetrySnapshotOf, loopOf, routingOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
+import { benchmarkIdentityOf } from '../benchmarks/config.js';
 import { nativePartition } from '../native/store.js';
 import { NATIVE_SLOT_HOLD_UNTIL } from '../native/route.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
@@ -133,6 +134,7 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
   }
   return {
     jobId: String(i.jobId),
+    ...(benchmarkIdentityOf(i.benchmark) ? { benchmark: benchmarkIdentityOf(i.benchmark) } : {}),
     ...(i.executionMode === 'subscription' || i.executionMode === 'standard' ? { executionMode: i.executionMode } : {}),
     repository: String(i.repository),
     ...(typeof i.issue === 'number' ? { issue: i.issue } : {}),
@@ -632,6 +634,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                     ...jobSummaryKey(job),
                     executionMode: job.native ? 'subscription' : 'standard',
                     jobId: job.jobId,
+                    ...(job.benchmark ? { benchmark: job.benchmark } : {}),
                     repository: job.repository,
                     ...(job.issue !== undefined ? { issue: job.issue } : {}),
                     ...(job.pullRequest !== undefined ? { pullRequest: job.pullRequest } : {}),
@@ -713,6 +716,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       if (!i) return null;
       return {
         jobId: String(i.jobId),
+        ...(benchmarkIdentityOf(i.benchmark) ? { benchmark: benchmarkIdentityOf(i.benchmark) } : {}),
+        ...(typeof i.benchmarkAgent === 'string' ? { benchmarkAgent: i.benchmarkAgent } : {}),
+        ...(typeof i.benchmarkWorkflow === 'string' ? { benchmarkWorkflow: i.benchmarkWorkflow } : {}),
         tokenHash: String(i.tokenHash),
         ...(i.native ? { native: i.native as Job['native'] } : {}),
         installationId: Number(i.installationId),

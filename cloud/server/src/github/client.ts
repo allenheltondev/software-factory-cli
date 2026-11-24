@@ -76,7 +76,7 @@ export interface GitHubApi {
   /** The App's bot user (`<slug>[bot]`), read with any token. */
   getBotUser(token: string, slug: string): Promise<GitHubUser>;
   listInstallationRepositories(installationToken: string): Promise<GitHubRepository[]>;
-  issueState?(installationToken: string, repository: string, issue: number): Promise<{ open: boolean; labels: string[] }>;
+  issueState?(installationToken: string, repository: string, issue: number): Promise<{ open: boolean; labels: string[]; pullRequest?: true }>;
   /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
   createIssueComment(installationToken: string, repository: string, issue: number, body: string): Promise<void>;
 }
@@ -183,7 +183,7 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       const out = await json<Json>(await call(path, token), 'GET /repos/issues');
       const labels = Array.isArray(out.labels) ? out.labels.flatMap((label: unknown) =>
         label && typeof label === 'object' && 'name' in label && typeof label.name === 'string' ? [label.name] : []) : [];
-      return { open: out.state === 'open', labels };
+      return { open: out.state === 'open', labels, ...(out.pull_request ? { pullRequest: true as const } : {}) };
     },
 
     async createIssueComment(token, repository, issue, body) {

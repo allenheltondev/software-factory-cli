@@ -57,6 +57,7 @@ export function createWebhookHandler({
   loadSettings,
   launch,
   routines,
+  benchmarkInstallationId,
   now = () => Date.now(),
   log = (m: string) => console.log(m),
 }: {
@@ -67,6 +68,7 @@ export function createWebhookHandler({
   launch?: Launcher;
   /** A matched routine runs on Anthropic, without an Updraft microVM. */
   routines?: RoutineDispatcher;
+  benchmarkInstallationId?: number;
   now?: () => number;
   log?: (message: string) => void;
 }) {
@@ -126,6 +128,7 @@ export function createWebhookHandler({
 
     if (event === 'ping') return done('pong');
     const launches = (event === 'issues' && action === 'labeled') || (Object.hasOwn(PULL_REQUEST_ACTIONS, event) && PULL_REQUEST_ACTIONS[event]!.includes(action));
+    if (launches && validInstallation && installationId === benchmarkInstallationId) return done('not_dispatched');
     if (event === 'issues' && action === 'labeled' && validInstallation && routines) {
       const routed = await routines({ installationId, deliveryId: delivery, eventName: event, payload });
       if (routed) {

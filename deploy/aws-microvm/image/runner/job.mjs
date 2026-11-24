@@ -234,6 +234,7 @@ export async function runJob(request, deps) {
   const result = {
     deliveryId: payload.deliveryId,
     eventName: payload.eventName,
+    ...(payload.benchmark ? { benchmark: payload.benchmark } : {}),
     microvmId,
     // succeeded | failed | timed_out | terminated | runner_error, or state_not_saved: the job
     // ran and what it changed in the shared state could not be saved (jobOutcome says how
@@ -666,6 +667,9 @@ async function prepare(payload, deps) {
     if (relative === CONFIG_FILE) sawConfig = true;
   }
   if (!sawConfig) throw new Error(`no ${CONFIG_FILE} at s3://${payload.bucket}/${payload.configPrefix}${CONFIG_FILE}`);
+  if (payload.benchmarkConfigKey) {
+    await fs.writeFile(path.join(stateDir, CONFIG_FILE), await deps.s3Get(payload.bucket, payload.benchmarkConfigKey), { mode: 0o600 });
+  }
 
   if (payload.version === 2) {
     // Updraft Cloud: no key in the job at all. An installation token for this job's repository,
@@ -744,7 +748,8 @@ export function finishDetail(result) {
   if (verdicts.length) detail.verificationPassed = !verdicts.includes(false);
   if (typeof result.summary?.prUrl === 'string') detail.prUrl = result.summary.prUrl;
   if (Number.isSafeInteger(result.summary?.prNumber)) detail.prNumber = result.summary.prNumber;
-  if (result.summary?.routing) detail.routing = result.summary.routing;
+  if (result.benchmark) detail.routing = { source: 'fixed', pool: 'benchmark' };
+  else if (result.summary?.routing) detail.routing = result.summary.routing;
   const logs = (result.logs ?? []).map((key) => String(key).split('/').pop());
   if (logs.length) detail.logs = logs;
   // Agent telemetry: the trace, for a link to it, and whether it got there.

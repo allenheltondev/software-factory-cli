@@ -2,6 +2,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { loopOf, routingOf, stepsOf, telemetryOf } from './jobs/lifecycle.js';
+import { benchmarkIdentityOf } from './benchmarks/config.js';
 
 interface Attribute {
   S?: string;
@@ -67,7 +68,7 @@ export async function enrichFinishedJobs(records: StreamRecord[], stack: string,
         toolCalls: telemetry.toolCalls, toolErrors: telemetry.toolErrors, durationMs: telemetry.durationMs,
       },
       retriedAs: row.retriedAs?.S ?? null,
-      benchmark: null,
+      benchmark: benchmarkIdentityOf(value(row.benchmark)) ?? null,
     });
   }
   return results;
