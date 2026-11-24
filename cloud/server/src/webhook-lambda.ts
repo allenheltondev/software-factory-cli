@@ -151,7 +151,7 @@ const handleWebhook = createWebhookHandler({
   loadSettings,
   launch,
   routines: createRoutineDispatcher({
-    store, rules: createDynamoRoutineRuleStore(env.TABLE_NAME ?? ''),
+    store, rules: createDynamoRoutineRuleStore(env.TABLE_NAME ?? ''), killSwitch,
     readToken: async (name) => (await secrets.send(new GetSecretValueCommand({ SecretId: name }))).SecretString ?? null,
     notifyRun: async (installationId, repository, repositoryId, issue, sessionUrl) => {
       const settings = await loadSettings();

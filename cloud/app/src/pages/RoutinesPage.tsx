@@ -16,6 +16,7 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
   const [label, setLabel] = useState('');
   const [url, setUrl] = useState('');
   const [token, setToken] = useState('');
+  const [actors, setActors] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,9 +39,10 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
     setBusy(true);
     setError(null);
     try {
-      const result = await api.setRoutine(installationId, { repositoryId: Number(repositoryId), label, url: url.trim(), token: token.trim() });
+      const result = await api.setRoutine(installationId, { repositoryId: Number(repositoryId), label, url: url.trim(), token: token.trim(), ...(actors.trim() ? { allowedActors: actors.split(',').map((a) => a.trim()).filter(Boolean) } : {}) });
       setLoad({ ...load, rules: result.rules });
       setToken('');
+      setActors('');
       setLabel('');
       setUrl('');
       setRepositoryId('');
@@ -90,6 +92,7 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
                       <div className="min-w-0">
                         <div className="font-medium">{r.repository} · {r.label}</div>
                         <div className="break-all text-xs text-muted-foreground">{r.url}</div>
+                        <div className="text-xs text-muted-foreground">Allowed actors: {r.allowedActors.join(', ')}</div>
                       </div>
                       <Button variant="secondary" disabled={busy} onClick={() => void remove(r.id)}>Remove</Button>
                     </li>
@@ -111,6 +114,8 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
                   </select>
                 </label>
                 <Input label="Issue label" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="agent" required />
+                <Input label="Allowed GitHub actors" value={actors} onChange={(e) => setActors(e.target.value)} placeholder="Your GitHub login (default), or comma-separated logins" />
+                <p className="text-sm text-muted-foreground">Leave blank to allow only your linked GitHub login. Existing workflow actor restrictions and pauses still apply.</p>
                 <Input label="API trigger URL" value={url} onChange={(e) => setUrl(e.target.value)}
                   placeholder="https://api.anthropic.com/v1/claude_code/routines/trig_.../fire" required />
                 <Input label="Routine API trigger token" type="password" value={token} onChange={(e) => setToken(e.target.value)}
@@ -118,7 +123,7 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
                 {error && <Alert variant="error">{error}</Alert>}
                 <p className="text-sm text-muted-foreground">
                   The token is saved write-only in Secrets Manager. An API trigger can start only its configured task;
-                  it cannot read your Claude account. A GitHub issue labeled with this label starts a new task run.
+                  it cannot read your Claude account. Only an allowed GitHub actor applying this label starts a new task run.
                 </p>
                 <div><Button type="submit" loading={busy} disabled={!repositoryId || !label.trim() || !url.trim() || !token.trim()}>Save route</Button></div>
               </form>

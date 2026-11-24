@@ -173,6 +173,7 @@ export interface RoutineRule {
   url: string;
   updatedAt: string;
   updatedBy: string;
+  allowedActors: string[];
 }
 export interface RoutinesView { rules: RoutineRule[]; }
 
@@ -740,7 +741,7 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
       request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify(input) }),
     removeTelemetryKey: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'DELETE' }),
     routines: (installationId: number) => request<RoutinesView>(`/installations/${installationId}/routines`),
-    setRoutine: (installationId: number, input: { repositoryId: number; label: string; url: string; token: string }) =>
+    setRoutine: (installationId: number, input: { repositoryId: number; label: string; url: string; token: string; allowedActors?: string[] }) =>
       request<RoutinesView>(`/installations/${installationId}/routines`, { method: 'PUT', body: JSON.stringify(input) }),
     removeRoutine: (installationId: number, ruleId: string) =>
       request<RoutinesView>(`/installations/${installationId}/routines/${encodeURIComponent(ruleId)}`, { method: 'DELETE' }),

@@ -10,19 +10,24 @@ export interface RoutineRule {
   url: string;
   updatedAt: string;
   updatedBy: string;
+  allowedActors: string[];
+  credentialId: string;
 }
+export type PublicRoutineRule = Omit<RoutineRule, 'credentialId'>;
+export const publicRoutine = ({ credentialId: _credentialId, ...rule }: RoutineRule): PublicRoutineRule => rule;
 export interface RoutineRuleStore {
   list(installationId: number): Promise<RoutineRule[]>;
   get(installationId: number, id: string): Promise<RoutineRule | null>;
-  put(installationId: number, rule: RoutineRule): Promise<'stored' | 'uninstalled'>;
-  remove(installationId: number, id: string): Promise<void>;
+  put(installationId: number, rule: RoutineRule, expectedCredentialId?: string): Promise<'stored' | 'uninstalled' | 'conflict'>;
+  remove(installationId: number, id: string, expectedCredentialId: string): Promise<boolean>;
 }
 export const MAX_ROUTINES = 25;
 export const routineLabel = (s: string) => s.trim().toLowerCase();
 export const routineId = (repositoryId: number, label: string) =>
   createHash('sha256').update(`${repositoryId}\n${routineLabel(label)}`).digest('hex').slice(0, 32);
-export const routineSecretName = (installationId: number, id: string) =>
-  `updraft/tenants/${installationId}/routine-triggers/${id}`;
+export const routineSecretName = (installationId: number, id: string, credentialId: string) =>
+  `updraft/tenants/${installationId}/routine-triggers/${id}/${credentialId}`;
+export const validActor = (s: unknown): s is string => typeof s === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?$/.test(s);
 
 /** Permit only Anthropic's official per-routine fire endpoint, never an arbitrary URL. */
 export function validRoutineUrl(raw: unknown): raw is string {
@@ -41,9 +46,12 @@ export const validRoutineToken = (s: unknown): s is string =>
 function ruleOf(raw: Record<string, unknown> | undefined): RoutineRule | null {
   if (!raw || typeof raw.id !== 'string' || typeof raw.repositoryId !== 'number' ||
       typeof raw.repository !== 'string' || typeof raw.label !== 'string' ||
-      !validRoutineUrl(raw.url) || typeof raw.updatedAt !== 'string' || typeof raw.updatedBy !== 'string') return null;
+      !validRoutineUrl(raw.url) || typeof raw.updatedAt !== 'string' || typeof raw.updatedBy !== 'string' ||
+      typeof raw.credentialId !== 'string' || !/^[a-f0-9-]{36}$/.test(raw.credentialId) ||
+      !Array.isArray(raw.allowedActors) || raw.allowedActors.length === 0 || !raw.allowedActors.every(validActor)) return null;
   return { id: raw.id, repositoryId: raw.repositoryId, repository: raw.repository,
-    label: raw.label, url: raw.url, updatedAt: raw.updatedAt, updatedBy: raw.updatedBy };
+    label: raw.label, url: raw.url, updatedAt: raw.updatedAt, updatedBy: raw.updatedBy,
+    allowedActors: raw.allowedActors, credentialId: raw.credentialId };
 }
 export function createDynamoRoutineRuleStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): RoutineRuleStore {
   const key = (id: number, ruleId: string) => ({ pk: `TENANT#${id}`, sk: `ROUTINE#${ruleId}` });
@@ -67,24 +75,35 @@ export function createDynamoRoutineRuleStore(tableName: string, client = DynamoD
       const out = await client.send(new GetCommand({ TableName: tableName, Key: key(id, ruleId), ConsistentRead: true }));
       return ruleOf(out.Item);
     },
-    async put(id, rule) {
+    async put(id, rule, expectedCredentialId) {
       try {
         await client.send(new TransactWriteCommand({
           TransactItems: [
             { ConditionCheck: { TableName: tableName, Key: { pk: `TENANT#${id}`, sk: 'META' },
               ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :gone)',
               ExpressionAttributeValues: { ':gone': 'uninstalled' } } },
-            { Put: { TableName: tableName, Item: { ...key(id, rule.id), ...rule } } },
+            { Put: { TableName: tableName, Item: { ...key(id, rule.id), ...rule },
+              ...(expectedCredentialId === undefined ? { ConditionExpression: 'attribute_not_exists(pk)' } : {
+                ConditionExpression: 'credentialId = :expected', ExpressionAttributeValues: { ':expected': expectedCredentialId },
+              }) } },
           ],
         }));
         return 'stored';
       } catch (err) {
         if (err instanceof TransactionCanceledException && err.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed') return 'uninstalled';
+        if (err instanceof TransactionCanceledException && err.CancellationReasons?.[1]?.Code === 'ConditionalCheckFailed') return 'conflict';
         throw err;
       }
     },
-    async remove(id, ruleId) {
-      await client.send(new DeleteCommand({ TableName: tableName, Key: key(id, ruleId) }));
+    async remove(id, ruleId, expectedCredentialId) {
+      try {
+        await client.send(new DeleteCommand({ TableName: tableName, Key: key(id, ruleId),
+          ConditionExpression: 'credentialId = :expected', ExpressionAttributeValues: { ':expected': expectedCredentialId } }));
+        return true;
+      } catch (err) {
+        if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+        throw err;
+      }
     },
   };
 }
