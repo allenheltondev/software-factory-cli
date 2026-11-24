@@ -172,7 +172,7 @@ There is no `sam build`. `ApiFunction`'s `CodeUri` is the bundled `server/dist`,
 The account's **default** EventBridge bus receives `source: updraft.cloud` and
 `detail-type: Job Finished` when a tenant job summary first moves to `finished`. Consumers in the
 account subscribe with a rule on the default bus matching that source and detail type, so they
-need no bus name, SSM lookup, or deploy order. `JobFinishedEventsFunction` reads the table stream
+need no bus name, SSM lookup, or deploy order. `JobFinishedPublisherFunction` reads the table stream
 (filtered to that transition) and puts the events. The infrastructure is always deployed and
 has no deploy flag.
 
@@ -220,7 +220,7 @@ aws lambda invoke --function-name "$FUNCTION" --payload fileb://batch.json out.j
 jq -e 'has("FunctionError") | not' invoke.json && aws s3 rm "s3://$BUCKET/$KEY"
 ```
 
-`$FUNCTION` is the stack output `JobFinishedEventsFunctionName`. The function re-checks each
+`$FUNCTION` is the stack output `JobFinishedPublisherFunctionName`. The function re-checks each
 tenant's opt-in when it replays a record, and consumers deduplicate, so replaying a batch that
 was partly published is safe. This procedure has not yet been exercised against a live failure.
 

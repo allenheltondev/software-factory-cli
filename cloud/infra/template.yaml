@@ -222,7 +222,7 @@ Resources:
       MetricName: Errors
       Dimensions:
         - Name: FunctionName
-          Value: !Ref JobFinishedEventsFunction
+          Value: !Ref JobFinishedPublisherFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -238,7 +238,7 @@ Resources:
       MetricName: DestinationDeliveryFailures
       Dimensions:
         - Name: FunctionName
-          Value: !Ref JobFinishedEventsFunction
+          Value: !Ref JobFinishedPublisherFunction
       Statistic: Sum
       Period: 60
       EvaluationPeriods: 1
@@ -248,7 +248,12 @@ Resources:
 
   # Job Finished events (v1, cloud/README.md): a finished tenant job summary on the table's
   # stream becomes one event on the account's default bus. Consumers subscribe with a rule there.
-  JobFinishedEventsFunction:
+  # Named JobFinishedPublisherFunction (formerly JobFinishedEventsFunction) on purpose: changing
+  # a stream mapping's StartingPosition replaces it, and CloudFormation creates the replacement
+  # before deleting the original, which Lambda refuses for the same function and stream. A new
+  # function gets its own mapping; the old pair is removed in cleanup. The brief overlap only
+  # duplicates events, which consumers deduplicate.
+  JobFinishedPublisherFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: ../server/dist
@@ -1295,9 +1300,9 @@ Resources:
         # No CustomErrorResponses on purpose -- see SpaRouterFunction above.
 
 Outputs:
-  JobFinishedEventsFunctionName:
+  JobFinishedPublisherFunctionName:
     Description: Publishes Job Finished events; replay a failure record by invoking it (cloud/README.md)
-    Value: !Ref JobFinishedEventsFunction
+    Value: !Ref JobFinishedPublisherFunction
   JobEventsFailureBucketName:
     Description: Failure records (full stream payloads) for Job Finished batches that could not be published
     Value: !Ref JobEventsFailureBucket

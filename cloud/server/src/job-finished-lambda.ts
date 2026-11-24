@@ -113,7 +113,7 @@ const optedIn = async (tenantId: string) => {
   return Item?.publishJobFinishedEvents === true && Item.disabledReason !== 'uninstalled';
 };
 
-/** The table stream's trigger (template.yaml JobFinishedEventsFunction): no EventBusName is the default bus. */
+/** The table stream's trigger (template.yaml JobFinishedPublisherFunction): no EventBusName is the default bus. */
 export const handler = async (event: { Records?: StreamRecord[] }) => {
   const details = await enrichFinishedJobs(event.Records ?? [], process.env.STACK_NAME!, optedIn);
   const published = await publishFinishedJobs(details, (Entries) => events.send(new PutEventsCommand({ Entries })));
