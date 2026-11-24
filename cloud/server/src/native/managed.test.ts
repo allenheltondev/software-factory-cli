@@ -62,6 +62,7 @@ describe('managed connection reservation', () => {
   let row: Worker | null;
   let clock: number;
   let disabled: boolean;
+  let otherSessions: Map<number, { generation: string }>;
   let admission: ReturnType<typeof createClaudeAdmission>;
   const managed = (overrides: Record<string, string> = {}) =>
     managedClaude({ ...env, ...overrides }, { admission, disabled: async () => disabled, now: () => clock })!;
@@ -71,7 +72,11 @@ describe('managed connection reservation', () => {
     row = null;
     clock = Date.now();
     disabled = false;
-    admission = createClaudeAdmission('test', admissionFixture().db);
+    otherSessions = new Map();
+    admission = createClaudeAdmission(
+      'test',
+      admissionFixture(undefined, (id) => (id === 55 ? current : otherSessions.get(id))).db,
+    );
     mocks.retire.mockImplementation(async (_id, _session, _mode, _worker, reason) => {
       if (current) {
         current.retiring = true;
@@ -284,7 +289,7 @@ describe('managed connection reservation', () => {
     expect(await admission.list()).toHaveLength(0);
   });
 
-  it('cannot launch a retired generation after another request replaces its session', async () => {
+  it('retains ambiguous exposure if its session changes after the launch marker commits', async () => {
     const launching = admission.launching.bind(admission);
     vi.spyOn(admission, 'launching').mockImplementation(async (generation) => {
       await launching(generation);
@@ -292,9 +297,12 @@ describe('managed connection reservation', () => {
     });
     await expect(managed().start(55)).rejects.toThrow('environment is retiring');
     expect(mocks.vm).not.toHaveBeenCalled();
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 1 });
+    expect(await admission.list()).toHaveLength(1);
   });
   it('cannot bypass platform admission by replaying a pre-budget unbound generation', async () => {
     current = { generation: 'legacy-generation', imageVersion: '9', requestedAt: clock - STARTUP_MS - 1 };
+    for (const id of [1, 2, 3, 4]) otherSessions.set(id, { generation: `occupied-${id}` });
     await Promise.all([1, 2, 3, 4].map((id) => admission.reserve(id, `occupied-${id}`, clock)));
     await expect(managed().retire(55, current.generation)).rejects.toThrow('capacity is full');
     expect(mocks.vm).not.toHaveBeenCalled();
@@ -322,5 +330,98 @@ describe('managed connection reservation', () => {
     }
     expect(mocks.vm.mock.calls.filter(([command]) => command instanceof RunMicrovmCommand)).toHaveLength(1);
     expect(await admission.list()).toHaveLength(1);
+  });
+  it('rejects a delayed reserve for G after retirement and lets replacement H connect', async () => {
+    current = {
+      generation: 'pending-G',
+      imageVersion: '10',
+      requestedAt: clock,
+      startupDeadline: clock + STARTUP_MS,
+      admissionRequired: true,
+    };
+    let resumeG!: () => void;
+    let resumeH!: () => void;
+    let reachedG!: () => void;
+    let reachedH!: () => void;
+    const gPaused = new Promise<void>((done) => {
+      reachedG = done;
+    });
+    const hPaused = new Promise<void>((done) => {
+      reachedH = done;
+    });
+    const gGate = new Promise<void>((done) => {
+      resumeG = done;
+    });
+    const hGate = new Promise<void>((done) => {
+      resumeH = done;
+    });
+    const reserve = admission.reserve.bind(admission);
+    vi.spyOn(admission, 'reserve').mockImplementation(async (id, generation, at, limits) => {
+      if (generation === 'pending-G') {
+        reachedG();
+        await gGate;
+      } else {
+        reachedH();
+        await hGate;
+      }
+      return reserve(id, generation, at, limits);
+    });
+    const stale = managed()
+      .start(55)
+      .catch((err: unknown) => err);
+    await gPaused;
+    expect(await managed().retire(55, 'pending-G')).toBe(true);
+    const replacement = managed()
+      .start(55)
+      .catch((err: unknown) => err);
+    await hPaused;
+    const replacementGeneration = current!.generation;
+    expect(replacementGeneration).not.toBe('pending-G');
+    resumeG();
+    expect(await stale).toBeInstanceOf(Error);
+    resumeH();
+    expect(await replacement).toBeUndefined();
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    expect((await admission.list()).map((lease) => lease.generation)).toEqual([replacementGeneration]);
+    expect(current?.microvmId).toBe('mvm-fixture');
+    expect(mocks.vm.mock.calls.filter(([command]) => command instanceof RunMicrovmCommand)).toHaveLength(1);
+  });
+
+  it('reclaims a stale never-launched hold when replacement wins before the launch marker', async () => {
+    const launching = admission.launching.bind(admission);
+    vi.spyOn(admission, 'launching').mockImplementationOnce(async (generation, at) => {
+      current = { ...current!, generation: 'replacement-H' };
+      return launching(generation, at);
+    });
+    await expect(managed().start(55)).rejects.toThrow('generation changed');
+    expect(mocks.vm).not.toHaveBeenCalled();
+    expect((await admission.list())[0]).toMatchObject({ mayHaveLaunched: false });
+    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(await admission.list()).toHaveLength(0);
+    await managed().start(55);
+    expect((await admission.list()).map((lease) => lease.generation)).toEqual(['replacement-H']);
+    expect(current?.microvmId).toBe('mvm-fixture');
+  });
+
+  it('marks an interrupted sealed legacy adoption before any recovery replay', async () => {
+    current = { generation: 'legacy-G', imageVersion: '10', requestedAt: clock };
+    await admission.reserve(55, 'legacy-G', clock);
+    current.retiring = true;
+    await admission.retiring('legacy-G');
+    let stopped = false;
+    mocks.vm.mockImplementation(async (command) => {
+      if (command instanceof RunMicrovmCommand) {
+        expect(await admission.get('legacy-G')).toMatchObject({ mayHaveLaunched: true, retiring: true });
+        return { microvmId: 'mvm-legacy' };
+      }
+      if (command.constructor.name === 'TerminateMicrovmCommand') {
+        stopped = true;
+        return {};
+      }
+      return { state: stopped ? 'TERMINATED' : 'RUNNING' };
+    });
+    expect(await managed().retire(55, 'legacy-G')).toBe(true);
+    expect(await admission.list()).toHaveLength(0);
+    expect(stopped).toBe(true);
   });
 });

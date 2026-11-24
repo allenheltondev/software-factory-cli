@@ -1,5 +1,9 @@
-import { ConditionalCheckFailedException, DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  ConditionalCheckFailedException,
+  DynamoDBClient,
+  TransactionCanceledException,
+} from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { FlowError } from '../flows/github.js';
 
 export const SESSION_SECONDS = 8 * 60 * 60;
@@ -105,22 +109,68 @@ export function createClaudeAdmission(
     migrate(registry);
     return registry;
   }
-  async function change<T>(mutate: (registry: Registry) => T): Promise<T> {
+  async function change<T>(
+    mutate: (registry: Registry) => T,
+    binding?: { generation: string; installationId?: number; state: 'active' | 'sealed' | 'inactive' },
+  ): Promise<T> {
     for (let attempt = 0; attempt < 12; attempt++) {
       const registry = await read();
       migrate(registry);
+      const installationId =
+        binding?.installationId ?? (binding ? registry.leases[binding.generation]?.installationId : undefined);
       const result = mutate(registry);
+      if (binding && installationId === undefined) return result;
       try {
-        await db.send(
-          new PutCommand({
-            TableName: table,
-            Item: { ...key, ...registry, revision: registry.revision + 1 },
-            ConditionExpression: registry.revision === 0 ? 'attribute_not_exists(pk)' : 'revision = :revision',
-            ...(registry.revision === 0 ? {} : { ExpressionAttributeValues: { ':revision': registry.revision } }),
-          }),
-        );
+        const put = {
+          TableName: table,
+          Item: { ...key, ...registry, revision: registry.revision + 1 },
+          ConditionExpression: registry.revision === 0 ? 'attribute_not_exists(pk)' : 'revision = :revision',
+          ...(registry.revision === 0 ? {} : { ExpressionAttributeValues: { ':revision': registry.revision } }),
+        };
+        if (binding) {
+          // Session eligibility and the global registry CAS commit together. A retired/replaced
+          // generation cannot recreate a hold or mark a previously safe hold as possibly launched.
+          await db.send(
+            new TransactWriteCommand({
+              TransactItems: [
+                { Put: put },
+                {
+                  ConditionCheck: {
+                    TableName: table,
+                    Key: { pk: `TENANT#${installationId}`, sk: 'CLAUDE_SESSION' },
+                    ConditionExpression:
+                      binding.state === 'active'
+                        ? 'generation = :generation AND attribute_not_exists(retiring)'
+                        : binding.state === 'sealed'
+                          ? 'generation = :generation AND retiring = :retiring'
+                          : 'attribute_not_exists(pk) OR generation <> :generation OR retiring = :retiring',
+                    ExpressionAttributeValues: {
+                      ':generation': binding.generation,
+                      ...(binding.state === 'active' ? {} : { ':retiring': true }),
+                    },
+                  },
+                },
+              ],
+            }),
+          );
+        } else await db.send(new PutCommand(put));
         return result;
       } catch (err) {
+        if (err instanceof TransactionCanceledException) {
+          if (err.CancellationReasons?.[1]?.Code === 'ConditionalCheckFailed') {
+            throw new FlowError(
+              'invalid_settings',
+              409,
+              'The Claude environment generation changed. Reconnect using its current status.',
+            );
+          }
+          if (
+            err.CancellationReasons?.some((reason) =>
+              ['ConditionalCheckFailed', 'TransactionConflict'].includes(reason.Code ?? ''),
+            )
+          )
+            continue;
+        }
         if (!(err instanceof ConditionalCheckFailedException)) throw err;
       }
     }
@@ -133,79 +183,89 @@ export function createClaudeAdmission(
     async get(generation: string) {
       return (await read()).leases[generation];
     },
-    reserve(installationId: number, generation: string, now: number, limits = DEFAULT_ADMISSION) {
-      return change((registry) => {
-        const existing = registry.leases[generation];
-        if (existing) {
-          if (existing.installationId !== installationId || existing.retiring)
+    reserve(installationId: number, generation: string, now: number, limits = DEFAULT_ADMISSION, recovery = false) {
+      return change(
+        (registry) => {
+          const existing = registry.leases[generation];
+          if (existing) {
+            if (existing.installationId !== installationId || existing.retiring)
+              throw new FlowError(
+                'invalid_settings',
+                409,
+                'This environment is retiring. Wait for it to stop, then reconnect.',
+              );
+            return existing;
+          }
+          if (
+            Object.keys(registry.leases).length >= limits.concurrent ||
+            Object.values(registry.leases).some((lease) => lease.installationId === installationId)
+          ) {
+            throw new FlowError(
+              'throttled',
+              429,
+              'Claude environment capacity is full. Try connecting again after an environment finishes.',
+            );
+          }
+          budgetDay(registry, now);
+          const held = Object.values(registry.leases).reduce(
+            (sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS),
+            0,
+          );
+          const tenantHeld = Object.values(registry.leases)
+            .filter((lease) => lease.installationId === installationId)
+            .reduce((sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS), 0);
+          const tenantSeconds = registry.tenants[String(installationId)] ?? 0;
+          if (
+            registry.seconds + held + SESSION_SECONDS > limits.dailySeconds ||
+            tenantSeconds + tenantHeld + SESSION_SECONDS > limits.tenantDailySeconds
+          ) {
+            throw new FlowError(
+              'throttled',
+              429,
+              'The daily Claude runtime budget is reserved or spent. Try again after an environment ends or after midnight UTC.',
+            );
+          }
+          const tenantLaunches = registry.tenantLaunches![String(installationId)] ?? 0;
+          if (
+            (registry.launches ?? 0) >= (limits.platformLaunchesPerDay ?? DEFAULT_ADMISSION.platformLaunchesPerDay!) ||
+            tenantLaunches >= (limits.tenantLaunchesPerDay ?? DEFAULT_ADMISSION.tenantLaunchesPerDay!)
+          ) {
+            throw new FlowError(
+              'throttled',
+              429,
+              'The daily Claude connection launch limit has been reached. Try again after midnight UTC or contact an operator.',
+            );
+          }
+          registry.launches = (registry.launches ?? 0) + 1;
+          registry.tenantLaunches![String(installationId)] = tenantLaunches + 1;
+          return (registry.leases[generation] = {
+            installationId,
+            generation,
+            requestedAt: now,
+            idleAt: now + (limits.idleMs ?? IDLE_MS),
+            idleMs: limits.idleMs ?? IDLE_MS,
+            reservedSeconds: SESSION_SECONDS,
+            mayHaveLaunched: false,
+          });
+        },
+        { installationId, generation, state: recovery ? 'sealed' : 'active' },
+      );
+    },
+    launching(generation: string, now = Date.now(), recovery = false) {
+      return change(
+        (registry) => {
+          const lease = registry.leases[generation];
+          if (!lease || (lease.retiring && !recovery))
             throw new FlowError(
               'invalid_settings',
               409,
-              'This environment is retiring. Wait for it to stop, then reconnect.',
+              'This environment was retired. Reconnect Claude to try again.',
             );
-          return existing;
-        }
-        if (
-          Object.keys(registry.leases).length >= limits.concurrent ||
-          Object.values(registry.leases).some((lease) => lease.installationId === installationId)
-        ) {
-          throw new FlowError(
-            'throttled',
-            429,
-            'Claude environment capacity is full. Try connecting again after an environment finishes.',
-          );
-        }
-        budgetDay(registry, now);
-        const held = Object.values(registry.leases).reduce(
-          (sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS),
-          0,
-        );
-        const tenantHeld = Object.values(registry.leases)
-          .filter((lease) => lease.installationId === installationId)
-          .reduce((sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS), 0);
-        const tenantSeconds = registry.tenants[String(installationId)] ?? 0;
-        if (
-          registry.seconds + held + SESSION_SECONDS > limits.dailySeconds ||
-          tenantSeconds + tenantHeld + SESSION_SECONDS > limits.tenantDailySeconds
-        ) {
-          throw new FlowError(
-            'throttled',
-            429,
-            'The daily Claude runtime budget is reserved or spent. Try again after an environment ends or after midnight UTC.',
-          );
-        }
-        const tenantLaunches = registry.tenantLaunches![String(installationId)] ?? 0;
-        if (
-          (registry.launches ?? 0) >= (limits.platformLaunchesPerDay ?? DEFAULT_ADMISSION.platformLaunchesPerDay!) ||
-          tenantLaunches >= (limits.tenantLaunchesPerDay ?? DEFAULT_ADMISSION.tenantLaunchesPerDay!)
-        ) {
-          throw new FlowError(
-            'throttled',
-            429,
-            'The daily Claude connection launch limit has been reached. Try again after midnight UTC or contact an operator.',
-          );
-        }
-        registry.launches = (registry.launches ?? 0) + 1;
-        registry.tenantLaunches![String(installationId)] = tenantLaunches + 1;
-        return (registry.leases[generation] = {
-          installationId,
-          generation,
-          requestedAt: now,
-          idleAt: now + (limits.idleMs ?? IDLE_MS),
-          idleMs: limits.idleMs ?? IDLE_MS,
-          reservedSeconds: SESSION_SECONDS,
-          mayHaveLaunched: false,
-        });
-      });
-    },
-    launching(generation: string, now = Date.now()) {
-      return change((registry) => {
-        const lease = registry.leases[generation];
-        if (!lease || lease.retiring)
-          throw new FlowError('invalid_settings', 409, 'This environment was retired. Reconnect Claude to try again.');
-        lease.mayHaveLaunched = true;
-        lease.launchedAt ??= now;
-      });
+          lease.mayHaveLaunched = true;
+          lease.launchedAt ??= now;
+        },
+        { generation, state: recovery ? 'sealed' : 'active' },
+      );
     },
     bind(generation: string, microvmId: string) {
       return change((registry) => {
@@ -227,6 +287,21 @@ export function createClaudeAdmission(
       return change((registry) => {
         const lease = registry.leases[generation];
         if (lease && !lease.retiring) lease.idleAt = now + (lease.idleMs ?? IDLE_MS);
+      });
+    },
+    /** Reclaim only a sealed/replaced generation whose latest registry state proves no launch. */
+    reclaimUnlaunched(generation: string) {
+      return change(
+        (registry) => {
+          const lease = registry.leases[generation];
+          if (!lease || lease.mayHaveLaunched || lease.microvmId || lease.launchedAt !== undefined) return false;
+          delete registry.leases[generation];
+          return true;
+        },
+        { generation, state: 'inactive' },
+      ).catch((err) => {
+        if (err instanceof FlowError && err.code === 'invalid_settings') return false;
+        throw err;
       });
     },
     /** Caller must establish physical termination, or seal a generation before any launch was possible. */

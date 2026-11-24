@@ -196,10 +196,14 @@ export function managedClaude(
       }
     }
     let lease = await admission.get(generation);
-    // Adopt pre-budget unbound generations before any recovery replay can create compute.
+    // Adoption/replay is allowed only for this atomically sealed generation. Every possible
+    // replay gets a durable launch marker, including a retry of an interrupted legacy adoption.
     if (!lease && !session.microvmId && !session.admissionRequired) {
-      await admission.reserve(id, generation, now(), policy);
-      await admission.launching(generation, now());
+      await admission.reserve(id, generation, now(), policy, true);
+      lease = await admission.get(generation);
+    }
+    if (!session.microvmId && !lease?.microvmId && !session.admissionRequired && !lease?.mayHaveLaunched) {
+      await admission.launching(generation, now(), true);
       lease = await admission.get(generation);
     }
     await admission.retiring(generation);
@@ -293,8 +297,10 @@ export function managedClaude(
       try {
         const session = await sessions.session(lease.installationId);
         if (!session || session.generation !== lease.generation) {
-          // A legacy/replaced generation is still charged until its exact VM is known to be gone.
-          if (lease.microvmId && ['TERMINATED', null].includes(await stateOf(lease.microvmId))) {
+          // A false launch marker is reclaimable only with an atomic stale-session check.
+          if (await admission.reclaimUnlaunched(lease.generation)) {
+            released++;
+          } else if (lease.microvmId && ['TERMINATED', null].includes(await stateOf(lease.microvmId))) {
             await admission.release(lease.generation, now());
             released++;
           } else failed++;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createClaudeAdmission, SESSION_SECONDS, IDLE_MS, managedPolicy } from './admission.js';
+import { createClaudeAdmission, SESSION_SECONDS, IDLE_MS, managedPolicy, type SessionLease } from './admission.js';
 import { admissionFixture } from './admission-fixture.js';
 const now = Date.UTC(2026, 10, 24);
 describe('platform-wide managed session admission', () => {
@@ -139,5 +139,54 @@ describe('platform-wide managed session admission', () => {
     expect(fixture.read()?.seconds).toBe(SESSION_SECONDS);
     await admission.release('legacy', now + 20 * 60000);
     expect(fixture.read()?.seconds).toBe(SESSION_SECONDS + 1200);
+  });
+  it('checks the current generation at the reservation transaction commit, not an earlier read', async () => {
+    let session: { generation: string; retiring?: boolean } = { generation: 'G' };
+    const fixture = admissionFixture(
+      undefined,
+      () => session,
+      () => {
+        session = { generation: 'H' };
+      },
+    );
+    const admission = createClaudeAdmission('test', fixture.db);
+    await expect(admission.reserve(1, 'G', now)).rejects.toThrow('generation changed');
+    expect(await admission.list()).toHaveLength(0);
+    expect(fixture.read()).toBeUndefined();
+  });
+  it('will not mark a sealed generation as launched and reclaims only inactive never-launched holds', async () => {
+    const session: { generation: string; retiring?: boolean } = { generation: 'G' };
+    const admission = createClaudeAdmission('test', admissionFixture(undefined, () => session).db);
+    await admission.reserve(1, 'G', now);
+    expect(await admission.reclaimUnlaunched('G')).toBe(false);
+    session.retiring = true;
+    await expect(admission.launching('G', now)).rejects.toThrow('generation changed');
+    expect(await admission.get('G')).toMatchObject({ mayHaveLaunched: false });
+    expect(await admission.reclaimUnlaunched('G')).toBe(true);
+    expect(await admission.get('G')).toBeUndefined();
+    await expect(admission.reserve(1, 'G', now)).rejects.toThrow('generation changed');
+    expect(await admission.list()).toHaveLength(0);
+  });
+  it('does not reclaim when a launch marker wins the registry race before cleanup commits', async () => {
+    let session: { generation: string; retiring?: boolean } = { generation: 'G' };
+    let race = false;
+    const fixture = admissionFixture(
+      undefined,
+      () => session,
+      () => {
+        if (!race) return;
+        race = false;
+        const item = structuredClone(fixture.read()!);
+        (item.leases as Record<string, SessionLease>).G!.mayHaveLaunched = true;
+        item.revision = Number(item.revision) + 1;
+        fixture.replace(item);
+      },
+    );
+    const admission = createClaudeAdmission('test', fixture.db);
+    await admission.reserve(1, 'G', now);
+    session = { generation: 'H' };
+    race = true;
+    expect(await admission.reclaimUnlaunched('G')).toBe(false);
+    expect(await admission.get('G')).toMatchObject({ mayHaveLaunched: true });
   });
 });
