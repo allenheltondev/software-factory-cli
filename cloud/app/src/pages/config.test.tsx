@@ -433,12 +433,12 @@ describe('the full editor', () => {
 
   it('says Kiro must be enabled by the deployment when it is not offered, and offers it once it is', async () => {
     configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple() })) }));
-    await userEvent.click(await screen.findByRole('button', { name: 'Go to agents' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Agents and pools' }));
     expect(screen.getByTestId('kiro-not-enabled')).toHaveTextContent('ship the Kiro CLI in its job image');
     expect(within(screen.getByLabelText('Add an agent')).queryByRole('option', { name: 'Kiro' })).toBeNull();
     cleanup();
     configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple(), agents: ['claude', 'codex', 'kiro'] })) }));
-    await userEvent.click(await screen.findByRole('button', { name: 'Go to agents' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Agents and pools' }));
     expect(within(screen.getByLabelText('Add an agent')).getByRole('option', { name: 'Kiro' })).toBeInTheDocument();
     expect(screen.queryByTestId('kiro-not-enabled')).toBeNull();
   });
