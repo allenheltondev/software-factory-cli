@@ -29,6 +29,12 @@ export interface JobStep {
   kind: StepKind;
   /** The agent profile that ran it, as the tenant's config names it. */
   agent?: string;
+  runId?: string;
+  adapter?: string;
+  model?: string;
+  effort?: string;
+  modelSource?: 'configured' | 'response';
+  usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number; toolCalls?: number; toolErrors?: number; durationMs?: number };
   /** How the step ended (succeeded, failed, canceled, superseded, ...). */
   outcome?: string;
   verificationPassed?: boolean;
@@ -38,9 +44,31 @@ export interface JobStep {
 
 /** The most steps a job keeps: a loop with maxRevisions 10 is 21. */
 export const MAX_STEPS = 24;
+export interface JobRouting {
+  source: 'pool' | 'tier' | 'fixed';
+  pool?: string;
+  tier?: string;
+  risk?: string;
+  confidence?: number;
+  hops?: number;
+}
 const CODE = /^[a-z][a-z_-]{0,39}$/;
 const AGENT = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const count = (v: unknown, max: number) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= max ? v : undefined);
+
+export function routingOf(raw: unknown): JobRouting | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  if (r.source !== 'pool' && r.source !== 'tier' && r.source !== 'fixed') return undefined;
+  const out: JobRouting = { source: r.source };
+  if (typeof r.pool === 'string' && AGENT.test(r.pool)) out.pool = r.pool;
+  if (typeof r.tier === 'string' && ['routine', 'standard', 'complex', 'high-risk'].includes(r.tier)) out.tier = r.tier;
+  if (typeof r.risk === 'string' && ['low', 'medium', 'high'].includes(r.risk)) out.risk = r.risk;
+  if (typeof r.confidence === 'number' && r.confidence >= 0 && r.confidence <= 1) out.confidence = r.confidence;
+  const hops = count(r.hops, 100);
+  if (hops !== undefined) out.hops = hops;
+  return out;
+}
 
 export function loopOf(raw: unknown): JobLoop | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
@@ -66,6 +94,21 @@ export function stepsOf(raw: unknown): JobStep[] | undefined {
     if (!(STEP_KINDS as readonly unknown[]).includes(r.kind)) continue;
     const step: JobStep = { kind: r.kind as StepKind };
     if (typeof r.agent === 'string' && AGENT.test(r.agent)) step.agent = r.agent;
+    if (typeof r.runId === 'string' && /^run_[A-Za-z0-9_-]{1,64}$/.test(r.runId)) step.runId = r.runId;
+    if (typeof r.adapter === 'string' && CODE.test(r.adapter)) step.adapter = r.adapter;
+    if (typeof r.model === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:@/+[\]-]{0,127}$/.test(r.model)) step.model = r.model;
+    if (typeof r.effort === 'string' && AGENT.test(r.effort)) step.effort = r.effort;
+    if (step.model && (r.modelSource === 'configured' || r.modelSource === 'response')) step.modelSource = r.modelSource;
+    if (r.usage && typeof r.usage === 'object') {
+      const u = r.usage as Record<string, unknown>;
+      const usage: NonNullable<JobStep['usage']> = {};
+      for (const key of ['inputTokens', 'outputTokens', 'toolCalls', 'toolErrors', 'durationMs'] as const) {
+        const value = count(u[key], 1_000_000_000);
+        if (value !== undefined) usage[key] = value;
+      }
+      if (typeof u.costUsd === 'number' && u.costUsd >= 0 && u.costUsd <= 100_000) usage.costUsd = u.costUsd;
+      if (Object.keys(usage).length) step.usage = usage;
+    }
     if (typeof r.outcome === 'string' && CODE.test(r.outcome)) step.outcome = r.outcome;
     if (typeof r.verificationPassed === 'boolean') step.verificationPassed = r.verificationPassed;
     if (typeof r.publication === 'string' && CODE.test(r.publication)) step.publication = r.publication;

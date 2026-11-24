@@ -385,7 +385,7 @@ export interface JobDetail {
   /** Where the review loop left the pull request. */
   loop?: { rounds: number; maxRevisions?: number; reviews: number; verdict?: 'ready-to-merge' | 'changes-requested'; stage?: LoopStage; merged?: boolean };
   /** Each step of the run, in order: the job itself, then reviews and revisions. */
-  steps?: Array<{ kind: StepKind; agent?: string; outcome?: string; verificationPassed?: boolean; publication?: string }>;
+  steps?: Array<{ kind: StepKind; agent?: string; model?: string; effort?: string; outcome?: string; verificationPassed?: boolean; publication?: string }>;
 }
 
 /**

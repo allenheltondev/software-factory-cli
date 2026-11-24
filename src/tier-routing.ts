@@ -59,13 +59,12 @@ export function routeJob(
   issue: { title: string; body: string; labels: readonly string[] },
   deps: TierDeps,
 ): RoutingDecision {
-  if (!tiers) return { rule: 'default', pool: selectPool(selector, issue.labels) };
-
   if (typeof selector !== 'string') {
     const have = new Set(issue.labels.map((l) => l.toLowerCase()));
     const rule = selector.rules.find((r) => have.has(r.hasLabel.toLowerCase()));
     if (rule) return { rule: 'legacy-label', detail: `label "${rule.hasLabel}"`, pool: rule.use };
   }
+  if (!tiers) return { rule: 'default', pool: selectPool(selector, issue.labels) };
 
   const names = { ...DEFAULT_OVERRIDE_LABELS, ...tiers.overrideLabels };
   const forced = ORDER.filter((t) => {

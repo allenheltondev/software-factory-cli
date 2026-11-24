@@ -837,6 +837,24 @@ describe('configRelativePath', () => {
 });
 
 describe('finishDetail (#71)', () => {
+  it('matches model and usage to each step by run ID', async () => {
+    const { finishDetail } = await import('../image/runner/job.mjs');
+    const detail = finishDetail({
+      summary: {
+        event: { name: 'issues' }, jobId: 'job_build', runId: 'run_build', agent: 'builder',
+        followOnJobs: [{ kind: 'review', runId: 'run_review', agent: 'reviewer' }],
+      },
+      telemetry: { runs: [
+        { runId: 'run_review', adapter: 'codex', model: 'review-model', modelSource: 'configured', usage: { inputTokens: 5 } },
+        { runId: 'run_build', adapter: 'claude', model: 'response-model', modelSource: 'response', usage: { inputTokens: 12 } },
+      ] },
+    });
+    expect(detail.steps).toMatchObject([
+      { kind: 'implement', model: 'response-model', modelSource: 'response', usage: { inputTokens: 12 } },
+      { kind: 'review', model: 'review-model', modelSource: 'configured', usage: { inputTokens: 5 } },
+    ]);
+  });
+
   it('reports a failed verification from whichever job failed it, and run-event\'s own outcome', async () => {
     const { finishDetail } = await import('../image/runner/job.mjs');
     const revisionFailed = {

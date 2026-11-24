@@ -189,9 +189,12 @@ function fakeTable() {
           // The one query filter the store sends (getJobSummary).
           if (input.FilterExpression === 'jobId = :job') found = found.filter((i) => i.jobId === values?.[':job']);
           else if (input.FilterExpression === 'deliveryId = :d') found = found.filter((i) => i.deliveryId === values?.[':d']);
-          else if (input.FilterExpression) throw new Error(`unsupported filter: ${String(input.FilterExpression)}`);
+          else if (input.FilterExpression === '#status = :finished AND ttl > :now') {
+            found = found.filter((i) => i.status === values?.[':finished'] && Number(i.ttl) > Number(values?.[':now']));
+          } else if (input.FilterExpression) throw new Error(`unsupported filter: ${String(input.FilterExpression)}`);
           if (typeof input.Limit === 'number') found = found.slice(0, input.Limit);
-          return { Items: input.ProjectionExpression ? found.map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })) : found.map((i) => ({ ...i })) };
+          return { Items: input.ProjectionExpression === 'detail.steps' ? found.map((i) => ({ detail: i.detail }))
+            : input.ProjectionExpression ? found.map((i) => ({ pk: i.pk, sk: i.sk, ttl: i.ttl })) : found.map((i) => ({ ...i })) };
         }
         case 'ScanCommand': {
           // FilterExpression 'sk = :meta AND begins_with(pk, :tenant)', the one scan the store makes.
@@ -1053,7 +1056,8 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
   });
 
   it('finishing keeps the first outcome and returns it, also to a repeated finish', async () => {
-    const store = createDynamoStore('T', fakeTable().client);
+    const table = fakeTable();
+    const store = createDynamoStore('T', table.client);
     await store.putJob({
       jobId: 'job_first0001',
       tokenHash: 'ab',
@@ -1067,9 +1071,20 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
       createdAt: tenant.createdAt,
       expiresAt: LATER,
     });
-    expect(await store.finishJob('job_first0001', 'failed')).toBe('failed');
+    table.fail((command) => command === 'TransactWriteCommand');
+    await expect(store.finishJob('job_first0001', 'failed')).rejects.toThrow('injected failure');
+    expect(await store.getJob('job_first0001')).toMatchObject({ status: 'launched' });
+    expect(await store.getJobSummary(55, 'job_first0001')).toMatchObject({ status: 'launched' });
+    table.fail(null);
+    const steps = [{ kind: 'implement' as const, runId: 'run_example', model: 'response-model', modelSource: 'response' as const }];
+    expect(await store.finishJob('job_first0001', 'failed', { at: Date.now(), detail: { steps } })).toBe('failed');
     expect(await store.finishJob('job_first0001', 'succeeded')).toBe('failed');
     expect((await store.getJob('job_first0001'))?.outcome).toBe('failed');
+    expect(await store.getJobSummary(55, 'job_first0001')).toMatchObject({ status: 'finished', outcome: 'failed', finishedAt: expect.any(String), detail: { steps } });
+    expect(await store.listJobStepModels(55)).toEqual(steps);
+    const summary = [...table.items.values()].find((item) => item.pk === 'TENANT#55' && item.jobId === 'job_first0001')!;
+    summary.ttl = Math.floor(Date.now() / 1000);
+    expect(await store.listJobStepModels(55)).toEqual([]);
     expect(await store.finishJob('job_nobody001', 'failed')).toBeNull();
   });
 

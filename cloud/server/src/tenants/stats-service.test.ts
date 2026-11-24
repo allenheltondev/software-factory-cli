@@ -9,22 +9,24 @@ import type { Caller } from '../caller.js';
 import { FlowError } from '../flows/github.js';
 import { createS3StateReader } from './s3-logs.js';
 import { createStatsService, stateKeyOf, type StateReader } from './stats-service.js';
+import type { Store } from '../store/store.js';
 
 const caller = { sub: 'u1' } as Caller;
 const END = Date.parse('2026-11-18T12:00:00.000Z');
 
 /** A real shared state database, as the runners leave it: the CLI's fixture history, in one file. */
-function stateBytes(): Uint8Array {
+function stateBytes(read?: (db: ReturnType<typeof openDatabase>) => void): Uint8Array {
   const dir = mkdtempSync(join(tmpdir(), 'updraft-state-'));
   const file = join(dir, 'state.db');
   const db = openDatabase(file);
   buildHistory(END, db);
+  read?.(db);
   db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   db.close();
   return readFileSync(file);
 }
 
-function setup(objects: Record<string, { body: Uint8Array; etag: string }> = {}) {
+function setup(objects: Record<string, { body: Uint8Array; etag: string }> = {}, store?: Pick<Store, 'listJobStepModels'>) {
   const reads: Array<{ key: string; etag?: string }> = [];
   const readState: StateReader = async (key, etag) => {
     reads.push({ key, ...(etag ? { etag } : {}) });
@@ -38,11 +40,26 @@ function setup(objects: Record<string, { body: Uint8Array; etag: string }> = {})
     return {} as never;
   };
   const clock = { now: END };
-  const service = createStatsService({ github: { member }, readState, cacheDir: mkdtempSync(join(tmpdir(), 'updraft-cache-')), now: () => clock.now, log: () => {} });
+  const service = createStatsService({ github: { member }, readState, store, cacheDir: mkdtempSync(join(tmpdir(), 'updraft-cache-')), now: () => clock.now, log: () => {} });
   return { service, reads, clock, objects };
 }
 
 describe('insights', () => {
+  it('groups a reviewer run under the recorded response model by run ID', async () => {
+    let runIds: string[] = [];
+    const body = stateBytes((db) => {
+      runIds = (db.prepare("SELECT subject_id FROM metric_events WHERE kind = 'review.verdict'").all() as Array<{ subject_id: string }>)
+        .map(({ subject_id }) => subject_id);
+    });
+    const { service } = setup({ [stateKeyOf(55)]: { body, etag: 'model-v1' } }, {
+      listJobStepModels: async (id) => {
+        expect(id).toBe(55);
+        return runIds.map((runId) => ({ kind: 'review', runId, adapter: 'codex', model: 'observed-model', modelSource: 'response' }));
+      },
+    });
+    const { report } = await service.insights(caller, 55);
+    expect(report.overall.review.byModel['codex/observed-model']).toMatchObject({ model: 'observed-model', runs: 4 });
+  });
   it('reports the CLI stats of the shared state: per repository, review findings, rounds', async () => {
     const { service } = setup({ [stateKeyOf(55)]: { body: stateBytes(), etag: '"v1"' } });
     const out = await service.insights(caller, 55, {});

@@ -544,6 +544,8 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   /** Codex: the open turn's chat span. */
   let turn = null;
   const summary = { runId: null, kind: null, agent: null, adapter: null, chats: 0, tools: 0, toolErrors: 0, inputTokens: 0, outputTokens: 0, outcome: null, costUsd: null, review: null, change: null };
+  let responseModel;
+  let hasTokenUsage = false;
   let vibeUsage;
   /** When the run's first line was read: its preparation (prompt, worktree) starts then. */
   let firstAt = null;
@@ -710,6 +712,8 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     if (!c) return;
     ctx.chat = null;
     const u = c.usage ?? {};
+    if (c.usage) hasTokenUsage = true;
+    if (!ctx.sub && typeof c.model === 'string') responseModel = c.model;
     const cacheRead = Number(u.cache_read_input_tokens) || 0;
     const cacheWrite = Number(u.cache_creation_input_tokens) || 0;
     // The conventions' input count includes the cache reads and writes; Anthropic's does not.
@@ -942,6 +946,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     const cached = Number(usage?.cached_input_tokens) || 0;
     const written = Number(usage?.cache_write_input_tokens) || 0;
     const output = Number(usage?.output_tokens) || 0;
+    if (usage) hasTokenUsage = true;
     // OpenAI's input count already includes the cached tokens.
     Object.assign(t.span.attributes, {
       'updraft.usage.reasoning_output_tokens': Number(usage?.reasoning_output_tokens) || undefined,
@@ -1200,6 +1205,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         summary.inputTokens = input ?? 0;
         summary.outputTokens = output ?? 0;
         summary.costUsd = cost ?? null;
+        hasTokenUsage ||= input !== undefined || output !== undefined;
       }
     } else if (line.startsWith('---- verification (')) {
       verifySpan = {
@@ -1418,6 +1424,17 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
         };
       }
       if (agentSpan) {
+        summary.model = responseModel ?? h.model;
+        summary.modelSource = responseModel ? 'response' : h.model ? 'configured' : undefined;
+        summary.effort = h.effort;
+        summary.usage = {
+          inputTokens: hasTokenUsage ? (vibeUsage ? vibeUsage['gen_ai.usage.input_tokens'] : summary.inputTokens) : undefined,
+          outputTokens: hasTokenUsage ? (vibeUsage ? vibeUsage['gen_ai.usage.output_tokens'] : summary.outputTokens) : undefined,
+          costUsd: summary.costUsd ?? undefined,
+          toolCalls: summary.tools,
+          toolErrors: summary.toolErrors,
+          durationMs: Math.max(0, Math.round((agentSpan.end ?? at) - agentSpan.start)),
+        };
         Object.assign(agentSpan.attributes, {
           'updraft.agent.tool_calls': summary.tools,
           'updraft.agent.tool_errors': summary.toolErrors,

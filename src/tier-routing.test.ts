@@ -9,7 +9,8 @@ const issue = (title: string, body = '', labels: string[] = []) => ({ title, bod
 
 describe('routeJob', () => {
   it('without tiers behaves exactly like label routing', () => {
-    expect(routeJob(selector, undefined, issue('Fix auth', '', ['art']), up)).toEqual({ rule: 'default', pool: 'art' });
+    expect(routeJob(selector, undefined, issue('Fix auth', '', ['art']), up)).toMatchObject({ rule: 'legacy-label', pool: 'art' });
+    expect(routeJob(selector, undefined, issue('Fix auth'), up)).toEqual({ rule: 'default', pool: 'mid' });
     expect(routeJob('solo', undefined, issue('Fix auth'), up)).toEqual({ rule: 'default', pool: 'solo' });
   });
 

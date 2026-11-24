@@ -40,7 +40,7 @@ const common = {
 
 await build({
   ...common,
-  entryPoints: { index: join(root, 'src', 'lambda.ts') },
+  entryPoints: { index: join(root, 'src', 'lambda.ts'), 'job-finished': join(root, 'src', 'job-finished-lambda.ts') },
   // The Node.js 22 runtime ships AWS SDK v3; use it rather than bundling a copy.
   external: ['@aws-sdk/*'],
 });
