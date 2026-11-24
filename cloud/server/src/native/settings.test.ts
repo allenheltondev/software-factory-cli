@@ -152,6 +152,46 @@ describe('Claude subscription mode in the installation app', () => {
     expect(start).toHaveBeenCalledExactlyOnceWith(55);
   });
 
+  it('connects an active owner without a waiting issue or enabled routing and preserves mode', async () => {
+    member.mockResolvedValue({ tenant: { status: 'active' }, summary: { role: 'owner' } });
+    const start = vi.fn();
+    const get = vi.fn();
+    const api = createNativeSettingsService({ github, mode, workers, managed: {
+      route: async (id) => ({ ...route, installationId: id }), start, sessions: { get }, grant: () => undefined,
+    } });
+    await api.start(caller, 55);
+    expect(start).toHaveBeenCalledExactlyOnceWith(55);
+    expect(get).not.toHaveBeenCalled();
+    expect(enabled).toBe(false);
+    member.mockResolvedValue({ tenant: { status: 'suspended' }, summary: { role: 'owner' } });
+    await expect(api.start(caller, 55)).rejects.toThrow('permission to connect');
+    member.mockResolvedValue({ tenant: { status: 'active' }, summary: { role: 'member' } });
+    await expect(api.start(caller, 55)).rejects.toThrow('Only an installation owner');
+    expect(start).toHaveBeenCalledTimes(1);
+    member.mockResolvedValue(undefined);
+  });
+
+  it('reuses restart fencing for expired and offline current-image sessions', async () => {
+    member.mockResolvedValue({ tenant: { status: 'active' }, summary: { role: 'owner' } });
+    const stop = vi.fn();
+    const api = createNativeSettingsService({ github, mode, workers, now: () => now, managed: {
+      route: async () => ({ ...route, imageVersion: '4' }), start: vi.fn(), stop,
+      imageVersion: '4', vmState: async () => 'RUNNING', sessions: { get: vi.fn() }, grant: () => undefined,
+    } });
+    worker!.auth = 'expired';
+    queued = ['job_busy'];
+    await expect(api.restart(caller, 55)).rejects.toThrow('current subscription job');
+    expect(stop).not.toHaveBeenCalled();
+    queued = []; fenceCommits = false;
+    await expect(api.restart(caller, 55)).rejects.toThrow('changed');
+    fenceCommits = true;
+    await api.restart(caller, 55);
+    expect(stop).toHaveBeenCalledExactlyOnceWith('mvm-native');
+    worker!.auth = 'connected'; now += 61000;
+    expect(await api.view(caller, 55)).toMatchObject({ recovery: { state: 'required' }, worker: { online: false } });
+    member.mockResolvedValue(undefined);
+  });
+
   describe('a managed worker on an older image', () => {
     let vm: string | null;
     const stop = vi.fn(async () => { vm = 'TERMINATING'; });

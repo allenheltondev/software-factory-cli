@@ -16,7 +16,7 @@ export function createNativeSettingsService(d: {
     imageVersion?: string;
     stop?(microvmId: string): Promise<void>;
     vmState?(id: number): Promise<string | null>;
-    sessions: Pick<ClaudeSessions, 'get'> & Partial<Pick<ClaudeSessions, 'pending'>>;
+    sessions: Pick<ClaudeSessions, 'get'> & Partial<Pick<ClaudeSessions, 'pending' | 'session'>>;
     grant(route: NativeRoute): (() => Promise<{ url: string; token: string; port: number; expiresAt?: string }>) | undefined;
   };
   mode: NativeModeStore;
@@ -26,6 +26,8 @@ export function createNativeSettingsService(d: {
   now?: () => number;
 }) {
   const now = d.now ?? Date.now;
+  const replacementState = (vm: string | null | undefined) =>
+    vm === null || vm === 'TERMINATED' ? 'stopped' as const : vm === 'TERMINATING' ? 'stopping' as const : 'required' as const;
   const route = (id: number) => d.route?.installationId === id ? Promise.resolve(d.route) : d.managed?.route(id);
   async function availableTriggers(tenant?: Tenant): Promise<NativeTrigger[]> {
     if (!d.store || tenant?.activeConfigVersion === undefined) return [];
@@ -57,16 +59,27 @@ export function createNativeSettingsService(d: {
     ]);
     const stale = !worker || worker.microvmId !== r.microvmId || worker.imageVersion !== r.imageVersion || worker.fenced === true || now() - worker.heartbeatAt > 60_000;
     const managed = r !== d.route ? d.managed : undefined;
-    const [upgrade, pending] = await Promise.all([upgradeOf(r), managed?.sessions.pending?.(installationId)]);
+    const [upgrade, pending, session, queued] = await Promise.all([
+      upgradeOf(r), managed?.sessions.pending?.(installationId), managed?.sessions.session?.(installationId),
+      worker ? d.workers.queued(r.installationId, r.workerId) : Promise.resolve([]),
+    ]);
+    const recovering = !upgrade && managed && worker?.microvmId === r.microvmId && (worker.fenced || worker.auth === 'expired' || stale);
+    const awaitingWorker = !upgrade && !recovering && managed && session && (!worker || worker.microvmId !== r.microvmId || worker.auth === 'unavailable');
+    const vm = recovering || awaitingWorker ? await managed?.vmState?.(installationId) : undefined;
+    const preparing = Boolean(awaitingWorker && (!session.microvmId || (vm !== null && vm !== 'TERMINATED' && vm !== 'TERMINATING')));
+    const recovery = recovering ? { state: replacementState(vm) } : undefined;
     return {
+      preparing,
+      ...(recovery ? { recovery } : {}),
+      ...(session?.microvmId === r.microvmId ? { sessionExpiresAt: new Date(session.requestedAt + 8 * 60 * 60_000).toISOString() } : {}),
       ...(upgrade ? { upgrade } : {}),
       ...(pending?.[0] ? { pendingRequest: pending[0].id } : {}),
       // Restarting and signing in are owner actions; members see the state, not the buttons.
-      owner: membership?.summary?.role === 'owner',
+      owner: membership?.summary?.role === 'owner' && membership?.tenant?.status === 'active',
       configured: true,
       enabled: mode.enabled,
       managed: Boolean(d.managed && r !== d.route),
-      browserLogin: Boolean(r === d.route ? d.loginGrant : d.managed) && membership?.summary?.role === 'owner',
+      browserLogin: Boolean(r === d.route ? d.loginGrant : d.managed) && membership?.summary?.role === 'owner' && membership?.tenant?.status === 'active',
       triggers: mode.triggers ?? legacyNativeTriggers(r),
       availableTriggers: available,
       repository: r.repository,
@@ -74,9 +87,10 @@ export function createNativeSettingsService(d: {
       worker: worker ? {
         status: stale ? 'offline' : worker.auth,
         online: !stale,
-        busy: !!(worker.active || worker.settling),
+        busy: !!(worker.active || worker.settling || queued.length > 0),
         lastHeartbeatAt: new Date(worker.heartbeatAt).toISOString(),
         workerVersion: worker.workerVersion,
+        generation: r.generation ?? r.microvmId,
       } : null,
     };
   }
@@ -95,7 +109,7 @@ export function createNativeSettingsService(d: {
           worker.active || worker.settling || now() - worker.heartbeatAt > 60_000 || !['auth-required', 'expired'].includes(worker.auth)) {
         throw new FlowError('invalid_settings', 409, 'Wait for the worker to be online and ready for sign-in');
       }
-      return grant();
+      return { ...await grant(), generation: r.generation ?? r.microvmId };
     },
     async waiting(caller: Caller, installationId: number, requestId: string) {
       await d.github.member(caller, installationId);
@@ -106,29 +120,32 @@ export function createNativeSettingsService(d: {
         expiresAt: new Date(item.expiresAt).toISOString(), jobId: item.jobId, reason: item.reason,
       };
     },
-    async start(caller: Caller, installationId: number, requestId: string) {
+    async start(caller: Caller, installationId: number, requestId?: string) {
       const { summary, tenant } = await d.github.member(caller, installationId);
       if (summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner can start a subscription session');
-      const item = await d.managed?.sessions.get(installationId, requestId);
+      const item = requestId ? await d.managed?.sessions.get(installationId, requestId) : undefined;
       const r = await route(installationId);
-      if (!d.managed || !r || r === d.route || tenant.status !== 'active' || !item || item.status !== 'waiting' || item.expiresAt <= now() ||
-          !await d.mode.enabled(installationId, r.workerId)) {
-        throw new FlowError('invalid_settings', 409, 'This installation does not have an active Claude sign-in request');
+      if (!d.managed || !r || r.installationId !== installationId || r === d.route || tenant.status !== 'active' || (requestId !== undefined && (!item || item.status !== 'waiting' || item.expiresAt <= now()))) {
+        throw new FlowError('invalid_settings', 409, 'This installation does not have an active Claude sign-in request or permission to connect');
       }
       await d.managed.start(installationId);
       return view(caller, installationId);
     },
-    /** Stops an idle managed worker that runs an older image, so the next start uses the deployed one. */
+    /** Fences and stops exactly an idle outdated, expired, or lost managed session. */
     async restart(caller: Caller, installationId: number) {
       const { summary, tenant } = await d.github.member(caller, installationId);
       if (summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner can restart the Claude worker');
       const r = await route(installationId);
-      if (!d.managed?.stop || !r || r === d.route || tenant.status !== 'active') {
+      if (!d.managed?.stop || !r || r.installationId !== installationId || r === d.route || tenant.status !== 'active') {
         throw new FlowError('invalid_settings', 409, 'This installation has no Claude worker to restart');
       }
       const upgrade = await upgradeOf(r);
-      if (!upgrade) throw new FlowError('invalid_settings', 409, 'The Claude worker is already up to date');
-      if (upgrade.state === 'required') {
+      const previous = await d.workers.get(r.installationId, r.workerId);
+      if (!upgrade && (!previous || previous.microvmId !== r.microvmId || (!previous.fenced && previous.auth !== 'expired' && now() - previous.heartbeatAt <= 60_000))) {
+        throw new FlowError('invalid_settings', 409, 'The Claude worker is already up to date and healthy');
+      }
+      const state = upgrade?.state ?? replacementState(await d.managed.vmState?.(installationId));
+      if (state === 'required') {
         // Read the dispatch revision first: an enqueue after this read makes the fence fail.
         const mode = await d.mode.snapshot(r.installationId, r.workerId);
         const worker = await d.workers.get(r.installationId, r.workerId);

@@ -190,6 +190,7 @@ export interface NativeClaudeTrigger {
 }
 
 export interface NativeClaudeLoginGrant {
+  generation?: string;
   expiresAt?: string;
   url: string;
   token: string;
@@ -204,6 +205,10 @@ export interface ClaudeWaitingRequest {
 }
 
 export interface NativeClaudeView {
+  /** A reserved session is booting; readiness still requires its live heartbeat. */
+  preparing?: boolean;
+  sessionExpiresAt?: string;
+  recovery?: { state: 'required' | 'stopping' | 'stopped' };
   managed?: boolean;
   /** The worker runs an older image than the deployed one and must be restarted. */
   upgrade?: { from: string; to: string; state: 'required' | 'stopping' | 'stopped' };
@@ -224,6 +229,7 @@ export interface NativeClaudeView {
     busy: boolean;
     lastHeartbeatAt: string;
     workerVersion: string;
+    generation?: string;
   };
 }
 
@@ -763,15 +769,15 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
       request<RoutinesView>(`/installations/${installationId}/routines`, { method: 'PUT', body: JSON.stringify(input) }),
     removeRoutine: (installationId: number, ruleId: string) =>
       request<RoutinesView>(`/installations/${installationId}/routines/${encodeURIComponent(ruleId)}`, { method: 'DELETE' }),
-    nativeClaudeWaiting: (installationId: number, id: string) =>
-      request<ClaudeWaitingRequest>(`/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}`),
-    nativeClaudeStart: (installationId: number, id: string) =>
-      request<NativeClaudeView>(`/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}/start`, { method: 'POST' }),
+    nativeClaudeWaiting: (installationId: number, id: string, signal?: AbortSignal) =>
+      request<ClaudeWaitingRequest>(`/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}`, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000) }),
+    nativeClaudeStart: (installationId: number, id?: string) =>
+      request<NativeClaudeView>(id ? `/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}/start` : `/installations/${installationId}/claude-subscription/connect`, { method: 'POST', signal: AbortSignal.timeout(30000) }),
     nativeClaudeRestart: (installationId: number) =>
-      request<NativeClaudeView>(`/installations/${installationId}/claude-subscription/restart`, { method: 'POST' }),
-    nativeClaudeLogin: (installationId: number) =>
-      request<NativeClaudeLoginGrant>(`/installations/${installationId}/claude-subscription/login`, { method: 'POST' }),
-    nativeClaude: (installationId: number) => request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription'),
+      request<NativeClaudeView>(`/installations/${installationId}/claude-subscription/restart`, { method: 'POST', signal: AbortSignal.timeout(30000) }),
+    nativeClaudeLogin: (installationId: number, signal?: AbortSignal) =>
+      request<NativeClaudeLoginGrant>(`/installations/${installationId}/claude-subscription/login`, { method: 'POST', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000) }),
+    nativeClaude: (installationId: number, signal?: AbortSignal) => request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000) }),
     setNativeClaudeMode: (installationId: number, enabled: boolean, triggers?: NativeClaudeTrigger[]) =>
       request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { method: 'PUT', body: JSON.stringify({ enabled, triggers }) }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),

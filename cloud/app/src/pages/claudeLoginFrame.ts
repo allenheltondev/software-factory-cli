@@ -1,6 +1,6 @@
 import type { NativeClaudeLoginGrant } from '../api/client';
 
-export function claudeLoginFrame(grant: NativeClaudeLoginGrant): string {
+export function claudeLoginFrame(grant: NativeClaudeLoginGrant, theme?: 'light' | 'dark'): string {
   const url = new URL(grant.url);
   if (url.protocol !== 'wss:' || !url.hostname.endsWith('.on.aws') || url.pathname !== '/claude-login' ||
       url.port || url.search || url.hash || url.username || url.password || grant.port !== 8081 ||
@@ -8,18 +8,23 @@ export function claudeLoginFrame(grant: NativeClaudeLoginGrant): string {
   // Opaque-origin, no storage, no external scripts. The code is sent directly to
   // the worker and is never sent to the parent frame or the Updraft API.
   const values = JSON.stringify([url.href, grant.token, grant.port]).replace(/</g, '\\u003c');
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  return `<!doctype html><html lang="en"${theme === 'dark' || theme === 'light' ? ` data-theme="${theme}"` : ''}><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src ${url.origin}; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <style>
-body{font:14px/1.5 system-ui,sans-serif;color:#172638;background:#f4f7fa;margin:0;padding:16px;box-sizing:border-box}
-p{margin:0 0 10px}a{color:#075aaf}#code-entry{margin-top:12px}label{display:block;font-weight:600}
-input{box-sizing:border-box;width:100%;max-width:24rem;margin:4px 0 8px;padding:6px}button{cursor:pointer}
+ :root{color-scheme:light dark;--bg:#fff;--fg:#0e2233;--muted:#5a7184;--border:#dce6ee;--accent:#0668b8}
+@media(prefers-color-scheme:dark){:root:not([data-theme]){--bg:#0e2233;--fg:#e2ecf3;--muted:#8ca6b8;--border:#244155;--accent:#4eaeff}}
+:root[data-theme="dark"]{--bg:#0e2233;--fg:#e2ecf3;--muted:#8ca6b8;--border:#244155;--accent:#4eaeff}
+*{box-sizing:border-box}body{font:14px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg);margin:0;padding:20px}
+p{margin:0 0 16px;color:var(--muted)}a,button{display:inline-flex;align-items:center;justify-content:center;min-height:44px;border-radius:8px;padding:10px 16px;font:600 14px/1.5 system-ui,sans-serif;text-decoration:none;border:1px solid var(--accent);background:var(--accent);color:var(--bg);cursor:pointer}
+[hidden]{display:none!important}#code-entry{margin-top:20px}label{display:block;font-weight:600}
+input{width:100%;margin:8px 0 12px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}input:focus-visible,a:focus-visible,button:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
 </style></head><body>
 <p id="status" role="status">Connecting to the sign-in worker…</p>
 <a id="authorize" hidden target="_blank" rel="noopener noreferrer">Continue to Claude ↗</a>
 <div id="code-entry" hidden><label for="code">Code from Claude</label>
-<input id="code" type="password" autocomplete="off" maxlength="2048" required>
+<input id="code" type="password" autocomplete="off" maxlength="2048" aria-describedby="code-help" required>
+<p id="code-help">Return from Claude and paste the authorization code here. It goes directly to your private environment.</p>
 <button id="finish" type="button">Finish sign-in</button></div>
 <script>
 const [url, token, port] = ${values};
@@ -28,6 +33,7 @@ const link = document.querySelector('#authorize');
 const form = document.querySelector('#code-entry');
 const input = document.querySelector('#code');
 let terminal = false;
+new ResizeObserver(() => parent.postMessage({ kind: 'updraft-claude-login', result: 'resize', height: Math.ceil(document.body.getBoundingClientRect().height) + 2 }, '*')).observe(document.body);
 function update(result) {
   terminal = true;
   link.hidden = true;
@@ -35,7 +41,7 @@ function update(result) {
   form.hidden = true;
   input.value = '';
   status.textContent = result === 'connected'
-    ? 'Claude is connected. Return to the Updraft page.'
+    ? 'Claude confirmed sign-in. Verifying your connection…'
     : result === 'expired' ? 'This sign-in expired. Start a new sign-in in Updraft.'
     : 'Could not complete sign-in. Try again in Updraft.';
   parent.postMessage({ kind: 'updraft-claude-login', result }, '*');
