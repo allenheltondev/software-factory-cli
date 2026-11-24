@@ -117,8 +117,10 @@ export function labelEventIdOf(job: { eventId: string; envelope?: EventEnvelope 
  * changes_requested: a submitted review with state CHANGES_REQUESTED by an allowed actor.
  * updraft_review: a changes-requested verdict of Updraft's own reviewer run, taken from the
  * worker's database when the verdict is recorded (never read back from GitHub).
+ * ci_failure: GitHub's checks failed on a head the reviewer found ready (repositories.<repo>.ciFix,
+ * src/publish/ci.ts); the "review" is the worker's own summary of the failed checks.
  */
-export type RevisionTriggerKind = 'changes_requested' | 'updraft_review';
+export type RevisionTriggerKind = 'changes_requested' | 'updraft_review' | 'ci_failure';
 
 /** One inline comment of the triggering review, as it read when the review was ingested. Untrusted text. */
 export interface ReviewCommentSnapshot {
@@ -165,8 +167,8 @@ export interface RevisionRequest {
   originalEventId: string;
   review: ReviewSnapshot;
   /**
-   * updraft_review only: the head commit the verdict was for. The revision is dropped as stale
-   * unless the pull request is still at this commit when it starts.
+   * updraft_review and ci_failure: the head commit the verdict (or the failed checks) was for. The
+   * revision is dropped as stale unless the pull request is still at this commit when it starts.
    */
   reviewedSha?: string;
 }

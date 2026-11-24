@@ -11,7 +11,19 @@ export const STEP_KINDS = ['implement', 'revision', 'review'] as const;
 export type StepKind = (typeof STEP_KINDS)[number];
 
 /** The review loop's stages (`updraft status`; docs/run-event.md, `loop.stage`). */
-export const LOOP_STAGES = ['awaiting-review', 'reviewing', 'changes-requested', 'revising', 'ready-to-merge', 'merging', 'merged', 'needs-human', 'closed'] as const;
+export const LOOP_STAGES = [
+  'awaiting-review',
+  'reviewing',
+  'changes-requested',
+  'revising',
+  'waiting-for-ci',
+  'fixing-ci',
+  'ready-to-merge',
+  'merging',
+  'merged',
+  'needs-human',
+  'closed',
+] as const;
 export type LoopStage = (typeof LOOP_STAGES)[number];
 
 export interface JobLoop {

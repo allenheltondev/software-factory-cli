@@ -324,6 +324,31 @@ export const repositorySchema = z.strictObject({
    */
   autoMergeRequiredChecks: z.array(z.string().min(1)).min(1).optional(),
   /**
+   * With review: GitHub's checks on a PR's head are part of the loop (docs/ci-fix.md). A
+   * ready-to-merge verdict does not end the loop while the applicable checks are pending or
+   * failing: pending checks are waited for, and with revise a failure on the current head queues
+   * a revision with the failed checks' diagnostics, counted against maxRevisions. Only once the
+   * checks pass is a draft marked ready for review, or auto-merge considered. `true`, or an object
+   * for options. Default false.
+   */
+  ciFix: z
+    .union([
+      z.boolean(),
+      z.strictObject({
+        /**
+         * Names of the check runs or commit statuses that decide. Only these are waited for, and
+         * each must report success. Default: autoMergeRequiredChecks when set, else every check
+         * on the commit except those in `ignore`.
+         */
+        checks: z.array(z.string().min(1)).min(1).optional(),
+        /** Names of check runs or commit statuses that never count, e.g. a preview deployment that is not about the code. */
+        ignore: z.array(z.string().min(1)).optional(),
+        /** How long to wait for pending checks on one head before giving up, in minutes. Default 60. */
+        waitMinutes: z.number().positive().max(24 * 60).optional(),
+      }),
+    ])
+    .optional(),
+  /**
    * Live mode: let a run wait on a pull request in another repository (docs/dependencies.md). The
    * agent names it with an UPDRAFT-WAITING-ON line; the worker publishes nothing for that run,
    * watches the pull request, and runs the issue again once it is merged.
@@ -537,6 +562,37 @@ export function reviewPoolFor(repo: Pick<RepositoryConfig, 'review'>, wf: Pick<W
 /** True when reviewer runs happen for this repository: live mode, publication on, review on. */
 export function reviewActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'review'>): boolean {
   return config.execution.mode === 'live' && reviewSettings(repo).enabled && publishMode(repo) !== 'none';
+}
+
+/** Minutes the CI step waits for pending checks on one head when repositories.<repo>.ciFix.waitMinutes is not set. */
+export const DEFAULT_CI_WAIT_MINUTES = 60;
+
+export interface CiSettings {
+  /** A failure on the current head queues a revision (revise is on); otherwise it is left for a person. */
+  fix: boolean;
+  /** The checks that decide, or null for every check except `ignore`. */
+  checks: string[] | null;
+  ignore: string[];
+  waitMs: number;
+}
+
+/**
+ * repositories.<repo>.ciFix as settings, or null when the CI step is off for the repository: not
+ * set, or the review loop is not active (live mode, publish and review).
+ */
+export function ciSettings(
+  config: Pick<UpdraftConfig, 'execution'>,
+  repo: Pick<RepositoryConfig, 'publish' | 'review' | 'revise' | 'ciFix' | 'autoMergeRequiredChecks'>,
+): CiSettings | null {
+  const c = repo.ciFix;
+  if (c === undefined || c === false || !reviewActive(config, repo)) return null;
+  const o = c === true ? {} : c;
+  return {
+    fix: reviseActive(config, repo),
+    checks: o.checks ? [...o.checks] : repo.autoMergeRequiredChecks ? [...repo.autoMergeRequiredChecks] : null,
+    ignore: [...(o.ignore ?? [])],
+    waitMs: (o.waitMinutes ?? DEFAULT_CI_WAIT_MINUTES) * 60_000,
+  };
 }
 
 /** Minutes auto-merge waits for pending checks when repositories.<repo>.autoMergeWaitMinutes is not set. */

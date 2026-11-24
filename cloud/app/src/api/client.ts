@@ -382,7 +382,18 @@ export interface TelemetryView {
 }
 
 export type StepKind = 'implement' | 'revision' | 'review';
-export type LoopStage = 'awaiting-review' | 'reviewing' | 'changes-requested' | 'revising' | 'ready-to-merge' | 'merging' | 'merged' | 'needs-human' | 'closed';
+export type LoopStage =
+  | 'awaiting-review'
+  | 'reviewing'
+  | 'changes-requested'
+  | 'revising'
+  | 'waiting-for-ci'
+  | 'fixing-ci'
+  | 'ready-to-merge'
+  | 'merging'
+  | 'merged'
+  | 'needs-human'
+  | 'closed';
 
 export interface JobDetail {
   updraftOutcome?: string;

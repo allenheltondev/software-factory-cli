@@ -220,6 +220,9 @@ Repository permissions of the App, by what you have turned on:
 | Issues | Read and write | `publish` (the comment on the issue) and `commentOnFailure` |
 | Contents | Read and write | `publish` and `revise`: pushing the job branch |
 | Pull requests | Read and write | `publish` (opening the PR) and `revise` (reading reviews, replying on the PR) |
+| Checks | Read-only | `autoMerge` and `ciFix`: reading the head commit's check runs and their annotations |
+| Commit statuses | Read-only | `autoMerge` and `ciFix`: reading the head commit's statuses |
+| Actions | Read-only | `ciFix`: reading the logs of failed GitHub Actions jobs for the fix's diagnostics |
 | Workflows | Read and write | Only if agents change files under `.github/workflows/` |
 
 So a worker that publishes needs **Metadata read; Contents, Pull requests and Issues read and

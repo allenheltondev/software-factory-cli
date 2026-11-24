@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { legacyNativeTriggers, sameNativeRepository, sameNativeTrigger, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
 import { hashToken, jobPaths } from '../broker/broker.js';
 import { NativeEnqueueRejectedError, type Job, type Quotas, type Store } from '../store/store.js';
-import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
+import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS, pullRequestOfPayload } from '../tenants/dispatch.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
@@ -167,6 +167,7 @@ export interface LaunchRequest {
     issue?: { number?: unknown };
     pull_request?: { number?: unknown; head?: { ref?: unknown } };
     review?: { state?: unknown };
+    check_suite?: { head_branch?: unknown; pull_requests?: unknown };
   };
 }
 
@@ -254,6 +255,7 @@ export function createLauncher(deps: LaunchDeps) {
       }
       decision = { repository: d.repository, repositoryId: d.repositoryId, keys: d.keys, label: d.label, issue: req.payload.issue!.number as number };
     } else {
+      const subject = pullRequestOfPayload(eventName, req.payload);
       const d = decidePullRequestDispatch(
         config?.dispatch,
         {
@@ -262,8 +264,8 @@ export function createLauncher(deps: LaunchDeps) {
           repositoryFullName: req.payload.repository?.full_name,
           repositoryId: req.payload.repository?.id,
           sender: req.payload.sender?.login,
-          number: req.payload.pull_request?.number,
-          headRef: req.payload.pull_request?.head?.ref,
+          number: subject.number,
+          headRef: subject.headRef,
           reviewState: req.payload.review?.state,
         },
         req.appBot ? { appBot: req.appBot } : {},

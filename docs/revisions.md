@@ -6,10 +6,11 @@ worker queues a revision job, runs the agent on the PR's branch with the review,
 result, pushes the new commits to the PR and replies there. Merging, approving and resolving
 stay with people.
 
-Reviews by people are one of two things that can ask for a revision. With
+Reviews by people are one of the things that can ask for a revision. With
 `repositories.<repo>.review` on as well, Updraft's own reviewer run does too: see
-[The review loop](review-loop.md). Everything on this page applies to both unless it says
-otherwise.
+[The review loop](review-loop.md). With `ciFix` as well, so do GitHub checks that failed on a
+head the reviewer found ready: see [CI in the review loop](ci-fix.md). Everything on this page
+applies to all of them unless it says otherwise.
 
 ```yaml
 actions:

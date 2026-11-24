@@ -36,6 +36,8 @@ updraft run-event --event-file <path> [--event-name issues] [--delivery-id <id>]
 | `issues` | `labeled` | The workflow's job for the issue, if the poller's dispatch rules would queue one |
 | `pull_request_review` | `submitted`, `edited`, `dismissed` | The review loop's look at that pull request: a change request by an allowed actor queues a revision |
 | `pull_request` | `synchronize`, `closed` | The same look: a new head commit gets its reviewer run; a closed or merged pull request stops being watched and its queued work is canceled |
+| `check_suite`, `check_run` | `completed` | With `ciFix`: the same look, and the [CI step](ci-fix.md) for the pull request the payload lists: checks that failed on its ready head queue a revision, passed checks mark it ready. Checks still pending start nothing and keep nothing running |
+| `status` | (none) | The same, for the watched pull request whose head is the payload's commit |
 
 Every other event name or action is "nothing to do", decided from the payload alone. That
 includes `pull_request.reopened`: a closed pull request is no longer watched, for good, so a

@@ -654,6 +654,36 @@ describe('decideEvent: pull request events', () => {
   });
 });
 
+describe('decideEvent: check suites (ciFix)', () => {
+  const options = { acceptedEvents: [...LOOP_EVENTS, 'check_suite'] };
+  const suite = (overrides = {}) => ({
+    action: 'completed',
+    repository: { id: 1, full_name: 'Octo/Repo' },
+    sender: { login: 'my-updraft-app[bot]' },
+    check_suite: { head_branch: 'updraft/issue-12-job_abc', head_sha: 'a'.repeat(40), pull_requests: [{ number: 34, head: { ref: 'updraft/issue-12-job_abc' } }] },
+    ...overrides,
+  });
+
+  it('launches for a finished suite on an Updraft pull request, naming it, whoever pushed the commit', () => {
+    expect(decideEvent('check_suite', suite(), { ...options, ignoredSenders: ['my-updraft-app[bot]'] })).toEqual({
+      launch: true,
+      reason: 'check_suite.completed',
+      pullRequest: { repository: 'octo/repo', number: 34 },
+    });
+  });
+
+  it('launches nothing unless accepted, finished, about a pull request, and on a job branch', () => {
+    expect(decideEvent('check_suite', suite(), { acceptedEvents: LOOP_EVENTS }).launch).toBe(false);
+    expect(decideEvent('check_suite', suite({ action: 'requested' }), options).launch).toBe(false);
+    expect(decideEvent('check_suite', suite({ check_suite: { head_branch: 'main', pull_requests: [] } }), options)).toEqual({ launch: false, reason: 'the check suite is not about a pull request' });
+    expect(decideEvent('check_suite', suite({ check_suite: { pull_requests: [{ number: 34, head: { ref: 'feature/x' } }] } }), options)).toEqual({
+      launch: false,
+      reason: 'the pull request is not on an Updraft job branch',
+    });
+    expect(parseAcceptedEvents('issues,check_suite')).toEqual(['issues', 'check_suite']);
+  });
+});
+
 describe('parseAcceptedEvents and the launcher settings for the loop', () => {
   it('defaults to issues only', () => {
     expect(parseAcceptedEvents(undefined)).toEqual(['issues']);

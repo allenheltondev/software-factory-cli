@@ -2,6 +2,7 @@
 // one issue and at most one pull request. Anything else a test reaches is reported as a bug.
 import {
   GitHubError,
+  type CheckRunDiagnostics,
   type CommitChecks,
   type CreatePullRequestInput,
   type GitHubApi,
@@ -19,7 +20,15 @@ import {
 } from '../src/github/api.js';
 import type { RepoRef } from '../src/types.js';
 
-type Failable = 'createPullRequestReview' | 'listPullRequestReviews' | 'getPullRequest' | 'markPullRequestReady' | 'getCommitChecks' | 'mergePullRequest' | 'createIssueComment';
+type Failable =
+  | 'createPullRequestReview'
+  | 'listPullRequestReviews'
+  | 'getPullRequest'
+  | 'markPullRequestReady'
+  | 'getCommitChecks'
+  | 'getCheckRunDiagnostics'
+  | 'mergePullRequest'
+  | 'createIssueComment';
 
 export class FakeLoopGitHub {
   login = 'updraft-bot';
@@ -33,6 +42,8 @@ export class FakeLoopGitHub {
   comments: Array<GitHubIssueComment & { issue: number }> = [];
   /** One passing check by default: auto-merge needs independent CI to have passed. */
   checks: CommitChecks = { total: 1, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
+  /** Annotations and log of each failed check run, by check run id (the CI step). */
+  diagnostics: Record<number, CheckRunDiagnostics> = {};
   issueEvents: GitHubIssueEvent[] = [];
   /** Every write, in order. */
   readonly writes: string[] = [];
@@ -184,6 +195,11 @@ export class FakeLoopGitHub {
     this.calls.push(`getCommitChecks ${sha}`);
     this.maybeFail('getCommitChecks');
     return this.checks;
+  }
+  async getCheckRunDiagnostics(_repo: RepoRef, checkRunId: number): Promise<CheckRunDiagnostics> {
+    this.calls.push(`getCheckRunDiagnostics ${checkRunId}`);
+    this.maybeFail('getCheckRunDiagnostics');
+    return this.diagnostics[checkRunId] ?? { annotations: [], logTail: null, problems: ['there is no GitHub Actions log for this check'] };
   }
   async mergePullRequest(_repo: RepoRef, pull: number, input: MergePullRequestInput): Promise<{ merged: boolean; sha: string | null; message: string }> {
     this.calls.push('mergePullRequest');

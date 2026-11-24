@@ -79,11 +79,12 @@ Parameters:
   AcceptedEvents:
     Type: String
     Default: issues
-    AllowedPattern: '^(issues|pull_request_review|pull_request)(,(issues|pull_request_review|pull_request))*$'
+    AllowedPattern: '^(issues|pull_request_review|pull_request|check_suite)(,(issues|pull_request_review|pull_request|check_suite))*$'
     Description: >-
       Comma-separated webhook events that may start a microVM. "issues" alone runs
       labelled issues. Add pull_request_review and pull_request when the Updraft config
-      uses review or revise: "issues,pull_request_review,pull_request".
+      uses review or revise: "issues,pull_request_review,pull_request". Add check_suite
+      when it uses ciFix, so finished checks resume the loop.
   PullRequestBranchPrefix:
     Type: String
     Default: updraft/

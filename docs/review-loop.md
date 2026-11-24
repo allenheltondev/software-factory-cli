@@ -64,7 +64,9 @@ by GitHub until they have.
 | reviewing | A reviewer run is in progress, or its review is being posted | changes requested, ready to merge, or needs a human if the run fails |
 | changes requested (round n of max) | A reviewer or an allowed person asked for changes; the revision job is queued | revising |
 | revising | The coding agent is running on the PR branch, or its commits are being pushed | awaiting review (new head), or needs a human |
-| ready to merge | The reviewer found the current head ready; a draft was marked ready for review. The end state unless `autoMerge` is on. If Updraft tried to merge and could not, the reason is shown here | merged by a person, or merging |
+| waiting for CI | `ciFix`: the reviewer found the current head ready; its checks are pending or not looked at yet ([CI in the review loop](ci-fix.md)) | ready to merge, fixing failed checks, or needs a human |
+| fixing failed checks | `ciFix`: checks failed on the current head; a revision with their diagnostics is queued or running | awaiting review (new head), or needs a human |
+| ready to merge | The reviewer found the current head ready (and, with `ciFix`, its checks passed); a draft was marked ready for review. The end state unless `autoMerge` is on. If Updraft tried to merge and could not, the reason is shown here | merged by a person, or merging |
 | merging / waiting for checks | `autoMerge`: waiting for pending checks, or the merge was requested | merged, or ready to merge with the reason it was not merged |
 | merged | Updraft merged it | none |
 | needs a human | The loop cannot continue by itself; the line says why: `maxRevisions` reached, the reviewer run failed or gave no readable verdict, a revision failed or pushed nothing, or `revise` is off | `updraft retry JOB_ID`, a push, a new review, or a merge by hand |
@@ -264,7 +266,8 @@ Through the same path as every live run: the agent's container if it has one, th
   together. When the limit is reached, the PR gets the one existing comment about it and stays
   at "needs a human".
 - **ready-to-merge**, for the current head: the worker checks on GitHub that the PR is still
-  at that commit, marks a draft ready for review, and stops.
+  at that commit, marks a draft ready for review, and stops. With `ciFix`, it waits for the
+  head's checks first, and a failure gets a revision: see [CI in the review loop](ci-fix.md).
 
 ## Auto-merge
 
@@ -277,6 +280,9 @@ without being attacked. With auto-merge on, a wrong "ready to merge" becomes a c
 base branch with nobody having looked at it. Leave it off unless every actor in
 `allowedActors` is someone you would let push to the base branch directly, and protect the
 branch on GitHub with required checks you trust.
+
+With [`ciFix`](ci-fix.md) on, a head is only considered once the CI step found its checks
+passed; a failure there is fixed rather than refused. The gates below still apply on top.
 
 Updraft merges only when all of these hold, evaluated again after every poll until the merge
 settles one way or the other:

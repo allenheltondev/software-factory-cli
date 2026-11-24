@@ -85,6 +85,9 @@ repositories:
     # reviewer, several take turns (e.g. pools.reviewers: { agents: [codex, kiro, claude] }).
     # review: true
     # review: { pool: reviewers }
+    # With review: wait for GitHub's checks before a PR the reviewer found ready counts as ready; with revise, a
+    # failing check gets a revision with its diagnostics (docs/ci-fix.md).
+    # ciFix: true
     # With review: merge a PR the reviewer found ready, once its checks passed. Off unless set; read docs/review-loop.md first.
     # autoMerge: squash
     workflows:

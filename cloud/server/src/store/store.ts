@@ -234,9 +234,10 @@ export interface DispatchRules {
    * same, like `actors`. Absent everywhere on versions published before #70 (the launcher then
    * reads them from the bundle, key-needs.ts).
    * `review`, `revise`: the repository's review loop is on, so events on its pull requests can
-   * start a job (a review asking for changes, a push, a close).
+   * start a job (a review asking for changes, a push, a close). `ci`: with review, ciFix is on,
+   * so a finished check suite on its pull requests can start one too.
    */
-  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; keys?: string[]; review?: true; revise?: true; triggers: { label: string; actors?: string[]; keys?: string[] }[] }>;
+  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; keys?: string[]; review?: true; revise?: true; ci?: true; triggers: { label: string; actors?: string[]; keys?: string[] }[] }>;
   /** The rules record each repository's review loop (`review`, `revise`); absent on versions published before pull request events started jobs. */
   loop?: true;
 }

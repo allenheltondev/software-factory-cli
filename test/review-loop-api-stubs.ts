@@ -4,7 +4,7 @@ import type { GitHubApi } from '../src/github/api.js';
 
 type ReviewLoopApi = Pick<
   GitHubApi,
-  'getPullRequest' | 'listPullRequestReviews' | 'createPullRequestReview' | 'markPullRequestReady' | 'getCommitChecks' | 'mergePullRequest'
+  'getPullRequest' | 'listPullRequestReviews' | 'createPullRequestReview' | 'markPullRequestReady' | 'getCommitChecks' | 'getCheckRunDiagnostics' | 'mergePullRequest'
 >;
 
 const unused = (name: string) => (): never => {
@@ -17,5 +17,6 @@ export class ReviewLoopApiStubs implements ReviewLoopApi {
   createPullRequestReview: ReviewLoopApi['createPullRequestReview'] = unused('createPullRequestReview');
   markPullRequestReady: ReviewLoopApi['markPullRequestReady'] = unused('markPullRequestReady');
   getCommitChecks: ReviewLoopApi['getCommitChecks'] = unused('getCommitChecks');
+  getCheckRunDiagnostics: ReviewLoopApi['getCheckRunDiagnostics'] = unused('getCheckRunDiagnostics');
   mergePullRequest: ReviewLoopApi['mergePullRequest'] = unused('mergePullRequest');
 }

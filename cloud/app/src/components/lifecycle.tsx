@@ -12,6 +12,8 @@ export const STAGE: Record<LoopStage, { label: string; tone: Tone }> = {
   reviewing: { label: 'Reviewing', tone: 'primary' },
   'changes-requested': { label: 'Changes requested', tone: 'warning' },
   revising: { label: 'Revising', tone: 'primary' },
+  'waiting-for-ci': { label: 'Waiting for CI', tone: 'neutral' },
+  'fixing-ci': { label: 'Fixing failed checks', tone: 'primary' },
   'ready-to-merge': { label: 'Ready to merge', tone: 'success' },
   merging: { label: 'Merging', tone: 'primary' },
   merged: { label: 'Merged', tone: 'success' },

@@ -67,6 +67,8 @@ import { appRequestProblem, redactGitHubSecrets } from './app-auth.js';
 import { appIdentity, createUserCredentials, repoOfRequest, userIdentity, type GitHubCredentials } from './credentials.js';
 import {
   GitHubError,
+  type CheckAnnotation,
+  type CheckDetail,
   type CommitChecks,
   type GitHubApi,
   type GitHubIssue,
@@ -107,6 +109,14 @@ export const REQUEST_TIMEOUT_MS = 60_000;
 export const USER_AGENT = 'updraft';
 export const API_VERSION = '2022-11-28';
 const DEFAULT_BASE_URL = 'https://api.github.com';
+/** A check's summary or description kept by getCommitChecks. */
+const DETAIL_SUMMARY_MAX = 2_000;
+
+/** A failure worth trying again later rather than reporting: no answer, a 5xx, a rate limit. */
+function isTransientGitHubError(err: unknown): boolean {
+  return err instanceof GitHubError && (err.status === 0 || err.status >= 500 || err.isRateLimit);
+}
+
 /** Safety stop for internally paginated lists (100 per page). */
 const MAX_LIST_PAGES = 100;
 
@@ -908,6 +918,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       const failing: string[] = [];
       const pending: string[] = [];
       const succeeded: string[] = [];
+      const details: CheckDetail[] = [];
       let total = 0;
       // Both listings are paginated. Every page is read, and a listing that could not be read to
       // its end (more pages than this client follows, or fewer entries than GitHub counted) makes
@@ -921,7 +932,10 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
           complete = false;
           break;
         }
-        const res: RawResponse<{ total_count?: number; statuses?: Array<{ context?: string; state?: string }> }> = await request(next);
+        const res: RawResponse<{
+          total_count?: number;
+          statuses?: Array<{ context?: string; state?: string; target_url?: string | null; description?: string | null }>;
+        }> = await request(next);
         if (typeof res.data?.total_count === 'number') statusCount = res.data.total_count;
         for (const s of res.data?.statuses ?? []) {
           const name = s.context ?? '(status)';
@@ -930,9 +944,18 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
           if (seenStatuses.has(name)) continue;
           seenStatuses.add(name);
           total++;
-          if (s.state === 'pending') pending.push(name);
-          else if (s.state === 'success') succeeded.push(name);
+          const outcome = s.state === 'pending' ? 'pending' : s.state === 'success' ? 'success' : 'failure';
+          if (outcome === 'pending') pending.push(name);
+          else if (outcome === 'success') succeeded.push(name);
           else failing.push(name);
+          details.push({
+            kind: 'status',
+            name,
+            outcome,
+            conclusion: s.state ?? null,
+            url: s.target_url ?? null,
+            ...(s.description ? { summary: s.description.slice(0, DETAIL_SUMMARY_MAX) } : {}),
+          });
         }
         next = parseLinkHeader(res.headers.get('link'))['next'];
       }
@@ -946,21 +969,107 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
           complete = false;
           break;
         }
-        const res: RawResponse<{ total_count?: number; check_runs?: Array<{ name?: string; status?: string; conclusion?: string | null }> }> = await request(next);
+        const res: RawResponse<{
+          total_count?: number;
+          check_runs?: Array<{
+            id?: number;
+            name?: string;
+            status?: string;
+            conclusion?: string | null;
+            html_url?: string | null;
+            details_url?: string | null;
+            app?: { slug?: string | null } | null;
+            output?: { title?: string | null; summary?: string | null } | null;
+          }>;
+        }> = await request(next);
         if (typeof res.data?.total_count === 'number') runCount = res.data.total_count;
         for (const c of res.data?.check_runs ?? []) {
           runsSeen++;
           total++;
           const name = c.name ?? '(check run)';
-          if (c.status !== 'completed') pending.push(name);
-          else if (c.conclusion === 'success') succeeded.push(name);
+          let outcome: CheckDetail['outcome'];
+          if (c.status !== 'completed') outcome = 'pending';
+          else if (c.conclusion === 'success') outcome = 'success';
           // Skipped and neutral do not block, and do not count as a pass either.
-          else if (!['neutral', 'skipped'].includes(c.conclusion ?? '')) failing.push(name);
+          else if (['neutral', 'skipped'].includes(c.conclusion ?? '')) outcome = 'skipped';
+          else outcome = 'failure';
+          if (outcome === 'pending') pending.push(name);
+          else if (outcome === 'success') succeeded.push(name);
+          else if (outcome === 'failure') failing.push(name);
+          const summary = [c.output?.title, c.output?.summary].filter((t): t is string => typeof t === 'string' && t.trim() !== '').join('\n');
+          details.push({
+            kind: 'check-run',
+            name,
+            outcome,
+            conclusion: c.status === 'completed' ? (c.conclusion ?? null) : null,
+            url: c.html_url ?? c.details_url ?? null,
+            ...(typeof c.id === 'number' ? { checkRunId: c.id } : {}),
+            app: c.app?.slug ?? null,
+            ...(summary ? { summary: summary.slice(0, DETAIL_SUMMARY_MAX) } : {}),
+          });
         }
         next = parseLinkHeader(res.headers.get('link'))['next'];
       }
       if (runCount !== null && runsSeen < runCount) complete = false;
-      return { total, failing, pending, succeeded, complete };
+      return { total, failing, pending, succeeded, complete, details };
+    },
+
+    async getCheckRunDiagnostics(repo, checkRunId, o = {}) {
+      const problems: string[] = [];
+      const annotations: CheckAnnotation[] = [];
+      try {
+        const res = await request<Array<{ path?: string; start_line?: number | null; annotation_level?: string; message?: string; title?: string | null }>>(
+          `${repoPath(repo)}/check-runs/${checkRunId}/annotations`,
+          { query: { per_page: 50 } },
+        );
+        for (const a of res.data ?? []) {
+          annotations.push({ path: a.path ?? '', line: a.start_line ?? null, level: a.annotation_level ?? 'failure', message: a.message ?? '', title: a.title ?? null });
+        }
+      } catch (err) {
+        if (isTransientGitHubError(err)) throw err;
+        problems.push(`the annotations could not be read: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // For a GitHub Actions check run the check run id is its job's id. The logs endpoint answers
+      // with a redirect to a short-lived download URL; that URL carries its own authorization, so
+      // it is fetched without the token, which never leaves for another host.
+      let logTail: string | null = null;
+      const maxBytes = o.maxLogBytes ?? 64_000;
+      try {
+        const url = buildUrl(`${repoPath(repo)}/actions/jobs/${checkRunId}/logs`);
+        const token = await credentials.token(repo.fullName);
+        let res: Response;
+        try {
+          res = await doFetch(url, {
+            method: 'GET',
+            redirect: 'manual',
+            headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': API_VERSION, 'User-Agent': USER_AGENT, Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+        } catch (err) {
+          throw networkError('GET', url.replace(baseUrl, ''), err, timeoutMs, token);
+        }
+        const location = res.headers.get('location');
+        if (res.status >= 300 && res.status < 400 && location && /^https:\/\//.test(location)) {
+          const blob = await doFetch(location, { method: 'GET', headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(timeoutMs) });
+          if (blob.ok) {
+            const text = await blob.text();
+            logTail = text.length > maxBytes ? text.slice(text.length - maxBytes) : text;
+          } else {
+            problems.push(`the job log could not be downloaded (${blob.status})`);
+          }
+        } else if (res.ok) {
+          const text = await res.text();
+          logTail = text.length > maxBytes ? text.slice(text.length - maxBytes) : text;
+        } else if (res.status === 404 || res.status === 410) {
+          problems.push('there is no GitHub Actions log for this check (it is not an Actions job, or the log expired)');
+        } else {
+          problems.push(`the job log could not be read (${res.status}${res.status === 403 ? ': the token needs Actions: read' : ''})`);
+        }
+      } catch (err) {
+        if (isTransientGitHubError(err)) throw err;
+        problems.push(`the job log could not be read: ${redactGitHubSecrets(err instanceof Error ? err.message : String(err))}`);
+      }
+      return { annotations, logTail, problems };
     },
 
     async mergePullRequest(repo, pullNumber, input) {

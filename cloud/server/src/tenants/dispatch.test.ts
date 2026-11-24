@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideDispatch, decidePullRequestDispatch, dispatchRules } from './dispatch.js';
+import { decideDispatch, decidePullRequestDispatch, dispatchRules, pullRequestOfPayload } from './dispatch.js';
 
 const compiled = {
   dispatch: { allowedActors: ['Pat', 'sam'] },
@@ -111,6 +111,31 @@ describe('decidePullRequestDispatch', () => {
     expect(code({ repositoryFullName: 'acme/review-only', repositoryId: 10 })).toBe('loop_off');
     expect(code({ repositoryFullName: 'acme/review-only', repositoryId: 10, eventName: 'pull_request', action: 'synchronize' })).toBe('start');
     expect(code({ repositoryFullName: 'acme/off', repositoryId: 11, eventName: 'pull_request', action: 'closed' })).toBe('loop_off');
+  });
+
+  it('starts a job for a finished check suite when ciFix is on, whoever pushed the commit', () => {
+    const withCi = dispatchRules({
+      dispatch: { allowedActors: ['Pat'] },
+      repositories: {
+        'acme/web': { id: 9, review: true, revise: true, ciFix: { ignore: ['preview'] }, workflows: [{ trigger: { label: 'updraft' } }] },
+        'acme/no-review': { id: 12, ciFix: true, workflows: [{ trigger: { label: 'updraft' } }] },
+      },
+    });
+    expect(withCi.repositories['acme/web']).toMatchObject({ ci: true });
+    expect(withCi.repositories['acme/no-review']?.ci).toBeUndefined();
+    const suite = { ...review(), eventName: 'check_suite', action: 'completed', reviewState: undefined };
+    expect(decidePullRequestDispatch(withCi, { ...suite, sender: 'updraft[bot]' }, { appBot: 'updraft[bot]' })).toMatchObject({ start: true, pullRequest: 12, closing: false });
+    expect(decidePullRequestDispatch(withCi, { ...suite, sender: 'stranger' })).toMatchObject({ start: true });
+    expect(decidePullRequestDispatch(withCi, { ...suite, action: 'requested' })).toMatchObject({ start: false, code: 'event_not_accepted' });
+    // ciFix off (rules without it): a check suite leads to no work.
+    expect(decidePullRequestDispatch(rules, suite)).toMatchObject({ start: false, code: 'loop_off' });
+    expect(decidePullRequestDispatch(withCi, { ...suite, headRef: 'feature/x' })).toMatchObject({ start: false, code: 'not_updraft_pr' });
+  });
+
+  it('finds the pull request of a check suite in its payload', () => {
+    expect(pullRequestOfPayload('check_suite', { check_suite: { head_branch: 'updraft/x', pull_requests: [{ number: 5, head: { ref: 'updraft/y' } }] } })).toEqual({ number: 5, headRef: 'updraft/y' });
+    expect(pullRequestOfPayload('check_suite', { check_suite: { head_branch: 'updraft/x', pull_requests: [] } })).toEqual({ number: undefined, headRef: 'updraft/x' });
+    expect(pullRequestOfPayload('pull_request', { pull_request: { number: 7, head: { ref: 'updraft/z' } } })).toEqual({ number: 7, headRef: 'updraft/z' });
   });
 
   it('asks for a publish when the rules predate the loop, and honors a pause', () => {

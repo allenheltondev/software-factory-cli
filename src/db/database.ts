@@ -25,7 +25,7 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 /** The schema version that added dependency_waits (docs/dependencies.md). */
 export const DEPENDENCIES_SCHEMA_VERSION = 17;
@@ -609,7 +609,40 @@ const MIGRATIONS: Record<number, Migration> = {
     CREATE INDEX IF NOT EXISTS dependency_waits_by_state ON dependency_waits (state, next_check_at);
     CREATE INDEX IF NOT EXISTS dependency_waits_by_job ON dependency_waits (job_id);
   `,
+  // The CI step of the review loop (repositories.<repo>.ciFix, docs/ci-fix.md): what GitHub's
+  // checks say about the head in ci_sha, once that head has a ready-to-merge verdict. On the PR's
+  // row, like the merge, so it survives "updraft clean --older-than" and is merged with it.
+  // ci_state: waiting (checks pending or not registered yet), passed (the applicable checks
+  // hold), fixing (a failure queued the revision in ci_fix_job_id), blocked (a person has to act,
+  // see ci_reason; final for that head); NULL: not looked at yet. Each column only if missing: a
+  // database taken back to an older user_version by hand keeps them.
+  18: (db) => {
+    const have = new Set((db.prepare('PRAGMA table_info(revision_prs)').all() as { name: string }[]).map((c) => c.name));
+    for (const [name, decl] of CI_COLUMNS) if (!have.has(name)) db.exec(`ALTER TABLE revision_prs ADD COLUMN ${name} ${decl}`);
+  },
 };
+
+/** Migration 18's columns of revision_prs. */
+const CI_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ['ci_state', "TEXT CHECK (ci_state IN ('waiting','passed','fixing','blocked'))"],
+  ['ci_sha', 'TEXT'],
+  ['ci_reason', 'TEXT'],
+  ['ci_wait_started_at', 'TEXT'],
+  ['ci_checked_at', 'TEXT'],
+  // what failed on ci_sha, as a digest
+  ['ci_signature', 'TEXT'],
+  // the revision a failure on ci_sha queued
+  ['ci_fix_job_id', 'TEXT'],
+  // CI-fix revisions the PR was given
+  ['ci_fixes', 'INTEGER NOT NULL DEFAULT 0'],
+  // the failure the newest CI fix was for: the same one again is no progress
+  ['ci_last_fix_signature', 'TEXT'],
+  // the head the one CI comment on the PR is about (src/publish/ci.ts)
+  ['ci_comment_sha', 'TEXT'],
+  ['ci_comment_id', 'INTEGER'],
+  ['ci_comment_url', 'TEXT'],
+  ['ci_comment_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+];
 
 /**
  * v4: derive jobs.start_failures from run history the way v3 computed the streak:

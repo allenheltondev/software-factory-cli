@@ -87,7 +87,7 @@ describe('createGitHubApi: the review loop', () => {
       fakeFetch((url) => (url.pathname.endsWith('/status') ? json({ state: 'pending', total_count: statuses.length, statuses }) : json({ total_count: runs.length, check_runs: runs })));
     const none = answer([], []);
     const api = await createGitHubApi({ token: 't', fetch: none.fn });
-    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 0, failing: [], pending: [], succeeded: [], complete: true });
+    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 0, failing: [], pending: [], succeeded: [], complete: true, details: [] });
     expect(none.calls.map((c) => c.url)).toEqual([
       `https://api.github.com/repositories/42/commits/${SHA}/status?per_page=100`,
       `https://api.github.com/repositories/42/commits/${SHA}/check-runs?per_page=100`,
@@ -112,7 +112,7 @@ describe('createGitHubApi: the review loop', () => {
         { name: 'later', status: 'queued', conclusion: null },
       ],
     );
-    expect(await (await createGitHubApi({ token: 't', fetch: mixed.fn })).getCommitChecks(repo, SHA)).toEqual({
+    expect(await (await createGitHubApi({ token: 't', fetch: mixed.fn })).getCommitChecks(repo, SHA)).toMatchObject({
       total: 13,
       failing: ['ci/red', 'ci/err', 'test', 'e2e', 'slow', 'gate'],
       pending: ['ci/wait', 'deploy', 'later'],
@@ -120,6 +120,64 @@ describe('createGitHubApi: the review loop', () => {
       succeeded: ['ci/ok', 'build'],
       complete: true,
     });
+  });
+
+  it('reports each check with its outcome, conclusion, link and check run id, for the CI step', async () => {
+    const { fn } = fakeFetch((url) =>
+      url.pathname.endsWith('/status')
+        ? json({ total_count: 1, statuses: [{ context: 'ext/ci', state: 'error', target_url: 'https://ci.example/1', description: 'agent lost' }] })
+        : json({
+            total_count: 3,
+            check_runs: [
+              { id: 7, name: 'test', status: 'completed', conclusion: 'failure', html_url: 'https://github.com/o/r/runs/7', app: { slug: 'github-actions' }, output: { title: '2 failed', summary: 'see log' } },
+              { id: 8, name: 'docs', status: 'completed', conclusion: 'skipped', html_url: null, details_url: 'https://d/8' },
+              { id: 9, name: 'e2e', status: 'in_progress', conclusion: null },
+            ],
+          }),
+    );
+    const checks = await (await createGitHubApi({ token: 't', fetch: fn })).getCommitChecks(repo, SHA);
+    expect(checks.details).toEqual([
+      { kind: 'status', name: 'ext/ci', outcome: 'failure', conclusion: 'error', url: 'https://ci.example/1', summary: 'agent lost' },
+      { kind: 'check-run', name: 'test', outcome: 'failure', conclusion: 'failure', url: 'https://github.com/o/r/runs/7', checkRunId: 7, app: 'github-actions', summary: '2 failed\nsee log' },
+      { kind: 'check-run', name: 'docs', outcome: 'skipped', conclusion: 'skipped', url: 'https://d/8', checkRunId: 8, app: null },
+      { kind: 'check-run', name: 'e2e', outcome: 'pending', conclusion: null, url: null, checkRunId: 9, app: null },
+    ]);
+  });
+
+  it('reads a failed check run\'s annotations and the end of its job log, sending the token only to the API', async () => {
+    const seen: Array<{ url: string; auth: string | null; redirect: string | undefined }> = [];
+    const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      seen.push({ url: url.toString(), auth: new Headers(init?.headers).get('authorization'), redirect: init?.redirect });
+      if (url.pathname.endsWith('/annotations')) return json([{ path: 'src/a.ts', start_line: 3, annotation_level: 'failure', message: 'expected 1 to be 2', title: 'a.test.ts' }]);
+      if (url.pathname.endsWith('/logs')) return new Response(null, { status: 302, headers: { location: 'https://blob.example/log?sig=x' } });
+      return new Response(`${'x\n'.repeat(10)}2026-01-01T00:00:00.0000000Z ##[error]Process completed with exit code 1.`, { status: 200 });
+    }) as typeof fetch;
+    const api = await createGitHubApi({ token: 'secret-token', fetch: fn });
+    const d = await api.getCheckRunDiagnostics(repo, 7, { maxLogBytes: 70 });
+    expect(d.annotations).toEqual([{ path: 'src/a.ts', line: 3, level: 'failure', message: 'expected 1 to be 2', title: 'a.test.ts' }]);
+    expect(d.logTail).toMatch(/##\[error\]Process completed with exit code 1\.$/);
+    expect(d.logTail!.length).toBeLessThanOrEqual(70);
+    expect(d.problems).toEqual([]);
+    expect(seen.map((c) => [c.url, c.auth])).toEqual([
+      ['https://api.github.com/repositories/42/check-runs/7/annotations?per_page=50', 'Bearer secret-token'],
+      ['https://api.github.com/repositories/42/actions/jobs/7/logs', 'Bearer secret-token'],
+      ['https://blob.example/log?sig=x', null],
+    ]);
+    expect(seen[1]!.redirect).toBe('manual');
+
+    // Not an Actions job (or its log expired), and annotations it may not read: said, not thrown.
+    const none = await (
+      await createGitHubApi({ token: 't', fetch: fakeFetch((url) => (url.pathname.endsWith('/annotations') ? json({ message: 'Forbidden' }, { status: 403 }) : json({ message: 'Not Found' }, { status: 404 }))).fn })
+    ).getCheckRunDiagnostics(repo, 8);
+    expect(none.annotations).toEqual([]);
+    expect(none.logTail).toBeNull();
+    expect(none.problems).toEqual([expect.stringMatching(/annotations could not be read/), expect.stringMatching(/no GitHub Actions log/)]);
+
+    // An outage is not a missing diagnostic: it is thrown, and the step is taken again later.
+    await expect(
+      (await createGitHubApi({ token: 't', fetch: fakeFetch(() => json({ message: 'down' }, { status: 502 })).fn })).getCheckRunDiagnostics(repo, 9),
+    ).rejects.toMatchObject({ status: 502 });
   });
 
   it('reads every page of statuses and check runs, so a failure on a later page is seen', async () => {
@@ -137,7 +195,7 @@ describe('createGitHubApi: the review loop', () => {
         : json({ total_count: 2, check_runs: [{ name: 'late', status: 'in_progress', conclusion: null }] });
     });
     const api = await createGitHubApi({ token: 't', fetch: fn });
-    expect(await api.getCommitChecks(repo, SHA)).toEqual({ total: 4, failing: ['ci/late-red'], pending: ['late'], succeeded: ['ci/ok', 'build'], complete: true });
+    expect(await api.getCommitChecks(repo, SHA)).toMatchObject({ total: 4, failing: ['ci/late-red'], pending: ['late'], succeeded: ['ci/ok', 'build'], complete: true });
     expect(calls.map((c) => new URL(c.url).pathname.split('/').pop() + new URL(c.url).search)).toEqual([
       'status?per_page=100',
       'status?per_page=100&page=2',
@@ -151,7 +209,7 @@ describe('createGitHubApi: the review loop', () => {
     const short = fakeFetch((url) =>
       url.pathname.endsWith('/status') ? json({ total_count: 3, statuses: [{ context: 'ci/ok', state: 'success' }] }) : json({ total_count: 0, check_runs: [] }),
     );
-    expect(await (await createGitHubApi({ token: 't', fetch: short.fn })).getCommitChecks(repo, SHA)).toEqual({ total: 1, failing: [], pending: [], succeeded: ['ci/ok'], complete: false });
+    expect(await (await createGitHubApi({ token: 't', fetch: short.fn })).getCommitChecks(repo, SHA)).toMatchObject({ total: 1, failing: [], pending: [], succeeded: ['ci/ok'], complete: false });
 
     const fewerRuns = fakeFetch((url) =>
       url.pathname.endsWith('/status') ? json({ total_count: 0, statuses: [] }) : json({ total_count: 5, check_runs: [{ name: 'build', status: 'completed', conclusion: 'success' }] }),
