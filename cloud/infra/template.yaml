@@ -207,6 +207,12 @@ Resources:
               - lambda:CreateMicrovmAuthToken
               - lambda:TerminateMicrovm
             Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt ManagedClaudeExecutionRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: lambda.amazonaws.com
 
   ManagedClaudeControlSecret:
     Type: AWS::SecretsManager::Secret
@@ -219,7 +225,7 @@ Resources:
 
   ManagedClaudeExecutionRole:
     Type: AWS::IAM::Role
-    Condition: ManagedClaude
+    # Provision before activation so the image smoke test uses the tenant runtime role.
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -236,6 +242,14 @@ Resources:
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !GetAtt BrokerFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}:*
 
   ManagedClaudeWebhookName:
     Type: AWS::SSM::Parameter
@@ -397,6 +411,7 @@ Resources:
           NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
           NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
           NATIVE_MANAGED_ROLE_ARN: !If [ManagedClaude, !GetAtt ManagedClaudeExecutionRole.Arn, ""]
+          NATIVE_MANAGED_LOG_GROUP: !If [ManagedClaude, !Ref MicrovmLogGroup, ""]
           BROKER_FUNCTION_NAME: !Ref BrokerFunction
           NATIVE_WORKER_LOGIN_IMAGE_ARN: !If [NativeWorkerBrowserLogin, !Ref NativeWorkerImageArn, ""]
           # Tenant config bundles: the console publishes them (tenants/config-service.ts).
@@ -1197,6 +1212,9 @@ Outputs:
   MicrovmExecutionRoleArn:
     Description: The one execution role of every job microVM (it reaches no tenant's data itself)
     Value: !GetAtt MicrovmExecutionRole.Arn
+  ManagedClaudeExecutionRoleArn:
+    Description: Execution role used by managed Claude sessions and the Claude release smoke test
+    Value: !GetAtt ManagedClaudeExecutionRole.Arn
   JobImageName:
     Description: The MicroVM image jobs run (server/scripts/build-job-image.ts builds it)
     Value: !Sub ${AWS::StackName}-job

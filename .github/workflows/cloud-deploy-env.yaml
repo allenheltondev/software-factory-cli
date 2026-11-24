@@ -8,6 +8,7 @@ name: Deploy Updraft Cloud (one environment)
 # One-time setup per GitHub environment (Settings > Environments):
 #   secret   AWS_DEPLOYMENT_ROLE_ARN   an IAM role this repo may assume through GitHub OIDC
 #   variable HOSTED_ZONE_ID        Production only: the readysetcloud.io Route 53 hosted zone id
+#   variable ENABLE_MANAGED_CLAUDE Production only: explicit opt-in for the owner pilot
 # Until the secret exists the job skips with a notice instead of failing.
 
 on:
@@ -290,12 +291,12 @@ jobs:
         run: echo "Claude subscription image verified ($VERIFIED_VERSION)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: aws-actions/setup-sam@v3
-        if: steps.claude.outputs.version != '' && inputs.deploy_claude
+        if: steps.claude.outputs.version != '' && (inputs.deploy_claude || (inputs.environment == 'Production' && vars.ENABLE_MANAGED_CLAUDE == 'true'))
         with:
           use-installer: true
 
       - name: Deploy the verified Claude subscription image
-        if: steps.claude.outputs.version != '' && inputs.deploy_claude
+        if: steps.claude.outputs.version != '' && (inputs.deploy_claude || (inputs.environment == 'Production' && vars.ENABLE_MANAGED_CLAUDE == 'true'))
         working-directory: cloud
         env:
           VERIFIED_VERSION: ${{ steps.claude.outputs.version }}

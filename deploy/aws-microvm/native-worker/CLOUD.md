@@ -10,8 +10,9 @@ still apply. Local regression tests are not evidence of an AWS subscription exec
 The Cloud release workflow builds and publishes a dedicated image in each environment.
 It checks a signed-out AWS worker for an official Claude sign-in link and confirms that
 the browser grant cannot reach the lifecycle port. A failed check leaves the deployed
-image version as it was. Staging and Production deploy verified images automatically.
-The production owner can opt their own installation into the pilot from the console.
+image version as it was. Staging deploys verified images automatically. To authorize a
+Production pilot, set `ENABLE_MANAGED_CLAUDE=true` in the Production GitHub environment and
+run the Production deploy workflow. The production owner then selects pilot triggers in the console.
 Other installations need to opt in separately. Track broader rollout in #100.
 The workflow passes the verified version to CloudFormation as `ManagedClaudeImageVersion`.
 To run the same build and smoke test without enabling routing, use

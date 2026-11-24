@@ -86,6 +86,7 @@ async function main() {
     if (!outputs[name]) throw new Error(`stack ${values.stack} has no ${name} output; deploy it first`);
   }
   const native = values['native-claude'];
+  if (native && !outputs.ManagedClaudeExecutionRoleArn) throw new Error('stack has no ManagedClaudeExecutionRoleArn output; deploy the stack first');
   const parameter = (name: string) => deployed?.Parameters?.find((p) => p.ParameterKey === name)?.ParameterValue;
   const imageName = native ? parameter('ManagedClaudeImageName') : outputs.JobImageName;
   if (!imageName) throw new Error('stack has no image name');
@@ -105,7 +106,7 @@ async function main() {
 
   async function verifyNative(version: string) {
     await checkNativeClaudeImage(microvms, {
-      imageArn, version, region, executionRoleArn: outputs.MicrovmExecutionRoleArn!,
+      imageArn, version, region, executionRoleArn: outputs.ManagedClaudeExecutionRoleArn!,
       logGroup: outputs.MicrovmLogGroup!, brokerFunctionName: outputs.BrokerFunctionName!,
     });
     console.log(`==> Claude worker version ${version} passed the AWS sign-in smoke test`);

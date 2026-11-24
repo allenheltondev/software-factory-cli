@@ -40,5 +40,4 @@ jobs:
       environment: Production
       domain: updraft.readysetcloud.io
       build_image: ${{ inputs.build_image == true }}
-      deploy_claude: true
     secrets: inherit
