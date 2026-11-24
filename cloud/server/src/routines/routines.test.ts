@@ -108,7 +108,7 @@ describe('Claude Code scheduled-task API triggers', () => {
 
   it('requires installation membership and never returns a stored token', async () => {
     const rules = memoryRules();
-    const secrets = { put: vi.fn(), remove: vi.fn() };
+    const secrets = { put: vi.fn().mockResolvedValue(undefined), remove: vi.fn().mockResolvedValue(undefined) };
     const service = createRoutineService({
       rules, secrets, store: { getTenant: async () => ({ status: 'active' }) } as never,
       github: {
