@@ -46,6 +46,34 @@ const KNOWN_PROGRAMS = new Set([
   ...OTHER_KNOWN,
 ]);
 
+/** The Updraft MCP server's shell tool: a transport for a shell command, observed as the command. */
+const SHELL_MCP_TOOLS = new Set(['mcp__updraft__exec']);
+export const isShellTool = (name) => name === 'Bash' || SHELL_MCP_TOOLS.has(name);
+
+/** Subcommands that may be named after a program: a fixed, small set, so names stay low-cardinality. */
+const GIT_OPERATIONS = new Set(['status', 'diff', 'log', 'show', 'add', 'commit', 'branch', 'checkout', 'switch', 'push', 'pull', 'fetch', 'merge', 'rebase', 'stash', 'reset', 'restore', 'clone', 'rev-parse', 'blame']);
+const PACKAGE_OPERATIONS = new Set(['test', 'install', 'ci', 'build', 'lint', 'typecheck', 'format']);
+const MAX_OPERATIONS = 3;
+
+/** One simple command as a short name: a known program, plus an allowlisted subcommand right after it. */
+function operationLabel(program, args) {
+  const sub = args[0];
+  if (program === 'git' && GIT_OPERATIONS.has(sub)) return `git ${sub}`;
+  if (PACKAGE_MANAGERS.has(program)) {
+    const script = sub === 'run' || sub === 'run-script' ? args[1] : sub;
+    if (PACKAGE_OPERATIONS.has(script)) return `${program} ${script}`;
+  }
+  return program;
+}
+
+/** The span-name suffix for a described command: up to three recognized operations, else null. */
+export function operationName(d) {
+  const ops = d?.operations ?? [];
+  if (!ops.length) return null;
+  const unique = [...new Set(ops)];
+  return unique.slice(0, MAX_OPERATIONS).join(' / ') + (unique.length > MAX_OPERATIONS ? ' / …' : '');
+}
+
 const TEST_WORD = /^(test|tests|t|tst|spec|specs|e2e|unit|integration)(:|$)|^test[:_-]|[:_-]test$|^(vitest|jest|mocha|pytest|playwright|cypress)$/;
 const LINT_WORD = /^(lint|typecheck|type-check|types|check|format|fmt|prettier|eslint|stylelint)(:|$)|^lint[:_-]|[:_-]lint$/;
 const BUILD_WORD = /^(build|compile|bundle|package|dist)(:|$)|^build[:_-]/;
@@ -212,10 +240,12 @@ export function describeCommand(command, depth = 0) {
   const commands = splitShell(command);
   if (!commands) return null;
   const programs = [];
+  const operations = [];
   let category = null;
   let unknown = 0;
-  const add = (program, c) => {
+  const add = (program, c, label = program) => {
     programs.push(program);
+    operations.push(label);
     if (category === null || rank(c) < rank(category)) category = c;
   };
   for (const tokens of commands) {
@@ -262,6 +292,7 @@ export function describeCommand(command, depth = 0) {
         if (!inner) return null;
         unknown += inner.unknown ?? 0;
         for (const p of inner.programs) programs.push(p);
+        for (const o of inner.operations) operations.push(o);
         if (category === null || rank(inner.category) < rank(category)) category = inner.category;
         continue;
       }
@@ -271,10 +302,10 @@ export function describeCommand(command, depth = 0) {
       unknown += 1;
       continue;
     }
-    add(program, categorize(program, tokens.slice(i + 1)));
+    add(program, categorize(program, tokens.slice(i + 1)), operationLabel(program, tokens.slice(i + 1)));
   }
-  if (!programs.length) return unknown ? { program: undefined, programs: [], category: 'other', unknown } : null;
-  return { program: programs[0], programs: [...new Set(programs)].slice(0, 16), category: category ?? 'other', ...(unknown ? { unknown } : {}) };
+  if (!programs.length) return unknown ? { program: undefined, programs: [], operations: [], category: 'other', unknown } : null;
+  return { program: programs[0], programs: [...new Set(programs)].slice(0, 16), operations: operations.slice(0, 16), category: category ?? 'other', ...(unknown ? { unknown } : {}) };
 }
 
 /** A path as recorded: relative to the first root it is under, else as given; cut to 512 characters. */
@@ -381,9 +412,11 @@ function globExtension(glob) {
 export function claudeToolAttributes(name, input, roots) {
   const a = {};
   const i = input && typeof input === 'object' ? input : {};
-  if (name === 'Bash') {
+  if (isShellTool(name)) {
     const d = describeCommand(i.command);
     Object.assign(a, commandAttributes(d));
+    const op = name === 'Bash' ? null : operationName(d);
+    if (op) a['updraft.tool.operation'] = op;
     if (i.run_in_background === true) a['updraft.tool.background'] = true;
     if (typeof i.timeout === 'number') a['updraft.tool.timeout_ms'] = i.timeout;
   } else if (name === 'Edit') {
@@ -431,6 +464,11 @@ export function resultAttributes(category, name, text, failed, programs = []) {
   if ((name === 'Grep' || name === 'Glob') && !failed) a['updraft.tool.search.results'] = /^(No (files|matches) found|Found 0 )/.test(out.trim()) ? 0 : lineCount(out.trim());
   if (failed) {
     const code = /^Exit code (\d+)/.exec(out);
+    if (code) a['updraft.tool.exit_code'] = Number(code[1]);
+  }
+  if (isShellTool(name) && name !== 'Bash') {
+    // The exec tool ends its output with "exit=<n>"; without it the status is unknown, not success.
+    const code = /(?:^|\n)exit=(\d+)\s*$/.exec(out);
     if (code) a['updraft.tool.exit_code'] = Number(code[1]);
   }
   if (category === 'test' || category === 'lint' || category === 'build') Object.assign(a, testAttributes(parseTestOutput(out)), checkAttributes(parseCheckOutput(out, programs)));

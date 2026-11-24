@@ -33,6 +33,7 @@ import { StringDecoder } from 'node:string_decoder';
 import {
   checkAttributes,
   claudeToolAttributes,
+  isShellTool,
   codexTodoAttributes,
   codexToolAttributes,
   describeCommand,
@@ -831,7 +832,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
             traceId,
             spanId: newSpanId(),
             parentSpanId: ctx.span.spanId,
-            name: `execute_tool ${block.name}`,
+            name: `execute_tool ${detail['updraft.tool.operation'] ?? block.name}`,
             kind: KIND_INTERNAL,
             start: at,
             attributes: {
@@ -868,7 +869,9 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
           tool.span.attributes['error.type'] = 'tool_error';
           summary.toolErrors += 1;
         } else tool.span.attributes['gen_ai.tool.call.result'] = content(text);
-        behavior.tool({ category: tool.category, name: tool.name, attrs: tool.span.attributes, command: tool.name === 'Bash' ? tool.input.command : undefined, failed, start: tool.span.start, end: at });
+        // A shell command through the MCP exec tool failed when it exited non-zero, too.
+        const exited = tool.name !== 'Bash' && isShellTool(tool.name) && (tool.span.attributes['updraft.tool.exit_code'] ?? 0) > 0;
+        behavior.tool({ category: tool.category, name: tool.name, attrs: tool.span.attributes, command: isShellTool(tool.name) ? tool.input.command : undefined, failed: failed || exited, start: tool.span.start, end: at });
         // The subagent this tool ran, if any, ends with it.
         const sub = contexts.get(block.tool_use_id);
         if (sub) {

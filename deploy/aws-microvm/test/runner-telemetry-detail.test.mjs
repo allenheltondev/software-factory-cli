@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { claudeToolAttributes, codexToolAttributes, describeCommand, isTestPath, lineCount, parseCheckOutput, parseTestOutput, relativePath, resultAttributes } from '../image/runner/telemetry-detail.mjs';
+import { operationName, claudeToolAttributes, codexToolAttributes, describeCommand, isTestPath, lineCount, parseCheckOutput, parseTestOutput, relativePath, resultAttributes } from '../image/runner/telemetry-detail.mjs';
 
 /** A Bash call's command attributes. */
 const commandAttributesOf = (command) => Object.fromEntries(Object.entries(claudeToolAttributes('Bash', { command }, [])).filter(([, v]) => v !== undefined));
@@ -35,40 +35,40 @@ describe('describeCommand', () => {
   });
 
   it('lists every program, never arguments, and refuses what is not a command', () => {
-    expect(describeCommand('git add -A && git commit -m "secret message" && npm test')).toEqual({ program: 'git', programs: ['git', 'npm'], category: 'test' });
+    expect(describeCommand('git add -A && git commit -m "secret message" && npm test')).toEqual({ program: 'git', programs: ['git', 'npm'], operations: ['git add', 'git commit', 'npm test'], category: 'test' });
     expect(describeCommand('')).toBeNull();
     expect(describeCommand('cd /tmp')).toBeNull();
     expect(describeCommand(42)).toBeNull();
   });
 
   it('never takes a word inside quotes for a program', () => {
-    expect(describeCommand("printf 'a; secretword --x' && npm test")).toEqual({ program: 'printf', programs: ['printf', 'npm'], category: 'test' });
-    expect(describeCommand('echo "x | hiddenprog; y" | wc -l')).toEqual({ program: 'echo', programs: ['echo', 'wc'], category: 'read' });
+    expect(describeCommand("printf 'a; secretword --x' && npm test")).toEqual({ program: 'printf', programs: ['printf', 'npm'], operations: ['printf', 'npm test'], category: 'test' });
+    expect(describeCommand('echo "x | hiddenprog; y" | wc -l')).toEqual({ program: 'echo', programs: ['echo', 'wc'], operations: ['echo', 'wc'], category: 'read' });
     expect(describeCommand('git commit -m a\\;b')).toMatchObject({ programs: ['git'] });
-    expect(describeCommand("bash -lc 'grep -r \"a;b\" src && npm test'")).toEqual({ program: 'grep', programs: ['grep', 'npm'], category: 'test' });
-    expect(describeCommand('npm test 2>&1 | tail -5')).toEqual({ program: 'npm', programs: ['npm', 'tail'], category: 'test' });
-    expect(describeCommand('ls # rm -rf; secretword')).toEqual({ program: 'ls', programs: ['ls'], category: 'search' });
+    expect(describeCommand("bash -lc 'grep -r \"a;b\" src && npm test'")).toEqual({ program: 'grep', programs: ['grep', 'npm'], operations: ['grep', 'npm test'], category: 'test' });
+    expect(describeCommand('npm test 2>&1 | tail -5')).toEqual({ program: 'npm', programs: ['npm', 'tail'], operations: ['npm test', 'tail'], category: 'test' });
+    expect(describeCommand('ls # rm -rf; secretword')).toEqual({ program: 'ls', programs: ['ls'], operations: ['ls'], category: 'search' });
   });
 
   it('names only well-known programs; anything else is counted', () => {
-    expect(describeCommand('some-tool --flag')).toEqual({ program: undefined, programs: [], category: 'other', unknown: 1 });
-    expect(describeCommand('./scripts/private_fixture_value.sh && npm test')).toEqual({ program: 'npm', programs: ['npm'], category: 'test', unknown: 1 });
+    expect(describeCommand('some-tool --flag')).toEqual({ program: undefined, programs: [], operations: [], category: 'other', unknown: 1 });
+    expect(describeCommand('./scripts/private_fixture_value.sh && npm test')).toEqual({ program: 'npm', programs: ['npm'], operations: ['npm test'], category: 'test', unknown: 1 });
     expect(describeCommand('env -u private_fixture_value npm test')).toMatchObject({ programs: [], unknown: 1 });
     expect(commandAttributesOf('some-tool --flag')).toEqual({ 'updraft.tool.command.unknown_programs': 1, 'updraft.tool.command.category': 'other', 'updraft.tool.category': 'other' });
   });
 
   it('keeps a conditional or arithmetic expression whole', () => {
     const cond = '[[ "$stage" == ready && "private_fixture_value" == "$stage" ]] && npm test';
-    expect(describeCommand(cond)).toEqual({ program: 'npm', programs: ['npm'], category: 'test' });
-    expect(describeCommand('[[ -f a || ( -d b ) ]] && make test')).toEqual({ program: 'make', programs: ['make'], category: 'test' });
-    expect(describeCommand('(( n > 1 && private_fixture_value < 3 )) && git status')).toEqual({ program: 'git', programs: ['git'], category: 'git' });
+    expect(describeCommand(cond)).toEqual({ program: 'npm', programs: ['npm'], operations: ['npm test'], category: 'test' });
+    expect(describeCommand('[[ -f a || ( -d b ) ]] && make test')).toEqual({ program: 'make', programs: ['make'], operations: ['make'], category: 'test' });
+    expect(describeCommand('(( n > 1 && private_fixture_value < 3 )) && git status')).toEqual({ program: 'git', programs: ['git'], operations: ['git status'], category: 'git' });
     expect(describeCommand('[[ -f a && private_fixture_value')).toBeNull();
   });
 
   it("reads a shell's -c only among its own options, before its first operand", () => {
-    expect(describeCommand("bash ./check.sh -c 'private_script_argument'")).toEqual({ program: 'bash', programs: ['bash'], category: 'run' });
-    expect(describeCommand("bash -e -o pipefail -c 'npm test'")).toEqual({ program: 'npm', programs: ['npm'], category: 'test' });
-    expect(describeCommand("sh -- -c 'private_script_argument'")).toEqual({ program: 'sh', programs: ['sh'], category: 'run' });
+    expect(describeCommand("bash ./check.sh -c 'private_script_argument'")).toEqual({ program: 'bash', programs: ['bash'], operations: ['bash'], category: 'run' });
+    expect(describeCommand("bash -e -o pipefail -c 'npm test'")).toEqual({ program: 'npm', programs: ['npm'], operations: ['npm test'], category: 'test' });
+    expect(describeCommand("sh -- -c 'private_script_argument'")).toEqual({ program: 'sh', programs: ['sh'], operations: ['sh'], category: 'run' });
   });
 
   it('never exports an unusual word, whatever the command (content off)', () => {
@@ -208,5 +208,34 @@ describe('test runner output', () => {
     expect(parseCheckOutput('Found 4 errors in 2 files.\n', ['tsc'])).toEqual({ tool: 'tsc', errors: 4, warnings: 0 });
     expect(parseCheckOutput('All checks passed!\n', ['ruff'])).toEqual({ tool: 'ruff', errors: 0, warnings: 0 });
     expect(parseCheckOutput('Found 4 errors in 2 files.\n')).toEqual({ tool: 'unknown', errors: 4, warnings: 0 });
+  });
+});
+
+describe('Updraft MCP exec', () => {
+  const opOf = (command) => claudeToolAttributes('mcp__updraft__exec', { command }, [])['updraft.tool.operation'];
+  it.each([
+    ['git status', 'git status'],
+    ['git diff HEAD~1', 'git diff'],
+    ['git -C /secret status', 'git'],
+    ['npm test', 'npm test'],
+    ['npm run build', 'npm build'],
+    ['npm run deploy-prod', 'npm'],
+    ['grep -r x . | grep y; sed s/a/b/ f; cat f', 'grep / sed / cat'],
+    ['./mystery --token=abc', undefined],
+    ['echo $(whoami)', undefined],
+    ["echo 'unterminated", undefined],
+    ['ls && cat a && head a && wc a', 'ls / cat / head / …'],
+  ])('%s -> %s', (command, op) => expect(opOf(command)).toBe(op));
+
+  it('classifies like Bash and leaves other MCP tools alone', () => {
+    expect(claudeToolAttributes('mcp__updraft__exec', { command: 'npm test' }, [])['updraft.tool.category']).toBe('test');
+    expect(claudeToolAttributes('mcp__other__exec', { command: 'npm test' }, [])['updraft.tool.category']).toBe('mcp');
+    expect(claudeToolAttributes('Bash', { command: 'git status' }, [])['updraft.tool.operation']).toBeUndefined();
+    expect(operationName(null)).toBeNull();
+  });
+
+  it('reads the exit status from the result, and leaves it unset when absent', () => {
+    expect(resultAttributes('git', 'mcp__updraft__exec', 'x\nexit=2', false)['updraft.tool.exit_code']).toBe(2);
+    expect(resultAttributes('git', 'mcp__updraft__exec', 'x', false)['updraft.tool.exit_code']).toBeUndefined();
   });
 });
