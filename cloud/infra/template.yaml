@@ -330,6 +330,8 @@ Resources:
             Action:
               - lambda:GetMicrovmImage
               - lambda:GetMicrovmImageVersion
+              - lambda:ListMicrovmImageVersions
+              - lambda:DeleteMicrovmImageVersion
               - lambda:TagResource
               - lambda:UpdateMicrovmImage
               - lambda:RunMicrovm
