@@ -4,6 +4,7 @@ import {
   AccessDeniedException,
   ConflictException,
   DeleteMicrovmImageVersionCommand,
+  GetMicrovmImageCommand,
   ListMicrovmImageVersionsCommand,
   ResourceNotFoundException,
   type LambdaMicrovmsClient,
@@ -12,6 +13,33 @@ import {
 
 /** How many of the newest versions a build leaves in place. */
 export const DEFAULT_KEEP_VERSIONS = 5;
+
+const BUSY_IMAGE_STATES = new Set(['CREATING', 'UPDATING', 'DELETING']);
+const SETTLE_TIMEOUT_MS = 10 * 60 * 1000;
+const SETTLE_POLL_MS = 5_000;
+
+/**
+ * Waits until the image is not changing. Deleting versions puts it in UPDATING for a while, and
+ * the API refuses an update or another delete until that is over ("Cannot update MicroVM Image in
+ * its current state").
+ */
+export async function waitForImageSettled(
+  microvms: LambdaMicrovmsClient,
+  imageArn: string,
+  options: { timeoutMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; log?: (line: string) => void } = {},
+): Promise<void> {
+  const { timeoutMs = SETTLE_TIMEOUT_MS, pollMs = SETTLE_POLL_MS, log = console.log } = options;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let waited = 0;
+  for (;;) {
+    const { state } = await microvms.send(new GetMicrovmImageCommand({ imageIdentifier: imageArn }));
+    if (!BUSY_IMAGE_STATES.has(state ?? '')) return;
+    if (waited >= timeoutMs) throw new Error(`the image is still ${state} after ${Math.round(timeoutMs / 60000)} minutes`);
+    if (waited === 0) log(`    waiting for the image to finish ${state?.toLowerCase()}`);
+    await sleep(pollMs);
+    waited += pollMs;
+  }
+}
 
 export interface PruneResult {
   deleted: string[];
@@ -46,11 +74,13 @@ export function versionsToDelete(versions: MicrovmImageVersionSummary[], keep: n
 export async function pruneImageVersions(
   microvms: LambdaMicrovmsClient,
   imageArn: string,
-  options: { keep?: number; protect?: Iterable<string | undefined>; log?: (line: string) => void } = {},
+  options: { keep?: number; protect?: Iterable<string | undefined>; log?: (line: string) => void; settle?: typeof waitForImageSettled } = {},
 ): Promise<PruneResult> {
   const log = options.log ?? console.log;
+  const settle = options.settle ?? waitForImageSettled;
   const result: PruneResult = { deleted: [], skipped: [] };
   const versions: MicrovmImageVersionSummary[] = [];
+  await settle(microvms, imageArn, { log });
   try {
     let nextToken: string | undefined;
     do {
@@ -85,6 +115,7 @@ export async function pruneImageVersions(
       throw error;
     }
   }
+  if (result.deleted.length) await settle(microvms, imageArn, { log });
   if (result.deleted.length) log(`==> deleted ${result.deleted.length} old image version${result.deleted.length === 1 ? '' : 's'}: ${result.deleted.join(', ')}`);
   return result;
 }
