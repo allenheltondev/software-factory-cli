@@ -235,8 +235,8 @@ describe('agent telemetry: Claude Code', () => {
     expect(one(spans, 'execute_tool mcp__github__search').attributes['updraft.tool.category']).toBe('mcp');
     for (const s of spans) expect(s.name).not.toMatch(/secret|TOKEN|sk-123|mystery|etc/);
     const agent = one(spans, 'invoke_agent claude-opus');
-    expect(agent.attributes['updraft.behavior.test_runs']).toBe(1);
-    expect(agent.attributes['updraft.behavior.test_runs_failed']).toBe(1);
+    expect(agent.attributes['updraft.agent.test_runs']).toBe(1);
+    expect(agent.attributes['updraft.agent.test_runs_failed']).toBe(1);
   });
 
   it('marks failures: a tool error, a failed run, a failed verify command', async () => {

@@ -35,40 +35,40 @@ describe('describeCommand', () => {
   });
 
   it('lists every program, never arguments, and refuses what is not a command', () => {
-    expect(describeCommand('git add -A && git commit -m "secret message" && npm test')).toEqual({ program: 'git', programs: ['git', 'npm'], category: 'test' });
+    expect(describeCommand('git add -A && git commit -m "secret message" && npm test')).toEqual({ program: 'git', programs: ['git', 'npm'], operations: ['git add', 'git commit', 'npm test'], category: 'test' });
     expect(describeCommand('')).toBeNull();
     expect(describeCommand('cd /tmp')).toBeNull();
     expect(describeCommand(42)).toBeNull();
   });
 
   it('never takes a word inside quotes for a program', () => {
-    expect(describeCommand("printf 'a; secretword --x' && npm test")).toEqual({ program: 'printf', programs: ['printf', 'npm'], category: 'test' });
-    expect(describeCommand('echo "x | hiddenprog; y" | wc -l')).toEqual({ program: 'echo', programs: ['echo', 'wc'], category: 'read' });
+    expect(describeCommand("printf 'a; secretword --x' && npm test")).toEqual({ program: 'printf', programs: ['printf', 'npm'], operations: ['printf', 'npm test'], category: 'test' });
+    expect(describeCommand('echo "x | hiddenprog; y" | wc -l')).toEqual({ program: 'echo', programs: ['echo', 'wc'], operations: ['echo', 'wc'], category: 'read' });
     expect(describeCommand('git commit -m a\\;b')).toMatchObject({ programs: ['git'] });
-    expect(describeCommand("bash -lc 'grep -r \"a;b\" src && npm test'")).toEqual({ program: 'grep', programs: ['grep', 'npm'], category: 'test' });
-    expect(describeCommand('npm test 2>&1 | tail -5')).toEqual({ program: 'npm', programs: ['npm', 'tail'], category: 'test' });
-    expect(describeCommand('ls # rm -rf; secretword')).toEqual({ program: 'ls', programs: ['ls'], category: 'search' });
+    expect(describeCommand("bash -lc 'grep -r \"a;b\" src && npm test'")).toEqual({ program: 'grep', programs: ['grep', 'npm'], operations: ['grep', 'npm test'], category: 'test' });
+    expect(describeCommand('npm test 2>&1 | tail -5')).toEqual({ program: 'npm', programs: ['npm', 'tail'], operations: ['npm test', 'tail'], category: 'test' });
+    expect(describeCommand('ls # rm -rf; secretword')).toEqual({ program: 'ls', programs: ['ls'], operations: ['ls'], category: 'search' });
   });
 
   it('names only well-known programs; anything else is counted', () => {
-    expect(describeCommand('some-tool --flag')).toEqual({ program: undefined, programs: [], category: 'other', unknown: 1 });
-    expect(describeCommand('./scripts/private_fixture_value.sh && npm test')).toEqual({ program: 'npm', programs: ['npm'], category: 'test', unknown: 1 });
+    expect(describeCommand('some-tool --flag')).toEqual({ program: undefined, programs: [], operations: [], category: 'other', unknown: 1 });
+    expect(describeCommand('./scripts/private_fixture_value.sh && npm test')).toEqual({ program: 'npm', programs: ['npm'], operations: ['npm test'], category: 'test', unknown: 1 });
     expect(describeCommand('env -u private_fixture_value npm test')).toMatchObject({ programs: [], unknown: 1 });
     expect(commandAttributesOf('some-tool --flag')).toEqual({ 'updraft.tool.command.unknown_programs': 1, 'updraft.tool.command.category': 'other', 'updraft.tool.category': 'other' });
   });
 
   it('keeps a conditional or arithmetic expression whole', () => {
     const cond = '[[ "$stage" == ready && "private_fixture_value" == "$stage" ]] && npm test';
-    expect(describeCommand(cond)).toEqual({ program: 'npm', programs: ['npm'], category: 'test' });
-    expect(describeCommand('[[ -f a || ( -d b ) ]] && make test')).toEqual({ program: 'make', programs: ['make'], category: 'test' });
-    expect(describeCommand('(( n > 1 && private_fixture_value < 3 )) && git status')).toEqual({ program: 'git', programs: ['git'], category: 'git' });
+    expect(describeCommand(cond)).toEqual({ program: 'npm', programs: ['npm'], operations: ['npm test'], category: 'test' });
+    expect(describeCommand('[[ -f a || ( -d b ) ]] && make test')).toEqual({ program: 'make', programs: ['make'], operations: ['make'], category: 'test' });
+    expect(describeCommand('(( n > 1 && private_fixture_value < 3 )) && git status')).toEqual({ program: 'git', programs: ['git'], operations: ['git status'], category: 'git' });
     expect(describeCommand('[[ -f a && private_fixture_value')).toBeNull();
   });
 
   it("reads a shell's -c only among its own options, before its first operand", () => {
-    expect(describeCommand("bash ./check.sh -c 'private_script_argument'")).toEqual({ program: 'bash', programs: ['bash'], category: 'run' });
-    expect(describeCommand("bash -e -o pipefail -c 'npm test'")).toEqual({ program: 'npm', programs: ['npm'], category: 'test' });
-    expect(describeCommand("sh -- -c 'private_script_argument'")).toEqual({ program: 'sh', programs: ['sh'], category: 'run' });
+    expect(describeCommand("bash ./check.sh -c 'private_script_argument'")).toEqual({ program: 'bash', programs: ['bash'], operations: ['bash'], category: 'run' });
+    expect(describeCommand("bash -e -o pipefail -c 'npm test'")).toEqual({ program: 'npm', programs: ['npm'], operations: ['npm test'], category: 'test' });
+    expect(describeCommand("sh -- -c 'private_script_argument'")).toEqual({ program: 'sh', programs: ['sh'], operations: ['sh'], category: 'run' });
   });
 
   it('never exports an unusual word, whatever the command (content off)', () => {
