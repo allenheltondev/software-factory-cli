@@ -173,9 +173,8 @@ The account's **default** EventBridge bus receives `source: updraft.cloud` and
 `detail-type: Job Finished` when a tenant job summary first moves to `finished`. Consumers in the
 account subscribe with a rule on the default bus matching that source and detail type, so they
 need no bus name, SSM lookup, or deploy order. `JobFinishedEventsFunction` reads the table stream
-(filtered to that transition) and puts the events. Failed batches are retried, bisected, and
-then sent to `JobEventsDeadLetterQueue`, which `JobEventsDeadLetterAlarm` watches. The
-infrastructure is always deployed and has no deploy flag.
+(filtered to that transition) and puts the events. The infrastructure is always deployed and
+has no deploy flag.
 
 Publishing is per tenant and off by default. After the installation opts in, a platform admin
 turns it on with `PUT /api/v1/admin/tenants/<installation-id>/job-finished-events` and
@@ -187,11 +186,36 @@ metadata. They exclude log contents and trace payloads. Changes within v1 are ad
 Consumers should deduplicate delivery attempts using `stack`, `tenantId` and `jobId`. A batch
 retry can deliver an event twice, and several Updraft stacks in one account share the default
 bus, told apart by `stack`. A later metadata update to an already finished job does not create
-a finish event. Events start from when the function is deployed (the stream is read from
-`LATEST`), so jobs that finished earlier are not sent.
+a finish event. The trigger reads the stream from `TRIM_HORIZON`. When the mapping is created or
+replaced, it re-reads up to the last 24 hours, so a job that finished during the cutover is sent
+rather than skipped. Expect duplicates at that point, which consumers deduplicate. Jobs older
+than the stream's 24 hours are not sent.
 Insights uses recorded response models while the source job summaries are retained for
 30 days. After a summary expires, historical groups use the configured model from the
 durable run history. Longer views can therefore include both attribution sources.
+
+#### Recovering failed events
+
+A batch that still fails after its retries (5, with the batch split in half each time) is
+written to `JobEventsFailureBucket` (stack output `JobEventsFailureBucketName`) as a failure
+record. Each record holds the full invocation payload, the stream records themselves, and is
+kept for 90 days. The table stream keeps records for only 24 hours, so this bucket, not the
+stream, is what makes a failure recoverable. Each new record also puts a pointer on
+`JobEventsDeadLetterQueue`, and `JobEventsDeadLetterAlarm` goes off when the queue holds any
+message.
+
+To replay one, after fixing the cause:
+
+```sh
+aws s3 cp "s3://$BUCKET/$KEY" record.json
+jq -r '.payload' record.json > batch.json   # the original {"Records": [...]} batch
+aws lambda invoke --function-name "$FUNCTION" --payload fileb://batch.json out.json
+```
+
+`$FUNCTION` is the stack output `JobFinishedEventsFunctionName`. The function re-checks each
+tenant's opt-in when it replays a record, and consumers deduplicate, so replaying a batch that
+was partly published is safe. Delete the queue message once the record is replayed. This
+procedure has not yet been exercised against a live failure.
 
 ### Mistral API pilot
 

@@ -187,11 +187,59 @@ Globals:
     Tracing: Active
 
 Resources:
+  # Where a batch of finished jobs goes when it could not be published after its retries.
+  # A stream trigger's SQS/SNS destination keeps only pointers into the stream, which DynamoDB
+  # trims after 24 hours; an S3 destination keeps the invocation's full payload (the stream
+  # records themselves), so a failure can be replayed long after (cloud/README.md, "Recovering
+  # failed events"). Kept 90 days.
+  JobEventsFailureBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: JobEventsDeadLetterQueuePolicy
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireFailedJobEvents
+            Status: Enabled
+            ExpirationInDays: 90
+      # Each failure record also drops a pointer on the queue below, which the alarm watches.
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt JobEventsDeadLetterQueue.Arn
+
+  # Pointers to failure records in JobEventsFailureBucket: the alarm's signal, not the data.
   JobEventsDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
+
+  JobEventsDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref JobEventsDeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # By account rather than bucket ARN: the bucket's notification needs this policy to
+          # exist first, so naming the bucket here would be a dependency cycle.
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt JobEventsDeadLetterQueue.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
 
   JobEventsDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -225,14 +273,19 @@ Resources:
           Type: DynamoDB
           Properties:
             Stream: !GetAtt UpdraftTable.StreamArn
-            StartingPosition: LATEST
+            # TRIM_HORIZON, not LATEST: a new or replaced mapping starts polling
+            # asynchronously, and LATEST would silently skip finishes during that window. This
+            # re-reads up to 24 hours of the stream on creation; consumers deduplicate on stack,
+            # tenantId and jobId, and the opt-in is checked as each record is processed.
+            StartingPosition: TRIM_HORIZON
             BatchSize: 10
             MaximumRetryAttempts: 5
             BisectBatchOnFunctionError: true
             DestinationConfig:
               OnFailure:
-                Type: SQS
-                Destination: !GetAtt JobEventsDeadLetterQueue.Arn
+                # SAM grants the function's role the S3 writes this needs.
+                Type: S3
+                Destination: !GetAtt JobEventsFailureBucket.Arn
             FilterCriteria:
               Filters:
                 - Pattern: >-
@@ -248,9 +301,6 @@ Resources:
             - Effect: Allow
               Action: events:PutEvents
               Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
-            - Effect: Allow
-              Action: sqs:SendMessage
-              Resource: !GetAtt JobEventsDeadLetterQueue.Arn
 
   ClaudeImageDeploymentPolicy:
     Type: AWS::IAM::Policy
@@ -1255,6 +1305,12 @@ Resources:
         # No CustomErrorResponses on purpose -- see SpaRouterFunction above.
 
 Outputs:
+  JobFinishedEventsFunctionName:
+    Description: Publishes Job Finished events; replay a failure record by invoking it (cloud/README.md)
+    Value: !Ref JobFinishedEventsFunction
+  JobEventsFailureBucketName:
+    Description: Failure records (full stream payloads) for Job Finished batches that could not be published
+    Value: !Ref JobEventsFailureBucket
   AppUrl:
     Description: >
       The deployment's one public URL -- SPA at /, API at /api. The custom domain when one is
