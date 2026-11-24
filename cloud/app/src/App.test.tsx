@@ -57,6 +57,7 @@ describe('navItems', () => {
   it('keeps repository and job views distinct in the installation sidebar', () => {
     const tenant = { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: 'active', role: 'owner' } as const;
     expect(navItems('/installations/55', '?tab=repositories', tenant).filter((item) => item.active).map((item) => item.id)).toEqual(['repositories']);
+    expect(navItems('/installations/55/claude', '?request=job_example', tenant).filter((item) => item.active).map((item) => item.id)).toEqual(['claude']);
     expect(navItems('/installations/55/jobs/job_123', '', tenant).filter((item) => item.active).map((item) => item.id)).toEqual(['activity']);
     expect(navItems('/installations', '')[0]).toMatchObject({ id: 'installations', active: true });
   });

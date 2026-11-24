@@ -6,18 +6,20 @@ on:
     branches: [main]
     paths:
       - 'cloud/**'
-      # The server bundles the CLI's config schema and agent profiles from src/.
-      - 'src/config/**'
-      - 'src/agents/**'
+      # The Claude image packages the CLI from this checkout.
+      - 'src/**'
+      - 'tsconfig*.json'
+      - 'scripts/copy-telemetry.mjs'
       # The job image (cloud-deploy-env.yaml rebuilds it when the active one was built from other inputs).
       - 'deploy/aws-microvm/image/**'
+      - 'deploy/aws-microvm/native-worker/**'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/cloud-*.yaml'
   workflow_dispatch:
     inputs:
       build_image:
-        description: Build the job image even if nothing it is built from changed
+        description: Rebuild the worker images even if their inputs are unchanged
         type: boolean
         default: false
 

@@ -111,7 +111,13 @@ smoke:
 # `Name=Value` for a parameter the caller set, `Name=""` when they set it empty, nothing when they
 # did not set it at all. sam parses a bare `Name=` as no override; only `Name=""` is empty.
 domain_override = $(if $(filter undefined,$(origin $(2))),,$(if $($(2)),"$(1)=$($(2))",'$(1)=""'))
-PARAM_OVERRIDES = $(strip $(call domain_override,AppDomainName,APP_DOMAIN_NAME) $(call domain_override,AppHostedZoneId,APP_HOSTED_ZONE_ID) $(call domain_override,ManagedClaudeImageName,MANAGED_CLAUDE_IMAGE_NAME) $(call domain_override,ManagedClaudeImageVersion,MANAGED_CLAUDE_IMAGE_VERSION))
+PARAM_OVERRIDES = $(strip \
+	$(call domain_override,AppDomainName,APP_DOMAIN_NAME) \
+	$(call domain_override,AppHostedZoneId,APP_HOSTED_ZONE_ID) \
+	$(call domain_override,ManagedClaudeImageName,MANAGED_CLAUDE_IMAGE_NAME) \
+	$(call domain_override,ManagedClaudeImageVersion,MANAGED_CLAUDE_IMAGE_VERSION) \
+	$(call domain_override,ManagedClaudeConsoleOrigin,MANAGED_CLAUDE_CONSOLE_ORIGIN) \
+	$(call domain_override,ClaudeImageDeploymentRoleName,CLAUDE_IMAGE_DEPLOYMENT_ROLE_NAME))
 
 deploy-backend:
 	@set -e; \

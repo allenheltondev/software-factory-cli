@@ -28,6 +28,7 @@ export function navItems(pathname: string, search: string, tenant?: TenantSummar
       { id: 'insights', label: 'Insights', href: `${base}/insights`, active: pathname === `${base}/insights`, section: tenant.accountLogin },
       { id: 'config', label: 'Configuration', href: `${base}/config`, active: pathname === `${base}/config` || pathname.startsWith(`${base}/config/`), section: 'Installation settings' },
       { id: 'keys', label: 'Agent keys', href: `${base}/keys`, active: pathname === `${base}/keys`, section: 'Installation settings' },
+      { id: 'claude', label: 'Claude subscription', href: `${base}/claude`, active: pathname === `${base}/claude`, section: 'Installation settings' },
       { id: 'telemetry', label: 'Telemetry', href: `${base}/telemetry`, active: pathname === `${base}/telemetry`, section: 'Installation settings' },
     );
   }
