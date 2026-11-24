@@ -69,10 +69,10 @@ function codexConfigValues(args: readonly string[], key: string): string[] {
 
 interface Mapping {
   modelFromArgs: (args: readonly string[]) => string[];
-  effortArgs: (effort: string) => string[];
-  effortFromArgs: (args: readonly string[]) => string[];
+  effortArgs?: (effort: string) => string[];
+  effortFromArgs?: (args: readonly string[]) => string[];
   /** How the effort is written in args, for messages. */
-  effortHint: string;
+  effortHint?: string;
 }
 
 const MAPPINGS: Record<string, Mapping> = {
@@ -94,6 +94,7 @@ const MAPPINGS: Record<string, Mapping> = {
     effortFromArgs: (a) => optionValues(a, ['--effort']),
     effortHint: '--effort',
   },
+  vibe: { modelFromArgs: (a) => optionValues(a, ['--model']) },
 };
 
 /** What a model or effort value may not be: empty, a flag lookalike, or something a process cannot be given. */
@@ -137,7 +138,8 @@ export function agentProfile(adapter: string, agent: ProfileInput): AgentProfile
     return { model: own(agent.model), effort: own(agent.effort), problems };
   }
   const model = resolve('model', agent.model, map.modelFromArgs(args), '--model', problems);
-  const effort = resolve('effort', agent.effort, map.effortFromArgs(args), map.effortHint, problems);
+  if (agent.effort !== undefined && !map.effortArgs) problems.push('set reasoning effort in the Vibe model preset');
+  const effort = resolve('effort', agent.effort, map.effortFromArgs?.(args) ?? [], map.effortHint ?? '', problems);
   return { model, effort, problems };
 }
 
@@ -150,7 +152,7 @@ export function effectiveArgs(adapter: string, agent: ProfileInput): string[] {
   const args = [...(agent.args ?? [])];
   if (!MAPPINGS[adapter]) return args;
   if (agent.model !== undefined) args.push('--model', agent.model);
-  if (agent.effort !== undefined) args.push(...MAPPINGS[adapter]!.effortArgs(agent.effort));
+  if (agent.effort !== undefined) args.push(...(MAPPINGS[adapter]!.effortArgs?.(agent.effort) ?? []));
   return args;
 }
 

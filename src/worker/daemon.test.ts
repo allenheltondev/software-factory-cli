@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -592,13 +592,17 @@ describe('runDaemon', () => {
 
   it('at start, records the publish settings and sweeps unpublished runs once, after reconcile and before the first poll', async () => {
     const db = openDatabase(':memory:');
+    const paths = makePaths();
     const workflows = [{ trigger: { event: 'issue.labeled' as const, label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }];
     const config = makeConfig({ repositories: { 'owner/repo': { id: 1, publish: 'draft-pr', workflows } } });
     // A previous worker crashed mid-run; reconcile closes that run.
     acquireWorkerLock(db, { workerId: 'wrk_old', pid: 4000, hostname: 'host-a' }, { now: () => Date.now(), isPidAlive: () => true });
     insertJob(db);
-    const claim = claimNextJob(db, config, { workerId: 'wrk_old', hostname: 'host-a', leaseSeconds: 60, runsDir: join('x', 'runs') })!;
+    const claim = claimNextJob(db, config, { workerId: 'wrk_old', hostname: 'host-a', leaseSeconds: 60, runsDir: paths.runsDir })!;
     markExecutionStarted(db, claim.run.id, { workerId: 'wrk_old' });
+    const abandoned = join(paths.runsDir, claim.run.id, '.vibe-usage-abc123', 'session');
+    mkdirSync(abandoned, { recursive: true });
+    writeFileSync(join(abandoned, 'journal.jsonl'), 'private session contents');
 
     const events: string[] = [];
     const publisher = {
@@ -613,6 +617,7 @@ describe('runDaemon', () => {
     };
     const deps = baseDeps(db, {
       config,
+      paths,
       publisher,
       now: () => T0,
       poll: async () => {
@@ -621,6 +626,7 @@ describe('runDaemon', () => {
       },
     });
     await runDaemon(deps);
+    expect(existsSync(abandoned)).toBe(false);
     expect(events).toEqual([`sweep (left-over run interrupted, publish draft-pr since ${new Date(T0).toISOString()})`, 'poll']);
   });
 

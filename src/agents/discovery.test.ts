@@ -161,7 +161,7 @@ describe('discoverAgents on Windows', () => {
   it('finds npm shims, resolves them to direct spawn targets, and reports Kiro missing', async () => {
     const m = base();
     const rs = await discoverAgents(m);
-    expect(rs.map((r) => r.adapter)).toEqual(['codex', 'claude', 'kiro']);
+    expect(rs.map((r) => r.adapter)).toEqual(['codex', 'claude', 'kiro', 'vibe']);
 
     const claude = byAdapter(rs, 'claude');
     expect(claude).toMatchObject({
@@ -191,6 +191,7 @@ describe('discoverAgents on Windows', () => {
     const kiro = byAdapter(rs, 'kiro');
     expect(kiro).toMatchObject({ installed: false, runnable: 'no', signedIn: 'no', usable: false });
     expect(kiro.notes.join()).toMatch(/kiro-cli not found/);
+    expect(byAdapter(rs, 'vibe')).toMatchObject({ installed: false, signedIn: 'unknown', usable: false });
 
     // Never spawns a .cmd, never sends a prompt.
     expect(m.calls.every((c) => !/\.cmd$/i.test(c.file))).toBe(true);

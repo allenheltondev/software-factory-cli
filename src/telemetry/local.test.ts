@@ -3,6 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import * as claude from '../../test/claude-stream.js';
+import { consumeVibeUsage } from '../agents/vibe-usage.js';
+import { silentLogger } from '../util/log.js';
 import { createLocalTelemetry, localTelemetryFromEnv, parseHeaders } from './local.js';
 
 describe('local agent telemetry from the OTEL_EXPORTER_OTLP_* variables', () => {
@@ -45,6 +47,51 @@ describe('local agent telemetry from the OTEL_EXPORTER_OTLP_* variables', () => 
 describe('a trace per run', () => {
   const header = (runId: string, issue: number) =>
     [`updraft run ${runId}`, 'job: job_local1 (attempt 1)', 'repository: octo/widgets (id 42)', `issue: #${issue} Title`, 'agent: claude-opus (adapter claude)', '', '---- agent output (stdout and stderr) ----', ''].join('\n');
+
+  it.each([true, false])('exports only reported Vibe totals (report present: %s)', async (hasReport) => {
+    const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-vibe-telemetry-'));
+    try {
+      const runDir = path.join(runsDir, 'run_a');
+      const reportDir = path.join(runDir, 'report');
+      fs.mkdirSync(reportDir, { recursive: true });
+      if (hasReport) fs.writeFileSync(path.join(reportDir, 'export.json'), JSON.stringify({
+        schema_version: 1,
+        usage: { input_tokens: 12, output_tokens: 4, cached_input_tokens: 0 },
+        steps: 1,
+        cost_usd: 0.003,
+        config: { private: 'never-export-this' },
+        subagents: [{ usage: { input_tokens: 3, output_tokens: 1, cached_input_tokens: 0 }, steps: 1, cost_usd: 0 }],
+      }));
+      const usage = await consumeVibeUsage(reportDir, silentLogger);
+      expect(fs.existsSync(reportDir)).toBe(false);
+      const posts: string[] = [];
+      const fetchFn = (async (_url: string, init: RequestInit) => {
+        posts.push(String(init.body));
+        return { ok: true, status: 200, text: async () => '' };
+      }) as unknown as typeof fetch;
+      const config = localTelemetryFromEnv({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' })!;
+      const trace = createLocalTelemetry(config, { runsDir, fetch: fetchFn, pollMs: 20 }).begin('run_a')!;
+      fs.writeFileSync(path.join(runDir, 'run.log'), [
+        header('run_a', 7).replace('claude-opus (adapter claude)', 'devstral (adapter vibe)'),
+        '---- end of agent output ----', usage, `outcome: ${hasReport ? 'succeeded' : 'failed'}`, '',
+      ].filter((line) => line !== undefined).join('\n'));
+      await trace.end(hasReport ? 'succeeded' : 'failed');
+      const body = posts.join('\n');
+      expect(body).toContain('invoke_agent devstral');
+      expect(body).not.toContain('never-export-this');
+      if (hasReport) {
+        expect(body).toContain('"key":"gen_ai.usage.input_tokens","value":{"intValue":"15"}');
+        expect(body).toContain('"key":"gen_ai.usage.output_tokens","value":{"intValue":"5"}');
+        expect(body).toContain('"key":"gen_ai.usage.cache_read.input_tokens","value":{"intValue":"0"}');
+        expect(body).toContain('"key":"updraft.agent.reported_cost_usd","value":{"doubleValue":0.003}');
+      } else {
+        expect(body).not.toContain('gen_ai.usage.input_tokens');
+        expect(body).not.toContain('updraft.agent.reported_cost_usd');
+      }
+    } finally {
+      fs.rmSync(runsDir, { recursive: true, force: true });
+    }
+  });
 
   it('sends to OTEL_EXPORTER_OTLP_TRACES_ENDPOINT exactly, its own path and query kept', async () => {
     const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-local-telemetry-'));
