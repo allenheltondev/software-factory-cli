@@ -14,7 +14,7 @@ export function createNativeSettingsService(d: {
     start(id: number): Promise<void>;
     /** The deployed worker image version; a session on another one must be restarted. */
     imageVersion?: string;
-    stop?(id: number): Promise<void>;
+    stop?(microvmId: string): Promise<void>;
     vmState?(id: number): Promise<string | null>;
     sessions: Pick<ClaudeSessions, 'get'> & Partial<Pick<ClaudeSessions, 'pending'>>;
     grant(route: NativeRoute): (() => Promise<{ url: string; token: string; port: number; expiresAt?: string }>) | undefined;
@@ -61,6 +61,8 @@ export function createNativeSettingsService(d: {
     return {
       ...(upgrade ? { upgrade } : {}),
       ...(pending?.[0] ? { pendingRequest: pending[0].id } : {}),
+      // Restarting and signing in are owner actions; members see the state, not the buttons.
+      owner: membership?.summary?.role === 'owner',
       configured: true,
       enabled: mode.enabled,
       managed: Boolean(d.managed && r !== d.route),
@@ -127,11 +129,24 @@ export function createNativeSettingsService(d: {
       const upgrade = await upgradeOf(r);
       if (!upgrade) throw new FlowError('invalid_settings', 409, 'The Claude worker is already up to date');
       if (upgrade.state === 'required') {
+        // Read the dispatch revision first: an enqueue after this read makes the fence fail.
+        const mode = await d.mode.snapshot(r.installationId, r.workerId);
         const worker = await d.workers.get(r.installationId, r.workerId);
-        if (worker?.active || worker?.settling || (await d.workers.queued(r.installationId, r.workerId)).length > 0) {
+        if (!worker || worker.microvmId !== r.microvmId) {
+          throw new FlowError('invalid_settings', 409, 'The Claude worker is still starting; try again in a minute');
+        }
+        if (worker.active || worker.settling || (await d.workers.queued(r.installationId, r.workerId)).length > 0) {
           throw new FlowError('invalid_settings', 409, 'Wait for the current subscription job to finish before restarting the worker');
         }
-        await d.managed.stop(installationId);
+        // Fence before stopping: once this commits, no poll can claim and no launch can queue work
+        // for this VM. A fenced worker (an earlier restart whose stop failed) needs only the stop.
+        if (!worker.fenced && !await d.mode.fenceForRestart(r.installationId, r.workerId, {
+          revision: mode.revision, ...(mode.routingVersion !== undefined ? { routingVersion: mode.routingVersion } : {}),
+          workerVersion: worker.version, microvmId: r.microvmId,
+        })) {
+          throw new FlowError('invalid_settings', 409, 'The worker or its queued jobs changed; refresh the status and try again');
+        }
+        await d.managed.stop(r.microvmId);
       }
       return view(caller, installationId);
     },

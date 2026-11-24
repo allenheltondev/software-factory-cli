@@ -209,6 +209,8 @@ export interface NativeClaudeView {
   upgrade?: { from: string; to: string; state: 'required' | 'stopping' | 'stopped' };
   /** A GitHub job waiting for a signed-in worker, which a new worker can be started for. */
   pendingRequest?: string;
+  /** The caller owns the installation: only owners restart the worker or sign in. */
+  owner?: boolean;
   browserLogin?: boolean;
   triggers?: NativeClaudeTrigger[];
   availableTriggers?: NativeClaudeTrigger[];

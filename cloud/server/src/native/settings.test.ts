@@ -26,6 +26,7 @@ describe('Claude subscription mode in the installation app', () => {
   let queued: string[];
   let now: number;
   let mode: NativeModeStore;
+  let fenceCommits: boolean;
   let workers: NativeStore;
 
   beforeEach(() => {
@@ -43,7 +44,9 @@ describe('Claude subscription mode in the installation app', () => {
       enabled: async () => enabled,
       snapshot: async () => ({ enabled, revision: 0 }),
       setEnabled: async (_, __, next) => { enabled = next; return true; },
+      fenceForRestart: async () => fenceCommits,
     };
+    fenceCommits = true;
     workers = {
       async get() { return worker; },
       async put() { return true; },
@@ -160,10 +163,13 @@ describe('Claude subscription mode in the installation app', () => {
     const owner = () => member.mockResolvedValueOnce({ tenant: { status: 'active' }, summary: { role: 'owner' } });
     beforeEach(() => { vm = 'RUNNING'; stop.mockClear(); worker!.imageVersion = '9.0'; worker!.workerId = 'managed-55'; });
 
-    it('tells the console a restart is required and which job a new worker can start for', async () => {
+    it('tells the console a restart is required, which job a new worker can start for, and who may act', async () => {
+      owner();
       expect(await managed().view(caller, 55)).toMatchObject({
-        upgrade: { from: '9.0', to: '10.0', state: 'required' }, pendingRequest: 'job_' + 'w'.repeat(16),
+        upgrade: { from: '9.0', to: '10.0', state: 'required' }, pendingRequest: 'job_' + 'w'.repeat(16), owner: true,
       });
+      member.mockResolvedValueOnce({ tenant: { status: 'active' }, summary: { role: 'member' } });
+      expect(await managed().view(caller, 55)).toMatchObject({ upgrade: { state: 'required' }, owner: false });
       vm = 'TERMINATED';
       expect(await managed().view(caller, 55)).toMatchObject({ upgrade: { state: 'stopped' } });
     });
@@ -182,7 +188,25 @@ describe('Claude subscription mode in the installation app', () => {
       queued = [];
       owner();
       expect(await managed().restart(caller, 55)).toMatchObject({ upgrade: { state: 'stopping' } });
-      expect(stop).toHaveBeenCalledExactlyOnceWith(55);
+      expect(stop).toHaveBeenCalledExactlyOnceWith('mvm-native');
+    });
+
+    it('stops nothing when the fence loses to a claim or an enqueue, and finishes an earlier fenced restart', async () => {
+      fenceCommits = false;
+      owner();
+      await expect(managed().restart(caller, 55)).rejects.toThrow('changed');
+      expect(stop).not.toHaveBeenCalled();
+      worker!.fenced = true;
+      owner();
+      await managed().restart(caller, 55);
+      expect(stop).toHaveBeenCalledExactlyOnceWith('mvm-native');
+    });
+
+    it('refuses while the worker has not registered this VM yet', async () => {
+      worker!.microvmId = 'mvm-other';
+      owner();
+      await expect(managed().restart(caller, 55)).rejects.toThrow('still starting');
+      expect(stop).not.toHaveBeenCalled();
     });
 
     it('refuses to restart a worker that is already on the deployed image', async () => {

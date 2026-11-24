@@ -84,12 +84,13 @@ export function managedClaude(env = process.env) {
     }
   }
 
-  /** Ends the installation's current session VM so the next start launches the deployed image. */
-  async function stop(id: number) {
-    const session = await sessions.session(id);
-    if (!session?.microvmId) return;
+  /**
+   * Ends exactly the VM the caller inspected and fenced, never whatever the session points at
+   * now: a replacement started meanwhile (another tab, say) is left alone.
+   */
+  async function stop(microvmId: string) {
     try {
-      await microvms.send(new TerminateMicrovmCommand({ microvmIdentifier: session.microvmId }));
+      await microvms.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId }));
     } catch (error) {
       if (!(error instanceof ResourceNotFoundException)) throw error;
     }

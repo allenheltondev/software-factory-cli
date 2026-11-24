@@ -265,7 +265,13 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
                 <strong> Subscription jobs will not run until you restart it.</strong> New jobs wait for you instead of failing.
               </p>
               <ProgressIndicator steps={upgradeSteps} />
-              {upgrade.state === 'required' && (
+              {!view.owner && (
+                <p className="text-sm">
+                  <strong>An installation owner has to do this.</strong> Only owners can restart the worker and sign in to Claude.
+                  Ask one to open this page; jobs wait until they do.
+                </p>
+              )}
+              {view.owner && upgrade.state === 'required' && (
                 <div className="flex flex-col gap-1">
                   <div>
                     <Button type="button" onClick={() => void restartWorker()} loading={restarting} disabled={restarting || Boolean(view.worker?.busy)}>
@@ -276,7 +282,7 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
                 </div>
               )}
               {upgrade.state === 'stopping' && <p role="status" className="text-sm font-medium">Stopping the old worker… this page updates by itself.</p>}
-              {upgrade.state === 'stopped' && (startId ? (
+              {view.owner && upgrade.state === 'stopped' && (startId ? (
                 <div>
                   <Button type="button" onClick={() => void startWorker(startId)} loading={startingWorker} disabled={startingWorker}>
                     Start new worker and sign in
