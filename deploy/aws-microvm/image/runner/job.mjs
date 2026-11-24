@@ -792,7 +792,7 @@ export function finishDetail(result) {
       };
     };
     const steps = [
-      ...own.map((j) => step(j, j.kind === 'review' || j.kind === 'revision' ? j.kind : ownKind)).filter((s) => s.kind),
+      ...own.map((j) => step(j, j.kind === 'review' || j.kind === 'revision' || j.kind === 'implement' ? j.kind : ownKind)).filter((s) => s.kind),
       ...follow.filter((j) => j.kind === 'review' || j.kind === 'revision').map((j) => step(j, j.kind)),
     ];
     if (steps.length) detail.steps = steps;

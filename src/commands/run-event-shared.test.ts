@@ -27,6 +27,21 @@ import { fakeContext, type MemoryOutput } from './fakes.js';
 import { runEventCommand, type RunEventDeps, type RunEventOptions, type RunEventSummary } from './run-event.js';
 
 const REPO_ID = 42;
+const runnerModule = '../../deploy/aws-microvm/image/runner/job.mjs';
+
+async function expectStandaloneFinish(summary: RunEventSummary, kind: 'review' | 'revision') {
+  const { finishDetail } = await import(runnerModule);
+  expect(summary).toMatchObject({ kind, routing: { source: 'pool' } });
+  expect(summary.runId).toBeTruthy();
+  const report = finishDetail({
+    summary,
+    telemetry: { runs: [{ runId: summary.runId, model: 'response-model', modelSource: 'response', usage: { inputTokens: 42 } }] },
+  });
+  expect(report).toMatchObject({
+    routing: { source: 'pool', pool: expect.any(String) },
+    steps: [{ kind, runId: summary.runId, model: 'response-model', usage: { inputTokens: 42 } }],
+  });
+}
 const FULL = 'octo/widgets';
 const ISSUE = 7;
 const PR = 100;
@@ -511,6 +526,7 @@ describe('updraft run-event: pull request events', { timeout: 180_000 }, () => {
     const v = event(w, 'vm review', 'submitted', { repo: { revise: true } });
     const r = await v.run({ eventName: 'pull_request_review', deliveryId: 'd-review' });
     expect(r.code).toBe(0);
+    await expectStandaloneFinish(r.summary, 'revision');
     expect(r.summary).toMatchObject({
       event: { name: 'pull_request_review', action: 'submitted', pullRequest: PR, issue: null, repositoryId: REPO_ID },
       dispatched: true,
@@ -569,6 +585,7 @@ describe('updraft run-event: pull request events', { timeout: 180_000 }, () => {
     const v = event(w, 'vm push', 'synchronize', { repo, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] });
     const r = await v.run({ eventName: 'pull_request' });
     expect(r.code).toBe(0);
+    await expectStandaloneFinish(r.summary, 'review');
     expect(r.summary).toMatchObject({
       event: { name: 'pull_request', action: 'synchronize', pullRequest: PR },
       dispatched: true,
