@@ -7,11 +7,6 @@ Description: >
   app client to that pool).
 
 Parameters:
-  JobFinishedEventsInfrastructure:
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
-    Description: Provision the EventBridge job-finished bus and Pipe after its deploy-role permissions are in place.
   ClaudeImageDeploymentRoleName:
     Type: String
     Default: ''
@@ -166,7 +161,6 @@ Rules:
         AssertDescription: Enabling the native test route requires its dedicated image and control secret ARNs.
 
 Conditions:
-  DeployJobFinishedEvents: !Equals [!Ref JobFinishedEventsInfrastructure, 'true']
   ClaudeImageDeployment: !Not [!Equals [!Ref ClaudeImageDeploymentRoleName, '']]
   ManagedClaude: !Not [!Equals [!Ref ManagedClaudeImageVersion, '']]
   ManagedClaudeOriginOverride: !Not [!Equals [!Ref ManagedClaudeConsoleOrigin, '']]
@@ -193,62 +187,104 @@ Globals:
     Tracing: Active
 
 Resources:
-  JobEventsBus:
-    Type: AWS::Events::EventBus
-    Condition: DeployJobFinishedEvents
+  # Where a batch of finished jobs goes when it could not be published after its retries.
+  # A stream trigger's SQS/SNS destination keeps only pointers into the stream, which DynamoDB
+  # trims after 24 hours; an S3 destination keeps the invocation's full payload (the stream
+  # records themselves), so a failure can be replayed long after (cloud/README.md, "Recovering
+  # failed events"). Kept 90 days.
+  JobEventsFailureBucket:
+    Type: AWS::S3::Bucket
     Properties:
-      Name: !Sub ${AWS::StackName}-events
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireFailedJobEvents
+            Status: Enabled
+            ExpirationInDays: 90
 
-  JobEventsBusName:
-    Type: AWS::SSM::Parameter
-    Condition: DeployJobFinishedEvents
-    Properties:
-      Name: !Sub /updraft/${AWS::StackName}/event-bus-name
-      Type: String
-      Value: !Ref JobEventsBus
-
-  JobEventsBusArn:
-    Type: AWS::SSM::Parameter
-    Condition: DeployJobFinishedEvents
-    Properties:
-      Name: !Sub /updraft/${AWS::StackName}/event-bus-arn
-      Type: String
-      Value: !GetAtt JobEventsBus.Arn
-
-  JobEventsDeadLetterQueue:
-    Type: AWS::SQS::Queue
-    Condition: DeployJobFinishedEvents
-    Properties:
-      MessageRetentionPeriod: 1209600
-      SqsManagedSseEnabled: true
-
-  JobEventsDeadLetterAlarm:
+  # Alarms from the function's own metrics (no bucket notification, which the deploy role may
+  # not manage). Errors: a batch is failing and being retried; after its retries it lands in
+  # JobEventsFailureBucket. DestinationDeliveryFailures: even that write failed, and the batch
+  # is lost once the stream trims it (24 hours).
+  JobEventsPublishErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: DeployJobFinishedEvents
     Properties:
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
+      AlarmDescription: Job Finished events are failing to publish; failed batches land in JobEventsFailureBucket (cloud/README.md).
+      Namespace: AWS/Lambda
+      MetricName: Errors
       Dimensions:
-        - Name: QueueName
-          Value: !GetAtt JobEventsDeadLetterQueue.QueueName
-      Statistic: Maximum
+        - Name: FunctionName
+          Value: !Ref JobFinishedPublisherFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  JobEventsDestinationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A failed Job Finished batch could not be written to JobEventsFailureBucket; replay it from the stream within 24 hours.
+      Namespace: AWS/Lambda
+      MetricName: DestinationDeliveryFailures
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JobFinishedPublisherFunction
+      Statistic: Sum
       Period: 60
       EvaluationPeriods: 1
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
-  JobEventsEnrichment:
+  # Job Finished events (v1, cloud/README.md): a finished tenant job summary on the table's
+  # stream becomes one event on the account's default bus. Consumers subscribe with a rule there.
+  # Named JobFinishedPublisherFunction (formerly JobFinishedEventsFunction) on purpose: changing
+  # a stream mapping's StartingPosition replaces it, and CloudFormation creates the replacement
+  # before deleting the original, which Lambda refuses for the same function and stream. A new
+  # function gets its own mapping; the old pair is removed in cleanup. The brief overlap only
+  # duplicates events, which consumers deduplicate.
+  JobFinishedPublisherFunction:
     Type: AWS::Serverless::Function
-    Condition: DeployJobFinishedEvents
     Properties:
       CodeUri: ../server/dist
       Handler: job-finished.handler
-      Timeout: 15
+      Timeout: 30
       Environment:
         Variables:
           STACK_NAME: !Ref AWS::StackName
           TABLE_NAME: !Ref UpdraftTable
+      Events:
+        JobFinished:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt UpdraftTable.StreamArn
+            # TRIM_HORIZON, not LATEST: a new or replaced mapping starts polling
+            # asynchronously, and LATEST would silently skip finishes during that window. This
+            # re-reads up to 24 hours of the stream on creation; consumers deduplicate on stack,
+            # tenantId and jobId, and the opt-in is checked as each record is processed.
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            MaximumRetryAttempts: 5
+            BisectBatchOnFunctionError: true
+            DestinationConfig:
+              OnFailure:
+                # SAM grants the function's role the S3 writes this needs.
+                Type: S3
+                Destination: !GetAtt JobEventsFailureBucket.Arn
+            FilterCriteria:
+              Filters:
+                - Pattern: >-
+                    {"eventName":["MODIFY"],"dynamodb":{"NewImage":{"pk":{"S":[{"prefix":"TENANT#"}]},"sk":{"S":[{"prefix":"JOB#"}]},"status":{"S":["finished"]}},"OldImage":{"status":{"S":[{"anything-but":"finished"}]}}}}
       Policies:
         - Statement:
             - Effect: Allow
@@ -257,66 +293,9 @@ Resources:
               Condition:
                 ForAllValues:StringLike:
                   dynamodb:LeadingKeys: ['TENANT#*']
-
-  JobEventsPipeRole:
-    Type: AWS::IAM::Role
-    Condition: DeployJobFinishedEvents
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: pipes.amazonaws.com
-            Action: sts:AssumeRole
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
-      Policies:
-        - PolicyName: job-finished-pipe
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator]
-                Resource: !GetAtt UpdraftTable.StreamArn
-              - Effect: Allow
-                Action: dynamodb:ListStreams
-                Resource: '*'
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt JobEventsEnrichment.Arn
-              - Effect: Allow
-                Action: events:PutEvents
-                Resource: !GetAtt JobEventsBus.Arn
-              - Effect: Allow
-                Action: sqs:SendMessage
-                Resource: !GetAtt JobEventsDeadLetterQueue.Arn
-
-  JobEventsPipe:
-    Type: AWS::Pipes::Pipe
-    Condition: DeployJobFinishedEvents
-    Properties:
-      Name: !Sub ${AWS::StackName}-job-finished
-      RoleArn: !GetAtt JobEventsPipeRole.Arn
-      Source: !GetAtt UpdraftTable.StreamArn
-      SourceParameters:
-        FilterCriteria:
-          Filters:
-            - Pattern: >-
-                {"eventName":["MODIFY"],"dynamodb":{"NewImage":{"pk":{"S":[{"prefix":"TENANT#"}]},"sk":{"S":[{"prefix":"JOB#"}]},"status":{"S":["finished"]}},"OldImage":{"status":{"S":[{"anything-but":"finished"}]}}}}
-        DynamoDBStreamParameters:
-          StartingPosition: LATEST
-          BatchSize: 1
-          MaximumRetryAttempts: 5
-          DeadLetterConfig:
-            Arn: !GetAtt JobEventsDeadLetterQueue.Arn
-      Enrichment: !GetAtt JobEventsEnrichment.Arn
-      Target: !GetAtt JobEventsBus.Arn
-      TargetParameters:
-        EventBridgeEventBusParameters:
-          Source: updraft.cloud
-          DetailType: Job Finished
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
 
   ClaudeImageDeploymentPolicy:
     Type: AWS::IAM::Policy
@@ -1322,6 +1301,12 @@ Resources:
         # No CustomErrorResponses on purpose -- see SpaRouterFunction above.
 
 Outputs:
+  JobFinishedPublisherFunctionName:
+    Description: Publishes Job Finished events; replay a failure record by invoking it (cloud/README.md)
+    Value: !Ref JobFinishedPublisherFunction
+  JobEventsFailureBucketName:
+    Description: Failure records (full stream payloads) for Job Finished batches that could not be published
+    Value: !Ref JobEventsFailureBucket
   AppUrl:
     Description: >
       The deployment's one public URL -- SPA at /, API at /api. The custom domain when one is
