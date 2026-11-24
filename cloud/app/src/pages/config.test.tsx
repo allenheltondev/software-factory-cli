@@ -182,6 +182,14 @@ describe('the simple page', () => {
     expect(screen.queryByTestId('kiro-not-enabled')).toBeNull();
   });
 
+  it('still says the deployment must enable Kiro when the saved config already uses it', async () => {
+    const config = baseConfig();
+    config.agents.kiro = { adapter: 'kiro', enabled: true };
+    config.pools.builders!.agents.push('kiro');
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config })) }));
+    expect(await screen.findByTestId('kiro-not-enabled')).toBeInTheDocument();
+  });
+
   it('ticks coding and review agents separately; no review agent means no review, one reviews its own work', async () => {
     const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);

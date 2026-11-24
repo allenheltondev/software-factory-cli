@@ -294,7 +294,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
               </div>
             );
           })}
-          {!adapters.includes('kiro') && (
+          {!offered('kiro') && (
             <div className="py-3">
               <KiroNotEnabled />
             </div>
