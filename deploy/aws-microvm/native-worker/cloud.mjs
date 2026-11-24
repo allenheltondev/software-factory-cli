@@ -11,6 +11,19 @@ export function cloudConfig(c) {
   return c;
 }
 
+/**
+ * The root job runner's environment. Deliberately no inherited secret, native HOME, Claude
+ * overrides or control token. The runner is root and installs the packet filter itself, so its
+ * PATH includes the sbin directories: Amazon Linux 2023 installs `nft` as /usr/sbin/nft.
+ */
+export function runnerEnvironment(config, request, env = process.env) {
+  return { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LANG: 'C.UTF-8', HOME: '/root', AWS_REGION: config.region,
+    UPDRAFT_JOB_UID: '1000', UPDRAFT_JOB_GID: '1000', UPDRAFT_JOB_HOME: '/home/updraft', UPDRAFT_JOB_USER: 'updraft',
+    UPDRAFT_NATIVE_WORKER: '1', UPDRAFT_RUN_REQUEST: JSON.stringify(request),
+    ...Object.fromEntries(['AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', 'AWS_CONTAINER_CREDENTIALS_FULL_URI', 'AWS_CONTAINER_AUTHORIZATION_TOKEN', 'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE']
+      .filter((k) => env[k]).map((k) => [k, env[k]])) };
+}
+
 /** Fail closed on any uncertain broker response: stop polling and let Cloud fence this VM.
  * Only the root dispatcher holds the control credential. A job gets its own broker token.
  */
@@ -27,12 +40,7 @@ export async function startCloudWorker(config, microvmId, service, options = {})
     } finally { clearTimeout(timer); }
   };
   const launch = options.launch ?? ((request) => spawn(process.execPath, ['/opt/updraft/runner/run-job.mjs'], {
-    // Deliberately no inherited secret, native HOME, Claude overrides or control token.
-    env: { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: '/root', AWS_REGION: config.region,
-      UPDRAFT_JOB_UID: '1000', UPDRAFT_JOB_GID: '1000', UPDRAFT_JOB_HOME: '/home/updraft', UPDRAFT_JOB_USER: 'updraft',
-      UPDRAFT_NATIVE_WORKER: '1', UPDRAFT_RUN_REQUEST: JSON.stringify(request),
-      ...Object.fromEntries(['AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', 'AWS_CONTAINER_CREDENTIALS_FULL_URI', 'AWS_CONTAINER_AUTHORIZATION_TOKEN', 'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE']
-        .filter((k) => process.env[k]).map((k) => [k, process.env[k]])) }, stdio: ['ignore', 'inherit', 'inherit'],
+    env: runnerEnvironment(config, request), stdio: ['ignore', 'inherit', 'inherit'],
   }));
   const session = randomUUID();
   const interval = options.interval ?? 10_000;

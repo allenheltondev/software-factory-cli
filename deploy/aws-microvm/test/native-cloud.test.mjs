@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { cloudConfig, startCloudWorker } from '../native-worker/cloud.mjs';
+import { cloudConfig, runnerEnvironment, startCloudWorker } from '../native-worker/cloud.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
 import { nativeConfig, NATIVE_RUNTIME } from '../image/runner/native-config.mjs';
 import { checkAgentConfig, SANDBOX_RUNTIME, SANDBOX_IMAGE } from '../image/runner/isolation.mjs';
@@ -19,6 +19,16 @@ describe('root subscription worker Cloud loop', () => {
     expect(bootPayload(JSON.stringify({ fileSystemId: 'fs-12345678', accessPointId: 'fsap-12345678', cloud: config })).cloud).toEqual(config);
     expect(() => cloudConfig({ ...config, claudeToken: 'never' })).toThrow();
     expect(() => cloudConfig({ ...config, controlSecretArn: '/native/home/.credentials' })).toThrow();
+  });
+  it('starts the root runner with sbin on PATH (nft is /usr/sbin/nft) and no inherited secrets', () => {
+    const env = runnerEnvironment(config, { payload: {} }, {
+      ANTHROPIC_API_KEY: 'never', CLAUDE_CONFIG_DIR: '/native/home', AWS_CONTAINER_CREDENTIALS_FULL_URI: 'http://169.254.170.23/v1/credentials',
+    });
+    expect(env.PATH.split(':')).toEqual(expect.arrayContaining(['/usr/sbin', '/sbin', '/usr/bin', '/bin']));
+    expect(env.AWS_CONTAINER_CREDENTIALS_FULL_URI).toBe('http://169.254.170.23/v1/credentials');
+    expect(env).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(env).not.toHaveProperty('CLAUDE_CONFIG_DIR');
+    expect(env.UPDRAFT_NATIVE_WORKER).toBe('1');
   });
   it('forces all Claude profiles into the shared slot and verifies other profiles through the existing sandbox', () => {
     const input = { agents: { claude: { authentication: 'default', container: { image: 'other', env: ['ANTHROPIC_API_KEY'] } },
