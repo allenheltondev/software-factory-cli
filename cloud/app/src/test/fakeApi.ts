@@ -34,6 +34,7 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     nativeClaudeWaiting: vi.fn(),
     nativeClaudeStart: vi.fn(),
     nativeClaudeLogin: vi.fn(),
+    nativeClaudeRestart: vi.fn(),
     nativeClaude: vi.fn(),
     setNativeClaudeMode: vi.fn(),
     telemetry: vi.fn(),

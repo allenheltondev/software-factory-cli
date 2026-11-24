@@ -568,7 +568,8 @@ Resources:
           - ManagedClaude
           - Statement:
               - Effect: Allow
-                Action: [lambda:GetMicrovm, lambda:RunMicrovm, lambda:CreateMicrovmAuthToken]
+                # TerminateMicrovm: an owner's restart of an idle worker on an older image (native/settings.ts).
+                Action: [lambda:GetMicrovm, lambda:RunMicrovm, lambda:TerminateMicrovm, lambda:CreateMicrovmAuthToken]
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
               - Effect: Allow
                 Action: lambda:PassNetworkConnector

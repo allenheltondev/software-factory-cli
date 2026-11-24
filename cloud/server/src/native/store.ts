@@ -65,6 +65,13 @@ export interface NativeModeStore {
   snapshot(installationId: number, workerId: string): Promise<NativeMode>;
   /** Commit only if neither dispatch nor the worker changed since the idle checks. */
   setEnabled(installationId: number, workerId: string, enabled: boolean, expected: { revision: number; workerVersion: number | null; routingVersion?: number; triggers?: NativeTrigger[] }): Promise<boolean>;
+  /**
+   * Fence an idle worker before an owner's restart stops its VM, in one transaction: the worker
+   * row (exactly this VM, unchanged since the idle checks, nothing active or settling) is fenced,
+   * so no poll can claim work; and the mode's revision and routing version move on, so neither an
+   * enqueue since the empty queue read nor a launch that read the old routing can queue a job.
+   */
+  fenceForRestart(installationId: number, workerId: string, expected: { revision: number; routingVersion?: number; workerVersion: number; microvmId: string }): Promise<boolean>;
 }
 
 export function createNativeModeStore(
@@ -100,6 +107,29 @@ export function createNativeModeStore(
             ...(expected.workerVersion === null ? {} : {
               ExpressionAttributeNames: { '#v': 'version' }, ExpressionAttributeValues: { ':v': expected.workerVersion },
             }),
+          } },
+        ] }));
+        return true;
+      } catch (e) {
+        if (e instanceof TransactionCanceledException && e.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return false;
+        throw e;
+      }
+    },
+    async fenceForRestart(installationId, workerId, expected) {
+      try {
+        await db.send(new TransactWriteCommand({ TransactItems: [
+          { Update: {
+            TableName: table, Key: key(installationId, workerId),
+            UpdateExpression: 'SET revision = :next, routingVersion = :routing',
+            ConditionExpression: expected.revision === 0 ? 'attribute_not_exists(revision) OR revision = :revision' : 'revision = :revision',
+            ExpressionAttributeValues: { ':revision': expected.revision, ':next': expected.revision + 1, ':routing': (expected.routingVersion ?? 0) + 1 },
+          } },
+          { Update: {
+            TableName: table, Key: { pk: nativePartition(installationId, workerId), sk: 'WORKER' },
+            UpdateExpression: 'SET fenced = :fenced, #v = :next',
+            ConditionExpression: '#v = :v AND microvmId = :vm AND attribute_not_exists(active) AND attribute_not_exists(settling)',
+            ExpressionAttributeNames: { '#v': 'version' },
+            ExpressionAttributeValues: { ':fenced': true, ':v': expected.workerVersion, ':next': expected.workerVersion + 1, ':vm': expected.microvmId },
           } },
         ] }));
         return true;

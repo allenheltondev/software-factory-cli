@@ -101,4 +101,61 @@ describe('Claude subscription settings page', () => {
     expect(screen.getByRole('button', { name: 'Use subscription' })).toBeDisabled();
     expect(screen.getByRole('link', { name: /Worker setup guide/ })).toHaveAttribute('href', expect.stringContaining('/CLOUD.md'));
   });
+
+  describe('a worker on an older image', () => {
+    const managed: NativeClaudeView = { ...ready, managed: true, browserLogin: true, enabled: true, owner: true };
+    const pending = 'job_' + 'p'.repeat(16);
+
+    it('puts a restart banner with steps above everything else and restarts on one click', async () => {
+      const user = userEvent.setup();
+      const nativeClaudeRestart = vi.fn().mockResolvedValue({ ...managed, upgrade: { from: '9.0', to: '10.0', state: 'stopping' } });
+      show(fakeApi({ nativeClaude: async () => ({ ...managed, upgrade: { from: '9.0', to: '10.0', state: 'required' } }), nativeClaudeRestart }));
+      const banner = await screen.findByTestId('worker-restart');
+      expect(banner).toHaveTextContent('Action required: restart your Claude worker');
+      expect(banner).toHaveTextContent(/still running the old version \(9\.0; the current version is 10\.0\)/);
+      expect(banner).toHaveTextContent('Subscription jobs will not run until you restart it.');
+      expect(banner).toHaveTextContent('Start the new worker and sign in to Claude');
+      expect(banner.compareDocumentPosition(screen.getByText('Execution mode')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      await user.click(screen.getByRole('button', { name: 'Restart worker' }));
+      expect(nativeClaudeRestart).toHaveBeenCalledExactlyOnceWith(55);
+      expect(await screen.findByText(/Stopping the old worker… this page updates by itself/)).toBeInTheDocument();
+    });
+
+    it('shows a member the banner but not the owner-only actions, and says who must act', async () => {
+      const member = { ...managed, owner: false, browserLogin: false };
+      const { unmount } = show(fakeApi({ nativeClaude: async () => ({ ...member, upgrade: { from: '9.0', to: '10.0', state: 'required' } }) }));
+      const banner = await screen.findByTestId('worker-restart');
+      expect(banner).toHaveTextContent('An installation owner has to do this.');
+      expect(screen.queryByRole('button', { name: 'Restart worker' })).not.toBeInTheDocument();
+      unmount();
+      show(fakeApi({ nativeClaude: async () => ({ ...member, worker: null, pendingRequest: pending, upgrade: { from: '9.0', to: '10.0', state: 'stopped' } }) }));
+      expect(await screen.findByText('An installation owner has to do this.')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Start new worker/ })).not.toBeInTheDocument();
+      expect(screen.queryByText(/apply a subscription label/)).not.toBeInTheDocument();
+    });
+
+    it('will not restart a worker while a job runs on it', async () => {
+      show(fakeApi({ nativeClaude: async () => ({ ...managed, worker: { ...ready.worker!, busy: true }, upgrade: { from: '9.0', to: '10.0', state: 'required' } }) }));
+      expect(await screen.findByRole('button', { name: 'Restart worker' })).toBeDisabled();
+      expect(screen.getByText(/Restart it once that job finishes/)).toBeInTheDocument();
+    });
+
+    it('starts the new worker for a waiting job once the old one has stopped', async () => {
+      const user = userEvent.setup();
+      const nativeClaudeStart = vi.fn().mockResolvedValue({ ...managed, worker: null });
+      show(fakeApi({
+        nativeClaude: async () => ({ ...managed, worker: null, pendingRequest: pending, upgrade: { from: '9.0', to: '10.0', state: 'stopped' } }),
+        nativeClaudeStart,
+      }));
+      await user.click(await screen.findByRole('button', { name: 'Start new worker and sign in' }));
+      expect(nativeClaudeStart).toHaveBeenCalledExactlyOnceWith(55, pending);
+    });
+
+    it('says how to start the new worker when no job is waiting', async () => {
+      show(fakeApi({ nativeClaude: async () => ({ ...managed, worker: null, upgrade: { from: '9.0', to: '10.0', state: 'stopped' } }) }));
+      expect(await screen.findByText(/The old worker is stopped\./)).toBeInTheDocument();
+      expect(screen.getByTestId('worker-restart')).toHaveTextContent(/apply a subscription label to an issue/);
+      expect(screen.queryByRole('button', { name: /Start new worker/ })).not.toBeInTheDocument();
+    });
+  });
 });

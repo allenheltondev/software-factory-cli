@@ -41,6 +41,9 @@ function fakeTable() {
     if (expr === '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling)') {
       return item?.version === values[':v'] && !item?.active && !item?.settling;
     }
+    if (expr === '#v = :v AND microvmId = :vm AND attribute_not_exists(active) AND attribute_not_exists(settling)') {
+      return item?.version === values[':v'] && item?.microvmId === values[':vm'] && !item?.active && !item?.settling;
+    }
     if (expr === 'attribute_not_exists(pk)') return !item;
     if (expr === 'attribute_exists(pk)') return Boolean(item);
     if (
@@ -1234,6 +1237,82 @@ describe('native mode changes and dispatch transactions', () => {
     expect(await mode.enabled(55, route.workerId)).toBe(true);
     expect(await query(55, route.workerId)).toEqual([job.jobId]);
   });
+  describe('an owner restarting a worker on an older image', () => {
+    const owner = { member: async () => ({ tenant: { status: 'active' }, summary: { role: 'owner' } }), configContext: async () => ({}) } as unknown as Pick<GitHubFlows, 'member' | 'configContext'>;
+    async function restartable() {
+      const base = await setup();
+      const stopped: string[] = [];
+      const api = createNativeSettingsService({ github: owner, mode: base.mode, workers: base.workers, managed: {
+        route: async () => ({ ...route, generation: 'generation-old', imageVersion: '7' }), start: async () => {}, imageVersion: '8',
+        stop: async (id) => { stopped.push(id); }, vmState: async () => 'RUNNING',
+        sessions: { get: async () => undefined }, grant: () => undefined,
+      } });
+      return { ...base, api, stopped };
+    }
+
+    it('fences the idle worker and stops exactly its VM; a launch that read the old routing cannot queue', async () => {
+      const { api, store, workers, mode, stopped } = await restartable();
+      const before = await mode.snapshot(55, route.workerId);
+      await api.restart({ sub: 'owner' }, 55);
+      expect(stopped).toEqual([route.microvmId]);
+      expect(await workers.get(55, route.workerId)).toMatchObject({ fenced: true, version: 2 });
+      await expect(store.putJob({ ...job, native: { workerId: route.workerId, routingVersion: before.routingVersion } }))
+        .rejects.toBeInstanceOf(NativeEnqueueRejectedError);
+      expect(await store.getJob(job.jobId)).toBeNull();
+    });
+
+    it('refuses and stops nothing when a launch queues a job after the empty queue read', async () => {
+      const { api, store, workers, stopped } = await restartable();
+      const query = workers.queued;
+      workers.queued = async (...args) => {
+        const ids = await query(...args);
+        await store.putJob(job);
+        return ids;
+      };
+      await expect(api.restart({ sub: 'owner' }, 55)).rejects.toThrow('changed');
+      expect(stopped).toEqual([]);
+      expect(await workers.get(55, route.workerId)).not.toHaveProperty('fenced');
+      expect(await query(55, route.workerId)).toEqual([job.jobId]);
+    });
+
+    it('refuses and stops nothing when a poll claims a job during the idle checks', async () => {
+      const { api, store, workers, worker, stopped } = await restartable();
+      await store.putJob(job);
+      await workers.dequeue(55, route.workerId, job.jobId);
+      const query = workers.queued;
+      workers.queued = async (...args) => {
+        await workers.put({ ...worker, version: worker.version + 1, active: { jobId: job.jobId, until: DEADLINE } }, worker.version);
+        return query(...args);
+      };
+      await expect(api.restart({ sub: 'owner' }, 55)).rejects.toThrow('changed');
+      expect(stopped).toEqual([]);
+      expect((await workers.get(55, route.workerId))?.active?.jobId).toBe(job.jobId);
+    });
+
+    it('leaves a replacement alone: a request that read the old VM cannot fence or stop the new one', async () => {
+      const { api, workers, worker, stopped } = await restartable();
+      // Another tab already replaced the worker; this request's route still names the old VM.
+      await workers.put({ ...worker, version: worker.version + 1, microvmId: 'mvm-replacement', session: 'session-replacement0' }, worker.version);
+      await expect(api.restart({ sub: 'owner' }, 55)).rejects.toThrow('still starting');
+      expect(stopped).toEqual([]);
+      expect(await workers.get(55, route.workerId)).toMatchObject({ microvmId: 'mvm-replacement' });
+      expect(await workers.get(55, route.workerId)).not.toHaveProperty('fenced');
+    });
+
+    it('fences only once: two overlapping restarts never both commit', async () => {
+      const { api, mode, workers, stopped } = await restartable();
+      const fence = mode.fenceForRestart.bind(mode);
+      let raced = false;
+      mode.fenceForRestart = async (...args) => {
+        if (!raced) { raced = true; await api.restart({ sub: 'owner' }, 55); }
+        return fence(...args);
+      };
+      await expect(api.restart({ sub: 'owner' }, 55)).rejects.toThrow('changed');
+      expect(stopped).toEqual([route.microvmId]);
+      expect(await workers.get(55, route.workerId)).toMatchObject({ fenced: true, version: 2 });
+    });
+  });
+
   it('rejects a delayed native enqueue after switching to API mode without writing any job rows', async () => {
     const { table, store, mode, api } = await setup();
     await api.update({ sub: 'member' }, 55, false);

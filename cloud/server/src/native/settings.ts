@@ -12,7 +12,11 @@ export function createNativeSettingsService(d: {
   managed?: {
     route(id: number): Promise<NativeRoute>;
     start(id: number): Promise<void>;
-    sessions: Pick<ClaudeSessions, 'get'>;
+    /** The deployed worker image version; a session on another one must be restarted. */
+    imageVersion?: string;
+    stop?(microvmId: string): Promise<void>;
+    vmState?(id: number): Promise<string | null>;
+    sessions: Pick<ClaudeSessions, 'get'> & Partial<Pick<ClaudeSessions, 'pending'>>;
     grant(route: NativeRoute): (() => Promise<{ url: string; token: string; port: number; expiresAt?: string }>) | undefined;
   };
   mode: NativeModeStore;
@@ -30,6 +34,18 @@ export function createNativeSettingsService(d: {
       rule.paused ? [] : [...new Set(rule.triggers.filter((t) => (t.keys ?? rule.keys)?.includes('ANTHROPIC_API_KEY')).map((t) => t.label))].map((label) => ({ repository, repositoryId: rule.id, label })));
   }
 
+  /**
+   * A managed session VM built from an older image than the deployed one: `required` while it
+   * runs, `stopping` once asked to stop, `stopped` when a new worker can be started.
+   */
+  async function upgradeOf(r: NativeRoute) {
+    const latest = d.managed?.imageVersion;
+    if (r === d.route || !latest || r.microvmId === 'mvm-pending' || r.imageVersion === latest || !d.managed?.vmState) return undefined;
+    const state = await d.managed.vmState(r.installationId);
+    const status = state === null || state === 'TERMINATED' ? 'stopped' as const : state === 'TERMINATING' ? 'stopping' as const : 'required' as const;
+    return { from: r.imageVersion, to: latest, state: status };
+  }
+
   async function view(caller: Caller, installationId: number) {
     const membership = await d.github.member(caller, installationId);
     const r = await route(installationId);
@@ -40,7 +56,13 @@ export function createNativeSettingsService(d: {
       availableTriggers(membership?.tenant),
     ]);
     const stale = !worker || worker.microvmId !== r.microvmId || worker.imageVersion !== r.imageVersion || worker.fenced === true || now() - worker.heartbeatAt > 60_000;
+    const managed = r !== d.route ? d.managed : undefined;
+    const [upgrade, pending] = await Promise.all([upgradeOf(r), managed?.sessions.pending?.(installationId)]);
     return {
+      ...(upgrade ? { upgrade } : {}),
+      ...(pending?.[0] ? { pendingRequest: pending[0].id } : {}),
+      // Restarting and signing in are owner actions; members see the state, not the buttons.
+      owner: membership?.summary?.role === 'owner',
       configured: true,
       enabled: mode.enabled,
       managed: Boolean(d.managed && r !== d.route),
@@ -94,6 +116,38 @@ export function createNativeSettingsService(d: {
         throw new FlowError('invalid_settings', 409, 'This installation does not have an active Claude sign-in request');
       }
       await d.managed.start(installationId);
+      return view(caller, installationId);
+    },
+    /** Stops an idle managed worker that runs an older image, so the next start uses the deployed one. */
+    async restart(caller: Caller, installationId: number) {
+      const { summary, tenant } = await d.github.member(caller, installationId);
+      if (summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner can restart the Claude worker');
+      const r = await route(installationId);
+      if (!d.managed?.stop || !r || r === d.route || tenant.status !== 'active') {
+        throw new FlowError('invalid_settings', 409, 'This installation has no Claude worker to restart');
+      }
+      const upgrade = await upgradeOf(r);
+      if (!upgrade) throw new FlowError('invalid_settings', 409, 'The Claude worker is already up to date');
+      if (upgrade.state === 'required') {
+        // Read the dispatch revision first: an enqueue after this read makes the fence fail.
+        const mode = await d.mode.snapshot(r.installationId, r.workerId);
+        const worker = await d.workers.get(r.installationId, r.workerId);
+        if (!worker || worker.microvmId !== r.microvmId) {
+          throw new FlowError('invalid_settings', 409, 'The Claude worker is still starting; try again in a minute');
+        }
+        if (worker.active || worker.settling || (await d.workers.queued(r.installationId, r.workerId)).length > 0) {
+          throw new FlowError('invalid_settings', 409, 'Wait for the current subscription job to finish before restarting the worker');
+        }
+        // Fence before stopping: once this commits, no poll can claim and no launch can queue work
+        // for this VM. A fenced worker (an earlier restart whose stop failed) needs only the stop.
+        if (!worker.fenced && !await d.mode.fenceForRestart(r.installationId, r.workerId, {
+          revision: mode.revision, ...(mode.routingVersion !== undefined ? { routingVersion: mode.routingVersion } : {}),
+          workerVersion: worker.version, microvmId: r.microvmId,
+        })) {
+          throw new FlowError('invalid_settings', 409, 'The worker or its queued jobs changed; refresh the status and try again');
+        }
+        await d.managed.stop(r.microvmId);
+      }
       return view(caller, installationId);
     },
     async update(caller: Caller, installationId: number, enabled: boolean, selection?: NativeTrigger[]) {

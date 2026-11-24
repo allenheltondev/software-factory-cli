@@ -33,6 +33,15 @@ checks that the issue is open, the label is present, and the active configuratio
 authorizes the action. Waiting requests expire in 24 hours and hold no worker slots or job
 runtime quota. A new worker receives a different control credential and has to sign in again.
 
+A deploy that changes `ManagedClaudeImageVersion` leaves a running worker on its old image.
+Cloud sends it no new jobs: they wait for sign-in instead. The console's Claude page shows a
+**restart required** banner with the steps; members see it too, but only an owner can act.
+**Restart worker** refuses a worker with an active, settling or queued job. Otherwise one
+transaction fences the worker row (that exact VM, unchanged since the checks) and advances the
+mode's revision and routing version, so no poll can claim and no launch can queue work for it.
+Only then is that exact VM terminated. Once it has stopped, **Start new worker and sign in**
+launches the deployed image for a waiting job, and the owner signs in again.
+
 For live acceptance, use two test installations. Verify a member can see their own waiting
 request, only the owner can start sign-in, and another installation cannot view or start it.
 Repeat the webhook and open two sign-in tabs, then confirm one comment, one worker, and one
