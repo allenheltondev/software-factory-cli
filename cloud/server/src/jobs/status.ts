@@ -1,4 +1,7 @@
+import { isBenchmarkLabel } from '../benchmarks/config.js';
 import type { DeliveryRecord, JobSummary } from '../store/store.js';
+
+export const BENCHMARK_RETRY_MESSAGE = 'To rerun this benchmark, submit a fresh arm through the benchmark harness';
 
 /**
  * How a job ended, as the console shows it (#71). From the outcome the runner reported to the
@@ -98,7 +101,10 @@ const RETRYABLE: ReadonlySet<JobResult> = new Set<JobResult>([
  * agent succeeded (its job is `succeeded` in the shared state, so the event would end as a
  * duplicate and publish nothing: `updraft run-event --retry` requeues only failed work).
  */
-export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs' | 'pullRequest'>): boolean {
+type RetryStatus = Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs' | 'pullRequest' | 'benchmark' | 'label'>;
+
+export function retryable(job: RetryStatus): boolean {
+  if (job.benchmark || isBenchmarkLabel(job.label)) return false;
   // A retry started a job for it already: that one is the one to look at (and to retry).
   if (job.retriedAs) return false;
   // A job of a pull request's review loop (a revision, a review): the loop's own records decide
@@ -111,7 +117,8 @@ export function retryable(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' 
 }
 
 /** Why a job cannot be retried, in words, for the one that asked. */
-export function notRetryableMessage(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'retriedAs' | 'pullRequest'>): string {
+export function notRetryableMessage(job: RetryStatus): string {
+  if (job.benchmark || isBenchmarkLabel(job.label)) return BENCHMARK_RETRY_MESSAGE;
   if (job.retriedAs) return 'This job was already retried';
   if (jobResult(job) === 'running') return 'This job is still running';
   if (jobResult(job) === 'publish_failure') return 'The agent’s work succeeded and only publishing it failed, so running the event again would not publish it: check the App can push and open pull requests, then apply the label again on GitHub';

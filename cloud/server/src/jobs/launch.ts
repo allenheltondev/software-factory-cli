@@ -10,7 +10,7 @@ import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
 import { dayOf, monthOf, tenantQuotas, type ThrottleNotice } from './quotas.js';
-import { BENCHMARK_LABEL, type BenchmarkIdentity } from '../benchmarks/config.js';
+import { BENCHMARK_LABEL, isBenchmarkLabel, type BenchmarkIdentity } from '../benchmarks/config.js';
 
 export type { ThrottleNotice } from './quotas.js';
 
@@ -229,7 +229,7 @@ export function createLauncher(deps: LaunchDeps) {
     const benchmark = req.benchmark;
     if (benchmark ? (!isIssue || req.installationId !== deps.benchmarkInstallationId ||
       req.payload.label?.name !== BENCHMARK_LABEL || !req.jobId)
-      : req.installationId === deps.benchmarkInstallationId) return skip('not_dispatched');
+      : req.installationId === deps.benchmarkInstallationId || isBenchmarkLabel(req.payload.label?.name)) return skip('not_dispatched');
     if (isIssue ? !Number.isInteger(req.payload.issue?.number) : !Object.hasOwn(PULL_REQUEST_ACTIONS, eventName)) return skip('ignored');
 
     // Strongly consistent, both: a delivery right after a publish sees the new active config (not

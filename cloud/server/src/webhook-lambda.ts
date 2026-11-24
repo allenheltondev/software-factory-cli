@@ -39,7 +39,8 @@ const github = createGitHubApi();
 const loadSettings = createSettingsLoader();
 const benchmarkInstallationId = Number(env.BENCHMARK_INSTALLATION_ID);
 const benchmarkRepositoryId = Number(env.BENCHMARK_REPOSITORY_ID);
-const benchmarkEnabled = Number.isSafeInteger(benchmarkInstallationId) && benchmarkInstallationId > 0 &&
+const benchmarkInstallationConfigured = Number.isSafeInteger(benchmarkInstallationId) && benchmarkInstallationId > 0;
+const benchmarkEnabled = benchmarkInstallationConfigured &&
   Number.isSafeInteger(benchmarkRepositoryId) && benchmarkRepositoryId > 0;
 
 const killSwitch = createKillSwitch({
@@ -78,7 +79,7 @@ function launcher(): Launcher | undefined {
   const partition = env.PARTITION ?? 'aws';
   return createLauncher({
     store,
-    ...(benchmarkEnabled ? { benchmarkInstallationId } : {}),
+    ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
     native: nativeWorker.launch,
     resolveNative: nativeWorker.resolveNative,
     ...(nativeWorker.managed ? {
@@ -185,7 +186,7 @@ const handleWebhook = createWebhookHandler({
   github,
   loadSettings,
   launch,
-  ...(benchmarkEnabled ? { benchmarkInstallationId } : {}),
+  ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
   routines: createRoutineDispatcher({
     store, rules: createDynamoRoutineRuleStore(env.TABLE_NAME ?? ''), killSwitch,
     readToken: async (name) => (await secrets.send(new GetSecretValueCommand({ SecretId: name }))).SecretString ?? null,

@@ -154,6 +154,16 @@ Parameters:
     Description: Route 53 hosted zone that holds AppDomainName's parent domain.
 
 Rules:
+  BenchmarkReferences:
+    Assertions:
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref BenchmarkInstallationId, '0']
+            - !Equals [!Ref BenchmarkRepositoryId, '0']
+          - !And
+            - !Not [!Equals [!Ref BenchmarkInstallationId, '0']]
+            - !Not [!Equals [!Ref BenchmarkRepositoryId, '0']]
+        AssertDescription: Set both benchmark IDs to enable dispatch or set both to zero to disable it.
   ManagedClaudeReferences:
     Assertions:
       - Assert: !Or
@@ -748,7 +758,6 @@ Resources:
             Method: post
             Auth:
               Authorizer: AWS_IAM
-              OverrideApiAuth: true
         GitHub:
           Type: Api
           Properties:

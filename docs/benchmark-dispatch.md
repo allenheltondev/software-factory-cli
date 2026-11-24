@@ -10,11 +10,12 @@ using the stack's execute-api URL. Give the harness role in the stack's AWS acco
    profile an explicit model and configure its provider API key in the sandbox tenant.
 2. Deploy a benchmark-capable microVM image and set `BenchmarkInstallationId` and
    `BenchmarkRepositoryId` on the Cloud stack. Both default to zero, which
-   disables dispatch. Turn on Job Finished events for the benchmark tenant if
+   disables dispatch. Set the two IDs together. Turn on Job Finished events for the benchmark tenant if
    the harness consumes results from EventBridge.
 3. An allowed GitHub actor applies `updraft:benchmark` to an open sandbox issue.
    Use that actor's login in the request. The runner checks the label's GitHub
-   history before doing work. The label itself does not launch a job.
+   history before doing work. The label is reserved even when benchmark dispatch
+   is disabled.
 
 ```json
 {
@@ -34,8 +35,8 @@ is omitted, dispatch uses the sandbox tenant's active version at launch.
 
 A successful launch returns HTTP 202 and a `jobId`. Resubmitting the same
 request while the backend job record is retained returns the same ID with
-`duplicate`. Use a different arm for
-another agent or an intentional rerun. Conflicts return HTTP 409. A dispatch
+`duplicate`. Submit a fresh arm through the harness for another agent or an
+intentional rerun. Conflicts return HTTP 409. A dispatch
 still being registered returns `benchmark_dispatch_in_progress` and can be
 retried. Quota throttling returns HTTP 429.
 

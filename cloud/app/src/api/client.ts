@@ -288,6 +288,7 @@ export interface JobView {
   logs: string[];
   /** The job ended without finishing its work, and the console can run it again. */
   retryable?: boolean;
+  benchmark?: { runId: string; caseId: string; arm: string };
   /** The job a retry started for this one. */
   retriedAs?: string;
   /** What the runner reported at the finish (as the broker checked it). */

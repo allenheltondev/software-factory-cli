@@ -3,6 +3,10 @@ import { createHash } from 'node:crypto';
 
 export const BENCHMARK_LABEL = 'updraft:benchmark';
 
+export function isBenchmarkLabel(label: unknown): boolean {
+  return typeof label === 'string' && label.toLowerCase() === BENCHMARK_LABEL;
+}
+
 export interface BenchmarkIdentity {
   runId: string;
   caseId: string;

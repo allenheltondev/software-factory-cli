@@ -83,7 +83,7 @@ describe('benchmark dispatch preparation', () => {
     expect(policy).toContain(firstJob!.deliveryId);
     expect(policy).toContain('ANTHROPIC_API_KEY');
     expect(policy).not.toContain(secondJob!.deliveryId);
-    expect(policy).not.toContain('OPENAI_API_KEY');
+    expect(policy).not.toContain('CODEX_API_KEY');
     expect(await dispatch(fast)).toMatchObject({ disposition: 'duplicate', jobId: results[0]?.jobId });
     expect(await dispatch({ ...fast, agent: 'deep' })).toMatchObject({ status: 409, disposition: 'benchmark_identity_conflict' });
     expect(await dispatch({ ...fast, actor: 'mallory', benchmark: { ...fast.benchmark, arm: 'other' } })).toMatchObject({ status: 403 });

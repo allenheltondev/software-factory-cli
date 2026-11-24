@@ -334,6 +334,12 @@ describe('JobPage (#71)', () => {
       expect(await screen.findByRole('link', { name: 'job_newjob0001' })).toHaveAttribute('href', '/installations/55/jobs/job_newjob0001');
       expect(screen.queryByRole('button', { name: 'Retry job' })).not.toBeInTheDocument();
     });
+    it('directs finished benchmark jobs to the harness', async () => {
+      const benchmark = { runId: 'pilot', caseId: 'issue-17', arm: 'fast' };
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ benchmark, retryable: false, logs: [] }), deliveries: [] }), retryJob: vi.fn() }));
+      expect(await screen.findByText('To rerun this benchmark, submit a fresh arm through the benchmark harness.')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Retry job' })).not.toBeInTheDocument();
+    });
 
     it('is not offered for a job that is running, succeeded, or cannot be retried', async () => {
       showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ retryable: false }), deliveries: [] }), jobLog: vi.fn().mockResolvedValue({ name: 'run.log', text: 'x', size: 1, truncated: false }), retryJob: vi.fn() }));

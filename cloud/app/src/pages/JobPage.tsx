@@ -71,6 +71,9 @@ function Retry({ job, api, installationId }: { job: JobView; api: JobApi; instal
   const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  if (job.status === 'finished' && (job.benchmark || job.label?.toLowerCase() === 'updraft:benchmark')) {
+    return <p className="mt-4 text-sm">To rerun this benchmark, submit a fresh arm through the benchmark harness.</p>;
+  }
   if (job.retriedAs) {
     return (
       <p className="mt-4 text-sm" data-testid="job-retried">

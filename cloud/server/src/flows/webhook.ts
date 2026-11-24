@@ -1,3 +1,4 @@
+import { isBenchmarkLabel } from '../benchmarks/config.js';
 import type { GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import { verifySignature } from '../github/signature.js';
@@ -128,7 +129,8 @@ export function createWebhookHandler({
 
     if (event === 'ping') return done('pong');
     const launches = (event === 'issues' && action === 'labeled') || (Object.hasOwn(PULL_REQUEST_ACTIONS, event) && PULL_REQUEST_ACTIONS[event]!.includes(action));
-    if (launches && validInstallation && installationId === benchmarkInstallationId) return done('not_dispatched');
+    if (launches && ((validInstallation && installationId === benchmarkInstallationId) ||
+      (event === 'issues' && isBenchmarkLabel(payload.label?.name)))) return done('not_dispatched');
     if (event === 'issues' && action === 'labeled' && validInstallation && routines) {
       const routed = await routines({ installationId, deliveryId: delivery, eventName: event, payload });
       if (routed) {
