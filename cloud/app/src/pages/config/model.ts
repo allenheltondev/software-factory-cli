@@ -4,8 +4,8 @@ import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepos
 export const NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 export const NAME_RULE = 'Lower-case letters, digits and "-", at most 40';
 
-export const AGENT_LABEL: Record<AgentAdapter, string> = { claude: 'Claude Code', codex: 'Codex', kiro: 'Kiro' };
-export const KEY_FOR: Record<AgentAdapter, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY' };
+export const AGENT_LABEL: Record<AgentAdapter, string> = { claude: 'Claude Code', codex: 'Codex', kiro: 'Kiro', vibe: 'Mistral Vibe' };
+export const KEY_FOR: Record<AgentAdapter, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY', vibe: 'MISTRAL_API_KEY' };
 /** What an API from before the deployment named its agents offers. */
 export const DEFAULT_OFFERED: AgentAdapter[] = ['claude', 'codex'];
 

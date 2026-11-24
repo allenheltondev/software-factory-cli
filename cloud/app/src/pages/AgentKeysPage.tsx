@@ -29,6 +29,16 @@ const external = (href: string, text: string) => (
 );
 
 export const PROVIDERS: Record<string, Provider> = {
+  MISTRAL_API_KEY: {
+    agent: 'Mistral Vibe',
+    company: 'Mistral',
+    placeholder: 'Your Mistral Studio API key',
+    getKeyUrl: AGENT_GUIDES.vibe.getKeyUrl,
+    guide: AGENT_GUIDES.vibe,
+    steps: [<>Create a Studio key in {external(AGENT_GUIDES.vibe.getKeyUrl, 'Mistral')} and copy it here.</>],
+    checkedOnSave: true,
+    problem: (value) => /^[A-Za-z0-9_.-]{20,512}$/.test(value) ? null : 'Enter a Mistral Studio API key without spaces.',
+  },
   ANTHROPIC_API_KEY: {
     agent: 'Claude',
     company: 'Anthropic',

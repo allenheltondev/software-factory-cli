@@ -19,7 +19,7 @@ export interface SetupStep {
 
 const linkClass = 'auth-link font-semibold';
 /** An adapter's key name, to name the agent as the keys page does. */
-const KEY_OF: Record<string, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY' };
+const KEY_OF: Record<string, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY', vibe: 'MISTRAL_API_KEY' };
 
 /**
  * The steps from an installed App to a first job, each with whether it is done and where to do

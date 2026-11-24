@@ -1,4 +1,5 @@
-import { lstat, readFile, readdir, rm } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, open, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Logger } from '../util/log.js';
 
@@ -46,7 +47,17 @@ export async function consumeVibeUsage(directory: string, log: Pick<Logger, 'war
     const file = join(directory, 'export.json');
     const info = await lstat(file);
     if (!info.isFile() || info.size > MAX_REPORT_BYTES) return;
-    const report = JSON.parse(await readFile(file, 'utf8'));
+    const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let report;
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > MAX_REPORT_BYTES) return;
+      const data = Buffer.alloc(stat.size);
+      const { bytesRead } = await handle.read(data);
+      report = JSON.parse(data.toString('utf8', 0, bytesRead));
+    } finally {
+      await handle.close();
+    }
     if (report?.schema_version !== 1) return;
     const runs = [report, ...(Array.isArray(report.subagents) ? report.subagents : [])];
     const sum = (read: (run: typeof report) => number | undefined, validate = count) => {
