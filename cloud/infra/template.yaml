@@ -194,7 +194,6 @@ Resources:
   # failed events"). Kept 90 days.
   JobEventsFailureBucket:
     Type: AWS::S3::Bucket
-    DependsOn: JobEventsDeadLetterQueuePolicy
     Properties:
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -210,46 +209,37 @@ Resources:
           - Id: ExpireFailedJobEvents
             Status: Enabled
             ExpirationInDays: 90
-      # Each failure record also drops a pointer on the queue below, which the alarm watches.
-      NotificationConfiguration:
-        QueueConfigurations:
-          - Event: s3:ObjectCreated:*
-            Queue: !GetAtt JobEventsDeadLetterQueue.Arn
 
-  # Pointers to failure records in JobEventsFailureBucket: the alarm's signal, not the data.
-  JobEventsDeadLetterQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      MessageRetentionPeriod: 1209600
-      SqsManagedSseEnabled: true
-
-  JobEventsDeadLetterQueuePolicy:
-    Type: AWS::SQS::QueuePolicy
-    Properties:
-      Queues: [!Ref JobEventsDeadLetterQueue]
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          # By account rather than bucket ARN: the bucket's notification needs this policy to
-          # exist first, so naming the bucket here would be a dependency cycle.
-          - Effect: Allow
-            Principal:
-              Service: s3.amazonaws.com
-            Action: sqs:SendMessage
-            Resource: !GetAtt JobEventsDeadLetterQueue.Arn
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
-
-  JobEventsDeadLetterAlarm:
+  # Alarms from the function's own metrics (no bucket notification, which the deploy role may
+  # not manage). Errors: a batch is failing and being retried; after its retries it lands in
+  # JobEventsFailureBucket. DestinationDeliveryFailures: even that write failed, and the batch
+  # is lost once the stream trims it (24 hours).
+  JobEventsPublishErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
+      AlarmDescription: Job Finished events are failing to publish; failed batches land in JobEventsFailureBucket (cloud/README.md).
+      Namespace: AWS/Lambda
+      MetricName: Errors
       Dimensions:
-        - Name: QueueName
-          Value: !GetAtt JobEventsDeadLetterQueue.QueueName
-      Statistic: Maximum
+        - Name: FunctionName
+          Value: !Ref JobFinishedEventsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  JobEventsDestinationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A failed Job Finished batch could not be written to JobEventsFailureBucket; replay it from the stream within 24 hours.
+      Namespace: AWS/Lambda
+      MetricName: DestinationDeliveryFailures
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JobFinishedEventsFunction
+      Statistic: Sum
       Period: 60
       EvaluationPeriods: 1
       Threshold: 0

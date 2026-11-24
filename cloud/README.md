@@ -200,22 +200,29 @@ A batch that still fails after its retries (5, with the batch split in half each
 written to `JobEventsFailureBucket` (stack output `JobEventsFailureBucketName`) as a failure
 record. Each record holds the full invocation payload, the stream records themselves, and is
 kept for 90 days. The table stream keeps records for only 24 hours, so this bucket, not the
-stream, is what makes a failure recoverable. Each new record also puts a pointer on
-`JobEventsDeadLetterQueue`, and `JobEventsDeadLetterAlarm` goes off when the queue holds any
-message.
+stream, is what makes a failure recoverable.
 
-To replay one, after fixing the cause:
+Two alarms watch the function's own metrics:
+
+- `JobEventsPublishErrorsAlarm` (Lambda `Errors`) goes off as soon as a batch starts failing. A
+  batch that recovers on retry needs nothing. Otherwise its failure record appears in the bucket.
+- `JobEventsDestinationFailuresAlarm` (`DestinationDeliveryFailures`) means even the failure
+  record could not be written. The batch is then lost once the stream trims it, so fix the cause
+  within 24 hours; the mapping's retries will not bring it back.
+
+To replay a failure record, after fixing the cause:
 
 ```sh
 aws s3 cp "s3://$BUCKET/$KEY" record.json
 jq -r '.payload' record.json > batch.json   # the original {"Records": [...]} batch
-aws lambda invoke --function-name "$FUNCTION" --payload fileb://batch.json out.json
+aws lambda invoke --function-name "$FUNCTION" --payload fileb://batch.json out.json > invoke.json
+# Only if the replay succeeded: FunctionError is absent from the response.
+jq -e 'has("FunctionError") | not' invoke.json && aws s3 rm "s3://$BUCKET/$KEY"
 ```
 
 `$FUNCTION` is the stack output `JobFinishedEventsFunctionName`. The function re-checks each
 tenant's opt-in when it replays a record, and consumers deduplicate, so replaying a batch that
-was partly published is safe. Delete the queue message once the record is replayed. This
-procedure has not yet been exercised against a live failure.
+was partly published is safe. This procedure has not yet been exercised against a live failure.
 
 ### Mistral API pilot
 
