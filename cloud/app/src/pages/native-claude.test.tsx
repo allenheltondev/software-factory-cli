@@ -97,7 +97,7 @@ describe('Claude subscription settings page', () => {
 
   it('explains that first-time AWS worker provisioning remains necessary', async () => {
     show(fakeApi({ nativeClaude: async () => ({ configured: false, enabled: false, worker: null }) }));
-    expect(await screen.findByText(/needs to be provisioned once/)).toBeInTheDocument();
+    expect(await screen.findByText(/Claude subscription is unavailable in this deployment/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Use subscription' })).toBeDisabled();
     expect(screen.getByRole('link', { name: /Worker setup guide/ })).toHaveAttribute('href', expect.stringContaining('/CLOUD.md'));
   });

@@ -276,7 +276,7 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
           )}
           {!view.configured && (
             <Alert variant="info">
-              The dedicated subscription worker needs to be provisioned once before it can be enabled here.
+              Claude subscription is unavailable in this deployment. An Updraft operator needs to enable the worker image before you can select triggers.
               <a className="auth-link ml-1" href="https://github.com/allenheltondev/software-factory-cli/blob/main/deploy/aws-microvm/native-worker/CLOUD.md" target="_blank" rel="noreferrer">Worker setup guide ↗</a>
             </Alert>
           )}
@@ -322,7 +322,7 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
             </Card>
           )}
           <p className="text-sm text-muted-foreground">
-            Mode changes affect new GitHub jobs. Wait for any active subscription job to finish before switching.
+            Mode changes affect new GitHub jobs. Retrying an earlier job keeps its original execution mode. To test subscription routing, apply a selected start label to a new issue after enabling the subscription.
             The AWS subscription worker has not yet passed its complete live acceptance test.
           </p>
         </>

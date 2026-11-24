@@ -160,6 +160,10 @@ Both workflows call `.github/workflows/cloud-deploy-env.yaml`, which runs these 
      - If any record can't be read, nothing is deleted.
      - Pruning is best-effort. A failure leaves old files behind and doesn't fail the deploy, because the release is already live.
 4. `scripts/smoke.mjs` against the deployed URL.
+5. Build and smoke-test the worker images in AWS. The Claude subscription image uses a separate
+   release job. CloudFormation deploys the verified version in Staging and in Production
+   when an operator enables the pilot. Each installation selects its own subscription triggers. See the
+   [Claude subscription release and acceptance criteria](../deploy/aws-microvm/native-worker/CLOUD.md).
 
 There is no `sam build`. `ApiFunction`'s `CodeUri` is the bundled `server/dist`, which `sam deploy` zips and uploads itself.
 

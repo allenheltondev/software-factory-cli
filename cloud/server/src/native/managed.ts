@@ -12,6 +12,7 @@ export function managedClaude(env = process.env) {
   const imageArn = env.NATIVE_MANAGED_IMAGE_ARN;
   const imageVersion = env.NATIVE_MANAGED_IMAGE_VERSION;
   const executionRoleArn = env.NATIVE_MANAGED_ROLE_ARN;
+  const logGroup = env.NATIVE_MANAGED_LOG_GROUP;
   const controlSecretArn = env.NATIVE_MANAGED_SECRET_ARN;
   if (!imageArn || !imageVersion || !controlSecretArn) return undefined;
 
@@ -61,6 +62,7 @@ export function managedClaude(env = process.env) {
     const result = await microvms.send(new RunMicrovmCommand({
       clientToken: session.generation, imageIdentifier: imageArn, imageVersion: session.imageVersion, executionRoleArn,
       maximumDurationInSeconds: MAX_SECONDS,
+      ...(logGroup ? { logging: { cloudWatch: { logGroup } } } : {}),
       ingressNetworkConnectors: [connector + 'HTTP_INGRESS'], egressNetworkConnectors: [connector + 'INTERNET_EGRESS'],
       runHookPayload: JSON.stringify({ storage: 'ephemeral', cloud: {
         region, brokerFunctionName, workerId: managedWorkerId(id), imageVersion: session.imageVersion, workerVersion: 'tenant-browser-1', controlToken: token,

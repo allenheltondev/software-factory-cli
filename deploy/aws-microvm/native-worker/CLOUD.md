@@ -7,10 +7,16 @@ still apply. Local regression tests are not evidence of an AWS subscription exec
 
 ## Tenant-managed disposable sessions
 
-After testing the dedicated browser-login image in AWS, set `ManagedClaudeImageName` and
-`ManagedClaudeImageVersion` on the Cloud stack. Leave the version empty on stacks where
-this flow is disabled. From `cloud/`, pass `MANAGED_CLAUDE_IMAGE_NAME` and
-`MANAGED_CLAUDE_IMAGE_VERSION` to `make deploy-backend` to set the parameters.
+The Cloud release workflow builds and publishes a dedicated image in each environment.
+It checks a signed-out AWS worker for an official Claude sign-in link and confirms that
+the browser grant cannot reach the lifecycle port. A failed check leaves the deployed
+image version as it was. Staging deploys verified images automatically. To authorize a
+Production pilot, set `ENABLE_MANAGED_CLAUDE=true` in the Production GitHub environment and
+run the Production deploy workflow. The production owner then selects pilot triggers in the console.
+Other installations need to opt in separately. Track broader rollout in #100.
+The workflow passes the verified version to CloudFormation as `ManagedClaudeImageVersion`.
+To run the same build and smoke test without enabling routing, use
+`npm run build-job-image --workspace=server -- --native-claude` from `cloud/`.
 CloudFormation creates a broker-only execution role, an application
 control key, and the reference that lets the broker wake the webhook Lambda. The installation
 owns the saved trigger selection, one current session binding, and its waiting delivery
@@ -30,8 +36,8 @@ runtime quota. A new worker receives a different control credential and has to s
 For live acceptance, use two test installations. Verify a member can see their own waiting
 request, only the owner can start sign-in, and another installation cannot view or start it.
 Repeat the webhook and open two sign-in tabs, then confirm one comment, one worker, and one
-job. Verify the lifecycle-port denial and repository credential isolation before enabling
-the image version in Production. Complete a real GitHub job, let the session expire, and
+job. Verify the lifecycle-port denial and repository credential isolation before expanding
+the pilot. Complete a real GitHub job, let the session expire, and
 confirm the next labeled issue waits for a fresh login without API billing.
 
 ## Disposable browser sign-in pilot

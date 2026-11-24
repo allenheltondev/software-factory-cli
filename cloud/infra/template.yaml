@@ -7,6 +7,11 @@ Description: >
   app client to that pool).
 
 Parameters:
+  ClaudeImageDeploymentRoleName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[A-Za-z0-9_+=,.@-]{1,64}$'
+    Description: Existing GitHub deployment role that builds and verifies the Claude image.
   ManagedClaudeImageName:
     Type: String
     Default: updraft-native-claude
@@ -16,6 +21,11 @@ Parameters:
     Type: String
     Default: ''
     Description: Built, live-verified browser-login image version. A nonempty value enables tenant-managed Claude sessions.
+  ManagedClaudeConsoleOrigin:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://[A-Za-z0-9.-]+$'
+    Description: Public console origin for issue sign-in links when the console uses its CloudFront domain.
   NativeWorkerRoute:
     Type: String
     Default: ''
@@ -139,7 +149,8 @@ Rules:
       - Assert: !Or
           - !Equals [!Ref ManagedClaudeImageVersion, '']
           - !Not [!Equals [!Ref AppDomainName, '']]
-        AssertDescription: Managed Claude requires a public console domain for GitHub issue links.
+          - !Not [!Equals [!Ref ManagedClaudeConsoleOrigin, '']]
+        AssertDescription: Managed Claude requires a public console origin for GitHub issue links.
   NativeWorkerReferences:
     Assertions:
       - Assert: !Or
@@ -150,7 +161,9 @@ Rules:
         AssertDescription: Enabling the native test route requires its dedicated image and control secret ARNs.
 
 Conditions:
+  ClaudeImageDeployment: !Not [!Equals [!Ref ClaudeImageDeploymentRoleName, '']]
   ManagedClaude: !Not [!Equals [!Ref ManagedClaudeImageVersion, '']]
+  ManagedClaudeOriginOverride: !Not [!Equals [!Ref ManagedClaudeConsoleOrigin, '']]
   NativeWorkerBrowserLogin: !And
     - !Condition NativeWorkerEnabled
     - !Equals [!Ref NativeWorkerBrowserSignIn, 'true']
@@ -174,6 +187,33 @@ Globals:
     Tracing: Active
 
 Resources:
+  ClaudeImageDeploymentPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ClaudeImageDeployment
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-claude-image-release
+      Roles: [!Ref ClaudeImageDeploymentRoleName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:GetMicrovmImage
+              - lambda:GetMicrovmImageVersion
+              - lambda:TagResource
+              - lambda:UpdateMicrovmImage
+              - lambda:RunMicrovm
+              - lambda:GetMicrovm
+              - lambda:CreateMicrovmAuthToken
+              - lambda:TerminateMicrovm
+            Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt ManagedClaudeExecutionRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: lambda.amazonaws.com
+
   ManagedClaudeControlSecret:
     Type: AWS::SecretsManager::Secret
     Condition: ManagedClaude
@@ -185,7 +225,7 @@ Resources:
 
   ManagedClaudeExecutionRole:
     Type: AWS::IAM::Role
-    Condition: ManagedClaude
+    # Provision before activation so the image smoke test uses the tenant runtime role.
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -202,6 +242,14 @@ Resources:
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !GetAtt BrokerFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroup}:*
 
   ManagedClaudeWebhookName:
     Type: AWS::SSM::Parameter
@@ -363,6 +411,7 @@ Resources:
           NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
           NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
           NATIVE_MANAGED_ROLE_ARN: !If [ManagedClaude, !GetAtt ManagedClaudeExecutionRole.Arn, ""]
+          NATIVE_MANAGED_LOG_GROUP: !If [ManagedClaude, !Ref MicrovmLogGroup, ""]
           BROKER_FUNCTION_NAME: !Ref BrokerFunction
           NATIVE_WORKER_LOGIN_IMAGE_ARN: !If [NativeWorkerBrowserLogin, !Ref NativeWorkerImageArn, ""]
           # Tenant config bundles: the console publishes them (tenants/config-service.ts).
@@ -492,7 +541,10 @@ Resources:
           NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
           NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
           NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
-          CLAUDE_CONSOLE_ORIGIN: !If [ManagedClaude, !Sub 'https://${AppDomainName}', ""]
+          CLAUDE_CONSOLE_ORIGIN: !If
+            - ManagedClaude
+            - !If [ManagedClaudeOriginOverride, !Ref ManagedClaudeConsoleOrigin, !Sub 'https://${AppDomainName}']
+            - ''
           BROKER_FUNCTION_NAME: !Ref BrokerFunction
           MICROVM_LOG_GROUP: !Ref MicrovmLogGroup
           # Agent timeouts are capped at 120 minutes and verify at 30 (tenants/config.ts).
@@ -1176,6 +1228,9 @@ Outputs:
   MicrovmExecutionRoleArn:
     Description: The one execution role of every job microVM (it reaches no tenant's data itself)
     Value: !GetAtt MicrovmExecutionRole.Arn
+  ManagedClaudeExecutionRoleArn:
+    Description: Execution role used by managed Claude sessions and the Claude release smoke test
+    Value: !GetAtt ManagedClaudeExecutionRole.Arn
   JobImageName:
     Description: The MicroVM image jobs run (server/scripts/build-job-image.ts builds it)
     Value: !Sub ${AWS::StackName}-job

@@ -8,6 +8,7 @@ import { identityCommand } from './service.mjs';
 export const LOGIN_PORT = 8081;
 const LIMIT = 65536;
 const TIMEOUT = 5 * 60_000;
+const AUTH_STATUS_TIMEOUT = 30_000;
 const args = ['--restricted', '--setting-sources', '', 'auth'];
 
 export function loginUrl(output) {
@@ -19,7 +20,7 @@ export function loginUrl(output) {
   }
 }
 
-export function attachLogin(socket, config, checkAuth, launch = spawn) {
+export function attachLogin(socket, config, checkAuth, launch = spawn, report = () => {}) {
   let child;
   let sentUrl = false;
   let sentCode = false;
@@ -46,7 +47,7 @@ export function attachLogin(socket, config, checkAuth, launch = spawn) {
   socket.once('error', close);
   socket.on('message', (data, binary) => {
     const code = binary ? '' : data.toString();
-    if (!sentUrl || !child || sentCode || !/^[!-~]{1,2048}$/.test(code)) { finish('failed'); return; }
+    if (!sentUrl || !child || sentCode || !/^[!-~]{1,2048}$/.test(code)) { report('invalid_input'); finish('failed'); return; }
     sentCode = true;
     child.stdin.end(code + '\n');
   });
@@ -54,28 +55,29 @@ export function attachLogin(socket, config, checkAuth, launch = spawn) {
     const status = await checkAuth();
     if (closed) return;
     if (status === 'connected') { finish('connected'); return; }
-    if (!['login_required', 'expired'].includes(status)) { finish('failed'); return; }
+    if (!['login_required', 'expired'].includes(status)) { report('auth_status_' + status); finish('failed'); return; }
     child = launch(config.claude, [...args, 'login', '--claudeai'], { cwd: '/', env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    child.stdin.on('error', () => finish('failed'));
-    child.once('error', () => finish('failed'));
+    child.stdin.on('error', () => { report('cli_input_error'); finish('failed'); });
+    child.once('error', () => { report('cli_launch_error'); finish('failed'); });
     for (const stream of [child.stdout, child.stderr]) stream.on('data', (data) => {
       bytes += data.length;
-      if (bytes > LIMIT) { finish('failed'); return; }
+      if (bytes > LIMIT) { report('cli_output_limit'); finish('failed'); return; }
       if (sentUrl || closed) return;
       output += data.toString('utf8');
       if (!output.includes('Paste code')) return;
       const url = loginUrl(output);
       output = '';
-      if (!url) { finish('failed'); return; }
+      if (!url) { report('cli_authorize_url_missing'); finish('failed'); return; }
       sentUrl = true;
       send({ url });
     });
     child.once('close', (code) => {
       if (closed) return;
       child = undefined;
+      if (!sentUrl) report(`cli_exited_before_prompt_${code ?? 'signal'}`);
       void checkAuth().then((status) => finish(code === 0 && status === 'connected' ? 'connected' : 'failed'), () => finish('failed'));
     });
-  })().catch(() => finish('failed'));
+  })().catch(() => { report('login_unavailable'); finish('failed'); });
   return close;
 }
 
@@ -87,8 +89,18 @@ async function run(config) {
     const { execFile } = await import('node:child_process');
     return new Promise((resolve) => {
       const env = claudeEnv(config);
-      execFile(config.claude, [...args, 'status'], { cwd: '/', env, timeout: 10000, maxBuffer: LIMIT },
-        (error, stdout) => resolve(nativeClaudeAuthFromStatus({ code: error ? (typeof error.code === 'number' ? error.code : null) : 0, stdout }, env).state));
+      execFile(config.claude, [...args, 'status'], { cwd: '/', env, timeout: AUTH_STATUS_TIMEOUT, killSignal: 'SIGKILL', maxBuffer: LIMIT },
+        (error, stdout) => {
+          const code = error ? (typeof error.code === 'number' ? error.code : null) : 0;
+          const { state } = nativeClaudeAuthFromStatus({ code, stdout }, env);
+          if (state === 'unknown') {
+            const outcome = error?.killed ? 'killed'
+              : typeof code === 'number' ? `exit_${code}`
+                : ['ENOENT', 'EACCES', 'ENOEXEC'].includes(error?.code) ? error.code.toLowerCase() : 'unavailable';
+            process.send?.({ loginPhase: `auth_probe_${outcome}_${stdout.length ? 'output' : 'empty'}` });
+          }
+          resolve(state);
+        });
     });
   }
   const httpServer = http.createServer((_req, res) => res.writeHead(404).end());
@@ -104,7 +116,7 @@ async function run(config) {
     ws.handleUpgrade(req, socket, head, (client) => {
       active = true;
       client.once('close', () => { active = false; });
-      attachLogin(client, config, checkAuth);
+      attachLogin(client, config, checkAuth, spawn, (phase) => process.send?.({ loginPhase: phase }));
     });
   });
   httpServer.listen(LOGIN_PORT, '0.0.0.0', () => process.send?.({ ready: true }));
@@ -125,6 +137,11 @@ export async function startBrowserLogin(config) {
     child.kill('SIGKILL');
     throw error;
   } finally { clearTimeout(timer); }
+  child.on('message', (value) => {
+    if (typeof value?.loginPhase === 'string' && /^[a-z0-9_]{1,60}$/.test(value.loginPhase)) {
+      console.error(JSON.stringify({ browserLogin: value.loginPhase }));
+    }
+  });
   return child;
 }
 
