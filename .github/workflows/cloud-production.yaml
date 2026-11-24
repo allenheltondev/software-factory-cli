@@ -40,6 +40,5 @@ jobs:
       environment: Production
       domain: updraft.readysetcloud.io
       build_image: ${{ inputs.build_image == true }}
-      # Enable in the release PR after the Staging acceptance checks and issue #100 are cleared.
-      deploy_claude: false
+      deploy_claude: true
     secrets: inherit

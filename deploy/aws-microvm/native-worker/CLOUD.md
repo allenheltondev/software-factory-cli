@@ -10,8 +10,9 @@ still apply. Local regression tests are not evidence of an AWS subscription exec
 The Cloud release workflow builds and publishes a dedicated image in each environment.
 It checks a signed-out AWS worker for an official Claude sign-in link and confirms that
 the browser grant cannot reach the lifecycle port. A failed check leaves the deployed
-image version as it was. Staging deploys verified images automatically. Set `deploy_claude: true`
-in the Production workflow as part of the release PR once the live tests below and #100 are cleared.
+image version as it was. Staging and Production deploy verified images automatically.
+The production owner can opt their own installation into the pilot from the console.
+Other installations need to opt in separately. Track broader rollout in #100.
 The workflow passes the verified version to CloudFormation as `ManagedClaudeImageVersion`.
 To run the same build and smoke test without enabling routing, use
 `npm run build-job-image --workspace=server -- --native-claude` from `cloud/`.
@@ -34,8 +35,8 @@ runtime quota. A new worker receives a different control credential and has to s
 For live acceptance, use two test installations. Verify a member can see their own waiting
 request, only the owner can start sign-in, and another installation cannot view or start it.
 Repeat the webhook and open two sign-in tabs, then confirm one comment, one worker, and one
-job. Verify the lifecycle-port denial and repository credential isolation before enabling
-the image version in Production. Complete a real GitHub job, let the session expire, and
+job. Verify the lifecycle-port denial and repository credential isolation before expanding
+the pilot. Complete a real GitHub job, let the session expire, and
 confirm the next labeled issue waits for a fresh login without API billing.
 
 ## Disposable browser sign-in pilot
