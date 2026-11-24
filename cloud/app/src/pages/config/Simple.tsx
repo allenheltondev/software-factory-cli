@@ -284,8 +284,8 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                 </div>
                 {agent && modelOpen === a && (
                   <div className="grid gap-4 sm:grid-cols-2">
-                    <Input label="Model" hint="For coding and reviewing. Empty: the agent's default" value={agent.model ?? ''} error={issuesAt(errors, `agents.${a}.model`)} onChange={(e) => onChange({ ...config, agents: { ...config.agents, [a]: { ...agent, model: e.target.value || undefined } } })} />
-                    <Input label="Reasoning effort" hint="For example low, medium or high" list="effort-levels" value={agent.effort ?? ''} error={issuesAt(errors, `agents.${a}.effort`)} onChange={(e) => onChange({ ...config, agents: { ...config.agents, [a]: { ...agent, effort: e.target.value || undefined } } })} />
+                    <Input label="Model" hint={agent.adapter === 'vibe' ? 'Mistral API model ID. Default: mistral-medium-latest' : "For coding and reviewing. Empty: the agent's default"} value={agent.model ?? ''} error={issuesAt(errors, `agents.${a}.model`)} onChange={(e) => onChange({ ...config, agents: { ...config.agents, [a]: { ...agent, model: e.target.value || undefined } } })} />
+                    {agent.adapter !== 'vibe' && <Input label="Reasoning effort" hint="For example low, medium or high" list="effort-levels" value={agent.effort ?? ''} error={issuesAt(errors, `agents.${a}.effort`)} onChange={(e) => onChange({ ...config, agents: { ...config.agents, [a]: { ...agent, effort: e.target.value || undefined } } })} />}
                   </div>
                 )}
                 {keyForm(a, 'coding')}

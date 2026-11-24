@@ -1,4 +1,5 @@
-import { lstat, readFile, readdir, rm } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, open, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Logger } from '../util/log.js';
 
@@ -6,6 +7,12 @@ const MAX_REPORT_BYTES = 1024 * 1024;
 const count = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 const money = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 export const VIBE_EXPORT_PREFIX = '.vibe-usage-';
+
+interface VibeRunUsage {
+  usage?: { input_tokens?: unknown; output_tokens?: unknown; cached_input_tokens?: unknown };
+  cost_usd?: unknown;
+  steps?: unknown;
+}
 
 async function removeExport(directory: string, log: Pick<Logger, 'warn'>): Promise<void> {
   try {
@@ -46,10 +53,20 @@ export async function consumeVibeUsage(directory: string, log: Pick<Logger, 'war
     const file = join(directory, 'export.json');
     const info = await lstat(file);
     if (!info.isFile() || info.size > MAX_REPORT_BYTES) return;
-    const report = JSON.parse(await readFile(file, 'utf8'));
+    const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let report: (VibeRunUsage & { schema_version?: unknown; subagents?: VibeRunUsage[] }) | null;
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > MAX_REPORT_BYTES) return;
+      const data = Buffer.alloc(stat.size);
+      const { bytesRead } = await handle.read(data);
+      report = JSON.parse(data.toString('utf8', 0, bytesRead));
+    } finally {
+      await handle.close();
+    }
     if (report?.schema_version !== 1) return;
     const runs = [report, ...(Array.isArray(report.subagents) ? report.subagents : [])];
-    const sum = (read: (run: typeof report) => number | undefined, validate = count) => {
+    const sum = (read: (run: VibeRunUsage) => number | undefined, validate = count) => {
       const values = runs.map(read);
       return values.every((value) => value !== undefined)
         ? validate(values.reduce<number>((total, value) => total + (value ?? 0), 0))

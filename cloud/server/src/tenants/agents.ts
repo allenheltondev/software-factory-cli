@@ -1,5 +1,5 @@
 /** Every agent Updraft Cloud can run, and the variable each one's API key is passed in as. */
-export const SUPPORTED_AGENT_KEY_ENV = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY' } as const;
+export const SUPPORTED_AGENT_KEY_ENV = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY', vibe: 'MISTRAL_API_KEY' } as const;
 export type CloudAgent = keyof typeof SUPPORTED_AGENT_KEY_ENV;
 
 /** What a deployment runs when CLOUD_AGENTS is not set: what the job image ships by default and Codex, as before Kiro. */

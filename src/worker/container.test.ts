@@ -314,6 +314,19 @@ describe('containInvocation', () => {
     });
     expect(byPath.mounts[byPath.mounts.length - 1]).toEqual({ path: promptFile, readOnly: true });
     expect(byPath.mounts.filter((m) => m.path.startsWith(join(f.root, 'runs')))).toHaveLength(1);
+
+    const report = join(f.root, 'runs', 'run_vibe', '.vibe-usage-abc123');
+    const vibe = containInvocation({
+      invocation: { file: 'vibe', args: ['--output-dir', report, '--prompt'], promptVia: 'stdin' },
+      runtime: '/usr/bin/docker',
+      container: containerSchema.parse({ image: 'runner:1', env: ['MISTRAL_API_KEY'] }),
+      runId: 'run_vibe',
+      worktree: wt,
+      promptFile,
+      vibeReportDir: report,
+    });
+    expect(vibe.mounts.filter((m) => m.path.startsWith(join(f.root, 'runs')))).toEqual([{ path: report, readOnly: false }]);
+    expect(vibe.envNames).toEqual(['MISTRAL_API_KEY']);
   });
 });
 

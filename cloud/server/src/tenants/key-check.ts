@@ -12,15 +12,17 @@ export const checkAgentKeyWithProvider = (fetchFn: typeof fetch = fetch, timeout
   async (name, value) => {
     // Kiro documents no API to check a key against; its first job does.
     if (name === 'KIRO_API_KEY') return 'unchecked';
+    const bearerEndpoint = name === 'CODEX_API_KEY' ? 'https://api.openai.com/v1/models'
+      : name === 'MISTRAL_API_KEY' ? 'https://api.mistral.ai/v1/models' : null;
     const request: { url: string; headers: Record<string, string> } | null =
       name === 'ANTHROPIC_API_KEY'
         ? { url: 'https://api.anthropic.com/v1/models?limit=1', headers: { 'x-api-key': value, 'anthropic-version': '2023-06-01' } }
-        : name === 'CODEX_API_KEY'
-          ? { url: 'https://api.openai.com/v1/models', headers: { authorization: `Bearer ${value}` } }
+        : bearerEndpoint
+          ? { url: bearerEndpoint, headers: { authorization: `Bearer ${value}` } }
           : null;
     if (!request) return 'unavailable';
     try {
-      const res = await fetchFn(request.url, { headers: request.headers, signal: AbortSignal.timeout(timeoutMs) });
+      const res = await fetchFn(request.url, { headers: request.headers, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
       if (res.ok) return 'valid';
       // 401 is a key the provider does not know; 403 one it knows but refuses. Both are unusable.
       if (res.status === 401 || res.status === 403) return 'invalid';
