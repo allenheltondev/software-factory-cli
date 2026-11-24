@@ -115,7 +115,6 @@ PARAM_OVERRIDES = $(strip \
 	$(call domain_override,AppDomainName,APP_DOMAIN_NAME) \
 	$(call domain_override,AppHostedZoneId,APP_HOSTED_ZONE_ID) \
 	$(call domain_override,CloudAgents,CLOUD_AGENTS) \
-	$(call domain_override,JobFinishedEventsInfrastructure,JOB_FINISHED_EVENTS_INFRASTRUCTURE) \
 	$(call domain_override,ManagedClaudeImageName,MANAGED_CLAUDE_IMAGE_NAME) \
 	$(call domain_override,ManagedClaudeImageVersion,MANAGED_CLAUDE_IMAGE_VERSION) \
 	$(call domain_override,ManagedClaudeConsoleOrigin,MANAGED_CLAUDE_CONSOLE_ORIGIN) \

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { enrichFinishedJobs } from './job-finished-lambda.js';
+import { EVENT_DETAIL_TYPE, EVENT_SOURCE, enrichFinishedJobs, publishFinishedJobs } from './job-finished-lambda.js';
 import { stepsOf } from './jobs/lifecycle.js';
 
 const time = '2026-11-24T00:00:00Z';
@@ -51,4 +51,32 @@ it('bounds step metadata while keeping old step shapes', () => {
     { kind: 'implement' },
     { kind: 'review', adapter: 'claude', effort: 'high', usage: { outputTokens: 0, toolCalls: 8 } },
   ]);
+});
+
+describe('publishing to the default bus', () => {
+  const detail = (jobId: string) => ({ schemaVersion: 1, stack: 'test', tenantId: '42', jobId }) as unknown as Parameters<typeof publishFinishedJobs>[0][number];
+
+  it('puts each finished job as one Job Finished event, at most 10 per call', async () => {
+    type Entry = { Source: string; DetailType: string; Detail: string };
+    const calls: Entry[][] = [];
+    const put = vi.fn(async (entries: Entry[]) => { calls.push(entries); return { FailedEntryCount: 0 }; });
+    const details = Array.from({ length: 12 }, (_, i) => detail(`job_${i}`));
+    await expect(publishFinishedJobs(details, put)).resolves.toBe(12);
+    expect(put).toHaveBeenCalledTimes(2);
+    const first = calls[0]!;
+    expect(first).toHaveLength(10);
+    expect(first[0]).toEqual({ Source: EVENT_SOURCE, DetailType: EVENT_DETAIL_TYPE, Detail: JSON.stringify(details[0]) });
+    // No EventBusName: the account's default bus.
+    expect(first[0]).not.toHaveProperty('EventBusName');
+  });
+
+  it('throws on a rejected entry, so the stream trigger retries the batch', async () => {
+    await expect(publishFinishedJobs([detail('job_1')], async () => ({ FailedEntryCount: 1 }))).rejects.toThrow(/rejected 1 of 1/);
+  });
+
+  it('puts nothing when no record is a first finish', async () => {
+    const put = vi.fn(async () => ({}));
+    await expect(publishFinishedJobs([], put)).resolves.toBe(0);
+    expect(put).not.toHaveBeenCalled();
+  });
 });

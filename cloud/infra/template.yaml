@@ -7,11 +7,6 @@ Description: >
   app client to that pool).
 
 Parameters:
-  JobFinishedEventsInfrastructure:
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
-    Description: Provision the EventBridge job-finished bus and Pipe after its deploy-role permissions are in place.
   ClaudeImageDeploymentRoleName:
     Type: String
     Default: ''
@@ -166,7 +161,6 @@ Rules:
         AssertDescription: Enabling the native test route requires its dedicated image and control secret ARNs.
 
 Conditions:
-  DeployJobFinishedEvents: !Equals [!Ref JobFinishedEventsInfrastructure, 'true']
   ClaudeImageDeployment: !Not [!Equals [!Ref ClaudeImageDeploymentRoleName, '']]
   ManagedClaude: !Not [!Equals [!Ref ManagedClaudeImageVersion, '']]
   ManagedClaudeOriginOverride: !Not [!Equals [!Ref ManagedClaudeConsoleOrigin, '']]
@@ -193,38 +187,14 @@ Globals:
     Tracing: Active
 
 Resources:
-  JobEventsBus:
-    Type: AWS::Events::EventBus
-    Condition: DeployJobFinishedEvents
-    Properties:
-      Name: !Sub ${AWS::StackName}-events
-
-  JobEventsBusName:
-    Type: AWS::SSM::Parameter
-    Condition: DeployJobFinishedEvents
-    Properties:
-      Name: !Sub /updraft/${AWS::StackName}/event-bus-name
-      Type: String
-      Value: !Ref JobEventsBus
-
-  JobEventsBusArn:
-    Type: AWS::SSM::Parameter
-    Condition: DeployJobFinishedEvents
-    Properties:
-      Name: !Sub /updraft/${AWS::StackName}/event-bus-arn
-      Type: String
-      Value: !GetAtt JobEventsBus.Arn
-
   JobEventsDeadLetterQueue:
     Type: AWS::SQS::Queue
-    Condition: DeployJobFinishedEvents
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
   JobEventsDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: DeployJobFinishedEvents
     Properties:
       Namespace: AWS/SQS
       MetricName: ApproximateNumberOfMessagesVisible
@@ -238,17 +208,35 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
-  JobEventsEnrichment:
+  # Job Finished events (v1, cloud/README.md): a finished tenant job summary on the table's
+  # stream becomes one event on the account's default bus. Consumers subscribe with a rule there.
+  JobFinishedEventsFunction:
     Type: AWS::Serverless::Function
-    Condition: DeployJobFinishedEvents
     Properties:
       CodeUri: ../server/dist
       Handler: job-finished.handler
-      Timeout: 15
+      Timeout: 30
       Environment:
         Variables:
           STACK_NAME: !Ref AWS::StackName
           TABLE_NAME: !Ref UpdraftTable
+      Events:
+        JobFinished:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt UpdraftTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumRetryAttempts: 5
+            BisectBatchOnFunctionError: true
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination: !GetAtt JobEventsDeadLetterQueue.Arn
+            FilterCriteria:
+              Filters:
+                - Pattern: >-
+                    {"eventName":["MODIFY"],"dynamodb":{"NewImage":{"pk":{"S":[{"prefix":"TENANT#"}]},"sk":{"S":[{"prefix":"JOB#"}]},"status":{"S":["finished"]}},"OldImage":{"status":{"S":[{"anything-but":"finished"}]}}}}
       Policies:
         - Statement:
             - Effect: Allow
@@ -257,66 +245,12 @@ Resources:
               Condition:
                 ForAllValues:StringLike:
                   dynamodb:LeadingKeys: ['TENANT#*']
-
-  JobEventsPipeRole:
-    Type: AWS::IAM::Role
-    Condition: DeployJobFinishedEvents
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: pipes.amazonaws.com
-            Action: sts:AssumeRole
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
-      Policies:
-        - PolicyName: job-finished-pipe
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator]
-                Resource: !GetAtt UpdraftTable.StreamArn
-              - Effect: Allow
-                Action: dynamodb:ListStreams
-                Resource: '*'
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt JobEventsEnrichment.Arn
-              - Effect: Allow
-                Action: events:PutEvents
-                Resource: !GetAtt JobEventsBus.Arn
-              - Effect: Allow
-                Action: sqs:SendMessage
-                Resource: !GetAtt JobEventsDeadLetterQueue.Arn
-
-  JobEventsPipe:
-    Type: AWS::Pipes::Pipe
-    Condition: DeployJobFinishedEvents
-    Properties:
-      Name: !Sub ${AWS::StackName}-job-finished
-      RoleArn: !GetAtt JobEventsPipeRole.Arn
-      Source: !GetAtt UpdraftTable.StreamArn
-      SourceParameters:
-        FilterCriteria:
-          Filters:
-            - Pattern: >-
-                {"eventName":["MODIFY"],"dynamodb":{"NewImage":{"pk":{"S":[{"prefix":"TENANT#"}]},"sk":{"S":[{"prefix":"JOB#"}]},"status":{"S":["finished"]}},"OldImage":{"status":{"S":[{"anything-but":"finished"}]}}}}
-        DynamoDBStreamParameters:
-          StartingPosition: LATEST
-          BatchSize: 1
-          MaximumRetryAttempts: 5
-          DeadLetterConfig:
-            Arn: !GetAtt JobEventsDeadLetterQueue.Arn
-      Enrichment: !GetAtt JobEventsEnrichment.Arn
-      Target: !GetAtt JobEventsBus.Arn
-      TargetParameters:
-        EventBridgeEventBusParameters:
-          Source: updraft.cloud
-          DetailType: Job Finished
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt JobEventsDeadLetterQueue.Arn
 
   ClaudeImageDeploymentPolicy:
     Type: AWS::IAM::Policy

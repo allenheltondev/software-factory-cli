@@ -169,26 +169,29 @@ There is no `sam build`. `ApiFunction`'s `CodeUri` is the bundled `server/dist`,
 
 ### Job Finished events (v1)
 
-The `<stack>-events` bus receives `source: updraft.cloud` and `detail-type: Job Finished`
-when a tenant job summary first moves to `finished`. Discover the bus in SSM under
-`/updraft/<stack>/event-bus-name` and `/updraft/<stack>/event-bus-arn`.
-The setting defaults to off. After the installation opts in, a platform admin can set
-it with `PUT /api/v1/admin/tenants/<installation-id>/job-finished-events` and
+The account's **default** EventBridge bus receives `source: updraft.cloud` and
+`detail-type: Job Finished` when a tenant job summary first moves to `finished`. Consumers in the
+account subscribe with a rule on the default bus matching that source and detail type, so they
+need no bus name, SSM lookup, or deploy order. `JobFinishedEventsFunction` reads the table stream
+(filtered to that transition) and puts the events. Failed batches are retried, bisected, and
+then sent to `JobEventsDeadLetterQueue`, which `JobEventsDeadLetterAlarm` watches. The
+infrastructure is always deployed and has no deploy flag.
+
+Publishing is per tenant and off by default. After the installation opts in, a platform admin
+turns it on with `PUT /api/v1/admin/tenants/<installation-id>/job-finished-events` and
 `{"enabled":true}`. Use `{"enabled":false}` to stop publishing new events.
 
 Payloads include `schemaVersion: 1`, the stack, tenant and job IDs, repository,
 timestamps, status and outcome, and available verification, PR, step, routing and usage
 metadata. They exclude log contents and trace payloads. Changes within v1 are additive.
-Consumers should deduplicate delivery attempts using `stack`, `tenantId` and `jobId`.
-A later metadata update to an already finished job does not create a finish event.
+Consumers should deduplicate delivery attempts using `stack`, `tenantId` and `jobId`. A batch
+retry can deliver an event twice, and several Updraft stacks in one account share the default
+bus, told apart by `stack`. A later metadata update to an already finished job does not create
+a finish event. Events start from when the function is deployed (the stream is read from
+`LATEST`), so jobs that finished earlier are not sent.
 Insights uses recorded response models while the source job summaries are retained for
 30 days. After a summary expires, historical groups use the configured model from the
 durable run history. Longer views can therefore include both attribution sources.
-
-To provision the event infrastructure, first give the deployment role permission to
-manage EventBridge Pipes on `pipe/<stack>-job-finished` and to pass the stack's Pipe execution
-role to `pipes.amazonaws.com`. Then set `ENABLE_JOB_FINISHED_EVENTS=true` in the target
-GitHub environment, or pass `JOB_FINISHED_EVENTS_INFRASTRUCTURE=true` to `make deploy-backend`.
 
 ### Mistral API pilot
 
