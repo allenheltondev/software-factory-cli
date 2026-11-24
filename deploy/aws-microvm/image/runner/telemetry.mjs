@@ -544,6 +544,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
   /** Codex: the open turn's chat span. */
   let turn = null;
   const summary = { runId: null, kind: null, agent: null, adapter: null, chats: 0, tools: 0, toolErrors: 0, inputTokens: 0, outputTokens: 0, outcome: null, costUsd: null, review: null, change: null };
+  let vibeUsage;
   /** When the run's first line was read: its preparation (prompt, worktree) starts then. */
   let firstAt = null;
   let prepareSpan = null;
@@ -1182,6 +1183,24 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
     } else if (line === '---- end of agent output ----') {
       phase = 'after';
       endAgent(at);
+    } else if (h.adapter === 'vibe' && phase === 'after' && !vibeUsage && line.startsWith('vibe usage: ')) {
+      const data = parseJson(line.slice('vibe usage: '.length));
+      if (data && typeof data === 'object') {
+        const count = (v) => Number.isSafeInteger(v) && v >= 0 ? v : undefined;
+        const cost = Number.isFinite(data.costUsd) && data.costUsd >= 0 ? data.costUsd : undefined;
+        const input = count(data.inputTokens);
+        const output = count(data.outputTokens);
+        vibeUsage = {
+          'gen_ai.usage.input_tokens': input,
+          'gen_ai.usage.output_tokens': output,
+          'gen_ai.usage.cache_read.input_tokens': count(data.cacheReadTokens),
+          'updraft.agent.reported_cost_usd': cost,
+          'updraft.agent.reported_model_steps': count(data.modelSteps),
+        };
+        summary.inputTokens = input ?? 0;
+        summary.outputTokens = output ?? 0;
+        summary.costUsd = cost ?? null;
+      }
     } else if (line.startsWith('---- verification (')) {
       verifySpan = {
         traceId,
@@ -1406,6 +1425,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
           ...behavior.attributes(agentSpan.start, agentSpan.end ?? at),
           'gen_ai.usage.input_tokens': summary.inputTokens || undefined,
           'gen_ai.usage.output_tokens': summary.outputTokens || undefined,
+          ...vibeUsage,
           ...(summary.change
             ? {
                 'updraft.change.commits': change.commits,

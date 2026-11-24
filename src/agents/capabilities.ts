@@ -22,6 +22,7 @@ export function helpArgs(adapter: string): string[] | null {
   switch (adapter) {
     case 'claude':
     case 'codex':
+    case 'vibe':
       return ['--help'];
     case 'kiro':
       return ['chat', '--help'];
@@ -31,10 +32,11 @@ export function helpArgs(adapter: string): string[] | null {
 }
 
 /** The options each adapter uses for model and effort (see MAPPINGS in profile.ts). Codex sets effort through `-c`. */
-const OPTIONS: Record<string, { model: string; effort: string }> = {
+const OPTIONS: Record<string, { model: string; effort?: string }> = {
   claude: { model: '--model', effort: '--effort' },
   codex: { model: '--model', effort: '--config' },
   kiro: { model: '--model', effort: '--effort' },
+  vibe: { model: '--model' },
 };
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -44,7 +46,7 @@ export function helpAdvertises(help: string, flag: string): boolean {
   return new RegExp(`(^|[\\s,|\\[(])${escape(flag)}(?![\\w-])`, 'm').test(help);
 }
 
-const CLI_NAMES: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', kiro: 'Kiro CLI' };
+const CLI_NAMES: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', kiro: 'Kiro CLI', vibe: 'Mistral Vibe' };
 
 /**
  * Compare what a profile asks for with what the CLI's help text advertises. `help` is null when
@@ -55,7 +57,7 @@ export function checkCapabilities(adapter: string, profile: Pick<AgentProfile, '
   const wants: { what: 'model' | 'effort'; flag: string }[] = [];
   if (opts) {
     if (profile.model.value !== null) wants.push({ what: 'model', flag: opts.model });
-    if (profile.effort.value !== null) wants.push({ what: 'effort', flag: opts.effort });
+    if (profile.effort.value !== null && opts.effort) wants.push({ what: 'effort', flag: opts.effort });
   }
   if (!wants.length) return { state: 'ok', messages: [] };
   const cli = CLI_NAMES[adapter] ?? adapter;

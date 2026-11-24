@@ -125,7 +125,7 @@ repositories:
 | `github.app.tokenFile` | none | Instead of the key: a file of installation tokens that something else mints and replaces before they expire, so the worker never holds the key and reaches only what the token reaches. `UPDRAFT_GITHUB_APP_TOKEN_FILE` in the worker's environment names another file. See [docs/github-app.md](docs/github-app.md#a-token-file-instead-of-the-key) |
 | `github.app.installationId` | looked up per repository | Use this installation for every repository. Leave it out when repositories are under different owners |
 | `github.app.commitAsApp` | `false` | Live mode: agents commit as the App's bot (through `GIT_AUTHOR_*` and `GIT_COMMITTER_*` in the agent's environment) instead of the local Git identity. Commits are never rewritten afterwards |
-| `agents.<name>.adapter` | the agent's name | `codex`, `claude` or `kiro` |
+| `agents.<name>.adapter` | the agent's name | `codex`, `claude`, `kiro` or `vibe` (local Updraft) |
 | `agents.<name>.enabled` | `true` | Disabled agents are never chosen |
 | `agents.<name>.maxConcurrent` | `1` | Per-agent cap across all pools and repos, 1-32 |
 | `agents.<name>.command` | found by discovery | Live mode: the agent CLI to run. An absolute path, a path relative to the config file's directory, or a name looked up on `PATH`. Windows npm `.cmd` shims are resolved to the real executable or Node entry point. With `container`, a name or path inside the image, used as written |
@@ -208,6 +208,7 @@ the permission profile and platform notes for each agent:
 - [docs/agents/claude.md](docs/agents/claude.md) for Claude Code
 - [docs/agents/codex.md](docs/agents/codex.md) for Codex
 - [docs/agents/kiro.md](docs/agents/kiro.md) for Kiro
+- [docs/agents/vibe.md](docs/agents/vibe.md) for Mistral Vibe
 
 ## Publication
 

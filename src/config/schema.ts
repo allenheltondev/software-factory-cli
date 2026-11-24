@@ -6,7 +6,7 @@ export const CONFIG_VERSION = 1;
  * Agent adapters the CLI knows about. Whether an adapter can run agents in live mode is a separate
  * question: see src/agents/adapters/registry.ts (all three are implemented).
  */
-export const KNOWN_ADAPTERS = ['codex', 'claude', 'kiro'] as const;
+export const KNOWN_ADAPTERS = ['codex', 'claude', 'kiro', 'vibe'] as const;
 export type AdapterName = (typeof KNOWN_ADAPTERS)[number];
 
 export const EXECUTION_MODES = ['log-only', 'prepare-only', 'live'] as const;

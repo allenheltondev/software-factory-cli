@@ -20,7 +20,8 @@
 import { followsLines } from './trace-links.js';
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { closeSync, openSync } from 'node:fs';
-import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { consumeVibeUsage } from '../agents/vibe-usage.js';
 import { dirname, join, resolve } from 'node:path';
 import {
   getAdapter,
@@ -898,6 +899,8 @@ export class LiveExecutor implements Executor {
     const startedAt = ctx.now();
     let identity: Promise<void> = Promise.resolve();
     let agentRun: AgentRun;
+    let vibeReport: string | undefined;
+    let vibeUsage: string | undefined;
     const killGraceMs = this.opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     const box = contained;
     if (box) {
@@ -906,6 +909,10 @@ export class LiveExecutor implements Executor {
       trackContainer(box.runtime, box.name, agentEnv);
     }
     try {
+      if (adapterName === 'vibe' && !box) {
+        vibeReport = await mkdtemp(join(runDir, '.vibe-usage-')).catch(() => undefined);
+        if (vibeReport) invocation.args.splice(-1, 0, '--output-dir', vibeReport);
+      }
       agentRun = await runAgent({
         invocation,
         cwd: prepared.worktreePath,
@@ -940,6 +947,7 @@ export class LiveExecutor implements Executor {
       ctx.log.warn('agent could not start', { error: why, logPath });
       throw err instanceof StartFailedError ? err : new StartFailedError(why, { cause: err });
     } finally {
+      if (vibeReport) vibeUsage = await consumeVibeUsage(vibeReport);
       if (box) {
         // --rm removes the container when its command exits. If the client died first (killed
         // from outside, a runtime restart) the container may still be there: make sure it isn't.
@@ -997,6 +1005,7 @@ export class LiveExecutor implements Executor {
 
     await log([
       '---- end of agent output ----',
+      ...(vibeUsage ? [vibeUsage] : []),
       `exit: ${agentRun.code !== null ? `code ${agentRun.code}` : `signal ${agentRun.signal ?? 'unknown'}`} after ${seconds}s` +
         (agentRun.stopped ? ` (stopped by the worker: ${agentRun.stopped})` : ''),
       ...(agentRun.leftovers ? ['note: processes the agent left running in its process group were stopped'] : []),
