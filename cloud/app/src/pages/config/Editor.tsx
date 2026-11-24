@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Alert, Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Input, SegmentedControl, Select, StatusBadge } from '@readysetcloud/ui';
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleAgent, ConsoleConfig, ConsoleRepository, ConsoleWorkflow, MergeMethod } from '../../api/client';
+import { KiroNotEnabled } from '../../components/kiro';
 import { installationSettingsUrl } from '../../lib/diagnostics';
 import { Check, FieldError, ParsedText, PromptField } from './fields';
 import { InlineKey, type KeyApi } from './InlineKey';
@@ -558,6 +559,7 @@ function AgentsSection({ config, onChange, view, errors, installationId, keyApi,
               Add agent
             </Button>
           </div>
+          {!offered.includes('kiro') && <KiroNotEnabled />}
         </CardBody>
       </Card>
 

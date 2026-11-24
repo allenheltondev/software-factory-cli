@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import { AuthProvider, configureAuth } from '@readysetcloud/ui/auth';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router';
@@ -169,6 +169,17 @@ describe('the simple page', () => {
     const first = await screen.findByTestId('first-publish');
     expect(first).toHaveTextContent('add the label updraft to an issue in acme/web');
     expect(within(first).getByRole('link', { name: /acme\/web/ })).toHaveAttribute('href', 'https://github.com/acme/web/issues');
+  });
+
+  it('offers Kiro where the deployment runs it, and says the deployment must enable it where it does not', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published()) }));
+    expect(await screen.findByTestId('kiro-not-enabled')).toHaveTextContent('add kiro to its CloudAgents setting');
+    expect(screen.queryByTestId('coding-kiro')).toBeNull();
+    cleanup();
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } })) }));
+    expect(await screen.findByTestId('coding-kiro')).toBeInTheDocument();
+    expect(screen.getByTestId('review-kiro')).toBeInTheDocument();
+    expect(screen.queryByTestId('kiro-not-enabled')).toBeNull();
   });
 
   it('ticks coding and review agents separately; no review agent means no review, one reviews its own work', async () => {
@@ -418,6 +429,18 @@ describe('the full editor', () => {
     await userEvent.click(within(screen.getByTestId('agent-codex')).getByRole('checkbox', { name: 'On' }));
     expect(screen.queryByTestId('config-missing-keys')).toBeNull();
     expect(within(screen.getByTestId('agent-codex')).queryByTestId('inline-key-codex')).toBeNull();
+  });
+
+  it('says Kiro must be enabled by the deployment when it is not offered, and offers it once it is', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple() })) }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Go to agents' }));
+    expect(screen.getByTestId('kiro-not-enabled')).toHaveTextContent('ship the Kiro CLI in its job image');
+    expect(within(screen.getByLabelText('Add an agent')).queryByRole('option', { name: 'Kiro' })).toBeNull();
+    cleanup();
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple(), agents: ['claude', 'codex', 'kiro'] })) }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Go to agents' }));
+    expect(within(screen.getByLabelText('Add an agent')).getByRole('option', { name: 'Kiro' })).toBeInTheDocument();
+    expect(screen.queryByTestId('kiro-not-enabled')).toBeNull();
   });
 
   it('refreshes key status when the tab regains focus without touching the draft', async () => {
