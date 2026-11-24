@@ -2,7 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { jobPaths } from '../broker/broker.js';
 import type { Store } from '../store/store.js';
 import { errorClassOf, newJobId, type Launcher } from './launch.js';
-import { notRetryableMessage, retryable } from './status.js';
+import { isBenchmarkLabel } from '../benchmarks/config.js';
+import { BENCHMARK_RETRY_MESSAGE, notRetryableMessage, retryable } from './status.js';
 
 /**
  * Retrying a job from the console: the launcher runs the job's own event again.
@@ -112,6 +113,7 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
     // past the job's end, the summary 30 days.
     const job = await store.getJob(jobId);
     if (!job || job.installationId !== installationId) return no(410, 'event_gone', 'This job is too old to run again: its event is no longer kept. Apply the label again on GitHub instead');
+    if (job.benchmark || isBenchmarkLabel(job.label)) return no(409, 'not_retryable', BENCHMARK_RETRY_MESSAGE);
 
     let body: string | null;
     try {

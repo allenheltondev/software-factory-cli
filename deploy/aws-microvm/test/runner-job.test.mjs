@@ -138,6 +138,20 @@ const written = (calls) => {
 const onLinuxLikeHost = process.platform !== 'win32';
 
 describe.runIf(onLinuxLikeHost)('runJob', () => {
+  it('runs each benchmark arm with its private config and the published prompt', async () => {
+    for (const arm of ['fast', 'deep']) {
+      const benchmark = { runId: 'pilot', caseId: 'issue-12', arm };
+      const benchmarkConfigKey = `events/${arm}/benchmark-config.yaml`;
+      const pinned = `agents:\n  ${arm}: { model: ${arm}-1 }\n`;
+      const { deps } = fakeDeps('success', { objects: { [benchmarkConfigKey]: pinned } });
+      const result = await runJob(request({ benchmark, benchmarkConfigKey }), deps);
+      expect(result).toMatchObject({ outcome: 'succeeded', benchmark });
+      const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+      expect(record.config).toBe(pinned);
+      expect(record.prompt).toBe('# Implement the issue\n');
+    }
+  });
+
   it('prepares a private state directory, runs updraft run-event, reports and terminates', async () => {
     const { deps, calls, output } = fakeDeps('success');
     const result = await runJob(request(), deps);

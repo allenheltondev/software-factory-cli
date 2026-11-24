@@ -1,5 +1,5 @@
 import { generateKeyPairSync } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { GitHubInstallation } from '../github/client.js';
 import { signBody, verifySignature } from '../github/signature.js';
 import type { AppSettings } from '../github/settings.js';
@@ -31,7 +31,8 @@ const installation = (suspendedAt: string | null): GitHubInstallation => ({
 });
 
 /** `github` says what GitHub reports for installation 55 right now: an installation, gone (null), or an error. */
-async function setup(github: { current: GitHubInstallation | null | Error } = { current: installation(null) }, launch?: Launcher) {
+async function setup(github: { current: GitHubInstallation | null | Error } = { current: installation(null) }, launch?: Launcher,
+  routing: Pick<Parameters<typeof createWebhookHandler>[0], 'routines' | 'benchmarkInstallationId'> = {}) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant, {
     installationId: 55,
@@ -53,6 +54,7 @@ async function setup(github: { current: GitHubInstallation | null | Error } = { 
     },
     loadSettings: async () => SETTINGS,
     ...(launch ? { launch } : {}),
+    ...routing,
     now: () => clock.now,
     log: () => {},
   });
@@ -77,6 +79,18 @@ describe('verifySignature', () => {
 });
 
 describe('webhook', () => {
+  it.each([
+    { label: 'Updraft:Benchmark', installationId: undefined },
+    { label: 'updraft', installationId: 55 },
+  ])('fences ordinary dispatch for $label when the benchmark installation is $installationId', async ({ label, installationId }) => {
+    const launch = vi.fn<Launcher>(async () => ({ status: 202, disposition: 'launched' }));
+    const routines = vi.fn(async () => null);
+    const { deliver } = await setup(undefined, launch, { routines, ...(installationId ? { benchmarkInstallationId: installationId } : {}) });
+    expect(await deliver('issues', { action: 'labeled', installation: { id: 55 }, issue: { number: 12 }, label: { name: label } }))
+      .toMatchObject({ body: { disposition: 'not_dispatched' } });
+    expect(routines).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  });
   it('refuses a bad signature before reading anything', async () => {
     const { deliver, store } = await setup();
     const res = await deliver('installation', { action: 'deleted', installation: { id: 55 } }, 'wrong');

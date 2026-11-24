@@ -18,6 +18,8 @@ import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './j
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
+import { BENCHMARK_LABEL } from './benchmarks/config.js';
+import { createBenchmarkDispatch } from './benchmarks/dispatch.js';
 
 /**
  * The GitHub webhook's Lambda entry point (dist/webhook.mjs): POST /api/webhooks/github, a route
@@ -35,6 +37,11 @@ const secrets = new SecretsManagerClient(clientOptions);
 const microvms = new LambdaMicrovmsClient(clientOptions);
 const github = createGitHubApi();
 const loadSettings = createSettingsLoader();
+const benchmarkInstallationId = Number(env.BENCHMARK_INSTALLATION_ID);
+const benchmarkRepositoryId = Number(env.BENCHMARK_REPOSITORY_ID);
+const benchmarkInstallationConfigured = Number.isSafeInteger(benchmarkInstallationId) && benchmarkInstallationId > 0;
+const benchmarkEnabled = benchmarkInstallationConfigured &&
+  Number.isSafeInteger(benchmarkRepositoryId) && benchmarkRepositoryId > 0;
 
 const killSwitch = createKillSwitch({
   read: async () => {
@@ -72,6 +79,7 @@ function launcher(): Launcher | undefined {
   const partition = env.PARTITION ?? 'aws';
   return createLauncher({
     store,
+    ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
     native: nativeWorker.launch,
     resolveNative: nativeWorker.resolveNative,
     ...(nativeWorker.managed ? {
@@ -145,11 +153,40 @@ function launcher(): Launcher | undefined {
 }
 
 const launch = launcher();
+const dispatchBenchmark = benchmarkEnabled && launch ? createBenchmarkDispatch({
+  installationId: benchmarkInstallationId,
+  repositoryId: benchmarkRepositoryId,
+  store,
+  launch,
+  async readConfig(installationId, version) {
+    try {
+      const result = await s3.send(new GetObjectCommand({ Bucket: env.TENANT_BUCKET, Key: `${configPrefix(installationId, version)}config.yaml` }));
+      return (await result.Body?.transformToString('utf8')) ?? null;
+    } catch (error) {
+      if ((error as Error)?.name === 'NoSuchKey') return null;
+      throw error;
+    }
+  },
+  async issueOpenWithMarker(installationId, repository, repositoryId, issue) {
+    const settings = await loadSettings();
+    if (!settings || !github.issueState) return false;
+    try {
+      const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId,
+        { repositoryIds: [repositoryId], permissions: { issues: 'read' } });
+      const state = await github.issueState(token, repository, issue);
+      return state.open && !state.pullRequest && state.labels.some((label) => label.toLowerCase() === BENCHMARK_LABEL);
+    } catch (error) {
+      if (error instanceof GitHubError && error.status === 404) return false;
+      throw error;
+    }
+  },
+}) : undefined;
 const handleWebhook = createWebhookHandler({
   store,
   github,
   loadSettings,
   launch,
+  ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
   routines: createRoutineDispatcher({
     store, rules: createDynamoRoutineRuleStore(env.TABLE_NAME ?? ''), killSwitch,
     readToken: async (name) => (await secrets.send(new GetSecretValueCommand({ SecretId: name }))).SecretString ?? null,
@@ -242,6 +279,17 @@ export async function handler(event: APIGatewayProxyEvent | RetryRequest | { act
     return retryJob ? retryJob(event) : { ok: false, status: 503, code: 'jobs_off', message: 'Jobs are not configured' };
   }
   const body = event.isBase64Encoded && event.body ? Buffer.from(event.body, 'base64').toString('utf8') : (event.body ?? '');
+  if (event.resource === '/api/benchmark/jobs' && event.httpMethod === 'POST') {
+    const reply = (statusCode: number, data: object) => ({ statusCode, headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) });
+    if (!dispatchBenchmark) return reply(404, { disposition: 'benchmark_unavailable' });
+    const identity = event.requestContext?.identity;
+    if (!identity?.userArn || identity.accountId !== env.BENCHMARK_ACCOUNT_ID) return reply(403, { disposition: 'forbidden' });
+    if (Buffer.byteLength(body) > 8192) return reply(400, { disposition: 'invalid_benchmark' });
+    let request: unknown;
+    try { request = JSON.parse(body); } catch { return reply(400, { disposition: 'invalid_benchmark' }); }
+    const result = await dispatchBenchmark(request);
+    return reply(result.status, result);
+  }
   const res = await handleWebhook({ body, headers: event.headers ?? {} });
   return { statusCode: res.status, headers: { 'content-type': 'application/json' }, body: JSON.stringify(res.body) };
 }

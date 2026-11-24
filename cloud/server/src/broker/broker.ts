@@ -68,16 +68,18 @@ export interface JobPaths {
   configPrefix: string;
   resultKeyPrefix: string;
   stateKey: string;
+  benchmarkConfigKey?: string;
 }
 
 /** Where a job's data is, all under its tenant's prefix of the tenant bucket. */
-export function jobPaths(job: Pick<Job, 'installationId' | 'configVersion' | 'deliveryId'>): JobPaths {
+export function jobPaths(job: Pick<Job, 'installationId' | 'configVersion' | 'deliveryId' | 'benchmark'>): JobPaths {
   const base = `tenants/${job.installationId}/`;
   return {
     eventKey: `${base}events/${job.deliveryId}/event.json`,
     configPrefix: configPrefix(job.installationId, job.configVersion),
     resultKeyPrefix: `${base}results/${job.deliveryId}/`,
-    stateKey: `${base}state/state.db`,
+    stateKey: job.benchmark ? `${base}state/benchmark/${job.deliveryId}/state.db` : `${base}state/state.db`,
+    ...(job.benchmark ? { benchmarkConfigKey: `${base}events/${job.deliveryId}/benchmark-config.yaml` } : {}),
   };
 }
 
@@ -92,14 +94,14 @@ export interface PolicyContext {
  * The session policy for one job. AWS intersects it with the data role's own policy, so the
  * credentials can never reach more than this, whatever the role allows.
  */
-export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersion' | 'deliveryId' | 'native' | 'agentKeys'>, ctx: PolicyContext) {
+export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersion' | 'deliveryId' | 'native' | 'agentKeys' | 'benchmark'>, ctx: PolicyContext) {
   const p = jobPaths(job);
   const bucketArn = `arn:${ctx.partition}:s3:::${ctx.bucket}`;
   const statePrefix = p.stateKey.slice(0, p.stateKey.lastIndexOf('/') + 1);
   return {
     Version: '2012-10-17',
     Statement: [
-      { Effect: 'Allow', Action: 's3:GetObject', Resource: [`${bucketArn}/${p.eventKey}`, `${bucketArn}/${p.configPrefix}*`] },
+      { Effect: 'Allow', Action: 's3:GetObject', Resource: [`${bucketArn}/${p.eventKey}`, `${bucketArn}/${p.configPrefix}*`, ...(p.benchmarkConfigKey ? [`${bucketArn}/${p.benchmarkConfigKey}`] : [])] },
       // Listing is how the runner learns the config's file names and whether a state database exists.
       { Effect: 'Allow', Action: 's3:ListBucket', Resource: bucketArn, Condition: { StringLike: { 's3:prefix': [`${p.configPrefix}*`, `${statePrefix}*`] } } },
       { Effect: 'Allow', Action: ['s3:GetObject', 's3:PutObject'], Resource: `${bucketArn}/${statePrefix}*` },
@@ -107,7 +109,9 @@ export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersio
       {
         Effect: 'Allow',
         Action: 'secretsmanager:GetSecretValue',
-        Resource: job.native
+        Resource: job.benchmark
+          ? (job.agentKeys ?? []).map((k) => `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretName(job.installationId, k)}-*`)
+          : job.native
           ? (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY').map((k) => `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretName(job.installationId, k)}-*`)
           : `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretPrefix(job.installationId)}*`,
       },
@@ -151,7 +155,7 @@ export interface BrokerDeps {
 }
 
 export type BrokerResponse =
-  | { ok: true; descriptor: JobPaths & { bucket: string; region: string; agentKeySecrets: Record<string, string>; telemetry?: JobTelemetry }; credentials: ScopedCredentials }
+  | { ok: true; descriptor: JobPaths & { bucket: string; region: string; agentKeySecrets: Record<string, string>; telemetry?: JobTelemetry; benchmark?: Job['benchmark'] }; credentials: ScopedCredentials }
   | { ok: true; tokenFile: Record<string, unknown> }
   | { ok: true; finished: true }
   | { ok: true; terminated: true }
@@ -214,7 +218,7 @@ export function createBroker(deps: BrokerDeps) {
     const notice = number !== undefined ? { repositoryId: job.repositoryId, issue: number, day: dayOf(at) } : undefined;
     const first = await deps.store.recordThrottle(job.installationId, job.createdAt.slice(0, 7), notice);
     log({ jobId: job.jobId, installationId: job.installationId, throttled: limit, at: 'start' });
-    if (first && number !== undefined && job.quotas && deps.notifyThrottled) {
+    if (first && !job.benchmark && number !== undefined && job.quotas && deps.notifyThrottled) {
       await deps
         .notifyThrottled({ installationId: job.installationId, repository: job.repository, repositoryId: job.repositoryId, issue: number, ...(job.issue === undefined ? { pullRequest: true } : {}), limit, quotas: job.quotas })
         .catch((err: unknown) => log({ jobId: job.jobId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
@@ -223,12 +227,13 @@ export function createBroker(deps: BrokerDeps) {
 
   return async function handle(request: unknown): Promise<BrokerResponse> {
     if (typeof request !== 'object' || request === null) return { ok: false, error: 'bad_request' };
-    const { action, jobId, token, outcome, detail } = request as Record<string, unknown>;
+    const { action, jobId, token, outcome, detail, benchmarkProtocol } = request as Record<string, unknown>;
     if (action !== 'start' && action !== 'credentials' && action !== 'github-token' && action !== 'finish' && action !== 'terminate') {
       return { ok: false, error: 'bad_request' };
     }
     const job = await verify(jobId, token);
     if (!job) return REFUSED;
+    if (job.benchmark && action === 'start' && benchmarkProtocol !== 1) return REFUSED;
 
     // Stopping the job's own microVM is allowed whatever the job's state (finished, expired, its
     // tenant suspended): it only ever ends that one microVM, which the launcher recorded. The
@@ -348,7 +353,7 @@ export function createBroker(deps: BrokerDeps) {
       // The tenant's key secrets by variable name; the runner reads them with the credentials (a
       // missing one is a key the tenant has not set).
       // Only the agents this deployment runs (CloudAgents): one taken out of service gets no key.
-      const agentKeySecrets = Object.fromEntries((job.native ? (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY') : AGENT_KEY_NAMES).map((name) => [name, agentKeySecretName(job.installationId, name)]));
+      const agentKeySecrets = Object.fromEntries((job.benchmark ? job.agentKeys ?? [] : job.native ? (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY') : AGENT_KEY_NAMES).map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
       // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
       // and keeps it with the job with that destination's link settings: every later `start` (a
@@ -381,7 +386,7 @@ export function createBroker(deps: BrokerDeps) {
         policy: JSON.stringify(jobSessionPolicy(job.native && telemetry ? { ...job, agentKeys: [...(job.agentKeys ?? []), TELEMETRY_KEY_NAME] } : job, deps.policy)),
         durationSeconds: SESSION_SECONDS,
       });
-            return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(telemetry ? { telemetry } : {}) }, credentials };
+            return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(job.benchmark ? { benchmark: job.benchmark } : {}), ...(telemetry ? { telemetry } : {}) }, credentials };
     }
 
     // github-token: a token for this job's repository only, as the CLI reads it (token-file-auth.ts).

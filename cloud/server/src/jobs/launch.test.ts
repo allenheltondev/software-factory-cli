@@ -1,4 +1,9 @@
 import { waitingId } from '../native/sessions.js';
+import { parse, stringify } from 'yaml';
+import { jobBranchName } from '../../../../src/git/worktree.js';
+import { eventJobId } from '../../../../src/poller/webhook.js';
+import { BENCHMARK_LABEL } from '../benchmarks/config.js';
+import { createBenchmarkDispatch } from '../benchmarks/dispatch.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type DispatchRules, type Tenant } from '../store/store.js';
@@ -229,6 +234,60 @@ describe('the launcher', () => {
     });
     expect(await broker({ action: 'terminate', jobId: result.jobId, token: jobToken })).toEqual({ ok: true, terminated: true });
     expect(terminateMicrovm).toHaveBeenCalledWith('mvm-0001');
+  });
+
+  it('isolates two arms through the real launcher and broker and reserves the marker when disabled', async () => {
+    const published = {
+      version: 1, dispatch: { allowedActors: ['pat'] },
+      agents: { fast: { adapter: 'claude', model: 'fast-1' }, deep: { adapter: 'codex', model: 'deep-2' } },
+      pools: { build: { agents: ['fast', 'deep'] } }, actions: { build: { prompt: 'prompts/build.md' } },
+      repositories: { 'acme/web': { id: 9, autoMerge: 'squash',
+        workflows: [{ id: 'build', action: 'build', pool: 'build', trigger: { event: 'issue.labeled', label: BENCHMARK_LABEL } }] } },
+    };
+    const version = await store.createConfigVersion(55, { sha256: 'bench', files: ['config.yaml'], publishedAt: '', publishedBy: 's',
+      dispatch: dispatchRules(published, { keysFor: () => ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    for (const name of ['ANTHROPIC_API_KEY', 'CODEX_API_KEY']) await store.putAgentKeyMeta(55, { name, updatedAt: 't', updatedBy: 'pat' });
+    expect(await createLauncher(deps)(request({ label: { name: 'Updraft:Benchmark' } }))).toMatchObject({ disposition: 'not_dispatched' });
+    const launch = createLauncher({ ...deps, benchmarkInstallationId: 55 });
+    expect(await launch(request())).toMatchObject({ disposition: 'not_dispatched' });
+    const dispatch = createBenchmarkDispatch({ installationId: 55, repositoryId: 9, store, launch,
+      readConfig: async () => stringify(published), issueOpenWithMarker: async () => true });
+    const input = { repository: 'acme/web', issue: 12, workflow: 'build', actor: 'pat' };
+    const arms = ['fast', 'deep'].map((agent) => ({ ...input, agent, benchmark: { runId: 'pilot', caseId: 'case', arm: agent } }));
+    const results = await Promise.all(arms.map(dispatch));
+    expect(results).toMatchObject([{ status: 202 }, { status: 202 }]);
+    expect(await dispatch(arms[0])).toMatchObject({ disposition: 'duplicate', jobId: results[0]?.jobId });
+    expect(runs).toHaveLength(2);
+    const broker = createBroker({
+      store, loadSettings: async () => null, github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
+      assumeRole: async () => ({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(NOW + 3600_000).toISOString() }),
+      terminateMicrovm: async () => {}, microvmState: async () => 'RUNNING',
+      policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
+      now: () => NOW,
+    });
+    const stateKeys = new Set<string>();
+    const branches = new Set<string>();
+    for (const run of runs) {
+      const { jobId, jobToken } = JSON.parse(run.runHookPayload).broker;
+      const start = { action: 'start', jobId, token: jobToken };
+      expect(await broker(start)).toMatchObject({ ok: false });
+      const response = await broker({ ...start, benchmarkProtocol: 1 });
+      if (!response.ok || !('descriptor' in response)) throw new Error('Expected a benchmark descriptor');
+      const descriptor = response.descriptor;
+      stateKeys.add(descriptor.stateKey);
+      const arm = descriptor.benchmark!.arm as 'fast' | 'deep';
+      const config = parse(events[descriptor.benchmarkConfigKey!]!);
+      const workflow = config.repositories['acme/web'].workflows[0];
+      branches.add(jobBranchName({ id: eventJobId(9, workflow.id, 'same-github-label-event'), issueNumber: 12 }, 1));
+      expect(config.agents).toEqual({ [arm]: expect.objectContaining({ model: published.agents[arm].model }) });
+      expect(config.repositories['acme/web']).toMatchObject({ publish: 'draft-pr', review: false });
+      expect(config.repositories['acme/web']).not.toHaveProperty('autoMerge');
+      expect(Object.keys(descriptor.agentKeySecrets)).toEqual([arm === 'fast' ? 'ANTHROPIC_API_KEY' : 'CODEX_API_KEY']);
+    }
+    expect(stateKeys.size).toBe(2);
+    expect(branches.size).toBe(2);
   });
 
   describe('bring your own key (#70)', () => {

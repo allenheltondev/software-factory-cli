@@ -91,7 +91,7 @@ export function createBrokerClient(broker, options = {}) {
 
   return {
     /** The descriptor and the first credentials. */
-    start: () => call('start'),
+    start: () => call('start', { benchmarkProtocol: 1 }),
     credentials: () => call('credentials'),
     /** The token file document (Updraft's github.app.tokenFile format). */
     githubToken: async () => (await call('github-token')).tokenFile,
@@ -148,6 +148,8 @@ export async function startBrokerJob(payload, { client, createAwsDeps, now = Dat
     configPrefix: d.configPrefix,
     resultKeyPrefix: d.resultKeyPrefix,
     stateKey: d.stateKey,
+    ...(typeof d.benchmarkConfigKey === 'string' ? { benchmarkConfigKey: d.benchmarkConfigKey } : {}),
+    ...(d.benchmark && typeof d.benchmark === 'object' ? { benchmark: d.benchmark } : {}),
     agentKeySecrets: d.agentKeySecrets ?? {},
     // The tenant's agent telemetry (telemetry.mjs), when it is on: where to, and the key's secret.
     ...(d.telemetry && typeof d.telemetry === 'object' ? { telemetry: d.telemetry } : {}),

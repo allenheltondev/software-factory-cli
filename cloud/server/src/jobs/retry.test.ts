@@ -44,6 +44,16 @@ async function child(store: Awaited<ReturnType<typeof setup>>['store'], id: stri
 const ask = (jobId = 'job_retry00001', installationId = 55) => ({ updraftRetry: { installationId, jobId } });
 
 describe('retrying a job (jobs/retry.ts)', () => {
+  it.each([
+    { benchmark: { runId: 'pilot', caseId: 'case', arm: 'a' } },
+    { label: 'Updraft:Benchmark' },
+  ])('refuses a benchmark retry without depending on dispatch configuration', async (jobOver) => {
+    const { store, retry, launch, readEvent, j } = await setup({ jobOver });
+    expect(retryable((await store.getJobSummary(j.installationId, j.jobId))!)).toBe(false);
+    expect(await retry(ask())).toMatchObject({ status: 409, code: 'not_retryable', message: expect.stringContaining('fresh arm') });
+    expect(readEvent).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  });
   it("runs the job's own event again under a delivery of its own", async () => {
     const { retry, launch, readEvent, j, store } = await setup();
     expect(await retry(ask())).toEqual({ ok: true, jobId: 'job_new000001' });

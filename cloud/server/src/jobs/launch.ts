@@ -10,6 +10,7 @@ import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
 import { dayOf, monthOf, tenantQuotas, type ThrottleNotice } from './quotas.js';
+import { BENCHMARK_LABEL, isBenchmarkLabel, type BenchmarkIdentity } from '../benchmarks/config.js';
 
 export type { ThrottleNotice } from './quotas.js';
 
@@ -114,6 +115,7 @@ export interface NativeLaunch {
 }
 
 export interface LaunchDeps {
+  benchmarkInstallationId?: number;
   native?: NativeLaunch;
   resolveNative?(installationId: number): Promise<NativeLaunch | undefined>;
   parkedClaude?(request: LaunchRequest): Promise<string | undefined>;
@@ -142,6 +144,7 @@ export interface LaunchDeps {
 }
 
 export interface LaunchRequest {
+  benchmark?: { identity: BenchmarkIdentity; configVersion: number; configYaml: string; agentKey: string; agent: string; workflow: string };
   installationId: number;
   deliveryId: string;
   /** The X-GitHub-Event header. Absent: `issues`. */
@@ -224,6 +227,10 @@ export function createLauncher(deps: LaunchDeps) {
     if (req.jobId !== undefined && !JOB_ID.test(req.jobId)) return { status: 400, disposition: 'bad_job_id' };
     const eventName = req.eventName ?? 'issues';
     const isIssue = eventName === 'issues';
+    const benchmark = req.benchmark;
+    if (benchmark ? (!isIssue || req.installationId !== deps.benchmarkInstallationId ||
+      req.payload.label?.name !== BENCHMARK_LABEL || !req.jobId)
+      : req.installationId === deps.benchmarkInstallationId || isBenchmarkLabel(req.payload.label?.name)) return skip('not_dispatched');
     if (isIssue ? !Number.isInteger(req.payload.issue?.number) : !Object.hasOwn(PULL_REQUEST_ACTIONS, eventName)) return skip('ignored');
 
     // Strongly consistent, both: a delivery right after a publish sees the new active config (not
@@ -234,11 +241,12 @@ export function createLauncher(deps: LaunchDeps) {
     // A pull request action that leads to no work (opened, labeled, ...): before any more reads.
     if (!isIssue && (typeof req.payload.action !== 'string' || !PULL_REQUEST_ACTIONS[eventName]!.includes(req.payload.action))) return skip('ignored');
     if (tenant.status !== 'active') return skip('tenant_inactive');
-    if (tenant.activeConfigVersion === undefined) return skip('no_config');
-    const config = await deps.store.getConfigVersion(req.installationId, tenant.activeConfigVersion, { consistent: true });
+    const configVersion = benchmark?.configVersion ?? tenant.activeConfigVersion;
+    if (configVersion === undefined) return skip('no_config');
+    const config = await deps.store.getConfigVersion(req.installationId, configVersion, { consistent: true });
     // What the job is for: an issue (its label) or a pull request (its review loop).
     let decision: { repository: string; repositoryId: number; keys: string[] | null; label?: string; issue?: number; pullRequest?: number };
-    const binding = deps.native?.route.installationId === req.installationId ? deps.native : await deps.resolveNative?.(req.installationId);
+    const binding = benchmark ? undefined : deps.native?.route.installationId === req.installationId ? deps.native : await deps.resolveNative?.(req.installationId);
     const mode = await binding?.mode?.();
     const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
     let workerId = req.retryRuntime?.workerId;
@@ -253,7 +261,7 @@ export function createLauncher(deps: LaunchDeps) {
         log({ delivery: req.deliveryId, installationId: req.installationId, ignored: d.reason });
         return skip('not_dispatched', { reason: d.code, message: d.reason });
       }
-      decision = { repository: d.repository, repositoryId: d.repositoryId, keys: d.keys, label: d.label, issue: req.payload.issue!.number as number };
+      decision = { repository: d.repository, repositoryId: d.repositoryId, keys: benchmark ? [benchmark.agentKey] : d.keys, label: d.label, issue: req.payload.issue!.number as number };
     } else {
       const subject = pullRequestOfPayload(eventName, req.payload);
       const d = decidePullRequestDispatch(
@@ -346,7 +354,7 @@ export function createLauncher(deps: LaunchDeps) {
     let needed = decision.keys;
     if (needed === null && isIssue) {
       needed = deps.bundleKeys
-        ? await deps.bundleKeys.forEvent(req.installationId, tenant.activeConfigVersion, {
+        ? await deps.bundleKeys.forEvent(req.installationId, configVersion, {
             repositoryFullName: req.payload.repository?.full_name,
             repositoryId: req.payload.repository?.id,
             label: req.payload.label?.name,
@@ -438,7 +446,7 @@ export function createLauncher(deps: LaunchDeps) {
       const issue = number;
       const first = await deps.store.recordThrottle(req.installationId, month, { repositoryId: decision.repositoryId, issue, day });
       log({ delivery: req.deliveryId, installationId: req.installationId, repository: decision.repository, issue, throttled: reserved.limit });
-      if (first && deps.notifyThrottled) {
+      if (first && !benchmark && deps.notifyThrottled) {
         await deps
           .notifyThrottled({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, issue, limit: reserved.limit, quotas, ...(decision.pullRequest !== undefined ? { pullRequest: true } : {}) })
           .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
@@ -454,7 +462,8 @@ export function createLauncher(deps: LaunchDeps) {
       installationId: req.installationId,
       repository: decision.repository,
       repositoryId: decision.repositoryId,
-      configVersion: tenant.activeConfigVersion,
+      configVersion,
+      ...(benchmark ? { benchmark: benchmark.identity, benchmarkAgent: benchmark.agent, benchmarkWorkflow: benchmark.workflow } : {}),
       deliveryId: req.deliveryId,
       eventName,
       ...(native ? { native: { workerId: native.route.workerId, ...(native.route.generation ? { generation: native.route.generation } : {}), ...(mode?.routingVersion !== undefined ? { routingVersion: mode.routingVersion } : {}), ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) } } : {}),
@@ -477,7 +486,9 @@ export function createLauncher(deps: LaunchDeps) {
     let launching = false;
     let microvmId: string | undefined;
     try {
-      await deps.putEvent(jobPaths(job).eventKey, req.body);
+      const paths = jobPaths(job);
+      if (benchmark && paths.benchmarkConfigKey) await deps.putEvent(paths.benchmarkConfigKey, benchmark.configYaml);
+      await deps.putEvent(paths.eventKey, req.body);
       await deps.store.putJob(job);
       recorded = true;
       // From here a microVM may exist: the reservation is no longer reclaimable as a launch that

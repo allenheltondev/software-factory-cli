@@ -7,6 +7,16 @@ Description: >
   app client to that pool).
 
 Parameters:
+  BenchmarkInstallationId:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Dedicated benchmark GitHub installation. Zero disables benchmark dispatch.
+  BenchmarkRepositoryId:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: The sandbox repository ID allowed to receive benchmark jobs.
   ClaudeImageDeploymentRoleName:
     Type: String
     Default: ''
@@ -144,6 +154,16 @@ Parameters:
     Description: Route 53 hosted zone that holds AppDomainName's parent domain.
 
 Rules:
+  BenchmarkReferences:
+    Assertions:
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref BenchmarkInstallationId, '0']
+            - !Equals [!Ref BenchmarkRepositoryId, '0']
+          - !And
+            - !Not [!Equals [!Ref BenchmarkInstallationId, '0']]
+            - !Not [!Equals [!Ref BenchmarkRepositoryId, '0']]
+        AssertDescription: Set both benchmark IDs to enable dispatch or set both to zero to disable it.
   ManagedClaudeReferences:
     Assertions:
       - Assert: !Or
@@ -647,6 +667,9 @@ Resources:
           PARTITION: !Ref AWS::Partition
           JOB_IMAGE_ARN: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
           JOB_IMAGE_VERSION_PARAMETER: !Sub /updraft/${AWS::StackName}/job-image-version
+          BENCHMARK_INSTALLATION_ID: !Ref BenchmarkInstallationId
+          BENCHMARK_REPOSITORY_ID: !Ref BenchmarkRepositoryId
+          BENCHMARK_ACCOUNT_ID: !Ref AWS::AccountId
           EXECUTION_ROLE_ARN: !GetAtt MicrovmExecutionRole.Arn
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
@@ -727,6 +750,14 @@ Resources:
               Action: iam:PassRole
               Resource: !GetAtt MicrovmExecutionRole.Arn
       Events:
+        Benchmark:
+          Type: Api
+          Properties:
+            RestApiId: !Ref UpdraftApi
+            Path: /api/benchmark/jobs
+            Method: post
+            Auth:
+              Authorizer: AWS_IAM
         GitHub:
           Type: Api
           Properties:

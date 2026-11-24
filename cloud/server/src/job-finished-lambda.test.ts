@@ -41,6 +41,14 @@ describe('finished job enrichment', () => {
     ], 'test', optedIn)).resolves.toEqual([]);
     expect(optedIn).not.toHaveBeenCalled();
   });
+
+  it('includes the benchmark arm from the stored summary even when no runner detail exists', async () => {
+    const { detail: _detail, ...summary } = row;
+    const benchmark = { M: { runId: { S: 'pilot' }, caseId: { S: 'issue-17' }, arm: { S: 'fast' } } };
+    const image = { ...summary, outcome: { S: 'launch_failed' }, benchmark };
+    await expect(enrichFinishedJobs([{ ...record, dynamodb: { ...record.dynamodb, NewImage: image } }], 'test', async () => true))
+      .resolves.toMatchObject([{ outcome: 'launch_failed', benchmark: { runId: 'pilot', caseId: 'issue-17', arm: 'fast' } }]);
+  });
 });
 
 it('bounds step metadata while keeping old step shapes', () => {

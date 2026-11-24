@@ -131,6 +131,7 @@ export interface Usage {
 
 /** A job as the admin view lists it: what started it and how it ended. */
 export interface JobSummary {
+  benchmark?: import('../benchmarks/config.js').BenchmarkIdentity;
   executionMode?: 'subscription' | 'standard';
   jobId: string;
   repository: string;
@@ -328,6 +329,9 @@ export interface DispatchRefusal {
  * what this record pins: the tenant, the repository and the config version.
  */
 export interface Job {
+  benchmark?: import('../benchmarks/config.js').BenchmarkIdentity;
+  benchmarkAgent?: string;
+  benchmarkWorkflow?: string;
   /** Opt-in persistent subscription worker; never dispatched to RunMicrovm. */
   native?: { workerId: string; generation?: string; routingVersion?: number; notBefore?: number; retry?: boolean };
   jobId: string;
@@ -1074,6 +1078,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       summaries.set(job.jobId, {
         installationId: job.installationId,
         jobId: job.jobId,
+        ...(job.benchmark ? { benchmark: job.benchmark } : {}),
         repository: job.repository,
         ...(job.issue !== undefined ? { issue: job.issue } : {}),
         ...(job.pullRequest !== undefined ? { pullRequest: job.pullRequest } : {}),
