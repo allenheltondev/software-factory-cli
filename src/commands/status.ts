@@ -135,7 +135,7 @@ export function renderReviewRequest(r: ReviewRequest): string {
   const who = `by ${r.reviewer ?? 'an unknown user'}${r.submittedAt ? ` at ${r.submittedAt}` : ''}`;
   switch (r.state) {
     case 'queued':
-      return `${who}${r.trigger === 'updraft_review' ? " (Updraft's reviewer)" : ''}: revision job ${r.jobId ?? '(pruned)'}`;
+      return `${who}${r.trigger === 'updraft_review' ? " (Updraft's reviewer)" : r.trigger === 'ci_failure' ? ' (failed checks)' : ''}: revision job ${r.jobId ?? '(pruned)'}`;
     case 'over-limit':
       return `${who}: not acted on — ${oneLine(r.reason ?? 'the pull request reached maxRevisions', 140)}`;
     default:
@@ -146,7 +146,10 @@ export function renderReviewRequest(r: ReviewRequest): string {
 /** " (revision of PR #n)" for a revision job, " (review of PR #n)" for a reviewer job, so its issue number is not read as the whole story. */
 function revisionNote(job: Job): string {
   const revision = revisionOf(job);
-  if (revision) return ` (revision of PR #${revision.pullRequest.number}${revision.trigger === 'updraft_review' ? ', requested by the reviewer' : ''})`;
+  if (revision) {
+    const why = revision.trigger === 'updraft_review' ? ', requested by the reviewer' : revision.trigger === 'ci_failure' ? ', to fix failed checks' : '';
+    return ` (revision of PR #${revision.pullRequest.number}${why})`;
+  }
   const review = reviewOf(job);
   return review ? ` (review of PR #${review.pullRequest.number} at ${review.headSha.slice(0, 12)})` : '';
 }
@@ -157,6 +160,8 @@ export const STAGE_LABELS: Record<PrStage, string> = {
   reviewing: 'reviewing',
   'changes-requested': 'changes requested',
   revising: 'revising',
+  'waiting-for-ci': 'waiting for CI',
+  'fixing-ci': 'fixing failed checks',
   'ready-to-merge': 'ready to merge',
   merging: 'merging / waiting for checks',
   merged: 'merged',

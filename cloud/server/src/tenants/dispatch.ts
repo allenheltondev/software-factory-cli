@@ -12,7 +12,7 @@ import type { DispatchRules } from '../store/store.js';
  */
 
 type Workflow = { trigger?: { label?: unknown }; allowedActors?: unknown };
-type Repository = { id?: unknown; workflows?: unknown; review?: unknown; revise?: unknown };
+type Repository = { id?: unknown; workflows?: unknown; review?: unknown; revise?: unknown; ciFix?: unknown };
 
 /** What a repository's dispatch rules need beyond the compiled config: whether it is paused. */
 export interface DispatchOptions {
@@ -52,6 +52,8 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
     // and always publishes): whether events on the repository's pull requests can lead to work.
     const review = repo.review === true || (typeof repo.review === 'object' && repo.review !== null && !Array.isArray(repo.review));
     const revise = repo.revise === true;
+    // The CI step (the CLI's ciSettings): with review on, a finished check suite can lead to work.
+    const ci = review && (repo.ciFix === true || (typeof repo.ciFix === 'object' && repo.ciFix !== null && !Array.isArray(repo.ciFix)));
     repositories[fullName.toLowerCase()] = {
       id: repo.id,
       ...(paused.has(fullName.toLowerCase()) ? { paused: true } : {}),
@@ -59,6 +61,7 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
       ...(sharedKeys ? { keys: firstKeys } : {}),
       ...(review ? { review: true as const } : {}),
       ...(revise ? { revise: true as const } : {}),
+      ...(ci ? { ci: true as const } : {}),
       triggers: stored,
     };
   }
@@ -110,7 +113,25 @@ export function decideDispatch(
 export const PULL_REQUEST_ACTIONS: Readonly<Record<string, readonly string[]>> = {
   pull_request_review: ['submitted', 'edited', 'dismissed'],
   pull_request: ['synchronize', 'closed'],
+  // The CI step (ciFix): checks finished on a pull request's head. One delivery per suite.
+  check_suite: ['completed'],
 };
+
+/**
+ * The pull request a delivery is about and its head branch: the payload's `pull_request`, or for
+ * a check suite the first pull request it lists (those whose head is the suite's commit).
+ */
+export function pullRequestOfPayload(
+  eventName: string,
+  payload: { pull_request?: { number?: unknown; head?: { ref?: unknown } }; check_suite?: { head_branch?: unknown; pull_requests?: unknown } },
+): { number: unknown; headRef: unknown } {
+  if (eventName === 'check_suite') {
+    const listed = Array.isArray(payload.check_suite?.pull_requests) ? (payload.check_suite.pull_requests as Array<{ number?: unknown; head?: { ref?: unknown } } | null>) : [];
+    const first = listed.find((p) => typeof p?.number === 'number' && Number.isSafeInteger(p.number));
+    return { number: first?.number, headRef: first?.head?.ref ?? payload.check_suite?.head_branch };
+  }
+  return { number: payload.pull_request?.number, headRef: payload.pull_request?.head?.ref };
+}
 
 /** Updraft's job branches are `updraft/issue-<n>-<job id>`: revisions and reviews only concern those. */
 export const UPDRAFT_BRANCH_PREFIX = 'updraft/';
@@ -174,6 +195,8 @@ export function decidePullRequestDispatch(
   if (!rules.loop) return { start: false, reason: 'the active config was published before pull request events started jobs: publish it again', code: 'loop_off' };
   const review = event.eventName === 'pull_request_review';
   const push = event.eventName === 'pull_request' && event.action === 'synchronize';
+  const checks = event.eventName === 'check_suite';
+  if (checks && !repo.ci) return { start: false, reason: 'ciFix is off for this repository', code: 'loop_off' };
   if (review && !repo.revise) return { start: false, reason: 'revisions are off for this repository', code: 'loop_off' };
   if (push && !repo.review) return { start: false, reason: 'review is off for this repository', code: 'loop_off' };
   if (!repo.review && !repo.revise) return { start: false, reason: 'review and revisions are off for this repository', code: 'loop_off' };
@@ -181,7 +204,8 @@ export function decidePullRequestDispatch(
     return { start: false, reason: 'the pull request is not on an Updraft branch', code: 'not_updraft_pr' };
   }
   const sender = typeof event.sender === 'string' ? event.sender.toLowerCase() : '';
-  if (options.appBot && sender === options.appBot.toLowerCase()) return { start: false, reason: "the App's own review or push: the run that made it handles what follows", code: 'own_event' };
+  // A check suite's sender is whoever pushed, often the App itself; its checks are news all the same.
+  if (!checks && options.appBot && sender === options.appBot.toLowerCase()) return { start: false, reason: "the App's own review or push: the run that made it handles what follows", code: 'own_event' };
   if (review && typeof event.reviewState === 'string' && event.reviewState.toLowerCase() === 'commented') {
     return { start: false, reason: 'a comment review starts nothing (only "Request changes" does)', code: 'comment_review' };
   }

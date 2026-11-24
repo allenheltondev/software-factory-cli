@@ -34,6 +34,8 @@ const MAX_CHANGE_REQUESTS = 5;
 // ---------------------------------------------------------------------------
 
 export type MergeState = 'waiting' | 'merging' | 'merged' | 'blocked';
+/** The CI step for one head: waiting for checks, passed, a fix was queued, or a person has to act. */
+export type CiState = 'waiting' | 'passed' | 'fixing' | 'blocked';
 
 /** A watched PR with what the review loop knows about it. */
 export interface LoopPr extends RevisionPr {
@@ -60,6 +62,21 @@ export interface LoopPr extends RevisionPr {
   mergeCommentUrl: string | null;
   mergeCommentAttempts: number;
   mergeCommentError: string | null;
+  /** The CI step (repositories.<repo>.ciFix) for the head `ciSha`; null when it was not looked at yet. */
+  ciState: CiState | null;
+  ciSha: string | null;
+  ciReason: string | null;
+  ciWaitStartedAt: string | null;
+  ciCheckedAt: string | null;
+  ciSignature: string | null;
+  ciFixJobId: string | null;
+  /** CI-fix revisions the PR was given, across heads. */
+  ciFixes: number;
+  ciLastFixSignature: string | null;
+  ciCommentSha: string | null;
+  ciCommentId: number | null;
+  ciCommentUrl: string | null;
+  ciCommentAttempts: number;
 }
 
 interface LoopPrRow extends RevisionPrRow {
@@ -82,6 +99,19 @@ interface LoopPrRow extends RevisionPrRow {
   merge_comment_url: string | null;
   merge_comment_attempts: number;
   merge_comment_error: string | null;
+  ci_state: CiState | null;
+  ci_sha: string | null;
+  ci_reason: string | null;
+  ci_wait_started_at: string | null;
+  ci_checked_at: string | null;
+  ci_signature: string | null;
+  ci_fix_job_id: string | null;
+  ci_fixes: number;
+  ci_last_fix_signature: string | null;
+  ci_comment_sha: string | null;
+  ci_comment_id: number | null;
+  ci_comment_url: string | null;
+  ci_comment_attempts: number;
 }
 
 function rowToLoopPr(r: LoopPrRow): LoopPr {
@@ -106,6 +136,19 @@ function rowToLoopPr(r: LoopPrRow): LoopPr {
     mergeCommentUrl: r.merge_comment_url,
     mergeCommentAttempts: r.merge_comment_attempts,
     mergeCommentError: r.merge_comment_error,
+    ciState: r.ci_state,
+    ciSha: r.ci_sha,
+    ciReason: r.ci_reason,
+    ciWaitStartedAt: r.ci_wait_started_at,
+    ciCheckedAt: r.ci_checked_at,
+    ciSignature: r.ci_signature,
+    ciFixJobId: r.ci_fix_job_id,
+    ciFixes: r.ci_fixes,
+    ciLastFixSignature: r.ci_last_fix_signature,
+    ciCommentSha: r.ci_comment_sha,
+    ciCommentId: r.ci_comment_id,
+    ciCommentUrl: r.ci_comment_url,
+    ciCommentAttempts: r.ci_comment_attempts,
   };
 }
 
@@ -609,12 +652,15 @@ export function markReadyRecorded(db: Db, repoId: number, prNumber: number, now?
  * Open PRs whose newest verdict is ready-to-merge for their current head and whose merge has not
  * settled for that head: not looked at, waiting for checks, or sent with an unknown result.
  */
-export function listMergeCandidates(db: Db, repoId: number): LoopPr[] {
+export function listMergeCandidates(db: Db, repoId: number, opts: { requireCi?: boolean } = {}): LoopPr[] {
+  // With the CI step on, a head is not a candidate before its checks passed there: a failure is
+  // the CI step's to fix, not the merge's to refuse for good.
+  const ci = opts.requireCi ? "AND ci_sha = head_sha AND ci_state = 'passed'" : '';
   return (
     db
       .prepare(
         `SELECT * FROM revision_prs
-         WHERE repo_id = ? AND state = 'open' AND verdict = 'ready-to-merge' AND head_sha IS NOT NULL AND verdict_sha = head_sha
+         WHERE repo_id = ? AND state = 'open' AND verdict = 'ready-to-merge' AND head_sha IS NOT NULL AND verdict_sha = head_sha ${ci}
            AND (merge_sha IS NULL OR merge_sha != head_sha OR merge_state IS NULL OR merge_state IN ('waiting', 'merging'))
          ORDER BY pr_number`,
       )
@@ -717,6 +763,126 @@ export function recordMergeNotice(
 }
 
 // ---------------------------------------------------------------------------
+// The CI step (repositories.<repo>.ciFix, src/publish/ci.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Open PRs whose newest verdict is ready-to-merge for their current head and whose CI step has
+ * not settled for that head: not looked at, or waiting for checks.
+ */
+export function listCiCandidates(db: Db, repoId: number): LoopPr[] {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM revision_prs
+         WHERE repo_id = ? AND state = 'open' AND verdict = 'ready-to-merge' AND head_sha IS NOT NULL AND verdict_sha = head_sha
+           AND (ci_sha IS NULL OR ci_sha != head_sha OR ci_state IS NULL OR ci_state = 'waiting')
+         ORDER BY pr_number`,
+      )
+      .all(repoId) as unknown as LoopPrRow[]
+  ).map(rowToLoopPr);
+}
+
+/**
+ * Point the PR's CI columns at `sha`, clearing what was recorded for an earlier head. What spans
+ * heads stays: the number of CI fixes and the failure the newest one was for. No-op when they are
+ * already about `sha`.
+ */
+export function startCiFor(db: Db, repoId: number, prNumber: number, sha: string, now?: () => number): void {
+  db.prepare(
+    `UPDATE revision_prs SET ci_sha = ?, ci_state = NULL, ci_reason = NULL, ci_wait_started_at = NULL, ci_checked_at = NULL, ci_signature = NULL,
+            ci_fix_job_id = NULL, ci_comment_attempts = 0, updated_at = ?
+     WHERE repo_id = ? AND pr_number = ? AND (ci_sha IS NULL OR ci_sha != ?)`,
+  ).run(sha, nowIso(now), repoId, prNumber, sha);
+}
+
+export type CiStep =
+  | { state: 'waiting'; reason: string }
+  | { state: 'passed'; reason: string }
+  /** A revision was queued for the failure `signature` (null: nothing was read that could tell it apart from the next). */
+  | { state: 'fixing'; reason: string; jobId: string; signature: string | null }
+  | { state: 'blocked'; reason: string; signature?: string | null };
+
+/**
+ * Record a step of the CI step for `sha`. Changes nothing unless the CI columns are still about
+ * `sha` and not final (not looked at, or waiting). Returns whether it changed the row.
+ */
+export function setCiState(db: Db, repoId: number, prNumber: number, sha: string, s: CiStep, now?: () => number): boolean {
+  const at = nowIso(now);
+  const where = `repo_id = ? AND pr_number = ? AND ci_sha = ? AND (ci_state IS NULL OR ci_state = 'waiting')`;
+  let changes: number | bigint;
+  switch (s.state) {
+    case 'waiting':
+      changes = db
+        .prepare(
+          `UPDATE revision_prs SET ci_state = 'waiting', ci_reason = ?, ci_wait_started_at = coalesce(ci_wait_started_at, ?), ci_checked_at = ?, updated_at = ? WHERE ${where}`,
+        )
+        .run(s.reason, at, at, at, repoId, prNumber, sha).changes;
+      break;
+    case 'passed':
+      changes = db.prepare(`UPDATE revision_prs SET ci_state = 'passed', ci_reason = ?, ci_checked_at = ?, updated_at = ? WHERE ${where}`).run(s.reason, at, at, repoId, prNumber, sha).changes;
+      break;
+    case 'fixing':
+      changes = db
+        .prepare(
+          `UPDATE revision_prs SET ci_state = 'fixing', ci_reason = ?, ci_checked_at = ?, ci_signature = ?, ci_fix_job_id = ?, ci_fixes = ci_fixes + 1,
+                  ci_last_fix_signature = ?, updated_at = ? WHERE ${where}`,
+        )
+        .run(s.reason, at, s.signature, s.jobId, s.signature, at, repoId, prNumber, sha).changes;
+      break;
+    case 'blocked':
+      changes = db
+        .prepare(`UPDATE revision_prs SET ci_state = 'blocked', ci_reason = ?, ci_checked_at = ?, ci_signature = coalesce(?, ci_signature), updated_at = ? WHERE ${where}`)
+        .run(s.reason, at, s.signature ?? null, at, repoId, prNumber, sha).changes;
+      break;
+  }
+  return Number(changes) > 0;
+}
+
+/** Open PRs whose CI step queued a fix or stopped for a person, and whose one comment about that head is still to be posted. */
+export function listPendingCiNotices(db: Db, maxAttempts: number): LoopPr[] {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM revision_prs
+         WHERE state = 'open' AND ci_state IN ('fixing', 'blocked') AND ci_sha IS NOT NULL
+           AND (ci_comment_sha IS NULL OR ci_comment_sha != ci_sha) AND ci_comment_attempts < ?
+         ORDER BY updated_at`,
+      )
+      .all(maxAttempts) as unknown as LoopPrRow[]
+  ).map(rowToLoopPr);
+}
+
+/** Record the outcome of one attempt to post the CI comment for `sha`. */
+export function recordCiNotice(db: Db, repoId: number, prNumber: number, sha: string, r: { commentId: number; commentUrl: string } | { error: string }, now?: () => number): void {
+  const at = nowIso(now);
+  if ('error' in r) {
+    db.prepare('UPDATE revision_prs SET ci_comment_attempts = ci_comment_attempts + 1, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND ci_sha = ?').run(
+      at,
+      repoId,
+      prNumber,
+      sha,
+    );
+  } else {
+    db.prepare(
+      `UPDATE revision_prs SET ci_comment_sha = ?, ci_comment_id = ?, ci_comment_url = ?, ci_comment_attempts = ci_comment_attempts + 1, updated_at = ?
+       WHERE repo_id = ? AND pr_number = ? AND ci_sha = ?`,
+    ).run(sha, r.commentId, r.commentUrl, at, repoId, prNumber, sha);
+  }
+}
+
+/** A revision job of the PR that is queued or running, whatever asked for it, except the one for `exceptReviewId`; or null. */
+export function activeRevisionJob(db: Db, repoId: number, prNumber: number, exceptReviewId?: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT j.id FROM review_requests r JOIN jobs j ON j.id = r.job_id
+       WHERE r.repo_id = ? AND r.pr_number = ? AND r.review_id != ? AND j.status IN ('queued', 'running') ORDER BY j.created_at LIMIT 1`,
+    )
+    .get(repoId, prNumber, exceptReviewId ?? '') as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Stage, for `updraft status`
 // ---------------------------------------------------------------------------
 
@@ -725,6 +891,8 @@ export type PrStage =
   | 'reviewing'
   | 'changes-requested'
   | 'revising'
+  | 'waiting-for-ci'
+  | 'fixing-ci'
   | 'ready-to-merge'
   | 'merging'
   | 'merged'
@@ -743,7 +911,7 @@ const short = (sha: string | null) => (sha ? sha.slice(0, 12) : '?');
  * Where a watched PR stands in the loop, from local state alone. `maxRevisions` is the
  * repository's limit. Stages and their transitions are listed in docs/review-loop.md.
  */
-export function prStage(db: Db, pr: LoopPr, maxRevisions: number): PrStageInfo {
+export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: boolean } = {}): PrStageInfo {
   if (pr.mergeState === 'merged') return { stage: 'merged', detail: `merged by Updraft at ${pr.mergedAt ?? '?'} (head ${short(pr.mergeSha)})` };
   if (pr.state === 'closed') return { stage: 'closed', detail: 'closed or merged on GitHub; no longer watched' };
 
@@ -762,14 +930,20 @@ export function prStage(db: Db, pr: LoopPr, maxRevisions: number): PrStageInfo {
   const round = `round ${countRevisions(db, pr.repoId, pr.prNumber)} of ${maxRevisions}`;
 
   const revising = revisionJobs.find((j) => j.status === 'running');
-  if (revising) return { stage: 'revising', detail: `revision job ${revising.id} is running (${round})` };
+  if (revising) {
+    if (revising.id === pr.ciFixJobId) return { stage: 'fixing-ci', detail: `revision job ${revising.id} is fixing the failed checks (${round})` };
+    return { stage: 'revising', detail: `revision job ${revising.id} is running (${round})` };
+  }
   if (push && (push.state === 'publishing' || (push.state === 'failed' && push.retryable === 1))) {
     return { stage: 'revising', detail: `the revision of run ${push.run_id} is being pushed (${round})` };
   }
   const reviewing = reviewJobs.find((j) => j.status === 'running');
   if (reviewing) return { stage: 'reviewing', detail: `reviewer job ${reviewing.id} is running` };
   const queuedRevision = revisionJobs.find((j) => j.status === 'queued');
-  if (queuedRevision) return { stage: 'changes-requested', detail: `${round}; revision job ${queuedRevision.id} is queued` };
+  if (queuedRevision) {
+    if (queuedRevision.id === pr.ciFixJobId) return { stage: 'fixing-ci', detail: `checks failed on ${short(pr.ciSha)}; ${round}; revision job ${queuedRevision.id} is queued` };
+    return { stage: 'changes-requested', detail: `${round}; revision job ${queuedRevision.id} is queued` };
+  }
   const queuedReview = reviewJobs.find((j) => j.status === 'queued');
   if (queuedReview) return { stage: 'awaiting-review', detail: `reviewer job ${queuedReview.id} is queued` };
   if (!pr.headSha) return { stage: 'awaiting-review', detail: 'the head commit is not known yet' };
@@ -783,6 +957,20 @@ export function prStage(db: Db, pr: LoopPr, maxRevisions: number): PrStageInfo {
     : undefined;
 
   if (pr.verdictSha === pr.headSha && pr.verdict === 'ready-to-merge') {
+    if (opts.ci) {
+      const ci = pr.ciSha === pr.headSha ? pr.ciState : null;
+      if (ci === null) return { stage: 'waiting-for-ci', detail: `${head} was found ready; its checks have not been looked at yet` };
+      if (ci === 'waiting') return { stage: 'waiting-for-ci', detail: `${head} was found ready; waiting since ${pr.ciWaitStartedAt ?? '?'}: ${pr.ciReason ?? 'checks are pending'}` };
+      if (ci === 'blocked') return { stage: 'needs-human', detail: `${head} was found ready, but its checks need a person: ${pr.ciReason ?? 'no reason recorded'}` };
+      if (ci === 'fixing') {
+        const job = revisionJobs.find((j) => j.id === pr.ciFixJobId);
+        if (job && job.status !== 'succeeded') {
+          return { stage: 'needs-human', detail: `the CI fix (revision job ${job.id}) is ${job.status}${job.status_reason ? `: ${job.status_reason}` : ''}; "updraft retry ${job.id}" tries again` };
+        }
+        if (push && push.state !== 'published') return { stage: 'needs-human', detail: `the CI fix for ${head} pushed nothing: ${push.error ?? 'no reason recorded'}` };
+        return { stage: 'fixing-ci', detail: `checks failed on ${head}: ${pr.ciReason ?? 'a fix was queued'}` };
+      }
+    }
     if (pr.mergeSha === pr.headSha) {
       if (pr.mergeState === 'waiting') return { stage: 'merging', detail: `waiting since ${pr.mergeWaitStartedAt ?? '?'}: ${pr.mergeReason ?? 'checks are pending'}` };
       if (pr.mergeState === 'merging') return { stage: 'merging', detail: `the merge of ${head} was requested` };

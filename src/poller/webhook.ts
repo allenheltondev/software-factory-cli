@@ -13,7 +13,8 @@
 // `labeled` event for this label, by the payload's sender, created at the payload's time. From
 // there the existing pre-start checks run unchanged.
 import { createHash } from 'node:crypto';
-import { reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
+import { ciSettings, reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
+import { getRevisionPr, listOpenRevisionPrsByHead } from '../db/revisions.js';
 import type { NewJob } from '../db/ingest.js';
 import type { GitHubApi, GitHubIssueEvent } from '../github/api.js';
 import { labelEquals } from '../routing.js';
@@ -124,6 +125,11 @@ const HANDLERS: Readonly<Record<string, Readonly<Record<string, Handler>>>> = {
   issues: { labeled: issueLabeled },
   pull_request_review: { submitted: pullRequestChanged, edited: pullRequestChanged, dismissed: pullRequestChanged },
   pull_request: { synchronize: pullRequestChanged, closed: pullRequestChanged },
+  // The CI step (repositories.<repo>.ciFix): checks finished on a pull request's head.
+  check_suite: { completed: checksChanged },
+  check_run: { completed: checksChanged },
+  // A commit status has no action; `decideWebhook` gives it the action "created".
+  status: { created: checksChanged },
 };
 
 /** Event names and actions `decideWebhook` acts on, for messages and docs. */
@@ -141,7 +147,7 @@ export async function decideWebhook(deps: WebhookDeps, input: { eventName: strin
   const issue = obj(payload?.issue);
   const event: WebhookEventInfo = {
     name: input.eventName,
-    action: str(payload?.action),
+    action: input.eventName === 'status' ? 'created' : str(payload?.action),
     deliveryId: input.deliveryId ?? null,
     repository: str(repository?.full_name),
     repositoryId: int(repository?.id),
@@ -222,6 +228,39 @@ async function pullRequestChanged(deps: WebhookDeps, _payload: Payload, event: W
     return nothing('review-loop-off', `neither revise nor review is on for ${found.fullName} (both need publish and execution.mode: live), so nothing acts on its pull requests`);
   }
   return { dispatch: 'poll-reviews', repo: { id: found.cfg.id, fullName: found.fullName }, pullRequest: event.pullRequest, event };
+}
+
+/**
+ * A `check_suite`, `check_run` or `status` delivery: checks changed on some commit. As for a pull
+ * request event, the payload only says where to look: the pull request is one of the payload's
+ * (for a check), or the watched pull request whose head is the payload's commit (for a status,
+ * which names no pull request); the CI step reads the checks from the API itself.
+ */
+async function checksChanged(deps: WebhookDeps, payload: Payload, event: WebhookEventInfo): Promise<WebhookDecision> {
+  const nothing = (reason: NothingToDoReason, message: string): WebhookDecision => ({ dispatch: false, reason, message, event });
+  if (event.repositoryId === null) return nothing('malformed-payload', `the ${event.name} event lacks a repository id`);
+  const found = findRepo(deps.config, event.repositoryId);
+  if (!found) {
+    return nothing('repository-not-configured', `no configured repository has id ${event.repositoryId}${event.repository ? ` (${event.repository})` : ''}`);
+  }
+  if (!ciSettings(deps.config, found.cfg)) {
+    return nothing('review-loop-off', `ciFix is not on for ${found.fullName} (it needs review, publish and execution.mode: live), so nothing acts on its checks`);
+  }
+  const subject = obj(payload.check_suite) ?? obj(payload.check_run);
+  const listed = [...(Array.isArray(subject?.pull_requests) ? subject.pull_requests : []), ...(Array.isArray(obj(subject?.check_suite)?.pull_requests) ? (obj(subject?.check_suite)!.pull_requests as unknown[]) : [])]
+    .map((p) => int(obj(p)?.number))
+    .filter((n): n is number => n !== null);
+  let pullRequest: number | null = null;
+  // Of the pull requests named, one this worker watches; otherwise the first, for the run to rule out.
+  const watched = (n: number) => getRevisionPr(deps.db, found.cfg.id, n)?.state === 'open';
+  pullRequest = listed.find(watched) ?? listed[0] ?? null;
+  if (pullRequest === null && event.name === 'status') {
+    const sha = str(payload.sha);
+    if (sha) pullRequest = listOpenRevisionPrsByHead(deps.db, found.cfg.id, sha)[0] ?? null;
+  }
+  if (pullRequest === null) return nothing('pull-request', `the ${event.name} event is not about a pull request this worker watches`);
+  event.pullRequest = pullRequest;
+  return { dispatch: 'poll-reviews', repo: { id: found.cfg.id, fullName: found.fullName }, pullRequest, event };
 }
 
 async function issueLabeled(deps: WebhookDeps, payload: Payload, event: WebhookEventInfo): Promise<WebhookDecision> {

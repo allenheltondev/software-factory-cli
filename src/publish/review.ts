@@ -16,7 +16,7 @@
 //
 // Same lease and attempt fence around every write as publication and the revision push.
 import { appendFile } from 'node:fs/promises';
-import { DEFAULT_MAX_REVISIONS, autoMergeMethod, reviewActive, reviseActive, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
+import { DEFAULT_MAX_REVISIONS, autoMergeMethod, ciSettings, reviewActive, reviseActive, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import { recordError } from '../db/database.js';
 import {
   beginPrReview,
@@ -42,6 +42,7 @@ import { sameLogin, workerLogin } from '../github/identity.js';
 import { verdictTrigger } from '../poller/review-trigger.js';
 import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type ReviewVerdict, type RevisionRequest, type Run } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
+import { evaluateCiAll, postCiNotices } from './ci.js';
 import { code } from './failure-comment.js';
 import { evaluateAutoMerges, postMergeNotices } from './merge.js';
 import { safeMarkdown } from './markdown.js';
@@ -123,6 +124,12 @@ function nextStep(config: UpdraftConfig, repo: RepositoryConfig, verdict: Review
       : `If this is still the head commit, Updraft queues a revision for these findings (revision ${used + 1} of at most ${max}).`;
   }
   const method = autoMergeMethod(config, repo);
+  const ci = ciSettings(config, repo);
+  if (ci) {
+    const failure = ci.fix ? 'a failing check gets an automatic fix, which is reviewed again' : 'a failing check is left for a person';
+    const then = method ? `Updraft merges it (${method}) once nothing else stands in the way, or says why not here` : 'merging is up to a person';
+    return `If this is still the head commit, Updraft waits for its checks: ${failure}. Once they pass, ${then}.`;
+  }
   return method
     ? `If this is still the head commit, Updraft merges it (${method}) once its checks have passed and nothing else stands in the way; otherwise it says why here.`
     : 'Merging is up to a person.';
@@ -346,7 +353,8 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
         observeHead(deps.db, job.repoId, prNumber, pr.headSha, readAt);
         outcome = 'stale';
         detail = `the pull request is at ${short(pr.headSha)} now; this verdict was for ${short(headSha)}`;
-      } else if (pr.draft) {
+      } else if (pr.draft && !ciSettings(deps.config, repo)) {
+        // With the CI step on, the draft is marked ready once the checks of this head passed (ci.ts).
         hold();
         await deps.api.markPullRequestReady(repoRef, pr.nodeId);
         markReadyRecorded(deps.db, job.repoId, prNumber, now);
@@ -445,6 +453,12 @@ export function createReviewLoopPublisher(deps: PublishDeps, inner?: Publisher):
         if (signal?.aborted) return;
         await post(runId, signal);
       }
+      schedule();
+      if (signal?.aborted) return;
+      // The checks of heads found ready (ciFix), before the merge: a merge needs them passed.
+      await evaluateCiAll(deps, signal);
+      if (signal?.aborted) return;
+      await postCiNotices(deps, signal);
       schedule();
       if (signal?.aborted) return;
       await evaluateAutoMerges(deps, signal);

@@ -33,6 +33,31 @@ describe('validateConfig', () => {
     expect(r.config.agents.codex?.enabled).toBe(true);
   });
 
+  it('accepts ciFix as true or with options, and warns where it cannot act', () => {
+    const repo = 'allenheltondev/kids-and-dragons';
+    const cfg = example();
+    cfg.repositories[repo].publish = 'draft-pr';
+    cfg.repositories[repo].ciFix = { checks: ['test'], ignore: ['preview'], waitMinutes: 30 };
+    const noReview = validateConfig(cfg);
+    expect(noReview.ok).toBe(true);
+    expect(noReview.warnings).toContainEqual({ path: `repositories.${repo}.ciFix`, message: expect.stringMatching(/no effect without review/) });
+
+    cfg.repositories[repo].review = true;
+    const noRevise = validateConfig(cfg);
+    expect(noRevise.warnings).toContainEqual({ path: `repositories.${repo}.ciFix`, message: expect.stringMatching(/revise is off, so a failing check is only reported/) });
+
+    // autoMergeRequiredChecks names the deciding checks for ciFix too, so it is not "no effect" there.
+    cfg.repositories[repo].revise = true;
+    cfg.repositories[repo].ciFix = true;
+    cfg.repositories[repo].autoMergeRequiredChecks = ['test'];
+    expect(validateConfig(cfg).warnings.filter((w) => w.path.endsWith('.ciFix') || w.path.endsWith('.autoMergeRequiredChecks'))).toEqual([]);
+
+    cfg.repositories[repo].ciFix = { waitMinutes: 0 };
+    expect(validateConfig(cfg).ok).toBe(false);
+    cfg.repositories[repo].ciFix = { unknown: true };
+    expect(validateConfig(cfg).ok).toBe(false);
+  });
+
   it('defaults publish to none and warns when it is set outside live mode', () => {
     const repo = 'allenheltondev/kids-and-dragons';
     const plain = validateConfig(example());

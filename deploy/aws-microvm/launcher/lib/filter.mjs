@@ -16,6 +16,9 @@ export const SUPPORTED = Object.freeze({
   // Not `reopened`: a closed pull request is no longer watched, for good, so run-event would
   // start, find that out and exit. An action that is not listed starts no microVM.
   pull_request: Object.freeze(['synchronize', 'closed']),
+  // The CI step (repositories.<repo>.ciFix): a check suite finished on a pull request's head. One
+  // delivery per suite, not per check run, and a status event names no pull request at all.
+  check_suite: Object.freeze(['completed']),
 });
 
 export const DEFAULT_ACCEPTED_EVENTS = Object.freeze(['issues']);
@@ -87,19 +90,33 @@ function decideIssue(eventName, action, payload, options) {
   return { launch: true, reason: `${eventName}.${action}` };
 }
 
+/**
+ * The pull request a delivery is about, and its head branch: the payload's pull_request, or for a
+ * check suite the first pull request it lists (GitHub lists those whose head is the suite's commit).
+ */
+export function pullRequestOf(eventName, payload) {
+  if (eventName === 'check_suite') {
+    const listed = Array.isArray(payload.check_suite?.pull_requests) ? payload.check_suite.pull_requests : [];
+    const first = listed.find((p) => Number.isInteger(p?.number));
+    return { number: first?.number, branch: first?.head?.ref ?? payload.check_suite?.head_branch };
+  }
+  return { number: payload.pull_request?.number, branch: payload.pull_request?.head?.ref };
+}
+
 function decidePullRequest(eventName, action, payload, options) {
-  const number = payload.pull_request?.number;
-  if (!Number.isInteger(number)) return skip('payload has no pull_request.number');
+  const { number, branch } = pullRequestOf(eventName, payload);
+  if (!Number.isInteger(number)) return skip(eventName === 'check_suite' ? 'the check suite is not about a pull request' : 'payload has no pull_request.number');
   // Revisions and reviews are only ever made to pull requests Updraft opened, and those are
   // on its job branches. A pull request on any other branch cannot lead to work.
   const prefix = options.prBranchPrefix ?? DEFAULT_PR_BRANCH_PREFIX;
-  const branch = payload.pull_request?.head?.ref;
   if (prefix !== '' && (typeof branch !== 'string' || !branch.startsWith(prefix))) {
     return skip('the pull request is not on an Updraft job branch');
   }
   const sender = payload.sender?.login;
   const ignored = (options.ignoredSenders ?? []).map((login) => login.toLowerCase());
-  if (typeof sender === 'string' && ignored.includes(sender.toLowerCase())) {
+  // A check suite's sender is whoever pushed the commit, often the App itself: its checks are
+  // still news to the run that pushed, which has ended by the time they finish.
+  if (eventName !== 'check_suite' && typeof sender === 'string' && ignored.includes(sender.toLowerCase())) {
     return skip('the sender is in IGNORED_SENDERS');
   }
   if (eventName === 'pull_request_review') {

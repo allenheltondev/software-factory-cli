@@ -305,6 +305,57 @@ describe('updraft run-event: the whole review loop in one run', { timeout: 180_0
     expect(again.upload()).toMatchObject({ changed: false });
   });
 
+  it('with ciFix: ends while CI is pending, then fixes a failure a check suite reports, reviews the fix and merges it once its checks pass', async () => {
+    const w = world();
+    const failing = new Set<string>();
+    let first = '';
+    // The first head's checks are pending, then fail; every later head's pass.
+    w.gh.getCommitChecks = async (_repo, sha) => {
+      w.gh.calls.push(`getCommitChecks ${sha}`);
+      first ||= sha;
+      if (sha === first) return failing.has(sha) ? { total: 1, failing: ['ci / test'], pending: [], succeeded: [], complete: true } : { total: 1, failing: [], pending: ['ci / test'], succeeded: [], complete: true };
+      return { total: 1, failing: [], pending: [], succeeded: ['ci / test'], complete: true };
+    };
+    const repo = { ...LOOP, ciFix: true };
+    const reviewerArgs = ['--mode', 'review', '--verdict', 'ready-to-merge'];
+    const one = vm(w, 'vm one', { repo, reviewerArgs });
+    const r = await one.run({ deliveryId: 'd-1' });
+    expect(r.code).toBe(0);
+    // A clean review while CI is pending: the run ends instead of waiting, and nothing is ready or merged.
+    expect(r.summary).toMatchObject({ outcome: 'succeeded', drain: 'idle', loop: { reviews: 1, verdict: 'ready-to-merge', stage: 'waiting-for-ci', ready: false, merged: false } });
+    expect(w.gh.writes.filter((x) => x.startsWith('ready') || x.startsWith('merge'))).toEqual([]);
+    expect(one.upload()).toMatchObject({ changed: true });
+
+    // CI fails on that head; the check suite's delivery reaches another machine.
+    failing.add(first);
+    const suite = {
+      action: 'completed',
+      repository: { id: REPO_ID, full_name: FULL },
+      sender: { login: 'updraft-bot' },
+      check_suite: { head_branch: BRANCH, head_sha: first, pull_requests: [{ number: PR, head: { ref: BRANCH } }] },
+    };
+    const two = vm(w, 'vm two', { repo, reviewerArgs, payload: suite });
+    two.download();
+    const fixed = await two.run({ eventName: 'check_suite', deliveryId: 'd-2' });
+    expect(fixed.err).not.toContain('ERROR');
+    expect(fixed.code).toBe(0);
+    const head2 = remoteHead(w.f, BRANCH);
+    expect(head2).not.toBe(first);
+    expect(fixed.summary).toMatchObject({ dispatched: true, loop: { rounds: 1, reviews: 2, verdictSha: head2, stage: 'merged', ready: true, merged: true } });
+    expect(jobsOf(two.state)).toEqual([
+      ['issue.labeled', 'succeeded'],
+      ['pull_request.review', 'succeeded'],
+      ['pull_request.changes_requested', 'succeeded'],
+      ['pull_request.review', 'succeeded'],
+    ]);
+    const revision = withDb(two.state, (db) => db.prepare("SELECT trigger_kind, state FROM review_requests").all());
+    expect(revision).toEqual([{ trigger_kind: 'ci_failure', state: 'queued' }]);
+    // The merge names the commit whose review and checks were both green.
+    expect(w.gh.merges).toEqual([{ sha: head2, method: 'squash' }]);
+    // One comment said a fix was queued for the failing head.
+    expect(w.gh.comments.filter((c) => c.body.includes(`<!-- updraft-ci: ${first} -->`))).toHaveLength(1);
+  });
+
   it('keeps waiting for checks before merging, and reports why a pull request was not merged', async () => {
     const w = world();
     // Pending at first; green once the drain has asked a few times.

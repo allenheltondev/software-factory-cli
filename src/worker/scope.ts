@@ -10,13 +10,14 @@
 //   loop hangs off a pull request: reviewer jobs, revision jobs, review postings, revision
 //   pushes, the merge.
 // Everything else in the database is read and never changed.
-import { autoMergeMethod, reviseActive, type UpdraftConfig } from '../config/schema.js';
+import { autoMergeMethod, ciSettings, reviseActive, type UpdraftConfig } from '../config/schema.js';
 import { activeCooldowns } from '../db/capacity.js';
 import type { Db } from '../db/database.js';
 import { activeForeignHolds, holdSubject } from '../db/holds.js';
-import { listMergeCandidates, listPendingMergeNotices, type LoopPr } from '../db/pr-reviews.js';
+import { listCiCandidates, listMergeCandidates, listPendingCiNotices, listPendingMergeNotices, type LoopPr } from '../db/pr-reviews.js';
 import { getJob, getRun } from '../db/queue.js';
 import { listPendingLimitNotices, REVISION_MAX_AUTO_ATTEMPTS } from '../db/revisions.js';
+import { MAX_CI_NOTICE_ATTEMPTS } from '../publish/ci.js';
 import { MAX_NOTICE_ATTEMPTS } from '../publish/merge.js';
 import type { PublishScope } from '../publish/publish.js';
 import { reviewOf, revisionOf } from '../types.js';
@@ -95,7 +96,10 @@ export interface PendingWork {
   nextRetryAt: number | null;
   /** Pull requests whose auto-merge has not settled: still to be evaluated, waiting for checks, or sent without an answer. */
   merges: LoopPr[];
-  /** Comments that say why a pull request was not merged, or that it reached maxRevisions, still to be posted. */
+  /**
+   * Comments that say why a pull request was not merged, that it reached maxRevisions, or what its
+   * checks did, still to be posted; and CI steps (ciFix) not taken yet for a head found ready.
+   */
   notices: number;
   /**
    * When the earliest usage-limit cooldown in force ends (epoch millis), if a queued job is
@@ -118,7 +122,7 @@ export function pendingWork(db: Db, config: UpdraftConfig, scope: EventScope | n
   const repos = new Map(Object.values(config.repositories).map((cfg) => [cfg.id, cfg]));
   for (const cfg of repos.values()) {
     if (!autoMergeMethod(config, cfg)) continue;
-    merges.push(...listMergeCandidates(db, cfg.id).filter((pr) => inScope.pr(pr.repoId, pr.prNumber)));
+    merges.push(...listMergeCandidates(db, cfg.id, { requireCi: ciSettings(config, cfg) !== null }).filter((pr) => inScope.pr(pr.repoId, pr.prNumber)));
   }
   // The same conditions under which merge.ts and revision.ts post them: a notice nobody will post is not pending.
   for (const pr of listPendingMergeNotices(db, MAX_NOTICE_ATTEMPTS)) {
@@ -128,6 +132,17 @@ export function pendingWork(db: Db, config: UpdraftConfig, scope: EventScope | n
   for (const pr of listPendingLimitNotices(db, REVISION_MAX_AUTO_ATTEMPTS)) {
     const cfg = repos.get(pr.repoId);
     if (cfg && reviseActive(config, cfg) && inScope.pr(pr.repoId, pr.prNumber)) notices++;
+  }
+  // The CI step (ciFix): a head found ready whose checks were not looked at yet is a step to take,
+  // and so is its one comment. A head that is only waiting for its checks is not: nothing has to
+  // stay up for it, the next check or status event (or poll) takes the step again.
+  for (const cfg of repos.values()) {
+    if (!ciSettings(config, cfg)) continue;
+    for (const pr of listCiCandidates(db, cfg.id)) if (pr.ciSha !== pr.headSha || pr.ciState === null) if (inScope.pr(pr.repoId, pr.prNumber)) notices++;
+  }
+  for (const pr of listPendingCiNotices(db, MAX_CI_NOTICE_ATTEMPTS)) {
+    const cfg = repos.get(pr.repoId);
+    if (cfg && ciSettings(config, cfg) && inScope.pr(pr.repoId, pr.prNumber)) notices++;
   }
 
   let cooldownEndsAt: number | null = null;

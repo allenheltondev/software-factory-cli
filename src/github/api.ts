@@ -222,6 +222,45 @@ export interface CommitChecks {
    * what was seen, and the commit must not be treated as passing.
    */
   complete: boolean;
+  /**
+   * Each status and check run seen, with what the CI step (src/publish/ci.ts) needs to tell
+   * failures apart and to link to them. Absent from clients that do not report it.
+   */
+  details?: CheckDetail[];
+}
+
+/** One commit status or check run, as getCommitChecks saw it. Names, URLs and summaries are untrusted text. */
+export interface CheckDetail {
+  kind: 'check-run' | 'status';
+  name: string;
+  /** pending, success, skipped (skipped or neutral), or failure: for a check run its conclusion decides, for a status its state. */
+  outcome: 'pending' | 'success' | 'skipped' | 'failure';
+  /** A check run's conclusion (failure, timed_out, cancelled, action_required, stale, startup_failure...) or a status's state (failure, error). */
+  conclusion: string | null;
+  /** Where a person sees it: a check run's html_url, a status's target_url. */
+  url: string | null;
+  /** Check runs: their id (for a GitHub Actions check run, also the id of its job) and the App that reported it. */
+  checkRunId?: number;
+  app?: string | null;
+  /** A check run's output title and summary, or a status's description; capped. */
+  summary?: string;
+}
+
+/** One annotation of a check run. Untrusted text. */
+export interface CheckAnnotation {
+  path: string;
+  line: number | null;
+  level: string;
+  message: string;
+  title: string | null;
+}
+
+export interface CheckRunDiagnostics {
+  annotations: CheckAnnotation[];
+  /** The end of the job's log, for a GitHub Actions check run; null when there is none or it could not be read. */
+  logTail: string | null;
+  /** Why something could not be read (a permission, a log that expired), in the client's words. */
+  problems: string[];
 }
 
 export interface MergePullRequestInput {
@@ -297,6 +336,12 @@ export interface GitHubApi {
   markPullRequestReady(repo: RepoRef, nodeId: string): Promise<void>;
   /** Commit statuses and check runs of one commit (two REST requests, plus one per further 100 check runs). */
   getCommitChecks(repo: RepoRef, sha: string): Promise<CommitChecks>;
+  /**
+   * The annotations of one check run (first page) and, for a GitHub Actions check run, the end of
+   * its job's log (at most `maxLogBytes`). Used by the CI step for failed checks only. Never throws
+   * for a part it cannot read: that is listed in `problems`.
+   */
+  getCheckRunDiagnostics(repo: RepoRef, checkRunId: number, opts?: { maxLogBytes?: number }): Promise<CheckRunDiagnostics>;
   /**
    * Write: merge a pull request at exactly `sha`. Used only by auto-merge. Throws GitHubError with
    * GitHub's status when the merge is refused: 405 not mergeable (conflicts, branch protection, a

@@ -4,7 +4,7 @@ import { verifySignature } from '../github/signature.js';
 import type { LoadSettings } from '../github/settings.js';
 import { errorClassOf, type Launcher } from '../jobs/launch.js';
 import type { RoutineDispatcher } from '../routines/dispatch.js';
-import { PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
+import { PULL_REQUEST_ACTIONS, pullRequestOfPayload } from '../tenants/dispatch.js';
 import { deliveryFromLaunch, LIFECYCLE_EVENTS, type DeliveryEvent } from '../jobs/deliveries.js';
 import type { DeliveryRecord, Store } from '../store/store.js';
 
@@ -92,6 +92,7 @@ export function createWebhookHandler({
       issue?: { number?: unknown };
       pull_request?: { number?: unknown; head?: { ref?: unknown } };
       review?: { state?: unknown };
+      check_suite?: { head_branch?: unknown; pull_requests?: unknown };
     };
     try {
       payload = JSON.parse(req.body) as typeof payload;
@@ -114,7 +115,7 @@ export function createWebhookHandler({
       ...(action ? { action: action.slice(0, 64) } : {}),
       ...(typeof payload.repository?.full_name === 'string' ? { repository: payload.repository.full_name.slice(0, 200) } : {}),
       ...(Number.isSafeInteger(payload.issue?.number) ? { issue: payload.issue!.number as number } : {}),
-      ...(Number.isSafeInteger(payload.pull_request?.number) ? { pullRequest: payload.pull_request!.number as number } : {}),
+      ...((n) => (Number.isSafeInteger(n) ? { pullRequest: n as number } : {}))(pullRequestOfPayload(event, payload).number),
       ...(typeof payload.label?.name === 'string' ? { label: payload.label.name.slice(0, 100) } : {}),
       ...(typeof payload.sender?.login === 'string' ? { sender: payload.sender.login.slice(0, 100) } : {}),
     };

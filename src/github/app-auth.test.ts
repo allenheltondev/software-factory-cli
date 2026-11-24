@@ -525,6 +525,9 @@ describe('redactGitHubSecrets', () => {
 describe('App permissions', () => {
   it('needs only read access for polling, and write access for what publication and comments do', () => {
     expect(requiredAppPermissions({ publish: false, commentOnFailure: false })).toEqual({ metadata: 'read', issues: 'read' });
+    // ciFix reads checks, statuses and the logs of failed Actions jobs.
+    expect(requiredAppPermissions({ publish: true, commentOnFailure: false, ciFix: true })).toMatchObject({ checks: 'read', statuses: 'read', actions: 'read' });
+    expect(requiredAppPermissions({ publish: true, commentOnFailure: false, autoMerge: true })).not.toHaveProperty('actions');
     expect(requiredAppPermissions({ publish: false, commentOnFailure: true })).toEqual({ metadata: 'read', issues: 'write' });
     expect(requiredAppPermissions({ publish: true, commentOnFailure: false })).toEqual({
       metadata: 'read',

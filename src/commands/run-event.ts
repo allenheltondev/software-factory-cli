@@ -18,7 +18,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../config/io.js';
-import { autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
+import { ciSettings, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
 import { routeSourceOf } from '../db/metrics.js';
 import { getFailureComment } from '../db/failure-comments.js';
@@ -40,6 +40,7 @@ import { decideWebhook, type WebhookDeps, type WebhookEventInfo } from '../polle
 import { createAssignmentCommenter, type AssignmentCommenter } from '../publish/assignment-comment.js';
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
+import { evaluateCiAll, postCiNotices } from '../publish/ci.js';
 import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
 import { createRevisionPublisher, findRevisionClaims, revisionsEnabled, SUPERSEDED_PREFIX } from '../publish/revision.js';
 import { reviewOf, revisionOf, type Job, type RepoRef, type VerificationSummary } from '../types.js';
@@ -495,7 +496,7 @@ function summarizeLoop(db: Db, config: UpdraftConfig, repoId: number, prNumber: 
   const cfg = Object.values(config.repositories).find((r) => r.id === repoId);
   if (!pr || !cfg) return null;
   const maxRevisions = cfg.maxRevisions ?? DEFAULT_MAX_REVISIONS;
-  const stage = prStage(db, pr, maxRevisions);
+  const stage = prStage(db, pr, maxRevisions, { ci: ciSettings(config, cfg) !== null });
   const merged = pr.mergeState === 'merged';
   let notMergedReason: string | null = null;
   if (!merged) {
@@ -787,7 +788,17 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       // The review poller, for this pull request: the API says what its reviews and its head
       // are, and the loop's own rules decide what that queues or cancels.
       const polled = await pollRepoReviews({ db: openDb, api, config }, repo, repoCfg, log.child({ component: 'reviews', repo: repo.fullName }), { only: n });
-      summary.dispatched = (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0) > 0;
+      // The CI step (ciFix) for this pull request, now: a check or status event says its checks
+      // changed, and any other event is a moment to reconcile them, so a missed delivery or a run
+      // that stopped early does not leave a failed head without its fix. Waiting costs nothing here.
+      // Within the scope: a pull request another run still holds is that run's to take the step for.
+      // The worker's clock, as for the review poller above and the publishers of the drain: the CI
+      // step's wait is measured across both.
+      const ciDeps = { db: openDb, config, api, log: log.child({ component: 'ci' }), scope };
+      const ci = await evaluateCiAll(ciDeps, undefined, { only: { repoId: repo.id, prNumber: n }, force: true });
+      if (ci.length) await postCiNotices(ciDeps);
+      const ciQueued = ci.filter((r) => r.status === 'fixing').length;
+      summary.dispatched = (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0) + ciQueued > 0;
       // What it queued is this run's own, also on a pull request another run still holds.
       if (summary.dispatched) scope.engage();
       summary.loop = summarizeLoop(openDb, config, repo.id, n);

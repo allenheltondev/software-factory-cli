@@ -199,10 +199,19 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       if (repo.autoMergeWaitMinutes !== undefined && repo.autoMerge === undefined) {
         warnings.push({ path: `repositories.${repoName}.autoMergeWaitMinutes`, message: 'has no effect without autoMerge' });
       }
-      if (repo.autoMergeRequiredChecks !== undefined && repo.autoMerge === undefined) {
-        warnings.push({ path: `repositories.${repoName}.autoMergeRequiredChecks`, message: 'has no effect without autoMerge' });
+      if (repo.autoMergeRequiredChecks !== undefined && repo.autoMerge === undefined && !repo.ciFix) {
+        warnings.push({ path: `repositories.${repoName}.autoMergeRequiredChecks`, message: 'has no effect without autoMerge or ciFix' });
+      }
+      if (repo.ciFix && !repo.revise) {
+        warnings.push({
+          path: `repositories.${repoName}.ciFix`,
+          message: 'revise is off, so a failing check is only reported: the pull request waits for a person instead of getting a revision',
+        });
       }
     } else {
+      if (repo.ciFix) {
+        warnings.push({ path: `repositories.${repoName}.ciFix`, message: 'has no effect without review: the checks are waited for after a ready-to-merge verdict' });
+      }
       if (repo.autoMerge !== undefined) {
         warnings.push({
           path: `repositories.${repoName}.autoMerge`,

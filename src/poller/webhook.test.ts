@@ -104,6 +104,9 @@ describe('decideWebhook', () => {
       'pull_request_review.dismissed',
       'pull_request.synchronize',
       'pull_request.closed',
+      'check_suite.completed',
+      'check_run.completed',
+      'status.created',
     ]);
   });
 

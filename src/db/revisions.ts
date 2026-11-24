@@ -162,6 +162,13 @@ export function getRevisionPr(db: Db, repoId: number, prNumber: number): Revisio
   return row ? rowToRevisionPr(row) : null;
 }
 
+/** Numbers of the open watched PRs whose head, as last known, is `sha` (a commit status names a commit, not a pull request). */
+export function listOpenRevisionPrsByHead(db: Db, repoId: number, sha: string): number[] {
+  return (db.prepare("SELECT pr_number FROM revision_prs WHERE repo_id = ? AND state = 'open' AND head_sha = ? ORDER BY pr_number").all(repoId, sha) as { pr_number: number }[]).map(
+    (r) => r.pr_number,
+  );
+}
+
 export function listOpenRevisionPrs(db: Db, repoId: number): RevisionPr[] {
   return (
     db.prepare("SELECT * FROM revision_prs WHERE repo_id = ? AND state = 'open' ORDER BY pr_number").all(repoId) as unknown as RevisionPrRow[]

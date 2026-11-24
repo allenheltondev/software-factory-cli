@@ -115,11 +115,37 @@ export function verdictTrigger(v: {
   };
 }
 
+/** Review id (the dedupe key in review_requests) of the CI fix for one head: one per (PR, head), whatever failed and however often it was seen. */
+export function ciFailureReviewId(prNumber: number, headSha: string): string {
+  return `ci-failure:${prNumber}:${headSha}`;
+}
+
+/**
+ * The revision that failed checks on a head ask for (src/publish/ci.ts). `diagnostics` is the
+ * worker's own summary of the failed checks; the annotations and log lines in it come from CI and
+ * are untrusted, so the revision prompt fences them like any review.
+ */
+export function ciTrigger(c: { prNumber: number; headSha: string; diagnostics: string; worker: string; url: string; recordedAt: string }): {
+  kind: RevisionTriggerKind;
+  reviewId: string;
+  review: ReviewSnapshot;
+  reviewedSha: string;
+} {
+  const id = ciFailureReviewId(c.prNumber, c.headSha);
+  return {
+    kind: 'ci_failure',
+    reviewId: id,
+    reviewedSha: c.headSha,
+    review: { id, url: c.url, author: c.worker, submittedAt: c.recordedAt, body: c.diagnostics, comments: [], omittedComments: 0, headSha: c.headSha },
+  };
+}
+
 /**
  * Why whoever asked for a queued revision may no longer do so, or null. A person must still be an
  * allowed actor; Updraft's own reviewer needs `reviewOn` (the repository still has review on).
  */
 export function requesterProblem(revision: RevisionRequest, allowedActors: readonly string[], reviewOn: boolean): string | null {
+  if (revision.trigger === 'ci_failure') return reviewOn ? null : 'review is off for this repository now, so failed checks are no longer acted on';
   if (revision.trigger === 'updraft_review') return reviewOn ? null : 'review is off for this repository now, so its reviewer verdicts are no longer acted on';
   return isAllowedActor(allowedActors, revision.review.author)
     ? null
@@ -132,7 +158,10 @@ export function requesterProblem(revision: RevisionRequest, allowedActors: reado
  * Change requests by people are not bound to a commit and are never stale.
  */
 export function verdictStale(revision: RevisionRequest, headSha: string | null): string | null {
-  if (revision.trigger !== 'updraft_review' || !revision.reviewedSha || headSha === null || headSha === revision.reviewedSha) return null;
+  if (revision.trigger === 'changes_requested' || !revision.reviewedSha || headSha === null || headSha === revision.reviewedSha) return null;
+  if (revision.trigger === 'ci_failure') {
+    return `the failed checks were on ${revision.reviewedSha.slice(0, 12)}, but the pull request is now at ${headSha.slice(0, 12)}; that failure is stale`;
+  }
   return `the reviewer's verdict was for ${revision.reviewedSha.slice(0, 12)}, but the pull request is now at ${headSha.slice(0, 12)}; the verdict is stale`;
 }
 
@@ -142,6 +171,8 @@ export function verdictStale(revision: RevisionRequest, headSha: string | null):
  * A review that is no longer listed is not proof of anything and does not cancel.
  */
 export function reviewWithdrawn(revision: RevisionRequest, current: readonly GitHubReview[]): string | null {
+  // Failed checks are not a review anyone can dismiss; whether they still apply is verdictStale's to say.
+  if (revision.trigger === 'ci_failure') return null;
   const { review } = revision;
   const now = current.find((r) => r.id === review.id);
   if (now && now.state !== 'CHANGES_REQUESTED') {
