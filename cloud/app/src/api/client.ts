@@ -208,6 +208,10 @@ export interface NativeClaudeView {
   /** A reserved session is booting; readiness still requires its live heartbeat. */
   preparing?: boolean;
   startupFailed?: boolean;
+  retired?: boolean;
+  retirementReason?: string;
+  idleExpiresAt?: string;
+  connectionPolicy?: { maxSessionSeconds: number; idleSeconds: number; concurrentSessions: number; tenantDailySeconds: number; platformDailySeconds: number; tenantLaunchesPerDay: number; platformLaunchesPerDay: number };
   sessionExpiresAt?: string;
   recovery?: { state: 'required' | 'stopping' | 'stopped' };
   managed?: boolean;

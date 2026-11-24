@@ -2,8 +2,8 @@ import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
 import { GetCommand, PutCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
 /** Admission tests use the actual CAS implementation against a strongly consistent in-memory item. */
-export function admissionFixture() {
-  let item: Record<string, unknown> | undefined;
+export function admissionFixture(initial?: Record<string, unknown>) {
+  let item: Record<string, unknown> | undefined = initial ? structuredClone(initial) : undefined;
   const send = async (command: unknown) => {
     if (command instanceof GetCommand) return { Item: item ? structuredClone(item) : undefined };
     if (command instanceof PutCommand) {

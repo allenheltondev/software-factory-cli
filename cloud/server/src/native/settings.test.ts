@@ -267,4 +267,39 @@ describe('Claude subscription mode in the installation app', () => {
     await expect(service.update(caller, 99, true)).rejects.toThrow('is provisioned for this installation');
     expect(enabled).toBe(false);
   });
+  it('keeps the original restart target when another tab replaces it after eligibility evaluation', async () => {
+    const oldSession = { generation: 'old-generation', imageVersion: '9', microvmId: 'mvm-old', requestedAt: now };
+    const newSession = { generation: 'new-generation', imageVersion: '10', microvmId: 'mvm-new', requestedAt: now };
+    let current = oldSession;
+    const stop = vi.fn();
+    const retire = vi.fn(async (_id: number, generation: string) => {
+      if (current.generation !== generation) return false;
+      await stop(current.microvmId);
+      return true;
+    });
+    const api = createNativeSettingsService({ github: { ...github, member: vi.fn().mockResolvedValue({ tenant: { status: 'active' }, summary: { role: 'owner' } }) }, mode, now: () => now,
+      workers: { ...workers, get: async () => {
+        const snapshot = { ...worker!, workerId: 'managed-55', microvmId: current.microvmId, imageVersion: current.imageVersion };
+        current = newSession; // Replacement wins after the old eligibility snapshot, before retire.
+        return snapshot;
+      } },
+      managed: { route: async () => ({ ...route, workerId: 'managed-55', ...current }), imageVersion: '10', start: vi.fn(), stop, retire,
+        vmState: async () => 'RUNNING', lifecycle: async () => ({ preparing: false, startupFailed: false, retiring: false }),
+        sessions: { get: vi.fn(), session: async () => ({ ...current }) }, grant: () => undefined,
+      },
+    });
+    expect(await api.restart(caller, 55)).toMatchObject({ worker: { status: 'connected' } });
+    expect(retire).toHaveBeenCalledExactlyOnceWith(55, 'old-generation');
+    expect(stop).not.toHaveBeenCalled();
+  });
+  it('rejects a binding change between the route and the initial session snapshot', async () => {
+    const retire = vi.fn();
+    const api = createNativeSettingsService({ github: { ...github, member: vi.fn().mockResolvedValue({ tenant: { status: 'active' }, summary: { role: 'owner' } }) }, mode, workers,
+      managed: { route: async () => ({ ...route, generation: 'old', microvmId: 'mvm-old' }), start: vi.fn(), stop: vi.fn(), retire,
+        sessions: { get: vi.fn(), session: async () => ({ generation: 'new', microvmId: 'mvm-new', imageVersion: '10', requestedAt: now }) }, grant: () => undefined },
+    });
+    await expect(api.restart(caller, 55)).rejects.toThrow('environment changed');
+    expect(retire).not.toHaveBeenCalled();
+  });
+
 });

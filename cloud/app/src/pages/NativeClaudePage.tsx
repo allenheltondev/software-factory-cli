@@ -95,11 +95,10 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
             next.owner &&
             !canceled.current &&
             ((next.managed && connectRequested) ||
-              next.preparing ||
-              (next.upgrade ?? next.recovery)?.state === 'stopping')
+              (!next.retired && (next.preparing || (next.upgrade ?? next.recovery)?.state === 'stopping')))
           ) {
             flow.current = true;
-            recoveryRequested.current = Boolean(connectRequested && next.startupFailed);
+            recoveryRequested.current = Boolean(connectRequested && (next.startupFailed || next.retired));
             setPhase('preparing');
             try {
               const replacement = next.upgrade ?? next.recovery;
@@ -131,8 +130,8 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
             if (live) setError('Could not load the waiting job. You can still connect your Claude account.');
           }
         }
-        if (!next.startupFailed) recoveryRequested.current = false;
-        if (flow.current && next.startupFailed && !recoveryRequested.current) {
+        if (!next.startupFailed && !next.retired) recoveryRequested.current = false;
+        if (flow.current && (next.startupFailed || next.retired) && !recoveryRequested.current) {
           flow.current = false;
           grantRequested.current = false;
           setLoginPage(undefined);
@@ -255,7 +254,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
     const version = ++revision.current;
     mutationPending.current = true;
     canceled.current = false;
-    recoveryRequested.current = Boolean(view?.startupFailed);
+    recoveryRequested.current = Boolean(view?.startupFailed || view?.retired);
     setGenerationChanged(false);
     setError(undefined);
     setPhase('preparing');
@@ -338,15 +337,26 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
               {phase === 'idle' && (
                 <>
                   <StatusBadge tone={ready ? 'success' : 'warning'}>
-                    {ready ? 'Connected' : 'Connection required'}
+                    {view.retired ? 'Session ended' : ready ? 'Connected' : 'Connection required'}
                   </StatusBadge>
                   <p className="text-sm text-muted-foreground">
-                    Connecting starts a temporary dedicated environment for up to eight hours. Idle environments close
-                    after 15 minutes. Your API key stays saved. Enable subscription routing separately below.
+                    Your dedicated connection lasts up to {(view.connectionPolicy?.maxSessionSeconds ?? 28800) / 3600}{' '}
+                    hours, including normal breaks. An environment with no work may close after{' '}
+                    {(view.connectionPolicy?.idleSeconds ?? 28800) >= 3600
+                      ? `${(view.connectionPolicy?.idleSeconds ?? 28800) / 3600} hours`
+                      : `${(view.connectionPolicy?.idleSeconds ?? 28800) / 60} minutes`}{' '}
+                    idle. Your API key stays saved. Enable subscription routing separately below.
                   </p>
-                  {view.sessionExpiresAt && (
+                  {view.connectionPolicy && (
                     <p className="text-sm text-muted-foreground">
-                      Session expires{' '}
+                      Up to {view.connectionPolicy.tenantLaunchesPerDay} new environments per UTC day, within a{' '}
+                      {view.connectionPolicy.tenantDailySeconds / 3600}-hour runtime budget. Unused runtime is released
+                      only after the environment has stopped.
+                    </p>
+                  )}
+                  {view.sessionExpiresAt && !view.retired && (
+                    <p className="text-sm text-muted-foreground">
+                      Current connection expires{' '}
                       {new Date(view.sessionExpiresAt).toLocaleString(undefined, { timeZoneName: 'short' })}.
                     </p>
                   )}
@@ -380,11 +390,17 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                       <Button disabled={Boolean(view.worker?.busy)} onClick={() => void connect()}>
                         {view.upgrade
                           ? 'Update and reconnect'
-                          : view.worker || view.startupFailed
+                          : view.worker || view.startupFailed || view.retired
                             ? 'Reconnect Claude'
                             : 'Connect Claude account'}
                       </Button>
                     </div>
+                  )}
+                  {view.retired && (
+                    <p role="status">
+                      This connection has ended. Reconnect Claude when you are ready; opening this page does not start
+                      another environment.
+                    </p>
                   )}
                   {view.startupFailed && (
                     <Alert variant="error">

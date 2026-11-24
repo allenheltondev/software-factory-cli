@@ -9,7 +9,14 @@ import {
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from '../jobs/kill-switch.js';
-import { createClaudeAdmission, IDLE_MS, SESSION_SECONDS, STARTUP_MS, type ClaudeAdmission } from './admission.js';
+import {
+  createClaudeAdmission,
+  IDLE_MS,
+  managedPolicy,
+  SESSION_SECONDS,
+  STARTUP_MS,
+  type ClaudeAdmission,
+} from './admission.js';
 import type { ManagedSession } from './sessions.js';
 import { FlowError } from '../flows/github.js';
 import type { NativeRoute } from './route.js';
@@ -32,6 +39,7 @@ export function managedClaude(
   const mode = createNativeModeStore(env.TABLE_NAME ?? '');
   const admission = options.admission ?? createClaudeAdmission(env.TABLE_NAME ?? '');
   const now = options.now ?? Date.now;
+  const policy = managedPolicy(env);
   const ssm = new SSMClient({});
   const killSwitch = createKillSwitch({
     now,
@@ -119,8 +127,14 @@ export function managedClaude(
       throw err;
     }
   }
-  async function lifecycle(id: number) {
+  async function lifecycle(id: number, generation?: string) {
     const session = await sessions.session(id);
+    if (generation && session?.generation !== generation)
+      throw new FlowError(
+        'invalid_settings',
+        409,
+        'The Claude environment changed. Check its current status before reconnecting.',
+      );
     if (!session) return { preparing: false, startupFailed: false, retiring: false };
     const lease = await admission.get(session.generation);
     const worker = await workers.get(id, managedWorkerId(id));
@@ -130,11 +144,25 @@ export function managedClaude(
       ['auth-required', 'connected', 'expired'].includes(worker.auth);
     if (ready && !session.retiring && !session.readyAt) {
       await sessions.ready(id, session.generation, now());
-      if (lease) await admission.touch(session.generation, now());
+      if (lease) {
+        await admission.touch(session.generation, now());
+        lease.idleAt = now() + (lease.idleMs ?? IDLE_MS);
+      }
     }
     const startupFailed =
       !session.readyAt && !ready && now() >= (session.startupDeadline ?? session.requestedAt + STARTUP_MS);
+    const idleMs = lease?.idleMs ?? policy.idleMs ?? IDLE_MS;
+    const busy = worker?.active || worker?.settling || (await workers.queued(id, managedWorkerId(id))).length > 0;
+    const lifetimeAt = session.requestedAt + SESSION_SECONDS * 1000;
+    const idleAt = lease
+      ? Math.max(lease.idleAt, (worker?.lastWorkAt ?? 0) + idleMs, busy ? now() + idleMs : 0)
+      : lifetimeAt;
     return {
+      expiresAt: new Date(Math.min(lifetimeAt, idleAt)).toISOString(),
+      idleSeconds: idleMs / 1000,
+      idleExpiresAt: new Date(idleAt).toISOString(),
+      retired: session.retiring === true && !['reconnect', 'startup-failed'].includes(session.retirementReason ?? ''),
+      retirementReason: session.retirementReason,
       preparing: !!lease && !session.retiring && !startupFailed && !session.readyAt && !ready,
       startupFailed,
       retiring: session.retiring === true,
@@ -142,7 +170,11 @@ export function managedClaude(
   }
 
   /** Session + mode + worker fencing is atomic, even when the worker never registered. */
-  async function retire(id: number, generation: string): Promise<boolean> {
+  async function retire(
+    id: number,
+    generation: string,
+    reason: NonNullable<ManagedSession['retirementReason']> = 'reconnect',
+  ): Promise<boolean> {
     const session = await sessions.session(id);
     if (!session || session.generation !== generation) return false;
     if (!session.retiring) {
@@ -155,7 +187,7 @@ export function managedClaude(
           'Wait for active, settling, and queued Claude jobs to finish before reconnecting.',
         );
       }
-      if (!(await sessions.retire(id, session, snapshot, worker))) {
+      if (!(await sessions.retire(id, session, snapshot, worker, reason))) {
         throw new FlowError(
           'invalid_settings',
           409,
@@ -166,8 +198,8 @@ export function managedClaude(
     let lease = await admission.get(generation);
     // Adopt pre-budget unbound generations before any recovery replay can create compute.
     if (!lease && !session.microvmId && !session.admissionRequired) {
-      await admission.reserve(id, generation, now());
-      await admission.launching(generation);
+      await admission.reserve(id, generation, now(), policy);
+      await admission.launching(generation, now());
       lease = await admission.get(generation);
     }
     await admission.retiring(generation);
@@ -185,7 +217,7 @@ export function managedClaude(
         if (!['TERMINATED', null].includes(await stateOf(vm))) return false;
       }
     }
-    await admission.release(generation);
+    await admission.release(generation, now());
     return true;
   }
 
@@ -223,18 +255,18 @@ export function managedClaude(
             409,
             'This Claude environment did not become ready. Reconnect Claude to replace it safely.',
           );
-        await admission.reserve(id, session.generation, now());
+        await admission.reserve(id, session.generation, now(), policy);
         await admission.bind(session.generation, session.microvmId);
         return;
       }
-      await admission.release(session.generation);
+      await admission.release(session.generation, now());
     }
     if (!session || session.microvmId || session.retiring) {
       const reserved = await sessions.requestSession(id, session, imageVersion!, now());
       session = reserved ?? (await sessions.session(id));
       if (!session || session.microvmId || session.retiring) return;
     }
-    await admission.reserve(id, session.generation, now());
+    await admission.reserve(id, session.generation, now(), policy);
     // Fetch the secret before the launch marker. Failure here can be sealed/released without a VM.
     let token: string;
     try {
@@ -243,7 +275,7 @@ export function managedClaude(
       await retire(id, session.generation);
       throw err;
     }
-    await admission.launching(session.generation);
+    await admission.launching(session.generation, now());
     const current = await sessions.session(id);
     if (!current || current.generation !== session.generation || current.retiring)
       throw new FlowError('invalid_settings', 409, 'This Claude environment is retiring. Try again shortly.');
@@ -263,7 +295,7 @@ export function managedClaude(
         if (!session || session.generation !== lease.generation) {
           // A legacy/replaced generation is still charged until its exact VM is known to be gone.
           if (lease.microvmId && ['TERMINATED', null].includes(await stateOf(lease.microvmId))) {
-            await admission.release(lease.generation);
+            await admission.release(lease.generation, now());
             released++;
           } else failed++;
           continue;
@@ -278,7 +310,7 @@ export function managedClaude(
           continue;
         }
         const state = session.microvmId ? await stateOf(session.microvmId) : undefined;
-        const lifecycleState = await lifecycle(lease.installationId);
+        const lifecycleState = await lifecycle(lease.installationId, lease.generation);
         if (
           paused ||
           session.retiring ||
@@ -286,10 +318,19 @@ export function managedClaude(
           state === null ||
           state === 'TERMINATED' ||
           lifecycleState.startupFailed ||
-          now() >= Math.max(lease.idleAt, (worker?.lastWorkAt ?? 0) + IDLE_MS) ||
+          now() >= Math.max(lease.idleAt, (worker?.lastWorkAt ?? 0) + (lease.idleMs ?? IDLE_MS)) ||
           now() >= session.requestedAt + SESSION_SECONDS * 1000
         ) {
-          if (await retire(lease.installationId, lease.generation)) released++;
+          const reason =
+            session.retirementReason ??
+            (paused
+              ? 'disabled'
+              : lifecycleState.startupFailed
+                ? 'startup-failed'
+                : state === null || state === 'TERMINATED' || now() >= session.requestedAt + SESSION_SECONDS * 1000
+                  ? 'expired'
+                  : 'idle');
+          if (await retire(lease.installationId, lease.generation, reason)) released++;
         }
       } catch {
         failed++;
@@ -298,8 +339,14 @@ export function managedClaude(
     return { released, failed };
   }
   /** The state of the installation's current session VM, or null when it has none or it is gone. */
-  async function vmState(id: number): Promise<string | null> {
+  async function vmState(id: number, generation?: string): Promise<string | null> {
     const session = await sessions.session(id);
+    if (generation && session?.generation !== generation)
+      throw new FlowError(
+        'invalid_settings',
+        409,
+        'The Claude environment changed. Check its current status before reconnecting.',
+      );
     if (!session?.microvmId) return null;
     try {
       return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: session.microvmId }))).state ?? null;
@@ -333,6 +380,15 @@ export function managedClaude(
     sessions,
     imageArn,
     imageVersion,
+    policy: {
+      maxSessionSeconds: SESSION_SECONDS,
+      idleSeconds: (policy.idleMs ?? IDLE_MS) / 1000,
+      concurrentSessions: policy.concurrent,
+      tenantDailySeconds: policy.tenantDailySeconds,
+      platformDailySeconds: policy.dailySeconds,
+      tenantLaunchesPerDay: policy.tenantLaunchesPerDay!,
+      platformLaunchesPerDay: policy.platformLaunchesPerDay!,
+    },
     secret,
   };
 }

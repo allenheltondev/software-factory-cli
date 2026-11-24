@@ -31,6 +31,37 @@ Parameters:
     Type: String
     Default: ''
     Description: Built, live-verified browser-login image version. A nonempty value enables tenant-managed Claude sessions.
+  ManagedClaudeIdleMinutes:
+    Type: Number
+    Default: 480
+    MinValue: 15
+    MaxValue: 480
+    Description: Idle connection timeout in minutes, capped by the eight-hour session lifetime. Default preserves normal breaks.
+  ManagedClaudeConcurrentSessions:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 20
+  ManagedClaudePlatformDailyHours:
+    Type: Number
+    Default: 192
+    MinValue: 8
+    MaxValue: 8000
+  ManagedClaudeTenantDailyHours:
+    Type: Number
+    Default: 24
+    MinValue: 8
+    MaxValue: 192
+  ManagedClaudePlatformLaunchesPerDay:
+    Type: Number
+    Default: 96
+    MinValue: 1
+    MaxValue: 1000
+  ManagedClaudeTenantLaunchesPerDay:
+    Type: Number
+    Default: 12
+    MinValue: 1
+    MaxValue: 100
   ManagedClaudeConsoleOrigin:
     Type: String
     Default: ''
@@ -541,6 +572,12 @@ Resources:
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
           NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
+          NATIVE_MANAGED_IDLE_MINUTES: !Ref ManagedClaudeIdleMinutes
+          NATIVE_MANAGED_CONCURRENT_SESSIONS: !Ref ManagedClaudeConcurrentSessions
+          NATIVE_MANAGED_PLATFORM_DAILY_HOURS: !Ref ManagedClaudePlatformDailyHours
+          NATIVE_MANAGED_TENANT_DAILY_HOURS: !Ref ManagedClaudeTenantDailyHours
+          NATIVE_MANAGED_PLATFORM_LAUNCHES_PER_DAY: !Ref ManagedClaudePlatformLaunchesPerDay
+          NATIVE_MANAGED_TENANT_LAUNCHES_PER_DAY: !Ref ManagedClaudeTenantLaunchesPerDay
           NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
           NATIVE_MANAGED_ROLE_ARN: !If [ManagedClaude, !GetAtt ManagedClaudeExecutionRole.Arn, ""]
           NATIVE_MANAGED_LOG_GROUP: !If [ManagedClaude, !Ref MicrovmLogGroup, ""]
@@ -678,6 +715,12 @@ Resources:
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
           NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
+          NATIVE_MANAGED_IDLE_MINUTES: !Ref ManagedClaudeIdleMinutes
+          NATIVE_MANAGED_CONCURRENT_SESSIONS: !Ref ManagedClaudeConcurrentSessions
+          NATIVE_MANAGED_PLATFORM_DAILY_HOURS: !Ref ManagedClaudePlatformDailyHours
+          NATIVE_MANAGED_TENANT_DAILY_HOURS: !Ref ManagedClaudeTenantDailyHours
+          NATIVE_MANAGED_PLATFORM_LAUNCHES_PER_DAY: !Ref ManagedClaudePlatformLaunchesPerDay
+          NATIVE_MANAGED_TENANT_LAUNCHES_PER_DAY: !Ref ManagedClaudeTenantLaunchesPerDay
           NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
           CLAUDE_CONSOLE_ORIGIN: !If
             - ManagedClaude
@@ -789,6 +832,12 @@ Resources:
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
           NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
+          NATIVE_MANAGED_IDLE_MINUTES: !Ref ManagedClaudeIdleMinutes
+          NATIVE_MANAGED_CONCURRENT_SESSIONS: !Ref ManagedClaudeConcurrentSessions
+          NATIVE_MANAGED_PLATFORM_DAILY_HOURS: !Ref ManagedClaudePlatformDailyHours
+          NATIVE_MANAGED_TENANT_DAILY_HOURS: !Ref ManagedClaudeTenantDailyHours
+          NATIVE_MANAGED_PLATFORM_LAUNCHES_PER_DAY: !Ref ManagedClaudePlatformLaunchesPerDay
+          NATIVE_MANAGED_TENANT_LAUNCHES_PER_DAY: !Ref ManagedClaudeTenantLaunchesPerDay
           NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
           NATIVE_MANAGED_ROLE_ARN: !If [ManagedClaude, !GetAtt ManagedClaudeExecutionRole.Arn, ""]
           NATIVE_MANAGED_LOG_GROUP: !If [ManagedClaude, !Ref MicrovmLogGroup, ""]
@@ -1092,6 +1141,12 @@ Resources:
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
           NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
+          NATIVE_MANAGED_IDLE_MINUTES: !Ref ManagedClaudeIdleMinutes
+          NATIVE_MANAGED_CONCURRENT_SESSIONS: !Ref ManagedClaudeConcurrentSessions
+          NATIVE_MANAGED_PLATFORM_DAILY_HOURS: !Ref ManagedClaudePlatformDailyHours
+          NATIVE_MANAGED_TENANT_DAILY_HOURS: !Ref ManagedClaudeTenantDailyHours
+          NATIVE_MANAGED_PLATFORM_LAUNCHES_PER_DAY: !Ref ManagedClaudePlatformLaunchesPerDay
+          NATIVE_MANAGED_TENANT_LAUNCHES_PER_DAY: !Ref ManagedClaudeTenantLaunchesPerDay
           NATIVE_MANAGED_SECRET_ARN: !If [ManagedClaude, !Ref ManagedClaudeControlSecret, ""]
           CLAUDE_WEBHOOK_PARAMETER: !If [ManagedClaude, !Sub '/updraft/${AWS::StackName}/claude-webhook', ""]
           PARTITION: !Ref AWS::Partition

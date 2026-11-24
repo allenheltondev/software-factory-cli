@@ -13,6 +13,7 @@ export interface ManagedSession {
   startupDeadline?: number;
   readyAt?: number;
   retiring?: boolean;
+  retirementReason?: 'reconnect' | 'idle' | 'expired' | 'disabled' | 'startup-failed';
   admissionRequired?: boolean;
 }
 
@@ -66,15 +67,15 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
       } catch (err) { if (!(err instanceof ConditionalCheckFailedException)) throw err; }
     },
     /** Seal the exact generation AND its dispatch revision, including a missing worker row. */
-    async retire(id: number, session: ManagedSession, mode: NativeMode, worker: Worker | null) {
+    async retire(id: number, session: ManagedSession, mode: NativeMode, worker: Worker | null, reason: NonNullable<ManagedSession['retirementReason']> = 'reconnect') {
       const fenced: Worker = { ...(worker ?? { version: 0, installationId: id, workerId: managedWorkerId(id), session: session.generation,
         imageVersion: session.imageVersion, workerVersion: 'unregistered', auth: 'unavailable', heartbeatAt: 0 }),
         microvmId: session.microvmId ?? 'mvm-pending', version: (worker?.version ?? 0) + 1, fenced: true };
       try {
         await db.send(new TransactWriteCommand({ TransactItems: [
-          { Update: { TableName: table, Key: sessionKey(id), UpdateExpression: 'SET retiring = :yes',
+          { Update: { TableName: table, Key: sessionKey(id), UpdateExpression: 'SET retiring = :yes, retirementReason = :reason',
             ConditionExpression: 'generation = :g AND attribute_not_exists(retiring)',
-            ExpressionAttributeValues: { ':g': session.generation, ':yes': true } } },
+            ExpressionAttributeValues: { ':g': session.generation, ':yes': true, ':reason': reason } } },
           { Update: { TableName: table, Key: { pk: nativePartition(id, managedWorkerId(id)), sk: 'MODE' },
             UpdateExpression: 'SET revision = :next, routingVersion = :routing',
             ConditionExpression: mode.revision === 0 ? 'attribute_not_exists(revision) OR revision = :revision' : 'revision = :revision',

@@ -309,4 +309,47 @@ describe('guided Claude connection', () => {
     expect(await screen.findByTitle('Private Claude sign-in')).toBeInTheDocument();
     expect(nativeClaudeLogin).toHaveBeenCalledOnce();
   });
+  it('shows configured idle policy before connection and effective expiry while connected', async () => {
+    const deadline = '2026-11-24T21:00:00Z';
+    const policy = {
+      maxSessionSeconds: 28800,
+      idleSeconds: 7200,
+      concurrentSessions: 4,
+      tenantDailySeconds: 86400,
+      platformDailySeconds: 691200,
+      tenantLaunchesPerDay: 12,
+      platformLaunchesPerDay: 96,
+    };
+    let current: NativeClaudeView = { ...ready, worker: null, connectionPolicy: policy };
+    show(fakeApi({ nativeClaude: async () => current }));
+    expect(await screen.findByText(/close after 2 hours idle/)).toBeInTheDocument();
+    expect(screen.getByText(/12 new environments per UTC day/)).toBeInTheDocument();
+    current = { ...ready, connectionPolicy: policy, sessionExpiresAt: deadline, idleExpiresAt: deadline };
+    await focus();
+    expect(screen.getByText(/Current connection expires/)).toHaveTextContent(
+      new Date(deadline).toLocaleString(undefined, { timeZoneName: 'short' }),
+    );
+  });
+  it.each(['stopping', 'stopped'] as const)(
+    'does not restart an intentionally retired %s session during status restoration',
+    async (state) => {
+      const nativeClaudeStart = vi.fn();
+      const nativeClaudeRestart = vi.fn();
+      const current: NativeClaudeView = {
+        ...ready,
+        worker: null,
+        preparing: false,
+        retired: true,
+        retirementReason: 'idle',
+        recovery: { state },
+      };
+      show(fakeApi({ nativeClaude: async () => current, nativeClaudeStart, nativeClaudeRestart }));
+      expect(await screen.findByText('Session ended')).toBeInTheDocument();
+      await focus();
+      await focus();
+      expect(screen.getByRole('button', { name: 'Reconnect Claude' })).toBeEnabled();
+      expect(nativeClaudeStart).not.toHaveBeenCalled();
+      expect(nativeClaudeRestart).not.toHaveBeenCalled();
+    },
+  );
 });

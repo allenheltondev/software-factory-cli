@@ -51,7 +51,7 @@ function fixture(worker?: Worker, registrationRace = false, enqueueRace = false)
         const key = `${update.Key?.pk}|${update.Key?.sk}`;
         const item = items.get(key)!;
         const values = update.ExpressionAttributeValues!;
-        if (update.UpdateExpression === 'SET retiring = :yes') item.retiring = true;
+        if (update.UpdateExpression?.startsWith('SET retiring = :yes')) { item.retiring = true; item.retirementReason = values[':reason']; }
         else {
           item.revision = values[':next'];
           item.routingVersion = values[':routing'];

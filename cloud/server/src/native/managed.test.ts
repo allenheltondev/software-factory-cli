@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { GetMicrovmCommand, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { managedClaude } from './managed.js';
-import { createClaudeAdmission, IDLE_MS, STARTUP_MS } from './admission.js';
+import { createClaudeAdmission, STARTUP_MS } from './admission.js';
 import { admissionFixture } from './admission-fixture.js';
 import type { Worker } from './store.js';
 import type { ManagedSession } from './sessions.js';
@@ -63,7 +63,8 @@ describe('managed connection reservation', () => {
   let clock: number;
   let disabled: boolean;
   let admission: ReturnType<typeof createClaudeAdmission>;
-  const managed = () => managedClaude(env, { admission, disabled: async () => disabled, now: () => clock })!;
+  const managed = (overrides: Record<string, string> = {}) =>
+    managedClaude({ ...env, ...overrides }, { admission, disabled: async () => disabled, now: () => clock })!;
   beforeEach(() => {
     vi.clearAllMocks();
     current = undefined;
@@ -71,8 +72,11 @@ describe('managed connection reservation', () => {
     clock = Date.now();
     disabled = false;
     admission = createClaudeAdmission('test', admissionFixture().db);
-    mocks.retire.mockImplementation(async () => {
-      if (current) current.retiring = true;
+    mocks.retire.mockImplementation(async (_id, _session, _mode, _worker, reason) => {
+      if (current) {
+        current.retiring = true;
+        current.retirementReason = reason;
+      }
       return true;
     });
     mocks.ready.mockImplementation(async () => {
@@ -204,6 +208,7 @@ describe('managed connection reservation', () => {
         expect.objectContaining({ generation: 'fixture-generation-initial' }),
         expect.objectContaining({ revision: 0 }),
         auth === 'missing' ? null : expect.objectContaining({ auth: 'unavailable' }),
+        'startup-failed',
       );
       await managed().start(55);
       expect(current?.microvmId).toBe('mvm-replacement');
@@ -234,7 +239,7 @@ describe('managed connection reservation', () => {
     expect(mocks.vm).not.toHaveBeenCalled();
     expect(await admission.list()).toHaveLength(0);
   });
-  it('cleans up idle connected environments before the eight-hour maximum', async () => {
+  it('honors a configured idle deadline and exposes the effective expiration', async () => {
     let state = 'RUNNING';
     mocks.vm.mockImplementation(async (command) => {
       if (command instanceof RunMicrovmCommand) return { microvmId: 'mvm-fixture' };
@@ -244,7 +249,8 @@ describe('managed connection reservation', () => {
       }
       return { state };
     });
-    await managed().start(55);
+    const configured = () => managed({ NATIVE_MANAGED_IDLE_MINUTES: '120' });
+    await configured().start(55);
     row = {
       installationId: 55,
       workerId: 'managed-55',
@@ -256,13 +262,17 @@ describe('managed connection reservation', () => {
       heartbeatAt: clock,
       auth: 'connected',
     };
-    await managed().lifecycle(55);
-    clock += IDLE_MS - 1;
-    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    await configured().lifecycle(55);
+    clock += 2 * 3600000 - 1;
+    expect(await configured().reconcile()).toEqual({ released: 0, failed: 0 });
+    expect((await configured().lifecycle(55)).expiresAt).toBe(
+      new Date(current!.requestedAt + 2 * 3600000).toISOString(),
+    );
     clock += 2;
-    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(await configured().reconcile()).toEqual({ released: 1, failed: 0 });
     expect(await admission.list()).toHaveLength(0);
     expect(state).toBe('TERMINATED');
+    expect(await configured().lifecycle(55)).toMatchObject({ retired: true, retirementReason: 'idle' });
   });
   it('retains capacity while a stop is uncertain and releases it only after confirmed termination', async () => {
     await managed().start(55);
@@ -289,5 +299,28 @@ describe('managed connection reservation', () => {
     await expect(managed().retire(55, current.generation)).rejects.toThrow('capacity is full');
     expect(mocks.vm).not.toHaveBeenCalled();
     expect(await admission.list()).toHaveLength(4);
+  });
+  it('keeps one healthy connection through morning and lunch breaks under the default policy', async () => {
+    await managed().start(55);
+    row = {
+      installationId: 55,
+      workerId: 'managed-55',
+      microvmId: current!.microvmId!,
+      imageVersion: '10',
+      workerVersion: 'test',
+      version: 1,
+      session: 'worker-session-123456',
+      heartbeatAt: clock,
+      auth: 'connected',
+    };
+    const originalGeneration = current!.generation;
+    for (const minutes of [30, 60, 90, 120]) {
+      clock += minutes * 60000;
+      await managed().start(55);
+      expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+      expect(current!.generation).toBe(originalGeneration);
+    }
+    expect(mocks.vm.mock.calls.filter(([command]) => command instanceof RunMicrovmCommand)).toHaveLength(1);
+    expect(await admission.list()).toHaveLength(1);
   });
 });

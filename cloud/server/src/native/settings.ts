@@ -15,8 +15,9 @@ export function createNativeSettingsService(d: {
     /** The deployed worker image version; a session on another one must be restarted. */
     imageVersion?: string;
     stop?(microvmId: string): Promise<void>;
-    vmState?(id: number): Promise<string | null>;
-    lifecycle?(id: number): Promise<{ preparing: boolean; startupFailed: boolean; retiring: boolean }>;
+    vmState?(id: number, generation?: string): Promise<string | null>;
+    lifecycle?(id: number, generation?: string): Promise<{ preparing: boolean; startupFailed: boolean; retiring: boolean; retired?: boolean; retirementReason?: string; expiresAt?: string; idleExpiresAt?: string; idleSeconds?: number }>;
+    policy?: { maxSessionSeconds: number; idleSeconds: number; concurrentSessions: number; tenantDailySeconds: number; platformDailySeconds: number; tenantLaunchesPerDay: number; platformLaunchesPerDay: number };
     retire?(id: number, generation: string): Promise<boolean>;
     sessions: Pick<ClaudeSessions, 'get'> & Partial<Pick<ClaudeSessions, 'pending' | 'session'>>;
     grant(route: NativeRoute): (() => Promise<{ url: string; token: string; port: number; expiresAt?: string }>) | undefined;
@@ -45,7 +46,7 @@ export function createNativeSettingsService(d: {
   async function upgradeOf(r: NativeRoute) {
     const latest = d.managed?.imageVersion;
     if (r === d.route || !latest || r.microvmId === 'mvm-pending' || r.imageVersion === latest || !d.managed?.vmState) return undefined;
-    const state = await d.managed.vmState(r.installationId);
+    const state = await d.managed.vmState(r.installationId, r.generation);
     const status = state === null || state === 'TERMINATED' ? 'stopped' as const : state === 'TERMINATING' ? 'stopping' as const : 'required' as const;
     return { from: r.imageVersion, to: latest, state: status };
   }
@@ -65,7 +66,7 @@ export function createNativeSettingsService(d: {
       upgradeOf(r), managed?.sessions.pending?.(installationId), managed?.sessions.session?.(installationId),
       worker ? d.workers.queued(r.installationId, r.workerId) : Promise.resolve([]),
     ]);
-    const lifecycle = await managed?.lifecycle?.(installationId);
+    const lifecycle = await managed?.lifecycle?.(installationId, r.generation);
     const recovering = lifecycle?.startupFailed || lifecycle?.retiring || !upgrade && managed && worker?.microvmId === r.microvmId && (worker.fenced || worker.auth === 'expired' || stale);
     const awaitingWorker = !upgrade && !recovering && managed && session && (!worker || worker.microvmId !== r.microvmId || worker.auth === 'unavailable');
     const vm = recovering || awaitingWorker ? await managed?.vmState?.(installationId) : undefined;
@@ -74,8 +75,12 @@ export function createNativeSettingsService(d: {
     return {
       preparing,
       startupFailed: lifecycle?.startupFailed ?? false,
+      retired: lifecycle?.retired ?? false,
+      ...(lifecycle?.retirementReason ? { retirementReason: lifecycle.retirementReason } : {}),
+      ...(managed?.policy ? { connectionPolicy: { ...managed.policy, ...(lifecycle?.idleSeconds !== undefined ? { idleSeconds: lifecycle.idleSeconds } : {}) } } : {}),
+      ...(lifecycle?.idleExpiresAt && !lifecycle.retired ? { idleExpiresAt: lifecycle.idleExpiresAt } : {}),
       ...(recovery ? { recovery } : {}),
-      ...(session?.microvmId === r.microvmId ? { sessionExpiresAt: new Date(session.requestedAt + 8 * 60 * 60_000).toISOString() } : {}),
+      ...(lifecycle?.expiresAt && !lifecycle.retired ? { sessionExpiresAt: lifecycle.expiresAt } : !lifecycle?.retired && session?.microvmId === r.microvmId ? { sessionExpiresAt: new Date(session.requestedAt + 8 * 60 * 60_000).toISOString() } : {}),
       ...(upgrade ? { upgrade } : {}),
       ...(pending?.[0] ? { pendingRequest: pending[0].id } : {}),
       // Restarting and signing in are owner actions; members see the state, not the buttons.
@@ -139,17 +144,26 @@ export function createNativeSettingsService(d: {
     async restart(caller: Caller, installationId: number) {
       const { summary, tenant } = await d.github.member(caller, installationId);
       if (summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner can restart the Claude worker');
+      // First snapshot is the only retirement target, including pending/retiring sessions.
+      const session = await d.managed?.sessions.session?.(installationId);
       const r = await route(installationId);
       if (!d.managed?.stop || !r || r.installationId !== installationId || r === d.route || tenant.status !== 'active') {
         throw new FlowError('invalid_settings', 409, 'This installation has no Claude worker to restart');
       }
+      // Capture the target once. Eligibility must never select a different generation later.
+      if (d.managed.retire && d.managed.sessions.session && !session) {
+        throw new FlowError('invalid_settings', 409, 'The Claude environment changed. Check its current status before reconnecting.');
+      }
+      if (session && ((r.generation && r.generation !== session.generation) ||
+          (r.microvmId !== 'mvm-pending' && r.microvmId !== session.microvmId))) {
+        throw new FlowError('invalid_settings', 409, 'The Claude environment changed. Check its current status before reconnecting.');
+      }
       const upgrade = await upgradeOf(r);
-      const lifecycle = await d.managed.lifecycle?.(installationId);
+      const lifecycle = await d.managed.lifecycle?.(installationId, session?.generation);
       const previous = await d.workers.get(r.installationId, r.workerId);
       if (!upgrade && !lifecycle?.startupFailed && !lifecycle?.retiring && (!previous || previous.microvmId !== r.microvmId || (!previous.fenced && previous.auth !== 'expired' && now() - previous.heartbeatAt <= 60_000))) {
         throw new FlowError('invalid_settings', 409, 'The Claude worker is already up to date and healthy');
       }
-      const session = await d.managed.sessions.session?.(installationId);
       if (d.managed.retire && session) {
         await d.managed.retire(installationId, session.generation);
         return view(caller, installationId);
