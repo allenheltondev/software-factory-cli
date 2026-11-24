@@ -192,7 +192,7 @@ tool's output):
 | Where | Attributes |
 | --- | --- |
 | Every tool call | `updraft.tool.category` (`test`, `lint`, `build`, `install`, `git`, `github`, `network`, `run`, `edit`, `filesystem`, `search`, `read`, `web`, `plan`, `delegate`, `mcp`, `other`), `updraft.tool.output.bytes`, `updraft.tool.output.lines` |
-| A command (Bash, Codex `shell`) | `updraft.tool.command.program` (the first program that is not `cd`), `updraft.tool.command.programs`, `updraft.tool.command.unknown_programs`, `updraft.tool.exit_code`, `updraft.tool.background`. Only well-known programs (npm, git, pytest, cargo, grep, ...) are ever named; any other is only counted, so no misreading of an unusual command can export one of its words. The command is split the way the shell would (quotes, escapes, comments, redirections, `[[ ... ]]` and `(( ... ))` as one unit, a shell's `-c` only among its own options), and a command whose boundaries cannot be known for certain (an unterminated quote or conditional, `$(...)` or backticks, a heredoc) gets no program |
+| A command (Bash, Codex `shell`, and the Updraft MCP exec tool `mcp__updraft__exec`) | `updraft.tool.command.program` (the first program that is not `cd`), `updraft.tool.command.programs`, `updraft.tool.command.unknown_programs`, `updraft.tool.exit_code`, `updraft.tool.background`. Only well-known programs (npm, git, pytest, cargo, grep, ...) are ever named; any other is only counted, so no misreading of an unusual command can export one of its words. The command is split the way the shell would (quotes, escapes, comments, redirections, `[[ ... ]]` and `(( ... ))` as one unit, a shell's `-c` only among its own options), and a command whose boundaries cannot be known for certain (an unterminated quote or conditional, `$(...)` or backticks, a heredoc) gets no program |
 | An edit (Edit, MultiEdit, Write, `apply_patch`) | `updraft.tool.file.path` (relative to the worktree), `.extension`, `.test`, `updraft.tool.lines_added`, `updraft.tool.lines_removed`; for a patch `updraft.tool.file.paths` and counts by kind |
 | Read, Grep, Glob, WebFetch | the file or directory, a glob's extension only (`*.ts`), how many lines or results came back; WebFetch's host only |
 | A test run (an agent's command or a verify command) | `updraft.test.framework` (vitest, jest, pytest, go, cargo, mocha, rspec, node-test), `.passed`, `.failed`, `.skipped`, `.total`, `.failed_tests` (names, never messages, up to 20); `updraft.check.tool`, `.errors`, `.warnings` for tsc, eslint, mypy and ruff, each told by its own summary or by the program the command ran |
@@ -315,6 +315,26 @@ Every value is redacted with the job's own keys (the agent keys and the destinat
 patterns for anything shaped like a provider key, bearer token or key header, then cut to
 16 KB. A JSON value is cut inside its strings, so it stays valid JSON. Code and issue text are
 not redacted: they are what the content is.
+
+### Shell commands through the Updraft MCP exec tool
+
+A subscription worker's shell calls arrive as the MCP tool `mcp__updraft__exec`. Updraft treats that one
+known tool as shell execution: it gets the same command attributes, category, test and check
+results and behavior tracking as Bash. Its span is named `execute_tool <operation>` (for example
+`execute_tool git status`, `execute_tool npm test`, `execute_tool grep / sed / cat`) and carries
+`updraft.tool.operation` with the same text. Operations are known program names, plus a subcommand
+only from a fixed list (git: status, diff, log, ...; npm, pnpm, yarn, bun: test, install, ci, build,
+lint, ...); a compound command shows at most three, joined by ` / `, then `…`. Arguments, paths,
+unknown programs and anything the parser cannot read with certainty never appear, with content
+capture on or off; with nothing recognized the name stays `execute_tool mcp__updraft__exec`.
+`gen_ai.tool.name`, `gen_ai.tool.call.id` and `gen_ai.tool.type=extension` keep the wrapper's
+identity, so filter on those for MCP transport. `updraft.tool.exit_code` is read from the result's
+trailing `exit=<n>` and left unset when it is absent; a non-zero exit counts as failed for
+behavior metrics, while the span's error status still follows the tool result's `is_error`.
+
+**Span-name change:** queries that matched `name = "execute_tool mcp__updraft__exec"` should use
+`gen_ai.tool.name` instead. Whether Honeycomb's compact Agent Timeline shows the full name depends
+on span width; the raw span name is what is exported.
 
 ## The contract
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { claudeToolAttributes, codexToolAttributes, describeCommand, isTestPath, lineCount, parseCheckOutput, parseTestOutput, relativePath, resultAttributes } from '../image/runner/telemetry-detail.mjs';
+import { operationName, claudeToolAttributes, codexToolAttributes, describeCommand, isTestPath, lineCount, parseCheckOutput, parseTestOutput, relativePath, resultAttributes } from '../image/runner/telemetry-detail.mjs';
 
 /** A Bash call's command attributes. */
 const commandAttributesOf = (command) => Object.fromEntries(Object.entries(claudeToolAttributes('Bash', { command }, [])).filter(([, v]) => v !== undefined));
@@ -208,5 +208,34 @@ describe('test runner output', () => {
     expect(parseCheckOutput('Found 4 errors in 2 files.\n', ['tsc'])).toEqual({ tool: 'tsc', errors: 4, warnings: 0 });
     expect(parseCheckOutput('All checks passed!\n', ['ruff'])).toEqual({ tool: 'ruff', errors: 0, warnings: 0 });
     expect(parseCheckOutput('Found 4 errors in 2 files.\n')).toEqual({ tool: 'unknown', errors: 4, warnings: 0 });
+  });
+});
+
+describe('Updraft MCP exec', () => {
+  const opOf = (command) => claudeToolAttributes('mcp__updraft__exec', { command }, [])['updraft.tool.operation'];
+  it.each([
+    ['git status', 'git status'],
+    ['git diff HEAD~1', 'git diff'],
+    ['git -C /secret status', 'git'],
+    ['npm test', 'npm test'],
+    ['npm run build', 'npm build'],
+    ['npm run deploy-prod', 'npm'],
+    ['grep -r x . | grep y; sed s/a/b/ f; cat f', 'grep / sed / cat'],
+    ['./mystery --token=abc', undefined],
+    ['echo $(whoami)', undefined],
+    ["echo 'unterminated", undefined],
+    ['ls && cat a && head a && wc a', 'ls / cat / head / …'],
+  ])('%s -> %s', (command, op) => expect(opOf(command)).toBe(op));
+
+  it('classifies like Bash and leaves other MCP tools alone', () => {
+    expect(claudeToolAttributes('mcp__updraft__exec', { command: 'npm test' }, [])['updraft.tool.category']).toBe('test');
+    expect(claudeToolAttributes('mcp__other__exec', { command: 'npm test' }, [])['updraft.tool.category']).toBe('mcp');
+    expect(claudeToolAttributes('Bash', { command: 'git status' }, [])['updraft.tool.operation']).toBeUndefined();
+    expect(operationName(null)).toBeNull();
+  });
+
+  it('reads the exit status from the result, and leaves it unset when absent', () => {
+    expect(resultAttributes('git', 'mcp__updraft__exec', 'x\nexit=2', false)['updraft.tool.exit_code']).toBe(2);
+    expect(resultAttributes('git', 'mcp__updraft__exec', 'x', false)['updraft.tool.exit_code']).toBeUndefined();
   });
 });

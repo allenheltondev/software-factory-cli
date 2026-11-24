@@ -209,6 +209,36 @@ describe('agent telemetry: Claude Code', () => {
     expect(subChat.attributes['gen_ai.agent.name']).toBe('claude-opus/Explore');
   });
 
+  it('names an Updraft MCP exec call by its shell operation and counts it like native Bash', async () => {
+    const t = setup();
+    const mcp = (id, command) => {
+      const ev = claude.assistantToolUse(id, command);
+      ev.message.content[0].name = 'mcp__updraft__exec';
+      return ev;
+    };
+    const other = claude.assistantToolUse('toolu_3', 'whatever');
+    other.message.content[0].name = 'mcp__github__search';
+    const failing = claude.toolResult('toolu_2', 'Tests  1 failed | 4 passed (5)\nexit=1');
+    await t.step('run_1', `${header()}\n`, 0);
+    await t.step('run_1', claude.stream(claude.init(), mcp('toolu_1', 'git status --porcelain secret-path'), claude.toolResult('toolu_1', 'ok\nexit=0')), 500);
+    await t.step('run_1', claude.stream(mcp('toolu_2', 'npm test'), failing), 500);
+    await t.step('run_1', claude.stream(mcp('toolu_4', 'grep -r TOKEN=abc . | sed s/a/b/; ./mystery --key=sk-123; cat /etc/x'), claude.toolResult('toolu_4', 'x')), 500);
+    await t.step('run_1', claude.stream(mcp('toolu_5', 'echo $(whoami)'), claude.toolResult('toolu_5', 'x')), 500);
+    await t.step('run_1', claude.stream(other, claude.toolResult('toolu_3', 'x')), 500);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const spans = t.exporter.spans;
+    const status = one(spans, 'execute_tool git status');
+    expect(status.attributes).toMatchObject({ 'gen_ai.operation.name': 'execute_tool', 'gen_ai.tool.name': 'mcp__updraft__exec', 'gen_ai.tool.call.id': 'toolu_1', 'gen_ai.tool.type': 'extension', 'updraft.tool.category': 'git', 'updraft.tool.exit_code': 0 });
+    expect(one(spans, 'execute_tool npm test').attributes).toMatchObject({ 'updraft.tool.category': 'test', 'updraft.tool.exit_code': 1, 'updraft.test.failed': 1, 'updraft.test.passed': 4 });
+    expect(one(spans, 'execute_tool grep / sed / cat')).toBeTruthy();
+    expect(one(spans, 'execute_tool mcp__updraft__exec').attributes['gen_ai.tool.call.id']).toBe('toolu_5');
+    expect(one(spans, 'execute_tool mcp__github__search').attributes['updraft.tool.category']).toBe('mcp');
+    for (const s of spans) expect(s.name).not.toMatch(/secret|TOKEN|sk-123|mystery|etc/);
+    const agent = one(spans, 'invoke_agent claude-opus');
+    expect(agent.attributes['updraft.behavior.test_runs']).toBe(1);
+    expect(agent.attributes['updraft.behavior.test_runs_failed']).toBe(1);
+  });
+
   it('marks failures: a tool error, a failed run, a failed verify command', async () => {
     const t = setup();
     const err = claude.toolResult('toolu_1', 'command not found');
