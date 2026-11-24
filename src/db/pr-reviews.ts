@@ -799,8 +799,8 @@ export function startCiFor(db: Db, repoId: number, prNumber: number, sha: string
 export type CiStep =
   | { state: 'waiting'; reason: string }
   | { state: 'passed'; reason: string }
-  /** A revision was queued for the failure `signature`. */
-  | { state: 'fixing'; reason: string; jobId: string; signature: string }
+  /** A revision was queued for the failure `signature` (null: nothing was read that could tell it apart from the next). */
+  | { state: 'fixing'; reason: string; jobId: string; signature: string | null }
   | { state: 'blocked'; reason: string; signature?: string | null };
 
 /**

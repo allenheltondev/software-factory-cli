@@ -200,24 +200,38 @@ export interface DiagnosedFailure {
   diagnostics: CheckRunDiagnostics | null;
 }
 
+/** What every failed Actions step says, whatever failed: not a fingerprint of anything. */
+const GENERIC_LINE = /^(?:##\[error\])?\s*process completed with exit code #\.?$/;
+
 /**
- * The failure as a digest: which checks failed, how, and with which messages, with numbers
- * (durations, counts, line numbers) taken out. The same digest after a fix is no progress.
+ * The failure as a digest of what was read of it: the annotations and the error region of each
+ * failed check's log, with timestamps and numbers (durations, counts, line numbers) taken out and
+ * the runner's generic "Process completed with exit code N." left out. The same digest after a fix
+ * is no progress.
+ *
+ * `null` when the content of some failed check was not read (a commit status, a check past
+ * MAX_DIAGNOSED_CHECKS, a log that could not be read) or says nothing beyond the generic line:
+ * two such failures cannot be told apart, so they are not taken for the same failure.
  */
-export function failureSignature(failures: readonly DiagnosedFailure[]): string {
+export function failureSignature(failures: readonly DiagnosedFailure[]): string | null {
+  if (!failures.length) return null;
   const norm = (t: string) => t.replace(/\d+/g, '#').replace(/\s+/g, ' ').trim().toLowerCase();
-  const parts = failures
-    .map((f) => {
-      const notes = (f.diagnostics?.annotations ?? []).slice(0, MAX_ANNOTATIONS).map((a) => norm(`${a.path} ${a.message}`)).sort();
-      const errors = (f.diagnostics?.logTail ?? '')
-        .split('\n')
-        .map(stripTimestamp)
-        .filter((l) => /##\[error\]/.test(l))
-        .map(norm);
-      return [norm(f.check.name), f.check.conclusion ?? '', ...notes, ...errors].join('\u0001');
-    })
-    .sort();
-  return createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 32);
+  const meaningful = (t: string) => t !== '' && !GENERIC_LINE.test(t);
+  const parts: string[] = [];
+  for (const f of failures) {
+    const notes = (f.diagnostics?.annotations ?? [])
+      .slice(0, MAX_ANNOTATIONS)
+      .filter((a) => meaningful(norm(a.message)))
+      .map((a) => norm(`${a.path} ${a.title ?? ''} ${a.message}`))
+      .sort();
+    let tail = f.diagnostics?.logTail ?? '';
+    // A tail cut at MAX_LOG_BYTES starts mid-line, at a place that moves with the length of the log.
+    if (tail.length >= MAX_LOG_BYTES) tail = tail.slice(tail.indexOf('\n') + 1);
+    const lines = tail ? logExcerpt(tail).split('\n').map(norm).filter(meaningful) : [];
+    if (!notes.length && !lines.length) return null;
+    parts.push([norm(f.check.name), f.check.conclusion ?? '', ...notes, '\u0002', ...lines].join('\u0001'));
+  }
+  return createHash('sha256').update(parts.sort().join('\u0000')).digest('hex').slice(0, 32);
 }
 
 /** The diagnostics a CI-fix revision is given, as plain text. Untrusted parts are redacted and capped; the prompt fences the whole. */
@@ -346,7 +360,7 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
       diagnosed = verdict.failures.map((check) => ({ check, diagnostics: { annotations: [], logTail: null, problems: [`the diagnostics could not be read: ${message(err)}`] } }));
     }
     const signature = failureSignature(diagnosed);
-    if (pr.ciLastFixSignature === signature) {
+    if (signature !== null && pr.ciLastFixSignature === signature) {
       return block(
         `check(s) ${failedNames} failed on ${short(sha)} in the same way as before the last automatic fix, so another fix is unlikely to help`,
         signature,

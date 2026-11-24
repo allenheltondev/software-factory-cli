@@ -362,6 +362,26 @@ describe('the CI step after a clean review', () => {
     expect(t.stage()).toMatchObject({ stage: 'needs-human' });
   });
 
+  it('keeps fixing when the same check fails in a new way, or when nothing of the failure was read', async () => {
+    const generic = { path: '.github', line: null, level: 'failure', message: 'Process completed with exit code 1.', title: null };
+    const logOf = (test: string) => `2026-11-18T12:00:00.0000000Z npm test\n2026-11-18T12:00:01.0000000Z FAIL ${test}\n2026-11-18T12:00:02.0000000Z ##[error]Process completed with exit code 1.`;
+    const s = setup();
+    s.gh.checks = checksOf([FAILED_TEST]);
+    s.gh.diagnostics[7] = { annotations: [generic], logTail: logOf('widget.test.ts > adds'), problems: [] };
+    await s.review('ready-to-merge');
+    await s.ci();
+    s.revised(s.queued()[0]!, H2);
+    // Progress: the first test passes now and another one fails; only the runner's line is the same.
+    s.gh.diagnostics[7] = { annotations: [generic], logTail: logOf('gadget.test.ts > removes'), problems: [] };
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'fixing' }]);
+    s.revised(s.queued()[0]!, H3);
+    // Nothing but the generic line was read: not taken for the same failure as the one before.
+    s.gh.diagnostics[7] = { annotations: [generic], logTail: null, problems: [] };
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'fixing' }]);
+  });
+
   it('only reports a failure when revise is off', async () => {
     const s = setup({ revise: false });
     s.gh.checks = checksOf([FAILED_TEST]);
@@ -489,6 +509,19 @@ describe('diagnostics', () => {
     const other = [{ check: FAILED_TEST, diagnostics: { ...DIAGNOSTICS, annotations: [{ ...DIAGNOSTICS.annotations[0]!, message: 'cannot read property x' }] } }];
     expect(failureSignature(later)).toBe(failureSignature(a));
     expect(failureSignature(other)).not.toBe(failureSignature(a));
+  });
+  it('signs a failure by its log, not by the runner\'s generic exit line', () => {
+    const generic = { path: '.github', line: null, level: 'failure', message: 'Process completed with exit code 1.', title: null };
+    const logOf = (body: string) => `2026-11-18T12:00:00.0000000Z npm test\n${body}\n2026-11-18T12:00:02.0000000Z ##[error]Process completed with exit code 1.`;
+    const one = [{ check: FAILED_TEST, diagnostics: { annotations: [generic], logTail: logOf('FAIL a.test.ts > adds: expected 3 to be 4'), problems: [] } }];
+    const two = [{ check: FAILED_TEST, diagnostics: { annotations: [generic], logTail: logOf('FAIL b.test.ts > removes: expected [] to be empty'), problems: [] } }];
+    expect(failureSignature(one)).not.toBeNull();
+    expect(failureSignature(two)).not.toBe(failureSignature(one));
+    // Nothing read beyond the generic line, or nothing read at all: no fingerprint.
+    expect(failureSignature([{ check: FAILED_TEST, diagnostics: { annotations: [generic], logTail: null, problems: [] } }])).toBeNull();
+    expect(failureSignature([{ check: FAILED_TEST, diagnostics: null }])).toBeNull();
+    expect(failureSignature([...one, { check: run('lint', 'failure', 8), diagnostics: null }])).toBeNull();
+    expect(failureSignature([])).toBeNull();
   });
 });
 

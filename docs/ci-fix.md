@@ -95,7 +95,10 @@ pull request, when:
 
 - `maxRevisions` is used up;
 - **no progress:** the same checks failed in the same way (the same check names, conclusions,
-  annotation messages and `##[error]` lines, with numbers taken out) as before the last CI fix;
+  annotation messages and error region of the job log, with timestamps and numbers taken out, and
+  the runner's generic "Process completed with exit code N." ignored) as before the last CI fix.
+  A failure whose content was not read (a commit status, a check whose log could not be read) is
+  never taken for the same failure; `maxRevisions` bounds those;
 - a failure is not one code can fix (see the table above), or the checks never finish;
 - `revise` is off;
 - the revision ran and pushed nothing (the agent found no cause in the code, say), or failed;
