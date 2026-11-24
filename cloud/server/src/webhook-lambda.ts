@@ -2,8 +2,11 @@ import { waitingId } from './native/sessions.js';
 import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
+import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { createWebhookHandler } from './flows/webhook.js';
+import { createRoutineDispatcher } from './routines/dispatch.js';
+import { createDynamoRoutineRuleStore } from './routines/rules.js';
 import { createGitHubApi, GitHubError } from './github/client.js';
 import { appJwt } from './github/jwt.js';
 import { createSettingsLoader } from './github/settings.js';
@@ -28,6 +31,7 @@ const store = createDynamoStore(env.TABLE_NAME ?? '');
 const clientOptions = { maxAttempts: 2 };
 const s3 = new S3Client(clientOptions);
 const ssm = new SSMClient(clientOptions);
+const secrets = new SecretsManagerClient(clientOptions);
 const microvms = new LambdaMicrovmsClient(clientOptions);
 const github = createGitHubApi();
 const loadSettings = createSettingsLoader();
@@ -146,6 +150,17 @@ const handleWebhook = createWebhookHandler({
   github,
   loadSettings,
   launch,
+  routines: createRoutineDispatcher({
+    store, rules: createDynamoRoutineRuleStore(env.TABLE_NAME ?? ''), killSwitch,
+    readToken: async (name) => (await secrets.send(new GetSecretValueCommand({ SecretId: name }))).SecretString ?? null,
+    notifyRun: async (installationId, repository, repositoryId, issue, sessionUrl) => {
+      const settings = await loadSettings();
+      if (!settings) return;
+      const token = (await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId,
+        { repositoryIds: [repositoryId], permissions: { issues: 'write' } })).token;
+      await github.createIssueComment(token, repository, issue, `Claude Code scheduled task started: ${sessionUrl}`);
+    },
+  }),
 });
 
 // A retry from the console (jobs/retry.ts): the API function invokes this one directly, since

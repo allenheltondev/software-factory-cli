@@ -3,6 +3,7 @@ import { appJwt } from '../github/jwt.js';
 import { verifySignature } from '../github/signature.js';
 import type { LoadSettings } from '../github/settings.js';
 import { errorClassOf, type Launcher } from '../jobs/launch.js';
+import type { RoutineDispatcher } from '../routines/dispatch.js';
 import { PULL_REQUEST_ACTIONS } from '../tenants/dispatch.js';
 import { deliveryFromLaunch, LIFECYCLE_EVENTS, type DeliveryEvent } from '../jobs/deliveries.js';
 import type { DeliveryRecord, Store } from '../store/store.js';
@@ -55,6 +56,7 @@ export function createWebhookHandler({
   github,
   loadSettings,
   launch,
+  routines,
   now = () => Date.now(),
   log = (m: string) => console.log(m),
 }: {
@@ -63,6 +65,8 @@ export function createWebhookHandler({
   loadSettings: LoadSettings;
   /** Absent: no job is ever started (local development, tests of the lifecycle). */
   launch?: Launcher;
+  /** A matched routine runs on Anthropic, without an Updraft microVM. */
+  routines?: RoutineDispatcher;
   now?: () => number;
   log?: (message: string) => void;
 }) {
@@ -122,6 +126,15 @@ export function createWebhookHandler({
 
     if (event === 'ping') return done('pong');
     const launches = (event === 'issues' && action === 'labeled') || (Object.hasOwn(PULL_REQUEST_ACTIONS, event) && PULL_REQUEST_ACTIONS[event]!.includes(action));
+    if (event === 'issues' && action === 'labeled' && validInstallation && routines) {
+      const routed = await routines({ installationId, deliveryId: delivery, eventName: event, payload });
+      if (routed) {
+        await record({ ...base, disposition: routed.disposition,
+          ...(routed.reason ? { reason: routed.reason } : {}),
+          ...(routed.message ? { message: routed.message } : {}) });
+        return done(routed.disposition, routed.status);
+      }
+    }
     if (launches && validInstallation && launch) {
       let result;
       try {

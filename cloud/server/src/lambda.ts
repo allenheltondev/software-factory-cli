@@ -6,6 +6,8 @@ import { handle } from 'hono/aws-lambda';
 import { adminAccess, DEFAULT_ADMIN_GROUP } from './admin/access.js';
 import { createAdminService } from './admin/admin.js';
 import { createApp } from './app.js';
+import { createRoutineService } from './routines/service.js';
+import { createDynamoRoutineRuleStore } from './routines/rules.js';
 import { callerFromClaims, groupsFrom, type Claims } from './caller.js';
 import { createGitHubFlows } from './flows/github.js';
 import { createGitHubApi } from './github/client.js';
@@ -128,6 +130,7 @@ const app = createApp({
     ? {
         github,
         agentKeys: agentKeyService,
+        routines: createRoutineService({ store, github, rules: createDynamoRoutineRuleStore(tableName), secrets: createSecretsManagerPort() }),
         nativeClaude: createNativeSettingsService({ github, store,
           ...(managedWorker ? { managed: { ...managedWorker, grant: (route) => browserLoginGrant(managedWorker.imageArn, route) } } : {}),
           route: nativeRoute(process.env.NATIVE_WORKER_ROUTE),

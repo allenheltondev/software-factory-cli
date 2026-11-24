@@ -67,7 +67,8 @@ export type FlowErrorCode =
   | 'log_expired'
   | 'log_unavailable'
   // Agent keys (tenants/agent-key-service.ts).
-  | 'invalid_key';
+  | 'invalid_key'
+  | 'invalid_routine';
 
 export class FlowError extends Error {
   readonly code: FlowErrorCode;

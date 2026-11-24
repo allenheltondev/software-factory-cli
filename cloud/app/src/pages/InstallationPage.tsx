@@ -442,6 +442,9 @@ function DeliveriesList({ deliveries, base }: { deliveries: Delivery[]; base: st
                 </div>
                 <div className="flex flex-wrap items-center gap-3 text-sm">
                   <span>{deliveryReason(d)}</span>
+                  {d.disposition === 'routine_triggered' && d.message?.startsWith('https://claude.ai/code/session_') && (
+                    <a className="auth-link" href={d.message} target="_blank" rel="noreferrer">View Claude session</a>
+                  )}
                   {d.jobId && d.reason === 'native_waiting_for_sign_in' && (
                     <Link className="auth-link" to={`${base}/claude?request=${encodeURIComponent(d.jobId)}`}>Open Claude sign-in request</Link>
                   )}

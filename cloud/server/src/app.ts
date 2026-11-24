@@ -7,6 +7,7 @@ import type { Caller } from './caller.js';
 import { safeMessage } from './tenants/redact.js';
 import { FlowError, type GitHubFlows } from './flows/github.js';
 import type { TenantLimits } from './store/store.js';
+import type { RoutineService } from './routines/service.js';
 import type { AgentKeyService } from './tenants/agent-key-service.js';
 import type { StatusService } from './tenants/status-service.js';
 import type { StatsService } from './tenants/stats-service.js';
@@ -79,6 +80,7 @@ export interface AppOptions {
   admin?: { access: AdminAccess; service: AdminService };
   config?: ConfigService;
   agentKeys?: AgentKeyService;
+  routines?: RoutineService;
   nativeClaude?: NativeSettingsService;
   status?: StatusService;
   stats?: StatsService;
@@ -96,7 +98,7 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** Who did it, for the admin's actions: their email, else their sub. */
 const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
 
-export function createApp({ resolveCaller, github, admin, config, agentKeys, nativeClaude, status, stats, telemetry, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
+export function createApp({ resolveCaller, github, admin, config, agentKeys, routines, nativeClaude, status, stats, telemetry, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -284,6 +286,28 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, nat
         return c.json({ error: 'bad_request' }, 400);
       }
       return c.json(await agentKeys.set(c.get('caller'), id, c.req.param('name'), value));
+    });
+  }
+
+  if (routines) {
+    const positive = (raw: string) => {
+      const n = Number(raw);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    };
+    app.get('/v1/installations/:id/routines', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await routines.list(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.put('/v1/installations/:id/routines', async (c) => {
+      const id = positive(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      if (Number(c.req.header('content-length') ?? 0) > 4096) return c.json({ error: 'too_large' }, 413);
+      const input = await c.req.json().catch(() => null);
+      return c.json(await routines.set(c.get('caller'), id, input));
+    });
+    app.delete('/v1/installations/:id/routines/:ruleId', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await routines.remove(c.get('caller'), id, c.req.param('ruleId'))) : c.json({ error: 'not_found' }, 404);
     });
   }
 

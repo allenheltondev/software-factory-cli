@@ -1,6 +1,6 @@
 import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException } from '@aws-sdk/client-lambda-microvms';
 import { DeleteObjectsCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
-import { DeleteSecretCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { DeleteSecretCommand, ListSecretsCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { createReconciler } from './jobs/reconcile.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
@@ -90,6 +90,19 @@ async function cleanupTenants(): Promise<{ cleaned: number[]; failed: number }> 
     async deleteObjects(keys) {
       const out = await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true } }));
       if (out.Errors?.length) throw new Error(`could not delete ${out.Errors.length} object(s), e.g. ${out.Errors[0]?.Key}: ${out.Errors[0]?.Code}`);
+    },
+    // List secrets, not Dynamo routine metadata: its TTL may expire before daily cleanup.
+    // Keep paging until all tokens under this tenant have been found.
+    routineSecretNames: async (id) => {
+      const names: string[] = [];
+      const prefix = `updraft/tenants/${id}/routine-triggers/`;
+      let NextToken: string | undefined;
+      do {
+        const page = await secrets.send(new ListSecretsCommand({ Filters: [{ Key: 'name', Values: [prefix] }], NextToken }));
+        for (const secret of page.SecretList ?? []) if (secret.Name?.startsWith(prefix)) names.push(secret.Name);
+        NextToken = page.NextToken;
+      } while (NextToken);
+      return names;
     },
     secrets: {
       async remove(name) {

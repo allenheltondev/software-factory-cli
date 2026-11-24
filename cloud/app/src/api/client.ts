@@ -164,6 +164,19 @@ export interface AgentKeyView {
   lastUsed?: { at: string; ok: boolean };
 }
 
+/** Public metadata only: routine trigger tokens are never returned. */
+export interface RoutineRule {
+  id: string;
+  repositoryId: number;
+  repository: string;
+  label: string;
+  url: string;
+  updatedAt: string;
+  updatedBy: string;
+  allowedActors: string[];
+}
+export interface RoutinesView { rules: RoutineRule[]; }
+
 export interface AgentKeysView {
   keys: AgentKeyView[];
   refusals: { at: string; deliveryId: string; repository: string; issue: number; reason: string }[];
@@ -211,7 +224,7 @@ export interface NativeClaudeView {
 // A tenant's status and diagnostics (server/src/tenants/status-service.ts).
 
 export type InstallationStatus = 'active' | 'suspended' | 'missing_permissions' | 'disabled' | 'uninstalled';
-export type DeliveryDisposition = 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched';
+export type DeliveryDisposition = 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
 export type JobResult =
   | 'running'
   | 'success'
@@ -727,6 +740,11 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     setTelemetryKey: (installationId: number, input: TelemetryKeyInput) =>
       request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'PUT', body: JSON.stringify(input) }),
     removeTelemetryKey: (installationId: number) => request<TelemetryView>(`/installations/${installationId}/telemetry/key`, { method: 'DELETE' }),
+    routines: (installationId: number) => request<RoutinesView>(`/installations/${installationId}/routines`),
+    setRoutine: (installationId: number, input: { repositoryId: number; label: string; url: string; token: string; allowedActors?: string[] }) =>
+      request<RoutinesView>(`/installations/${installationId}/routines`, { method: 'PUT', body: JSON.stringify(input) }),
+    removeRoutine: (installationId: number, ruleId: string) =>
+      request<RoutinesView>(`/installations/${installationId}/routines/${encodeURIComponent(ruleId)}`, { method: 'DELETE' }),
     nativeClaudeWaiting: (installationId: number, id: string) =>
       request<ClaudeWaitingRequest>(`/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}`),
     nativeClaudeStart: (installationId: number, id: string) =>
