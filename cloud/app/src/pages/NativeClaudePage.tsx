@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
-import { Alert, Button, Card, CardBody, CardHeader, CardTitle, Skeleton, StatusBadge } from '@readysetcloud/ui';
+import { Alert, Button, Card, CardBody, CardHeader, CardTitle, ProgressIndicator, Skeleton, StatusBadge, type ProgressStep } from '@readysetcloud/ui';
 import { api as defaultApi, type ApiClient, type ClaudeWaitingRequest, type NativeClaudeTrigger, type NativeClaudeView } from '../api/client';
 
 import { claudeLoginFrame } from './claudeLoginFrame';
 
-type Api = Pick<ApiClient, 'nativeClaude' | 'setNativeClaudeMode' | 'nativeClaudeLogin' | 'nativeClaudeWaiting' | 'nativeClaudeStart'>;
+type Api = Pick<ApiClient, 'nativeClaude' | 'setNativeClaudeMode' | 'nativeClaudeLogin' | 'nativeClaudeWaiting' | 'nativeClaudeStart' | 'nativeClaudeRestart'>;
 type Load = { state: 'loading' } | { state: 'error'; message: string } | { state: 'ok'; view: NativeClaudeView };
 
 const triggerKey = (trigger: NativeClaudeTrigger) => JSON.stringify([trigger.repositoryId, trigger.repository.toLowerCase(), trigger.label.toLowerCase()]);
@@ -37,6 +37,7 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
   const [openingLogin, setOpeningLogin] = useState(false);
   const [waitingForWorker, setWaitingForWorker] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const [draft, setDraft] = useState<NativeClaudeTrigger[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -80,6 +81,9 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
       void api.nativeClaude(installationId).then(async (view) => {
         if (!live || !view.worker?.online) return;
         setLoad({ state: 'ok', view });
+        // A worker that has just booted can report `unavailable` before Claude answers its
+        // status check: keep checking until it says whether it needs a sign-in.
+        if (view.worker.status === 'unavailable') return;
         try {
           if (['auth-required', 'expired'].includes(view.worker.status)) {
             const grant = await api.nativeClaudeLogin(installationId);
@@ -101,14 +105,14 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
     return () => { live = false; clearInterval(timer); clearTimeout(timeout); };
   }, [api, installationId, startingWorker]);
 
-  async function startWorker() {
-    if (!requestId || startingWorker) return;
+  async function startWorker(id: string | undefined) {
+    if (!id || startingWorker) return;
     setStartingWorker(true);
     setError(null);
     try {
-      const view = await api.nativeClaudeStart(installationId, requestId);
+      const view = await api.nativeClaudeStart(installationId, id);
       setLoad({ state: 'ok', view });
-      if (view.worker?.online) {
+      if (view.worker?.online && view.worker.status !== 'unavailable') {
         if (['auth-required', 'expired'].includes(view.worker.status)) await openLogin();
         setStartingWorker(false);
       }
@@ -164,6 +168,33 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
     };
   }, [api, installationId, waitingForWorker]);
 
+  const upgradeState = fetched.state === 'ok' ? fetched.view.upgrade?.state : undefined;
+  useEffect(() => {
+    if (upgradeState !== 'stopping') return;
+    let live = true;
+    const interval = setInterval(() => {
+      void api.nativeClaude(installationId).then((view) => { if (live) setLoad({ state: 'ok', view }); }, () => {});
+    }, 3000);
+    const timeout = setTimeout(() => {
+      clearInterval(interval);
+      if (live) setError('The old worker is taking longer than usual to stop. Refresh worker status to check again.');
+    }, 180_000);
+    return () => { live = false; clearInterval(interval); clearTimeout(timeout); };
+  }, [api, installationId, upgradeState]);
+
+  async function restartWorker() {
+    if (restarting) return;
+    setRestarting(true);
+    setError(null);
+    try {
+      setLoad({ state: 'ok', view: await api.nativeClaudeRestart(installationId) });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not restart the Claude worker.');
+    } finally {
+      setRestarting(false);
+    }
+  }
+
   async function refresh() {
     try {
       setLoad({ state: 'ok', view: await api.nativeClaude(installationId) });
@@ -194,6 +225,19 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
   const available = new Map((view?.availableTriggers ?? []).map((trigger) => [triggerKey(trigger), trigger]));
   const options = new Map([...(view?.triggers ?? []).map((trigger) => [triggerKey(trigger), trigger] as const), ...available]);
   const ready = view?.worker?.online === true && view.worker.status === 'connected';
+  const upgrade = view?.upgrade;
+  // A waiting GitHub job a new worker can be started for: the deep link's, else any.
+  const startId = request?.status === 'waiting' ? requestId ?? undefined : view?.pendingRequest;
+  const upgradeSteps: ProgressStep[] = upgrade ? [
+    { id: 'stop', label: 'Restart the worker', status: upgrade.state === 'stopped' ? 'completed' : 'in-progress',
+      description: upgrade.state === 'stopping' ? 'Stopping the old worker. This usually takes under a minute.' : 'Stops the old worker and ends its Claude sign-in.' },
+    { id: 'sign-in', label: 'Start the new worker and sign in to Claude', status: upgrade.state === 'stopped' ? 'in-progress' : 'pending',
+      description: 'Sign in with the same Claude account. The new worker cannot reuse the old sign-in.' },
+    startId
+      ? { id: 'resume', label: 'Waiting GitHub jobs start on their own', status: 'pending',
+        description: 'Nothing to relabel: jobs waiting for sign-in resume once Claude is connected.' }
+      : { id: 'resume', label: 'Your next labeled issue runs on the new worker', status: 'pending' },
+  ] : [];
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
@@ -213,6 +257,39 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
       )}
       {view && (
         <>
+          {upgrade && (
+            <Alert variant="error" data-testid="worker-restart" className="flex flex-col gap-3 border-2">
+              <h2 className="text-lg font-semibold">Action required: restart your Claude worker</h2>
+              <p className="text-sm">
+                Updraft was updated, but your Claude worker is still running the old version ({upgrade.from}; the current version is {upgrade.to}).
+                <strong> Subscription jobs will not run until you restart it.</strong> New jobs wait for you instead of failing.
+              </p>
+              <ProgressIndicator steps={upgradeSteps} />
+              {upgrade.state === 'required' && (
+                <div className="flex flex-col gap-1">
+                  <div>
+                    <Button type="button" onClick={() => void restartWorker()} loading={restarting} disabled={restarting || Boolean(view.worker?.busy)}>
+                      Restart worker
+                    </Button>
+                  </div>
+                  {view.worker?.busy && <p className="text-sm">A subscription job is running on the old worker. Restart it once that job finishes.</p>}
+                </div>
+              )}
+              {upgrade.state === 'stopping' && <p role="status" className="text-sm font-medium">Stopping the old worker… this page updates by itself.</p>}
+              {upgrade.state === 'stopped' && (startId ? (
+                <div>
+                  <Button type="button" onClick={() => void startWorker(startId)} loading={startingWorker} disabled={startingWorker}>
+                    Start new worker and sign in
+                  </Button>
+                </div>
+              ) : (
+                <p className="text-sm">
+                  <strong>The old worker is stopped.</strong> No GitHub job is waiting, so the new worker starts with your next job:
+                  apply a subscription label to an issue (remove it first if it is already there). Updraft posts a sign-in link on the issue that brings you back here.
+                </p>
+              ))}
+            </Alert>
+          )}
           <Card>
             <CardHeader><CardTitle>Execution mode</CardTitle></CardHeader>
             <CardBody>
@@ -286,7 +363,7 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
               Your API key is still saved.
             </Alert>
           )}
-          {view.browserLogin && !ready && (
+          {view.browserLogin && !ready && !upgrade && (
             <Card>
               <CardHeader><CardTitle>Sign in to Claude</CardTitle></CardHeader>
               <CardBody className="flex flex-col gap-3">
@@ -299,8 +376,8 @@ export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
                 ) : (
                   <>
                     <p className="text-sm">Sign in with Claude in your browser, then return here to finish.</p>
-                    {view.managed && request?.status === 'waiting' && !view.worker?.online && (
-                      <div><Button onClick={() => void startWorker()} loading={startingWorker} disabled={startingWorker}>Start worker and sign in</Button></div>
+                    {view.managed && startId && !view.worker?.online && (
+                      <div><Button onClick={() => void startWorker(startId)} loading={startingWorker} disabled={startingWorker}>Start worker and sign in</Button></div>
                     )}
                     <div><Button onClick={() => void openLogin()} loading={openingLogin}
                       disabled={openingLogin || !view.worker?.online || !['auth-required', 'expired'].includes(view.worker.status)}>

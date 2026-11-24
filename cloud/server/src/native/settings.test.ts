@@ -149,6 +149,54 @@ describe('Claude subscription mode in the installation app', () => {
     expect(start).toHaveBeenCalledExactlyOnceWith(55);
   });
 
+  describe('a managed worker on an older image', () => {
+    let vm: string | null;
+    const stop = vi.fn(async () => { vm = 'TERMINATING'; });
+    const managed = () => createNativeSettingsService({ github, mode, workers, now: () => now, managed: {
+      route: async (id) => ({ ...route, installationId: id, workerId: `managed-${id}`, microvmId: 'mvm-native', imageVersion: '9.0' }),
+      start: vi.fn(), stop, vmState: async () => vm, imageVersion: '10.0',
+      sessions: { get: vi.fn(), pending: async () => [{ id: 'job_' + 'w'.repeat(16) } as never] }, grant: () => undefined,
+    } });
+    const owner = () => member.mockResolvedValueOnce({ tenant: { status: 'active' }, summary: { role: 'owner' } });
+    beforeEach(() => { vm = 'RUNNING'; stop.mockClear(); worker!.imageVersion = '9.0'; worker!.workerId = 'managed-55'; });
+
+    it('tells the console a restart is required and which job a new worker can start for', async () => {
+      expect(await managed().view(caller, 55)).toMatchObject({
+        upgrade: { from: '9.0', to: '10.0', state: 'required' }, pendingRequest: 'job_' + 'w'.repeat(16),
+      });
+      vm = 'TERMINATED';
+      expect(await managed().view(caller, 55)).toMatchObject({ upgrade: { state: 'stopped' } });
+    });
+
+    it('lets only an owner stop an idle outdated worker, and never one with work on it', async () => {
+      member.mockResolvedValueOnce({ tenant: { status: 'active' }, summary: { role: 'member' } });
+      await expect(managed().restart(caller, 55)).rejects.toThrow('Only an installation owner');
+      worker!.active = { jobId: 'job_active0000001', until: now + 30_000 };
+      owner();
+      await expect(managed().restart(caller, 55)).rejects.toThrow('current subscription job');
+      delete worker!.active;
+      queued = ['job_queued0000001'];
+      owner();
+      await expect(managed().restart(caller, 55)).rejects.toThrow('current subscription job');
+      expect(stop).not.toHaveBeenCalled();
+      queued = [];
+      owner();
+      expect(await managed().restart(caller, 55)).toMatchObject({ upgrade: { state: 'stopping' } });
+      expect(stop).toHaveBeenCalledExactlyOnceWith(55);
+    });
+
+    it('refuses to restart a worker that is already on the deployed image', async () => {
+      const current = createNativeSettingsService({ github, mode, workers, now: () => now, managed: {
+        route: async (id) => ({ ...route, installationId: id, workerId: `managed-${id}`, imageVersion: '10.0' }),
+        start: vi.fn(), stop, vmState: async () => 'RUNNING', imageVersion: '10.0', sessions: { get: vi.fn() }, grant: () => undefined,
+      } });
+      expect(await current.view(caller, 55)).not.toHaveProperty('upgrade');
+      owner();
+      await expect(current.restart(caller, 55)).rejects.toThrow('already up to date');
+      expect(stop).not.toHaveBeenCalled();
+    });
+  });
+
   it('does not expose a route or permit changes to an installation without a pinned worker', async () => {
     const service = createNativeSettingsService({ github, mode, workers });
     expect(await service.view(caller, 99)).toEqual({ configured: false, enabled: false, worker: null });

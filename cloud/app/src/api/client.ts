@@ -205,6 +205,10 @@ export interface ClaudeWaitingRequest {
 
 export interface NativeClaudeView {
   managed?: boolean;
+  /** The worker runs an older image than the deployed one and must be restarted. */
+  upgrade?: { from: string; to: string; state: 'required' | 'stopping' | 'stopped' };
+  /** A GitHub job waiting for a signed-in worker, which a new worker can be started for. */
+  pendingRequest?: string;
   browserLogin?: boolean;
   triggers?: NativeClaudeTrigger[];
   availableTriggers?: NativeClaudeTrigger[];
@@ -749,6 +753,8 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
       request<ClaudeWaitingRequest>(`/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}`),
     nativeClaudeStart: (installationId: number, id: string) =>
       request<NativeClaudeView>(`/installations/${installationId}/claude-subscription/requests/${encodeURIComponent(id)}/start`, { method: 'POST' }),
+    nativeClaudeRestart: (installationId: number) =>
+      request<NativeClaudeView>(`/installations/${installationId}/claude-subscription/restart`, { method: 'POST' }),
     nativeClaudeLogin: (installationId: number) =>
       request<NativeClaudeLoginGrant>(`/installations/${installationId}/claude-subscription/login`, { method: 'POST' }),
     nativeClaude: (installationId: number) => request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription'),

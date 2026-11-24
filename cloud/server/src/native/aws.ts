@@ -33,9 +33,12 @@ export function nativeAws(store: Store, disabled: () => Promise<boolean> = async
       catch (e) { if (e instanceof ResourceNotFoundException) return null; throw e; }
     },
   });
-  const forLaunch = (route: NativeRoute) => ({
+  // A managed worker still on an image older than the deployed one gets no new job: the job
+  // waits for sign-in instead, and the console asks the owner to restart the worker.
+  const forLaunch = (route: NativeRoute, latestImageVersion?: string) => ({
     route, secret: () => secret(route), mode: () => mode.snapshot(route.installationId, route.workerId),
     async ready() {
+      if (latestImageVersion !== undefined && route.imageVersion !== latestImageVersion) return false;
       const worker = await workers.get(route.installationId, route.workerId);
       return !!worker && worker.microvmId === route.microvmId && worker.imageVersion === route.imageVersion &&
         !worker.fenced && worker.auth === 'connected' && Date.now() - worker.heartbeatAt <= 60_000;
@@ -51,7 +54,7 @@ export function nativeAws(store: Store, disabled: () => Promise<boolean> = async
       return makeControl(route).handle(event);
     } },
     launch: pinned ? forLaunch(pinned) : undefined,
-    resolveNative: managed ? async (id: number) => forLaunch(await managed.route(id)) : undefined,
+    resolveNative: managed ? async (id: number) => forLaunch(await managed.route(id), managed.imageVersion) : undefined,
     managed,
   };
 }

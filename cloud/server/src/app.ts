@@ -339,6 +339,10 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
       if (!id || !/^job_[A-Za-z0-9_-]{16}$/.test(requestId)) return c.json({ error: 'not_found' }, 404);
       return c.json(await nativeClaude.start(c.get('caller'), id, requestId));
     });
+    app.post('/v1/installations/:id/claude-subscription/restart', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await nativeClaude.restart(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
     app.post('/v1/installations/:id/claude-subscription/login', async (c) => {
       const id = positive(c.req.param('id'));
       if (!id) return c.json({ error: 'not_found' }, 404);

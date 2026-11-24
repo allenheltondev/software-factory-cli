@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
+import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException, RunMicrovmCommand, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { FlowError } from '../flows/github.js';
 import type { NativeRoute } from './route.js';
@@ -72,5 +72,28 @@ export function managedClaude(env = process.env) {
     await sessions.bind(id, session.generation, result.microvmId);
   }
 
-  return { route, start, sessions, imageArn, secret };
+  /** The state of the installation's current session VM, or null when it has none or it is gone. */
+  async function vmState(id: number): Promise<string | null> {
+    const session = await sessions.session(id);
+    if (!session?.microvmId) return null;
+    try {
+      return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: session.microvmId }))).state ?? null;
+    } catch (error) {
+      if (error instanceof ResourceNotFoundException) return null;
+      throw error;
+    }
+  }
+
+  /** Ends the installation's current session VM so the next start launches the deployed image. */
+  async function stop(id: number) {
+    const session = await sessions.session(id);
+    if (!session?.microvmId) return;
+    try {
+      await microvms.send(new TerminateMicrovmCommand({ microvmIdentifier: session.microvmId }));
+    } catch (error) {
+      if (!(error instanceof ResourceNotFoundException)) throw error;
+    }
+  }
+
+  return { route, start, stop, vmState, sessions, imageArn, imageVersion, secret };
 }
