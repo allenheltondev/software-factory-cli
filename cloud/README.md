@@ -162,6 +162,21 @@ Both workflows call `.github/workflows/cloud-deploy-env.yaml`, which runs these 
 
 There is no `sam build`. `ApiFunction`'s `CodeUri` is the bundled `server/dist`, which `sam deploy` zips and uploads itself.
 
+### Job Finished events (v1)
+
+The `updraft-events` bus receives `source: updraft.cloud` and `detail-type: Job Finished`
+when a tenant job summary first moves to `finished`. Discover the bus in SSM under
+`/updraft/<stack>/event-bus-name` and `/updraft/<stack>/event-bus-arn`.
+The setting defaults to off. After the installation opts in, a platform admin can set
+it with `PUT /api/v1/admin/tenants/<installation-id>/job-finished-events` and
+`{"enabled":true}`. Use `{"enabled":false}` to stop publishing new events.
+
+Payloads include `schemaVersion: 1`, the stack, tenant and job IDs, repository,
+timestamps, status and outcome, and available verification, PR, step, routing and usage
+metadata. They exclude log contents and trace payloads. Changes within v1 are additive.
+Consumers should deduplicate delivery attempts using `stack`, `tenantId` and `jobId`.
+A later metadata update to an already finished job does not create a finish event.
+
 ### One-time setup
 
 1. **AWS accounts.** Staging and Production are separate accounts, and both need rsc-core deployed. The template reads `/readysetcloud/auth/user-pool-id` and `/readysetcloud/auth/user-pool-arn` from SSM.

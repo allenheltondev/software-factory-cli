@@ -246,6 +246,7 @@ describe('the admin routes', () => {
       ['/api/v1/admin/tenants', {}],
       ['/api/v1/admin/tenants/55', {}],
       ['/api/v1/admin/tenants/55/disable', json({})],
+      ['/api/v1/admin/tenants/55/job-finished-events', { ...json({ enabled: true }), method: 'PUT' }],
       ['/api/v1/admin/jobs/job_abc12345/release', json({})],
     ] as const) {
       const res = await a.request(path, init);
@@ -279,5 +280,17 @@ describe('the admin routes', () => {
     expect((await put({ limits: { platformConcurrentJobs: 5 } })).status).toBe(400);
     expect((await put({})).status).toBe(400);
     expect(await (await put({ limits: null })).json()).not.toHaveProperty('limits');
+  });
+
+  it('lets an admin change one installation’s event opt-in', async () => {
+    const { app: a, store } = await app({ sub: 'x', groups: ['admin'] });
+    const path = '/api/v1/admin/tenants/55/job-finished-events';
+    const put = (enabled: unknown) => a.request(path, { ...json({ enabled }), method: 'PUT' });
+    expect(await (await a.request('/api/v1/admin/tenants/55')).json()).toMatchObject({ publishJobFinishedEvents: false });
+    expect((await put('true')).status).toBe(400);
+    expect(await (await put(true)).json()).toEqual({ enabled: true });
+    expect((await store.getTenant(55))?.publishJobFinishedEvents).toBe(true);
+    expect(await (await put(false)).json()).toEqual({ enabled: false });
+    expect((await store.getTenant(55))?.publishJobFinishedEvents).toBe(false);
   });
 });

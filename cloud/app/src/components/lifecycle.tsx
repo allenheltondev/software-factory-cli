@@ -96,6 +96,7 @@ export function Lifecycle({ detail, running }: { detail?: JobDetail; running: bo
             {step.agent && (
               <span className="text-xs text-muted-foreground">
                 <code>{step.agent}</code> {KIND[step.kind].verb}
+                {step.model && <> · <code>{step.model}</code>{step.effort && ` (${step.effort})`}</>}
                 {step.verificationPassed === true ? ' · verify passed' : ''}
               </span>
             )}

@@ -5,7 +5,7 @@ import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
-import { loopOf, stepsOf, telemetryOf, type JobTelemetryDescriptor, type JobTelemetrySnapshot } from '../jobs/lifecycle.js';
+import { loopOf, routingOf, stepsOf, telemetryOf, type JobTelemetryDescriptor, type JobTelemetrySnapshot } from '../jobs/lifecycle.js';
 import { isFailure, type Job, type JobFinishDetail, type Store, type TelemetrySettings } from '../store/store.js';
 import { AGENT_KEY_NAMES, UNCHECKED_AGENT_KEYS, agentKeySecretName, agentKeySecretPrefix } from '../tenants/agent-keys.js';
 import { SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
@@ -462,6 +462,8 @@ export function finishDetail(job: Pick<Job, 'repository'>, raw: unknown): JobFin
   }
   const steps = stepsOf(d.steps);
   if (steps) out.steps = steps;
+  const routing = routingOf(d.routing);
+  if (routing) out.routing = routing;
   if (Array.isArray(d.adapters) && d.adapters.length <= 16) out.adapters = [...new Set(d.adapters.filter((a): a is string => typeof a === 'string' && Object.hasOwn(SUPPORTED_AGENT_KEY_ENV, a)))].sort();
   return Object.keys(out).length ? out : undefined;
 }

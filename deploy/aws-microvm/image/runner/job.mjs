@@ -743,6 +743,8 @@ export function finishDetail(result) {
   const verdicts = jobs.map((j) => j?.verification?.passed).filter((v) => typeof v === 'boolean');
   if (verdicts.length) detail.verificationPassed = !verdicts.includes(false);
   if (typeof result.summary?.prUrl === 'string') detail.prUrl = result.summary.prUrl;
+  if (Number.isSafeInteger(result.summary?.prNumber)) detail.prNumber = result.summary.prNumber;
+  if (result.summary?.routing) detail.routing = result.summary.routing;
   const logs = (result.logs ?? []).map((key) => String(key).split('/').pop());
   if (logs.length) detail.logs = logs;
   // Agent telemetry: the trace, for a link to it, and whether it got there.
@@ -777,13 +779,18 @@ export function finishDetail(result) {
     const ownKind = event === 'issues' ? 'implement' : null;
     const own = Array.isArray(result.summary.jobs) && result.summary.jobs.length ? result.summary.jobs : result.summary.jobId ? [result.summary] : [];
     const follow = Array.isArray(result.summary.followOnJobs) ? result.summary.followOnJobs : [];
-    const step = (j, kind) => ({
-      kind,
-      agent: j.agent ?? undefined,
-      outcome: j.outcome ?? j.runOutcome ?? j.status ?? undefined,
-      verificationPassed: typeof j.verification?.passed === 'boolean' ? j.verification.passed : undefined,
-      publication: j.publication ?? undefined,
-    });
+    const runs = new Map((result.telemetry?.runs ?? []).filter((run) => typeof run?.runId === 'string').map((run) => [run.runId, run]));
+    const step = (j, kind) => {
+      const run = runs.get(j.runId);
+      return {
+        kind,
+        agent: j.agent ?? undefined,
+        outcome: j.outcome ?? j.runOutcome ?? j.status ?? undefined,
+        verificationPassed: typeof j.verification?.passed === 'boolean' ? j.verification.passed : undefined,
+        publication: j.publication ?? undefined,
+        ...(run ? { runId: run.runId, adapter: run.adapter, model: run.model, modelSource: run.modelSource, effort: run.effort, usage: run.usage } : {}),
+      };
+    };
     const steps = [
       ...own.map((j) => step(j, j.kind === 'review' || j.kind === 'revision' ? j.kind : ownKind)).filter((s) => s.kind),
       ...follow.filter((j) => j.kind === 'review' || j.kind === 'revision').map((j) => step(j, j.kind)),

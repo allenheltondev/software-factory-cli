@@ -157,6 +157,13 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, nat
         : null;
       return c.json(await service.setLimits(id, adminName(c.get('caller')), limits));
     });
+    app.put('/v1/admin/tenants/:id/job-finished-events', async (c) => {
+      const id = tenantId(c.req.param('id'));
+      if (!id) return c.json({ error: 'not_found' }, 404);
+      const body = await c.req.json().catch(() => null) as { enabled?: unknown } | null;
+      if (typeof body?.enabled !== 'boolean') return c.json({ error: 'bad_request' }, 400);
+      return c.json(await service.setJobFinishedEvents(id, adminName(c.get('caller')), body.enabled));
+    });
     app.post('/v1/admin/jobs/:jobId/release', async (c) => {
       const jobId = c.req.param('jobId');
       if (!JOB_ID.test(jobId)) return c.json({ error: 'not_found' }, 404);

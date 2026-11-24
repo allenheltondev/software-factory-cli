@@ -1,4 +1,4 @@
-import { destinationOf, jobTelemetrySnapshotOf, loopOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
+import { destinationOf, jobTelemetrySnapshotOf, loopOf, routingOf, stepsOf, telemetryOf } from '../jobs/lifecycle.js';
 import { nativePartition } from '../native/store.js';
 import { NATIVE_SLOT_HOLD_UNTIL } from '../native/route.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
@@ -126,6 +126,8 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
     if (loop) detail.loop = loop;
     const steps = stepsOf(d.steps);
     if (steps) detail.steps = steps;
+    const routing = routingOf(d.routing);
+    if (routing) detail.routing = routing;
     const telemetry = telemetryOf(d.telemetry);
     if (telemetry) detail.telemetry = telemetry;
   }
@@ -320,6 +322,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     if (typeof item.deleteAfter === 'number') t.deleteAfter = item.deleteAfter;
     if (typeof item.activeConfigVersion === 'number') t.activeConfigVersion = item.activeConfigVersion;
     if (typeof item.firstJobAt === 'string') t.firstJobAt = item.firstJobAt;
+    if (typeof item.publishJobFinishedEvents === 'boolean') t.publishJobFinishedEvents = item.publishJobFinishedEvents;
     if (typeof item.adminDisabledAt === 'string') {
       t.adminDisabled = {
         at: item.adminDisabledAt,
@@ -961,6 +964,20 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         return 'no_tenant';
       }
     },
+    async setJobFinishedEvents(id, enabled) {
+      try {
+        await client.send(new UpdateCommand({
+          TableName: T, Key: tenantKey(id),
+          UpdateExpression: 'SET publishJobFinishedEvents = :enabled',
+          ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+          ExpressionAttributeValues: { ':enabled': enabled, ':uninstalled': 'uninstalled' },
+        }));
+        return 'updated';
+      } catch (error) {
+        if (!(error instanceof ConditionalCheckFailedException)) throw error;
+        return 'no_tenant';
+      }
+    },
 
     async setAdminDisabled(id, disabled) {
       const notUninstalled = 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)';
@@ -1053,6 +1070,26 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         }),
       );
       return (out.Items ?? []).map(toJobSummary);
+    },
+    async listJobStepModels(id) {
+      const models: NonNullable<JobFinishDetail['steps']> = [];
+      let cursor: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          FilterExpression: '#status = :finished AND ttl > :now',
+          ProjectionExpression: 'detail.steps',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'JOB#', ':finished': 'finished', ':now': Math.floor(Date.now() / 1000) },
+          ExclusiveStartKey: cursor,
+        }));
+        for (const item of page.Items ?? []) {
+          models.push(...(stepsOf(item.detail?.steps) ?? []).filter((step) => step.runId && step.model));
+        }
+        cursor = page.LastEvaluatedKey;
+      } while (cursor);
+      return models;
     },
 
     async getJobSummary(id, jobId) {

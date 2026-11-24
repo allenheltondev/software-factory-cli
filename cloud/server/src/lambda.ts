@@ -145,7 +145,7 @@ const app = createApp({
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         // Insights: the tenant's shared state database, read only (tenants/*/state/state.db).
         telemetry: createTelemetryService({ store, github, secrets: createSecretsManagerPort(), check: checkHoneycombKey() }),
-        stats: createStatsService({ github, ...(bucket ? { readState: createS3StateReader(s3, bucket) } : {}), cacheDir: '/tmp/updraft-state' }),
+        stats: createStatsService({ github, store, ...(bucket ? { readState: createS3StateReader(s3, bucket) } : {}), cacheDir: '/tmp/updraft-state' }),
         admin: {
           access: adminAccess(process.env.ADMIN_GROUP ?? DEFAULT_ADMIN_GROUP),
           service: createAdminService({ store, quotas: quotasFromEnv(process.env) }),

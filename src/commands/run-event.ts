@@ -118,6 +118,7 @@ export interface RunEventJobSummary {
   status: string;
   runId: string | null;
   agent: string | null;
+  routing?: { source: 'pool' | 'tier' | 'fixed'; pool?: string; tier?: string; risk?: string; confidence?: number; hops?: number };
   /** The run's outcome (succeeded, failed, start_failed, interrupted); null when no agent run ended. */
   runOutcome: string | null;
   /** The worker's own reason when the job did not succeed (or its publication failed). */
@@ -420,6 +421,10 @@ function summarizeJob(db: Db, config: UpdraftConfig, jobId: string): RunEventJob
   const pub = run ? getPublication(db, run.id) : null;
   const comment = run ? getFailureComment(db, run.id) : null;
   const found = findRepoConfig(config, job);
+  const route = job.envelope.routing;
+  const selection = run ? db.prepare("SELECT tier, hops FROM metric_events WHERE kind = 'run.selected' AND subject_id = ?").get(run.id) as
+    { tier: string | null; hops: number | null } | undefined : undefined;
+  const tier = selection?.tier ?? route?.tier;
   const publishing = found ? publishMode(found.repo) !== 'none' : false;
   let error = job.status === 'succeeded' ? null : (job.statusReason ?? run?.error ?? null);
   if (job.status === 'succeeded' && pub?.state === 'failed') error = pub.error;
@@ -430,6 +435,14 @@ function summarizeJob(db: Db, config: UpdraftConfig, jobId: string): RunEventJob
     status: job.status,
     runId: run?.id ?? null,
     agent: run?.agent ?? null,
+    routing: {
+      source: tier ? 'tier' : 'pool',
+      pool: run?.pool ?? job.pool,
+      tier,
+      risk: route?.risk,
+      confidence: route?.confidence,
+      hops: selection?.hops ?? undefined,
+    },
     runOutcome: run?.outcome ?? null,
     error,
     branch: run?.summary?.branch ?? pub?.branch ?? null,

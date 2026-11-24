@@ -754,7 +754,10 @@ export function emptySection(): StatsSection {
  * or the one named by `repo` (OWNER/REPO, case-insensitive; matched against every name a
  * repository's facts or jobs were recorded under).
  */
-export function computeStats(db: Db | null, o: { since: number | null; now: number; label: string; repo?: string | null }): StatsReport {
+export function computeStats(db: Db | null, o: {
+  since: number | null; now: number; label: string; repo?: string | null;
+  stepModels?: ReadonlyMap<string, { model: string; adapter?: string; effort?: string; modelSource?: 'configured' | 'response' }>;
+}): StatsReport {
   const base = {
     version: STATS_JSON_VERSION,
     generatedAt: new Date(o.now).toISOString(),
@@ -764,6 +767,17 @@ export function computeStats(db: Db | null, o: { since: number | null; now: numb
   if (!db) return { ...base, database: false, facts: { total: 0, backfilled: 0 }, overall: emptySection(), byRepo: [] };
 
   let events = (db.prepare('SELECT * FROM metric_events ORDER BY at, id').all() as unknown as Partial<EventRow>[]).map(normalize);
+  if (o.stepModels) {
+    for (const event of events) {
+      if (event.kind !== 'run.selected') continue;
+      const model = o.stepModels.get(event.subject_id);
+      if (!model) continue;
+      event.model = model.model;
+      event.adapter = model.adapter ?? event.adapter;
+      event.effort = model.effort ?? event.effort;
+      event.model_source = model.modelSource === 'response' ? 'observed' : 'configured';
+    }
+  }
   let queue = [...(db.prepare(QUEUE_SQL).all() as unknown as QueueRow[]), ...waitingRows(db)];
 
   // Every name each repository was seen under, and the newest one to show.

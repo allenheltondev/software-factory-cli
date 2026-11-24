@@ -20,7 +20,7 @@
  * uninstalled, so DynamoDB deletes the tenant and its members once the retention has passed.
  */
 
-import type { JobLoop, JobStep, JobTelemetryReport, JobTelemetrySnapshot, LinkDestination } from '../jobs/lifecycle.js';
+import type { JobLoop, JobRouting, JobStep, JobTelemetryReport, JobTelemetrySnapshot, LinkDestination } from '../jobs/lifecycle.js';
 
 /** The native enqueue transaction was definitively rolled back because its mode was disabled. */
 export class NativeEnqueueRejectedError extends Error {
@@ -73,6 +73,7 @@ export interface Tenant {
   limits?: TenantLimits;
   /** When its first job started (the broker's first committed start), kept for good: setup is done. */
   firstJobAt?: string;
+  publishJobFinishedEvents?: boolean;
 }
 
 /** Per-tenant quotas an admin may override. Each one absent: the stack's default. */
@@ -159,6 +160,7 @@ export interface JobSummary {
  * shown in the console, never trusted for anything else.
  */
 export interface JobFinishDetail {
+  routing?: JobRouting;
   /** `updraft run-event`'s own outcome (succeeded, failed, publish-failed, nothing-to-do, ...). */
   updraftOutcome?: string;
   /** false: the job's verify commands failed. */
@@ -467,6 +469,7 @@ export interface Store {
   markFirstJob(installationId: number, at: string): Promise<void>;
   /** An admin's quota overrides; null removes them (the stack's defaults again). */
   setTenantLimits(installationId: number, limits: TenantLimits | null): Promise<'updated' | 'no_tenant'>;
+  setJobFinishedEvents(installationId: number, enabled: boolean): Promise<'updated' | 'no_tenant'>;
   /**
    * An admin disables the tenant (jobs stop at once: the launcher and the broker read its status)
    * or enables it again. Enabling makes it active only if GitHub has it active too.
@@ -476,6 +479,7 @@ export interface Store {
   listTenants(): Promise<Tenant[]>;
   /** The tenant's most recent jobs, newest first. */
   listRecentJobs(installationId: number, limit: number): Promise<JobSummary[]>;
+  listJobStepModels(installationId: number): Promise<JobStep[]>;
   /** One of the tenant's job summaries (30 days), or null: never another tenant's. */
   getJobSummary(installationId: number, jobId: string): Promise<JobSummary | null>;
   recordDelivery(installationId: number, delivery: DeliveryRecord): Promise<void>;
@@ -847,6 +851,10 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
         .slice(0, limit)
         .map(({ installationId: _id, ...s }) => ({ ...s }));
     },
+    async listJobStepModels(id) {
+      return [...summaries.values()].filter((s) => s.installationId === id && s.status === 'finished')
+        .flatMap((s) => s.detail?.steps ?? []).filter((step) => step.runId && step.model);
+    },
     async markFirstJob(id, at) {
       const t = tenants.get(id);
       if (t && t.firstJobAt === undefined) tenants.set(id, { ...t, firstJobAt: at });
@@ -858,6 +866,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       if (limits) next.limits = { ...limits };
       else delete next.limits;
       tenants.set(id, next);
+      return 'updated';
+    },
+    async setJobFinishedEvents(id, enabled) {
+      const tenant = tenants.get(id);
+      if (!tenant || tenant.disabledReason === 'uninstalled') return 'no_tenant';
+      tenants.set(id, { ...tenant, publishJobFinishedEvents: enabled });
       return 'updated';
     },
     async setSuspended(id, suspended) {

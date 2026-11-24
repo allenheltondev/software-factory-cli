@@ -187,6 +187,122 @@ Globals:
     Tracing: Active
 
 Resources:
+  JobEventsBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: updraft-events
+
+  JobEventsBusName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /updraft/${AWS::StackName}/event-bus-name
+      Type: String
+      Value: !Ref JobEventsBus
+
+  JobEventsBusArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /updraft/${AWS::StackName}/event-bus-arn
+      Type: String
+      Value: !GetAtt JobEventsBus.Arn
+
+  JobEventsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  JobEventsDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt JobEventsDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  JobEventsEnrichment:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../server/dist
+      Handler: job-finished.handler
+      Timeout: 15
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          TABLE_NAME: !Ref UpdraftTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt UpdraftTable.Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys: ['TENANT#*']
+
+  JobEventsPipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pipes.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: job-finished-pipe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator]
+                Resource: !GetAtt UpdraftTable.StreamArn
+              - Effect: Allow
+                Action: dynamodb:ListStreams
+                Resource: '*'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt JobEventsEnrichment.Arn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt JobEventsBus.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt JobEventsDeadLetterQueue.Arn
+
+  JobEventsPipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      RoleArn: !GetAtt JobEventsPipeRole.Arn
+      Source: !GetAtt UpdraftTable.StreamArn
+      SourceParameters:
+        FilterCriteria:
+          Filters:
+            - Pattern: >-
+                {"eventName":["MODIFY"],"dynamodb":{"NewImage":{"pk":{"S":[{"prefix":"TENANT#"}]},"sk":{"S":[{"prefix":"JOB#"}]},"status":{"S":["finished"]}},"OldImage":{"status":{"S":[{"anything-but":"finished"}]}}}}
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+          MaximumRetryAttempts: 5
+          DeadLetterConfig:
+            Arn: !GetAtt JobEventsDeadLetterQueue.Arn
+      Enrichment: !GetAtt JobEventsEnrichment.Arn
+      Target: !GetAtt JobEventsBus.Arn
+      TargetParameters:
+        EventBridgeEventBusParameters:
+          Source: updraft.cloud
+          DetailType: Job Finished
+
   ClaudeImageDeploymentPolicy:
     Type: AWS::IAM::Policy
     Condition: ClaudeImageDeployment

@@ -25,6 +25,7 @@ export interface AdminTenant {
   adminDisabled?: Tenant['adminDisabled'];
   activeConfigVersion?: number;
   createdAt: string;
+  publishJobFinishedEvents: boolean;
   /** Its quotas (the stack's defaults with its overrides), the overrides alone, and the defaults. */
   quotas: Quotas;
   limits?: TenantLimits;
@@ -72,6 +73,7 @@ export function createAdminService({
       ...(t.adminDisabled ? { adminDisabled: t.adminDisabled } : {}),
       ...(t.activeConfigVersion !== undefined ? { activeConfigVersion: t.activeConfigVersion } : {}),
       createdAt: t.createdAt,
+      publishJobFinishedEvents: t.publishJobFinishedEvents === true,
       quotas: tenantQuotas(quotas, t.limits),
       ...(t.limits ? { limits: t.limits } : {}),
       defaults: quotas,
@@ -143,6 +145,13 @@ export function createAdminService({
       }
       log({ admin: by, installationId: id, action: 'limits', limits: cleared ? null : limits });
       return detail(id);
+    },
+    async setJobFinishedEvents(id: number, by: string, enabled: boolean): Promise<{ enabled: boolean }> {
+      if ((await store.setJobFinishedEvents(id, enabled)) === 'no_tenant') {
+        throw new FlowError('not_found', 404, `There is no tenant for installation ${id}`);
+      }
+      log({ admin: by, installationId: id, action: 'job-finished-events', enabled });
+      return { enabled };
     },
 
     /**

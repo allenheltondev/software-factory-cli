@@ -6,6 +6,7 @@ import { FlowError, type GitHubFlows } from '../flows/github.js';
 // exactly as the CLI computes it: one definition of every number, wherever it is read.
 import { METRICS_SCHEMA_VERSION, openDatabaseReadOnly, SCHEMA_VERSION, schemaVersion } from '../../../../src/db/database.js';
 import { computeStats, type StatsReport } from '../../../../src/db/stats.js';
+import type { Store } from '../store/store.js';
 
 /**
  * A tenant's insights in the console: what the factory did over a window, across its
@@ -74,6 +75,7 @@ export interface Insights {
 export interface StatsServiceDeps {
   github: Pick<GitHubFlows, 'member'>;
   readState?: StateReader;
+  store?: Pick<Store, 'listJobStepModels'>;
   /** Where downloaded databases are kept (Lambda's /tmp). */
   cacheDir: string;
   /** The most bytes of snapshots kept between requests, over every tenant. */
@@ -84,7 +86,7 @@ export interface StatsServiceDeps {
 
 export const stateKeyOf = (installationId: number) => `tenants/${installationId}/state/state.db`;
 
-export function createStatsService({ github, readState, cacheDir, cacheBytes = CACHE_BYTES, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatsServiceDeps) {
+export function createStatsService({ github, readState, store, cacheDir, cacheBytes = CACHE_BYTES, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatsServiceDeps) {
   /**
    * Downloaded snapshots, least recently used first, within `cacheBytes` in all: Lambda's /tmp is
    * shared by every tenant a warm environment serves. A snapshot larger than the budget is read
@@ -185,11 +187,13 @@ export function createStatsService({ github, readState, cacheDir, cacheBytes = C
               throw new FlowError('state_newer', 503, 'The state was written by a newer Updraft than this console reads yet; try again after the next deploy');
             }
             // A database from before stats were recorded has no facts to report.
+            const stepModels = new Map((await store?.listJobStepModels(installationId) ?? [])
+              .flatMap((step) => step.runId && step.model ? [[step.runId, { ...step, model: step.model }] as const] : []));
             insights = {
               window,
               hasState: true,
               ...(state.lastModified ? { stateUpdatedAt: state.lastModified } : {}),
-              report: computeStats(version < METRICS_SCHEMA_VERSION ? null : db, range),
+              report: computeStats(version < METRICS_SCHEMA_VERSION ? null : db, { ...range, stepModels }),
             };
           } finally {
             db.close();
