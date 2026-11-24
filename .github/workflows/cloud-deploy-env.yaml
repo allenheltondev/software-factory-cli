@@ -116,9 +116,13 @@ jobs:
           APP_DOMAIN_NAME: ${{ inputs.domain }}
           APP_HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID }}
           OFFERED_AGENTS: ${{ vars.CLOUD_AGENTS }}
+          ENABLE_JOB_FINISHED_EVENTS: ${{ vars.ENABLE_JOB_FINISHED_EVENTS }}
           AWS_DEPLOYMENT_ROLE_ARN: ${{ secrets.AWS_DEPLOYMENT_ROLE_ARN }}
         run: |
           export CLAUDE_IMAGE_DEPLOYMENT_ROLE_NAME="${AWS_DEPLOYMENT_ROLE_ARN##*/}"
+          if [ "$ENABLE_JOB_FINISHED_EVENTS" = true ]; then
+            export JOB_FINISHED_EVENTS_INFRASTRUCTURE=true
+          fi
           if [ -n "$OFFERED_AGENTS" ]; then
             if [[ ! "$OFFERED_AGENTS" =~ ^(claude|codex|kiro|vibe)(,(claude|codex|kiro|vibe))*$ ]]; then
               echo "::error::CLOUD_AGENTS must be a comma-separated list of supported agent names."

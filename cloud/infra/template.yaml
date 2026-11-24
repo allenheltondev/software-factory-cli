@@ -7,6 +7,11 @@ Description: >
   app client to that pool).
 
 Parameters:
+  JobFinishedEventsInfrastructure:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Provision the EventBridge job-finished bus and Pipe after its deploy-role permissions are in place.
   ClaudeImageDeploymentRoleName:
     Type: String
     Default: ''
@@ -161,6 +166,7 @@ Rules:
         AssertDescription: Enabling the native test route requires its dedicated image and control secret ARNs.
 
 Conditions:
+  DeployJobFinishedEvents: !Equals [!Ref JobFinishedEventsInfrastructure, 'true']
   ClaudeImageDeployment: !Not [!Equals [!Ref ClaudeImageDeploymentRoleName, '']]
   ManagedClaude: !Not [!Equals [!Ref ManagedClaudeImageVersion, '']]
   ManagedClaudeOriginOverride: !Not [!Equals [!Ref ManagedClaudeConsoleOrigin, '']]
@@ -189,11 +195,13 @@ Globals:
 Resources:
   JobEventsBus:
     Type: AWS::Events::EventBus
+    Condition: DeployJobFinishedEvents
     Properties:
       Name: updraft-events
 
   JobEventsBusName:
     Type: AWS::SSM::Parameter
+    Condition: DeployJobFinishedEvents
     Properties:
       Name: !Sub /updraft/${AWS::StackName}/event-bus-name
       Type: String
@@ -201,6 +209,7 @@ Resources:
 
   JobEventsBusArn:
     Type: AWS::SSM::Parameter
+    Condition: DeployJobFinishedEvents
     Properties:
       Name: !Sub /updraft/${AWS::StackName}/event-bus-arn
       Type: String
@@ -208,12 +217,14 @@ Resources:
 
   JobEventsDeadLetterQueue:
     Type: AWS::SQS::Queue
+    Condition: DeployJobFinishedEvents
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
   JobEventsDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: DeployJobFinishedEvents
     Properties:
       Namespace: AWS/SQS
       MetricName: ApproximateNumberOfMessagesVisible
@@ -229,6 +240,7 @@ Resources:
 
   JobEventsEnrichment:
     Type: AWS::Serverless::Function
+    Condition: DeployJobFinishedEvents
     Properties:
       CodeUri: ../server/dist
       Handler: job-finished.handler
@@ -248,6 +260,7 @@ Resources:
 
   JobEventsPipeRole:
     Type: AWS::IAM::Role
+    Condition: DeployJobFinishedEvents
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -282,7 +295,9 @@ Resources:
 
   JobEventsPipe:
     Type: AWS::Pipes::Pipe
+    Condition: DeployJobFinishedEvents
     Properties:
+      Name: !Sub ${AWS::StackName}-job-finished
       RoleArn: !GetAtt JobEventsPipeRole.Arn
       Source: !GetAtt UpdraftTable.StreamArn
       SourceParameters:

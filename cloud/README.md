@@ -177,6 +177,11 @@ metadata. They exclude log contents and trace payloads. Changes within v1 are ad
 Consumers should deduplicate delivery attempts using `stack`, `tenantId` and `jobId`.
 A later metadata update to an already finished job does not create a finish event.
 
+To provision the event infrastructure, first give the deployment role permission to
+manage EventBridge Pipes on `pipe/<stack>-job-finished` and to pass the stack's Pipe execution
+role to `pipes.amazonaws.com`. Then set `ENABLE_JOB_FINISHED_EVENTS=true` in the target
+GitHub environment, or pass `JOB_FINISHED_EVENTS_INFRASTRUCTURE=true` to `make deploy-backend`.
+
 ### Mistral API pilot
 
 The hosted job image packages Mistral Vibe. After the new image is active in Staging, add
