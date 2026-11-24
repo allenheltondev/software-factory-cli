@@ -100,8 +100,13 @@ function Retry({ job, api, installationId }: { job: JobView; api: JobApi; instal
         <Button onClick={() => void run()} disabled={busy}>
           {busy ? 'Retrying…' : 'Retry job'}
         </Button>
-        <span className="text-sm">Runs the same event again as a new job, with the configuration active now.</span>
+        <span className="text-sm">Uses the current workflow configuration and this job’s original execution mode.</span>
       </div>
+      {job.executionMode !== 'subscription' && (
+        <p className="text-sm">To test Claude subscription routing, use a new labeled issue.{' '}
+          <Link className="auth-link" to={`/installations/${installationId}/claude`}>Claude subscription settings</Link>
+        </p>
+      )}
       {error && (
         <Alert variant="error" data-testid="job-retry-error">
           {error}

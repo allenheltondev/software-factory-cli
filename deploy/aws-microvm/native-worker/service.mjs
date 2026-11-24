@@ -269,10 +269,14 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     // Real namespace probe, including network isolation. A failed probe prevents listening.
     const probeDir = fs.mkdtempSync(`${c.workRoot}/.native-probe-`);
     fs.chownSync(probeDir, c.workerUid, c.workerGid);
+    // The supervisor can be PID 1 in the MicroVM. /proc/1 also exists inside
+    // an isolated PID namespace, so compare namespace identities instead.
+    const pidNamespace = fs.readlinkSync('/proc/self/ns/pid');
+    const mountNamespace = fs.readlinkSync('/proc/self/ns/mnt');
     const probe = sandboxChild(['run', '--rm', '--name', `probe-${randomUUID()}`, '--user', `${c.workerUid}:${c.workerGid}`,
       '--network', 'none', '--tmpfs', '/updraft-home:mode=1777', '-e', 'HOME=/updraft-home',
       '--mount', `type=bind,source=${probeDir},target=${probeDir}`, '--workdir', probeDir, IMAGE,
-      process.execPath, '-e', `const fs=require('fs'),os=require('os'); if(fs.existsSync(${JSON.stringify(c.credentialHome)}) || fs.existsSync('/proc/${process.pid}') || Object.values(os.networkInterfaces()).flat().some(a=>!a.internal)) process.exit(1);`]);
+      process.execPath, '-e', `const fs=require('fs'),os=require('os'); if(fs.existsSync(${JSON.stringify(c.credentialHome)}) || fs.readlinkSync('/proc/self/ns/pid') === ${JSON.stringify(pidNamespace)} || fs.readlinkSync('/proc/self/ns/mnt') === ${JSON.stringify(mountNamespace)} || Object.values(os.networkInterfaces()).flat().some(a=>!a.internal)) process.exit(1);`]);
     probe.stdin.end();
     probe.stdout.resume(); probe.stderr.resume();
     const code = await new Promise((resolve) => { probe.once('error', () => resolve(125)); probe.once('close', resolve); });

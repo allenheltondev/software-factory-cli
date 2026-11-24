@@ -51,9 +51,9 @@ export function fingerprintOf(files: readonly { path: string; data: Buffer }[]):
  * The image inputs in a checkout as they are on disk: tracked files and new ones git does not
  * ignore (installed modules, a packed tarball), so a local build fingerprints what it builds.
  */
-export function imageInputFiles(root = repoRoot): { path: string; data: Buffer }[] {
-  const listed = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...IMAGE_INPUTS], { cwd: root, encoding: 'utf8' });
-  const paths = [...new Set(listed.split('\0').filter((path) => path !== '' && isImageInput(path)))];
+export function imageInputFiles(root = repoRoot, inputs = IMAGE_INPUTS): { path: string; data: Buffer }[] {
+  const listed = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...inputs], { cwd: root, encoding: 'utf8' });
+  const paths = [...new Set(listed.split('\0').filter(Boolean))];
   // A tracked file deleted in the working tree is not an input any more.
   return paths.filter((path) => existsSync(join(root, path)) && statSync(join(root, path)).isFile()).map((path) => ({ path, data: readFileSync(join(root, path)) }));
 }

@@ -6,11 +6,13 @@ on:
   pull_request:
     paths:
       - 'cloud/**'
-      # The server bundles the CLI's config schema and agent profiles from src/.
-      - 'src/config/**'
-      - 'src/agents/**'
+      # The Claude image packages the CLI from this checkout.
+      - 'src/**'
+      - 'tsconfig*.json'
+      - 'scripts/copy-telemetry.mjs'
       # The job image (cloud-deploy-env.yaml rebuilds it when the active one was built from other inputs).
       - 'deploy/aws-microvm/image/**'
+      - 'deploy/aws-microvm/native-worker/**'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/cloud-*.yaml'
@@ -32,4 +34,5 @@ jobs:
       contents: read
     with:
       environment: Staging
+      deploy_claude: true
     secrets: inherit

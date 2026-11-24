@@ -18,7 +18,7 @@ export function endpointPorts(value) {
 }
 
 export function tokenArgs(microvmId, ports) {
-  if (typeof microvmId !== 'string' || !/^mvm-[A-Za-z0-9-]{1,100}$/.test(microvmId)) throw new Error('invalid MicroVM identifier');
+  if (typeof microvmId !== 'string' || !/^(?:microvm|mvm)-[A-Za-z0-9-]{1,100}$/.test(microvmId)) throw new Error('invalid MicroVM identifier');
   return ['lambda-microvms', 'create-microvm-auth-token', '--microvm-identifier', microvmId,
     '--expiration-in-minutes', '15', '--allowed-ports', JSON.stringify(endpointPorts(ports)), '--output', 'json'];
 }

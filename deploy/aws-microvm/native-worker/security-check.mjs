@@ -158,10 +158,13 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   // Ensure the Claude account can read the synthetic fixture; denied access must be meaningful.
   const readable = execFileSync('/usr/bin/setpriv', ['--reuid', String(claudeUid), '--regid', String(claudeUid), '--clear-groups', 'cat', `${credentialHome}/.claude/.credentials.json`], { encoding: 'utf8' });
   assert.equal(readable, marker);
+  // A PID can be reused inside the sandbox, especially when the supervisor is PID 1.
+  const supervisorPidNamespace = fs.readlinkSync('/proc/self/ns/pid');
+  const fromSupervisor = `test "$(readlink /proc/${process.pid}/ns/pid)" = ${quote(supervisorPidNamespace)} &&`;
   const attacks = [
     `cat ${quote(`${credentialHome}/.claude/.credentials.json`)}`,
-    `cat /proc/${process.pid}/environ`,
-    `cat /proc/${process.pid}/root${credentialHome}/.claude/.credentials.json`,
+    `${fromSupervisor} cat /proc/${process.pid}/environ`,
+    `${fromSupervisor} cat /proc/${process.pid}/root${credentialHome}/.claude/.credentials.json`,
     `ln -s ${quote(credentialHome)} stolen-home; cat stolen-home/.claude/.credentials.json`,
     `node -e 'require("fs").readFileSync(${JSON.stringify(`${credentialHome}/.claude/.credentials.json`)})'`,
     `mount --bind / /tmp/escape`,

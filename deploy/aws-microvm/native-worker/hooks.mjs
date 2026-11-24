@@ -33,6 +33,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   // Privileged provider lifecycle interface. Application endpoint tokens MUST exclude
   // port 9000; use endpoint-token.mjs and its deployed gateway probe when provisioning.
   const server = http.createServer((request, response) => {
+    let phase = 'dispatch';
     void (async () => {
       const route = request.url;
       if (request.method !== 'POST') { response.writeHead(405).end(); return; }
@@ -41,6 +42,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
         if (started || pending) { response.writeHead(409).end(); return; }
         pending = true;
         try {
+          phase = 'boot-payload';
           let body = '';
           for await (const chunk of request) {
             body += chunk;
@@ -50,15 +52,26 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
           const { storage, fileSystemId, accessPointId, cloud: cloudSettings } = bootPayload(lifecycle.runHookPayload);
           const ephemeral = storage === 'ephemeral';
           const storageArgs = ephemeral ? ['--ephemeral'] : [fileSystemId, accessPointId];
+          phase = 'credential-storage';
           await new Promise((resolve, reject) => execFile('/bin/sh', ['/opt/updraft/native-worker/mount-home.sh', ...storageArgs],
-            { timeout: 45000, maxBuffer: 65536 }, (error) => error ? reject(error) : resolve()));
+            { timeout: 45000, maxBuffer: 65536 }, (error, _stdout, stderr) => {
+              if (error && ephemeral) {
+                const reason = /permission denied|operation not permitted|already exists|not found|wrong fs type/i.exec(stderr)?.[0];
+                console.error('Disposable home mount failed' + (reason ? ': ' + reason.toLowerCase() : '.'));
+              }
+              if (error) reject(error); else resolve();
+            }));
+          phase = 'worker-config';
           const config = loadConfig('/etc/updraft-native-worker.json');
+          phase = 'repository-isolation';
           service = await startService(config, undefined, ephemeral ? assertEphemeralHome : undefined);
           try {
+            phase = 'health-listener';
             probe = await startProbe(config);
-            if (ephemeral && cloudSettings) login = await startBrowserLogin(config);
+            if (ephemeral && cloudSettings) { phase = 'browser-login-listener'; login = await startBrowserLogin(config); }
           } catch (error) { await probe?.close(); await service.close(); throw error; }
           if (cloudSettings) {
+            phase = 'cloud-registration';
             try { cloud = await startCloudWorker(cloudSettings, lifecycle.microvmId, service); }
             catch (error) { login?.kill(); await probe.close(); await service.close(); throw error; }
           }
@@ -89,8 +102,14 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       // Suspend/resume is deliberately not enabled by the prototype image recipe. EFS
       // reconnection and ongoing-job semantics must be proven before enabling idle policies.
       response.writeHead(503).end();
-    })().catch(() => {
-      console.error('Native worker lifecycle operation failed; worker is unavailable.');
+    })().catch((error) => {
+      const reason = error instanceof Error && [
+        'native worker namespace probe failed', 'credential lease failed',
+        'credential home already leased or lock unavailable', 'credential home must be private to the Claude account',
+        'credential mount needs a private local parent directory', 'disposable Claude home requires a private tmpfs mount',
+        'unexpected mount inside the disposable Claude home', 'probe listener exited before readiness',
+      ].includes(error.message) ? error.message : undefined;
+      console.error(JSON.stringify({ workerStartup: 'failed', phase, ...(reason ? { reason } : {}) }));
       if (!response.headersSent) response.writeHead(503).end();
     });
   });

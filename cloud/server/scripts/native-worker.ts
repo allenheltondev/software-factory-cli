@@ -16,7 +16,7 @@ async function launch(file: string, broker: string, region: string) {
   const role = /^arn:[\w-]+:iam::\d{12}:role\/[\w+=,.@/-]+$/;
   if (!arn.test(plan.imageArn ?? '') || !role.test(plan.executionRoleArn ?? '') ||
       !/^[\w-]{8,64}$/.test(plan.session ?? '') || !/^[\w:-]{1,200}$/.test(broker) ||
-      !/^[\w-]+-\d$/.test(region) || (plan.previousMicrovmId !== undefined && !/^mvm-[\w-]+$/.test(plan.previousMicrovmId))) {
+      !/^[\w-]+-\d$/.test(region) || (plan.previousMicrovmId !== undefined && !/^(?:microvm|mvm)-[\w-]+$/.test(plan.previousMicrovmId))) {
     throw new Error('invalid disposable worker references');
   }
   const client = new LambdaMicrovmsClient({ region });

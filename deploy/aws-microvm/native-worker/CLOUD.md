@@ -7,10 +7,14 @@ still apply. Local regression tests are not evidence of an AWS subscription exec
 
 ## Tenant-managed disposable sessions
 
-After testing the dedicated browser-login image in AWS, set `ManagedClaudeImageName` and
-`ManagedClaudeImageVersion` on the Cloud stack. Leave the version empty on stacks where
-this flow is disabled. From `cloud/`, pass `MANAGED_CLAUDE_IMAGE_NAME` and
-`MANAGED_CLAUDE_IMAGE_VERSION` to `make deploy-backend` to set the parameters.
+The Cloud release workflow builds and publishes a dedicated image in each environment.
+It checks a signed-out AWS worker for an official Claude sign-in link and confirms that
+the browser grant cannot reach the lifecycle port. A failed check leaves the deployed
+image version as it was. Staging deploys verified images automatically. Set `deploy_claude: true`
+in the Production workflow as part of the release PR once the live tests below and #100 are cleared.
+The workflow passes the verified version to CloudFormation as `ManagedClaudeImageVersion`.
+To run the same build and smoke test without enabling routing, use
+`npm run build-job-image --workspace=server -- --native-claude` from `cloud/`.
 CloudFormation creates a broker-only execution role, an application
 control key, and the reference that lets the broker wake the webhook Lambda. The installation
 owns the saved trigger selection, one current session binding, and its waiting delivery
