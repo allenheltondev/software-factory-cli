@@ -1,413 +1,628 @@
 import { useEffect, useRef, useState } from 'react';
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
-import { Alert, Button, Card, CardBody, CardHeader, CardTitle, ProgressIndicator, Skeleton, StatusBadge, type ProgressStep } from '@readysetcloud/ui';
-import { api as defaultApi, type ApiClient, type ClaudeWaitingRequest, type NativeClaudeTrigger, type NativeClaudeView } from '../api/client';
-
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router';
+import {
+  Alert,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  CardTitle,
+  ProgressIndicator,
+  Skeleton,
+  StatusBadge,
+} from '@readysetcloud/ui';
+import {
+  api as defaultApi,
+  ApiError,
+  type ApiClient,
+  type ClaudeWaitingRequest,
+  type NativeClaudeTrigger,
+  type NativeClaudeView,
+} from '../api/client';
 import { claudeLoginFrame } from './claudeLoginFrame';
-
-type Api = Pick<ApiClient, 'nativeClaude' | 'setNativeClaudeMode' | 'nativeClaudeLogin' | 'nativeClaudeWaiting' | 'nativeClaudeStart' | 'nativeClaudeRestart'>;
-type Load = { state: 'loading' } | { state: 'error'; message: string } | { state: 'ok'; view: NativeClaudeView };
-
-const triggerKey = (trigger: NativeClaudeTrigger) => JSON.stringify([trigger.repositoryId, trigger.repository.toLowerCase(), trigger.label.toLowerCase()]);
-
-const LOGIN = [
-  'cd /',
-  'setpriv --reuid 1001 --regid 1001 --clear-groups -- \\',
-  '  env -i PATH=/usr/local/bin:/usr/bin:/bin \\',
-  '  HOME=/var/lib/updraft-native-auth/home \\',
-  '  CLAUDE_CONFIG_DIR=/var/lib/updraft-native-auth/home/.claude \\',
-  "  claude --restricted --setting-sources '' auth login",
-].join('\n');
-
-/** Select execution mode for the operator-pinned worker; never a Claude OAuth/token proxy. */
-export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
+type Api = Pick<
+  ApiClient,
+  | 'nativeClaude'
+  | 'setNativeClaudeMode'
+  | 'nativeClaudeLogin'
+  | 'nativeClaudeWaiting'
+  | 'nativeClaudeStart'
+  | 'nativeClaudeRestart'
+>;
+const triggerKey = (t: NativeClaudeTrigger) =>
+  JSON.stringify([t.repositoryId, t.repository.toLowerCase(), t.label.toLowerCase()]);
+export function NativeClaudePage({ api }: { api?: Api }) {
   const { id } = useParams();
+  return <ClaudeConnectionPage key={id} api={api} />;
+}
+
+function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
+  const { id } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const connectRequested = (location.state as { connectClaude?: unknown } | null)?.connectClaude === true;
   const [params] = useSearchParams();
   const requestId = params.get('request');
-  const navigate = useNavigate();
   const installationId = Number(id);
-  const valid = Number.isSafeInteger(installationId) && installationId > 0;
-  const [fetched, setLoad] = useState<Load>({ state: 'loading' });
-  const load: Load = valid ? fetched : { state: 'error', message: 'There is no installation at this address.' };
-  const frame = useRef<HTMLIFrameElement>(null);
-  const [loginPage, setLoginPage] = useState<string | null>(null);
-  const [workerExpiresAt, setWorkerExpiresAt] = useState<string>();
+  const [view, setView] = useState<NativeClaudeView>();
+  const [error, setError] = useState<string>();
+  const [pollError, setPollError] = useState<string>();
   const [request, setRequest] = useState<ClaudeWaitingRequest>();
-  const [startingWorker, setStartingWorker] = useState(false);
-  const [openingLogin, setOpeningLogin] = useState(false);
-  const [waitingForWorker, setWaitingForWorker] = useState(false);
+  const [phase, setPhase] = useState<'idle' | 'preparing' | 'signin' | 'verifying'>('idle');
+  const [loginPage, setLoginPage] = useState<string>();
+  const [frameHeight, setFrameHeight] = useState(416);
+  const revision = useRef(0);
   const [busy, setBusy] = useState(false);
-  const [restarting, setRestarting] = useState(false);
   const [draft, setDraft] = useState<NativeClaudeTrigger[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
+  const frame = useRef<HTMLIFrameElement>(null);
+  const title = useRef<HTMLHeadingElement>(null);
+  const restoreFocus = useRef(false);
+  const flow = useRef(false);
+  const mutationPending = useRef(false);
+  const canceled = useRef(false);
+  const recoveryRequested = useRef(false);
+  const [generationChanged, setGenerationChanged] = useState(false);
+  const grantRequested = useRef(false);
+  const generation = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (!valid) return;
-    let live = true;
-    void api.nativeClaude(installationId).then(
-      (view) => { if (live) setLoad({ state: 'ok', view }); },
-      (err: unknown) => { if (live) setLoad({ state: 'error', message: err instanceof Error ? err.message : 'Could not load Claude settings.' }); },
-    );
-    return () => { live = false; };
-  }, [api, installationId, valid]);
-
+    if (phase === 'idle' && restoreFocus.current) {
+      restoreFocus.current = false;
+      title.current?.focus();
+    } else if (phase !== 'idle') {
+      restoreFocus.current = true;
+    }
+  }, [phase]);
   useEffect(() => {
-    if (!valid || !requestId) return;
     let live = true;
-    let finished = false;
-    const check = async () => {
-      try {
-        const state = await api.nativeClaudeWaiting(installationId, requestId);
-        if (!live) return;
-        setRequest(state);
-        finished = state.status !== 'waiting';
-        if (state.status === 'started' && state.jobId) void navigate(`/installations/${installationId}/jobs/${state.jobId}`, { replace: true });
-      } catch (err) {
-        if (live) setError(err instanceof Error ? err.message : 'Could not load the waiting job.');
-      }
-    };
-    void check();
-    const interval = setInterval(() => { if (finished) clearInterval(interval); else void check(); }, 4000);
-    return () => { live = false; clearInterval(interval); };
-  }, [api, installationId, navigate, requestId, valid]);
-
-  useEffect(() => {
-    if (!startingWorker) return;
-    let live = true;
+    const controller = new AbortController();
     let checking = false;
-    const timer = setInterval(() => {
-      if (checking) return;
+    let terminal = false;
+    let requestMissing = false;
+    let restored = false;
+    let failures = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    async function check() {
+      if (!live || checking || terminal) return;
       checking = true;
-      void api.nativeClaude(installationId).then(async (view) => {
-        if (!live || !view.worker?.online) return;
-        setLoad({ state: 'ok', view });
-        // A worker that has just booted can report `unavailable` before Claude answers its
-        // status check: keep checking until it says whether it needs a sign-in.
-        if (view.worker.status === 'unavailable') return;
-        try {
-          if (['auth-required', 'expired'].includes(view.worker.status)) {
-            const grant = await api.nativeClaudeLogin(installationId);
-            if (!live) return;
-            setLoginPage(claudeLoginFrame(grant));
-            setWorkerExpiresAt(grant.expiresAt);
+      const version = revision.current;
+      try {
+        const next = await api.nativeClaude(installationId, controller.signal);
+        if (!live || version !== revision.current) return;
+        setView(next);
+        if (!restored) {
+          restored = true;
+          if (
+            next.owner &&
+            !canceled.current &&
+            ((next.managed && connectRequested) ||
+              (!next.retired && (next.preparing || (next.upgrade ?? next.recovery)?.state === 'stopping')))
+          ) {
+            flow.current = true;
+            recoveryRequested.current = Boolean(connectRequested && (next.startupFailed || next.retired));
+            setPhase('preparing');
+            try {
+              const replacement = next.upgrade ?? next.recovery;
+              if (connectRequested && replacement?.state === 'required') await api.nativeClaudeRestart(installationId);
+              else if (next.preparing || (connectRequested && replacement?.state !== 'stopping'))
+                await api.nativeClaudeStart(installationId);
+            } catch (err) {
+              flow.current = false;
+              setPhase('idle');
+              setError(err instanceof Error ? err.message : 'Could not connect. Try again.');
+            }
+            if (!live || version !== revision.current) return;
           }
-        } catch (err) {
-          if (live) setError(err instanceof Error ? err.message : 'Could not open worker sign-in.');
-        } finally {
-          if (live) setStartingWorker(false);
         }
-      }, () => {}).finally(() => { checking = false; });
-    }, 2500);
-    const timeout = setTimeout(() => {
-      setStartingWorker(false);
-      setError('The worker has not checked in yet. Try again to check the same session.');
-    }, 120_000);
-    return () => { live = false; clearInterval(timer); clearTimeout(timeout); };
-  }, [api, installationId, startingWorker]);
 
-  async function startWorker(id: string | undefined) {
-    if (!id || startingWorker) return;
-    setStartingWorker(true);
-    setError(null);
-    try {
-      const view = await api.nativeClaudeStart(installationId, id);
-      setLoad({ state: 'ok', view });
-      if (view.worker?.online && view.worker.status !== 'unavailable') {
-        if (['auth-required', 'expired'].includes(view.worker.status)) await openLogin();
-        setStartingWorker(false);
+        // Consume entry intent before opening a grant: replacing router state cancels this effect.
+        if (connectRequested) {
+          void navigate({ pathname: location.pathname, search: location.search }, { replace: true, state: null });
+          return;
+        }
+        if (requestId && !requestMissing) {
+          try {
+            const waiting = await api.nativeClaudeWaiting(installationId, requestId, controller.signal);
+            if (!live || version !== revision.current) return;
+            setRequest(waiting);
+          } catch (err) {
+            if (err instanceof ApiError && [401, 403].includes(err.status)) throw err;
+            requestMissing = err instanceof ApiError && err.status === 404;
+            if (live) setError('Could not load the waiting job. You can still connect your Claude account.');
+          }
+        }
+        if (!next.startupFailed && !next.retired) recoveryRequested.current = false;
+        if (flow.current && (next.startupFailed || next.retired) && !recoveryRequested.current) {
+          flow.current = false;
+          grantRequested.current = false;
+          setLoginPage(undefined);
+          setPhase('idle');
+        } else if (
+          flow.current &&
+          !mutationPending.current &&
+          generation.current &&
+          next.worker?.generation &&
+          next.worker.generation !== generation.current
+        ) {
+          flow.current = false;
+          grantRequested.current = false;
+          setLoginPage(undefined);
+          setPhase('idle');
+          setGenerationChanged(true);
+          setError('Your Claude environment changed during sign-in. Reconnect Claude to continue.');
+        } else if (flow.current && !mutationPending.current && (next.upgrade ?? next.recovery)?.state === 'stopped') {
+          await api.nativeClaudeStart(installationId);
+        } else if (flow.current && !mutationPending.current && !next.upgrade && !next.recovery && next.worker?.online) {
+          if (
+            next.worker.status === 'connected' &&
+            (!generation.current || generation.current === next.worker.generation)
+          ) {
+            flow.current = false;
+            setPhase('idle');
+            setLoginPage(undefined);
+          } else if (['auth-required', 'expired'].includes(next.worker.status) && !grantRequested.current) {
+            grantRequested.current = true;
+            generation.current = next.worker.generation;
+            const grant = await api.nativeClaudeLogin(installationId, controller.signal).catch((err) => {
+              if (live && version === revision.current) grantRequested.current = false;
+              throw err;
+            });
+            if (!live || !flow.current || version !== revision.current) {
+              if (!live && version === revision.current) grantRequested.current = false;
+              return;
+            }
+            generation.current = grant.generation ?? generation.current;
+            setLoginPage(
+              claudeLoginFrame(
+                grant,
+                document.documentElement.dataset.theme === 'dark'
+                  ? 'dark'
+                  : document.documentElement.dataset.theme === 'light'
+                    ? 'light'
+                    : undefined,
+              ),
+            );
+            setPhase('signin');
+          }
+        }
+        failures = 0;
+        setPollError(undefined);
+      } catch (err) {
+        if (live) {
+          terminal = err instanceof ApiError && [401, 403, 404].includes(err.status);
+          if (terminal) {
+            flow.current = false;
+            setPhase('idle');
+            setLoginPage(undefined);
+          }
+          failures++;
+          setPollError(
+            (err instanceof Error ? err.message + ' ' : '') +
+              (terminal ? 'Check your installation access.' : 'Retrying automatically.'),
+          );
+        }
+      } finally {
+        checking = false;
+        if (live && !terminal)
+          timer = setTimeout(() => void check(), Math.min(30000, 2500 * 2 ** Math.min(failures, 4)));
       }
-    } catch (err) {
-      setStartingWorker(false);
-      setError(err instanceof Error ? err.message : 'Could not start the subscription worker.');
     }
-  }
-
-  async function openLogin() {
-    setError(null);
-    setOpeningLogin(true);
-    try {
-      const grant = await api.nativeClaudeLogin(installationId);
-      setLoginPage(claudeLoginFrame(grant));
-      setWorkerExpiresAt(grant.expiresAt);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not open worker sign-in.');
-    } finally {
-      setOpeningLogin(false);
-    }
-  }
-
+    const wake = () => {
+      clearTimeout(timer);
+      void check();
+    };
+    if (Number.isSafeInteger(installationId) && installationId > 0) void check();
+    window.addEventListener('focus', wake);
+    document.addEventListener('visibilitychange', wake);
+    return () => {
+      live = false;
+      controller.abort();
+      clearTimeout(timer);
+      window.removeEventListener('focus', wake);
+      document.removeEventListener('visibilitychange', wake);
+    };
+  }, [api, installationId, requestId, connectRequested, navigate, location.pathname, location.search]);
   useEffect(() => {
     const receive = (event: MessageEvent) => {
-      if (event.source !== frame.current?.contentWindow || event.origin !== 'null' ||
-          event.data?.kind !== 'updraft-claude-login' || event.data?.result !== 'connected') return;
-      setLoginPage(null);
-      setWaitingForWorker(true);
+      if (
+        event.source !== frame.current?.contentWindow ||
+        event.origin !== 'null' ||
+        event.data?.kind !== 'updraft-claude-login'
+      )
+        return;
+      if (
+        event.data.result === 'resize' &&
+        Number.isSafeInteger(event.data.height) &&
+        event.data.height >= 100 &&
+        event.data.height <= 1200
+      ) {
+        setFrameHeight(event.data.height);
+        return;
+      }
+      if (event.data.result === 'connected') setPhase('verifying');
+      else if (['expired', 'failed'].includes(event.data.result)) {
+        grantRequested.current = false;
+        flow.current = false;
+        setPhase('idle');
+        setLoginPage(undefined);
+        setError('Sign-in expired or was interrupted. Connect again to retry.');
+      }
     };
     window.addEventListener('message', receive);
     return () => window.removeEventListener('message', receive);
   }, []);
-
-  useEffect(() => {
-    if (!waitingForWorker) return;
-    let live = true;
-    const interval = setInterval(() => {
-      void api.nativeClaude(installationId).then((view) => {
-        if (!live || !view.worker?.online || view.worker.status !== 'connected') return;
-        setLoad({ state: 'ok', view });
-        setWaitingForWorker(false);
-      }, () => {});
-    }, 2000);
-    const timeout = setTimeout(() => {
-      setWaitingForWorker(false);
-      setError('The worker has not reported its sign-in yet. Refresh worker status to check again.');
-    }, 30_000);
-    return () => {
-      live = false;
-      clearInterval(interval);
-      clearTimeout(timeout);
-    };
-  }, [api, installationId, waitingForWorker]);
-
-  const upgradeState = fetched.state === 'ok' ? fetched.view.upgrade?.state : undefined;
-  useEffect(() => {
-    if (upgradeState !== 'stopping') return;
-    let live = true;
-    const interval = setInterval(() => {
-      void api.nativeClaude(installationId).then((view) => { if (live) setLoad({ state: 'ok', view }); }, () => {});
-    }, 3000);
-    const timeout = setTimeout(() => {
-      clearInterval(interval);
-      if (live) setError('The old worker is taking longer than usual to stop. Refresh worker status to check again.');
-    }, 180_000);
-    return () => { live = false; clearInterval(interval); clearTimeout(timeout); };
-  }, [api, installationId, upgradeState]);
-
-  async function restartWorker() {
-    if (restarting) return;
-    setRestarting(true);
-    setError(null);
+  async function connect() {
+    const version = ++revision.current;
+    mutationPending.current = true;
+    canceled.current = false;
+    recoveryRequested.current = Boolean(view?.startupFailed || view?.retired);
+    setGenerationChanged(false);
+    setError(undefined);
+    setPhase('preparing');
+    setLoginPage(undefined);
+    flow.current = true;
+    grantRequested.current = false;
+    generation.current = undefined;
     try {
-      setLoad({ state: 'ok', view: await api.nativeClaudeRestart(installationId) });
+      const replacement = view?.upgrade ?? view?.recovery;
+      if (replacement?.state === 'stopping') return;
+      const updated =
+        replacement?.state === 'required'
+          ? await api.nativeClaudeRestart(installationId)
+          : await api.nativeClaudeStart(installationId);
+      if (version === revision.current) setView(updated);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not restart the Claude worker.');
+      if (version === revision.current) {
+        flow.current = false;
+        setPhase('idle');
+        setError(err instanceof Error ? err.message : 'Could not connect. Try again.');
+      }
     } finally {
-      setRestarting(false);
+      if (version === revision.current) mutationPending.current = false;
     }
   }
-
-  async function refresh() {
-    try {
-      setLoad({ state: 'ok', view: await api.nativeClaude(installationId) });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not refresh worker status.');
-    }
-  }
-
   async function choose(enabled: boolean, triggers?: NativeClaudeTrigger[]) {
-    if (load.state !== 'ok' || busy) return;
+    revision.current++;
     setBusy(true);
-    setError(null);
+    setError(undefined);
     try {
-      const updated = triggers === undefined
-        ? await api.setNativeClaudeMode(installationId, enabled)
-        : await api.setNativeClaudeMode(installationId, enabled, triggers);
-      setLoad({ state: 'ok', view: updated });
-      if (triggers !== undefined) setDraft(null);
+      setView(await api.setNativeClaudeMode(installationId, enabled, triggers));
+      setDraft(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not change authentication mode.');
+      setError(err instanceof Error ? err.message : 'Could not save routing.');
     } finally {
       setBusy(false);
     }
   }
-
-  const view = load.state === 'ok' ? load.view : null;
+  const ready =
+    !generationChanged &&
+    !view?.upgrade &&
+    !view?.recovery &&
+    view?.worker?.online === true &&
+    view.worker.status === 'connected' &&
+    phase === 'idle';
   const selection = draft ?? view?.triggers ?? [];
-  const available = new Map((view?.availableTriggers ?? []).map((trigger) => [triggerKey(trigger), trigger]));
-  const options = new Map([...(view?.triggers ?? []).map((trigger) => [triggerKey(trigger), trigger] as const), ...available]);
-  const ready = view?.worker?.online === true && view.worker.status === 'connected';
-  const upgrade = view?.upgrade;
-  // A waiting GitHub job a new worker can be started for: the deep link's, else any.
-  const startId = request?.status === 'waiting' ? requestId ?? undefined : view?.pendingRequest;
-  const upgradeSteps: ProgressStep[] = upgrade ? [
-    { id: 'stop', label: 'Restart the worker', status: upgrade.state === 'stopped' ? 'completed' : 'in-progress',
-      description: upgrade.state === 'stopping' ? 'Stopping the old worker. This usually takes under a minute.' : 'Stops the old worker and ends its Claude sign-in.' },
-    { id: 'sign-in', label: 'Start the new worker and sign in to Claude', status: upgrade.state === 'stopped' ? 'in-progress' : 'pending',
-      description: 'Sign in with the same Claude account. The new worker cannot reuse the old sign-in.' },
-    startId
-      ? { id: 'resume', label: 'Waiting GitHub jobs start on their own', status: 'pending',
-        description: 'Nothing to relabel: jobs waiting for sign-in resume once Claude is connected.' }
-      : { id: 'resume', label: 'Your next labeled issue runs on the new worker', status: 'pending' },
-  ] : [];
-
+  const available = new Map((view?.availableTriggers ?? []).map((t) => [triggerKey(t), t]));
+  const options = new Map([...(view?.triggers ?? []).map((t) => [triggerKey(t), t] as const), ...available]);
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
-      <Link className="auth-link" to={'/installations/' + id + '/keys'}>← Agent keys</Link>
-      <header>
-        <h1 className="text-2xl font-semibold">Claude authentication</h1>
-        <p className="mt-2 text-sm text-muted-foreground">Choose how Claude Code runs for this installation. Switching modes never deletes your saved Anthropic API key.</p>
-      </header>
-      {load.state === 'loading' && <Skeleton className="h-40" />}
-      {load.state === 'error' && <Alert variant="error">{load.message}</Alert>}
-      {request && (
-        <Alert variant={request.status === 'waiting' ? 'info' : 'error'}>
-          {request.status === 'waiting'
-            ? ready ? 'Claude is connected. The waiting GitHub job will start automatically.' : 'This GitHub job is waiting for Claude subscription sign-in.'
-            : request.reason ?? (request.status === 'expired' ? 'This sign-in request expired.' : 'This job is no longer waiting for sign-in.')}
-        </Alert>
+      {phase === 'idle' && (
+        <Link className="auth-link" to={`/installations/${id}/keys`}>
+          ← Agent keys
+        </Link>
       )}
+      {phase === 'idle' && (
+        <header>
+          <h1 ref={title} tabIndex={-1} className="text-2xl font-semibold">
+            Claude account
+          </h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Connect your subscription, then choose which workflows use it.
+          </p>
+        </header>
+      )}
+      {error && <Alert variant="error">{error}</Alert>}
+      {pollError && <Alert variant="error">{pollError}</Alert>}
+      {!Number.isSafeInteger(installationId) || installationId <= 0 ? (
+        <Alert variant="error">There is no installation at this address.</Alert>
+      ) : !view && !pollError ? (
+        <Skeleton className="h-40" />
+      ) : null}
       {view && (
         <>
-          {upgrade && (
-            <Alert variant="error" data-testid="worker-restart" className="flex flex-col gap-3 border-2">
-              <h2 className="text-lg font-semibold">Action required: restart your Claude worker</h2>
-              <p className="text-sm">
-                Updraft was updated, but your Claude worker is still running the old version ({upgrade.from}; the current version is {upgrade.to}).
-                <strong> Subscription jobs will not run until you restart it.</strong> New jobs wait for you instead of failing.
-              </p>
-              <ProgressIndicator steps={upgradeSteps} />
-              {!view.owner && (
-                <p className="text-sm">
-                  <strong>An installation owner has to do this.</strong> Only owners can restart the worker and sign in to Claude.
-                  Ask one to open this page; jobs wait until they do.
-                </p>
+          <Card>
+            <CardHeader>
+              <CardTitle>{phase === 'idle' ? 'Connection' : 'Connect Claude account'}</CardTitle>
+            </CardHeader>
+            <CardBody className="flex flex-col gap-4">
+              {phase === 'idle' && (
+                <>
+                  <StatusBadge tone={ready ? 'success' : 'warning'}>
+                    {view.retired ? 'Session ended' : ready ? 'Connected' : 'Connection required'}
+                  </StatusBadge>
+                  <p className="text-sm text-muted-foreground">
+                    Your dedicated connection lasts up to {(view.connectionPolicy?.maxSessionSeconds ?? 28800) / 3600}{' '}
+                    hours, including normal breaks. An environment with no work may close after{' '}
+                    {(view.connectionPolicy?.idleSeconds ?? 28800) >= 3600
+                      ? `${(view.connectionPolicy?.idleSeconds ?? 28800) / 3600} hours`
+                      : `${(view.connectionPolicy?.idleSeconds ?? 28800) / 60} minutes`}{' '}
+                    idle. Your API key stays saved. Enable subscription routing separately below.
+                  </p>
+                  {view.connectionPolicy && (
+                    <p className="text-sm text-muted-foreground">
+                      Up to {view.connectionPolicy.tenantLaunchesPerDay} new environments per UTC day, within a{' '}
+                      {view.connectionPolicy.tenantDailySeconds / 3600}-hour runtime budget. Unused runtime is released
+                      only after the environment has stopped.
+                    </p>
+                  )}
+                  {view.sessionExpiresAt && !view.retired && (
+                    <p className="text-sm text-muted-foreground">
+                      Current connection expires{' '}
+                      {new Date(view.sessionExpiresAt).toLocaleString(undefined, { timeZoneName: 'short' })}.
+                    </p>
+                  )}
+                  {ready && (
+                    <p>
+                      {view.enabled
+                        ? 'Subscription routing is enabled.'
+                        : 'Your account is connected but no workflows use it yet.'}
+                    </p>
+                  )}
+                  {!view.owner && <p>An installation owner can connect this account.</p>}
+                  {view.owner && !view.managed && view.browserLogin && !ready && phase === 'idle' && (
+                    <Button
+                      onClick={() => {
+                        flow.current = true;
+                        grantRequested.current = false;
+                        setPhase('preparing');
+                      }}
+                    >
+                      Sign in to Claude
+                    </Button>
+                  )}
+                  {view.configured && !view.browserLogin && !ready && (
+                    <p>
+                      The worker is offline or Claude is not signed in. An operator can sign in through the existing AWS
+                      shell route.
+                    </p>
+                  )}
+                  {view.owner && view.managed && !ready && phase === 'idle' && (
+                    <div>
+                      <Button disabled={Boolean(view.worker?.busy)} onClick={() => void connect()}>
+                        {view.upgrade
+                          ? 'Update and reconnect'
+                          : view.worker || view.startupFailed || view.retired
+                            ? 'Reconnect Claude'
+                            : 'Connect Claude account'}
+                      </Button>
+                    </div>
+                  )}
+                  {view.retired && (
+                    <p role="status">
+                      This connection has ended. Reconnect Claude when you are ready; opening this page does not start
+                      another environment.
+                    </p>
+                  )}
+                  {view.startupFailed && (
+                    <Alert variant="error">
+                      Your Claude environment did not become ready. Reconnect Claude to replace it safely.
+                    </Alert>
+                  )}
+                  {view.worker?.busy && !ready && (
+                    <p role="status">Wait for the current job to finish before reconnecting.</p>
+                  )}
+                </>
               )}
-              {view.owner && upgrade.state === 'required' && (
-                <div className="flex flex-col gap-1">
+              {phase !== 'idle' && (
+                <section
+                  tabIndex={-1}
+                  ref={(node) => {
+                    if (node && !node.contains(document.activeElement)) node.focus();
+                  }}
+                  aria-label="Connect Claude account"
+                  className="flex flex-col gap-4"
+                >
+                  <ProgressIndicator
+                    aria-label="Connection progress"
+                    steps={['Preparing your environment', 'Sign in to Claude', 'Verifying connection', 'Connected'].map(
+                      (label, i) => ({
+                        id: String(i),
+                        label,
+                        status:
+                          i < ['preparing', 'signin', 'verifying'].indexOf(phase)
+                            ? 'completed'
+                            : i === ['preparing', 'signin', 'verifying'].indexOf(phase)
+                              ? 'in-progress'
+                              : 'pending',
+                      }),
+                    )}
+                  />
+                  <p role="status">
+                    {phase === 'preparing'
+                      ? 'Preparing your environment…'
+                      : phase === 'verifying'
+                        ? 'Verifying your connection with your environment…'
+                        : 'Continue below to sign in.'}
+                  </p>
+                  {loginPage && (
+                    <iframe
+                      ref={frame}
+                      title="Private Claude sign-in"
+                      style={{ height: frameHeight }}
+                      className="w-full rounded-lg border border-border"
+                      sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+                      srcDoc={loginPage}
+                    />
+                  )}
                   <div>
-                    <Button type="button" onClick={() => void restartWorker()} loading={restarting} disabled={restarting || Boolean(view.worker?.busy)}>
-                      Restart worker
+                    <Button
+                      variant="ghost"
+                      onClick={() => {
+                        revision.current++;
+                        canceled.current = true;
+                        mutationPending.current = false;
+                        flow.current = false;
+                        setLoginPage(undefined);
+                        setPhase('idle');
+                      }}
+                    >
+                      Cancel sign-in
                     </Button>
                   </div>
-                  {view.worker?.busy && <p className="text-sm">A subscription job is running on the old worker. Restart it once that job finishes.</p>}
-                </div>
+                </section>
               )}
-              {upgrade.state === 'stopping' && <p role="status" className="text-sm font-medium">Stopping the old worker… this page updates by itself.</p>}
-              {view.owner && upgrade.state === 'stopped' && (startId ? (
-                <div>
-                  <Button type="button" onClick={() => void startWorker(startId)} loading={startingWorker} disabled={startingWorker}>
-                    Start new worker and sign in
-                  </Button>
-                </div>
-              ) : (
-                <p className="text-sm">
-                  <strong>The old worker is stopped.</strong> No GitHub job is waiting, so the new worker starts with your next job:
-                  apply a subscription label to an issue (remove it first if it is already there). Updraft posts a sign-in link on the issue that brings you back here.
+              {request && (
+                <p>
+                  {request.status === 'waiting'
+                    ? 'Your GitHub job will resume automatically when eligible.'
+                    : request.reason}
                 </p>
-              ))}
-            </Alert>
-          )}
-          <Card>
-            <CardHeader><CardTitle>Execution mode</CardTitle></CardHeader>
-            <CardBody>
-              <div className="flex flex-col gap-4">
-                <section className="rounded-lg border border-border p-4">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <strong>Anthropic API key</strong>
-                    {!view.enabled && <StatusBadge tone="success">Selected</StatusBadge>}
-                  </div>
-                  <p className="my-2 text-sm text-muted-foreground">Keep using the API key saved under Agent keys. Existing Cloud jobs work as before.</p>
-                  <Button type="button" variant="secondary" disabled={busy || !view.enabled || Boolean(view.worker?.busy)} onClick={() => void choose(false)}>
-                    Use API key
-                  </Button>
-                </section>
-                <section className="rounded-lg border border-border p-4">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <strong>Claude Code subscription</strong>
-                    {view.enabled && <StatusBadge tone="success">Selected</StatusBadge>}
-                    {view.worker && <StatusBadge tone={ready ? 'success' : 'warning'}>{view.worker.status}</StatusBadge>}
-                  </div>
-                  <p className="my-2 text-sm text-muted-foreground">
-                    Run the official Claude CLI signed into your subscription on a dedicated worker.
-                    Choose published workflow triggers below. Other workflows keep their existing execution mode.
-                  </p>
-                  <Button type="button" disabled={busy || view.enabled || !view.configured || (!view.managed && !ready) || (view.triggers !== undefined && selection.length === 0) || Boolean(view.worker?.busy)} onClick={() => void choose(true, draft ?? undefined)}>
-                    Use subscription
-                  </Button>
-                </section>
-                {workerExpiresAt && <p className="text-sm text-muted-foreground">Worker session expires {new Date(workerExpiresAt).toLocaleString()}.</p>}
-                {error && <Alert variant="error">{error}</Alert>}
-                <div>
-                  <Button type="button" variant="ghost" disabled={busy} onClick={() => void refresh()}>Refresh worker status</Button>
-                </div>
-              </div>
+              )}
+              {request?.status === 'started' && request.jobId && (
+                <Link className="auth-link" to={`/installations/${installationId}/jobs/${request.jobId}`}>
+                  View resumed job
+                </Link>
+              )}
             </CardBody>
           </Card>
-          {view.configured && view.availableTriggers !== undefined && (
-            <Card>
-              <CardHeader><CardTitle>Workflow triggers</CardTitle></CardHeader>
-              <CardBody className="flex flex-col gap-3">
-                <p className="text-sm text-muted-foreground">Select the repository and label combinations that use this worker. Existing subscription pull requests keep their execution mode.</p>
-                {options.size === 0 && <p className="text-sm">Publish a workflow that uses Claude in <Link className="auth-link" to={`/installations/${installationId}/config`}>Configuration</Link> to add a trigger here.</p>}
-                {[...options].map(([key, trigger]) => {
-                  const checked = selection.some((item) => triggerKey(item) === key);
-                  return (
-                    <label key={key} className="flex items-baseline gap-2 text-sm">
-                      <input type="checkbox" checked={checked} disabled={busy || Boolean(view.worker?.busy) || (!available.has(key) && !checked)} onChange={(event) => {
-                        setDraft(event.target.checked ? [...selection, trigger] : selection.filter((item) => triggerKey(item) !== key));
-                      }} />
-                      <span>{trigger.repository} · {trigger.label}{!available.has(key) && ' (no longer published)'}</span>
-                    </label>
-                  );
-                })}
-                <div>
-                  <Button type="button" variant="secondary" disabled={busy || !draft || Boolean(view.worker?.busy) || (view.enabled && ((!view.managed && !ready) || selection.length === 0))} onClick={() => void choose(view.enabled, selection)}>
-                    Save workflow triggers
-                  </Button>
-                </div>
-              </CardBody>
-            </Card>
-          )}
-          {!view.configured && (
-            <Alert variant="info">
-              Claude subscription is unavailable in this deployment. An Updraft operator needs to enable the worker image before you can select triggers.
-              <a className="auth-link ml-1" href="https://github.com/allenheltondev/software-factory-cli/blob/main/deploy/aws-microvm/native-worker/CLOUD.md" target="_blank" rel="noreferrer">Worker setup guide ↗</a>
-            </Alert>
-          )}
-          {view.configured && !ready && !view.browserLogin && (
-            <Alert variant="info">
-              The worker is offline or Claude is not signed in. Connect through the AWS-managed shell and sign in with the official CLI.
-              Your API key is still saved.
-            </Alert>
-          )}
-          {view.browserLogin && !ready && !upgrade && (
-            <Card>
-              <CardHeader><CardTitle>Sign in to Claude</CardTitle></CardHeader>
-              <CardBody className="flex flex-col gap-3">
-                {waitingForWorker ? <p role="status">Waiting for the worker to report its sign-in…</p> : loginPage ? (
-                  <>
-                    <iframe ref={frame} title="Private Claude sign-in" className="h-56 w-full rounded-md border border-border"
-                      sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" srcDoc={loginPage} />
-                    <div><Button variant="ghost" onClick={() => setLoginPage(null)}>Close sign-in</Button></div>
-                  </>
-                ) : (
-                  <>
-                    <p className="text-sm">Sign in with Claude in your browser, then return here to finish.</p>
-                    {view.managed && startId && !view.worker?.online && (
-                      <div><Button onClick={() => void startWorker(startId)} loading={startingWorker} disabled={startingWorker}>Start worker and sign in</Button></div>
+          {phase === 'idle' && (
+            <>
+              <Card>
+                <CardHeader>
+                  <CardTitle>Execution mode</CardTitle>
+                </CardHeader>
+                <CardBody>
+                  <div className="flex flex-col gap-4">
+                    <section className="rounded-lg border border-border p-4">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <strong>Anthropic API key</strong>
+                        {!view.enabled && <StatusBadge tone="success">Selected</StatusBadge>}
+                      </div>
+                      <p className="my-2 text-sm text-muted-foreground">
+                        Keep using the API key saved under Agent keys. Existing Cloud jobs work as before.
+                      </p>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        disabled={!view.owner || busy || !view.enabled || Boolean(view.worker?.busy)}
+                        onClick={() => void choose(false)}
+                      >
+                        Use API key
+                      </Button>
+                    </section>
+                    <section className="rounded-lg border border-border p-4">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <strong>Claude Code subscription</strong>
+                        {view.enabled && <StatusBadge tone="success">Selected</StatusBadge>}
+                      </div>
+                      <p className="my-2 text-sm text-muted-foreground">
+                        Run the official Claude CLI signed into your subscription on a dedicated worker. Choose
+                        published workflow triggers below. Other workflows keep their existing execution mode.
+                      </p>
+                      <Button
+                        type="button"
+                        disabled={
+                          !view.owner ||
+                          busy ||
+                          view.enabled ||
+                          !view.configured ||
+                          (!view.managed && !ready) ||
+                          (view.triggers !== undefined && selection.length === 0) ||
+                          Boolean(view.worker?.busy)
+                        }
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              'Use your Claude subscription for the selected workflows? Other workflows keep their existing billing.',
+                            )
+                          )
+                            void choose(true, draft ?? undefined);
+                        }}
+                      >
+                        Use subscription
+                      </Button>
+                    </section>
+                  </div>
+                </CardBody>
+              </Card>
+              {view.configured && view.availableTriggers !== undefined && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Workflow triggers</CardTitle>
+                  </CardHeader>
+                  <CardBody className="flex flex-col gap-3">
+                    <p className="text-sm text-muted-foreground">
+                      Select the repository and label combinations that use this worker. Existing subscription pull
+                      requests keep their execution mode.
+                    </p>
+                    {options.size === 0 && (
+                      <p className="text-sm">
+                        Publish a workflow that uses Claude in{' '}
+                        <Link className="auth-link" to={`/installations/${installationId}/config`}>
+                          Configuration
+                        </Link>{' '}
+                        to add a trigger here.
+                      </p>
                     )}
-                    <div><Button onClick={() => void openLogin()} loading={openingLogin}
-                      disabled={openingLogin || !view.worker?.online || !['auth-required', 'expired'].includes(view.worker.status)}>
-                      Sign in to Claude
-                    </Button></div>
-                  </>
-                )}
-              </CardBody>
-            </Card>
+                    {[...options].map(([key, trigger]) => {
+                      const checked = selection.some((item) => triggerKey(item) === key);
+                      return (
+                        <label key={key} className="flex items-baseline gap-2 text-sm">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={
+                              !view.owner || busy || Boolean(view.worker?.busy) || (!available.has(key) && !checked)
+                            }
+                            onChange={(event) => {
+                              setDraft(
+                                event.target.checked
+                                  ? [...selection, trigger]
+                                  : selection.filter((item) => triggerKey(item) !== key),
+                              );
+                            }}
+                          />
+                          <span>
+                            {trigger.repository} · {trigger.label}
+                            {!available.has(key) && ' (no longer published)'}
+                          </span>
+                        </label>
+                      );
+                    })}
+                    <div>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        disabled={
+                          !view.owner ||
+                          busy ||
+                          !draft ||
+                          Boolean(view.worker?.busy) ||
+                          (view.enabled && ((!view.managed && !ready) || selection.length === 0))
+                        }
+                        onClick={() => void choose(view.enabled, selection)}
+                      >
+                        Save workflow triggers
+                      </Button>
+                    </div>
+                  </CardBody>
+                </Card>
+              )}
+              {!view.configured && (
+                <Alert variant="info">
+                  Claude subscription is unavailable in this deployment. An Updraft operator needs to enable the worker
+                  image before you can select triggers.
+                  <a
+                    className="auth-link ml-1"
+                    href="https://github.com/allenheltondev/software-factory-cli/blob/main/deploy/aws-microvm/native-worker/CLOUD.md"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Worker setup guide ↗
+                  </a>
+                </Alert>
+              )}
+            </>
           )}
-          {view.configured && !view.browserLogin && (
-            <Card>
-              <CardHeader><CardTitle>One-time subscription sign-in</CardTitle></CardHeader>
-              <CardBody>
-                <p className="text-sm">Run this inside a direct AWS shell session on your native worker. Authentication stays in Claude's own private directory.</p>
-                <pre className="mt-3 overflow-x-auto rounded-lg border border-border p-3 text-xs"><code>{LOGIN}</code></pre>
-                <a className="auth-link mt-2 inline-block" href="https://github.com/allenheltondev/software-factory-cli/blob/main/deploy/aws-microvm/native-worker/README.md" target="_blank" rel="noreferrer">Full worker and shell instructions ↗</a>
-              </CardBody>
-            </Card>
-          )}
-          <p className="text-sm text-muted-foreground">
-            Mode changes affect new GitHub jobs. Retrying an earlier job keeps its original execution mode. To test subscription routing, apply a selected start label to a new issue after enabling the subscription.
-            The AWS subscription worker has not yet passed its complete live acceptance test.
-          </p>
         </>
       )}
     </div>

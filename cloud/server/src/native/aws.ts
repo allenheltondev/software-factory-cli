@@ -7,10 +7,10 @@ import { nativeRoute, type NativeRoute } from './route.js';
 import { createNativeModeStore, createNativeStore } from './store.js';
 
 /** Resolves the legacy pinned route or the current managed session for an installation. */
-export function nativeAws(store: Store, disabled: () => Promise<boolean> = async () => false) {
+export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
   const e = process.env;
   const pinned = nativeRoute(e.NATIVE_WORKER_ROUTE);
-  const managed = managedClaude(e);
+  const managed = managedClaude(e, disabled ? { disabled } : {});
   const mode = createNativeModeStore(e.TABLE_NAME ?? '');
   const workers = createNativeStore(e.TABLE_NAME ?? '');
   const secrets = new SecretsManagerClient({});
@@ -23,7 +23,7 @@ export function nativeAws(store: Store, disabled: () => Promise<boolean> = async
     if (!value || value.length < 32 || value.length > 256) throw new Error('invalid worker control credential');
     return value;
   };
-  const makeControl = (route?: NativeRoute) => createNativeControl({ store, workers, route, secret: () => secret(route), disabled,
+  const makeControl = (route?: NativeRoute) => createNativeControl({ store, workers, route, secret: () => secret(route), disabled: disabled ?? (() => managed?.disabled() ?? Promise.resolve(false)),
     enabled: async () => !!route && mode.enabled(route.installationId, route.workerId),
     settings: { region: e.AWS_REGION ?? '', bucket: e.TENANT_BUCKET ?? '', imageArn: '', executionRoleArn: '', ingressConnectorArn: '', egressConnectorArn: '', logGroup: '',
       brokerFunctionName: e.BROKER_FUNCTION_NAME ?? e.AWS_LAMBDA_FUNCTION_NAME ?? '', maximumDurationSeconds: Number(e.MAX_DURATION_SECONDS ?? 10800), watchdogReserveSeconds: Number(e.WATCHDOG_RESERVE_SECONDS ?? 600) },

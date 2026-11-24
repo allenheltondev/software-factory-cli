@@ -67,7 +67,7 @@ export function createNativeControl(d: NativeControlDeps) {
     // Retain the durable marker through partial failures. Completion retries and
     // reconciliation can repeat releaseJob safely, then make the worker available.
     await d.store.releaseJob(job, unusedTime(job, now()));
-    const next = { ...w, version: w.version + 1 };
+    const next = { ...w, version: w.version + 1, lastWorkAt: now() };
     delete next.settling;
     return d.workers.put(next, w.version);
   }
@@ -163,7 +163,7 @@ export function createNativeControl(d: NativeControlDeps) {
           job.imageVersion !== r.imageVersion || job.native.generation !== r.generation) continue;
       const token = nativeJobToken(secret, job.jobId);
       if (hashToken(token) !== job.tokenHash) return refused; // rotated control key: drain before rotation
-      if (!await save(w, { active: { jobId: id, until: Math.min(job.expiresAt, now() + WORKER_LEASE_MS) } })) return refused;
+      if (!await save(w, { lastWorkAt: now(), active: { jobId: id, until: Math.min(job.expiresAt, now() + WORKER_LEASE_MS) } })) return refused;
       // Assignment is durable before it is handed out. A lost response fences this VM on expiry;
       // it never hands the task out a second time or falls back to BYOK.
       await d.store.attachMicrovm(id, r.microvmId);
