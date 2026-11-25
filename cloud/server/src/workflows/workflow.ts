@@ -167,6 +167,15 @@ const clearWait = (w: Workflow): Workflow => {
   return rest as Workflow;
 };
 
+/**
+ * Labeled again once it had ended: a new run, not a retry. A job parked before it started (a
+ * Claude sign-in or reconnect wait) began its run when it was parked, so its start is not a new one.
+ */
+function isNewRun(w: Workflow, job: Pick<Job, 'eventName'> & { jobId?: string; deliveryId?: string }): boolean {
+  return ISSUE_EVENTS.has(job.eventName) && !(job.deliveryId !== undefined && isRetryDelivery({ deliveryId: job.deliveryId })) &&
+    (w.status === 'finished' || w.status === 'blocked') && w.lastJobId !== undefined && (job.jobId === undefined || w.lastJobId !== job.jobId);
+}
+
 function newRun(w: Workflow): Workflow {
   const { pullRequest, prUrl: _u, ...rest } = w;
   return {
@@ -178,8 +187,7 @@ function newRun(w: Workflow): Workflow {
 /** A job of the workflow was launched. */
 export function onJobStarted(w: Workflow, job: Pick<Job, 'jobId' | 'eventName' | 'deliveryId' | 'pullRequest'> & Partial<Pick<Job, 'expiresAt' | 'native' | 'createdAt'>>, at: number): { workflow: Workflow; event: WorkflowEvent } {
   const retry = isRetryDelivery(job);
-  // Labeled again once it had ended: a new generation, not a retry.
-  const again = ISSUE_EVENTS.has(job.eventName) && !retry && (w.status === 'finished' || w.status === 'blocked') && w.lastJobId !== undefined;
+  const again = isNewRun(w, job);
   // A job on an earlier run's pull request (an event on it after the issue was labeled again):
   // history of that run, which changes nothing about the current one.
   const pastRun = again ? undefined : pastRunOf(w, job.pullRequest);
@@ -344,12 +352,17 @@ function usageOf(u: { inputTokens?: number; outputTokens?: number; costUsd?: num
 /** A job is waiting for something only a person can give (a Claude sign-in): the workflow waits, and blocks after SIGN_IN_LIMIT_MS. */
 export function onJobWaiting(
   w: Workflow,
-  job: { jobId?: string; eventName: string },
+  job: { jobId?: string; eventName: string; deliveryId?: string },
   why: { reason: string; message: string; nextAction: string },
   at: number,
 ): { workflow: Workflow; event: WorkflowEvent } {
+  // A new label parked for a sign-in starts its run now: the job that starts later continues it.
+  const again = isNewRun(w, job);
+  const generation = again ? w.generation + 1 : w.generation;
+  const base = again ? newRun(w) : w;
   const workflow: Workflow = {
-    ...clearWait(w),
+    ...clearWait(base),
+    generation,
     status: 'waiting',
     stage: 'awaiting-sign-in',
     reason: why.reason,
@@ -357,11 +370,11 @@ export function onJobWaiting(
     nextAction: why.nextAction,
     waitingSince: iso(at),
     nextCheckAt: iso(at + SIGN_IN_LIMIT_MS),
-    ...(job.jobId ? { lastJobId: job.jobId, lastJobAt: iso(at), jobRuns: withJobRun(w, job.jobId, w.generation) } : {}),
+    ...(job.jobId ? { lastJobId: job.jobId, lastJobAt: iso(at), jobRuns: withJobRun(w, job.jobId, generation) } : {}),
     updatedAt: iso(at),
   };
   return {
     workflow,
-    event: { id: `${job.jobId ?? 'pending'}:waiting:${why.reason}`, at: iso(at), kind: 'waiting', generation: w.generation, ...(job.jobId ? { jobId: job.jobId } : {}), eventName: job.eventName, stage: 'awaiting-sign-in', message: why.message },
+    event: { id: `${job.jobId ?? `pending-${job.deliveryId ?? 'unknown'}`}:waiting:${why.reason}`, at: iso(at), kind: 'waiting', generation, ...(job.jobId ? { jobId: job.jobId } : {}), eventName: job.eventName, stage: 'awaiting-sign-in', message: why.message },
   };
 }

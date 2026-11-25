@@ -232,4 +232,29 @@ describe('workflows', () => {
       expect(history.map((e) => [e.kind, e.generation])).toEqual([['job_started', 1], ['job_finished', 1]]);
     });
   });
+
+  it('a relabel parked for a Claude reconnect starts its run then, and the resumed job continues it', async () => {
+    for (const expireFirst of [false, true]) {
+      const s = setup();
+      await s.recorder.started(job());
+      await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'merged', merged: true } });
+      const parked = { installationId: 55, repository: 'acme/web', repositoryId: 99, issue: 7, eventName: 'issues', deliveryId: 'd-9', jobId: 'job_parked01' };
+      await s.recorder.waiting(parked, { reason: 'reconnect_required', message: 'waits', nextAction: 'reconnect' });
+      const waiting = await s.wf();
+      expect(waiting).toMatchObject({ generation: 2, status: 'waiting', stage: 'awaiting-sign-in', pastPullRequests: [{ number: 12, generation: 1 }] });
+      expect(waiting!.pullRequest).toBeUndefined();
+      // The wait may have expired (blocked) before someone reconnected: still the same run.
+      if (expireFirst) await updateWorkflow(s.store, 55, '99-i7', (w) => ({ workflow: { ...w!, status: 'blocked', reason: 'sign_in_expired' } }));
+      await s.recorder.started(job({ jobId: 'job_parked01', deliveryId: 'd-9' }));
+      expect(await s.wf()).toMatchObject({ generation: 2, status: 'active', lastJobId: 'job_parked01' });
+      await s.recorder.finished(job({ jobId: 'job_parked01', deliveryId: 'd-9' }), 'succeeded', { prNumber: 20, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } });
+      expect(await s.wf()).toMatchObject({ generation: 2, pullRequest: 20, stage: 'waiting-for-ci' });
+      // A late event on the old pull request is run 1's history.
+      const old = job({ jobId: 'job_oldpr001', issue: undefined, pullRequest: 12, eventName: 'pull_request', deliveryId: 'd-10' });
+      await s.recorder.started(old);
+      await s.recorder.finished(old, 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'closed' } });
+      expect(await s.wf()).toMatchObject({ generation: 2, pullRequest: 20, status: 'waiting', stage: 'waiting-for-ci' });
+      expect((await s.events()).filter((e) => e.jobId === 'job_parked01').map((e) => e.generation)).toEqual([2, 2, 2]);
+    }
+  });
 });
