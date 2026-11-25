@@ -4,6 +4,7 @@ import { runHookPayload, type LaunchSettings } from '../jobs/launch.js';
 import { isTerminated, unusedTime } from '../jobs/quotas.js';
 import { workflowIsPaused } from '../jobs/stop.js';
 import type { Job, Store } from '../store/store.js';
+import { effectiveRegistryHosts } from './registries.js';
 import { nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from './route.js';
 import type { AuthState, NativeStore, Worker } from './store.js';
 
@@ -252,11 +253,19 @@ export function createNativeControl(d: NativeControlDeps) {
           job.imageVersion !== r.imageVersion || job.native.generation !== r.generation) continue;
       const token = nativeJobToken(secret, job.jobId);
       if (hashToken(token) !== job.tokenHash) return refused; // rotated control key: drain before rotation
+      // The installation's registry hosts (#157), read before the assignment commits so a failed
+      // read hands nothing out. Snapshotted for this job: a later change applies from the next one.
+      // Bound to this job and to the route's installation, never another's. A stored value that no
+      // longer validates gives no hosts (the image's only) and says so; the worker checks again.
+      const policy = await d.store.getRegistryPolicy(r.installationId);
+      const registries = effectiveRegistryHosts(policy);
+      if (registries.problem) log({ nativeWorker: 'egress', installationId: r.installationId, jobId: id, reason: registries.problem });
+      const egress = { jobId: id, hosts: registries.hosts, version: policy?.version ?? 0, ...(registries.problem ? { problem: registries.problem } : {}) };
       // Lost to another poll: read again, and the winner's assignment refuses this poll.
       if (!await d.workers.assign(job, w, now(), Math.min(job.expiresAt, now() + WORKER_LEASE_MS))) return RETRY;
       // Assignment is durable before it is handed out. A lost response fences this VM on expiry;
       // it never hands the task out a second time or falls back to BYOK.
-      return { ok: true, busy: true, request: { microvmId: r.microvmId, payload: runHookPayload(d.settings, {
+      return { ok: true, busy: true, egress, request: { microvmId: r.microvmId, payload: runHookPayload(d.settings, {
         jobId: id, token, deliveryId: job.deliveryId, launchedAt: Date.parse(job.createdAt), eventName: job.eventName,
         notBefore: job.native.notBefore, retry: job.native.retry }) } };
     }

@@ -2028,6 +2028,55 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
+    async getRegistryPolicy(id) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: 'EGRESS' }, ConsistentRead: true }));
+      if (!out.Item) return null;
+      const i = out.Item;
+      // As stored. A value that is not a list becomes one entry that can never validate, so it
+      // fails closed (no hosts, the reason logged) instead of reading as an empty or a valid list.
+      return {
+        hosts: Array.isArray(i.hosts) ? (i.hosts as unknown[]) : [null],
+        updatedAt: typeof i.updatedAt === 'string' ? i.updatedAt : '',
+        updatedBy: typeof i.updatedBy === 'string' ? i.updatedBy : '',
+        version: Number(i.version ?? 0),
+      };
+    },
+
+    async putRegistryPolicy(id, policy, expected) {
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                ConditionCheck: {
+                  TableName: T,
+                  Key: tenantKey(id),
+                  ConditionExpression: 'attribute_exists(pk) AND (attribute_not_exists(disabledReason) OR disabledReason <> :uninstalled)',
+                  ExpressionAttributeValues: { ':uninstalled': 'uninstalled' },
+                },
+              },
+              {
+                Put: {
+                  TableName: T,
+                  Item: { pk: `TENANT#${id}`, sk: 'EGRESS', hosts: policy.hosts, updatedAt: policy.updatedAt, updatedBy: policy.updatedBy, version: expected + 1 },
+                  ConditionExpression: expected === 0 ? 'attribute_not_exists(pk) OR attribute_not_exists(version)' : 'version = :v',
+                  ...(expected === 0 ? {} : { ExpressionAttributeValues: { ':v': expected } }),
+                },
+              },
+            ],
+          }),
+        );
+        return 'stored';
+      } catch (err) {
+        if (err instanceof TransactionCanceledException) {
+          const [tenant, row] = err.CancellationReasons ?? [];
+          if (tenant?.Code === 'ConditionalCheckFailed') return 'uninstalled';
+          if (row?.Code === 'ConditionalCheckFailed') return 'conflict';
+        }
+        throw err;
+      }
+    },
+
     async recordTelemetryExport(id, result) {
       await tryUpdate({
         TableName: T,

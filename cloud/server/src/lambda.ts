@@ -25,6 +25,7 @@ import { browserLoginGrant } from './native/browser-login.js';
 import { nativeRoute } from './native/route.js';
 import { createNativeModeStore, createNativeStore } from './native/store.js';
 import { createNativeSettingsService } from './native/settings.js';
+import { createRegistryPolicyService } from './native/registries.js';
 import { createAgentKeyService } from './tenants/agent-key-service.js';
 import { createSecretsManagerPort } from './tenants/secrets-manager.js';
 import { checkAgentKeyWithProvider } from './tenants/key-check.js';
@@ -155,6 +156,7 @@ const app = createApp({
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         // Insights: the tenant's shared state database, read only (tenants/*/state/state.db).
         telemetry: createTelemetryService({ store, github, secrets: createSecretsManagerPort(), check: checkHoneycombKey() }),
+        registries: createRegistryPolicyService({ store, github }),
         stats: createStatsService({ github, store, ...(bucket ? { readState: createS3StateReader(s3, bucket) } : {}), cacheDir: '/tmp/updraft-state' }),
         admin: {
           access: adminAccess(process.env.ADMIN_GROUP ?? DEFAULT_ADMIN_GROUP),
