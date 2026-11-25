@@ -13,6 +13,8 @@ import { createGitHubFlows } from './flows/github.js';
 import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
 import type { RetryRequest, RetryResult } from './jobs/retry.js';
+import { awsJobStopper } from './jobs/stop-aws.js';
+import { nativeAws } from './native/aws.js';
 import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { managedClaude } from './native/managed.js';
@@ -75,9 +77,9 @@ const readLog = createS3LogReader(s3, bucket);
 // one invokes it directly, and only for a job it has already checked the caller may retry.
 const retryFunction = process.env.WEBHOOK_FUNCTION_NAME ?? '';
 const lambda = retryFunction ? new LambdaClient({}) : undefined;
-const requestRetry = async (installationId: number, jobId: string): Promise<RetryResult> => {
+const requestRetry = async (installationId: number, jobId: string, by?: string): Promise<RetryResult> => {
   const out = await lambda!.send(
-    new InvokeCommand({ FunctionName: retryFunction, InvocationType: 'RequestResponse', Payload: Buffer.from(JSON.stringify({ updraftRetry: { installationId, jobId } } satisfies RetryRequest)) }),
+    new InvokeCommand({ FunctionName: retryFunction, InvocationType: 'RequestResponse', Payload: Buffer.from(JSON.stringify({ updraftRetry: { installationId, jobId, ...(by ? { by } : {}) } } satisfies RetryRequest)) }),
   );
   // A function error (a crash, a timeout) carries no result: not a retry that started.
   if (out.FunctionError || !out.Payload) return { ok: false, status: 502, code: 'retry_failed', message: 'The job could not be started; try again' };
@@ -138,6 +140,7 @@ const app = createApp({
           mode: createNativeModeStore(tableName), workers: createNativeStore(tableName) }),
         status: createStatusService({
           store,
+          requestStop: awsJobStopper(store, nativeAws(store).control).request,
           github,
           agentKeys: agentKeyService,
           resultRetentionDays: Math.max(1, Number(process.env.RESULT_RETENTION_DAYS ?? 30) || 30),

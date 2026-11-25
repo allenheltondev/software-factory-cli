@@ -1,4 +1,5 @@
 import { waitingId } from '../native/sessions.js';
+import { workflowIsPaused } from './stop.js';
 import type { NativeMode } from '../native/store.js';
 import { randomBytes } from 'node:crypto';
 import { legacyNativeTriggers, sameNativeRepository, sameNativeTrigger, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
@@ -115,6 +116,7 @@ export interface NativeLaunch {
 }
 
 export interface LaunchDeps {
+  stopJob?: (job: Job) => Promise<unknown>;
   benchmarkInstallationId?: number;
   native?: NativeLaunch;
   resolveNative?(installationId: number): Promise<NativeLaunch | undefined>;
@@ -155,7 +157,7 @@ export interface LaunchRequest {
   body: string;
   /** A retry from the console (jobs/retry.ts): the job requeues the event's failed jobs in the shared state before it runs. */
   retry?: boolean;
-  retryRuntime?: { workerId?: string };
+  retryRuntime?: { workerId?: string; resumeOf?: string };
   resumeClaude?: boolean;
   /**
    * The id the job is to have (newJobId), for a caller that must record it before the launch, to
@@ -250,6 +252,7 @@ export function createLauncher(deps: LaunchDeps) {
     const mode = await binding?.mode?.();
     const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
     let workerId = req.retryRuntime?.workerId;
+    let workflowIssue: number | undefined;
     if (isIssue) {
       const d = decideDispatch(config?.dispatch, {
         repositoryFullName: req.payload.repository?.full_name,
@@ -301,6 +304,7 @@ export function createLauncher(deps: LaunchDeps) {
           return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this pull request runtime' });
         }
         workerId = originJob?.native?.workerId ?? workerId;
+        workflowIssue = originJob?.workflowIssue ?? originJob?.issue;
         if (origin?.label) {
           label = origin.label;
           // Only under the version active now, which this job runs: a republish may have changed
@@ -321,6 +325,11 @@ export function createLauncher(deps: LaunchDeps) {
     }
     // The issue or pull request the job is for: refusals and over-quota comments name it.
     const number = (decision.issue ?? decision.pullRequest)!;
+    if (await workflowIsPaused(deps.store, { installationId: req.installationId, repositoryId: decision.repositoryId,
+      issue: decision.issue, pullRequest: decision.pullRequest, workflowIssue,
+      resumeOf: req.retry ? req.retryRuntime?.resumeOf : undefined })) return skip('not_dispatched', {
+      reason: 'workflow_paused', message: 'An owner stopped this workflow. Resume automation or explicitly retry the stopped job to continue.',
+    });
 
     const selected = isIssue && !req.retryRuntime && (mode?.triggers === undefined || decision.keys?.includes('ANTHROPIC_API_KEY')) && triggers.some((t) => sameNativeTrigger(t, decision));
     const candidate = binding && (selected || workerId === binding.route.workerId) ? binding : undefined;
@@ -459,6 +468,8 @@ export function createLauncher(deps: LaunchDeps) {
     const job: Job = {
       jobId,
       tokenHash: hashToken(token),
+      ...(req.retryRuntime?.resumeOf ? { resumeOf: req.retryRuntime.resumeOf } : {}),
+      ...(workflowIssue !== undefined ? { workflowIssue } : {}),
       installationId: req.installationId,
       repository: decision.repository,
       repositoryId: decision.repositoryId,
@@ -491,6 +502,10 @@ export function createLauncher(deps: LaunchDeps) {
       await deps.putEvent(paths.eventKey, req.body);
       await deps.store.putJob(job);
       recorded = true;
+      const latestPause = await deps.store.getWorkflowPause(req.installationId, decision.repositoryId, number);
+      if (latestPause && job.resumeOf !== latestPause.jobId) {
+        await deps.store.requestJobStop(job, { requestedAt: now(), by: latestPause.by, reason: 'Workflow was stopped during dispatch' }, [number]);
+      }
       // From here a microVM may exist: the reservation is no longer reclaimable as a launch that
       // never got this far.
       await deps.store.markLaunching(jobId);
@@ -510,12 +525,17 @@ export function createLauncher(deps: LaunchDeps) {
       if (native) return { status: 503, disposition: 'launch_failed', jobId, errorClass: errorClassOf(err) };
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: safeMessage(err) });
       await releaseClaims();
+      const stopping = recorded ? await deps.store.getJob(jobId).catch(() => null) : null;
+      // RunMicrovm may have accepted a request whose response was lost. A canceled attempt
+      // retains its capacity and fence until the VM is found or its maximum duration passes.
+      if (launching && stopping?.stop) return { status: 202, disposition: 'cancelled', jobId };
       await deps.store.cancelReservation(reservation, launching ? 'launching' : 'reserved').catch(() => {});
       // Nothing runs for this record; its token must not be served, and it needs no reconciling.
       let outcome: string | null = null;
       if (recorded) {
-        outcome = await deps.store.finishJob(jobId, 'launch_failed').catch(() => null);
+        outcome = await deps.store.finishJob(jobId, stopping?.stop ? 'canceled' : 'launch_failed').catch(() => null);
         await deps.store.releaseJob(job).catch(() => {});
+        if (stopping?.stop) await deps.store.recordJobStop(job, { confirmedAt: now() });
       }
       // Finished with another outcome before it could launch: an admin released it, on purpose.
       // Not an error to have GitHub show (and nothing to redeliver).
@@ -541,6 +561,8 @@ export function createLauncher(deps: LaunchDeps) {
       }
     }
 
+    const current = await deps.store.getJob(jobId);
+    if (current?.stop && deps.stopJob) await deps.stopJob(current);
     log({ delivery: req.deliveryId, installationId: req.installationId, jobId, microvmId, repository: job.repository, configVersion: job.configVersion, imageVersion, launched: true });
     return { status: 202, disposition: 'launched', jobId };
   };

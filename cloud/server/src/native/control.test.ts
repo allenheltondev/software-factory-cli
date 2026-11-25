@@ -163,6 +163,39 @@ describe('native worker Cloud dispatch', () => {
     expect(await control.handle(input('heartbeat'))).toMatchObject({ cancel: true });
     expect(row?.active?.until).toBe(active.until);
   });
+
+  it('cancels a queued job while preserving a different active assignment', async () => {
+    const active = await assigned();
+    const other = await launch(request('delivery-queued'));
+    const job = (await store.getJob(other.jobId!))!;
+    const stopped = (await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop queue' }, [12]))!;
+    expect(await control.stop(stopped)).toBe(true);
+    expect(row?.active?.jobId).toBe(active.jobId); expect(row?.fenced).toBeFalsy();
+    expect(terminateMicrovm).not.toHaveBeenCalled();
+  });
+
+  it('allows cooperative stop, then fences only the unresponsive assignment after its grace period', async () => {
+    const job = await assigned();
+    const stopped = (await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop' }, [12]))!;
+    expect(await control.stop(stopped)).toBe(false);
+    expect(await control.handle(input('heartbeat'))).toMatchObject({ cancel: true });
+    expect(terminateMicrovm).not.toHaveBeenCalled();
+    clock += WORKER_LEASE_MS + 1;
+    expect(await control.stop(stopped)).toBe(false);
+    expect(row?.fenced).toBe(true); expect(terminateMicrovm).toHaveBeenCalledWith(route.microvmId);
+    expect(await store.listActiveJobs()).toHaveLength(1);
+    state = 'TERMINATED'; expect(await control.stop(stopped)).toBe(true);
+    expect((await store.getJob(job.jobId))?.stop?.reconnectRequired).toBe(true);
+    expect((await store.getJob(job.jobId))?.outcome).toBe('canceled');
+  });
+  it('never terminates a replacement worker or an unrelated assignment from an old stop', async () => {
+    const job = await assigned();
+    const stopped = (await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop' }, [12]))!;
+    row = { ...row!, version: row!.version + 1, microvmId: 'replacement-vm', session: 'replacement-session', active: { jobId: 'job_other0001', until: clock + WORKER_LEASE_MS } };
+    clock += WORKER_LEASE_MS + 1;
+    await expect(control.stop(stopped)).rejects.toThrow('Cannot identify');
+    expect(terminateMicrovm).not.toHaveBeenCalled(); expect(row.fenced).toBeFalsy();
+  });
   it('expires queued jobs instead of reclaiming their reservation after five minutes', async () => {
     const job = await queued(); clock += 6 * 60_000;
     expect(await control.reconcile(job)).toBe(false);

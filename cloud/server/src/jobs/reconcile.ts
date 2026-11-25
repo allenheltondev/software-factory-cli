@@ -33,10 +33,12 @@ export function createReconciler({
   store,
   microvmState,
   native,
+  stop,
   now = Date.now,
   log = (entry) => console.log(JSON.stringify(entry)),
 }: {
   store: Store;
+  stop?: { advance(job: import('../store/store.js').Job): Promise<import('./stop.js').StopResult> };
   native?: { reconcile(job: import('../store/store.js').Job): Promise<boolean> };
   /** lambda:GetMicrovm: the state, or null when Lambda has no such microVM. */
   microvmState: (microvmId: string) => Promise<string | null>;
@@ -51,6 +53,13 @@ export function createReconciler({
       const { jobId } = entry;
       try {
         const nativeJob = await store.getJob(jobId);
+        if (nativeJob?.stop) {
+          if (!stop) throw new Error('job cancellation reconciliation is not configured');
+          const result = await stop.advance(nativeJob);
+          if (result.state === 'stopping') { held++; if (result.stop?.error) failed++; }
+          else released.push(jobId);
+          continue;
+        }
         if (nativeJob?.native) {
           if (!native) throw new Error('native worker reconciliation is not configured');
           if (await native.reconcile(nativeJob)) released.push(jobId); else held++;

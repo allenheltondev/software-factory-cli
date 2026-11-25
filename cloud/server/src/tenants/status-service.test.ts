@@ -39,7 +39,7 @@ const job = (over: Partial<Job> = {}): Job => ({
   ...over,
 });
 
-async function setup(opts: { installation?: GitHubInstallation | null | Error; logs?: Record<string, string>; retentionDays?: number; requestRetry?: StatusServiceDeps['requestRetry'] } = {}) {
+async function setup(opts: { installation?: GitHubInstallation | null | Error; logs?: Record<string, string>; retentionDays?: number; requestRetry?: StatusServiceDeps['requestRetry']; requestStop?: StatusServiceDeps['requestStop']; role?: 'owner' | 'editor' } = {}) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant(), { installationId: 55, sub: 'u1', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
   const gh = 'installation' in opts ? opts.installation : { id: 55, account: { id: 900, login: 'acme', type: 'Organization' }, suspendedAt: null, permissions: ALL };
@@ -52,7 +52,7 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
   const member = async (_c: Caller, id: number) => {
     if (id !== 55) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
     const t = (await store.getTenant(55))!;
-    return { tenant: t, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: t.status, role: 'owner' as const }, githubLogin: 'Pat' };
+    return { tenant: t, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: t.status, role: opts.role ?? 'owner' }, githubLogin: 'Pat' };
   };
   const clock = { now: Date.now() };
   const service = createStatusService({
@@ -77,6 +77,7 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
     agentKeys: { list: async () => ({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: false, required: false }], refusals: [] }) },
     readLog,
     ...(opts.requestRetry ? { requestRetry: opts.requestRetry } : {}),
+    ...(opts.requestStop ? { requestStop: opts.requestStop } : {}),
     log: () => {},
   });
   const app = createApp({ resolveCaller: () => caller, status: service, logError: () => {} });
@@ -84,14 +85,48 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
     const res = await app.request(`/api/v1/installations/${path}`);
     return { status: res.status, body: (await res.json()) as Record<string, unknown>, cache: res.headers.get('cache-control') };
   };
-  const post = async (path: string) => {
-    const res = await app.request(`/api/v1/installations/${path}`, { method: 'POST' });
+  const post = async (path: string, body?: unknown) => {
+    const res = await app.request(`/api/v1/installations/${path}`, { method: 'POST', ...(body !== undefined ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) });
     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
   };
   return { store, service, get, post, reads, clock };
 }
 
 describe('status and diagnostics (#71)', () => {
+  it('authenticates a job stop as an installation owner and never accepts VM identifiers', async () => {
+    const requestStop = vi.fn<NonNullable<StatusServiceDeps['requestStop']>>().mockResolvedValue({ jobId: 'job_status0001', state: 'stopping' });
+    const owner = await setup({ requestStop });
+    expect(await owner.post('55/jobs/job_status0001/stop', { reason: 'off course' })).toMatchObject({ status: 202, body: { state: 'stopping' } });
+    expect(requestStop).toHaveBeenCalledWith(55, 'job_status0001', 'Pat', 'off course'); requestStop.mockClear();
+    expect(await owner.post('55/jobs/job_status0001/stop', { microvmId: 'arbitrary' })).toMatchObject({ status: 400 });
+    expect(await owner.post('55/jobs/job_status0001/stop', { reason: 'x'.repeat(501) })).toMatchObject({ status: 400 });
+    expect(await owner.post('66/jobs/job_status0001/stop', {})).toMatchObject({ status: 403 });
+    const editor = await setup({ requestStop, role: 'editor' });
+    expect(await editor.post('55/jobs/job_status0001/stop', {})).toMatchObject({ status: 403 });
+    expect(requestStop).not.toHaveBeenCalled();
+  });
+
+  it('shows a pending stop even if the runner finished, and forbids early retry', async () => {
+    const { store, get, post } = await setup({ requestStop: async () => null, requestRetry: async () => ({ ok: true, jobId: 'child' }) });
+    const j = job(); await store.putJob(j);
+    await store.requestJobStop(j, { requestedAt: Date.now(), by: 'pat', reason: 'stop' }, [12]);
+    await store.finishJob(j.jobId, 'succeeded');
+    expect(await get(`55/jobs/${j.jobId}`)).toMatchObject({ body: { job: { result: 'running', canStop: true } } });
+    expect(await post(`55/jobs/${j.jobId}/retry`)).toMatchObject({ status: 409, body: { error: 'stop_pending' } });
+  });
+  it('allows only an owner to resume confirmed stopped automation without launching work', async () => {
+    const requestRetry = vi.fn(); const { store, post } = await setup({ requestRetry });
+    const j = job(); await store.putJob(j);
+    await store.requestJobStop(j, { requestedAt: Date.now(), by: 'Pat', reason: 'stop' }, [12]);
+    expect(await post(`55/jobs/${j.jobId}/resume`)).toMatchObject({ status: 409 });
+    await store.finishJob(j.jobId, 'canceled'); await store.recordJobStop(j, { confirmedAt: Date.now() });
+    expect(await post(`55/jobs/${j.jobId}/resume`)).toMatchObject({ status: 200, body: { resumed: true } });
+    expect(await store.getWorkflowPause(55, 9, 12)).toBeNull();
+    expect((await store.getJobSummary(55, j.jobId))?.stop?.resumedBy).toBe('Pat');
+    expect(requestRetry).not.toHaveBeenCalled();
+    const editor = await setup({ role: 'editor' });
+    expect(await editor.post(`55/jobs/${j.jobId}/resume`)).toMatchObject({ status: 403 });
+  });
   it('reports telemetry status unknown, not unconfigured, when the settings read fails', async () => {
     const { store, get } = await setup();
     await store.putJob(job({ jobId: 'job_tel00001', status: 'finished', outcome: 'succeeded' }));

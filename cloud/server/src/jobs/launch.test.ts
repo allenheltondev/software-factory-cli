@@ -84,6 +84,35 @@ describe('the launcher', () => {
     };
   });
 
+  it('stops a late-arriving VM and prevents label replay until an explicit retry', async () => {
+    const { createJobStopper } = await import('./stop.js');
+    const terminated: string[] = [];
+    const stop = createJobStopper({ store, terminateMicrovm: async (id) => { terminated.push(id); }, microvmState: async () => 'TERMINATED', now: () => NOW, log: () => {} });
+    deps.stopJob = stop.advance;
+    runMicrovm = async (input) => {
+      await stop.request(55, input.clientToken, 'pat', 'stop while launching');
+      expect(await store.listActiveJobs()).toHaveLength(1);
+      return { microvmId: 'late-vm' };
+    };
+    const out = await createLauncher(deps)(request());
+    expect((await store.getJob(out.jobId!))?.outcome).toBe('canceled');
+    expect(await store.listActiveJobs()).toHaveLength(0);
+    // Already terminated is also confirmation; the termination API need not be called again.
+    expect(terminated).toEqual([]);
+    expect(await createLauncher(deps)(request({}, 'new-label-event'))).toMatchObject({ disposition: 'not_dispatched', reason: 'workflow_paused' });
+  });
+
+  it('keeps canceled work fenced and holds capacity when RunMicrovm loses its response', async () => {
+    const { createJobStopper } = await import('./stop.js');
+    const stop = createJobStopper({ store, terminateMicrovm: async () => {}, microvmState: async () => 'RUNNING', now: () => NOW, log: () => {} });
+    runMicrovm = async (input) => { await stop.request(55, input.clientToken, 'pat', 'stop'); throw new Error('lost response'); };
+    const out = await createLauncher(deps)(request());
+    expect(out).toMatchObject({ disposition: 'cancelled' });
+    expect((await store.getJob(out.jobId!))?.status).toBe('launched');
+    expect(await store.listActiveJobs()).toHaveLength(1);
+    expect(await createLauncher(deps)(request())).toMatchObject({ reason: 'workflow_paused' });
+  });
+
   it('routes a console-selected Claude trigger without a stack repository and refuses offline fallback', async () => {
     const version = await store.createConfigVersion(55, { sha256: 'y', files: [], publishedBy: 's', publishedAt: '',
       dispatch: dispatchRules({ dispatch: { allowedActors: ['pat'] }, repositories: {

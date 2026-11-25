@@ -42,7 +42,8 @@ export type JobResult =
   | 'not_run'
   | 'other';
 
-export function jobResult(job: Pick<JobSummary, 'status' | 'outcome' | 'detail'>): JobResult {
+export function jobResult(job: Pick<JobSummary, 'status' | 'outcome' | 'detail' | 'stop'>): JobResult {
+  if (job.stop && job.stop.confirmedAt === undefined) return 'running';
   if (job.status !== 'finished' || job.outcome === undefined) return 'running';
   const d = job.detail ?? {};
   switch (job.outcome) {

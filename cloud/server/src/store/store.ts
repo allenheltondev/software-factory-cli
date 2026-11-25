@@ -131,6 +131,7 @@ export interface Usage {
 
 /** A job as the admin view lists it: what started it and how it ended. */
 export interface JobSummary {
+  stop?: JobStop;
   benchmark?: import('../benchmarks/config.js').BenchmarkIdentity;
   executionMode?: 'subscription' | 'standard';
   jobId: string;
@@ -329,6 +330,10 @@ export interface DispatchRefusal {
  * what this record pins: the tenant, the repository and the config version.
  */
 export interface Job {
+  stop?: JobStop;
+  /** Explicit console retry allowed through a pause owned by its stopped parent. */
+  resumeOf?: string;
+  workflowIssue?: number;
   benchmark?: import('../benchmarks/config.js').BenchmarkIdentity;
   benchmarkAgent?: string;
   benchmarkWorkflow?: string;
@@ -403,6 +408,24 @@ export type StartResult =
   | { result: 'throttled'; limit: QuotaLimit };
 
 export type MemberRole = 'owner' | 'editor';
+
+/** Server-owned cancellation intent; retained with the job and its summary. */
+export interface JobStop {
+  requestedAt: number;
+  by: string;
+  reason: string;
+  confirmedAt?: number;
+  error?: string;
+  reconnectRequired?: boolean;
+  resumedAt?: number;
+  resumedBy?: string;
+}
+
+export interface WorkflowPause {
+  jobId: string;
+  at: number;
+  by: string;
+}
 
 export interface Member {
   installationId: number;
@@ -636,6 +659,11 @@ export interface Store {
   releaseJob(job: Job, refund?: { month: string; seconds: number }): Promise<void>;
   /** Its microVM was asked to stop: the job is retired for serving and starting. Set once. */
   markStopping(jobId: string): Promise<void>;
+  /** Atomically fence this live attempt, audit its operator, and pause automatic dispatch. */
+  requestJobStop(job: Job, stop: JobStop, subjects: number[]): Promise<Job | null>;
+  recordJobStop(job: Job, progress: Pick<JobStop, 'confirmedAt' | 'error' | 'reconnectRequired'>): Promise<void>;
+  getWorkflowPause(installationId: number, repositoryId: number, subject: number): Promise<WorkflowPause | null>;
+  resumeStoppedWorkflow(job: Job, subjects: number[], by: string, at: number): Promise<boolean>;
   /**
    * Holds the job's slots (its own, or free) until `until` (epoch ms), each on its own and only
    * while the job is not released (nothing to hold then): a running microVM keeps its capacity
@@ -730,6 +758,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const refusals: { id: number; r: DispatchRefusal }[] = [];
   const deliveries2: { id: number; d: DeliveryRecord }[] = [];
   const jobs = new Map<string, Job>();
+  const pauses = new Map<string, WorkflowPause>();
   /** `<installationId>/<deliveryId>` -> expiry (epoch ms) and the job holding the claim. */
   const deliveries = new Map<string, { expiresAt: number; jobId: string }>();
   /** `<installationId>/<n>` or `platform/<n>` -> the job holding the slot, and until when (epoch ms). */
@@ -954,6 +983,40 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const current = jobs.get(jobId);
       if (current && current.stopRequestedAt === undefined) jobs.set(jobId, { ...current, stopRequestedAt: Date.now() });
     },
+    async requestJobStop(job, stop, subjects) {
+      const current = jobs.get(job.jobId);
+      if (!current || current.installationId !== job.installationId) return null;
+      if (current.status === 'finished' || current.stop) return { ...current };
+      const next = { ...current, stopRequestedAt: current.stopRequestedAt ?? stop.requestedAt, stop: { ...stop } };
+      jobs.set(job.jobId, next);
+      const summary = summaries.get(job.jobId);
+      if (summary) summaries.set(job.jobId, { ...summary, stop: { ...stop } });
+      for (const subject of new Set(subjects)) pauses.set(`${job.installationId}/${job.repositoryId}/${subject}`, { jobId: job.jobId, at: stop.requestedAt, by: stop.by });
+      return { ...next };
+    },
+    async recordJobStop(job, progress) {
+      const current = jobs.get(job.jobId);
+      if (!current?.stop) return;
+      const stop = { ...current.stop, ...progress, ...(current.stop.confirmedAt !== undefined ? { confirmedAt: current.stop.confirmedAt } : {}) };
+      jobs.set(job.jobId, { ...current, stop });
+      const summary = summaries.get(job.jobId);
+      if (summary) summaries.set(job.jobId, { ...summary, stop });
+    },
+    async getWorkflowPause(id, repo, subject) {
+      return pauses.get(`${id}/${repo}/${subject}`) ?? null;
+    },
+    async resumeStoppedWorkflow(job, subjects, by, at) {
+      const current = jobs.get(job.jobId);
+      if (!current?.stop || current.stop.confirmedAt === undefined) return false;
+      const keys = [...new Set(subjects)].map((n) => `${job.installationId}/${job.repositoryId}/${n}`);
+      if (keys.some((k) => pauses.has(k) && pauses.get(k)?.jobId !== job.jobId)) return false;
+      for (const key of keys) pauses.delete(key);
+      const stop = { ...current.stop, resumedAt: current.stop.resumedAt ?? at, resumedBy: current.stop.resumedBy ?? by };
+      jobs.set(job.jobId, { ...current, stop });
+      const summary = summaries.get(job.jobId);
+      if (summary) summaries.set(job.jobId, { ...summary, stop });
+      return true;
+    },
     async holdSlots(job, until) {
       const now = Date.now();
       const current = jobs.get(job.jobId);
@@ -975,6 +1038,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async markLaunching(jobId) {
       const entry = active.get(jobId);
       if (!entry || entry.phase !== 'reserved') throw new Error(`job ${jobId} has no reservation to launch`);
+      if (jobs.get(jobId)?.stopRequestedAt !== undefined) throw new Error('job is stopping');
       active.set(jobId, { ...entry, phase: 'launching' });
       const j = jobs.get(jobId);
       if (j) jobs.set(jobId, { ...j, launchingAt: Date.now() });

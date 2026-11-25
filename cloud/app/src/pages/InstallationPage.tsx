@@ -22,9 +22,10 @@ import { api as defaultApi, type ApiClient, type Delivery, type DeliveryDisposit
 import { DISPOSITION, INSTALLATION, JOB_RESULT, deliveryReason, formatDuration, installationSettingsUrl } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
 import { LoopBadges } from '../components/lifecycle';
+import { JobActions, JobStopStatus } from '../components/job-actions';
 import { SetupChecklist, setupComplete, setupSteps } from '../components/setup';
 
-type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'>;
+type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'> & Partial<Pick<ApiClient, 'stopJob' | 'resumeJob'>>;
 type Tab = 'jobs' | 'deliveries' | 'repositories';
 type Load = { state: 'loading' } | { state: 'ok'; overview: Overview; jobs: JobView[]; deliveries: Delivery[] } | { state: 'error'; message: string };
 
@@ -103,6 +104,7 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
           <RepositoryView overview={load.overview} onRefresh={() => void refresh()} refreshing={refreshing} />
         ) : (
           <ActivityView
+            api={api}
             overview={load.overview}
             jobs={load.jobs}
             deliveries={load.deliveries}
@@ -146,8 +148,9 @@ function RepositoryView({ overview, onRefresh, refreshing }: { overview: Overvie
 }
 
 function ActivityView({
-  overview, jobs, deliveries, tab, onTab, onRefresh, refreshing, checkedAt,
+  overview, jobs, deliveries, tab, onTab, onRefresh, refreshing, checkedAt, api,
 }: Omit<Extract<Load, { state: 'ok' }>, 'state'> & {
+  api: InstallationApi;
   tab: Exclude<Tab, 'repositories'>;
   onTab: (tab: Exclude<Tab, 'repositories'>) => void;
   onRefresh: () => void;
@@ -202,7 +205,7 @@ function ActivityView({
             <CardTitle>Running jobs</CardTitle>
           </CardHeader>
           <CardBody>
-            <JobsList jobs={runningJobs} base={base} />
+            <JobsList jobs={runningJobs} base={base} api={api} installationId={t.installationId} onRefresh={onRefresh} />
           </CardBody>
         </Card>
       )}
@@ -223,7 +226,7 @@ function ActivityView({
         <CardBody>
           {tab === 'jobs' && (recentJobs.length === 0 && runningJobs.length > 0
             ? <EmptyState title="No finished jobs yet" description="Running jobs appear above until they finish." />
-            : <JobsList jobs={recentJobs} base={base} />)}
+            : <JobsList jobs={recentJobs} base={base} api={api} installationId={t.installationId} onRefresh={onRefresh} />)}
           {tab === 'deliveries' && <DeliveriesList deliveries={deliveries} base={base} />}
         </CardBody>
       </Card>
@@ -333,7 +336,7 @@ function Attention({ overview, base, skip }: { overview: Overview; base: string;
   );
 }
 
-function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
+function JobsList({ jobs, base, api, installationId, onRefresh }: { jobs: JobView[]; base: string; api?: InstallationApi; installationId?: number; onRefresh?: () => void }) {
   if (!jobs.length) {
     return <EmptyState title="No jobs yet" description="Label an issue in a configured repository with one of its trigger labels, and the job shows up here." />;
   }
@@ -343,7 +346,8 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
         const r = JOB_RESULT[j.result];
         return (
           <li key={j.jobId} className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 py-4" data-testid={`job-${j.jobId}`}>
-            <StatusBadge tone={r.tone}>{r.label}</StatusBadge>
+            <StatusBadge tone={r.tone}>{j.stop && j.stop.confirmedAt === undefined ? 'Stopping…' : r.label}</StatusBadge>
+            {api && installationId && onRefresh && <div className="ml-auto"><JobActions job={j} installationId={installationId} api={api} onRefresh={onRefresh} /></div>}
             <Link className="auth-link min-w-0 basis-full break-words font-medium sm:basis-auto" to={`${base}/jobs/${j.jobId}`}>
               {j.repository}
               {j.issue !== undefined ? `#${j.issue}` : j.pullRequest !== undefined ? `#${j.pullRequest}` : ''}
@@ -360,6 +364,7 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
               </a>
             )}
             <LoopBadges job={j} />
+            {j.stop && <div className="basis-full"><JobStopStatus job={j} /></div>}
             {j.telemetry?.traceUrl && (
               <a className="auth-link text-sm" href={j.telemetry.traceUrl} target="_blank" rel="noreferrer">
                 Trace ↗

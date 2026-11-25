@@ -37,6 +37,8 @@ export type FlowErrorCode =
   // Retrying a job (jobs/retry.ts, tenants/status-service.ts).
   | RetryErrorCode
   | 'retry_unavailable'
+  | 'stop_unavailable'
+  | 'stop_pending'
   | 'github_app_not_configured'
   | 'state_invalid'
   | 'github_exchange_failed'

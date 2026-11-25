@@ -278,6 +278,9 @@ export interface Delivery {
 }
 
 export interface JobView {
+  canStop?: boolean;
+  stop?: { requestedAt: number; by: string; reason: string; confirmedAt?: number; error?: string; reconnectRequired?: boolean; resumedAt?: number; resumedBy?: string };
+  canResume?: boolean;
   executionMode?: 'subscription' | 'standard';
   jobId: string;
   repository: string;
@@ -763,6 +766,9 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     /** Runs a job that did not finish its work again, as a new job (its id). Throws ApiError: `not_retryable`, `already_retried`, `throttled`, `event_gone`, ... (409, 410, 429). */
     retryJob: (installationId: number, jobId: string) =>
       request<{ jobId: string }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' }),
+    stopJob: (installationId: number, jobId: string, reason = 'Stopped from the console') =>
+      request<{ jobId: string; state: 'stopping' | 'canceled' | 'finished' }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/stop`, { method: 'POST', body: JSON.stringify({ reason }) }),
+    resumeJob: (installationId: number, jobId: string) => request<{ resumed: true }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/resume`, { method: 'POST' }),
     /** The end of a log; throws ApiError `log_expired` (410) once it is past the retention. */
     jobLog: (installationId: number, jobId: string, name: string) =>
       request<JobLog>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/logs/${encodeURIComponent(name)}`),

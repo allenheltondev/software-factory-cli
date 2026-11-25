@@ -26,6 +26,8 @@ import type {
   Job,
   JobFinishDetail,
   JobSummary,
+  JobStop,
+  WorkflowPause,
   Member,
   OAuthState,
   Quotas,
@@ -134,6 +136,7 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
   }
   return {
     jobId: String(i.jobId),
+    ...(i.stop && typeof i.stop === 'object' ? { stop: i.stop as JobStop } : {}),
     ...(benchmarkIdentityOf(i.benchmark) ? { benchmark: benchmarkIdentityOf(i.benchmark) } : {}),
     ...(i.executionMode === 'subscription' || i.executionMode === 'standard' ? { executionMode: i.executionMode } : {}),
     repository: String(i.repository),
@@ -696,7 +699,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   TableName: T,
                   Key: { pk: `JOB#${jobId}`, sk: 'META' },
                   UpdateExpression: 'SET launchingAt = :at',
-                  ConditionExpression: 'attribute_exists(pk)',
+                  ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(stopRequestedAt)',
                   ExpressionAttributeValues: { ':at': Date.now() },
                 },
               },
@@ -716,6 +719,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       if (!i) return null;
       return {
         jobId: String(i.jobId),
+        ...(i.stop && typeof i.stop === 'object' ? { stop: i.stop as JobStop } : {}),
+        ...(typeof i.resumeOf === 'string' ? { resumeOf: i.resumeOf } : {}),
+        ...(typeof i.workflowIssue === 'number' ? { workflowIssue: i.workflowIssue } : {}),
         ...(benchmarkIdentityOf(i.benchmark) ? { benchmark: benchmarkIdentityOf(i.benchmark) } : {}),
         ...(typeof i.benchmarkAgent === 'string' ? { benchmarkAgent: i.benchmarkAgent } : {}),
         ...(typeof i.benchmarkWorkflow === 'string' ? { benchmarkWorkflow: i.benchmarkWorkflow } : {}),
@@ -1451,6 +1457,59 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
+    async requestJobStop(job, stop, subjects) {
+      try {
+        await client.send(new TransactWriteCommand({ TransactItems: [
+          { Update: { TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
+            UpdateExpression: 'SET #stop = :stop, stopRequestedAt = if_not_exists(stopRequestedAt, :at)',
+            ConditionExpression: 'installationId = :installation AND #status <> :finished AND attribute_not_exists(#stop)',
+            ExpressionAttributeNames: { '#stop': 'stop', '#status': 'status' },
+            ExpressionAttributeValues: { ':stop': stop, ':at': stop.requestedAt, ':installation': job.installationId, ':finished': 'finished' } } },
+          { Update: { TableName: T, Key: jobSummaryKey(job), UpdateExpression: 'SET #stop = :stop',
+            ConditionExpression: 'attribute_exists(pk)', ExpressionAttributeNames: { '#stop': 'stop' }, ExpressionAttributeValues: { ':stop': stop } } },
+          ...[...new Set(subjects)].map((subject) => ({ Put: { TableName: T,
+            Item: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${subject}`, jobId: job.jobId, at: stop.requestedAt, by: stop.by } } })),
+        ] }));
+      } catch (err) {
+        if (!(err instanceof TransactionCanceledException) || !cancelledAt(err, 0)) throw err;
+      }
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' }, ConsistentRead: true }));
+      return out.Item ? out.Item as Job : null;
+    },
+    async recordJobStop(job, progress) {
+      const names: Record<string, string> = { '#stop': 'stop' };
+      const values: Record<string, unknown> = {};
+      const sets = Object.entries(progress).filter(([, v]) => v !== undefined).map(([k, v]) => {
+        names[`#${k}`] = k;
+        values[`:${k}`] = v;
+        return `#stop.#${k} = ${k === 'confirmedAt' ? `if_not_exists(#stop.#${k}, :${k})` : `:${k}`}`;
+      });
+      if (!sets.length) return;
+      await client.send(new TransactWriteCommand({ TransactItems: [ { pk: `JOB#${job.jobId}`, sk: 'META' }, jobSummaryKey(job) ].map((Key) => ({
+        Update: { TableName: T, Key, UpdateExpression: `SET ${sets.join(', ')}`, ConditionExpression: 'attribute_exists(#stop)',
+          ExpressionAttributeNames: names, ExpressionAttributeValues: values },
+      })) }));
+    },
+    async getWorkflowPause(id, repo, subject) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${subject}` }, ConsistentRead: true }));
+      return out.Item ? { jobId: String(out.Item.jobId), at: Number(out.Item.at), by: String(out.Item.by) } satisfies WorkflowPause : null;
+    },
+    async resumeStoppedWorkflow(job, subjects, by, at) {
+      try {
+        await client.send(new TransactWriteCommand({ TransactItems: [
+          ...[...new Set(subjects)].map((n) => ({ Delete: { TableName: T, Key: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${n}` },
+            ConditionExpression: 'attribute_not_exists(pk) OR jobId = :job', ExpressionAttributeValues: { ':job': job.jobId } } })),
+          ...[{ pk: `JOB#${job.jobId}`, sk: 'META' }, jobSummaryKey(job)].map((Key) => ({ Update: { TableName: T, Key,
+            UpdateExpression: 'SET #stop.#at = if_not_exists(#stop.#at, :at), #stop.#by = if_not_exists(#stop.#by, :by)',
+            ConditionExpression: 'attribute_exists(#stop.confirmedAt)',
+            ExpressionAttributeNames: { '#stop': 'stop', '#at': 'resumedAt', '#by': 'resumedBy' }, ExpressionAttributeValues: { ':at': at, ':by': by } } })),
+        ] }));
+        return true;
+      } catch (error) {
+        if (!(error instanceof TransactionCanceledException) || !error.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) throw error;
+        return false;
+      }
+    },
     async holdSlots(job, until) {
       const ttl = Math.ceil(until / 1000);
       let all = true;

@@ -23,7 +23,7 @@ export const JOB_RESULT: Record<JobResult, { label: string; tone: Tone; help: st
   running: { label: 'Running', tone: 'primary', help: 'The job is running in its microVM.' },
   success: { label: 'Succeeded', tone: 'success', help: 'The agent did the work and the pull request was published.' },
   nothing_to_do: { label: 'Nothing to do', tone: 'neutral', help: 'Updraft looked at the event and found nothing to do (for example, work that was already done).' },
-  canceled: { label: 'Canceled', tone: 'neutral', help: 'The job was canceled before any agent started (the issue changed, or the work was no longer wanted).' },
+  canceled: { label: 'Canceled', tone: 'neutral', help: 'The job was canceled. Existing commits, pull requests and history are preserved.' },
   superseded: { label: 'Superseded', tone: 'neutral', help: 'The job ran, but another run of the same event published first. Nothing on GitHub was changed by this one.' },
   deferred: {
     label: 'Deferred',

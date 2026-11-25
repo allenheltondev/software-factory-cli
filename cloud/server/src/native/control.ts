@@ -36,7 +36,8 @@ export function createNativeControl(d: NativeControlDeps) {
       const job = await d.store.getJob((w.active ?? w.settling)!.jobId);
       if (job) {
         await d.store.markStopping(job.jobId);
-        await d.store.finishJob(job.jobId, 'microvm_gone', { at: now() });
+        await d.store.finishJob(job.jobId, job.stop ? 'canceled' : 'microvm_gone', { at: now() });
+        if (job.stop) await d.store.recordJobStop(job, { confirmedAt: now(), error: '', reconnectRequired: true });
         await d.store.releaseJob(job, unusedTime(job, now()));
         await d.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
       }
@@ -66,13 +67,38 @@ export function createNativeControl(d: NativeControlDeps) {
     if (job.status !== 'finished' || w.settling?.jobId !== job.jobId) return false;
     // Retain the durable marker through partial failures. Completion retries and
     // reconciliation can repeat releaseJob safely, then make the worker available.
+    if (job.stop) await d.store.recordJobStop(job, { confirmedAt: now(), error: '' });
     await d.store.releaseJob(job, unusedTime(job, now()));
     const next = { ...w, version: w.version + 1, lastWorkAt: now() };
     delete next.settling;
-    return d.workers.put(next, w.version);
+    const settled = await d.workers.put(next, w.version);
+    return settled;
+  }
+  async function stop(job: Job): Promise<boolean> {
+    if (!job.native || !job.stop) return false;
+    const w = await d.workers.get(job.installationId, job.native.workerId);
+    if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
+    if (job.releasedAt !== undefined) return true;
+    if (w?.active?.jobId === job.jobId) {
+      if (job.microvmId && w.microvmId !== job.microvmId) throw new Error('Stopped assignment has a different worker VM');
+      // Heartbeats cancel the process tree without renewing this lease. Give the trusted
+      // runner time to reap it; only fence the exact assignment if it fails to settle.
+      if (!w.fenced && now() < job.stop.requestedAt + WORKER_LEASE_MS && w.active.until > now()) return false;
+      await d.store.recordJobStop(job, { reconnectRequired: true });
+      return fence(w);
+    }
+    if (!job.microvmId && w?.active?.jobId !== job.jobId) {
+      // A queued job never owns the busy worker. Dequeue it; leave unrelated work alone.
+      await d.store.finishJob(job.jobId, 'canceled', { at: now() });
+      await d.workers.dequeue(job.installationId, job.native.workerId, job.jobId);
+      return true;
+    }
+    // A completed assignment may have yielded the session to another job. Never kill it.
+    throw new Error('Cannot identify the stopped subscription assignment safely');
   }
   async function reconcile(job: Job): Promise<boolean> {
     if (!job.native) return false;
+    if (job.stop) return stop(job);
     const w = await d.workers.get(job.installationId, job.native.workerId);
     if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
     if (w?.active?.jobId === job.jobId) {
@@ -158,7 +184,7 @@ export function createNativeControl(d: NativeControlDeps) {
     if (p.op !== 'poll' || disabled || p.auth !== 'connected') return { ok: true, busy: false };
     for (const id of await d.workers.queued(r.installationId, r.workerId)) {
       const job = await d.store.getJob(id);
-      if (!job || job.status === 'finished' || job.expiresAt <= now()) { await d.workers.dequeue(r.installationId, r.workerId, id); continue; }
+      if (!job || job.status === 'finished' || job.stopRequestedAt !== undefined || job.expiresAt <= now()) { await d.workers.dequeue(r.installationId, r.workerId, id); continue; }
       if (!job.native || job.native.workerId !== r.workerId || job.installationId !== r.installationId || job.microvmId || !job.launchingAt ||
           job.imageVersion !== r.imageVersion || job.native.generation !== r.generation) continue;
       const token = nativeJobToken(secret, job.jobId);
@@ -174,5 +200,5 @@ export function createNativeControl(d: NativeControlDeps) {
     }
     return { ok: true, busy: false };
   }
-  return { handle, canServe, complete, reconcile };
+  return { handle, canServe, complete, reconcile, stop };
 }

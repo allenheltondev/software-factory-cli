@@ -28,6 +28,10 @@ function fakeTable() {
 
   function condition(expr: string | undefined, item: Item | undefined, values: Values = {}): boolean {
     if (!expr) return true;
+    if (expr === 'installationId = :installation AND #status <> :finished AND attribute_not_exists(#stop)') return item?.installationId === values[':installation'] && item?.status !== values[':finished'] && item?.stop === undefined;
+    if (expr === 'attribute_exists(#stop)') return item?.stop !== undefined;
+    if (expr === 'attribute_exists(#stop.confirmedAt)') return (item?.stop as Item | undefined)?.confirmedAt !== undefined;
+    if (expr === 'attribute_not_exists(pk) OR jobId = :job') return !item || item.jobId === values[':job'];
     if (expr === '#enabled = :enabled AND routingVersion = :routingVersion') {
       return item?.enabled === values[':enabled'] && item?.routingVersion === values[':routingVersion'];
     }
@@ -135,7 +139,10 @@ function fakeTable() {
         } else {
           const [lhs = '', rhs = ''] = action.split('=').map((x) => x.trim());
           const ifNotExists = /^if_not_exists\((\S+?),\s*(\S+?)\)$/.exec(rhs);
-          next[name(lhs)] = ifNotExists ? (next[name(ifNotExists[1]!)] ?? values[ifNotExists[2]!]) : values[rhs];
+          if (lhs.startsWith('#stop.')) {
+            const stop = { ...(next.stop as Item) }; const field = name(lhs.split('.')[1]!);
+            stop[field] = ifNotExists ? stop[field] ?? values[ifNotExists[2]!] : values[rhs]; next.stop = stop;
+          } else next[name(lhs)] = ifNotExists ? (next[name(ifNotExists[1]!)] ?? values[ifNotExists[2]!]) : values[rhs];
         }
       }
     }
@@ -685,6 +692,28 @@ describe('dynamo store: the admin view', () => {
 });
 
 describe('dynamo store: delivery claims and finished jobs (review fixes on #80)', () => {
+  it('atomically audits operator intent and fences the job and workflow, preserving first actor and finish', async () => {
+    const table = fakeTable(); const store = createDynamoStore('T', table.client);
+    const job: Job = { jobId: 'job_stop0001', installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12,
+      tokenHash: 'hash', configVersion: 1, deliveryId: 'd-stop', eventName: 'issues', status: 'launched', createdAt: new Date().toISOString(), expiresAt: Date.now() + 3600000 };
+    await store.putJob(job);
+    const audit = { requestedAt: Date.now(), by: 'pat', reason: 'stop' };
+    await store.requestJobStop(job, audit, [12, 12, 13]);
+    await store.requestJobStop(job, { ...audit, by: 'other' }, [12]);
+    expect((await store.getJob(job.jobId))?.stop).toEqual(audit);
+    expect((await store.getJobSummary(55, job.jobId))?.stop).toEqual(audit);
+    expect(await store.getWorkflowPause(55, 9, 13)).toMatchObject({ jobId: job.jobId });
+    expect(await store.getWorkflowPause(66, 9, 13)).toBeNull();
+    await store.recordJobStop(job, { error: 'AWS failed' });
+    await store.finishJob(job.jobId, 'succeeded');
+    await store.recordJobStop(job, { confirmedAt: audit.requestedAt + 1, error: '' });
+    await store.recordJobStop(job, { confirmedAt: audit.requestedAt + 2 });
+    expect((await store.getJobSummary(55, job.jobId))?.stop).toEqual({ ...audit, confirmedAt: audit.requestedAt + 1, error: '' });
+    expect((await store.getJob(job.jobId))?.outcome).toBe('succeeded');
+    expect(await store.resumeStoppedWorkflow(job, [12, 13], 'pat', audit.requestedAt + 10)).toBe(true);
+    expect(await store.getWorkflowPause(55, 9, 13)).toBeNull();
+    expect((await store.getJob(job.jobId))?.stop?.resumedBy).toBe('pat');
+  });
   const LATER = Date.now() + 3_600_000;
 
   it('a claim is released only by the job holding it, and releasing again is harmless', async () => {

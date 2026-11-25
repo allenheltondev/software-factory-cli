@@ -18,6 +18,7 @@ import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './j
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
+import { awsJobStopper } from './jobs/stop-aws.js';
 import { BENCHMARK_LABEL } from './benchmarks/config.js';
 import { createBenchmarkDispatch } from './benchmarks/dispatch.js';
 
@@ -72,6 +73,7 @@ async function imageVersion(): Promise<string | null> {
 }
 
 const nativeWorker = nativeAws(store);
+const stopJob = awsJobStopper(store, nativeWorker.control);
 
 function launcher(): Launcher | undefined {
   if (!env.JOB_IMAGE_ARN || !env.BROKER_FUNCTION_NAME) return undefined;
@@ -79,6 +81,7 @@ function launcher(): Launcher | undefined {
   const partition = env.PARTITION ?? 'aws';
   return createLauncher({
     store,
+    stopJob: stopJob.advance,
     ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
     native: nativeWorker.launch,
     resolveNative: nativeWorker.resolveNative,

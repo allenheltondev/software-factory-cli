@@ -104,6 +104,14 @@ describe('the job broker', () => {
     expect(JSON.stringify(policy)).not.toContain('tenants/55/config/2/');
   });
 
+  it('refuses starts, credentials and publication tokens after an owner stop fence', async () => {
+    await handle({ action: 'start', jobId: job.jobId, token });
+    await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop' }, []);
+    assumeRole.mockClear(); github.createInstallationToken.mockClear();
+    for (const action of ['start', 'credentials', 'github-token']) expect(await handle({ action, jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
+    expect(assumeRole).not.toHaveBeenCalled(); expect(github.createInstallationToken).not.toHaveBeenCalled();
+  });
+
   it("marks the tenant's first job when a job starts, once", async () => {
     expect((await store.getTenant(55))?.firstJobAt).toBeUndefined();
     await handle({ action: 'start', jobId: job.jobId, token });

@@ -52,13 +52,15 @@ export async function startCloudWorker(config, microvmId, service, options = {})
   let auth = await service.authStatus();
   const message = (op) => ({ op, session, microvmId, auth, imageVersion: config.imageVersion, workerVersion: config.workerVersion });
   const stopChild = async () => {
-    if (!child || childDone) return;
+    if (!child || childDone) return true;
     child.kill('SIGTERM');
     // runJob cancels/reaps its detached Updraft group before reporting completion. Never
     // start another job after a forced root-runner kill; Cloud physically fences the VM.
     let timer;
-    await Promise.race([ended, new Promise((resolve) => { timer = setTimeout(() => { child?.kill('SIGKILL'); resolve(); }, options.stopGrace ?? 25_000); })]);
+    let forced = false;
+    await Promise.race([ended, new Promise((resolve) => { timer = setTimeout(() => { forced = true; child?.kill('SIGKILL'); resolve(); }, options.stopGrace ?? 25_000); })]);
     clearTimeout(timer);
+    return !forced;
   };
   const loop = (async () => {
     try {
@@ -75,8 +77,13 @@ export async function startCloudWorker(config, microvmId, service, options = {})
       while (!stopped) {
         if (child) {
           const status = await call(message('heartbeat'));
-          if (status.cancel) { await stopChild(); throw new Error('worker job canceled'); }
-          if (childDone) {
+          if (status.cancel) {
+            if (!await stopChild()) throw new Error('worker cancellation required a forced kill');
+            const settled = await call(message('settled'));
+            if (settled.busy) throw new Error('canceled runner did not settle its lease');
+            child = undefined;
+          }
+          else if (childDone) {
             await ended;
             const settled = await call(message('settled'));
             if (settled.busy) throw new Error('runner exited without settling its lease');
