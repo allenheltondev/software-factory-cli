@@ -78,7 +78,7 @@ describe('root subscription worker Cloud loop', () => {
     const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, { call, launch: () => child, interval: 5 });
     await worker.done;
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-    expect(ops).toEqual(['register', 'poll', 'heartbeat', ...(failure === 'cancel' ? ['settled'] : [])]);
+    expect(ops).toEqual(['register', 'poll', 'heartbeat', ...(failure === 'cancel' ? ['settled', 'settled', 'settled'] : [])]);
     await worker.close();
   });
   it('keeps the signed-in session after a cooperative cancel only when the server confirms settlement', async () => {
@@ -111,6 +111,42 @@ describe('root subscription worker Cloud loop', () => {
     await worker.close();
     expect(child.kill).not.toHaveBeenCalled();
     expect(ops.slice(0, 4)).toEqual(['register', 'poll', 'heartbeat', 'settled']);
+  });
+  it('waits for transient settlement contention before running a distinct job on the same session', async () => {
+    const ops = []; const sessions = new Set(); let polls = 0; let settlements = 0;
+    const launch = vi.fn(() => {
+      const child = fakeChild();
+      globalThis.queueMicrotask(() => child.emit('close'));
+      return child;
+    });
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, launch,
+      call: async (p) => {
+        ops.push(p.op); sessions.add(p.session);
+        if (p.op === 'poll' && ++polls <= 2) return { ok: true, request: { payload: { jobId: `job-${polls}` } } };
+        if (p.op === 'settled') return { ok: true, busy: ++settlements <= 2 };
+        return { ok: true, busy: false };
+      },
+    });
+    await until(() => polls >= 3);
+    await worker.close();
+    expect(ops.slice(0, 7)).toEqual(['register', 'poll', 'heartbeat', 'settled', 'settled', 'settled', 'poll']);
+    expect(launch.mock.calls.map(([request]) => request.payload.jobId)).toEqual(['job-1', 'job-2']);
+    expect(sessions.size).toBe(1);
+    expect(launch.mock.results.every(({ value }) => value.kill.mock.calls.length === 0)).toBe(true);
+  });
+  it('never retries an uncertain settlement transport or polls another assignment', async () => {
+    const child = fakeChild(); const ops = [];
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, launch: () => { globalThis.queueMicrotask(() => child.emit('close')); return child; },
+      call: async (p) => {
+        ops.push(p.op);
+        if (p.op === 'settled') throw new Error('uncertain response');
+        return { ok: true, ...(p.op === 'poll' ? { request: { payload: {} } } : {}) };
+      },
+    });
+    await worker.done;
+    expect(ops).toEqual(['register', 'poll', 'heartbeat', 'settled']);
   });
   it('probes auth once more before reporting it unavailable, and never reuses an earlier answer', async () => {
     const answers = ['connected', 'unavailable', 'connected', 'unavailable', 'unavailable'];

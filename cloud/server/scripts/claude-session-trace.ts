@@ -21,6 +21,7 @@ import { readinessAction } from '../src/jobs/launch.js';
 import type { ManagedSession, WaitingClaudeJob } from '../src/native/sessions.js';
 import { managedWorkerId } from '../src/native/sessions.js';
 import { nativePartition, type Worker } from '../src/native/store.js';
+import type { Job } from '../src/store/store.js';
 import { createAdminClients } from './admin-clients.js';
 
 /** Enough of an id to match lines across snapshots and logs, not enough to act with. */
@@ -37,7 +38,8 @@ export interface TraceInput {
   queued: string[];
   waiting: Pick<WaitingClaudeJob, 'id' | 'status' | 'jobId' | 'reason'>[];
   vm?: { state: string | null; imageVersion?: string; idlePolicy?: unknown; startedAt?: Date };
-  jobs: { jobId: string; status: string; outcome?: string; microvmId?: string; generation?: string; createdAt: string }[];
+  jobs: (Pick<Job, 'jobId' | 'outcome' | 'microvmId' | 'createdAt'> &
+    Partial<Pick<Job, 'repository' | 'issue' | 'pullRequest' | 'eventName' | 'startedAt' | 'releasedAt' | 'reservedSeconds' | 'agentKeys'>> & { status: string; generation?: string })[];
 }
 
 /** One sanitized snapshot. Pure, so it is tested without AWS. */
@@ -71,7 +73,14 @@ export function snapshot(t: TraceInput) {
     },
     queued: t.queued,
     waiting: t.waiting.map((r) => ({ id: r.id, status: r.status, jobId: r.jobId, reason: r.reason })),
-    jobs: t.jobs.map((j) => ({ jobId: j.jobId, status: j.status, outcome: j.outcome, microvmId: j.microvmId, generation: short(j.generation), createdAt: j.createdAt })),
+    jobs: t.jobs.map((j) => ({ jobId: j.jobId, status: j.status, outcome: j.outcome, microvmId: j.microvmId, generation: short(j.generation), createdAt: j.createdAt,
+      eventName: j.eventName, startedAt: iso(j.startedAt), releasedAt: iso(j.releasedAt), reservedSeconds: j.reservedSeconds,
+      apiKeyRequested: j.agentKeys?.includes('ANTHROPIC_API_KEY'),
+      ...(j.repository && /^[\w.-]+\/[\w.-]+$/.test(j.repository) ? {
+        ...(j.issue ? { issueUrl: `https://github.com/${j.repository}/issues/${j.issue}` } : {}),
+        ...(j.pullRequest ? { pullRequestUrl: `https://github.com/${j.repository}/pull/${j.pullRequest}` } : {}),
+      } : {}),
+    })),
   };
 }
 
@@ -88,8 +97,10 @@ async function read(db: DynamoDBDocumentClient, table: string, installationId: n
   const waiting = (await query(tenant, 'CLAUDE_WAIT#')).filter((r) => Number(r.expiresAt) > Date.now()) as WaitingClaudeJob[];
   const summaries = await query(tenant, 'JOB#', jobsLimit, false);
   const jobs = await Promise.all(summaries.map(async (j) => {
-    const meta = await get<{ status: string; outcome?: string; microvmId?: string; native?: { generation?: string }; createdAt: string }>(`JOB#${j.jobId}`, 'META');
-    return { jobId: String(j.jobId), status: meta?.status ?? String(j.status), outcome: meta?.outcome, microvmId: meta?.microvmId, generation: meta?.native?.generation, createdAt: String(j.createdAt) };
+    const meta = await get<Job>(`JOB#${j.jobId}`, 'META');
+    return { jobId: String(j.jobId), status: meta?.status ?? String(j.status), outcome: meta?.outcome, microvmId: meta?.microvmId, generation: meta?.native?.generation, createdAt: String(j.createdAt),
+      repository: meta?.repository, issue: meta?.issue, pullRequest: meta?.pullRequest, eventName: meta?.eventName,
+      startedAt: meta?.startedAt, releasedAt: meta?.releasedAt, reservedSeconds: meta?.reservedSeconds, agentKeys: meta?.agentKeys };
   }));
   let vm: TraceInput['vm'];
   if (session?.microvmId) {
