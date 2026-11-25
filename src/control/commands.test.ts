@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { controlHelp, controlPolicy, controlReply, isAutomatedComment, MAX_CONTROL_TEXT, parseControlComment, repoPermissionOf } from './commands.js';
+import { controlHelp, controlPolicy, controlReply, isAutomatedComment, isControlActor, MAX_CONTROL_TEXT, parseControlComment, repoPermissionOf } from './commands.js';
 
 const H = ['updraft-app[bot]'];
 
@@ -72,8 +72,11 @@ describe('controlPolicy', () => {
       .toMatchObject({ respond: 'ignore' });
   });
 
-  it('refuses someone not allowed, whatever their GitHub access', () => {
-    expect(controlPolicy({ ...base, command: 'pause', actor: { login: 'mallory' }, permission: 'admin' })).toMatchObject({ respond: 'refuse', reason: 'not_allowed' });
+  it('ignores someone not allowed, whatever their GitHub access, without a reply', () => {
+    expect(controlPolicy({ ...base, command: 'pause', actor: { login: 'mallory' }, permission: 'admin' })).toMatchObject({ respond: 'ignore', reason: 'not_allowed' });
+    expect(isControlActor(['Alice'], 'alice')).toBe(true);
+    expect(isControlActor(['Alice'], 'mallory')).toBe(false);
+    expect(isControlActor(['Alice'], null)).toBe(false);
   });
 
   it('fails closed on an unknown permission and needs write', () => {
@@ -100,6 +103,10 @@ describe('helpers', () => {
   it('marks replies so they are never commands', () => {
     const reply = controlReply(42, '@updraft-app stop');
     expect(isAutomatedComment({ login: 'alice' }, reply, [])).toBe(true);
+  });
+
+  it('says plainly in help that a paused job already running continues', () => {
+    expect(controlHelp('updraft-app')).toContain('a job already running continues to completion and may still publish');
   });
 
   it('shows the real handle in help', () => {

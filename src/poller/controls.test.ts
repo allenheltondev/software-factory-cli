@@ -50,7 +50,9 @@ class FakeGitHub {
   async listRepoIssueComments(_r: unknown, o: { since: string }) {
     return { comments: this.comments.filter((c) => c.updatedAt >= o.since).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)), nextPage: null };
   }
+  permissionLookups: string[] = [];
   async getRepoPermission(_r: unknown, login: string) {
+    this.permissionLookups.push(login);
     const p = this.permissions[login];
     if (p === undefined) throw new GitHubError('boom', 502);
     return p;
@@ -148,14 +150,18 @@ describe('mention commands', () => {
     expect(listControlCommands(w.db, REPO_ID, ISSUE)).toHaveLength(1);
   });
 
-  it('refuses an actor who is not allowed, politely and without state', async () => {
+  it('ignores an actor who is not allowed: no permission lookup, no reply, no state', async () => {
     const w = await world();
-    w.gh.comment('mallory', '@updraft-app resume');
+    const c = w.gh.comment('mallory', '@updraft-app cancel');
+    await w.poll();
+    expect(w.gh.permissionLookups).toEqual([]);
+    expect(w.gh.posted).toEqual([]);
+    expect(activeControlPause(w.db, REPO_ID, ISSUE)).toBeNull();
+    expect(getControlCommand(w.db, REPO_ID, String(c.id))).toMatchObject({ outcome: 'ignored', message: 'not_allowed' });
     w.gh.comment('allen', '@updraft-app pause');
     await w.poll();
-    expect(w.gh.posted[0]!.body).toContain('not allowed to direct Updraft');
-    expect(w.gh.posted[0]!.body).not.toContain('#7');
-    expect(activeControlPause(w.db, REPO_ID, ISSUE)).not.toBeNull();
+    expect(w.gh.permissionLookups).toEqual(['allen']);
+    expect(w.gh.posted).toHaveLength(1);
   });
 
   it('refuses stop without maintain, and when the permission cannot be read', async () => {

@@ -169,7 +169,8 @@ export type ControlDecision =
  *
  * - automation (bots, the worker, Updraft's own replies) is ignored, never answered;
  * - the actor must be one the configuration allows to dispatch work in this repository
- *   (`allowedActors`, compared case-insensitively), and GitHub must say they have at least
+ *   (`allowedActors`, compared case-insensitively; anyone else is ignored, never answered, and
+ *   callers check this before any GitHub request: isControlActor), and GitHub must say they have at least
  *   write access to it now: a stale allowlist entry alone authorizes nothing;
  * - `stop` and `cancel` (destructive) need maintain or admin, the GitHub counterpart of Cloud's
  *   owner-only stop; so does resuming work such a command (or the console) stopped
@@ -188,12 +189,18 @@ export function controlPolicy(o: {
 }): ControlDecision {
   if (isAutomatedComment(o.actor, o.body, o.ownLogins)) return { allowed: false, respond: 'ignore', reason: 'automated' };
   const login = o.actor.login!.toLowerCase();
-  if (!o.allowedActors.some((a) => a.toLowerCase() === login)) return { allowed: false, respond: 'refuse', reason: 'not_allowed' };
+  // Not answered: anyone can comment, and no one outside the allowlist can make the App post.
+  if (!o.allowedActors.some((a) => a.toLowerCase() === login)) return { allowed: false, respond: 'ignore', reason: 'not_allowed' };
   if (o.command === 'help') return { allowed: true };
   if (o.permission === null) return { allowed: false, respond: 'refuse', reason: 'permission_unknown' };
   if (RANK[o.permission] < RANK.write) return { allowed: false, respond: 'refuse', reason: 'needs_write' };
   if ((DESTRUCTIVE_COMMANDS.has(o.command) || o.elevated) && RANK[o.permission] < RANK.maintain) return { allowed: false, respond: 'refuse', reason: 'needs_maintain' };
   return { allowed: true };
+}
+
+/** Whether `login` is one of the allowed actors: the free check every path makes first. */
+export function isControlActor(allowedActors: readonly string[], login: string | null | undefined): boolean {
+  return !!login && allowedActors.some((a) => a.toLowerCase() === login.toLowerCase());
 }
 
 /** What a refusal says. Never anything about the workflow's state: the asker may not see it. */
@@ -214,7 +221,7 @@ export function refusalMessage(reason: Exclude<ControlDecision, { allowed: true 
 export function controlHelp(handle: string, opts: { unsupported?: readonly ControlCommand[] } = {}): string {
   const h = `@${handle.replace(/^@/, '').replace(/\[bot\]$/, '')}`;
   const lines: Array<[ControlCommand, string]> = [
-    ['pause', 'stop starting new steps for this issue and its pull request; a step already running finishes'],
+    ['pause', 'hold new work for this issue and its pull request; a job already running continues to completion and may still publish (use `stop` to end it)'],
     ['resume', 'lift a pause and continue from where it stopped (the latest head of an existing pull request)'],
     ['stop', 'stop the active job now and pause (maintain or admin; name the job when there are several)'],
     ['cancel', 'stop active and queued work and pause; commits and pull requests are kept (maintain or admin)'],

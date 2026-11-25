@@ -11,7 +11,7 @@
 // - Who may give it is controlPolicy's (allowlist and current GitHub permission); a refusal says
 //   nothing about the workflow.
 import { allowedActorsFor, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
-import { controlHelp, controlPolicy, controlReply, isAutomatedComment, parseControlComment, refusalMessage, type RepoPermission } from '../control/commands.js';
+import { controlHelp, controlPolicy, controlReply, isAutomatedComment, isControlActor, parseControlComment, refusalMessage, type RepoPermission } from '../control/commands.js';
 import { applyLocalControl, LOCAL_UNSUPPORTED, resumeIsElevated, workflowPullRequest, type LocalControlResult } from '../control/local.js';
 import { transaction, type Db } from '../db/database.js';
 import { getControlCheckpoint, getControlCommand, recordControlCommand, saveControlCheckpoint, setControlReply, type ControlCommandRecord } from '../db/control.js';
@@ -104,6 +104,12 @@ async function handleComment(deps: ControlPollDeps, repo: RepoRef, cfg: Reposito
   }
   if (issue === null) {
     record('ignored', c.onPullRequest ? 'not a pull request Updraft opened' : 'not an issue Updraft works on');
+    return false;
+  }
+  // Not someone the configuration lets direct work here: no GitHub request and no reply.
+  if (!isControlActor(repositoryActors(config, cfg), c.user)) {
+    record('ignored', 'not_allowed');
+    log.info('command ignored: not an allowed actor', { comment: c.id });
     return false;
   }
   let permission: RepoPermission | null = null;
