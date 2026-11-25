@@ -146,6 +146,10 @@ recording it finds the same revision again by its dedupe key.
   is **Fix failing CI on pull requests the reviewer finds ready**, in a repository's settings
   (simple and full editor). A repository added to a reviewing workflow starts with it on; one
   configured before keeps its setting, so it stays off until it is ticked and published.
+  When the account's execution slot is taken, the check suite's event waits in the admission
+  queue and starts on its own once a slot frees; if the pull request's head has moved on by
+  then, the queued event is dropped (`stale_head`) and the newer head's events continue the
+  loop ([cloud/README.md](../cloud/README.md#admission-queue)).
 
 A GitHub App needs **Checks: Read-only** and **Commit statuses: Read-only**, and **Actions:
 Read-only** for job logs (without it the revision gets the annotations only, and the
