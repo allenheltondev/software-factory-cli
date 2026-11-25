@@ -25,7 +25,10 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
+
+/** The schema version that added the needs-verification outcome of pr_reviews (docs/acceptance.md). */
+export const ACCEPTANCE_SCHEMA_VERSION = 20;
 
 /** The schema version that added review_findings (docs/review-loop.md, "Findings as threads"). */
 export const FINDINGS_SCHEMA_VERSION = 19;
@@ -665,7 +668,27 @@ const MIGRATIONS: Record<number, Migration> = {
     );
     CREATE INDEX IF NOT EXISTS review_findings_by_run ON review_findings (run_id);
   `,
+  // Acceptance criteria (docs/acceptance.md): a verdict held back because mandatory criteria are
+  // unverified or unclear, which a person has to resolve (no revision is queued), is the outcome
+  // needs-verification. SQLite cannot change a CHECK in place, so pr_reviews is rebuilt from its
+  // own definition with the one value added, keeping every column, row and index.
+  20: (db) => rebuildWithOutcome(db, 'needs-verification'),
 };
+
+/** pr_reviews rebuilt with `value` allowed as an outcome; nothing when it already is. */
+function rebuildWithOutcome(db: Db, value: string): void {
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pr_reviews'").get() as { sql: string } | undefined;
+  if (!table) return;
+  const marker = "'no-revise',";
+  if (table.sql.includes(`'${value}'`) || !table.sql.includes(marker)) return;
+  const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pr_reviews' AND sql IS NOT NULL").all() as { sql: string }[];
+  const created = table.sql.replace(marker, `${marker}'${value}',`).replace(/^CREATE TABLE\s+("?)pr_reviews\1/i, 'CREATE TABLE pr_reviews_rebuilt');
+  db.exec(created);
+  db.exec('INSERT INTO pr_reviews_rebuilt SELECT * FROM pr_reviews');
+  db.exec('DROP TABLE pr_reviews');
+  db.exec('ALTER TABLE pr_reviews_rebuilt RENAME TO pr_reviews');
+  for (const i of indexes) db.exec(i.sql);
+}
 
 /** Migration 18's columns of revision_prs. */
 const CI_COLUMNS: ReadonlyArray<readonly [string, string]> = [

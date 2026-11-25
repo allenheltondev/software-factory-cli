@@ -38,6 +38,8 @@ import {
 import { getJob, getRun } from '../db/queue.js';
 import { recordFindings, reviewRound, threadOf, unverifiedBlockers } from '../db/review-findings.js';
 import { readStructuredFindings, type StructuredReview } from '../agents/findings.js';
+import { acceptanceGate, assessAcceptance, gateReason, revisionCriteria, type AcceptanceAssessment, type AcceptanceGate } from '../agents/acceptance.js';
+import { previousAssessment, renderAcceptanceChecklist } from './acceptance.js';
 import { diffIndex } from './anchors.js';
 import { answerInThreads, applyFindingState, inlineComments, revisionFindingsOf, planThreads, recordPostedThreads, renderStructuredReview, verdictContradiction, withoutInline, type ThreadAnswers, type ThreadPlan } from './threads.js';
 import { countRevisions, enqueueRevision, getReviewRequest, revisionJob } from '../db/revisions.js';
@@ -101,6 +103,10 @@ export function renderReview(o: {
   findings: string;
   /** What the worker does with this verdict under the current config, in its own words. */
   next: string;
+  /** Why the reviewer's ready-to-merge is taken as changes requested (the acceptance criteria), if it is. */
+  override?: string | null;
+  /** The acceptance checklist (acceptance.ts), if the review had criteria to assess. */
+  acceptance?: string | null;
 }): string {
   const marker = reviewMarker(o.runId);
   const body = [
@@ -109,17 +115,25 @@ export function renderReview(o: {
     `Automated review of commit ${code(short(o.headSha))} by agent ${inline(o.agent)} (run ${code(o.runId)}). It is posted as a comment because the ` +
       'account that opened a pull request cannot approve or request changes on it; the verdict itself is recorded by the worker.',
     '',
+    ...(o.override ? [`Updraft: the reviewer wrote ready to merge, but ${inline(o.override)}, so this counts as changes requested.`, ''] : []),
     '**Findings**',
     '',
     safeMarkdown(o.findings.trim() || '(the reviewer wrote no findings)', MAX_FINDINGS),
     '',
+    ...(o.acceptance ? [o.acceptance, ''] : []),
     o.next,
   ].join('\n');
   return `${cap(body, MAX_BODY - marker.length - 2)}\n\n${marker}`;
 }
 
 /** The sentence under the findings: what happens next, as far as the config says. */
-function nextStep(config: UpdraftConfig, repo: RepositoryConfig, verdict: ReviewVerdict, used: number): string {
+function nextStep(config: UpdraftConfig, repo: RepositoryConfig, verdict: ReviewVerdict, used: number, held: AcceptanceGate | null = null): string {
+  if (held && !held.unmet.length && held.pending.length) {
+    return (
+      'If this is still the head commit, Updraft queues no revision: what is missing is evidence or clarification an agent cannot provide. ' +
+      'A person checks the unverified criteria (or clarifies the issue, which a new review then reads) and merges, or pushes a change for a new review.'
+    );
+  }
   if (verdict === 'changes-requested') {
     if (!reviseActive(config, repo)) return 'Revisions are off for this repository, so the changes are up to a person.';
     const max = repo.maxRevisions ?? DEFAULT_MAX_REVISIONS;
@@ -208,7 +222,16 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     blockers: unverifiedBlockers(deps.db, job.repoId, prNumber),
     rootOf: (key) => threadOf(deps.db, job.repoId, prNumber, key),
   });
-  const verdict: ReviewVerdict = override ? 'changes-requested' : result.verdict;
+  // Acceptance criteria (docs/acceptance.md): with policy enforce, a ready-to-merge that leaves a
+  // mandatory criterion not verified is not ready. Unmet criteria are a revision's to fix; criteria
+  // only a person can settle (unverified, unclear) hold the head back without a revision.
+  const assessment: AcceptanceAssessment | null = result.acceptance ? assessAcceptance(result.acceptance, result.findings) : null;
+  const gate = assessment ? acceptanceGate(assessment) : null;
+  const enforced = assessment?.policy === 'enforce' && gate && !gate.passed ? gate : null;
+  const acceptanceOverride = !override && result.verdict === 'ready-to-merge' && enforced ? gateReason(enforced) : null;
+  /** Held back for a person: the review's ready-to-merge stands in the way of nothing a revision can fix. */
+  const holdForPerson = Boolean(acceptanceOverride && enforced && !enforced.unmet.length);
+  const verdict: ReviewVerdict = override || acceptanceOverride ? 'changes-requested' : result.verdict;
 
   const begun = beginPrReview(deps.db, {
     runId,
@@ -273,6 +296,14 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     // 1. The comment review: recorded, found by its marker among the worker's own reviews, or new.
     // With structured findings, those whose line the reviewed diff has are inline comments of it.
     if (override) await runLog([`verdict: the reviewer wrote ready-to-merge, but ${override}; taken as changes-requested`]);
+    if (acceptanceOverride) await runLog([`verdict: the reviewer wrote ready-to-merge, but ${acceptanceOverride}; taken as changes-requested`]);
+    if (assessment) {
+      const counts = assessment.rows.reduce<Record<string, number>>((m, r) => ({ ...m, [r.status]: (m[r.status] ?? 0) + 1 }), {});
+      await runLog([
+        `acceptance: ${assessment.rows.length} criteria (${Object.entries(counts).map(([k, n]) => `${n} ${k}`).join(', ') || 'none'}), policy ${assessment.policy}` +
+          (assessment.problem ? `; ${assessment.problem}` : ''),
+      ]);
+    }
     if (reading.problem) await runLog([`findings: ${reading.problem}; the review is posted as written`]);
     const round = structured ? reviewRound(deps.db, runId) : 0;
     const login = await workerLogin(deps.api);
@@ -282,7 +313,16 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
       const found = (await deps.api.listPullRequestReviews(repoRef, prNumber)).find((r) => r.body.includes(marker) && sameLogin(r.user, login));
       let posted: PullRequestReviewSummary | undefined = found;
       if (!posted) {
-        const next = nextStep(deps.config, repo, verdict, countRevisions(deps.db, job.repoId, prNumber));
+        const checklist = assessment && gate
+          ? renderAcceptanceChecklist({
+              assessment,
+              gate,
+              headSha,
+              prUrl: request.pullRequest.url,
+              previous: previousAssessment(deps.db, { repoId: job.repoId, prNumber, runId, createdAt: rev.createdAt }),
+            })
+          : null;
+        const next = nextStep(deps.config, repo, verdict, countRevisions(deps.db, job.repoId, prNumber), holdForPerson ? enforced : null);
         const create = async (input: Parameters<typeof deps.api.createPullRequestReview>[2]): Promise<PullRequestReviewSummary> => {
           hold(); // the lookup may have outlived the lease
           try {
@@ -322,8 +362,8 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
               structured,
               plan: p,
               threads: (key) => threadOf(deps.db, job.repoId, prNumber, key),
-              override,
-              next,
+              override: override ?? acceptanceOverride,
+              next: checklist ? `${checklist}\n\n${next}` : next,
               marker,
               maxBody: MAX_BODY,
             });
@@ -341,7 +381,12 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
           posted ??= await create({ body: render(plan), commitId: headSha });
           await runLog([`findings: ${plan.inline.length} inline, ${plan.summary.length} in the summary, ${plan.repeats.length} in earlier threads, ${structured.checks.length} check(s) of earlier findings`]);
         } else {
-          posted = await create({ body: renderReview({ runId, agent: run.agent, verdict, headSha, findings: result.findings, next }), commitId: headSha });
+          // A block that was read (it held only criteria) is not shown as raw JSON: the checklist says it.
+          const findings = reading.structured ? reading.prose : result.findings;
+          posted = await create({
+            body: renderReview({ runId, agent: run.agent, verdict, headSha, findings, next, override: acceptanceOverride, acceptance: checklist }),
+            commitId: headSha,
+          });
         }
       }
       hold({ reviewId: posted.id, reviewUrl: posted.htmlUrl });
@@ -405,6 +450,10 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     } else if (!current) {
       outcome = 'stale';
       detail = `the pull request is at ${watched.headSha ? short(watched.headSha) : 'another commit'} now; this verdict was for ${short(headSha)}`;
+    } else if (decision.triggers && holdForPerson && !unverifiedBlockers(deps.db, job.repoId, prNumber).length) {
+      // Only evidence or clarification is missing: a revision cannot provide either.
+      outcome = 'needs-verification';
+      detail = acceptanceOverride;
     } else if (decision.triggers) {
       if (!reviseActive(deps.config, repo)) {
         outcome = 'no-revise';
@@ -417,6 +466,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
           review: decision.review,
           reviewedSha: decision.reviewedSha,
           ...(revisionFindings.length ? { findings: revisionFindings } : {}),
+          ...(enforced && (enforced.unmet.length || enforced.pending.length) ? { acceptance: revisionCriteria(enforced) } : {}),
         };
         const max = repo.maxRevisions ?? DEFAULT_MAX_REVISIONS;
         const record = {

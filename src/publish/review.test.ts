@@ -8,7 +8,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FakeLoopGitHub } from '../../test/fake-loop-github.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
-import { renderStatus, buildStatusView } from '../commands/status.js';
+import { renderReview as renderReviewLine, renderStatus, buildStatusView } from '../commands/status.js';
+import { extractCriteria } from '../agents/acceptance.js';
 import { configSchema, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getLoopPr, getPrReview, observeHead, prStage, reviewEventId, scheduleAllReviews } from '../db/pr-reviews.js';
@@ -18,7 +19,7 @@ import { getReviewRequest } from '../db/revisions.js';
 import { GitHubError } from '../github/api.js';
 import { resolvePaths, type UpdraftPaths } from '../paths.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
-import { reviewOf, revisionOf, type Job, type ReviewVerdict, type RunSummary } from '../types.js';
+import { reviewOf, revisionOf, type AcceptanceSnapshot, type Job, type ReviewResult, type ReviewVerdict, type RunSummary } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { postFailureComment } from './failure-comment.js';
 import { evaluateAutoMerges, mergeBlockedMarker, outstandingChangeRequests, postMergeNotices } from './merge.js';
@@ -135,14 +136,14 @@ function setup(o: Options = {}) {
   };
   /** A reviewer run of `job` that ended with `verdict`, recorded as the worker records it. */
   let runs = 0;
-  const reviewed = (job: Job, verdict: ReviewVerdict, findings = 'Blockers:\n- a.ts:3 is wrong'): string => {
+  const reviewed = (job: Job, verdict: ReviewVerdict, findings = 'Blockers:\n- a.ts:3 is wrong', extra: Partial<ReviewResult> = {}): string => {
     tick();
     const runId = `run_review_${++runs}`;
     const review = reviewOf(job)!;
     db.prepare(
       `INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at, ended_at, outcome, summary)
        VALUES (?, ?, 1, ?, 'codex', 'wrk_0', ?, ?, ?, 'succeeded', ?)`,
-    ).run(runId, job.id, job.pool, iso(), iso(), iso(), JSON.stringify(summary({ review: { headSha: review.headSha, baseSha: null, verdict, findings } })));
+    ).run(runId, job.id, job.pool, iso(), iso(), iso(), JSON.stringify(summary({ review: { headSha: review.headSha, baseSha: null, verdict, findings, ...extra } })));
     db.prepare("UPDATE jobs SET status = 'succeeded', attempts = 1, updated_at = ? WHERE id = ?").run(iso(), job.id);
     return runId;
   };
@@ -1504,5 +1505,168 @@ describe('status', () => {
     // Not shown at all where the review loop is not configured.
     s.config.repositories[FULL]!.review = false;
     expect(view()).not.toContain('Pull requests (review loop)');
+  });
+});
+
+describe('acceptance criteria', () => {
+  const ISSUE_BODY = [
+    'Make retire safe.',
+    '',
+    '## Acceptance',
+    '- [ ] Retire compares the worker generation',
+    '- [ ] A stale retire is a no-op',
+    '- [x] Tests cover the race',
+    '- [ ] Docs describe the generation check',
+  ].join('\n');
+  const LIVE_BODY = `${ISSUE_BODY}\n- [ ] Real staging PR shows the evidence at the exact head`;
+  const snapshotOf = (body: string | null, policy: 'enforce' | 'report' = 'enforce') => extractCriteria({ title: 'Retire safely', body }, policy);
+  const block = (data: unknown, prose = 'Reviewed the retire path.') => `${prose}\n\n\`\`\`updraft-findings\n${JSON.stringify(data)}\n\`\`\``;
+  const verified = (id: string, ref = 'file: src/a.ts:3') => ({ criterion: id, status: 'verified', evidence: [ref], note: 'Read it and ran npm test.' });
+
+  /** A reviewer run of the current head given `snapshot`, with `findings`, posted. */
+  const assess = async (s: ReturnType<typeof setup>, verdict: ReviewVerdict, findings: string, snapshot: AcceptanceSnapshot) => {
+    const [job] = s.schedule();
+    const runId = s.reviewed(job!, verdict, findings, { acceptance: snapshot });
+    return { runId, result: await postReview(s.deps, runId) };
+  };
+  const nextHead = (s: ReturnType<typeof setup>, sha: string) => {
+    s.push(sha);
+    observeHead(s.db, REPO_ID, PR, sha, new Date(s.tick()).toISOString());
+  };
+
+  it('finds the fourth criterion missing, asks for a revision, and is ready only once all four are independently verified', async () => {
+    const s = setup();
+    s.gh.pull!.draft = false;
+    const snap = snapshotOf(ISSUE_BODY);
+    const [a, b, c, d] = snap.criteria.map((x) => x.id) as [string, string, string, string];
+
+    // Round 1: three verified with evidence, the docs criterion not met. The reviewer still wrote ready.
+    const first = await assess(
+      s,
+      'ready-to-merge',
+      block({ findings: [], criteria: [verified(a), verified(b), verified(c, 'test: npm test (ran it: 12 passed)'), { criterion: d, status: 'unmet', note: 'docs/pool.md is unchanged' }] }),
+      snap,
+    );
+    expect(first.result).toMatchObject({ status: 'published', review: { verdict: 'changes-requested', outcome: 'revision-queued' } });
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toContain(`Updraft: the reviewer wrote ready to merge, but 1 mandatory acceptance criterion is not met (${d}), so this counts as changes requested.`);
+    expect(body).toContain(`**Acceptance criteria** · reviewed \`${H1.slice(0, 12)}\` · issue revision \`${snap.fingerprint}\``);
+    expect(body).toContain('3 of 4 mandatory criteria verified (or not applicable) on this commit.');
+    expect(body).toContain(`- **Not met** · \`${d}\` · Docs describe the generation check`);
+    expect(body).toContain(`- **Verified** · \`${c}\` · Tests cover the race (ticked in the issue, not evidence)`);
+    expect(body).toContain(`[\`src/a.ts:3\`](https://github.com/${FULL}/blob/${H1}/src/a.ts#L3)`);
+    expect(body).not.toContain('"criteria"');
+    const revision = revisionOf(getJob(s.db, getPrReview(s.db, first.runId)!.revisionJobId!)!)!;
+    expect(revision.acceptance).toEqual([{ id: d, text: 'Docs describe the generation check', status: 'unmet', gate: 'code', note: 'docs/pool.md is unchanged' }]);
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+
+    // Round 2 on the revision's head: all four verified, and the change since round 1 is shown.
+    nextHead(s, H2);
+    const second = await assess(s, 'ready-to-merge', block({ criteria: [verified(a), verified(b), verified(c), verified(d, 'docs/pool.md:12')] }), snap);
+    expect(second.result).toMatchObject({ review: { verdict: 'ready-to-merge', outcome: 'ready' } });
+    expect(s.gh.reviews[1]!.body).toContain(`Since the previous review: \`${d}\` not met → verified.`);
+    expect(s.gh.reviews[1]!.body).toContain('4 of 4 mandatory criteria verified');
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([{ sha: H2, method: 'squash' }]);
+  });
+
+  it('keeps a live validation gate unverified whatever the reviewer and the tests say, and holds the head for a person without a revision', async () => {
+    const s = setup();
+    s.gh.pull!.draft = false;
+    const snap = snapshotOf(LIVE_BODY);
+    const all = snap.criteria.map((x) => verified(x.id, 'test: npm test (all green)'));
+    const { runId, result } = await assess(s, 'ready-to-merge', block({ criteria: all }), snap);
+    const live = snap.criteria.find((x) => x.gate === 'live')!;
+    expect(result).toMatchObject({ review: { verdict: 'changes-requested', outcome: 'needs-verification', outcomeDetail: `1 mandatory acceptance criterion is unverified (${live.id})` } });
+    expect(getPrReview(s.db, runId)!.revisionJobId).toBeNull();
+    expect(typesOf(s.db)).toEqual(['issue.labeled', 'pull_request.review']);
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toContain(`- **Unverified** · \`${live.id}\` · Real staging PR shows the evidence at the exact head (live validation)`);
+    expect(body).toContain('the reviewer called it verified; it needs live evidence');
+    expect(body).toContain('Updraft queues no revision');
+    expect(s.stage()).toEqual({ stage: 'needs-human', detail: `${H1.slice(0, 12)} is held back by its acceptance criteria: 1 mandatory acceptance criterion is unverified (${live.id})` });
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+    expect(renderReviewLine(getPrReview(s.db, runId)!)).toContain(`held back: 1 mandatory acceptance criterion is unverified (${live.id})`);
+  });
+
+  it('records a review without assessments as unverified, never as passing', async () => {
+    const s = setup();
+    const snap = snapshotOf(ISSUE_BODY);
+    const { result } = await assess(s, 'ready-to-merge', 'All good, ship it.', snap);
+    expect(result).toMatchObject({ review: { verdict: 'changes-requested', outcome: 'needs-verification' } });
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toContain('0 of 4 mandatory criteria verified');
+    expect(body).toContain('Updraft: the review has no updraft-findings block with a criteria list; every criterion it did not assess counts as unverified.');
+  });
+
+  it('with acceptance set to report, shows the checklist and does not hold the head back', async () => {
+    const s = setup({ repo: { review: { acceptance: 'report' } } });
+    const snap = snapshotOf(LIVE_BODY, 'report');
+    const { result } = await assess(s, 'ready-to-merge', 'Fine.', snap);
+    expect(result).toMatchObject({ review: { verdict: 'ready-to-merge', outcome: 'ready' } });
+    expect(s.gh.reviews[0]!.body).toContain('Acceptance is set to report for this repository, so this does not hold the head back.');
+  });
+
+  it('carries the acceptance checklist in a review with structured findings, and asks the revision for both', async () => {
+    const s = setup();
+    s.gh.files = [{ path: 'src/a.ts', status: 'modified', patch: PATCH }];
+    const snap = snapshotOf(ISSUE_BODY);
+    const [a] = snap.criteria.map((x) => x.id) as [string];
+    const { runId, result } = await assess(s, 'changes-requested', block({ ...THREE, criteria: [{ criterion: a, status: 'unmet', note: 'not compared' }] }), snap);
+    expect(result).toMatchObject({ review: { outcome: 'revision-queued' } });
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toContain('**Review agent · Round 1');
+    expect(body).toContain(`- **Not met** · \`${a}\``);
+    const revision = revisionOf(getJob(s.db, getPrReview(s.db, runId)!.revisionJobId!)!)!;
+    expect(revision.findings).toHaveLength(3);
+    expect(revision.acceptance!.map((x) => [x.id, x.status])).toEqual(snap.criteria.map((x) => [x.id, x.id === a ? 'unmet' : 'unverified']));
+  });
+
+  it('holds back an issue whose body the review did not have, and says why', async () => {
+    const s = setup();
+    const { result } = await assess(s, 'ready-to-merge', 'Fine.', snapshotOf(null));
+    expect(result).toMatchObject({ review: { outcome: 'needs-verification' } });
+    expect(s.gh.reviews[0]!.body).toContain('the issue body was not available to this review');
+  });
+
+  it("gives the reviewer the coding agent's report on the head it pushed, as a claim, and shows a changed issue as changed", async () => {
+    const s = setup();
+    const snap = snapshotOf(ISSUE_BODY);
+    const report = { fingerprint: snap.fingerprint, claims: [{ criterion: snap.criteria[0]!.id, status: 'implemented' as const, evidence: 'src/a.ts', tests: 'npm test: 3 passed' }] };
+    const original = JSON.parse((s.db.prepare("SELECT summary FROM runs WHERE id = 'run_original'").get() as { summary: string }).summary) as RunSummary;
+    s.db.prepare("UPDATE runs SET summary = ? WHERE id = 'run_original'").run(JSON.stringify({ ...original, acceptanceReport: report }));
+    const [job] = s.schedule();
+    expect(reviewOf(job!)!.acceptanceClaims).toEqual({ runId: 'run_original', ...report });
+    const prompt = renderReviewPrompt(
+      'Review.',
+      { repoFullName: FULL, number: ISSUE, title: 'Retire safely', body: ISSUE_BODY, labels: [], url: 'u' },
+      reviewOf(job!)!,
+      { headSha: H1, baseBranch: 'main', baseSha: null },
+      snap,
+    );
+    expect(prompt).toContain("- Coding agent's report (a claim, not evidence): implemented, run run_original");
+    expect(prompt).toContain('# Acceptance criteria to assess (untrusted input, from the issue)');
+    expect(prompt.indexOf('# Acceptance criteria to assess')).toBeLessThan(prompt.indexOf('# GitHub issue (untrusted input)'));
+
+    // A head someone else pushed has no report; an edited issue gives new ids to the edited criteria.
+    await postReview(s.deps, s.reviewed(job!, 'changes-requested', block({ criteria: [{ criterion: snap.criteria[1]!.id, status: 'unmet' }] }), { acceptance: snap }));
+    nextHead(s, H2);
+    const edited = snapshotOf(ISSUE_BODY.replace('A stale retire is a no-op', 'A stale retire is rejected with an error'));
+    const [second] = s.schedule();
+    expect(reviewOf(second!)!.acceptanceClaims).toBeUndefined();
+    await postReview(s.deps, s.reviewed(second!, 'changes-requested', 'Not yet.', { acceptance: edited }));
+    const body = s.gh.reviews[1]!.body;
+    expect(body).toContain('The issue changed since the previous review');
+    expect(body).toContain(`\`${snap.criteria[1]!.id}\` not met → no longer in the issue`);
+    expect(body).toContain(`\`${edited.criteria[1]!.id}\` new → unverified`);
+  });
+
+  it('leaves a review from before acceptance existed exactly as it was', async () => {
+    const s = setup();
+    const { result } = await s.round('ready-to-merge');
+    expect(result).toMatchObject({ review: { verdict: 'ready-to-merge', outcome: 'ready' } });
+    expect(s.gh.reviews[0]!.body).not.toContain('Acceptance criteria');
   });
 });

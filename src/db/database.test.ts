@@ -404,3 +404,46 @@ describe('migration v13', () => {
     expect(strip(metricRows(h.db))).toEqual(strip(live.filter((r) => !retriedFailure(r))));
   });
 });
+
+describe('migration v20', () => {
+  it('lets pr_reviews hold the needs-verification outcome, keeping every row, column and index of a v19 database', () => {
+    const db = openDatabase(':memory:', { migrateTo: 19 });
+    db.prepare(
+      `INSERT INTO jobs (id, repo_id, repo_full_name, workflow_id, event_id, issue_number, action, pool, envelope, status, attempts, created_at, updated_at)
+       VALUES ('job_1', 1, 'o/r', 'wf', 'pr-review:5:sha_a', 1, 'implement-issue', 'reviewers', '{}', 'succeeded', 1, 't', 't')`,
+    ).run();
+    for (const id of ['run_1', 'run_2', 'run_3']) {
+      db.prepare(`INSERT INTO runs (id, job_id, attempt, pool, agent, worker_id, lease_expires_at, started_at) VALUES (?, 'job_1', ?, 'reviewers', 'codex', 'w', 't', 't')`).run(
+        id,
+        Number(id.slice(-1)),
+      );
+    }
+    db.prepare(
+      `INSERT INTO pr_reviews (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, head_sha, agent, verdict, findings, state, outcome, findings_count, created_at, updated_at)
+       VALUES ('run_1', 'job_1', 1, 'o/r', 1, 5, 'sha_a', 'codex', 'changes-requested', 'text', 'published', 'revision-queued', 2, 't1', 't2')`,
+    ).run();
+    const insert = (runId: string, outcome: string) =>
+      db
+        .prepare(
+          `INSERT INTO pr_reviews (run_id, job_id, repo_id, repo_full_name, issue_number, pr_number, head_sha, agent, verdict, findings, state, outcome, created_at, updated_at)
+           VALUES (?, 'job_1', 1, 'o/r', 1, 5, 'sha_b', 'codex', 'changes-requested', 'text', 'published', ?, 't3', 't4')`,
+        )
+        .run(runId, outcome);
+    expect(() => insert('run_2', 'needs-verification')).toThrow(/CHECK/i);
+    const indexes = () =>
+      (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pr_reviews' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+    const before = indexes();
+    migrate(db, 20);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 20 });
+    expect(db.prepare('SELECT run_id, outcome, findings_count, created_at FROM pr_reviews').all()).toEqual([
+      { run_id: 'run_1', outcome: 'revision-queued', findings_count: 2, created_at: 't1' },
+    ]);
+    expect(indexes()).toEqual(before);
+    insert('run_2', 'needs-verification');
+    expect(() => insert('run_3', 'something-else')).toThrow(/CHECK/i);
+    // Again, as after a hand downgrade: nothing to do.
+    db.exec('PRAGMA user_version = 19');
+    migrate(db, 20);
+    expect(db.prepare('SELECT count(*) AS n FROM pr_reviews').get()).toEqual({ n: 2 });
+  });
+});
