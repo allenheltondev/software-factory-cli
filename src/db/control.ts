@@ -12,6 +12,8 @@ import { nowIso } from '../util/ids.js';
 export const CONTROL_PAUSE_PREFIX = 'control:pause:';
 export const CONTROL_COMMAND_PREFIX = 'control:command:';
 export const CONTROL_CHECKPOINT_PREFIX = 'control:checkpoint:';
+/** Per repository: the last `seq` given to a command record. */
+export const CONTROL_SEQ_PREFIX = 'control:seq:';
 
 /** Why a workflow is held: a `pause`, or a `stop`/`cancel` (resuming those needs maintain). */
 export type PauseKind = 'pause' | 'stop' | 'cancel';
@@ -143,7 +145,9 @@ export function getControlCommand(db: Db, repoId: number, source: string): Contr
 export function recordControlCommand(db: Db, record: ControlCommandRecord): boolean {
   return transaction(db, () => {
     if (getControlCommand(db, record.repoId, record.source)) return false;
-    const seq = Math.max(0, ...listControlCommands(db, record.repoId).map((r) => r.seq ?? 0)) + 1;
+    const seqKey = `${CONTROL_SEQ_PREFIX}${record.repoId}`;
+    const seq = (readJson<number>(db, seqKey) ?? 0) + 1;
+    writeJson(db, seqKey, seq);
     const res = db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING').run(commandKey(record.repoId, record.source), JSON.stringify({ ...record, seq }));
     return Number(res.changes) > 0;
   });

@@ -98,17 +98,12 @@ async function handleComment(deps: ControlPollDeps, repo: RepoRef, cfg: Reposito
     source, repoId: repo.id, issue: issue ?? c.issueNumber, pullRequest: c.onPullRequest ? c.issueNumber : null, actor: c.user ?? '', command, receivedAt: nowIso(now),
   };
   const record = (outcome: ControlCommandRecord['outcome'], message: string, headSha: string | null = null) => recordControlCommand(db, { ...base, outcome, message, headSha });
-  if (isAutomatedComment({ login: c.user, type: c.userType }, c.body, own)) {
-    record('ignored', 'automated comment');
-    return false;
-  }
-  if (issue === null) {
-    record('ignored', c.onPullRequest ? 'not a pull request Updraft opened' : 'not an issue Updraft works on');
-    return false;
-  }
+  // Left alone, and not recorded (so strangers cannot grow the state database): automation, a
+  // subject Updraft does not manage, someone not allowed. Nothing is done for them, so reading the
+  // comment again (the checkpoint's overlap) is harmless.
+  if (isAutomatedComment({ login: c.user, type: c.userType }, c.body, own) || issue === null) return false;
   // Not someone the configuration lets direct work here: no GitHub request and no reply.
   if (!isControlActor(repositoryActors(config, cfg), c.user)) {
-    record('ignored', 'not_allowed');
     log.info('command ignored: not an allowed actor', { comment: c.id });
     return false;
   }
@@ -133,8 +128,9 @@ async function handleComment(deps: ControlPollDeps, repo: RepoRef, cfg: Reposito
     }
   };
   if (!decision.allowed) {
-    record(decision.respond === 'ignore' ? 'ignored' : 'refused', decision.reason);
-    if (decision.respond === 'refuse') await reply(refusalMessage(decision.reason, command));
+    if (decision.respond === 'ignore') return false;
+    record('refused', decision.reason);
+    await reply(refusalMessage(decision.reason, command));
     log.info('command refused', { comment: c.id, actor: c.user, command, reason: decision.reason });
     return true;
   }

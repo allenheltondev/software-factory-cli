@@ -20,6 +20,8 @@ describe('control command records', () => {
     expect(recordControlCommand(db, record('cli-0000', 'resume'))).toBe(true);
     expect(recordControlCommand(db, record('cli-8888', 'pause'))).toBe(true);
     expect(listControlCommands(db, 42, 7).map((r) => [r.command, r.seq])).toEqual([['pause', 1], ['resume', 2], ['pause', 3]]);
+    // The sequence is one counter row per repository, not a scan of the history.
+    expect(db.prepare("SELECT value FROM meta WHERE key = 'control:seq:42'").get()).toEqual({ value: '3' });
   });
 
   it('orders by time received first, and records a duplicate once', () => {

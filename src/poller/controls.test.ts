@@ -157,7 +157,8 @@ describe('mention commands', () => {
     expect(w.gh.permissionLookups).toEqual([]);
     expect(w.gh.posted).toEqual([]);
     expect(activeControlPause(w.db, REPO_ID, ISSUE)).toBeNull();
-    expect(getControlCommand(w.db, REPO_ID, String(c.id))).toMatchObject({ outcome: 'ignored', message: 'not_allowed' });
+    // Not even recorded: strangers cannot grow the state database.
+    expect(getControlCommand(w.db, REPO_ID, String(c.id))).toBeNull();
     w.gh.comment('allen', '@updraft-app pause');
     await w.poll();
     expect(w.gh.permissionLookups).toEqual(['allen']);
@@ -186,6 +187,9 @@ describe('mention commands', () => {
     await w.poll();
     expect(w.gh.posted).toEqual([]);
     expect(activeControlPause(w.db, REPO_ID, ISSUE)).toBeNull();
+    // Nothing of them is kept as a control record.
+    const rows = w.db.prepare("SELECT count(*) AS n FROM meta WHERE key LIKE 'control:command:%'").get() as { n: number };
+    expect(rows.n).toBe(0);
   });
 
   it('answers an unknown command with help naming the real handle', async () => {
