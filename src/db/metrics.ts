@@ -442,7 +442,7 @@ export function routeSourceOf(r: RoutingNote | null): RouteSource | null {
 }
 
 /** A fixed code for why the route is what it is; never the free-text detail. */
-function routeReasonCode(r: RoutingNote | null): string | null {
+export function routeReasonCode(r: RoutingNote | null): string | null {
   if (!r?.rule) return null;
   if (r.rule === 'triage') return r.triage?.origin === 'cache' ? 'triage-cached' : 'triage-answered';
   if (r.rule === 'heuristic') return r.triage?.origin === 'fallback' ? 'triage-unavailable' : r.uncertain ? 'low-confidence' : 'confident';
@@ -451,6 +451,9 @@ function routeReasonCode(r: RoutingNote | null): string | null {
 
 /** A configured model or effort value kept only when it looks like one (no paths, no free text). */
 const safeSetting = (v: string | null | undefined): string | null => (v && v.length <= 80 && /^[A-Za-z0-9._:@+/-]+$/.test(v) && !v.startsWith('/') && !v.includes('..') ? v : null);
+
+/** The pool the configuration gives a tier. */
+const poolOfTier = (t: TierConfig, tier: Tier): string | undefined => (tier === 'high-risk' ? t.highRisk?.pool : t.pools[tier]);
 
 /** The tier whose pool this is, when the configuration names one. */
 export function tierOfPool(t: TierConfig | undefined, pool: string): Tier | null {
@@ -505,7 +508,13 @@ export function noteRunSelected(
   const tiers = Object.values(config.repositories)
     .find((r) => r.id === job.repo_id)
     ?.workflows.find((w) => workflowId(w) === job.workflow_id)?.tiers;
-  const resolved = tierOfPool(tiers, run.pool) ?? (job.escalation_hops === 0 ? requested : null);
+  // The tier this attempt was given: the router's, or the newest escalation's. Several tiers may
+  // share one pool, so the pool alone cannot name it; it is the fallback (a config that changed).
+  const target =
+    job.escalation_hops === 0
+      ? requested
+      : tierOrNull((db.prepare("SELECT tier FROM metric_events WHERE kind = 'job.escalated' AND subject_id = ?").get(`${job.id}:${job.escalation_hops}`) as { tier: string | null } | undefined)?.tier);
+  const resolved = (target && tiers && poolOfTier(tiers, target) === run.pool ? target : null) ?? tierOfPool(tiers, run.pool) ?? (job.escalation_hops === 0 ? requested : null);
   insertRouting(db, {
     kind: 'run.selected',
     subject: run.id,

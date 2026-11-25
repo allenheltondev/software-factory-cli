@@ -103,6 +103,17 @@ describe('run selection facts', () => {
     expect(routingRows(h2.db)[0]).toMatchObject({ model: null });
   });
 
+  it('records the tier the router chose when several tiers share its pool (#140)', () => {
+    const h = history();
+    h.config = configSchema.parse({
+      ...config,
+      repositories: { 'octo/widgets': { ...config.repositories['octo/widgets']!, workflows: [{ ...config.repositories['octo/widgets']!.workflows[0]!, tiers: { pools: { routine: 'plain', standard: 'plain', complex: 'plain' } } }] } },
+    });
+    queue(h, 1, routed('complex', 'plain'));
+    h.run({});
+    expect(routingRows(h.db).find((r) => r.kind === 'run.selected')).toMatchObject({ tier: 'complex', requested_tier: 'complex' });
+  });
+
   it('keeps the tier a retry or escalation resolved to, and counts retries once', () => {
     const h = history();
     const jobId = queue(h, 1, routed('routine', 'fast'));
