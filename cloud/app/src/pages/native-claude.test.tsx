@@ -128,6 +128,20 @@ describe('guided Claude connection', () => {
     expect(screen.queryByRole('button', { name: 'Connect Claude account' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Use subscription' })).toBeDisabled();
   });
+  it('keeps a compatible older session connected and offers an optional idle upgrade', async () => {
+    const current: NativeClaudeView = { ...ready, updateAvailable: { from: '9', to: '10', state: 'required' } };
+    const restart = vi.fn(async () => ({ ...current, updateAvailable: { ...current.updateAvailable!, state: 'stopping' as const } }));
+    const { unmount } = show(fakeApi({ nativeClaude: async () => current, nativeClaudeRestart: restart }));
+    expect(await screen.findByText('Connected')).toBeInTheDocument();
+    expect(screen.getByText(/Update available: image/)).toBeInTheDocument();
+    expect(restart).not.toHaveBeenCalled();
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Update and reconnect' }));
+    expect(restart).toHaveBeenCalledExactlyOnceWith(55);
+    unmount();
+    show(fakeApi({ nativeClaude: async () => ({ ...current, worker: { ...ready.worker!, busy: true } }) }));
+    expect(await screen.findByRole('button', { name: 'Update and reconnect' })).toBeDisabled();
+    expect(screen.getByText('Connected')).toBeInTheDocument();
+  });
   it('updates an old image in one action and blocks busy recovery', async () => {
     const user = userEvent.setup();
     const current: NativeClaudeView = { ...ready, upgrade: { from: '9', to: '10', state: 'required' } };

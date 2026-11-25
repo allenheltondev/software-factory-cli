@@ -35,7 +35,10 @@ function fakeTable() {
     if (!expr) return true;
     if (expr === 'attribute_not_exists(pk) OR jobId = :parent') return !item || item.jobId === values[':parent'];
     if (expr === '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling) AND attribute_not_exists(fenced)') return !!item && item.version === values[':v'] && !item.active && !item.settling && item.fenced === undefined;
-    if (expr === 'installationId = :installation AND #status = :launched AND attribute_not_exists(stopRequestedAt) AND attribute_not_exists(microvmId) AND attribute_exists(launchingAt) AND expiresAt > :at') return !!item && item.installationId === values[':installation'] && item.status === values[':launched'] && item.stopRequestedAt === undefined && item.microvmId === undefined && item.launchingAt !== undefined && Number(item.expiresAt) > Number(values[':at']);
+    if (expr.endsWith(' AND native.generation = :generation')) return condition(expr.slice(0, -' AND native.generation = :generation'.length), item, values) && (item?.native as Item | undefined)?.generation === values[':generation'];
+    if (expr === 'generation = :g AND microvmId = :vm AND imageVersion = :image AND attribute_not_exists(retiring)') return item?.generation === values[':g'] && item?.microvmId === values[':vm'] && item?.imageVersion === values[':image'] && item?.retiring === undefined;
+    if (expr === 'native.generation = :old AND tokenHash = :previous AND attribute_not_exists(microvmId) AND attribute_not_exists(startedAt) AND attribute_not_exists(stopRequestedAt) AND #status = :launched') return (item?.native as Item | undefined)?.generation === values[':old'] && item?.tokenHash === values[':previous'] && item?.microvmId === undefined && item?.startedAt === undefined && item?.stopRequestedAt === undefined && item?.status === values[':launched'];
+    if (expr === 'installationId = :installation AND #status = :launched AND attribute_not_exists(stopRequestedAt) AND attribute_not_exists(microvmId) AND attribute_exists(launchingAt) AND expiresAt > :at AND imageVersion = :image') return !!item && item.installationId === values[':installation'] && item.status === values[':launched'] && item.stopRequestedAt === undefined && item.microvmId === undefined && item.launchingAt !== undefined && Number(item.expiresAt) > Number(values[':at']) && item.imageVersion === values[':image'];
     if (expr === 'installationId = :installation AND attribute_not_exists(releasedAt) AND attribute_not_exists(#stop)') return item?.installationId === values[':installation'] && item?.releasedAt === undefined && item?.stop === undefined;
     if (expr === 'attribute_exists(#stop)') return item?.stop !== undefined;
     if (expr === 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)') return !item || (item.jobId === values[':job'] && item.at === values[':pat']);
@@ -48,6 +51,7 @@ function fakeTable() {
       return item?.enabled === values[':enabled'] && (item?.routingVersion === undefined || item.routingVersion === values[':routingVersion']);
     }
     if (expr === '#enabled = :enabled') return item?.enabled === values[':enabled'];
+    if (expr === 'revision = :revision AND #state = :approved') return item?.revision === values[':revision'] && item?.state === values[':approved'];
     if (expr === 'revision = :revision') return item?.revision === values[':revision'];
     if (expr === 'attribute_not_exists(revision) OR revision = :revision') return item?.revision === undefined || item.revision === values[':revision'];
     if (expr === '#v = :v') return item?.version === values[':v'];
@@ -151,6 +155,8 @@ function fakeTable() {
           if (lhs.startsWith('#stop.')) {
             const stop = { ...(next.stop as Item) }; const field = name(lhs.split('.')[1]!);
             stop[field] = ifNotExists ? stop[field] ?? values[ifNotExists[2]!] : values[rhs]; next.stop = stop;
+          } else if (lhs.startsWith('native.')) {
+            next.native = { ...(next.native as Item), [lhs.split('.')[1]!]: values[rhs] };
           } else next[name(lhs)] = ifNotExists ? (next[name(ifNotExists[1]!)] ?? values[ifNotExists[2]!]) : values[rhs];
         }
       }
@@ -307,6 +313,39 @@ describe('dynamo store: native queue admission', () => {
     }
     return { table, store, workers, control, stop, input, enqueue, terminate, clock };
   }
+
+  it('rotates only a never-started queued job into the exact replacement session', async () => {
+    const s = await cancellationFixture();
+    const job = await s.enqueue('job_upgrade01', 9);
+    const old = { ...job, native: { ...job.native!, generation: 'generation-old' } };
+    s.table.items.set(`JOB#${job.jobId}|META`, { ...s.table.items.get(`JOB#${job.jobId}|META`)!, native: old.native });
+    const target: NativeRoute = { installationId: 55, workerId: 'test-worker', generation: 'generation-new', microvmId: 'mvm-new', imageVersion: '4', controlSecretArn: '' };
+    const session = { pk: 'TENANT#55', sk: 'CLAUDE_SESSION', generation: target.generation, microvmId: target.microvmId, imageVersion: target.imageVersion };
+    s.table.items.set('TENANT#55|CLAUDE_SESSION', { ...session, retiring: true });
+    expect(await s.workers.rebindQueued!(old, target, 'new-token-hash')).toBe(false);
+    expect((await s.store.getJob(job.jobId))?.tokenHash).toBe(old.tokenHash);
+    s.table.items.set('TENANT#55|CLAUDE_SESSION', session);
+    s.table.items.get(`JOB#${job.jobId}|META`)!.startedAt = s.clock;
+    expect(await s.workers.rebindQueued!(old, target, 'new-token-hash')).toBe(false);
+    delete s.table.items.get(`JOB#${job.jobId}|META`)!.startedAt;
+    expect(await s.workers.rebindQueued!(old, target, 'new-token-hash')).toBe(true);
+    expect(await s.store.getJob(job.jobId)).toMatchObject({ tokenHash: 'new-token-hash', imageVersion: '4', native: { generation: 'generation-new' }, expiresAt: job.expiresAt });
+    expect(await s.workers.rebindQueued!(old, target, 'stale-token-hash')).toBe(false);
+    expect(await s.workers.queued(55, 'test-worker')).toContain(job.jobId);
+  });
+
+  it('preserves a queued job when revocation wins the approval/assignment race', async () => {
+    const s = await cancellationFixture();
+    const job = await s.enqueue('job_rollout01', 9);
+    const worker = { ...(await s.workers.get(55, 'test-worker'))!, workerVersion: 'tenant-browser-1' };
+    await s.workers.put(worker, worker.version);
+    s.table.items.set('NATIVE_IMAGE#3|POLICY', { pk: 'NATIVE_IMAGE#3', sk: 'POLICY', revision: 2, state: 'revoked' });
+    const oldApproval = { imageVersion: '3', revision: 1, state: 'approved' as const, protocol: 'tenant-browser-1', reason: 'Compatible' };
+    expect(await s.workers.assign(job, worker, s.clock, s.clock + 60000, oldApproval)).toBe(false);
+    expect((await s.store.getJob(job.jobId))?.microvmId).toBeUndefined();
+    expect((await s.workers.get(55, 'test-worker'))?.active).toBeUndefined();
+    expect(await s.workers.queued(55, 'test-worker')).toContain(job.jobId);
+  });
 
   it('serializes a queued stop before assignment and advances the next issue on the same session', async () => {
     const s = await cancellationFixture(); const target = await s.enqueue('job_aaaStop0001', 7); const next = await s.enqueue('job_bbbNext0001', 8);

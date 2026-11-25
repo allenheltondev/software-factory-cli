@@ -92,7 +92,17 @@ export async function startCloudWorker(config, microvmId, service, options = {})
           if (status.cancel && !childDone && !await stopChild()) throw new Error('worker cancellation required a forced kill');
           if (childDone) {
             await ended;
-            const settled = await call(message('settled'));
+            // Settlement is idempotent. An explicit busy answer can mean Cloud still has
+            // its durable release marker after write contention. Wait a bounded number
+            // of times without polling or launching another job. Refusals and transport
+            // uncertainty still stop the dispatcher immediately.
+            let settled;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              settled = await call(message('settled'));
+              if (!settled.busy) break;
+              console.log(JSON.stringify({ nativeWorker: 'wait', reason: 'settlement_busy', attempt: attempt + 1 }));
+              if (attempt < 2) await pause(interval, undefined, { signal: controller.signal });
+            }
             if (settled.busy) throw new Error('runner exited without settling its lease');
             child = undefined;
           }

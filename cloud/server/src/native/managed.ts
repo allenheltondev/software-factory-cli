@@ -1,3 +1,4 @@
+import { createImagePolicies, imageDecision } from './image-policy.js';
 import { createHmac } from 'node:crypto';
 import {
   GetMicrovmCommand,
@@ -39,6 +40,7 @@ export function managedClaude(
   const controlSecretArn = env.NATIVE_MANAGED_SECRET_ARN;
   if (!imageArn || !imageVersion || !controlSecretArn) return undefined;
 
+  const imagePolicy = createImagePolicies(env.TABLE_NAME ?? '', imageVersion);
   const sessions = createClaudeSessions(env.TABLE_NAME ?? '');
   const workers = createNativeStore(env.TABLE_NAME ?? '');
   const mode = createNativeModeStore(env.TABLE_NAME ?? '');
@@ -89,7 +91,19 @@ export function managedClaude(
     };
   }
 
-  async function launch(session: ManagedSession, id: number, preparedToken?: string) {
+  async function launch(session: ManagedSession, id: number, preparedToken?: string, recovery = false) {
+    // Recovery is only for an already sealed generation with an ambiguous launch marker.
+    // Replaying its original client token discovers the VM for termination, never dispatch.
+    if (recovery) {
+      const sealed = await sessions.session(id);
+      const lease = await admission.get(session.generation);
+      if (!sealed?.retiring || sealed.generation !== session.generation || sealed.imageVersion !== session.imageVersion || !lease?.mayHaveLaunched) {
+        throw new FlowError('invalid_settings', 409, 'Recovery requires the exact sealed generation and its launch marker');
+      }
+    } else {
+      const image = await imagePolicy(session.imageVersion);
+      if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `Reserved Claude image cannot start: ${image.reason}`);
+    }
     const region = env.AWS_REGION ?? '';
     const brokerFunctionName = env.BROKER_FUNCTION_NAME;
     if (!executionRoleArn || !brokerFunctionName || !region)
@@ -200,14 +214,18 @@ export function managedClaude(
         console.log(JSON.stringify({ claudeSession: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'recovered' }));
         return false;
       }
-      if (worker?.active || worker?.settling || (await workers.queued(id, managedWorkerId(id))).length) {
+      const image = await imagePolicy(session.imageVersion);
+      const emergency = reason === 'image-revoked' && image.state === 'revoked' ? image : undefined;
+      if (reason === 'image-revoked' && !emergency) return false;
+      const mandatory = imageDecision(image) !== 'approved';
+      if ((!emergency && (worker?.active || worker?.settling)) || (!mandatory && (await workers.queued(id, managedWorkerId(id))).length)) {
         throw new FlowError(
           'invalid_settings',
           409,
           'Wait for active, settling, and queued Claude jobs to finish before reconnecting.',
         );
       }
-      if (!(await sessions.retire(id, session, snapshot, worker, reason))) {
+      if (!(await sessions.retire(id, session, snapshot, worker, reason, ...(emergency ? [emergency] as const : [])))) {
         // For cleanup, a worker that changed after this read is one that is alive: keep it.
         if (stillDue) {
           console.log(JSON.stringify({ claudeSession: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'changed' }));
@@ -236,7 +254,7 @@ export function managedClaude(
     // A durable launch marker means AWS might have accepted an invocation whose response was lost.
     // Replay the SAME client token to discover that VM; never free capacity on a timeout/absent row.
     if (!vm && (lease?.mayHaveLaunched || !session.admissionRequired)) {
-      vm = await launch(session, id);
+      vm = await launch(session, id, undefined, true);
       if (lease) await admission.bind(generation, vm);
     }
     if (vm) {
@@ -251,6 +269,8 @@ export function managedClaude(
   }
 
   async function start(id: number) {
+    const image = await imagePolicy(imageVersion!);
+    if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `Claude image cannot start: ${image.reason}`);
     if (await disabled())
       throw new FlowError(
         'throttled',
@@ -260,6 +280,14 @@ export function managedClaude(
     if (!executionRoleArn || !env.BROKER_FUNCTION_NAME || !env.AWS_REGION)
       throw new FlowError('invalid_settings', 409, 'Claude launch configuration is incomplete. Contact an operator.');
     let session = await sessions.session(id);
+    if (session && !session.retiring && !session.microvmId) {
+      const reservedImage = await imagePolicy(session.imageVersion);
+      if (imageDecision(reservedImage) !== 'approved') {
+        const reason = reservedImage.state === 'revoked' ? 'image-revoked' : 'image-blocked';
+        if (!await retire(id, session.generation, reason)) throw new FlowError('invalid_settings', 409, 'The blocked Claude environment is stopping. Try again shortly.');
+        session = { ...session, retiring: true };
+      }
+    }
     if (
       session &&
       (session.retiring ||
@@ -295,6 +323,11 @@ export function managedClaude(
       session = reserved ?? (await sessions.session(id));
       if (!session || session.microvmId || session.retiring) return;
     }
+    const reservedImage = await imagePolicy(session.imageVersion);
+    if (imageDecision(reservedImage) !== 'approved') {
+      await retire(id, session.generation, reservedImage.state === 'revoked' ? 'image-revoked' : 'image-blocked');
+      throw new FlowError('invalid_settings', 409, `Reserved Claude image cannot start: ${reservedImage.reason}`);
+    }
     await admission.reserve(id, session.generation, now(), policy);
     // Fetch the secret before the launch marker. Failure here can be sealed/released without a VM.
     let token: string;
@@ -329,6 +362,22 @@ export function managedClaude(
             await admission.release(lease.generation, now());
             released++;
           } else failed++;
+          continue;
+        }
+        // A committed seal is irreversible. Finish physical retirement before consulting
+        // current policy or busy/queue state: reapproval cannot make this generation usable.
+        if (session.retiring) {
+          const reason = session.retirementReason ?? 'reconnect';
+          console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation, microvmId: session.microvmId, reason, retry: true }));
+          if (await retire(lease.installationId, lease.generation, reason)) released++;
+          continue;
+        }
+        // Emergency containment cannot depend on the revoked image polling, registering, or
+        // owning an active job. Never-started queue entries survive generation retirement.
+        const image = await imagePolicy(session.imageVersion);
+        if (image.state === 'revoked') {
+          console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation, microvmId: session.microvmId, reason: 'image-revoked' }));
+          if (await retire(lease.installationId, lease.generation, 'image-revoked')) released++;
           continue;
         }
         const worker = await workers.get(lease.installationId, managedWorkerId(lease.installationId));
@@ -416,6 +465,7 @@ export function managedClaude(
     sessions,
     imageArn,
     imageVersion,
+    imagePolicy,
     policy: {
       maxSessionSeconds: SESSION_SECONDS,
       idleSeconds: (policy.idleMs ?? IDLE_MS) / 1000,
