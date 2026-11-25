@@ -227,6 +227,23 @@ describe('the job page links to its trace', () => {
     expect(screen.queryByTestId('job-work')).not.toBeInTheDocument();
   });
 
+  it('does not ask a configured installation to set telemetry up', async () => {
+    showJob(job({ telemetryStatus: 'enabled' }));
+    expect(await screen.findByTestId('job-telemetry-status')).toHaveTextContent('No telemetry report available');
+    expect(screen.queryByRole('link', { name: 'Set up agent telemetry' })).not.toBeInTheDocument();
+  });
+
+  it('says so when the telemetry settings could not be read', async () => {
+    showJob(job({ telemetryStatus: 'unknown' }));
+    expect(await screen.findByTestId('job-telemetry-status')).toHaveTextContent('Unable to check telemetry settings');
+    expect(screen.queryByRole('link', { name: 'Set up agent telemetry' })).not.toBeInTheDocument();
+  });
+
+  it('offers settings when telemetry is paused', async () => {
+    showJob(job({ telemetryStatus: 'paused' }));
+    expect(await screen.findByRole('link', { name: 'Manage telemetry settings' })).toBeInTheDocument();
+  });
+
   it('shows what the agents did with no destination at all: totals and moments, no links', async () => {
     showJob(
       job({

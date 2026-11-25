@@ -464,6 +464,17 @@ describe("a job's links stay with the destination that got its trace", () => {
     detail: { telemetry: { traceId, spans: 9, exported: 9, failed: 0, startedAt: '2026-11-21T10:00:00.000Z', marks: [{ kind: 'agent', spanId: 'cd'.repeat(8) }, { kind: 'step_failed', spanId: 'ef'.repeat(8), sent: false }] } },
   };
 
+  it('reports the installation telemetry status apart from the job export', async () => {
+    const { service, store } = await setup();
+    expect(jobView(job, await store.getTelemetry(55)).telemetryStatus).toBe('not_configured');
+    await service.setKey(caller, 55, { value: KEY, region: 'us' });
+    const settings = await store.getTelemetry(55);
+    expect(jobView(job, settings).telemetryStatus).toBe('enabled');
+    expect(jobView(job, settings).telemetry).toBeUndefined();
+    expect(jobView(job, null, { settingsUnavailable: true }).telemetryStatus).toBe('unknown');
+    expect(JSON.stringify(jobView(job, settings).telemetryStatus)).not.toMatch(/secret|key/i);
+  });
+
   it('keeps a Honeycomb job linked to Honeycomb after the destination became CloudWatch, then a custom one', async () => {
     const { service, store } = await setup();
     await service.setKey(caller, 55, { value: KEY, region: 'us' });

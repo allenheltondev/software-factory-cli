@@ -350,15 +350,29 @@ function Traces({ job, installationId }: { job: JobView; installationId: number 
   const t = job.telemetry;
   const [copied, setCopied] = useState(false);
   if (!t || t.local) {
+    const status = job.telemetryStatus;
+    const finished = job.result !== 'running';
+    const settings = (
+      <Link className="auth-link font-semibold" to={`/installations/${installationId}/telemetry`}>
+        {status === 'paused' ? 'Manage telemetry settings' : status === 'unknown' ? 'Check telemetry settings' : 'Set up agent telemetry'}
+      </Link>
+    );
+    let message: string | null;
+    if (t?.local) message = 'Local telemetry: this job did not export its traces. What it recorded locally is shown below.';
+    else if (status === 'unknown') message = 'Unable to check telemetry settings. Reload to retry.';
+    else if (status === 'paused') message = 'Telemetry paused. This job has no telemetry report.';
+    else if (status === 'enabled') message = finished ? 'No telemetry report available for this job.' : 'Telemetry enabled · trace details pending';
+    else message = null;
+    // Only an installation confirmed not configured is asked to set telemetry up.
+    const showSettings = status === undefined || status === 'not_configured' || status === 'paused' || status === 'unknown';
     return (
       <Card data-testid="job-telemetry">
         <CardHeader>
           <CardTitle>Traces</CardTitle>
         </CardHeader>
-        <CardBody className="text-sm">
-          <Link className="auth-link font-semibold" to={`/installations/${installationId}/telemetry`}>
-            Set up agent telemetry
-          </Link>
+        <CardBody className="flex flex-col gap-2 text-sm">
+          {message && <p data-testid="job-telemetry-status">{message}</p>}
+          {showSettings && !(t?.local && status === 'enabled') && settings}
         </CardBody>
       </Card>
     );

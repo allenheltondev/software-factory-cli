@@ -306,6 +306,8 @@ export interface JobView {
   detail?: JobDetail;
   /** Its agents' trace in the installation's tracing tool, when telemetry was on. */
   telemetry?: JobTelemetry;
+  /** The installation's telemetry setting now; apart from what this job exported. Absent from an older server. */
+  telemetryStatus?: 'not_configured' | 'paused' | 'enabled' | 'unknown';
 }
 
 export interface JobTelemetry {

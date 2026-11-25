@@ -59,7 +59,12 @@ export interface JobView extends JobSummary {
   retryable: boolean;
   /** Its agents' trace in the tenant's Honeycomb, when telemetry was on for it. */
   telemetry?: JobTelemetryView;
+  /** The installation's telemetry setting now (nonsecret), apart from what this job exported. */
+  telemetryStatus: TelemetryInstallationStatus;
 }
+
+/** `unknown`: the settings could not be read, which is not the same as not configured. */
+export type TelemetryInstallationStatus = 'not_configured' | 'paused' | 'enabled' | 'unknown';
 
 export interface JobTelemetryView {
   traceId: string;
@@ -107,6 +112,8 @@ export interface JobTimelineEntry {
 export interface JobViewOptions {
   now?: number;
   timelineTemplate?: string | null;
+  /** The installation's settings could not be read. */
+  settingsUnavailable?: boolean;
 }
 
 export interface Overview {
@@ -192,8 +199,9 @@ export function conversationOf(job: JobSummary): string | undefined {
   return job.detail?.telemetry?.conversationId ?? (job.issue !== undefined ? `${job.repository}#${job.issue}` : undefined);
 }
 
-export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = null, { now = Date.now(), timelineTemplate = null }: JobViewOptions = {}): JobView {
-  const view: JobView = { ...job, result: jobResult(job), retryable: retryable(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
+export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = null, { now = Date.now(), timelineTemplate = null, settingsUnavailable = false }: JobViewOptions = {}): JobView {
+  const telemetryStatus: TelemetryInstallationStatus = settingsUnavailable ? 'unknown' : !telemetry?.key ? 'not_configured' : telemetry.enabled ? 'enabled' : 'paused';
+  const view: JobView = { telemetryStatus, ...job, result: jobResult(job), retryable: retryable(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
   if (job.issue !== undefined) view.issueUrl = `https://github.com/${job.repository}/issues/${job.issue}`;
   if (job.detail?.prUrl) view.prUrl = job.detail.prUrl;
   // A job of a pull request's event (its review loop): that pull request, whatever the run reported.
@@ -234,7 +242,8 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
 }
 
 export function createStatusService({ store, github, agentKeys, readLog, requestRetry, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
-  const view = (job: JobSummary, telemetry: TelemetrySettings | null) => jobView(job, telemetry, { now: now(), timelineTemplate });
+  const view = (job: JobSummary, telemetry: TelemetrySettings | null, settingsUnavailable = false) => jobView(job, telemetry, { now: now(), timelineTemplate, settingsUnavailable });
+  const settingsOf = (installationId: number) => store.getTelemetry(installationId).then((t) => ({ t, unavailable: false }), () => ({ t: null, unavailable: true }));
   const limitOf = (raw: unknown) => {
     const n = Number(raw);
     return Number.isSafeInteger(n) && n > 0 ? Math.min(n, LIST_LIMIT) : 50;
@@ -361,8 +370,8 @@ export function createStatusService({ store, github, agentKeys, readLog, request
 
     async jobs(caller: Caller, installationId: number, limit?: unknown): Promise<{ jobs: JobView[] }> {
       await github.member(caller, installationId);
-      const [jobs, telemetry] = await Promise.all([store.listRecentJobs(installationId, limitOf(limit)), store.getTelemetry(installationId).catch(() => null)]);
-      return { jobs: jobs.map((j) => view(j, telemetry)) };
+      const [jobs, settings] = await Promise.all([store.listRecentJobs(installationId, limitOf(limit)), settingsOf(installationId)]);
+      return { jobs: jobs.map((j) => view(j, settings.t, settings.unavailable)) };
     },
 
     /**
@@ -376,13 +385,13 @@ export function createStatusService({ store, github, agentKeys, readLog, request
       // Every kept attempt of its delivery: GitHub reuses the id on a redelivery, so an earlier
       // attempt (one that failed to launch, a day before) is part of this job's history.
       const conversationId = conversationOf(job);
-      const [deliveries, telemetry, recent] = await Promise.all([
+      const [deliveries, settings, recent] = await Promise.all([
         job.deliveryId ? store.listDeliveriesOf(installationId, job.deliveryId) : Promise.resolve([]),
-        store.getTelemetry(installationId).catch(() => null),
+        settingsOf(installationId),
         conversationId ? store.listRecentJobs(installationId, LIST_LIMIT).catch(() => []) : Promise.resolve([]),
       ]);
-      const conversation = recent.filter((j) => j.jobId !== job.jobId && conversationOf(j) === conversationId).map((j) => view(j, telemetry));
-      return { job: view(job, telemetry), deliveries, conversation };
+      const conversation = recent.filter((j) => j.jobId !== job.jobId && conversationOf(j) === conversationId).map((j) => view(j, settings.t, settings.unavailable));
+      return { job: view(job, settings.t, settings.unavailable), deliveries, conversation };
     },
 
     /**
