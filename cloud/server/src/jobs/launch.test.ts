@@ -150,7 +150,8 @@ describe('the launcher', () => {
   it.each([
     ['heartbeat-stale', 'native_waiting_for_worker'],
     ['auth-unavailable', 'native_waiting_for_worker'],
-    ['worker-missing', 'native_waiting_for_worker'],
+    ['worker-starting', 'native_waiting_for_worker'],
+    ['worker-lost', 'native_waiting_for_reconnect'],
     ['environment-suspended', 'native_waiting_for_reconnect'],
     ['environment-ended', 'native_waiting_for_reconnect'],
     ['fenced', 'native_waiting_for_reconnect'],

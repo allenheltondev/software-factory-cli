@@ -117,17 +117,18 @@ export interface NativeLaunch {
 }
 
 /** Why a subscription worker is not taking a job now; see readinessAction for what it asks of the owner. */
-export type NativeReadiness = 'ready' | 'image-outdated' | 'worker-missing' | 'worker-replaced' | 'fenced' | 'heartbeat-stale'
+export type NativeReadiness = 'ready' | 'image-outdated' | 'worker-starting' | 'worker-lost' | 'fenced' | 'heartbeat-stale'
   | 'environment-suspended' | 'environment-ended' | 'auth-required' | 'expired' | 'auth-unavailable';
 /**
  * sign-in: the CLI login is gone or expired. reconnect: this environment can never serve again
- * (suspended with no resume, ended, fenced, or on a retired image). wait: a gap a healthy
- * environment recovers from by itself; the parked job starts on the worker's next connected poll.
+ * (suspended with no resume, ended, fenced, its worker lost, or on a retired image). wait: a
+ * bounded gap (startup, a heartbeat within its grace, an unreadable auth probe) that a healthy
+ * environment recovers from; the parked job starts on the worker's next connected poll.
  */
 export function readinessAction(reason: NativeReadiness): 'none' | 'sign-in' | 'reconnect' | 'wait' {
   if (reason === 'ready') return 'none';
   if (reason === 'auth-required' || reason === 'expired') return 'sign-in';
-  if (['environment-suspended', 'environment-ended', 'fenced', 'image-outdated'].includes(reason)) return 'reconnect';
+  if (['environment-suspended', 'environment-ended', 'fenced', 'worker-lost', 'image-outdated'].includes(reason)) return 'reconnect';
   return 'wait';
 }
 export const needsSignIn = (reason: NativeReadiness) => readinessAction(reason) === 'sign-in';

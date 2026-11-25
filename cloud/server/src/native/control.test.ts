@@ -269,6 +269,95 @@ describe('native worker Cloud dispatch', () => {
     expect(row).toMatchObject({ session: 'session-0123456789', active: { jobId: second.jobId } });
     expect(terminateMicrovm).not.toHaveBeenCalled();
   });
+  // The dispatcher's real contract (worker-control.mjs): any response without ok: true throws,
+  // and the loop stops for good. So every answer below must be ok: true.
+  const nextJobOnSameVm = async (deliveryId: string) => {
+    const next = (await store.getJob((await launch(request(deliveryId))).jobId!))!;
+    const assignment = await control.handle(input('poll'));
+    expect(assignment).toMatchObject({ ok: true, request: { microvmId: route.microvmId, payload: { broker: { jobId: next.jobId } } } });
+    expect(row).toMatchObject({ session: 'session-0123456789', microvmId: route.microvmId, active: { jobId: next.jobId } });
+    expect(row?.fenced).toBeUndefined(); expect(terminateMicrovm).not.toHaveBeenCalled();
+  };
+  it('answers a heartbeat from the winning state when completion commits between its read and write (#144)', async () => {
+    const job = await assigned();
+    await store.finishJob(job.jobId, 'succeeded');
+    const put = workers.put;
+    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      // The heartbeat has read the active row; the runner's completion lands before it writes.
+      expect(await control.complete((await store.getJob(job.jobId))!)).toBe(true);
+      return put(next, previous);
+    });
+    expect(await control.handle(input('heartbeat'))).toEqual({ ok: true, busy: false });
+    expect(row?.active).toBeUndefined(); expect(row?.settling).toBeUndefined();
+    expect(await control.handle(input('settled'))).toEqual({ ok: true, busy: false });
+    await nextJobOnSameVm('delivery-after-race');
+  });
+  it('answers a heartbeat that loses to the settling transition as busy, not refused', async () => {
+    const job = await assigned();
+    await store.finishJob(job.jobId, 'succeeded');
+    const put = workers.put;
+    let heartbeat: Record<string, unknown> | undefined;
+    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      // complete() has read the active row; a heartbeat lands, then complete's settling write.
+      heartbeat = await control.handle(input('heartbeat'));
+      return put(next, previous);
+    });
+    expect(await control.complete((await store.getJob(job.jobId))!)).toBe(true);
+    expect(heartbeat).toMatchObject({ ok: true, cancel: false });
+    await nextJobOnSameVm('delivery-after-settling');
+  });
+  const settling = async () => {
+    const job = await assigned();
+    await store.finishJob(job.jobId, 'succeeded');
+    const next = { ...row!, version: row!.version + 1, settling: { jobId: job.jobId } };
+    delete next.active;
+    row = next;
+    return (await store.getJob(job.jobId))!;
+  };
+  type Finalizer = 'terminate' | 'settled' | 'reconcile';
+  const finalize = async (who: Finalizer, job: Job) => who === 'terminate' ? control.complete(job)
+    : who === 'reconcile' ? control.reconcile(job) : (await control.handle(input('settled'))).ok === true && row?.settling === undefined;
+  it.each([
+    ['terminate', 'settled'], ['settled', 'terminate'], ['reconcile', 'settled'],
+    ['settled', 'reconcile'], ['terminate', 'reconcile'], ['reconcile', 'terminate'],
+  ] as [Finalizer, Finalizer][])('lets %s lose its final clear to %s without failing either (#144)', async (loser, winner) => {
+    const job = await settling();
+    const release = vi.spyOn(store, 'releaseJob');
+    const put = workers.put;
+    let won: boolean | undefined;
+    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      won = await finalize(winner, job);
+      return put(next, previous);
+    });
+    if (loser === 'settled') expect(await control.handle(input('settled'))).toEqual({ ok: true, busy: false });
+    else expect(await finalize(loser, job)).toBe(true);
+    expect(won).toBe(true);
+    expect(release).toHaveBeenCalled();
+    expect(row?.settling).toBeUndefined(); expect(row?.active).toBeUndefined();
+    expect(await store.listActiveJobs()).toEqual([]);
+    await nextJobOnSameVm(`delivery-${loser}-${winner}`);
+  });
+  it('settles from the dispatcher when the runner finished but its own terminate never landed', async () => {
+    const job = await assigned();
+    await store.finishJob(job.jobId, 'succeeded');
+    expect(await control.handle(input('settled'))).toEqual({ ok: true, busy: false });
+    expect((await store.getJob(job.jobId))?.stopRequestedAt).toBeDefined();
+    await nextJobOnSameVm('delivery-after-dispatcher-settle');
+  });
+  it('still refuses a settled claim for a runner that exited without reporting its finish', async () => {
+    await assigned();
+    expect(await control.handle(input('settled'))).toMatchObject({ ok: false });
+    expect(row?.active).toBeDefined();
+  });
+  it('fails closed when a lost final clear left the worker fenced', async () => {
+    const job = await settling();
+    const put = workers.put;
+    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      row = { ...row!, version: row!.version + 1, fenced: true };
+      return put(next, previous);
+    });
+    expect(await control.complete(job)).toBe(false);
+  });
   it('still cancels an active job whose stop was requested before it finished', async () => {
     const job = await assigned();
     await store.markStopping(job.jobId);
@@ -314,7 +403,8 @@ describe('native worker Cloud dispatch', () => {
     await expect(control.complete(finished)).rejects.toThrow('settlement response lost');
     expect(release).not.toHaveBeenCalled();
     expect(row?.active).toBeUndefined(); expect(row?.settling?.jobId).toBe(job.jobId);
-    writes.mockResolvedValueOnce(false);
+    // A final clear that keeps failing (not a lost race: nothing else changed the row).
+    writes.mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValueOnce(false);
     expect(await control.complete(finished)).toBe(false);
     expect(row?.settling?.jobId).toBe(job.jobId);
     expect(await control.canServe(job)).toBe(false);

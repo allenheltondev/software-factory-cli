@@ -22,6 +22,7 @@ import { FlowError } from '../flows/github.js';
 import type { NativeRoute } from './route.js';
 import { createClaudeSessions, managedWorkerId } from './sessions.js';
 import { createNativeModeStore, createNativeStore } from './store.js';
+import { classifyReadiness } from './readiness.js';
 
 export const MANAGED_IDLE_POLICY = { maxIdleDurationSeconds: SESSION_SECONDS, suspendedDurationSeconds: 0, autoResumeEnabled: false };
 /** A VM in these states runs no worker loop: it cannot serve, and with no resume it never will. */
@@ -326,6 +327,11 @@ export function managedClaude(
         }
         const state = session.microvmId ? await stateOf(session.microvmId) : undefined;
         const lifecycleState = await lifecycle(lease.installationId, lease.generation);
+        // A ready session whose dispatcher has been silent past its grace never recovers (its loop
+        // does not restart): retire it now, rather than advertise it until the idle deadline.
+        const lost = !!session.readyAt && !!session.microvmId && classifyReadiness(
+          { ...base(lease.installationId), microvmId: session.microvmId, imageVersion: session.imageVersion },
+          worker, now(), undefined, { vmState: state }) === 'worker-lost';
         if (
           paused ||
           session.retiring ||
@@ -333,6 +339,7 @@ export function managedClaude(
           state === null ||
           state === 'TERMINATED' ||
           SUSPENDED_STATES.includes(state ?? '') ||
+          lost ||
           lifecycleState.startupFailed ||
           now() >= Math.max(lease.idleAt, (worker?.lastWorkAt ?? 0) + (lease.idleMs ?? IDLE_MS)) ||
           now() >= session.requestedAt + SESSION_SECONDS * 1000
@@ -345,9 +352,11 @@ export function managedClaude(
                 ? 'startup-failed'
                 : SUSPENDED_STATES.includes(state ?? '')
                   ? 'suspended'
-                  : state === null || state === 'TERMINATED' || now() >= session.requestedAt + SESSION_SECONDS * 1000
-                    ? 'expired'
-                    : 'idle');
+                  : lost
+                    ? 'worker-lost'
+                    : state === null || state === 'TERMINATED' || now() >= session.requestedAt + SESSION_SECONDS * 1000
+                      ? 'expired'
+                      : 'idle');
           console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation,
             microvmId: session.microvmId, vmState: state ?? null, reason, idleMs: lease.idleMs ?? IDLE_MS }));
           if (await retire(lease.installationId, lease.generation, reason)) released++;

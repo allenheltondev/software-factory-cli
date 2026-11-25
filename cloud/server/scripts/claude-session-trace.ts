@@ -15,8 +15,8 @@ import { parseArgs } from 'node:util';
 import { DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException } from '@aws-sdk/client-lambda-microvms';
 import { GetCommand, QueryCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import { IDLE_MS, SESSION_SECONDS, type SessionLease } from '../src/native/admission.js';
-import { classifyReadiness } from '../src/native/aws.js';
+import { IDLE_MS, SESSION_SECONDS, STARTUP_MS, type SessionLease } from '../src/native/admission.js';
+import { classifyReadiness } from '../src/native/readiness.js';
 import { readinessAction } from '../src/jobs/launch.js';
 import type { ManagedSession, WaitingClaudeJob } from '../src/native/sessions.js';
 import { managedWorkerId } from '../src/native/sessions.js';
@@ -47,7 +47,8 @@ export function snapshot(t: TraceInput) {
   const route = s?.microvmId && !s.retiring
     ? { installationId: t.installationId, workerId: managedWorkerId(t.installationId), microvmId: s.microvmId, imageVersion: s.imageVersion, controlSecretArn: '' }
     : undefined;
-  const readiness = route ? classifyReadiness(route, w, t.now, t.latestImageVersion, t.vm?.state) : 'no-session';
+  const startingUntil = s && !s.readyAt ? s.startupDeadline ?? s.requestedAt + STARTUP_MS : undefined;
+  const readiness = route ? classifyReadiness(route, w, t.now, t.latestImageVersion, { startingUntil, ...(t.vm ? { vmState: t.vm.state } : {}) }) : 'no-session';
   const idleMs = t.lease?.idleMs ?? IDLE_MS;
   const idleAt = t.lease ? Math.max(t.lease.idleAt, (w?.lastWorkAt ?? 0) + idleMs) : undefined;
   return {

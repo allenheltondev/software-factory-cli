@@ -90,8 +90,19 @@ When a labeled issue cannot start at once, the webhook names why and what it nee
 | Readiness | Owner action | Meaning |
 | --- | --- | --- |
 | `auth-required`, `expired` | sign in | the CLI login is gone |
-| `environment-suspended`, `environment-ended`, `fenced`, `image-outdated` | reconnect | this environment can never run a job again |
-| `heartbeat-stale`, `auth-unavailable`, `worker-missing`, `worker-replaced` | none: wait | a gap the environment recovers from; the job starts on the worker's next connected poll |
+| `environment-suspended`, `environment-ended`, `fenced`, `worker-lost`, `image-outdated` | reconnect | this environment can never run a job again |
+| `worker-starting`, `heartbeat-stale`, `auth-unavailable` | none: wait | a bounded gap; the job starts on the worker's next connected poll |
+
+`worker-starting` lasts only until the session's startup deadline. `heartbeat-stale` lasts only
+three minutes on a running VM. After that the in-VM dispatcher is `worker-lost`: its loop never
+restarts. Cleanup then retires the environment with that reason, unless it still holds active,
+settling or queued work. Parked jobs are kept and resume once Claude is reconnected.
+
+The dispatcher stops for good on any refused control call. So Cloud answers each call from the
+state that won any concurrent write: the runner's terminate, the dispatcher's `settled`, a
+heartbeat or a reconciliation. It does not refuse a call that merely lost a race. A `settled`
+request for a runner that reported its finish settles that assignment itself. A runner that
+exited without a finish is still refused and fenced.
 
 `claude-session-trace` prints the same decision from the stored state, read-only and without
 secrets. Run it for the hosted acceptance runs and keep the output with the record:

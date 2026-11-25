@@ -27,8 +27,6 @@ describe('subscription dispatch readiness (#144)', () => {
   });
   const readiness = () => nativeAws({} as never).launch!.readiness!();
   it.each([
-    ['a missing worker row', null, 'worker-missing'],
-    ['another VM', worker({ microvmId: 'mvm-b' }), 'worker-replaced'],
     ['a fenced worker', worker({ fenced: true }), 'fenced'],
     ['a signed-out CLI', worker({ auth: 'auth-required' }), 'auth-required'],
     ['an expired login', worker({ auth: 'expired' }), 'expired'],
@@ -40,20 +38,35 @@ describe('subscription dispatch readiness (#144)', () => {
     expect(mocks.vm).not.toHaveBeenCalled();
   });
   it.each([
-    ['SUSPENDED', 'environment-suspended'],
-    ['SUSPENDING', 'environment-suspended'],
-    ['TERMINATED', 'environment-ended'],
-    ['RUNNING', 'heartbeat-stale'],
-  ])('tells a %s VM behind a stale heartbeat apart', async (state, expected) => {
-    mocks.worker.mockResolvedValue(worker({ heartbeatAt: Date.now() - 2 * 60_000 }));
+    ['SUSPENDED', 2, 'environment-suspended'],
+    ['SUSPENDING', 2, 'environment-suspended'],
+    ['TERMINATED', 2, 'environment-ended'],
+    ['RUNNING', 2, 'heartbeat-stale'],
+    ['RUNNING', 4, 'worker-lost'],
+    ['SUSPENDED', 30, 'environment-suspended'],
+  ])('tells a %s VM behind a heartbeat %i minutes old apart', async (state, minutes, expected) => {
+    mocks.worker.mockResolvedValue(worker({ heartbeatAt: Date.now() - minutes * 60_000 }));
     mocks.vm.mockResolvedValue({ state });
     expect(await readiness()).toBe(expected);
   });
-  it('treats a VM AWS no longer knows as ended, and an unreadable state as a gap, never as ready', async () => {
+  it('treats a VM AWS no longer knows as ended, and an unreadable state by heartbeat age alone, never as ready', async () => {
     mocks.worker.mockResolvedValue(worker({ heartbeatAt: Date.now() - 2 * 60_000 }));
     mocks.vm.mockRejectedValueOnce(new ResourceNotFoundException({ message: 'gone', $metadata: {} }));
     expect(await readiness()).toBe('environment-ended');
     mocks.vm.mockRejectedValueOnce(new Error('throttled'));
     expect(await readiness()).toBe('heartbeat-stale');
+    mocks.worker.mockResolvedValue(worker({ heartbeatAt: Date.now() - 10 * 60_000 }));
+    mocks.vm.mockRejectedValueOnce(new Error('throttled'));
+    expect(await readiness()).toBe('worker-lost');
+  });
+  it.each([
+    ['no worker row', null],
+    ['a worker of another VM', worker({ microvmId: 'mvm-b' })],
+  ])('reads the VM for %s on a pinned route: lost while it runs, ended once it is gone', async (_name, row) => {
+    mocks.worker.mockResolvedValue(row);
+    mocks.vm.mockResolvedValue({ state: 'RUNNING' });
+    expect(await readiness()).toBe('worker-lost');
+    mocks.vm.mockResolvedValue({ state: 'TERMINATED' });
+    expect(await readiness()).toBe('environment-ended');
   });
 });
