@@ -446,4 +446,11 @@ describe('migration v20', () => {
     migrate(db, 20);
     expect(db.prepare('SELECT count(*) AS n FROM pr_reviews').get()).toEqual({ n: 2 });
   });
+
+  it('refuses to stamp v20 on a pr_reviews whose outcome constraint it does not recognize', () => {
+    const db = openDatabase(':memory:', { migrateTo: 19 });
+    db.exec("DROP TABLE pr_reviews; CREATE TABLE pr_reviews (run_id TEXT PRIMARY KEY, outcome TEXT CHECK (outcome IN ('ready','stale')))");
+    expect(() => migrate(db, 20)).toThrow(/does not recognize/);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 19 });
+  });
 });

@@ -680,7 +680,10 @@ function rebuildWithOutcome(db: Db, value: string): void {
   const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pr_reviews'").get() as { sql: string } | undefined;
   if (!table) return;
   const marker = "'no-revise',";
-  if (table.sql.includes(`'${value}'`) || !table.sql.includes(marker)) return;
+  if (table.sql.includes(`'${value}'`)) return;
+  // A definition this migration does not know: stamping the version without the change would
+  // leave a database that refuses the outcome while claiming to allow it.
+  if (!table.sql.includes(marker)) throw new Error(`pr_reviews has an outcome constraint this migration does not recognize; cannot add '${value}'`);
   const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pr_reviews' AND sql IS NOT NULL").all() as { sql: string }[];
   const created = table.sql.replace(marker, `${marker}'${value}',`).replace(/^CREATE TABLE\s+("?)pr_reviews\1/i, 'CREATE TABLE pr_reviews_rebuilt');
   db.exec(created);
