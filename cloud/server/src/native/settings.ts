@@ -2,6 +2,7 @@ import { imageDecision, type ImagePolicy } from './image-policy.js';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows } from '../flows/github.js';
 import type { Store, Tenant } from '../store/store.js';
+import { routeWorkerVersion } from './readiness.js';
 import { legacyNativeTriggers, sameNativeTrigger, type NativeRoute, type NativeTrigger } from './route.js';
 import type { ClaudeSessions } from './sessions.js';
 import type { NativeModeStore, NativeStore } from './store.js';
@@ -68,7 +69,7 @@ export function createNativeSettingsService(d: {
     const stale = !worker || worker.microvmId !== r.microvmId || worker.imageVersion !== r.imageVersion || worker.fenced === true || now() - worker.heartbeatAt > 60_000;
     const managed = r !== d.route ? d.managed : undefined;
     const [imageUpdate, pending, session, queued] = await Promise.all([
-      upgradeOf(r, worker?.workerVersion), managed?.sessions.pending?.(installationId), managed?.sessions.session?.(installationId),
+      upgradeOf(r, routeWorkerVersion(r, worker)), managed?.sessions.pending?.(installationId), managed?.sessions.session?.(installationId),
       worker ? d.workers.queued(r.installationId, r.workerId) : Promise.resolve([]),
     ]);
     const upgrade = imageUpdate?.optional ? undefined : imageUpdate;
@@ -122,7 +123,7 @@ export function createNativeSettingsService(d: {
       }
       const worker = await d.workers.get(installationId, r.workerId);
       const image = await d.managed?.imagePolicy?.(r.imageVersion);
-      if (image && imageDecision(image, worker?.workerVersion) !== 'approved') throw new FlowError('invalid_settings', 409, `Claude image requires an update: ${image.reason}`);
+      if (image && imageDecision(image, routeWorkerVersion(r, worker)) !== 'approved') throw new FlowError('invalid_settings', 409, `Claude image requires an update: ${image.reason}`);
       if (!worker || worker.microvmId !== r.microvmId || worker.imageVersion !== r.imageVersion || worker.fenced ||
           worker.active || worker.settling || now() - worker.heartbeatAt > 60_000 || !['auth-required', 'expired'].includes(worker.auth)) {
         throw new FlowError('invalid_settings', 409, 'Wait for the worker to be online and ready for sign-in');
@@ -168,7 +169,7 @@ export function createNativeSettingsService(d: {
         throw new FlowError('invalid_settings', 409, 'The Claude environment changed. Check its current status before reconnecting.');
       }
       const previous = await d.workers.get(r.installationId, r.workerId);
-      const upgrade = await upgradeOf(r, previous?.workerVersion);
+      const upgrade = await upgradeOf(r, routeWorkerVersion(r, previous));
       const lifecycle = await d.managed.lifecycle?.(installationId, session?.generation);
       if (!upgrade && !lifecycle?.startupFailed && !lifecycle?.retiring && (!previous || previous.microvmId !== r.microvmId || (!previous.fenced && previous.auth !== 'expired' && now() - previous.heartbeatAt <= 60_000))) {
         throw new FlowError('invalid_settings', 409, 'The Claude worker is already up to date and healthy');
