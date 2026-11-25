@@ -385,6 +385,8 @@ export interface GitHubApi {
   listReviewThreads?(repo: RepoRef, pullNumber: number): Promise<ReviewThread[]>;
   /** Write: resolve a review thread (GraphQL). Only ever called for a thread the worker started. */
   resolveReviewThread?(repo: RepoRef, threadId: string): Promise<void>;
+  /** Write: reopen a resolved review thread (GraphQL). Only ever called for a thread the worker started. */
+  unresolveReviewThread?(repo: RepoRef, threadId: string): Promise<void>;
   /** Write: turn a draft pull request into one that is ready for review (GraphQL; REST cannot). */
   markPullRequestReady(repo: RepoRef, nodeId: string): Promise<void>;
   /** Commit statuses and check runs of one commit (two REST requests, plus one per further 100 check runs). */

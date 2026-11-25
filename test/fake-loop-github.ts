@@ -35,6 +35,7 @@ type Failable =
   | 'createIssueComment'
   | 'replyToReviewComment'
   | 'resolveReviewThread'
+  | 'unresolveReviewThread'
   | 'listReviewThreads';
 
 export class FakeLoopGitHub {
@@ -237,6 +238,12 @@ export class FakeLoopGitHub {
     this.maybeFail('resolveReviewThread');
     this.writes.push(`resolve ${threadId}`);
     this.resolved.add(Number(threadId.replace(/^T_/, '')));
+    this.touch();
+  }
+  async unresolveReviewThread(_repo: RepoRef, threadId: string): Promise<void> {
+    this.maybeFail('unresolveReviewThread');
+    this.writes.push(`reopen ${threadId}`);
+    this.resolved.delete(Number(threadId.replace(/^T_/, '')));
     this.touch();
   }
   /** The thread replies under a first comment, oldest first. */

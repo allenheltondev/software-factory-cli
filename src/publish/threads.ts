@@ -27,6 +27,7 @@ import {
   applyRepeat,
   findingsOfRun,
   getFinding,
+  markThreadReopened,
   markThreadResolved,
   promoteThread,
   recordCheck,
@@ -308,7 +309,7 @@ export function verdictContradiction(
 
 export interface ThreadDeps {
   db: Db;
-  api: Pick<GitHubApi, 'listPullRequestReviewComments' | 'replyToReviewComment' | 'listReviewThreads' | 'resolveReviewThread'>;
+  api: Pick<GitHubApi, 'listPullRequestReviewComments' | 'replyToReviewComment' | 'listReviewThreads' | 'resolveReviewThread' | 'unresolveReviewThread'>;
   now?: () => number;
   /**
    * Called right before every external write and every change of the database: confirms the
@@ -499,6 +500,36 @@ export async function answerInThreads(
     }
   }
   const cache: Parameters<typeof findThread>[5] = {};
+  // A thread this review found unresolved is reopened on GitHub if it was resolved: a regressed
+  // blocker must not sit in a collapsed thread. Only the worker's own threads, while the pull
+  // request is still at this head.
+  const reopened = new Set<string>();
+  const unresolvedRoots = [...o.answers.repeats.map((r) => r.root), ...o.answers.checks.filter((c) => c.status === 'unresolved').map((c) => c.root)];
+  for (const root of unresolvedRoots) {
+    if (!root.commentId || reopened.has(root.key) || !deps.api.listReviewThreads || !deps.api.unresolveReviewThread) continue;
+    reopened.add(root.key);
+    try {
+      const thread = await findThread(deps, repo, prNumber, root.commentId, o.login, cache);
+      if (!thread?.isResolved) {
+        if (root.threadResolvedAt) {
+          deps.guard();
+          markThreadReopened(deps.db, repo.id, prNumber, root.key, deps.now);
+        }
+        continue;
+      }
+      if (!(await o.stillCurrent())) {
+        log.push(`threads: the pull request moved on from ${short(o.headSha)}; the thread of ${root.key} was not reopened`);
+        continue;
+      }
+      deps.guard();
+      await deps.api.unresolveReviewThread(repo, thread.id);
+      thread.isResolved = false;
+      deps.guard();
+      markThreadReopened(deps.db, repo.id, prNumber, root.key, deps.now);
+    } catch (err) {
+      settle(deps, err, log, `could not reopen the thread of ${root.key}; its reply and the review summary say it is unresolved`);
+    }
+  }
   for (const c of o.answers.checks) {
     const { root } = c;
     if (!root.commentId) continue;
@@ -545,6 +576,25 @@ export async function answerInThreads(
     }
   }
   return { log };
+}
+
+/**
+ * What a revision of this review answers, by thread, as the threads stand once the review's state
+ * is recorded: each finding of the review (a repeat by the thread it repeats, which now carries
+ * the strongest severity and all the evidence), then each earlier thread its checks found
+ * unresolved without repeating it, so a reopened blocker gets a keyed answer too.
+ */
+export function revisionFindingsOf(db: Db, o: { repoId: number; prNumber: number; runId: string; structured: StructuredReview }): RevisionFinding[] {
+  const roots: ReviewFinding[] = [];
+  const seen = new Set<string>();
+  const add = (r: ReviewFinding | null) => {
+    if (!r || seen.has(r.key) || r.status === 'verified') return;
+    seen.add(r.key);
+    roots.push(r);
+  };
+  for (const f of findingsOfRun(db, o.runId)) add(threadOf(db, o.repoId, o.prNumber, f.key) ?? f);
+  for (const c of o.structured.checks) if (c.status !== 'verified') add(threadOf(db, o.repoId, o.prNumber, c.finding));
+  return roots.map((r) => ({ key: r.key, severity: r.severity, title: r.title, problem: r.problem, suggestion: r.suggestion, path: r.path, line: r.line, threadUrl: r.commentUrl }));
 }
 
 // ---------------------------------------------------------------------------

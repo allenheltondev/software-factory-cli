@@ -36,10 +36,10 @@ import {
   type ReviewOutcome,
 } from '../db/pr-reviews.js';
 import { getJob, getRun } from '../db/queue.js';
-import { findingsOfRun, recordFindings, reviewRound, threadOf, unverifiedBlockers } from '../db/review-findings.js';
+import { recordFindings, reviewRound, threadOf, unverifiedBlockers } from '../db/review-findings.js';
 import { readStructuredFindings, type StructuredReview } from '../agents/findings.js';
 import { diffIndex } from './anchors.js';
-import { answerInThreads, applyFindingState, inlineComments, planThreads, recordPostedThreads, renderStructuredReview, verdictContradiction, withoutInline, type ThreadAnswers, type ThreadPlan } from './threads.js';
+import { answerInThreads, applyFindingState, inlineComments, revisionFindingsOf, planThreads, recordPostedThreads, renderStructuredReview, verdictContradiction, withoutInline, type ThreadAnswers, type ThreadPlan } from './threads.js';
 import { countRevisions, enqueueRevision, getReviewRequest, revisionJob } from '../db/revisions.js';
 import { GitHubError, type PullRequestReviewSummary } from '../github/api.js';
 import { sameLogin, workerLogin } from '../github/identity.js';
@@ -351,7 +351,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     // 1b. Structured findings: recorded with the inline comments the review posted, whatever head
     // it is for. What they change about earlier findings waits for step 3.
     const threadDeps = { db: deps.db, api: deps.api, now, guard: () => hold(), repoFullName, runId };
-    const revisionFindings: RevisionFinding[] = [];
+    let revisionFindings: RevisionFinding[] = [];
     let ownComments: Awaited<ReturnType<typeof recordPostedThreads>>['comments'] = null;
     if (structured && rev.reviewId) {
       hold();
@@ -359,15 +359,6 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
       const recorded = await recordPostedThreads(threadDeps, { repo: repoRef, prNumber, runId, reviewId: rev.reviewId, login });
       ownComments = recorded.comments;
       if (recorded.log.length) await runLog(recorded.log);
-      const seen = new Set<string>();
-      for (const f of findingsOfRun(deps.db, runId)) {
-        // A repeat posted inline, of a finding that had no thread, is its own thread (step 3 makes it so).
-        const earlier = threadOf(deps.db, job.repoId, prNumber, f.key) ?? f;
-        const root = f.commentId && !earlier.commentId ? f : earlier;
-        if (seen.has(root.key)) continue;
-        seen.add(root.key);
-        revisionFindings.push({ key: root.key, severity: f.severity, title: f.title, problem: f.problem, suggestion: f.suggestion, path: f.path, line: f.line, threadUrl: root.commentUrl });
-      }
     }
 
     // 2. The verdict, from the worker's own record. Only a verdict for the current head acts.
@@ -388,6 +379,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
       recorded = transaction(deps.db, () => {
         answers = applyFindingState(threadDeps, { repoId: job.repoId, prNumber, runId, headSha, at: rev.createdAt, structured });
         if (routed === 'ready-to-merge' && unverifiedBlockers(deps.db, job.repoId, prNumber).length) routed = 'changes-requested';
+        revisionFindings = revisionFindingsOf(deps.db, { repoId: job.repoId, prNumber, runId, structured });
         return recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict: routed, headSha, now });
       });
       if (routed !== verdict) await runLog(['verdict: a blocker is still open after this review\'s checks; taken as changes-requested']);

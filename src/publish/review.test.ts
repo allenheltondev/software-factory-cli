@@ -695,7 +695,8 @@ describe('findings as threads', () => {
     expect(body).toContain('`run_other#F9` (not a finding of this pull request; ignored): not checked');
     // The repeat joins F2's thread, which had none on GitHub: it is in the summary.
     expect(getFinding(s.db, REPO_ID, PR, `${second.runId}#F1`)).toMatchObject({ threadKey: `${first.runId}#F2` });
-    expect(revisionOf(getJob(s.db, getPrReview(s.db, second.runId)!.revisionJobId!)!)!.findings!.map((f) => f.key)).toEqual([`${first.runId}#F2`]);
+    // The repeat answers by F2's thread; F3, found unresolved by a check, gets a keyed answer too.
+    expect(revisionOf(getJob(s.db, getPrReview(s.db, second.runId)!.revisionJobId!)!)!.findings!.map((f) => f.key)).toEqual([`${first.runId}#F2`, `${first.runId}#F3`]);
 
     // The same review posted again changes nothing in the threads.
     const writes = s.gh.writes.length;
@@ -1029,8 +1030,56 @@ describe('findings as threads', () => {
     expect(await postReview(s.deps, run)).toMatchObject({ review: { verdict: 'changes-requested' } });
     expect(s.pr()).toMatchObject({ verdict: 'changes-requested', verdictSha: H3 });
     expect(getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!.status).toBe('unresolved');
+    expect(revisionOf(getJob(s.db, getPrReview(s.db, run)!.revisionJobId!)!)!.findings!.map((f) => [f.key, f.severity])).toEqual([[`${first.runId}#F1`, 'blocker']]);
+    // It was resolved on GitHub when verified; found broken again, it is reopened.
+    const f1 = getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!;
+    expect(s.gh.writes).toContain(`reopen T_${f1.commentId}`);
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(false);
+    expect(f1.threadResolvedAt).toBeNull();
     await s.mergeStep();
     expect(s.gh.merges).toEqual([]);
+  });
+
+  it('never lets a repeat that calls an open blocker a suggestion make it one', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    const f1 = `${first.runId}#F1`;
+    const r2 = nextRound(
+      s,
+      H2,
+      'changes-requested',
+      structuredFindings({ findings: [{ id: 'S', severity: 'suggestion', title: 'Generation check', problem: 'Still missing.', sameAs: f1 }], checks: [{ finding: `${first.runId}#F2`, status: 'verified' }] }),
+    );
+    await postReview(s.deps, r2);
+    expect(getFinding(s.db, REPO_ID, PR, f1)).toMatchObject({ severity: 'blocker', status: 'unresolved', problem: 'Still missing.' });
+    const run = nextRound(s, H3, 'ready-to-merge', structuredFindings({ findings: [], checks: [] }));
+    expect(await postReview(s.deps, run)).toMatchObject({ review: { verdict: 'changes-requested' } });
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+  });
+
+  it('never reopens a thread a person started, and does not reopen once the pull request moves on', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    const f1 = getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!;
+    await postReview(s.deps, nextRound(s, H2, 'ready-to-merge', structuredFindings({ findings: [], checks: [{ finding: f1.key, status: 'verified' }, { finding: `${first.runId}#F2`, status: 'verified' }] })));
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(true);
+    // A person's resolved thread, untouched whatever happens.
+    s.gh.reviewComments.push({ id: 7000, reviewId: 3, inReplyToId: null, user: 'allen', body: 'mine', path: 'src/a.ts', htmlUrl: 'h' });
+    s.gh.resolved.add(7000);
+    const run = nextRound(s, H3, 'changes-requested', structuredFindings({ findings: [], checks: [{ finding: f1.key, status: 'unresolved', note: 'broken' }] }));
+    const list = s.gh.listReviewThreads.bind(s.gh);
+    s.gh.listReviewThreads = async () => {
+      const r = await list();
+      s.push('4'.repeat(40));
+      return r;
+    };
+    await postReview(s.deps, run);
+    expect(s.gh.writes.filter((w) => w.startsWith('reopen'))).toEqual([]);
+    expect(s.gh.resolved.has(7000)).toBe(true);
+    // Its state is unresolved all the same, and the reply says so.
+    expect(getFinding(s.db, REPO_ID, PR, f1.key)!.status).toBe('unresolved');
+    expect(s.gh.thread(f1.commentId!).at(-1)!.body).toContain('This is still open');
   });
 
   it('records a ready verdict only together with the findings it verified: interrupted, it is not ready; retried, it merges', async () => {
@@ -1074,6 +1123,9 @@ describe('findings as threads', () => {
     expect(root).toMatchObject({ severity: 'blocker', title: 'Race is back', status: 'unresolved' });
     expect(root.problem).toContain('Without the test the race came back.');
     expect(root.problem).toContain('Also: Still no test.');
+    const queued = revisionOf(getJob(s.db, s.pr().verdictRunId ? getPrReview(s.db, s.pr().verdictRunId!)!.revisionJobId! : '')!)!;
+    expect(queued.findings!.find((f) => f.key === f3)).toMatchObject({ severity: 'blocker', title: 'Race is back', problem: expect.stringContaining('Also: Still no test.') });
+    expect(queued.findings!.filter((f) => f.key === f3)).toHaveLength(1);
     // The next ready review that does not verify it is not ready.
     const run = nextRound(s, H3, 'ready-to-merge', structuredFindings({ findings: [], checks: [] }));
     expect(await postReview(s.deps, run)).toMatchObject({ review: { verdict: 'changes-requested' } });

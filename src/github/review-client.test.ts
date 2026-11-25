@@ -108,11 +108,13 @@ describe('createGitHubApi: the review loop', () => {
 
   it('reads review threads with the repository check, and resolves one', async () => {
     const threads = { data: { repository: { databaseId: 42, pullRequest: { reviewThreads: { nodes: [{ id: 'T1', isResolved: false, comments: { nodes: [{ databaseId: 70, author: { login: 'bot' } }] } }, null] } } } } };
-    const { fn, calls } = fakeFetch((_url, call) => (call.body?.includes('resolveReviewThread') ? json({ data: { resolveReviewThread: { thread: { isResolved: true } } } }) : json(threads)));
+    const { fn, calls } = fakeFetch((_url, call) => (call.body?.includes('esolveReviewThread') ? json({ data: { resolveReviewThread: { thread: { isResolved: true } } } }) : json(threads)));
     const api = await createGitHubApi({ token: 't', fetch: fn });
     expect(await api.listReviewThreads!(repo, 5)).toEqual([{ id: 'T1', isResolved: false, rootCommentId: 70, rootAuthor: 'bot' }]);
     await api.resolveReviewThread!(repo, 'T1');
     expect(JSON.parse(calls.at(-1)!.body!).variables).toEqual({ id: 'T1' });
+    await api.unresolveReviewThread!(repo, 'T1');
+    expect(JSON.parse(calls.at(-1)!.body!)).toMatchObject({ query: expect.stringContaining('unresolveReviewThread'), variables: { id: 'T1' } });
 
     // A thread on the second page is found.
     const paged = fakeFetch((_url, call) => {

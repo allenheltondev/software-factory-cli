@@ -532,6 +532,12 @@ const RESOLVE_THREAD_MUTATION = `mutation($id: ID!) {
   }
 }`;
 
+const UNRESOLVE_THREAD_MUTATION = `mutation($id: ID!) {
+  unresolveReviewThread(input: { threadId: $id }) {
+    thread { isResolved }
+  }
+}`;
+
 const MARK_READY_MUTATION = `mutation($id: ID!) {
   markPullRequestReadyForReview(input: { pullRequestId: $id }) {
     pullRequest { isDraft }
@@ -713,6 +719,23 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     repoNames.set(repo.id, repo.fullName);
     return `/repositories/${repo.id}`;
   };
+
+  async function threadMutation(repo: RepoRef, threadId: string, query: string, doing: string): Promise<void> {
+    const what = `${doing} a review thread of ${repo.fullName}`;
+    const res = await request<GraphQLResponse<Record<string, { thread?: { isResolved?: boolean } | null } | null>>>('/graphql', {
+      method: 'POST',
+      body: { query, variables: { id: threadId } },
+      // The mutation names only a node id; say which repository it is for.
+      repo: repo.fullName,
+    });
+    const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
+    if (errors.length) {
+      const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
+      const limited = errors.some((e) => e.type === 'RATE_LIMITED');
+      const denied = errors.some((e) => e.type === 'FORBIDDEN' || e.type === 'NOT_FOUND');
+      throw new GitHubError(`POST /graphql (${what}) failed: ${detail}`, limited ? 429 : denied ? 403 : 422, limited ? (retryAfterFrom(res.headers) ?? 60) : null);
+    }
+  }
 
   return {
     async getViewer() {
@@ -1028,19 +1051,11 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     },
 
     async resolveReviewThread(repo, threadId) {
-      const what = `resolving a review thread of ${repo.fullName}`;
-      const res = await request<GraphQLResponse<{ resolveReviewThread?: { thread?: { isResolved?: boolean } | null } | null }>>('/graphql', {
-        method: 'POST',
-        body: { query: RESOLVE_THREAD_MUTATION, variables: { id: threadId } },
-        repo: repo.fullName,
-      });
-      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
-      if (errors.length) {
-        const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
-        const limited = errors.some((e) => e.type === 'RATE_LIMITED');
-        const denied = errors.some((e) => e.type === 'FORBIDDEN' || e.type === 'NOT_FOUND');
-        throw new GitHubError(`POST /graphql (${what}) failed: ${detail}`, limited ? 429 : denied ? 403 : 422, limited ? (retryAfterFrom(res.headers) ?? 60) : null);
-      }
+      await threadMutation(repo, threadId, RESOLVE_THREAD_MUTATION, 'resolving');
+    },
+
+    async unresolveReviewThread(repo, threadId) {
+      await threadMutation(repo, threadId, UNRESOLVE_THREAD_MUTATION, 'reopening');
     },
 
     async markPullRequestReady(repo, nodeId) {

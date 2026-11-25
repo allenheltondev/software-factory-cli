@@ -240,13 +240,16 @@ export function recordCheck(db: Db, repoId: number, prNumber: number, threadKey:
 
 /**
  * A finding of a current review that repeats an earlier one: the thread is unresolved again, and
- * carries what the reviewer found now (its severity, text and place), so the next round sees the
- * finding as it is, not as it was first written. Guarded like recordCheck.
+ * carries what the reviewer found now (its text and place), so the next round sees the finding as
+ * it is, not as it was first written. Its severity only ever goes up: a blocker that is repeated is
+ * still not fixed, so a repeat that calls it a suggestion does not make it one. Guarded like
+ * recordCheck.
  */
 export function applyRepeat(db: Db, repoId: number, prNumber: number, threadKey: string, repeat: ReviewFinding, at: string, now?: () => number): boolean {
   const res = db
     .prepare(
-      `UPDATE review_findings SET severity = ?, title = ?, problem = ?, suggestion = ?, path = ?, line = ?, status = 'unresolved', status_sha = ?, status_note = ?, status_at = ?,
+      `UPDATE review_findings SET severity = CASE WHEN severity = 'blocker' THEN 'blocker' ELSE ? END, title = ?, problem = ?, suggestion = ?, path = ?, line = ?,
+              status = 'unresolved', status_sha = ?, status_note = ?, status_at = ?,
               updated_at = ? WHERE repo_id = ? AND pr_number = ? AND finding_key = ? AND (status_at IS NULL OR status_at <= ?)`,
     )
     .run(repeat.severity, repeat.title, repeat.problem, repeat.suggestion, repeat.path, repeat.line, repeat.headSha, repeat.problem, at, iso(now), repoId, prNumber, threadKey, at);
@@ -266,10 +269,16 @@ export function promoteThread(db: Db, repoId: number, prNumber: number, alias: s
   db.prepare('UPDATE review_findings SET thread_key = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND (thread_key = ? OR finding_key = ?)').run(alias, at, repoId, prNumber, a.threadKey, alias);
   if (old) {
     db.prepare(
-      `UPDATE review_findings SET status = ?, status_sha = ?, status_note = ?, status_at = ?, resolution = ?, resolution_note = ?, resolution_sha = ?, resolution_run_id = ?, updated_at = ?
+      `UPDATE review_findings SET status = ?, status_sha = ?, status_note = ?, status_at = ?, resolution = ?, resolution_note = ?, resolution_sha = ?, resolution_run_id = ?,
+              severity = CASE WHEN ? = 'blocker' THEN 'blocker' ELSE severity END, updated_at = ?
        WHERE repo_id = ? AND pr_number = ? AND finding_key = ?`,
-    ).run(old.status, old.statusSha, old.statusNote, old.statusAt, old.resolution, old.resolutionNote, old.resolutionSha, old.resolutionRunId, at, repoId, prNumber, alias);
+    ).run(old.status, old.statusSha, old.statusNote, old.statusAt, old.resolution, old.resolutionNote, old.resolutionSha, old.resolutionRunId, old.severity, at, repoId, prNumber, alias);
   }
+}
+
+/** The thread was reopened on GitHub (a later review found it unresolved again). */
+export function markThreadReopened(db: Db, repoId: number, prNumber: number, threadKey: string, now?: () => number): void {
+  db.prepare('UPDATE review_findings SET thread_resolved_at = NULL, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND finding_key = ?').run(iso(now), repoId, prNumber, threadKey);
 }
 
 export function markThreadResolved(db: Db, repoId: number, prNumber: number, threadKey: string, now?: () => number): void {
