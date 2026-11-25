@@ -9,8 +9,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  DEFAULT_REGISTRY_HOSTS, EGRESS_HEADER, TLS_ACCESS_DENIED, buildAllowlist, classifyAddress, createEgressProxy, hostAllowed, ipv6Groups,
-  parseClientHello, parseConnect, parseEgressConfig, parseHostRule, refusal, vetTarget,
+  DEFAULT_REGISTRY_HOSTS, EGRESS_HEADER, MAX_TENANT_HOSTS, TLS_ACCESS_DENIED, buildAllowlist, classifyAddress, createEgressProxy, hostAllowed, ipv6Groups,
+  mergeRules, parseClientHello, parseConnect, parseEgressConfig, parseHostRule, parseJobEgress, parseTenantHost, refusal, vetTarget,
 } from '../image/sandbox/egress-proxy.mjs';
 import { diagnosticLine, parseProxyHead, proxyEnv } from '../image/sandbox/egress-shim.mjs';
 
@@ -96,6 +96,74 @@ describe('egress allowlist', () => {
     expect(() => parseEgressConfig({ shim, ports: [0] })).toThrow();
     expect(() => parseEgressConfig({ shim: '/opt/updraft/shim.mjs' })).toThrow(/under \/usr/);
     expect(parseEgressConfig({ shim, ports: [443, 8443], maxConnections: 4 }).limits).toEqual({ ports: [443, 8443], maxConnections: 4 });
+  });
+});
+
+describe('per-installation hosts (#157)', () => {
+  it.each([
+    ['npm.pkg.github.com', { wildcard: false, host: 'npm.pkg.github.com' }],
+    ['ACME.jfrog.io', { wildcard: false, host: 'acme.jfrog.io' }],
+    ['acme-123456789012.d.codeartifact.us-east-1.amazonaws.com', { wildcard: false, host: 'acme-123456789012.d.codeartifact.us-east-1.amazonaws.com' }],
+    ['*.artifacts.acme.dev', { wildcard: true, host: 'artifacts.acme.dev' }],
+  ])('accepts %j', (entry, rule) => {
+    expect(parseTenantHost(entry)).toEqual(rule);
+  });
+
+  it.each([
+    ['10.0.0.1', /not a host name/],
+    ['169.254.169.254', /not a host name/],
+    ['[fd00:ec2::254]', /not a host name/],
+    ['https://npm.pkg.github.com', /not a host name/],
+    ['npm.pkg.github.com:443', /not a host name/],
+    ['*', /not a host name/],
+    ['*.com', /not a host name pattern/],
+    ['localhost', /not a host name/],
+    ['registry.localhost', /internal name/],
+    ['nexus.corp', /internal name/],
+    ['mirror.internal', /internal name/],
+    ['npm.svc.cluster.local', /internal name/],
+    ['router.home.arpa', /internal name/],
+    ['1.0.0.127.in-addr.arpa', /internal name/],
+    ['*.amazonaws.com', /shared domain/],
+    ['*.s3.amazonaws.com', /shared domain/],
+    ['*.jfrog.io', /shared domain/],
+    ['*.github.io', /shared domain/],
+    ['*.co.uk', /shared domain/],
+  ])('refuses %j', (entry, problem) => {
+    expect(parseTenantHost(entry).problem).toMatch(problem);
+  });
+
+  it('refuses entries that are not text', () => {
+    for (const entry of [1, null, {}, ['a.example.dev']]) expect(parseTenantHost(entry)).toEqual({ problem: 'an entry is not text' });
+  });
+
+  it("takes a job's policy only for that job, and only whole", () => {
+    expect(parseJobEgress({ jobId: 'job_1', hosts: ['npm.pkg.github.com', '*.artifacts.acme.dev'], version: 3 }, 'job_1')).toEqual({
+      rules: [{ wildcard: false, host: 'npm.pkg.github.com' }, { wildcard: true, host: 'artifacts.acme.dev' }],
+      hosts: ['npm.pkg.github.com', '*.artifacts.acme.dev'],
+    });
+    const none = (problem) => ({ rules: [], hosts: [], problem });
+    expect(parseJobEgress(undefined, 'job_1')).toEqual(none('no-policy'));
+    expect(parseJobEgress('npm.pkg.github.com', 'job_1')).toEqual(none('malformed'));
+    expect(parseJobEgress({ jobId: 'job_1', hosts: [], allowHosts: ['x.example.dev'] }, 'job_1')).toEqual(none('malformed'));
+    // Another job's (another installation's) policy is never applied to this one.
+    expect(parseJobEgress({ jobId: 'job_2', hosts: ['npm.pkg.github.com'] }, 'job_1')).toEqual(none('other-job'));
+    expect(parseJobEgress({ jobId: 'job_1', hosts: ['npm.pkg.github.com'] }, undefined)).toEqual(none('other-job'));
+    // One bad entry refuses the whole list: never a partial policy.
+    expect(parseJobEgress({ jobId: 'job_1', hosts: ['npm.pkg.github.com', '169.254.169.254'] }, 'job_1')).toEqual(none('invalid-host'));
+    expect(parseJobEgress({ jobId: 'job_1', hosts: Array.from({ length: MAX_TENANT_HOSTS + 1 }, (_, i) => `r${i}.acme.dev`) }, 'job_1')).toEqual(none('too-many-hosts'));
+    expect(parseJobEgress({ jobId: 'job_1', hosts: 'npm.pkg.github.com' }, 'job_1')).toEqual(none('malformed'));
+    // Cloud found the stored value invalid: defaults only, and the reason is kept.
+    expect(parseJobEgress({ jobId: 'job_1', hosts: [], problem: 'invalid-stored-policy' }, 'job_1')).toEqual(none('cloud-invalid-stored-policy'));
+    expect(parseJobEgress({ jobId: 'job_1', hosts: ['a.acme.dev'], problem: 'Bad\nthing' }, 'job_1')).toEqual(none('malformed'));
+  });
+
+  it("adds a job's hosts after the image's, without duplicates", () => {
+    const base = buildAllowlist({ allowHosts: ['npm.pkg.github.com'] });
+    const merged = mergeRules(base, [{ wildcard: false, host: 'npm.pkg.github.com' }, { wildcard: false, host: 'acme.jfrog.io' }]);
+    expect(merged.length).toBe(base.length + 1);
+    expect(hostAllowed('acme.jfrog.io', merged)).toBe(true);
+    expect(hostAllowed('acme.jfrog.io', base)).toBe(false);
   });
 });
 
@@ -224,6 +292,11 @@ const NAMES = {
   'pypi.org': [{ address: PUBLIC, family: 4 }],
   'rebind.example.dev': [{ address: '169.254.169.254', family: 4 }],
   'down.example.dev': [{ address: PUBLIC, family: 4 }],
+  'registry.acme.io': [{ address: PUBLIC, family: 4 }],
+  'other.tenant.io': [{ address: PUBLIC, family: 4 }],
+  // An installation's host whose name points inward, wholly or in part (DNS rebinding).
+  'inward.acme.io': [{ address: '10.0.0.5', family: 4 }],
+  'mixed.acme.io': [{ address: PUBLIC, family: 4 }, { address: 'fd00:ec2::254', family: 6 }],
 };
 
 /** A lookup that settles only when told to: { promise, resolve(), reject() }. */
@@ -548,6 +621,63 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
       await drained();
     });
 
+    it("drops every live connection when a job's policy is applied or removed", async () => {
+      const { socket, lookups } = await startProxy();
+      const live = await hold(socket, 'CONNECT registry.npmjs.org:443 HTTP/1.1\r\n\r\n');
+      await new Promise((r) => live.once('data', r));
+      const pending = await hold(socket, 'CONNECT hang.example.dev:443 HTTP/1.1\r\n\r\n');
+      await vi.waitFor(() => expect(lookups).toHaveLength(1));
+      const closed = Promise.all([live, pending].map((s) => new Promise((r) => s.once('close', r))));
+      expect(proxy.setRules(mergeRules(proxy.rules(), parseJobEgress({ jobId: 'j', hosts: ['registry.acme.io'] }, 'j').rules))).toBeGreaterThanOrEqual(2);
+      await closed;
+      // The answer for the old policy's lookup arrives after the change: it connects nowhere.
+      lookups[0].resolve([{ address: PUBLIC, family: 4 }]);
+      await settle();
+      await drained();
+      expect(proxy.stats.allowed).toBe(0);
+    });
+
+    it("reaches an installation's host only during its job, and never another installation's", async () => {
+      const { socket } = await startProxy();
+      const base = proxy.rules();
+      const acmeHello = await clientHello('registry.acme.io');
+      expect((await tunnel(socket, 'registry.acme.io:443')).head).toContain('reason=not-allowed');
+      // Job 1 (installation A).
+      proxy.setRules(mergeRules(base, parseJobEgress({ jobId: 'job_a', hosts: ['registry.acme.io'] }, 'job_a').rules));
+      expect((await tunnel(socket, 'registry.acme.io:443', { first: acmeHello })).head).toBe('HTTP/1.1 200 Connection Established');
+      expect((await tunnel(socket, 'other.tenant.io:443')).head).toContain('reason=not-allowed');
+      // Job 1 ends: the image's hosts again. Job 2 (installation B) gets only its own.
+      proxy.setRules(base);
+      proxy.setRules(mergeRules(base, parseJobEgress({ jobId: 'job_b', hosts: ['other.tenant.io'] }, 'job_b').rules));
+      expect((await tunnel(socket, 'registry.acme.io:443')).head).toContain('reason=not-allowed');
+      expect((await tunnel(socket, 'other.tenant.io:443', { first: await clientHello('other.tenant.io') })).head).toBe('HTTP/1.1 200 Connection Established');
+      // A policy handed to job B but naming job A is ignored entirely.
+      expect(parseJobEgress({ jobId: 'job_a', hosts: ['registry.acme.io'] }, 'job_b').rules).toEqual([]);
+      await drained();
+    });
+
+    it.each([
+      ['inward.acme.io', 'private'],
+      ['mixed.acme.io', 'unique-local'],
+    ])("still refuses an installation's host %s that resolves inward", async (host, detail) => {
+      const { socket, connects } = await startProxy();
+      proxy.setRules(mergeRules(proxy.rules(), parseJobEgress({ jobId: 'j', hosts: [host] }, 'j').rules));
+      const result = await tunnel(socket, `${host}:443`);
+      expect(result.head).toContain('reason=non-public-address');
+      expect(result.head).toContain(`detail=${detail}`);
+      expect(connects).toEqual([]);
+    });
+
+    it("keeps the TLS binding for an installation's host", async () => {
+      const { socket } = await startProxy();
+      proxy.setRules(mergeRules(proxy.rules(), parseJobEgress({ jobId: 'j', hosts: ['registry.acme.io'] }, 'j').rules));
+      const result = await tunnel(socket, 'registry.acme.io:443', { first: evilHello, close: 'server' });
+      expect(result.rest.equals(TLS_ACCESS_DENIED)).toBe(true);
+      expect(logs).toContainEqual(expect.objectContaining({ reason: 'tls-authority-mismatch' }));
+      expect(() => proxy.setRules([{ host: 'x.example.dev' }])).toThrow();
+      expect(() => proxy.setRules('registry.acme.io')).toThrow();
+    });
+
     it('bounds concurrent tunnels', async () => {
       const { socket } = await startProxy({ limits: { maxConnections: 1 } });
       const held = await hold(socket, 'CONNECT registry.npmjs.org:443 HTTP/1.1\r\n\r\n');
@@ -621,7 +751,8 @@ describe.skipIf(!unix)('egress shim', () => {
     expect(result.stdout).toContain('HTTP/1.1 200 Connection Established tunneled');
     expect(result.stdout).toContain('HTTP/1.1 403 Forbidden');
     expect(result.stdout).toContain('npm_config_https_proxy=true');
-    expect(result.stderr).toContain('updraft-egress: refused CONNECT github.com:443 (not-allowed): the host is not an allowed package registry [2 times]');
+    expect(result.stderr).toContain('updraft-egress: refused CONNECT github.com:443 (not-allowed): the host is not an allowed package registry; an installation owner can add it in the Updraft console');
+    expect(result.stderr).toMatch(/github\.com:443 \(not-allowed\)[^\n]*\[2 times\]/);
     expect(result.stderr).toContain('updraft-egress: refused CONNECT rebind.example.dev:443 (non-public-address): the name resolves to a non-public address (link-local)');
     // pypi.org got plain bytes instead of a ClientHello: refused at the handshake.
     expect(result.stderr).toContain('updraft-egress: refused CONNECT pypi.org:443 (tls-refused)');

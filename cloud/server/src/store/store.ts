@@ -304,6 +304,19 @@ export interface TelemetrySettings {
   lastExport?: TelemetryExport;
 }
 
+/**
+ * An installation's extra package registry hosts for subscription (native worker) jobs (#157,
+ * native/registries.ts). Hosts are as stored: `unknown`, because every reader validates them again
+ * and applies none of a list that no longer validates.
+ */
+export interface RegistryPolicy {
+  hosts: unknown[];
+  updatedAt: string;
+  updatedBy: string;
+  /** Bumped by every write; a write names the version it read (putRegistryPolicy). */
+  version?: number;
+}
+
 export interface TelemetryExport {
   at: string;
   jobId: string;
@@ -600,6 +613,9 @@ export interface Store {
    * or gone, like a key's metadata.
    */
   putTelemetry(installationId: number, settings: TelemetrySettings, expected: number): Promise<'stored' | 'conflict' | 'uninstalled'>;
+  getRegistryPolicy(installationId: number): Promise<RegistryPolicy | null>;
+  /** As putTelemetry: version `expected + 1` over `expected` only (0: none yet), refused once uninstalled. */
+  putRegistryPolicy(installationId: number, policy: RegistryPolicy, expected: number): Promise<'stored' | 'conflict' | 'uninstalled'>;
   /** How a job's export went; nothing when telemetry was never set up. */
   recordTelemetryExport(installationId: number, result: TelemetryExport): Promise<void>;
   recordRefusal(installationId: number, refusal: DispatchRefusal): Promise<void>;
@@ -801,6 +817,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const cleanups = new Map<number, CleanupEntry>();
   const keys = new Map<string, AgentKeyMeta>();
   const telemetry = new Map<number, TelemetrySettings>();
+  const registries = new Map<number, RegistryPolicy>();
   const refusals: { id: number; r: DispatchRefusal }[] = [];
   const deliveries2: { id: number; d: DeliveryRecord }[] = [];
   const jobs = new Map<string, Job>();
@@ -1311,6 +1328,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       for (const [k, c] of configs) if (c.installationId === id) configs.delete(k);
       for (const k of [...keys.keys()]) if (k.startsWith(`${id}/`)) keys.delete(k);
       telemetry.delete(id);
+      registries.delete(id);
       for (let i = refusals.length - 1; i >= 0; i--) if (refusals[i]!.id === id) refusals.splice(i, 1);
       for (let i = deliveries2.length - 1; i >= 0; i--) if (deliveries2[i]!.id === id) deliveries2.splice(i, 1);
       for (const m of [slots, days, months]) for (const k of [...m.keys()]) if (k.startsWith(`${id}/`)) m.delete(k);
@@ -1334,6 +1352,17 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       if (!t || t.disabledReason === 'uninstalled') return 'uninstalled';
       if ((telemetry.get(id)?.version ?? 0) !== expected) return 'conflict';
       telemetry.set(id, structuredClone({ ...settings, version: expected + 1 }));
+      return 'stored';
+    },
+    async getRegistryPolicy(id) {
+      const r = registries.get(id);
+      return r ? structuredClone(r) : null;
+    },
+    async putRegistryPolicy(id, policy, expected) {
+      const t = tenants.get(id);
+      if (!t || t.disabledReason === 'uninstalled') return 'uninstalled';
+      if ((registries.get(id)?.version ?? 0) !== expected) return 'conflict';
+      registries.set(id, structuredClone({ ...policy, version: expected + 1 }));
       return 'stored';
     },
     async recordTelemetryExport(id, result) {

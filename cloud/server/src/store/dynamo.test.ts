@@ -4,6 +4,7 @@ import { createNativeModeStore, createNativeStore, type Worker } from '../native
 import { createNativeSettingsService } from '../native/settings.js';
 import { createNativeControl } from '../native/control.js';
 import { nativeJobToken } from '../native/route.js';
+import { effectiveRegistryHosts } from '../native/registries.js';
 import { hashToken } from '../broker/broker.js';
 import { createJobStopper } from '../jobs/stop.js';
 import type { GitHubFlows } from '../flows/github.js';
@@ -629,6 +630,25 @@ describe('dynamo store: review fixes on #78', () => {
     await store.putTelemetry(55, settings, 3);
     await store.markUninstalled(55, DEADLINE);
     expect(await store.putTelemetry(55, settings, 2)).toBe('uninstalled');
+  });
+
+  it('writes package registry hosts only over the version that was read, per tenant, and not after the uninstall (#157)', async () => {
+    const { store, table } = await seeded();
+    const policy = { hosts: ['npm.pkg.github.com'], updatedAt: 't', updatedBy: 'pat' };
+    expect(await store.getRegistryPolicy(55)).toBeNull();
+    expect(await store.putRegistryPolicy(55, policy, 0)).toBe('stored');
+    expect(await store.putRegistryPolicy(55, { ...policy, hosts: ['acme.jfrog.io'] }, 0)).toBe('conflict');
+    expect(await store.getRegistryPolicy(55)).toEqual({ ...policy, version: 1 });
+    expect(table.items.get('TENANT#55|EGRESS')).toMatchObject({ hosts: ['npm.pkg.github.com'], version: 1 });
+    expect(await store.putRegistryPolicy(77, policy, 0)).toBe('uninstalled'); // no such tenant
+    // A value that is not a list comes back as one that cannot validate, not as an empty list.
+    table.items.set('TENANT#55|EGRESS', { pk: 'TENANT#55', sk: 'EGRESS', hosts: 'npm.pkg.github.com', version: 1 });
+    const stale = await store.getRegistryPolicy(55);
+    expect(stale?.hosts).toEqual([null]);
+    expect(effectiveRegistryHosts(stale)).toEqual({ hosts: [], problem: 'invalid-stored-policy' });
+    await store.markUninstalled(55, DEADLINE);
+    expect(table.items.get('TENANT#55|EGRESS')?.ttl).toBe(TTL);
+    expect(await store.putRegistryPolicy(55, policy, 1)).toBe('uninstalled');
   });
 
   it('refuses key metadata once the tenant is uninstalled', async () => {

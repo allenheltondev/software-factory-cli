@@ -73,7 +73,8 @@ export function parseProxyHead(buffer) {
 export function diagnosticLine({ reason, target, detail, count }) {
   const what = target ? `CONNECT ${target}` : 'a request';
   const why = {
-    'not-allowed': 'the host is not an allowed package registry',
+    'not-allowed': 'the host is not an allowed package registry; an installation owner can add it in the Updraft console (Claude subscription, Package registries), or an operator in the worker\'s egress.allowHosts',
+    'policy-changed': 'the job ended or its egress policy changed while the request was being checked',
     'ip-literal': 'only allowed registry host names are reachable, not addresses',
     'port-not-allowed': 'the port is not allowed',
     'non-public-address': `the name resolves to a non-public address${detail ? ` (${detail})` : ''}`,

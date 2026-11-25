@@ -49,6 +49,9 @@ export async function startCloudWorker(config, microvmId, service, options = {})
   let child;
   let ended;
   let childDone = false;
+  // Set when a job's registry hosts could not be removed after its runner exited: the next
+  // iteration stops this worker rather than poll for work with the previous job's rules.
+  let egressResetFailed = false;
   // A status probe that cannot tell (a slow or failed `claude auth status`) is probed once more
   // before it is reported: one unreadable probe should not park the next issue (#144). Only a
   // fresh answer is ever sent; an earlier "connected" is never reused in its place.
@@ -84,6 +87,7 @@ export async function startCloudWorker(config, microvmId, service, options = {})
         }
       }
       while (!stopped) {
+        if (egressResetFailed) throw new Error('egress policy reset failed');
         if (child) {
           const status = await call(message('heartbeat'));
           // A cancel for a runner that already exited has nothing left to stop: settle it, and let
@@ -111,10 +115,24 @@ export async function startCloudWorker(config, microvmId, service, options = {})
           const response = await call(message('poll'));
           if (stopped) break;
           if (response.request) {
+            // The installation's registry hosts for exactly this assignment (#157), applied
+            // before the runner starts and removed as soon as it exits. Bound to the job id the
+            // broker token is for; anything else leaves the image's hosts only. A failure to apply
+            // stops this worker before the job runs.
+            service.applyJobEgress?.(response.egress, response.request?.payload?.broker?.jobId);
             child = launch(response.request);
             childDone = false;
             ended = new Promise((resolve) => {
-              const finish = () => { childDone = true; resolve(); };
+              const finish = () => {
+                if (!childDone) {
+                  try { service.resetJobEgress?.(); } catch {
+                    egressResetFailed = true;
+                    console.error('Removing the finished job\'s registry hosts failed; the worker stops before polling again.');
+                  }
+                }
+                childDone = true;
+                resolve();
+              };
               child.once('close', finish); child.once('error', finish);
             });
           } else if (response.busy) throw new Error('uncertain worker assignment');
@@ -125,6 +143,7 @@ export async function startCloudWorker(config, microvmId, service, options = {})
       if (!stopped) console.error('Cloud worker stopped; operator recovery and confirmed VM termination required.');
       stopped = true;
       await stopChild();
+      try { service.resetJobEgress?.(); } catch { /* the supervisor is going away */ }
       // No more heartbeats: reconciliation fences any outstanding assignment. Do not
       // free its quota slot locally, restart this loop, or launch a BYOK fallback.
     }

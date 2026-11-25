@@ -189,6 +189,22 @@ export interface NativeClaudeTrigger {
   label: string;
 }
 
+/** Extra package registries for subscription jobs (#157). The server checks every host. */
+export interface PackageRegistriesView {
+  hosts: string[];
+  /** The public registries every job reaches. */
+  defaults: string[];
+  max: number;
+  /** Only an owner of an active installation changes the list. */
+  canEdit: boolean;
+  /** The version a save must name. */
+  version: number;
+  updatedAt?: string;
+  updatedBy?: string;
+  /** The saved list no longer validates: jobs get the defaults only until it is saved again. */
+  problem?: string;
+}
+
 export interface NativeClaudeLoginGrant {
   generation?: string;
   expiresAt?: string;
@@ -880,6 +896,10 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     nativeClaude: (installationId: number, signal?: AbortSignal) => request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000) }),
     setNativeClaudeMode: (installationId: number, enabled: boolean, triggers?: NativeClaudeTrigger[]) =>
       request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { method: 'PUT', body: JSON.stringify({ enabled, triggers }) }),
+    packageRegistries: (installationId: number) => request<PackageRegistriesView>(`/installations/${installationId}/package-registries`),
+    /** Replaces the list over `version`; a 409 means someone else saved first. */
+    setPackageRegistries: (installationId: number, hosts: string[], version: number) =>
+      request<PackageRegistriesView>(`/installations/${installationId}/package-registries`, { method: 'PUT', body: JSON.stringify({ hosts, version }) }),
     agentKeys: (installationId: number) => request<AgentKeysView>(`/installations/${installationId}/agent-keys`),
     /** The key is sent once and never comes back. */
     setAgentKey: (installationId: number, name: string, value: string) =>

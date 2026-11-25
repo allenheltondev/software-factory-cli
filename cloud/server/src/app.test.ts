@@ -81,3 +81,29 @@ describe('createApp', () => {
     expect(logError).toHaveBeenCalledOnce();
   });
 });
+
+describe('package registry routes (#157)', () => {
+  const view = { hosts: [], defaults: [], max: 20, canEdit: true, version: 0 };
+  const registries = { view: vi.fn().mockResolvedValue(view), update: vi.fn().mockResolvedValue({ ...view, hosts: ['npm.pkg.github.com'], version: 1 }) };
+  const app = createApp({ resolveCaller: () => ({ sub: 'user-1' }), registries });
+  const put = (body: string) => app.request('/api/v1/installations/55/package-registries', { method: 'PUT', body, headers: { 'content-type': 'application/json' } });
+
+  it('reads and writes one installation, passing only hosts and version through', async () => {
+    const res = await app.request('/api/v1/installations/55/package-registries');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(registries.view).toHaveBeenCalledWith({ sub: 'user-1' }, 55);
+    expect((await put(JSON.stringify({ hosts: ['npm.pkg.github.com'], version: 0 }))).status).toBe(200);
+    expect(registries.update).toHaveBeenCalledWith({ sub: 'user-1' }, 55, { hosts: ['npm.pkg.github.com'], version: 0 });
+  });
+
+  it.each(['not json', '[]', JSON.stringify({ hosts: [], version: 0, installationId: 56 })])('refuses the body %s', async (body) => {
+    registries.update.mockClear();
+    expect((await put(body)).status).toBe(400);
+    expect(registries.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses an installation id that is not a positive integer', async () => {
+    expect((await app.request('/api/v1/installations/-1/package-registries')).status).toBe(404);
+  });
+});
