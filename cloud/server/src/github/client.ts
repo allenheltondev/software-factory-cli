@@ -24,6 +24,8 @@ export interface GitHubInstallation {
   suspendedAt: string | null;
   /** What the installation grants the App (`contents: write`, ...). */
   permissions?: Record<string, string>;
+  /** The webhook events the installation is subscribed to (`issues`, `check_suite`, ...); absent when GitHub did not say. */
+  events?: string[];
 }
 
 export interface GitHubRepository {
@@ -202,6 +204,7 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
         ...(i.permissions && typeof i.permissions === 'object'
           ? { permissions: Object.fromEntries(Object.entries(i.permissions as Json).filter(([, v]) => typeof v === 'string')) as Record<string, string> }
           : {}),
+        ...(Array.isArray(i.events) ? { events: (i.events as unknown[]).filter((e): e is string => typeof e === 'string') } : {}),
       };
     },
 

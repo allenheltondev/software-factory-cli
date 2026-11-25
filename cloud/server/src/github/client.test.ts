@@ -16,6 +16,15 @@ describe('the GitHub client', () => {
     expect(new Headers(calls[0]!.init.headers).get('authorization')).toBe('Bearer ghs_x');
   });
 
+  it('reads an installation with its permissions and the events it is subscribed to', async () => {
+    const api = createGitHubApi(async () => new Response(JSON.stringify({ id: 7, account: { id: 1, login: 'acme', type: 'Organization' }, suspended_at: null,
+      permissions: { contents: 'write', bogus: 3 }, events: ['issues', 'check_suite', 4] }), { status: 200 }));
+    expect(await api.getInstallation('jwt', 7)).toEqual({ id: 7, account: { id: 1, login: 'acme', type: 'Organization' }, suspendedAt: null,
+      permissions: { contents: 'write' }, events: ['issues', 'check_suite'] });
+    const silent = createGitHubApi(async () => new Response(JSON.stringify({ id: 7, account: { id: 1, login: 'acme', type: 'User' }, suspended_at: null }), { status: 200 }));
+    expect(await silent.getInstallation('jwt', 7)).not.toHaveProperty('events');
+  });
+
   it('fails on a refused comment', async () => {
     const api = createGitHubApi(async () => new Response('{}', { status: 403 }));
     await expect(api.createIssueComment('ghs_x', 'acme/web', 12, 'x')).rejects.toBeInstanceOf(GitHubError);
