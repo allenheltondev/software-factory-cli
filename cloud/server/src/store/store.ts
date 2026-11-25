@@ -197,7 +197,7 @@ export interface DeliveryRecord {
   pullRequest?: number;
   label?: string;
   sender?: string;
-  disposition: 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
+  disposition: 'filtered' | 'deduped' | 'coalesced' | 'queued' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
   reason?: string;
   message?: string;
   /** launch_failed: the AWS error's class (its name), never its message. */

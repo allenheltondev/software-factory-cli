@@ -1,4 +1,5 @@
 import type { Job, QuotaLimit, Quotas, TenantLimits } from '../store/store.js';
+import { QUEUE_MAX_PER_TENANT } from './queue.js';
 
 /**
  * Quotas and abuse controls (#68). Per tenant: concurrent jobs, jobs per day and microVM minutes
@@ -20,8 +21,11 @@ import type { Job, QuotaLimit, Quotas, TenantLimits } from '../store/store.js';
  *                       once Lambda shows its microVM terminated (the broker's terminate, or
  *                       reconciliation every five minutes: reconcile.ts).
  *
- * A delivery over a quota starts nothing: it is recorded as throttled, and the issue gets one
- * comment a day saying why. Re-applying the label is how to try again.
+ * A delivery that finds the concurrency taken is not refused: it waits in the admission queue
+ * (queue.ts) and starts once a slot frees, with nothing counted while it waits. A delivery over a
+ * budget (the day's jobs, the month's minutes), or one the queue has no room for, starts nothing:
+ * it is recorded as throttled, and the issue gets one comment a day saying why. Re-applying the
+ * label is how to try again then. (Without a queue configured, concurrency throttles the same way.)
  */
 
 /** An over-quota comment to post on the issue whose label started nothing, or the pull request whose event did. */
@@ -33,7 +37,8 @@ export interface ThrottleNotice {
   issue: number;
   /** The event was its pull request's (a review, a push): the comment says how to try again there. */
   pullRequest?: boolean;
-  limit: QuotaLimit;
+  /** The quota, or the admission queue's own bound (`queue_full`). */
+  limit: QuotaLimit | 'queue_full';
   quotas: Quotas;
 }
 
@@ -97,8 +102,9 @@ export const dayOf = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 export const monthOf = (ms: number) => new Date(ms).toISOString().slice(0, 7);
 
 /** The comment on an issue whose label started nothing because of a quota, or on a pull request whose event did not. */
-export function throttledComment(limit: QuotaLimit, quotas: Quotas, pullRequest = false): string {
-  const why: Record<QuotaLimit, string> = {
+export function throttledComment(limit: QuotaLimit | 'queue_full', quotas: Quotas, pullRequest = false): string {
+  const why: Record<QuotaLimit | 'queue_full', string> = {
+    queue_full: `this account already has the most Updraft work queued that it may (${QUEUE_MAX_PER_TENANT} waiting)`,
     concurrent_jobs:
       quotas.concurrentJobs === 1
         ? 'another Updraft job is already running for this account, and it runs one at a time'
@@ -107,7 +113,8 @@ export function throttledComment(limit: QuotaLimit, quotas: Quotas, pullRequest 
     microvm_minutes: `this account has used its ${quotas.microvmMinutesPerMonth} minutes of Updraft job time for this month (UTC)`,
     platform_concurrency: 'Updraft Cloud is running as many jobs as it can right now',
   };
-  const when: Record<QuotaLimit, string> = {
+  const when: Record<QuotaLimit | 'queue_full', string> = {
+    queue_full: 'once some of the queued work has started',
     concurrent_jobs: 'once the running job finishes',
     jobs_per_day: 'tomorrow',
     microvm_minutes: 'next month',

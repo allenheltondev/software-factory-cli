@@ -6,7 +6,7 @@
  */
 import type { Job, JobFinishDetail } from '../store/store.js';
 import type { WorkflowStore } from './store.js';
-import { newWorkflow, onJobFinished, onJobStarted, onJobWaiting, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
+import { newWorkflow, onJobFinished, onJobQueued, onJobStarted, onJobWaiting, onQueueEnded, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
 
 type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'> & Partial<Pick<Job, 'expiresAt' | 'native'>>;
 
@@ -95,6 +95,23 @@ export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => nu
         const at = now();
         if (job.jobId) await o.store.linkJob(job.installationId, job.jobId, id);
         await updateWorkflow(o.store, job.installationId, id, (w) => onJobWaiting(w ?? newWorkflow(job, id, at), job, why, at));
+      }),
+    /** A delivery waits in the admission queue for capacity (jobs/queue.ts), under its job's stable id. */
+    queued: (job: JobRef, why: { reason: string; message: string }) =>
+      safely('queue', job, async () => {
+        const id = await workflowOfJob(o.store, job);
+        if (!id) return;
+        const at = now();
+        await o.store.linkJob(job.installationId, job.jobId, id);
+        await updateWorkflow(o.store, job.installationId, id, (w) => onJobQueued(w ?? newWorkflow(job, id, at), job, why, at));
+      }),
+    /** A queued job will never start, and why. Only a workflow still waiting on it changes. */
+    queueEnded: (job: JobRef, why: { reason: string; message: string; nextAction?: string }) =>
+      safely('queue end', job, async () => {
+        const id = await workflowOfJob(o.store, job);
+        if (!id) return;
+        const at = now();
+        await updateWorkflow(o.store, job.installationId, id, (w) => (w ? onQueueEnded(w, job, why, at) : null));
       }),
     /** A job finished: its runner's finish (broker), or the reconciler found its microVM gone. */
     finished: (job: JobRef, outcome: string, detail?: JobFinishDetail) =>

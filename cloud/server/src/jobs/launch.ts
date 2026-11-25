@@ -5,7 +5,7 @@ import type { NativeMode } from '../native/store.js';
 import { randomBytes } from 'node:crypto';
 import { legacyNativeTriggers, sameNativeRepository, sameNativeTrigger, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
 import { hashToken, jobPaths } from '../broker/broker.js';
-import { NativeEnqueueRejectedError, type Job, type Quotas, type Store } from '../store/store.js';
+import { NativeEnqueueRejectedError, type Job, type QuotaLimit, type Quotas, type Store } from '../store/store.js';
 import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS, pullRequestOfPayload } from '../tenants/dispatch.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
@@ -31,8 +31,10 @@ export type { ThrottleNotice } from './quotas.js';
  *      a redelivery for long; the job's microVM holds it for its whole lifetime once it starts
  *      (the broker's `start`), and does not run if a redelivery's job has taken it by then
  *   5. quotas (quotas.ts): a slot of the tenant's and of the platform's, the day's jobs and the
- *      month's microVM minutes. Over one: recorded as throttled, the claim given up, one comment a
- *      day on the issue, and nothing started
+ *      month's microVM minutes. No slot free (or earlier work of the tenant waiting): the delivery
+ *      waits in the admission queue (queue.ts), acknowledged, and is started from there under the
+ *      same job id once capacity frees. Over a budget (day, month) or the queue's bound: recorded
+ *      as throttled, the claim given up, one comment a day on the issue, and nothing started
  *   6. the event body to tenants/<id>/events/<delivery>/event.json
  *   7. the job record: its tenant, repository, label, sender, config and image versions, its
  *      slots and reserved seconds, and the hash of a fresh job token
@@ -168,6 +170,12 @@ export interface LaunchDeps {
   bundleKeys?: BundleKeys;
   /** Posts the over-quota comment on the issue (once a day per issue). Its failure is only logged. */
   notifyThrottled?: (input: ThrottleNotice) => Promise<void>;
+  /**
+   * The admission queue (jobs/queue.ts): a fresh delivery that finds the tenant's or the platform's
+   * concurrency taken (or earlier work of the tenant waiting) is kept there and started later,
+   * rather than refused. Absent: such a delivery is throttled, as before.
+   */
+  queue?: import('./queue.js').AdmissionQueue;
   /** Records each launched job on its issue's workflow (workflows/recorder.ts). Best effort. */
   workflows?: import('../workflows/recorder.js').WorkflowRecorder;
   now?: () => number;
@@ -195,6 +203,12 @@ export interface LaunchRequest {
   retry?: boolean;
   retryRuntime?: { workerId?: string; resumeOf?: string };
   resumeClaude?: boolean;
+  /**
+   * Admitted from the queue (jobs/queue.ts), under its stable `jobId`: never queued again (a
+   * capacity wait answers `capacity_wait`), and refused when the execution route chosen at
+   * enqueue (`standard`, or the subscription worker's id) is no longer the one that applies.
+   */
+  queued?: { route: string };
   /**
    * The id the job is to have (newJobId), for a caller that must record it before the launch, to
    * find the job again if it never hears how the launch ended. Absent: the launcher chooses.
@@ -370,6 +384,11 @@ export function createLauncher(deps: LaunchDeps) {
     const selected = isIssue && !req.retryRuntime && (mode?.triggers === undefined || decision.keys?.includes('ANTHROPIC_API_KEY')) && triggers.some((t) => sameNativeTrigger(t, decision));
     const candidate = binding && (selected || workerId === binding.route.workerId) ? binding : undefined;
     const native = candidate && (mode?.enabled ?? await candidate.enabled?.() ?? true) ? candidate : undefined;
+    // Queued work keeps the route it was queued for: a change of routing (subscription mode
+    // turned on or off, another worker) refuses it, never silently moves it to API keys or back.
+    if (req.queued && req.queued.route !== (native?.route.workerId ?? 'standard')) {
+      return skip('not_dispatched', { reason: 'route_changed', message: 'The execution route for this workflow changed while the job was queued (Claude subscription or API key)' });
+    }
     if (req.resumeClaude && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'This workflow no longer uses Claude subscription routing' });
     if (workerId && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'The subscription worker is disabled; reconnect it to continue this job' });
     const imageVersion = native?.route.imageVersion ?? await deps.imageVersion();
@@ -512,6 +531,52 @@ export function createLauncher(deps: LaunchDeps) {
     const quotas = tenantQuotas(deps.quotas, tenant.limits);
     const day = dayOf(launchedAt);
     const month = monthOf(launchedAt);
+    /** The over-quota comment, once a day per issue; never for queued work (its acknowledgement says why). */
+    const throttled = async (limit: QuotaLimit | 'queue_full'): Promise<LaunchResult> => {
+      const issue = number;
+      const first = await deps.store.recordThrottle(req.installationId, month, { repositoryId: decision.repositoryId, issue, day });
+      log({ delivery: req.deliveryId, installationId: req.installationId, repository: decision.repository, issue, throttled: limit });
+      if (first && !benchmark && !req.queued && deps.notifyThrottled) {
+        await deps
+          .notifyThrottled({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, issue, limit, quotas, ...(decision.pullRequest !== undefined ? { pullRequest: true } : {}) })
+          .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
+      }
+      return skip('throttled', { reason: limit });
+    };
+    // A fresh delivery of eligible work (not a console retry, a sign-in resume or a benchmark arm,
+    // which keep their own paths) waits in the admission queue rather than being refused for capacity.
+    const queue = deps.queue && !benchmark && !req.retry && !req.resumeClaude && !req.retryRuntime && !req.queued ? deps.queue : undefined;
+    const enqueue = async (reason: 'concurrent_jobs' | 'platform_concurrency' | 'queue_ahead'): Promise<LaunchResult> => {
+      let out;
+      try {
+        out = await queue!.enqueue({
+          request: req, jobId, repository: decision.repository, repositoryId: decision.repositoryId,
+          ...(decision.issue !== undefined ? { issue: decision.issue } : {}),
+          ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}),
+          ...(workflowIssue !== undefined ? { workflowIssue } : {}),
+          ...(decision.label ? { label: decision.label } : {}),
+          route: native?.route.workerId ?? 'standard', configVersion, reason,
+        });
+      } finally {
+        // The entry (or its subject's lock) dedupes from here; a failed enqueue leaves the delivery redeliverable.
+        await releaseClaims();
+      }
+      if (out.result === 'queued') return { status: 202, disposition: 'queued', jobId: out.entry.jobId, reason };
+      if (out.result === 'joined') return { status: 200, disposition: 'queue_joined', jobId: out.entry.jobId, message: `already queued as ${out.entry.jobId}` };
+      if (out.result === 'busy') return { status: 503, disposition: 'queue_busy', jobId: out.entry.jobId, message: `queued job ${out.entry.jobId} is starting now: redeliver this event` };
+      return throttled('queue_full');
+    };
+    // FIFO: earlier work of the tenant that waits goes first, even if a slot is free this instant.
+    if (queue) {
+      let ahead: boolean;
+      try {
+        ahead = await queue.hasWaiting(req.installationId);
+      } catch (err) {
+        await releaseClaims();
+        throw err;
+      }
+      if (ahead) return enqueue('queue_ahead');
+    }
     let reserved;
     try {
       reserved = await deps.store.reserveJob({ installationId: req.installationId, jobId, holdUntil: native ? NATIVE_SLOT_HOLD_UNTIL : launchedAt + durationMs, day, month, quotas });
@@ -520,17 +585,13 @@ export function createLauncher(deps: LaunchDeps) {
       throw err;
     }
     if (!reserved.ok) {
+      const capacity = reserved.limit === 'concurrent_jobs' || reserved.limit === 'platform_concurrency';
+      if (capacity && queue) return enqueue(reserved.limit as 'concurrent_jobs' | 'platform_concurrency');
       // Not this delivery's to keep: re-applying the label (a new delivery) or redelivering it tries again.
       await releaseClaims();
-      const issue = number;
-      const first = await deps.store.recordThrottle(req.installationId, month, { repositoryId: decision.repositoryId, issue, day });
-      log({ delivery: req.deliveryId, installationId: req.installationId, repository: decision.repository, issue, throttled: reserved.limit });
-      if (first && !benchmark && deps.notifyThrottled) {
-        await deps
-          .notifyThrottled({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, issue, limit: reserved.limit, quotas, ...(decision.pullRequest !== undefined ? { pullRequest: true } : {}) })
-          .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the issue: ${(err as Error)?.message}` }));
-      }
-      return skip('throttled', { reason: reserved.limit });
+      // Queued work that finds capacity gone again goes back in line (jobs/queue.ts); nothing is recorded.
+      if (capacity && req.queued) return { status: 200, disposition: 'capacity_wait', reason: reserved.limit };
+      return throttled(reserved.limit);
     }
     const reservation = { installationId: req.installationId, jobId, tenantSlot: reserved.tenantSlot, platformSlot: reserved.platformSlot, day, month };
 

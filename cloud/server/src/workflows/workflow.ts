@@ -20,7 +20,7 @@ import type { JobLoop, LoopStage } from '../jobs/lifecycle.js';
 export type WorkflowStatus = 'active' | 'waiting' | 'blocked' | 'finished';
 
 /** Where a workflow is: the review loop's stage, or the step before it has one. */
-export type WorkflowStage = 'implementing' | 'reviewing-loop' | 'awaiting-sign-in' | 'publish-failed' | LoopStage | 'done' | 'failed';
+export type WorkflowStage = 'implementing' | 'reviewing-loop' | 'awaiting-sign-in' | 'queued' | 'publish-failed' | LoopStage | 'done' | 'failed';
 
 export interface Workflow {
   workflowId: string;
@@ -383,5 +383,61 @@ export function onJobWaiting(
   return {
     workflow,
     event: { id: `${job.jobId ?? `pending-${job.deliveryId ?? 'unknown'}`}:waiting:${why.reason}`, at: iso(at), kind: 'waiting', generation, ...(job.jobId ? { jobId: job.jobId } : {}), eventName: job.eventName, stage: 'awaiting-sign-in', message: why.message },
+  };
+}
+
+/**
+ * A job waits in the admission queue (jobs/queue.ts) for execution capacity: the workflow waits,
+ * with why, and needs no one to act. It is not due a reconciler look: the queue's dispatcher starts
+ * the job, or records why it never will (onQueueEnded). A relabel queued after the last run ended
+ * starts a new run now, as a parked sign-in does; an event on an earlier run's pull request is history.
+ */
+export function onJobQueued(
+  w: Workflow,
+  job: { jobId: string; eventName: string; deliveryId?: string; pullRequest?: number },
+  why: { reason: string; message: string },
+  at: number,
+): { workflow: Workflow; event: WorkflowEvent } {
+  const again = isNewRun(w, job);
+  const pastRun = again ? undefined : pastRunOf(w, job.pullRequest);
+  const event = (generation: number, message: string): WorkflowEvent => ({ id: `${job.jobId}:queued`, at: iso(at), kind: 'waiting', generation, jobId: job.jobId, eventName: job.eventName, stage: 'queued', message });
+  if (pastRun !== undefined) {
+    return { workflow: { ...w, jobRuns: withJobRun(w, job.jobId, pastRun), updatedAt: iso(at) }, event: event(pastRun, `On pull request #${job.pullRequest} of run ${pastRun}: queued, history only.`) };
+  }
+  const generation = again ? w.generation + 1 : w.generation;
+  const base = again ? newRun(w) : w;
+  const workflow: Workflow = {
+    ...clearWait(base),
+    generation,
+    status: 'waiting',
+    stage: 'queued',
+    reason: why.reason,
+    message: why.message,
+    nextAction: 'No action is needed: the job starts automatically when capacity is available.',
+    waitingSince: iso(at),
+    lastJobId: job.jobId,
+    lastJobAt: iso(at),
+    jobRuns: withJobRun(w, job.jobId, generation),
+    updatedAt: iso(at),
+  };
+  return { workflow, event: event(generation, why.message) };
+}
+
+/**
+ * A queued job will not start (its label was removed, its issue closed, a stop paused the
+ * workflow, a budget or a key refused it, or it waited too long). Only while it is still the
+ * workflow's latest job and still queued: anything newer decides the workflow's state.
+ */
+export function onQueueEnded(
+  w: Workflow,
+  job: { jobId: string },
+  why: { reason: string; message: string; nextAction?: string },
+  at: number,
+): { workflow: Workflow; event: WorkflowEvent } | null {
+  if (w.lastJobId !== job.jobId || w.stage !== 'queued' || w.status !== 'waiting') return null;
+  const { waitingSince: _w, nextCheckAt: _c, nextAction: _n, ...rest } = w;
+  return {
+    workflow: { ...rest, status: 'blocked', reason: why.reason, message: why.message, ...(why.nextAction ? { nextAction: why.nextAction } : {}), updatedAt: iso(at) },
+    event: { id: `${job.jobId}:queue-ended`, at: iso(at), kind: 'blocked', generation: w.generation, jobId: job.jobId, stage: 'queued', message: why.message },
   };
 }
