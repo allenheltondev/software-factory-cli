@@ -30,7 +30,7 @@ export interface Workflow {
   issue?: number;
   pullRequest?: number;
   prUrl?: string;
-  /** 1 for the first labeled run; +1 each time the issue is labeled again after it finished or blocked. */
+  /** 1 for the first labeled run; +1 each time the issue is labeled again after it finished or blocked. `pullRequest` and `prUrl` are the current run's. */
   generation: number;
   status: WorkflowStatus;
   stage: WorkflowStage;
@@ -48,9 +48,8 @@ export interface Workflow {
   nextCheckAt?: string;
   /** Since when it has waited in its current stage (ISO). */
   waitingSince?: string;
-  /** CI re-dispatches the reconciler made for the current head, and the head they were for. */
-  recoveries?: number;
-  recoveredSha?: string;
+  /** Pull requests of earlier runs (newest last, at most MAX_PAST_PULL_REQUESTS): their events are history of the run they belong to. */
+  pastPullRequests?: { number: number; generation: number }[];
   createdAt: string;
   updatedAt: string;
   /** Optimistic concurrency: incremented on every save. */
@@ -62,7 +61,7 @@ export interface Workflow {
   };
 }
 
-export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_recovered' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered';
+export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered';
 
 /** One entry of a workflow's timeline. `id` is immutable and unique: recording an event twice changes nothing. */
 export interface WorkflowEvent {
@@ -104,6 +103,13 @@ export const MAX_JOB_RUNS = 50;
 /** A pull request ready for a person, or stopped for one, is looked at this often: a merge or close whose delivery was missed still ends the workflow. */
 export const PR_POLL_MS = 6 * 60 * 60 * 1000;
 
+/** Earlier runs' pull requests the workflow remembers. */
+export const MAX_PAST_PULL_REQUESTS = 20;
+
+/** The earlier run a pull request belongs to, if it is not the current run's. */
+const pastRunOf = (w: Workflow, pr: number | undefined): number | undefined =>
+  pr === undefined || pr === w.pullRequest ? undefined : w.pastPullRequests?.findLast((p) => p.number === pr)?.generation;
+
 const withJobRun = (w: Workflow, jobId: string, generation: number): Workflow['jobRuns'] =>
   [...(w.jobRuns ?? []).filter((r) => r.jobId !== jobId), { jobId, generation }].slice(-MAX_JOB_RUNS);
 
@@ -118,8 +124,6 @@ export const CI_FIRST_CHECK_MS = 15 * 60 * 1000;
 export const CI_RECHECK_MS = 15 * 60 * 1000;
 /** A head whose checks have not finished after this is blocked: a person has to look. */
 export const CI_WAIT_LIMIT_MS = 24 * 60 * 60 * 1000;
-/** Missed check events the reconciler re-dispatches for one head, at most. */
-export const MAX_CI_RECOVERIES = 2;
 /** A loop stage that waits for an event (a review, a push) is looked at after this, and blocked after STALL_LIMIT_MS. */
 export const STALL_CHECK_MS = 2 * 60 * 60 * 1000;
 export const STALL_LIMIT_MS = 6 * 60 * 60 * 1000;
@@ -168,23 +172,49 @@ const clearWait = (w: Workflow): Workflow => {
   return rest as Workflow;
 };
 
+/**
+ * Labeled again once it had ended: a new run, not a retry. A job parked before it started (a
+ * Claude sign-in or reconnect wait) began its run when it was parked, so its start is not a new one.
+ */
+function isNewRun(w: Workflow, job: Pick<Job, 'eventName'> & { jobId?: string; deliveryId?: string }): boolean {
+  return ISSUE_EVENTS.has(job.eventName) && !(job.deliveryId !== undefined && isRetryDelivery({ deliveryId: job.deliveryId })) &&
+    (w.status === 'finished' || w.status === 'blocked') && w.lastJobId !== undefined && (job.jobId === undefined || w.lastJobId !== job.jobId);
+}
+
+function newRun(w: Workflow): Workflow {
+  const { pullRequest, prUrl: _u, ...rest } = w;
+  return {
+    ...rest,
+    ...(pullRequest !== undefined ? { pastPullRequests: [...(w.pastPullRequests ?? []).filter((p) => p.number !== pullRequest), { number: pullRequest, generation: w.generation }].slice(-MAX_PAST_PULL_REQUESTS) } : {}),
+  } as Workflow;
+}
+
 /** A job of the workflow was launched. */
 export function onJobStarted(w: Workflow, job: Pick<Job, 'jobId' | 'eventName' | 'deliveryId' | 'pullRequest'> & Partial<Pick<Job, 'expiresAt' | 'native' | 'createdAt'>>, at: number): { workflow: Workflow; event: WorkflowEvent } {
   const retry = isRetryDelivery(job);
-  // Labeled again once it had ended: a new generation, not a retry.
-  const again = ISSUE_EVENTS.has(job.eventName) && !retry && (w.status === 'finished' || w.status === 'blocked') && w.lastJobId !== undefined;
+  const again = isNewRun(w, job);
+  // A job on an earlier run's pull request (an event on it after the issue was labeled again):
+  // history of that run, which changes nothing about the current one.
+  const pastRun = again ? undefined : pastRunOf(w, job.pullRequest);
+  if (pastRun !== undefined) {
+    return {
+      workflow: { ...w, jobRuns: withJobRun(w, job.jobId, pastRun), updatedAt: iso(at) },
+      event: { id: `${job.jobId}:started`, at: iso(at), kind: 'job_started', generation: pastRun, jobId: job.jobId, eventName: job.eventName, ...(retry ? { retry: true } : {}), ...(job.native ? { subscription: true } : {}), prNumber: job.pullRequest, message: `On pull request #${job.pullRequest} of run ${pastRun}: history only, the current run is not changed.` },
+    };
+  }
   const generation = again ? w.generation + 1 : w.generation;
+  // A new run starts from no pull request: the last run's is history, and what it found or did
+  // there (its pull request, its CI) says nothing about this one.
+  const base = again ? newRun(w) : w;
   const workflow: Workflow = {
-    ...clearWait(w),
+    ...clearWait(base),
     generation,
     status: 'active',
     stage: stageOfStart(job),
     lastJobId: job.jobId,
     lastJobAt: job.createdAt ?? iso(at),
     jobRuns: withJobRun(w, job.jobId, generation),
-    ...(job.pullRequest !== undefined && w.pullRequest === undefined ? { pullRequest: job.pullRequest } : {}),
-    // A new head is coming: what the reconciler did for the last one no longer counts.
-    ...(job.eventName !== 'check_suite' ? { recoveries: 0 } : {}),
+    ...(job.pullRequest !== undefined && base.pullRequest === undefined ? { pullRequest: job.pullRequest } : {}),
     // Looked at once the job could no longer be running: a finish that was never recorded is found then.
     ...(job.expiresAt !== undefined ? { nextCheckAt: iso(job.expiresAt + FINISH_GRACE_MS) } : {}),
     updatedAt: iso(at),
@@ -212,7 +242,7 @@ export function onJobStarted(w: Workflow, job: Pick<Job, 'jobId' | 'eventName' |
  */
 export function onJobFinished(
   w: Workflow,
-  job: Pick<Job, 'jobId' | 'eventName'> & Partial<Pick<Job, 'createdAt'>>,
+  job: Pick<Job, 'jobId' | 'eventName'> & Partial<Pick<Job, 'createdAt' | 'pullRequest'>>,
   outcome: string,
   detail: JobFinishDetail | undefined,
   at: number,
@@ -220,16 +250,21 @@ export function onJobFinished(
   // Only the workflow's latest job decides its state. Any other job's finish (an earlier job's,
   // late or replayed, whatever stage the workflow is in now) is history, filed under its own run.
   // A job whose start was never recorded is the latest only if it was created after the last one.
-  const isLatest =
-    w.lastJobId === undefined ||
-    w.lastJobId === job.jobId ||
-    (!(w.jobRuns ?? []).some((r) => r.jobId === job.jobId) && job.createdAt !== undefined && w.lastJobAt !== undefined && job.createdAt > w.lastJobAt);
-  const superseded = !isLatest;
-  const run = (w.jobRuns ?? []).find((r) => r.jobId === job.jobId)?.generation ?? w.generation;
+  // A job on (or reporting) an earlier run's pull request is history of that run.
+  const known = (w.jobRuns ?? []).find((r) => r.jobId === job.jobId);
+  const pastRun = pastRunOf(w, job.pullRequest) ?? pastRunOf(w, detail?.prNumber);
+  const lostStart = !known && w.lastJobId !== undefined && w.lastJobId !== job.jobId && job.createdAt !== undefined && w.lastJobAt !== undefined && job.createdAt > w.lastJobAt;
+  const isLatest = (known === undefined || known.generation === w.generation) && pastRun === undefined && (w.lastJobId === undefined || w.lastJobId === job.jobId || lostStart);
+  // A pull request a person already merged or closed (seen by the reconciler) stays that way.
+  const ended = w.status === 'finished' && (w.stage === 'merged' || w.stage === 'closed');
+  const superseded = !isLatest || ended;
+  const run = known?.generation ?? pastRun ?? w.generation;
   const loop = detail?.loop;
   const prNumber = detail?.prNumber;
   const base: Workflow = {
     ...w,
+    // A job whose start was never recorded, created after the last one: the latest from now on.
+    ...(lostStart || w.lastJobId === undefined ? { lastJobId: job.jobId, ...(job.createdAt ? { lastJobAt: job.createdAt } : {}), jobRuns: withJobRun(w, job.jobId, w.generation) } : {}),
     ...(prNumber !== undefined && w.pullRequest === undefined ? { pullRequest: prNumber } : {}),
     ...(detail?.prUrl && !w.prUrl ? { prUrl: detail.prUrl } : {}),
     updatedAt: iso(at),
@@ -247,7 +282,14 @@ export function onJobFinished(
     ...(detail?.steps?.length ? { steps: detail.steps.map((s) => ({ kind: s.kind, ...(s.agent ? { agent: s.agent } : {}), ...(s.outcome ? { outcome: s.outcome } : {}), ...(usageOf(s.usage) ? { usage: usageOf(s.usage)! } : {}) })) } : {}),
     ...(loop ? { loop: { rounds: loop.rounds, reviews: loop.reviews, ...(loop.maxRevisions !== undefined ? { maxRevisions: loop.maxRevisions } : {}), ...(loop.verdict ? { verdict: loop.verdict } : {}) } } : {}),
   };
-  if (superseded) return { workflow: { ...w, updatedAt: iso(at) }, event: { ...event, message: 'A later job of this workflow had already started; this finish is history.' } };
+  if (superseded) {
+    const why = pastRun !== undefined
+      ? `On pull request #${job.pullRequest ?? prNumber} of run ${pastRun}: this finish is history.`
+      : isLatest
+        ? `Pull request #${w.pullRequest} had already been ${w.stage}; this finish is history.`
+        : 'A later job of this workflow had already started; this finish is history.';
+    return { workflow: { ...w, updatedAt: iso(at) }, event: { ...event, message: why } };
+  }
 
   const next = detail?.updraftOutcome === 'publish-failed' && outcome === 'succeeded'
     ? { ...clearWait(base), status: 'blocked' as const, stage: 'publish-failed' as const, reason: 'publish_failed', message: 'The agent finished, but its work could not be published to GitHub.', nextAction: 'Open the job to see why, fix it, then apply the label again on GitHub: the run\'s work is kept, and publication is tried again.' }
@@ -316,12 +358,17 @@ function usageOf(u: { inputTokens?: number; outputTokens?: number; costUsd?: num
 /** A job is waiting for something only a person can give (a Claude sign-in): the workflow waits, and blocks after SIGN_IN_LIMIT_MS. */
 export function onJobWaiting(
   w: Workflow,
-  job: { jobId?: string; eventName: string },
+  job: { jobId?: string; eventName: string; deliveryId?: string },
   why: { reason: string; message: string; nextAction: string },
   at: number,
 ): { workflow: Workflow; event: WorkflowEvent } {
+  // A new label parked for a sign-in starts its run now: the job that starts later continues it.
+  const again = isNewRun(w, job);
+  const generation = again ? w.generation + 1 : w.generation;
+  const base = again ? newRun(w) : w;
   const workflow: Workflow = {
-    ...clearWait(w),
+    ...clearWait(base),
+    generation,
     status: 'waiting',
     stage: 'awaiting-sign-in',
     reason: why.reason,
@@ -329,11 +376,11 @@ export function onJobWaiting(
     nextAction: why.nextAction,
     waitingSince: iso(at),
     nextCheckAt: iso(at + SIGN_IN_LIMIT_MS),
-    ...(job.jobId ? { lastJobId: job.jobId, lastJobAt: iso(at), jobRuns: withJobRun(w, job.jobId, w.generation) } : {}),
+    ...(job.jobId ? { lastJobId: job.jobId, lastJobAt: iso(at), jobRuns: withJobRun(w, job.jobId, generation) } : {}),
     updatedAt: iso(at),
   };
   return {
     workflow,
-    event: { id: `${job.jobId ?? 'pending'}:waiting:${why.reason}`, at: iso(at), kind: 'waiting', generation: w.generation, ...(job.jobId ? { jobId: job.jobId } : {}), eventName: job.eventName, stage: 'awaiting-sign-in', message: why.message },
+    event: { id: `${job.jobId ?? `pending-${job.deliveryId ?? 'unknown'}`}:waiting:${why.reason}`, at: iso(at), kind: 'waiting', generation, ...(job.jobId ? { jobId: job.jobId } : {}), eventName: job.eventName, stage: 'awaiting-sign-in', message: why.message },
   };
 }

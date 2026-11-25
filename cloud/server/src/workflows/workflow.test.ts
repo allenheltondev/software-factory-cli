@@ -140,7 +140,9 @@ describe('workflows', () => {
     expect((await s.events()).find((e) => e.id === 'job_issue0001:finished')).toMatchObject({ generation: 1, message: expect.stringMatching(/history/) });
 
     // A new run starts; a late finish of the first run's job is filed under run 1, not the new one.
-    await s.recorder.finished(b, 'succeeded', { prNumber: 12, loop: { rounds: 1, reviews: 2, stage: 'merged' } });
+    const c = job({ jobId: 'job_pr000002', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: 'd-3' });
+    await s.recorder.started(c);
+    await s.recorder.finished(c, 'succeeded', { prNumber: 12, loop: { rounds: 1, reviews: 2, stage: 'merged' } });
     await s.recorder.started(job({ jobId: 'job_again001', deliveryId: 'd-9' }));
     expect(await s.wf()).toMatchObject({ generation: 2 });
     const late = job({ jobId: 'job_pr000009', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: 'd-8' });
@@ -162,5 +164,97 @@ describe('workflows', () => {
       return null;
     });
     expect((await s.events()).some((e) => e.id === 'phantom')).toBe(false);
+  });
+
+  describe('replays and runs', () => {
+    it('a replayed finish changes nothing, even after a person merged the pull request', async () => {
+      const s = setup();
+      await s.recorder.started(job());
+      await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'ready-to-merge' } });
+      // The reconciler saw the merge.
+      await updateWorkflow(s.store, 55, '99-i7', (w) => ({ workflow: { ...w!, status: 'finished', stage: 'merged' }, event: { id: 'pr-merged:12@x', at: new Date().toISOString(), kind: 'finished', generation: 1 } }));
+      const before = await s.wf();
+      await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'ready-to-merge' } });
+      expect(await s.wf()).toEqual(before);
+      expect((await s.events()).filter((e) => e.kind === 'job_finished')).toHaveLength(1);
+    });
+
+    it('a first finish of the latest job after the merge was seen is history', async () => {
+      const s = setup();
+      await s.recorder.started(job());
+      await updateWorkflow(s.store, 55, '99-i7', (w) => ({ workflow: { ...w!, pullRequest: 12, status: 'finished', stage: 'merged' } }));
+      await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'changes-requested' } });
+      expect(await s.wf()).toMatchObject({ status: 'finished', stage: 'merged' });
+      expect((await s.events()).at(-1)).toMatchObject({ kind: 'job_finished', message: expect.stringMatching(/already been merged/) });
+    });
+
+    it('a replayed start never makes an older job current again', async () => {
+      const s = setup();
+      await s.recorder.started(job());
+      await s.store.linkPullRequest(55, 99, 12, '99-i7');
+      await s.recorder.started(job({ jobId: 'job_newer001', issue: undefined, pullRequest: 12, eventName: 'pull_request_review', deliveryId: 'd-2' }));
+      const before = await s.wf();
+      await s.recorder.started(job());
+      expect(await s.wf()).toEqual(before);
+      expect(before).toMatchObject({ lastJobId: 'job_newer001' });
+    });
+
+    it('a finish whose start was lost makes that job the latest', async () => {
+      const s = setup();
+      await s.recorder.started(job({ createdAt: new Date(T0).toISOString() }));
+      await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'changes-requested' } });
+      await s.store.linkPullRequest(55, 99, 12, '99-i7');
+      const lost = job({ jobId: 'job_lost0001', issue: undefined, pullRequest: 12, eventName: 'pull_request_review', deliveryId: 'd-2', createdAt: new Date(T0 + 60_000).toISOString() });
+      await s.recorder.finished(lost, 'succeeded', { prNumber: 12, loop: { rounds: 1, reviews: 2, stage: 'waiting-for-ci' } });
+      expect(await s.wf()).toMatchObject({ lastJobId: 'job_lost0001', lastJobAt: new Date(T0 + 60_000).toISOString(), stage: 'waiting-for-ci' });
+      expect((await s.wf())!.jobRuns!.at(-1)).toEqual({ jobId: 'job_lost0001', generation: 1 });
+    });
+
+    it('a new run starts without the last run\'s pull request, and that pull request\'s events are its history', async () => {
+      const s = setup();
+      await s.recorder.started(job());
+      await s.recorder.finished(job(), 'succeeded', { prNumber: 12, prUrl: 'https://github.com/acme/web/pull/12', loop: { rounds: 0, reviews: 1, stage: 'merged', merged: true } });
+      await s.recorder.started(job({ jobId: 'job_again001', deliveryId: 'd-9' }));
+      const run2 = await s.wf();
+      expect(run2).toMatchObject({ generation: 2, status: 'active', pastPullRequests: [{ number: 12, generation: 1 }] });
+      expect(run2!.pullRequest).toBeUndefined();
+      expect(run2!.prUrl).toBeUndefined();
+      await s.recorder.finished(job({ jobId: 'job_again001', deliveryId: 'd-9' }), 'succeeded', { prNumber: 20, prUrl: 'https://github.com/acme/web/pull/20', loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } });
+      expect(await s.wf()).toMatchObject({ pullRequest: 20, prUrl: 'https://github.com/acme/web/pull/20', stage: 'waiting-for-ci' });
+
+      // A delivery for the old pull request #12 (still mapped to this workflow) is run 1's history.
+      const old = job({ jobId: 'job_oldpr001', issue: undefined, pullRequest: 12, eventName: 'pull_request', deliveryId: 'd-10' });
+      const waiting = await s.wf();
+      await s.recorder.started(old);
+      await s.recorder.finished(old, 'failed');
+      expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'waiting-for-ci', pullRequest: 20, lastJobId: waiting!.lastJobId, generation: 2 });
+      const history = (await s.events()).filter((e) => e.jobId === 'job_oldpr001');
+      expect(history.map((e) => [e.kind, e.generation])).toEqual([['job_started', 1], ['job_finished', 1]]);
+    });
+  });
+
+  it('a relabel parked for a Claude reconnect starts its run then, and the resumed job continues it', async () => {
+    for (const expireFirst of [false, true]) {
+      const s = setup();
+      await s.recorder.started(job());
+      await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'merged', merged: true } });
+      const parked = { installationId: 55, repository: 'acme/web', repositoryId: 99, issue: 7, eventName: 'issues', deliveryId: 'd-9', jobId: 'job_parked01' };
+      await s.recorder.waiting(parked, { reason: 'reconnect_required', message: 'waits', nextAction: 'reconnect' });
+      const waiting = await s.wf();
+      expect(waiting).toMatchObject({ generation: 2, status: 'waiting', stage: 'awaiting-sign-in', pastPullRequests: [{ number: 12, generation: 1 }] });
+      expect(waiting!.pullRequest).toBeUndefined();
+      // The wait may have expired (blocked) before someone reconnected: still the same run.
+      if (expireFirst) await updateWorkflow(s.store, 55, '99-i7', (w) => ({ workflow: { ...w!, status: 'blocked', reason: 'sign_in_expired' } }));
+      await s.recorder.started(job({ jobId: 'job_parked01', deliveryId: 'd-9' }));
+      expect(await s.wf()).toMatchObject({ generation: 2, status: 'active', lastJobId: 'job_parked01' });
+      await s.recorder.finished(job({ jobId: 'job_parked01', deliveryId: 'd-9' }), 'succeeded', { prNumber: 20, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } });
+      expect(await s.wf()).toMatchObject({ generation: 2, pullRequest: 20, stage: 'waiting-for-ci' });
+      // A late event on the old pull request is run 1's history.
+      const old = job({ jobId: 'job_oldpr001', issue: undefined, pullRequest: 12, eventName: 'pull_request', deliveryId: 'd-10' });
+      await s.recorder.started(old);
+      await s.recorder.finished(old, 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'closed' } });
+      expect(await s.wf()).toMatchObject({ generation: 2, pullRequest: 20, status: 'waiting', stage: 'waiting-for-ci' });
+      expect((await s.events()).filter((e) => e.jobId === 'job_parked01').map((e) => e.generation)).toEqual([2, 2, 2]);
+    }
   });
 });

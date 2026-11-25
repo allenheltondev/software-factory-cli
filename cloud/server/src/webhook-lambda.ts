@@ -282,21 +282,9 @@ async function resumeClaude(installationId: number) {
   }
 }
 
-// Workflow reconciliation (workflows/reconcile.ts), on its own schedule: here, since a missed
-// check event is recovered by launching the job it would have started.
-const reconcileWorkflows = createWorkflowReconciler({
-  store: workflowStore,
-  controls: store,
-  jobs: store,
-  github,
-  loadSettings,
-  ...(launch ? { launch } : {}),
-  appBot: async () => {
-    const settings = await loadSettings();
-    return settings?.slug ? `${settings.slug}[bot]` : undefined;
-  },
-  killSwitch,
-});
+// Workflow reconciliation (workflows/reconcile.ts), on its own schedule. It reports what it
+// finds and starts no job.
+const reconcileWorkflows = createWorkflowReconciler({ store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch });
 
 const scanLabels = createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings });
 

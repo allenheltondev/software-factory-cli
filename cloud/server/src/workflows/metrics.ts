@@ -13,7 +13,6 @@ export function reconcileMetricsLine(report: ReconcileReport, labels: LabelScanR
   const values: Record<string, { value: number; unit: 'Count' | 'Seconds' }> = {
     Runs: { value: 1, unit: 'Count' },
     Checked: { value: report.checked, unit: 'Count' },
-    Recovered: { value: report.recovered, unit: 'Count' },
     Repaired: { value: report.repaired, unit: 'Count' },
     Blocked: { value: report.blocked, unit: 'Count' },
     Finished: { value: report.finished, unit: 'Count' },

@@ -296,7 +296,8 @@ export interface WorkflowView {
   lastJobId?: string;
   nextCheckAt?: string;
   waitingSince?: string;
-  recoveries?: number;
+  /** Pull requests of earlier runs, and the run each belongs to. */
+  pastPullRequests?: { number: number; generation: number }[];
   createdAt: string;
   updatedAt: string;
   /** Rebuilt from job records (jobs from before workflows were recorded): read only, with what it cannot know. */
@@ -322,7 +323,7 @@ export interface WorkflowTotals {
 export interface WorkflowEvent {
   id: string;
   at: string;
-  kind: 'job_started' | 'job_finished' | 'ci_recovered' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered';
+  kind: 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered';
   generation: number;
   jobId?: string;
   eventName?: string;
