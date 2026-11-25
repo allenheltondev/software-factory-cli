@@ -91,16 +91,13 @@ const LIVE_GATE = new RegExp(
     String.raw`\bmanually (?:check|confirm|test|verify)\w*`,
     String.raw`\breal (?:github )?(?:pr|pull requests?|staging|deployments?|environments?|hosted (?:runs?|jobs?)|end-to-end runs?)\b`,
     String.raw`\b(?:verif\w*|validat\w*|test(?:ed|ing)?|demonstrat\w*|observ\w*|confirm\w*|shown?) (?:on|in|against) (?:production|prod|a real\b|the hosted|a hosted|a deployed)`,
-    String.raw`\bdeployed (?:to|on|in) (?:staging|production|prod)\b`,
+    String.raw`\bdeploy(?:ed|s|ing)? (?:it |this |the change )?(?:to|on|in) (?:staging|production|prod)\b`,
+    String.raw`\b(?:(?:after|once) (?:the |a |each )?|post[- ])deploy(?:ment|ed|ing|s)?\b`,
+    String.raw`\breal (?:physical )?devices?\b`,
     String.raw`\blive (?:validation|tests?|testing|runs?)\b`,
   ].join('|'),
   'i',
 );
-// Checked items of an issue template that are about the report itself, not the change: never
-// criteria. Only ticked items, and only these phrasings, so a real criterion is never dropped.
-const TEMPLATE_BOILERPLATE =
-  /^\s*(?:i\s+(?:have\s+)?(?:searched|read|reviewed|checked|agree|confirm(?:ed)?)\b.*\b(?:existing issues|duplicates?|code of conduct|contributing|documentation|faq|guidelines|terms)\b|i\s+agree to (?:follow )?(?:the|this project's) code of conduct)/i;
-
 /** The text a criterion's id is derived from: case, spacing and Markdown emphasis do not change it. */
 function normalized(text: string): string {
   return text.toLowerCase().replace(/[*_`~]/g, '').replace(/\s+/g, ' ').trim();
@@ -181,9 +178,7 @@ function listItems(body: string): Item[] {
 export function extractCriteria(issue: { title: string; body: string | null }, policy: AcceptancePolicy = 'enforce'): AcceptanceSnapshot {
   const fingerprint = issueFingerprint(issue);
   if (issue.body === null) return { fingerprint, source: 'unavailable', criteria: [], omitted: 0, policy };
-  const items = listItems(issue.body).filter(
-    (i) => !i.outOfScope && i.text.replace(/[*_`~\s]/g, '').length > 0 && !(i.checkbox && i.checked && TEMPLATE_BOILERPLATE.test(i.text)),
-  );
+  const items = listItems(issue.body).filter((i) => !i.outOfScope && i.text.replace(/[*_`~\s]/g, '').length > 0);
   const boxes = items.filter((i) => i.checkbox);
   const chosen = boxes.length ? boxes : items.filter((i) => i.requirementSection);
   const source = boxes.length ? 'checklist' : chosen.length ? 'requirements' : 'none';

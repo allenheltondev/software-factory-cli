@@ -118,6 +118,11 @@ describe('extractCriteria', () => {
       'Behaviour is confirmed in production',
       'Deployed to production without errors',
       'Live validation of the webhook',
+      'Deploy to prod and watch the error rate',
+      'Works after deploy',
+      'No errors after deployment',
+      'Tested on real devices',
+      'Runs on a real device',
     ]) {
       expect(gate(live), live).toBe('live');
     }
@@ -134,22 +139,25 @@ describe('extractCriteria', () => {
     }
   });
 
-  it('leaves out ticked issue-template boilerplate, and never anything unticked or about the change', () => {
+  it('keeps every ticked item as a mandatory criterion, template-like or not: the reviewer marks report-only ones not applicable', () => {
     const s = extractCriteria(
       issue(
         [
-          '### Before submitting',
+          '## Acceptance',
+          '- [x] I have reviewed the documentation and updated the CLI reference for --foo',
+          '- [x] I checked that the duplicates are removed from the export',
           '- [x] I searched existing issues for duplicates',
-          '- [x] I have read the contributing guidelines',
-          '- [x] I agree to follow the code of conduct',
-          '- [ ] I searched existing issues for duplicates',
-          '### Acceptance',
-          '- [x] Retire checks the generation',
-          '- [ ] I read the logs and they show the generation',
         ].join('\n'),
       ),
     );
-    expect(s.criteria.map((c) => c.text)).toEqual(['I searched existing issues for duplicates', 'Retire checks the generation', 'I read the logs and they show the generation']);
+    expect(s.criteria.map((c) => [c.text, c.mandatory, c.checkedInSource])).toEqual([
+      ['I have reviewed the documentation and updated the CLI reference for --foo', true, true],
+      ['I checked that the duplicates are removed from the export', true, true],
+      ['I searched existing issues for duplicates', true, true],
+    ]);
+    // Unassessed, each one holds the head back.
+    expect(acceptanceGate(assessAcceptance(s, review({ findings: [] }))).pending).toHaveLength(3);
+    expect(reviewerAcceptanceInstructions(s).join('\n')).toContain('is `not-applicable`, with that reason in `note`');
   });
 
   it('never lets criteria beyond the limit pass: they hold the head back', () => {

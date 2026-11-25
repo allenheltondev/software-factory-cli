@@ -45,14 +45,10 @@ are counted, the prompt says so, and they appear on the checklist as one mandato
 That row is always unverified, since no review was given them, so a head is never ready on 30
 of more. Split such an issue, or have a person confirm them.
 
-Issue-template boilerplate is handled conservatively:
-
-- **Ticked boilerplate is left out:** a ticked item such as "I searched existing issues for
-  duplicates", "I have read the contributing guidelines" or "I agree to follow the code of
-  conduct" is about the report, not the change. Only ticked items with these phrasings are left
-  out, so an unticked one, or anything that is about the change, stays a criterion.
-- **Anything else that is plainly about the report:** the reviewer is told to mark it
-  `not-applicable` with that reason, and never to do so for anything the change could do.
+Every listed item is a criterion, including issue-template boilerplate such as a ticked "I
+searched existing issues". No item is dropped by guessing at its wording. The reviewer is told
+to mark an item that is plainly about the issue report, not the change, `not-applicable` with
+that reason, and never to do so for anything the change could do.
 
 ### Ids and issue revisions
 
@@ -164,7 +160,8 @@ which no agent review can provide. Examples:
 - "a hosted run/test/validation";
 - "screenshot", "screen recording", "manual test" or "manually verify";
 - "a real PR/deployment/environment";
-- "confirmed in production" or "deployed to production";
+- "confirmed in production", "deploy(ed) to prod/production" or "after deploy(ment)";
+- "real device(s)";
 - "live validation/test/run".
 
 A criterion that only names a live system is a code criterion. "Keep hosted mode working" and
