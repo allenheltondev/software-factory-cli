@@ -1,8 +1,8 @@
 /**
  * What a workflow reconciliation run did, as CloudWatch metrics (Embedded Metric Format: one JSON
  * log line that CloudWatch turns into metrics, so no API call and no permission is needed). In
- * namespace Updraft/Workflows, without dimensions. The stack's alarms watch Runs, Failed and
- * OldestDueSeconds (infra/template.yaml); the runbook is in cloud/README.md.
+ * namespace Updraft/Workflows, without dimensions. What to watch in them is in cloud/README.md
+ * ("Workflow reconciliation runbook").
  */
 import type { LabelScanReport } from './label-scan.js';
 import type { ReconcileReport } from './reconcile.js';

@@ -422,13 +422,11 @@ Every run of `WebhookFunction`'s `ReconcileWorkflows` schedule logs one Embedded
 - **Backlog:** `Backlog`, and `OldestDueSeconds`, how long the oldest workflow due a look has waited.
 - **Label scan:** `LabelTenants`, `LabelRecovered` and `LabelRefused`.
 
-The metrics feed three alarms:
+There are no alarms on them yet. These are the signs to watch for:
 
-| Alarm | What it means | What to do |
-| --- | --- | --- |
-| `WorkflowReconcileNotRunningAlarm` | No run completed in 15 minutes. | Check the schedule is enabled and `WebhookFunction` is not throttled or failing at start (its `Errors` metric and log group). A run that throws before it logs metrics counts as not running. |
-| `WorkflowReconcileFailingAlarm` | Some workflow or tenant failed in three runs in a row. | Find the `workflow reconciliation failed` / `label scan failed` log lines: they name the installation and workflow. GitHub errors (a revoked installation, rate limits) clear on their own. A failing workflow is looked at again 15 minutes later, and a failing tenant's scan an hour later, so one cannot hold up the rest. |
-| `WorkflowReconcileBacklogAlarm` | A workflow has been due a look for more than 30 minutes. | Each run looks at 25 workflows. A growing `Backlog` means more are due than that: raise `limit` in `webhook-lambda.ts`, or the schedule's rate. A steady `OldestDueSeconds` with a small backlog points at one workflow that fails every time (see the failing alarm). |
+- **Not running:** no `Runs` in 15 minutes. Check the schedule is enabled, and that `WebhookFunction` is not throttled or failing at start (its `Errors` metric and log group). A run that throws before it logs its metrics counts as not running.
+- **Failing:** `Failed` above zero for several runs in a row. Find the `workflow reconciliation failed` and `label scan failed` log lines: they name the installation and the workflow. GitHub errors (a revoked installation, rate limits) clear on their own. A failing workflow is looked at again 15 minutes later, and a failing tenant's scan an hour later, so one cannot hold up the rest.
+- **Behind:** `OldestDueSeconds` over 30 minutes. Each run looks at 25 workflows, so a growing `Backlog` means more are due than that: raise `limit` in `webhook-lambda.ts`, or the schedule's rate. A steady `OldestDueSeconds` with a small backlog points at one workflow that fails every time.
 
 **Blocked workflows:** these are not alarms; they are for the tenant. The workflow's page says why and what to do: retry the job, sign in, re-run a stuck check, apply the label again, or act on the pull request.
 
