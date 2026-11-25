@@ -72,12 +72,28 @@ describe('root subscription worker Cloud loop', () => {
       ops.push(p.op);
       if (p.op === 'poll') return { ok: true, request: { payload: {} } };
       if (p.op === 'heartbeat') { if (failure === 'network failure') throw new Error('offline'); return { ok: true, cancel: true }; }
+      if (p.op === 'settled') return { ok: true, busy: true };
       return { ok: true };
     };
     const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, { call, launch: () => child, interval: 5 });
     await worker.done;
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-    expect(ops).toEqual(['register', 'poll', 'heartbeat']);
+    expect(ops).toEqual(['register', 'poll', 'heartbeat', ...(failure === 'cancel' ? ['settled'] : [])]);
+    await worker.close();
+  });
+  it('keeps the signed-in session after a cooperative cancel only when the server confirms settlement', async () => {
+    const child = fakeChild(); let polls = 0; let settled = false;
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, launch: () => child,
+      call: async (p) => {
+        if (p.op === 'poll' && ++polls === 1) return { ok: true, request: { payload: {} } };
+        if (p.op === 'heartbeat') return { ok: true, cancel: true };
+        if (p.op === 'settled') settled = true;
+        return { ok: true, busy: false };
+      },
+    });
+    await until(() => polls >= 2);
+    expect(settled).toBe(true); expect(child.kill).toHaveBeenCalledWith('SIGTERM');
     await worker.close();
   });
   it('settles and keeps polling when a cancel arrives after the runner already exited (#144)', async () => {

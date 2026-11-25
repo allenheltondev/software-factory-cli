@@ -71,6 +71,10 @@ export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => nu
     }
   };
   return {
+    async issueOfPullRequest(installationId: number, repositoryId: number, pullRequest: number) {
+      const id = await o.store.workflowOfPullRequest(installationId, repositoryId, pullRequest);
+      return id ? (await o.store.getWorkflow(installationId, id))?.issue : undefined;
+    },
     /** A job was launched (jobs/launch.ts). */
     started: (job: JobRef) =>
       safely('start', job, async () => {

@@ -54,6 +54,12 @@ export interface Workflow {
   updatedAt: string;
   /** Optimistic concurrency: incremented on every save. */
   version: number;
+  /** Presentation overlay; the authoritative admission fence is the durable PAUSE record. */
+  controlPause?: {
+    jobId: string; at: number; by: string;
+    /** What the workflow said before the pause, restored on resume. */
+    previous: Pick<Workflow, 'status' | 'reason' | 'message' | 'nextAction' | 'nextCheckAt'>;
+  };
 }
 
 export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered';
@@ -163,7 +169,7 @@ export function newWorkflow(job: Pick<Job, 'installationId' | 'repository' | 're
 }
 
 const clearWait = (w: Workflow): Workflow => {
-  const { reason: _r, message: _m, nextAction: _n, nextCheckAt: _c, waitingSince: _w, ...rest } = w;
+  const { reason: _r, message: _m, nextAction: _n, nextCheckAt: _c, waitingSince: _w, controlPause: _p, ...rest } = w;
   return rest as Workflow;
 };
 
@@ -306,6 +312,7 @@ function settle(w: Workflow, outcome: string, stage: LoopStage | undefined, at: 
   const blocked = (s: WorkflowStage, reason: string, message: string, nextAction: string): Workflow => ({ ...w, status: 'blocked', stage: s, reason, message, nextAction });
   const finished = (s: WorkflowStage): Workflow => ({ ...w, status: 'finished', stage: s });
 
+  if (outcome === 'canceled') return blocked('failed', 'job_canceled', 'The job was canceled; its existing PR and commits are preserved.', 'Resume automation from the stopped job, or explicitly retry it where supported.');
   if (isFailure(outcome) && outcome !== 'superseded') {
     if (outcome === 'microvm_gone') {
       return blocked('failed', 'job_lost', 'The job stopped without reporting how it ended: its microVM is gone.', 'Retry the job from its page.');

@@ -1,4 +1,6 @@
 import { waitingId } from '../native/sessions.js';
+import { workflowIsPaused } from './stop.js';
+import { WorkflowPausedError } from './workflow-gate.js';
 import type { NativeMode } from '../native/store.js';
 import { randomBytes } from 'node:crypto';
 import { legacyNativeTriggers, sameNativeRepository, sameNativeTrigger, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
@@ -146,6 +148,7 @@ export function waitingComment(link: string, reason?: NativeReadiness): string {
 
 
 export interface LaunchDeps {
+  stopJob?: (job: Job, returnedMicrovmId?: string) => Promise<unknown>;
   benchmarkInstallationId?: number;
   native?: NativeLaunch;
   resolveNative?(installationId: number): Promise<NativeLaunch | undefined>;
@@ -177,6 +180,8 @@ export interface LaunchDeps {
 }
 
 export interface LaunchRequest {
+  /** Server-owned workflow provenance, used by durable recovery after job retention expires. */
+  workflowIssue?: number;
   benchmark?: { identity: BenchmarkIdentity; configVersion: number; configYaml: string; agentKey: string; agent: string; workflow: string };
   installationId: number;
   deliveryId: string;
@@ -188,7 +193,7 @@ export interface LaunchRequest {
   body: string;
   /** A retry from the console (jobs/retry.ts): the job requeues the event's failed jobs in the shared state before it runs. */
   retry?: boolean;
-  retryRuntime?: { workerId?: string };
+  retryRuntime?: { workerId?: string; resumeOf?: string };
   resumeClaude?: boolean;
   /**
    * The id the job is to have (newJobId), for a caller that must record it before the launch, to
@@ -283,6 +288,7 @@ export function createLauncher(deps: LaunchDeps) {
     const mode = await binding?.mode?.();
     const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
     let workerId = req.retryRuntime?.workerId;
+    let workflowIssue = req.workflowIssue;
     if (isIssue) {
       const d = decideDispatch(config?.dispatch, {
         repositoryFullName: req.payload.repository?.full_name,
@@ -334,6 +340,7 @@ export function createLauncher(deps: LaunchDeps) {
           return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this pull request runtime' });
         }
         workerId = originJob?.native?.workerId ?? workerId;
+        workflowIssue = await deps.workflows?.issueOfPullRequest(req.installationId, d.repositoryId, d.pullRequest) ?? originJob?.workflowIssue ?? originJob?.issue ?? workflowIssue;
         if (origin?.label) {
           label = origin.label;
           // Only under the version active now, which this job runs: a republish may have changed
@@ -354,6 +361,11 @@ export function createLauncher(deps: LaunchDeps) {
     }
     // The issue or pull request the job is for: refusals and over-quota comments name it.
     const number = (decision.issue ?? decision.pullRequest)!;
+    if (await workflowIsPaused(deps.store, { installationId: req.installationId, repositoryId: decision.repositoryId,
+      issue: decision.issue, pullRequest: decision.pullRequest, workflowIssue,
+      resumeOf: req.retry ? req.retryRuntime?.resumeOf : undefined })) return skip('not_dispatched', {
+      reason: 'workflow_paused', message: 'An owner stopped this workflow. Resume automation or explicitly retry the stopped job to continue.',
+    });
 
     const selected = isIssue && !req.retryRuntime && (mode?.triggers === undefined || decision.keys?.includes('ANTHROPIC_API_KEY')) && triggers.some((t) => sameNativeTrigger(t, decision));
     const candidate = binding && (selected || workerId === binding.route.workerId) ? binding : undefined;
@@ -526,6 +538,8 @@ export function createLauncher(deps: LaunchDeps) {
     const job: Job = {
       jobId,
       tokenHash: hashToken(token),
+      ...(req.retryRuntime?.resumeOf ? { resumeOf: req.retryRuntime.resumeOf } : {}),
+      ...(workflowIssue !== undefined ? { workflowIssue } : {}),
       installationId: req.installationId,
       repository: decision.repository,
       repositoryId: decision.repositoryId,
@@ -567,6 +581,16 @@ export function createLauncher(deps: LaunchDeps) {
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) }));
       microvmId = out.microvmId;
     } catch (err) {
+      if (recorded && err instanceof WorkflowPausedError) {
+        const stopped = await deps.store.requestJobStop(job, { requestedAt: now(), by: 'workflow control', reason: 'Workflow paused before launch admission' }, []);
+        if (stopped && deps.stopJob) await deps.stopJob(stopped);
+        else if (await deps.store.cancelReservation(reservation, 'reserved') === 'cancelled') {
+          await deps.store.finishJob(jobId, 'canceled');
+          await deps.store.recordJobStop(job, { confirmedAt: now() });
+          await deps.store.releaseJob(job);
+        }
+        return { status: 202, disposition: 'cancelled', jobId };
+      }
       if (native && !recorded && err instanceof NativeEnqueueRejectedError) {
         // The mode condition rolled back the enqueue: nothing can execute this reservation.
         await deps.store.cancelReservation(reservation, 'reserved');
@@ -578,12 +602,17 @@ export function createLauncher(deps: LaunchDeps) {
       if (native) return { status: 503, disposition: 'launch_failed', jobId, errorClass: errorClassOf(err) };
       log({ delivery: req.deliveryId, installationId: req.installationId, jobId, error: 'launch failed', name: (err as Error)?.name, message: safeMessage(err) });
       await releaseClaims();
+      const stopping = recorded ? await deps.store.getJob(jobId).catch(() => null) : null;
+      // RunMicrovm may have accepted a request whose response was lost. A canceled attempt
+      // retains its capacity and fence until the VM is found or its maximum duration passes.
+      if (launching && stopping?.stop) return { status: 202, disposition: 'cancelled', jobId };
       await deps.store.cancelReservation(reservation, launching ? 'launching' : 'reserved').catch(() => {});
       // Nothing runs for this record; its token must not be served, and it needs no reconciling.
       let outcome: string | null = null;
       if (recorded) {
-        outcome = await deps.store.finishJob(jobId, 'launch_failed').catch(() => null);
+        outcome = await deps.store.finishJob(jobId, stopping?.stop ? 'canceled' : 'launch_failed').catch(() => null);
         await deps.store.releaseJob(job).catch(() => {});
+        if (stopping?.stop) await deps.store.recordJobStop(job, { confirmedAt: now() });
       }
       // Finished with another outcome before it could launch: an admin released it, on purpose.
       // Not an error to have GitHub show (and nothing to redeliver).
@@ -607,8 +636,23 @@ export function createLauncher(deps: LaunchDeps) {
           else await new Promise((r) => setTimeout(r, (deps.retryDelayMs ?? 200) * attempt));
         }
       }
+      if (!attached) {
+        if (!deps.stopJob) throw new Error(`Could not register or retire VM ${microvmId} for ${jobId}`);
+        // The trusted response is retained by the stop service independently of the
+        // failed attachment. Never forget a known VM and leave it billing to expiry.
+        await deps.stopJob(job, microvmId);
+        return { status: 503, disposition: 'launch_failed', jobId, errorClass: 'VmRegistrationFailed' };
+      }
     }
 
+    const current = await deps.store.getJob(jobId);
+    if (current && !current.stop && await workflowIsPaused(deps.store, current)) {
+      // Launch admission won before the pause. Its VM may now exist, but no agent may
+      // start after the pause: retire this sibling without replacing the owner's pause.
+      await deps.store.requestJobStop(current, { requestedAt: now(), by: 'workflow control', reason: 'Workflow paused while VM launch was in flight' }, []);
+    }
+    const latest = await deps.store.getJob(jobId);
+    if (latest?.stop && deps.stopJob) await deps.stopJob(latest);
     log({ delivery: req.deliveryId, installationId: req.installationId, jobId, microvmId, repository: job.repository, configVersion: job.configVersion, imageVersion, launched: true });
     return { status: 202, disposition: 'launched', jobId };
   };

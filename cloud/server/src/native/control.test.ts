@@ -44,6 +44,13 @@ describe('native worker Cloud dispatch', () => {
     workers = {
       async get() { return row ? structuredClone(row) : null; },
       async put(w, previous) { if ((row?.version ?? null) !== previous) return false; row = structuredClone(w); return true; },
+      async assign(job, w, at, until) {
+        const fresh = await store.getJob(job.jobId);
+        if (!fresh || fresh.stopRequestedAt !== undefined || fresh.status === 'finished' || fresh.microvmId || fresh.expiresAt <= at) return false;
+        if (!await workers.put({ ...w, version: w.version + 1, lastWorkAt: at, active: { jobId: job.jobId, until } }, w.version)) return false;
+        await store.attachMicrovm(job.jobId, w.microvmId);
+        return true;
+      },
       async queued() {
         const ids = (await store.listRecentJobs(55, 100)).map((j) => j.jobId);
         const jobs = await Promise.all(ids.map((id) => store.getJob(id)));
@@ -162,6 +169,69 @@ describe('native worker Cloud dispatch', () => {
     const active = row!.active!; disabled = true; clock += 1000;
     expect(await control.handle(input('heartbeat'))).toMatchObject({ cancel: true });
     expect(row?.active?.until).toBe(active.until);
+  });
+
+  it('cancels a queued job while preserving a different active assignment', async () => {
+    const active = await assigned();
+    const other = await launch(request('delivery-queued'));
+    const job = (await store.getJob(other.jobId!))!;
+    const stopped = (await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop queue' }, [12]))!;
+    expect(await control.stop(stopped)).toBe(true);
+    expect(row?.active?.jobId).toBe(active.jobId); expect(row?.fenced).toBeFalsy();
+    expect(terminateMicrovm).not.toHaveBeenCalled();
+  });
+
+  it('allows cooperative stop, then fences only the unresponsive assignment after its grace period', async () => {
+    const job = await assigned();
+    const stopped = (await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop' }, [12]))!;
+    expect(await control.stop(stopped)).toBe(false);
+    expect(await control.handle(input('heartbeat'))).toMatchObject({ cancel: true });
+    expect(terminateMicrovm).not.toHaveBeenCalled();
+    clock += WORKER_LEASE_MS + 1;
+    expect(await control.stop(stopped)).toBe(false);
+    expect(row?.fenced).toBe(true); expect(terminateMicrovm).toHaveBeenCalledWith(route.microvmId);
+    expect(await store.listActiveJobs()).toHaveLength(1);
+    state = 'TERMINATED'; expect(await control.stop(stopped)).toBe(true);
+    expect((await store.getJob(job.jobId))?.stop?.reconnectRequired).toBe(true);
+    expect((await store.getJob(job.jobId))?.outcome).toBe('canceled');
+  });
+  it('never terminates a replacement worker or an unrelated assignment from an old stop', async () => {
+    const job = await assigned();
+    const stopped = (await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop' }, [12]))!;
+    row = { ...row!, version: row!.version + 1, microvmId: 'replacement-vm', session: 'replacement-session', active: { jobId: 'job_other0001', until: clock + WORKER_LEASE_MS } };
+    clock += WORKER_LEASE_MS + 1;
+    await expect(control.stop(stopped)).rejects.toThrow('Cannot identify');
+    expect(terminateMicrovm).not.toHaveBeenCalled(); expect(row.fenced).toBeFalsy();
+  });
+  it('does not report reconnect when cooperative settlement beats the expired-grace fence CAS', async () => {
+    const job = await assigned();
+    const stopped = (await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop' }, [12]))!;
+    // A heartbeat read before the stop may have extended the lease before its CAS landed.
+    row!.active!.until += WORKER_LEASE_MS;
+    clock += WORKER_LEASE_MS + 1;
+    const put = workers.put;
+    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      expect(next.fenced).toBe(true);
+      await store.finishJob(job.jobId, 'canceled');
+      expect(await control.complete((await store.getJob(job.jobId))!)).toBe(true);
+      return put(next, previous);
+    });
+    expect(await control.stop(stopped)).toBe(false);
+    expect((await store.getJob(job.jobId))?.stop).toMatchObject({ confirmedAt: clock, reconnectRequired: false });
+    expect(row?.fenced).toBeUndefined(); expect(terminateMicrovm).not.toHaveBeenCalled();
+  });
+  it('does not report reconnect when a heartbeat wins a forced-stop CAS', async () => {
+    const job = await assigned();
+    const stopped = (await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop' }, [12]))!;
+    row!.active!.until += WORKER_LEASE_MS; clock += WORKER_LEASE_MS + 1;
+    const put = workers.put;
+    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      row = { ...row!, version: row!.version + 1 };
+      return put(next, previous);
+    });
+    expect(await control.stop(stopped)).toBe(false);
+    expect((await store.getJob(job.jobId))?.stop?.reconnectRequired).toBeUndefined();
+    expect(terminateMicrovm).not.toHaveBeenCalled();
   });
   it('expires queued jobs instead of reclaiming their reservation after five minutes', async () => {
     const job = await queued(); clock += 6 * 60_000;

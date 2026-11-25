@@ -4,6 +4,7 @@ import type { Store } from '../store/store.js';
 import { errorClassOf, newJobId, type Launcher } from './launch.js';
 import { isBenchmarkLabel } from '../benchmarks/config.js';
 import { BENCHMARK_RETRY_MESSAGE, notRetryableMessage, retryable } from './status.js';
+import { resumeJobPause, stopSubjects } from './stop.js';
 
 /**
  * Retrying a job from the console: the launcher runs the job's own event again.
@@ -23,7 +24,7 @@ import { BENCHMARK_RETRY_MESSAGE, notRetryableMessage, retryable } from './statu
 
 /** What the API function sends the webhook function. */
 export interface RetryRequest {
-  updraftRetry: { installationId: number; jobId: string };
+  updraftRetry: { installationId: number; jobId: string; by?: string };
 }
 
 /** Why a retry did not start a job; the API answers with it as the error code. */
@@ -50,7 +51,8 @@ export type RetryResult =
 
 export const isRetryRequest = (event: unknown): event is RetryRequest => {
   const r = (event as RetryRequest | null)?.updraftRetry;
-  return typeof r === 'object' && r !== null && Number.isSafeInteger(r.installationId) && typeof r.jobId === 'string';
+  return typeof r === 'object' && r !== null && Number.isSafeInteger(r.installationId) && typeof r.jobId === 'string' &&
+    (r.by === undefined || typeof r.by === 'string' && r.by.length <= 200);
 };
 
 /**
@@ -103,16 +105,22 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
     return entry?.phase === 'reserved' ? 'prelaunch' : 'never';
   };
 
-  return async function retry({ updraftRetry: { installationId, jobId } }: RetryRequest): Promise<RetryResult> {
+  return async function retry({ updraftRetry: { installationId, jobId, by } }: RetryRequest): Promise<RetryResult> {
     const summary = await store.getJobSummary(installationId, jobId);
     // Another tenant's job is not found, however it was named.
     if (!summary) return no(404, 'not_found', 'There is no such job in this installation');
+    if (summary.stop && summary.stop.confirmedAt === undefined) return no(409, 'not_retryable', 'Execution is still stopping; wait for confirmed cancellation');
     if (summary.retriedAs) return no(409, 'already_retried', notRetryableMessage(summary));
     if (!retryable(summary)) return no(409, 'not_retryable', notRetryableMessage(summary));
     // The job's own record says which event it ran (its delivery, its config version): kept a week
     // past the job's end, the summary 30 days.
     const job = await store.getJob(jobId);
     if (!job || job.installationId !== installationId) return no(410, 'event_gone', 'This job is too old to run again: its event is no longer kept. Apply the label again on GitHub instead');
+    const resumeParent = async () => {
+      if (!job.stop) return;
+      try { await resumeJobPause(store, { ...job, stop: job.stop }, stopSubjects(job, summary.detail?.prNumber), by ?? 'authorized console retry', now()); }
+      catch (error) { log({ installationId, jobId, warning: 'retry started; workflow pause could not be cleared, use Resume automation', name: (error as Error)?.name }); }
+    };
     if (job.benchmark || isBenchmarkLabel(job.label)) return no(409, 'not_retryable', BENCHMARK_RETRY_MESSAGE);
 
     let body: string | null;
@@ -146,6 +154,7 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
         // Recorded in the one conditional write that checks it is still the claim seen: another
         // request that has taken it since, or one that settled it, leaves this one nothing to do.
         if (!(await store.settleJobRetry(job, stale.child, at))) return no(409, 'already_retried', 'This job is being retried, or was already');
+        await resumeParent();
         log({ installationId, jobId, newJobId: stale.child, recovered: true });
         return { ok: true, jobId: stale.child };
       }
@@ -163,7 +172,7 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
     let result;
     try {
       const bot = await appBot?.();
-      result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload, retry: true, retryRuntime: { ...(job.native ? { workerId: job.native.workerId } : {}) }, jobId: child });
+      result = await launch({ installationId, deliveryId: retryDeliveryId(jobId), eventName: job.eventName, ...(bot ? { appBot: bot } : {}), body, payload, retry: true, retryRuntime: { ...(job.native ? { workerId: job.native.workerId } : {}), ...(job.stop ? { resumeOf: jobId } : {}) }, jobId: child });
     } catch (err) {
       log({ installationId, jobId, error: 'retry failed before launching', name: errorClassOf(err) });
       await giveBack();
@@ -185,6 +194,7 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
         }
       }
       if (!recorded) log({ installationId, jobId, newJobId: result.jobId, warning: 'the retry started a job but is not on record; the next request will settle it from the claim' });
+      await resumeParent();
       return { ok: true, jobId: result.jobId };
     }
     // Nothing started: the retry can be asked for again.

@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { hashToken } from '../broker/broker.js';
 import { runHookPayload, type LaunchSettings } from '../jobs/launch.js';
 import { isTerminated, unusedTime } from '../jobs/quotas.js';
+import { workflowIsPaused } from '../jobs/stop.js';
 import type { Job, Store } from '../store/store.js';
 import { nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from './route.js';
 import type { AuthState, NativeStore, Worker } from './store.js';
@@ -42,7 +43,8 @@ export function createNativeControl(d: NativeControlDeps) {
       const job = await d.store.getJob((w.active ?? w.settling)!.jobId);
       if (job) {
         await d.store.markStopping(job.jobId);
-        await d.store.finishJob(job.jobId, 'microvm_gone', { at: now() });
+        await d.store.finishJob(job.jobId, job.stop ? 'canceled' : 'microvm_gone', { at: now() });
+        if (job.stop) await d.store.recordJobStop(job, { confirmedAt: now(), error: '', reconnectRequired: true });
         await d.store.releaseJob(job, unusedTime(job, now()));
         await d.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
       }
@@ -83,27 +85,55 @@ export function createNativeControl(d: NativeControlDeps) {
   }
   async function finishSettlement(w: Worker, job: Job): Promise<boolean> {
     if (job.status !== 'finished' || w.settling?.jobId !== job.jobId) return false;
+    if (w.fenced) return fence(w);
     // Retain the durable marker through partial failures. Completion retries and
     // reconciliation can repeat releaseJob safely, then make the worker available.
+    if (job.stop) await d.store.recordJobStop(job, { confirmedAt: now(), error: '' });
     await d.store.releaseJob(job, unusedTime(job, now()));
+    const reused = async () => {
+      if (job.stop) await d.store.recordJobStop(job, { reconnectRequired: false });
+      return true;
+    };
     for (let attempt = 0; attempt < COMPLETE_ATTEMPTS; attempt++) {
       const next = { ...w, version: w.version + 1, lastWorkAt: now() };
       delete next.settling;
-      if (await d.workers.put(next, w.version)) return true;
+      if (await d.workers.put(next, w.version)) return reused();
       // The runner's terminate, the dispatcher's settled and reconciliation all finish the same
       // settlement. Losing that race is not a failure: if this exact session and VM no longer
       // hold the job in any form, the release above is confirmed and the worker is free (#144).
       const fresh = await d.workers.get(w.installationId, w.workerId);
       const same = !!fresh && fresh.session === w.session && fresh.microvmId === w.microvmId && !fresh.fenced;
-      if (same && fresh.settling?.jobId !== job.jobId && fresh.active?.jobId !== job.jobId) return true;
+      if (same && fresh.settling?.jobId !== job.jobId && fresh.active?.jobId !== job.jobId) return reused();
       // Fenced, replaced, or reassigned: uncertain, so fail closed.
       if (!same || fresh.settling?.jobId !== job.jobId) return false;
       w = fresh; // still settling this job; another write moved the version on
     }
     return false;
   }
+  async function stop(job: Job): Promise<boolean> {
+    if (!job.native || !job.stop) return false;
+    const w = await d.workers.get(job.installationId, job.native.workerId);
+    if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
+    if (job.releasedAt !== undefined) return true;
+    if (w?.active?.jobId === job.jobId) {
+      if (job.microvmId && w.microvmId !== job.microvmId) throw new Error('Stopped assignment has a different worker VM');
+      // Heartbeats cancel the process tree without renewing this lease. Give the trusted
+      // runner time to reap it; only fence the exact assignment if it fails to settle.
+      if (!w.fenced && now() < job.stop.requestedAt + WORKER_LEASE_MS && w.active.until > now()) return false;
+      return fence(w);
+    }
+    if (!job.microvmId && w?.active?.jobId !== job.jobId) {
+      // A queued job never owns the busy worker. Dequeue it; leave unrelated work alone.
+      await d.store.finishJob(job.jobId, 'canceled', { at: now() });
+      await d.workers.dequeue(job.installationId, job.native.workerId, job.jobId);
+      return true;
+    }
+    // A completed assignment may have yielded the session to another job. Never kill it.
+    throw new Error('Cannot identify the stopped subscription assignment safely');
+  }
   async function reconcile(job: Job): Promise<boolean> {
     if (!job.native) return false;
+    if (job.stop) return stop(job);
     const w = await d.workers.get(job.installationId, job.native.workerId);
     if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
     if (w?.active?.jobId === job.jobId) {
@@ -216,22 +246,21 @@ export function createNativeControl(d: NativeControlDeps) {
     if (p.op !== 'poll' || disabled || p.auth !== 'connected') return { ok: true, busy: false };
     for (const id of await d.workers.queued(r.installationId, r.workerId)) {
       const job = await d.store.getJob(id);
-      if (!job || job.status === 'finished' || job.expiresAt <= now()) { await d.workers.dequeue(r.installationId, r.workerId, id); continue; }
+      if (!job || job.status === 'finished' || job.stopRequestedAt !== undefined || job.expiresAt <= now()) { await d.workers.dequeue(r.installationId, r.workerId, id); continue; }
+      if (await workflowIsPaused(d.store, job)) continue;
       if (!job.native || job.native.workerId !== r.workerId || job.installationId !== r.installationId || job.microvmId || !job.launchingAt ||
           job.imageVersion !== r.imageVersion || job.native.generation !== r.generation) continue;
       const token = nativeJobToken(secret, job.jobId);
       if (hashToken(token) !== job.tokenHash) return refused; // rotated control key: drain before rotation
       // Lost to another poll: read again, and the winner's assignment refuses this poll.
-      if (!await save(w, { lastWorkAt: now(), active: { jobId: id, until: Math.min(job.expiresAt, now() + WORKER_LEASE_MS) } })) return RETRY;
+      if (!await d.workers.assign(job, w, now(), Math.min(job.expiresAt, now() + WORKER_LEASE_MS))) return RETRY;
       // Assignment is durable before it is handed out. A lost response fences this VM on expiry;
       // it never hands the task out a second time or falls back to BYOK.
-      await d.store.attachMicrovm(id, r.microvmId);
-      await d.workers.dequeue(r.installationId, r.workerId, id);
       return { ok: true, busy: true, request: { microvmId: r.microvmId, payload: runHookPayload(d.settings, {
         jobId: id, token, deliveryId: job.deliveryId, launchedAt: Date.parse(job.createdAt), eventName: job.eventName,
         notBefore: job.native.notBefore, retry: job.native.retry }) } };
     }
     return { ok: true, busy: false };
   }
-  return { handle, canServe, complete, reconcile };
+  return { handle, canServe, complete, reconcile, stop };
 }

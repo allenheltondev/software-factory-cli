@@ -604,6 +604,16 @@ Resources:
           WEBHOOK_FUNCTION_NAME: !Ref WebhookFunction
           NODE_OPTIONS: --enable-source-maps
       Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
+              Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
+            - !If
+              - NativeWorkerEnabled
+              - Effect: Allow
+                Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
+                Resource: !Ref NativeWorkerImageArn
+              - !Ref AWS::NoValue
         - !If
           - ManagedClaude
           - Statement:
@@ -788,7 +798,7 @@ Resources:
               Action: s3:GetObject
               Resource: !Sub ${TenantBucket.Arn}/tenants/*/config/*
             - Effect: Allow
-              Action: lambda:RunMicrovm
+              Action: [lambda:RunMicrovm, lambda:GetMicrovm, lambda:TerminateMicrovm]
               Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
             # RunMicrovm is given the Lambda-provided NO_INGRESS and INTERNET_EGRESS connectors, and
             # AWS authorizes passing them separately. The action has no resource type in IAM, so a
@@ -905,7 +915,7 @@ Resources:
                 Resource: !Ref NativeWorkerImageArn
               - !Ref AWS::NoValue
             - Effect: Allow
-              Action: lambda:GetMicrovm
+              Action: [lambda:GetMicrovm, lambda:TerminateMicrovm]
               Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${AWS::StackName}-job
       Events:
         Daily:
@@ -919,7 +929,7 @@ Resources:
           Type: ScheduleV2
           Properties:
             Description: Free the quota slots of jobs whose microVM has terminated (server/src/jobs/reconcile.ts)
-            ScheduleExpression: rate(5 minutes)
+            ScheduleExpression: rate(1 minute)
             Input: '{"task":"reconcile"}'
             RetryPolicy:
               MaximumRetryAttempts: 0

@@ -2,7 +2,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { CommitCheckCounts, PullRequestHead } from '../github/client.js';
 import type { Job, JobSummary } from '../store/store.js';
-import { createWorkflowRecorder } from './recorder.js';
+import { createWorkflowRecorder, updateWorkflow } from './recorder.js';
 import { createWorkflowReconciler } from './reconcile.js';
 import { createMemoryWorkflowStore } from './store.js';
 import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
@@ -19,6 +19,7 @@ const job = (over: Record<string, unknown> = {}) =>
 
 function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; engaged?: boolean; jobs?: Record<string, { job?: Partial<Job>; summary?: Partial<JobSummary> }> } = {}) {
   const store = createMemoryWorkflowStore();
+  const controls = { getWorkflowPause: vi.fn(async (_i: number, _r: number, _s: number): Promise<import('../store/store.js').WorkflowPause | null> => null) };
   let clock = T0;
   const now = () => clock;
   const recorder = createWorkflowRecorder({ store, now, log: () => {} });
@@ -29,6 +30,7 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; e
   };
   const reconcile = createWorkflowReconciler({
     store,
+    controls,
     jobs: {
       getJob: async (id: string) => (o.jobs?.[id]?.job as Job | undefined) ?? null,
       getJobSummary: async (_i: number, id: string) => (o.jobs?.[id]?.summary as JobSummary | undefined) ?? null,
@@ -46,10 +48,53 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; e
     await recorder.started(job());
     await recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci', verdict: 'ready-to-merge' } });
   };
-  return { store, recorder, reconcile, github, tick, wf, waitForCi };
+  return { store, controls, recorder, reconcile, github, tick, wf, waitForCi };
 }
 
 describe('workflow reconciliation', () => {
+  it('reports intentional pauses before CI and resumes report-only diagnosis after explicit unpause', async () => {
+    const s = setup(); await s.waitForCi(); s.tick(CI_FIRST_CHECK_MS);
+    s.controls.getWorkflowPause.mockImplementation(async (_i, _r, n) => n === 7 ? { jobId: 'job_stopped0001', at: T0, by: 'pat' } : null);
+    expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+    expect(s.github.commitChecks).not.toHaveBeenCalled();
+    expect(await s.wf()).toMatchObject({ reason: 'workflow_paused', controlPause: { jobId: 'job_stopped0001' } });
+    s.controls.getWorkflowPause.mockResolvedValue(null); s.tick(CI_RECHECK_MS);
+    expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+    expect(await s.wf()).toMatchObject({ reason: 'ci_event_missed' });
+    expect(await s.wf()).not.toHaveProperty('controlPause');
+  });
+  it('reports a pause once while it lasts, and records no undefined value', async () => {
+    const s = setup(); await s.waitForCi(); s.tick(CI_FIRST_CHECK_MS);
+    s.controls.getWorkflowPause.mockResolvedValue({ jobId: 'job_stopped0001', at: T0, by: 'pat' });
+    expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+    s.tick(CI_RECHECK_MS);
+    expect(await s.reconcile()).toMatchObject({ checked: 1, blocked: 0 });
+    expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).filter((e) => e.kind === 'blocked')).toHaveLength(1);
+    const stored = (await s.wf())!;
+    const undefinedAt = (o: unknown, path = ''): string[] =>
+      o && typeof o === 'object' ? Object.entries(o).flatMap(([k, v]) => (v === undefined ? [`${path}${k}`] : undefinedAt(v, `${path}${k}.`))) : [];
+    expect(undefinedAt(stored)).toEqual([]);
+    expect(stored.controlPause!.previous).toEqual({ status: 'waiting', reason: 'ci_pending', message: expect.any(String), nextCheckAt: new Date(T0 + CI_FIRST_CHECK_MS).toISOString() });
+  });
+
+  it('on resume, gives a workflow that was already blocked its own state back, without diagnosing it again', async () => {
+    const s = setup();
+    await s.recorder.started(job());
+    await s.recorder.finished(job(), 'failed', { prNumber: 12 });
+    // Blocked (job_failed), not due; a stop pauses it and a look happens anyway (another workflow due).
+    await updateWorkflow(s.store, 55, '99-i7', (w) => ({ workflow: { ...w!, nextCheckAt: new Date(T0).toISOString() } }));
+    s.controls.getWorkflowPause.mockResolvedValue({ jobId: 'job_issue0001', at: T0, by: 'pat' });
+    await s.reconcile();
+    expect(await s.wf()).toMatchObject({ reason: 'workflow_paused' });
+    s.controls.getWorkflowPause.mockResolvedValue(null);
+    s.tick(STALL_LIMIT_MS + CI_RECHECK_MS);
+    await s.reconcile();
+    const back = (await s.wf())!;
+    expect(back).toMatchObject({ status: 'blocked', reason: 'job_failed' });
+    expect(back).not.toHaveProperty('controlPause');
+    expect(s.github.pullRequestHead).not.toHaveBeenCalled();
+  });
+
   it('does nothing before a CI wait is due, and reports what is left due and for how long', async () => {
     const s = setup();
     await s.waitForCi();
@@ -222,7 +267,7 @@ describe('workflow reconciliation', () => {
       const s = setup();
       await s.waitForCi();
       s.tick(CI_FIRST_CHECK_MS);
-      const other = createWorkflowReconciler({ store: s.store, github: s.github, loadSettings: async () => SETTINGS as never, now: () => T0 + CI_FIRST_CHECK_MS, log: () => {} });
+      const other = createWorkflowReconciler({ store: s.store, controls: s.controls, github: s.github, loadSettings: async () => SETTINGS as never, now: () => T0 + CI_FIRST_CHECK_MS, log: () => {} });
       await Promise.all([s.reconcile(), other()]);
       expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).filter((e) => e.kind === 'blocked')).toHaveLength(1);
     });

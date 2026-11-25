@@ -4,6 +4,7 @@ import { GitHubError, type GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
+import { workflowIsPaused } from '../jobs/stop.js';
 import { dayOf, isTerminated, unusedTime, type ThrottleNotice } from '../jobs/quotas.js';
 import { loopOf, routingOf, stepsOf, telemetryOf, type JobTelemetryDescriptor, type JobTelemetrySnapshot } from '../jobs/lifecycle.js';
 import { isFailure, type Job, type JobFinishDetail, type Store, type TelemetrySettings } from '../store/store.js';
@@ -201,6 +202,7 @@ export function createBroker(deps: BrokerDeps) {
   async function servable(job: Job): Promise<boolean> {
     if (job.native && (!deps.native || !await deps.native.canServe(job))) return false;
     if (job.status === 'finished' || job.stopRequestedAt !== undefined || now() > job.expiresAt) return false;
+    if (await workflowIsPaused(deps.store, job)) return false;
     // Strongly consistent, like the job: a suspend or uninstall that has committed stops the next
     // request, rather than one that happens to read a stale replica.
     const tenant = await deps.store.getTenant(job.installationId, { consistent: true });
@@ -300,12 +302,14 @@ export function createBroker(deps: BrokerDeps) {
           : linkDestinationFor(await deps.store.getTelemetry(job.installationId).catch(() => null), sentTo);
         if (destination) finished.telemetry.destination = destination;
       }
-      const recorded = (await deps.store.finishJob(job.jobId, given, { at: now(), detail: finished })) ?? given;
+      const stopping = (await deps.store.getJob(job.jobId))?.stop;
+      const actual = stopping && (given === 'terminated' || given === 'runner_error' && job.startedAt === undefined) ? 'canceled' : given;
+      const recorded = (await deps.store.finishJob(job.jobId, actual, { at: now(), detail: finished })) ?? actual;
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
-      if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
+      if (recorded !== 'succeeded' && !stopping) await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
       // The workflow learns the finish whose outcome stuck; a repeated finish with another outcome changes nothing there.
-      if (recorded === given) await deps.workflows?.finished(job, recorded, finished);
+      if (recorded === actual) await deps.workflows?.finished(job, recorded, finished);
       // How the job's telemetry export went, for the settings page. Best effort, like the key's use.
       const sent = finished?.telemetry;
       // A job read only for the console (no destination) exported nothing to report.

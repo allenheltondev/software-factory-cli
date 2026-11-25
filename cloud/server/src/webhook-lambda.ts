@@ -23,6 +23,7 @@ import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './j
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
+import { awsJobStopper } from './jobs/stop-aws.js';
 import { BENCHMARK_LABEL } from './benchmarks/config.js';
 import { createBenchmarkDispatch } from './benchmarks/dispatch.js';
 
@@ -79,6 +80,7 @@ async function imageVersion(): Promise<string | null> {
 }
 
 const nativeWorker = nativeAws(store);
+const stopJob = awsJobStopper(store, nativeWorker.control, workflows);
 
 
 function launcher(): Launcher | undefined {
@@ -87,6 +89,7 @@ function launcher(): Launcher | undefined {
   const partition = env.PARTITION ?? 'aws';
   return createLauncher({
     store,
+    stopJob: stopJob.advance,
     workflows,
     ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
     native: nativeWorker.launch,
@@ -282,7 +285,7 @@ async function resumeClaude(installationId: number) {
 
 // Workflow reconciliation (workflows/reconcile.ts), on its own schedule. It reports what it
 // finds and starts no job.
-const reconcileWorkflows = createWorkflowReconciler({ store: workflowStore, jobs: store, github, loadSettings, killSwitch });
+const reconcileWorkflows = createWorkflowReconciler({ store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch });
 
 const scanLabels = createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings });
 

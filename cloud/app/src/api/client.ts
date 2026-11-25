@@ -305,6 +305,19 @@ export interface WorkflowView {
   gaps?: string[];
 }
 
+/** A stop's pause of a workflow: it lasts until an owner resumes it. */
+export interface WorkflowPause {
+  jobId: string;
+  at: number;
+  by: string;
+  reason?: string;
+  subjects?: number[];
+  confirmedAt?: number;
+  /** The issue or pull request number the pause was found on: what resuming it names. */
+  subject: number;
+  canResume: boolean;
+}
+
 export interface WorkflowTotals {
   jobs: number;
   retries: number;
@@ -340,6 +353,9 @@ export interface WorkflowEvent {
 }
 
 export interface JobView {
+  canStop?: boolean;
+  stop?: { requestedAt: number; by: string; reason: string; confirmedAt?: number; error?: string; reconnectRequired?: boolean; resumedAt?: number; resumedBy?: string };
+  canResume?: boolean;
   executionMode?: 'subscription' | 'standard';
   jobId: string;
   repository: string;
@@ -824,12 +840,18 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     job: (installationId: number, jobId: string) => request<{ job: JobView; deliveries: Delivery[]; conversation?: JobView[] }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}`),
     workflows: (installationId: number, limit = 100) => request<{ workflows: WorkflowView[] }>(`/installations/${installationId}/workflows?limit=${limit}`),
     workflow: (installationId: number, workflowId: string) =>
-      request<{ workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}`),
+      request<{ workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals; pause?: WorkflowPause }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}`),
+    /** Lift exactly this pause (the one shown), even after the stopped job's records expired; a newer stop answers 409. */
+    resumeWorkflow: (installationId: number, workflowId: string, pause: Pick<WorkflowPause, 'jobId' | 'at' | 'subject'>) =>
+      request<{ resumed: true }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}/resume`, { method: 'POST', body: JSON.stringify({ jobId: pause.jobId, at: pause.at, subject: pause.subject }) }),
     /** The workflow a job belongs to; null when none was recorded (a job from before workflows). */
     jobWorkflow: (installationId: number, jobId: string) => request<{ workflowId: string | null }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/workflow`),
     /** Runs a job that did not finish its work again, as a new job (its id). Throws ApiError: `not_retryable`, `already_retried`, `throttled`, `event_gone`, ... (409, 410, 429). */
     retryJob: (installationId: number, jobId: string) =>
       request<{ jobId: string }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' }),
+    stopJob: (installationId: number, jobId: string, reason = 'Stopped from the console') =>
+      request<{ jobId: string; state: 'stopping' | 'canceled' | 'finished' }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/stop`, { method: 'POST', body: JSON.stringify({ reason }) }),
+    resumeJob: (installationId: number, jobId: string) => request<{ resumed: true }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/resume`, { method: 'POST' }),
     /** The end of a log; throws ApiError `log_expired` (410) once it is past the retention. */
     jobLog: (installationId: number, jobId: string, name: string) =>
       request<JobLog>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/logs/${encodeURIComponent(name)}`),

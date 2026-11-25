@@ -5,8 +5,9 @@ import { ApiError, api as defaultApi, type ApiClient, type Delivery, type JobLog
 import { DISPOSITION, JOB_RESULT, deliveryReason, formatBytes, formatDuration } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
 import { Lifecycle } from '../components/lifecycle';
+import { JobActions, JobStopStatus } from '../components/job-actions';
 
-type JobApi = Pick<ApiClient, 'job' | 'jobLog'> & Partial<Pick<ApiClient, 'retryJob' | 'jobWorkflow'>>;
+type JobApi = Pick<ApiClient, 'job' | 'jobLog'> & Partial<Pick<ApiClient, 'retryJob' | 'stopJob' | 'resumeJob' | 'jobWorkflow'>>;
 type Load = { state: 'loading' } | { state: 'ok'; job: JobView; deliveries: Delivery[]; conversation?: JobView[] } | { state: 'error'; message: string };
 type LogLoad = { state: 'loading' } | { state: 'ok'; log: JobLog } | { state: 'expired' } | { state: 'error'; message: string };
 
@@ -54,7 +55,7 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
     };
   }, [api, installationId, jobId, valid]);
 
-  const running = load.state === 'ok' && load.job.result === 'running';
+  const running = load.state === 'ok' && (load.job.result === 'running' || !!load.job.stop?.error);
   useEffect(() => {
     if (!running) return;
     const timer = setInterval(() => void refresh(), refreshMs);
@@ -143,7 +144,7 @@ function Loaded({ job, deliveries, conversation, api, installationId, onRefresh 
   const logName = selectedLog && names.includes(selectedLog) ? selectedLog : (names[0] ?? '');
   return (
     <>
-      <JobSummary job={job} installationId={installationId} api={api} onViewLogs={() => setSelectedLog(names[0])} />
+      <JobSummary job={job} installationId={installationId} api={api} onRefresh={onRefresh} onViewLogs={() => setSelectedLog(names[0])} />
 
       {job.logs.length > 0 && <Logs job={job} api={api} installationId={installationId} names={names} name={logName} onSelect={setSelectedLog} />}
 
@@ -236,7 +237,7 @@ function Metric({ label, children }: { label: string; children: ReactNode }) {
  * The top of the page: what the job is, how it stands and why, the facts that matter at a
  * glance, and what to do next. The technical identifiers are below, quieter.
  */
-function JobSummary({ job, installationId, api, onViewLogs }: { job: JobView; installationId: number; api: JobApi; onViewLogs: () => void }) {
+function JobSummary({ job, installationId, api, onViewLogs, onRefresh }: { job: JobView; installationId: number; api: JobApi; onViewLogs: () => void; onRefresh: () => void }) {
   const r = JOB_RESULT[job.result];
   const running = job.result === 'running';
   const elapsed = useElapsed(job.createdAt, running);
@@ -253,18 +254,20 @@ function JobSummary({ job, installationId, api, onViewLogs }: { job: JobView; in
         {job.issue !== undefined ? `#${job.issue}` : job.pullRequest !== undefined ? `#${job.pullRequest}` : ''}
       </PageHeroTitle>
       <PageHeroSubtitle data-testid="job-help">
-        <span className="sr-only">Status: {r.label}. </span>
-        {r.help}
+        <span className="sr-only">Status: {job.stop && job.stop.confirmedAt === undefined ? 'Stopping' : r.label}. </span>
+        {job.stop && job.stop.confirmedAt === undefined ? 'Stopping execution. Automatic continuation is paused.' : r.help}
       </PageHeroSubtitle>
       <PageHeroChips>
         <PageHeroChip tone={r.tone} data-testid="job-result">
-          {r.label}
+          {job.stop && job.stop.confirmedAt === undefined ? 'Stopping…' : r.label}
         </PageHeroChip>
         {job.executionMode && <PageHeroChip>{job.executionMode === 'subscription' ? 'Claude subscription' : 'Standard worker'}</PageHeroChip>}
         {job.label && <PageHeroChip>Label {job.label}</PageHeroChip>}
         {job.pullRequest !== undefined && <PageHeroChip>Pull request event</PageHeroChip>}
         {job.sender && <PageHeroChip>By @{job.sender}</PageHeroChip>}
       </PageHeroChips>
+      <JobStopStatus job={job} />
+      <div className="mt-3 flex justify-end"><JobActions job={job} installationId={installationId} api={api} onRefresh={onRefresh} /></div>
 
       <dl className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(7.5rem,1fr))] gap-3" data-testid="job-facts">
         <Metric label={running ? 'Elapsed (live)' : 'Duration'}>{running ? `Running… ${elapsed !== null ? clock(elapsed * 1000) : ''}`.trim() : formatDuration(job.durationSeconds)}</Metric>

@@ -2,11 +2,15 @@ import { createLauncher, pullRequestLease } from '../jobs/launch.js';
 import { dispatchRules } from '../tenants/dispatch.js';
 import { createNativeModeStore, createNativeStore, type Worker } from '../native/store.js';
 import { createNativeSettingsService } from '../native/settings.js';
+import { createNativeControl } from '../native/control.js';
+import { nativeJobToken } from '../native/route.js';
+import { hashToken } from '../broker/broker.js';
+import { createJobStopper } from '../jobs/stop.js';
 import type { GitHubFlows } from '../flows/github.js';
 import type { NativeRoute } from '../native/route.js';
 import { ConditionalCheckFailedException, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createDynamoStore } from './dynamo.js';
 import { NativeEnqueueRejectedError, type Job, type Member, type Quotas, type Tenant } from './store.js';
 
@@ -28,6 +32,14 @@ function fakeTable() {
 
   function condition(expr: string | undefined, item: Item | undefined, values: Values = {}): boolean {
     if (!expr) return true;
+    if (expr === 'attribute_not_exists(pk) OR jobId = :parent') return !item || item.jobId === values[':parent'];
+    if (expr === '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling) AND attribute_not_exists(fenced)') return !!item && item.version === values[':v'] && !item.active && !item.settling && item.fenced === undefined;
+    if (expr === 'installationId = :installation AND #status = :launched AND attribute_not_exists(stopRequestedAt) AND attribute_not_exists(microvmId) AND attribute_exists(launchingAt) AND expiresAt > :at') return !!item && item.installationId === values[':installation'] && item.status === values[':launched'] && item.stopRequestedAt === undefined && item.microvmId === undefined && item.launchingAt !== undefined && Number(item.expiresAt) > Number(values[':at']);
+    if (expr === 'installationId = :installation AND attribute_not_exists(releasedAt) AND attribute_not_exists(#stop)') return item?.installationId === values[':installation'] && item?.releasedAt === undefined && item?.stop === undefined;
+    if (expr === 'attribute_exists(#stop)') return item?.stop !== undefined;
+    if (expr === 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)') return !item || (item.jobId === values[':job'] && item.at === values[':pat']);
+    if (expr === 'attribute_exists(#stop.confirmedAt)') return (item?.stop as Item | undefined)?.confirmedAt !== undefined;
+    if (expr === 'attribute_not_exists(pk) OR jobId = :job') return !item || item.jobId === values[':job'];
     if (expr === '#enabled = :enabled AND routingVersion = :routingVersion') {
       return item?.enabled === values[':enabled'] && item?.routingVersion === values[':routingVersion'];
     }
@@ -135,7 +147,10 @@ function fakeTable() {
         } else {
           const [lhs = '', rhs = ''] = action.split('=').map((x) => x.trim());
           const ifNotExists = /^if_not_exists\((\S+?),\s*(\S+?)\)$/.exec(rhs);
-          next[name(lhs)] = ifNotExists ? (next[name(ifNotExists[1]!)] ?? values[ifNotExists[2]!]) : values[rhs];
+          if (lhs.startsWith('#stop.')) {
+            const stop = { ...(next.stop as Item) }; const field = name(lhs.split('.')[1]!);
+            stop[field] = ifNotExists ? stop[field] ?? values[ifNotExists[2]!] : values[rhs]; next.stop = stop;
+          } else next[name(lhs)] = ifNotExists ? (next[name(ifNotExists[1]!)] ?? values[ifNotExists[2]!]) : values[rhs];
         }
       }
     }
@@ -234,6 +249,7 @@ function fakeTable() {
 
   return {
     client: client as unknown as DynamoDBDocumentClient,
+    rawClient: client,
     items,
     fail(fn: ((name: string, input: Item) => boolean) | null) {
       failWhen = fn;
@@ -268,6 +284,80 @@ async function seeded() {
 }
 
 describe('dynamo store: native queue admission', () => {
+  async function cancellationFixture() {
+    const table = fakeTable(); const store = createDynamoStore('T', table.client); const workers = createNativeStore('T', table.client);
+    const clock = Date.now(); const secret = 's'.repeat(43);
+    const route: NativeRoute = { installationId: 55, workerId: 'test-worker', microvmId: 'mvm-shared', imageVersion: '3', controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/test' };
+    await store.putTenantWithMember(tenant, member('owner'));
+    table.items.set('NATIVE#55#test-worker|MODE', { pk: 'NATIVE#55#test-worker', sk: 'MODE', enabled: true });
+    const settings = { region: 'us-east-1', bucket: 'b', imageArn: 'image', executionRoleArn: 'role', ingressConnectorArn: 'in', egressConnectorArn: 'out', logGroup: 'logs', brokerFunctionName: 'broker', maximumDurationSeconds: 3600, watchdogReserveSeconds: 60 };
+    const terminate = vi.fn(async () => {});
+    const control = createNativeControl({ store, workers, route, secret: async () => secret, settings, terminateMicrovm: terminate,
+      microvmState: async () => 'RUNNING', disabled: async () => false, now: () => clock, log: () => {} });
+    const stop = createJobStopper({ store, native: control, terminateMicrovm: terminate, microvmState: async () => 'RUNNING', now: () => clock, log: () => {} });
+    const input = (op: string) => ({ action: 'worker', op, workerId: route.workerId, token: secret, session: 'session-0123456789', microvmId: route.microvmId, imageVersion: route.imageVersion, workerVersion: '104', auth: 'connected' });
+    await control.handle(input('register'));
+    async function enqueue(id: string, issue: number) {
+      const r = await store.reserveJob({ installationId: 55, jobId: id, holdUntil: clock + 3600000, day: '2026-11-25', month: '2026-11', quotas: { concurrentJobs: 10, platformConcurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 10000 } });
+      if (!r.ok) throw new Error('fixture reservation failed');
+      const job: Job = { jobId: id, installationId: 55, repositoryId: 99, repository: 'acme/web', issue, tokenHash: hashToken(nativeJobToken(secret, id)), configVersion: 1, deliveryId: id,
+        eventName: 'issues', status: 'launched', createdAt: new Date(clock).toISOString(), expiresAt: clock + 3600000, imageVersion: '3', native: { workerId: route.workerId }, tenantSlot: r.tenantSlot, platformSlot: r.platformSlot };
+      await store.putJob(job); await store.markLaunching(id); return (await store.getJob(id))!;
+    }
+    return { table, store, workers, control, stop, input, enqueue, terminate, clock };
+  }
+
+  it('serializes a queued stop before assignment and advances the next issue on the same session', async () => {
+    const s = await cancellationFixture(); const target = await s.enqueue('job_aaaStop0001', 7); const next = await s.enqueue('job_bbbNext0001', 8);
+    const assign = s.workers.assign.bind(s.workers);
+    vi.spyOn(s.workers, 'assign').mockImplementationOnce(async (...args) => {
+      expect(args[0].jobId).toBe(target.jobId);
+      expect(await s.stop.request(55, target.jobId, 'pat', 'cancel queue')).toMatchObject({ state: 'canceled' });
+      return assign(...args); // stale poll loses the actual DynamoDB transaction
+    });
+    expect(await s.control.handle(s.input('poll'))).toMatchObject({ request: { microvmId: 'mvm-shared', payload: { broker: { jobId: next.jobId } } } });
+    expect((await s.store.getJob(target.jobId))?.microvmId).toBeUndefined();
+    expect((await s.workers.get(55, 'test-worker'))?.active?.jobId).toBe(next.jobId);
+    expect((await s.store.listActiveJobs()).map((j) => j.jobId)).toEqual([next.jobId]);
+    expect(s.terminate).not.toHaveBeenCalled();
+  });
+
+  it('holds capacity when assignment wins, then hands off the same healthy session after settlement', async () => {
+    const s = await cancellationFixture(); const target = await s.enqueue('job_aaaStop0001', 7); const next = await s.enqueue('job_bbbNext0001', 8);
+    expect(await s.control.handle(s.input('poll'))).toMatchObject({ request: { payload: { broker: { jobId: target.jobId } } } });
+    expect(await s.stop.request(55, target.jobId, 'pat', 'stop assigned')).toMatchObject({ state: 'stopping' });
+    expect(await s.store.listActiveJobs()).toHaveLength(2);
+    expect(await s.control.handle(s.input('heartbeat'))).toMatchObject({ cancel: true });
+    await s.store.finishJob(target.jobId, 'canceled');
+    expect(await s.control.complete((await s.store.getJob(target.jobId))!)).toBe(true);
+    expect(await s.control.handle(s.input('poll'))).toMatchObject({ request: { microvmId: 'mvm-shared', payload: { broker: { jobId: next.jobId } } } });
+    expect((await s.store.getJob(target.jobId))?.stop).toMatchObject({ reconnectRequired: false });
+    expect(s.terminate).not.toHaveBeenCalled();
+  });
+
+  it.each(['launch', 'start', 'assign'] as const)('rejects a mapped issue pause at transactional %s admission', async (boundary) => {
+    const s = await cancellationFixture(); const owner = await s.enqueue('job_owner0001', 7);
+    const sibling = { ...owner, jobId: 'job_sibling01', deliveryId: 'sibling', issue: undefined, pullRequest: 12, workflowIssue: 7, microvmId: undefined };
+    delete sibling.launchingAt;
+    const r = await s.store.reserveJob({ installationId: 55, jobId: sibling.jobId, holdUntil: sibling.expiresAt, day: '2026-11-25', month: '2026-11', quotas: { concurrentJobs: 10, platformConcurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 10000 } });
+    if (!r.ok) throw new Error('fixture reservation failed'); sibling.tenantSlot = r.tenantSlot; sibling.platformSlot = r.platformSlot;
+    await s.store.putJob(sibling); if (boundary !== 'launch') await s.store.markLaunching(sibling.jobId);
+    const send = s.table.rawClient.send.bind(s.table.rawClient); let intercepted = false;
+    vi.spyOn(s.table.rawClient, 'send').mockImplementation(async (command) => {
+      if (!intercepted && command.constructor.name === 'TransactWriteCommand') {
+        intercepted = true;
+        await s.store.requestJobStop(owner, { requestedAt: s.clock, by: 'pat', reason: 'stop source issue' }, [7]);
+      }
+      return send(command);
+    });
+    if (boundary === 'launch') await expect(s.store.markLaunching(sibling.jobId)).rejects.toThrow('paused');
+    if (boundary === 'start') expect(await s.store.startJob(sibling, sibling.expiresAt)).toEqual({ result: 'retired' });
+    if (boundary === 'assign') expect(await s.workers.assign((await s.store.getJob(sibling.jobId))!, (await s.workers.get(55, 'test-worker'))!, s.clock, s.clock + 60000)).toBe(false);
+    const current = await s.store.getJob(sibling.jobId);
+    expect(current?.startedAt).toBeUndefined(); expect(current?.microvmId).toBeUndefined();
+    if (boundary === 'launch') expect(current?.launchingAt).toBeUndefined();
+    expect((await s.workers.get(55, 'test-worker'))?.active).toBeUndefined();
+  });
   it('atomically records the job, summary and queue entry and retains unresolved native evidence', async () => {
     const { store, table } = await seeded();
     const job: Job = { jobId: 'job_native00000001', tokenHash: 'hash-only', installationId: 55, repository: 'acme/web', repositoryId: 9,
@@ -685,6 +775,92 @@ describe('dynamo store: the admin view', () => {
 });
 
 describe('dynamo store: delivery claims and finished jobs (review fixes on #80)', () => {
+  it('atomically audits operator intent and fences the job and workflow, preserving first actor and finish', async () => {
+    const table = fakeTable(); const store = createDynamoStore('T', table.client);
+    const job: Job = { jobId: 'job_stop0001', installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12,
+      tokenHash: 'hash', configVersion: 1, deliveryId: 'd-stop', eventName: 'issues', status: 'launched', createdAt: new Date().toISOString(), expiresAt: Date.now() + 3600000 };
+    await store.putJob(job);
+    const audit = { requestedAt: Date.now(), by: 'pat', reason: 'stop' };
+    await store.requestJobStop(job, audit, [12, 12, 13]);
+    await store.requestJobStop(job, { ...audit, by: 'other' }, [12]);
+    expect((await store.getJob(job.jobId))?.stop).toEqual(audit);
+    expect((await store.getJobSummary(55, job.jobId))?.stop).toEqual(audit);
+    expect(await store.getWorkflowPause(55, 9, 13)).toMatchObject({ jobId: job.jobId });
+    expect(await store.getWorkflowPause(66, 9, 13)).toBeNull();
+    await store.recordJobStop(job, { error: 'AWS failed' });
+    await store.finishJob(job.jobId, 'succeeded');
+    await store.recordJobStop(job, { confirmedAt: audit.requestedAt + 1, error: '' });
+    await store.recordJobStop(job, { confirmedAt: audit.requestedAt + 2 });
+    expect((await store.getJobSummary(55, job.jobId))?.stop).toEqual({ ...audit, confirmedAt: audit.requestedAt + 1, error: '' });
+    expect((await store.getJob(job.jobId))?.outcome).toBe('succeeded');
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: job.jobId, at: audit.requestedAt }, [12, 13], 'pat', audit.requestedAt + 10)).toBe(true);
+    expect(await store.getWorkflowPause(55, 9, 13)).toBeNull();
+    expect((await store.getJob(job.jobId))?.stop?.resumedBy).toBe('pat');
+    const completed = { ...job, jobId: 'job_finished01', deliveryId: 'd-finished' };
+    await store.putJob(completed); await store.finishJob(completed.jobId, 'succeeded');
+    await store.requestJobStop(completed, { ...audit, executionMicrovmId: 'mvm-retiring' }, [12]);
+    expect(await store.getJob(completed.jobId)).toMatchObject({ status: 'finished', outcome: 'succeeded', stop: { executionMicrovmId: 'mvm-retiring' } });
+    await store.recordJobStop(completed, { executionMicrovmId: 'mvm-retiring' });
+    expect((await store.getJobSummary(55, completed.jobId))?.stop?.executionMicrovmId).toBe('mvm-retiring');
+  });
+
+  it('keeps a pause, and what resuming it needs, past the job\'s own records, and resumes exactly that pause', async () => {
+    const table = fakeTable(); const store = createDynamoStore('T', table.client);
+    const job: Job = { jobId: 'job_stop0002', installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12,
+      tokenHash: 'hash', configVersion: 1, deliveryId: 'd-stop2', eventName: 'issues', status: 'launched', createdAt: new Date().toISOString(), expiresAt: Date.now() + 3600000 };
+    await store.putJob(job);
+    const stop = { requestedAt: Date.now(), by: 'pat', reason: 'off course' };
+    await store.requestJobStop(job, stop, [12, 13]);
+    // No TTL on the pause; it names every subject it holds.
+    expect(table.items.get('TENANT#55|PAUSE#9#12')?.ttl).toBeUndefined();
+    expect(await store.getWorkflowPause(55, 9, 13)).toEqual({ jobId: job.jobId, at: stop.requestedAt, by: 'pat', reason: 'off course', subjects: [12, 13], repository: 'acme/web', issue: 12, jobCreatedAt: job.createdAt });
+    // Listed per subject, without PAUSELOG records.
+    expect((await store.listWorkflowPauses(55, 10)).map((p) => [p.repositoryId, p.subject, p.jobId])).toEqual([[9, 12, job.jobId], [9, 13, job.jobId]]);
+    await store.confirmWorkflowPause(job, [12, 13], stop.requestedAt + 5);
+    await store.confirmWorkflowPause({ ...job, jobId: 'job_other0001' }, [12], stop.requestedAt + 9);
+    expect((await store.getWorkflowPause(55, 9, 12))?.confirmedAt).toBe(stop.requestedAt + 5);
+
+    // META expires first: its summary is still marked resumed, found through the pause.
+    const summaryKey = [...table.items.keys()].find((k) => k.endsWith(`#${job.jobId}`))!;
+    table.items.delete(`JOB#${job.jobId}|META`);
+    const other = { ...job, jobId: 'job_stop0003', deliveryId: 'd-stop3', issue: 40 };
+    await store.putJob(other); await store.requestJobStop(other, { ...stop, requestedAt: stop.requestedAt + 1 }, [40]);
+    table.items.delete(`JOB#${other.jobId}|META`);
+    expect(await store.resumeWorkflowPause(55, 9, (await store.getWorkflowPause(55, 9, 40))!, [40], 'sam', stop.requestedAt + 15)).toBe(true);
+    expect((table.items.get([...table.items.keys()].find((k) => k.endsWith(`#${other.jobId}`))!)?.stop as { resumedBy?: string })?.resumedBy).toBe('sam');
+    expect(table.items.has(`JOB#${other.jobId}|META`)).toBe(false);
+    // Both of the job's records expire.
+    table.items.delete(summaryKey);
+    expect(await store.getJob(job.jobId)).toBeNull();
+    expect(await store.getJobSummary(55, job.jobId)).toBeNull();
+
+    // A resume of another pause changes nothing.
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: job.jobId, at: stop.requestedAt - 1 }, [12, 13], 'sam', stop.requestedAt + 20)).toBe(false);
+    expect(await store.getWorkflowPause(55, 9, 12)).not.toBeNull();
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: job.jobId, at: stop.requestedAt }, [12, 13], 'sam', stop.requestedAt + 20)).toBe(true);
+    expect(await store.getWorkflowPause(55, 9, 12)).toBeNull();
+    expect(await store.getWorkflowPause(55, 9, 13)).toBeNull();
+    expect(await store.getPauseResume(55, 9, { jobId: job.jobId, at: stop.requestedAt })).toEqual({ resumedAt: stop.requestedAt + 20, resumedBy: 'sam', subjects: [12, 13] });
+    // No record was invented for the expired job.
+    expect(table.items.has(`JOB#${job.jobId}|META`)).toBe(false);
+    // Resuming again is harmless, and keeps the first audit.
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: job.jobId, at: stop.requestedAt }, [12, 13], 'lee', stop.requestedAt + 30)).toBe(true);
+    expect((await store.getPauseResume(55, 9, { jobId: job.jobId, at: stop.requestedAt }))?.resumedBy).toBe('sam');
+  });
+
+  it('never lifts a newer pause that took one of the subjects', async () => {
+    const table = fakeTable(); const store = createDynamoStore('T', table.client);
+    const base = { installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12, tokenHash: 'hash', configVersion: 1, eventName: 'issues', status: 'launched' as const, createdAt: new Date().toISOString(), expiresAt: Date.now() + 3600000 };
+    const first: Job = { ...base, jobId: 'job_first0002', deliveryId: 'd-a' };
+    const newer: Job = { ...base, jobId: 'job_newer0002', deliveryId: 'd-b', pullRequest: 13 };
+    await store.putJob(first); await store.putJob(newer);
+    await store.requestJobStop(first, { requestedAt: 1000, by: 'pat', reason: 'x' }, [12, 13]);
+    await store.requestJobStop(newer, { requestedAt: 2000, by: 'sam', reason: 'y' }, [13]);
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: first.jobId, at: 1000 }, [12, 13], 'pat', 3000)).toBe(false);
+    expect(await store.getWorkflowPause(55, 9, 12)).toMatchObject({ jobId: first.jobId });
+    expect(await store.getWorkflowPause(55, 9, 13)).toMatchObject({ jobId: newer.jobId });
+    expect(await store.getPauseResume(55, 9, { jobId: first.jobId, at: 1000 })).toBeNull();
+  });
   const LATER = Date.now() + 3_600_000;
 
   it('a claim is released only by the job holding it, and releasing again is harmless', async () => {

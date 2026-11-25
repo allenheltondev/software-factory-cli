@@ -2,6 +2,7 @@ import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException } fr
 import { DeleteObjectsCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import { DeleteSecretCommand, ListSecretsCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { createReconciler } from './jobs/reconcile.js';
+import { awsJobStopper } from './jobs/stop-aws.js';
 import { createDynamoWorkflowStore } from './workflows/store.js';
 import { createWorkflowRecorder } from './workflows/recorder.js';
 import { createDynamoStore } from './store/dynamo.js';
@@ -25,9 +26,11 @@ const store = createDynamoStore(process.env.TABLE_NAME ?? '');
 const microvms = new LambdaMicrovmsClient({});
 
 const nativeWorker = nativeAws(store);
+const workflows = createWorkflowRecorder({ store: createDynamoWorkflowStore(process.env.TABLE_NAME ?? '') });
 const reconcile = createReconciler({
   store,
-  workflows: createWorkflowRecorder({ store: createDynamoWorkflowStore(process.env.TABLE_NAME ?? '') }),
+  stop: awsJobStopper(store, nativeWorker.control, workflows),
+  workflows,
   native: nativeWorker.control,
   async microvmState(microvmId) {
     try {

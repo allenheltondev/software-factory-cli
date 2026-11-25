@@ -2,6 +2,7 @@ import { destinationOf, jobTelemetrySnapshotOf, loopOf, routingOf, stepsOf, tele
 import { benchmarkIdentityOf } from '../benchmarks/config.js';
 import { nativePartition } from '../native/store.js';
 import { NATIVE_SLOT_HOLD_UNTIL } from '../native/route.js';
+import { workflowAdmissionChecks, WorkflowPausedError } from '../jobs/workflow-gate.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import {
   DeleteCommand,
@@ -26,6 +27,9 @@ import type {
   Job,
   JobFinishDetail,
   JobSummary,
+  JobStop,
+  WorkflowPause,
+  HeldPause,
   Member,
   OAuthState,
   Quotas,
@@ -34,7 +38,7 @@ import type {
   Tenant,
   TenantLimits,
 } from './store.js';
-import { finishFields, isFailure, NativeEnqueueRejectedError } from './store.js';
+import { finishFields, isFailure, NativeEnqueueRejectedError, pausedOf } from './store.js';
 
 const DAY_SECONDS = 24 * 3600;
 const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
@@ -134,6 +138,7 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
   }
   return {
     jobId: String(i.jobId),
+    ...(i.stop && typeof i.stop === 'object' ? { stop: i.stop as JobStop } : {}),
     ...(benchmarkIdentityOf(i.benchmark) ? { benchmark: benchmarkIdentityOf(i.benchmark) } : {}),
     ...(i.executionMode === 'subscription' || i.executionMode === 'standard' ? { executionMode: i.executionMode } : {}),
     repository: String(i.repository),
@@ -152,6 +157,20 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
     ...(typeof i.microvmId === 'string' ? { microvmId: i.microvmId } : {}),
     ...(Object.keys(detail).length ? { detail } : {}),
   };
+}
+
+/** A PAUSE record as read: only what it holds, typed. */
+function pauseItem(i: Record<string, unknown>): WorkflowPause {
+  const n = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) ? v : undefined);
+  const out: WorkflowPause = { jobId: String(i.jobId), at: Number(i.at), by: String(i.by) };
+  if (typeof i.reason === 'string') out.reason = i.reason;
+  if (Array.isArray(i.subjects)) out.subjects = i.subjects.map(Number).filter(Number.isSafeInteger);
+  if (n(i.confirmedAt) !== undefined) out.confirmedAt = n(i.confirmedAt)!;
+  if (typeof i.repository === 'string') out.repository = i.repository;
+  if (n(i.issue) !== undefined) out.issue = n(i.issue)!;
+  if (n(i.pullRequest) !== undefined) out.pullRequest = n(i.pullRequest)!;
+  if (typeof i.jobCreatedAt === 'string') out.jobCreatedAt = i.jobCreatedAt;
+  return out;
 }
 
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
@@ -676,6 +695,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async markLaunching(jobId) {
+      const current = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' }, ConsistentRead: true }));
+      const gates = current.Item ? workflowAdmissionChecks(T, current.Item as Job) : [];
       // The phase and the job's own record of it, together: the active entry is deleted when the
       // reservation is reclaimed, before the job is failed, so it cannot be the only evidence.
       try {
@@ -696,14 +717,16 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   TableName: T,
                   Key: { pk: `JOB#${jobId}`, sk: 'META' },
                   UpdateExpression: 'SET launchingAt = :at',
-                  ConditionExpression: 'attribute_exists(pk)',
+                  ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(stopRequestedAt)',
                   ExpressionAttributeValues: { ':at': Date.now() },
                 },
               },
+              ...gates,
             ],
           }),
         );
       } catch (err) {
+        if (err instanceof TransactionCanceledException && gates.some((_, i) => cancelledAt(err, 2 + i))) throw new WorkflowPausedError();
         if (err instanceof TransactionCanceledException) throw new Error(`job ${jobId} has no reservation to launch`, { cause: err });
         throw err;
       }
@@ -716,6 +739,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       if (!i) return null;
       return {
         jobId: String(i.jobId),
+        ...(i.stop && typeof i.stop === 'object' ? { stop: i.stop as JobStop } : {}),
+        ...(typeof i.resumeOf === 'string' ? { resumeOf: i.resumeOf } : {}),
+        ...(typeof i.workflowIssue === 'number' ? { workflowIssue: i.workflowIssue } : {}),
         ...(benchmarkIdentityOf(i.benchmark) ? { benchmark: benchmarkIdentityOf(i.benchmark) } : {}),
         ...(typeof i.benchmarkAgent === 'string' ? { benchmarkAgent: i.benchmarkAgent } : {}),
         ...(typeof i.benchmarkWorkflow === 'string' ? { benchmarkWorkflow: i.benchmarkWorkflow } : {}),
@@ -1379,6 +1405,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async startJob(job, holdUntil): Promise<StartResult> {
+      const gates = workflowAdmissionChecks(T, job);
       const ttl = Math.ceil(holdUntil / 1000);
       const slots = jobSlotKeys(job);
       const monthLimit = job.quotas ? job.quotas.microvmMinutesPerMonth * 60 : undefined;
@@ -1416,12 +1443,14 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                     },
                   ]
                 : []),
+              ...gates,
             ],
           }),
         );
         return { result: 'started' };
       } catch (err) {
         if (!(err instanceof TransactionCanceledException)) throw err;
+        if (gates.some((_, i) => cancelledAt(err, 2 + slots.length + (job.reservedSeconds ? 1 : 0) + i))) return { result: 'retired' };
         if (cancelledAt(err, 0)) {
           const current = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' }, ConsistentRead: true }));
           const retired = !current.Item || current.Item.status === 'finished' || current.Item.stopRequestedAt !== undefined;
@@ -1451,6 +1480,126 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       }
     },
 
+    async requestJobStop(job, stop, subjects) {
+      try {
+        await client.send(new TransactWriteCommand({ TransactItems: [
+          { Update: { TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
+            UpdateExpression: 'SET #stop = :stop, stopRequestedAt = if_not_exists(stopRequestedAt, :at)',
+            ConditionExpression: 'installationId = :installation AND attribute_not_exists(releasedAt) AND attribute_not_exists(#stop)',
+            ExpressionAttributeNames: { '#stop': 'stop' },
+            ExpressionAttributeValues: { ':stop': stop, ':at': stop.requestedAt, ':installation': job.installationId } } },
+          { Update: { TableName: T, Key: jobSummaryKey(job), UpdateExpression: 'SET #stop = :stop',
+            ConditionExpression: 'attribute_exists(pk)', ExpressionAttributeNames: { '#stop': 'stop' }, ExpressionAttributeValues: { ':stop': stop } } },
+          // No TTL: a pause lasts until an owner resumes it, and holds what resuming needs.
+          ...[...new Set(subjects)].map((subject) => ({ Put: { TableName: T,
+            Item: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${subject}`, jobId: job.jobId, at: stop.requestedAt, by: stop.by, reason: stop.reason, subjects: [...new Set(subjects)], ...pausedOf(job) } } })),
+        ] }));
+      } catch (err) {
+        if (!(err instanceof TransactionCanceledException) || !cancelledAt(err, 0)) throw err;
+      }
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' }, ConsistentRead: true }));
+      return out.Item ? out.Item as Job : null;
+    },
+    async recordJobStop(job, progress) {
+      const names: Record<string, string> = { '#stop': 'stop' };
+      const values: Record<string, unknown> = {};
+      const sets = Object.entries(progress).filter(([, v]) => v !== undefined).map(([k, v]) => {
+        names[`#${k}`] = k;
+        values[`:${k}`] = v;
+        return `#stop.#${k} = ${k === 'confirmedAt' ? `if_not_exists(#stop.#${k}, :${k})` : `:${k}`}`;
+      });
+      if (!sets.length) return;
+      await client.send(new TransactWriteCommand({ TransactItems: [ { pk: `JOB#${job.jobId}`, sk: 'META' }, jobSummaryKey(job) ].map((Key) => ({
+        Update: { TableName: T, Key, UpdateExpression: `SET ${sets.join(', ')}`, ConditionExpression: 'attribute_exists(#stop)',
+          ExpressionAttributeNames: names, ExpressionAttributeValues: values },
+      })) }));
+    },
+    async getWorkflowPause(id, repo, subject) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${subject}` }, ConsistentRead: true }));
+      return out.Item ? pauseItem(out.Item) : null;
+    },
+    async listWorkflowPauses(id, limit) {
+      const out: HeldPause[] = [];
+      let start: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(new QueryCommand({ TableName: T, KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'PAUSE#' }, ...(start ? { ExclusiveStartKey: start } : {}) }));
+        for (const i of page.Items ?? []) {
+          const [, repo, subject] = String(i.sk).split('#');
+          if (Number.isSafeInteger(Number(repo)) && Number.isSafeInteger(Number(subject))) out.push({ ...pauseItem(i), repositoryId: Number(repo), subject: Number(subject) });
+        }
+        start = page.LastEvaluatedKey;
+      } while (start && out.length < limit);
+      return out.slice(0, limit);
+    },
+    async confirmWorkflowPause(job, subjects, confirmedAt) {
+      for (const n of new Set(subjects)) {
+        try {
+          await client.send(new UpdateCommand({ TableName: T, Key: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${n}` },
+            UpdateExpression: 'SET confirmedAt = if_not_exists(confirmedAt, :at)', ConditionExpression: 'jobId = :job',
+            ExpressionAttributeValues: { ':at': confirmedAt, ':job': job.jobId } }));
+        } catch (err) {
+          // Not this job's pause (none, or a newer one): nothing to confirm.
+          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        }
+      }
+    },
+    async resumeWorkflowPause(id, repo, pause, subjects, by, at) {
+      const all = [...new Set(subjects)];
+      try {
+        await client.send(new TransactWriteCommand({ TransactItems: [
+          // Exactly this pause, on each subject; a subject already gone is fine, another pause is not.
+          ...all.map((n) => ({ Delete: { TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${n}` },
+            ConditionExpression: 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)', ExpressionAttributeNames: { '#at': 'at' },
+            ExpressionAttributeValues: { ':job': pause.jobId, ':pat': pause.at } } })),
+          // Who resumed it, kept for good, independent of the job's records. The first resume stands.
+          { Put: { TableName: T, Item: { pk: `TENANT#${id}`, sk: `PAUSELOG#${repo}#${pause.jobId}#${pause.at}`, jobId: pause.jobId, at: pause.at, resumedAt: at, resumedBy: by, subjects: all },
+            ConditionExpression: 'attribute_not_exists(pk)' } },
+        ] }));
+      } catch (error) {
+        if (!(error instanceof TransactionCanceledException)) throw error;
+        const reasons = error.CancellationReasons ?? [];
+        // A newer pause holds a subject: nothing changed.
+        if (reasons.slice(0, all.length).some((r) => r.Code === 'ConditionalCheckFailed')) return false;
+        // Resumed already (the audit exists): resume what is left, without a second audit.
+        if (reasons[all.length]?.Code !== 'ConditionalCheckFailed') throw error;
+        if (all.length) try {
+          await client.send(new TransactWriteCommand({ TransactItems: all.map((n) => ({ Delete: { TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${n}` },
+            ConditionExpression: 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)', ExpressionAttributeNames: { '#at': 'at' },
+            ExpressionAttributeValues: { ':job': pause.jobId, ':pat': pause.at } } })) }));
+        } catch (again) {
+          if (again instanceof TransactionCanceledException && again.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return false;
+          throw again;
+        }
+      }
+      // The job's own records, where they still exist, say so too: a projection of the durable
+      // audit, best effort, since the resume has happened. Its summary is found through the pause
+      // (it holds the job's creation time) even once META is gone; either may have expired.
+      try {
+        const job = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${pause.jobId}`, sk: 'META' }, ConsistentRead: true }));
+        const createdAt = job.Item?.installationId === id ? String(job.Item.createdAt) : pause.jobCreatedAt;
+        const keys = [
+          ...(job.Item?.installationId === id ? [{ pk: `JOB#${pause.jobId}`, sk: 'META' }] : []),
+          ...(createdAt ? [jobSummaryKey({ installationId: id, createdAt, jobId: pause.jobId })] : []),
+        ];
+        for (const Key of keys) {
+          try {
+            await client.send(new UpdateCommand({ TableName: T, Key,
+              UpdateExpression: 'SET #stop.#at = if_not_exists(#stop.#at, :at), #stop.#by = if_not_exists(#stop.#by, :by)', ConditionExpression: 'attribute_exists(#stop)',
+              ExpressionAttributeNames: { '#stop': 'stop', '#at': 'resumedAt', '#by': 'resumedBy' }, ExpressionAttributeValues: { ':at': at, ':by': by } }));
+          } catch (err) {
+            if (!(err instanceof ConditionalCheckFailedException)) throw err;
+          }
+        }
+      } catch (err) {
+        console.log(JSON.stringify({ installationId: id, jobId: pause.jobId, warning: 'workflow resumed; marking the job record resumed failed (the pause audit is authoritative)', name: (err as Error)?.name }));
+      }
+      return true;
+    },
+    async getPauseResume(id, repo, pause) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSELOG#${repo}#${pause.jobId}#${pause.at}` }, ConsistentRead: true }));
+      return out.Item ? { resumedAt: Number(out.Item.resumedAt), resumedBy: String(out.Item.resumedBy), subjects: Array.isArray(out.Item.subjects) ? out.Item.subjects.map(Number) : [] } : null;
+    },
     async holdSlots(job, until) {
       const ttl = Math.ceil(until / 1000);
       let all = true;

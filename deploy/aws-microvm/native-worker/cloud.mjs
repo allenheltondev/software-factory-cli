@@ -61,13 +61,15 @@ export async function startCloudWorker(config, microvmId, service, options = {})
   let auth = await service.authStatus();
   const message = (op) => ({ op, session, microvmId, auth, imageVersion: config.imageVersion, workerVersion: config.workerVersion });
   const stopChild = async () => {
-    if (!child || childDone) return;
+    if (!child || childDone) return true;
     child.kill('SIGTERM');
     // runJob cancels/reaps its detached Updraft group before reporting completion. Never
     // start another job after a forced root-runner kill; Cloud physically fences the VM.
     let timer;
-    await Promise.race([ended, new Promise((resolve) => { timer = setTimeout(() => { child?.kill('SIGKILL'); resolve(); }, options.stopGrace ?? 25_000); })]);
+    let forced = false;
+    await Promise.race([ended, new Promise((resolve) => { timer = setTimeout(() => { forced = true; child?.kill('SIGKILL'); resolve(); }, options.stopGrace ?? 25_000); })]);
     clearTimeout(timer);
+    return !forced;
   };
   const loop = (async () => {
     try {
@@ -87,7 +89,7 @@ export async function startCloudWorker(config, microvmId, service, options = {})
           // A cancel for a runner that already exited has nothing left to stop: settle it, and let
           // Cloud's answer decide (a lease it cannot settle still stops this worker). Ending the
           // loop here would strand a healthy shared session until its VM is fenced (#144).
-          if (status.cancel && !childDone) { await stopChild(); throw new Error('worker job canceled'); }
+          if (status.cancel && !childDone && !await stopChild()) throw new Error('worker cancellation required a forced kill');
           if (childDone) {
             await ended;
             const settled = await call(message('settled'));

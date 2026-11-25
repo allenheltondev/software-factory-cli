@@ -2,6 +2,7 @@ import { JOB_PERMISSIONS } from '../broker/broker.js';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows, type TenantSummary } from '../flows/github.js';
 import type { RetryResult } from '../jobs/retry.js';
+import { resumeJobPause, resumeWorkflowPause, stopSubjects, type ResumeOutcome, type StopResult } from '../jobs/stop.js';
 import { countBy, deliveryCounts, jobResult, notRetryableMessage, retryable, type JobResult } from '../jobs/status.js';
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
@@ -50,6 +51,8 @@ export interface MissingPermission {
 export type InstallationStatus = 'active' | 'suspended' | 'missing_permissions' | 'disabled' | 'uninstalled';
 
 export interface JobView extends JobSummary {
+  canStop?: boolean;
+  canResume?: boolean;
   result: JobResult;
   issueUrl?: string;
   prUrl?: string;
@@ -160,7 +163,8 @@ export interface StatusServiceDeps {
   agentKeys: Pick<AgentKeyService, 'list'>;
   readLog?: LogReader;
   /** Asks the launcher to run a job's event again (jobs/retry.ts). Absent: retrying is not offered. */
-  requestRetry?: (installationId: number, jobId: string) => Promise<RetryResult>;
+  requestRetry?: (installationId: number, jobId: string, by?: string) => Promise<RetryResult>;
+  requestStop?: (installationId: number, jobId: string, by: string, reason: string) => Promise<StopResult | null>;
   /** The stack's ResultRetentionDays: a job's logs are expired once it ended longer ago than that. */
   resultRetentionDays?: number;
   /** HONEYCOMB_TIMELINE_URL, as parseTimelineTemplate accepted it: a link to a conversation in Agent Timeline. */
@@ -241,7 +245,15 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
   return view;
 }
 
-export function createStatusService({ store, github, agentKeys, readLog, requestRetry, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
+/** A resume that did not happen, as the error the console shows. */
+function resumed(outcome: ResumeOutcome): void {
+  if (outcome === 'resumed') return;
+  if (outcome === 'not_paused') throw new FlowError('not_found', 404, 'This workflow is not paused');
+  if (outcome === 'stop_pending') throw new FlowError('stop_pending', 409, 'Wait until execution has stopped before resuming automation');
+  throw new FlowError('pause_changed', 409, 'A newer stop controls this workflow; look at it again before resuming');
+}
+
+export function createStatusService({ store, github, agentKeys, readLog, requestRetry, requestStop, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
   const view = (job: JobSummary, telemetry: TelemetrySettings | null, settingsUnavailable = false) => jobView(job, telemetry, { now: now(), timelineTemplate, settingsUnavailable });
   const settingsOf = (installationId: number) => store.getTelemetry(installationId).then((t) => ({ t, unavailable: false }), () => ({ t: null, unavailable: true }));
   const limitOf = (raw: unknown) => {
@@ -369,9 +381,11 @@ export function createStatusService({ store, github, agentKeys, readLog, request
     },
 
     async jobs(caller: Caller, installationId: number, limit?: unknown): Promise<{ jobs: JobView[] }> {
-      await github.member(caller, installationId);
+      const member = await github.member(caller, installationId);
       const [jobs, settings] = await Promise.all([store.listRecentJobs(installationId, limitOf(limit)), settingsOf(installationId)]);
-      return { jobs: jobs.map((j) => view(j, settings.t, settings.unavailable)) };
+      const active = requestStop && member.summary.role === 'owner' ? new Set((await store.listActiveJobs()).filter((j) => j.installationId === installationId).map((j) => j.jobId)) : new Set<string>();
+      return { jobs: jobs.map((j) => ({ ...view(j, settings.t, settings.unavailable), canResume: member.summary.role === 'owner' && j.stop?.confirmedAt !== undefined && j.stop.resumedAt === undefined,
+        canStop: !!requestStop && member.summary.role === 'owner' && (j.status !== 'finished' || !!j.stop && (j.stop.confirmedAt === undefined || !!j.stop.error) || active.has(j.jobId)) })) };
     },
 
     /**
@@ -379,7 +393,7 @@ export function createStatusService({ store, github, agentKeys, readLog, request
      * (the issue's implement run, reviews and revisions; newest first, among the latest jobs).
      */
     async job(caller: Caller, installationId: number, jobId: string): Promise<{ job: JobView; deliveries: DeliveryRecord[]; conversation: JobView[] }> {
-      await github.member(caller, installationId);
+      const member = await github.member(caller, installationId);
       const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
       if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
       // Every kept attempt of its delivery: GitHub reuses the id on a redelivery, so an earlier
@@ -391,7 +405,9 @@ export function createStatusService({ store, github, agentKeys, readLog, request
         conversationId ? store.listRecentJobs(installationId, LIST_LIMIT).catch(() => []) : Promise.resolve([]),
       ]);
       const conversation = recent.filter((j) => j.jobId !== job.jobId && conversationOf(j) === conversationId).map((j) => view(j, settings.t, settings.unavailable));
-      return { job: view(job, settings.t, settings.unavailable), deliveries, conversation };
+      const execution = requestStop && member.summary.role === 'owner' ? await store.getJob(jobId) : null;
+      return { job: { ...view(job, settings.t, settings.unavailable), canResume: member.summary.role === 'owner' && job.stop?.confirmedAt !== undefined && job.stop.resumedAt === undefined,
+        canStop: !!requestStop && member.summary.role === 'owner' && (job.status !== 'finished' || !!job.stop && (job.stop.confirmedAt === undefined || !!job.stop.error) || !!execution && execution.releasedAt === undefined) }, deliveries, conversation };
     },
 
     /**
@@ -399,16 +415,58 @@ export function createStatusService({ store, github, agentKeys, readLog, request
      * the tenant's quotas, keys and active configuration apply as they do to any job). Members only.
      */
     async retry(caller: Caller, installationId: number, jobId: string): Promise<{ jobId: string }> {
-      await github.member(caller, installationId);
+      const member = await github.member(caller, installationId);
       const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
       if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
+      if (job.stop && member.summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner may restart intentionally stopped work');
+      if (job.stop && job.stop.confirmedAt === undefined) throw new FlowError('stop_pending', 409, 'Wait until execution has stopped before retrying');
       if (job.retriedAs) throw new FlowError('already_retried', 409, notRetryableMessage(job));
       if (!retryable(job)) throw new FlowError('not_retryable', 409, notRetryableMessage(job));
       if (!requestRetry) throw new FlowError('retry_unavailable', 503, 'Retrying is not available in this deployment');
-      const out = await requestRetry(installationId, jobId);
+      const out = job.stop ? await requestRetry(installationId, jobId, member.githubLogin ?? caller.sub) : await requestRetry(installationId, jobId);
       if (!out.ok) throw new FlowError(out.code, out.status, out.message);
       log({ installationId, jobId, retried: true, newJobId: out.jobId });
       return { jobId: out.jobId };
+    },
+
+    async stop(caller: Caller, installationId: number, jobId: string, reason: string): Promise<StopResult> {
+      const member = await github.member(caller, installationId);
+      if (member.summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner may stop jobs');
+      if (!JOB_ID.test(jobId)) throw new FlowError('not_found', 404, 'There is no such job in this installation');
+      if (!requestStop) throw new FlowError('stop_unavailable', 503, 'Stopping jobs is unavailable in this deployment');
+      const out = await requestStop(installationId, jobId, member.githubLogin ?? caller.sub, reason);
+      if (!out) throw new FlowError('not_found', 404, 'There is no such job in this installation');
+      return out;
+    },
+
+    /** Resume future automation without replaying an event or duplicating the current PR. */
+    async resume(caller: Caller, installationId: number, jobId: string): Promise<{ resumed: true }> {
+      const member = await github.member(caller, installationId);
+      if (member.summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner may resume stopped automation');
+      const summary = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
+      const job = summary ? await store.getJob(jobId) : null;
+      if (!job || job.installationId !== installationId || !job.stop) throw new FlowError('not_found', 404, 'There is no stopped job in this installation; a paused workflow can be resumed from its page');
+      if (job.stop.confirmedAt === undefined) throw new FlowError('stop_pending', 409, 'Wait until execution has stopped before resuming automation');
+      // The pause this job's stop made, on any of its subjects, as a whole; a newer stop is never lifted.
+      resumed(await resumeJobPause(store, { ...job, stop: job.stop }, stopSubjects(job, summary?.detail?.prNumber), member.githubLogin ?? caller.sub, now()));
+      return { resumed: true };
+    },
+
+    /**
+     * Resume a paused workflow (`<repositoryId>-i<issue>` or `-p<n>`) from the pause itself: the
+     * only way once the stopped job's records have expired. `expected` is the pause the owner saw,
+     * so a newer stop is never lifted by mistake.
+     */
+    async resumeWorkflow(caller: Caller, installationId: number, workflowId: string, expected?: { jobId: string; at: number; subject?: number }): Promise<{ resumed: true }> {
+      const member = await github.member(caller, installationId);
+      if (member.summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner may resume stopped automation');
+      const m = /^([0-9]{1,20})-[ip]([0-9]{1,10})$/.exec(workflowId);
+      if (!m) throw new FlowError('not_found', 404, 'There is no such workflow in this installation');
+      // The subject the pause was shown on (the workflow's pull request, say), or the workflow's own.
+      // Only exactly the pause named is lifted, wherever it is read: a newer one answers 409.
+      const subject = expected?.subject ?? Number(m[2]);
+      resumed(await resumeWorkflowPause(store, { installationId, repositoryId: Number(m[1]), subject, ...(expected ? { expected: { jobId: expected.jobId, at: expected.at } } : {}), by: member.githubLogin ?? caller.sub, at: now() }));
+      return { resumed: true };
     },
 
     /** The end of one of a job's logs. The job is looked up in the tenant's own partition, so another tenant's log cannot be named. */
