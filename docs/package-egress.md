@@ -138,17 +138,17 @@ It logs targets, reasons and byte counts, never request or response contents.
   sandbox *with* the microVM's network: the agent CLIs reach their model APIs from inside it.
   There, registries were already reachable, and so is every other public host except the
   credential addresses the packet filter blocks (`runner/isolation.mjs`). Narrowing that path
-  to an allowlist needs per-agent API hosts and is a separate change.
+  to an allowlist needs per-agent API hosts and is a separate change (#157).
 - **Allowlist per image, not per installation.** `allowHosts` lives in the root-owned worker
   config of the image. A per-installation list needs a Cloud setting delivered to the managed
-  worker. Until then, extra hosts are an operator change.
+  worker. Until then, extra hosts are an operator change. Tracked in #157.
 - **No private registry credentials.** Private registries can be allowed by host, but there is
   no supported way to give a job a scoped registry token. Do not put one in the repository or
   the image. This needs a broker-issued, job-scoped secret that the proxy injects, so the token
   never enters the sandbox.
 - **No dependency cache across jobs.** Every job installs cold. This is predictable and works,
   and a cold install of this repository's `cloud/` workspace takes about 10 s. A lockfile-keyed
-  cache is a possible optimization.
+  cache is a possible optimization (#156).
 
 ## Evidence (local, not deployed)
 
