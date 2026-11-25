@@ -225,6 +225,22 @@ describe('repository readiness (#137)', () => {
     expect(repo(r).status).toBe('unknown');
   });
 
+  it('reports what waits in the admission queue, for information only', async () => {
+    const entry = (over: Record<string, unknown>) => ({ jobId: 'job_q', installationId: 55, repository: 'acme/web', repositoryId: 9, deliveryId: 'd', eventName: 'issues', eventKey: 'k', route: 'standard',
+      configVersion: 3, reason: 'concurrent_jobs', state: 'queued', enqueuedAt: NOW - 12 * 60_000, expiresAt: NOW + 1, attempts: 0, ...over }) as never;
+    const list = vi.fn(async (id: number) => { expect(id).toBe(55); return [entry({}), entry({ jobId: 'job_r', enqueuedAt: NOW - 60_000 }), entry({ state: 'admitted' }), entry({ repositoryId: 77 })]; });
+    const r = await setup(world(), { queue: { list } }).service.readiness(caller, 55);
+    expect(get(r, 'queue')).toMatchObject({ state: 'failing', required: false, problem: 'transient', summary: expect.stringContaining('2 jobs wait') });
+    expect(get(r, 'queue')!.summary).toContain('12 min');
+    expect(repo(r).status).toBe('ready');
+    const empty = await setup(world(), { queue: { list: async () => [] } }).service.readiness(caller, 55);
+    expect(get(empty, 'queue')).toMatchObject({ state: 'verified', required: false });
+    const unread = await setup(world(), { queue: { list: async () => { throw new Error('x'); } } }).service.readiness(caller, 55);
+    expect(get(unread, 'queue')).toMatchObject({ state: 'unverified', required: false });
+    expect(repo(unread).status).toBe('ready');
+    expect(get(await setup(world()).service.readiness(caller, 55), 'queue')).toBeUndefined();
+  });
+
   it('runs one assessment for concurrent misses of one installation', async () => {
     const { service, calls } = setup(world());
     const [a, b, c] = await Promise.all([service.readiness(caller, 55), service.readiness(caller, 55), service.readiness(caller, 55, { refresh: true })]);

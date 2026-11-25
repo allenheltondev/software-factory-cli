@@ -32,8 +32,8 @@ const STAGE: Record<ReadinessCheck['stage'], string> = {
 };
 
 function stateOf(c: ReadinessCheck): { label: string; tone: Tone } {
-  if (c.state === 'failing' && !c.required) return { label: 'Optional', tone: 'warning' };
   if (c.state === 'failing' && (c.problem === 'transient' || c.problem === 'paused' || c.problem === 'provider')) return { label: c.problem === 'paused' ? 'Paused' : 'Waiting', tone: 'warning' };
+  if (c.state === 'failing' && !c.required) return { label: 'Optional', tone: 'warning' };
   if (c.state === 'unverified' && c.unverified === 'needs_run') return { label: 'Needs a run', tone: 'neutral' };
   return STATE[c.state];
 }

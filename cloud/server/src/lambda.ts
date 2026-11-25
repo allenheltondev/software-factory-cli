@@ -191,6 +191,7 @@ const app = createApp({
           agentKeys: agentKeyService,
           quotas: quotasFromEnv(process.env),
           killSwitch,
+          queue: createDynamoQueueStore(tableName),
           ...(jobImageParameter ? { imageVersion: async () => (await parameter(jobImageParameter))?.trim() || null } : {}),
           native: async (id) => {
             // The binding dispatch would use: the pinned route for its installation, else the managed session.

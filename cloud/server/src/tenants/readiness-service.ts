@@ -6,6 +6,7 @@ import { readinessAction, type NativeReadiness } from '../jobs/launch.js';
 import { dayOf, monthOf, tenantQuotas } from '../jobs/quotas.js';
 import { jobResult, type JobResult } from '../jobs/status.js';
 import { sameNativeTrigger, type NativeTrigger } from '../native/route.js';
+import { isWaiting, type QueueEntry, type QueueStore } from '../jobs/queue-store.js';
 import type { ConfigVersion, DispatchRules, HeldPause, JobSummary, Quotas, Store, Tenant, TelemetrySettings, Usage } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { AGENT_KEY_ENV } from './agents.js';
@@ -112,6 +113,8 @@ export interface ReadinessServiceDeps {
   /** The published job image version; null while jobs are off. Absent: not checked here. */
   imageVersion?: () => Promise<string | null>;
   native?: (installationId: number) => Promise<NativeBinding | undefined>;
+  /** The admission queue (jobs/queue-store.ts), read only: what waits, for information. */
+  queue?: Pick<QueueStore, 'list'>;
   now?: () => number;
   /** How long a check is served again without asking (per installation, per Lambda container). */
   ttlMs?: number;
@@ -282,7 +285,7 @@ function capacityChecks(f: InstallationFacts): ReadinessCheck[] {
   const out: ReadinessCheck[] = [];
   if (u.jobsToday >= q.jobsPerDay) out.push({ id: 'quota-daily', stage: 'capacity', required: true, state: 'failing', problem: 'transient', summary: `Today's job limit is reached (${u.jobsToday} of ${q.jobsPerDay}); new jobs are throttled until 00:00 UTC.` });
   if (u.microvmSecondsThisMonth >= q.microvmMinutesPerMonth * 60) out.push({ id: 'quota-minutes', stage: 'capacity', required: true, state: 'failing', problem: 'transient', summary: `This month's compute minutes are used up (${Math.floor(u.microvmSecondsThisMonth / 60)} of ${q.microvmMinutesPerMonth}); new jobs are throttled until next month.` });
-  if (running >= q.concurrentJobs) out.push({ id: 'quota-concurrent', stage: 'capacity', required: true, state: 'failing', problem: 'transient', summary: `${running} of ${q.concurrentJobs} concurrent job slots are in use; a new job is throttled until one finishes.` });
+  if (running >= q.concurrentJobs) out.push({ id: 'quota-concurrent', stage: 'capacity', required: true, state: 'failing', problem: 'transient', summary: `${running} of ${q.concurrentJobs} concurrent job slots are in use; a new job waits until one finishes.` });
   if (!out.length) out.push({ id: 'quota', stage: 'capacity', required: true, state: 'verified',
     summary: `Within quotas: ${u.jobsToday} of ${q.jobsPerDay} jobs today, ${Math.floor(u.microvmSecondsThisMonth / 60)} of ${q.microvmMinutesPerMonth} minutes this month, ${running} of ${q.concurrentJobs} running. The platform-wide limit is checked at dispatch.` });
   return out;
@@ -322,6 +325,9 @@ interface RepositoryFacts {
   pauses: Read<HeldPause[]>;
   native: Read<NativeBinding | undefined> | null;
   nativeReadiness: Read<NativeReadiness> | null;
+  /** null: this deployment has no admission queue to read. */
+  queue?: Read<QueueEntry[]> | null;
+  now?: number;
 }
 
 /** One configured repository's checks. Pure: the facts are read first. */
@@ -428,6 +434,18 @@ export function repositoryChecks(f: RepositoryFacts): ReadinessCheck[] {
     if (subjects.length) out.push({ id: 'workflow-pauses', stage: 'pauses', required: false, state: 'failing', problem: 'paused', summary: `${subjects.length === 1 ? 'One workflow is' : `${subjects.length} workflows are`} paused by an owner (${subjects.slice(0, 5).map((n) => `#${n}`).join(', ')}${subjects.length > 5 ? ', ...' : ''}); ${subjects.length === 1 ? 'it waits' : 'they wait'} for a resume. Other issues still start.`, fix: { text: 'Review paused workflows', target: 'workflows' } });
   }
 
+  // The admission queue: informational only, since a waiting job starts once capacity frees.
+  if (f.queue === null || f.queue === undefined) { /* no queue in this deployment */ }
+  else if (!f.queue.ok) out.push(unverifiedCheck('queue', 'capacity', 'The admission queue could not be read just now.', 'read_failed', false));
+  else {
+    const waiting = f.queue.value.filter((e) => isWaiting(e) && e.repositoryId === rule.id);
+    const oldest = Math.min(...waiting.map((e) => e.enqueuedAt));
+    const minutes = waiting.length ? Math.max(0, Math.round(((f.now ?? Date.now()) - oldest) / 60_000)) : 0;
+    out.push(waiting.length
+      ? { id: 'queue', stage: 'capacity', required: false, state: 'failing', problem: 'transient', summary: `${waiting.length === 1 ? 'One job waits' : `${waiting.length} jobs wait`} in the admission queue (the oldest for ${minutes} min); ${waiting.length === 1 ? 'it starts' : 'they start'} as capacity frees.`, fix: { text: 'Open the jobs', target: 'workflows' } }
+      : { id: 'queue', stage: 'capacity', required: false, state: 'verified', summary: 'No job of this repository waits in the admission queue.' });
+  }
+
   out.push(unverifiedCheck('egress', 'egress', 'Package registry access is exercised only when a job installs dependencies.', 'needs_run'));
   return out;
 }
@@ -465,7 +483,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
   async function assess(caller: Caller, installationId: number, tenant: Tenant): Promise<Omit<ReadinessReport, 'cached'>> {
     const at = now();
     const read = <T>(p: () => Promise<T>) => within(p, timeout);
-    const [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native] = await Promise.all([
+    const [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, queue] = await Promise.all([
       read(() => d.github.installation(caller, installationId)),
       tenant.activeConfigVersion === undefined ? Promise.resolve(null) : read(() => d.store.getConfigVersion(installationId, tenant.activeConfigVersion!, { consistent: true })),
       tenant.status === 'active' ? read(() => d.github.repositories(caller, installationId).then((r): Listed => Object.assign([...r.repositories], r.truncated ? { truncated: true as const } : {}))) : Promise.resolve(null),
@@ -477,6 +495,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
       d.killSwitch ? read(async (): Promise<KillSwitchState> => d.killSwitch!.state ? d.killSwitch!.state() : (await d.killSwitch!.engaged()) ? 'on' : 'off') : Promise.resolve(null),
       d.imageVersion ? read(() => d.imageVersion!()) : Promise.resolve(null),
       d.native ? read(() => d.native!(installationId)) : Promise.resolve(null),
+      d.queue ? read(() => d.queue!.list(installationId, RECENT_JOBS)) : Promise.resolve(null),
     ]);
     const rules = version?.ok ? version.value?.dispatch : undefined;
     const binding = native?.ok ? native.value : undefined;
@@ -490,7 +509,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
     const listed = reachable?.ok ? reachable.value : [];
     const live = new Map(listed.map((r) => [r.fullName.toLowerCase(), r]));
     const repositories: RepositoryReadiness[] = names.map(([name, rule]) => {
-      const checks = repositoryChecks({ name, rule, loop: rules?.loop === true, live: live.get(name), reachable, gh, keys, pauses, native, nativeReadiness });
+      const checks = repositoryChecks({ name, rule, loop: rules?.loop === true, live: live.get(name), reachable, gh, keys, pauses, native, nativeReadiness, queue, now: at });
       const last = lastJobOf(jobs, name);
       checks.push(executionCheck(last, tenant.activeConfigVersion, jobs.ok));
       return { repository: live.get(name)?.fullName ?? name, repositoryId: rule.id, status: combineStatus([...installation, ...checks]), checks, ...(last ? { lastJob: last } : {}) };
@@ -501,7 +520,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
     }
     const order: Record<RepositoryStatus, number> = { action_needed: 0, temporarily_unavailable: 1, unknown: 2, paused: 3, ready: 4, not_configured: 5 };
     repositories.sort((a, b) => order[a.status] - order[b.status] || a.repository.localeCompare(b.repository));
-    const unread = [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, nativeReadiness].filter((r) => r && !r.ok).length;
+    const unread = [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, nativeReadiness, queue].filter((r) => r && !r.ok).length;
     if (unread) log({ installationId, readiness: 'partial', unread });
     return { checkedAt: new Date(at).toISOString(), configVersion: tenant.activeConfigVersion ?? null, installation, repositories, limitations: LIMITATIONS };
   }
