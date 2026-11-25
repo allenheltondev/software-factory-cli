@@ -65,6 +65,50 @@ describe('root subscription worker Cloud loop', () => {
     expect(calls[0]).not.toHaveProperty('controlSecretArn');
     expect(calls[0]).not.toHaveProperty('rawStatus');
   });
+  it("applies each assignment's registry policy before its runner starts and removes it when the runner exits (#157)", async () => {
+    const children = [fakeChild(), fakeChild()];
+    const events = [];
+    let polls = 0;
+    const call = async (p) => {
+      if (p.op === 'poll') {
+        polls += 1;
+        if (polls === 1) return { ok: true, request: { payload: { broker: { jobId: 'job_a' } } }, egress: { jobId: 'job_a', hosts: ['npm.pkg.github.com'] } };
+        if (polls === 2) return { ok: true, request: { payload: { broker: { jobId: 'job_b' } } }, egress: { jobId: 'job_a', hosts: ['npm.pkg.github.com'] } };
+      }
+      if (p.op === 'settled') events.push('settled');
+      return { ok: true, busy: false };
+    };
+    const service = {
+      authStatus: async () => 'connected',
+      applyJobEgress: vi.fn((egress, jobId) => events.push(`apply ${jobId} ${JSON.stringify(egress)}`)),
+      resetJobEgress: vi.fn(() => events.push('reset')),
+    };
+    let launched = 0;
+    const launch = vi.fn(() => { events.push('launch'); return children[launched++]; });
+    const worker = await startCloudWorker(config, 'mvm-native', service, { call, launch, interval: 5 });
+    await until(() => launch.mock.calls.length === 1);
+    children[0].emit('close');
+    await until(() => launch.mock.calls.length === 2);
+    children[1].emit('close');
+    await until(() => events.filter((e) => e === 'settled').length === 2);
+    await worker.close();
+    expect(events).toEqual([
+      `apply job_a ${JSON.stringify({ jobId: 'job_a', hosts: ['npm.pkg.github.com'] })}`, 'launch', 'reset', 'settled',
+      // The second assignment carries a policy for another job: it is passed with the real job id,
+      // and parseJobEgress (the supervisor) refuses it, leaving the image's hosts only.
+      `apply job_b ${JSON.stringify({ jobId: 'job_a', hosts: ['npm.pkg.github.com'] })}`, 'launch', 'reset', 'settled',
+      'reset',
+    ]);
+  });
+  it('starts no runner when the registry policy cannot be applied', async () => {
+    const launch = vi.fn(() => fakeChild());
+    const service = { authStatus: async () => 'connected', applyJobEgress: () => { throw new Error('proxy gone'); }, resetJobEgress: vi.fn() };
+    const call = async (p) => (p.op === 'poll' ? { ok: true, request: { payload: { broker: { jobId: 'job_a' } } }, egress: { jobId: 'job_a', hosts: [] } } : { ok: true });
+    const worker = await startCloudWorker(config, 'mvm-native', service, { call, launch, interval: 5 });
+    await worker.done;
+    expect(launch).not.toHaveBeenCalled();
+    await worker.close();
+  });
   it.each(['cancel', 'network failure'])('stops the runner and polling on %s without releasing a lease locally', async (failure) => {
     const child = fakeChild();
     const ops = [];

@@ -27,7 +27,7 @@
 import dns from 'node:dns';
 import net from 'node:net';
 
-/** The public registries of the common ecosystems. A tenant adds its own with allowHosts. */
+/** The public registries of the common ecosystems. Operators add hosts with allowHosts, installations through Cloud (#157). */
 export const DEFAULT_REGISTRY_HOSTS = Object.freeze([
   // npm, Yarn, pnpm (and Corepack's downloads of them)
   'registry.npmjs.org', 'registry.yarnpkg.com', 'repo.yarnpkg.com',
@@ -108,6 +108,87 @@ export function buildAllowlist({ defaultRegistries = true, allowHosts = [] } = {
   const rules = [...(defaultRegistries ? DEFAULT_REGISTRY_HOSTS : []), ...allowHosts].map(parseHostRule);
   const seen = new Set();
   return rules.filter((rule) => {
+    const key = `${rule.wildcard ? '*.' : ''}${rule.host}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Per-installation hosts (#157)
+// ---------------------------------------------------------------------------
+
+/** At most this many hosts per installation. */
+export const MAX_TENANT_HOSTS = 20;
+
+/**
+ * Top-level names that never reach the public internet (RFC 6761, RFC 8375 and common private
+ * use). A tenant's entry ending in one is refused; the address check would refuse it anyway.
+ */
+export const INTERNAL_TLDS = Object.freeze(['local', 'localhost', 'internal', 'lan', 'home', 'corp', 'intranet', 'localdomain', 'arpa', 'test', 'invalid', 'example', 'onion']);
+
+/**
+ * Suffixes under which unrelated parties get their own names (cloud storage, hosting and CDN
+ * domains). An exact host below one is fine (`acme-123.d.codeartifact.us-east-1.amazonaws.com`);
+ * a wildcard over one would admit every other customer's names too, so it is refused. Not
+ * exhaustive: a wildcard always admits every name below it, whoever controls them.
+ */
+export const SHARED_SUFFIXES = Object.freeze([
+  'amazonaws.com', 'cloudfront.net', 'awsapps.com', 'on.aws',
+  'azurewebsites.net', 'azureedge.net', 'core.windows.net', 'azurecr.io', 'trafficmanager.net', 'cloudapp.net',
+  'googleapis.com', 'appspot.com', 'run.app', 'web.app', 'firebaseapp.com', 'cloudfunctions.net', 'pkg.dev', 'storage.googleapis.com',
+  'github.io', 'githubusercontent.com', 'github.com', 'gitlab.io', 'gitlab.com', 'bitbucket.io',
+  'herokuapp.com', 'vercel.app', 'netlify.app', 'pages.dev', 'workers.dev', 'fly.dev', 'onrender.com', 'railway.app',
+  'jfrog.io', 'cloudsmith.io', 'packagecloud.io', 'gemfury.com', 'fury.io',
+  'ngrok.io', 'ngrok-free.app', 'ngrok.app', 'trycloudflare.com', 'r2.dev', 'digitaloceanspaces.com', 'backblazeb2.com',
+  'co.uk', 'co.jp', 'com.au', 'com.br', 'co.in', 'com.cn',
+]);
+
+/**
+ * One installation's entry: parseHostRule's rules, and additionally no internal top-level name
+ * and no wildcard over a shared suffix. Returns the rule or { problem }. Pure.
+ */
+export function parseTenantHost(text) {
+  if (typeof text !== 'string') return { problem: 'an entry is not text' };
+  let rule;
+  try { rule = parseHostRule(text); } catch (error) { return { problem: error.message }; }
+  const labels = rule.host.split('.');
+  if (INTERNAL_TLDS.includes(labels.at(-1)) || rule.host.endsWith('.home.arpa')) return { problem: `"${text}" is an internal name, which a job can never reach` };
+  if (rule.wildcard && SHARED_SUFFIXES.some((suffix) => rule.host === suffix || rule.host.endsWith(`.${suffix}`))) {
+    return { problem: `"${text}" covers a shared domain where anyone can get a name; list the exact host instead` };
+  }
+  return rule;
+}
+
+/**
+ * The per-job policy the Cloud dispatcher hands the supervisor with an assignment:
+ * `{ jobId, hosts: [...], problem? }`. Returns { rules, hosts, problem? }. Anything unexpected
+ * (unknown keys, another job's policy, a bad entry, too many) yields no tenant rules at all and
+ * names the problem: the job then gets the image's hosts only. Never partial. Pure.
+ */
+export function parseJobEgress(raw, jobId) {
+  const none = (problem) => ({ rules: [], hosts: [], ...(problem ? { problem } : {}) });
+  if (raw === undefined || raw === null) return none('no-policy');
+  if (typeof raw !== 'object' || Array.isArray(raw)) return none('malformed');
+  if (Object.keys(raw).some((key) => !['jobId', 'hosts', 'problem', 'version'].includes(key))) return none('malformed');
+  if (typeof jobId !== 'string' || raw.jobId !== jobId) return none('other-job');
+  if (raw.problem !== undefined) return none(typeof raw.problem === 'string' && /^[a-z-]{1,40}$/.test(raw.problem) ? `cloud-${raw.problem}` : 'malformed');
+  if (!Array.isArray(raw.hosts)) return none('malformed');
+  if (raw.hosts.length > MAX_TENANT_HOSTS) return none('too-many-hosts');
+  const rules = [];
+  for (const entry of raw.hosts) {
+    const rule = parseTenantHost(entry);
+    if (rule.problem) return none('invalid-host');
+    rules.push(rule);
+  }
+  return { rules, hosts: rules.map((rule) => `${rule.wildcard ? '*.' : ''}${rule.host}`) };
+}
+
+/** The image's rules followed by a job's, without duplicates. Pure. */
+export function mergeRules(base, extra) {
+  const seen = new Set();
+  return [...base, ...extra].filter((rule) => {
     const key = `${rule.wildcard ? '*.' : ''}${rule.host}`;
     if (seen.has(key)) return false;
     seen.add(key);
@@ -232,6 +313,7 @@ const STATUS = {
   'connect-failed': [502, 'Bad Gateway'],
   'connect-timeout': [504, 'Gateway Timeout'],
   'too-many-connections': [503, 'Service Unavailable'],
+  'policy-changed': [503, 'Service Unavailable'],
 };
 
 /** A host or detail safe to put in a header and a log line: bounded, printable, no separators. */
@@ -242,7 +324,7 @@ export function sanitize(text, max = 120) {
 /** What the refusal means to the person reading the command's output. */
 export function explain(reason, target) {
   switch (reason) {
-    case 'not-allowed': return `${target} is not an allowed package registry; add it to the worker's egress allowHosts if the repository needs it`;
+    case 'not-allowed': return `${target} is not an allowed package registry; an installation owner can add it under Claude subscription, Package registries, in the Updraft console (or an operator in the worker's egress allowHosts)`;
     case 'ip-literal': return `${target} is an address; only allowed registry host names are reachable`;
     case 'port-not-allowed': return `${target} uses a port the egress policy does not allow`;
     case 'non-public-address': return `${target} resolves to a non-public address, which is never reachable from a job`;
@@ -252,6 +334,7 @@ export function explain(reason, target) {
     case 'connect-failed': return `${target} refused or dropped the connection`;
     case 'connect-timeout': return `${target} did not answer in time`;
     case 'too-many-connections': return 'too many registry connections are open at once';
+    case 'policy-changed': return 'the job ended or its egress policy changed while the request was being checked';
     case 'https-only': return 'only HTTPS (CONNECT) requests to package registries are allowed';
     default: return 'the proxy could not read the request';
   }
@@ -430,8 +513,12 @@ export function parseClientHello(buffer, maxBytes = DEFAULT_LIMITS.maxHelloBytes
  * is not seen (see docs/package-egress.md, "What the boundary is").
  */
 export function createEgressProxy(options, deps = {}) {
-  const rules = options.rules;
+  let rules = options.rules;
   if (!Array.isArray(rules)) throw new Error('the egress proxy needs an allowlist');
+  // Bumped by every policy change (setRules). A connection admitted under one policy never
+  // continues under another: every live one is dropped at the change, and one whose name
+  // resolved across a change is refused when the answer arrives.
+  let generation = 0;
   const limits = { ...DEFAULT_LIMITS, ...(options.limits ?? {}) };
   const resolveName = deps.resolve ?? defaultResolve;
   const connect = deps.connect ?? defaultConnect;
@@ -489,6 +576,7 @@ export function createEgressProxy(options, deps = {}) {
     client.once('close', () => { sockets.delete(client); stats.clients -= 1; });
 
     let stage = 'head';
+    const admittedIn = generation;
     let done = false;
     let timer;
     let upstream;
@@ -560,6 +648,7 @@ export function createEgressProxy(options, deps = {}) {
     const onVetted = (target) => {
       if (done) return; // the peer left, or the connection ended, while the name resolved
       cancelLookup = undefined;
+      if (admittedIn !== generation) { finish('policy-changed'); return; }
       if (target.reason) { finish(target.reason, target.detail); return; }
       if (stats.open >= limits.maxConnections) { finish('too-many-connections'); return; }
       stats.open += 1;
@@ -646,6 +735,23 @@ export function createEgressProxy(options, deps = {}) {
       let waiters = 0;
       for (const entry of lookups.values()) waiters += entry.waiters.size;
       return { sockets: sockets.size, lookups: lookups.size, waiters };
+    },
+    /** The allowlist now in force. */
+    rules() { return rules; },
+    /**
+     * Replace the allowlist (a job's policy, or the image's again once the job ended). Every
+     * live connection is dropped first, whatever its stage, so nothing admitted under the old
+     * policy outlives it. Returns how many sockets were dropped.
+     */
+    setRules(next) {
+      if (!Array.isArray(next) || next.some((rule) => !rule || typeof rule.host !== 'string' || typeof rule.wildcard !== 'boolean')) {
+        throw new Error('the egress proxy needs an allowlist');
+      }
+      generation += 1;
+      rules = next.map((rule) => ({ wildcard: rule.wildcard, host: rule.host }));
+      const dropped = sockets.size;
+      for (const s of [...sockets]) s.destroy();
+      return dropped;
     },
     /** Stop accepting and drop every open connection. */
     async close() {

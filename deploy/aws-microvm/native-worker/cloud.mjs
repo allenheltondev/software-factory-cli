@@ -101,10 +101,19 @@ export async function startCloudWorker(config, microvmId, service, options = {})
           const response = await call(message('poll'));
           if (stopped) break;
           if (response.request) {
+            // The installation's registry hosts for exactly this assignment (#157), applied
+            // before the runner starts and removed as soon as it exits. Bound to the job id the
+            // broker token is for; anything else leaves the image's hosts only. A failure to apply
+            // stops this worker before the job runs.
+            service.applyJobEgress?.(response.egress, response.request?.payload?.broker?.jobId);
             child = launch(response.request);
             childDone = false;
             ended = new Promise((resolve) => {
-              const finish = () => { childDone = true; resolve(); };
+              const finish = () => {
+                if (!childDone) service.resetJobEgress?.();
+                childDone = true;
+                resolve();
+              };
               child.once('close', finish); child.once('error', finish);
             });
           } else if (response.busy) throw new Error('uncertain worker assignment');
@@ -115,6 +124,7 @@ export async function startCloudWorker(config, microvmId, service, options = {})
       if (!stopped) console.error('Cloud worker stopped; operator recovery and confirmed VM termination required.');
       stopped = true;
       await stopChild();
+      try { service.resetJobEgress?.(); } catch { /* the supervisor is going away */ }
       // No more heartbeats: reconciliation fences any outstanding assignment. Do not
       // free its quota slot locally, restart this loop, or launch a BYOK fallback.
     }

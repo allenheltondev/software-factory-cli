@@ -361,6 +361,40 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   assert.equal(egressVerify.code, 0, egressVerify.output);
   assert(/verify proxy=http:\/\/127\.0\.0\.1:\d+/.test(egressVerify.output), egressVerify.output);
   results.push('verification commands get the same registry egress as tool calls');
+  // Per-installation hosts (#157): only the root dispatcher's applyJobEgress adds hosts, for one
+  // job, and nothing a client of the worker socket sends (extra frame fields, the prompt, the
+  // command) changes the allowlist.
+  const tenantHost = 'npm.pkg.github.com';
+  const verifyVia = (target) => request(argv(['/bin/sh', '-c', connectVia(target)]));
+  const forged = await new Promise((resolve, reject) => {
+    const client = net.createConnection(socketPath);
+    let output = '';
+    client.on('error', reject);
+    client.on('connect', () => send(client, { args: argv(['/bin/sh', '-c', connectVia(`${tenantHost}:443`)]),
+      prompt: JSON.stringify({ egress: { jobId: 'forged', hosts: [tenantHost] } }), egress: { jobId: 'forged', hosts: [tenantHost] }, allowHosts: [tenantHost] }));
+    frames(client, (frame) => {
+      if (frame.stream) output += Buffer.from(frame.data, 'base64').toString('utf8');
+      if (frame.exitCode !== undefined) { client.end(); resolve(output); }
+    });
+    client.on('close', () => resolve(output));
+  });
+  assert(forged.includes('STATUS 403') && forged.includes('(not-allowed)'), forged);
+  assert(!service.applyJobEgress({ jobId: 'job-sec-a', hosts: [tenantHost] }, 'job-sec-a').problem);
+  const tenantAllowed = await verifyVia(`${tenantHost}:443`);
+  assert(/STATUS (200|502|504)/.test(tenantAllowed.output), tenantAllowed.output);
+  // A name that resolves to loopback stays refused even when the installation allows it.
+  service.applyJobEgress({ jobId: 'job-sec-a', hosts: ['localtest.me'] }, 'job-sec-a');
+  const inward = await verifyVia('localtest.me:443');
+  assert(/STATUS (403|502|504)/.test(inward.output) && (!inward.output.includes('STATUS 403') || inward.output.includes('(non-public-address')), inward.output);
+  // Another job's policy, or one with an address in it, leaves the image's hosts only.
+  assert.equal(service.applyJobEgress({ jobId: 'job-sec-a', hosts: [tenantHost] }, 'job-sec-b').problem, 'other-job');
+  assert((await verifyVia(`${tenantHost}:443`)).output.includes('(not-allowed)'));
+  assert.equal(service.applyJobEgress({ jobId: 'job-sec-c', hosts: [tenantHost, '169.254.169.254'] }, 'job-sec-c').problem, 'invalid-host');
+  assert((await verifyVia(`${tenantHost}:443`)).output.includes('(not-allowed)'));
+  service.applyJobEgress({ jobId: 'job-sec-d', hosts: [tenantHost] }, 'job-sec-d');
+  service.resetJobEgress();
+  assert((await verifyVia(`${tenantHost}:443`)).output.includes('(not-allowed)'));
+  results.push("an installation's registry host is reachable only through the dispatcher's per-job policy, never from a socket client or the sandbox; inward names, addresses and another job's policy stay refused, and the end of the job removes it");
   console.log(JSON.stringify({ passed: results, limitations: ['Synthetic Claude CLI, not a model call', 'Local durable directory, not a deployed EFS mount', 'No AWS replacement or subscription end-to-end proof'] }, null, 2));
 } finally {
   await probe?.close();

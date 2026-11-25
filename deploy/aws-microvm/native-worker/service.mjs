@@ -7,7 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { IMAGE, DEFAULT_SOCKET, MAX_FRAME, DEFAULT_TOOL_TIMEOUT_SECONDS, EGRESS_SOCKET, loadConfig, claudeEnv, validateRun, claudeArgs, checkInventory, trustedFile, withEgress, networkNote } from './policy.mjs';
-import { createEgressProxy, parseEgressConfig } from '../image/sandbox/egress-proxy.mjs';
+import { createEgressProxy, mergeRules, parseEgressConfig, parseJobEgress, sanitize } from '../image/sandbox/egress-proxy.mjs';
 import { frames, send } from './protocol.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -90,15 +90,18 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   const toolTimeoutMs = (c.toolTimeoutSeconds ?? DEFAULT_TOOL_TIMEOUT_SECONDS) * 1000;
   let egress;
   let egressProxy;
+  let imageRules = [];
+  const logEgress = (record) => process.stdout.write(`${JSON.stringify(record)}\n`);
   if (c.egress) {
     const policy = parseEgressConfig(c.egress);
+    imageRules = policy.rules;
     const dir = `${scratch}/egress`;
     fs.mkdirSync(dir, { mode: 0o710 });
     fs.chownSync(dir, 0, c.workerGid);
     fs.chmodSync(dir, 0o710); // the umask above would leave it 0700, closed to the job identity
     egressProxy = createEgressProxy({ rules: policy.rules, limits: policy.limits }, {
       // Decisions only: target, reason and byte counts, never request or payload bytes.
-      log: (record) => process.stdout.write(`${JSON.stringify(record)}\n`),
+      log: logEgress,
     });
     const socketFile = `${dir}/${EGRESS_SOCKET}`;
     try {
@@ -326,7 +329,35 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     fs.rmSync(scratch, { recursive: true, force: true });
     throw error;
   }
+  /**
+   * Per-installation registry hosts (#157). Only the root Cloud dispatcher calls this, with the
+   * policy Cloud returned alongside an assignment over the worker's control credential; nothing
+   * the job identity, the sandbox or the repository sends reaches it. The job's hosts are added
+   * to the image's, and every live proxy connection is dropped first (setRules). An absent,
+   * invalid or other job's policy leaves the image's hosts only, with the reason logged.
+   */
+  function applyJobEgress(raw, jobId) {
+    const parsed = parseJobEgress(raw, jobId);
+    const record = { event: 'egress-policy', jobId: sanitize(jobId ?? '', 64) };
+    if (!egressProxy) {
+      // Egress is off in this image: no route out, whatever the installation allows.
+      logEgress({ ...record, decision: 'off', tenantHosts: parsed.hosts.length });
+      return { applied: false, hosts: [] };
+    }
+    egressProxy.setRules(mergeRules(imageRules, parsed.rules));
+    logEgress({ ...record, decision: parsed.problem && parsed.problem !== 'no-policy' ? 'defaults-only' : 'apply',
+      hosts: parsed.hosts.map((host) => sanitize(host)), ...(parsed.problem ? { reason: parsed.problem } : {}) });
+    return { applied: true, hosts: parsed.hosts, ...(parsed.problem ? { problem: parsed.problem } : {}) };
+  }
+  /** Back to the image's hosts once a job's runner has exited; live connections are dropped. */
+  function resetJobEgress() {
+    if (!egressProxy) return;
+    egressProxy.setRules(imageRules);
+    logEgress({ event: 'egress-policy', decision: 'reset' });
+  }
   return {
+    applyJobEgress,
+    resetJobEgress,
     async authStatus() {
       const cwd = fs.mkdtempSync(`${scratch}/status-`);
       fs.chownSync(cwd, c.claudeUid, c.claudeGid);
