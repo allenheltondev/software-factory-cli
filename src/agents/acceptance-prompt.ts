@@ -114,7 +114,9 @@ export function reviewerAcceptanceInstructions(snapshot: AcceptanceSnapshot | nu
       'whatever you write: say what a person must check.',
     `- Add, as \`I1\`, \`I2\`, ... (from the issue) or \`S1\`, \`S2\`, ... (from a change request below), at most ${MAX_INFERRED} concrete requirements ` +
       'the issue or an authorized change request clearly asks for that are not in the list, each with its `text`; `"optional": true` for one that is only a suggestion.',
-    '- Do not write ready-to-merge while a mandatory criterion is not verified or not applicable: the worker holds the pull request back anyway, and says why.',
+    '- Write changes-requested when a mandatory criterion is unmet. When the only open criteria are ones a person has to settle (unverified for ' +
+      'want of live evidence, or needing clarification) and the code is otherwise ready, write ready-to-merge: the worker holds the pull request ' +
+      'back for a person, and a revision could not provide that evidence anyway.',
     '',
   ];
 }
