@@ -521,6 +521,12 @@ export async function answerInThreads(
         log.push(`threads: the pull request moved on from ${short(o.headSha)}; the thread of ${root.key} was not reopened`);
         continue;
       }
+      // Right before: still this head's unresolved finding; a newer check may have verified it while the threads were listed.
+      const now = getFinding(deps.db, repo.id, prNumber, root.key);
+      if (now?.status !== 'unresolved' || now.statusSha !== o.headSha) {
+        log.push(`threads: ${root.key} is no longer unresolved for ${short(o.headSha)}; the thread was not reopened`);
+        continue;
+      }
       deps.guard();
       await deps.api.unresolveReviewThread(repo, thread.id);
       thread.isResolved = false;
