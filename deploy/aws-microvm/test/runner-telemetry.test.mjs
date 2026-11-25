@@ -102,7 +102,7 @@ describe('agent telemetry: Claude Code', () => {
     const spans = t.exporter.spans;
 
     const root = one(spans, 'invoke_workflow updraft');
-    const agent = one(spans, 'invoke_agent claude-opus');
+    const agent = one(spans, 'invoke_agent implement / claude-opus');
     const tool = one(spans, 'execute_tool Bash');
     const chats = byName(spans, 'chat claude-sonnet-4-5');
     expect(chats).toHaveLength(2);
@@ -118,7 +118,7 @@ describe('agent telemetry: Claude Code', () => {
       parentSpanId: root.spanId,
       attributes: {
         'gen_ai.operation.name': 'invoke_agent',
-        'gen_ai.agent.name': 'claude-opus',
+        'gen_ai.agent.name': 'implement / claude-opus', 'updraft.agent.profile': 'claude-opus', 'updraft.agent.role': 'coding',
         'gen_ai.agent.id': claude.SESSION,
         'gen_ai.provider.name': 'anthropic',
         'gen_ai.request.model': 'claude-opus-4-1',
@@ -178,7 +178,7 @@ describe('agent telemetry: Claude Code', () => {
     const tool = one(spans, 'execute_tool Bash');
     expect(tool.attributes['gen_ai.tool.call.arguments']).toBe('{"command":"echo [redacted]"}');
     expect(tool.attributes['gen_ai.tool.call.result']).toMatch(/… \[50 more characters\]$/);
-    const agent = one(spans, 'invoke_agent claude-opus');
+    const agent = one(spans, 'invoke_agent implement / claude-opus');
     expect(JSON.parse(agent.attributes['gen_ai.input.messages'])).toEqual([{ role: 'user', parts: [{ type: 'text', content: 'Implement issue #7.' }] }]);
     expect(JSON.parse(agent.attributes['gen_ai.output.messages'])[0].parts[0].content).toBe('Added it.');
     const [, second] = byName(spans, 'chat claude-sonnet-4-5');
@@ -202,11 +202,11 @@ describe('agent telemetry: Claude Code', () => {
     await t.tracer.stop({ outcome: 'succeeded' });
     const spans = t.exporter.spans;
     const tool = one(spans, 'execute_tool Task');
-    const sub = one(spans, 'invoke_agent claude-opus/Explore');
+    const sub = one(spans, 'invoke_agent implement / claude-opus / Explore');
     expect(sub.parentSpanId).toBe(tool.spanId);
-    expect(sub.attributes['gen_ai.agent.name']).toBe('claude-opus/Explore');
+    expect(sub.attributes['gen_ai.agent.name']).toBe('implement / claude-opus / Explore');
     const subChat = spans.find((s) => s.name.startsWith('chat') && s.parentSpanId === sub.spanId);
-    expect(subChat.attributes['gen_ai.agent.name']).toBe('claude-opus/Explore');
+    expect(subChat.attributes['gen_ai.agent.name']).toBe('implement / claude-opus / Explore');
   });
 
   it('names an Updraft MCP exec call by its shell operation and counts it like native Bash', async () => {
@@ -234,7 +234,7 @@ describe('agent telemetry: Claude Code', () => {
     expect(one(spans, 'execute_tool mcp__updraft__exec').attributes['gen_ai.tool.call.id']).toBe('toolu_5');
     expect(one(spans, 'execute_tool mcp__github__search').attributes['updraft.tool.category']).toBe('mcp');
     for (const s of spans) expect(s.name).not.toMatch(/secret|TOKEN|sk-123|mystery|etc/);
-    const agent = one(spans, 'invoke_agent claude-opus');
+    const agent = one(spans, 'invoke_agent implement / claude-opus');
     expect(agent.attributes['updraft.agent.test_runs']).toBe(1);
     expect(agent.attributes['updraft.agent.test_runs_failed']).toBe(1);
   });
@@ -249,9 +249,38 @@ describe('agent telemetry: Claude Code', () => {
     await t.tracer.stop({ outcome: 'failed' });
     const spans = t.exporter.spans;
     expect(one(spans, 'execute_tool Bash')).toMatchObject({ error: true, attributes: { 'error.type': 'tool_error' } });
-    expect(one(spans, 'invoke_agent claude-opus')).toMatchObject({ error: true, attributes: { 'error.type': 'error_max_turns' } });
+    expect(one(spans, 'invoke_agent implement / claude-opus')).toMatchObject({ error: true, attributes: { 'error.type': 'error_max_turns' } });
     expect(one(spans, 'execute_tool verify')).toMatchObject({ error: true, attributes: { 'error.type': 'exit_code', 'updraft.tool.exit_code': 1 } });
     expect(one(spans, 'invoke_workflow updraft')).toMatchObject({ error: true, attributes: { 'error.type': 'failed' } });
+  });
+});
+
+describe('agent telemetry: role-qualified agent lanes', () => {
+  it('separates implement, review, revision and CI repair of one profile, down to chat and tool spans', async () => {
+    const t = setup();
+    const body = `${claude.stream(claude.assistantText('done'))}---- end of agent output ----\noutcome: succeeded\n`;
+    await t.step('run_1', `${header()}\n${body}`, 1000);
+    await t.step('run_2', `${header({ runId: 'run_2', kind: 'review' })}\n${body}`, 1000);
+    await t.step('run_3', `${header({ runId: 'run_3', kind: 'revision' })}\n${body}`, 1000);
+    await t.step('run_4', `${header({ runId: 'run_4', kind: 'revision' }).replace('(updraft_review)', '(ci_failure)')}\n${body}`, 1000);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const spans = t.exporter.spans;
+    for (const [name, role, detail, kind] of [
+      ['implement / claude-opus', 'coding', 'implement', 'implement'],
+      ['review / claude-opus', 'reviewing', 'review', 'review'],
+      ['revision / claude-opus', 'coding', 'revision', 'revision'],
+      ['ci_repair / claude-opus', 'coding', 'ci_repair', 'revision'],
+    ]) {
+      const agent = one(spans, `invoke_agent ${name}`);
+      expect(agent.attributes).toMatchObject({ 'gen_ai.agent.name': name, 'updraft.agent.profile': 'claude-opus', 'updraft.agent.role': role, 'updraft.agent.role.detail': detail, 'updraft.job.kind': kind });
+      const children = spans.filter((s) => s.parentSpanId === agent.spanId);
+      expect(children.length).toBeGreaterThan(0);
+      for (const c of children) expect(c.attributes['gen_ai.agent.name']).toBe(name);
+    }
+    // Updraft's own spans stay on its lane, with no agent role.
+    const root = spans.find((s) => s.name.startsWith('invoke_workflow'));
+    expect(root.attributes['gen_ai.agent.name']).toBe('updraft');
+    expect(root.attributes['updraft.agent.role']).toBeUndefined();
   });
 });
 
@@ -270,7 +299,7 @@ describe('agent telemetry: Codex and the review loop', () => {
     const out = await t.tracer.stop({ outcome: 'succeeded' });
     const spans = t.exporter.spans;
 
-    const review = one(spans, 'invoke_agent codex');
+    const review = one(spans, 'invoke_agent review / codex');
     expect(review.attributes).toMatchObject({ 'gen_ai.provider.name': 'openai', 'updraft.job.kind': 'review', 'gen_ai.agent.id': codex.THREAD, 'updraft.pull_request': 100 });
     const turn = one(spans, 'chat gpt-5-codex');
     expect(turn.parentSpanId).toBe(review.spanId);
@@ -280,8 +309,12 @@ describe('agent telemetry: Codex and the review loop', () => {
     expect(shell.end - shell.start).toBe(2500);
     expect(shell.attributes['updraft.tool.exit_code']).toBe(0);
 
-    const agents = byName(spans, 'invoke_agent claude-opus');
-    expect(agents.map((a) => a.attributes['updraft.job.kind']).sort()).toEqual(['implement', 'revision']);
+    expect(byName(spans, 'invoke_agent implement / claude-opus')).toHaveLength(1);
+    const revision = one(spans, 'invoke_agent revision / claude-opus');
+    expect(revision.attributes).toMatchObject({ 'updraft.job.kind': 'revision', 'updraft.agent.role': 'coding', 'updraft.agent.role.detail': 'revision', 'updraft.agent.profile': 'claude-opus' });
+    expect(review.attributes).toMatchObject({ 'gen_ai.agent.name': 'review / codex', 'updraft.agent.role': 'reviewing', 'updraft.agent.profile': 'codex' });
+    expect(turn.attributes['gen_ai.agent.name']).toBe('review / codex');
+    expect(shell.attributes['gen_ai.agent.name']).toBe('review / codex');
     expect(out.conversationIds).toEqual(['octo/widgets#7']);
     expect(out.runs.map((r) => r.kind)).toEqual(['implement', 'review', 'revision']);
     // The agents that ran, whose keys the job used.
@@ -391,7 +424,7 @@ describe('agent telemetry: structural detail, without content', () => {
     expect(one(spans, 'execute_tool Edit').attributes).toMatchObject({ 'updraft.tool.file.path': 'src/theme.ts', 'updraft.tool.category': 'edit', 'updraft.tool.lines_added': 2, 'updraft.tool.lines_removed': 1 });
     expect(one(spans, 'execute_tool Bash').attributes).toMatchObject({ 'updraft.tool.command.program': 'npm', 'updraft.tool.category': 'test', 'updraft.tool.exit_code': 1, 'updraft.test.failed': 1, 'updraft.test.passed': 4, 'updraft.test.failed_tests': ['src/theme.test.ts > theme > toggles'] });
 
-    const agent = one(spans, 'invoke_agent claude-opus');
+    const agent = one(spans, 'invoke_agent implement / claude-opus');
     expect(agent.attributes).toMatchObject({
       'updraft.agent.cli_version': '2.1.289',
       'updraft.agent.permission_mode': 'bypassPermissions',
@@ -454,7 +487,7 @@ describe('agent telemetry: structural detail, without content', () => {
     );
     await t.tracer.stop({ outcome: 'succeeded' });
     const spans = t.exporter.spans;
-    expect(one(spans, 'invoke_agent claude-opus').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3 });
+    expect(one(spans, 'invoke_agent implement / claude-opus').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3 });
     expect(one(spans, 'updraft post_review').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.outcome': 'revision-queued' });
     expect(one(spans, 'invoke_workflow updraft').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3, 'updraft.review.outcome': 'revision-queued' });
   });
@@ -476,7 +509,7 @@ describe('agent telemetry: structural detail, without content', () => {
     const spans = t.exporter.spans;
     expect(one(spans, 'updraft prepare')).toMatchObject({ error: true, errorMessage: 'could not prepare the worktree: fatal: bad object', attributes: { 'error.type': 'failed' } });
     expect(one(spans, 'updraft failure_comment').events.map((e) => e.name)).toEqual(['comment.posted']);
-    expect(byName(spans, 'invoke_agent claude-opus')).toHaveLength(0);
+    expect(byName(spans, 'invoke_agent implement / claude-opus')).toHaveLength(0);
   });
 
   it('reads Codex commands, patches and todo lists', async () => {
@@ -500,7 +533,7 @@ describe('agent telemetry: structural detail, without content', () => {
     expect(one(spans, 'execute_tool shell').attributes).toMatchObject({ 'updraft.tool.command.program': 'vitest', 'updraft.tool.category': 'test', 'updraft.test.failed': 2, 'updraft.tool.exit_code': 1 });
     expect(one(spans, 'execute_tool apply_patch').attributes).toMatchObject({ 'updraft.tool.file.path': 'src/theme.test.ts', 'updraft.tool.file.test': true, 'updraft.tool.category': 'edit' });
     expect(one(spans, 'chat gpt-5-codex').attributes['updraft.usage.reasoning_output_tokens']).toBe(64);
-    expect(one(spans, 'invoke_agent codex').events.find((e) => e.name === 'todo.update').attributes).toMatchObject({ 'updraft.todo.total': 2, 'updraft.todo.completed': 1 });
+    expect(one(spans, 'invoke_agent implement / codex').events.find((e) => e.name === 'todo.update').attributes).toMatchObject({ 'updraft.todo.total': 2, 'updraft.todo.completed': 1 });
   });
 });
 
@@ -532,7 +565,7 @@ describe('agent telemetry: how the agent worked', () => {
     await t.step('run_1', claude.stream(claude.assistantText('done'), claude.success('ok')), 1000);
     await t.step('run_1', '---- end of agent output ----\noutcome: succeeded\n', 0);
     await t.tracer.stop({ outcome: 'succeeded' });
-    const agent = one(t.exporter.spans, 'invoke_agent claude-opus');
+    const agent = one(t.exporter.spans, 'invoke_agent implement / claude-opus');
     expect(agent.attributes).toMatchObject({
       'updraft.agent.tools.search': 1,
       'updraft.agent.tools.test': 3,
@@ -568,7 +601,7 @@ describe('agent telemetry: how the agent worked', () => {
     }
     await t.step('run_1', '---- end of agent output ----\noutcome: failed\n', 0);
     await t.tracer.stop({ outcome: 'failed' });
-    expect(one(t.exporter.spans, 'invoke_agent claude-opus').attributes).toMatchObject({ 'updraft.agent.repeated_commands': 3, 'updraft.agent.thrashing': true, 'updraft.agent.max_consecutive_tool_errors': 4 });
+    expect(one(t.exporter.spans, 'invoke_agent implement / claude-opus').attributes).toMatchObject({ 'updraft.agent.repeated_commands': 3, 'updraft.agent.thrashing': true, 'updraft.agent.max_consecutive_tool_errors': 4 });
     expect(one(t.exporter.spans, 'invoke_workflow updraft').attributes['updraft.agent.thrashing']).toBe(true);
   });
 
@@ -578,7 +611,7 @@ describe('agent telemetry: how the agent worked', () => {
     await t.step('run_9', `${header({ runId: 'run_9', kind: 'revision' }).replace('pool: deep', 'follows: run run_5 (review, trace ' + review + ')\npool: deep')}\n`, 0);
     await t.step('run_9', '---- end of agent output ----\noutcome: succeeded\n', 1000);
     await t.tracer.stop({ outcome: 'succeeded' });
-    const agent = one(t.exporter.spans, 'invoke_agent claude-opus');
+    const agent = one(t.exporter.spans, 'invoke_agent implement / claude-opus');
     expect(agent.spanId).toBe(agentSpanIdFor('run_9'));
     expect(agent.links).toEqual([{ traceId: review, spanId: agentSpanIdFor('run_5'), attributes: { 'updraft.link.relation': 'review', 'updraft.run.id': 'run_5' } }]);
     expect(toOtlpSpan(agent).links).toEqual([{ traceId: review, spanId: agentSpanIdFor('run_5'), attributes: [{ key: 'updraft.link.relation', value: { stringValue: 'review' } }, { key: 'updraft.run.id', value: { stringValue: 'run_5' } }] }]);

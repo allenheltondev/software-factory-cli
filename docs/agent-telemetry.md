@@ -152,7 +152,7 @@ invoke_workflow updraft                 the job; agent "updraft"
 | Span | `gen_ai.operation.name` | Kind | Notable attributes |
 | --- | --- | --- | --- |
 | `invoke_workflow updraft` | `invoke_workflow` | internal | `updraft.job.outcome`, `updraft.pull_request(.url)`, `updraft.loop.stage`, `updraft.loop.rounds`, `updraft.loop.reviews`, `updraft.loop.merged` |
-| `invoke_agent <profile>` | `invoke_agent` | internal | `gen_ai.agent.name` (the profile), `gen_ai.agent.id` (the Claude session or Codex thread), `gen_ai.provider.name`, `gen_ai.request.model` (configured), `updraft.job.kind`, `updraft.run.outcome`, totals of tokens and tool calls |
+| `invoke_agent <role> / <profile>` | `invoke_agent` | internal | `gen_ai.agent.name` (`<role> / <profile>`), `updraft.agent.profile` (the configured profile), `updraft.agent.role` (`coding` or `reviewing`), `updraft.agent.role.detail`, `gen_ai.agent.id` (the Claude session or Codex thread), `gen_ai.provider.name`, `gen_ai.request.model` (configured), `updraft.job.kind`, `updraft.run.outcome`, totals of tokens and tool calls |
 | `chat <model>` | `chat` | client | `gen_ai.response.model` (what the API reported), `gen_ai.response.id`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens`, `gen_ai.response.finish_reasons` |
 | `execute_tool <tool>` | `execute_tool` | internal | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type` (`function`, or `extension` for MCP tools), `updraft.tool.exit_code` |
 | `execute_tool verify` | `execute_tool` | internal | `updraft.verify.command`, `updraft.verify.index`, `updraft.tool.exit_code` |
@@ -162,6 +162,29 @@ Every span carries `gen_ai.conversation.id`, which is `<owner>/<repo>#<issue>`, 
 traces into a conversation by the first and spans into lanes by the second, so one issue's implement run, each review, and each revision, over however
 many webhook events and microVMs, read as one conversation, with the coding agent, the reviewing
 agent and Updraft itself each in its own lane.
+
+### Agent lane names
+
+An agent's `gen_ai.agent.name` is `<role> / <profile>`, so implementation, review and revision are
+separate lanes even when they use the same profile (`implement / claude-standard`,
+`review / claude-standard`, `revision / claude-standard`). The role comes from the run's kind in
+its run header (not from the profile, model or prompt), and is one of `implement`, `review`,
+`revision` or `ci_repair` (a revision whose trigger is `ci_failure`). A header with no kind is
+`implement`; a run is only `review` when its header says it reviews code. The same name is on the
+run's `invoke_agent`, `chat` and `execute_tool` spans; a Claude subagent is
+`<role> / <profile> / <subagent_type>`. Every agent span also has:
+
+- `updraft.agent.profile`: the configured profile, stable across roles.
+- `updraft.agent.role`: `coding` (implement, revision, ci_repair) or `reviewing`.
+- `updraft.agent.role.detail`: `implement`, `review`, `revision` or `ci_repair`.
+- `updraft.job.kind`: unchanged (`implement`, `review`, `revision`).
+
+Updraft's own spans keep `gen_ai.agent.name` = `updraft` and carry no role. The conversation id and
+trace ids are unchanged. **Migration:** queries that grouped or filtered on `gen_ai.agent.name` equal
+to a raw profile should use `updraft.agent.profile` (spans from before this change have no such
+attribute, so use `COALESCE(updraft.agent.profile, gen_ai.agent.name)`), and group by
+`updraft.agent.role` for coding versus reviewing. Historical spans have no role; use
+`updraft.job.kind` for them.
 
 Details that follow the conventions:
 
@@ -174,7 +197,7 @@ Details that follow the conventions:
   previous tool results back (or started), and ends when the response's last block arrived. A
   Codex turn has no per-call breakdown, so it is one `chat` span with the turn's usage.
 - **The calling agent emits `invoke_agent`.** A Claude Code subagent is an `execute_tool Task`
-  span with an `invoke_agent <profile>/<subagent_type>` span under it; the subagent's own model and
+  span with an `invoke_agent <role> / <profile> / <subagent_type>` span under it; the subagent's own model and
   tool calls carry its own agent name, as the conventions suggest for multi-agent workflows.
 - **Failures are span errors.** A tool result marked `is_error`, a Codex command that exited
   non-zero or an MCP call that failed, an agent run that did not succeed, a verify command that

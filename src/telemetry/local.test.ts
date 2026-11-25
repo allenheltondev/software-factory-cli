@@ -77,7 +77,7 @@ describe('a trace per run', () => {
       ].filter((line) => line !== undefined).join('\n'));
       await trace.end(hasReport ? 'succeeded' : 'failed');
       const body = posts.join('\n');
-      expect(body).toContain('invoke_agent devstral');
+      expect(body).toContain('invoke_agent implement / devstral');
       expect(body).not.toContain('never-export-this');
       if (hasReport) {
         expect(body).toContain('"key":"gen_ai.usage.input_tokens","value":{"intValue":"15"}');

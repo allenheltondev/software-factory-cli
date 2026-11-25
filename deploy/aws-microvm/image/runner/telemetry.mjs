@@ -9,10 +9,10 @@
 // and turns them into spans:
 //
 //   invoke_workflow updraft                 the job (one trace per microVM), agent "updraft"
-//   ├─ invoke_agent <profile>               one agent run: implement, review or revision
+//   ├─ invoke_agent <role> / <profile>             one agent run: implement, review or revision
 //   │  ├─ chat <model>                      one model response, with its token usage
 //   │  ├─ execute_tool <tool>               one tool call (Bash, Edit, shell, an MCP tool, ...)
-//   │  │  └─ invoke_agent <profile>/<type>  a Claude Code subagent (the Task tool), with its own spans
+//   │  │  └─ invoke_agent <role> / <profile> / <type>  a Claude Code subagent (the Task tool), with its own spans
 //   │  └─ ...
 //   └─ execute_tool verify                  each of the workflow's verify commands, agent "updraft"
 //
@@ -344,7 +344,10 @@ export function parseHeaderLine(line, h) {
   } else if (line.startsWith('code written by agent: ')) h.kind = 'review';
   else if (line.startsWith('review: ') && h.kind !== 'review') h.kind = 'revision';
   else if ((m = /^pull request: #(\d+)/.exec(line))) h.pullRequest = Number(m[1]);
-  else if ((m = /^trigger: (\S+)/.exec(line))) h.trigger = m[1];
+  else if ((m = /^trigger: (\S+)(?: \(([a-z_]{1,32})\))?/.exec(line))) {
+    h.trigger = m[1];
+    if (m[2]) h.revisionTrigger = m[2];
+  }
   else if ((m = /^review: \S+ \((\d+) inline comment/.exec(line))) h.reviewComments = Number(m[1]);
   // What the worker logs once the worktree is ready, just before the agent starts.
   else if ((m = /^base: (\S+) at ([0-9a-f]{7,40})/.exec(line))) {
@@ -571,9 +574,16 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
 
   const conversationId = () => (h.repository && h.issue !== undefined ? `${h.repository}#${h.issue}` : (h.jobId ?? path.basename(runDir)));
   const provider = () => PROVIDER[h.adapter] ?? h.adapter;
-  const base = (agentName) => ({
+  /** The run's role from its kind alone: reviewing, else coding (implementation, revision, CI repair). */
+  const role = () => (h.kind === 'review' ? 'reviewing' : 'coding');
+  /** The run's bounded role label: implement, review, revision or ci_repair (a revision the CI failure triggered). */
+  const roleLabel = () => (h.kind === 'revision' && h.revisionTrigger === 'ci_failure' ? 'ci_repair' : (h.kind ?? 'implement'));
+  /** The agent's lane: `<role> / <profile>`. Built from run metadata, never prompt text. A subagent adds its type. */
+  const laneName = (suffix) => `${roleLabel()} / ${h.agent ?? 'agent'}${suffix ? ` / ${suffix}` : ''}`;
+  const base = (agentName, profile = h.agent) => ({
     'gen_ai.conversation.id': conversationId(),
     'gen_ai.agent.name': agentName,
+    ...(agentName !== 'updraft' ? { 'updraft.agent.profile': profile ?? 'agent', 'updraft.agent.role': role(), 'updraft.agent.role.detail': roleLabel() } : {}),
     ...(provider() ? { 'gen_ai.provider.name': provider() } : {}),
     'updraft.run.id': h.runId,
     'updraft.job.id': h.jobId,
@@ -670,11 +680,11 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       // Derived from the run id, so a later job's trace can link to this run.
       spanId: h.runId ? agentSpanIdFor(h.runId) : newSpanId(),
       parentSpanId: rootSpanId,
-      name: `invoke_agent ${h.agent ?? 'agent'}`,
+      name: `invoke_agent ${laneName()}`,
       kind: KIND_INTERNAL,
       start: at,
       attributes: {
-        ...base(h.agent ?? 'agent'),
+        ...base(laneName()),
         'gen_ai.operation.name': 'invoke_agent',
         'gen_ai.request.model': h.model,
         'updraft.agent.effort': h.effort,
@@ -688,7 +698,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       // The runs this one follows: the review it answers, the code it reviews.
       links: (h.follows ?? []).map((f) => ({ traceId: f.traceId, spanId: agentSpanIdFor(f.runId), attributes: { 'updraft.link.relation': f.relation, 'updraft.run.id': f.runId } })),
     };
-    contexts.set('', { span: agentSpan, name: h.agent ?? 'agent', last: at, chat: null, pendingInput: [] });
+    contexts.set('', { span: agentSpan, name: laneName(), last: at, chat: null, pendingInput: [] });
     Object.assign(summary, { runId: h.runId ?? null, kind: h.kind, agent: h.agent ?? null, adapter: h.adapter ?? null });
     if (captureContent && readPrompt) {
       readPrompt()
@@ -747,7 +757,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
       // A subagent's message: its invoke_agent span hangs under the tool call that started it.
       const tool = tools.get(key);
       const type = typeof tool?.input?.subagent_type === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(tool.input.subagent_type) ? tool.input.subagent_type : 'subagent';
-      const name = `${h.agent ?? 'agent'}/${type}`;
+      const name = laneName(type);
       const span = {
         traceId,
         spanId: newSpanId(),
@@ -987,7 +997,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
           name: model ? `chat ${model}` : 'chat',
           kind: KIND_CLIENT,
           start: at,
-          attributes: { ...base(h.agent ?? 'agent'), 'gen_ai.operation.name': 'chat', 'gen_ai.request.model': model },
+          attributes: { ...base(laneName()), 'gen_ai.operation.name': 'chat', 'gen_ai.request.model': model },
         },
         parts: [],
         toolCalls: 0,
@@ -1034,7 +1044,7 @@ export function createRunTrace({ traceId, rootSpanId, runDir, captureContent, re
           kind: KIND_INTERNAL,
           start: at,
           attributes: {
-            ...base(h.agent ?? 'agent'),
+            ...base(laneName()),
             'gen_ai.operation.name': 'execute_tool',
             'gen_ai.tool.name': kind.name,
             'gen_ai.tool.call.id': item.id,
