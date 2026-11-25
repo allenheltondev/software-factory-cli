@@ -351,7 +351,7 @@ describe('JobPage (#71)', () => {
   it('shows a running job without logs yet, and refuses a bad job id without asking', async () => {
     showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ status: 'launched', result: 'running', logs: [], durationSeconds: undefined }), deliveries: [] }) }));
     expect(await screen.findByText('Logs appear when the job ends')).toBeInTheDocument();
-    expect(screen.getByTestId('job-facts')).toHaveTextContent('Running…');
+    expect(screen.getByTestId('job-facts')).toHaveTextContent('Elapsed (live)');
     const never = fakeApi();
     showJob(never, '/installations/55/jobs/not-a-job');
     expect(await screen.findByTestId('job-error')).toBeInTheDocument();

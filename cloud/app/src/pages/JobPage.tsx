@@ -127,11 +127,14 @@ function Loaded({ job, deliveries, conversation, api, installationId, onRefresh 
   return (
     <>
       <PageHero data-testid="job">
-        <PageHeroTitle>
+        <PageHeroTitle className="break-words">
           {job.repository}
           {job.issue !== undefined ? `#${job.issue}` : job.pullRequest !== undefined ? `#${job.pullRequest}` : ''}
         </PageHeroTitle>
-        <PageHeroSubtitle data-testid="job-help">{r.help}</PageHeroSubtitle>
+        <PageHeroSubtitle data-testid="job-help">
+          <span className="sr-only">Status: {r.label}. </span>
+          {r.help}
+        </PageHeroSubtitle>
         <PageHeroChips>
           <PageHeroChip tone={r.tone} data-testid="job-result">
             {r.label}
@@ -141,57 +144,61 @@ function Loaded({ job, deliveries, conversation, api, installationId, onRefresh 
           {job.pullRequest !== undefined && <PageHeroChip>Pull request event</PageHeroChip>}
           {job.sender && <PageHeroChip>By @{job.sender}</PageHeroChip>}
         </PageHeroChips>
-        <div className="mt-4 flex flex-wrap gap-3 text-sm">
+
+        <dl className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-4" data-testid="job-facts">
+          <Metric label={job.result === 'running' ? 'Elapsed (live)' : 'Duration'}>
+            {job.result === 'running' ? <Elapsed since={job.createdAt} /> : formatDuration(job.durationSeconds)}
+          </Metric>
+          <Metric label="Started">
+            <span title={exact(job.createdAt)}>{relativeTime(job.createdAt)}</span>
+          </Metric>
+          <Metric label="Configuration">
+            {job.configVersion !== undefined ? (
+              <Link className="auth-link" to={`/installations/${installationId}/config/history`}>
+                v{job.configVersion}
+              </Link>
+            ) : (
+              '—'
+            )}
+          </Metric>
+          <Metric label={job.telemetry?.totals ? 'Agent runs' : 'Outcome'}>
+            {job.telemetry?.totals ? job.telemetry.totals.runs : <code className="text-sm">{job.outcome ?? 'running'}</code>}
+          </Metric>
+        </dl>
+
+        <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center" data-testid="job-actions">
           {job.logs.length > 0 && (
-            <a className="auth-link font-semibold" href="#job-logs" onClick={() => setSelectedLog(names[0])}>
+            <a className="auth-link inline-flex min-h-11 items-center font-semibold" href="#job-logs" onClick={() => setSelectedLog(names[0])}>
               {job.logs.includes('run.log') ? 'View run log' : 'View logs'}
             </a>
           )}
           {job.issueUrl && (
-            <a className="auth-link" href={job.issueUrl} target="_blank" rel="noreferrer">
+            <a className="auth-link inline-flex min-h-11 items-center" href={job.issueUrl} target="_blank" rel="noreferrer">
               Issue ↗
             </a>
           )}
           {job.prUrl && (
-            <a className="auth-link" href={job.prUrl} target="_blank" rel="noreferrer" data-testid="job-pr">
+            <a className="auth-link inline-flex min-h-11 items-center" href={job.prUrl} target="_blank" rel="noreferrer" data-testid="job-pr">
               Pull request ↗
             </a>
           )}
+          <a className="auth-link inline-flex min-h-11 items-center" href="#job-telemetry">
+            {job.telemetry && !job.telemetry.local ? 'Traces' : 'Telemetry'} ↓
+          </a>
         </div>
         <Retry key={job.jobId} job={job} api={api} installationId={installationId} />
+
+        <p className="mt-4 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+          Job <code className="break-all">{job.jobId}</code>
+          <CopyButton text={job.jobId} label="Copy job ID" />
+        </p>
       </PageHero>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Details</CardTitle>
-        </CardHeader>
-        <CardBody>
-          <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-4" data-testid="job-facts">
-            <Fact label="Started">
-              <span title={exact(job.createdAt)}>{relativeTime(job.createdAt)}</span>
-            </Fact>
-            <Fact label="Duration">{job.result === 'running' ? 'Running…' : formatDuration(job.durationSeconds)}</Fact>
-            <Fact label="Configuration">
-              {job.configVersion !== undefined ? (
-                <Link className="auth-link" to={`/installations/${installationId}/config/history`}>
-                  v{job.configVersion}
-                </Link>
-              ) : (
-                '—'
-              )}
-            </Fact>
-            <Fact label="Outcome">
-              <code className="text-sm">{job.outcome ?? 'running'}</code>
-            </Fact>
-          </dl>
-          <p className="mt-4 text-sm">
-            Job <code>{job.jobId}</code>
-          </p>
-        </CardBody>
-      </Card>
+      <Traces job={job} installationId={installationId} onRetry={onRefresh} />
 
       {job.logs.length > 0 && <Logs job={job} api={api} installationId={installationId} names={names} name={logName} onSelect={setSelectedLog} />}
 
+      <div className="grid gap-6 lg:grid-cols-2 [&>*]:min-w-0" data-testid="job-execution">
       <Card data-testid="job-lifecycle-card">
         <CardHeader>
           <CardTitle>Lifecycle</CardTitle>
@@ -202,8 +209,7 @@ function Loaded({ job, deliveries, conversation, api, installationId, onRefresh 
       </Card>
 
       <AgentWork job={job} />
-
-      <Traces job={job} installationId={installationId} onRetry={onRefresh} />
+      </div>
 
       <Conversation job={job} others={conversation} installationId={installationId} />
 
@@ -366,7 +372,7 @@ function Traces({ job, installationId, onRetry }: { job: JobView; installationId
     // Only an installation confirmed not configured is asked to set telemetry up.
     const showSettings = status === undefined || status === 'not_configured' || status === 'paused' || status === 'unknown';
     return (
-      <Card data-testid="job-telemetry">
+      <Card id="job-telemetry" className="scroll-mt-20" data-testid="job-telemetry">
         <CardHeader>
           <CardTitle>Traces</CardTitle>
         </CardHeader>
@@ -392,7 +398,7 @@ function Traces({ job, installationId, onRetry }: { job: JobView; installationId
     }
   };
   return (
-    <Card data-testid="job-telemetry">
+    <Card id="job-telemetry" className="scroll-mt-20" data-testid="job-telemetry">
       <CardHeader>
         <CardTitle>Traces{t.destination ? ` in ${t.destination}` : ''}</CardTitle>
       </CardHeader>
@@ -467,6 +473,47 @@ function Conversation({ job, others, installationId }: { job: JobView; others: J
         </ol>
       </CardBody>
     </Card>
+  );
+}
+
+function Metric({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1 rounded-lg border border-border bg-card/60 px-3 py-2">
+      <dt className="text-xs uppercase tracking-wide text-muted-foreground">{label}</dt>
+      <dd className="break-words text-lg font-semibold">{children}</dd>
+    </div>
+  );
+}
+
+/** Time since a start, ticking each second while it is on screen. */
+function Elapsed({ since }: { since: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const start = new Date(since).getTime();
+  return <span>{Number.isFinite(start) ? formatDuration(Math.max(0, Math.round((now - start) / 1000))) : 'Running…'}</span>;
+}
+
+function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <Button
+      variant="ghost"
+      aria-label={label}
+      onClick={() => {
+        navigator.clipboard.writeText(text).then(
+          () => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          },
+          () => undefined,
+        );
+      }}
+    >
+      {copied ? 'Copied' : 'Copy'}
+    </Button>
   );
 }
 
