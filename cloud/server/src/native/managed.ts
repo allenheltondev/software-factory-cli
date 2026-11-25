@@ -21,7 +21,12 @@ import type { ManagedSession } from './sessions.js';
 import { FlowError } from '../flows/github.js';
 import type { NativeRoute } from './route.js';
 import { createClaudeSessions, managedWorkerId } from './sessions.js';
-import { createNativeModeStore, createNativeStore } from './store.js';
+import { createNativeModeStore, createNativeStore, type Worker } from './store.js';
+import { classifyReadiness } from './readiness.js';
+
+export const MANAGED_IDLE_POLICY = { maxIdleDurationSeconds: SESSION_SECONDS, suspendedDurationSeconds: 0, autoResumeEnabled: false };
+/** A VM in these states runs no worker loop: it cannot serve, and with no resume it never will. */
+export const SUSPENDED_STATES = ['SUSPENDING', 'SUSPENDED'];
 
 export function managedClaude(
   env = process.env,
@@ -99,6 +104,11 @@ export function managedClaude(
         imageVersion: session.imageVersion,
         executionRoleArn,
         maximumDurationInSeconds: SESSION_SECONDS,
+        // Idle is measured by inbound endpoint traffic, and this worker only polls outward: with
+        // the service default it could be suspended minutes after sign-in, its heartbeats would
+        // stop, and the next issue would ask for sign-in again (#144). Idle for its whole life,
+        // like a job VM; never kept suspended (the image has no suspend/resume hooks).
+        idlePolicy: MANAGED_IDLE_POLICY,
         ...(logGroup ? { logging: { cloudWatch: { logGroup } } } : {}),
         ingressNetworkConnectors: [connector + 'HTTP_INGRESS'],
         egressNetworkConnectors: [connector + 'INTERNET_EGRESS'],
@@ -174,12 +184,22 @@ export function managedClaude(
     id: number,
     generation: string,
     reason: NonNullable<ManagedSession['retirementReason']> = 'reconnect',
+    /**
+     * Cleanup's reason, decided again on the exact worker snapshot whose version the sealing
+     * transaction checks: a worker that heartbeat or worked since cleanup read it is left alone
+     * (#144). A later write changes that version, so the transaction then fails instead.
+     */
+    stillDue?: (worker: Worker | null) => boolean,
   ): Promise<boolean> {
     const session = await sessions.session(id);
     if (!session || session.generation !== generation) return false;
     if (!session.retiring) {
       const snapshot = await mode.snapshot(id, managedWorkerId(id));
       const worker = await workers.get(id, managedWorkerId(id));
+      if (stillDue && !stillDue(worker)) {
+        console.log(JSON.stringify({ claudeSession: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'recovered' }));
+        return false;
+      }
       if (worker?.active || worker?.settling || (await workers.queued(id, managedWorkerId(id))).length) {
         throw new FlowError(
           'invalid_settings',
@@ -188,6 +208,11 @@ export function managedClaude(
         );
       }
       if (!(await sessions.retire(id, session, snapshot, worker, reason))) {
+        // For cleanup, a worker that changed after this read is one that is alive: keep it.
+        if (stillDue) {
+          console.log(JSON.stringify({ claudeSession: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'changed' }));
+          return false;
+        }
         throw new FlowError(
           'invalid_settings',
           409,
@@ -317,26 +342,31 @@ export function managedClaude(
         }
         const state = session.microvmId ? await stateOf(session.microvmId) : undefined;
         const lifecycleState = await lifecycle(lease.installationId, lease.generation);
-        if (
-          paused ||
-          session.retiring ||
-          lease.retiring ||
-          state === null ||
-          state === 'TERMINATED' ||
-          lifecycleState.startupFailed ||
-          now() >= Math.max(lease.idleAt, (worker?.lastWorkAt ?? 0) + (lease.idleMs ?? IDLE_MS)) ||
-          now() >= session.requestedAt + SESSION_SECONDS * 1000
-        ) {
-          const reason =
-            session.retirementReason ??
-            (paused
-              ? 'disabled'
-              : lifecycleState.startupFailed
-                ? 'startup-failed'
-                : state === null || state === 'TERMINATED' || now() >= session.requestedAt + SESSION_SECONDS * 1000
-                  ? 'expired'
-                  : 'idle');
-          if (await retire(lease.installationId, lease.generation, reason)) released++;
+        const idleMs = lease.idleMs ?? IDLE_MS;
+        const lifetimeOver = () => now() >= session.requestedAt + SESSION_SECONDS * 1000;
+        // Every worker-dependent part of the decision is a function of one worker snapshot, so
+        // retire() can make it again on the snapshot its transaction is conditioned on.
+        const due = (w: Worker | null): NonNullable<ManagedSession['retirementReason']> | undefined => {
+          if (w?.active || w?.settling) return undefined;
+          const registered = !!w && w.microvmId === session.microvmId && ['auth-required', 'connected', 'expired'].includes(w.auth);
+          const startupFailed = lifecycleState.startupFailed && !registered;
+          // A ready session whose dispatcher has been silent past its grace never recovers (its
+          // loop does not restart): retire it, rather than advertise it until the idle deadline.
+          const lost = !!session.readyAt && !!session.microvmId && classifyReadiness(
+            { ...base(lease.installationId), microvmId: session.microvmId, imageVersion: session.imageVersion },
+            w, now(), undefined, { vmState: state }) === 'worker-lost';
+          const idle = now() >= Math.max(lease.idleAt, (w?.lastWorkAt ?? 0) + idleMs);
+          const gone = state === null || state === 'TERMINATED';
+          const suspendedVm = SUSPENDED_STATES.includes(state ?? '');
+          if (!(paused || session.retiring || lease.retiring || gone || suspendedVm || lost || startupFailed || idle || lifetimeOver())) return undefined;
+          return session.retirementReason ?? (paused ? 'disabled' : startupFailed ? 'startup-failed' : suspendedVm ? 'suspended'
+            : lost ? 'worker-lost' : gone || lifetimeOver() ? 'expired' : 'idle');
+        };
+        const reason = due(worker);
+        if (reason) {
+          console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation,
+            microvmId: session.microvmId, vmState: state ?? null, reason, idleMs }));
+          if (await retire(lease.installationId, lease.generation, reason, (fresh) => due(fresh) !== undefined)) released++;
         }
       } catch {
         failed++;

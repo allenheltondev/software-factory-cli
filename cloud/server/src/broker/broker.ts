@@ -251,8 +251,16 @@ export function createBroker(deps: BrokerDeps) {
     if (action === 'terminate') {
       // Retired first, whatever its outcome: a job being stopped is served nothing more, and a
       // delayed start can never admit it.
+      if (job.native) {
+        // A native job the runner finished itself is released first, then marked: a heartbeat
+        // that reads a stop request while the worker still holds the job is told to cancel, and
+        // the shared worker stops for good (#144). An unfinished job is stopped first, as below.
+        if (job.status !== 'finished') await deps.store.markStopping(job.jobId);
+        if (!deps.native || !await deps.native.complete(job)) return { ok: false, error: 'unavailable' };
+        await deps.store.markStopping(job.jobId);
+        return { ok: true, terminated: true };
+      }
       await deps.store.markStopping(job.jobId);
-      if (job.native) return deps.native && await deps.native.complete(job) ? { ok: true, terminated: true } : { ok: false, error: 'unavailable' };
       if (!job.microvmId) return { ok: false, error: 'unavailable' };
       await deps.terminateMicrovm(job.microvmId);
       // The job's quota capacity follows its microVM, not its outcome: freed (and its unused time
