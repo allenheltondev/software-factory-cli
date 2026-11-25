@@ -55,8 +55,10 @@ official CLI. Cloud dispatch remains disabled by default; [CLOUD.md](CLOUD.md) d
 operator-only #104 test route. The boundary does not protect source code from model requests
 authorized by the job. Repository code has no network except package registries, reached
 through a root proxy over a bound Unix socket while the sandbox keeps `--network none`
-([docs/package-egress.md](../../../docs/package-egress.md)). Without the config's `egress`
-section, it has no network at all. Bake other tools into the image. Triage, background jobs, arbitrary agent flags, alternate adapters,
+([docs/package-egress.md](../../../docs/package-egress.md)). Under Cloud dispatch, an
+installation owner can add registry hosts for that installation's jobs only; they arrive with
+each assignment over the control channel and are removed when the job ends. Without the config's
+`egress` section, it has no network at all. Bake other tools into the image. Triage, background jobs, arbitrary agent flags, alternate adapters,
 suspend/resume and sharing this storage between tenants are outside this proof.
 Prompts are limited to 512 KiB, each tool command to `toolTimeoutSeconds` (default 120, 600 in
 the example config)/256 KiB output, and each

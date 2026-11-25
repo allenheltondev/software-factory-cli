@@ -256,6 +256,57 @@ describe('native worker Cloud dispatch', () => {
     expect(await store.listActiveJobs()).toHaveLength(0);
     expect(await control.canServe(job)).toBe(false);
   });
+  describe("an installation's package registries (#157)", () => {
+    const policy = (hosts: unknown[]) => ({ hosts, updatedAt: '2026-11-25T00:00:00.000Z', updatedBy: 'pat' });
+    it("hands each assignment its own installation's hosts, bound to that job, and never in a heartbeat", async () => {
+      await store.putTenantWithMember({ installationId: 56, accountId: 901, accountLogin: 'other', accountType: 'Organization', status: 'active', createdAt: '', createdBy: 't' },
+        { installationId: 56, sub: 't', role: 'owner', githubUserId: 2, githubLogin: 'sam', addedAt: '' });
+      expect(await store.putRegistryPolicy(55, policy(['npm.pkg.github.com', '*.artifacts.acme.dev']), 0)).toBe('stored');
+      expect(await store.putRegistryPolicy(56, policy(['registry.other.dev']), 0)).toBe('stored');
+      const job = await queued();
+      await control.handle(input('register'));
+      const assignment = await control.handle(input('poll'));
+      expect(assignment.egress).toEqual({ jobId: job.jobId, hosts: ['npm.pkg.github.com', '*.artifacts.acme.dev'], version: 1 });
+      expect((assignment.request as { payload: { broker: { jobId: string } } }).payload.broker.jobId).toBe(job.jobId);
+      expect(JSON.stringify(assignment)).not.toContain('registry.other.dev');
+      // A change during the job is saved, and is not sent to the running job.
+      expect(await store.putRegistryPolicy(55, policy(['changed.acme.dev']), 1)).toBe('stored');
+      const heartbeat = await control.handle(input('heartbeat'));
+      expect(heartbeat).toMatchObject({ ok: true, busy: true });
+      expect(heartbeat).not.toHaveProperty('egress');
+      // The next job gets the list as it is then.
+      await store.finishJob(job.jobId, 'succeeded');
+      expect(await control.complete((await store.getJob(job.jobId))!)).toBe(true);
+      const second = (await store.getJob((await launch(request('delivery-2'))).jobId!))!;
+      const next = await control.handle(input('poll'));
+      expect(next.egress).toEqual({ jobId: second.jobId, hosts: ['changed.acme.dev'], version: 2 });
+    });
+    it('sends no hosts, and says why, when the stored list no longer validates', async () => {
+      const logs: Record<string, unknown>[] = [];
+      control = createNativeControl({ store, workers, route, secret: async () => secret, settings, terminateMicrovm, microvmState: async () => state,
+        disabled: async () => disabled, enabled: async () => subscriptionEnabled, now: () => clock, log: (entry) => logs.push(entry) });
+      expect(await store.putRegistryPolicy(55, policy(['npm.pkg.github.com', '169.254.169.254']), 0)).toBe('stored');
+      const job = await queued();
+      await control.handle(input('register'));
+      const assignment = await control.handle(input('poll'));
+      expect(assignment.egress).toEqual({ jobId: job.jobId, hosts: [], version: 1, problem: 'invalid-stored-policy' });
+      expect(logs).toContainEqual({ nativeWorker: 'egress', installationId: 55, jobId: job.jobId, reason: 'invalid-stored-policy' });
+    });
+    it('sends an empty list when none is saved', async () => {
+      const job = await queued();
+      await control.handle(input('register'));
+      expect((await control.handle(input('poll'))).egress).toEqual({ jobId: job.jobId, hosts: [], version: 0 });
+    });
+    it('assigns nothing when the list cannot be read', async () => {
+      const job = await queued();
+      await control.handle(input('register'));
+      vi.spyOn(store, 'getRegistryPolicy').mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+      await expect(control.handle(input('poll'))).rejects.toThrow('DynamoDB unavailable');
+      expect(row?.active).toBeUndefined();
+      expect((await store.getJob(job.jobId))?.microvmId).toBeUndefined();
+      expect(await control.handle(input('poll'))).toHaveProperty('request');
+    });
+  });
   it('settles through a heartbeat CAS conflict by reading the worker again', async () => {
     const job = await assigned();
     await store.finishJob(job.jobId, 'succeeded');
