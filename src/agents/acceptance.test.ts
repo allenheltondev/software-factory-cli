@@ -10,6 +10,7 @@ import {
   readAcceptanceReport,
   readEvidence,
   revisionCriteria,
+  UNLISTED_CRITERIA,
   UNREAD_ISSUE,
 } from './acceptance.js';
 import { coderAcceptanceSection, reviewerAcceptanceInstructions, reviewerAcceptanceSection } from './acceptance-prompt.js';
@@ -103,6 +104,63 @@ describe('extractCriteria', () => {
     const s = extractCriteria(issue(body));
     expect(s.criteria).toHaveLength(MAX_CRITERIA);
     expect(s.omitted).toBe(5);
+  });
+
+  it('marks as live only criteria that ask for live evidence or action, not ones that merely name a live system', () => {
+    const gate = (text: string) => extractCriteria(issue(`- [ ] ${text}`)).criteria[0]!.gate;
+    for (const live of [
+      'Verified on staging',
+      'A staging PR shows the checklist',
+      'A hosted run completes end to end',
+      'Include a screenshot of the editor',
+      'Manually test the sign-in flow',
+      'Real PR shows criterion evidence at the exact head',
+      'Behaviour is confirmed in production',
+      'Deployed to production without errors',
+      'Live validation of the webhook',
+    ]) {
+      expect(gate(live), live).toBe('live');
+    }
+    for (const code of [
+      'Keep hosted mode working',
+      "Don't break production deployments",
+      'Production config is read from the environment',
+      'The deploy script handles a missing region',
+      'Add UI examples to the docs',
+      'Real-time counters update',
+      'Staging is not mentioned in logs',
+    ]) {
+      expect(gate(code), code).toBe('code');
+    }
+  });
+
+  it('leaves out ticked issue-template boilerplate, and never anything unticked or about the change', () => {
+    const s = extractCriteria(
+      issue(
+        [
+          '### Before submitting',
+          '- [x] I searched existing issues for duplicates',
+          '- [x] I have read the contributing guidelines',
+          '- [x] I agree to follow the code of conduct',
+          '- [ ] I searched existing issues for duplicates',
+          '### Acceptance',
+          '- [x] Retire checks the generation',
+          '- [ ] I read the logs and they show the generation',
+        ].join('\n'),
+      ),
+    );
+    expect(s.criteria.map((c) => c.text)).toEqual(['I searched existing issues for duplicates', 'Retire checks the generation', 'I read the logs and they show the generation']);
+  });
+
+  it('never lets criteria beyond the limit pass: they hold the head back', () => {
+    const body = Array.from({ length: MAX_CRITERIA + 1 }, (_, i) => `- [ ] item ${i}`).join('\n');
+    const s = extractCriteria(issue(body));
+    const a = assessAcceptance(s, review({ criteria: s.criteria.map((c) => ({ criterion: c.id, status: 'verified', evidence: ['src/a.ts'] })) }));
+    expect(a.rows.filter((r) => r.status === 'verified')).toHaveLength(MAX_CRITERIA);
+    expect(a.rows.at(-1)).toMatchObject({ id: UNLISTED_CRITERIA, mandatory: true, status: 'unverified', text: '1 more criteria of the issue' });
+    const g = acceptanceGate(a);
+    expect(g.passed).toBe(false);
+    expect(g.pending.map((r) => r.id)).toEqual([UNLISTED_CRITERIA]);
   });
 
   it('reports a withheld body as unavailable, never as an issue without requirements', () => {

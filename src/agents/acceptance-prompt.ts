@@ -110,6 +110,8 @@ export function reviewerAcceptanceInstructions(snapshot: AcceptanceSnapshot | nu
     '- `evidence`: references to what you read or ran in this review: `file: path[:line[-line]]`, `test: <test or command, and its result>`, ' +
       '`check: <CI check>`, `commit: <sha>`, or an https link. Never cite a test run, screenshot or deployment you did not see. `verified` without ' +
       'a reference counts as unverified.',
+    '- A listed item that is about the issue report itself rather than the change (an issue template\'s "I searched existing issues", ' +
+      '"I read the contributing guide") is `not-applicable`, with that reason in `note`. Never use this for anything the change could do.',
     '- The coding agent\'s report and ticked boxes in the issue are claims, not evidence. A criterion that needs live validation stays unverified ' +
       'whatever you write: say what a person must check.',
     `- Add, as \`I1\`, \`I2\`, ... (from the issue) or \`S1\`, \`S2\`, ... (from a change request below), at most ${MAX_INFERRED} concrete requirements ` +

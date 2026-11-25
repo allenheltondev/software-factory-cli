@@ -41,6 +41,8 @@ export const MAX_INFERRED = 10;
 export const MAX_EVIDENCE = 8;
 /** The row of an issue whose body the review did not have. */
 export const UNREAD_ISSUE = 'ISSUE';
+/** The row of the criteria beyond MAX_CRITERIA, which no review was given. */
+export const UNLISTED_CRITERIA = 'MORE';
 const MAX_CRITERION_TEXT = 500;
 const MAX_NOTE = 1_500;
 const MAX_REF = 300;
@@ -74,10 +76,30 @@ const OUT_OF_SCOPE = /\b(out of scope|non-goals?|not in scope|won'?t do|not doin
 const OPTIONAL_SECTION = /\b(optional|nice[- ]to[- ]haves?|stretch( goals?)?|follow[- ]?ups?|future( work)?|later)\b/i;
 const REQUIREMENT_SECTION = /\b(acceptance|criteria|requirements?|definition of done|done when|must|deliverables?|expected (behaviou?r|results?))\b/i;
 const OPTIONAL_ITEM = /^\s*(?:\(optional\)|\[optional\]|optional\s*[:-]|nice[- ]to[- ]have\s*[:-]?)|\((?:optional|nice[- ]to[- ]have)\)/i;
-// Evidence no agent review can produce on its own. Deliberately narrow phrases: a false match only
-// makes a criterion need a person, never pass.
-const LIVE_GATE =
-  /\b(staging|hosted|in production|production (?:deploy\w*|environment|traffic)|deployed|live (?:test\w*|validation|environment|deploy\w*|run)|screenshots?|screen recording|manual(?:ly)? (?:test\w*|verif\w*|check\w*|qa)|real (?:github|pr|pull requests?|staging|deploy\w*|environment|repo\w*|issues?|users?|devices?|browsers?|hardware|accounts?|end-to-end|hosted|cloud)|end-to-end (?:hosted|deploy\w*|run)|ui examples?)\b/i;
+// Evidence no agent review can produce on its own: a criterion that asks for something to be
+// shown or done on a live system, not one that merely names one ("keep hosted mode working",
+// "don't break production deployments" are code criteria). Deliberately narrow phrases: a false
+// match only makes a criterion need a person, never pass.
+const LIVE_GATE = new RegExp(
+  [
+    String.raw`\b(?:on|in|against|to) (?:the |a )?staging\b`,
+    String.raw`\bstaging (?:pr|pull requests?|runs?|tests?|environment|deploy\w*|validation|evidence|issues?)\b`,
+    String.raw`\bhosted (?:runs?|tests?|testing|validation|end-to-end|e2e|jobs?|evidence|acceptance)\b`,
+    String.raw`\bscreenshots?\b`,
+    String.raw`\bscreen recordings?\b`,
+    String.raw`\bmanual(?:ly)? (?:tests?|testing|verif\w*|qa)\b`,
+    String.raw`\bmanually (?:check|confirm|test|verify)\w*`,
+    String.raw`\breal (?:github )?(?:pr|pull requests?|staging|deployments?|environments?|hosted (?:runs?|jobs?)|end-to-end runs?)\b`,
+    String.raw`\b(?:verif\w*|validat\w*|test(?:ed|ing)?|demonstrat\w*|observ\w*|confirm\w*|shown?) (?:on|in|against) (?:production|prod|a real\b|the hosted|a hosted|a deployed)`,
+    String.raw`\bdeployed (?:to|on|in) (?:staging|production|prod)\b`,
+    String.raw`\blive (?:validation|tests?|testing|runs?)\b`,
+  ].join('|'),
+  'i',
+);
+// Checked items of an issue template that are about the report itself, not the change: never
+// criteria. Only ticked items, and only these phrasings, so a real criterion is never dropped.
+const TEMPLATE_BOILERPLATE =
+  /^\s*(?:i\s+(?:have\s+)?(?:searched|read|reviewed|checked|agree|confirm(?:ed)?)\b.*\b(?:existing issues|duplicates?|code of conduct|contributing|documentation|faq|guidelines|terms)\b|i\s+agree to (?:follow )?(?:the|this project's) code of conduct)/i;
 
 /** The text a criterion's id is derived from: case, spacing and Markdown emphasis do not change it. */
 function normalized(text: string): string {
@@ -159,7 +181,9 @@ function listItems(body: string): Item[] {
 export function extractCriteria(issue: { title: string; body: string | null }, policy: AcceptancePolicy = 'enforce'): AcceptanceSnapshot {
   const fingerprint = issueFingerprint(issue);
   if (issue.body === null) return { fingerprint, source: 'unavailable', criteria: [], omitted: 0, policy };
-  const items = listItems(issue.body).filter((i) => !i.outOfScope && i.text.replace(/[*_`~\s]/g, '').length > 0);
+  const items = listItems(issue.body).filter(
+    (i) => !i.outOfScope && i.text.replace(/[*_`~\s]/g, '').length > 0 && !(i.checkbox && i.checked && TEMPLATE_BOILERPLATE.test(i.text)),
+  );
   const boxes = items.filter((i) => i.checkbox);
   const chosen = boxes.length ? boxes : items.filter((i) => i.requirementSection);
   const source = boxes.length ? 'checklist' : chosen.length ? 'requirements' : 'none';
@@ -401,6 +425,22 @@ export function assessAcceptance(snapshot: AcceptanceSnapshot, findingsText: str
   for (const a of added) {
     const gate = LIVE_GATE.test(a.text) || a.entry.live === true ? 'live' : 'code';
     rows.push(judge({ id: a.id, text: a.text, mandatory: a.mandatory, gate, origin: a.origin, checkedInSource: false }, a.entry));
+  }
+  if (snapshot.omitted > 0) {
+    // Criteria no review was given cannot have been verified by one.
+    rows.push({
+      id: UNLISTED_CRITERIA,
+      text: `${snapshot.omitted} more criteria of the issue`,
+      mandatory: true,
+      gate: 'code',
+      origin: 'requirement',
+      checkedInSource: false,
+      claimed: null,
+      status: 'unverified',
+      evidence: [],
+      note: null,
+      notes: [`the issue lists more than ${MAX_CRITERIA} criteria and these were beyond what one review is given, so they are unverified; a person confirms them, or the issue is split`],
+    });
   }
   if (snapshot.source === 'unavailable') {
     // Not knowing what the issue asks for is not the same as it asking for nothing.

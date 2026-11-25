@@ -39,6 +39,15 @@ describe('the acceptance checklist', () => {
     expect(text).not.toContain('this head is not ready');
   });
 
+  it('shows the criteria beyond the limit as a row that holds the head back', () => {
+    const snap = extractCriteria({ title: 't', body: Array.from({ length: 32 }, (_, i) => `- [ ] item ${i}`).join('\n') });
+    const a = assessAcceptance(snap, block({ criteria: snap.criteria.map((c) => ({ criterion: c.id, status: 'verified', evidence: ['src/a.ts'] })) }));
+    const text = renderAcceptanceChecklist({ assessment: a, gate: acceptanceGate(a), headSha: SHA, prUrl: PR_URL, previous: null });
+    expect(text).toContain('- **Unverified** · `MORE` · 2 more criteria of the issue');
+    expect(text).toContain('30 of 31 mandatory criteria verified');
+    expect(text).toContain('this head is not ready while 1 mandatory acceptance criterion is unverified (MORE)');
+  });
+
   it('says so honestly when the issue lists nothing and the reviewer named nothing', () => {
     const a = assessAcceptance(extractCriteria({ title: 't', body: 'Make it faster.' }), 'ok');
     expect(renderAcceptanceChecklist({ assessment: a, gate: acceptanceGate(a), headSha: SHA, prUrl: PR_URL, previous: null })).toContain(
