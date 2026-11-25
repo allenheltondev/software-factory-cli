@@ -128,6 +128,12 @@ export interface GitHubApi {
    * at most `limit`. For automatic recovery: whether a lost job may have published anything.
    */
   matchingBranches?(installationToken: string, repository: string, prefix: string, limit: number): Promise<string[]>;
+  /**
+   * Pull requests in any state (open, closed, merged) created at or after `since` (ISO) whose head
+   * branch starts with `prefix`, newest first (GET /repos/{owner}/{repo}/pulls?state=all&sort=created).
+   * `complete` is false when the listing was cut short before reaching `since`: then a match may be missing.
+   */
+  pullRequestsByHeadPrefix?(installationToken: string, repository: string, prefix: string, since: string): Promise<{ numbers: number[]; complete: boolean }>;
   /** The newest time `label` was applied to an issue: the event's id, who applied it and when; null when it never was. */
   latestLabelEvent?(installationToken: string, repository: string, issue: number, label: string): Promise<LabelEvent | null>;
   /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
@@ -330,6 +336,22 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
         if (names.length >= limit) break;
       }
       return names;
+    },
+
+    async pullRequestsByHeadPrefix(token, repository, prefix, since) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const numbers: number[] = [];
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const out = await json<Json[]>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=all&sort=created&direction=desc&per_page=100&page=${page}`, token), 'GET /repos/pulls');
+        const pulls = Array.isArray(out) ? out : [];
+        for (const p of pulls) {
+          if (String(p.created_at ?? '') < since) return { numbers, complete: true };
+          const ref = (p.head as Json | undefined)?.ref;
+          if (typeof ref === 'string' && ref.startsWith(prefix) && typeof p.number === 'number') numbers.push(p.number);
+        }
+        if (pulls.length < 100) return { numbers, complete: true };
+      }
+      return { numbers, complete: false };
     },
 
     async createIssueComment(token, repository, issue, body) {

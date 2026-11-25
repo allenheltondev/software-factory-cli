@@ -116,4 +116,24 @@ describe('the GitHub client', () => {
     expect(await api.matchingBranches!('ghs_x', 'acme/web', 'updraft/issue-7-', 1)).toHaveLength(1);
     await expect(createGitHubApi(async () => new Response('{}', { status: 403 })).matchingBranches!('ghs_x', 'acme/web', 'updraft/issue-7-', 5)).rejects.toBeInstanceOf(GitHubError);
   });
+
+  it('finds pull requests in any state from a head prefix since a time, and says when it could not look that far', async () => {
+    const urls: string[] = [];
+    const page = (n: number) => Array.from({ length: 100 }, (_, i) => ({ number: n * 100 + i, created_at: '2026-11-25T00:00:00Z', head: { ref: i === 3 ? 'updraft/issue-7-job_x-2' : 'feature' } }));
+    const api = createGitHubApi(async (url) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify([
+        { number: 21, created_at: '2026-11-25T10:00:00Z', state: 'closed', merged_at: 'x', head: { ref: 'updraft/issue-7-job_a' } },
+        { number: 20, created_at: '2026-11-25T09:00:00Z', head: { ref: 'updraft/issue-70-job_b' } },
+        { number: 19, created_at: '2026-11-24T00:00:00Z', head: { ref: 'updraft/issue-7-job_old' } },
+      ]), { status: 200 });
+    });
+    expect(await api.pullRequestsByHeadPrefix!('ghs_x', 'acme/web', 'updraft/issue-7-', '2026-11-25T00:00:00Z')).toEqual({ numbers: [21], complete: true });
+    expect(urls[0]).toBe('https://api.github.com/repos/acme/web/pulls?state=all&sort=created&direction=desc&per_page=100&page=1');
+    let n = 0;
+    const endless = createGitHubApi(async () => new Response(JSON.stringify(page(n++)), { status: 200 }));
+    const out = await endless.pullRequestsByHeadPrefix!('ghs_x', 'acme/web', 'updraft/issue-7-', '2026-11-01T00:00:00Z');
+    expect(out.complete).toBe(false);
+    expect(out.numbers).toContain(3);
+  });
 });
