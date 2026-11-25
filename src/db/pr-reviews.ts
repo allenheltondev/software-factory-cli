@@ -875,13 +875,17 @@ export function setCiState(db: Db, repoId: number, prNumber: number, sha: string
   return Number(changes) > 0;
 }
 
-/** Open PRs whose CI step queued a fix or stopped for a person, and whose one comment about that head is still to be posted. */
+/**
+ * Open PRs whose CI step queued a fix or stopped for a person, or whose checks passed after an
+ * automatic CI fix of the pull request (the outcome of that fix), and whose one comment about that
+ * head is still to be posted. A head that passed without any CI fix gets no comment.
+ */
 export function listPendingCiNotices(db: Db, maxAttempts: number): LoopPr[] {
   return (
     db
       .prepare(
         `SELECT * FROM revision_prs
-         WHERE state = 'open' AND ci_state IN ('fixing', 'blocked') AND ci_sha IS NOT NULL
+         WHERE state = 'open' AND (ci_state IN ('fixing', 'blocked') OR (ci_state = 'passed' AND ci_fixes > 0)) AND ci_sha IS NOT NULL
            AND (ci_comment_sha IS NULL OR ci_comment_sha != ci_sha) AND ci_comment_attempts < ?
          ORDER BY updated_at`,
       )
@@ -889,10 +893,25 @@ export function listPendingCiNotices(db: Db, maxAttempts: number): LoopPr[] {
   ).map(rowToLoopPr);
 }
 
-/** Record the outcome of one attempt to post the CI comment for `sha`. */
-export function recordCiNotice(db: Db, repoId: number, prNumber: number, sha: string, r: { commentId: number; commentUrl: string } | { error: string }, now?: () => number): void {
+/**
+ * Record the outcome of one attempt to post the CI comment for `sha`. `skipped`: the comment is
+ * not owed (nothing is posted), so it counts as said and is not looked for again.
+ */
+export function recordCiNotice(
+  db: Db,
+  repoId: number,
+  prNumber: number,
+  sha: string,
+  r: { commentId: number; commentUrl: string } | { error: string } | { skipped: true },
+  now?: () => number,
+): void {
   const at = nowIso(now);
-  if ('error' in r) {
+  if ('skipped' in r) {
+    db.prepare(
+      `UPDATE revision_prs SET ci_comment_sha = ?, ci_comment_id = NULL, ci_comment_url = NULL, ci_comment_attempts = ci_comment_attempts + 1, updated_at = ?
+       WHERE repo_id = ? AND pr_number = ? AND ci_sha = ?`,
+    ).run(sha, at, repoId, prNumber, sha);
+  } else if ('error' in r) {
     db.prepare('UPDATE revision_prs SET ci_comment_attempts = ci_comment_attempts + 1, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND ci_sha = ?').run(
       at,
       repoId,

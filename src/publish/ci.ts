@@ -19,7 +19,7 @@
 // left to its own review. The revision is dropped before it starts if the head moved since
 // (verdictStale). CI output is untrusted input: it is redacted, capped and fenced in the prompt.
 import { createHash } from 'node:crypto';
-import { ciSettings, DEFAULT_MAX_REVISIONS, workflowId, type CiSettings, type RepositoryConfig } from '../config/schema.js';
+import { autoMergeMethod, ciSettings, DEFAULT_MAX_REVISIONS, workflowId, type CiSettings, type MergeMethod, type RepositoryConfig } from '../config/schema.js';
 import {
   activeRevisionJob,
   getLoopPr,
@@ -107,6 +107,13 @@ export function checkDetails(checks: CommitChecks): CheckDetail[] {
   ];
 }
 
+/** The checks that decide under the repository's settings: not ignored, and among `checks` when it is set. */
+export function relevantChecks(checks: CommitChecks, s: Pick<CiSettings, 'checks' | 'ignore'>): CheckDetail[] {
+  const ignored = new Set(s.ignore.map((n) => n.toLowerCase()));
+  const wanted = s.checks ? new Set(s.checks.map((n) => n.toLowerCase())) : null;
+  return checkDetails(checks).filter((d) => !ignored.has(d.name.toLowerCase()) && (wanted === null || wanted.has(d.name.toLowerCase())));
+}
+
 export type CiVerdict =
   | { action: 'wait'; reason: string; failures: CheckDetail[] }
   | { action: 'pass'; reason: string }
@@ -118,9 +125,8 @@ export type CiVerdict =
  * been waited on; `sincePushMs`: how long ago it was pushed (null when unknown). Pure.
  */
 export function judgeChecks(checks: CommitChecks, s: Pick<CiSettings, 'checks' | 'ignore' | 'waitMs'>, sha: string, waitedMs: number, sincePushMs: number | null): CiVerdict {
-  const ignored = new Set(s.ignore.map((n) => n.toLowerCase()));
   const wanted = s.checks ? new Set(s.checks.map((n) => n.toLowerCase())) : null;
-  const relevant = checkDetails(checks).filter((d) => !ignored.has(d.name.toLowerCase()) && (wanted === null || wanted.has(d.name.toLowerCase())));
+  const relevant = relevantChecks(checks, s);
   const failed = relevant.filter((d) => d.outcome === 'failure');
   const fixable = failed.filter((d) => failureKind(d) === 'code');
   const pending = relevant.filter((d) => d.outcome === 'pending');
@@ -459,40 +465,111 @@ export async function evaluateCiAll(deps: CiDeps, signal?: AbortSignal, opts: { 
 // The comment
 // ---------------------------------------------------------------------------
 
+const CI_ROLE = 'Updraft · CI';
+/** The first line of a CI comment written by this version (renderCiNotice), and not before. */
+const CI_HEADING = /^\*\*Updraft · CI · `/;
+
 /** Hidden marker on the one CI comment of a head. */
 export function ciNoticeMarker(sha: string): string {
   return `<!-- updraft-ci: ${sha} -->`;
 }
 
-export function renderCiNotice(o: { pr: LoopPr; sha: string; max: number; repoFullName: string }): string {
-  const { pr } = o;
-  const reason = fenced(cap(pr.ciReason ?? 'no reason was recorded', 2_000));
-  const lines =
-    pr.ciState === 'fixing'
-      ? [
-          `GitHub's checks failed on commit ${code(short(o.sha))}, which Updraft's reviewer found ready to merge. Updraft queued a revision to fix them ` +
-            `(automatic fix ${pr.ciFixes}; revisions of this pull request count against ${code(`repositories.${o.repoFullName}.maxRevisions`)}: ${o.max}).`,
-          '',
-          '**Failed**',
-          '',
-          reason,
-          '',
-          `Revision job ${code(pr.ciFixJobId ?? '?')} gets the failed checks, their annotations and the end of their logs. Its push gets a new review and new checks.`,
-        ]
-      : [
-          `Updraft's reviewer found commit ${code(short(o.sha))} ready to merge, but its checks need a person: Updraft will not fix or merge this commit by itself.`,
-          '',
-          '**Reason**',
-          '',
-          reason,
-          '',
-          'A new commit on this branch gets a new review and new checks.',
-        ];
-  return [...lines, '', ciNoticeMarker(o.sha)].join('\n');
+/** A check's link for Markdown: https only, and the characters that would end the link escaped. Null when it is not one. */
+export function checkLink(url: string | null | undefined): string | null {
+  if (!url) return null;
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:' || u.username || u.password) return null;
+  return u.href.replace(/[()<>\s]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`);
+}
+
+/** One line per failed check of the head: its name, what it concluded and its link where GitHub gave one. */
+function failedLines(failed: readonly CheckDetail[]): string[] {
+  const shown = failed.slice(0, MAX_NAMES).map((d) => {
+    const link = checkLink(d.url);
+    const name = code(d.name);
+    return `- ${link ? `[${name}](${link})` : name} (${d.kind === 'status' ? 'status' : 'check run'}: ${d.conclusion ?? 'failed'})`;
+  });
+  return failed.length > MAX_NAMES ? [...shown, `- and ${failed.length - MAX_NAMES} more, on the pull request's Checks tab`] : shown;
 }
 
 /**
- * Post the one comment for each head whose CI step queued a fix or stopped for a person. Looks
+ * The one comment of a head's CI step, spoken as **Updraft · CI**: a fix was queued (with the
+ * failed checks and their links), the checks need a person, or, after an automatic CI fix of the
+ * pull request, the checks passed and what happens now. `failed`: the head's failed checks as read
+ * for the comment, or null when they could not be read (the reason still names them).
+ */
+export function renderCiNotice(o: {
+  pr: LoopPr;
+  sha: string;
+  max: number;
+  repoFullName: string;
+  failed?: readonly CheckDetail[] | null;
+  merge?: MergeMethod | null;
+}): string {
+  const { pr } = o;
+  const reason = fenced(cap(pr.ciReason ?? 'no reason was recorded', 2_000));
+  const head = `**${CI_ROLE} · ${code(short(o.sha))}**`;
+  const failed = o.failed?.length ? ['**Failed checks**', '', ...failedLines(o.failed), ''] : [];
+  let lines: string[];
+  if (pr.ciState === 'passed') {
+    lines = [
+      head,
+      '',
+      `The checks passed on commit ${code(short(o.sha))} after ${pr.ciFixes} automatic CI fix(es) on this pull request, and Updraft's reviewer found this ` +
+        'same commit ready to merge: review and checks are both clean on it.',
+      '',
+      code(cap(pr.ciReason ?? 'passed', 300)),
+      '',
+      o.merge ? `Updraft merges it (${code(o.merge)}) if nothing else stands in the way; if something does, it says why here.` : 'It is ready for a person to merge.',
+    ];
+  } else if (pr.ciState === 'fixing') {
+    lines = [
+      head,
+      '',
+      `The review passed, but GitHub's checks failed on commit ${code(short(o.sha))}, which Updraft's reviewer found ready to merge. Updraft queued a revision to fix them ` +
+        `(automatic CI fix ${pr.ciFixes} on this pull request; revisions of this pull request count against ${code(`repositories.${o.repoFullName}.maxRevisions`)}: ${o.max}).`,
+      '',
+      ...failed,
+      '**Failed**',
+      '',
+      reason,
+      '',
+      `Revision job ${code(pr.ciFixJobId ?? '?')} gets the failed checks, their annotations and the end of their logs. Its push gets a new review and new checks.`,
+    ];
+  } else {
+    lines = [
+      head,
+      '',
+      `Updraft's reviewer found commit ${code(short(o.sha))} ready to merge, but its checks need a person: Updraft will not fix or merge this commit by itself.`,
+      '',
+      ...failed,
+      '**Reason**',
+      '',
+      reason,
+      '',
+      'A new commit on this branch gets a new review and new checks.',
+    ];
+  }
+  return [...lines, '', ciNoticeMarker(o.sha)].join('\n');
+}
+
+/** The failed checks of `sha` that decide, for the comment. Best effort: null when GitHub could not be asked. */
+async function failedChecks(deps: CiDeps, repo: RepoRef, sha: string, settings: Pick<CiSettings, 'checks' | 'ignore'>): Promise<CheckDetail[] | null> {
+  try {
+    return relevantChecks(await deps.api.getCommitChecks(repo, sha), settings).filter((d) => d.outcome === 'failure');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Post the one comment for each head whose CI step queued a fix or stopped for a person, or whose
+ * checks passed after an automatic CI fix of the pull request. Looks
  * for the marker among the worker's own comments before posting. Never throws.
  */
 export async function postCiNotices(deps: CiDeps, signal?: AbortSignal): Promise<void> {
@@ -507,15 +584,33 @@ export async function postCiNotices(deps: CiDeps, signal?: AbortSignal): Promise
     if (signal?.aborted) return;
     const found = findRepoConfig(deps.config, { repoId: pr.repoId, repoFullName: '' });
     const sha = pr.ciSha;
-    if (!found || !sha || !ciSettings(deps.config, found.repo)) continue;
+    const settings = found ? ciSettings(deps.config, found.repo) : null;
+    if (!found || !sha || !settings) continue;
     const repoRef = { id: pr.repoId, fullName: found.fullName };
     try {
       const login = await workerLogin(deps.api);
       const marker = ciNoticeMarker(sha);
-      const existing = (await deps.api.listIssueComments(repoRef, pr.prNumber)).find((c) => c.body.includes(marker) && sameLogin(c.user, login));
-      const posted =
-        existing ??
-        (await deps.api.createIssueComment(repoRef, pr.prNumber, renderCiNotice({ pr, sha, max: found.repo.maxRevisions ?? DEFAULT_MAX_REVISIONS, repoFullName: found.fullName })));
+      const own = (await deps.api.listIssueComments(repoRef, pr.prNumber)).filter((c) => sameLogin(c.user, login));
+      const existing = own.find((c) => c.body.includes(marker));
+      // The outcome of a fix is said only where this version said the fix was queued (its CI
+      // comment carries the Updraft · CI heading). A pull request fixed before this version
+      // already had its last word: it is recorded as said, and never gets a late comment.
+      if (!existing && pr.ciState === 'passed' && !own.some((c) => c.body.includes('<!-- updraft-ci: ') && CI_HEADING.test(c.body))) {
+        recordCiNotice(deps.db, pr.repoId, pr.prNumber, sha, { skipped: true }, deps.now);
+        deps.log.info('not commenting on checks that passed after a fix queued before this version', { repo: found.fullName, pr: pr.prNumber });
+        continue;
+      }
+      const render = async () =>
+        renderCiNotice({
+          pr,
+          sha,
+          max: found.repo.maxRevisions ?? DEFAULT_MAX_REVISIONS,
+          repoFullName: found.fullName,
+          // Linked on the pull request even when their logs cannot be read.
+          failed: pr.ciState === 'passed' ? null : await failedChecks(deps, repoRef, sha, settings),
+          merge: autoMergeMethod(deps.config, found.repo),
+        });
+      const posted = existing ?? (await deps.api.createIssueComment(repoRef, pr.prNumber, await render()));
       recordCiNotice(deps.db, pr.repoId, pr.prNumber, sha, { commentId: posted.id, commentUrl: posted.htmlUrl }, deps.now);
       deps.log.info('commented on the checks', { repo: found.fullName, pr: pr.prNumber, state: pr.ciState, comment: posted.htmlUrl });
     } catch (err) {
