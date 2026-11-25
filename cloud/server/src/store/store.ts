@@ -759,11 +759,14 @@ export interface Store {
    */
   claimControlCommand(record: ControlCommandRecord): Promise<boolean>;
   /**
-   * Sets `control` on exactly this pause (job and time) on every one of these subjects, in one
-   * transaction: a GitHub `cancel` taking over a `pause` (resuming it then needs maintain), or the
-   * jobs a cancel stopped. False, and nothing changed, when any subject is held by another pause.
+   * Replaces exactly the pause `expected` (job and time) with `next`, in one transaction: on each of
+   * `held` (which must hold `expected`), and on each of `added` (which must hold no pause). A GitHub
+   * `cancel` taking over a `pause`, or recording the jobs it stopped. `next.at` must differ from
+   * `expected.at`: the pause's identity changes, so a resume decided against the earlier pause (its
+   * delete is conditioned on job and time) can no longer lift it. False, and nothing changed, when
+   * any subject is not as expected.
    */
-  setPauseControl(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at'>, subjects: number[], control: NonNullable<WorkflowPause['control']>): Promise<boolean>;
+  takeOverPause(installationId: number, repositoryId: number, expected: Pick<WorkflowPause, 'jobId' | 'at'>, next: WorkflowPause, held: number[], added: number[]): Promise<boolean>;
   /** What came of a claimed command: its audit record's outcome. */
   finishControlCommand(record: Pick<ControlCommandRecord, 'installationId' | 'repositoryId' | 'commentId'>, outcome: ControlCommandRecord['outcome'], message: string): Promise<void>;
   getControlCommand(installationId: number, repositoryId: number, commentId: number): Promise<ControlCommandRecord | null>;
@@ -1163,10 +1166,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       for (const n of all) pauses.set(`${id}/${repo}/${n}`, { ...pause, subjects: all });
       return 'paused';
     },
-    async setPauseControl(id, repo, pause, subjects, control) {
-      const keys = [...new Set(subjects)].map((n) => `${id}/${repo}/${n}`);
-      if (keys.some((k) => pauses.get(k)?.jobId !== pause.jobId || pauses.get(k)?.at !== pause.at)) return false;
-      for (const k of keys) pauses.set(k, { ...pauses.get(k)!, control: { ...control } });
+    async takeOverPause(id, repo, expected, next, held, added) {
+      const heldKeys = [...new Set(held)].map((n) => `${id}/${repo}/${n}`);
+      const addedKeys = [...new Set(added)].filter((n) => !held.includes(n)).map((n) => `${id}/${repo}/${n}`);
+      if (heldKeys.some((k) => pauses.get(k)?.jobId !== expected.jobId || pauses.get(k)?.at !== expected.at)) return false;
+      if (addedKeys.some((k) => pauses.has(k))) return false;
+      for (const k of [...heldKeys, ...addedKeys]) pauses.set(k, { ...next });
       return true;
     },
     async claimControlCommand(record) {

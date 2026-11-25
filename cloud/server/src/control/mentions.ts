@@ -40,7 +40,7 @@ export interface MentionGitHub {
 }
 
 export interface MentionDeps {
-  store: Pick<Store, 'getTenant' | 'getConfigVersion' | 'getWorkflowPause' | 'pauseWorkflowSubjects' | 'setPauseControl' | 'claimControlCommand' | 'finishControlCommand' | 'listActiveJobs' | 'getJob' | 'resumeWorkflowPause'>;
+  store: Pick<Store, 'getTenant' | 'getConfigVersion' | 'getWorkflowPause' | 'pauseWorkflowSubjects' | 'takeOverPause' | 'claimControlCommand' | 'finishControlCommand' | 'listActiveJobs' | 'getJob' | 'resumeWorkflowPause'>;
   github: MentionGitHub;
   /** The App's slug: `@<slug>` is the handle. */
   slug: () => Promise<string | undefined>;
@@ -50,6 +50,8 @@ export interface MentionDeps {
   issueOfPullRequest?: (installationId: number, repositoryId: number, pullRequest: number) => Promise<number | undefined>;
   /** Whether Updraft manages this issue (it has a workflow, or a pause): read from the table, no GitHub call. */
   managedIssue: (installationId: number, repositoryId: number, issue: number) => Promise<boolean>;
+  /** Whether a pull request with no linked issue is still Updraft's: a workflow of it, or a pause on it. */
+  managedPullRequest?: (installationId: number, repositoryId: number, pullRequest: number) => Promise<boolean>;
   consoleOrigin?: string;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
@@ -127,7 +129,8 @@ export function createMentionHandler(d: MentionDeps) {
     let issue: number | undefined;
     if (onPullRequest) {
       issue = await d.issueOfPullRequest?.(e.installationId, repositoryId, number);
-      if (issue === undefined) return { disposition: 'filtered', reason: 'not_managed' };
+      // A workflow of the pull request alone (no issue linked), or a pause held on it, counts too.
+      if (issue === undefined && !(await d.managedPullRequest?.(e.installationId, repositoryId, number))) return { disposition: 'filtered', reason: 'not_managed' };
     } else {
       if (!(await d.managedIssue(e.installationId, repositoryId, number))) return { disposition: 'filtered', reason: 'not_managed' };
       issue = number;
@@ -208,6 +211,23 @@ export function createMentionHandler(d: MentionDeps) {
         jobId: `control-${commentId}`, at: now(), by, reason: (parsed.text || `${command} from GitHub`).slice(0, 500), confirmedAt: now(),
         repository, ...(issue !== undefined ? { issue } : {}), ...(onPullRequest ? { pullRequest: number } : {}), control: { kind, source: String(commentId) },
       });
+      /**
+       * Take over the pause in place (`first`, else a fresh read) with `control`, on every subject
+       * of this command: its own subjects stay conditioned on it, the others must hold none. A new
+       * `at` changes its identity, so a resume decided against the earlier pause cannot lift it.
+       * Retried once from a fresh read; false when the workflow kept changing.
+       */
+      const takeOver = async (first: WorkflowPause | null, make: (p: WorkflowPause) => WorkflowPause['control']): Promise<boolean> => {
+        let p = first ?? (await held());
+        for (let attempt = 0; attempt < 2 && p; attempt++) {
+          const own = p.subjects ?? [];
+          const control = make(p);
+          const next: WorkflowPause = { ...p, at: Math.max(now(), p.at + 1), subjects: [...new Set([...own, ...subjects])], ...(control ? { control } : {}) };
+          if (await d.store.takeOverPause(e.installationId, repositoryId, p, next, own, subjects.filter((n) => !own.includes(n)))) return true;
+          p = await held();
+        }
+        return false;
+      };
       const cancelQueued = async (): Promise<string[]> => {
         const out: string[] = [];
         for (const s of [issue !== undefined ? { issue } : null, onPullRequest ? { pullRequest: number } : null]) {
@@ -245,14 +265,15 @@ export function createMentionHandler(d: MentionDeps) {
         case 'cancel': {
           // 1. Hold the workflow first, so nothing is admitted while the rest is ended: a new
           // cancel pause, or the pause in place taken over (a `pause` becomes a cancel, so only a
-          // maintainer can lift it).
+          // maintainer can lift it), extended to every subject of this command.
           const reason = (parsed.text || 'Canceled from GitHub').slice(0, 500);
           let pause = await held();
           if (!pause) {
             await d.store.pauseWorkflowSubjects(e.installationId, repositoryId, controlPause('cancel'), subjects);
             pause = await held();
-          } else if (pause.control?.kind === 'pause') {
-            if (!(await d.store.setPauseControl(e.installationId, repositoryId, pause, [...new Set([...subjects, ...(pause.subjects ?? [])])], { ...pause.control, kind: 'cancel' }))) {
+            if (pause && subjects.some((n) => !(pause!.subjects ?? []).includes(n)) && !(await takeOver(pause, (p) => p.control ?? { kind: 'cancel', source: String(commentId) }))) pause = null;
+          } else if (pause.control?.kind === 'pause' || subjects.some((n) => !(pause!.subjects ?? []).includes(n))) {
+            if (!(await takeOver(pause, (p) => (p.control ? { ...p.control, kind: 'cancel' } : undefined)))) {
               return finish('refused', `${ref} changed while it was being canceled; nothing was canceled. Look at it and comment again.${link}`);
             }
           }
@@ -267,16 +288,19 @@ export function createMentionHandler(d: MentionDeps) {
             const result = await d.stopJob!(e.installationId, job.jobId, by, reason);
             if (result) { stopped.push(job.jobId); said.push(`${job.jobId} (${result.state})`); }
           }
+          let unrecorded = '';
           if (stopped.length) {
-            const now = await held();
-            if (now) {
-              const prior = now.control?.stopped ?? (now.control ? [] : [now.jobId]);
-              await d.store.setPauseControl(e.installationId, repositoryId, now, now.subjects ?? subjects,
-                { kind: 'cancel', source: now.control?.source ?? String(commentId), stopped: [...prior.filter((j) => !stopped.includes(j)), ...stopped] });
+            const recorded = await takeOver(null, (p) => {
+              const prior = p.control?.stopped ?? (p.control ? [] : [p.jobId]);
+              return { kind: 'cancel', source: p.control?.source ?? String(commentId), stopped: [...prior.filter((j) => !stopped.includes(j)), ...stopped] };
+            });
+            if (!recorded) {
+              log({ control: 'cancel_unrecorded', installationId: e.installationId, repositoryId, commentId, stopped });
+              unrecorded = ` The workflow changed meanwhile, so the stopped jobs are not all recorded for resume: after resuming, run ${stopped.join(', ')} again with Retry job in the console if needed.`;
             }
           }
           return finish('applied',
-            `Canceled work on ${ref}:${queued.length ? ` queued ${queued.join(', ')} canceled;` : ''}${said.length ? ` stopping ${said.join(', ')};` : ''} commits and pull requests are kept. Nothing starts until a maintainer resumes it.${link}`);
+            `Canceled work on ${ref}:${queued.length ? ` queued ${queued.join(', ')} canceled;` : ''}${said.length ? ` stopping ${said.join(', ')};` : ''} commits and pull requests are kept. Nothing starts until a maintainer resumes it.${unrecorded}${link}`);
         }
         case 'resume': {
           if (state !== 'open') return finish('refused', `${ref} is ${state}, so there is nothing to resume. Reopen it and apply the trigger label to start new work.${link}`);

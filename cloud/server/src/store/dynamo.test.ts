@@ -871,12 +871,17 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.getWorkflowPause(55, 9, 40)).toEqual({ ...pause, subjects: [12, 40] });
     expect(await store.pauseWorkflowSubjects(55, 9, { ...pause, jobId: 'control-78', at: 2000 }, [40, 41])).toBe('held');
     expect(await store.getWorkflowPause(55, 9, 41)).toBeNull();
-    // A cancel takes the pause over, on every subject or none.
-    expect(await store.setPauseControl(55, 9, { jobId: 'control-other', at: 1000 }, [12, 40], { kind: 'cancel', source: '79' })).toBe(false);
+    // A cancel takes the pause over, on every subject or none, under a new identity, and extends it.
+    const next = { ...pause, at: 1500, control: { kind: 'cancel' as const, source: '77', stopped: ['job_a'] }, subjects: [12, 40, 41] };
+    expect(await store.takeOverPause(55, 9, { jobId: 'control-other', at: 1000 }, next, [12, 40], [41])).toBe(false);
     expect((await store.getWorkflowPause(55, 9, 12))?.control?.kind).toBe('pause');
-    expect(await store.setPauseControl(55, 9, pause, [12, 40], { kind: 'cancel', source: '77', stopped: ['job_a'] })).toBe(true);
-    expect(await store.getWorkflowPause(55, 9, 40)).toMatchObject({ control: { kind: 'cancel', source: '77', stopped: ['job_a'] } });
-    expect(await store.resumeWorkflowPause(55, 9, pause, [12, 40], 'github:olive', 3000)).toBe(true);
+    expect(await store.getWorkflowPause(55, 9, 41)).toBeNull();
+    expect(await store.takeOverPause(55, 9, pause, next, [12, 40], [41])).toBe(true);
+    expect(await store.getWorkflowPause(55, 9, 41)).toMatchObject({ at: 1500, control: { kind: 'cancel', source: '77', stopped: ['job_a'] } });
+    // A resume decided against the earlier pause no longer lifts it.
+    expect(await store.resumeWorkflowPause(55, 9, pause, [12, 40], 'github:pat', 2500)).toBe(false);
+    expect(await store.getWorkflowPause(55, 9, 12)).toMatchObject({ at: 1500 });
+    expect(await store.resumeWorkflowPause(55, 9, next, [12, 40, 41], 'github:olive', 3000)).toBe(true);
     expect(await store.getWorkflowPause(55, 9, 12)).toBeNull();
 
     const record = { installationId: 55, repositoryId: 9, repository: 'acme/web', commentId: 77, deliveryId: 'd-77', actor: 'pat', command: 'pause', issue: 12, receivedAt: '2026-11-25T00:00:00.000Z' };

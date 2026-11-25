@@ -34,7 +34,8 @@ identity (the App's slug, or the `gh` account's login), or `controls.handle`. `h
   `<!-- updraft… -->` markers) are ignored without a reply, so replies can never loop.
 - Each command is handled once, by comment id: a redelivered webhook, a replayed event, a re-read or a restart
   does nothing more. The record of it (who, what, when, the head it was judged against, the outcome) is the
-  audit trail.
+  audit trail. Comments nothing is done for (automation, someone not allowed, a subject Updraft does not manage) are
+  not recorded, so they cannot grow the state.
 
 Commands only apply to work Updraft manages: an issue it has worked on, or a pull request on an Updraft branch
 (`updraft/…`) it opened. Anything else, and any repository not in the configuration, is left alone, unanswered.
@@ -66,7 +67,7 @@ and a pull request's head must be in the same repository (never a fork's look-al
 | `pause` | Nothing new of the workflow starts: queued work is held, and later events are held too. A job already running **continues to completion and may still publish**; the reply names it. Use `stop` to end it. |
 | `resume` | Lifts the pause it finds, exactly that one: a newer stop always wins. Then continues from where it stopped (below). On a closed issue or a merged or closed pull request, nothing is resumed: reopen and label it to start new work. |
 | `stop` | Emergency stop of the one active job of this issue and its pull requests, through the same stop primitive as the console's **Stop job** (docs: `cloud/server/src/jobs/STOPPING.md`). Pauses the workflow. With no active job, nothing happens; with several, it names them and stops none: name one. The reply says *stopping* until termination is confirmed. It never turns on the platform kill switch. |
-| `cancel` | Holds the workflow first (a new pause, or the `pause` in place taken over, so only a maintainer can lift it), then ends its queued work and stops every active job. Resume runs each stopped job again. Commits, branches and pull requests are kept. |
+| `cancel` | Holds the workflow first (a new pause, or the pause in place taken over and extended to the issue and the pull request, so only a maintainer can lift it), then ends its queued work and stops every active job. Resume runs each stopped job again. Taking a pause over gives it a new identity, so a resume decided against the earlier pause can never lift the cancel. Commits, branches and pull requests are kept. |
 | `review` | Reviews the pull request's current head again, without a dummy commit. Earlier reviews and threads stay. |
 | `steer` | Queues a coding run on the pull request with the text as a change request by the person who wrote it, under `maxRevisions` and the usual checks; the next review checks it too (it becomes an `S<n>` acceptance requirement, see [Acceptance criteria](acceptance.md)). A run already in progress does not see it. On an issue with no pull request yet, it is refused: comment on the pull request once it opens. |
 | `escalate` | Not available yet: routing policy (tiers, escalation, tier override labels) decides. |

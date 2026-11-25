@@ -1621,12 +1621,17 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         throw err;
       }
     },
-    async setPauseControl(id, repo, pause, subjects, control) {
+    async takeOverPause(id, repo, expected, next, held, added) {
+      const heldSet = [...new Set(held)];
+      const addedSet = [...new Set(added)].filter((n) => !heldSet.includes(n));
+      const item = (n: number) => ({ pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${n}`, ...next });
       try {
-        await client.send(new TransactWriteCommand({ TransactItems: [...new Set(subjects)].map((n) => ({ Update: { TableName: T,
-          Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${n}` }, UpdateExpression: 'SET #control = :control',
-          ConditionExpression: 'jobId = :job AND #at = :pat', ExpressionAttributeNames: { '#control': 'control', '#at': 'at' },
-          ExpressionAttributeValues: { ':control': control, ':job': pause.jobId, ':pat': pause.at } } })) }));
+        // No TTL, like every pause.
+        await client.send(new TransactWriteCommand({ TransactItems: [
+          ...heldSet.map((n) => ({ Put: { TableName: T, Item: item(n), ConditionExpression: 'jobId = :job AND #at = :pat',
+            ExpressionAttributeNames: { '#at': 'at' }, ExpressionAttributeValues: { ':job': expected.jobId, ':pat': expected.at } } })),
+          ...addedSet.map((n) => ({ Put: { TableName: T, Item: item(n), ConditionExpression: 'attribute_not_exists(pk)' } })),
+        ] }));
         return true;
       } catch (err) {
         if (err instanceof TransactionCanceledException && err.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return false;

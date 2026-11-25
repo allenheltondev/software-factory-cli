@@ -24,6 +24,9 @@ describe('GitHub mention commands (Cloud)', () => {
   let pr: { state: 'open' | 'closed'; merged: boolean; headRef: string; headSha: string; headRepoId: number | null };
   let githubCalls: string[];
   let managed: Set<number>;
+  let managedPrs: Set<number>;
+  /** While set, the permission lookup for this login waits for `release`. */
+  let hold: { login: string; until: Promise<void> } | null;
   let issueOpen: boolean;
   let retry: ReturnType<typeof vi.fn>;
   let queueCancel: Mock<(installationId: number, jobId: string, by: string) => Promise<{ ok: boolean; state: string }>>;
@@ -45,6 +48,8 @@ describe('GitHub mention commands (Cloud)', () => {
     pr = { state: 'open', merged: false, headRef: 'updraft/issue-12-job_x', headSha: 'a'.repeat(40), headRepoId: REPO.id };
     githubCalls = [];
     managed = new Set([ISSUE]);
+    managedPrs = new Set();
+    hold = null;
     issueOpen = true;
     retry = vi.fn(async () => ({ ok: true, jobId: 'job_retried000001' }));
     queueCancel = vi.fn(async (_i: number, _j: string, _b: string) => ({ ok: true, state: 'canceled' }));
@@ -58,6 +63,7 @@ describe('GitHub mention commands (Cloud)', () => {
       github: {
         permission: async (_i, _r, _n, login) => {
           githubCalls.push(`permission ${login}`);
+          if (hold?.login === login) await hold.until;
           const p = permissions[login];
           if (p === undefined) throw new Error('unavailable');
           return p;
@@ -70,6 +76,7 @@ describe('GitHub mention commands (Cloud)', () => {
       queue: { waitingFor: async (_i, _r, s) => (s.issue === ISSUE ? ({ jobId: 'job_queued00000001' } as never) : null), cancel: queueCancel as never },
       retry: retry as never,
       issueOfPullRequest: async (_i, _r, n) => (n === PR ? ISSUE : undefined),
+      managedPullRequest: async (_i, _r, n) => managedPrs.has(n),
       managedIssue: async (_i, _r, n) => managed.has(n),
       consoleOrigin: 'https://updraft.example',
       now: () => clock,
@@ -161,6 +168,57 @@ describe('GitHub mention commands (Cloud)', () => {
     expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).not.toBeNull();
     expect(await handle(comment('olive', '@updraft-app resume'))).toMatchObject({ reason: 'control_applied' });
     expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toBeNull();
+  });
+
+  it('a write-only resume racing a maintainer’s cancel cannot lift it', async () => {
+    await handle(comment('pat', '@updraft-app pause'));
+    let release!: () => void;
+    hold = { login: 'pat', until: new Promise((r) => { release = r; }) };
+    // The resume reads the pause (a plain pause: write is enough), then waits on its permission lookup...
+    const resuming = handle(comment('pat', '@updraft-app resume'));
+    await new Promise((r) => setTimeout(r, 0));
+    // ...while a maintainer cancels.
+    expect(await handle(comment('olive', '@updraft-app cancel'))).toMatchObject({ reason: 'control_applied' });
+    release();
+    expect(await resuming).toMatchObject({ reason: 'control_refused' });
+    expect(replies.at(-1)!.body).toContain('paused again in the meantime');
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toMatchObject({ control: { kind: 'cancel' } });
+  });
+
+  it('a cancel on the pull request takes over a pause given on the issue, and holds both', async () => {
+    expect(await handle(comment('pat', '@updraft-app pause'))).toMatchObject({ reason: 'control_applied' });
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, PR)).toBeNull();
+    expect(await handle(comment('olive', '@updraft-app cancel', { onPr: true }))).toMatchObject({ reason: 'control_applied' });
+    for (const n of [ISSUE, PR]) expect(await store.getWorkflowPause(INSTALLATION, REPO.id, n)).toMatchObject({ control: { kind: 'cancel' }, subjects: [ISSUE, PR] });
+    expect(queueCancel).toHaveBeenCalledWith(INSTALLATION, 'job_queued00000001', 'github:olive');
+    expect(await handle(comment('pat', '@updraft-app resume', { onPr: true }))).toMatchObject({ reason: 'control_refused' });
+    expect(replies.at(-1)!.body).toContain('needs maintain or admin');
+    expect(await handle(comment('olive', '@updraft-app resume', { onPr: true }))).toMatchObject({ reason: 'control_applied' });
+    for (const n of [ISSUE, PR]) expect(await store.getWorkflowPause(INSTALLATION, REPO.id, n)).toBeNull();
+  });
+
+  it('says so, truthfully, when the stopped jobs could not be recorded for resume', async () => {
+    await runningJob();
+    // Every attempt to record the stopped jobs loses a race.
+    const original = store.takeOverPause.bind(store);
+    store.takeOverPause = async (...a) => (a[3].control?.stopped ? false : original(...a));
+    expect(await handle(comment('olive', '@updraft-app cancel'))).toMatchObject({ reason: 'control_applied' });
+    expect(replies.at(-1)!.body).toContain('run job_running000001 again with Retry job in the console');
+    // It was still held: the stop's own pause.
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toMatchObject({ jobId: 'job_running000001' });
+  });
+
+  it('accepts a pull request with no linked issue when its workflow or a pause says it is Updraft’s', async () => {
+    const lonely = 41;
+    const event = (id: number) => {
+      const c = comment('pat', '@updraft-app pause', { onPr: true, id });
+      c.payload.issue = { number: lonely, pull_request: { url: 'x' } };
+      return c;
+    };
+    expect(await handle(event(601))).toMatchObject({ reason: 'not_managed' });
+    managedPrs.add(lonely);
+    expect(await handle(event(602))).toMatchObject({ reason: 'control_applied' });
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, lonely)).toMatchObject({ control: { kind: 'pause' }, subjects: [lonely] });
   });
 
   it('cancel holds first, then ends queued and every active job; resume runs each stopped job again', async () => {
