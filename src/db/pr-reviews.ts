@@ -17,6 +17,7 @@ import {
   type ReviewRunRequest,
   type ReviewSnapshot,
   type ReviewVerdict,
+  type RunSummary,
 } from '../types.js';
 import { newId, nowIso } from '../util/ids.js';
 import { rowToJob, transaction, type Db, type JobRow } from './database.js';
@@ -280,6 +281,25 @@ function humanChangeRequests(db: Db, repoId: number, prNumber: number, allowedAc
 }
 
 /**
+ * The acceptance report of the Updraft run whose push put `sha` at the head of the PR
+ * (docs/acceptance.md): the coding agent's claims, for the reviewer to check. Null when someone
+ * else pushed it, or the run wrote none.
+ */
+function acceptanceClaimsFor(db: Db, repoId: number, prNumber: number, sha: string): ReviewRunRequest['acceptanceClaims'] | null {
+  const runId = codeRunForHead(db, repoId, prNumber, sha);
+  if (!runId) return null;
+  const row = db.prepare('SELECT summary FROM runs WHERE id = ?').get(runId) as { summary: string | null } | undefined;
+  let report: RunSummary['acceptanceReport'];
+  try {
+    report = row?.summary ? (JSON.parse(row.summary) as RunSummary).acceptanceReport : undefined;
+  } catch {
+    report = undefined;
+  }
+  if (!report || typeof report.fingerprint !== 'string' || !Array.isArray(report.claims)) return null;
+  return { runId, fingerprint: report.fingerprint, claims: report.claims };
+}
+
+/**
  * Queue the reviewer job for the PR's current head, unless one exists or existed (the jobs unique
  * key and the pruned_events tombstones, as for every job). Same workflow, action and issue as the
  * job that opened the PR; the pool is chosen by reviewPoolFor (`o.pool`). Returns
@@ -323,6 +343,8 @@ export function enqueueReviewJob(
     };
     const unlisted = countOpenThreads(db, repo.id, pr.prNumber) - (review.openFindings?.length ?? 0);
     if (unlisted > 0) review.openFindingsOmitted = unlisted;
+    const claims = acceptanceClaimsFor(db, repo.id, pr.prNumber, headSha);
+    if (claims) review.acceptanceClaims = claims;
     const envelope: EventEnvelope = {
       schemaVersion: ENVELOPE_SCHEMA_VERSION,
       type: 'pull_request.review',
@@ -398,10 +420,11 @@ export function scheduleAllReviews(db: Db, config: UpdraftConfig, now?: () => nu
 /**
  * What the worker did with a verdict once its review was posted. ready: ready to merge for the
  * current head. revision-queued / over-limit / no-revise: a changes-requested verdict queued a
- * revision, met maxRevisions, or found the revision loop off. stale: the PR's head had moved on.
- * closed: the PR was no longer open.
+ * revision, met maxRevisions, or found the revision loop off. needs-verification: mandatory
+ * acceptance criteria are unverified or unclear and no revision can settle them, so a person has
+ * to (docs/acceptance.md). stale: the PR's head had moved on. closed: the PR was no longer open.
  */
-export type ReviewOutcome = 'ready' | 'revision-queued' | 'over-limit' | 'no-revise' | 'stale' | 'closed';
+export type ReviewOutcome = 'ready' | 'revision-queued' | 'over-limit' | 'no-revise' | 'needs-verification' | 'stale' | 'closed';
 
 export interface PrReview {
   runId: string;
@@ -996,6 +1019,9 @@ export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: b
     const verdictRow = pr.verdictRunId ? getPrReview(db, pr.verdictRunId) : null;
     if (verdictRow?.outcome === 'over-limit' || (pr.limitReachedAt && !verdictRow?.revisionJobId)) {
       return { stage: 'needs-human', detail: `changes were requested for ${head}, but the pull request used its ${maxRevisions} revision(s) (maxRevisions)` };
+    }
+    if (verdictRow?.outcome === 'needs-verification') {
+      return { stage: 'needs-human', detail: `${head} is held back by its acceptance criteria: ${verdictRow.outcomeDetail ?? 'some are unverified'}` };
     }
     if (verdictRow?.outcome === 'no-revise') return { stage: 'needs-human', detail: `changes were requested for ${head}, and revise is off, so nothing acts on them` };
     const job = verdictRow?.revisionJobId ? revisionJobs.find((j) => j.id === verdictRow.revisionJobId) : undefined;
