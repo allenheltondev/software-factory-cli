@@ -50,8 +50,12 @@ npx tsx scripts/claude-image-policy.ts --image 18.0 --state revoked --reason "Cr
   transferred. Existing job deadlines, quotas, stop checks, and workflow pauses
   still apply.
 - `revoked` immediately refuses subsequent broker authorization checks, even
-  for active jobs. A worker heartbeat or active-job reconciliation fences the
-  exact worker and requests physical VM termination; capacity is released only
+  for active jobs. Worker control, active-job reconciliation, and the independent
+  five-minute managed-session reconciliation fence the exact session generation
+  and request physical VM termination. Managed-session cleanup checks revocation
+  before busy/queue checks, including silent and unregistered workers. Its atomic
+  fence checks the revocation revision, so a concurrent reapproval cannot be
+  mistaken for the old emergency decision; capacity is released only
   after termination is confirmed. Already delivered credentials cannot be
   recalled, so emergency containment requires that physical stop. This is not a
   claim of instantaneous VM termination at the policy write. Queued jobs are not
@@ -73,6 +77,20 @@ must name an approved, supported image. Revoking the latest image does not cause
 automatic downgrade. The console shows the policy reason separately from auth
 failure. Waiting requests and jobs retain their normal expiry; this policy does
 not extend their lifetime.
+
+## Pending reservations and ambiguous launches
+
+Connect checks the image actually recorded in a pending reservation, then checks
+it again immediately before the ordinary AWS launch. A reservation on blocked A
+is sealed and retired before approved B can replace it. Waiting jobs survive.
+A never-launched reservation is released without launching A. If a durable launch
+marker makes the prior AWS outcome ambiguous, recovery requires the exact sealed
+generation and marker: replay its original client token to discover/quarantine
+the old VM, terminate it, and confirm termination before freeing accounting or
+starting B. That recovery replay can create a VM if the original call never
+arrived; the sealed session cannot dispatch work or issue job credentials. A
+failed replay or unconfirmed termination retains the hold for retry. No ordinary
+launch is allowed to bypass the exact-image approval check.
 
 ## Hosted acceptance still required
 

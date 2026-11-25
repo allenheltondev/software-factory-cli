@@ -568,4 +568,83 @@ describe('managed connection reservation', () => {
     expect(await mocks.queued()).toEqual(['queued-job']);
   });
 
+  it.each(['unregistered', 'silent', 'queued', 'active'] as const)('independently terminates a revoked %s session without worker cooperation', async (kind) => {
+    await managed().start(55);
+    const generation = current!.generation;
+    row = kind === 'unregistered' ? null : { ...connectedWorker(), heartbeatAt: 0 };
+    if (kind === 'queued') mocks.queued.mockResolvedValue(['never-started-job']);
+    if (kind === 'active') row!.active = { jobId: 'active-job', until: clock + 60000 };
+    mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 2, state: 'revoked', protocol: 'tenant-browser-1', reason: 'Emergency revoke' }));
+    let stopped = false;
+    mocks.vm.mockImplementation(async (command) => {
+      if (command.constructor.name === 'TerminateMicrovmCommand') { stopped = true; return {}; }
+      return { state: stopped ? 'TERMINATED' : 'RUNNING' };
+    });
+    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(stopped).toBe(true);
+    expect(current).toMatchObject({ generation, retiring: true, retirementReason: 'image-revoked' });
+    expect(mocks.retire).toHaveBeenCalledWith(55, expect.objectContaining({ generation }), expect.anything(), row, 'image-revoked', expect.objectContaining({ state: 'revoked', revision: 2 }));
+    expect(await admission.list()).toHaveLength(0);
+    if (kind === 'queued') expect(await mocks.queued()).toEqual(['never-started-job']);
+  });
+  it('retains revoked-session accounting until independent termination is confirmed', async () => {
+    await managed().start(55);
+    mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 2, state: 'revoked', protocol: 'tenant-browser-1', reason: 'Emergency revoke' }));
+    mocks.vm.mockResolvedValue({ state: 'UNKNOWN' });
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    expect(await admission.list()).toHaveLength(1);
+    mocks.vm.mockResolvedValue({ state: 'TERMINATED' });
+    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(await admission.list()).toHaveLength(0);
+  });
+  it.each(['draining', 'revoked'] as const)('replaces a pending %s A reservation with approved B before admitting a launch', async (state) => {
+    current = { generation: 'pending-A', imageVersion: '9', requestedAt: clock, admissionRequired: true };
+    await admission.reserve(55, current.generation, clock);
+    mocks.queued.mockResolvedValue(['waiting-job']);
+    mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 2, state: imageVersion === '9' ? state : 'approved', protocol: 'tenant-browser-1', reason: 'Policy update' }));
+    await managed().start(55);
+    const launches = mocks.vm.mock.calls.filter(([command]) => command instanceof RunMicrovmCommand);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]![0].input.imageVersion).toBe('10');
+    expect(current!.generation).not.toBe('pending-A');
+    expect(current!.imageVersion).toBe('10');
+    expect((await admission.list()).map((lease) => lease.generation)).toEqual([current!.generation]);
+    expect(await mocks.queued()).toEqual(['waiting-job']);
+  });
+  it.each(['draining', 'revoked'] as const)('quarantines an ambiguous %s A launch before replacement with B', async (state) => {
+    current = { generation: 'pending-A', imageVersion: '9', requestedAt: clock, admissionRequired: true };
+    await admission.reserve(55, current.generation, clock);
+    await admission.launching(current.generation, clock);
+    mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 2, state: imageVersion === '9' ? state : 'approved', protocol: 'tenant-browser-1', reason: 'Policy update' }));
+    let oldStopped = false;
+    mocks.vm.mockImplementation(async (command) => {
+      if (command instanceof RunMicrovmCommand) {
+        if (command.input.imageVersion === '9') {
+          expect(current!.retiring).toBe(true);
+          expect(command.input.clientToken).toBe('pending-A');
+          expect(await admission.get('pending-A')).toMatchObject({ retiring: true, mayHaveLaunched: true });
+          return { microvmId: 'mvm-old' };
+        }
+        expect(oldStopped).toBe(true);
+        return { microvmId: 'mvm-new' };
+      }
+      if (command.constructor.name === 'TerminateMicrovmCommand') { oldStopped = true; return {}; }
+      return { state: oldStopped ? 'TERMINATED' : 'RUNNING' };
+    });
+    await managed().start(55);
+    expect(current).toMatchObject({ imageVersion: '10', microvmId: 'mvm-new' });
+    expect((await admission.list()).map((lease) => lease.generation)).toEqual([current!.generation]);
+  });
+
+  it('checks the exact reserved image again when policy changes during connect preparation', async () => {
+    current = { generation: 'pending-A', imageVersion: '9', requestedAt: clock, admissionRequired: true };
+    await admission.reserve(55, current.generation, clock);
+    let blocked = false;
+    mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 2, state: blocked && imageVersion === '9' ? 'revoked' : 'approved', protocol: 'tenant-browser-1', reason: 'Policy changed' }));
+    mocks.secret.mockImplementation(async () => { blocked = true; return { SecretString: 'fixture-control-root-'.repeat(3) }; });
+    await expect(managed().start(55)).rejects.toThrow('Reserved Claude image cannot start');
+    expect(mocks.vm.mock.calls.filter(([command]) => command instanceof RunMicrovmCommand)).toHaveLength(0);
+    expect(await admission.get('pending-A')).toMatchObject({ mayHaveLaunched: true });
+  });
+
 });
