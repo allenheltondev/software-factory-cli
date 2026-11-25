@@ -37,7 +37,10 @@ import { renderPrompt, renderRevisionPrompt, type IssueContext } from '../agents
 import { dependencyMergedSection, dependencyProtocolSection, MAX_DEPENDENCY_WAITS, readDependency } from '../agents/dependency.js';
 import type { DeclaredDependency } from '../db/dependency-waits.js';
 import { renderReviewPrompt } from '../agents/review-prompt.js';
+import { extractCriteria, readAcceptanceReport } from '../agents/acceptance.js';
+import { coderAcceptanceSection } from '../agents/acceptance-prompt.js';
 import {
+  acceptancePolicy,
   agentAdapter,
   dependencySettings,
   DEFAULT_TIMEOUT_MINUTES,
@@ -48,7 +51,7 @@ import {
 } from '../config/schema.js';
 import { ownEntry, type Claim } from '../db/queue.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree, type PreparedWorktree } from '../git/worktree.js';
-import { resumeOf, reviewOf, revisionOf, type ReviewResult, type RunOutcome, type RunSummary, type VerificationCommandResult, type VerificationSummary } from '../types.js';
+import { resumeOf, reviewOf, revisionOf, type AcceptanceSnapshot, type ReviewResult, type RunOutcome, type RunSummary, type VerificationCommandResult, type VerificationSummary } from '../types.js';
 import {
   canceledByUser,
   findRepoConfig,
@@ -685,22 +688,33 @@ export class LiveExecutor implements Executor {
       url: ctx.issue?.url ?? env.issue.url,
     };
     const promptFile = join(runDir, 'prompt.md');
+    // The issue's acceptance criteria (docs/acceptance.md), read from the issue as this run is given
+    // it: for the reviewer to assess, and for the coding agent to implement and report on.
+    const policy = acceptancePolicy(found.repo);
+    const acceptance: AcceptanceSnapshot | null = policy ? extractCriteria(issue, policy) : null;
     // A reviewer's prompt names the base commit, which is only known once the clone was fetched (step 3).
     const reviewPrompt = (r: ReviewRunState, base: { baseBranch: string | null; baseSha: string | null }) =>
-      renderReviewPrompt(actionPrompt, issue, r.request, { headSha: r.request.headSha, baseBranch: base.baseBranch, baseSha: base.baseSha });
+      renderReviewPrompt(actionPrompt, issue, r.request, { headSha: r.request.headSha, baseBranch: base.baseBranch, baseSha: base.baseSha }, acceptance);
     await writeFile(
       promptFile,
       review
         ? reviewPrompt(review, { baseBranch: review.request.pullRequest.baseBranch, baseSha: null })
         : revision
-          ? renderRevisionPrompt(actionPrompt, issue, revision)
+          ? renderRevisionPrompt(actionPrompt, issue, revision, coderAcceptanceSection(acceptance, revision.acceptance ?? []))
           : renderPrompt(actionPrompt, issue, [
               ...(resume ? dependencyMergedSection(resume) : []),
               ...(dependencies ? dependencyProtocolSection(dependencies.repositories, { waitsLeft }) : []),
+              ...coderAcceptanceSection(acceptance),
             ]),
       'utf8',
     );
     if (ctx.issue?.withheld) await log([`issue body: withheld from the agent (${ctx.issue.withheld})`]);
+    if (acceptance) {
+      await log([
+        `acceptance: ${acceptance.criteria.length} criteria from the issue (${acceptance.source}, issue revision ${acceptance.fingerprint}, policy ${acceptance.policy})` +
+          (acceptance.omitted ? `; ${acceptance.omitted} more not listed` : ''),
+      ]);
+    }
 
     // 2. Find the CLI before touching the clone, so a missing binary leaves no worktree behind.
     const baseEnv = withoutKeys(this.opts.env ?? process.env, WITHHELD_ENV);
@@ -963,7 +977,7 @@ export class LiveExecutor implements Executor {
     // 6. Outcome.
     // Read before the stderr is appended: with separateStderr this is the agent's stdout alone.
     const outputTail = await tailLines(logPath, outputStart);
-    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || review || dependencies || revision?.findings?.length ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || review || dependencies || revision?.findings?.length || acceptance?.criteria.length ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
     const stderrText = await moveStderr();
     // What exit interpretation and summaries see: stdout, then stderr (an error is often only there).
     const rawOutput = stderrText.trim() ? (agentOutput ? `${agentOutput.replace(/\r?\n$/, '')}\n${stderrText}` : stderrText) : agentOutput;
@@ -1111,6 +1125,7 @@ export class LiveExecutor implements Executor {
           verdict: parsed.verdict,
           findings: parsed.findings,
           findingsCount: parsed.findingsCount,
+          ...(acceptance ? { acceptance } : {}),
         };
         await log([`review verdict for ${prepared.baseSha}: ${parsed.verdict}`]);
         // Telemetry only: a missing or malformed count says so here and changes nothing else.
@@ -1139,6 +1154,21 @@ export class LiveExecutor implements Executor {
       await log([`resolutions: ${read.resolutions.length} of ${revision.findings.length} finding(s) reported${read.problem ? ` (${read.problem})` : ''}`]);
     }
 
+    // 6e. A code run given acceptance criteria: the agent's report per criterion, a claim for the
+    // reviewer. Not part of the outcome; a missing report is said in run.log.
+    let acceptanceReport: RunSummary['acceptanceReport'];
+    if (!review && acceptance?.criteria.length && outcome === 'succeeded') {
+      let final: string | null | undefined;
+      try {
+        final = adapter.finalMessage ? adapter.finalMessage(agentOutput) : undefined;
+      } catch {
+        final = undefined;
+      }
+      const read = readAcceptanceReport(final ?? agentOutput, acceptance);
+      acceptanceReport = read.report ?? undefined;
+      await log([`acceptance report: ${read.report?.claims.length ?? 0} of ${acceptance.criteria.length} criteria reported${read.problem ? ` (${read.problem})` : ''}; a claim, not a verification`]);
+    }
+
     // 7. Summary.
     let summary: RunSummary | null = null;
     const tail: string[] = ['', 'summary:'];
@@ -1155,6 +1185,7 @@ export class LiveExecutor implements Executor {
       if (verification) summary.verification = verification;
       if (reviewResult) summary.review = reviewResult;
       if (resolutions) summary.resolutions = resolutions;
+      if (acceptanceReport) summary.acceptanceReport = acceptanceReport;
       tail.push(...renderSummary(detail).map((l) => `  ${l}`));
     } catch (err) {
       tail.push(`  could not summarize the run: ${message(err)}`);

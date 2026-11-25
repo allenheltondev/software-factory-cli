@@ -106,6 +106,11 @@ describe('helpers', () => {
     config.workflows.docs.label = 'docs';
     config.workflows.docs.review = { ...config.workflows.docs.review, enabled: false };
     expect(workflowConflict(config, repo)).toMatch(/review or revise pull requests differently/);
+    // The acceptance policy is part of it; unset is the CLI's default, enforce.
+    config.workflows.docs.review = { ...config.workflows.implement!.review, acceptance: 'report' };
+    expect(workflowConflict(config, repo)).toMatch(/review or revise pull requests differently/);
+    config.workflows.docs.review = { ...config.workflows.implement!.review, acceptance: 'enforce' };
+    expect(workflowConflict(config, repo)).toBeNull();
   });
 });
 

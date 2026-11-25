@@ -441,6 +441,19 @@ function WorkflowsSection({ config, onChange, view, errors, generation }: Editor
                       </Check>
                       {selfReviewNeeded && !w.review.allowSameAgent && <p className="text-sm text-error">An agent would only ever review its own work: add another agent to {w.review.pool}, or allow this.</p>}
                     </div>
+                    <Select
+                      label="Acceptance criteria"
+                      value={w.review.acceptance ?? 'enforce'}
+                      error={issuesAt(errors, `${path}.review.acceptance`)}
+                      onChange={(e) => {
+                        const acceptance = e.target.value as 'enforce' | 'report' | 'off';
+                        patch(name, { review: { ...w.review, acceptance } });
+                      }}
+                    >
+                      <option value="enforce">Enforce: not ready until every required criterion is verified</option>
+                      <option value="report">Report: show the checklist, never hold a pull request back</option>
+                      <option value="off">Off: do not check the issue's criteria</option>
+                    </Select>
                   </div>
                 )}
                 <Check checked={w.revise.enabled} onChange={(enabled) => patch(name, { revise: { ...w.revise, enabled } })}>
