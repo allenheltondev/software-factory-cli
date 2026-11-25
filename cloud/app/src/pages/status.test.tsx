@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
@@ -345,6 +345,64 @@ describe('JobPage (#71)', () => {
       showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ retryable: false }), deliveries: [] }), jobLog: vi.fn().mockResolvedValue({ name: 'run.log', text: 'x', size: 1, truncated: false }), retryJob: vi.fn() }));
       await screen.findByTestId('job-result');
       expect(screen.queryByRole('button', { name: 'Retry job' })).not.toBeInTheDocument();
+    });
+  });
+
+  describe('the summary at the top', () => {
+    const jobLog = vi.fn().mockResolvedValue({ name: 'run.log', text: 'x', size: 1, truncated: false });
+    it('counts the elapsed time up while the job runs, from its start, and labels it so', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ['Date', 'setInterval', 'clearInterval'] });
+      try {
+        const startedAt = new Date(Date.now() - 65_000).toISOString();
+        showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ status: 'launched', result: 'running', logs: [], durationSeconds: undefined, createdAt: startedAt }), deliveries: [] }), jobLog }));
+        const facts = await screen.findByTestId('job-facts');
+        expect(facts).toHaveTextContent('Elapsed');
+        expect(facts).toHaveTextContent('Running… 1:05');
+        await act(async () => {
+          vi.advanceTimersByTime(3000);
+        });
+        expect(facts).toHaveTextContent('Running… 1:08');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('shows review counts only when the runner reported them, and a dash otherwise', async () => {
+      const loop = { rounds: 1, maxRevisions: 3, reviews: 2 };
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ detail: { loop } }), deliveries: [] }), jobLog }));
+      const facts = await screen.findByTestId('job-facts');
+      expect(facts).toHaveTextContent('2 reviews');
+      expect(facts).toHaveTextContent('1 revision round of 3');
+      cleanup();
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job(), deliveries: [] }), jobLog }));
+      expect(await screen.findByTestId('job-facts')).toHaveTextContent(/Review\s*—/);
+    });
+
+    it('puts the main links in one row at the top, with the conversation link when the trace was sent', async () => {
+      const telemetry = { traceId: 'ab'.repeat(16), timelineUrl: 'https://ui.example.com/c', timelineLabel: 'Open in Agent Timeline', spans: 3, exported: 3, failed: 0 };
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ prUrl: 'https://github.com/acme/web/pull/7', telemetry }), deliveries: [] }), jobLog }));
+      const actions = await screen.findByTestId('job-actions');
+      expect(within(actions).getByRole('link', { name: 'View run log' })).toHaveAttribute('href', '#job-logs');
+      expect(within(actions).getByRole('link', { name: /Issue/ })).toHaveAttribute('href', 'https://github.com/acme/web/issues/12');
+      expect(within(actions).getByRole('link', { name: /Pull request/ })).toHaveAttribute('href', 'https://github.com/acme/web/pull/7');
+      expect(within(actions).getByRole('link', { name: /Open in Agent Timeline/ })).toHaveAttribute('href', 'https://ui.example.com/c');
+    });
+
+    it('offers no conversation link for a job that only collected telemetry locally', async () => {
+      const telemetry = { traceId: 'ab'.repeat(16), local: true, timelineUrl: 'https://ui.example.com/c', spans: 0, exported: 0, failed: 0 };
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ telemetry }), deliveries: [] }), jobLog }));
+      await screen.findByTestId('job-actions');
+      expect(screen.queryByTestId('job-hero-conversation')).not.toBeInTheDocument();
+    });
+
+    it('keeps the job id and raw outcome as quiet, copyable identifiers', async () => {
+      const user = userEvent.setup();
+      showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job(), deliveries: [] }), jobLog }));
+      const ids = await screen.findByTestId('job-identifiers');
+      expect(ids).toHaveTextContent('job_abcdefgh01');
+      expect(ids).toHaveTextContent('Outcome failed');
+      await user.click(within(ids).getByRole('button', { name: 'Copy job' }));
+      expect(await navigator.clipboard.readText()).toBe('job_abcdefgh01');
     });
   });
 
