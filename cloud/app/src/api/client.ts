@@ -680,7 +680,8 @@ export interface ConsoleWorkflow {
   pool: string;
   prompt: string;
   timeoutMinutes?: number;
-  review: { enabled: boolean; pool: string; prompt: string; allowSameAgent: boolean };
+  /** acceptance: how the issue's acceptance criteria are checked; absent means the CLI's default, enforce. */
+  review: { enabled: boolean; pool: string; prompt: string; allowSameAgent: boolean; acceptance?: 'enforce' | 'report' | 'off' };
   revise: { enabled: boolean; prompt: string; maxRevisions?: number };
 }
 
