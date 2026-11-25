@@ -254,6 +254,21 @@ describe('native worker Cloud dispatch', () => {
     expect(await control.handle(input('poll'))).toMatchObject({ ok: true, request: { microvmId: route.microvmId, payload: { broker: { jobId: next.jobId } } } });
     expect(row?.active?.jobId).toBe(next.jobId);
   });
+  it('queues an issue labeled while the worker is busy and hands it to the same VM after settlement', async () => {
+    const first = await assigned();
+    const second = (await store.getJob((await launch(request('delivery-busy'))).jobId!))!;
+    expect(second.native?.workerId).toBe(route.workerId); expect(second.microvmId).toBeUndefined();
+    expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true, busy: true, cancel: false });
+    expect(await control.handle(input('poll'))).toMatchObject({ ok: false });
+    await store.finishJob(first.jobId, 'succeeded');
+    expect(await control.complete((await store.getJob(first.jobId))!)).toBe(true);
+    expect(await control.handle(input('settled'))).toMatchObject({ ok: true, busy: false });
+    const next = await control.handle(input('poll'));
+    expect(next).toMatchObject({ ok: true, request: { microvmId: route.microvmId, payload: { broker: { jobId: second.jobId } } } });
+    expect(await control.handle(input('poll'))).toMatchObject({ ok: false });
+    expect(row).toMatchObject({ session: 'session-0123456789', active: { jobId: second.jobId } });
+    expect(terminateMicrovm).not.toHaveBeenCalled();
+  });
   it('still cancels an active job whose stop was requested before it finished', async () => {
     const job = await assigned();
     await store.markStopping(job.jobId);

@@ -23,6 +23,10 @@ import type { NativeRoute } from './route.js';
 import { createClaudeSessions, managedWorkerId } from './sessions.js';
 import { createNativeModeStore, createNativeStore } from './store.js';
 
+export const MANAGED_IDLE_POLICY = { maxIdleDurationSeconds: SESSION_SECONDS, suspendedDurationSeconds: 0, autoResumeEnabled: false };
+/** A VM in these states runs no worker loop: it cannot serve, and with no resume it never will. */
+export const SUSPENDED_STATES = ['SUSPENDING', 'SUSPENDED'];
+
 export function managedClaude(
   env = process.env,
   options: { disabled?: () => Promise<boolean>; now?: () => number; admission?: ClaudeAdmission } = {},
@@ -99,6 +103,11 @@ export function managedClaude(
         imageVersion: session.imageVersion,
         executionRoleArn,
         maximumDurationInSeconds: SESSION_SECONDS,
+        // Idle is measured by inbound endpoint traffic, and this worker only polls outward: with
+        // the service default it could be suspended minutes after sign-in, its heartbeats would
+        // stop, and the next issue would ask for sign-in again (#144). Idle for its whole life,
+        // like a job VM; never kept suspended (the image has no suspend/resume hooks).
+        idlePolicy: MANAGED_IDLE_POLICY,
         ...(logGroup ? { logging: { cloudWatch: { logGroup } } } : {}),
         ingressNetworkConnectors: [connector + 'HTTP_INGRESS'],
         egressNetworkConnectors: [connector + 'INTERNET_EGRESS'],
@@ -323,6 +332,7 @@ export function managedClaude(
           lease.retiring ||
           state === null ||
           state === 'TERMINATED' ||
+          SUSPENDED_STATES.includes(state ?? '') ||
           lifecycleState.startupFailed ||
           now() >= Math.max(lease.idleAt, (worker?.lastWorkAt ?? 0) + (lease.idleMs ?? IDLE_MS)) ||
           now() >= session.requestedAt + SESSION_SECONDS * 1000
@@ -333,9 +343,13 @@ export function managedClaude(
               ? 'disabled'
               : lifecycleState.startupFailed
                 ? 'startup-failed'
-                : state === null || state === 'TERMINATED' || now() >= session.requestedAt + SESSION_SECONDS * 1000
-                  ? 'expired'
-                  : 'idle');
+                : SUSPENDED_STATES.includes(state ?? '')
+                  ? 'suspended'
+                  : state === null || state === 'TERMINATED' || now() >= session.requestedAt + SESSION_SECONDS * 1000
+                    ? 'expired'
+                    : 'idle');
+          console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation,
+            microvmId: session.microvmId, vmState: state ?? null, reason, idleMs: lease.idleMs ?? IDLE_MS }));
           if (await retire(lease.installationId, lease.generation, reason)) released++;
         }
       } catch {

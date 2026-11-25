@@ -13,7 +13,7 @@ export interface ManagedSession {
   startupDeadline?: number;
   readyAt?: number;
   retiring?: boolean;
-  retirementReason?: 'reconnect' | 'idle' | 'expired' | 'disabled' | 'startup-failed';
+  retirementReason?: 'reconnect' | 'idle' | 'expired' | 'suspended' | 'disabled' | 'startup-failed';
   admissionRequired?: boolean;
 }
 

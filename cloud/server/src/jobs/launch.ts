@@ -116,9 +116,29 @@ export interface NativeLaunch {
   readiness?(): Promise<NativeReadiness>;
 }
 
-/** Only auth-required and expired mean the owner must sign in again; the rest wait for the worker. */
-export type NativeReadiness = 'ready' | 'image-outdated' | 'worker-missing' | 'worker-replaced' | 'fenced' | 'heartbeat-stale' | 'auth-required' | 'expired' | 'auth-unavailable';
-export const needsSignIn = (reason: NativeReadiness) => reason === 'auth-required' || reason === 'expired';
+/** Why a subscription worker is not taking a job now; see readinessAction for what it asks of the owner. */
+export type NativeReadiness = 'ready' | 'image-outdated' | 'worker-missing' | 'worker-replaced' | 'fenced' | 'heartbeat-stale'
+  | 'environment-suspended' | 'environment-ended' | 'auth-required' | 'expired' | 'auth-unavailable';
+/**
+ * sign-in: the CLI login is gone or expired. reconnect: this environment can never serve again
+ * (suspended with no resume, ended, fenced, or on a retired image). wait: a gap a healthy
+ * environment recovers from by itself; the parked job starts on the worker's next connected poll.
+ */
+export function readinessAction(reason: NativeReadiness): 'none' | 'sign-in' | 'reconnect' | 'wait' {
+  if (reason === 'ready') return 'none';
+  if (reason === 'auth-required' || reason === 'expired') return 'sign-in';
+  if (['environment-suspended', 'environment-ended', 'fenced', 'image-outdated'].includes(reason)) return 'reconnect';
+  return 'wait';
+}
+export const needsSignIn = (reason: NativeReadiness) => readinessAction(reason) === 'sign-in';
+/** The issue comment for a parked job: it asks the owner for sign-in only when auth is gone. */
+export function waitingComment(link: string, reason?: NativeReadiness): string {
+  const action = reason === undefined ? 'sign-in' : readinessAction(reason);
+  if (action === 'reconnect') return `This Updraft job is waiting because the connected Claude environment can no longer run jobs (${reason}). [Open the waiting job in Updraft](${link}) and reconnect Claude; the job resumes automatically once it is connected.`;
+  if (action === 'wait') return `This Updraft job is waiting for the connected Claude environment to become available (${reason}). It starts automatically when the environment is ready; no sign-in is needed. [Open the waiting job in Updraft](${link}).`;
+  return `This Updraft job is waiting for Claude subscription sign-in. [Open the waiting job in Updraft](${link}). An installation owner can sign in once and the job will resume automatically.`;
+}
+
 
 export interface LaunchDeps {
   benchmarkInstallationId?: number;
@@ -350,14 +370,17 @@ export function createLauncher(deps: LaunchDeps) {
     if (native && readiness) {
       // One line per dispatch decision, with no credential or account detail (#144).
       log({ delivery: req.deliveryId, installationId: req.installationId, nativeDispatch: readiness === 'ready' ? 'reuse' : 'wait',
-        readiness, generation: native.route.generation, microvmId: native.route.microvmId, imageVersion: native.route.imageVersion });
+        readiness, ownerAction: readinessAction(readiness), generation: native.route.generation, microvmId: native.route.microvmId, imageVersion: native.route.imageVersion });
     }
     if (native && readiness && readiness !== 'ready') {
       if (native.route.workerId.startsWith('managed-') && decision.issue !== undefined && !req.resumeClaude && !req.retry && deps.waitForClaude) {
         const jobId = await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness);
-        return needsSignIn(readiness)
+        const action = readinessAction(readiness);
+        return action === 'sign-in'
           ? { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Waiting for Claude subscription sign-in', jobId }
-          : { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_worker', message: `Waiting for the connected Claude environment (${readiness})`, jobId };
+          : action === 'reconnect'
+            ? { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_reconnect', message: `Waiting for Claude to be reconnected (${readiness})`, jobId }
+            : { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_worker', message: `Waiting for the connected Claude environment (${readiness})`, jobId };
       }
       return skip('not_dispatched', { reason: 'native_worker_unavailable', message: 'The Claude subscription worker is offline or needs sign-in. Reconnect it before retrying this delivery.' });
     }

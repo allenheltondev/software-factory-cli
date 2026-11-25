@@ -49,6 +49,15 @@ export async function startCloudWorker(config, microvmId, service, options = {})
   let child;
   let ended;
   let childDone = false;
+  // A status probe that cannot tell (a slow or failed `claude auth status`) is probed once more
+  // before it is reported: one unreadable probe should not park the next issue (#144). Only a
+  // fresh answer is ever sent; an earlier "connected" is never reused in its place.
+  const probeAuth = async () => {
+    const first = await service.authStatus();
+    if (first !== 'unavailable' || stopped) return first;
+    await pause(options.authRetryDelay ?? 1_000, undefined, { signal: controller.signal }).catch(() => {});
+    return stopped ? first : service.authStatus();
+  };
   let auth = await service.authStatus();
   const message = (op) => ({ op, session, microvmId, auth, imageVersion: config.imageVersion, workerVersion: config.workerVersion });
   const stopChild = async () => {
@@ -86,7 +95,7 @@ export async function startCloudWorker(config, microvmId, service, options = {})
             child = undefined;
           }
         } else {
-          auth = await service.authStatus();
+          auth = await probeAuth();
           const response = await call(message('poll'));
           if (stopped) break;
           if (response.request) {

@@ -120,7 +120,43 @@ describe('managed connection reservation', () => {
       new Set(['fixture-generation-initial']),
     );
     expect(launches.every((command) => command.input.maximumDurationInSeconds === 8 * 60 * 60)).toBe(true);
+    // The worker gets no inbound endpoint traffic: never left to the service's idle default (#144).
+    expect(launches.every((command) => JSON.stringify(command.input.idlePolicy) ===
+      JSON.stringify({ maxIdleDurationSeconds: 8 * 60 * 60, suspendedDurationSeconds: 0, autoResumeEnabled: false }))).toBe(true);
     expect(current?.microvmId).toBe('mvm-fixture');
+  });
+  const connectedWorker = (): Worker => ({ installationId: 55, workerId: 'managed-55', microvmId: 'mvm-fixture', imageVersion: '10',
+    workerVersion: 'test', version: 1, session: 'worker-session-123456', heartbeatAt: clock, auth: 'connected', lastWorkAt: clock });
+  it('keeps a connected idle session across cleanup runs minutes after its last job (#144)', async () => {
+    await managed().start(55);
+    row = connectedWorker();
+    await managed().lifecycle(55);
+    for (const minutes of [1, 5, 10, 30]) {
+      clock += minutes * 60_000;
+      row = { ...row!, heartbeatAt: clock };
+      expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    }
+    expect(mocks.retire).not.toHaveBeenCalled();
+    expect(current?.retiring).toBeUndefined();
+    expect((await managed().route(55)).microvmId).toBe('mvm-fixture');
+  });
+  it.each(['SUSPENDING', 'SUSPENDED'])('retires a %s environment with that precise reason', async (vmState) => {
+    let stopped = false;
+    mocks.vm.mockImplementation(async (command) => {
+      if (command instanceof RunMicrovmCommand) return { microvmId: 'mvm-fixture' };
+      if (command.constructor.name === 'TerminateMicrovmCommand') { stopped = true; return {}; }
+      return { state: stopped ? 'TERMINATED' : current?.readyAt ? vmState : 'RUNNING' };
+    });
+    await managed().start(55);
+    row = connectedWorker();
+    await managed().lifecycle(55);
+    clock += 60_000;
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(mocks.retire).toHaveBeenCalledWith(55, expect.anything(), expect.anything(), expect.anything(), 'suspended');
+    expect(stopped).toBe(true);
+    expect(logs.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual(expect.objectContaining({ claudeSession: 'retire', reason: 'suspended', vmState }));
+    logs.mockRestore();
   });
   it('reuses a healthy worker without reserving or launching another environment', async () => {
     current = { generation: 'existing', imageVersion: '10', requestedAt: Date.now(), microvmId: 'mvm-existing' };
