@@ -172,6 +172,7 @@ function parseBrokerPayload(payload) {
     deliveryId: text(payload.deliveryId, 'deliveryId', DELIVERY_ID_PATTERN),
     eventName: text(payload.eventName, 'eventName', EVENT_NAME_PATTERN),
     region: text(payload.region, 'region', /^[a-z0-9-]{1,32}$/),
+    ...consoleOriginField(payload.consoleOrigin),
     broker: {
       functionName: text(broker.functionName, 'broker.functionName', /^[A-Za-z0-9:_./-]{1,170}$/),
       jobId: text(broker.jobId, 'broker.jobId', /^[A-Za-z0-9_-]{8,64}$/),
@@ -274,4 +275,16 @@ function readBody(req) {
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+/** Optional: the deployment's console origin, for the job link in assignment comments. Malformed: left out. */
+function consoleOriginField(value) {
+  if (typeof value !== 'string' || value.length > 256) return {};
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password || url.origin !== value) return {};
+    return { consoleOrigin: url.origin };
+  } catch {
+    return {};
+  }
 }

@@ -713,6 +713,25 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2 (job broker)', () => {
     expect(calls.find(([name]) => name === 'finishJob')).toEqual(['finishJob', 'succeeded']);
   });
 
+  it('gives run-event the Cloud job link context, and none of it without a trusted console origin', async () => {
+    const linked = brokerDeps('success');
+    const req = brokerRequest();
+    req.payload.consoleOrigin = 'https://updraft.readysetcloud.io';
+    expect((await runJob(req, linked.deps)).outcome).toBe('succeeded');
+    expect(JSON.parse(fs.readFileSync(recordFile, 'utf8')).env).toMatchObject({
+      UPDRAFT_CONSOLE_ORIGIN: 'https://updraft.readysetcloud.io',
+      UPDRAFT_CLOUD_INSTALLATION_ID: '55',
+      UPDRAFT_CLOUD_JOB_ID: 'job_abc12345',
+    });
+
+    fs.rmSync(recordFile, { force: true });
+    const plain = brokerDeps('success');
+    expect((await runJob(brokerRequest(), plain.deps)).outcome).toBe('succeeded');
+    const env = JSON.parse(fs.readFileSync(recordFile, 'utf8')).env;
+    expect(env).not.toHaveProperty('UPDRAFT_CONSOLE_ORIGIN');
+    expect(env).not.toHaveProperty('UPDRAFT_CLOUD_JOB_ID');
+  });
+
   it('replaces the token file while the job runs', async () => {
     const { deps, calls } = brokerDeps('slow-state', {
       deps: { tokenRefreshMs: 40 },

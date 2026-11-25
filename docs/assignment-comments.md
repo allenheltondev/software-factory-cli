@@ -21,7 +21,12 @@ Values are escaped for a Markdown table.
 ## Job link
 
 Hosted runs (`updraft run-event` started by the Updraft runner, for API-key MicroVMs and native
-subscription workers alike) receive three nonsecret environment variables:
+subscription workers alike) receive three nonsecret environment variables. Operators do not set
+them by hand: the Cloud launcher puts the deployment's console origin (`UPDRAFT_CONSOLE_ORIGIN` on
+the launching Lambdas, from the stack's `AppDomainName`, or `ManagedClaudeConsoleOrigin` when set;
+empty means no link) in the run-hook payload as `consoleOrigin`, and the runner sets the variables
+for every try of `run-event`, from that origin, the broker's job id (the Cloud job id, the same for
+retries and for every local run of the job) and the installation id in the broker's token file:
 `UPDRAFT_CONSOLE_ORIGIN` (the deployment's trusted console origin, https; production is
 `https://updraft.readysetcloud.io`, staging and self-hosted deployments set their own),
 `UPDRAFT_CLOUD_INSTALLATION_ID` and `UPDRAFT_CLOUD_JOB_ID`. With all three valid, the comment links

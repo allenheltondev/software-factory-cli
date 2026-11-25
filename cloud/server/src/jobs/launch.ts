@@ -87,6 +87,8 @@ export interface LaunchSettings {
   egressConnectorArn: string;
   logGroup: string;
   brokerFunctionName: string;
+  /** The deployment's trusted console origin (https), for job links in GitHub comments; absent: plain IDs. */
+  consoleOrigin?: string;
   maximumDurationSeconds: number;
   watchdogReserveSeconds: number;
 }
@@ -561,6 +563,16 @@ type HookJob = { jobId: string; token: string; deliveryId: string; launchedAt: n
  * broker. `notBefore`: a pull request job's coalescing lease ends then, and the runner starts the
  * run no earlier.
  */
+function validConsoleOrigin(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    const u = new URL(value);
+    return u.protocol === 'https:' && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+}
+
 export function runHookPayload(s: LaunchSettings, job: HookJob) {
   return {
     version: RUN_HOOK_PAYLOAD_VERSION,
@@ -570,6 +582,7 @@ export function runHookPayload(s: LaunchSettings, job: HookJob) {
     ...(job.retry ? { retry: true } : {}),
     region: s.region,
     broker: { functionName: s.brokerFunctionName, jobId: job.jobId, jobToken: job.token },
+    ...(validConsoleOrigin(s.consoleOrigin) ? { consoleOrigin: new URL(s.consoleOrigin!).origin } : {}),
     maximumDurationSeconds: s.maximumDurationSeconds,
     watchdogReserveSeconds: s.watchdogReserveSeconds,
     launchedAt: new Date(job.launchedAt).toISOString(),

@@ -1,4 +1,5 @@
 /* global fetch */
+import { parseRunRequest } from '../image/runner/hooks.mjs';
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HOOK_BASE_PATH, createHookHandler, parseRunRequest } from '../image/runner/hooks.mjs';
@@ -106,6 +107,21 @@ describe('lifecycle hook routing', () => {
     // A later valid /run still works: a rejected request does not use up the one start.
     expect((await hook('run', runBody())).status).toBe(200);
     expect(calls.started).toHaveLength(1);
+  });
+
+  it('keeps a valid https consoleOrigin of a version 2 payload and drops anything else', () => {
+    const v2 = (extra) => ({
+      microvmId: 'mvm-1',
+      runHookPayload: JSON.stringify({
+        version: 2, deliveryId: 'd-1', eventName: 'issues', region: 'us-east-1',
+        broker: { functionName: 'broker', jobId: 'job_abc12345', jobToken: 'x'.repeat(43) },
+        maximumDurationSeconds: 3600, watchdogReserveSeconds: 60, launchedAt: '2026-01-02T03:04:05.000Z', ...extra,
+      }),
+    });
+    expect(parseRunRequest(v2({ consoleOrigin: 'https://updraft.readysetcloud.io' })).payload.consoleOrigin).toBe('https://updraft.readysetcloud.io');
+    for (const bad of ['http://x.io', 'https://x.io/path', 'https://u:p@x.io', 'junk', 5]) {
+      expect(parseRunRequest(v2({ consoleOrigin: bad })).payload).not.toHaveProperty('consoleOrigin');
+    }
   });
 
   it('rejects an oversized /run body', async () => {
