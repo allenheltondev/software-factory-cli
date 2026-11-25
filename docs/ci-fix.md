@@ -120,9 +120,15 @@ and "needs a human" says why when the CI step stopped. Revision jobs for checks 
 `(revision of PR #n, to fix failed checks)`, and their change requests `(failed checks)`. The
 same stages are in `updraft run-event`'s summary and in Updraft Cloud's job view.
 
-On the pull request, one comment per head says that a fix was queued (which checks failed,
-with links, and how many automatic fixes there were) or why a person has to act. The
-revision's own reply follows its push, as for any revision.
+On the pull request, one comment per head, headed **Updraft · CI** and the commit, says that a
+fix was queued (which checks failed, each linked to its run on GitHub even when its log could
+not be read, and how many automatic fixes there were) or why a person has to act. The
+revision's own reply follows its push: the **Coding agent** names the commit the checks failed
+on and links the commit it pushed, as its account, not a verification. Its push is reviewed
+again, and once the review agent finds the new head ready and its checks pass, one more
+**Updraft · CI** comment for that head says so, and that the pull request is ready for a person
+to merge (or that Updraft merges it, with auto-merge on). A head whose checks passed without
+any CI fix of the pull request gets no comment: the review already said what happens next.
 
 ## State and recovery
 

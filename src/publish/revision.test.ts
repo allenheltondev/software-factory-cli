@@ -596,6 +596,38 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     expect(getRevision(s.db, s.runId)).toMatchObject({ state: 'skipped', headSha: null });
   });
 
+  it('answers a CI fix as the Coding agent, naming the failed head and linking the commit it pushed, not as a change request', async () => {
+    const p = await published();
+    const failedSha = 'a'.repeat(40);
+    const ci = (base: RevisionRequest): RevisionRequest => ({
+      ...base,
+      trigger: 'ci_failure',
+      reviewedSha: failedSha,
+      review: { ...base.review, url: `https://github.com/${FULL}/runs/7`, author: 'updraft-bot[bot]', headSha: failedSha },
+    });
+    const s = await revised(p, { req: ci(request(p)) });
+    const api = new FakeCommentsApi();
+    expect((await reviseRun(deps(s, api), s.runId)).status).toBe('published');
+    const reply = api.comments[0]!.body;
+    expect(reply).toMatch(
+      new RegExp(
+        `^\\*\\*Coding agent\\*\\* · pushed 1 commit\\(s\\) to fix the checks that failed on \`${failedSha.slice(0, 12)}\` \\(https://github.com/${FULL}/runs/7\\); ` +
+          `the pull request is now at \\[\`${s.localSha.slice(0, 12)}\`\\]\\(https://github.com/${FULL}/commit/${s.localSha}\\)\\.`,
+      ),
+    );
+    expect(reply).toMatch(/not a verification: the review agent reviews the new head, and Updraft · CI reads its checks again/);
+    expect(reply).not.toContain('changes requested by');
+
+    // A CI fix that changed nothing says the checks stay failed and who acts next.
+    const q = await published();
+    const none = await revised(q, { commits: 0, req: ci(request(q)) });
+    const api2 = new FakeCommentsApi();
+    expect((await reviseRun(deps(none, api2), none.runId)).status).toBe('skipped');
+    expect(api2.comments[0]!.body).toMatch(new RegExp(`a revision for the checks that failed on \`${failedSha.slice(0, 12)}\`.*made no commits`));
+    expect(api2.comments[0]!.body).toMatch(/fixing them is up to a person/);
+    expect(api2.comments[0]!.body).not.toContain('changes requested by');
+  });
+
   it('pushes nothing to a PR that was closed while the revision ran', async () => {
     const s = await revised(await published());
     s.db.prepare("UPDATE revision_prs SET state = 'closed'").run();

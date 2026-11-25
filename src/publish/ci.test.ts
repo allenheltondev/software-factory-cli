@@ -240,6 +240,11 @@ describe('the CI step after a clean review', () => {
     expect(s.ciComments()).toHaveLength(1);
     expect(s.ciComments()[0]!.body).toContain(ciNoticeMarker(H1));
     expect(s.ciComments()[0]!.body).toMatch(/queued a revision to fix them/);
+    // Spoken as Updraft · CI, with each failed check linked, also without reading its log.
+    expect(s.ciComments()[0]!.body).toMatch(new RegExp(`^\\*\\*Updraft · CI · \`${H1.slice(0, 12)}\`\\*\\*`));
+    expect(s.ciComments()[0]!.body).toContain(`- [\`test\`](https://github.com/${FULL}/runs/7) (check run: failure)`);
+    expect(s.ciComments()[0]!.body).toContain(`- [\`lint\`](https://github.com/${FULL}/runs/8) (check run: failure)`);
+    expect(s.ciComments()[0]!.body).not.toContain('`build`');
     // Nothing was merged or marked ready for the failing head.
     expect(s.gh.merges).toEqual([]);
     await evaluateAutoMerges(s.deps);
@@ -263,9 +268,43 @@ describe('the CI step after a clean review', () => {
     s.gh.checks = checksOf([run('build', 'success', 11), run('test', 'success', 12), run('lint', 'success', 13)]);
     s.tick(CI_POLL_MS);
     expect(await s.ci()).toMatchObject([{ status: 'passed' }]);
+    // The outcome of the fix is said on the pull request, once, for the fixed head.
+    expect(s.ciComments()).toHaveLength(2);
+    const passed = s.ciComments()[1]!.body;
+    expect(passed).toContain(ciNoticeMarker(H2));
+    expect(passed).toMatch(new RegExp(`^\\*\\*Updraft · CI · \`${H2.slice(0, 12)}\`\\*\\*`));
+    expect(passed).toMatch(/checks passed on commit .* after 1 automatic CI fix\(es\).*review and checks are both clean on it/s);
+    expect(passed).toMatch(/Updraft merges it \(`squash`\) if nothing else stands in the way/);
+    await s.ci(true);
+    expect(s.ciComments()).toHaveLength(2);
     // Merged only now: review and checks green on the same head.
     await evaluateAutoMerges(s.deps);
     expect(s.gh.merges).toEqual([{ sha: H2, method: 'squash' }]);
+  });
+
+  it('says a fixed head passed and is ready for a person when auto-merge is off; a head that passed without a fix gets no comment', async () => {
+    const s = setup();
+    s.gh.checks = checksOf([run('build', 'success', 1)]);
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'passed' }]);
+    expect(s.ciComments()).toEqual([]);
+
+    const t = setup();
+    // A failed check whose link is not one GitHub would give is named, not linked.
+    t.gh.checks = checksOf([run('test', 'failure', 7, { url: 'javascript:alert(1)' })]);
+    await t.review('ready-to-merge');
+    await t.ci();
+    expect(t.ciComments()).toHaveLength(1);
+    expect(t.ciComments()[0]!.body).toContain('- `test` (check run: failure)');
+    expect(t.ciComments()[0]!.body).not.toContain('javascript:');
+    const [job] = t.queued();
+    t.revised(job!, H2);
+    t.gh.checks = checksOf([run('test', 'success', 12)]);
+    await t.review('ready-to-merge');
+    expect(await t.ci()).toMatchObject([{ status: 'passed' }]);
+    expect(t.ciComments()).toHaveLength(2);
+    expect(t.ciComments()[1]!.body).toMatch(/It is ready for a person to merge\./);
+    expect(t.ciComments()[1]!.body).not.toMatch(/Updraft merges it/);
   });
 
   it('never fixes a head the pull request moved on from, and drops a fix whose head moved', async () => {

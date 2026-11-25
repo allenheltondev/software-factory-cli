@@ -875,13 +875,17 @@ export function setCiState(db: Db, repoId: number, prNumber: number, sha: string
   return Number(changes) > 0;
 }
 
-/** Open PRs whose CI step queued a fix or stopped for a person, and whose one comment about that head is still to be posted. */
+/**
+ * Open PRs whose CI step queued a fix or stopped for a person, or whose checks passed after an
+ * automatic CI fix of the pull request (the outcome of that fix), and whose one comment about that
+ * head is still to be posted. A head that passed without any CI fix gets no comment.
+ */
 export function listPendingCiNotices(db: Db, maxAttempts: number): LoopPr[] {
   return (
     db
       .prepare(
         `SELECT * FROM revision_prs
-         WHERE state = 'open' AND ci_state IN ('fixing', 'blocked') AND ci_sha IS NOT NULL
+         WHERE state = 'open' AND (ci_state IN ('fixing', 'blocked') OR (ci_state = 'passed' AND ci_fixes > 0)) AND ci_sha IS NOT NULL
            AND (ci_comment_sha IS NULL OR ci_comment_sha != ci_sha) AND ci_comment_attempts < ?
          ORDER BY updated_at`,
       )
