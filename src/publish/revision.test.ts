@@ -626,6 +626,21 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     expect(api2.comments[0]!.body).toMatch(new RegExp(`a revision for the checks that failed on \`${failedSha.slice(0, 12)}\`.*made no commits`));
     expect(api2.comments[0]!.body).toMatch(/fixing them is up to a person/);
     expect(api2.comments[0]!.body).not.toContain('changes requested by');
+
+    // A status's target URL is set by whatever wrote the status: only a plain https link is shown.
+    const r = await published();
+    const unsafe = (base: RevisionRequest): RevisionRequest => ({ ...ci(base), review: { ...ci(base).review, url: 'javascript:alert(1)' } });
+    const bad = await revised(r, { req: unsafe(request(r)) });
+    const api3 = new FakeCommentsApi();
+    expect((await reviseRun(deps(bad, api3), bad.runId)).status).toBe('published');
+    expect(api3.comments[0]!.body).toMatch(new RegExp(`to fix the checks that failed on \`${failedSha.slice(0, 12)}\`; the pull request is now at`));
+    expect(api3.comments[0]!.body).not.toContain('javascript:');
+    const t = await published();
+    const badNone = await revised(t, { commits: 0, req: unsafe(request(t)) });
+    const api4 = new FakeCommentsApi();
+    await reviseRun(deps(badNone, api4), badNone.runId);
+    expect(api4.comments[0]!.body).toMatch(new RegExp(`a revision for the checks that failed on \`${failedSha.slice(0, 12)}\`, but`));
+    expect(api4.comments[0]!.body).not.toContain('javascript:');
   });
 
   it('pushes nothing to a PR that was closed while the revision ran', async () => {

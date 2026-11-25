@@ -48,6 +48,7 @@ import { code } from './failure-comment.js';
 import { runDetails, selectionLine } from './run-details.js';
 import { safeMarkdown } from './markdown.js';
 import { answerFindings, commitUrl } from './threads.js';
+import { checkLink } from './ci.js';
 import { workerLogin } from '../github/identity.js';
 import {
   cap,
@@ -190,9 +191,13 @@ function withMarker(lines: string[], marker: string): string {
  * person: its "review" is the worker's own summary of them, so it is not named as a change request.
  */
 function askedFor(review: RevisionRequest['review'], trigger: RevisionRequest['trigger'] | undefined): string {
-  return trigger === 'ci_failure'
-    ? `the checks that failed on ${code(short(review.headSha ?? '?'))} (${review.url})`
-    : `the changes requested by ${code(review.author)} in ${review.url}`;
+  if (trigger === 'ci_failure') {
+    // A CI fix's URL is a failed check's or a commit status's target, which any integration that
+    // can write statuses sets: linked only when it is a plain https link, else left out.
+    const link = checkLink(review.url);
+    return `the checks that failed on ${code(short(review.headSha ?? '?'))}${link ? ` (${link})` : ''}`;
+  }
+  return `the changes requested by ${code(review.author)} in ${review.url}`;
 }
 
 /** The reply after a push: the new commits, the verification result and the agent's final message, all inert. */

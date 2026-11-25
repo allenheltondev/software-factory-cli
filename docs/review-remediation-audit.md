@@ -135,6 +135,15 @@ item 14). It sorts each requirement and acceptance criterion into one of three k
   configured method. A head that passes without any CI fix gets no comment: the review already said
   what follows, so there is no extra noise. No schema change; the existing `ci_comment_*` columns
   and their shared-state merge rule are reused.
+- **Upgrades:** a PR whose fix was queued before this version gets no late "passed" comment. The
+  check is whether the worker's CI comment on that PR has the new `Updraft · CI` heading. If it
+  doesn't, the head is recorded as said (`recordCiNotice` `{ skipped: true }`) and not looked at
+  again. A schema migration was not used because it would make older CLIs refuse the shared
+  state database.
+- **Link safety:** a CI fix's check or status URL can be set by any integration that can write
+  statuses. The reply shows it only through `checkLink` (https only, no userinfo, characters that
+  would end the link escaped) and leaves it out otherwise. Tested with a `javascript:` URL in both
+  the pushed and the no-commit replies.
 - **Tests (`src/publish/ci.test.ts`):** the existing end-to-end test now checks the "passed"
   comment for the fixed head with auto-merge on, and that it is not posted twice. A new test covers
   auto-merge off ("ready for a person to merge") and no comment for a head that passed without a

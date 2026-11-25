@@ -129,6 +129,10 @@ again, and once the review agent finds the new head ready and its checks pass, o
 **Updraft · CI** comment for that head says so, and that the pull request is ready for a person
 to merge (or that Updraft merges it, with auto-merge on). A head whose checks passed without
 any CI fix of the pull request gets no comment: the review already said what happens next.
+Neither does a pull request whose fix was queued by an earlier version of Updraft (its CI
+comment has no **Updraft · CI** heading): the outcome is recorded as said, with no late comment.
+A failed check's link, in the comment and in the coding agent's reply, is shown only when it is
+a plain https link: a commit status's target is set by whatever wrote the status.
 
 ## State and recovery
 

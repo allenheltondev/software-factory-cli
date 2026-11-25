@@ -305,6 +305,31 @@ describe('the CI step after a clean review', () => {
     expect(t.ciComments()).toHaveLength(2);
     expect(t.ciComments()[1]!.body).toMatch(/It is ready for a person to merge\./);
     expect(t.ciComments()[1]!.body).not.toMatch(/Updraft merges it/);
+    expect(t.ciComments()[1]!.body).toContain('after 1 automatic CI fix(es) on this pull request');
+  });
+
+  it('never comments late on a pull request whose CI fix was queued before this version', async () => {
+    const s = setup();
+    s.gh.checks = checksOf([FAILED_TEST]);
+    await s.review('ready-to-merge');
+    await s.ci();
+    expect(s.ciComments()).toHaveLength(1);
+    // The fix's comment as an earlier version wrote it: no Updraft · CI heading.
+    const old = s.ciComments()[0]!;
+    old.body = old.body.replace(/^\*\*Updraft · CI · [^\n]*\n\n/, '');
+    expect(old.body).toMatch(/^The review passed, but GitHub's checks failed/);
+    const [job] = s.queued();
+    s.revised(job!, H2);
+    s.gh.checks = checksOf([run('test', 'success', 12)]);
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'passed' }]);
+    // Nothing posted, and recorded as said: never looked for again.
+    expect(s.ciComments()).toHaveLength(1);
+    expect(s.pr()).toMatchObject({ ciSha: H2, ciState: 'passed', ciCommentSha: H2, ciCommentId: null });
+    s.gh.calls.length = 0;
+    await s.ci(true);
+    expect(s.gh.calls.filter((c) => c.startsWith('listIssueComments') || c.startsWith('createIssueComment'))).toEqual([]);
+    expect(s.ciComments()).toHaveLength(1);
   });
 
   it('never fixes a head the pull request moved on from, and drops a fix whose head moved', async () => {
