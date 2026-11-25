@@ -92,6 +92,21 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
 }
 
 describe('status and diagnostics (#71)', () => {
+  it('reports telemetry status unknown, not unconfigured, when the settings read fails', async () => {
+    const { store, get } = await setup();
+    await store.putJob(job({ jobId: 'job_tel00001', status: 'finished', outcome: 'succeeded' }));
+    const ok = await get('55/jobs/job_tel00001');
+    expect((ok.body.job as { telemetryStatus: string }).telemetryStatus).toBe('not_configured');
+    store.getTelemetry = async () => {
+      throw new Error('dynamo down');
+    };
+    const failed = await get('55/jobs/job_tel00001');
+    expect(failed.status).toBe(200);
+    expect((failed.body.job as { telemetryStatus: string }).telemetryStatus).toBe('unknown');
+    const list = await get('55/jobs');
+    expect((list.body.jobs as { telemetryStatus: string }[])[0]!.telemetryStatus).toBe('unknown');
+  });
+
   describe('the overview', () => {
     it('shows an active installation with its repositories, config, keys and activity', async () => {
       const { store, get } = await setup();
