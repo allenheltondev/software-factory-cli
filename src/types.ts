@@ -156,6 +156,22 @@ export interface ReviewSnapshot {
   headSha?: string;
 }
 
+/**
+ * A finding of Updraft's reviewer that a revision answers (docs/review-loop.md, "Findings as
+ * threads"): the reviewer's text (untrusted) and the thread it is discussed in. `key` names the
+ * thread: the coding agent reports on each key.
+ */
+export interface RevisionFinding {
+  key: string;
+  severity: 'blocker' | 'suggestion';
+  title: string;
+  problem: string;
+  suggestion: string | null;
+  path: string | null;
+  line: number | null;
+  threadUrl: string | null;
+}
+
 /** The revision a pull_request.changes_requested job carries out. */
 export interface RevisionRequest {
   trigger: RevisionTriggerKind;
@@ -171,6 +187,8 @@ export interface RevisionRequest {
    * revision is dropped as stale unless the pull request is still at this commit when it starts.
    */
   reviewedSha?: string;
+  /** updraft_review with structured findings: each one to report on. Absent for a legacy review, a person's review and a CI fix. */
+  findings?: RevisionFinding[];
 }
 
 /** What Updraft's reviewer concluded about one head commit. Anything else is not a verdict. */
@@ -201,6 +219,25 @@ export interface ReviewRunRequest {
   priorReviews: PriorReviewSnapshot[];
   /** Change requests by allowed actors that queued a revision of this PR, oldest first, as snapshotted when each was ingested. */
   changeRequests: ReviewSnapshot[];
+  /**
+   * Structured findings of earlier rounds that no reviewer has verified yet, oldest first, with the
+   * coding agent's report on each (a claim): what this reviewer checks. Absent before findings existed.
+   */
+  openFindings?: OpenFindingSnapshot[];
+}
+
+/** An earlier finding to re-check (docs/review-loop.md, "Findings as threads"). Its text and report are untrusted. */
+export interface OpenFindingSnapshot {
+  key: string;
+  severity: 'blocker' | 'suggestion';
+  title: string;
+  problem: string;
+  path: string | null;
+  line: number | null;
+  /** What a reviewer last found, if any. */
+  status: 'open' | 'unresolved';
+  /** The coding agent's report, if a revision answered it. */
+  resolution: { status: 'fixed' | 'disagreed' | 'deferred' | 'unable' | 'unreported'; note: string | null; sha: string } | null;
 }
 
 /** The reviewer run a job carries out, or null for any other job. */
@@ -326,6 +363,8 @@ export interface RunSummary {
   verification?: VerificationSummary;
   /** A reviewer run only: the commit it reviewed and what it concluded. Absent when no verdict could be read. */
   review?: ReviewResult;
+  /** A revision of structured findings only: the agent's own report per finding key (a claim, never a check). */
+  resolutions?: { finding: string; status: 'fixed' | 'disagreed' | 'deferred' | 'unable'; note: string | null; tests: string | null }[];
 }
 
 /** The parsed result of a reviewer run. `findings` is the reviewer's text before the verdict line: untrusted. */

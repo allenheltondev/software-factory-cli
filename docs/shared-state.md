@@ -159,6 +159,7 @@ adding its rule and its row here.
 | `revisions` | `run_id` | As `failure_comments`, for `published` and `skipped` |
 | `pr_reviews` | `run_id` | As `revisions` |
 | `dependency_waits` | `run_id` | Inserted only when its run is in `--into`. A wait that has ended there (`resumed`, `closed`, `canceled` or `expired`) is never replaced by one still `waiting`; otherwise the later `updated_at` wins (this run on a tie). [Waits](dependencies.md) are only checked by `updraft start` |
+| `review_findings` | `repo_id, pr_number, finding_key` | The later `updated_at` wins (this run on a tie): a finding only gains a thread, the coding agent's report and a reviewer's check over time |
 | `revision_prs` | `repo_id, pr_number` | A merged row beats an unmerged one, and a closed row an open one. Between two open rows the later `updated_at` wins, as a whole row. (A [reconstructed](#reconstructed-rows) row carries the epoch as its `updated_at`, so every recorded row is later) |
 | `review_requests` | `repo_id, review_id` | The decision recorded first stands: `--into`'s row is kept |
 | `pruned_events` | `repo_id, workflow_id, event_id` | Tombstones are only ever added; an existing one is kept as it is |

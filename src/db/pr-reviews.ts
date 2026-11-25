@@ -5,6 +5,7 @@
 //
 // The PRs are the rows of revision_prs (src/db/revisions.ts): one row per PR Updraft opened,
 // shared with the revision loop. The columns this module owns were added by migration 11.
+import { openThreads } from './review-findings.js';
 import { allowedActorsFor, reviewActive, reviewPoolFor, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import {
   ENVELOPE_SCHEMA_VERSION,
@@ -309,6 +310,16 @@ export function enqueueReviewJob(
       originalEventId: pr.originalEventId,
       priorReviews: priorReviews(db, repo.id, pr.prNumber),
       changeRequests: humanChangeRequests(db, repo.id, pr.prNumber, o.allowedActors),
+      openFindings: openThreads(db, repo.id, pr.prNumber).map((f) => ({
+        key: f.key,
+        severity: f.severity,
+        title: f.title,
+        problem: cap(f.problem, 2_000),
+        path: f.path,
+        line: f.line,
+        status: f.status === 'unresolved' ? ('unresolved' as const) : ('open' as const),
+        resolution: f.resolution && f.resolutionSha ? { status: f.resolution, note: f.resolutionNote, sha: f.resolutionSha } : null,
+      })),
     };
     const envelope: EventEnvelope = {
       schemaVersion: ENVELOPE_SCHEMA_VERSION,

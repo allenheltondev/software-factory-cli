@@ -77,6 +77,7 @@ import { APP_KEY_PATH_ENV, APP_TOKEN_FILE_ENV } from '../github/app-auth.js';
 import { commitIdentityEnv, type CommitIdentity } from '../github/credentials.js';
 import { processStartTime, taskkillPath } from './process.js';
 import { discardReviewWorktree, readReviewVerdict, reviewBase, type ReviewRunState } from './review-run.js';
+import { readResolutions } from '../agents/findings.js';
 import { cleanSummaryLines, countUncommitted, hasSubmodules, headCommit, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 import { ESCALATION_MARKER } from '../escalation/escalation.js';
 import { displayVerifyCommand, verifyInvocation, type VerifyInvocation } from './verify.js';
@@ -962,7 +963,7 @@ export class LiveExecutor implements Executor {
     // 6. Outcome.
     // Read before the stderr is appended: with separateStderr this is the agent's stdout alone.
     const outputTail = await tailLines(logPath, outputStart);
-    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || review || dependencies ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || review || dependencies || revision?.findings?.length ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
     const stderrText = await moveStderr();
     // What exit interpretation and summaries see: stdout, then stderr (an error is often only there).
     const rawOutput = stderrText.trim() ? (agentOutput ? `${agentOutput.replace(/\r?\n$/, '')}\n${stderrText}` : stderrText) : agentOutput;
@@ -1122,6 +1123,22 @@ export class LiveExecutor implements Executor {
       }
     }
 
+    // 6d. A revision of structured findings: the agent's report per finding, from its final
+    // message. Not part of the outcome: a missing or unreadable report is said in run.log, and
+    // each finding is then answered as unreported once the push is confirmed.
+    let resolutions: RunSummary['resolutions'];
+    if (revision?.findings?.length && outcome === 'succeeded') {
+      let final: string | null | undefined;
+      try {
+        final = adapter.finalMessage ? adapter.finalMessage(agentOutput) : undefined;
+      } catch {
+        final = undefined;
+      }
+      const read = readResolutions(final ?? agentOutput, new Set(revision.findings.map((f) => f.key)));
+      resolutions = read.resolutions;
+      await log([`resolutions: ${read.resolutions.length} of ${revision.findings.length} finding(s) reported${read.problem ? ` (${read.problem})` : ''}`]);
+    }
+
     // 7. Summary.
     let summary: RunSummary | null = null;
     const tail: string[] = ['', 'summary:'];
@@ -1137,6 +1154,7 @@ export class LiveExecutor implements Executor {
       summary = detail.summary;
       if (verification) summary.verification = verification;
       if (reviewResult) summary.review = reviewResult;
+      if (resolutions) summary.resolutions = resolutions;
       tail.push(...renderSummary(detail).map((l) => `  ${l}`));
     } catch (err) {
       tail.push(`  could not summarize the run: ${message(err)}`);

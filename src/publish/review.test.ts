@@ -24,6 +24,9 @@ import { postFailureComment } from './failure-comment.js';
 import { evaluateAutoMerges, mergeBlockedMarker, outstandingChangeRequests, postMergeNotices } from './merge.js';
 import { publishRun, type PublishDeps } from './publish.js';
 import { createReviewLoopPublisher, postReview, reviewMarker } from './review.js';
+import { findingsOfRun, getFinding, recordResolution } from '../db/review-findings.js';
+import { renderReviewPrompt } from '../agents/review-prompt.js';
+import { findingMarker } from './threads.js';
 import { postLimitNotices } from './revision.js';
 
 const REPO_ID = 42;
@@ -541,6 +544,195 @@ describe('postReview', () => {
     await publisher.retryDue();
     expect(inner).toEqual(['run_original', 'retryDue']);
     expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+  });
+});
+
+const PATCH = ['@@ -1,3 +1,4 @@', ' line1', '-old2', '+new2', '+new3', ' line4'].join('\n');
+const structuredFindings = (data: unknown, prose = 'Two problems with the retire path.') => `${prose}\n\n\`\`\`updraft-findings\n${JSON.stringify(data)}\n\`\`\`\nUPDRAFT-FINDINGS: 3`;
+const THREE = {
+  findings: [
+    { id: 'F1', severity: 'blocker', title: 'Generation not checked', path: 'src/a.ts', line: 3, problem: 'Retiring does not check the generation, so a stale worker is retired.', suggestion: 'Compare generations first.' },
+    { id: 'F2', severity: 'blocker', title: 'Docs are stale', path: 'docs/pool.md', line: 10, problem: 'The doc still says retire is unconditional.' },
+    { id: 'F3', severity: 'suggestion', title: 'Add a race test', problem: 'A test for the race would keep it fixed.' },
+  ],
+};
+
+describe('findings as threads', () => {
+  const withDiff = () => {
+    const s = setup();
+    s.gh.files = [{ path: 'src/a.ts', status: 'modified', patch: PATCH }];
+    return s;
+  };
+  const post = async (s: ReturnType<typeof setup>, verdict: ReviewVerdict, findings: string) => {
+    const [job] = s.schedule();
+    const runId = s.reviewed(job!, verdict, findings);
+    return { runId, result: await postReview(s.deps, runId) };
+  };
+
+  it('posts one review: located findings as inline threads, the rest in its summary, and hands the revision each finding', async () => {
+    const s = withDiff();
+    const { runId, result } = await post(s, 'changes-requested', structuredFindings(THREE));
+    expect(result).toMatchObject({ status: 'published', review: { outcome: 'revision-queued' } });
+    expect(s.gh.writes).toEqual([`review #${PR} COMMENT at ${H1} with 1 inline`]);
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toContain(`**Review agent · Round 1 · reviewed \`${H1.slice(0, 12)}\`**`);
+    expect(body).toContain("I found 2 blockers and 1 suggestion. I'm requesting a revision before this is ready.");
+    expect(body).toContain('- **Blocker F1** · Generation not checked · `src/a.ts` line 3: in its thread on the diff');
+    expect(body).toContain("- **Blocker F2** · Docs are stale · `docs/pool.md` line 10 (the file is not part of this pull request's change)");
+    expect(body).toContain('The doc still says retire is unconditional.');
+    expect(body).toContain('- **Suggestion F3** · Add a race test (no file was given)');
+    // Not repeated in full: F1's text is in its thread, not the summary.
+    expect(body).not.toContain('Compare generations first.');
+    expect(body).not.toContain('updraft-findings');
+    const [comment] = s.gh.reviewComments;
+    expect(comment).toMatchObject({ path: 'src/a.ts', line: 3, side: 'RIGHT', user: 'updraft-bot' });
+    expect(comment!.body).toContain('**Review agent · Blocker F1:** Generation not checked');
+    expect(comment!.body).toContain('**Suggested change:**\n\n> Compare generations first.');
+    expect(comment!.body.endsWith(findingMarker(`${runId}#F1`))).toBe(true);
+
+    expect(findingsOfRun(s.db, runId).map((f) => [f.key, f.commentId !== null, f.severity])).toEqual([
+      [`${runId}#F1`, true, 'blocker'],
+      [`${runId}#F2`, false, 'blocker'],
+      [`${runId}#F3`, false, 'suggestion'],
+    ]);
+    const revision = revisionOf(getJob(s.db, getPrReview(s.db, runId)!.revisionJobId!)!)!;
+    expect(revision.findings).toEqual([
+      { key: `${runId}#F1`, severity: 'blocker', title: 'Generation not checked', problem: expect.any(String), suggestion: 'Compare generations first.', path: 'src/a.ts', line: 3, threadUrl: comment!.htmlUrl },
+      expect.objectContaining({ key: `${runId}#F2`, threadUrl: null }),
+      expect.objectContaining({ key: `${runId}#F3`, threadUrl: null }),
+    ]);
+  });
+
+  it('keeps every finding when GitHub refuses the inline comments, and when the head moved', async () => {
+    const s = withDiff();
+    s.gh.refuseInline = true;
+    const { runId } = await post(s, 'changes-requested', structuredFindings(THREE));
+    expect(s.gh.writes).toEqual([`review #${PR} COMMENT at ${H1}`]);
+    expect(s.gh.reviews[0]!.body).toContain('- **Blocker F1** · Generation not checked · `src/a.ts` line 3 (GitHub did not accept it as an inline comment)');
+    expect(s.gh.reviews[0]!.body).toContain('Compare generations first.');
+    expect(findingsOfRun(s.db, runId).every((f) => f.commentId === null)).toBe(true);
+
+    const moved = withDiff();
+    const [job] = moved.schedule();
+    const run = moved.reviewed(job!, 'changes-requested', structuredFindings(THREE));
+    moved.push(H2);
+    await postReview(moved.deps, run);
+    expect(moved.gh.reviewComments).toEqual([]);
+    expect(moved.gh.reviews[0]!.body).toContain(`(the pull request is at ${H2.slice(0, 12)} now, not the reviewed ${H1.slice(0, 12)})`);
+  });
+
+  it('posts a legacy review as before, and a broken block as prose', async () => {
+    const s = withDiff();
+    await post(s, 'changes-requested', 'Blockers:\n- a.ts:3 is wrong');
+    expect(s.gh.reviews[0]!.body).toContain('**Updraft review: changes requested**');
+    expect(s.gh.calls).not.toContain('listPullRequestFiles');
+
+    const broken = withDiff();
+    await post(broken, 'changes-requested', 'Bad\n```updraft-findings\n{oops\n```');
+    expect(broken.gh.reviews[0]!.body).toContain('**Updraft review: changes requested**');
+    expect(broken.gh.reviews[0]!.body).toContain('{oops');
+  });
+
+  it('never posts the review or its threads twice when the first answer was lost, and takes no one else\'s marker', async () => {
+    const s = withDiff();
+    const [job] = s.schedule();
+    const runId = s.reviewed(job!, 'changes-requested', structuredFindings(THREE));
+    // Someone copies the marker into a comment of their own.
+    s.gh.reviewComments.push({ id: 5000, reviewId: 1, inReplyToId: null, user: 'mallory', body: findingMarker(`${runId}#F1`), path: 'src/a.ts', htmlUrl: 'evil' });
+    const create = s.gh.createPullRequestReview.bind(s.gh);
+    let lose = true;
+    s.gh.createPullRequestReview = async (...a: Parameters<typeof create>) => {
+      const r = await create(...a);
+      if (lose) {
+        lose = false;
+        throw new GitHubError('POST failed: 502', 502);
+      }
+      return r;
+    };
+    expect(await postReview(s.deps, runId)).toMatchObject({ status: 'failed', retryable: true });
+    expect(await postReview(s.deps, runId)).toMatchObject({ status: 'published' });
+    expect(s.gh.reviews).toHaveLength(1);
+    expect(s.gh.reviewComments.filter((c) => c.user === 'updraft-bot')).toHaveLength(1);
+    const f1 = getFinding(s.db, REPO_ID, PR, `${runId}#F1`)!;
+    expect(f1.commentId).not.toBe(5000);
+    expect(f1.commentId).toBe(s.gh.reviewComments.find((c) => c.user === 'updraft-bot')!.id);
+  });
+
+  it('answers the checks of a later round in the earlier threads, and resolves only verified threads it started', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    const f1 = getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!;
+    // A person's own thread on the same pull request.
+    s.gh.reviewComments.push({ id: 6000, reviewId: 2, inReplyToId: null, user: 'allen', body: 'please also rename', path: 'src/a.ts', htmlUrl: 'human' });
+
+    s.push(H2);
+    observeHead(s.db, REPO_ID, PR, H2, new Date(s.tick()).toISOString());
+    const second = await post(
+      s,
+      'changes-requested',
+      structuredFindings({
+        findings: [{ id: 'F1', severity: 'blocker', title: 'Docs are stale', problem: 'Still says unconditional.', sameAs: `${first.runId}#F2` }],
+        checks: [
+          { finding: `${first.runId}#F1`, status: 'verified', note: 'The generation check and its test are there.' },
+          { finding: `${first.runId}#F3`, status: 'unresolved', note: 'No race test yet.' },
+          { finding: 'run_other#F9', status: 'verified' },
+        ],
+      }),
+    );
+    expect(second.result.status).toBe('published');
+    const replies = s.gh.thread(f1.commentId!);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]!.body).toContain(`**Review agent · Round 2:** I verified this on \`${H2.slice(0, 12)}\`. The generation check and its test are there. Resolved.`);
+    expect(s.gh.writes).toContain(`resolve T_${f1.commentId}`);
+    expect(s.gh.resolved.has(6000)).toBe(false);
+    expect(getFinding(s.db, REPO_ID, PR, f1.key)).toMatchObject({ status: 'verified', statusSha: H2, threadResolvedAt: expect.any(String) });
+    // F3 had no inline thread: its check is recorded, and in the summary.
+    expect(getFinding(s.db, REPO_ID, PR, `${first.runId}#F3`)).toMatchObject({ status: 'unresolved' });
+    const body = s.gh.reviews[1]!.body;
+    expect(body).toContain('- Blocker F1 · Generation not checked: verified on this head. The generation check and its test are there.');
+    expect(body).toContain('- Suggestion F3 · Add a race test: still open on this head. No race test yet.');
+    expect(body).toContain('`run_other#F9` (not a finding of this pull request; ignored): not checked');
+    // The repeat joins F2's thread, which had none on GitHub: it is in the summary.
+    expect(getFinding(s.db, REPO_ID, PR, `${second.runId}#F1`)).toMatchObject({ threadKey: `${first.runId}#F2` });
+    expect(revisionOf(getJob(s.db, getPrReview(s.db, second.runId)!.revisionJobId!)!)!.findings!.map((f) => f.key)).toEqual([`${first.runId}#F2`]);
+
+    // The same review posted again changes nothing in the threads.
+    const writes = s.gh.writes.length;
+    await postReview(s.deps, second.runId);
+    expect(s.gh.writes).toHaveLength(writes);
+  });
+
+  it('gives the next reviewer the findings no one verified yet, with the coding agent\'s report as a claim', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    recordResolution(s.db, REPO_ID, PR, `${first.runId}#F1`, { resolution: 'fixed', note: 'Compared generations.', sha: H2, runId: 'run_fix' });
+    s.push(H2);
+    observeHead(s.db, REPO_ID, PR, H2, new Date(s.tick()).toISOString());
+    const [job] = s.schedule();
+    expect(reviewOf(job!)!.openFindings!.map((f) => [f.key, f.status, f.resolution?.status ?? null])).toEqual([
+      [`${first.runId}#F1`, 'open', 'fixed'],
+      [`${first.runId}#F2`, 'open', null],
+      [`${first.runId}#F3`, 'open', null],
+    ]);
+    const prompt = renderReviewPrompt('Review.', { repoFullName: FULL, number: ISSUE, title: 't', body: 'b', labels: [], url: 'u' }, reviewOf(job!)!, { headSha: H2, baseBranch: 'main', baseSha: H1 });
+    expect(prompt).toContain(`## Earlier finding 1 of 3: "${first.runId}#F1"`);
+    expect(prompt).toContain(`- Coding agent's report (a claim, not a verification): fixed, in commit ${H2}`);
+    expect(prompt).toContain('<untrusted-coding-agent-report>\nCompared generations.\n</untrusted-coding-agent-report>');
+  });
+
+  it('follows up in the existing thread when a finding with a thread recurs', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    const f1 = getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!;
+    s.push(H2);
+    observeHead(s.db, REPO_ID, PR, H2, new Date(s.tick()).toISOString());
+    s.gh.files = [{ path: 'src/a.ts', status: 'modified', patch: PATCH }];
+    const second = await post(s, 'changes-requested', structuredFindings({ findings: [{ id: 'F1', severity: 'blocker', title: 'Generation not checked', path: 'src/a.ts', line: 3, problem: 'Still retires a stale worker.', sameAs: f1.key }] }));
+    // No new inline thread: a reply in the first one.
+    expect(s.gh.reviewComments.filter((c) => c.inReplyToId === null && c.user === 'updraft-bot')).toHaveLength(1);
+    expect(s.gh.thread(f1.commentId!)[0]!.body).toContain('this is still not fixed. Still retires a stale worker.');
+    expect(s.gh.reviews[1]!.body).toContain(`still not fixed; followed up in [its thread](${f1.commentUrl})`);
+    expect(revisionOf(getJob(s.db, getPrReview(s.db, second.runId)!.revisionJobId!)!)!.findings!.map((f) => f.key)).toEqual([f1.key]);
   });
 });
 

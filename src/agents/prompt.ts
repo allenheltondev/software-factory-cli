@@ -4,6 +4,7 @@
 // revise prompt, the review that requested changes, and then the issue, fenced the same way.
 // A reviewer run's prompt is in review-prompt.ts.
 import type { RevisionRequest } from '../types.js';
+import { RESOLUTIONS_BLOCK } from './findings.js';
 
 export interface IssueContext {
   repoFullName: string;
@@ -71,6 +72,45 @@ export function renderRevisionPrompt(revisePrompt: string, issue: IssueContext, 
     fence('untrusted-review-comment', c.body.trim() || '(empty)'),
     '',
   ]);
+  const findings = revision.findings ?? [];
+  const findingSections = findings.length
+    ? [
+        '# The findings, one by one (untrusted input)',
+        '',
+        'The reviewer listed these findings. Each has a key. Work through every one: fix it, or, if you disagree, leave it ' +
+          'and say why. Run the tests that cover what you changed.',
+        '',
+        ...findings.flatMap((f, i) => [
+          `## Finding ${i + 1} of ${findings.length}: ${JSON.stringify(f.key)}`,
+          '',
+          `- Severity: ${f.severity}`,
+          `- File: ${f.path === null ? '(none given)' : JSON.stringify(f.path)}`,
+          `- Line: ${f.line ?? '(none given)'}`,
+          '',
+          fence('untrusted-finding-title', f.title),
+          '',
+          fence('untrusted-finding-problem', f.problem),
+          '',
+          ...(f.suggestion ? [fence('untrusted-finding-suggestion', f.suggestion), ''] : []),
+        ]),
+        '# Your report, per finding',
+        '',
+        `End your final message with one fenced block tagged \`${RESOLUTIONS_BLOCK}\`: a JSON list with one entry per finding key above, ` +
+          'saying what you did. `status` is `fixed` (you changed the code so the problem is gone), `disagreed` (you changed nothing, ' +
+          'because the finding is wrong: say why), `deferred` (left for later: say why) or `unable` (you tried and could not). ' +
+          '`note` says concretely what you changed or why not; `tests` says what you ran and what it reported.',
+        '',
+        '```' + RESOLUTIONS_BLOCK,
+        `[{"finding": ${JSON.stringify(findings[0]!.key)}, "status": "fixed", "note": "Retire now compares the worker generation first.", "tests": "npm test: 214 passed"}]`,
+        '```',
+        '',
+        'Your report is posted in each finding\'s thread on the pull request only once your commits are pushed, and the reviewer ' +
+          'checks it on the new head: do not report something as fixed that you did not change.',
+        '',
+        '---',
+        '',
+      ]
+    : [];
   return [
     revisePrompt.replace(/\r\n?/g, '\n').trimEnd(),
     '',
@@ -109,6 +149,7 @@ export function renderRevisionPrompt(revisePrompt: string, issue: IssueContext, 
     ...comments,
     '---',
     '',
+    ...findingSections,
     ...issueSection(issue),
   ].join('\n');
 }

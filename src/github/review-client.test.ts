@@ -67,6 +67,59 @@ describe('createGitHubApi: the review loop', () => {
     expect(JSON.parse(calls[2]!.body!)).toEqual({ event: 'COMMENT', body: 'findings' });
   });
 
+  it('submits inline comments with a COMMENT review, a range with its start', async () => {
+    const { fn, calls } = fakeFetch(() => json({ id: 9, state: 'COMMENTED', user: { login: 'bot' }, body: 'x', html_url: 'u', submitted_at: 't', commit_id: SHA }));
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    await api.createPullRequestReview(repo, 5, {
+      body: 'x',
+      commitId: SHA,
+      comments: [
+        { path: 'a.ts', line: 4, side: 'RIGHT', body: 'one' },
+        { path: 'b.ts', line: 9, side: 'LEFT', startLine: 7, body: 'range' },
+      ],
+    });
+    expect(JSON.parse(calls[0]!.body!)).toEqual({
+      event: 'COMMENT',
+      body: 'x',
+      commit_id: SHA,
+      comments: [
+        { path: 'a.ts', line: 4, side: 'RIGHT', body: 'one' },
+        { path: 'b.ts', line: 9, side: 'LEFT', start_line: 7, start_side: 'LEFT', body: 'range' },
+      ],
+    });
+  });
+
+  it('lists diff files and review comments, and replies in a thread', async () => {
+    const { fn, calls } = fakeFetch((url, call) => {
+      if (url.pathname.endsWith('/files')) return json([{ filename: 'a.ts', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b' }, { filename: 'img.png', status: 'added' }]);
+      if (call.method === 'POST') return json({ id: 77, in_reply_to_id: 70, user: { login: 'bot' }, body: 'r', path: 'a.ts', html_url: 'h77' });
+      return json([{ id: 70, pull_request_review_id: 9, user: { login: 'bot' }, body: 'c', path: 'a.ts', html_url: 'h70' }]);
+    });
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    expect(await api.listPullRequestFiles!(repo, 5)).toEqual([
+      { path: 'a.ts', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b' },
+      { path: 'img.png', status: 'added', patch: null },
+    ]);
+    expect(await api.listPullRequestReviewComments!(repo, 5)).toEqual([{ id: 70, reviewId: 9, inReplyToId: null, user: 'bot', body: 'c', path: 'a.ts', htmlUrl: 'h70' }]);
+    expect(await api.replyToReviewComment!(repo, 5, 70, 'r')).toMatchObject({ id: 77, inReplyToId: 70 });
+    expect(calls.at(-1)).toMatchObject({ method: 'POST', url: 'https://api.github.com/repositories/42/pulls/5/comments/70/replies' });
+    expect(JSON.parse(calls.at(-1)!.body!)).toEqual({ body: 'r' });
+  });
+
+  it('reads review threads with the repository check, and resolves one', async () => {
+    const threads = { data: { repository: { databaseId: 42, pullRequest: { reviewThreads: { nodes: [{ id: 'T1', isResolved: false, comments: { nodes: [{ databaseId: 70, author: { login: 'bot' } }] } }, null] } } } } };
+    const { fn, calls } = fakeFetch((_url, call) => (call.body?.includes('resolveReviewThread') ? json({ data: { resolveReviewThread: { thread: { isResolved: true } } } }) : json(threads)));
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    expect(await api.listReviewThreads!(repo, 5)).toEqual([{ id: 'T1', isResolved: false, rootCommentId: 70, rootAuthor: 'bot' }]);
+    await api.resolveReviewThread!(repo, 'T1');
+    expect(JSON.parse(calls.at(-1)!.body!).variables).toEqual({ id: 'T1' });
+
+    const renamed = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json({ data: { repository: { databaseId: 7, pullRequest: null } } })).fn });
+    await expect(renamed.listReviewThreads!(repo, 5)).rejects.toThrow(/now names repository 7/);
+    const refused = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json({ errors: [{ type: 'FORBIDDEN', message: 'no' }] })).fn });
+    await expect(refused.resolveReviewThread!(repo, 'T1')).rejects.toMatchObject({ status: 403 });
+  });
+
   it('marks a draft ready through GraphQL and turns GraphQL errors into failures', async () => {
     const { fn, calls } = fakeFetch(() => json({ data: { markPullRequestReadyForReview: { pullRequest: { isDraft: false } } } }));
     const api = await createGitHubApi({ token: 't', fetch: fn });

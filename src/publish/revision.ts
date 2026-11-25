@@ -46,6 +46,8 @@ import { revisionOf, type Job, type RepoRef, type Revision, type RevisionRequest
 import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
 import { safeMarkdown } from './markdown.js';
+import { answerFindings } from './threads.js';
+import { workerLogin } from '../github/identity.js';
 import {
   cap,
   classifyFailure,
@@ -183,11 +185,19 @@ function withMarker(lines: string[], marker: string): string {
 }
 
 /** The reply after a push: the new commits, the verification result and the agent's final message, all inert. */
-export function renderRevisionReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary; commitCount: number }): string {
+export function renderRevisionReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary; commitCount: number; perFinding?: string[] }): string {
   return withMarker(
     [
-      `Updraft pushed ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`,
-      '',
+      ...(o.perFinding?.length
+        ? [
+            `**Coding agent** · pushed ${o.commitCount} commit(s) for the findings in ${o.review.url}`,
+            '',
+            '**Per finding** (the coding agent\'s account; the review agent checks it on the new head)',
+            '',
+            ...o.perFinding,
+            '',
+          ]
+        : [`Updraft pushed ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`, '']),
       `From run ${code(o.runId)} (agent ${inline(o.agent)}). Review it before merging; merging is up to a person.`,
       '',
       ...renderRunResult(o.summary, o.commitCount),
@@ -570,8 +580,30 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     }
     if (rev.headSha !== localSha || !rev.pushedAt) hold({ headSha: localSha, pushedAt: rev.pushedAt ?? new Date(now()).toISOString() });
 
+    // 3b. Structured findings: the coding agent's report on each, now that its push is confirmed,
+    // in each finding's thread. Best effort: the reply below carries what could not be put there.
+    let perFinding: string[] = [];
+    if (request.findings?.length) {
+      hold();
+      const answered = await answerFindings(
+        { db: deps.db, api: deps.api, now },
+        {
+          repo: repoRef,
+          prNumber,
+          runId,
+          sha: localSha,
+          prUrl: request.pullRequest.url,
+          login: await workerLogin(deps.api),
+          findings: request.findings,
+          resolutions: run.summary.resolutions ?? [],
+        },
+      );
+      perFinding = answered.lines;
+      if (answered.log.length) await runLog(answered.log);
+    }
+
     // 4. The reply: recorded, found by marker, or new.
-    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount }), { headSha: localSha });
+    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding }), { headSha: localSha });
 
     const done = finish({ state: 'published' });
     log.info('revision pushed', { pr: prNumber, from: baseSha, to: localSha });

@@ -78,6 +78,7 @@ import {
   type GitHubPullRequest,
   type GitHubRepo,
   type GitHubReview,
+  type PullRequestReviewComment,
   type IssueEventsPage,
   type PullRequestDetails,
   type PullRequestReviewSummary,
@@ -468,6 +469,62 @@ function mapReviewSummary(r: RawReviewSummary): PullRequestReviewSummary {
     commitId: r.commit_id ?? null,
   };
 }
+
+interface RawPullRequestFile {
+  filename?: string;
+  status?: string;
+  patch?: string | null;
+}
+
+interface RawRestReviewComment {
+  id: number;
+  pull_request_review_id?: number | null;
+  in_reply_to_id?: number | null;
+  user?: { login?: string } | null;
+  body?: string | null;
+  path?: string | null;
+  html_url?: string;
+}
+
+function mapReviewComment(r: RawRestReviewComment): PullRequestReviewComment {
+  return {
+    id: r.id,
+    reviewId: r.pull_request_review_id ?? null,
+    inReplyToId: r.in_reply_to_id ?? null,
+    user: r.user?.login ?? null,
+    body: r.body ?? '',
+    path: r.path ?? '',
+    htmlUrl: r.html_url ?? '',
+  };
+}
+
+interface RawReviewThreads {
+  repository: {
+    databaseId: number | null;
+    pullRequest: {
+      reviewThreads?: {
+        nodes?: Array<{ id: string; isResolved?: boolean; comments?: { nodes?: Array<{ databaseId?: number | null; author?: { login?: string } | null } | null> } } | null>;
+      };
+    } | null;
+  } | null;
+}
+
+const REVIEW_THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    databaseId
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes { id isResolved comments(first: 1) { nodes { databaseId author { login } } } }
+      }
+    }
+  }
+}`;
+
+const RESOLVE_THREAD_MUTATION = `mutation($id: ID!) {
+  resolveReviewThread(input: { threadId: $id }) {
+    thread { isResolved }
+  }
+}`;
 
 const MARK_READY_MUTATION = `mutation($id: ID!) {
   markPullRequestReadyForReview(input: { pullRequestId: $id }) {
@@ -892,9 +949,82 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       const res = await request<RawReviewSummary>(`${repoPath(repo)}/pulls/${pullNumber}/reviews`, {
         method: 'POST',
         // COMMENT, always: this client has no way to approve or to request changes.
-        body: { event: 'COMMENT', body: input.body, ...(input.commitId ? { commit_id: input.commitId } : {}) },
+        body: {
+          event: 'COMMENT',
+          body: input.body,
+          ...(input.commitId ? { commit_id: input.commitId } : {}),
+          ...(input.comments?.length
+            ? {
+                comments: input.comments.map((c) => ({
+                  path: c.path,
+                  line: c.line,
+                  side: c.side,
+                  ...(c.startLine !== undefined ? { start_line: c.startLine, start_side: c.startSide ?? c.side } : {}),
+                  body: c.body,
+                })),
+              }
+            : {}),
+        },
       });
       return mapReviewSummary(res.data!);
+    },
+
+    async listPullRequestFiles(repo, pullNumber) {
+      const raw = await paginate<RawPullRequestFile>(`${repoPath(repo)}/pulls/${pullNumber}/files`);
+      return raw.map((f) => ({ path: f.filename ?? '', status: f.status ?? '', patch: typeof f.patch === 'string' ? f.patch : null }));
+    },
+
+    async listPullRequestReviewComments(repo, pullNumber) {
+      const raw = await paginate<RawRestReviewComment>(`${repoPath(repo)}/pulls/${pullNumber}/comments`, { sort: 'created', direction: 'asc' });
+      return raw.map(mapReviewComment);
+    },
+
+    async replyToReviewComment(repo, pullNumber, commentId, body) {
+      const res = await request<RawRestReviewComment>(`${repoPath(repo)}/pulls/${pullNumber}/comments/${commentId}/replies`, { method: 'POST', body: { body } });
+      return mapReviewComment(res.data!);
+    },
+
+    async listReviewThreads(repo, pullNumber) {
+      const [owner, name, ...rest] = repo.fullName.split('/');
+      if (!owner || !name || rest.length) throw new GitHubError(`invalid repository name "${repo.fullName}"`, 502);
+      const what = `review threads of ${repo.fullName}#${pullNumber}`;
+      const res = await request<GraphQLResponse<RawReviewThreads>>('/graphql', {
+        method: 'POST',
+        body: { query: REVIEW_THREADS_QUERY, variables: { owner, name, number: pullNumber } },
+      });
+      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
+      if (errors.length) {
+        const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
+        const limited = errors.some((e) => e.type === 'RATE_LIMITED');
+        throw new GitHubError(`POST /graphql (${what}) failed: ${detail}`, limited ? 429 : 502, limited ? (retryAfterFrom(res.headers) ?? 60) : null);
+      }
+      const repository = res.data?.data?.repository ?? null;
+      if (!repository) throw new GitHubError(`POST /graphql (${what}) returned no repository`, 502);
+      if (repository.databaseId !== repo.id) {
+        throw new GitHubError(`POST /graphql (${what}): "${repo.fullName}" now names repository ${repository.databaseId ?? 'unknown'}, not ${repo.id}`, 502);
+      }
+      if (!repository.pullRequest) throw new GitHubError(`POST /graphql (${what}): pull request not found`, 404);
+      return (repository.pullRequest.reviewThreads?.nodes ?? []).flatMap((t) => {
+        if (!t) return [];
+        const first = t.comments?.nodes?.[0] ?? null;
+        return [{ id: t.id, isResolved: t.isResolved === true, rootCommentId: first?.databaseId ?? null, rootAuthor: first?.author?.login ?? null }];
+      });
+    },
+
+    async resolveReviewThread(repo, threadId) {
+      const what = `resolving a review thread of ${repo.fullName}`;
+      const res = await request<GraphQLResponse<{ resolveReviewThread?: { thread?: { isResolved?: boolean } | null } | null }>>('/graphql', {
+        method: 'POST',
+        body: { query: RESOLVE_THREAD_MUTATION, variables: { id: threadId } },
+        repo: repo.fullName,
+      });
+      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
+      if (errors.length) {
+        const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
+        const limited = errors.some((e) => e.type === 'RATE_LIMITED');
+        const denied = errors.some((e) => e.type === 'FORBIDDEN' || e.type === 'NOT_FOUND');
+        throw new GitHubError(`POST /graphql (${what}) failed: ${detail}`, limited ? 429 : denied ? 403 : 422, limited ? (retryAfterFrom(res.headers) ?? 60) : null);
+      }
     },
 
     async markPullRequestReady(repo, nodeId) {

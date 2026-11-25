@@ -106,7 +106,8 @@ export interface FindingsCount {
  */
 export function readFindingsCount(findings: string): FindingsCount {
   const lines = findings.replace(CONTROL, '').replace(/\r\n?/g, '\n').split('\n');
-  const marked = new Set(lines.flatMap((l, i) => (bare(l).toUpperCase().startsWith(FINDINGS_TOKEN) ? [i] : [])));
+  // A code fence opening a block tagged updraft-findings (findings.ts) is not a count line.
+  const marked = new Set(lines.flatMap((l, i) => (!/^\s*(?:`{3,}|~{3,})/.test(l) && bare(l).toUpperCase().startsWith(FINDINGS_TOKEN) ? [i] : [])));
   const rest = marked.size ? lines.filter((_, i) => !marked.has(i)).join('\n').trim() : findings;
   if (marked.size === 0) return { count: null, problem: `the reviewer wrote no ${FINDINGS_TOKEN} line`, findings: rest };
   if (marked.size > 1) {

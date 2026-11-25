@@ -83,6 +83,10 @@ labelled as untrusted input like the issue in an ordinary run:
 
 Long reviews are capped: 50 inline comments, with limits on each text.
 
+A revision of a review with structured findings also gets each finding by key, and reports on
+each one. Its report is posted in the finding's thread once the push is confirmed: see
+[Findings as threads](review-loop.md#findings-as-threads).
+
 ## Where the agent runs
 
 In a new worktree and a new local branch, like any attempt, created from the PR branch's

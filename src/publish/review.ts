@@ -36,11 +36,15 @@ import {
   type ReviewOutcome,
 } from '../db/pr-reviews.js';
 import { getJob, getRun } from '../db/queue.js';
+import { findingsOfRun, recordFindings, reviewRound, threadOf } from '../db/review-findings.js';
+import { readStructuredFindings, type StructuredReview } from '../agents/findings.js';
+import { diffIndex } from './anchors.js';
+import { afterStructuredReview, inlineComments, planThreads, renderStructuredReview, withoutInline, type ThreadPlan } from './threads.js';
 import { countRevisions, enqueueRevision, getReviewRequest, revisionJob } from '../db/revisions.js';
 import { GitHubError, type PullRequestReviewSummary } from '../github/api.js';
 import { sameLogin, workerLogin } from '../github/identity.js';
 import { verdictTrigger } from '../poller/review-trigger.js';
-import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type ReviewVerdict, type RevisionRequest, type Run } from '../types.js';
+import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type ReviewVerdict, type RevisionFinding, type RevisionRequest, type Run } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { evaluateCiAll, postCiNotices } from './ci.js';
 import { code } from './failure-comment.js';
@@ -255,6 +259,11 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     }
 
     // 1. The comment review: recorded, found by its marker among the worker's own reviews, or new.
+    // With structured findings, those whose line the reviewed diff has are inline comments of it.
+    const reading = readStructuredFindings(result.findings);
+    const structured: StructuredReview | null = reading.structured && (reading.structured.findings.length || reading.structured.checks.length) ? reading.structured : null;
+    if (reading.problem) await runLog([`findings: ${reading.problem}; the review is posted as written`]);
+    const round = structured ? reviewRound(deps.db, runId) : 0;
     const login = await workerLogin(deps.api);
     if (!rev.reviewId) {
       hold();
@@ -262,28 +271,89 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
       const found = (await deps.api.listPullRequestReviews(repoRef, prNumber)).find((r) => r.body.includes(marker) && sameLogin(r.user, login));
       let posted: PullRequestReviewSummary | undefined = found;
       if (!posted) {
-        const body = renderReview({
-          runId,
-          agent: run.agent,
-          verdict: result.verdict,
-          headSha,
-          findings: result.findings,
-          next: nextStep(deps.config, repo, result.verdict, countRevisions(deps.db, job.repoId, prNumber)),
-        });
-        hold(); // the lookup may have outlived the lease
-        try {
-          posted = await deps.api.createPullRequestReview(repoRef, prNumber, { body, commitId: headSha });
-        } catch (err) {
-          // The commit is no longer part of the pull request (its branch was rewritten). The body
-          // names the commit, so the review is still worth having, unpinned.
-          if (!(err instanceof GitHubError) || err.status !== 422) throw err;
-          hold();
-          posted = await deps.api.createPullRequestReview(repoRef, prNumber, { body });
-          await runLog([`GitHub refused to attach the review to ${short(headSha)} (${err.message}); posted it without a commit`]);
+        const next = nextStep(deps.config, repo, result.verdict, countRevisions(deps.db, job.repoId, prNumber));
+        const create = async (input: Parameters<typeof deps.api.createPullRequestReview>[2]): Promise<PullRequestReviewSummary> => {
+          hold(); // the lookup may have outlived the lease
+          try {
+            return await deps.api.createPullRequestReview(repoRef, prNumber, input);
+          } catch (err) {
+            // The commit is no longer part of the pull request (its branch was rewritten). The body
+            // names the commit, so the review is still worth having, unpinned.
+            if (!(err instanceof GitHubError) || err.status !== 422 || !input.commitId || input.comments?.length) throw err;
+            hold();
+            const unpinned = await deps.api.createPullRequestReview(repoRef, prNumber, { body: input.body });
+            await runLog([`GitHub refused to attach the review to ${short(headSha)} (${err.message}); posted it without a commit`]);
+            return unpinned;
+          }
+        };
+        if (structured) {
+          let diff: ReturnType<typeof diffIndex> | null = null;
+          let noDiff: string | undefined;
+          if (!deps.api.listPullRequestFiles) noDiff = 'this GitHub client cannot post inline comments';
+          else {
+            hold();
+            const pr = await deps.api.getPullRequest(repoRef, prNumber);
+            if (pr.headSha !== headSha) noDiff = `the pull request is at ${short(pr.headSha)} now, not the reviewed ${short(headSha)}`;
+            else {
+              hold();
+              diff = diffIndex(await deps.api.listPullRequestFiles(repoRef, prNumber));
+            }
+          }
+          let plan = planThreads(structured, { diff, noDiff, rootOf: (key) => threadOf(deps.db, job.repoId, prNumber, key) });
+          const render = (p: ThreadPlan) =>
+            renderStructuredReview({
+              runId,
+              agent: run.agent,
+              round,
+              verdict: result.verdict,
+              headSha,
+              prose: reading.prose,
+              structured,
+              plan: p,
+              threads: (key) => threadOf(deps.db, job.repoId, prNumber, key),
+              next,
+              marker,
+              maxBody: MAX_BODY,
+            });
+          if (plan.inline.length) {
+            try {
+              posted = await create({ body: render(plan), commitId: headSha, comments: inlineComments({ runId, round, headSha, plan }) });
+            } catch (err) {
+              // GitHub refuses the whole review when it cannot place one comment. Every finding is
+              // kept: they all go in the summary instead.
+              if (!(err instanceof GitHubError) || err.status !== 422) throw err;
+              plan = withoutInline(plan, 'GitHub did not accept it as an inline comment');
+              await runLog([`GitHub refused the inline comments (${err.message}); posting every finding in the review summary`]);
+            }
+          }
+          posted ??= await create({ body: render(plan), commitId: headSha });
+          await runLog([`findings: ${plan.inline.length} inline, ${plan.summary.length} in the summary, ${plan.repeats.length} in earlier threads, ${structured.checks.length} check(s) of earlier findings`]);
+        } else {
+          posted = await create({ body: renderReview({ runId, agent: run.agent, verdict: result.verdict, headSha, findings: result.findings, next }), commitId: headSha });
         }
       }
       hold({ reviewId: posted.id, reviewUrl: posted.htmlUrl });
       await runLog([found ? `review already on pull request #${prNumber}: ${posted.htmlUrl}` : `posted a comment review on pull request #${prNumber}: ${posted.htmlUrl}`]);
+    }
+
+    // 1b. Structured findings: recorded with their threads; repeats and checks answered in the
+    // threads of the earlier findings. Best effort: the summary has every finding already.
+    const revisionFindings: RevisionFinding[] = [];
+    if (structured && rev.reviewId) {
+      recordFindings(deps.db, { repoId: job.repoId, prNumber, runId, headSha, reviewId: rev.reviewId, findings: structured.findings, now });
+      hold();
+      const threaded = await afterStructuredReview(
+        { db: deps.db, api: deps.api, now },
+        { repo: repoRef, prNumber, runId, reviewId: rev.reviewId, headSha, round, structured, login },
+      );
+      if (threaded.log.length) await runLog(threaded.log);
+      const seen = new Set<string>();
+      for (const f of findingsOfRun(deps.db, runId)) {
+        const root = threadOf(deps.db, job.repoId, prNumber, f.key) ?? f;
+        if (seen.has(root.key)) continue;
+        seen.add(root.key);
+        revisionFindings.push({ key: root.key, severity: f.severity, title: f.title, problem: f.problem, suggestion: f.suggestion, path: f.path, line: f.line, threadUrl: root.commentUrl });
+      }
     }
 
     // 2. The verdict, from the worker's own record. Only a verdict for the current head acts.
@@ -316,6 +386,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
           originalEventId: watched.originalEventId,
           review: decision.review,
           reviewedSha: decision.reviewedSha,
+          ...(revisionFindings.length ? { findings: revisionFindings } : {}),
         };
         const max = repo.maxRevisions ?? DEFAULT_MAX_REVISIONS;
         const record = {

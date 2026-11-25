@@ -18,7 +18,9 @@ import { GitError, runGit, type GitOptions } from '../git/git.js';
 import { jobBranchName, jobWorktreePath, prepareJobWorktree } from '../git/worktree.js';
 import { GitHubError, type GitHubApi, type GitHubIssueComment } from '../github/api.js';
 import type { UpdraftPaths } from '../paths.js';
-import type { RepoRef, RevisionRequest, RunOutcome } from '../types.js';
+import type { RepoRef, RevisionRequest, RunOutcome, RunSummary } from '../types.js';
+import { getFinding, recordFindings, setThreadComment } from '../db/review-findings.js';
+import type { PullRequestReviewComment } from '../github/api.js';
 import { silentLogger } from '../util/log.js';
 import { summarizeRun } from '../worker/run-summary.js';
 import { failureCommentMarker, postFailureComment } from './failure-comment.js';
@@ -210,7 +212,7 @@ interface RevisionScenario extends Published {
  */
 async function revised(
   p: Published,
-  o: { commits?: number; outcome?: RunOutcome; edit?: (worktree: string) => void; req?: RevisionRequest; error?: string } = {},
+  o: { commits?: number; outcome?: RunOutcome; edit?: (worktree: string) => void; req?: RevisionRequest; error?: string; resolutions?: RunSummary['resolutions'] } = {},
 ): Promise<RevisionScenario> {
   const { f, db, paths } = p;
   const req = o.req ?? request(p);
@@ -238,6 +240,7 @@ async function revised(
   }
   o.edit?.(prepared.worktreePath);
   const { summary } = await summarizeRun({ worktree: prepared.worktreePath, branch: localBranch, baseSha: prepared.baseSha, lastOutput: ['Renamed it.', 'Ping @octocat ```not a fence```'] });
+  if (o.resolutions) summary.resolutions = o.resolutions;
   const runId = `run_${job.id}`;
   const logPath = join(paths.runsDir, runId, 'run.log');
   mkdirSync(join(paths.runsDir, runId), { recursive: true });
@@ -320,6 +323,73 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     expect(readFileSync(s.logPath, 'utf8')).toContain(`revision: commented on pull request #${PR}`);
     // Never a PR, a review, a merge: the fake throws on anything but comments.
     expect(api.calls).toEqual([`listComments ${REPO_ID} #${PR}`, `createComment ${REPO_ID} #${PR}`]);
+  });
+
+  it('answers each finding in its thread once the push is confirmed, and the rest in its reply', async () => {
+    const p = await published();
+    recordFindings(p.db, {
+      repoId: REPO_ID,
+      prNumber: PR,
+      runId: 'run_rev1',
+      headSha: 'h1',
+      reviewId: 9,
+      findings: [
+        { id: 'F1', severity: 'blocker', title: 'Generation not checked', problem: 'p1', suggestion: null, path: 'src/a.ts', location: null, sameAs: null, notes: [] },
+        { id: 'F2', severity: 'suggestion', title: 'Rename x', problem: 'p2', suggestion: null, path: null, location: null, sameAs: null, notes: [] },
+      ],
+    });
+    setThreadComment(p.db, REPO_ID, PR, 'run_rev1#F1', { id: 70, url: 'https://github.com/octo/widgets/pull/100#discussion_r70' });
+    const findings = [
+      { key: 'run_rev1#F1', severity: 'blocker' as const, title: 'Generation not checked', problem: 'p1', suggestion: null, path: 'src/a.ts', line: 3, threadUrl: 'https://github.com/octo/widgets/pull/100#discussion_r70' },
+      { key: 'run_rev1#F2', severity: 'suggestion' as const, title: 'Rename x', problem: 'p2', suggestion: null, path: null, line: null, threadUrl: null },
+    ];
+    const s = await revised(p, {
+      req: { ...request(p), trigger: 'updraft_review', findings },
+      resolutions: [
+        { finding: 'run_rev1#F1', status: 'fixed', note: 'Retire compares generations now.', tests: 'npm test: 12 passed' },
+        { finding: 'run_rev1#F2', status: 'disagreed', note: 'x is the domain term.', tests: null },
+      ],
+    });
+    class ThreadsApi extends FakeCommentsApi {
+      threadComments: PullRequestReviewComment[] = [{ id: 70, reviewId: 9, inReplyToId: null, user: 'allen', body: 'finding', path: 'src/a.ts', htmlUrl: 'https://github.com/octo/widgets/pull/100#discussion_r70' }];
+      async listPullRequestReviewComments(): Promise<PullRequestReviewComment[]> {
+        return [...this.threadComments];
+      }
+      async replyToReviewComment(_r: RepoRef, _pr: number, commentId: number, body: string): Promise<PullRequestReviewComment> {
+        this.calls.push(`reply ${commentId}`);
+        const c = { id: 71, reviewId: null, inReplyToId: commentId, user: 'allen', body, path: 'src/a.ts', htmlUrl: 'https://github.com/octo/widgets/pull/100#discussion_r71' };
+        this.threadComments.push(c);
+        return c;
+      }
+    }
+    const api = new ThreadsApi();
+    expect((await reviseRun(deps(s, api), s.runId)).status).toBe('published');
+    expect(api.calls.filter((c) => c.startsWith('reply'))).toEqual(['reply 70']);
+    const reply = api.threadComments.at(-1)!.body;
+    expect(reply).toContain(`**Coding agent:** Fixed in [${s.localSha.slice(0, 12)}](https://github.com/${FULL}/commit/${s.localSha}). Retire compares generations now.`);
+    expect(reply).toContain('Tests: npm test: 12 passed');
+    expect(reply).toContain('not a verification');
+    const pr = api.comments[0]!.body;
+    expect(pr).toContain('**Coding agent** · pushed 1 commit(s)');
+    expect(pr).toContain('- Blocker · Generation not checked: fixed ([in its thread](https://github.com/octo/widgets/pull/100#discussion_r71))');
+    expect(pr).toContain(`- Suggestion · Rename x: Not changed: I disagree, in`);
+    expect(pr).toContain('x is the domain term.');
+    expect(getFinding(p.db, REPO_ID, PR, 'run_rev1#F1')).toMatchObject({ resolution: 'fixed', resolutionSha: s.localSha, status: 'open' });
+    expect(getFinding(p.db, REPO_ID, PR, 'run_rev1#F2')).toMatchObject({ resolution: 'disagreed' });
+
+    // Again: nothing new in the thread.
+    await reviseRun(deps(s, api), s.runId);
+    expect(api.calls.filter((c) => c.startsWith('reply'))).toHaveLength(1);
+  });
+
+  it('says nothing in the threads of a revision that pushed nothing', async () => {
+    const p = await published();
+    const findings = [{ key: 'run_rev2#F1', severity: 'blocker' as const, title: 't', problem: 'p', suggestion: null, path: null, line: null, threadUrl: null }];
+    const s = await revised(p, { commits: 0, req: { ...request(p), trigger: 'updraft_review', findings }, resolutions: [{ finding: 'run_rev2#F1', status: 'fixed', note: 'done', tests: null }] });
+    const api = new FakeCommentsApi();
+    await reviseRun(deps(s, api), s.runId);
+    expect(api.comments[0]!.body).toContain('made no commits, so nothing was pushed');
+    expect(api.comments[0]!.body).not.toContain('Fixed in');
   });
 
   it('builds on commits a person pushed to the PR branch before the run started', async () => {
