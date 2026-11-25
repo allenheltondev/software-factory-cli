@@ -11,6 +11,7 @@
 // (classifyReadiness, the same rules the webhook uses). It writes nothing and prints no
 // token, secret or account identity. --watch repeats it every N seconds until interrupted, so
 // a whole A-then-B sequence, including a cleanup run, is captured as a timeline.
+import { createImagePolicies, type ImagePolicy } from '../src/native/image-policy.js';
 import { parseArgs } from 'node:util';
 import { DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException } from '@aws-sdk/client-lambda-microvms';
@@ -21,6 +22,7 @@ import { readinessAction } from '../src/jobs/launch.js';
 import type { ManagedSession, WaitingClaudeJob } from '../src/native/sessions.js';
 import { managedWorkerId } from '../src/native/sessions.js';
 import { nativePartition, type Worker } from '../src/native/store.js';
+import type { Job } from '../src/store/store.js';
 import { createAdminClients } from './admin-clients.js';
 
 /** Enough of an id to match lines across snapshots and logs, not enough to act with. */
@@ -31,13 +33,15 @@ export interface TraceInput {
   installationId: number;
   now: number;
   latestImageVersion?: string;
+  imagePolicy?: ImagePolicy;
   session?: ManagedSession;
   lease?: SessionLease;
   worker: Worker | null;
   queued: string[];
   waiting: Pick<WaitingClaudeJob, 'id' | 'status' | 'jobId' | 'reason'>[];
   vm?: { state: string | null; imageVersion?: string; idlePolicy?: unknown; startedAt?: Date };
-  jobs: { jobId: string; status: string; outcome?: string; microvmId?: string; generation?: string; createdAt: string }[];
+  jobs: (Pick<Job, 'jobId' | 'outcome' | 'microvmId' | 'createdAt'> &
+    Partial<Pick<Job, 'repository' | 'issue' | 'pullRequest' | 'eventName' | 'startedAt' | 'releasedAt' | 'reservedSeconds' | 'agentKeys'>> & { status: string; generation?: string })[];
 }
 
 /** One sanitized snapshot. Pure, so it is tested without AWS. */
@@ -50,12 +54,13 @@ export function snapshot(t: TraceInput) {
     ...(s?.microvmId && !s.retiring ? { generation: s.generation } : {}),
   };
   const session = sessionPhase(s, route, STARTUP_MS);
-  const readiness = classifyReadiness(route, w, t.now, t.latestImageVersion, { session, ...(t.vm ? { vmState: t.vm.state } : {}) });
+  const readiness = classifyReadiness(route, w, t.now, t.latestImageVersion, { session, imagePolicy: t.imagePolicy, ...(t.vm ? { vmState: t.vm.state } : {}) });
   const idleMs = t.lease?.idleMs ?? IDLE_MS;
   const idleAt = t.lease ? Math.max(t.lease.idleAt, (w?.lastWorkAt ?? 0) + idleMs) : undefined;
   return {
     at: iso(t.now),
     installationId: t.installationId,
+    imagePolicy: t.imagePolicy,
     dispatch: { readiness, session: session.phase, ownerAction: readinessAction(readiness) },
     session: s && {
       generation: short(s.generation), imageVersion: s.imageVersion, microvmId: s.microvmId,
@@ -71,7 +76,14 @@ export function snapshot(t: TraceInput) {
     },
     queued: t.queued,
     waiting: t.waiting.map((r) => ({ id: r.id, status: r.status, jobId: r.jobId, reason: r.reason })),
-    jobs: t.jobs.map((j) => ({ jobId: j.jobId, status: j.status, outcome: j.outcome, microvmId: j.microvmId, generation: short(j.generation), createdAt: j.createdAt })),
+    jobs: t.jobs.map((j) => ({ jobId: j.jobId, status: j.status, outcome: j.outcome, microvmId: j.microvmId, generation: short(j.generation), createdAt: j.createdAt,
+      eventName: j.eventName, startedAt: iso(j.startedAt), releasedAt: iso(j.releasedAt), reservedSeconds: j.reservedSeconds,
+      apiKeyRequested: j.agentKeys?.includes('ANTHROPIC_API_KEY'),
+      ...(j.repository && /^[\w.-]+\/[\w.-]+$/.test(j.repository) ? {
+        ...(j.issue ? { issueUrl: `https://github.com/${j.repository}/issues/${j.issue}` } : {}),
+        ...(j.pullRequest ? { pullRequestUrl: `https://github.com/${j.repository}/pull/${j.pullRequest}` } : {}),
+      } : {}),
+    })),
   };
 }
 
@@ -88,8 +100,10 @@ async function read(db: DynamoDBDocumentClient, table: string, installationId: n
   const waiting = (await query(tenant, 'CLAUDE_WAIT#')).filter((r) => Number(r.expiresAt) > Date.now()) as WaitingClaudeJob[];
   const summaries = await query(tenant, 'JOB#', jobsLimit, false);
   const jobs = await Promise.all(summaries.map(async (j) => {
-    const meta = await get<{ status: string; outcome?: string; microvmId?: string; native?: { generation?: string }; createdAt: string }>(`JOB#${j.jobId}`, 'META');
-    return { jobId: String(j.jobId), status: meta?.status ?? String(j.status), outcome: meta?.outcome, microvmId: meta?.microvmId, generation: meta?.native?.generation, createdAt: String(j.createdAt) };
+    const meta = await get<Job>(`JOB#${j.jobId}`, 'META');
+    return { jobId: String(j.jobId), status: meta?.status ?? String(j.status), outcome: meta?.outcome, microvmId: meta?.microvmId, generation: meta?.native?.generation, createdAt: String(j.createdAt),
+      repository: meta?.repository, issue: meta?.issue, pullRequest: meta?.pullRequest, eventName: meta?.eventName,
+      startedAt: meta?.startedAt, releasedAt: meta?.releasedAt, reservedSeconds: meta?.reservedSeconds, agentKeys: meta?.agentKeys };
   }));
   let vm: TraceInput['vm'];
   if (session?.microvmId) {
@@ -101,7 +115,8 @@ async function read(db: DynamoDBDocumentClient, table: string, installationId: n
       vm = { state: null };
     }
   }
-  return snapshot({ installationId, now: Date.now(), latestImageVersion, session, lease: session ? registry?.leases?.[session.generation] : undefined,
+  const imagePolicy = session ? await createImagePolicies(table, latestImageVersion ?? '', db)(session.imageVersion) : undefined;
+  return snapshot({ imagePolicy, installationId, now: Date.now(), latestImageVersion, session, lease: session ? registry?.leases?.[session.generation] : undefined,
     worker, queued, waiting, vm, jobs });
 }
 

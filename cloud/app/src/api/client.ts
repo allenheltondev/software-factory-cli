@@ -216,7 +216,9 @@ export interface NativeClaudeView {
   recovery?: { state: 'required' | 'stopping' | 'stopped' };
   managed?: boolean;
   /** The worker runs an older image than the deployed one and must be restarted. */
-  upgrade?: { from: string; to: string; state: 'required' | 'stopping' | 'stopped' };
+  upgrade?: { from: string; to: string; state: 'required' | 'stopping' | 'stopped'; reason?: string };
+  upgradeBlocked?: boolean;
+  updateAvailable?: { from: string; to: string; state: 'required' | 'stopping' | 'stopped'; reason?: string };
   /** A GitHub job waiting for a signed-in worker, which a new worker can be started for. */
   pendingRequest?: string;
   /** The caller owns the installation: only owners restart the worker or sign in. */

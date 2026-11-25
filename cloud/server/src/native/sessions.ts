@@ -1,3 +1,4 @@
+import { imagePolicyKey, type ImagePolicy } from './image-policy.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
@@ -13,7 +14,7 @@ export interface ManagedSession {
   startupDeadline?: number;
   readyAt?: number;
   retiring?: boolean;
-  retirementReason?: 'reconnect' | 'idle' | 'expired' | 'suspended' | 'worker-lost' | 'disabled' | 'startup-failed';
+  retirementReason?: 'reconnect' | 'idle' | 'expired' | 'suspended' | 'worker-lost' | 'disabled' | 'startup-failed' | 'image-revoked' | 'image-blocked';
   admissionRequired?: boolean;
 }
 
@@ -67,7 +68,8 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
       } catch (err) { if (!(err instanceof ConditionalCheckFailedException)) throw err; }
     },
     /** Seal the exact generation AND its dispatch revision, including a missing worker row. */
-    async retire(id: number, session: ManagedSession, mode: NativeMode, worker: Worker | null, reason: NonNullable<ManagedSession['retirementReason']> = 'reconnect') {
+    async retire(id: number, session: ManagedSession, mode: NativeMode, worker: Worker | null, reason: NonNullable<ManagedSession['retirementReason']> = 'reconnect', emergency?: ImagePolicy) {
+      if (emergency && (emergency.state !== 'revoked' || emergency.imageVersion !== session.imageVersion || emergency.revision < 1)) return false;
       const fenced: Worker = { ...(worker ?? { version: 0, installationId: id, workerId: managedWorkerId(id), session: session.generation,
         imageVersion: session.imageVersion, workerVersion: 'unregistered', auth: 'unavailable', heartbeatAt: 0 }),
         microvmId: session.microvmId ?? 'mvm-pending', version: (worker?.version ?? 0) + 1, fenced: true };
@@ -81,8 +83,12 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
             ConditionExpression: mode.revision === 0 ? 'attribute_not_exists(revision) OR revision = :revision' : 'revision = :revision',
             ExpressionAttributeValues: { ':revision': mode.revision, ':next': mode.revision + 1, ':routing': (mode.routingVersion ?? 0) + 1 } } },
           { Put: { TableName: table, Item: { pk: nativePartition(id, managedWorkerId(id)), sk: 'WORKER', ...fenced },
-            ConditionExpression: worker ? '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling)' : 'attribute_not_exists(pk)',
+            ConditionExpression: worker ? (emergency ? '#v = :v' : '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling)') : 'attribute_not_exists(pk)',
             ...(worker ? { ExpressionAttributeNames: { '#v': 'version' }, ExpressionAttributeValues: { ':v': worker.version } } : {}) } },
+          ...(emergency ? [{ ConditionCheck: { TableName: table, Key: imagePolicyKey(session.imageVersion),
+            ConditionExpression: 'revision = :revision AND #state = :revoked',
+            ExpressionAttributeNames: { '#state': 'state' }, ExpressionAttributeValues: { ':revision': emergency.revision, ':revoked': 'revoked' },
+          } }] : []),
         ] }));
         return true;
       } catch (err) {

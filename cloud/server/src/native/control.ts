@@ -1,3 +1,4 @@
+import { imageDecision, type ImagePolicy } from './image-policy.js';
 import { timingSafeEqual } from 'node:crypto';
 import { hashToken } from '../broker/broker.js';
 import { runHookPayload, type LaunchSettings } from '../jobs/launch.js';
@@ -16,6 +17,7 @@ export interface NativeControlDeps {
   store: Store;
   workers: NativeStore;
   route?: NativeRoute;
+  imagePolicy?(): Promise<ImagePolicy>;
   secret(): Promise<string>;
   settings: LaunchSettings;
   terminateMicrovm(id: string): Promise<void>;
@@ -48,13 +50,23 @@ export function createNativeControl(d: NativeControlDeps) {
         await d.store.releaseJob(job, unusedTime(job, now()));
         await d.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
       }
+      const current = await d.workers.get(w.installationId, w.workerId);
+      if (current?.session === w.session && current.microvmId === w.microvmId && current.fenced) {
+        const cleared = { ...current, version: current.version + 1 };
+        delete cleared.active;
+        delete cleared.settling;
+        if (!await d.workers.put(cleared, current.version)) return false;
+      }
     }
     return true;
   }
   async function canServe(job: Job): Promise<boolean> {
     if (!job.native) return true;
     const w = await d.workers.get(job.installationId, job.native.workerId);
-    return !!w && !w.fenced && w.active?.jobId === job.jobId && w.active.until > now() && w.microvmId === job.microvmId;
+    const policy = await d.imagePolicy?.();
+    const access = policy && imageDecision(policy, w?.workerVersion);
+    if (access && access !== 'approved' && access !== 'image-draining') return false;
+    return !!w && w.imageVersion === job.imageVersion && (!d.route || job.native.generation === d.route.generation && w.microvmId === d.route.microvmId && w.imageVersion === d.route.imageVersion) && !w.fenced && w.active?.jobId === job.jobId && w.active.until > now() && w.microvmId === job.microvmId;
   }
   async function complete(job: Job): Promise<boolean> {
     if (!job.native) return false;
@@ -134,6 +146,10 @@ export function createNativeControl(d: NativeControlDeps) {
   async function reconcile(job: Job): Promise<boolean> {
     if (!job.native) return false;
     if (job.stop) return stop(job);
+    if (d.imagePolicy && imageDecision(await d.imagePolicy()) === 'image-revoked') {
+      const worker = await d.workers.get(job.installationId, job.native.workerId);
+      if (worker?.active?.jobId === job.jobId || worker?.settling?.jobId === job.jobId) return fence(worker);
+    }
     const w = await d.workers.get(job.installationId, job.native.workerId);
     if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
     if (w?.active?.jobId === job.jobId) {
@@ -208,6 +224,14 @@ export function createNativeControl(d: NativeControlDeps) {
       if (!await d.workers.put(registered, null)) return refused;
       w = registered;
     }
+    if (w.workerVersion !== p.workerVersion) return refused;
+    const policy = await d.imagePolicy?.();
+    const access = policy && imageDecision(policy, p.workerVersion);
+    if (access && access !== 'approved' && access !== 'image-draining') {
+      log({ nativeWorker: 'retire', installationId: r.installationId, reason: access, imageVersion: r.imageVersion });
+      await fence(w);
+      return refused;
+    }
     const tenant = await d.store.getTenant(r.installationId, { consistent: true });
     const disabled = tenant?.status !== 'active' || await d.disabled() || (d.enabled ? !await d.enabled() : false);
     if (w.settling) {
@@ -243,17 +267,23 @@ export function createNativeControl(d: NativeControlDeps) {
     }
     if (!await save(w, { heartbeatAt: now(), auth: p.auth as AuthState })) return RETRY;
     w = { ...w, version: w.version + 1 };
-    if (p.op !== 'poll' || disabled || p.auth !== 'connected') return { ok: true, busy: false };
+    if (p.op !== 'poll' || disabled || access === 'image-draining' || p.auth !== 'connected') return { ok: true, busy: false };
     for (const id of await d.workers.queued(r.installationId, r.workerId)) {
-      const job = await d.store.getJob(id);
+      let job = await d.store.getJob(id);
       if (!job || job.status === 'finished' || job.stopRequestedAt !== undefined || job.expiresAt <= now()) { await d.workers.dequeue(r.installationId, r.workerId, id); continue; }
       if (await workflowIsPaused(d.store, job)) continue;
+      if (job.native?.workerId === r.workerId && job.native.generation && r.generation && job.native.generation !== r.generation && !job.microvmId && !job.startedAt) {
+        const tokenHash = hashToken(nativeJobToken(secret, job.jobId));
+        if (!await d.workers.rebindQueued?.(job, r, tokenHash)) continue;
+        job = (await d.store.getJob(id))!;
+        log({ nativeWorker: 'reuse', installationId: r.installationId, jobId: id, reason: 'queued_generation_rebound', imageVersion: r.imageVersion });
+      }
       if (!job.native || job.native.workerId !== r.workerId || job.installationId !== r.installationId || job.microvmId || !job.launchingAt ||
           job.imageVersion !== r.imageVersion || job.native.generation !== r.generation) continue;
       const token = nativeJobToken(secret, job.jobId);
       if (hashToken(token) !== job.tokenHash) return refused; // rotated control key: drain before rotation
       // Lost to another poll: read again, and the winner's assignment refuses this poll.
-      if (!await d.workers.assign(job, w, now(), Math.min(job.expiresAt, now() + WORKER_LEASE_MS))) return RETRY;
+      if (!await d.workers.assign(job, w, now(), Math.min(job.expiresAt, now() + WORKER_LEASE_MS), policy)) return RETRY;
       // Assignment is durable before it is handed out. A lost response fences this VM on expiry;
       // it never hands the task out a second time or falls back to BYOK.
       return { ok: true, busy: true, request: { microvmId: r.microvmId, payload: runHookPayload(d.settings, {

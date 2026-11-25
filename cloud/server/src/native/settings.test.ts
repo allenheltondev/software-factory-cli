@@ -207,12 +207,12 @@ describe('Claude subscription mode in the installation app', () => {
     it('tells the console a restart is required, which job a new worker can start for, and who may act', async () => {
       owner();
       expect(await managed().view(caller, 55)).toMatchObject({
-        upgrade: { from: '9.0', to: '10.0', state: 'required' }, pendingRequest: 'job_' + 'w'.repeat(16), owner: true,
+        updateAvailable: { from: '9.0', to: '10.0', state: 'required' }, pendingRequest: 'job_' + 'w'.repeat(16), owner: true,
       });
       member.mockResolvedValueOnce({ tenant: { status: 'active' }, summary: { role: 'member' } });
-      expect(await managed().view(caller, 55)).toMatchObject({ upgrade: { state: 'required' }, owner: false });
+      expect(await managed().view(caller, 55)).toMatchObject({ updateAvailable: { state: 'required' }, owner: false });
       vm = 'TERMINATED';
-      expect(await managed().view(caller, 55)).toMatchObject({ upgrade: { state: 'stopped' } });
+      expect(await managed().view(caller, 55)).toMatchObject({ updateAvailable: { state: 'stopped' } });
     });
 
     it('lets only an owner stop an idle outdated worker, and never one with work on it', async () => {
@@ -228,7 +228,7 @@ describe('Claude subscription mode in the installation app', () => {
       expect(stop).not.toHaveBeenCalled();
       queued = [];
       owner();
-      expect(await managed().restart(caller, 55)).toMatchObject({ upgrade: { state: 'stopping' } });
+      expect(await managed().restart(caller, 55)).toMatchObject({ updateAvailable: { state: 'stopping' } });
       expect(stop).toHaveBeenCalledExactlyOnceWith('mvm-native');
     });
 
@@ -301,6 +301,17 @@ describe('Claude subscription mode in the installation app', () => {
     });
     await expect(api.restart(caller, 55)).rejects.toThrow('environment changed');
     expect(retire).not.toHaveBeenCalled();
+  });
+
+  it('reports a mandatory policy reason and allows queued-work recovery without mistaking it for active execution', async () => {
+    queued = ['waiting-job'];
+    worker!.workerVersion = 'tenant-browser-1';
+    const service = createNativeSettingsService({ github, mode, workers, now: () => now, managed: {
+      route: async () => route, start: vi.fn(), stop: vi.fn(), vmState: async () => 'RUNNING', imageVersion: '10',
+      imagePolicy: async () => ({ imageVersion: route.imageVersion, revision: 2, state: 'draining', protocol: 'tenant-browser-1', reason: 'Security upgrade required' }),
+      sessions: { get: vi.fn() }, grant: () => undefined,
+    } });
+    expect(await service.view(caller, 55)).toMatchObject({ upgrade: { reason: 'Security upgrade required', optional: false }, upgradeBlocked: false, worker: { busy: true } });
   });
 
 });

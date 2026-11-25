@@ -96,13 +96,13 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
             next.owner &&
             !canceled.current &&
             ((next.managed && connectRequested) ||
-              (!next.retired && (next.preparing || (next.upgrade ?? next.recovery)?.state === 'stopping')))
+              (!next.retired && (next.preparing || (next.upgrade ?? next.updateAvailable ?? next.recovery)?.state === 'stopping')))
           ) {
             flow.current = true;
             recoveryRequested.current = Boolean(connectRequested && (next.startupFailed || next.retired));
             setPhase('preparing');
             try {
-              const replacement = next.upgrade ?? next.recovery;
+              const replacement = next.upgrade ?? next.updateAvailable ?? next.recovery;
               if (connectRequested && replacement?.state === 'required') await api.nativeClaudeRestart(installationId);
               else if (next.preparing || (connectRequested && replacement?.state !== 'stopping'))
                 await api.nativeClaudeStart(installationId);
@@ -150,7 +150,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
           setPhase('idle');
           setGenerationChanged(true);
           setError('Your Claude environment changed during sign-in. Reconnect Claude to continue.');
-        } else if (flow.current && !mutationPending.current && (next.upgrade ?? next.recovery)?.state === 'stopped') {
+        } else if (flow.current && !mutationPending.current && (next.upgrade ?? next.updateAvailable ?? next.recovery)?.state === 'stopped') {
           await api.nativeClaudeStart(installationId);
         } else if (flow.current && !mutationPending.current && !next.upgrade && !next.recovery && next.worker?.online) {
           if (
@@ -264,7 +264,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
     grantRequested.current = false;
     generation.current = undefined;
     try {
-      const replacement = view?.upgrade ?? view?.recovery;
+      const replacement = view?.upgrade ?? view?.updateAvailable ?? view?.recovery;
       if (replacement?.state === 'stopping') return;
       const updated =
         replacement?.state === 'required'
@@ -298,9 +298,11 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
     !generationChanged &&
     !view?.upgrade &&
     !view?.recovery &&
+    (!view?.updateAvailable || view.updateAvailable.state === 'required') &&
     view?.worker?.online === true &&
     view.worker.status === 'connected' &&
     phase === 'idle';
+  const upgradeBusy = view?.upgrade ? (view.upgradeBlocked ?? Boolean(view.worker?.busy)) : Boolean(view?.worker?.busy);
   const selection = draft ?? view?.triggers ?? [];
   const available = new Map((view?.availableTriggers ?? []).map((t) => [triggerKey(t), t]));
   const options = new Map([...(view?.triggers ?? []).map((t) => [triggerKey(t), t] as const), ...available]);
@@ -339,7 +341,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
               {phase === 'idle' && (
                 <>
                   <StatusBadge tone={ready ? 'success' : 'warning'}>
-                    {view.retired ? 'Session ended' : ready ? 'Connected' : 'Connection required'}
+                    {view.retired ? 'Session ended' : view.upgrade ? 'Update required' : ready ? 'Connected' : 'Connection required'}
                   </StatusBadge>
                   <p className="text-sm text-muted-foreground">
                     Your dedicated connection lasts up to {(view.connectionPolicy?.maxSessionSeconds ?? 28800) / 3600}{' '}
@@ -389,7 +391,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                   )}
                   {view.owner && view.managed && !ready && phase === 'idle' && (
                     <div>
-                      <Button disabled={Boolean(view.worker?.busy)} onClick={() => void connect()}>
+                      <Button disabled={upgradeBusy} onClick={() => void connect()}>
                         {view.upgrade
                           ? 'Update and reconnect'
                           : view.worker || view.startupFailed || view.retired
@@ -398,6 +400,16 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                       </Button>
                     </div>
                   )}
+                  {phase === 'idle' && view.updateAvailable && (
+                    <div>
+                      <p>Update available: image {view.updateAvailable.from} → {view.updateAvailable.to}.
+                        Your current connection can continue until it expires. Updating requires signing in again.</p>
+                      {view.owner && <Button disabled={Boolean(view.worker?.busy)} onClick={() => void connect()}>
+                        Update and reconnect
+                      </Button>}
+                    </div>
+                  )}
+                  {view.upgrade?.reason && <p role="status">Update required: {view.upgrade.reason}</p>}
                   {view.retired && (
                     <p role="status">
                       This connection has ended. Reconnect Claude when you are ready; opening this page does not start
@@ -409,7 +421,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                       Your Claude environment did not become ready. Reconnect Claude to replace it safely.
                     </Alert>
                   )}
-                  {view.worker?.busy && !ready && (
+                  {upgradeBusy && !ready && (
                     <p role="status">Wait for the current job to finish before reconnecting.</p>
                   )}
                 </>
