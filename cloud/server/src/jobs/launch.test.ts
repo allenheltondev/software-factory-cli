@@ -1,3 +1,5 @@
+import { createWorkflowRecorder } from '../workflows/recorder.js';
+import { createMemoryWorkflowStore } from '../workflows/store.js';
 import { waitingId } from '../native/sessions.js';
 import { parse, stringify } from 'yaml';
 import { jobBranchName } from '../../../../src/git/worktree.js';
@@ -161,9 +163,13 @@ describe('the launcher', () => {
     deps.waitForClaude = vi.fn(async () => { parked = true; return id; });
     deps.parkedClaude = async () => parked ? id : undefined;
     const reserve = vi.spyOn(store, 'reserveJob');
+    const workflowStore = createMemoryWorkflowStore();
+    deps.workflows = createWorkflowRecorder({ store: workflowStore, log: () => {} });
     const launch = createLauncher(deps);
     const event = request();
     expect(await launch(event)).toMatchObject({ status: 202, reason: 'native_waiting_for_sign_in', jobId: id });
+    // The issue's workflow waits for the sign-in, with what to do.
+    expect(await workflowStore.getWorkflow(55, '9-i12')).toMatchObject({ status: 'waiting', stage: 'awaiting-sign-in', reason: 'sign_in_required', lastJobId: id });
     expect(await launch(event)).toMatchObject({ reason: 'native_waiting_for_sign_in', jobId: id });
     expect(deps.waitForClaude).toHaveBeenCalledOnce();
     expect(reserve).not.toHaveBeenCalled();

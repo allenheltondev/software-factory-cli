@@ -47,6 +47,36 @@ export class GitHubError extends Error {
   }
 }
 
+export interface PullRequestHead {
+  state: 'open' | 'closed';
+  merged: boolean;
+  headSha: string;
+  headRef: string;
+}
+
+export interface LabeledIssue {
+  number: number;
+  title: string;
+  htmlUrl: string;
+  labels: string[];
+}
+
+export interface LabelEvent {
+  id: number;
+  actor: string | null;
+  createdAt: string;
+  label: string;
+}
+
+export interface CommitCheckCounts {
+  /** Check runs and statuses seen. */
+  total: number;
+  pending: number;
+  failed: number;
+  passed: number;
+  complete: boolean;
+}
+
 export interface GitHubApi {
   /** Exchange an authorization code for a user-to-server token (POST /login/oauth/access_token). */
   exchangeCode(input: {
@@ -77,6 +107,21 @@ export interface GitHubApi {
   getBotUser(token: string, slug: string): Promise<GitHubUser>;
   listInstallationRepositories(installationToken: string): Promise<GitHubRepository[]>;
   issueState?(installationToken: string, repository: string, issue: number): Promise<{ open: boolean; labels: string[]; pullRequest?: true }>;
+  /** A pull request's state and head (GET /repos/{owner}/{repo}/pulls/{n}). For the workflow reconciler. */
+  pullRequestHead?(installationToken: string, repository: string, pullRequest: number): Promise<PullRequestHead>;
+  /**
+   * The checks of one commit, check runs and commit statuses together (newest per name or
+   * context), as counts. `complete` is false when a listing could not be read to its end: then
+   * nothing is known to be finished. For the workflow reconciler.
+   */
+  commitChecks?(installationToken: string, repository: string, sha: string): Promise<CommitCheckCounts>;
+  /**
+   * Open issues (not pull requests) carrying `label`, updated since `since` (ISO), newest first, at
+   * most `limit`. For the missed-label scan (workflows/label-scan.ts).
+   */
+  labeledIssues?(installationToken: string, repository: string, label: string, since: string, limit: number): Promise<LabeledIssue[]>;
+  /** The newest time `label` was applied to an issue: the event's id, who applied it and when; null when it never was. */
+  latestLabelEvent?(installationToken: string, repository: string, issue: number, label: string): Promise<LabelEvent | null>;
   /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
   createIssueComment(installationToken: string, repository: string, issue: number, body: string): Promise<void>;
 }
@@ -184,6 +229,79 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       const labels = Array.isArray(out.labels) ? out.labels.flatMap((label: unknown) =>
         label && typeof label === 'object' && 'name' in label && typeof label.name === 'string' ? [label.name] : []) : [];
       return { open: out.state === 'open', labels, ...(out.pull_request ? { pullRequest: true as const } : {}) };
+    },
+
+    async pullRequestHead(token, repository, pullRequest) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const out = await json<Json>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pullRequest}`, token), 'GET /repos/pulls');
+      const head = (out.head ?? {}) as Json;
+      return { state: out.state === 'open' ? 'open' : 'closed', merged: out.merged === true, headSha: String(head.sha ?? ''), headRef: String(head.ref ?? '') };
+    },
+
+    async commitChecks(token, repository, sha) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(sha)}`;
+      const counts = { total: 0, pending: 0, failed: 0, passed: 0, complete: true };
+      // Check runs: the newest per name (GitHub's default filter=latest).
+      let seenRuns = 0;
+      let totalRuns = 0;
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const out = await json<{ total_count?: number; check_runs?: Json[] }>(await call(`${base}/check-runs?per_page=100&page=${page}`, token), 'GET /repos/commits/check-runs');
+        totalRuns = Number(out.total_count ?? 0);
+        const runs = out.check_runs ?? [];
+        for (const r of runs) {
+          seenRuns++;
+          counts.total++;
+          if (r.status !== 'completed') counts.pending++;
+          else if (['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(r.conclusion))) counts.failed++;
+          else counts.passed++;
+        }
+        if (runs.length < 100) break;
+      }
+      if (seenRuns < totalRuns) counts.complete = false;
+      // Commit statuses: the combined view lists the newest per context.
+      const status = await json<{ statuses?: Json[]; total_count?: number }>(await call(`${base}/status?per_page=100`, token), 'GET /repos/commits/status');
+      const statuses = status.statuses ?? [];
+      for (const st of statuses) {
+        counts.total++;
+        if (st.state === 'pending') counts.pending++;
+        else if (st.state === 'success') counts.passed++;
+        else counts.failed++;
+      }
+      if (typeof status.total_count === 'number' && status.total_count > statuses.length) counts.complete = false;
+      return counts;
+    },
+
+    async labeledIssues(token, repository, label, since, limit) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const q = new URLSearchParams({ state: 'open', labels: label, since, sort: 'updated', direction: 'desc', per_page: String(Math.min(100, limit)) });
+      const out = await json<Json[]>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?${q}`, token), 'GET /repos/issues');
+      return (Array.isArray(out) ? out : [])
+        .filter((i) => !i.pull_request && typeof i.number === 'number')
+        .slice(0, limit)
+        .map((i) => ({
+          number: Number(i.number),
+          title: String(i.title ?? ''),
+          htmlUrl: String(i.html_url ?? ''),
+          labels: Array.isArray(i.labels) ? (i.labels as Json[]).flatMap((l) => (typeof l?.name === 'string' ? [l.name] : [])) : [],
+        }));
+    },
+
+    async latestLabelEvent(token, repository, issue, label) {
+      const [owner = '', repo = ''] = repository.split('/');
+      let newest: LabelEvent | null = null;
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const out = await json<Json[]>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue}/events?per_page=100&page=${page}`, token), 'GET /repos/issues/events');
+        const events = Array.isArray(out) ? out : [];
+        for (const e of events) {
+          const name = (e.label as Json | undefined)?.name;
+          if (e.event !== 'labeled' || typeof name !== 'string' || name.toLowerCase() !== label.toLowerCase() || typeof e.id !== 'number') continue;
+          const at = String(e.created_at ?? '');
+          if (!newest || at >= newest.createdAt) newest = { id: e.id, actor: typeof (e.actor as Json | undefined)?.login === 'string' ? String((e.actor as Json).login) : null, createdAt: at, label: name };
+        }
+        if (events.length < 100) break;
+      }
+      return newest;
     },
 
     async createIssueComment(token, repository, issue, body) {

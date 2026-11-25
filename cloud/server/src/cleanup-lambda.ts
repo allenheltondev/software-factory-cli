@@ -3,6 +3,8 @@ import { DeleteObjectsCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/c
 import { DeleteSecretCommand, ListSecretsCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { createReconciler } from './jobs/reconcile.js';
 import { awsJobStopper } from './jobs/stop-aws.js';
+import { createDynamoWorkflowStore } from './workflows/store.js';
+import { createWorkflowRecorder } from './workflows/recorder.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
 import { runCleanup } from './tenants/cleanup.js';
@@ -27,6 +29,7 @@ const nativeWorker = nativeAws(store);
 const reconcile = createReconciler({
   store,
   stop: awsJobStopper(store, nativeWorker.control),
+  workflows: createWorkflowRecorder({ store: createDynamoWorkflowStore(process.env.TABLE_NAME ?? '') }),
   native: nativeWorker.control,
   async microvmState(microvmId) {
     try {

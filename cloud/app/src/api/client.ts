@@ -277,6 +277,67 @@ export interface Delivery {
   jobId?: string;
 }
 
+/** An issue's whole story across jobs (#139): what Updraft recorded, never agent text. */
+export type WorkflowStatus = 'active' | 'waiting' | 'blocked' | 'finished';
+
+export interface WorkflowView {
+  workflowId: string;
+  repository: string;
+  repositoryId: number;
+  issue?: number;
+  pullRequest?: number;
+  prUrl?: string;
+  generation: number;
+  status: WorkflowStatus;
+  stage: string;
+  reason?: string;
+  message?: string;
+  nextAction?: string;
+  lastJobId?: string;
+  nextCheckAt?: string;
+  waitingSince?: string;
+  recoveries?: number;
+  createdAt: string;
+  updatedAt: string;
+  /** Rebuilt from job records (jobs from before workflows were recorded): read only, with what it cannot know. */
+  reconstructed?: true;
+  gaps?: string[];
+}
+
+export interface WorkflowTotals {
+  jobs: number;
+  retries: number;
+  reviews: number;
+  revisions: number;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  stepsWithoutCost: number;
+  subscription: boolean;
+  activeSeconds: number;
+  wallSeconds: number;
+  running: boolean;
+}
+
+export interface WorkflowEvent {
+  id: string;
+  at: string;
+  kind: 'job_started' | 'job_finished' | 'ci_recovered' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered';
+  generation: number;
+  jobId?: string;
+  eventName?: string;
+  retry?: boolean;
+  outcome?: string;
+  stage?: string;
+  prNumber?: number;
+  prUrl?: string;
+  steps?: { kind: string; agent?: string; outcome?: string; usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number; durationMs?: number } }[];
+  subscription?: boolean;
+  loop?: { rounds: number; maxRevisions?: number; reviews: number; verdict?: 'ready-to-merge' | 'changes-requested' };
+  headSha?: string;
+  message?: string;
+}
+
 export interface JobView {
   canStop?: boolean;
   stop?: { requestedAt: number; by: string; reason: string; confirmedAt?: number; error?: string; reconnectRequired?: boolean; resumedAt?: number; resumedBy?: string };
@@ -763,6 +824,11 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     deliveries: (installationId: number, limit = 100) => request<{ deliveries: Delivery[] }>(`/installations/${installationId}/deliveries?limit=${limit}`),
     jobs: (installationId: number, limit = 100) => request<{ jobs: JobView[] }>(`/installations/${installationId}/jobs?limit=${limit}`),
     job: (installationId: number, jobId: string) => request<{ job: JobView; deliveries: Delivery[]; conversation?: JobView[] }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}`),
+    workflows: (installationId: number, limit = 100) => request<{ workflows: WorkflowView[] }>(`/installations/${installationId}/workflows?limit=${limit}`),
+    workflow: (installationId: number, workflowId: string) =>
+      request<{ workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}`),
+    /** The workflow a job belongs to; null when none was recorded (a job from before workflows). */
+    jobWorkflow: (installationId: number, jobId: string) => request<{ workflowId: string | null }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/workflow`),
     /** Runs a job that did not finish its work again, as a new job (its id). Throws ApiError: `not_retryable`, `already_retried`, `throttled`, `event_gone`, ... (409, 410, 429). */
     retryJob: (installationId: number, jobId: string) =>
       request<{ jobId: string }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' }),

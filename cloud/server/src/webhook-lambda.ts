@@ -1,3 +1,8 @@
+import { createDynamoWorkflowStore } from './workflows/store.js';
+import { createWorkflowRecorder } from './workflows/recorder.js';
+import { createWorkflowReconciler, type ReconcileReport } from './workflows/reconcile.js';
+import { createLabelScanner, type LabelScanReport } from './workflows/label-scan.js';
+import { reconcileMetricsLine } from './workflows/metrics.js';
 import { waitingId } from './native/sessions.js';
 import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -29,6 +34,8 @@ import { createBenchmarkDispatch } from './benchmarks/dispatch.js';
 
 const env = process.env;
 const store = createDynamoStore(env.TABLE_NAME ?? '');
+const workflowStore = createDynamoWorkflowStore(env.TABLE_NAME ?? '');
+const workflows = createWorkflowRecorder({ store: workflowStore });
 
 // GitHub waits 10 seconds for a webhook: one retry at most.
 const clientOptions = { maxAttempts: 2 };
@@ -83,6 +90,7 @@ function launcher(): Launcher | undefined {
   return createLauncher({
     store,
     stopJob: stopJob.advance,
+    workflows,
     ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
     native: nativeWorker.launch,
     resolveNative: nativeWorker.resolveNative,
@@ -274,7 +282,37 @@ async function resumeClaude(installationId: number) {
   }
 }
 
-export async function handler(event: APIGatewayProxyEvent | RetryRequest | { action: 'resumeClaude'; installationId: number }): Promise<APIGatewayProxyResult | RetryResult | void> {
+// Workflow reconciliation (workflows/reconcile.ts), on its own schedule: here, since a missed
+// check event is recovered by launching the job it would have started.
+const reconcileWorkflows = createWorkflowReconciler({
+  store: workflowStore,
+  jobs: store,
+  github,
+  loadSettings,
+  ...(launch ? { launch } : {}),
+  appBot: async () => {
+    const settings = await loadSettings();
+    return settings?.slug ? `${settings.slug}[bot]` : undefined;
+  },
+  killSwitch,
+});
+
+const scanLabels = createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings });
+
+export async function handler(
+  event: APIGatewayProxyEvent | RetryRequest | { action: 'resumeClaude'; installationId: number } | { action: 'reconcileWorkflows' },
+): Promise<APIGatewayProxyResult | RetryResult | (ReconcileReport & { labels: LabelScanReport }) | void> {
+  if ('action' in event && event.action === 'reconcileWorkflows') {
+    const report = await reconcileWorkflows();
+    // Labeled issues whose delivery never came (workflows/label-scan.ts): reported, never started.
+    const labels = !(await killSwitch.engaged()) ? await scanLabels() : { tenants: 0, flagged: 0, failed: 0 };
+    const combined = { ...report, labels };
+    // Metrics first, whatever follows: a failing run is what the alarms look for.
+    console.log(reconcileMetricsLine(report, labels, Date.now()));
+    // The next run (five minutes on) retries what failed; fail this one so alarms see it.
+    if (report.failed > 0 || labels.failed > 0) throw new Error(`workflow reconciliation failed for ${report.failed} workflow(s) and ${labels.failed} tenant label scan(s)`);
+    return combined;
+  }
   if ('action' in event) {
     if (event.action === 'resumeClaude' && Number.isSafeInteger(event.installationId) && event.installationId > 0) await resumeClaude(event.installationId);
     return;

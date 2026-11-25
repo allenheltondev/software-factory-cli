@@ -8,6 +8,8 @@ import { loadTokenFile } from '../../../../src/github/token-file-auth.js';
 import type { AppSettings } from '../github/settings.js';
 import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
 import { createReconciler } from '../jobs/reconcile.js';
+import { createWorkflowRecorder } from '../workflows/recorder.js';
+import { createMemoryWorkflowStore } from '../workflows/store.js';
 import { createBroker, hashToken, JOB_PERMISSIONS, jobPaths, jobSessionPolicy, OPTIONAL_JOB_PERMISSIONS, SESSION_SECONDS } from './broker.js';
 import { GitHubError } from '../github/client.js';
 import { telemetryView } from '../tenants/telemetry-service.js';
@@ -322,6 +324,21 @@ describe('the job broker', () => {
     await store.setSuspended(55, false);
     await store.markUninstalled(55, NOW + 1000);
     expect(await handle({ action: 'github-token', jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
+  });
+
+  it('records the finish that stuck on the job\'s workflow, once', async () => {
+    const workflows = createMemoryWorkflowStore();
+    const recorder = createWorkflowRecorder({ store: workflows, now: () => clock, log: () => {} });
+    job = { ...job, issue: 7 };
+    await store.putJob(job);
+    handle = createBroker({ store, loadSettings: async () => SETTINGS, github, assumeRole, terminateMicrovm, microvmState, stopCheckDelayMs: 1, policy: POLICY, now: () => clock, workflows: recorder });
+    await handle({ action: 'start', jobId: job.jobId, token });
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'succeeded', detail: { prUrl: 'https://github.com/acme/web/pull/12', prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } } });
+    expect(await workflows.getWorkflow(55, '99-i7')).toMatchObject({ status: 'waiting', stage: 'waiting-for-ci', pullRequest: 12 });
+    expect(await workflows.workflowOfPullRequest(55, 99, 12)).toBe('99-i7');
+    // A repeated finish with another outcome does not change what was recorded.
+    await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'failed' });
+    expect(await workflows.getWorkflow(55, '99-i7')).toMatchObject({ status: 'waiting', stage: 'waiting-for-ci' });
   });
 
   it('mints an installation token for the job\'s repository only, as a token file the CLI reads', async () => {

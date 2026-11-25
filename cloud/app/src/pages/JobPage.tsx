@@ -7,7 +7,7 @@ import { relativeTime } from '../lib/time';
 import { Lifecycle } from '../components/lifecycle';
 import { JobActions, JobStopStatus } from '../components/job-actions';
 
-type JobApi = Pick<ApiClient, 'job' | 'jobLog'> & Partial<Pick<ApiClient, 'retryJob' | 'stopJob' | 'resumeJob'>>;
+type JobApi = Pick<ApiClient, 'job' | 'jobLog'> & Partial<Pick<ApiClient, 'retryJob' | 'stopJob' | 'resumeJob' | 'jobWorkflow'>>;
 type Load = { state: 'loading' } | { state: 'ok'; job: JobView; deliveries: Delivery[]; conversation?: JobView[] } | { state: 'error'; message: string };
 type LogLoad = { state: 'loading' } | { state: 'ok'; log: JobLog } | { state: 'expired' } | { state: 'error'; message: string };
 
@@ -44,6 +44,17 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
     };
   }, [refresh, valid]);
 
+  // The workflow the job belongs to (#139), once: a link up to the issue's whole story.
+  const [workflowId, setWorkflowId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!valid || !api.jobWorkflow) return;
+    let on = true;
+    api.jobWorkflow(installationId, jobId).then((r) => on && setWorkflowId(r.workflowId), () => {});
+    return () => {
+      on = false;
+    };
+  }, [api, installationId, jobId, valid]);
+
   const running = load.state === 'ok' && load.job.result === 'running';
   useEffect(() => {
     if (!running) return;
@@ -53,9 +64,16 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
 
   return (
     <div className="flex flex-col gap-6">
-      <Link className="auth-link" to={`/installations/${id}`}>
-        ← Installation
-      </Link>
+      <div className="flex flex-wrap gap-4">
+        <Link className="auth-link" to={`/installations/${id}`}>
+          ← Installation
+        </Link>
+        {workflowId && (
+          <Link className="auth-link" to={`/installations/${id}/workflows/${workflowId}`} data-testid="job-workflow">
+            Workflow
+          </Link>
+        )}
+      </div>
       {load.state === 'loading' && <Skeleton className="h-40" data-testid="job-loading" />}
       {load.state === 'error' && (
         <Alert variant="error" data-testid="job-error">
