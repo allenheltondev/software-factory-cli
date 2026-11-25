@@ -31,6 +31,7 @@ export interface ReviewFinding {
   status: FindingStatus;
   statusSha: string | null;
   statusNote: string | null;
+  statusAt: string | null;
   resolution: FindingResolution | null;
   resolutionNote: string | null;
   resolutionSha: string | null;
@@ -60,6 +61,7 @@ interface Row {
   status: FindingStatus;
   status_sha: string | null;
   status_note: string | null;
+  status_at: string | null;
   resolution: FindingResolution | null;
   resolution_note: string | null;
   resolution_sha: string | null;
@@ -89,6 +91,7 @@ const toFinding = (r: Row): ReviewFinding => ({
   status: r.status,
   statusSha: r.status_sha,
   statusNote: r.status_note,
+  statusAt: r.status_at,
   resolution: r.resolution,
   resolutionNote: r.resolution_note,
   resolutionSha: r.resolution_sha,
@@ -169,17 +172,6 @@ export function recordFindings(
       at,
       at,
     );
-    // A repeated finding reopens its thread: the reviewer found it is still there.
-    if (root && root.key !== key && root.status === 'verified') {
-      db.prepare("UPDATE review_findings SET status = 'unresolved', status_sha = ?, status_note = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND finding_key = ?").run(
-        r.headSha,
-        f.problem,
-        at,
-        r.repoId,
-        r.prNumber,
-        root.key,
-      );
-    }
   }
   return findingsOfRun(db, r.runId);
 }
@@ -209,17 +201,53 @@ export function recordResolution(
   ).run(r.resolution, r.note, r.sha, r.runId, iso(r.now), repoId, prNumber, threadKey);
 }
 
-/** A later reviewer's check of a thread against the head it reviewed. */
-export function recordCheck(db: Db, repoId: number, prNumber: number, threadKey: string, c: { status: 'verified' | 'unresolved'; sha: string; note: string; now?: () => number }): void {
-  db.prepare('UPDATE review_findings SET status = ?, status_sha = ?, status_note = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND finding_key = ?').run(
-    c.status,
-    c.sha,
-    c.note,
-    iso(c.now),
-    repoId,
-    prNumber,
-    threadKey,
-  );
+/**
+ * A later reviewer's check of a thread against the head it reviewed. `at` is when that review
+ * was recorded: a check from a review older than the one behind the thread's status changes
+ * nothing, so a late retry of an old review never overwrites a newer verdict. Returns whether it
+ * was recorded.
+ */
+export function recordCheck(db: Db, repoId: number, prNumber: number, threadKey: string, c: { status: 'verified' | 'unresolved'; sha: string; note: string; at: string; now?: () => number }): boolean {
+  const res = db
+    .prepare(
+      'UPDATE review_findings SET status = ?, status_sha = ?, status_note = ?, status_at = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND finding_key = ? AND (status_at IS NULL OR status_at <= ?)',
+    )
+    .run(c.status, c.sha, c.note, c.at, iso(c.now), repoId, prNumber, threadKey, c.at);
+  return Number(res.changes) > 0;
+}
+
+/**
+ * A finding of a current review that repeats an earlier one: the thread is unresolved again, and
+ * carries what the reviewer found now (its severity, text and place), so the next round sees the
+ * finding as it is, not as it was first written. Guarded like recordCheck.
+ */
+export function applyRepeat(db: Db, repoId: number, prNumber: number, threadKey: string, repeat: ReviewFinding, at: string, now?: () => number): boolean {
+  const res = db
+    .prepare(
+      `UPDATE review_findings SET severity = ?, title = ?, problem = ?, suggestion = ?, path = ?, line = ?, status = 'unresolved', status_sha = ?, status_note = ?, status_at = ?,
+              updated_at = ? WHERE repo_id = ? AND pr_number = ? AND finding_key = ? AND (status_at IS NULL OR status_at <= ?)`,
+    )
+    .run(repeat.severity, repeat.title, repeat.problem, repeat.suggestion, repeat.path, repeat.line, repeat.headSha, repeat.problem, at, iso(now), repoId, prNumber, threadKey, at);
+  return Number(res.changes) > 0;
+}
+
+/**
+ * The thread of `alias` (a repeat) moves to `alias` itself: the earlier finding had no thread on
+ * GitHub, and the repeat was posted inline. Every finding of the old thread follows it, and the
+ * new root takes over the old root's report, so nothing of the thread's history is lost.
+ */
+export function promoteThread(db: Db, repoId: number, prNumber: number, alias: string, now?: () => number): void {
+  const a = getFinding(db, repoId, prNumber, alias);
+  if (!a || a.threadKey === a.key) return;
+  const old = getFinding(db, repoId, prNumber, a.threadKey);
+  const at = iso(now);
+  db.prepare('UPDATE review_findings SET thread_key = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND (thread_key = ? OR finding_key = ?)').run(alias, at, repoId, prNumber, a.threadKey, alias);
+  if (old) {
+    db.prepare(
+      `UPDATE review_findings SET status = ?, status_sha = ?, status_note = ?, status_at = ?, resolution = ?, resolution_note = ?, resolution_sha = ?, resolution_run_id = ?, updated_at = ?
+       WHERE repo_id = ? AND pr_number = ? AND finding_key = ?`,
+    ).run(old.status, old.statusSha, old.statusNote, old.statusAt, old.resolution, old.resolutionNote, old.resolutionSha, old.resolutionRunId, at, repoId, prNumber, alias);
+  }
 }
 
 export function markThreadResolved(db: Db, repoId: number, prNumber: number, threadKey: string, now?: () => number): void {

@@ -653,6 +653,7 @@ const MIGRATIONS: Record<number, Migration> = {
       status             TEXT    NOT NULL DEFAULT 'open' CHECK (status IN ('open','verified','unresolved')),
       status_sha         TEXT,               -- the head the status is about
       status_note        TEXT,
+      status_at          TEXT,               -- when the review behind the status was recorded: an older one never overwrites it
       resolution         TEXT    CHECK (resolution IN ('fixed','disagreed','deferred','unable','unreported')),
       resolution_note    TEXT,
       resolution_sha     TEXT,

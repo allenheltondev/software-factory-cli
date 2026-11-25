@@ -586,7 +586,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     if (request.findings?.length) {
       hold();
       const answered = await answerFindings(
-        { db: deps.db, api: deps.api, now },
+        { db: deps.db, api: deps.api, now, guard: () => hold(), repoFullName, runId },
         {
           repo: repoRef,
           prNumber,

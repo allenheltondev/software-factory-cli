@@ -114,6 +114,22 @@ describe('createGitHubApi: the review loop', () => {
     await api.resolveReviewThread!(repo, 'T1');
     expect(JSON.parse(calls.at(-1)!.body!).variables).toEqual({ id: 'T1' });
 
+    // A thread on the second page is found.
+    const paged = fakeFetch((_url, call) => {
+      const vars = JSON.parse(call.body!).variables as { cursor: string | null };
+      const page = (nodes: unknown[], next: string | null) => json({ data: { repository: { databaseId: 42, pullRequest: { reviewThreads: { pageInfo: { hasNextPage: next !== null, endCursor: next }, nodes } } } } });
+      return vars.cursor === null ? page([{ id: 'T1', isResolved: true, comments: { nodes: [{ databaseId: 1 }] } }], 'c1') : page([{ id: 'T2', isResolved: false, comments: { nodes: [{ databaseId: 2, author: { login: 'bot' } }] } }], null);
+    });
+    const pagedApi = await createGitHubApi({ token: 't', fetch: paged.fn });
+    expect((await pagedApi.listReviewThreads!(repo, 5)).map((t) => t.id)).toEqual(['T1', 'T2']);
+    expect(JSON.parse(paged.calls[1]!.body!).variables.cursor).toBe('c1');
+    // Never read to the end: an error, not a short list.
+    const endless = await createGitHubApi({
+      token: 't',
+      fetch: fakeFetch(() => json({ data: { repository: { databaseId: 42, pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: 'more' }, nodes: [] } } } } })).fn,
+    });
+    await expect(endless.listReviewThreads!(repo, 5)).rejects.toThrow(/not all were read/);
+
     const renamed = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json({ data: { repository: { databaseId: 7, pullRequest: null } } })).fn });
     await expect(renamed.listReviewThreads!(repo, 5)).rejects.toThrow(/now names repository 7/);
     const refused = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json({ errors: [{ type: 'FORBIDDEN', message: 'no' }] })).fn });

@@ -79,6 +79,7 @@ import {
   type GitHubRepo,
   type GitHubReview,
   type PullRequestReviewComment,
+  type ReviewThread,
   type IssueEventsPage,
   type PullRequestDetails,
   type PullRequestReviewSummary,
@@ -503,17 +504,22 @@ interface RawReviewThreads {
     databaseId: number | null;
     pullRequest: {
       reviewThreads?: {
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
         nodes?: Array<{ id: string; isResolved?: boolean; comments?: { nodes?: Array<{ databaseId?: number | null; author?: { login?: string } | null } | null> } } | null>;
       };
     } | null;
   } | null;
 }
 
-const REVIEW_THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+/** Pages of 100 review threads read at most: a pull request with more is reported as not fully read. */
+const MAX_THREAD_PAGES = 20;
+
+const REVIEW_THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     databaseId
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
         nodes { id isResolved comments(first: 1) { nodes { databaseId author { login } } } }
       }
     }
@@ -988,27 +994,37 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       const [owner, name, ...rest] = repo.fullName.split('/');
       if (!owner || !name || rest.length) throw new GitHubError(`invalid repository name "${repo.fullName}"`, 502);
       const what = `review threads of ${repo.fullName}#${pullNumber}`;
-      const res = await request<GraphQLResponse<RawReviewThreads>>('/graphql', {
-        method: 'POST',
-        body: { query: REVIEW_THREADS_QUERY, variables: { owner, name, number: pullNumber } },
-      });
-      const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
-      if (errors.length) {
-        const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
-        const limited = errors.some((e) => e.type === 'RATE_LIMITED');
-        throw new GitHubError(`POST /graphql (${what}) failed: ${detail}`, limited ? 429 : 502, limited ? (retryAfterFrom(res.headers) ?? 60) : null);
+      const out: ReviewThread[] = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < MAX_THREAD_PAGES; page++) {
+        const res: RawResponse<GraphQLResponse<RawReviewThreads>> = await request<GraphQLResponse<RawReviewThreads>>('/graphql', {
+          method: 'POST',
+          body: { query: REVIEW_THREADS_QUERY, variables: { owner, name, number: pullNumber, cursor } },
+        });
+        const errors = Array.isArray(res.data?.errors) ? res.data.errors : [];
+        if (errors.length) {
+          const detail = errors.map((e) => e.message ?? e.type ?? 'unknown error').join('; ');
+          const limited = errors.some((e) => e.type === 'RATE_LIMITED');
+          throw new GitHubError(`POST /graphql (${what}) failed: ${detail}`, limited ? 429 : 502, limited ? (retryAfterFrom(res.headers) ?? 60) : null);
+        }
+        const repository = res.data?.data?.repository ?? null;
+        if (!repository) throw new GitHubError(`POST /graphql (${what}) returned no repository`, 502);
+        if (repository.databaseId !== repo.id) {
+          throw new GitHubError(`POST /graphql (${what}): "${repo.fullName}" now names repository ${repository.databaseId ?? 'unknown'}, not ${repo.id}`, 502);
+        }
+        if (!repository.pullRequest) throw new GitHubError(`POST /graphql (${what}): pull request not found`, 404);
+        const threads = repository.pullRequest.reviewThreads;
+        for (const t of threads?.nodes ?? []) {
+          if (!t) continue;
+          const first = t.comments?.nodes?.[0] ?? null;
+          out.push({ id: t.id, isResolved: t.isResolved === true, rootCommentId: first?.databaseId ?? null, rootAuthor: first?.author?.login ?? null });
+        }
+        if (!threads?.pageInfo?.hasNextPage) return out;
+        cursor = threads.pageInfo.endCursor ?? null;
+        if (!cursor) break;
       }
-      const repository = res.data?.data?.repository ?? null;
-      if (!repository) throw new GitHubError(`POST /graphql (${what}) returned no repository`, 502);
-      if (repository.databaseId !== repo.id) {
-        throw new GitHubError(`POST /graphql (${what}): "${repo.fullName}" now names repository ${repository.databaseId ?? 'unknown'}, not ${repo.id}`, 502);
-      }
-      if (!repository.pullRequest) throw new GitHubError(`POST /graphql (${what}): pull request not found`, 404);
-      return (repository.pullRequest.reviewThreads?.nodes ?? []).flatMap((t) => {
-        if (!t) return [];
-        const first = t.comments?.nodes?.[0] ?? null;
-        return [{ id: t.id, isResolved: t.isResolved === true, rootCommentId: first?.databaseId ?? null, rootAuthor: first?.author?.login ?? null }];
-      });
+      // Not read to the end: a thread that is not listed must not read as "not there".
+      throw new GitHubError(`POST /graphql (${what}): more than ${MAX_THREAD_PAGES * 100} review threads, or no cursor to read on; not all were read`, 422);
     },
 
     async resolveReviewThread(repo, threadId) {

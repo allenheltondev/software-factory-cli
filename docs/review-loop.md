@@ -270,7 +270,7 @@ Before its findings count and verdict lines, the reviewer writes one fenced bloc
 - **Repeats:** `sameAs` names an earlier finding of this pull request that is still not fixed. The new finding joins that finding's thread.
 - **Checks:** `checks` re-check earlier findings against the commit under review. `verified` or `unresolved`; anything else counts as unresolved.
 - **Limits:** a block holds at most 50 findings and 50 checks. Each text field is capped, and control characters are removed.
-- **Verdict:** the block never decides anything. The verdict line alone decides, as before.
+- **Verdict:** the verdict line decides, as before, but a structured review's verdict must agree with its findings. A `ready-to-merge` is never acted on as ready when the review lists a blocker, finds an earlier blocker unresolved (a `checks` entry or a `sameAs` repeat), or leaves an earlier blocker it was given unchecked. It is recorded and acted on as changes requested, and the review says why. A legacy review on a pull request with no earlier structured findings is not checked.
 - **Fallback:** a review with no block, two blocks or a block that isn't valid JSON is posted as a legacy review: its whole text, as before. Run.log says why.
 
 ### On the pull request
@@ -279,8 +279,9 @@ Before its findings count and verdict lines, the reviewer writes one fenced bloc
 - **Inline threads:** a finding whose line is in the pull request's diff, as GitHub shows it for the reviewed head, is posted with the review as an inline comment on that line. Its full text is in the thread and not repeated in the summary. Updraft never invents a line: a range must be within one hunk, and the file must have a diff.
 - **The rest:** findings on lines outside the diff, files the change didn't touch, findings with no file, findings beyond 25 inline comments, and every finding when the pull request has moved past the reviewed commit go in the summary in full, with the reason.
 - **Refused inline comments:** GitHub refuses the whole review when it can't place one comment. Updraft then posts the review again with every finding in the summary. Nothing is dropped.
-- **Repeats:** a repeat of a finding that has a thread gets a reply in that thread ("this is still not fixed"), not a new thread.
-- **Checks:** each check of an earlier finding is answered in that finding's thread. A thread is resolved only when the check `verified` it and the thread is one the worker started: its first comment was posted by the worker's own login, with the review recorded for that run. A person's thread is never resolved. A check that names no finding of this pull request is ignored, and the summary says so.
+- **Current head only:** repeats and checks change earlier findings, and are answered in their threads, only for a review of the pull request's current head, looked at on GitHub just before. A review whose head has moved on is posted as history and changes nothing. A check or repeat from an older review never overwrites the state a newer review recorded.
+- **Repeats:** a repeat of a finding that has a thread gets a reply in that thread ("this is still not fixed", with the current text), not a new thread. The summary carries the repeat's full text too. A repeat of a finding that was only in a summary, posted inline now, becomes that finding's thread. Either way, the thread takes on the repeat's current severity and text, so a suggestion that now blocks is a blocker for the next round.
+- **Checks:** each check of an earlier finding is answered in that finding's thread. A thread is resolved only when the check `verified` it and the thread is one the worker started: its first comment was posted by the worker's own login, with the review recorded for that run. A person's thread is never resolved. The resolution is recorded only once GitHub confirms it, and the reply never says "resolved" on its own. A check that names no finding of this pull request is ignored, and the summary says so.
 
 ### The revision
 
@@ -307,7 +308,9 @@ read. A finding the agent doesn't report on is answered as having no report.
 
 - **The worker's records:** what the worker recorded decides, never the posted text. That record is the finding, its thread (the comment the worker itself posted), the coding agent's report and the reviewer's check, kept in `review_findings` in the state database and merged across Cloud jobs (see [shared state](shared-state.md)).
 - **Markers:** every reply carries a marker for its kind, run and thread, so a retry or a lost response never posts it twice. A marker copied into someone else's comment is ignored.
-- **Best effort:** thread steps never hold up the verdict. If one fails, run.log says so, the summary still has every finding, and the verdict acts as it would without threads.
+- **The fence:** every thread write and every change of a finding's state is made under the step's lease and attempt fence, checked right before it, with the same stop and deadline. An attempt that lost its lease, or is stopping, writes nothing more.
+- **Failures:** a thread write GitHub refuses for good (a permission, a thread that is gone) is said in run.log; the summary has the finding, and the step goes on. A failure worth retrying (a rate limit, a 5xx, the network) fails the attempt, which is retried like any. The review is not posted twice, and no reply is either.
+- **Many threads:** the threads of a pull request are read page by page. One with more than 2000 threads is reported as not fully read, and its findings are verified, not resolved.
 - **Without thread support:** a GitHub client without thread support posts the summary only.
 
 ## Where the reviewer runs
