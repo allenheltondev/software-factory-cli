@@ -3,11 +3,34 @@
 In live mode, when the worker claims an implementation run and the final dispatch check passes, it
 comments once on the source issue, just before the agent starts:
 
-> Updraft assigned **codex** to work on this issue.
+> Updraft assigned a worker to this issue.
 >
-> - **Job ID** `job_...`
-> - **Run ID** `run_...`
-> - **Pool** `general`
+> | Field | Value |
+> | --- | --- |
+> | Worker | `codex` |
+> | Model (configured) | `claude-sonnet` |
+> | Complexity | `standard` |
+> | Job ID | [job_...](https://updraft.readysetcloud.io/installations/123/jobs/job_...) |
+> | Run ID | `run_...` |
+> | Pool | `general` |
+
+Model shows `CLI default` or `Unknown` when no model is configured or recorded, and complexity
+`Not classified` when the job was not routed; a model is never claimed as observed at assignment.
+Values are escaped for a Markdown table.
+
+## Job link
+
+Hosted runs (`updraft run-event` started by the Updraft runner, for API-key MicroVMs and native
+subscription workers alike) receive three nonsecret environment variables:
+`UPDRAFT_CONSOLE_ORIGIN` (the deployment's trusted console origin, https; production is
+`https://updraft.readysetcloud.io`, staging and self-hosted deployments set their own),
+`UPDRAFT_CLOUD_INSTALLATION_ID` and `UPDRAFT_CLOUD_JOB_ID`. With all three valid, the comment links
+`/installations/<id>/jobs/<cloud job id>`. If the Cloud job id equals the local job id, the Job ID
+cell is the link; otherwise the local Job ID stays plain and an `Updraft job` row carries the link.
+The link grants no access: the console still requires sign-in and installation membership.
+Standalone workers, or missing or invalid context (non-https origin, an origin with a path or
+credentials, malformed ids), render the same table with plain IDs and no link. The destination
+never comes from issue content, agent output or repository configuration.
 
 It names the agent actually selected for the run. The wording is about assignment, so it stays
 accurate if the run later fails (a failure comment, if enabled, follows separately). Prompts,

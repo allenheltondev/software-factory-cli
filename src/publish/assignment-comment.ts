@@ -16,8 +16,7 @@ import { GitHubError, type GitHubApi } from '../github/api.js';
 import { GitHubAppError } from '../github/app-auth.js';
 import type { Job, Run } from '../types.js';
 import type { Logger } from '../util/log.js';
-import { code } from './failure-comment.js';
-import { detailLines, runDetails, type RunDetails } from './run-details.js';
+import { runDetails, type RunDetails } from './run-details.js';
 
 /** Writes tried per assignment (the first plus retries of transient failures). */
 export const ASSIGNMENT_MAX_ATTEMPTS = 4;
@@ -30,6 +29,8 @@ export interface AssignmentCommentDeps {
   api: GitHubApi;
   log: Logger;
   now?: () => number;
+  /** Hosted console context (runner-provided); absent for standalone workers. */
+  console?: ConsoleContext | null;
   /** Wait between attempts; resolves early on abort. Injectable for tests. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
@@ -47,15 +48,72 @@ export function assignmentCommentMarker(runId: string): string {
   return `<!-- updraft-run-assigned: ${runId} -->`;
 }
 
-export function renderAssignmentComment(o: { details: RunDetails; jobId: string; runId: string; pool: string }): string {
+/**
+ * Hosted context the runner hands to `updraft run-event`: the trusted console origin, the GitHub
+ * installation id and the Cloud job id. All three are required for a link; none is a secret.
+ */
+export interface ConsoleContext {
+  origin: string;
+  installationId: string;
+  cloudJobId: string;
+}
+
+/** Reads the hosted context from the runner's environment; null when absent or unusable. */
+export function consoleContextFromEnv(env: NodeJS.ProcessEnv): ConsoleContext | null {
+  const installationId = env.UPDRAFT_CLOUD_INSTALLATION_ID?.trim();
+  const cloudJobId = env.UPDRAFT_CLOUD_JOB_ID?.trim();
+  const origin = env.UPDRAFT_CONSOLE_ORIGIN?.trim();
+  if (!origin || !installationId || !cloudJobId) return null;
+  return { origin, installationId, cloudJobId };
+}
+
+/** The job page URL, or null when the context is missing or not a plain https (or localhost http) origin. */
+export function consoleJobUrl(ctx: ConsoleContext | null | undefined): string | null {
+  if (!ctx || !/^\d+$/.test(ctx.installationId) || !/^[A-Za-z0-9_.-]{1,128}$/.test(ctx.cloudJobId)) return null;
+  let u: URL;
+  try {
+    u = new URL(ctx.origin);
+  } catch {
+    return null;
+  }
+  const local = u.hostname === 'localhost' || u.hostname === '127.0.0.1';
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && local)) return null;
+  if (u.username || u.password || (u.pathname !== '/' && u.pathname !== '') || u.search || u.hash) return null;
+  return `${u.origin}/installations/${encodeURIComponent(ctx.installationId)}/jobs/${encodeURIComponent(ctx.cloudJobId)}`;
+}
+
+/** A table cell: one line, pipes and markup escaped. */
+function cell(text: string): string {
+  return text.replace(/<!--|-->/g, '').replace(/\s+/g, ' ').trim().replace(/[\\|]/g, '\\$&').replace(/`/g, '\\`') || '?';
+}
+const codeCell = (text: string) => `\`${cell(text).replace(/\\([`])/g, '$1').replace(/`/g, "'")}\``;
+
+export function renderAssignmentComment(o: {
+  details: RunDetails;
+  jobId: string;
+  runId: string;
+  pool: string;
+  console?: ConsoleContext | null;
+}): string {
+  const url = consoleJobUrl(o.console);
+  const cloudId = o.console?.cloudJobId ?? '';
+  const rows: Array<[string, string]> = [['Worker', codeCell(o.details.worker)]];
+  const kind = o.details.modelKind ? 'configured' : null;
+  rows.push([`Model${kind ? ` (${kind})` : ''}`, codeCell(o.details.model)]);
+  rows.push(['Complexity', codeCell(o.details.complexity)]);
+  if (url && cloudId === o.jobId) {
+    rows.push(['Job ID', `[${cell(o.jobId).replace(/[\[\]]/g, '\\$&')}](${url})`]);
+  } else {
+    rows.push(['Job ID', codeCell(o.jobId)]);
+    if (url) rows.push(['Updraft job', `[${cell(cloudId).replace(/[\[\]]/g, '\\$&')}](${url})`]);
+  }
+  rows.push(['Run ID', codeCell(o.runId)], ['Pool', codeCell(o.pool)]);
   return [
     'Updraft assigned a worker to this issue.',
     '',
-    `- **Worker** ${code(o.details.worker)}`,
-    ...detailLines(o.details, true),
-    `- **Job ID** ${code(o.jobId)}`,
-    `- **Run ID** ${code(o.runId)}`,
-    `- **Pool** ${code(o.pool)}`,
+    '| Field | Value |',
+    '| --- | --- |',
+    ...rows.map(([k, v]) => `| ${k} | ${v} |`),
     '',
     assignmentCommentMarker(o.runId),
   ].join('\n');
@@ -107,7 +165,7 @@ export function createAssignmentCommenter(deps: AssignmentCommentDeps): Assignme
             const created = await deps.api.createIssueComment(
               repoRef,
               job.issueNumber,
-              renderAssignmentComment({ details: runDetails(deps.db, job, run), jobId: job.id, runId: run.id, pool: run.pool }),
+              renderAssignmentComment({ details: runDetails(deps.db, job, run), jobId: job.id, runId: run.id, pool: run.pool, console: deps.console }),
             );
             log.info('assignment comment posted', { comment: created.htmlUrl });
             return;

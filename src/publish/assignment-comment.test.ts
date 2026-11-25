@@ -4,7 +4,7 @@ import { openDatabase } from '../db/database.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
 import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job, type Run } from '../types.js';
 import { silentLogger } from '../util/log.js';
-import { assignmentCommentMarker, createAssignmentCommenter, renderAssignmentComment } from './assignment-comment.js';
+import { consoleContextFromEnv, consoleJobUrl, assignmentCommentMarker, createAssignmentCommenter, renderAssignmentComment } from './assignment-comment.js';
 
 const config = (mode: 'live' | 'log-only' | 'prepare-only' = 'live'): UpdraftConfig =>
   configSchema.parse({
@@ -70,9 +70,11 @@ describe('assignment comment', () => {
     expect(api.comments).toHaveLength(1);
     expect(api.comments[0]!.body).toBe(renderAssignmentComment({ details: { worker: 'codex', model: 'Unknown', modelKind: null, complexity: 'Not classified' }, jobId: 'job_1', runId: 'run_1', pool: 'general' }));
     expect(api.comments[0]!.body).toContain('Updraft assigned a worker to this issue.');
-    expect(api.comments[0]!.body).toContain('- **Worker** `codex`');
-    expect(api.comments[0]!.body).toContain('- **Model** `Unknown`');
-    expect(api.comments[0]!.body).toContain('- **Complexity** `Not classified`');
+    expect(api.comments[0]!.body).toContain('| Field | Value |\n| --- | --- |');
+    expect(api.comments[0]!.body).toContain('| Worker | `codex` |');
+    expect(api.comments[0]!.body).toContain('| Model | `Unknown` |');
+    expect(api.comments[0]!.body).toContain('| Complexity | `Not classified` |');
+    expect(api.comments[0]!.body).not.toContain('](');
     expect(api.comments[0]!.body).toContain('`job_1`');
     expect(api.comments[0]!.body).toContain('`run_1`');
     expect(api.comments[0]!.body).toContain('`general`');
@@ -121,5 +123,51 @@ describe('assignment comment', () => {
     const create = vi.spyOn(api, 'createIssueComment');
     await expect(commenter.announce(job(), run('run_1', 'codex'))).resolves.toBeUndefined();
     expect(create).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('assignment comment table and link', () => {
+  const details = { worker: 'claude-standard', model: 'claude-sonnet', modelKind: 'configured' as const, complexity: 'standard' };
+  const base = { details, jobId: 'job_1', runId: 'run_1', pool: 'Workhorses' };
+  const ctx = (o: object = {}) => ({ origin: 'https://updraft.readysetcloud.io', installationId: '123', cloudJobId: 'job_1', ...o });
+
+  it('links the job when the Cloud job id is the job id', () => {
+    const body = renderAssignmentComment({ ...base, console: ctx() });
+    expect(body).toContain('| Model (configured) | `claude-sonnet` |');
+    expect(body).toContain('| Job ID | [job_1](https://updraft.readysetcloud.io/installations/123/jobs/job_1) |');
+    expect(body).toContain('| Run ID | `run_1` |');
+    expect(body).toContain('| Pool | `Workhorses` |');
+  });
+
+  it('keeps the local job id and adds an Updraft job row when ids differ', () => {
+    const body = renderAssignmentComment({ ...base, console: ctx({ cloudJobId: 'cloud_9' }) });
+    expect(body).toContain('| Job ID | `job_1` |');
+    expect(body).toContain('| Updraft job | [cloud_9](https://updraft.readysetcloud.io/installations/123/jobs/cloud_9) |');
+  });
+
+  it('uses a staging origin and encodes path segments', () => {
+    expect(consoleJobUrl(ctx({ origin: 'https://staging.example.com' }))).toBe('https://staging.example.com/installations/123/jobs/job_1');
+    expect(consoleJobUrl(ctx({ cloudJobId: 'a/b' }))).toBeNull();
+  });
+
+  it('renders no link for missing or untrusted context', () => {
+    for (const c of [null, undefined, ctx({ origin: 'javascript:alert(1)' }), ctx({ origin: 'http://evil.com' }), ctx({ origin: 'https://u:p@x.com' }), ctx({ origin: 'https://x.com/path' }), ctx({ installationId: 'x' })]) {
+      const body = renderAssignmentComment({ ...base, console: c });
+      expect(body).not.toContain('](');
+      expect(body).toContain('| Job ID | `job_1` |');
+    }
+  });
+
+  it('reads context from the environment only when complete', () => {
+    expect(consoleContextFromEnv({})).toBeNull();
+    expect(consoleContextFromEnv({ UPDRAFT_CONSOLE_ORIGIN: 'https://a.io', UPDRAFT_CLOUD_INSTALLATION_ID: '1' })).toBeNull();
+    expect(consoleContextFromEnv({ UPDRAFT_CONSOLE_ORIGIN: 'https://a.io', UPDRAFT_CLOUD_INSTALLATION_ID: '1', UPDRAFT_CLOUD_JOB_ID: 'j' })).toEqual({ origin: 'https://a.io', installationId: '1', cloudJobId: 'j' });
+  });
+
+  it('escapes table values and handles missing metadata', () => {
+    const body = renderAssignmentComment({ ...base, details: { ...details, worker: 'a|b', model: 'Unknown', modelKind: null, complexity: 'Not classified' }, pool: 'x|y\nz' });
+    expect(body).toContain('| Worker | `a\\|b` |');
+    expect(body).toContain('| Model | `Unknown` |');
+    expect(body).toContain('| Pool | `x\\|y z` |');
   });
 });
