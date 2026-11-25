@@ -85,4 +85,16 @@ describe('the GitHub client', () => {
     expect(urls[0]).toContain('/repos/acme/web/issues?state=open&labels=updraft&since=2026-11-24T00%3A00%3A00Z');
     expect(await api.latestLabelEvent!('ghs_x', 'acme/web', 7, 'UPDRAFT')).toEqual({ id: 3, actor: 'pat', createdAt: '2026-11-22T00:00:00Z', label: 'updraft' });
   });
+
+  it('lists the branches under a prefix, and nothing else', async () => {
+    const urls: string[] = [];
+    const api = createGitHubApi(async (url) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify([{ ref: 'refs/heads/updraft/issue-7-job_a' }, { ref: 'refs/heads/updraft/issue-7-job_b-2' }, { ref: 'refs/tags/updraft/issue-7-x' }]), { status: 200 });
+    });
+    expect(await api.matchingBranches!('ghs_x', 'acme/web', 'updraft/issue-7-', 5)).toEqual(['updraft/issue-7-job_a', 'updraft/issue-7-job_b-2']);
+    expect(urls[0]).toBe('https://api.github.com/repos/acme/web/git/matching-refs/heads/updraft/issue-7-');
+    expect(await api.matchingBranches!('ghs_x', 'acme/web', 'updraft/issue-7-', 1)).toHaveLength(1);
+    await expect(createGitHubApi(async () => new Response('{}', { status: 403 })).matchingBranches!('ghs_x', 'acme/web', 'updraft/issue-7-', 5)).rejects.toBeInstanceOf(GitHubError);
+  });
 });
