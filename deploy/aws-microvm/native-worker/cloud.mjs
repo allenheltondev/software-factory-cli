@@ -75,7 +75,10 @@ export async function startCloudWorker(config, microvmId, service, options = {})
       while (!stopped) {
         if (child) {
           const status = await call(message('heartbeat'));
-          if (status.cancel) { await stopChild(); throw new Error('worker job canceled'); }
+          // A cancel for a runner that already exited has nothing left to stop: settle it, and let
+          // Cloud's answer decide (a lease it cannot settle still stops this worker). Ending the
+          // loop here would strand a healthy shared session until its VM is fenced (#144).
+          if (status.cancel && !childDone) { await stopChild(); throw new Error('worker job canceled'); }
           if (childDone) {
             await ended;
             const settled = await call(message('settled'));

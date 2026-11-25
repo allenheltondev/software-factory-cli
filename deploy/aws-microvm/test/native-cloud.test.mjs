@@ -80,6 +80,22 @@ describe('root subscription worker Cloud loop', () => {
     expect(ops).toEqual(['register', 'poll', 'heartbeat']);
     await worker.close();
   });
+  it('settles and keeps polling when a cancel arrives after the runner already exited (#144)', async () => {
+    const child = fakeChild();
+    const ops = [];
+    let polls = 0;
+    const call = async (p) => {
+      ops.push(p.op);
+      if (p.op === 'poll') return ++polls === 1 ? { ok: true, request: { payload: {} } } : { ok: true, busy: false };
+      if (p.op === 'heartbeat') return { ok: true, cancel: true };
+      return { ok: true, busy: false };
+    };
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, { call, launch: () => { globalThis.queueMicrotask(() => child.emit('close')); return child; }, interval: 5 });
+    await until(() => polls >= 3);
+    await worker.close();
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(ops.slice(0, 4)).toEqual(['register', 'poll', 'heartbeat', 'settled']);
+  });
   it('does not renew a lease after a spawn error or exit without confirmed settlement', async () => {
     const child = fakeChild();
     let heartbeats = 0;

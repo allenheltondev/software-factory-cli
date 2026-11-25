@@ -186,18 +186,32 @@ describe('native worker Cloud dispatch', () => {
     expect(await store.listActiveJobs()).toHaveLength(0);
     expect(await control.canServe(job)).toBe(false);
   });
-  it('retains quota on a settlement CAS conflict with a heartbeat, then settles on retry', async () => {
+  it('settles through a heartbeat CAS conflict by reading the worker again', async () => {
+    const job = await assigned();
+    await store.finishJob(job.jobId, 'succeeded');
+    const finished = (await store.getJob(job.jobId))!;
+    const put = workers.put;
+    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
+      expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true, cancel: false });
+      return put(next, previous);
+    });
+    expect(await control.complete(finished)).toBe(true);
+    expect(row?.active).toBeUndefined(); expect(row?.settling).toBeUndefined(); expect(row?.fenced).toBeUndefined();
+    expect(await store.listActiveJobs()).toEqual([]);
+  });
+  it('retains quota when every settlement CAS conflicts, then settles on a later retry', async () => {
     const job = await assigned();
     await store.finishJob(job.jobId, 'succeeded');
     const finished = (await store.getJob(job.jobId))!;
     const release = vi.spyOn(store, 'releaseJob');
     const put = workers.put;
-    vi.spyOn(workers, 'put').mockImplementationOnce(async (next, previous) => {
-      expect(next.settling?.jobId).toBe(job.jobId);
-      expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true });
+    let conflicts = 3;
+    const spy = vi.spyOn(workers, 'put').mockImplementation(async (next, previous) => {
+      if (next.settling && conflicts-- > 0) expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true });
       return put(next, previous);
     });
     expect(await control.complete(finished)).toBe(false);
+    spy.mockRestore();
     expect(release).not.toHaveBeenCalled();
     expect(row?.active?.jobId).toBe(job.jobId);
     expect(row?.settling).toBeUndefined();
@@ -209,6 +223,43 @@ describe('native worker Cloud dispatch', () => {
     expect(release).toHaveBeenCalledTimes(1);
     expect(row?.active).toBeUndefined(); expect(row?.settling).toBeUndefined();
     expect(await store.listActiveJobs()).toEqual([]);
+  });
+  it('keeps the shared worker for the next issue when a heartbeat lands during completion (#144)', async () => {
+    const job = await assigned();
+    const broker = createBroker({ store, native: control, loadSettings: async () => null, github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
+      assumeRole: vi.fn().mockResolvedValue({ accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(clock + 3600_000).toISOString() }),
+      terminateMicrovm, microvmState: async () => state, policy: { bucket: 'bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' }, now: () => clock });
+    const call = (action: string, extra = {}) => broker({ action, jobId: job.jobId, token: nativeJobToken(secret, job.jobId), ...extra });
+    await call('start');
+    await call('finish', { outcome: 'succeeded' });
+    // The worker heartbeats while the broker handles the runner's terminate: before this fix the
+    // stop request was written first, the heartbeat answered cancel, and the worker loop ended.
+    const heartbeats: Record<string, unknown>[] = [];
+    const get = workers.get;
+    vi.spyOn(workers, 'get').mockImplementationOnce(async (...args) => {
+      heartbeats.push(await control.handle(input('heartbeat')));
+      return get(...args);
+    });
+    expect(await call('terminate')).toMatchObject({ ok: true, terminated: true });
+    expect(heartbeats).toEqual([expect.objectContaining({ ok: true, cancel: false })]);
+    expect((await store.getJob(job.jobId))?.stopRequestedAt).toBeDefined();
+    expect(row).toMatchObject({ session: 'session-0123456789', microvmId: route.microvmId });
+    expect(row?.fenced).toBeUndefined(); expect(terminateMicrovm).not.toHaveBeenCalled();
+    // The runner has exited: the dispatcher settles, then the next issue goes to the same VM.
+    expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true, busy: false });
+    expect(await control.handle(input('settled'))).toMatchObject({ ok: true, busy: false });
+    clock += 3 * 60_000;
+    expect(await control.handle(input('poll'))).toMatchObject({ ok: true, busy: false });
+    const next = (await store.getJob((await launch(request('delivery-2'))).jobId!))!;
+    expect(await control.handle(input('poll'))).toMatchObject({ ok: true, request: { microvmId: route.microvmId, payload: { broker: { jobId: next.jobId } } } });
+    expect(row?.active?.jobId).toBe(next.jobId);
+  });
+  it('still cancels an active job whose stop was requested before it finished', async () => {
+    const job = await assigned();
+    await store.markStopping(job.jobId);
+    expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true, cancel: true });
+    await store.finishJob(job.jobId, 'canceled');
+    expect(await control.handle(input('heartbeat'))).toMatchObject({ ok: true, cancel: true });
   });
   it('keeps a durable settlement marker across a release failure, blocks polling, and reconciles it', async () => {
     const job = await assigned();

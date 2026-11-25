@@ -4,6 +4,7 @@ import type { Store } from '../store/store.js';
 import { createNativeControl } from './control.js';
 import { managedClaude } from './managed.js';
 import { nativeRoute, type NativeRoute } from './route.js';
+import type { NativeReadiness } from '../jobs/launch.js';
 import { createNativeModeStore, createNativeStore } from './store.js';
 
 /** Resolves the legacy pinned route or the current managed session for an installation. */
@@ -34,16 +35,27 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
     },
   });
   // A managed worker still on an image older than the deployed one gets no new job: the job
-  // waits for sign-in instead, and the console asks the owner to restart the worker.
-  const forLaunch = (route: NativeRoute, latestImageVersion?: string) => ({
-    route, secret: () => secret(route), mode: () => mode.snapshot(route.installationId, route.workerId),
-    async ready() {
-      if (latestImageVersion !== undefined && route.imageVersion !== latestImageVersion) return false;
-      const worker = await workers.get(route.installationId, route.workerId);
-      return !!worker && worker.microvmId === route.microvmId && worker.imageVersion === route.imageVersion &&
-        !worker.fenced && worker.auth === 'connected' && Date.now() - worker.heartbeatAt <= 60_000;
-    },
-  });
+  // waits instead, and the console asks the owner to restart the worker. Each reason not to
+  // dispatch is named, so a healthy session between polls is never reported as signed out (#144).
+  const forLaunch = (route: NativeRoute, latestImageVersion?: string) => {
+    const readiness = () => readinessOf(route, latestImageVersion);
+    return {
+      route, secret: () => secret(route), mode: () => mode.snapshot(route.installationId, route.workerId),
+      async ready() { return (await readiness()) === 'ready'; },
+      readiness,
+    };
+  };
+  async function readinessOf(route: NativeRoute, latestImageVersion?: string): Promise<NativeReadiness> {
+    if (latestImageVersion !== undefined && route.imageVersion !== latestImageVersion) return 'image-outdated';
+    const worker = await workers.get(route.installationId, route.workerId);
+    if (!worker) return 'worker-missing';
+    if (worker.microvmId !== route.microvmId || worker.imageVersion !== route.imageVersion) return 'worker-replaced';
+    if (worker.fenced) return 'fenced';
+    if (Date.now() - worker.heartbeatAt > 60_000) return 'heartbeat-stale';
+    if (worker.auth === 'auth-required') return 'auth-required';
+    if (worker.auth === 'expired') return 'expired';
+    return worker.auth === 'connected' ? 'ready' : 'auth-unavailable';
+  }
   const control = makeControl(pinned);
   return {
     control: { ...control, async handle(event: unknown) {

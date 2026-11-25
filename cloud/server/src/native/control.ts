@@ -7,6 +7,7 @@ import { nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from './rout
 import type { AuthState, NativeStore, Worker } from './store.js';
 
 export const WORKER_LEASE_MS = 60_000;
+const COMPLETE_ATTEMPTS = 3;
 const AUTH = new Set(['connected', 'auth-required', 'expired', 'unavailable']);
 export interface NativeControlDeps {
   store: Store;
@@ -19,11 +20,14 @@ export interface NativeControlDeps {
   disabled(): Promise<boolean>;
   enabled?(): Promise<boolean>;
   now?: () => number;
+  /** Structured, credential-free decisions: reuse, retire, cancel. */
+  log?: (entry: Record<string, unknown>) => void;
 }
 
 /** No task is re-leased. A lost session is physically fenced before capacity is released. */
 export function createNativeControl(d: NativeControlDeps) {
   const now = d.now ?? Date.now;
+  const log = d.log ?? ((entry: Record<string, unknown>) => console.log(JSON.stringify(entry)));
   const refused = { ok: false, error: 'refused' };
   const save = (w: Worker, patch: Partial<Worker>) => d.workers.put({ ...w, ...patch, version: w.version + 1 }, w.version);
   async function fence(w: Worker): Promise<boolean> {
@@ -50,17 +54,30 @@ export function createNativeControl(d: NativeControlDeps) {
   }
   async function complete(job: Job): Promise<boolean> {
     if (!job.native) return false;
-    const w = await d.workers.get(job.installationId, job.native.workerId);
-    if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
-    if (!w || w.active?.jobId !== job.jobId) return job.releasedAt !== undefined;
-    // Only the trusted runner's completed job can release a healthy persistent worker.
-    if (job.status !== 'finished' || w.fenced || w.active.until <= now()) { await fence(w); return false; }
-    const next = { ...w, version: w.version + 1, settling: { jobId: job.jobId } };
-    delete next.active;
-    // A failed/ambiguous CAS must not free capacity. Once this transition commits,
-    // the assignment can never be served again and no new job can be polled yet.
-    if (!await d.workers.put(next, w.version)) return false;
-    return finishSettlement(next, job);
+    // A heartbeat landing between the read and the write is routine for a healthy worker: read
+    // again a few times rather than leave the runner retrying (and the slot held) for nothing.
+    for (let attempt = 0; attempt < COMPLETE_ATTEMPTS; attempt++) {
+      const w = await d.workers.get(job.installationId, job.native.workerId);
+      if (w?.settling?.jobId === job.jobId) return finishSettlement(w, job);
+      if (!w || w.active?.jobId !== job.jobId) return job.releasedAt !== undefined;
+      // Only the trusted runner's completed job can release a healthy persistent worker.
+      if (job.status !== 'finished' || w.fenced || w.active.until <= now()) {
+        log({ nativeWorker: 'retire', installationId: job.installationId, jobId: job.jobId,
+          reason: job.status !== 'finished' ? 'job_unfinished' : w.fenced ? 'worker_fenced' : 'lease_expired' });
+        await fence(w);
+        return false;
+      }
+      const next = { ...w, version: w.version + 1, settling: { jobId: job.jobId } };
+      delete next.active;
+      // A failed/ambiguous CAS must not free capacity. Once this transition commits,
+      // the assignment can never be served again and no new job can be polled yet.
+      if (await d.workers.put(next, w.version)) {
+        const settled = await finishSettlement(next, job);
+        log({ nativeWorker: 'reuse', installationId: job.installationId, jobId: job.jobId, settled });
+        return settled;
+      }
+    }
+    return false;
   }
   async function finishSettlement(w: Worker, job: Job): Promise<boolean> {
     if (job.status !== 'finished' || w.settling?.jobId !== job.jobId) return false;
@@ -149,6 +166,9 @@ export function createNativeControl(d: NativeControlDeps) {
       if (p.op === 'poll' || p.op === 'register' || p.op === 'settled') return refused;
       const job = await d.store.getJob(w.active.jobId);
       const cancel = disabled || !job || job.stopRequestedAt !== undefined || job.expiresAt <= now() || p.auth !== 'connected';
+      // The worker stops for good on a cancel, so each one says why.
+      if (cancel) log({ nativeWorker: 'cancel', installationId: r.installationId, jobId: w.active.jobId,
+        reason: disabled ? 'disabled' : !job ? 'job_missing' : job.stopRequestedAt !== undefined ? 'stop_requested' : job.expiresAt <= now() ? 'job_expired' : 'auth_' + String(p.auth) });
       if (!await save(w, { heartbeatAt: now(), auth: p.auth as AuthState,
         active: { ...w.active, until: cancel ? w.active.until : Math.min(job?.expiresAt ?? now(), now() + WORKER_LEASE_MS) } })) return refused;
       return { ok: true, busy: true, cancel };

@@ -13,7 +13,7 @@ import { createSettingsLoader } from './github/settings.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
-import { createLauncher, internetEgressConnector, noIngressConnector, type Launcher, type LaunchRequest } from './jobs/launch.js';
+import { createLauncher, internetEgressConnector, needsSignIn, noIngressConnector, type Launcher, type LaunchRequest } from './jobs/launch.js';
 import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
@@ -87,7 +87,7 @@ function launcher(): Launcher | undefined {
         const id = waitingId(request.installationId, request.deliveryId);
         return (await nativeWorker.managed!.sessions.get(request.installationId, id))?.id;
       },
-      async waitForClaude(request, repository, repositoryId, issue) {
+      async waitForClaude(request, repository, repositoryId, issue, reason) {
         const { installationId, deliveryId, eventName, appBot } = request;
         const id = waitingId(installationId, deliveryId);
         const eventKey = `tenants/${installationId}/events/claude-wait/${id}.json`;
@@ -101,7 +101,9 @@ function launcher(): Launcher | undefined {
                 { repositoryIds: [repositoryId], permissions: { issues: 'write' } });
               const url = new URL(`/installations/${installationId}/claude?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN);
               await github.createIssueComment(token, repository, issue,
-                `This Updraft job is waiting for Claude subscription sign-in. [Open the waiting job in Updraft](${url.href}). An installation owner can sign in once and the job will resume automatically.`);
+                reason === undefined || needsSignIn(reason)
+                  ? `This Updraft job is waiting for Claude subscription sign-in. [Open the waiting job in Updraft](${url.href}). An installation owner can sign in once and the job will resume automatically.`
+                  : `This Updraft job is waiting for the connected Claude environment to become available (${reason}). It starts automatically when the environment is ready; no sign-in is needed. [Open the waiting job in Updraft](${url.href}).`);
             }
           } catch (error) { console.error(JSON.stringify({ claudeWaiting: 'issue comment failed', name: (error as Error)?.name })); }
         }

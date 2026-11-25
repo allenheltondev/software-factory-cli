@@ -147,6 +147,33 @@ describe('the launcher', () => {
     expect(runs).toEqual([]);
   });
 
+  it.each([
+    ['heartbeat-stale', 'native_waiting_for_worker'],
+    ['auth-unavailable', 'native_waiting_for_worker'],
+    ['auth-required', 'native_waiting_for_sign_in'],
+    ['expired', 'native_waiting_for_sign_in'],
+  ] as const)('names why a managed issue waits (%s) and asks for sign-in only when auth is gone (#144)', async (readiness, reason) => {
+    const version = await store.createConfigVersion(55, { sha256: 'why', files: [], publishedBy: 's', publishedAt: '', dispatch: dispatchRules({
+      dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
+    }, { keysFor: () => ['ANTHROPIC_API_KEY'] }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    const logs: Record<string, unknown>[] = [];
+    deps.log = (entry) => logs.push(entry);
+    deps.resolveNative = async () => ({
+      route: { installationId: 55, workerId: 'managed-55', microvmId: 'mvm-native', imageVersion: '7', generation: 'session-a',
+        controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/root' },
+      secret: async () => 'scoped-worker-secret-01234567890',
+      mode: async () => ({ enabled: true, revision: 1, triggers: [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }] }),
+      readiness: async () => readiness,
+    });
+    deps.waitForClaude = vi.fn(async () => 'job_waiting');
+    expect(await createLauncher(deps)(request())).toMatchObject({ status: 202, reason, jobId: 'job_waiting' });
+    expect(deps.waitForClaude).toHaveBeenCalledWith(expect.anything(), 'acme/web', 9, 12, readiness);
+    expect(logs).toContainEqual(expect.objectContaining({ nativeDispatch: 'wait', readiness, generation: 'session-a', microvmId: 'mvm-native' }));
+    expect(runs).toEqual([]);
+  });
+
   it('starts a job: the event under its tenant, a pinned job record, a version 2 run hook, and its microVM recorded', async () => {
     const result = await createLauncher(deps)(request());
     expect(result).toMatchObject({ status: 202, disposition: 'launched', jobId: expect.stringMatching(/^job_[A-Za-z0-9_-]{16}$/) });

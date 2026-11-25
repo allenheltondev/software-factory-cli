@@ -112,14 +112,20 @@ export interface NativeLaunch {
   enabled?(): Promise<boolean>;
   mode?(): Promise<NativeMode>;
   ready?(): Promise<boolean>;
+  /** Why the worker cannot take a job now (or 'ready'); preferred over ready() when present. */
+  readiness?(): Promise<NativeReadiness>;
 }
+
+/** Only auth-required and expired mean the owner must sign in again; the rest wait for the worker. */
+export type NativeReadiness = 'ready' | 'image-outdated' | 'worker-missing' | 'worker-replaced' | 'fenced' | 'heartbeat-stale' | 'auth-required' | 'expired' | 'auth-unavailable';
+export const needsSignIn = (reason: NativeReadiness) => reason === 'auth-required' || reason === 'expired';
 
 export interface LaunchDeps {
   benchmarkInstallationId?: number;
   native?: NativeLaunch;
   resolveNative?(installationId: number): Promise<NativeLaunch | undefined>;
   parkedClaude?(request: LaunchRequest): Promise<string | undefined>;
-  waitForClaude?(request: LaunchRequest, repository: string, repositoryId: number, issue: number): Promise<string>;
+  waitForClaude?(request: LaunchRequest, repository: string, repositoryId: number, issue: number, reason?: NativeReadiness): Promise<string>;
   store: Store;
   settings: LaunchSettings;
   /** The published image version; null while jobs are off (no image built yet). */
@@ -338,10 +344,20 @@ export function createLauncher(deps: LaunchDeps) {
       const jobId = await deps.parkedClaude?.(req);
       if (jobId) return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Open the Claude sign-in request for this delivery', jobId };
     }
-    if (native?.ready && !await native.ready()) {
+    const readiness: NativeReadiness | undefined = native?.readiness ? await native.readiness()
+      // A worker that reports no reason keeps the old meaning of not ready: sign-in.
+      : native?.ready ? (await native.ready() ? 'ready' : 'auth-required') : undefined;
+    if (native && readiness) {
+      // One line per dispatch decision, with no credential or account detail (#144).
+      log({ delivery: req.deliveryId, installationId: req.installationId, nativeDispatch: readiness === 'ready' ? 'reuse' : 'wait',
+        readiness, generation: native.route.generation, microvmId: native.route.microvmId, imageVersion: native.route.imageVersion });
+    }
+    if (native && readiness && readiness !== 'ready') {
       if (native.route.workerId.startsWith('managed-') && decision.issue !== undefined && !req.resumeClaude && !req.retry && deps.waitForClaude) {
-        const jobId = await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue);
-        return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Waiting for Claude subscription sign-in', jobId };
+        const jobId = await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness);
+        return needsSignIn(readiness)
+          ? { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Waiting for Claude subscription sign-in', jobId }
+          : { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_worker', message: `Waiting for the connected Claude environment (${readiness})`, jobId };
       }
       return skip('not_dispatched', { reason: 'native_worker_unavailable', message: 'The Claude subscription worker is offline or needs sign-in. Reconnect it before retrying this delivery.' });
     }
