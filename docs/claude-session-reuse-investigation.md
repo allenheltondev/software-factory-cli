@@ -81,3 +81,13 @@ and verify subscription billing. No new hosted pilot was performed in this pass.
   persistent busy, transport uncertainty, cancellation, and same-session handoff.
 - ESLint passed for all four changed JavaScript/TypeScript files.
 - The hosted pilot on the new worker image is pending interactive owner sign-in.
+
+## Rolling image policy follow-up
+
+The expanded #144 requirement is implemented in the same PR. See
+[Claude image rollouts](claude-image-rollouts.md) for exact approvals, optional
+owner upgrades, drain/revoke fencing, queued-job recovery, and migration of
+pre-registry images. The historical `image-outdated` observation above describes
+the previous policy; latest-version inequality alone is no longer a reconnect
+reason for explicitly approved images. Hosted A/B rollout evidence is still
+pending owner sign-in and deployment.

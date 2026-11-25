@@ -11,6 +11,7 @@
 // (classifyReadiness, the same rules the webhook uses). It writes nothing and prints no
 // token, secret or account identity. --watch repeats it every N seconds until interrupted, so
 // a whole A-then-B sequence, including a cleanup run, is captured as a timeline.
+import { createImagePolicies, type ImagePolicy } from '../src/native/image-policy.js';
 import { parseArgs } from 'node:util';
 import { DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException } from '@aws-sdk/client-lambda-microvms';
@@ -32,6 +33,7 @@ export interface TraceInput {
   installationId: number;
   now: number;
   latestImageVersion?: string;
+  imagePolicy?: ImagePolicy;
   session?: ManagedSession;
   lease?: SessionLease;
   worker: Worker | null;
@@ -52,12 +54,13 @@ export function snapshot(t: TraceInput) {
     ...(s?.microvmId && !s.retiring ? { generation: s.generation } : {}),
   };
   const session = sessionPhase(s, route, STARTUP_MS);
-  const readiness = classifyReadiness(route, w, t.now, t.latestImageVersion, { session, ...(t.vm ? { vmState: t.vm.state } : {}) });
+  const readiness = classifyReadiness(route, w, t.now, t.latestImageVersion, { session, imagePolicy: t.imagePolicy, ...(t.vm ? { vmState: t.vm.state } : {}) });
   const idleMs = t.lease?.idleMs ?? IDLE_MS;
   const idleAt = t.lease ? Math.max(t.lease.idleAt, (w?.lastWorkAt ?? 0) + idleMs) : undefined;
   return {
     at: iso(t.now),
     installationId: t.installationId,
+    imagePolicy: t.imagePolicy,
     dispatch: { readiness, session: session.phase, ownerAction: readinessAction(readiness) },
     session: s && {
       generation: short(s.generation), imageVersion: s.imageVersion, microvmId: s.microvmId,
@@ -112,7 +115,8 @@ async function read(db: DynamoDBDocumentClient, table: string, installationId: n
       vm = { state: null };
     }
   }
-  return snapshot({ installationId, now: Date.now(), latestImageVersion, session, lease: session ? registry?.leases?.[session.generation] : undefined,
+  const imagePolicy = session ? await createImagePolicies(table, latestImageVersion ?? '', db)(session.imageVersion) : undefined;
+  return snapshot({ imagePolicy, installationId, now: Date.now(), latestImageVersion, session, lease: session ? registry?.leases?.[session.generation] : undefined,
     worker, queued, waiting, vm, jobs });
 }
 

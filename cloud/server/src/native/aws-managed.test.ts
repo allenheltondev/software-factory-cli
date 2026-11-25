@@ -6,6 +6,10 @@ import type { Worker } from './store.js';
 
 // The real managedClaude().route() and nativeAws().resolveNative() path, with storage and AWS
 // mocked: what dispatch decides for each phase of a managed session (#144, #152 review).
+vi.mock('./image-policy.js', async (original) => ({
+  ...(await original<typeof import('./image-policy.js')>()),
+  createImagePolicies: () => async (imageVersion: string) => ({ imageVersion, revision: 1, state: 'approved', protocol: 'tenant-browser-1', reason: 'test approval' }),
+}));
 const mocks = vi.hoisted(() => ({ vm: vi.fn(), session: vi.fn(), worker: vi.fn() }));
 vi.mock('@aws-sdk/client-lambda-microvms', async (original) => ({
   ...(await original<typeof import('@aws-sdk/client-lambda-microvms')>()),
@@ -34,7 +38,7 @@ const { nativeAws } = await import('./aws.js');
 const now = Date.now();
 const session = (patch: Partial<ManagedSession> = {}): ManagedSession => ({ generation: 'gen-a', imageVersion: '10', requestedAt: now - 60_000, startupDeadline: now - 60_000 + STARTUP_MS, ...patch });
 const worker = (patch: Partial<Worker> = {}): Worker => ({ version: 1, installationId: 55, workerId: 'managed-55', session: 'worker-session-0123456', microvmId: 'mvm-a',
-  imageVersion: '10', workerVersion: 't', auth: 'connected', heartbeatAt: Date.now(), ...patch });
+  imageVersion: '10', workerVersion: 'tenant-browser-1', auth: 'connected', heartbeatAt: Date.now(), ...patch });
 const readiness = async () => (await nativeAws({} as never).resolveNative!(55))!.readiness!();
 const vmReads = () => mocks.vm.mock.calls.filter(([command]) => command instanceof GetMicrovmCommand).map(([command]) => command.input.microvmIdentifier);
 
@@ -79,4 +83,13 @@ describe('managed route to dispatch readiness', () => {
     expect(await readiness()).toBe('ready');
     expect(vmReads()).toEqual([]);
   });
+  it('keeps dispatch on the actual approved session image across a routine rollout', async () => {
+    mocks.session.mockResolvedValue(session({ microvmId: 'mvm-a', readyAt: now - 30_000, imageVersion: '9' }));
+    mocks.worker.mockResolvedValue(worker({ imageVersion: '9' }));
+    const launch = (await nativeAws({} as never).resolveNative!(55))!;
+    expect(launch.route).toMatchObject({ imageVersion: '9', generation: 'gen-a', microvmId: 'mvm-a' });
+    expect(await launch.readiness!()).toBe('ready');
+    expect(vmReads()).toEqual([]);
+  });
+
 });

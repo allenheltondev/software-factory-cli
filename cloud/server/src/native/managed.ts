@@ -1,3 +1,4 @@
+import { createImagePolicies, imageDecision } from './image-policy.js';
 import { createHmac } from 'node:crypto';
 import {
   GetMicrovmCommand,
@@ -39,6 +40,7 @@ export function managedClaude(
   const controlSecretArn = env.NATIVE_MANAGED_SECRET_ARN;
   if (!imageArn || !imageVersion || !controlSecretArn) return undefined;
 
+  const imagePolicy = createImagePolicies(env.TABLE_NAME ?? '', imageVersion);
   const sessions = createClaudeSessions(env.TABLE_NAME ?? '');
   const workers = createNativeStore(env.TABLE_NAME ?? '');
   const mode = createNativeModeStore(env.TABLE_NAME ?? '');
@@ -200,7 +202,8 @@ export function managedClaude(
         console.log(JSON.stringify({ claudeSession: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'recovered' }));
         return false;
       }
-      if (worker?.active || worker?.settling || (await workers.queued(id, managedWorkerId(id))).length) {
+      const mandatory = imageDecision(await imagePolicy(session.imageVersion)) !== 'approved';
+      if (worker?.active || worker?.settling || (!mandatory && (await workers.queued(id, managedWorkerId(id))).length)) {
         throw new FlowError(
           'invalid_settings',
           409,
@@ -251,6 +254,8 @@ export function managedClaude(
   }
 
   async function start(id: number) {
+    const image = await imagePolicy(imageVersion!);
+    if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `Claude image cannot start: ${image.reason}`);
     if (await disabled())
       throw new FlowError(
         'throttled',
@@ -416,6 +421,7 @@ export function managedClaude(
     sessions,
     imageArn,
     imageVersion,
+    imagePolicy,
     policy: {
       maxSessionSeconds: SESSION_SECONDS,
       idleSeconds: (policy.idleMs ?? IDLE_MS) / 1000,

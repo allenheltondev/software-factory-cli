@@ -5,7 +5,12 @@ import { createClaudeAdmission, STARTUP_MS } from './admission.js';
 import { admissionFixture } from './admission-fixture.js';
 import type { Worker } from './store.js';
 import type { ManagedSession } from './sessions.js';
+vi.mock('./image-policy.js', async (original) => ({
+  ...(await original<typeof import('./image-policy.js')>()),
+  createImagePolicies: () => mocks.imagePolicy,
+}));
 const mocks = vi.hoisted(() => ({
+  imagePolicy: vi.fn(),
   vm: vi.fn(),
   secret: vi.fn(),
   session: vi.fn(),
@@ -68,6 +73,7 @@ describe('managed connection reservation', () => {
     managedClaude({ ...env, ...overrides }, { admission, disabled: async () => disabled, now: () => clock })!;
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 1, state: 'approved', protocol: 'tenant-browser-1', reason: 'test approval' }));
     current = undefined;
     row = null;
     clock = Date.now();
@@ -550,4 +556,16 @@ describe('managed connection reservation', () => {
     expect(await admission.list()).toHaveLength(0);
     expect(stopped).toBe(true);
   });
+  it('preserves queued work while retiring a mandatory-upgrade session at an idle boundary', async () => {
+    await managed().start(55);
+    row = connectedWorker();
+    mocks.queued.mockResolvedValue(['queued-job']);
+    await expect(managed().retire(55, current!.generation)).rejects.toThrow('queued');
+    mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 2, state: 'draining', protocol: 'tenant-browser-1', reason: 'Required security update' }));
+    mocks.vm.mockResolvedValue({ state: 'TERMINATED' });
+    expect(await managed().retire(55, current!.generation)).toBe(true);
+    expect(mocks.retire).toHaveBeenCalled();
+    expect(await mocks.queued()).toEqual(['queued-job']);
+  });
+
 });
