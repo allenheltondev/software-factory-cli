@@ -225,6 +225,7 @@ function JobSummary({ job, installationId, api, onViewLogs }: { job: JobView; in
   const loop = job.detail?.loop;
   const t = job.telemetry;
   const hasLogs = job.logs.length > 0;
+  const models = [...new Set((job.detail?.steps ?? []).map((st) => st.model).filter((m): m is string => !!m))];
   const conversationLink = t && !t.local ? (t.timelineUrl ?? t.conversationUrl) : undefined;
   const conversationLabel = t?.timelineUrl ? (t.timelineLabel ?? 'Open conversation') : 'Open conversation';
   return (
@@ -302,6 +303,13 @@ function JobSummary({ job, installationId, api, onViewLogs }: { job: JobView; in
 
       <div className="mt-5 flex flex-col gap-1 border-t border-border pt-3 text-xs text-muted-foreground" data-testid="job-identifiers">
         <CopyValue label="Job" value={job.jobId} />
+        {t?.traceId && <CopyValue label="Trace" value={t.traceId} />}
+        {t?.conversationId && <CopyValue label="Conversation" value={t.conversationId} />}
+        {models.length > 0 && (
+          <span data-testid="job-models">
+            {models.length === 1 ? 'Model' : 'Models'} (observed) <code>{models.join(', ')}</code>
+          </span>
+        )}
         <span>
           Outcome <code>{job.outcome ?? 'running'}</code>
         </span>
