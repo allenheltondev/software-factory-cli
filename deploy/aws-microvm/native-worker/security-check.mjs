@@ -32,8 +32,11 @@ try {
   fs.copyFileSync(path.resolve(source, '../image/sandbox/updraft-sandbox.mjs'), `${fixture}/image/sandbox/updraft-sandbox.mjs`);
   fs.copyFileSync(path.resolve(source, '../image/sandbox/egress-proxy.mjs'), `${fixture}/image/sandbox/egress-proxy.mjs`);
   // The shim must sit under /usr, the only system tree the sandbox mounts, as install.sh puts it.
-  shimDir = fs.mkdtempSync('/usr/local/lib/updraft-egress-check-');
+  // /usr/lib, not /usr/local/lib: hosted CI images hand /usr/local to the runner account, and
+  // the supervisor rightly refuses a shim under an ancestor it does not own.
+  shimDir = fs.mkdtempSync('/usr/lib/updraft-egress-check-');
   fs.copyFileSync(path.resolve(source, '../image/sandbox/egress-shim.mjs'), `${shimDir}/egress-shim.mjs`);
+  execFileSync('/bin/chown', ['-R', 'root:root', shimDir]);
   fs.chmodSync(shimDir, 0o755);
   fs.chmodSync(`${shimDir}/egress-shim.mjs`, 0o644);
   fs.copyFileSync(path.resolve(source, '../../../dist/agents/native-claude-auth.js'), `${fixture}/auth.mjs`);
