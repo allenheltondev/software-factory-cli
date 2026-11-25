@@ -141,7 +141,7 @@ const app = createApp({
           route: nativeRoute(process.env.NATIVE_WORKER_ROUTE),
           loginGrant: browserLoginGrant(process.env.NATIVE_WORKER_LOGIN_IMAGE_ARN ?? '', nativeRoute(process.env.NATIVE_WORKER_ROUTE)),
           mode: createNativeModeStore(tableName), workers: createNativeStore(tableName) }),
-        workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), jobs: store, github }),
+        workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), jobs: store, pauses: store, github }),
         status: createStatusService({
           store,
           requestStop: awsJobStopper(store, nativeAws(store).control, createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName) })).request,

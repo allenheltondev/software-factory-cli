@@ -137,6 +137,62 @@ describe('status and diagnostics (#71)', () => {
     const editor = await setup({ role: 'editor' });
     expect(await editor.post(`55/jobs/${j.jobId}/resume`)).toMatchObject({ status: 403 });
   });
+  describe('resuming a pause whose job records have expired', () => {
+    const expire = (store: Awaited<ReturnType<typeof setup>>['store'], what: 'meta' | 'summary' | 'both', jobId: string) => {
+      const getJob = store.getJob.bind(store); const getJobSummary = store.getJobSummary.bind(store);
+      if (what !== 'summary') store.getJob = async (id) => (id === jobId ? null : getJob(id));
+      if (what !== 'meta') store.getJobSummary = async (i, id) => (id === jobId ? null : getJobSummary(i, id));
+    };
+    const stopped = async (s: Awaited<ReturnType<typeof setup>>, over: Partial<Job> = {}) => {
+      const j = job(over); await s.store.putJob(j);
+      await s.store.requestJobStop(j, { requestedAt: 1_000, by: 'Pat', reason: 'stop' }, [12, 30]);
+      await s.store.finishJob(j.jobId, 'canceled'); await s.store.recordJobStop(j, { confirmedAt: 2_000 });
+      await s.store.confirmWorkflowPause(j, [12, 30], 2_000);
+      return j;
+    };
+    for (const what of ['meta', 'summary', 'both'] as const) {
+      it(`resumes from the workflow once the job's ${what === 'both' ? 'records are' : what === 'meta' ? 'record is' : 'summary is'} gone`, async () => {
+        const s = await setup(); const j = await stopped(s); expire(s.store, what, j.jobId);
+        // The job's own resume can no longer find it, and says where to go.
+        expect(await s.post(`55/jobs/${j.jobId}/resume`)).toMatchObject({ status: 404, body: { message: expect.stringMatching(/workflow can be resumed from its page/) } });
+        expect(await s.post('55/workflows/9-i12/resume', { jobId: j.jobId, at: 1_000 })).toMatchObject({ status: 200, body: { resumed: true } });
+        // Every subject the stop held is free, and who resumed it is kept.
+        expect(await s.store.getWorkflowPause(55, 9, 12)).toBeNull();
+        expect(await s.store.getWorkflowPause(55, 9, 30)).toBeNull();
+        expect(await s.store.getPauseResume(55, 9, { jobId: j.jobId, at: 1_000 })).toMatchObject({ resumedBy: 'Pat', subjects: [12, 30] });
+      });
+    }
+
+    it('resumes an unconfirmed pause only once the job record is gone (it cannot be running then)', async () => {
+      const s = await setup(); const j = job(); await s.store.putJob(j);
+      await s.store.requestJobStop(j, { requestedAt: 1_000, by: 'Pat', reason: 'stop' }, [12]);
+      expect(await s.post('55/workflows/9-i12/resume')).toMatchObject({ status: 409, body: { error: 'stop_pending' } });
+      expire(s.store, 'both', j.jobId);
+      expect(await s.post('55/workflows/9-i12/resume')).toMatchObject({ status: 200 });
+    });
+
+    it('never lifts a newer stop: the pause the owner saw must still be the one there', async () => {
+      const s = await setup(); const j = await stopped(s); expire(s.store, 'both', j.jobId);
+      const newer = job({ jobId: 'job_status0009', deliveryId: 'd-9' }); await s.store.putJob(newer);
+      await s.store.requestJobStop(newer, { requestedAt: 5_000, by: 'Sam', reason: 'again' }, [12]);
+      expect(await s.post('55/workflows/9-i12/resume', { jobId: j.jobId, at: 1_000 })).toMatchObject({ status: 409, body: { error: 'pause_changed' } });
+      expect(await s.store.getWorkflowPause(55, 9, 12)).toMatchObject({ jobId: newer.jobId });
+      // The newer stop took #12 only; resuming the old pause through #30 fails as a whole too.
+      expect(await s.post('55/workflows/9-i30/resume', { jobId: j.jobId, at: 1_000 })).toMatchObject({ status: 409, body: { error: 'pause_changed' } });
+      expect(await s.store.getWorkflowPause(55, 9, 30)).toMatchObject({ jobId: j.jobId });
+    });
+
+    it('is for owners, takes only the pause it names, and says when nothing is paused', async () => {
+      const editor = await setup({ role: 'editor' });
+      expect(await editor.post('55/workflows/9-i12/resume')).toMatchObject({ status: 403 });
+      const s = await setup();
+      expect(await s.post('55/workflows/9-i12/resume')).toMatchObject({ status: 404, body: { message: 'This workflow is not paused' } });
+      expect(await s.post('55/workflows/9-i12/resume', { jobId: 'job_x', microvmId: 'm' })).toMatchObject({ status: 400 });
+      expect(await s.post('55/workflows/9-i12/resume', { jobId: 'job_x' })).toMatchObject({ status: 400 });
+      expect(await s.post('55/workflows/legacy-x/resume')).toMatchObject({ status: 404 });
+    });
+  });
+
   it('reports telemetry status unknown, not unconfigured, when the settings read fails', async () => {
     const { store, get } = await setup();
     await store.putJob(job({ jobId: 'job_tel00001', status: 'finished', outcome: 'succeeded' }));

@@ -1475,8 +1475,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             ExpressionAttributeValues: { ':stop': stop, ':at': stop.requestedAt, ':installation': job.installationId } } },
           { Update: { TableName: T, Key: jobSummaryKey(job), UpdateExpression: 'SET #stop = :stop',
             ConditionExpression: 'attribute_exists(pk)', ExpressionAttributeNames: { '#stop': 'stop' }, ExpressionAttributeValues: { ':stop': stop } } },
+          // No TTL: a pause lasts until an owner resumes it, and holds what resuming needs.
           ...[...new Set(subjects)].map((subject) => ({ Put: { TableName: T,
-            Item: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${subject}`, jobId: job.jobId, at: stop.requestedAt, by: stop.by } } })),
+            Item: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${subject}`, jobId: job.jobId, at: stop.requestedAt, by: stop.by, reason: stop.reason, subjects: [...new Set(subjects)] } } })),
         ] }));
       } catch (err) {
         if (!(err instanceof TransactionCanceledException) || !cancelledAt(err, 0)) throw err;
@@ -1500,23 +1501,72 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
     async getWorkflowPause(id, repo, subject) {
       const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${subject}` }, ConsistentRead: true }));
-      return out.Item ? { jobId: String(out.Item.jobId), at: Number(out.Item.at), by: String(out.Item.by) } satisfies WorkflowPause : null;
+      if (!out.Item) return null;
+      const i = out.Item;
+      return {
+        jobId: String(i.jobId), at: Number(i.at), by: String(i.by),
+        ...(typeof i.reason === 'string' ? { reason: i.reason } : {}),
+        ...(Array.isArray(i.subjects) ? { subjects: i.subjects.map(Number).filter(Number.isSafeInteger) } : {}),
+        ...(typeof i.confirmedAt === 'number' ? { confirmedAt: i.confirmedAt } : {}),
+      } satisfies WorkflowPause;
     },
-    async resumeStoppedWorkflow(job, subjects, by, at) {
+    async confirmWorkflowPause(job, subjects, confirmedAt) {
+      for (const n of new Set(subjects)) {
+        try {
+          await client.send(new UpdateCommand({ TableName: T, Key: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${n}` },
+            UpdateExpression: 'SET confirmedAt = if_not_exists(confirmedAt, :at)', ConditionExpression: 'jobId = :job',
+            ExpressionAttributeValues: { ':at': confirmedAt, ':job': job.jobId } }));
+        } catch (err) {
+          // Not this job's pause (none, or a newer one): nothing to confirm.
+          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        }
+      }
+    },
+    async resumeWorkflowPause(id, repo, pause, subjects, by, at) {
+      const all = [...new Set(subjects)];
       try {
         await client.send(new TransactWriteCommand({ TransactItems: [
-          ...[...new Set(subjects)].map((n) => ({ Delete: { TableName: T, Key: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${n}` },
-            ConditionExpression: 'attribute_not_exists(pk) OR jobId = :job', ExpressionAttributeValues: { ':job': job.jobId } } })),
-          ...[{ pk: `JOB#${job.jobId}`, sk: 'META' }, jobSummaryKey(job)].map((Key) => ({ Update: { TableName: T, Key,
-            UpdateExpression: 'SET #stop.#at = if_not_exists(#stop.#at, :at), #stop.#by = if_not_exists(#stop.#by, :by)',
-            ConditionExpression: 'attribute_exists(#stop.confirmedAt)',
-            ExpressionAttributeNames: { '#stop': 'stop', '#at': 'resumedAt', '#by': 'resumedBy' }, ExpressionAttributeValues: { ':at': at, ':by': by } } })),
+          // Exactly this pause, on each subject; a subject already gone is fine, another pause is not.
+          ...all.map((n) => ({ Delete: { TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${n}` },
+            ConditionExpression: 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)', ExpressionAttributeNames: { '#at': 'at' },
+            ExpressionAttributeValues: { ':job': pause.jobId, ':pat': pause.at } } })),
+          // Who resumed it, kept for good, independent of the job's records. The first resume stands.
+          { Put: { TableName: T, Item: { pk: `TENANT#${id}`, sk: `PAUSELOG#${repo}#${pause.jobId}#${pause.at}`, jobId: pause.jobId, at: pause.at, resumedAt: at, resumedBy: by, subjects: all },
+            ConditionExpression: 'attribute_not_exists(pk)' } },
         ] }));
-        return true;
       } catch (error) {
-        if (!(error instanceof TransactionCanceledException) || !error.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) throw error;
-        return false;
+        if (!(error instanceof TransactionCanceledException)) throw error;
+        const reasons = error.CancellationReasons ?? [];
+        // A newer pause holds a subject: nothing changed.
+        if (reasons.slice(0, all.length).some((r) => r.Code === 'ConditionalCheckFailed')) return false;
+        // Resumed already (the audit exists): resume what is left, without a second audit.
+        if (reasons[all.length]?.Code !== 'ConditionalCheckFailed') throw error;
+        if (all.length) try {
+          await client.send(new TransactWriteCommand({ TransactItems: all.map((n) => ({ Delete: { TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${n}` },
+            ConditionExpression: 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)', ExpressionAttributeNames: { '#at': 'at' },
+            ExpressionAttributeValues: { ':job': pause.jobId, ':pat': pause.at } } })) }));
+        } catch (again) {
+          if (again instanceof TransactionCanceledException && again.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return false;
+          throw again;
+        }
       }
+      // The job's own records, where they still exist, say so too. Gone (expired) is fine.
+      const job = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${pause.jobId}`, sk: 'META' }, ConsistentRead: true }));
+      const keys = [...(job.Item && job.Item.installationId === id ? [{ pk: `JOB#${pause.jobId}`, sk: 'META' }, jobSummaryKey(job.Item as Job)] : [])];
+      for (const Key of keys) {
+        try {
+          await client.send(new UpdateCommand({ TableName: T, Key,
+            UpdateExpression: 'SET #stop.#at = if_not_exists(#stop.#at, :at), #stop.#by = if_not_exists(#stop.#by, :by)', ConditionExpression: 'attribute_exists(#stop)',
+            ExpressionAttributeNames: { '#stop': 'stop', '#at': 'resumedAt', '#by': 'resumedBy' }, ExpressionAttributeValues: { ':at': at, ':by': by } }));
+        } catch (err) {
+          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+        }
+      }
+      return true;
+    },
+    async getPauseResume(id, repo, pause) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSELOG#${repo}#${pause.jobId}#${pause.at}` }, ConsistentRead: true }));
+      return out.Item ? { resumedAt: Number(out.Item.resumedAt), resumedBy: String(out.Item.resumedBy), subjects: Array.isArray(out.Item.subjects) ? out.Item.subjects.map(Number) : [] } : null;
     },
     async holdSlots(job, until) {
       const ttl = Math.ceil(until / 1000);

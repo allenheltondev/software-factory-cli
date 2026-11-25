@@ -2,8 +2,7 @@ import { JOB_PERMISSIONS } from '../broker/broker.js';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows, type TenantSummary } from '../flows/github.js';
 import type { RetryResult } from '../jobs/retry.js';
-import type { StopResult } from '../jobs/stop.js';
-import { stopSubjects } from '../jobs/stop.js';
+import { resumeJobPause, resumeWorkflowPause, stopSubjects, type ResumeOutcome, type StopResult } from '../jobs/stop.js';
 import { countBy, deliveryCounts, jobResult, notRetryableMessage, retryable, type JobResult } from '../jobs/status.js';
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
@@ -246,6 +245,14 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
   return view;
 }
 
+/** A resume that did not happen, as the error the console shows. */
+function resumed(outcome: ResumeOutcome): void {
+  if (outcome === 'resumed') return;
+  if (outcome === 'not_paused') throw new FlowError('not_found', 404, 'This workflow is not paused');
+  if (outcome === 'stop_pending') throw new FlowError('stop_pending', 409, 'Wait until execution has stopped before resuming automation');
+  throw new FlowError('pause_changed', 409, 'A newer stop controls this workflow; look at it again before resuming');
+}
+
 export function createStatusService({ store, github, agentKeys, readLog, requestRetry, requestStop, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
   const view = (job: JobSummary, telemetry: TelemetrySettings | null, settingsUnavailable = false) => jobView(job, telemetry, { now: now(), timelineTemplate, settingsUnavailable });
   const settingsOf = (installationId: number) => store.getTelemetry(installationId).then((t) => ({ t, unavailable: false }), () => ({ t: null, unavailable: true }));
@@ -438,10 +445,24 @@ export function createStatusService({ store, github, agentKeys, readLog, request
       if (member.summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner may resume stopped automation');
       const summary = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
       const job = summary ? await store.getJob(jobId) : null;
-      if (!job || job.installationId !== installationId || !job.stop) throw new FlowError('not_found', 404, 'There is no stopped job in this installation');
+      if (!job || job.installationId !== installationId || !job.stop) throw new FlowError('not_found', 404, 'There is no stopped job in this installation; a paused workflow can be resumed from its page');
       if (job.stop.confirmedAt === undefined) throw new FlowError('stop_pending', 409, 'Wait until execution has stopped before resuming automation');
-      const subjects = stopSubjects(job, summary?.detail?.prNumber);
-      if (!await store.resumeStoppedWorkflow(job, subjects, member.githubLogin ?? caller.sub, now())) throw new FlowError('stop_pending', 409, 'A newer stop controls this workflow; resume from that job instead');
+      // The pause this job's stop made, on any of its subjects, as a whole; a newer stop is never lifted.
+      resumed(await resumeJobPause(store, { ...job, stop: job.stop }, stopSubjects(job, summary?.detail?.prNumber), member.githubLogin ?? caller.sub, now()));
+      return { resumed: true };
+    },
+
+    /**
+     * Resume a paused workflow (`<repositoryId>-i<issue>` or `-p<n>`) from the pause itself: the
+     * only way once the stopped job's records have expired. `expected` is the pause the owner saw,
+     * so a newer stop is never lifted by mistake.
+     */
+    async resumeWorkflow(caller: Caller, installationId: number, workflowId: string, expected?: { jobId: string; at: number }): Promise<{ resumed: true }> {
+      const member = await github.member(caller, installationId);
+      if (member.summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner may resume stopped automation');
+      const m = /^([0-9]{1,20})-[ip]([0-9]{1,10})$/.exec(workflowId);
+      if (!m) throw new FlowError('not_found', 404, 'There is no such workflow in this installation');
+      resumed(await resumeWorkflowPause(store, { installationId, repositoryId: Number(m[1]), subject: Number(m[2]), ...(expected ? { expected } : {}), by: member.githubLogin ?? caller.sub, at: now() }));
       return { resumed: true };
     },
 

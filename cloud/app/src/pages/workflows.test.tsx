@@ -76,6 +76,54 @@ describe('workflows in the console', () => {
     expect(screen.getByRole('region', { name: 'Run 2' })).toBeInTheDocument();
   });
 
+  it('shows a pause that outlives its job, and an owner resumes exactly that pause from here', async () => {
+    const user = userEvent.setup();
+    const pause = { jobId: 'job_abcdefgh02', at: Date.now() - 9 * 86_400_000, by: 'pat', reason: 'off course', canResume: true };
+    const resumeWorkflow = vi.fn().mockResolvedValue({ resumed: true });
+    const api = fakeApi({ workflow: vi.fn().mockResolvedValueOnce({ workflow: workflow(), events, pause }).mockResolvedValue({ workflow: workflow(), events }), resumeWorkflow });
+    render(
+      <MemoryRouter initialEntries={['/installations/55/workflows/99-i7']}>
+        <Routes>
+          <Route path="/installations/:id/workflows/:workflowId" element={<WorkflowPage api={api} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const panel = await screen.findByTestId('workflow-pause');
+    expect(panel).toHaveTextContent('Automation is paused. pat stopped job job_abcdefgh02');
+    expect(panel).toHaveTextContent('off course');
+    expect(within(panel).getByRole('link', { name: 'job job_abcdefgh02' })).toHaveAttribute('href', '/installations/55/jobs/job_abcdefgh02');
+    await user.click(within(panel).getByRole('button', { name: 'Resume automation' }));
+    expect(resumeWorkflow).toHaveBeenCalledWith(55, '99-i7', pause);
+    await waitFor(() => expect(screen.queryByTestId('workflow-pause')).toBeNull());
+  });
+
+  it('shows a pause without the resume action to someone who may not resume it, and says why a resume failed', async () => {
+    const pause = { jobId: 'job_abcdefgh02', at: Date.now(), by: 'pat', canResume: false };
+    const view = fakeApi({ workflow: vi.fn().mockResolvedValue({ workflow: workflow(), events, pause }), resumeWorkflow: vi.fn() });
+    const { unmount } = render(
+      <MemoryRouter initialEntries={['/installations/55/workflows/99-i7']}>
+        <Routes>
+          <Route path="/installations/:id/workflows/:workflowId" element={<WorkflowPage api={view} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByTestId('workflow-pause')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume automation' })).toBeNull();
+    unmount();
+
+    const user = userEvent.setup();
+    const owner = fakeApi({ workflow: vi.fn().mockResolvedValue({ workflow: workflow(), events, pause: { ...pause, canResume: true } }), resumeWorkflow: vi.fn().mockRejectedValue(new Error('A newer stop controls this workflow; look at it again before resuming')) });
+    render(
+      <MemoryRouter initialEntries={['/installations/55/workflows/99-i7']}>
+        <Routes>
+          <Route path="/installations/:id/workflows/:workflowId" element={<WorkflowPage api={owner} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await user.click(await screen.findByRole('button', { name: 'Resume automation' }));
+    expect(await screen.findByTestId('workflow-pause-error')).toHaveTextContent('A newer stop controls this workflow');
+  });
+
   it('refuses an address that is not a workflow without asking the API', async () => {
     const api = fakeApi();
     render(

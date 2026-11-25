@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
-import { Alert, Card, CardBody, CardHeader, CardTitle, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, Skeleton } from '@readysetcloud/ui';
-import { api as defaultApi, type ApiClient, type WorkflowEvent, type WorkflowTotals, type WorkflowView } from '../api/client';
+import { Alert, Button, Card, CardBody, CardHeader, CardTitle, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, Skeleton } from '@readysetcloud/ui';
+import { api as defaultApi, type ApiClient, type WorkflowEvent, type WorkflowPause, type WorkflowTotals, type WorkflowView } from '../api/client';
 import { WORKFLOW_STATUS, WorkflowTimeline, WorkflowTotalsView, stageLabel, workflowTitle } from '../components/workflows';
 import { relativeTime } from '../lib/time';
 
-type WorkflowApi = Pick<ApiClient, 'workflow'>;
-type Load = { state: 'loading' } | { state: 'ok'; workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals } | { state: 'error'; message: string };
+type WorkflowApi = Pick<ApiClient, 'workflow'> & Partial<Pick<ApiClient, 'resumeWorkflow'>>;
+type Load = { state: 'loading' } | { state: 'ok'; workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals; pause?: WorkflowPause } | { state: 'error'; message: string };
 
 const WORKFLOW_ID = /^(?:[0-9]{1,20}|legacy-[0-9a-f]{12})-[ip][0-9]{1,10}$/;
 export const WORKFLOW_REFRESH_MS = 15_000;
@@ -107,6 +107,7 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
               </CardBody>
             </Card>
           )}
+          {load.pause && <PausePanel pause={load.pause} base={base} resume={api.resumeWorkflow ? () => api.resumeWorkflow!(installationId, workflowId, load.pause!) : undefined} onResumed={() => void refresh()} />}
           {load.workflow.nextAction && (load.workflow.status === 'blocked' || load.workflow.status === 'waiting') && (
             <Alert variant={load.workflow.status === 'blocked' ? 'error' : 'info'} data-testid="workflow-next">
               <strong>Next:</strong> {load.workflow.nextAction}
@@ -123,5 +124,49 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * A stop paused this workflow: no GitHub event continues it until an owner resumes it. The pause
+ * outlives the stopped job's records, so this is where it is resumed once they are gone.
+ */
+function PausePanel({ pause, base, resume, onResumed }: { pause: WorkflowPause; base: string; resume?: () => Promise<unknown>; onResumed: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const run = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await resume!();
+      onResumed();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not resume automation.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Alert variant="info" data-testid="workflow-pause">
+      <div className="flex flex-col gap-2">
+        <p>
+          <strong>Automation is paused.</strong> {pause.by} stopped{' '}
+          <Link className="auth-link" to={`${base}/jobs/${pause.jobId}`}>
+            job {pause.jobId}
+          </Link>{' '}
+          {relativeTime(new Date(pause.at).toISOString())}
+          {pause.reason ? `: ${pause.reason}` : ''}. GitHub events on this workflow start nothing until it is resumed.
+        </p>
+        {pause.canResume && resume && (
+          <div className="flex flex-wrap items-center gap-3">
+            <Button onClick={() => void run()} disabled={busy}>
+              Resume automation
+            </Button>
+            <span className="text-sm">Future GitHub events continue the workflow. Nothing is run again.</span>
+          </div>
+        )}
+        {error && <p className="font-medium" data-testid="workflow-pause-error">{error}</p>}
+      </div>
+    </Alert>
   );
 }

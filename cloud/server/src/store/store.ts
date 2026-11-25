@@ -424,10 +424,21 @@ export interface JobStop {
   resumedBy?: string;
 }
 
+/**
+ * A stop's pause of a workflow's subjects (an issue, its pull requests). It never expires, and it
+ * holds everything needed to resume it, so it can be resumed after the stopped job's own records
+ * (META a week past its run, its summary 30 days) are gone.
+ */
 export interface WorkflowPause {
   jobId: string;
+  /** When the stop was requested: with jobId, the pause's identity. */
   at: number;
   by: string;
+  reason?: string;
+  /** Every subject the stop paused (each has its own record). */
+  subjects?: number[];
+  /** When the stopped job's execution was confirmed ended. */
+  confirmedAt?: number;
 }
 
 export interface Member {
@@ -666,7 +677,17 @@ export interface Store {
   requestJobStop(job: Job, stop: JobStop, subjects: number[]): Promise<Job | null>;
   recordJobStop(job: Job, progress: Pick<JobStop, 'confirmedAt' | 'error' | 'reconnectRequired' | 'executionMicrovmId'>): Promise<void>;
   getWorkflowPause(installationId: number, repositoryId: number, subject: number): Promise<WorkflowPause | null>;
-  resumeStoppedWorkflow(job: Job, subjects: number[], by: string, at: number): Promise<boolean>;
+  /** Records on each pause of the job that its execution has ended. Only a pause by this job changes. */
+  confirmWorkflowPause(job: Pick<Job, 'jobId' | 'installationId' | 'repositoryId'>, subjects: number[], confirmedAt: number): Promise<void>;
+  /**
+   * Resumes exactly this pause (job and time) on these subjects, in one transaction with a durable
+   * audit record: false, and nothing changed, when any of them is now held by another pause. The
+   * stopped job's records, where they still exist, are marked resumed afterwards. Needs no job
+   * record: a pause outlives them.
+   */
+  resumeWorkflowPause(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at'>, subjects: number[], by: string, at: number): Promise<boolean>;
+  /** The resume audit of a pause, if it was resumed. */
+  getPauseResume(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at'>): Promise<{ resumedAt: number; resumedBy: string; subjects: number[] } | null>;
   /**
    * Holds the job's slots (its own, or free) until `until` (epoch ms), each on its own and only
    * while the job is not released (nothing to hold then): a running microVM keeps its capacity
@@ -762,6 +783,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const deliveries2: { id: number; d: DeliveryRecord }[] = [];
   const jobs = new Map<string, Job>();
   const pauses = new Map<string, WorkflowPause>();
+  /** `<installationId>/<repositoryId>/<jobId>/<at>` -> who resumed that pause, kept for good. */
+  const resumes = new Map<string, { resumedAt: number; resumedBy: string; subjects: number[] }>();
   const paused = (job: Job) => workflowSubjects(job).some((n) => {
     const pause = pauses.get(`${job.installationId}/${job.repositoryId}/${n}`);
     return pause !== undefined && pause.jobId !== job.resumeOf;
@@ -998,7 +1021,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       jobs.set(job.jobId, next);
       const summary = summaries.get(job.jobId);
       if (summary) summaries.set(job.jobId, { ...summary, stop: { ...stop } });
-      for (const subject of new Set(subjects)) pauses.set(`${job.installationId}/${job.repositoryId}/${subject}`, { jobId: job.jobId, at: stop.requestedAt, by: stop.by });
+      const all = [...new Set(subjects)];
+      for (const subject of all) pauses.set(`${job.installationId}/${job.repositoryId}/${subject}`, { jobId: job.jobId, at: stop.requestedAt, by: stop.by, reason: stop.reason, subjects: all });
       return { ...next };
     },
     async recordJobStop(job, progress) {
@@ -1012,17 +1036,31 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async getWorkflowPause(id, repo, subject) {
       return pauses.get(`${id}/${repo}/${subject}`) ?? null;
     },
-    async resumeStoppedWorkflow(job, subjects, by, at) {
-      const current = jobs.get(job.jobId);
-      if (!current?.stop || current.stop.confirmedAt === undefined) return false;
-      const keys = [...new Set(subjects)].map((n) => `${job.installationId}/${job.repositoryId}/${n}`);
-      if (keys.some((k) => pauses.has(k) && pauses.get(k)?.jobId !== job.jobId)) return false;
+    async confirmWorkflowPause(job, subjects, confirmedAt) {
+      for (const n of new Set(subjects)) {
+        const k = `${job.installationId}/${job.repositoryId}/${n}`;
+        const p = pauses.get(k);
+        if (p?.jobId === job.jobId && p.confirmedAt === undefined) pauses.set(k, { ...p, confirmedAt });
+      }
+    },
+    async resumeWorkflowPause(id, repo, pause, subjects, by, at) {
+      const keys = [...new Set(subjects)].map((n) => `${id}/${repo}/${n}`);
+      // Only this pause: a subject held by another (newer) pause fails it all; one already gone is fine.
+      if (keys.some((k) => pauses.has(k) && (pauses.get(k)!.jobId !== pause.jobId || pauses.get(k)!.at !== pause.at))) return false;
       for (const key of keys) pauses.delete(key);
-      const stop = { ...current.stop, resumedAt: current.stop.resumedAt ?? at, resumedBy: current.stop.resumedBy ?? by };
-      jobs.set(job.jobId, { ...current, stop });
-      const summary = summaries.get(job.jobId);
-      if (summary) summaries.set(job.jobId, { ...summary, stop });
+      const audit = `${id}/${repo}/${pause.jobId}/${pause.at}`;
+      if (!resumes.has(audit)) resumes.set(audit, { resumedAt: at, resumedBy: by, subjects: [...new Set(subjects)] });
+      const current = jobs.get(pause.jobId);
+      if (current?.stop && current.installationId === id) {
+        const stop = { ...current.stop, resumedAt: current.stop.resumedAt ?? at, resumedBy: current.stop.resumedBy ?? by };
+        jobs.set(pause.jobId, { ...current, stop });
+        const summary = summaries.get(pause.jobId);
+        if (summary) summaries.set(pause.jobId, { ...summary, stop });
+      }
       return true;
+    },
+    async getPauseResume(id, repo, pause) {
+      return resumes.get(`${id}/${repo}/${pause.jobId}/${pause.at}`) ?? null;
     },
     async holdSlots(job, until) {
       const now = Date.now();

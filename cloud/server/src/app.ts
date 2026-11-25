@@ -426,6 +426,15 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
       const id = positive(c.req.param('id'));
       return id ? c.json(await status.resume(c.get('caller'), id, c.req.param('jobId'))) : c.json({ error: 'not_found' }, 404);
     });
+    app.post('/v1/installations/:id/workflows/:workflowId/resume', async (c) => {
+      const id = positive(c.req.param('id'));
+      const input: unknown = await c.req.json().catch(() => ({}));
+      // Optional: the pause the owner saw (its job and time), so a newer stop is never lifted.
+      const ok = input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input).every((k) => k === 'jobId' || k === 'at');
+      const { jobId, at } = (ok ? input : {}) as { jobId?: unknown; at?: unknown };
+      if (!ok || (jobId === undefined) !== (at === undefined) || (jobId !== undefined && (typeof jobId !== 'string' || !Number.isSafeInteger(at)))) return c.json({ error: 'bad_request' }, 400);
+      return id ? c.json(await status.resumeWorkflow(c.get('caller'), id, c.req.param('workflowId'), jobId !== undefined ? { jobId: jobId as string, at: at as number } : undefined)) : c.json({ error: 'not_found' }, 404);
+    });
     app.get('/v1/installations/:id/jobs/:jobId/logs/:name', async (c) => {
       const id = positive(c.req.param('id'));
       return id ? c.json(await status.log(c.get('caller'), id, c.req.param('jobId'), c.req.param('name'))) : c.json({ error: 'not_found' }, 404);

@@ -39,6 +39,7 @@ export type FlowErrorCode =
   | 'retry_unavailable'
   | 'stop_unavailable'
   | 'stop_pending'
+  | 'pause_changed'
   | 'github_app_not_configured'
   | 'state_invalid'
   | 'github_exchange_failed'

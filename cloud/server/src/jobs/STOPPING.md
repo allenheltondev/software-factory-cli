@@ -10,7 +10,10 @@ admin membership alone does not grant access to a tenant's stop endpoint.
 `reason` (at most 500 characters). It returns 202 with `state: stopping`, `canceled`,
 or `finished`. No request accepts a VM, worker, session, or installation override.
 `POST .../jobs/:job/resume` is owner-only and permits future automation after
-confirmed retirement; it does not start a job.
+confirmed retirement; it does not start a job. `POST .../workflows/:workflow/resume`
+(`<repositoryId>-i<issue>` or `-p<n>`, optional body `{ jobId, at }`: the pause the
+owner saw) does the same from the pause itself, and is the only resume once the stopped
+job's records have expired.
 The shared `createJobStopper` service is the integration point for future authorized
 GitHub commands in #135. A plain GitHub mention currently invokes nothing.
 
@@ -91,7 +94,20 @@ unpause. Normal dispatch uses durable issue/PR provenance even after the origina
 job expires. A canceled workflow remains explicitly
 blocked as `job_canceled`, rather than being mistaken for a missed finish or an
 ordinary CI wait. Owner-authorized **Resume automation** removes only pauses owned by this
-stopped job, atomically with a resume audit; it cannot clear a newer stop. It permits
+stopped job, atomically with a resume audit; it cannot clear a newer stop.
+
+**A pause outlives its job.** The `PAUSE#<repo>#<subject>` records have no TTL, and each
+holds what resuming needs: the stopping job and time (the pause's identity), who stopped it
+and why, every subject the stop paused, and, once execution was confirmed ended, when. The
+job's own records expire (META a week past its maximum run, its summary after 30 days); the
+pause does not. The workflow's page shows the pause and, to owners, **Resume automation**.
+That resume deletes the pause on every subject in one transaction conditioned on exactly that
+job and time, so a newer stop on any subject fails it as a whole and lifts nothing. With it
+goes a `PAUSELOG#<repo>#<job>#<at>` audit record (resumed when and by whom, also without
+TTL). A pause not yet marked confirmed is resumed only when its job record is gone, since a
+stopped job past its record's lifetime cannot still be running; while that record exists
+and is unconfirmed, the answer is `stop_pending`. The job's records, where they still exist,
+are marked resumed as well. A pause is never expired on its own. It permits
 future GitHub events and leaves this attempt stopped. It does not replay work,
 reevaluate the same PR head immediately, reopen a closed PR, or implement #135's
 checkpoint-aware resume. Existing **Retry job**, where supported, explicitly launches

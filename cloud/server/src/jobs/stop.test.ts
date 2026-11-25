@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMemoryStore, type Job } from '../store/store.js';
-import { createJobStopper, workflowIsPaused } from './stop.js';
+import { createJobStopper, resumeJobPause, workflowIsPaused } from './stop.js';
 import { createReconciler } from './reconcile.js';
 
 describe('durable job cancellation', () => {
@@ -148,14 +148,16 @@ describe('durable job cancellation', () => {
     expect(await workflowIsPaused(store, { ...job, resumeOf: job.jobId })).toBe(false);
     expect(await workflowIsPaused(store, { ...job, issue: 99 })).toBe(false);
     state = 'TERMINATED'; await stop.advance(job);
-    expect(await store.resumeStoppedWorkflow(job, [12], 'pat', clock)).toBe(true);
+    // The pause itself now says its execution ended, so it can be resumed after the job's records go.
+    expect((await store.getWorkflowPause(55, 9, 12))?.confirmedAt).toEqual(expect.any(Number));
+    expect(await resumeJobPause(store, (await store.getJob(job.jobId)) as never, [12], 'pat', clock)).toBe('resumed');
     expect(await workflowIsPaused(store, job)).toBe(false);
   });
   it('cannot resume through a newer stop on another attempt of the workflow', async () => {
     await request();
     const newer = { ...job, jobId: 'job_newer0001' }; await store.putJob(newer);
     await store.requestJobStop(newer, { requestedAt: ++clock, by: 'other-owner', reason: 'new stop' }, [12]);
-    expect(await store.resumeStoppedWorkflow(job, [12], 'pat', clock)).toBe(false);
+    expect(await resumeJobPause(store, (await store.getJob(job.jobId)) as never, [12], 'pat', clock)).toBe('changed');
     expect(await store.getWorkflowPause(55, 9, 12)).toMatchObject({ jobId: newer.jobId });
     expect((await store.getJob(job.jobId))?.stop?.resumedAt).toBeUndefined();
   });

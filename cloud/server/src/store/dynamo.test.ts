@@ -37,6 +37,7 @@ function fakeTable() {
     if (expr === 'installationId = :installation AND #status = :launched AND attribute_not_exists(stopRequestedAt) AND attribute_not_exists(microvmId) AND attribute_exists(launchingAt) AND expiresAt > :at') return !!item && item.installationId === values[':installation'] && item.status === values[':launched'] && item.stopRequestedAt === undefined && item.microvmId === undefined && item.launchingAt !== undefined && Number(item.expiresAt) > Number(values[':at']);
     if (expr === 'installationId = :installation AND attribute_not_exists(releasedAt) AND attribute_not_exists(#stop)') return item?.installationId === values[':installation'] && item?.releasedAt === undefined && item?.stop === undefined;
     if (expr === 'attribute_exists(#stop)') return item?.stop !== undefined;
+    if (expr === 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)') return !item || (item.jobId === values[':job'] && item.at === values[':pat']);
     if (expr === 'attribute_exists(#stop.confirmedAt)') return (item?.stop as Item | undefined)?.confirmedAt !== undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job') return !item || item.jobId === values[':job'];
     if (expr === '#enabled = :enabled AND routingVersion = :routingVersion') {
@@ -792,7 +793,7 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     await store.recordJobStop(job, { confirmedAt: audit.requestedAt + 2 });
     expect((await store.getJobSummary(55, job.jobId))?.stop).toEqual({ ...audit, confirmedAt: audit.requestedAt + 1, error: '' });
     expect((await store.getJob(job.jobId))?.outcome).toBe('succeeded');
-    expect(await store.resumeStoppedWorkflow(job, [12, 13], 'pat', audit.requestedAt + 10)).toBe(true);
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: job.jobId, at: audit.requestedAt }, [12, 13], 'pat', audit.requestedAt + 10)).toBe(true);
     expect(await store.getWorkflowPause(55, 9, 13)).toBeNull();
     expect((await store.getJob(job.jobId))?.stop?.resumedBy).toBe('pat');
     const completed = { ...job, jobId: 'job_finished01', deliveryId: 'd-finished' };
@@ -801,6 +802,53 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.getJob(completed.jobId)).toMatchObject({ status: 'finished', outcome: 'succeeded', stop: { executionMicrovmId: 'mvm-retiring' } });
     await store.recordJobStop(completed, { executionMicrovmId: 'mvm-retiring' });
     expect((await store.getJobSummary(55, completed.jobId))?.stop?.executionMicrovmId).toBe('mvm-retiring');
+  });
+
+  it('keeps a pause, and what resuming it needs, past the job\'s own records, and resumes exactly that pause', async () => {
+    const table = fakeTable(); const store = createDynamoStore('T', table.client);
+    const job: Job = { jobId: 'job_stop0002', installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12,
+      tokenHash: 'hash', configVersion: 1, deliveryId: 'd-stop2', eventName: 'issues', status: 'launched', createdAt: new Date().toISOString(), expiresAt: Date.now() + 3600000 };
+    await store.putJob(job);
+    const stop = { requestedAt: Date.now(), by: 'pat', reason: 'off course' };
+    await store.requestJobStop(job, stop, [12, 13]);
+    // No TTL on the pause; it names every subject it holds.
+    expect(table.items.get('TENANT#55|PAUSE#9#12')?.ttl).toBeUndefined();
+    expect(await store.getWorkflowPause(55, 9, 13)).toEqual({ jobId: job.jobId, at: stop.requestedAt, by: 'pat', reason: 'off course', subjects: [12, 13] });
+    await store.confirmWorkflowPause(job, [12, 13], stop.requestedAt + 5);
+    await store.confirmWorkflowPause({ ...job, jobId: 'job_other0001' }, [12], stop.requestedAt + 9);
+    expect((await store.getWorkflowPause(55, 9, 12))?.confirmedAt).toBe(stop.requestedAt + 5);
+
+    // Both of the job's records expire.
+    for (const k of [...table.items.keys()]) if (k.startsWith(`JOB#${job.jobId}|`) || k.endsWith(`#${job.jobId}`)) table.items.delete(k);
+    expect(await store.getJob(job.jobId)).toBeNull();
+    expect(await store.getJobSummary(55, job.jobId)).toBeNull();
+
+    // A resume of another pause changes nothing.
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: job.jobId, at: stop.requestedAt - 1 }, [12, 13], 'sam', stop.requestedAt + 20)).toBe(false);
+    expect(await store.getWorkflowPause(55, 9, 12)).not.toBeNull();
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: job.jobId, at: stop.requestedAt }, [12, 13], 'sam', stop.requestedAt + 20)).toBe(true);
+    expect(await store.getWorkflowPause(55, 9, 12)).toBeNull();
+    expect(await store.getWorkflowPause(55, 9, 13)).toBeNull();
+    expect(await store.getPauseResume(55, 9, { jobId: job.jobId, at: stop.requestedAt })).toEqual({ resumedAt: stop.requestedAt + 20, resumedBy: 'sam', subjects: [12, 13] });
+    // No record was invented for the expired job.
+    expect(table.items.has(`JOB#${job.jobId}|META`)).toBe(false);
+    // Resuming again is harmless, and keeps the first audit.
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: job.jobId, at: stop.requestedAt }, [12, 13], 'lee', stop.requestedAt + 30)).toBe(true);
+    expect((await store.getPauseResume(55, 9, { jobId: job.jobId, at: stop.requestedAt }))?.resumedBy).toBe('sam');
+  });
+
+  it('never lifts a newer pause that took one of the subjects', async () => {
+    const table = fakeTable(); const store = createDynamoStore('T', table.client);
+    const base = { installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12, tokenHash: 'hash', configVersion: 1, eventName: 'issues', status: 'launched' as const, createdAt: new Date().toISOString(), expiresAt: Date.now() + 3600000 };
+    const first: Job = { ...base, jobId: 'job_first0002', deliveryId: 'd-a' };
+    const newer: Job = { ...base, jobId: 'job_newer0002', deliveryId: 'd-b', pullRequest: 13 };
+    await store.putJob(first); await store.putJob(newer);
+    await store.requestJobStop(first, { requestedAt: 1000, by: 'pat', reason: 'x' }, [12, 13]);
+    await store.requestJobStop(newer, { requestedAt: 2000, by: 'sam', reason: 'y' }, [13]);
+    expect(await store.resumeWorkflowPause(55, 9, { jobId: first.jobId, at: 1000 }, [12, 13], 'pat', 3000)).toBe(false);
+    expect(await store.getWorkflowPause(55, 9, 12)).toMatchObject({ jobId: first.jobId });
+    expect(await store.getWorkflowPause(55, 9, 13)).toMatchObject({ jobId: newer.jobId });
+    expect(await store.getPauseResume(55, 9, { jobId: first.jobId, at: 1000 })).toBeNull();
   });
   const LATER = Date.now() + 3_600_000;
 

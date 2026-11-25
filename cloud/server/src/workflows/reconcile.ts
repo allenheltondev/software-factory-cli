@@ -103,7 +103,7 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
       await change(w, (cur) => ({
         workflow: {
           ...cur, status: 'blocked', reason: 'workflow_paused', message: `Automation was paused by ${pause.by}. The stopped job and existing pull request are preserved.`,
-          nextAction: `Resume automation or retry from job ${pause.jobId}.`, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at),
+          nextAction: `Resume automation from this workflow's page (nothing is run again), or retry job ${pause.jobId} from its page while it is still kept.`, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at),
           controlPause: { jobId: pause.jobId, at: pause.at, by: pause.by, previous: cur.controlPause?.previous ?? stateOf(cur) },
         },
         ...(!repeated ? { event: blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, 'An authorized stop paused automation on this workflow.') } : {}),

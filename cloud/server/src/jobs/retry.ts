@@ -4,7 +4,7 @@ import type { Store } from '../store/store.js';
 import { errorClassOf, newJobId, type Launcher } from './launch.js';
 import { isBenchmarkLabel } from '../benchmarks/config.js';
 import { BENCHMARK_RETRY_MESSAGE, notRetryableMessage, retryable } from './status.js';
-import { stopSubjects } from './stop.js';
+import { resumeJobPause, stopSubjects } from './stop.js';
 
 /**
  * Retrying a job from the console: the launcher runs the job's own event again.
@@ -118,7 +118,7 @@ export function createRetryHandler({ store, launch, readEvent, appBot, now = Dat
     if (!job || job.installationId !== installationId) return no(410, 'event_gone', 'This job is too old to run again: its event is no longer kept. Apply the label again on GitHub instead');
     const resumeParent = async () => {
       if (!job.stop) return;
-      try { await store.resumeStoppedWorkflow(job, stopSubjects(job, summary.detail?.prNumber), by ?? 'authorized console retry', now()); }
+      try { await resumeJobPause(store, { ...job, stop: job.stop }, stopSubjects(job, summary.detail?.prNumber), by ?? 'authorized console retry', now()); }
       catch (error) { log({ installationId, jobId, warning: 'retry started; workflow pause could not be cleared, use Resume automation', name: (error as Error)?.name }); }
     };
     if (job.benchmark || isBenchmarkLabel(job.label)) return no(409, 'not_retryable', BENCHMARK_RETRY_MESSAGE);
