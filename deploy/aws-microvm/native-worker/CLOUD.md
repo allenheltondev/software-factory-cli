@@ -34,7 +34,7 @@ authorizes the action. Waiting requests expire in 24 hours and hold no worker sl
 runtime quota. A new worker receives a different control credential and has to sign in again.
 
 A deploy that changes `ManagedClaudeImageVersion` leaves a running worker on its old image.
-Cloud sends it no new jobs: they wait (`image-outdated`), and the issue comment asks for a reconnect. The console's Claude page shows a
+Cloud sends it no new jobs: they wait (`image-unapproved`), and the issue comment asks for a reconnect. The console's Claude page shows a
 **restart required** banner with the steps; members see it too, but only an owner can act.
 **Restart worker** refuses a worker with an active, settling or queued job. Otherwise one
 transaction fences the worker row (that exact VM, unchanged since the checks) and advances the
@@ -90,7 +90,7 @@ When a labeled issue cannot start at once, the webhook names why and what it nee
 | Readiness | Owner action | Meaning |
 | --- | --- | --- |
 | `not-connected`, `auth-required`, `expired` | sign in | there is no session, or the CLI login is gone |
-| `environment-retiring`, `environment-suspended`, `environment-ended`, `fenced`, `worker-lost`, `startup-failed`, `image-outdated` | reconnect | this environment can never run a job again |
+| `environment-retiring`, `environment-suspended`, `environment-ended`, `fenced`, `worker-lost`, `startup-failed`, `image-draining`, `image-revoked`, `image-unapproved`, `protocol-incompatible` | reconnect | this environment can never run a job again |
 | `worker-starting`, `heartbeat-stale`, `auth-unavailable` | none: wait | a bounded gap; the job starts on the worker's next connected poll |
 
 Readiness is judged from the session record first. A session can be absent, reserved with no VM
@@ -129,7 +129,7 @@ npm run claude-session-trace --workspace=server -- --installation <id> --watch 3
    issue while it runs. The new issue must queue (`queued`) and start on the same VM after
    settlement.
 5. Check the failure paths: sign out, reconnect explicitly, deploy a new image and stop the
-   VM. Each must show its precise readiness (`auth-required`, `image-outdated`,
+   VM. Each must show its precise readiness (`auth-required`, `image-unapproved`,
    `environment-ended`). Waiting requests must be kept, and nothing may fall back to an API key.
 
 ## Provision the older EFS-backed proof

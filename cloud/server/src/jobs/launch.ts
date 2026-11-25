@@ -123,7 +123,7 @@ export interface NativeLaunch {
 }
 
 /** Why a subscription worker is not taking a job now; see readinessAction for what it asks of the owner. */
-export type NativeReadiness = 'ready' | 'not-connected' | 'image-outdated' | 'image-draining' | 'image-revoked' | 'image-unapproved' | 'protocol-incompatible' | 'worker-starting' | 'startup-failed' | 'worker-lost'
+export type NativeReadiness = 'ready' | 'not-connected' | 'image-draining' | 'image-revoked' | 'image-unapproved' | 'protocol-incompatible' | 'worker-starting' | 'startup-failed' | 'worker-lost'
   | 'fenced' | 'heartbeat-stale' | 'environment-retiring' | 'environment-suspended' | 'environment-ended'
   | 'auth-required' | 'expired' | 'auth-unavailable';
 /**
@@ -136,7 +136,7 @@ export function readinessAction(reason: NativeReadiness): 'none' | 'sign-in' | '
   if (reason === 'ready') return 'none';
   // No session yet: connecting is signing in (the first connection or after a retirement).
   if (reason === 'not-connected' || reason === 'auth-required' || reason === 'expired') return 'sign-in';
-  if (['environment-retiring', 'environment-suspended', 'environment-ended', 'fenced', 'worker-lost', 'startup-failed', 'image-outdated', 'image-draining', 'image-revoked', 'image-unapproved', 'protocol-incompatible'].includes(reason)) return 'reconnect';
+  if (['environment-retiring', 'environment-suspended', 'environment-ended', 'fenced', 'worker-lost', 'startup-failed', 'image-draining', 'image-revoked', 'image-unapproved', 'protocol-incompatible'].includes(reason)) return 'reconnect';
   return 'wait';
 }
 export const needsSignIn = (reason: NativeReadiness) => readinessAction(reason) === 'sign-in';
