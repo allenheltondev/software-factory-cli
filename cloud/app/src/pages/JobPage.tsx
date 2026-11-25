@@ -61,7 +61,7 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
           {load.message}
         </Alert>
       )}
-      {load.state === 'ok' && <Loaded key={load.job.jobId} job={load.job} deliveries={load.deliveries} conversation={load.conversation ?? []} api={api} installationId={installationId} />}
+      {load.state === 'ok' && <Loaded key={load.job.jobId} job={load.job} deliveries={load.deliveries} conversation={load.conversation ?? []} api={api} installationId={installationId} onRefresh={() => void refresh()} />}
     </div>
   );
 }
@@ -119,7 +119,7 @@ function Retry({ job, api, installationId }: { job: JobView; api: JobApi; instal
   );
 }
 
-function Loaded({ job, deliveries, conversation, api, installationId }: { job: JobView; deliveries: Delivery[]; conversation: JobView[]; api: JobApi; installationId: number }) {
+function Loaded({ job, deliveries, conversation, api, installationId, onRefresh }: { job: JobView; deliveries: Delivery[]; conversation: JobView[]; api: JobApi; installationId: number; onRefresh: () => void }) {
   const r = JOB_RESULT[job.result];
   const names = [...job.logs].sort((a, b) => (a === 'run.log' ? -1 : b === 'run.log' ? 1 : a.localeCompare(b)));
   const [selectedLog, setSelectedLog] = useState<string>();
@@ -203,7 +203,7 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
 
       <AgentWork job={job} />
 
-      <Traces job={job} installationId={installationId} onRetry={() => void refresh()} />
+      <Traces job={job} installationId={installationId} onRetry={onRefresh} />
 
       <Conversation job={job} others={conversation} installationId={installationId} />
 

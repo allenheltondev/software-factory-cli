@@ -470,7 +470,8 @@ describe("a job's links stay with the destination that got its trace", () => {
     await service.setKey(caller, 55, { value: KEY, region: 'us' });
     const settings = await store.getTelemetry(55);
     expect(jobView(job, settings).telemetryStatus).toBe('enabled');
-    expect(jobView(job, settings).telemetry).toBeUndefined();
+    expect(jobView(job, settings).telemetry).toMatchObject({ spans: 9, exported: 9, failed: 0 });
+    expect(jobView(job, null).telemetry).toMatchObject({ spans: 9, exported: 9, failed: 0 });
     expect(jobView(job, null, { settingsUnavailable: true }).telemetryStatus).toBe('unknown');
     expect(JSON.stringify(jobView(job, settings).telemetryStatus)).not.toMatch(/secret|key/i);
   });
