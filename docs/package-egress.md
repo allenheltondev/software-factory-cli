@@ -112,7 +112,57 @@ section stops it from listening.
 | `egress.shim` | required | The shim's path. Must be under `/usr`, root-owned and not writable by others |
 | `toolTimeoutSeconds` | `120` | Time limit per `exec` command (10 to 1800). The example config sets 600 |
 
-Removing `egress` restores the old behavior exactly: `--network none` with no route out.
+Removing `egress` restores the old behavior exactly: `--network none` with no route out. With
+no `egress` section, per-installation hosts are ignored too (the supervisor logs
+`"decision":"off"`): an installation can never turn the network on.
+
+## Per-installation registries (#157)
+
+An installation whose repositories install from a private registry or a mirror (for example
+`npm.pkg.github.com`, `acme.jfrog.io`, a CodeArtifact or Artifactory host) adds it in the
+console: **Claude subscription → Package registries**. Only an owner of an active installation
+can change the list; members see it read-only.
+
+- **What is accepted.** One host per line: an exact name (`npm.pkg.github.com`), or
+  `*.example.com` for every name *below* example.com (not the apex). At most 20. Refused with a
+  message at save time: IP addresses (any form), ports, URLs and paths, a bare `*`, single-label
+  names, internal names (`.local`, `.internal`, `.corp`, `.lan`, `.home.arpa`, `.arpa`,
+  `.localhost`, `.test`, `.example`, ...), and wildcards over a shared domain where anyone can
+  get a name (`*.amazonaws.com`, `*.jfrog.io`, `*.github.io`, `*.co.uk`, ...: the list in
+  `SHARED_SUFFIXES` of `egress-proxy.mjs`, which is not exhaustive). List the exact host there
+  instead. A test holds Cloud's check and the worker's to the same answers.
+- **When it applies.** Cloud reads the list when it assigns a job to the worker, and hands it
+  over with that assignment. The supervisor adds the hosts to the image's for that job and
+  removes them when the job's runner exits. A change saved during a job applies from the next
+  job; the running job keeps the list it started with. Every change of the proxy's list, at the
+  start and at the end of a job, first drops every live proxy connection, so nothing admitted
+  under one job's list carries into the next.
+- **How it reaches the job.** Only over the worker control channel: the worker's root
+  dispatcher calls the broker with its control credential, and the poll answer that assigns a
+  job carries `{ jobId, hosts }`. The dispatcher passes it to the supervisor in process, with the
+  job id of the assignment. Nothing the job identity, the sandbox, the agent or the repository
+  can write is read: not the supervisor socket's frames, not the prompt, not repository files,
+  not issue text. The security check attacks this (socket frames carrying `egress` and
+  `allowHosts`, a prompt naming hosts) and confirms the host stays refused.
+- **Tenant binding.** The list is stored per installation (`TENANT#<id>` / `EGRESS`) and read
+  for the installation the worker's route belongs to. The supervisor applies a list only if it
+  names the job id of the assignment it came with; a list for another job is ignored entirely.
+- **Fail closed.** Any doubt gives the job the image's hosts only, never part of a list, and the
+  reason is logged: a stored list that no longer validates (Cloud logs
+  `{"nativeWorker":"egress","reason":"invalid-stored-policy"}` and the console shows the list
+  as not applied), an entry the worker refuses (`invalid-host`), more than 20 (`too-many-hosts`),
+  an unexpected shape (`malformed`), another job's list (`other-job`). If Cloud cannot read the
+  list, it assigns nothing; the job stays queued for the next poll. If the supervisor cannot
+  apply a list, the dispatcher stops before the job runs.
+- **Same checks as every other host.** An installation's host gets the same treatment as a
+  default registry: HTTPS `CONNECT` to an allowed port, every resolved address public (a name
+  that resolves to a private, loopback or metadata address is refused, also when only one of
+  its addresses does), the TLS SNI bound to the name, the same limits and deadlines.
+
+The supervisor logs each change: `{"event":"egress-policy","jobId":...,"decision":"apply"|"defaults-only"|"reset"|"off","hosts":[...],"reason":...}`.
+
+This list applies to Claude subscription (native worker) jobs only. The standard Cloud path
+already reaches every public host (see [Limitations](#limitations-and-follow-ups)).
 
 ## What a failure looks like
 
@@ -126,7 +176,8 @@ updraft-egress: refused CONNECT github.com:443 (not-allowed): the host is not an
 
 | Reason | Stage | What to do |
 | --- | --- | --- |
-| `not-allowed` | policy | The host is not on the allowlist. Add it to `allowHosts` if the repository really needs it |
+| `not-allowed` | policy | The host is not on the allowlist. An installation owner adds it in the console (Claude subscription → Package registries); it applies from the next job. An operator can add it for every installation with `allowHosts` |
+| `policy-changed` | policy | The job ended, or the next one started, while this request was being checked. Not seen during a job |
 | `ip-literal`, `port-not-allowed`, `https-only` | policy | The tool asked for an address, another port or plain HTTP. Use the registry's HTTPS host name |
 | `non-public-address (<range>)` | DNS result | The name resolves to a private, loopback or metadata address. Never reachable from a job |
 | `dns-failure (<code>)`, `dns-timeout` | DNS | The registry's name does not resolve from the worker, or not within 5 s. Check the microVM's egress connector |
@@ -139,7 +190,18 @@ updraft-egress: refused CONNECT github.com:443 (not-allowed): the host is not an
 
 Registry authentication errors (401 or 403 from the registry itself, after the tunnel is up)
 and TLS errors come from the package manager, not from the proxy. They have no
-`updraft-egress:` line.
+`updraft-egress:` line. A private registry that needs a token answers 401 here: credentials are
+not supported yet (see [Private registry credentials](#private-registry-credentials)).
+
+An installation's host still refused during a job:
+
+- The host was saved after the job was assigned. It applies from the next job.
+- The console shows the list as not applied (the saved list no longer validates). Correct it and
+  save again. The supervisor log says `"decision":"defaults-only"` with the reason.
+- The host is refused as `non-public-address`: its name resolves to a private address, for
+  example a registry inside a VPC. Jobs never reach those, whoever allows them.
+- The registry redirects downloads to another host (a CDN or object storage). The refusal names
+  that host; add it too, as an exact name.
 
 The supervisor logs one JSON line per decision on stdout:
 `{"event":"egress","decision":"allow"|"deny"|"closed","target":"host:443","reason":...,"bytes":...}`.
@@ -178,8 +240,47 @@ downloads happen and not an exfiltration control. That is acceptable here becaus
 - The sandbox holds no credentials (README, "Execution boundary"). What could leave is the
   repository content the job already holds, which the agent can put in a pull request anyway.
 - If one host must be limited to downloads only, the answer is a constrained fetch mechanism,
-  such as a registry mirror the proxy alone talks to, not a wider allowlist. That would be a
-  separate design decision (#157).
+  such as a registry mirror the proxy alone talks to, not a wider allowlist (see
+  [Private registry credentials](#private-registry-credentials)).
+
+The same holds for an installation's own hosts. Adding one does **not** make it download-only
+and is **not** an exfiltration control: a job can send repository content to it, as to any
+allowed host. What per-installation lists add is scope: a host one installation allows is
+reachable only during that installation's jobs, never during another's.
+
+## Private registry credentials
+
+Decision (#157): **no credential is ever given to the sandbox, and the opaque `CONNECT` proxy
+does not inject one.** Private registries can be allowed by host today; one that needs a token
+answers 401.
+
+Why the proxy cannot simply add `Authorization`: a `CONNECT` tunnel carries TLS end to end
+between the package manager and the registry. The proxy sees only the ClientHello. Adding a
+header would mean terminating TLS: a certificate authority the sandbox trusts, the proxy
+reading and rewriting every request on every allowed host, and a much larger trusted component
+running as root. That is rejected. Putting the token in the sandbox (an `.npmrc`, an environment
+variable) is rejected too: the agent, install scripts and repository code could read it, and
+any allowed host could receive it.
+
+The design to follow, as a separate change: a **trusted registry fetcher** outside the sandbox,
+next to the proxy.
+
+- The sandbox talks plain HTTP to a per-registry loopback address the shim exposes (for example
+  `http://127.0.0.1:<port>/r/<name>/`), and the package manager's registry setting points there
+  (`npm_config_@scope:registry`, `PIP_INDEX_URL`, ...). No TLS is terminated: the fetcher makes
+  its own HTTPS request to the registry, validates the registry's certificate, and adds the
+  token.
+- **Download only:** `GET` and `HEAD`, no request body, paths under the configured prefix only,
+  redirects followed by the fetcher itself to the same host or an allowed download host, never
+  with the token on another host. Responses streamed back with size and time limits.
+- The token is a job-scoped secret: saved write-only in the console (like agent keys), delivered
+  by the broker to the root supervisor with the assignment, held in memory for the job, and never
+  written to the sandbox, logs or caches. Tokens that echo back in responses (rare) are a risk to
+  review per ecosystem.
+- Registries that use the fetcher are not also put on the `CONNECT` allowlist, so the token path
+  and the opaque path never share a host.
+
+This also gives a download-only route for any registry, which the opaque tunnel cannot.
 
 ## Security notes
 
@@ -193,15 +294,26 @@ downloads happen and not an exfiltration control. That is acceptable here becaus
 - **Hosted native Claude only.** The standard Cloud (API key) path runs agents in the same
   sandbox *with* the microVM's network: the agent CLIs reach their model APIs from inside it.
   There, registries were already reachable, and so is every other public host except the
-  credential addresses the packet filter blocks (`runner/isolation.mjs`). Narrowing that path
-  to an allowlist needs per-agent API hosts and is a separate change (#157).
-- **Allowlist per image, not per installation.** `allowHosts` lives in the root-owned worker
-  config of the image. A per-installation list needs a Cloud setting delivered to the managed
-  worker. Until then, extra hosts are an operator change. Tracked in #157.
-- **No private registry credentials.** Private registries can be allowed by host, but there is
-  no supported way to give a job a scoped registry token. Do not put one in the repository or
-  the image. This needs a broker-issued, job-scoped secret that the proxy injects, so the token
-  never enters the sandbox.
+  credential addresses the packet filter blocks (`runner/isolation.mjs`).
+- **Standard Cloud path: not narrowed yet (decision, #157).** Moving the standard path to
+  `--network none` behind this proxy is deferred, not adopted, because it cannot be done safely
+  without hosted validation of every agent:
+  - each enabled agent CLI (Claude Code, Codex, Kiro, Mistral Vibe) must reach its model API,
+    sign-in and token-refresh hosts through `HTTPS_PROXY` with `CONNECT`. Not every one is
+    confirmed to honor the variable for every request, and a missing host breaks every job of
+    that agent;
+  - agent telemetry reaches the runner's OTLP relay on the microVM's loopback
+    (`TELEMETRY_ENV`), which a separate network namespace does not have;
+  - `checkAgentConfig` accepts `network: host` for these agents and the isolation self-test does
+    not yet prove the reverse.
+  Until it is adopted, the standard path keeps its current boundary: the packet filter that
+  keeps every non-root user away from the credential addresses and the hook port
+  (`runner/isolation.mjs`), with every public host reachable. Per-installation registry lists do
+  not apply there (they would add nothing). The work to adopt it: a per-agent host table next to
+  `DEFAULT_REGISTRY_HOSTS`, the shim in front of agent CLIs, an OTLP route through the proxy or a
+  socket, `checkAgentConfig` requiring `network: none`, a self-test that a non-listed host is
+  refused, and a hosted run of each agent.
+- **No private registry credentials** yet: see [Private registry credentials](#private-registry-credentials).
 - **No dependency cache across jobs.** Every job installs cold. This is predictable and works,
   and a cold install of this repository's `cloud/` workspace takes about 10 s. A lockfile-keyed
   cache is a possible optimization (#156).
@@ -246,3 +358,12 @@ egress checks, and all 20 checks pass.
 
 **Not yet shown:** a deployed hosted subscription job and a standard Cloud job on AWS, and
 CI-repair runs there. Those need a deployed native image built from this change.
+
+Per-installation registries (#157), local only: the proxy over its socket with a stand-in
+resolver (an installation's host reachable only during its job and never during another's, inward
+and partly inward names refused, every connection dropped at each change, a lookup across a
+change connecting nowhere), Cloud's worker control (the list bound to the assigned job, read
+before the assignment commits, a change during a job reaching only the next one, an invalid
+stored list sent as none), and `security-check.mjs` (21 checks, root, real supervisor) with the
+socket-frame and prompt attacks. **Not yet shown:** a console save reaching a deployed worker's
+next job, and a second installation's job on AWS refusing that host.
