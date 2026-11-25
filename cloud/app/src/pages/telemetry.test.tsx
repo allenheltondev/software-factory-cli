@@ -256,6 +256,39 @@ describe('the job page links to its trace', () => {
     expect(screen.queryByRole('link', { name: 'Set up agent telemetry' })).not.toBeInTheDocument();
   });
 
+  it('shows the successful, partial and failed exports with their counts and no setup prompt', async () => {
+    const t = { traceId: 'ab'.repeat(16), traceUrl: 'https://ui.honeycomb.io/t', destination: 'Honeycomb' };
+    showJob(job({ telemetryStatus: 'enabled', telemetry: { ...t, spans: 5, exported: 5, failed: 0 } }));
+    expect(await screen.findByTestId('job-trace-link')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Set up agent telemetry' })).not.toBeInTheDocument();
+  });
+
+  it('warns on a partial export with its counts and reason', async () => {
+    showJob(job({ telemetryStatus: 'enabled', telemetry: { traceId: 'ab'.repeat(16), traceUrl: 'https://ui.honeycomb.io/t', destination: 'Honeycomb', spans: 10, exported: 7, failed: 3, lastError: 'HTTP 503' } }));
+    const card = await screen.findByTestId('job-telemetry');
+    expect(card).toHaveTextContent('7');
+    expect(card).toHaveTextContent('HTTP 503');
+    expect(screen.getByTestId('job-trace-link')).toBeInTheDocument();
+  });
+
+  it('warns on a failed export with its reason and no trace link', async () => {
+    showJob(job({ telemetryStatus: 'enabled', telemetry: { traceId: 'ab'.repeat(16), spans: 4, exported: 0, failed: 4, lastError: 'HTTP 401' } }));
+    const card = await screen.findByTestId('job-telemetry');
+    expect(card).toHaveTextContent('HTTP 401');
+    expect(screen.queryByTestId('job-trace-link')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Set up agent telemetry' })).not.toBeInTheDocument();
+  });
+
+  it('keeps historical links when the settings are unknown or paused', async () => {
+    showJob(job({ telemetryStatus: 'unknown', telemetry: { traceId: 'ab'.repeat(16), traceUrl: 'https://ui.honeycomb.io/t', destination: 'Honeycomb', spans: 2, exported: 2, failed: 0 } }));
+    expect(await screen.findByTestId('job-trace-link')).toHaveAttribute('href', 'https://ui.honeycomb.io/t');
+  });
+
+  it('says a finished job has no report, and not that telemetry is unset, when paused', async () => {
+    showJob(job({ telemetryStatus: 'paused' }));
+    expect(await screen.findByTestId('job-telemetry-status')).toHaveTextContent('Telemetry paused');
+  });
+
   it('offers settings when telemetry is paused', async () => {
     showJob(job({ telemetryStatus: 'paused' }));
     expect(await screen.findByRole('link', { name: 'Manage telemetry settings' })).toBeInTheDocument();

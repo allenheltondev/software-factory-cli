@@ -475,6 +475,28 @@ describe("a job's links stay with the destination that got its trace", () => {
     expect(JSON.stringify(jobView(job, settings).telemetryStatus)).not.toMatch(/secret|key/i);
   });
 
+  it('keeps historical links under the current status after the destination changes or is paused', async () => {
+    const { service, store } = await setup();
+    await service.setKey(caller, 55, { value: KEY, region: 'us' });
+    const sent = sentWith(job, await store.getTelemetry(55), { provider: 'honeycomb', host: 'api.honeycomb.io' });
+    await service.setKey(caller, 55, { provider: 'cloudwatch', awsRegion: 'us-east-1', value: 'AbCdEfGhIjKlMnOpQrStUv0123' });
+    const changed = jobView(sent, await store.getTelemetry(55));
+    expect(changed.telemetryStatus).toBe('enabled');
+    expect(changed.telemetry?.traceUrl).toMatch(/ui\.honeycomb\.io/);
+    await service.update(caller, 55, { enabled: false });
+    const paused = jobView(sent, await store.getTelemetry(55));
+    expect(paused.telemetryStatus).toBe('paused');
+    expect(paused.telemetry?.traceUrl).toMatch(/ui\.honeycomb\.io/);
+    // Settings unavailable: unknown, and a link to the snapshotted destination survives.
+    const unknown = jobView(sent, null, { settingsUnavailable: true });
+    expect(unknown.telemetryStatus).toBe('unknown');
+    expect(unknown.telemetry?.destination).toBe('Honeycomb');
+  });
+
+  it('never lets a job record override the computed telemetry status', () => {
+    expect(jobView({ ...job, telemetryStatus: 'enabled' } as never, null).telemetryStatus).toBe('not_configured');
+  });
+
   it('keeps a Honeycomb job linked to Honeycomb after the destination became CloudWatch, then a custom one', async () => {
     const { service, store } = await setup();
     await service.setKey(caller, 55, { value: KEY, region: 'us' });

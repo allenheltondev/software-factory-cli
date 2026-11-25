@@ -201,7 +201,7 @@ export function conversationOf(job: JobSummary): string | undefined {
 
 export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = null, { now = Date.now(), timelineTemplate = null, settingsUnavailable = false }: JobViewOptions = {}): JobView {
   const telemetryStatus: TelemetryInstallationStatus = settingsUnavailable ? 'unknown' : !telemetry?.key ? 'not_configured' : telemetry.enabled ? 'enabled' : 'paused';
-  const view: JobView = { telemetryStatus, ...job, result: jobResult(job), retryable: retryable(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
+  const view: JobView = { ...job, telemetryStatus, result: jobResult(job), retryable: retryable(job), logs: job.deliveryId && job.microvmId ? (job.detail?.logs ?? []) : [] };
   if (job.issue !== undefined) view.issueUrl = `https://github.com/${job.repository}/issues/${job.issue}`;
   if (job.detail?.prUrl) view.prUrl = job.detail.prUrl;
   // A job of a pull request's event (its review loop): that pull request, whatever the run reported.

@@ -361,7 +361,7 @@ function Traces({ job, installationId, onRetry }: { job: JobView; installationId
     if (t?.local) message = 'Local telemetry: this job did not export its traces. What it recorded locally is shown below.';
     else if (status === 'unknown') message = 'Unable to check telemetry settings.';
     else if (status === 'paused') message = 'Telemetry paused. This job has no telemetry report.';
-    else if (status === 'enabled') message = finished ? 'No telemetry report available for this job.' : 'Telemetry enabled · trace details pending';
+    else if (status === 'enabled') message = finished ? 'No telemetry report available for this job. The console cannot tell whether it never started, ran with telemetry off, or lost its report.' : 'Telemetry enabled · trace details pending';
     else message = null;
     // Only an installation confirmed not configured is asked to set telemetry up.
     const showSettings = status === undefined || status === 'not_configured' || status === 'paused' || status === 'unknown';
