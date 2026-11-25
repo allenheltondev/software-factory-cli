@@ -337,8 +337,16 @@ async function resumeClaude(installationId: number) {
 }
 
 // Workflow reconciliation (workflows/reconcile.ts), on its own schedule. It reports what it
-// finds and starts no job.
-const reconcileWorkflows = createWorkflowReconciler({ store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch });
+// finds, and recovers what is safe to (workflows/recovery.ts): only through the launcher (and the
+// admission queue behind it) and the console retry, with their fences.
+const appBot = async () => {
+  const settings = await loadSettings();
+  return settings?.slug ? `${settings.slug}[bot]` : undefined;
+};
+const reconcileWorkflows = createWorkflowReconciler({
+  store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch,
+  ...(launch && retryJob ? { recovery: { launch, retry: retryJob, appBot } } : {}),
+});
 
 const scanLabels = createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings });
 

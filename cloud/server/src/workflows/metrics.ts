@@ -14,6 +14,7 @@ export function reconcileMetricsLine(report: ReconcileReport, labels: LabelScanR
     Runs: { value: 1, unit: 'Count' },
     Checked: { value: report.checked, unit: 'Count' },
     Repaired: { value: report.repaired, unit: 'Count' },
+    Recovered: { value: report.recovered, unit: 'Count' },
     Blocked: { value: report.blocked, unit: 'Count' },
     Finished: { value: report.finished, unit: 'Count' },
     Failed: { value: report.failed + labels.failed, unit: 'Count' },
