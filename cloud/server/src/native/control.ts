@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { hashToken } from '../broker/broker.js';
 import { runHookPayload, type LaunchSettings } from '../jobs/launch.js';
 import { isTerminated, unusedTime } from '../jobs/quotas.js';
+import { workflowIsPaused } from '../jobs/stop.js';
 import type { Job, Store } from '../store/store.js';
 import { nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from './route.js';
 import type { AuthState, NativeStore, Worker } from './store.js';
@@ -240,17 +241,16 @@ export function createNativeControl(d: NativeControlDeps) {
     if (p.op !== 'poll' || disabled || p.auth !== 'connected') return { ok: true, busy: false };
     for (const id of await d.workers.queued(r.installationId, r.workerId)) {
       const job = await d.store.getJob(id);
-      if (!job || job.status === 'finished' || job.expiresAt <= now()) { await d.workers.dequeue(r.installationId, r.workerId, id); continue; }
+      if (!job || job.status === 'finished' || job.stopRequestedAt !== undefined || job.expiresAt <= now()) { await d.workers.dequeue(r.installationId, r.workerId, id); continue; }
+      if (await workflowIsPaused(d.store, job)) continue;
       if (!job.native || job.native.workerId !== r.workerId || job.installationId !== r.installationId || job.microvmId || !job.launchingAt ||
           job.imageVersion !== r.imageVersion || job.native.generation !== r.generation) continue;
       const token = nativeJobToken(secret, job.jobId);
       if (hashToken(token) !== job.tokenHash) return refused; // rotated control key: drain before rotation
       // Lost to another poll: read again, and the winner's assignment refuses this poll.
-      if (!await save(w, { lastWorkAt: now(), active: { jobId: id, until: Math.min(job.expiresAt, now() + WORKER_LEASE_MS) } })) return RETRY;
+      if (!await d.workers.assign(job, w, now(), Math.min(job.expiresAt, now() + WORKER_LEASE_MS))) return RETRY;
       // Assignment is durable before it is handed out. A lost response fences this VM on expiry;
       // it never hands the task out a second time or falls back to BYOK.
-      await d.store.attachMicrovm(id, r.microvmId);
-      await d.workers.dequeue(r.installationId, r.workerId, id);
       return { ok: true, busy: true, request: { microvmId: r.microvmId, payload: runHookPayload(d.settings, {
         jobId: id, token, deliveryId: job.deliveryId, launchedAt: Date.parse(job.createdAt), eventName: job.eventName,
         notBefore: job.native.notBefore, retry: job.native.retry }) } };

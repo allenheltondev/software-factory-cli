@@ -44,6 +44,13 @@ describe('native worker Cloud dispatch', () => {
     workers = {
       async get() { return row ? structuredClone(row) : null; },
       async put(w, previous) { if ((row?.version ?? null) !== previous) return false; row = structuredClone(w); return true; },
+      async assign(job, w, at, until) {
+        const fresh = await store.getJob(job.jobId);
+        if (!fresh || fresh.stopRequestedAt !== undefined || fresh.status === 'finished' || fresh.microvmId || fresh.expiresAt <= at) return false;
+        if (!await workers.put({ ...w, version: w.version + 1, lastWorkAt: at, active: { jobId: job.jobId, until } }, w.version)) return false;
+        await store.attachMicrovm(job.jobId, w.microvmId);
+        return true;
+      },
       async queued() {
         const ids = (await store.listRecentJobs(55, 100)).map((j) => j.jobId);
         const jobs = await Promise.all(ids.map((id) => store.getJob(id)));

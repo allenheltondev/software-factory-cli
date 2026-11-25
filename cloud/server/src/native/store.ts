@@ -1,4 +1,6 @@
 import type { NativeTrigger } from './route.js';
+import type { Job } from '../store/store.js';
+import { workflowAdmissionChecks } from '../jobs/workflow-gate.js';
 import { ConditionalCheckFailedException, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, DeleteCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -24,6 +26,9 @@ export interface NativeStore {
   get(installationId: number, workerId: string): Promise<Worker | null>;
   /** Compare-and-swap; never expire this row using DynamoDB TTL. */
   put(worker: Worker, previousVersion: number | null): Promise<boolean>;
+  /** Atomically take a queued, unfenced job and this idle worker version, attach its VM,
+   * and remove the queue entry. A stop/pause winning the transaction admits nothing. */
+  assign(job: Job, worker: Worker, at: number, until: number): Promise<boolean>;
   queued(installationId: number, workerId: string): Promise<string[]>;
   dequeue(installationId: number, workerId: string, jobId: string): Promise<void>;
 }
@@ -47,6 +52,28 @@ export function createNativeStore(table: string, db = DynamoDBDocumentClient.fro
       const { Items } = await db.send(new QueryCommand({ TableName: table, KeyConditionExpression: 'pk = :p AND begins_with(sk, :q)',
         ExpressionAttributeValues: { ':p': nativePartition(id, worker), ':q': 'QUEUE#' }, ConsistentRead: true, Limit: 100 }));
       return (Items ?? []).map((i) => String(i.jobId));
+    },
+    async assign(job, worker, at, until) {
+      if (!job.native || job.installationId !== worker.installationId || job.native.workerId !== worker.workerId) return false;
+      const next = { ...worker, version: worker.version + 1, lastWorkAt: at, active: { jobId: job.jobId, until } };
+      try {
+        await db.send(new TransactWriteCommand({ TransactItems: [
+          { Put: { TableName: table, Item: { ...key(worker.installationId, worker.workerId), ...next },
+            ConditionExpression: '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling) AND attribute_not_exists(fenced)',
+            ExpressionAttributeNames: { '#v': 'version' }, ExpressionAttributeValues: { ':v': worker.version } } },
+          { Update: { TableName: table, Key: { pk: `JOB#${job.jobId}`, sk: 'META' }, UpdateExpression: 'SET microvmId = :vm',
+            ConditionExpression: 'installationId = :installation AND #status = :launched AND attribute_not_exists(stopRequestedAt) AND attribute_not_exists(microvmId) AND attribute_exists(launchingAt) AND expiresAt > :at',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':vm': worker.microvmId, ':installation': job.installationId, ':launched': 'launched', ':at': at } } },
+          { Delete: { TableName: table, Key: { pk: nativePartition(worker.installationId, worker.workerId), sk: `QUEUE#${job.jobId}` },
+            ConditionExpression: 'jobId = :job', ExpressionAttributeValues: { ':job': job.jobId } } },
+          ...workflowAdmissionChecks(table, job),
+        ] }));
+        return true;
+      } catch (error) {
+        if (!(error instanceof TransactionCanceledException) || !error.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) throw error;
+        return false;
+      }
     },
     async dequeue(id, worker, jobId) { await db.send(new DeleteCommand({ TableName: table, Key: { pk: nativePartition(id, worker), sk: `QUEUE#${jobId}` } })); },
   };

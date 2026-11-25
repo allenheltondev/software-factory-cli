@@ -48,6 +48,7 @@ describe('Claude subscription mode in the installation app', () => {
     };
     fenceCommits = true;
     workers = {
+      async assign() { return false; },
       async get() { return worker; },
       async put() { return true; },
       async queued() { return queued; },

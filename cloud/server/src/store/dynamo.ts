@@ -2,6 +2,7 @@ import { destinationOf, jobTelemetrySnapshotOf, loopOf, routingOf, stepsOf, tele
 import { benchmarkIdentityOf } from '../benchmarks/config.js';
 import { nativePartition } from '../native/store.js';
 import { NATIVE_SLOT_HOLD_UNTIL } from '../native/route.js';
+import { workflowAdmissionChecks, WorkflowPausedError } from '../jobs/workflow-gate.js';
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import {
   DeleteCommand,
@@ -679,6 +680,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async markLaunching(jobId) {
+      const current = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${jobId}`, sk: 'META' }, ConsistentRead: true }));
+      const gates = current.Item ? workflowAdmissionChecks(T, current.Item as Job) : [];
       // The phase and the job's own record of it, together: the active entry is deleted when the
       // reservation is reclaimed, before the job is failed, so it cannot be the only evidence.
       try {
@@ -703,10 +706,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                   ExpressionAttributeValues: { ':at': Date.now() },
                 },
               },
+              ...gates,
             ],
           }),
         );
       } catch (err) {
+        if (err instanceof TransactionCanceledException && gates.some((_, i) => cancelledAt(err, 2 + i))) throw new WorkflowPausedError();
         if (err instanceof TransactionCanceledException) throw new Error(`job ${jobId} has no reservation to launch`, { cause: err });
         throw err;
       }
@@ -1385,6 +1390,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
 
     async startJob(job, holdUntil): Promise<StartResult> {
+      const gates = workflowAdmissionChecks(T, job);
       const ttl = Math.ceil(holdUntil / 1000);
       const slots = jobSlotKeys(job);
       const monthLimit = job.quotas ? job.quotas.microvmMinutesPerMonth * 60 : undefined;
@@ -1422,12 +1428,14 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
                     },
                   ]
                 : []),
+              ...gates,
             ],
           }),
         );
         return { result: 'started' };
       } catch (err) {
         if (!(err instanceof TransactionCanceledException)) throw err;
+        if (gates.some((_, i) => cancelledAt(err, 2 + slots.length + (job.reservedSeconds ? 1 : 0) + i))) return { result: 'retired' };
         if (cancelledAt(err, 0)) {
           const current = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' }, ConsistentRead: true }));
           const retired = !current.Item || current.Item.status === 'finished' || current.Item.stopRequestedAt !== undefined;

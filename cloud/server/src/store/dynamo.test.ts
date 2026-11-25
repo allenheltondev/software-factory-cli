@@ -28,6 +28,9 @@ function fakeTable() {
 
   function condition(expr: string | undefined, item: Item | undefined, values: Values = {}): boolean {
     if (!expr) return true;
+    if (expr === 'attribute_not_exists(pk) OR jobId = :parent') return !item || item.jobId === values[':parent'];
+    if (expr === '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling) AND attribute_not_exists(fenced)') return item?.version === values[':v'] && !item.active && !item.settling && item.fenced === undefined;
+    if (expr === 'installationId = :installation AND #status = :launched AND attribute_not_exists(stopRequestedAt) AND attribute_not_exists(microvmId) AND attribute_exists(launchingAt) AND expiresAt > :at') return item?.installationId === values[':installation'] && item.status === values[':launched'] && item.stopRequestedAt === undefined && item.microvmId === undefined && item.launchingAt !== undefined && Number(item.expiresAt) > Number(values[':at']);
     if (expr === 'installationId = :installation AND #status <> :finished AND attribute_not_exists(#stop)') return item?.installationId === values[':installation'] && item?.status !== values[':finished'] && item?.stop === undefined;
     if (expr === 'attribute_exists(#stop)') return item?.stop !== undefined;
     if (expr === 'attribute_exists(#stop.confirmedAt)') return (item?.stop as Item | undefined)?.confirmedAt !== undefined;

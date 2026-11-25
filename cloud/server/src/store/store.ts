@@ -21,6 +21,7 @@
  */
 
 import type { JobLoop, JobRouting, JobStep, JobTelemetryReport, JobTelemetrySnapshot, LinkDestination } from '../jobs/lifecycle.js';
+import { workflowSubjects, WorkflowPausedError } from '../jobs/workflow-gate.js';
 
 /** The native enqueue transaction was definitively rolled back because its mode was disabled. */
 export class NativeEnqueueRejectedError extends Error {
@@ -759,6 +760,10 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const deliveries2: { id: number; d: DeliveryRecord }[] = [];
   const jobs = new Map<string, Job>();
   const pauses = new Map<string, WorkflowPause>();
+  const paused = (job: Job) => workflowSubjects(job).some((n) => {
+    const pause = pauses.get(`${job.installationId}/${job.repositoryId}/${n}`);
+    return pause !== undefined && pause.jobId !== job.resumeOf;
+  });
   /** `<installationId>/<deliveryId>` -> expiry (epoch ms) and the job holding the claim. */
   const deliveries = new Map<string, { expiresAt: number; jobId: string }>();
   /** `<installationId>/<n>` or `platform/<n>` -> the job holding the slot, and until when (epoch ms). */
@@ -964,7 +969,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async startJob(job, holdUntil) {
       const now = Date.now();
       const current = jobs.get(job.jobId);
-      if (!current || current.status === 'finished' || current.stopRequestedAt !== undefined) return { result: 'retired' };
+      if (!current || current.status === 'finished' || current.stopRequestedAt !== undefined || paused(current)) return { result: 'retired' };
       if (current.startedAt !== undefined) return { result: 'already' };
       const claimKey = `${job.installationId}/${job.deliveryId}`;
       const claim = deliveries.get(claimKey);
@@ -1039,6 +1044,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const entry = active.get(jobId);
       if (!entry || entry.phase !== 'reserved') throw new Error(`job ${jobId} has no reservation to launch`);
       if (jobs.get(jobId)?.stopRequestedAt !== undefined) throw new Error('job is stopping');
+      if (jobs.has(jobId) && paused(jobs.get(jobId)!)) throw new WorkflowPausedError();
       active.set(jobId, { ...entry, phase: 'launching' });
       const j = jobs.get(jobId);
       if (j) jobs.set(jobId, { ...j, launchingAt: Date.now() });

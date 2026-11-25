@@ -1,5 +1,6 @@
 import { waitingId } from '../native/sessions.js';
 import { workflowIsPaused } from './stop.js';
+import { WorkflowPausedError } from './workflow-gate.js';
 import type { NativeMode } from '../native/store.js';
 import { randomBytes } from 'node:crypto';
 import { legacyNativeTriggers, sameNativeRepository, sameNativeTrigger, nativeJobToken, NATIVE_SLOT_HOLD_UNTIL, type NativeRoute } from '../native/route.js';
@@ -556,6 +557,11 @@ export function createLauncher(deps: LaunchDeps) {
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) }));
       microvmId = out.microvmId;
     } catch (err) {
+      if (recorded && err instanceof WorkflowPausedError) {
+        const stopped = await deps.store.requestJobStop(job, { requestedAt: now(), by: 'workflow control', reason: 'Workflow paused before launch admission' }, []);
+        if (stopped && deps.stopJob) await deps.stopJob(stopped);
+        return { status: 202, disposition: 'cancelled', jobId };
+      }
       if (native && !recorded && err instanceof NativeEnqueueRejectedError) {
         // The mode condition rolled back the enqueue: nothing can execute this reservation.
         await deps.store.cancelReservation(reservation, 'reserved');
@@ -604,7 +610,13 @@ export function createLauncher(deps: LaunchDeps) {
     }
 
     const current = await deps.store.getJob(jobId);
-    if (current?.stop && deps.stopJob) await deps.stopJob(current);
+    if (current && !current.stop && await workflowIsPaused(deps.store, current)) {
+      // Launch admission won before the pause. Its VM may now exist, but no agent may
+      // start after the pause: retire this sibling without replacing the owner's pause.
+      await deps.store.requestJobStop(current, { requestedAt: now(), by: 'workflow control', reason: 'Workflow paused while VM launch was in flight' }, []);
+    }
+    const latest = await deps.store.getJob(jobId);
+    if (latest?.stop && deps.stopJob) await deps.stopJob(latest);
     log({ delivery: req.deliveryId, installationId: req.installationId, jobId, microvmId, repository: job.repository, configVersion: job.configVersion, imageVersion, launched: true });
     return { status: 202, disposition: 'launched', jobId };
   };

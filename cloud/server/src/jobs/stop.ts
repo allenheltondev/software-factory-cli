@@ -1,5 +1,6 @@
 import type { Job, JobStop, Store } from '../store/store.js';
 import { isTerminated, unusedTime } from './quotas.js';
+import { workflowSubjects } from './workflow-gate.js';
 
 export interface StopResult {
   jobId: string;
@@ -7,8 +8,7 @@ export interface StopResult {
   stop?: JobStop;
 }
 
-export const stopSubjects = (job: Pick<Job, 'issue' | 'pullRequest' | 'workflowIssue'>, prNumber?: number) =>
-  [...new Set([job.issue, job.pullRequest, job.workflowIssue, prNumber].filter((n): n is number => n !== undefined))];
+export const stopSubjects = workflowSubjects;
 
 export async function workflowIsPaused(store: Store, job: Pick<Job, 'installationId' | 'repositoryId' | 'issue' | 'pullRequest' | 'workflowIssue' | 'resumeOf'>): Promise<boolean> {
   for (const subject of stopSubjects(job)) {
