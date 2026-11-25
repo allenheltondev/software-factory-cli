@@ -118,6 +118,10 @@ const queueNotifier: QueueNotifier = {
     const existing = await github.findIssueComment!(token, entry.repository, subject, marker, bot);
     return existing ?? (await github.postIssueComment!(token, entry.repository, subject, body));
   },
+  async find(entry, marker) {
+    const { token, bot } = await queueToken(entry);
+    return (await github.findIssueComment!(token, entry.repository, (entry.issue ?? entry.pullRequest)!, marker, bot)) ?? undefined;
+  },
   async update(entry, commentId, body) {
     const { token } = await queueToken(entry);
     await github.updateIssueComment!(token, entry.repository, commentId, body);
@@ -218,6 +222,7 @@ const dispatcher = launch
       notify: queueNotifier,
       workflows,
       killSwitch,
+      capacity: { store, quotas: quotasFromEnv(env) },
       ...(consoleOrigin ? { consoleOrigin } : {}),
     })
   : undefined;

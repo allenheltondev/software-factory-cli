@@ -236,6 +236,8 @@ export interface LaunchResult {
   message?: string;
   /** launch_failed: the error's class. */
   errorClass?: string;
+  /** coalesced: the job of the same pull request this event was folded into. */
+  coveredBy?: string;
 }
 
 // A GitHub delivery id is a GUID; it becomes part of an S3 key, so nothing else is accepted.
@@ -259,7 +261,7 @@ export function createLauncher(deps: LaunchDeps) {
    * was not confirmed in time (`unconfirmed`). A holder whose launch fails gives the lease back,
    * and this event takes it then, so it is never acknowledged for a job that does not exist.
    */
-  async function takeOrJoin(installationId: number, lease: string, jobId: string): Promise<'held' | 'covered' | 'unconfirmed'> {
+  async function takeOrJoin(installationId: number, lease: string, jobId: string, onHolder?: (holderJobId: string) => void): Promise<'held' | 'covered' | 'unconfirmed'> {
     const pollMs = deps.coalescePollMs ?? COALESCE_POLL_MS;
     const attempts = Math.max(1, Math.ceil((deps.coalesceConfirmMs ?? COALESCE_CONFIRM_MS) / pollMs));
     for (let attempt = 0; attempt <= attempts; attempt++) {
@@ -268,7 +270,10 @@ export function createLauncher(deps: LaunchDeps) {
       const claim = await deps.store.getDeliveryClaim(installationId, lease);
       if (!claim) continue; // given back (a failed launch) or just expired: take it next time round
       const holder = await deps.store.getJob(claim.jobId);
-      if (holder && holder.status !== 'finished' && (holder.microvmId !== undefined || holder.startedAt !== undefined || holder.native !== undefined)) return 'covered';
+      if (holder && holder.status !== 'finished' && (holder.microvmId !== undefined || holder.startedAt !== undefined || holder.native !== undefined)) {
+        onHolder?.(holder.jobId);
+        return 'covered';
+      }
     }
     return 'unconfirmed';
   }
@@ -508,14 +513,15 @@ export function createLauncher(deps: LaunchDeps) {
     let leaseAt = launchedAt;
     if (lease) {
       let covered: 'held' | 'covered' | 'unconfirmed';
+      let holderJobId: string | undefined;
       try {
-        covered = await takeOrJoin(req.installationId, lease, jobId);
+        covered = await takeOrJoin(req.installationId, lease, jobId, (h) => { holderJobId = h; });
       } catch (err) {
         await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
         throw err;
       }
       if (covered !== 'held') await deps.store.releaseDelivery(req.installationId, req.deliveryId, jobId).catch(() => {});
-      if (covered === 'covered') return skip('coalesced', { message: `a job for pull request #${decision.pullRequest} starts in a few seconds and will see this event` });
+      if (covered === 'covered') return { ...skip('coalesced', { message: `a job for pull request #${decision.pullRequest} starts in a few seconds and will see this event` }), ...(holderJobId ? { coveredBy: holderJobId } : {}) };
       if (covered === 'unconfirmed') {
         // Not acknowledged: GitHub shows the delivery failed, and redelivering it tries again.
         log({ delivery: req.deliveryId, installationId: req.installationId, warning: `the job holding pull request #${decision.pullRequest} was not confirmed launched in time` });
@@ -548,6 +554,14 @@ export function createLauncher(deps: LaunchDeps) {
     const queue = deps.queue && !benchmark && !req.retry && !req.resumeClaude && !req.retryRuntime && !req.queued ? deps.queue : undefined;
     const enqueue = async (reason: 'concurrent_jobs' | 'platform_concurrency' | 'queue_ahead'): Promise<LaunchResult> => {
       let out;
+      // Released once: as soon as the entry is kept, or here if the enqueue failed. Never again
+      // after that, when a dispatcher may already hold this delivery's claim under the same job id.
+      let released = false;
+      const releaseOnce = async () => {
+        if (released) return;
+        released = true;
+        await releaseClaims();
+      };
       try {
         out = await queue!.enqueue({
           request: req, jobId, repository: decision.repository, repositoryId: decision.repositoryId,
@@ -556,10 +570,11 @@ export function createLauncher(deps: LaunchDeps) {
           ...(workflowIssue !== undefined ? { workflowIssue } : {}),
           ...(decision.label ? { label: decision.label } : {}),
           route: native?.route.workerId ?? 'standard', configVersion, reason,
+          persisted: releaseOnce,
         });
       } finally {
         // The entry (or its subject's lock) dedupes from here; a failed enqueue leaves the delivery redeliverable.
-        await releaseClaims();
+        await releaseOnce();
       }
       if (out.result === 'queued') return { status: 202, disposition: 'queued', jobId: out.entry.jobId, reason };
       if (out.result === 'joined') return { status: 200, disposition: 'queue_joined', jobId: out.entry.jobId, message: `already queued as ${out.entry.jobId}` };

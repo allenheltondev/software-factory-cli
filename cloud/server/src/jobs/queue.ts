@@ -2,7 +2,7 @@ import type { GitHubApi } from '../github/client.js';
 import { GitHubError } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
-import type { Store } from '../store/store.js';
+import type { Quotas, Store } from '../store/store.js';
 import type { WorkflowRecorder } from '../workflows/recorder.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
 import type { LaunchRequest, LaunchResult } from './launch.js';
@@ -56,6 +56,9 @@ export const backoff = (attempts: number) => Math.min(BACKOFF_MAX_MS, BACKOFF_BA
  * the timeout is safe (its lease runs out, and its job record, if any, wins), only slower.
  */
 export const DISPATCH_BUDGET_MS = 6 * 1000;
+/** When a queued launch finds its own delivery claim held (no job record yet): looked at again after this, at most this. */
+export const DUPLICATE_RECHECK_MS = 5 * 1000;
+export const DUPLICATE_RECHECK_MAX_MS = 60 * 1000;
 /** How long the enqueue has to post its acknowledgement before the dispatcher posts a missing one. */
 export const ACK_GRACE_MS = 60 * 1000;
 /** Waiting entries one dispatch run reads. */
@@ -168,6 +171,8 @@ export interface QueueNotifier {
   /** Creates the comment and returns its id, or finds one already carrying `marker` (a post whose answer was lost). */
   post(e: QueueEntry, body: string, marker: string): Promise<number | undefined>;
   update(e: QueueEntry, commentId: number, body: string): Promise<void>;
+  /** The App's own comment carrying `marker`, if one was posted (its id never recorded). */
+  find?(e: QueueEntry, marker: string): Promise<number | undefined>;
 }
 
 export interface EnqueueInput {
@@ -182,6 +187,8 @@ export interface EnqueueInput {
   route: string;
   configVersion: number;
   reason: QueueWaitReason;
+  /** Called once the entry's write has committed (whatever its result), before any side effect. */
+  persisted?: () => Promise<void>;
 }
 
 export type EnqueueOutcome =
@@ -258,6 +265,9 @@ export function createAdmissionQueue(deps: {
         version: 0,
       };
       const out = await deps.store.enqueue(entry, deps.maxPerTenant ?? QUEUE_MAX_PER_TENANT);
+      // Kept (or joined, or refused for room): the launcher's delivery claim is released now, before
+      // the workflow and the comment, so a dispatcher woken by this very enqueue finds it free.
+      await input.persisted?.();
       if (out.result === 'full') return out;
       if (out.result === 'joined') {
         const existing = out.entry;
@@ -310,12 +320,25 @@ export function createAdmissionQueue(deps: {
 export async function syncComment(store: QueueStore, notify: QueueNotifier, e: QueueEntry, consoleOrigin: string | undefined, now: number, log: (entry: Record<string, unknown>) => void): Promise<QueueEntry> {
   if (e.commentState === e.state) return e;
   const body = queueComment(e, consoleOrigin, now);
+  const marker = queueCommentMarker(e.jobId);
   try {
-    let commentId = e.commentId;
+    // The comment's id as kept now (another writer may have recorded it after `e` was read), or
+    // the comment itself on GitHub (its id was never recorded): an existing comment is edited,
+    // whatever the state, rather than left saying something that is no longer true.
+    let commentId = e.commentId ?? (await store.get(e.installationId, e.jobId))?.commentId;
+    if (commentId === undefined && notify.find) commentId = await notify.find(e, marker);
     if (commentId !== undefined) await notify.update(e, commentId, body);
-    else if (isWaiting(e) || e.state === 'refused' || e.state === 'expired') commentId = await notify.post(e, body, queueCommentMarker(e.jobId));
-    const next: QueueEntry = { ...e, commentState: e.state, ...(commentId !== undefined ? { commentId } : {}) };
-    return (await store.update(next, e)) ? { ...next, version: e.version + 1 } : e;
+    else if (isWaiting(e) || e.state === 'refused' || e.state === 'expired') commentId = await notify.post(e, body, marker);
+    // Recorded on the entry as it is now: a version conflict re-reads and merges, so the id is
+    // never lost. The state shown is recorded only while the entry is still in it.
+    let cur: QueueEntry | null = e;
+    for (let attempt = 0; attempt < 4 && cur; attempt++) {
+      if (attempt > 0) cur = await store.get(e.installationId, e.jobId);
+      if (!cur) break;
+      const next: QueueEntry = { ...cur, ...(commentId !== undefined ? { commentId } : {}), ...(cur.state === e.state ? { commentState: e.state } : {}) };
+      if (await store.update(next, cur)) return { ...next, version: cur.version + 1 };
+    }
+    return e;
   } catch (err) {
     log({ installationId: e.installationId, jobId: e.jobId, warning: `could not update the queue comment: ${(err as Error)?.name ?? 'error'}` });
     return e;
@@ -427,10 +450,17 @@ export interface DispatcherDeps {
   readEvent: (key: string) => Promise<string | null>;
   revalidate: Revalidate;
   notify?: QueueNotifier;
-  workflows?: Pick<WorkflowRecorder, 'queueEnded'>;
+  workflows?: Pick<WorkflowRecorder, 'queueEnded' | 'queueCovered'>;
   killSwitch?: KillSwitch;
   consoleOrigin?: string;
   budgetMs?: number;
+  /**
+   * The slots held now and the quotas they count against (the stack's defaults, with the tenant's
+   * overrides): a full tenant, or a full platform, is skipped before any lease, GitHub call or
+   * launch, so it neither spends an attempt nor holds up tenants with room. Only a hint: the
+   * launcher's atomic reservation decides. Absent: every due entry is tried.
+   */
+  capacity?: { store: Pick<Store, 'getTenant' | 'heldSlots'>; quotas: Quotas };
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
 }
@@ -466,16 +496,45 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
     return settled;
   }
 
-  /** Back to waiting, at its place (FIFO keeps its enqueue time), looked at again after `delayMs`. */
-  async function release(e: QueueEntry, delayMs: number, reason?: QueueWaitReason): Promise<void> {
+  /**
+   * Back to waiting, at its place (FIFO keeps its enqueue time), looked at again after `delayMs`.
+   * `wait`: it waited for something outside it (capacity, the kill switch, a worker, its own launch
+   * claim), not a failed attempt: the lease's attempt is given back, so waiting never exhausts them.
+   */
+  async function release(e: QueueEntry, delayMs: number, reason?: QueueWaitReason, wait = false): Promise<void> {
     const { admittingUntil: _a, ...rest } = e;
-    const next: QueueEntry = { ...rest, state: 'queued', nextAttemptAt: now() + delayMs, ...(reason ? { reason } : {}) };
+    const next: QueueEntry = { ...rest, state: 'queued', nextAttemptAt: now() + delayMs, ...(reason ? { reason } : {}), ...(wait ? { attempts: Math.max(0, e.attempts - 1) } : {}) };
     if (!(await deps.queue.update(next, e))) return;
-    // An acknowledgement that never got out (the enqueue's post failed, or its Lambda died after
-    // the entry was kept): posted now, once the enqueue has had its chance.
-    if (deps.notify && next.commentState === undefined && now() - e.enqueuedAt >= ACK_GRACE_MS) {
-      await syncComment(deps.queue, deps.notify, { ...next, version: e.version + 1 }, deps.consoleOrigin, now(), log);
+    await ackMissing({ ...next, version: e.version + 1 });
+  }
+
+  /**
+   * An acknowledgement that never got out (the enqueue's post failed, or its Lambda died after the
+   * entry was kept): posted now, once the enqueue has had its chance.
+   */
+  async function ackMissing(e: QueueEntry): Promise<void> {
+    if (deps.notify && e.state === 'queued' && e.commentState === undefined && now() - e.enqueuedAt >= ACK_GRACE_MS) {
+      await syncComment(deps.queue, deps.notify, e, deps.consoleOrigin, now(), log);
     }
+  }
+
+  /** Whether the tenant, and the platform, have a slot free now (a hint; reserveJob decides). */
+  async function capacityFor(installationId: number): Promise<'free' | 'tenant_full' | 'platform_full'> {
+    const c = deps.capacity;
+    if (!c) return 'free';
+    const full = (held: number[], count: number) => {
+      const set = new Set(held);
+      for (let n = 0; n < count; n++) if (!set.has(n)) return false;
+      return true;
+    };
+    const tenant = await c.store.getTenant(installationId);
+    // No tenant, or not active: the launch says why, and ends the entry.
+    if (!tenant || tenant.status !== 'active') return 'free';
+    // As quotas.ts tenantQuotas: the defaults, with the tenant's overrides.
+    const quotas: Quotas = { ...c.quotas, ...Object.fromEntries(Object.entries(tenant.limits ?? {}).filter(([, v]) => typeof v === 'number')) };
+    if (full(await c.store.heldSlots(installationId), quotas.concurrentJobs)) return 'tenant_full';
+    if (full(await c.store.heldSlots('platform'), quotas.platformConcurrentJobs)) return 'platform_full';
+    return 'free';
   }
 
   /** A failed attempt: retried with backoff, refused once attempts run out. */
@@ -493,6 +552,16 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
     if (first.state === 'admitting' && (first.admittingUntil ?? 0) > at) return 'hold';
     const expired = at >= first.expiresAt;
     if (!expired && first.state === 'queued' && first.nextAttemptAt > at) return 'hold';
+    // (A stale `admitting` entry is taken whatever the slots say: its earlier attempt's job, if
+    // any, may be what holds them, and its record ends the entry.)
+    if (!expired && first.state === 'queued') {
+      const room = await capacityFor(first.installationId);
+      if (room !== 'free') {
+        // Nothing taken, nothing asked of GitHub: the entry keeps its place and its attempts.
+        await ackMissing(first);
+        return room;
+      }
+    }
     // Taken under a lease: no other dispatcher admits it until the lease runs out.
     const taken: QueueEntry = { ...first, state: 'admitting', admittingUntil: at + ADMIT_LEASE_MS, attempts: first.attempts + 1 };
     if (!(await deps.queue.update(taken, first))) return 'hold';
@@ -558,12 +627,16 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
         return 'admitted';
       case 'capacity_wait':
         // Capacity went again between the release and this launch: back in line, at its place.
-        await release(e, 0, r.reason === 'platform_concurrency' ? 'platform_concurrency' : 'concurrent_jobs');
+        // A wait, not a failed attempt.
+        await release(e, 0, r.reason === 'platform_concurrency' ? 'platform_concurrency' : 'concurrent_jobs', true);
         return r.reason === 'platform_concurrency' ? 'platform_full' : 'tenant_full';
-      case 'coalesced':
+      case 'coalesced': {
         // A job of the pull request is starting and reads it as it is then: this event is in it.
-        await end(e, 'admitted', { reason: 'coalesced', message: r.message ?? 'Covered by a job of the same pull request.' });
+        // The workflow follows that job, not this entry's (which never runs).
+        const settled = await end(e, 'admitted', { reason: 'coalesced', message: r.message ?? 'Covered by a job of the same pull request.', ...(r.coveredBy ? { jobId: r.coveredBy } : {}) });
+        if (settled) await deps.workflows?.queueCovered(subjectRef(e), r.coveredBy);
         return 'admitted';
+      }
       case 'cancelled':
         await end(e, 'canceled', { reason: 'canceled', message: 'it was canceled while starting.', ...(r.jobId ? { jobId: r.jobId } : {}) });
         return 'ended';
@@ -583,15 +656,21 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
           await end(e, 'canceled', { reason: 'superseded', message: `job \`${claim.jobId}\` already took this delivery.`, jobId: claim.jobId });
           return 'ended';
         }
-        await release(e, Math.max(BACKOFF_BASE_MS, (claim?.expiresAt ?? 0) - now()), 'retrying');
+        // Ours, with no job record (getJob found none before this launch): the enqueuing launch
+        // still finishing, or one that died before recording the job. Looked at again soon, within
+        // the claim's life, without spending an attempt or changing why it waits.
+        await release(e, Math.min(DUPLICATE_RECHECK_MAX_MS, Math.max(DUPLICATE_RECHECK_MS, (claim?.expiresAt ?? 0) - now())), undefined, true);
         return 'hold';
       }
       case 'kill_switch':
       case 'jobs_off':
-        // The platform paused jobs: the entry keeps its place, and its expiry.
-        await release(e, BACKOFF_BASE_MS);
+        // The platform paused jobs: the entry keeps its place, its expiry and its attempts.
+        await release(e, BACKOFF_BASE_MS, undefined, true);
         return 'platform_full';
       case 'coalesce_unconfirmed':
+        // Another job of the pull request is starting: wait for it, without spending an attempt.
+        await release(e, DUPLICATE_RECHECK_MS, undefined, true);
+        return 'hold';
       case 'launch_failed':
         if (r.jobId && (await deps.jobs.getJob(r.jobId).catch(() => null))) {
           // A launch that got as far as the job's record: never relaunched from here (its VM may
@@ -607,7 +686,11 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
           await end(e, 'admitted', { reason: r.reason, message: r.message ?? 'Waiting for the Claude subscription.', ...(r.jobId ? { jobId: r.jobId } : {}) });
           return 'admitted';
         }
-        if (r.reason === 'native_worker_unavailable') return failed(e, 'the Claude subscription worker is unavailable');
+        if (r.reason === 'native_worker_unavailable') {
+          // A worker that is offline is a wait (it reconnects), not a failed attempt: expiry bounds it.
+          await release(e, BACKOFF_BASE_MS, undefined, true);
+          return 'hold';
+        }
         if (r.reason === 'workflow_paused') {
           await end(e, 'canceled', { reason: 'workflow_paused', message: 'an owner stopped this workflow while the job was queued.', nextAction: 'Resume automation from the workflow page, then apply the label again.' });
           return 'ended';

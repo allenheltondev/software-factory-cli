@@ -4,7 +4,7 @@ import { dispatchRules } from '../tenants/dispatch.js';
 import { createWorkflowRecorder } from '../workflows/recorder.js';
 import { createMemoryWorkflowStore } from '../workflows/store.js';
 import { deliveryFromLaunch } from './deliveries.js';
-import { createLauncher, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
+import { createLauncher, pullRequestLease, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
 import { ADMIT_LEASE_MS, createAdmissionQueue, createGitHubRevalidator, createQueueDispatcher, dispatchMetricsLine, isQueueCancelRequest, MAX_ADMIT_ATTEMPTS, QUEUE_EXPIRY_MS, queueComment, queueCommentMarker, type QueueNotifier, type Revalidate } from './queue.js';
 import { createMemoryQueueStore, type QueueEntry } from './queue-store.js';
 import { jobResult } from './status.js';
@@ -500,6 +500,139 @@ describe('the admission queue', () => {
     expect(handed).not.toContain('Started');
   });
 
+  describe('waiting is not failing (review of #164)', () => {
+    it('never spends admission attempts on capacity waits: a long wait, then one transient error, is retried, not refused', async () => {
+      const launch = createLauncher(deps());
+      const dispatcher = dispatcherFor(launch);
+      const a = await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      for (let i = 0; i < MAX_ADMIT_ATTEMPTS + 2; i++) {
+        clock += 60_000;
+        await dispatcher.dispatch();
+      }
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'queued', attempts: 0, reason: 'concurrent_jobs' });
+      await finish(a.jobId!);
+      let failOnce = true;
+      revalidate = async () => {
+        if (failOnce) { failOnce = false; throw new GitHubError(502, 'bad gateway'); }
+        return { ok: true };
+      };
+      await dispatcher.dispatch();
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'queued', attempts: 1, reason: 'retrying' });
+      clock += 60 * 60_000;
+      await dispatcher.dispatch();
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'admitted' });
+      expect(runs.map((r) => r.clientToken)).toEqual([a.jobId, b.jobId]);
+    });
+
+    it('skips full tenants without a lease or a GitHub call, so a tenant with room behind many full ones starts within the budget', async () => {
+      const full = [101, 102, 103, 104, 105, 106, 107, 108, 109, 110];
+      for (const id of full) await setup(id, `t${id}/app`, id);
+      await setup(200, 'free/app', 200);
+      quotas = { ...ONE_AT_A_TIME, platformConcurrentJobs: 20 };
+      const launch = createLauncher(deps());
+      for (const id of full) {
+        expect((await launch(request(1, `run-${id}`, { installationId: id, repo: `t${id}/app`, repoId: id }))).disposition).toBe('launched');
+        clock += 10;
+        expect((await launch(request(2, `wait-${id}`, { installationId: id, repo: `t${id}/app`, repoId: id }))).disposition).toBe('queued');
+      }
+      // The free tenant's entry is queued last (a job of its own held its slot then, and has ended).
+      const z1 = await launch(request(1, 'z1', { installationId: 200, repo: 'free/app', repoId: 200 }));
+      clock += 10;
+      const z2 = await launch(request(2, 'z2', { installationId: 200, repo: 'free/app', repoId: 200 }));
+      expect(z2.disposition).toBe('queued');
+      await finish(z1.jobId!);
+      // Every GitHub check costs a second of the 6-second budget.
+      const checked: number[] = [];
+      revalidate = async (e) => { checked.push(e.installationId); clock += 1000; return { ok: true }; };
+      const report = await dispatcherFor(launch, { capacity: { store, quotas } }).dispatch();
+      expect(report).toMatchObject({ admitted: 1, tenantsAtCapacity: full.length });
+      expect(checked).toEqual([200]);
+      expect(runs.at(-1)?.clientToken).toBe(z2.jobId);
+      for (const id of full) expect((await queue.list(id, 5)).find((x) => x.state === 'queued')).toMatchObject({ attempts: 0, version: 2 }); // enqueue, then its comment: never leased
+    });
+
+    it('releases the delivery claim once the entry is kept: a wake during the enqueue admits at once', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      let woke: Awaited<ReturnType<ReturnType<typeof createQueueDispatcher>['dispatch']>> | undefined;
+      // The stream wakes a dispatcher while the enqueuing launch is still posting its acknowledgement,
+      // and the slot frees at that moment.
+      const racing: QueueNotifier = {
+        ...notify,
+        async post(e, body, marker) {
+          const id = await notify.post(e, body, marker);
+          if (!woke) {
+            await finish(a.jobId!);
+            woke = await dispatcherFor(launch).dispatch();
+          }
+          return id;
+        },
+      };
+      const b = await createLauncher(deps({ queue: createAdmissionQueue({ store: queue, putEvent: async (k, v) => void (events[k] = v), notify: racing, now: () => clock, log: () => {} }) }))(request(2, 'delivery-b'));
+      expect(b.disposition).toBe('queued');
+      expect(woke).toMatchObject({ admitted: 1 });
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'admitted', attempts: 1 });
+      expect(runs.map((r) => r.clientToken)).toEqual([a.jobId, b.jobId]);
+    });
+
+    it('treats its own held delivery claim as a short wait, not a failed attempt', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      await finish(a.jobId!);
+      // A launch for B that died after claiming its delivery, before recording the job.
+      expect(await store.claimDelivery(55, 'delivery-b', Date.now() + 3 * 60 * 60_000, b.jobId!)).toBe(true);
+      await dispatcherFor(launch).dispatch();
+      const e = (await queue.get(55, b.jobId!))!;
+      expect(e).toMatchObject({ state: 'queued', attempts: 0, reason: 'concurrent_jobs' });
+      expect(e.nextAttemptAt - clock).toBeLessThanOrEqual(60_000);
+      expect(comments[0]!.body).not.toContain('did not complete');
+    });
+  });
+
+  describe('the acknowledgement follows the work (review of #164)', () => {
+    it('keeps the comment id when another writer moved the entry on during the post, and edits it to Started', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const busy: QueueNotifier = {
+        ...notify,
+        async post(e, body, marker) {
+          const id = await notify.post(e, body, marker);
+          // A dispatcher touched the entry meanwhile: its version is not the one the enqueue read.
+          const cur = (await queue.get(e.installationId, e.jobId))!;
+          await queue.update({ ...cur, deliveries: cur.deliveries + 1 }, cur);
+          return id;
+        },
+      };
+      const b = await createLauncher(deps({ queue: createAdmissionQueue({ store: queue, putEvent: async (k, v) => void (events[k] = v), notify: busy, now: () => clock, log: () => {} }) }))(request(2, 'delivery-b'));
+      expect((await queue.get(55, b.jobId!))?.commentId).toBe(1);
+      await finish(a.jobId!);
+      await dispatcherFor(launch).dispatch();
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain('**Status:** Started');
+    });
+
+    it('finds and edits a posted acknowledgement whose id was never recorded, when the work starts or is canceled', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      const c = await launch(request(3, 'delivery-c'));
+      for (const id of [b.jobId!, c.jobId!]) {
+        const cur = (await queue.get(55, id))!;
+        const { commentId: _c, ...rest } = cur;
+        await queue.update(rest as QueueEntry, cur);
+      }
+      const finder: QueueNotifier = { ...notify, find: async (_e, marker) => comments.find((x) => x.body.includes(marker))?.id };
+      const dispatcher = dispatcherFor(launch, { notify: finder });
+      await finish(a.jobId!);
+      revalidate = async (e) => (e.issue === 3 ? { ok: false, reason: 'label_removed', message: 'the label was removed.' } : { ok: true });
+      await dispatcher.dispatch();
+      expect(await dispatcher.cancel(55, c.jobId!, 'pat')).toMatchObject({ ok: false }); // already ended at admission
+      expect(comments.map((x) => x.body.match(/\*\*Status:\*\* ([^\n]*)/)?.[1])).toEqual([expect.stringContaining('Started'), 'Canceled · label_removed']);
+    });
+  });
+
   describe('pull request events', () => {
     const prEvent = (deliveryId: string, eventName: string, over: Record<string, unknown> = {}): LaunchRequest => {
       const payload = {
@@ -532,6 +665,42 @@ describe('the admission queue', () => {
       await dispatcherFor(launch).dispatch();
       expect(runs.map((r) => r.clientToken)).toEqual([a.jobId, first.jobId]);
       expect(await store.getJob(first.jobId!)).toMatchObject({ eventName: 'pull_request', deliveryId: 'pr-2', pullRequest: 40 });
+    });
+
+    it("keeps the workflow on its running job when the same pull request's next event is queued behind it", async () => {
+      const recorder = createWorkflowRecorder({ store: workflowStore, now: () => clock, log: () => {} });
+      const launch = createLauncher(deps());
+      // A, a review job on pull request 40, runs; CI completes on its pull request meanwhile.
+      const a = await launch(prEvent('pr-a', 'pull_request_review'));
+      expect(a.disposition).toBe('launched');
+      await store.releaseDelivery(55, pullRequestLease(9, 40), a.jobId!); // its 20-second coalescing lease is over
+      const ci = await launch(prEvent('ci-1', 'check_suite', { check_suite: { head_sha: 'aaaaaaa1', head_branch: 'updraft/issue-12-abc', pull_requests: [{ number: 40 }] } }));
+      expect(ci.disposition).toBe('queued');
+      expect(await workflowStore.getWorkflow(55, '9-p40')).toMatchObject({ status: 'active', lastJobId: a.jobId, pendingJobId: ci.jobId });
+      // A's finish decides the workflow; it is not history.
+      const jobA = (await store.getJob(a.jobId!))!;
+      await recorder.finished(jobA, 'succeeded');
+      expect(await workflowStore.getWorkflow(55, '9-p40')).toMatchObject({ status: 'finished', stage: 'done', lastJobId: a.jobId });
+      // The queued event's head is stale by admission: it ends, and the workflow stays as A left it.
+      await finish(a.jobId!);
+      revalidate = async () => ({ ok: false, reason: 'stale_head', message: 'the head moved on.' });
+      await dispatcherFor(launch).dispatch();
+      const w = (await workflowStore.getWorkflow(55, '9-p40'))!;
+      expect(w).toMatchObject({ status: 'finished', stage: 'done', lastJobId: a.jobId });
+      expect(w.pendingJobId).toBeUndefined();
+    });
+
+    it('moves the workflow on to the covering job when queued work is coalesced into it', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const q = await launch(prEvent('pr-q', 'pull_request_review'));
+      expect(q.disposition).toBe('queued');
+      expect(await workflowStore.getWorkflow(55, '9-p40')).toMatchObject({ status: 'waiting', stage: 'queued', lastJobId: q.jobId });
+      await finish(a.jobId!);
+      const coalesced = async () => ({ status: 200, disposition: 'coalesced', coveredBy: 'job_holder000000001', message: 'covered' });
+      await dispatcherFor(coalesced).dispatch();
+      expect(await queue.get(55, q.jobId!)).toMatchObject({ state: 'admitted', outcome: { reason: 'coalesced', jobId: 'job_holder000000001' } });
+      expect(await workflowStore.getWorkflow(55, '9-p40')).toMatchObject({ status: 'active', stage: 'reviewing-loop', lastJobId: 'job_holder000000001' });
     });
 
     it('drops a queued push or check suite whose head is stale, rather than repairing old code', async () => {
