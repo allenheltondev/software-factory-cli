@@ -608,6 +608,8 @@ Resources:
           ADMIN_GROUP: !Ref AdminGroup
           # Retrying a job from the console: the launcher lives in the webhook function (jobs/retry.ts).
           WEBHOOK_FUNCTION_NAME: !Ref WebhookFunction
+          # Repository readiness (tenants/readiness-service.ts): whether a job image is published.
+          JOB_IMAGE_VERSION_PARAMETER: !Sub /updraft/${AWS::StackName}/job-image-version
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - Statement:
@@ -639,6 +641,9 @@ Resources:
           - !Ref AWS::NoValue
         - SSMParameterReadPolicy:
             ParameterName: updraft/kill-switch
+        # Read only, for repository readiness: jobs are off until the image version exists.
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub updraft/${AWS::StackName}/job-image-version
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
         - !If

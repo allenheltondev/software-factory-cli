@@ -21,6 +21,7 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     configVersion: vi.fn(),
     reactivateConfig: vi.fn(),
     overview: vi.fn(),
+    readiness: vi.fn().mockResolvedValue({ checkedAt: new Date().toISOString(), cached: false, configVersion: null, installation: [], repositories: [], limitations: [] }),
     insights: vi.fn(),
     deliveries: vi.fn(),
     jobs: vi.fn(),

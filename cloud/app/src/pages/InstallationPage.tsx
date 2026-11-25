@@ -25,8 +25,9 @@ import { relativeTime } from '../lib/time';
 import { LoopBadges } from '../components/lifecycle';
 import { JobActions, JobStopStatus } from '../components/job-actions';
 import { SetupChecklist, setupComplete, setupSteps } from '../components/setup';
+import { ReadinessPanel } from '../components/readiness';
 
-type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'> & Partial<Pick<ApiClient, 'workflows' | 'stopJob' | 'resumeJob' | 'cancelQueuedJob'>>;
+type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'> & Partial<Pick<ApiClient, 'workflows' | 'stopJob' | 'resumeJob' | 'cancelQueuedJob' | 'readiness'>>;
 type Tab = 'jobs' | 'workflows' | 'deliveries' | 'repositories';
 type Load = { state: 'loading' } | { state: 'ok'; overview: Overview; jobs: JobView[]; deliveries: Delivery[]; workflows: WorkflowView[] } | { state: 'error'; message: string };
 
@@ -108,7 +109,7 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
       )}
       {load.state === 'ok' && (
         tab === 'repositories' ? (
-          <RepositoryView overview={load.overview} onRefresh={() => void refresh()} refreshing={refreshing} />
+          <RepositoryView api={api} overview={load.overview} onRefresh={() => void refresh()} refreshing={refreshing} />
         ) : (
           <ActivityView
             api={api}
@@ -128,8 +129,9 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
   );
 }
 
-function RepositoryView({ overview, onRefresh, refreshing }: { overview: Overview; onRefresh: () => void; refreshing: boolean }) {
+function RepositoryView({ api, overview, onRefresh, refreshing }: { api: InstallationApi; overview: Overview; onRefresh: () => void; refreshing: boolean }) {
   const base = `/installations/${overview.tenant.installationId}`;
+  const readiness = api.readiness;
   return (
     <>
       <header className="flex flex-wrap items-center justify-between gap-3">
@@ -146,6 +148,7 @@ function RepositoryView({ overview, onRefresh, refreshing }: { overview: Overvie
           </Button>
         </div>
       </header>
+      {readiness && <ReadinessPanel api={{ readiness }} tenant={overview.tenant} base={base} />}
       <Card>
         <CardBody>
           <RepositoriesList repositories={overview.repositories} base={base} />
@@ -195,6 +198,11 @@ function ActivityView({
           <a className="auth-link" href={installationSettingsUrl(t)} target="_blank" rel="noreferrer">
             Installation on GitHub ↗
           </a>
+          {api.readiness && (
+            <Link className="auth-link" to={`${base}?tab=repositories`} data-testid="readiness-link">
+              Repository readiness
+            </Link>
+          )}
           <span className="flex w-full items-center gap-2 sm:ml-auto sm:w-auto">
             {checkedAt !== null && <span aria-live="polite">Updated {relativeTime(new Date(checkedAt).toISOString())}</span>}
             <Button variant="ghost" onClick={onRefresh} loading={refreshing} aria-label="Refresh">

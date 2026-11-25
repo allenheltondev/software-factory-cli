@@ -40,6 +40,17 @@ describe('exact image compatibility approval', () => {
     expect(imageDecision(await read('9.0'))).toBe('image-revoked');
     expect(imageDecision(await read('9.0'))).toBe('image-unapproved');
   });
+  it('judges protocol only by the worker registered for this VM, never a placeholder or previous VM row', () => {
+    // sessions.retire leaves a placeholder row for the retired VM with workerVersion 'unregistered'.
+    const placeholder: Worker = { ...worker, microvmId: 'mvm-retired', workerVersion: 'unregistered', heartbeatAt: 0, auth: 'unavailable' };
+    const bound = { session: { phase: 'bound' as const, startingUntil: 5000 } };
+    expect(classifyReadiness(route, placeholder, 1001, '9.0', { imagePolicy: policy, ...bound })).toBe('worker-starting');
+    expect(classifyReadiness(route, placeholder, 6000, '9.0', { imagePolicy: policy, ...bound })).toBe('startup-failed');
+    // The same incompatible protocol on this VM's own row is still fenced.
+    expect(classifyReadiness(route, { ...worker, workerVersion: 'unregistered' }, 1001, '9.0', { imagePolicy: policy, ...bound })).toBe('protocol-incompatible');
+    // Policy-level incompatibility does not depend on the worker row at all.
+    expect(classifyReadiness(route, placeholder, 1001, '9.0', { imagePolicy: { ...policy, protocol: 'future' }, ...bound })).toBe('protocol-incompatible');
+  });
   it('conditions assignment on the exact approval revision so a concurrent revoke wins', async () => {
     const send = vi.fn<(command: unknown) => Promise<object>>().mockResolvedValue({});
     const store = createNativeStore('table', dbWith(send));
