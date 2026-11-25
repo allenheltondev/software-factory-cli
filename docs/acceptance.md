@@ -19,6 +19,9 @@ repositories:
 - **`report`:** the same assessment and checklist, but it never holds a head back. This is the repository-wide waiver; see [Live gates and waivers](#live-gates-and-waivers).
 - **`off`:** the agents are not given the criteria, and nothing is checked.
 
+In the Cloud console, the same setting is *Acceptance criteria* under a workflow's review. The
+workflows of one repository must agree on it.
+
 Everything else in the review loop is unchanged and still applies on top: the verdict protocol,
 structured findings and their threads, `maxRevisions`, [CI](ci-fix.md) and every
 [auto-merge](review-loop.md#auto-merge) gate.
@@ -37,8 +40,19 @@ text an allowed actor stands behind, the body is withheld.
 Only the text is read, never rewritten. Items in code blocks and HTML comments are not
 criteria. Items under an *Out of scope* or *Non-goals* heading are left out. An item marked
 `(optional)`, or listed under an *Optional*, *Nice to have*, *Stretch* or *Follow-ups* heading,
-is optional: it is shown, and never holds a head back. At most 30 criteria are taken; the rest
-are counted, and the prompt says so.
+is optional: it is shown, and never holds a head back. At most 30 criteria are taken. The rest
+are counted, the prompt says so, and they appear on the checklist as one mandatory row, `MORE`.
+That row is always unverified, since no review was given them, so a head is never ready on 30
+of more. Split such an issue, or have a person confirm them.
+
+Issue-template boilerplate is handled conservatively:
+
+- **Ticked boilerplate is left out:** a ticked item such as "I searched existing issues for
+  duplicates", "I have read the contributing guidelines" or "I agree to follow the code of
+  conduct" is about the report, not the change. Only ticked items with these phrasings are left
+  out, so an unticked one, or anything that is about the change, stays a criterion.
+- **Anything else that is plainly about the report:** the reviewer is told to mark it
+  `not-applicable` with that reason, and never to do so for anything the change could do.
 
 ### Ids and issue revisions
 
@@ -143,10 +157,19 @@ With `acceptance: report`, all of the above is shown and nothing is held back.
 
 ### Live gates and waivers
 
-A **live gate** is a criterion that asks for evidence no agent review can produce: one that
-mentions staging, a hosted run, production, a deployment, a live test, screenshots, a screen
-recording, a manual test, a real PR, repository, deployment or environment, or UI examples. The
-phrases are deliberately narrow, and the match is a heuristic. A false match only makes a
+A **live gate** is a criterion that asks for something to be shown or done on a live system,
+which no agent review can provide. Examples:
+
+- "on staging" or "a staging PR/run/test";
+- "a hosted run/test/validation";
+- "screenshot", "screen recording", "manual test" or "manually verify";
+- "a real PR/deployment/environment";
+- "confirmed in production" or "deployed to production";
+- "live validation/test/run".
+
+A criterion that only names a live system is a code criterion. "Keep hosted mode working" and
+"Don't break production deployments" are both code criteria. The phrases are deliberately
+narrow, and the match is a heuristic. A false match only makes a
 criterion need a person, never pass. A live gate is never verified by an agent review,
 whatever the reviewer cites and however green the tests are. It stays unverified, and the head
 waits for a person.
@@ -209,6 +232,5 @@ Nothing here holds a secret: it is issue text, agent text, ids and hashes, bound
 ## What this does not do yet
 
 - **An issue edit:** an edit made after a head was found ready does not start a new review by itself. The next push does, and that review reads the edited issue. A head that is already ready stays ready until then.
-- **The Cloud console:** it does not expose `review.acceptance` yet. A config published from the console uses the default, `enforce`.
 - **A workflow view:** there is no issue-level workflow view of the checklist yet. It is on the review only.
 - **Evidence:** the existence of an evidence reference is not checked. A reference to a file, test or commit that does not exist is shown as the reviewer wrote it, linked, so a person can see that it is wrong.
