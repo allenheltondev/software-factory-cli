@@ -68,6 +68,15 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
   const change = (w: Workflow, f: (cur: Workflow) => { workflow: Workflow; event?: WorkflowEvent } | null) =>
     updateWorkflow(deps.store, w.installationId, w.workflowId, (cur) => (cur && cur.version === w.version ? f(cur) : null));
 
+  /** The workflow's own state, without what is absent (a record never holds an undefined value). */
+  const stateOf = (cur: Workflow): NonNullable<Workflow['controlPause']>['previous'] => ({
+    status: cur.status,
+    ...(cur.reason !== undefined ? { reason: cur.reason } : {}),
+    ...(cur.message !== undefined ? { message: cur.message } : {}),
+    ...(cur.nextAction !== undefined ? { nextAction: cur.nextAction } : {}),
+    ...(cur.nextCheckAt !== undefined ? { nextCheckAt: cur.nextCheckAt } : {}),
+  });
+
   const without = (w: Workflow, ...keys: (keyof Workflow)[]): Workflow => {
     const out = { ...w };
     for (const k of keys) delete out[k];
@@ -86,21 +95,32 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
       });
     const later = (ms: number) => change(w, (cur) => ({ workflow: { ...cur, nextCheckAt: iso(at + ms), updatedAt: iso(at) } }));
 
+    // An authorized stop paused the workflow's subjects: reported, and nothing else is looked at
+    // until it is resumed. What it said before is kept, and comes back on resume.
     const pause = await workflowPause(deps.controls, w);
     if (pause) {
-      const repeated = w.controlPause?.jobId === pause.jobId;
-      await change(w, (cur) => ({ workflow: {
-        ...cur, status: 'blocked', reason: 'workflow_paused', message: `Automation was paused by ${pause.by}. The stopped job and existing pull request are preserved.`,
-        nextAction: `Resume automation or retry from job ${pause.jobId}.`, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at),
-        controlPause: { ...pause, previous: cur.controlPause?.previous ?? { status: cur.status, reason: cur.reason, message: cur.message, nextAction: cur.nextAction } },
-      }, ...(!repeated ? { event: blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, 'An authorized stop paused automatic recovery.') } : {}) }));
-      report.blocked++;
+      const repeated = w.controlPause?.jobId === pause.jobId && w.controlPause.at === pause.at;
+      await change(w, (cur) => ({
+        workflow: {
+          ...cur, status: 'blocked', reason: 'workflow_paused', message: `Automation was paused by ${pause.by}. The stopped job and existing pull request are preserved.`,
+          nextAction: `Resume automation or retry from job ${pause.jobId}.`, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at),
+          controlPause: { jobId: pause.jobId, at: pause.at, by: pause.by, previous: cur.controlPause?.previous ?? stateOf(cur) },
+        },
+        ...(!repeated ? { event: blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, 'An authorized stop paused automation on this workflow.') } : {}),
+      }));
+      if (!repeated) report.blocked++;
       return;
     }
     if (w.controlPause) {
-      const restored = await change(w, (cur) => ({ workflow: { ...without(cur, 'controlPause', 'reason', 'message', 'nextAction'), ...cur.controlPause!.previous, updatedAt: iso(at) } }));
-      if (!restored) return;
+      const previous = w.controlPause.previous;
+      const restored = await change(w, (cur) => ({
+        workflow: { ...without(cur, 'controlPause', 'reason', 'message', 'nextAction', 'nextCheckAt'), ...previous, updatedAt: iso(at) },
+      }));
+      if (!restored || restored.version === w.version) return;
       w = restored;
+      // Back to what it was. Only a workflow that was due a look then is looked at now; a
+      // blocked or finished one stays as it was, and is not diagnosed again.
+      if (!w.nextCheckAt || Date.parse(w.nextCheckAt) > at || (w.status !== 'waiting' && w.status !== 'active')) return;
     }
 
     // A job was running, and by now it cannot be: its finish never reached the workflow (a lost

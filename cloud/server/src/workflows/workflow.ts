@@ -57,7 +57,8 @@ export interface Workflow {
   /** Presentation overlay; the authoritative admission fence is the durable PAUSE record. */
   controlPause?: {
     jobId: string; at: number; by: string;
-    previous: Pick<Workflow, 'status' | 'reason' | 'message' | 'nextAction'>;
+    /** What the workflow said before the pause, restored on resume. */
+    previous: Pick<Workflow, 'status' | 'reason' | 'message' | 'nextAction' | 'nextCheckAt'>;
   };
 }
 
