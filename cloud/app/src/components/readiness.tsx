@@ -100,7 +100,9 @@ export function ReadinessPanel({ api, tenant, base }: { api: ReadinessApi; tenan
   ), []);
   useEffect(() => {
     live.current = true;
-    void settle(api.readiness(tenant.installationId));
+    // Keys, the Claude session and pauses change on other pages: opening this one checks again
+    // (the server serves its last check when that is only seconds old).
+    void settle(api.readiness(tenant.installationId, true));
     return () => {
       live.current = false;
     };
@@ -140,10 +142,11 @@ export function ReadinessPanel({ api, tenant, base }: { api: ReadinessApi; tenan
         {error && (
           <Alert variant="error" data-testid="readiness-error">
             Readiness could not be checked: {error}
+            {report ? ` The result below is from ${relativeTime(report.checkedAt)} and may be out of date.` : ''}
           </Alert>
         )}
         {report && (
-          <div className="flex min-w-0 flex-col gap-4">
+          <div className={`flex min-w-0 flex-col gap-4${error ? ' opacity-60' : ''}`} {...(error ? { 'data-stale': 'true', 'aria-label': 'Outdated readiness result' } : {})} data-testid="readiness-report">
             {configured.length === 0 && (
               <p className="text-sm">
                 No repository is configured yet.{' '}

@@ -85,7 +85,7 @@ describe('repository readiness in the console (#137)', () => {
     expect(screen.getByTestId('readiness')).toHaveTextContent('acme/site is reachable but not configured');
     expect(screen.getByTestId('readiness-checked')).toHaveTextContent('configuration v3');
     expect(screen.getByTestId('readiness-limitations')).toHaveTextContent('does not run a job');
-    expect(readiness).toHaveBeenCalledWith(55);
+    expect(readiness).toHaveBeenCalledWith(55, true);
   });
 
   it('says when a result is a saved one, and checks again on request', async () => {
@@ -96,6 +96,15 @@ describe('repository readiness in the console (#137)', () => {
     await waitFor(() => expect(within(screen.getByTestId('readiness-acme/web')).getByText('Ready')).toBeInTheDocument());
     expect(readiness).toHaveBeenLastCalledWith(55, true);
     expect(screen.getByTestId('readiness-checked')).not.toHaveTextContent('saved result');
+  });
+
+  it('marks the shown result outdated when checking again fails', async () => {
+    const readiness = vi.fn().mockResolvedValueOnce(report()).mockRejectedValueOnce(new ApiError(502, 'internal_error', 'Bad gateway'));
+    show(readiness);
+    expect(await screen.findByTestId('readiness-report')).not.toHaveAttribute('data-stale');
+    await userEvent.click(screen.getByRole('button', { name: 'Check readiness again' }));
+    expect(await screen.findByTestId('readiness-error')).toHaveTextContent('may be out of date');
+    expect(screen.getByTestId('readiness-report')).toHaveAttribute('data-stale', 'true');
   });
 
   it('shows a failed check as an error, never as an empty healthy list', async () => {
