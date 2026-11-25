@@ -37,7 +37,7 @@ import { appCommitIdentity, type GitHubCredentials } from '../github/credentials
 import { checkJobDispatchable } from '../poller/poller.js';
 import { pollRepoReviews } from '../poller/reviews.js';
 import { decideWebhook, type WebhookDeps, type WebhookEventInfo } from '../poller/webhook.js';
-import { createAssignmentCommenter, type AssignmentCommenter } from '../publish/assignment-comment.js';
+import { consoleContextFromEnv, createAssignmentCommenter, type AssignmentCommenter } from '../publish/assignment-comment.js';
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
 import { evaluateCiAll, postCiNotices } from '../publish/ci.js';
@@ -1109,7 +1109,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     const revising = revisionsEnabled(config) ? createRevisionPublisher(publishDeps('revision'), publication) : publication;
     const publisher = reviewsEnabled(config) ? createReviewLoopPublisher(publishDeps('review'), revising) : revising;
     // The worker does not wait for an assignment comment; a process that is about to exit has to.
-    const announcer = createAssignmentCommenter({ db: openDb, config, api, log: log.child({ component: 'assignment-comment' }) });
+    const announcer = createAssignmentCommenter({ db: openDb, config, api, log: log.child({ component: 'assignment-comment' }), console: consoleContextFromEnv(process.env) });
     const assignmentCommenter: AssignmentCommenter = {
       announce(job, run, signal) {
         const p: Promise<void> = announcer.announce(job, run, signal).finally(() => announcements.delete(p));
