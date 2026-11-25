@@ -7,7 +7,7 @@ import { relativeTime } from '../lib/time';
 import { Lifecycle } from '../components/lifecycle';
 import { JobActions, JobStopStatus } from '../components/job-actions';
 
-type JobApi = Pick<ApiClient, 'job' | 'jobLog'> & Partial<Pick<ApiClient, 'retryJob' | 'stopJob' | 'resumeJob' | 'jobWorkflow'>>;
+type JobApi = Pick<ApiClient, 'job' | 'jobLog'> & Partial<Pick<ApiClient, 'retryJob' | 'stopJob' | 'resumeJob' | 'jobWorkflow' | 'cancelQueuedJob'>>;
 type Load = { state: 'loading' } | { state: 'ok'; job: JobView; deliveries: Delivery[]; conversation?: JobView[] } | { state: 'error'; message: string };
 type LogLoad = { state: 'loading' } | { state: 'ok'; log: JobLog } | { state: 'expired' } | { state: 'error'; message: string };
 
@@ -55,7 +55,7 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
     };
   }, [api, installationId, jobId, valid]);
 
-  const running = load.state === 'ok' && (load.job.result === 'running' || !!load.job.stop?.error);
+  const running = load.state === 'ok' && (load.job.result === 'running' || load.job.result === 'queued' || !!load.job.stop?.error);
   useEffect(() => {
     if (!running) return;
     const timer = setInterval(() => void refresh(), refreshMs);
@@ -82,6 +82,67 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
       )}
       {load.state === 'ok' && <Loaded key={load.job.jobId} job={load.job} deliveries={load.deliveries} conversation={load.conversation ?? []} api={api} installationId={installationId} onRefresh={() => void refresh()} />}
     </div>
+  );
+}
+
+const QUEUE_STATE: Record<NonNullable<JobView['queue']>['state'], string> = {
+  queued: 'Waiting for capacity',
+  admitting: 'Starting',
+  admitted: 'Started',
+  canceled: 'Canceled before it started',
+  refused: 'Not started',
+  expired: 'Expired before it started',
+};
+
+/** The job's time in the admission queue: why it waits, its place in line, and how it ended. Never an estimated start. */
+function QueueCard({ job }: { job: JobView }) {
+  const q = job.queue!;
+  const waiting = q.state === 'queued' || q.state === 'admitting';
+  return (
+    <Card data-testid="job-queue">
+      <CardHeader>
+        <CardTitle>Queue</CardTitle>
+      </CardHeader>
+      <CardBody>
+        <dl className="grid gap-x-6 gap-y-2 text-sm sm:grid-cols-[max-content_1fr]">
+          <dt className="text-muted-foreground">Status</dt>
+          <dd data-testid="job-queue-state">{QUEUE_STATE[q.state]}</dd>
+          <dt className="text-muted-foreground">Queued</dt>
+          <dd title={new Date(q.enqueuedAt).toLocaleString()}>{relativeTime(q.enqueuedAt)}</dd>
+          <dt className="text-muted-foreground">{waiting ? 'Waiting' : 'Waited'}</dt>
+          <dd>{formatDuration(q.waitedSeconds)}</dd>
+          {waiting && q.position !== undefined && (
+            <>
+              <dt className="text-muted-foreground">Place in line</dt>
+              <dd>#{q.position}</dd>
+            </>
+          )}
+          {waiting && (
+            <>
+              <dt className="text-muted-foreground">Why</dt>
+              <dd>{q.waitMessage} It starts automatically; no action is needed.</dd>
+              <dt className="text-muted-foreground">Expires</dt>
+              <dd title={new Date(q.expiresAt).toLocaleString()}>If it has not started by {new Date(q.expiresAt).toLocaleString()}</dd>
+            </>
+          )}
+          {q.outcome && !waiting && (
+            <>
+              <dt className="text-muted-foreground">Outcome</dt>
+              <dd data-testid="job-queue-outcome">
+                {q.outcome.message.charAt(0).toUpperCase() + q.outcome.message.slice(1)}
+                {q.outcome.nextAction && <span className="block">{q.outcome.nextAction}</span>}
+              </dd>
+            </>
+          )}
+          {q.deliveries > 1 && (
+            <>
+              <dt className="text-muted-foreground">Deliveries</dt>
+              <dd>{q.deliveries} folded into this job (relabels, redeliveries or later pull request events)</dd>
+            </>
+          )}
+        </dl>
+      </CardBody>
+    </Card>
   );
 }
 
@@ -145,6 +206,8 @@ function Loaded({ job, deliveries, conversation, api, installationId, onRefresh 
   return (
     <>
       <JobSummary job={job} installationId={installationId} api={api} onRefresh={onRefresh} onViewLogs={() => setSelectedLog(names[0])} />
+
+      {job.queue && <QueueCard job={job} />}
 
       {job.logs.length > 0 && <Logs job={job} api={api} installationId={installationId} names={names} name={logName} onSelect={setSelectedLog} />}
 
@@ -270,8 +333,8 @@ function JobSummary({ job, installationId, api, onViewLogs, onRefresh }: { job: 
       <div className="mt-3 flex justify-end"><JobActions job={job} installationId={installationId} api={api} onRefresh={onRefresh} /></div>
 
       <dl className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(7.5rem,1fr))] gap-3" data-testid="job-facts">
-        <Metric label={running ? 'Elapsed (live)' : 'Duration'}>{running ? `Running… ${elapsed !== null ? clock(elapsed * 1000) : ''}`.trim() : formatDuration(job.durationSeconds)}</Metric>
-        <Metric label="Started">
+        <Metric label={running ? 'Elapsed (live)' : 'Duration'}>{job.result === 'queued' ? 'Not started' : running ? `Running… ${elapsed !== null ? clock(elapsed * 1000) : ''}`.trim() : formatDuration(job.durationSeconds)}</Metric>
+        <Metric label={job.status === 'queued' || (job.queue && job.result !== 'running' && job.queue.state !== 'admitted') ? 'Queued' : 'Started'}>
           <span title={exact(job.createdAt)}>{relativeTime(job.createdAt)}</span>
         </Metric>
         <Metric label="Configuration">

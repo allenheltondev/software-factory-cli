@@ -17,7 +17,7 @@ export function JobStopStatus({ job }: { job: JobView }) {
 
 /** A secondary card action. The native modal provides focus trapping and Escape handling. */
 export function JobActions({ job, installationId, api, onRefresh }: {
-  job: JobView; installationId: number; api: Partial<Pick<ApiClient, 'stopJob' | 'resumeJob'>>; onRefresh: () => void;
+  job: JobView; installationId: number; api: Partial<Pick<ApiClient, 'stopJob' | 'resumeJob' | 'cancelQueuedJob'>>; onRefresh: () => void;
 }) {
   const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -27,7 +27,14 @@ export function JobActions({ job, installationId, api, onRefresh }: {
   const menu = useRef<HTMLDetailsElement>(null);
   const trigger = useRef<HTMLElement>(null);
   useEffect(() => { if (confirm) dialog.current?.showModal(); }, [confirm]);
-  if (!(job.canStop && api.stopJob) && !(job.canResume && api.resumeJob)) return null;
+  if (!(job.canStop && api.stopJob) && !(job.canResume && api.resumeJob) && !(job.canCancel && api.cancelQueuedJob)) return null;
+  // Queued work has nothing running: canceling it ends the wait (nothing to stop, nothing to confirm).
+  const cancelQueued = async () => {
+    setBusy(true); setError(undefined);
+    try { await api.cancelQueuedJob!(installationId, job.jobId); if (menu.current) menu.current.open = false; onRefresh(); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Could not cancel the queued job.'); }
+    finally { setBusy(false); }
+  };
   const close = () => { dialog.current?.close(); setConfirm(false); trigger.current?.focus(); };
   const stop = async () => {
     setBusy(true); setError(undefined);
@@ -49,6 +56,7 @@ export function JobActions({ job, installationId, api, onRefresh }: {
       <summary ref={trigger} className="auth-link inline-flex min-h-11 min-w-11 cursor-pointer list-none items-center justify-center rounded border border-border" aria-label={`Actions for ${target}`} title="Actions">⋯</summary>
       <div className="absolute right-0 z-10 min-w-40 rounded border border-border bg-surface p-2 shadow-lg">
         {job.canStop && api.stopJob && <button type="button" className="min-h-11 w-full rounded px-3 text-left text-error-600 hover:bg-muted dark:text-error-400" onClick={() => { if (menu.current) menu.current.open = false; if (job.stop?.confirmedAt !== undefined) void stop(); else setConfirm(true); }}>{job.stop?.confirmedAt !== undefined ? 'Retry cleanup' : job.stop ? 'Retry stop' : 'Stop job'}</button>}
+        {job.canCancel && api.cancelQueuedJob && <><button type="button" className="min-h-11 w-full rounded px-3 text-left text-error-600 hover:bg-muted dark:text-error-400" disabled={busy} onClick={() => void cancelQueued()}>Cancel queued job</button><p className="px-3 text-xs">It has not started. Apply the label again on GitHub to queue it later.</p></>}
         {job.canResume && api.resumeJob && <><button type="button" className="min-h-11 w-full rounded px-3 text-left hover:bg-muted" disabled={busy} onClick={() => void resume()}>Resume automation</button><p className="px-3 text-xs">Allow future GitHub events to continue. This job stays stopped.</p></>}
       </div>
     </details>

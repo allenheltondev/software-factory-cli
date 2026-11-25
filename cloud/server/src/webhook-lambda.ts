@@ -20,6 +20,8 @@ import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
 import { createLauncher, internetEgressConnector, noIngressConnector, waitingComment, type Launcher, type LaunchRequest } from './jobs/launch.js';
 import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
+import { createAdmissionQueue, createGitHubRevalidator, createQueueDispatcher, dispatchMetricsLine, isQueueCancelRequest, type DispatchReport, type QueueCancelRequest, type QueueCancelResult, type QueueNotifier } from './jobs/queue.js';
+import { createDynamoQueueStore, type QueueEntry } from './jobs/queue-store.js';
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
@@ -82,6 +84,51 @@ async function imageVersion(): Promise<string | null> {
 const nativeWorker = nativeAws(store);
 const stopJob = awsJobStopper(store, nativeWorker.control, workflows);
 
+const putEvent = async (key: string, body: string) => {
+  await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key, Body: body, ContentType: 'application/json' }));
+};
+const readEvent = async (key: string) => {
+  try {
+    const out = await s3.send(new GetObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key }));
+    return (await out.Body?.transformToString('utf8')) ?? null;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'NoSuchKey') return null;
+    throw err;
+  }
+};
+
+// The admission queue (jobs/queue.ts): its acknowledgement is the App's own comment, written with
+// a token for that one repository, allowed only to write issues (and a pull request's conversation).
+const queueStore = createDynamoQueueStore(env.TABLE_NAME ?? '');
+const consoleOrigin = env.UPDRAFT_CONSOLE_ORIGIN || undefined;
+const queueToken = async (entry: QueueEntry) => {
+  const settings = await loadSettings();
+  if (!settings) throw new Error('the App settings are unavailable');
+  const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), entry.installationId, {
+    repositoryIds: [entry.repositoryId],
+    permissions: throttleCommentPermissions(entry.issue === undefined),
+  });
+  return { token, bot: settings.slug ? `${settings.slug}[bot]` : undefined };
+};
+const queueNotifier: QueueNotifier = {
+  async post(entry, body, marker) {
+    const { token, bot } = await queueToken(entry);
+    const subject = (entry.issue ?? entry.pullRequest)!;
+    // A post whose answer was lost: found again, never posted twice.
+    const existing = await github.findIssueComment!(token, entry.repository, subject, marker, bot);
+    return existing ?? (await github.postIssueComment!(token, entry.repository, subject, body));
+  },
+  async find(entry, marker) {
+    const { token, bot } = await queueToken(entry);
+    return (await github.findIssueComment!(token, entry.repository, (entry.issue ?? entry.pullRequest)!, marker, bot)) ?? undefined;
+  },
+  async update(entry, commentId, body) {
+    const { token } = await queueToken(entry);
+    await github.updateIssueComment!(token, entry.repository, commentId, body);
+  },
+};
+const admissionQueue = createAdmissionQueue({ store: queueStore, putEvent, notify: queueNotifier, workflows, ...(consoleOrigin ? { consoleOrigin } : {}) });
+
 
 function launcher(): Launcher | undefined {
   if (!env.JOB_IMAGE_ARN || !env.BROKER_FUNCTION_NAME) return undefined;
@@ -143,9 +190,8 @@ function launcher(): Launcher | undefined {
         throw err;
       }
     }, configPrefix),
-    putEvent: async (key, body) => {
-      await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key, Body: body, ContentType: 'application/json' }));
-    },
+    putEvent,
+    queue: admissionQueue,
     runMicrovm: async (input) => {
       const out = await microvms.send(new RunMicrovmCommand(input));
       return { microvmId: out.microvmId };
@@ -166,6 +212,20 @@ function launcher(): Launcher | undefined {
 }
 
 const launch = launcher();
+const dispatcher = launch
+  ? createQueueDispatcher({
+      queue: queueStore,
+      jobs: store,
+      launch,
+      readEvent,
+      revalidate: createGitHubRevalidator({ github, loadSettings }),
+      notify: queueNotifier,
+      workflows,
+      killSwitch,
+      capacity: { store, quotas: quotasFromEnv(env) },
+      ...(consoleOrigin ? { consoleOrigin } : {}),
+    })
+  : undefined;
 const dispatchBenchmark = benchmarkEnabled && launch ? createBenchmarkDispatch({
   installationId: benchmarkInstallationId,
   repositoryId: benchmarkRepositoryId,
@@ -199,6 +259,7 @@ const handleWebhook = createWebhookHandler({
   github,
   loadSettings,
   launch,
+  ...(dispatcher ? { queueEvents: dispatcher } : {}),
   ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
   routines: createRoutineDispatcher({
     store, rules: createDynamoRoutineRuleStore(env.TABLE_NAME ?? ''), killSwitch,
@@ -219,15 +280,7 @@ const retryJob = launch
   ? createRetryHandler({
       store,
       launch,
-      readEvent: async (key) => {
-        try {
-          const out = await s3.send(new GetObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key }));
-          return (await out.Body?.transformToString('utf8')) ?? null;
-        } catch (err) {
-          if ((err as { name?: string }).name === 'NoSuchKey') return null;
-          throw err;
-        }
-      },
+      readEvent,
       appBot: async () => {
         const settings = await loadSettings();
         return settings?.slug ? `${settings.slug}[bot]` : undefined;
@@ -289,9 +342,39 @@ const reconcileWorkflows = createWorkflowReconciler({ store: workflowStore, cont
 
 const scanLabels = createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings });
 
+const isStreamWake = (event: object): event is { Records: unknown[] } => 'Records' in event && Array.isArray((event as { Records?: unknown }).Records);
+
+/** A dispatch run: on the schedule, or woken by the table stream (a slot freed, work queued). */
+async function dispatchQueue(trigger: 'schedule' | 'wake'): Promise<DispatchReport | undefined> {
+  if (!dispatcher) return undefined;
+  const report = await dispatcher.dispatch();
+  console.log(dispatchMetricsLine(report, trigger, Date.now()));
+  return report;
+}
+
 export async function handler(
-  event: APIGatewayProxyEvent | RetryRequest | { action: 'resumeClaude'; installationId: number } | { action: 'reconcileWorkflows' },
-): Promise<APIGatewayProxyResult | RetryResult | (ReconcileReport & { labels: LabelScanReport }) | void> {
+  event: APIGatewayProxyEvent | RetryRequest | QueueCancelRequest | { action: 'resumeClaude'; installationId: number } | { action: 'reconcileWorkflows' } | { action: 'dispatchQueue' } | { Records: unknown[] },
+): Promise<APIGatewayProxyResult | RetryResult | QueueCancelResult | DispatchReport | (ReconcileReport & { labels: LabelScanReport }) | void> {
+  // The table stream (template.yaml QueueWake): a slot was given back, or work was queued. Only a
+  // wakeup: the scheduled run catches anything this misses, so it never fails (no stream retries).
+  if (isStreamWake(event)) {
+    try {
+      await dispatchQueue('wake');
+    } catch (err) {
+      console.error(JSON.stringify({ queueDispatch: 'wake failed', name: (err as Error)?.name, message: (err as Error)?.message }));
+    }
+    return;
+  }
+  if ('action' in event && event.action === 'dispatchQueue') {
+    const report = await dispatchQueue('schedule');
+    if (report && report.failed > 0) throw new Error(`queue dispatch failed for ${report.failed} entr${report.failed === 1 ? 'y' : 'ies'}`);
+    return report;
+  }
+  if (isQueueCancelRequest(event)) {
+    if (!dispatcher) return { ok: false, status: 404, code: 'not_found', message: 'Jobs are not configured' };
+    const { installationId, jobId, by } = event.updraftQueue;
+    return dispatcher.cancel(installationId, jobId, by);
+  }
   if ('action' in event && event.action === 'reconcileWorkflows') {
     const report = await reconcileWorkflows();
     // Labeled issues whose delivery never came (workflows/label-scan.ts): reported, never started.

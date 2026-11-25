@@ -841,6 +841,33 @@ Resources:
             Input: '{"action":"reconcileWorkflows"}'
             RetryPolicy:
               MaximumRetryAttempts: 0
+        # The admission queue (server/src/jobs/queue.ts): queued work starts when a slot frees.
+        # The stream wakes the dispatcher at once; this schedule catches a lost wakeup, expiries
+        # and backoff. Both only ever admit through the launcher's atomic quota reservation.
+        DispatchQueue:
+          Type: ScheduleV2
+          Properties:
+            Description: Start queued jobs whose capacity is free; expire and refuse what cannot start (server/src/jobs/queue.ts)
+            ScheduleExpression: rate(1 minute)
+            Input: '{"action":"dispatchQueue"}'
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+        QueueWake:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt UpdraftTable.StreamArn
+            # A wakeup only: one missed while the mapping starts is caught by DispatchQueue.
+            StartingPosition: LATEST
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 1
+            # The handler never fails a wakeup; nothing is retried or kept.
+            MaximumRetryAttempts: 0
+            FilterCriteria:
+              Filters:
+                # A tenant's or the platform's concurrency slot was given back.
+                - Pattern: '{"eventName":["REMOVE"],"dynamodb":{"Keys":{"sk":{"S":[{"prefix":"SLOT#"}]}}}}'
+                # Work was queued (its platform index entry).
+                - Pattern: '{"eventName":["INSERT"],"dynamodb":{"Keys":{"pk":{"S":["PLATFORM#QUEUE"]}}}}'
 
   # The uninstall retention deadline for what DynamoDB TTL cannot reach (tenants/cleanup.ts):
   # once a day, the S3 prefix and agent key secrets of every uninstalled tenant past its deadline.

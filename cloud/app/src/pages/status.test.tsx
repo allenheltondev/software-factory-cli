@@ -419,3 +419,50 @@ describe('JobPage (#71)', () => {
     expect(never.job).not.toHaveBeenCalled();
   });
 });
+
+describe('queued jobs (#141)', () => {
+  const queued = (over: Partial<JobView> = {}): JobView => job({
+    jobId: 'job_queued0001', issue: 13, status: 'queued', result: 'queued', outcome: undefined, durationSeconds: undefined, logs: [], canCancel: true,
+    queue: { state: 'queued', reason: 'concurrent_jobs', waitMessage: "Your account's current execution slot is occupied.", enqueuedAt: NOW, expiresAt: NOW, waitedSeconds: 125, position: 1, attempts: 0, deliveries: 1, eventName: 'issues', route: 'standard' },
+    ...over,
+  });
+
+  it('lists queued work on its own, in order, as queued and never as running, and lets an owner cancel it', async () => {
+    const cancelQueuedJob = vi.fn().mockResolvedValue({ jobId: 'job_queued0001', state: 'canceled' });
+    showInstallation(api({
+      jobs: vi.fn().mockResolvedValue({ jobs: [queued(), job({ jobId: 'job_running', status: 'launched', result: 'running' }), job()] }),
+      cancelQueuedJob,
+    }));
+    const card = await screen.findByTestId('queued-jobs');
+    const row = within(card).getByTestId('job-job_queued0001');
+    expect(row).toHaveTextContent('Queued');
+    expect(row).toHaveTextContent('#1 in line');
+    expect(row).toHaveTextContent('Waiting 2 min 5 s');
+    expect(row).toHaveTextContent("Your account's current execution slot is occupied. It starts automatically; no action is needed.");
+    expect(row).not.toHaveTextContent('Running');
+    // Not repeated among the running or the recent jobs.
+    expect(screen.getAllByTestId('job-job_queued0001')).toHaveLength(1);
+    await userEvent.click(within(row).getByLabelText('Actions for acme/web#13'));
+    await userEvent.click(within(row).getByRole('button', { name: 'Cancel queued job' }));
+    expect(cancelQueuedJob).toHaveBeenCalledWith(55, 'job_queued0001');
+  });
+
+  it('opens a queued job at its stable link before it starts: why it waits, its place, no estimated start', async () => {
+    showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: queued(), deliveries: [] }) }), '/installations/55/jobs/job_queued0001');
+    expect(await screen.findByTestId('job-result')).toHaveTextContent('Queued');
+    const card = screen.getByTestId('job-queue');
+    expect(within(card).getByTestId('job-queue-state')).toHaveTextContent('Waiting for capacity');
+    expect(card).toHaveTextContent('#1');
+    expect(card).toHaveTextContent("Your account's current execution slot is occupied.");
+    expect(screen.getByTestId('job-facts')).toHaveTextContent('Not started');
+    expect(card).not.toHaveTextContent(/estimated|ETA/i);
+  });
+
+  it('shows why queued work ended without starting, and what to do', async () => {
+    showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: queued({ status: 'finished', result: 'not_run', canCancel: false, queue: { ...queued().queue!, state: 'refused', position: undefined, outcome: { at: NOW, reason: 'jobs_per_day', message: "the account's jobs for today (UTC) are used.", nextAction: 'Apply the label again tomorrow (UTC).' } } }), deliveries: [] }) }), '/installations/55/jobs/job_queued0001');
+    const outcome = await screen.findByTestId('job-queue-outcome');
+    expect(outcome).toHaveTextContent("The account's jobs for today (UTC) are used.");
+    expect(outcome).toHaveTextContent('Apply the label again tomorrow (UTC).');
+    expect(screen.getByTestId('job-queue-state')).toHaveTextContent('Not started');
+  });
+});

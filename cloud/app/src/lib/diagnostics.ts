@@ -20,6 +20,11 @@ export const INSTALLATION: Record<InstallationStatus, { label: string; tone: Ton
 };
 
 export const JOB_RESULT: Record<JobResult, { label: string; tone: Tone; help: string }> = {
+  queued: {
+    label: 'Queued',
+    tone: 'neutral',
+    help: 'Waiting for execution capacity. It starts automatically when a slot is free; no action is needed, and nothing is counted against quotas while it waits.',
+  },
   running: { label: 'Running', tone: 'primary', help: 'The job is running in its microVM.' },
   success: { label: 'Succeeded', tone: 'success', help: 'The agent did the work and the pull request was published.' },
   nothing_to_do: { label: 'Nothing to do', tone: 'neutral', help: 'Updraft looked at the event and found nothing to do (for example, work that was already done).' },
@@ -47,6 +52,7 @@ export const DISPOSITION: Record<DeliveryDisposition, { label: string; tone: Ton
   filtered: { label: 'Filtered', tone: 'neutral' },
   deduped: { label: 'Duplicate', tone: 'neutral' },
   coalesced: { label: 'Coalesced', tone: 'neutral' },
+  queued: { label: 'Queued', tone: 'neutral' },
   throttled: { label: 'Throttled', tone: 'warning' },
   launch_failed: { label: 'Launch failed', tone: 'error' },
   routine_triggered: { label: 'Claude task started', tone: 'success' },
@@ -67,6 +73,10 @@ const REASON: Record<string, string> = {
   jobs_off: 'Jobs were not available yet.',
   jobs_paused: 'Updraft had paused all jobs.',
   concurrent_jobs: 'A job was already running (one at a time).',
+  queue_ahead: 'Earlier queued work of this installation starts first.',
+  already_queued: 'The same issue or pull request already has queued work: this delivery was folded into it.',
+  queue_full: 'The installation already had the most work queued that it may.',
+  queue_canceled: 'Its queued job was canceled.',
   jobs_per_day: 'The daily job limit was reached.',
   microvm_minutes: 'The monthly compute allowance was used up.',
   platform_concurrency: 'Updraft was at capacity.',
@@ -81,7 +91,13 @@ export function deliveryReason(d: Delivery): string {
   if (d.disposition === 'routine_failed') return d.reason === 'trigger_token_unavailable' ? 'The routine trigger token is unavailable; reconnect the route.' : `Anthropic refused the trigger (${d.reason ?? 'unknown reason'}). Check the task and its API trigger.`;
   if (d.disposition === 'routine_unknown') return 'The request may have started a Claude task. Check Claude Code sessions before reapplying the label.';
   if (d.disposition === 'launched') return 'A job was started.';
+  if (d.disposition === 'queued') {
+    const why = d.reason === 'platform_concurrency' ? 'Updraft Cloud was at capacity' : d.reason === 'queue_ahead' ? 'earlier queued work of this installation starts first' : 'the installation’s execution slot was occupied';
+    return `Queued: ${why}. It starts automatically when capacity is available.`;
+  }
+  if (d.disposition === 'deduped' && d.reason === 'already_queued') return REASON.already_queued!;
   if (d.disposition === 'deduped') return 'A redelivery of a delivery that already has a job.';
+  if (d.disposition === 'launch_failed' && d.errorClass === 'QueueBusy') return 'Its queued job was starting at that moment; redeliver the event from GitHub so it is not missed.';
   if (d.disposition === 'coalesced') return d.pullRequest !== undefined ? `Folded into the job for pull request #${d.pullRequest}, which sees it.` : 'Folded into another delivery’s job.';
   // A pull request's event: who reviewed or pushed, not who applied a label; and the loop's own words.
   if (d.reason === 'actor_not_allowed' && d.event.startsWith('pull_request')) return 'The person who reviewed or pushed may not start work.';

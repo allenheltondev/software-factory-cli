@@ -32,7 +32,7 @@ const installation = (suspendedAt: string | null): GitHubInstallation => ({
 
 /** `github` says what GitHub reports for installation 55 right now: an installation, gone (null), or an error. */
 async function setup(github: { current: GitHubInstallation | null | Error } = { current: installation(null) }, launch?: Launcher,
-  routing: Pick<Parameters<typeof createWebhookHandler>[0], 'routines' | 'benchmarkInstallationId'> = {}) {
+  routing: Pick<Parameters<typeof createWebhookHandler>[0], 'routines' | 'benchmarkInstallationId' | 'queueEvents'> = {}) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant, {
     installationId: 55,
@@ -315,5 +315,22 @@ describe('webhook', () => {
       };
       expect(await deliver('issues', labeled)).toEqual({ status: 202, body: { ok: true, disposition: 'launched' } });
     });
+  });
+});
+
+describe('queued work and its issue', () => {
+  const issueEvent = (action: string, label?: string) => ({ action, installation: { id: 55 }, repository: { id: 9, full_name: 'acme/web' }, issue: { number: 12 }, ...(label ? { label: { name: label } } : {}), sender: { login: 'pat' } });
+  it('cancels queued work when its label is removed or its issue closed, and records it', async () => {
+    const subjectChanged = vi.fn(async () => true);
+    const { deliver, store } = await setup(undefined, undefined, { queueEvents: { subjectChanged } });
+    expect(await deliver('issues', issueEvent('unlabeled', 'updraft'))).toEqual({ status: 200, body: { ok: true, disposition: 'queue_canceled' } });
+    expect(subjectChanged).toHaveBeenCalledWith(55, 9, { issue: 12 }, { kind: 'unlabeled', label: 'updraft' });
+    expect(await deliver('issues', issueEvent('closed'))).toMatchObject({ body: { disposition: 'queue_canceled' } });
+    expect(subjectChanged).toHaveBeenLastCalledWith(55, 9, { issue: 12 }, { kind: 'closed' });
+    expect((await store.listDeliveries(55, 5)).map((d) => d.reason)).toEqual(['queue_canceled', 'queue_canceled']);
+  });
+  it('is an ordinary filtered delivery when nothing was queued', async () => {
+    const { deliver } = await setup(undefined, undefined, { queueEvents: { subjectChanged: async () => false } });
+    expect(await deliver('issues', issueEvent('unlabeled', 'updraft'))).toMatchObject({ body: { disposition: 'ignored' } });
   });
 });

@@ -64,6 +64,28 @@ response was lost leaves exactly one comment per run.
 
 Retries are in-process: if the worker stops before a comment is posted, it is not posted later.
 
+## Queued work (Updraft Cloud)
+
+When an Updraft Cloud account's execution capacity is taken (one job at a time by default), a
+labeled issue, or a review, push or CI event of an Updraft pull request, is queued instead of
+refused. Updraft acknowledges it once, as the App:
+
+> Updraft queued this issue. Your account's current execution slot is occupied. Work will start
+> automatically when capacity is available. No action is needed.
+>
+> **Status:** Queued · Waiting for capacity
+>
+> **Job:** [View in Updraft](https://updraft.readysetcloud.io/installations/123/jobs/job_example)
+
+The link is the job's real, stable id (or the plain id when no console origin is configured).
+The comment names no worker and promises no start time. It carries a hidden marker,
+`<!-- updraft-queue: JOB_ID -->`, so a retried post finds it instead of posting again. It is
+edited in place, never repeated: to `Started · queued for N minutes` when the job starts (the
+assignment comment above then follows, for an implementation run, with the worker actually
+selected), or to why it never started and what to do (`Canceled`, `Not started`, `Expired`).
+A relabel or redelivery of queued work changes nothing. Queue policy, bounds and expiry are in
+[cloud/README.md](../cloud/README.md#admission-queue).
+
 ## Permission
 
 The comment is posted as the active GitHub identity, like the other comments. Needed: a classic

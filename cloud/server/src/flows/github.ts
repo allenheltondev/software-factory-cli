@@ -37,6 +37,10 @@ export type FlowErrorCode =
   // Retrying a job (jobs/retry.ts, tenants/status-service.ts).
   | RetryErrorCode
   | 'retry_unavailable'
+  // Canceling a queued job (jobs/queue.ts).
+  | 'cancel_unavailable'
+  | 'not_queued'
+  | 'admitting'
   | 'stop_unavailable'
   | 'stop_pending'
   | 'pause_changed'
