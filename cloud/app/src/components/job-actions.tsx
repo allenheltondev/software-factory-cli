@@ -10,7 +10,7 @@ export function JobStopStatus({ job }: { job: JobView }) {
     {stop.confirmedAt === undefined && <p>Execution has not yet been confirmed stopped. Automatic continuation is paused.</p>}
     {stop.confirmedAt !== undefined && stop.resumedAt === undefined && <p>Automatic continuation is paused until an owner resumes automation or retries this job.</p>}
     {stop.resumedAt !== undefined && <p>Automation resumed by {stop.resumedBy} on {new Date(stop.resumedAt).toLocaleString()}. This job remains stopped.</p>}
-    {stop.error && stop.confirmedAt === undefined && <Alert variant="error">{stop.error}</Alert>}
+    {stop.error && <Alert variant="error">{stop.error}</Alert>}
     {stop.reconnectRequired && <p>The worker session required termination. Reconnect Claude before retrying this job.</p>}
   </div>;
 }
@@ -48,7 +48,7 @@ export function JobActions({ job, installationId, api, onRefresh }: {
     <details ref={menu}>
       <summary ref={trigger} className="auth-link inline-flex min-h-11 min-w-11 cursor-pointer list-none items-center justify-center rounded border border-border" aria-label={`Actions for ${target}`} title="Actions">⋯</summary>
       <div className="absolute right-0 z-10 min-w-40 rounded border border-border bg-surface p-2 shadow-lg">
-        {job.canStop && api.stopJob && <button type="button" className="min-h-11 w-full rounded px-3 text-left text-error-600 hover:bg-muted dark:text-error-400" onClick={() => { if (menu.current) menu.current.open = false; setConfirm(true); }}>{job.stop ? 'Retry stop' : 'Stop job'}</button>}
+        {job.canStop && api.stopJob && <button type="button" className="min-h-11 w-full rounded px-3 text-left text-error-600 hover:bg-muted dark:text-error-400" onClick={() => { if (menu.current) menu.current.open = false; if (job.stop?.confirmedAt !== undefined) void stop(); else setConfirm(true); }}>{job.stop?.confirmedAt !== undefined ? 'Retry cleanup' : job.stop ? 'Retry stop' : 'Stop job'}</button>}
         {job.canResume && api.resumeJob && <><button type="button" className="min-h-11 w-full rounded px-3 text-left hover:bg-muted" disabled={busy} onClick={() => void resume()}>Resume automation</button><p className="px-3 text-xs">Allow future GitHub events to continue. This job stays stopped.</p></>}
       </div>
     </details>

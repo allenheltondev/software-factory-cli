@@ -35,7 +35,7 @@ function fakeTable() {
     if (expr === 'attribute_not_exists(pk) OR jobId = :parent') return !item || item.jobId === values[':parent'];
     if (expr === '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling) AND attribute_not_exists(fenced)') return !!item && item.version === values[':v'] && !item.active && !item.settling && item.fenced === undefined;
     if (expr === 'installationId = :installation AND #status = :launched AND attribute_not_exists(stopRequestedAt) AND attribute_not_exists(microvmId) AND attribute_exists(launchingAt) AND expiresAt > :at') return !!item && item.installationId === values[':installation'] && item.status === values[':launched'] && item.stopRequestedAt === undefined && item.microvmId === undefined && item.launchingAt !== undefined && Number(item.expiresAt) > Number(values[':at']);
-    if (expr === 'installationId = :installation AND #status <> :finished AND attribute_not_exists(#stop)') return item?.installationId === values[':installation'] && item?.status !== values[':finished'] && item?.stop === undefined;
+    if (expr === 'installationId = :installation AND attribute_not_exists(releasedAt) AND attribute_not_exists(#stop)') return item?.installationId === values[':installation'] && item?.releasedAt === undefined && item?.stop === undefined;
     if (expr === 'attribute_exists(#stop)') return item?.stop !== undefined;
     if (expr === 'attribute_exists(#stop.confirmedAt)') return (item?.stop as Item | undefined)?.confirmedAt !== undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job') return !item || item.jobId === values[':job'];
@@ -795,6 +795,12 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.resumeStoppedWorkflow(job, [12, 13], 'pat', audit.requestedAt + 10)).toBe(true);
     expect(await store.getWorkflowPause(55, 9, 13)).toBeNull();
     expect((await store.getJob(job.jobId))?.stop?.resumedBy).toBe('pat');
+    const completed = { ...job, jobId: 'job_finished01', deliveryId: 'd-finished' };
+    await store.putJob(completed); await store.finishJob(completed.jobId, 'succeeded');
+    await store.requestJobStop(completed, { ...audit, executionMicrovmId: 'mvm-retiring' }, [12]);
+    expect(await store.getJob(completed.jobId)).toMatchObject({ status: 'finished', outcome: 'succeeded', stop: { executionMicrovmId: 'mvm-retiring' } });
+    await store.recordJobStop(completed, { executionMicrovmId: 'mvm-retiring' });
+    expect((await store.getJobSummary(55, completed.jobId))?.stop?.executionMicrovmId).toBe('mvm-retiring');
   });
   const LATER = Date.now() + 3_600_000;
 

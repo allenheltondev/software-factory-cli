@@ -575,7 +575,7 @@ describe('the launcher', () => {
     expect((await createLauncher(deps)(request())).disposition).toBe('launched');
   });
 
-  it('keeps trying to record the microVM on the job, and still reports the launch if it cannot', async () => {
+  it('retries VM registration and retires the known VM when registration remains unavailable', async () => {
     const attach = vi.spyOn(store, 'attachMicrovm').mockRejectedValueOnce(new Error('throttled'));
     const ok = await createLauncher(deps)(request());
     expect(ok.disposition).toBe('launched');
@@ -584,9 +584,32 @@ describe('the launcher', () => {
 
     attach.mockRejectedValue(new Error('down'));
     const logged: Record<string, unknown>[] = [];
-    const second = await createLauncher({ ...deps, log: (e) => logged.push(e) })(request({}, 'delivery-3'));
-    expect(second.disposition).toBe('launched');
+    const { createJobStopper } = await import('./stop.js');
+    const terminate = vi.fn(async () => {});
+    const stop = createJobStopper({ store, terminateMicrovm: terminate, microvmState: async () => 'TERMINATED', now: () => NOW, log: () => {} });
+    const second = await createLauncher({ ...deps, stopJob: stop.advance, log: (e) => logged.push(e) })(request({}, 'delivery-3'));
+    expect(second.disposition).toBe('launch_failed');
+    expect(terminate).toHaveBeenCalledWith('mvm-0001');
+    expect((await store.getJob(second.jobId!))?.stop).toMatchObject({ executionMicrovmId: 'mvm-0001', confirmedAt: NOW });
+    expect((await store.listActiveJobs()).map((j) => j.jobId)).not.toContain(second.jobId);
     expect(logged.some((e) => String(e.warning).includes('could not record the microVM'))).toBe(true);
+  });
+  it('keeps a stopped late VM recoverable when attachment and initial termination both fail', async () => {
+    const { createJobStopper } = await import('./stop.js');
+    let state = 'RUNNING';
+    const terminate = vi.fn().mockRejectedValueOnce(new Error('AWS unavailable')).mockImplementation(async () => { state = 'TERMINATED'; });
+    const stop = createJobStopper({ store, terminateMicrovm: terminate, microvmState: async () => state, now: () => NOW, log: () => {} });
+    vi.spyOn(store, 'attachMicrovm').mockRejectedValue(new Error('temporary table write failure'));
+    runMicrovm = async (input) => { await stop.request(55, input.clientToken, 'pat', 'emergency stop'); return { microvmId: 'mvm-late' }; };
+    const out = await createLauncher({ ...deps, stopJob: stop.advance })(request());
+    const job = (await store.getJob(out.jobId!))!;
+    expect(job.microvmId).toBeUndefined();
+    expect(job.stop).toMatchObject({ executionMicrovmId: 'mvm-late', by: 'pat', reason: 'emergency stop' });
+    expect(await store.listActiveJobs()).toHaveLength(1);
+    const reconcile = createReconciler({ store, stop, microvmState: async () => state, now: () => NOW, log: () => {} });
+    expect(await reconcile()).toMatchObject({ released: [job.jobId], failed: 0 });
+    expect(terminate).toHaveBeenLastCalledWith('mvm-late');
+    expect(await store.listActiveJobs()).toHaveLength(0);
   });
 
   it("reads the tenant and its active config strongly consistently, and the claim is held by the job's id", async () => {

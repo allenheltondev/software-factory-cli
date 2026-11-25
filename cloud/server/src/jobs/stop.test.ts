@@ -70,10 +70,20 @@ describe('durable job cancellation', () => {
     clock++; await request(); expect(await store.getJobSummary(55, job.jobId)).toEqual(first);
     expect(first?.stop).toMatchObject({ by: 'pat', reason: 'Agent is off course' });
   });
-  it('does not terminate a job that already finished, or overwrite a finish that wins the race', async () => {
-    await running(); await store.finishJob(job.jobId, 'succeeded');
+  it('does not terminate an execution already confirmed retired', async () => {
+    await running(); await store.finishJob(job.jobId, 'succeeded'); await store.releaseJob((await store.getJob(job.jobId))!);
     expect(await request()).toMatchObject({ state: 'finished' }); expect(terminate).not.toHaveBeenCalled();
     expect(await store.getWorkflowPause(55, 9, 12)).toBeNull();
+  });
+  it('terminates a finished but still-running VM without rewriting the successful outcome', async () => {
+    await running(); await store.finishJob(job.jobId, 'succeeded');
+    expect(await request()).toMatchObject({ state: 'stopping', accountingComplete: false });
+    expect(terminate).toHaveBeenCalledWith('mvm-exact');
+    expect((await store.getJob(job.jobId))?.outcome).toBe('succeeded');
+    state = 'TERMINATED';
+    expect(await stop.advance(job)).toMatchObject({ state: 'finished', accountingComplete: true });
+    expect((await store.getJob(job.jobId))?.outcome).toBe('succeeded');
+    expect(await store.listActiveJobs()).toHaveLength(0);
   });
   it('preserves a natural finish while still retiring the stopped execution', async () => {
     await running(); await request(); await store.finishJob(job.jobId, 'succeeded'); state = 'TERMINATED';
@@ -100,6 +110,36 @@ describe('durable job cancellation', () => {
     expect(await stop.advance(job)).toMatchObject({ state: 'canceled' });
     expect(await store.listActiveJobs()).toHaveLength(1);
     await stop.advance(job); expect(await store.listActiveJobs()).toHaveLength(0);
+  });
+  it('reports cleanup failure separately from confirmed cancellation and retries it in background', async () => {
+    await running(); state = 'TERMINATED';
+    const release = store.releaseJob;
+    store.releaseJob = vi.fn().mockRejectedValueOnce(new Error('accounting unavailable')).mockImplementation(release);
+    await store.requestJobStop(job, { requestedAt: clock, by: 'pat', reason: 'stop' }, [12]);
+    const reconcile = createReconciler({ store, stop, microvmState: async () => state, now: () => clock, log: () => {} });
+    expect(await reconcile()).toEqual({ released: [], held: 1, failed: 1 });
+    expect((await store.getJob(job.jobId))?.stop).toMatchObject({ confirmedAt: clock, error: expect.stringContaining('capacity cleanup failed') });
+    expect(await store.listActiveJobs()).toHaveLength(1);
+    expect(await reconcile()).toEqual({ released: [job.jobId], held: 0, failed: 0 });
+    expect((await store.getJob(job.jobId))?.stop?.error).toBe('');
+    expect(await store.listActiveJobs()).toHaveLength(0);
+  });
+  it('retains the returned VM identity when registration and its first termination fail', async () => {
+    await store.markLaunching(job.jobId);
+    terminate.mockRejectedValueOnce(new Error('AWS transient failure'));
+    expect(await stop.advance(job, 'mvm-returned')).toMatchObject({ state: 'stopping', accountingComplete: false });
+    expect((await store.getJob(job.jobId))?.stop?.executionMicrovmId).toBe('mvm-returned');
+    expect((await store.getJob(job.jobId))?.microvmId).toBeUndefined();
+    state = 'TERMINATED';
+    expect(await stop.advance(job)).toMatchObject({ state: 'canceled', accountingComplete: true });
+    expect(await store.listActiveJobs()).toHaveLength(0);
+  });
+  it('terminates the trusted returned VM even while both retirement metadata writes are unavailable', async () => {
+    await store.markLaunching(job.jobId);
+    store.requestJobStop = vi.fn().mockRejectedValue(new Error('table unavailable'));
+    await expect(stop.advance(job, 'mvm-returned')).rejects.toThrow('table unavailable');
+    expect(terminate).toHaveBeenCalledWith('mvm-returned');
+    expect(await store.listActiveJobs()).toHaveLength(1);
   });
   it('never touches another installation and keeps automatic continuation paused', async () => {
     await running(); expect(await stop.request(66, job.jobId, 'outsider', '')).toBeNull(); expect(terminate).not.toHaveBeenCalled();

@@ -415,6 +415,8 @@ export interface JobStop {
   requestedAt: number;
   by: string;
   reason: string;
+  /** Trusted launcher response retained even if attaching the VM to the job failed. */
+  executionMicrovmId?: string;
   confirmedAt?: number;
   error?: string;
   reconnectRequired?: boolean;
@@ -662,7 +664,7 @@ export interface Store {
   markStopping(jobId: string): Promise<void>;
   /** Atomically fence this live attempt, audit its operator, and pause automatic dispatch. */
   requestJobStop(job: Job, stop: JobStop, subjects: number[]): Promise<Job | null>;
-  recordJobStop(job: Job, progress: Pick<JobStop, 'confirmedAt' | 'error' | 'reconnectRequired'>): Promise<void>;
+  recordJobStop(job: Job, progress: Pick<JobStop, 'confirmedAt' | 'error' | 'reconnectRequired' | 'executionMicrovmId'>): Promise<void>;
   getWorkflowPause(installationId: number, repositoryId: number, subject: number): Promise<WorkflowPause | null>;
   resumeStoppedWorkflow(job: Job, subjects: number[], by: string, at: number): Promise<boolean>;
   /**
@@ -991,7 +993,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async requestJobStop(job, stop, subjects) {
       const current = jobs.get(job.jobId);
       if (!current || current.installationId !== job.installationId) return null;
-      if (current.status === 'finished' || current.stop) return { ...current };
+      if (current.releasedAt !== undefined || current.stop) return { ...current };
       const next = { ...current, stopRequestedAt: current.stopRequestedAt ?? stop.requestedAt, stop: { ...stop } };
       jobs.set(job.jobId, next);
       const summary = summaries.get(job.jobId);

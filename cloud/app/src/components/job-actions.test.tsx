@@ -7,6 +7,15 @@ import { JobActions, JobStopStatus } from './job-actions';
 const job: JobView = { jobId: 'job_stoppable01', repository: 'acme/web', issue: 12, canStop: true,
   status: 'launched', result: 'running', createdAt: new Date().toISOString(), logs: [] };
 describe('job card stop action', () => {
+  it('shows capacity cleanup failure after execution ended and allows a safe retry', async () => {
+    const user = userEvent.setup(); const stopJob = vi.fn().mockResolvedValue({ jobId: job.jobId, state: 'canceled' }); const refresh = vi.fn();
+    const ended = { ...job, outcome: 'canceled', stop: { requestedAt: Date.now(), confirmedAt: Date.now(), by: 'pat', reason: 'stop', error: 'Capacity cleanup failed; retry is safe.' } };
+    render(<><JobStopStatus job={ended} /><JobActions job={ended} installationId={55} api={{ stopJob }} onRefresh={refresh} /></>);
+    expect(screen.getByText('Capacity cleanup failed; retry is safe.')).toBeVisible();
+    await user.click(screen.getByLabelText('Actions for acme/web#12')); await user.click(screen.getByRole('button', { name: 'Retry cleanup' }));
+    expect(stopJob).toHaveBeenCalledWith(55, job.jobId); expect(refresh).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
   it('offers a secondary action, confirms its exact target, and restores focus on cancel', async () => {
     const user = userEvent.setup(); const stopJob = vi.fn();
     render(<JobActions job={job} installationId={55} api={{ stopJob }} onRefresh={() => {}} />);

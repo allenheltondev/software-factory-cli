@@ -55,7 +55,7 @@ export function JobPage({ api = defaultApi, refreshMs = JOB_REFRESH_MS }: { api?
     };
   }, [api, installationId, jobId, valid]);
 
-  const running = load.state === 'ok' && load.job.result === 'running';
+  const running = load.state === 'ok' && (load.job.result === 'running' || !!load.job.stop?.error);
   useEffect(() => {
     if (!running) return;
     const timer = setInterval(() => void refresh(), refreshMs);

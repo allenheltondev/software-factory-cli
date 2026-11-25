@@ -59,8 +59,8 @@ export function createReconciler({
         if (nativeJob?.stop) {
           if (!stop) throw new Error('job cancellation reconciliation is not configured');
           const result = await stop.advance(nativeJob);
-          if (result.state === 'stopping') { held++; if (result.stop?.error) failed++; }
-          else released.push(jobId);
+          if (result.accountingComplete) released.push(jobId); else held++;
+          if (result.stop?.error) failed++;
           continue;
         }
         if (nativeJob?.native) {

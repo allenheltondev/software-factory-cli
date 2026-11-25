@@ -93,8 +93,18 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
 }
 
 describe('status and diagnostics (#71)', () => {
+  it('offers stop for finished executions that have not retired, and cleanup retry after confirmation', async () => {
+    const { store, get } = await setup({ requestStop: async () => null });
+    const j = job(); await store.putJob(j); await store.finishJob(j.jobId, 'succeeded');
+    expect(await get(`55/jobs/${j.jobId}`)).toMatchObject({ body: { job: { canStop: true, result: 'success' } } });
+    await store.requestJobStop(j, { requestedAt: Date.now(), by: 'pat', reason: 'stop remaining VM' }, [12]);
+    await store.recordJobStop(j, { confirmedAt: Date.now(), error: 'Capacity cleanup failed' });
+    expect(await get(`55/jobs/${j.jobId}`)).toMatchObject({ body: { job: { canStop: true, result: 'success', stop: { error: 'Capacity cleanup failed' } } } });
+    await store.releaseJob(j); await store.recordJobStop(j, { error: '' });
+    expect(await get(`55/jobs/${j.jobId}`)).toMatchObject({ body: { job: { canStop: false, result: 'success' } } });
+  });
   it('authenticates a job stop as an installation owner and never accepts VM identifiers', async () => {
-    const requestStop = vi.fn<NonNullable<StatusServiceDeps['requestStop']>>().mockResolvedValue({ jobId: 'job_status0001', state: 'stopping' });
+    const requestStop = vi.fn<NonNullable<StatusServiceDeps['requestStop']>>().mockResolvedValue({ jobId: 'job_status0001', state: 'stopping', accountingComplete: false });
     const owner = await setup({ requestStop });
     expect(await owner.post('55/jobs/job_status0001/stop', { reason: 'off course' })).toMatchObject({ status: 202, body: { state: 'stopping' } });
     expect(requestStop).toHaveBeenCalledWith(55, 'job_status0001', 'Pat', 'off course'); requestStop.mockClear();

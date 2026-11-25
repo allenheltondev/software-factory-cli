@@ -376,7 +376,9 @@ export function createStatusService({ store, github, agentKeys, readLog, request
     async jobs(caller: Caller, installationId: number, limit?: unknown): Promise<{ jobs: JobView[] }> {
       const member = await github.member(caller, installationId);
       const [jobs, settings] = await Promise.all([store.listRecentJobs(installationId, limitOf(limit)), settingsOf(installationId)]);
-      return { jobs: jobs.map((j) => ({ ...view(j, settings.t, settings.unavailable), canResume: member.summary.role === 'owner' && j.stop?.confirmedAt !== undefined && j.stop.resumedAt === undefined, canStop: !!requestStop && member.summary.role === 'owner' && (j.status !== 'finished' || !!j.stop && j.stop.confirmedAt === undefined) })) };
+      const active = requestStop && member.summary.role === 'owner' ? new Set((await store.listActiveJobs()).filter((j) => j.installationId === installationId).map((j) => j.jobId)) : new Set<string>();
+      return { jobs: jobs.map((j) => ({ ...view(j, settings.t, settings.unavailable), canResume: member.summary.role === 'owner' && j.stop?.confirmedAt !== undefined && j.stop.resumedAt === undefined,
+        canStop: !!requestStop && member.summary.role === 'owner' && (j.status !== 'finished' || !!j.stop && (j.stop.confirmedAt === undefined || !!j.stop.error) || active.has(j.jobId)) })) };
     },
 
     /**
@@ -396,7 +398,9 @@ export function createStatusService({ store, github, agentKeys, readLog, request
         conversationId ? store.listRecentJobs(installationId, LIST_LIMIT).catch(() => []) : Promise.resolve([]),
       ]);
       const conversation = recent.filter((j) => j.jobId !== job.jobId && conversationOf(j) === conversationId).map((j) => view(j, settings.t, settings.unavailable));
-      return { job: { ...view(job, settings.t, settings.unavailable), canResume: member.summary.role === 'owner' && job.stop?.confirmedAt !== undefined && job.stop.resumedAt === undefined, canStop: !!requestStop && member.summary.role === 'owner' && (job.status !== 'finished' || !!job.stop && job.stop.confirmedAt === undefined) }, deliveries, conversation };
+      const execution = requestStop && member.summary.role === 'owner' ? await store.getJob(jobId) : null;
+      return { job: { ...view(job, settings.t, settings.unavailable), canResume: member.summary.role === 'owner' && job.stop?.confirmedAt !== undefined && job.stop.resumedAt === undefined,
+        canStop: !!requestStop && member.summary.role === 'owner' && (job.status !== 'finished' || !!job.stop && (job.stop.confirmedAt === undefined || !!job.stop.error) || !!execution && execution.releasedAt === undefined) }, deliveries, conversation };
     },
 
     /**

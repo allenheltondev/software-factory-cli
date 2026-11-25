@@ -146,7 +146,7 @@ export function waitingComment(link: string, reason?: NativeReadiness): string {
 
 
 export interface LaunchDeps {
-  stopJob?: (job: Job) => Promise<unknown>;
+  stopJob?: (job: Job, returnedMicrovmId?: string) => Promise<unknown>;
   benchmarkInstallationId?: number;
   native?: NativeLaunch;
   resolveNative?(installationId: number): Promise<NativeLaunch | undefined>;
@@ -633,6 +633,13 @@ export function createLauncher(deps: LaunchDeps) {
           if (attempt === 3) log({ delivery: req.deliveryId, jobId, microvmId, warning: `could not record the microVM: ${(err as Error)?.message}` });
           else await new Promise((r) => setTimeout(r, (deps.retryDelayMs ?? 200) * attempt));
         }
+      }
+      if (!attached) {
+        if (!deps.stopJob) throw new Error(`Could not register or retire VM ${microvmId} for ${jobId}`);
+        // The trusted response is retained by the stop service independently of the
+        // failed attachment. Never forget a known VM and leave it billing to expiry.
+        await deps.stopJob(job, microvmId);
+        return { status: 503, disposition: 'launch_failed', jobId, errorClass: 'VmRegistrationFailed' };
       }
     }
 

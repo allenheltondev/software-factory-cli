@@ -52,6 +52,17 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; e
 }
 
 describe('workflow reconciliation', () => {
+  it('reports intentional pauses before CI and resumes report-only diagnosis after explicit unpause', async () => {
+    const s = setup(); await s.waitForCi(); s.tick(CI_FIRST_CHECK_MS);
+    s.controls.getWorkflowPause.mockImplementation(async (_i, _r, n) => n === 7 ? { jobId: 'job_stopped0001', at: T0, by: 'pat' } : null);
+    expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+    expect(s.github.commitChecks).not.toHaveBeenCalled();
+    expect(await s.wf()).toMatchObject({ reason: 'workflow_paused', controlPause: { jobId: 'job_stopped0001' } });
+    s.controls.getWorkflowPause.mockResolvedValue(null); s.tick(CI_RECHECK_MS);
+    expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+    expect(await s.wf()).toMatchObject({ reason: 'ci_event_missed' });
+    expect(await s.wf()).not.toHaveProperty('controlPause');
+  });
   it('does nothing before a CI wait is due, and reports what is left due and for how long', async () => {
     const s = setup();
     await s.waitForCi();

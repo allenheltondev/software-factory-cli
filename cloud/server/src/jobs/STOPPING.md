@@ -50,6 +50,14 @@ or the maximum VM lifetime; it is never treated as confirmation that no VM exist
 `TERMINATING` is not confirmation: the VM must be `TERMINATED` or absent. Capacity
 and unused-time accounting use the existing idempotent release primitive.
 
+If RunMicrovm returned an ID but all registration attempts failed, the trusted launcher
+passes its own response to the stop service. That ID is retained on the stop audit as
+`executionMicrovmId`, independently of the failed attachment, and termination is
+attempted even if retirement metadata is temporarily unavailable. A failed termination
+remains recoverable from the audit by background reconciliation. Client requests never
+accept this identifier. A completed runner outcome is separate from physical retirement:
+owners can stop its remaining VM and retain its original success/failure outcome.
+
 Native jobs receive cancellation on their next heartbeat (normally ten seconds).
 The root runner signals and reaps the process group. The signed-in session is reused
 only after trusted server settlement; a forced root-runner kill never permits reuse.
@@ -68,15 +76,19 @@ Actions menu, and are retried by the one-minute reconciler independently of the
 browser. Structured `jobStop: requested | confirmed | failed` events include the
 job, installation, operator/timestamp or error class and confirmation latency in
 milliseconds for log-based alarms and stop-latency metrics.
+Execution confirmation also remains separate from accounting completion. A failed
+refund/slot release is reported as held/failed, never released, and is retried from the
+active reservation. Its error stays visible after execution ends, with **Retry cleanup**
+and continued status polling. A successful cleanup clears that error.
 
 ## Recovery
 
 Intentionally stopped work stays paused across redelivery, relabeling, PR events and
-CI events, including #154's missed-event recovery. The workflow reconciler displays
-`workflow_paused` and defers without reading CI or spending recovery attempts; it
-also checks again after reserving a recovery and gives the attempt back if a stop
-wins the final launcher gate. Durable issue/PR provenance is carried through recovery
-even after the originating job expires. A canceled workflow remains explicitly
+CI events. The updated #154 base makes missed-event recovery report-only: the
+workflow reconciler starts no jobs. It displays `workflow_paused` and defers without
+reading CI while an owner's pause is active, then resumes diagnosis after explicit
+unpause. Normal dispatch uses durable issue/PR provenance even after the originating
+job expires. A canceled workflow remains explicitly
 blocked as `job_canceled`, rather than being mistaken for a missed finish or an
 ordinary CI wait. Owner-authorized **Resume automation** removes only pauses owned by this
 stopped job, atomically with a resume audit; it cannot clear a newer stop. It permits

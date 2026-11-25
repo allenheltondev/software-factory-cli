@@ -82,7 +82,7 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
     };
   }, [refresh, valid]);
 
-  const running = tab !== 'repositories' && load.state === 'ok' ? load.overview.activity.running : 0;
+  const running = tab !== 'repositories' && load.state === 'ok' ? load.overview.activity.running + Number(load.jobs.some((job) => !!job.stop?.error)) : 0;
   useEffect(() => {
     if (!running) return;
     const timer = setInterval(() => void refresh(), refreshMs);

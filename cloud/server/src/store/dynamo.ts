@@ -1470,9 +1470,9 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         await client.send(new TransactWriteCommand({ TransactItems: [
           { Update: { TableName: T, Key: { pk: `JOB#${job.jobId}`, sk: 'META' },
             UpdateExpression: 'SET #stop = :stop, stopRequestedAt = if_not_exists(stopRequestedAt, :at)',
-            ConditionExpression: 'installationId = :installation AND #status <> :finished AND attribute_not_exists(#stop)',
-            ExpressionAttributeNames: { '#stop': 'stop', '#status': 'status' },
-            ExpressionAttributeValues: { ':stop': stop, ':at': stop.requestedAt, ':installation': job.installationId, ':finished': 'finished' } } },
+            ConditionExpression: 'installationId = :installation AND attribute_not_exists(releasedAt) AND attribute_not_exists(#stop)',
+            ExpressionAttributeNames: { '#stop': 'stop' },
+            ExpressionAttributeValues: { ':stop': stop, ':at': stop.requestedAt, ':installation': job.installationId } } },
           { Update: { TableName: T, Key: jobSummaryKey(job), UpdateExpression: 'SET #stop = :stop',
             ConditionExpression: 'attribute_exists(pk)', ExpressionAttributeNames: { '#stop': 'stop' }, ExpressionAttributeValues: { ':stop': stop } } },
           ...[...new Set(subjects)].map((subject) => ({ Put: { TableName: T,
