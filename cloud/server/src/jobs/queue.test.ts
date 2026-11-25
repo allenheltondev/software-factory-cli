@@ -591,6 +591,73 @@ describe('the admission queue', () => {
     });
   });
 
+  describe('re-review of #164', () => {
+    it('edits the acknowledgement to Started when the admission lands while its post is still in flight', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      let raced = false;
+      const slow: QueueNotifier = {
+        ...notify,
+        find: async (_e, marker) => comments.find((x) => x.body.includes(marker))?.id,
+        async post(e, body, marker) {
+          if (!raced) {
+            // The post is in flight: the slot frees, a woken dispatcher admits B, and its end
+            // finds no comment yet. Then GitHub answers for the "Queued" one.
+            raced = true;
+            await finish(a.jobId!);
+            await dispatcherFor(launch, { notify: slow }).dispatch();
+          }
+          return notify.post(e, body, marker);
+        },
+      };
+      const b = await createLauncher(deps({ queue: createAdmissionQueue({ store: queue, putEvent: async (k, v) => void (events[k] = v), notify: slow, now: () => clock, log: () => {} }) }))(request(2, 'delivery-b'));
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'admitted', commentId: 1, commentState: 'admitted' });
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain('**Status:** Started');
+    });
+
+    it('never moves a started job back to queued when its start is recorded before its wait', async () => {
+      const recorder = createWorkflowRecorder({ store: workflowStore, now: () => clock, log: () => {} });
+      const ref = { jobId: 'job_queued00000001', installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 2, eventName: 'issues', deliveryId: 'd-b' };
+      await recorder.started(ref);
+      await recorder.queued(ref, { reason: 'capacity_wait', message: 'Queued.' });
+      expect(await workflowStore.getWorkflow(55, '9-i2')).toMatchObject({ status: 'active', stage: 'implementing', lastJobId: ref.jobId });
+      expect((await workflowStore.listWorkflowEvents(55, '9-i2', 10)).map((e) => e.kind)).toEqual(['job_started']);
+    });
+
+    it('keeps a job parked for a Claude sign-in as the latest when work for the same workflow is queued', async () => {
+      const recorder = createWorkflowRecorder({ store: workflowStore, now: () => clock, log: () => {} });
+      const parked = { jobId: 'job_parked00000001', installationId: 55, repository: 'acme/web', repositoryId: 9, pullRequest: 40, eventName: 'pull_request_review', deliveryId: 'd-p' };
+      await recorder.waiting(parked, { reason: 'sign_in_required', message: 'Sign in.', nextAction: 'Sign in.' });
+      const q = { ...parked, jobId: 'job_queued00000002', eventName: 'check_suite', deliveryId: 'd-q' };
+      await recorder.queued(q, { reason: 'capacity_wait', message: 'Queued.' });
+      expect(await workflowStore.getWorkflow(55, '9-p40')).toMatchObject({ status: 'waiting', stage: 'awaiting-sign-in', lastJobId: parked.jobId, pendingJobId: q.jobId });
+      await recorder.queueEnded(q, { reason: 'queue_canceled', message: 'stale.' });
+      const w = (await workflowStore.getWorkflow(55, '9-p40'))!;
+      expect(w).toMatchObject({ status: 'waiting', stage: 'awaiting-sign-in', lastJobId: parked.jobId });
+      expect(w.pendingJobId).toBeUndefined();
+    });
+
+    it('backs a long wait for an offline subscription worker off to 15 minutes, spending no attempts', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      await finish(a.jobId!);
+      const offline = vi.fn(async () => ({ status: 200, disposition: 'not_dispatched', reason: 'native_worker_unavailable', message: 'offline' }));
+      const dispatcher = dispatcherFor(offline);
+      const gaps: number[] = [];
+      for (let i = 0; i < 8; i++) {
+        await dispatcher.dispatch();
+        const e = (await queue.get(55, b.jobId!))!;
+        expect(e).toMatchObject({ state: 'queued', attempts: 0 });
+        gaps.push(e.nextAttemptAt - clock);
+        clock = e.nextAttemptAt;
+      }
+      expect(gaps).toEqual([30_000, 60_000, 120_000, 240_000, 480_000, 900_000, 900_000, 900_000]);
+      expect(offline).toHaveBeenCalledTimes(8);
+    });
+  });
+
   describe('the acknowledgement follows the work (review of #164)', () => {
     it('keeps the comment id when another writer moved the entry on during the post, and edits it to Started', async () => {
       const launch = createLauncher(deps());

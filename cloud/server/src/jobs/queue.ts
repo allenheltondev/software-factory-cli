@@ -317,7 +317,7 @@ export function createAdmissionQueue(deps: {
  * person has something to do (refused, expired); a cancel for a removed label or a closed issue,
  * and an admission (its job posts its own assignment comment), stay quiet.
  */
-export async function syncComment(store: QueueStore, notify: QueueNotifier, e: QueueEntry, consoleOrigin: string | undefined, now: number, log: (entry: Record<string, unknown>) => void): Promise<QueueEntry> {
+export async function syncComment(store: QueueStore, notify: QueueNotifier, e: QueueEntry, consoleOrigin: string | undefined, now: number, log: (entry: Record<string, unknown>) => void, again = true): Promise<QueueEntry> {
   if (e.commentState === e.state) return e;
   const body = queueComment(e, consoleOrigin, now);
   const marker = queueCommentMarker(e.jobId);
@@ -336,7 +336,16 @@ export async function syncComment(store: QueueStore, notify: QueueNotifier, e: Q
       if (attempt > 0) cur = await store.get(e.installationId, e.jobId);
       if (!cur) break;
       const next: QueueEntry = { ...cur, ...(commentId !== undefined ? { commentId } : {}), ...(cur.state === e.state ? { commentState: e.state } : {}) };
-      if (await store.update(next, cur)) return { ...next, version: cur.version + 1 };
+      if (!(await store.update(next, cur))) continue;
+      const stored = { ...next, version: cur.version + 1 };
+      // The entry moved on while this comment was written (admitted, say, while the enqueue's
+      // post was in flight): the comment shows the older state, whatever the entry records it
+      // showed, so it is brought up to the entry's state now, once.
+      if (cur.state !== e.state && !(isWaiting(cur) && isWaiting(e)) && commentId !== undefined && again) {
+        const { commentState: _shown, ...unshown } = stored;
+        return syncComment(store, notify, unshown as QueueEntry, consoleOrigin, now, log, false);
+      }
+      return stored;
     }
     return e;
   } catch (err) {
@@ -501,9 +510,13 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
    * `wait`: it waited for something outside it (capacity, the kill switch, a worker, its own launch
    * claim), not a failed attempt: the lease's attempt is given back, so waiting never exhausts them.
    */
-  async function release(e: QueueEntry, delayMs: number, reason?: QueueWaitReason, wait = false): Promise<void> {
+  async function release(e: QueueEntry, delayMs: number, reason?: QueueWaitReason, wait = false, backingOff = false): Promise<void> {
     const { admittingUntil: _a, ...rest } = e;
-    const next: QueueEntry = { ...rest, state: 'queued', nextAttemptAt: now() + delayMs, ...(reason ? { reason } : {}), ...(wait ? { attempts: Math.max(0, e.attempts - 1) } : {}) };
+    // A wait that can last (an offline worker, the kill switch) backs off like a failure, without
+    // being one: 30 s, doubling to 15 min, so a stuck entry costs a few GitHub reads an hour.
+    const waits = backingOff ? (e.waits ?? 0) + 1 : 0;
+    const delay = backingOff ? backoff(waits) : delayMs;
+    const next: QueueEntry = { ...rest, state: 'queued', nextAttemptAt: now() + delay, waits, ...(reason ? { reason } : {}), ...(wait ? { attempts: Math.max(0, e.attempts - 1) } : {}) };
     if (!(await deps.queue.update(next, e))) return;
     await ackMissing({ ...next, version: e.version + 1 });
   }
@@ -665,7 +678,7 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
       case 'kill_switch':
       case 'jobs_off':
         // The platform paused jobs: the entry keeps its place, its expiry and its attempts.
-        await release(e, BACKOFF_BASE_MS, undefined, true);
+        await release(e, 0, undefined, true, true);
         return 'platform_full';
       case 'coalesce_unconfirmed':
         // Another job of the pull request is starting: wait for it, without spending an attempt.
@@ -688,7 +701,7 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
         }
         if (r.reason === 'native_worker_unavailable') {
           // A worker that is offline is a wait (it reconnects), not a failed attempt: expiry bounds it.
-          await release(e, BACKOFF_BASE_MS, undefined, true);
+          await release(e, 0, undefined, true, true);
           return 'hold';
         }
         if (r.reason === 'workflow_paused') {

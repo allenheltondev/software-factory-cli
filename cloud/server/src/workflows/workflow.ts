@@ -401,20 +401,27 @@ export function onJobQueued(
   job: { jobId: string; eventName: string; deliveryId?: string; pullRequest?: number },
   why: { reason: string; message: string },
   at: number,
-): { workflow: Workflow; event: WorkflowEvent } {
+): { workflow: Workflow; event: WorkflowEvent } | null {
+  // Known already: it started (its admission's start can be recorded before the enqueue's own
+  // record of the wait, now that the enqueue lets go of its delivery first), or it was recorded
+  // queued before. Nothing to add: a late "queued" must never move a started job back.
+  if ((w.jobRuns ?? []).some((r) => r.jobId === job.jobId) || w.lastJobId === job.jobId) return null;
   const again = isNewRun(w, job);
   const pastRun = again ? undefined : pastRunOf(w, job.pullRequest);
   const event = (generation: number, message: string): WorkflowEvent => ({ id: `${job.jobId}:queued`, at: iso(at), kind: 'waiting', generation, jobId: job.jobId, eventName: job.eventName, stage: 'queued', message });
   if (pastRun !== undefined) {
     return { workflow: { ...w, jobRuns: withJobRun(w, job.jobId, pastRun), updatedAt: iso(at) }, event: event(pastRun, `On pull request #${job.pullRequest} of run ${pastRun}: queued, history only.`) };
   }
-  // A job of this run is still running (CI finishing on its own pull request, a review while it
-  // revises): it stays the workflow's latest job, and its finish decides the workflow's state. The
+  // The run's latest job has not finished: it runs (CI finishing on its own pull request, a review
+  // while it revises), or it has not started yet itself (parked for a Claude sign-in, or queued).
+  // It stays the workflow's latest job, and what becomes of it decides the workflow's state. This
   // queued job is only pending; its start makes it the latest then.
-  if (w.status === 'active' && !again && w.lastJobId !== undefined && w.lastJobId !== job.jobId) {
+  const unfinished = w.status === 'active' || (w.status === 'waiting' && (w.stage === 'awaiting-sign-in' || w.stage === 'queued'));
+  if (unfinished && !again && w.lastJobId !== undefined) {
+    const why2 = w.status === 'active' ? 'which is still running' : w.stage === 'queued' ? 'which is queued too' : 'which waits for a Claude sign-in';
     return {
       workflow: { ...w, pendingJobId: job.jobId, jobRuns: withJobRun(w, job.jobId, w.generation), updatedAt: iso(at) },
-      event: event(w.generation, `${why.message} Pending behind job ${w.lastJobId}, which is still running.`),
+      event: event(w.generation, `${why.message} Pending behind job ${w.lastJobId}, ${why2}.`),
     };
   }
   const generation = again ? w.generation + 1 : w.generation;

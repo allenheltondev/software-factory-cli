@@ -60,6 +60,8 @@ export interface QueueEntry {
   expiresAt: number;
   /** Admission attempts made (a dispatcher took it); bounded, with backoff. */
   attempts: number;
+  /** Waits in a row for something outside it that backs off (an offline worker, the kill switch): 30 s doubling to 15 min. Never attempts. */
+  waits?: number;
   /** Not looked at again before this (backoff after a failed attempt). */
   nextAttemptAt: number;
   /** While `admitting`: the dispatcher's lease; past it, another may take the entry. */
