@@ -356,7 +356,7 @@ describe('JobPage (#71)', () => {
         const startedAt = new Date(Date.now() - 65_000).toISOString();
         showJob(fakeApi({ job: vi.fn().mockResolvedValue({ job: job({ status: 'launched', result: 'running', logs: [], durationSeconds: undefined, createdAt: startedAt }), deliveries: [] }), jobLog }));
         const facts = await screen.findByTestId('job-facts');
-        expect(facts).toHaveTextContent('Elapsed');
+        expect(facts).toHaveTextContent('Elapsed (live)');
         expect(facts).toHaveTextContent('Running… 1:05');
         await act(async () => {
           vi.advanceTimersByTime(3000);

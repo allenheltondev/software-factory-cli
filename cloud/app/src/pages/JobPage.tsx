@@ -233,7 +233,10 @@ function JobSummary({ job, installationId, api, onViewLogs }: { job: JobView; in
         {job.repository}
         {job.issue !== undefined ? `#${job.issue}` : job.pullRequest !== undefined ? `#${job.pullRequest}` : ''}
       </PageHeroTitle>
-      <PageHeroSubtitle data-testid="job-help">{r.help}</PageHeroSubtitle>
+      <PageHeroSubtitle data-testid="job-help">
+        <span className="sr-only">Status: {r.label}. </span>
+        {r.help}
+      </PageHeroSubtitle>
       <PageHeroChips>
         <PageHeroChip tone={r.tone} data-testid="job-result">
           {r.label}
@@ -245,7 +248,7 @@ function JobSummary({ job, installationId, api, onViewLogs }: { job: JobView; in
       </PageHeroChips>
 
       <dl className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(7.5rem,1fr))] gap-3" data-testid="job-facts">
-        <Metric label={running ? 'Elapsed' : 'Duration'}>{running ? `Running… ${elapsed !== null ? clock(elapsed * 1000) : ''}`.trim() : formatDuration(job.durationSeconds)}</Metric>
+        <Metric label={running ? 'Elapsed (live)' : 'Duration'}>{running ? `Running… ${elapsed !== null ? clock(elapsed * 1000) : ''}`.trim() : formatDuration(job.durationSeconds)}</Metric>
         <Metric label="Started">
           <span title={exact(job.createdAt)}>{relativeTime(job.createdAt)}</span>
         </Metric>
@@ -275,22 +278,22 @@ function JobSummary({ job, installationId, api, onViewLogs }: { job: JobView; in
 
       <div className="mt-5 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm" data-testid="job-actions">
         {hasLogs && (
-          <a className="auth-link font-semibold" href="#job-logs" onClick={onViewLogs}>
+          <a className="auth-link inline-flex min-h-11 items-center font-semibold" href="#job-logs" onClick={onViewLogs}>
             {job.logs.includes('run.log') ? 'View run log' : 'View logs'}
           </a>
         )}
         {job.issueUrl && (
-          <a className="auth-link font-semibold" href={job.issueUrl} target="_blank" rel="noreferrer">
+          <a className="auth-link inline-flex min-h-11 items-center font-semibold" href={job.issueUrl} target="_blank" rel="noreferrer">
             Issue ↗
           </a>
         )}
         {job.prUrl && (
-          <a className="auth-link font-semibold" href={job.prUrl} target="_blank" rel="noreferrer" data-testid="job-pr">
+          <a className="auth-link inline-flex min-h-11 items-center font-semibold" href={job.prUrl} target="_blank" rel="noreferrer" data-testid="job-pr">
             Pull request ↗
           </a>
         )}
         {conversationLink && (
-          <a className="auth-link font-semibold" href={conversationLink} target="_blank" rel="noreferrer" data-testid="job-hero-conversation">
+          <a className="auth-link inline-flex min-h-11 items-center font-semibold" href={conversationLink} target="_blank" rel="noreferrer" data-testid="job-hero-conversation">
             {conversationLabel} ↗
           </a>
         )}
