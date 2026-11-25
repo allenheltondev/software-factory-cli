@@ -62,9 +62,40 @@ export interface Workflow {
     /** What the workflow said before the pause, restored on resume. */
     previous: Pick<Workflow, 'status' | 'reason' | 'message' | 'nextAction' | 'nextCheckAt'>;
   };
+  /**
+   * Automatic recovery (workflows/recovery.ts): the latest action the reconciler took for this
+   * run, and how many it took. Its key is the action's idempotency key: an action is claimed with
+   * a versioned save before anything is launched, and never claimed again for the same key once
+   * its attempts are spent, so a duplicate or stale look can never start a second job for it.
+   */
+  recovery?: WorkflowRecovery;
 }
 
-export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered';
+export type RecoveryKind = 'missed_check_event' | 'lost_job';
+
+export interface WorkflowRecovery {
+  /** The run (generation) these counts belong to: a new run starts with none. */
+  generation: number;
+  /** Distinct actions started for this run, at most MAX_RECOVERIES_PER_RUN. */
+  used: number;
+  kind: RecoveryKind;
+  /** `ci:<generation>:<head sha>` or `lost:<job id>`. */
+  key: string;
+  /** When the action was first claimed, and when it was last tried (ISO). */
+  since: string;
+  at: string;
+  /** Tries of this action (a transient refusal is tried again, at most MAX_RECOVERY_ATTEMPTS). */
+  attempts: number;
+  /** missed_check_event: the job the synthesized event runs as; lost_job: the lost job retried. */
+  jobId: string;
+  deliveryId?: string;
+  headSha?: string;
+  /** What the last try came to (the launch's disposition or the retry's code), and the job it started. */
+  result?: string;
+  startedJobId?: string;
+}
+
+export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered' | 'recovery';
 
 /** One entry of a workflow's timeline. `id` is immutable and unique: recording an event twice changes nothing. */
 export interface WorkflowEvent {
@@ -115,6 +146,9 @@ const pastRunOf = (w: Workflow, pr: number | undefined): number | undefined =>
 
 const withJobRun = (w: Workflow, jobId: string, generation: number): Workflow['jobRuns'] =>
   [...(w.jobRuns ?? []).filter((r) => r.jobId !== jobId), { jobId, generation }].slice(-MAX_JOB_RUNS);
+
+/** A job lost with its worker is looked at this soon after: automatic recovery (workflows/recovery.ts) decides whether it may be retried. */
+export const LOST_JOB_LOOK_MS = 5 * 60 * 1000;
 
 /** A job that waits for a Claude sign-in is blocked once it has waited this long. */
 export const SIGN_IN_LIMIT_MS = 24 * 60 * 60 * 1000;
@@ -319,7 +353,8 @@ function settle(w: Workflow, outcome: string, stage: LoopStage | undefined, at: 
   if (outcome === 'canceled') return blocked('failed', 'job_canceled', 'The job was canceled; its existing PR and commits are preserved.', 'Resume automation from the stopped job, or explicitly retry it where supported.');
   if (isFailure(outcome) && outcome !== 'superseded') {
     if (outcome === 'microvm_gone') {
-      return blocked('failed', 'job_lost', 'The job stopped without reporting how it ended: its microVM is gone.', 'Retry the job from its page.');
+      // Looked at again soon: where it is safe, recovery retries it once; otherwise it stays blocked.
+      return { ...blocked('failed', 'job_lost', 'The job stopped without reporting how it ended: its microVM is gone.', 'Retry the job from its page.'), nextCheckAt: iso(at + LOST_JOB_LOOK_MS) };
     }
     return blocked('failed', 'job_failed', `The last job ended ${outcome}.`, 'Open the job to see why, then retry it from its page.');
   }

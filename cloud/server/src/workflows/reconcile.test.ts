@@ -5,7 +5,7 @@ import type { Job, JobSummary } from '../store/store.js';
 import { createWorkflowRecorder, updateWorkflow } from './recorder.js';
 import { createWorkflowReconciler } from './reconcile.js';
 import { createMemoryWorkflowStore } from './store.js';
-import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
+import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, LOST_JOB_LOOK_MS, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
 
 const T0 = Date.parse('2026-11-25T12:00:00.000Z');
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
@@ -219,6 +219,18 @@ describe('workflow reconciliation', () => {
       gone.tick(FINISH_GRACE_MS);
       expect(await gone.reconcile()).toMatchObject({ blocked: 1 });
       expect(await gone.wf()).toMatchObject({ status: 'blocked', reason: 'job_lost' });
+    });
+
+    it('without recovery, leaves a job lost with its worker blocked, and stops looking at it', async () => {
+      const s = setup();
+      await s.recorder.started(job());
+      await s.recorder.finished(job(), 'microvm_gone');
+      expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'job_lost', nextCheckAt: new Date(T0 + LOST_JOB_LOOK_MS).toISOString() });
+      s.tick(LOST_JOB_LOOK_MS);
+      expect(await s.reconcile()).toMatchObject({ checked: 1, blocked: 0, recovered: 0 });
+      expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'job_lost' });
+      expect((await s.wf())!.nextCheckAt).toBeUndefined();
+      expect(s.github.pullRequestHead).not.toHaveBeenCalled();
     });
 
     it('waits a day for a Claude sign-in, then blocks with what to do', async () => {

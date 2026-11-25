@@ -170,6 +170,8 @@ function eventTitle(e: WorkflowEvent): string {
       return 'Label event missed';
     case 'finish_recovered':
       return `Job finished (recovered)${e.outcome ? `: ${e.outcome.replace(/_/g, ' ')}` : ''}`;
+    case 'recovery':
+      return 'Automatic recovery';
     default:
       // A kind this console does not know (recorded by a newer or older server): shown as it is.
       return String((e as { kind: string }).kind).replace(/_/g, ' ');
@@ -179,7 +181,7 @@ function eventTitle(e: WorkflowEvent): string {
 const eventTone = (e: WorkflowEvent): Tone =>
   e.kind === 'blocked' || e.kind === 'label_missed'
     ? 'error'
-    : e.kind === 'waiting'
+    : e.kind === 'waiting' || e.kind === 'recovery'
       ? 'warning'
       : e.kind === 'finished'
         ? 'success'
