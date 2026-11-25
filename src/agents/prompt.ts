@@ -58,8 +58,10 @@ export function renderPrompt(actionPrompt: string, issue: IssueContext, sections
  * The prompt of a revision run: the action's revise prompt, the review that requested changes
  * (its body and inline comments, as snapshotted when it was ingested), then the original issue.
  * Only text the review trigger let through is in `revision`; everything from GitHub is fenced.
+ * `sections` (the worker's own text, each ending with a separator) go right before the issue: the
+ * acceptance criteria (acceptance-prompt.ts).
  */
-export function renderRevisionPrompt(revisePrompt: string, issue: IssueContext, revision: RevisionRequest): string {
+export function renderRevisionPrompt(revisePrompt: string, issue: IssueContext, revision: RevisionRequest, sections: readonly string[] = []): string {
   const { review, pullRequest } = revision;
   const comments = review.comments.flatMap((c, i) => [
     `## Inline comment ${i + 1} of ${review.comments.length}`,
@@ -150,6 +152,7 @@ export function renderRevisionPrompt(revisePrompt: string, issue: IssueContext, 
     '---',
     '',
     ...findingSections,
+    ...sections,
     ...issueSection(issue),
   ].join('\n');
 }

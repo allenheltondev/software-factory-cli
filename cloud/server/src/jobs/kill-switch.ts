@@ -9,7 +9,14 @@
  */
 export interface KillSwitch {
   engaged(): Promise<boolean>;
+  /**
+   * What was read, for diagnostics only (tenants/readiness-service.ts): `unreadable` is a switch
+   * that could not be read, which engaged() treats as on. Dispatch decides by engaged() alone.
+   */
+  state?(): Promise<KillSwitchState>;
 }
+
+export type KillSwitchState = 'on' | 'off' | 'unreadable';
 
 export const OFF_SWITCH: KillSwitch = { engaged: async () => false };
 
@@ -34,19 +41,23 @@ export function createKillSwitch({
   ttlMs?: number;
   log?: (entry: Record<string, unknown>) => void;
 }): KillSwitch {
-  let cached: { value: boolean; at: number } | undefined;
+  let cached: { state: KillSwitchState; at: number } | undefined;
+  async function state(): Promise<KillSwitchState> {
+    if (cached && now() - cached.at < ttlMs) return cached.state;
+    let value: KillSwitchState;
+    try {
+      value = isEngagedValue(await read()) ? 'on' : 'off';
+    } catch (err) {
+      log({ warning: 'the kill switch could not be read; treating it as on', message: (err as Error)?.message });
+      value = 'unreadable';
+    }
+    cached = { state: value, at: now() };
+    return value;
+  }
   return {
     async engaged() {
-      if (cached && now() - cached.at < ttlMs) return cached.value;
-      let value: boolean;
-      try {
-        value = isEngagedValue(await read());
-      } catch (err) {
-        log({ warning: 'the kill switch could not be read; treating it as on', message: (err as Error)?.message });
-        value = true;
-      }
-      cached = { value, at: now() };
-      return value;
+      return (await state()) !== 'off';
     },
+    state,
   };
 }

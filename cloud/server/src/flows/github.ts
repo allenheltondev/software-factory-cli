@@ -313,7 +313,7 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
   const installationTokens = new Map<number, { token: string; expiresAt: number }>();
 
   /** The repositories the installation reaches now, as GitHub reports them to the App. */
-  async function installationRepositories(s: AppSettings, installationId: number): Promise<GitHubRepository[]> {
+  async function installationRepositories(s: AppSettings, installationId: number): Promise<GitHubRepository[] & { truncated?: true }> {
     let cached = installationTokens.get(installationId);
     if (!cached || cached.expiresAt - now() < 5 * 60 * 1000) {
       cached = await github.createInstallationToken(appJwt(s.appId, s.privateKey, now()), installationId);
@@ -411,12 +411,14 @@ export function createGitHubFlows({ store, github, loadSettings, now = () => Dat
       await store.unlink(caller.sub);
     },
 
-    async repositories(caller: Caller, installationId: number): Promise<{ tenant: TenantSummary; repositories: GitHubRepository[] }> {
+    /** `truncated`: the installation reaches more repositories than were listed. */
+    async repositories(caller: Caller, installationId: number): Promise<{ tenant: TenantSummary; repositories: GitHubRepository[]; truncated?: true }> {
       const s = await settings();
       const { tenant, member } = await memberOf(caller, installationId);
       const summary = summarize(tenant, member);
       if (tenant.status !== 'active') return { tenant: summary, repositories: [] };
-      return { tenant: summary, repositories: await installationRepositories(s, installationId) };
+      const repositories = await installationRepositories(s, installationId);
+      return { tenant: summary, repositories, ...(repositories.truncated ? { truncated: true as const } : {}) };
     },
 
     /** A member's view of the tenant, or not_authorized (403): the check every tenant page makes, with no GitHub call. */
