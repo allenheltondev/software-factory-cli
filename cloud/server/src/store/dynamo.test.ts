@@ -42,6 +42,7 @@ function fakeTable() {
     if (expr === 'installationId = :installation AND attribute_not_exists(releasedAt) AND attribute_not_exists(#stop)') return item?.installationId === values[':installation'] && item?.releasedAt === undefined && item?.stop === undefined;
     if (expr === 'attribute_exists(#stop)') return item?.stop !== undefined;
     if (expr === 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)') return !item || (item.jobId === values[':job'] && item.at === values[':pat']);
+    if (expr === 'jobId = :job AND #at = :pat') return !!item && item.jobId === values[':job'] && item.at === values[':pat'];
     if (expr === 'attribute_exists(#stop.confirmedAt)') return (item?.stop as Item | undefined)?.confirmedAt !== undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job') return !item || item.jobId === values[':job'];
     if (expr === '#enabled = :enabled AND routingVersion = :routingVersion') {
@@ -870,6 +871,11 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.getWorkflowPause(55, 9, 40)).toEqual({ ...pause, subjects: [12, 40] });
     expect(await store.pauseWorkflowSubjects(55, 9, { ...pause, jobId: 'control-78', at: 2000 }, [40, 41])).toBe('held');
     expect(await store.getWorkflowPause(55, 9, 41)).toBeNull();
+    // A cancel takes the pause over, on every subject or none.
+    expect(await store.setPauseControl(55, 9, { jobId: 'control-other', at: 1000 }, [12, 40], { kind: 'cancel', source: '79' })).toBe(false);
+    expect((await store.getWorkflowPause(55, 9, 12))?.control?.kind).toBe('pause');
+    expect(await store.setPauseControl(55, 9, pause, [12, 40], { kind: 'cancel', source: '77', stopped: ['job_a'] })).toBe(true);
+    expect(await store.getWorkflowPause(55, 9, 40)).toMatchObject({ control: { kind: 'cancel', source: '77', stopped: ['job_a'] } });
     expect(await store.resumeWorkflowPause(55, 9, pause, [12, 40], 'github:olive', 3000)).toBe(true);
     expect(await store.getWorkflowPause(55, 9, 12)).toBeNull();
 

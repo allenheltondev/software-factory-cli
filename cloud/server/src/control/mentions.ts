@@ -1,4 +1,4 @@
-import { controlHelp, controlPolicy, controlReply, isAutomatedComment, parseControlComment, refusalMessage, type ControlCommand, type RepoPermission } from '../../../../src/control/commands.js';
+import { controlHelp, controlPolicy, controlReply, isAutomatedComment, isControlActor, parseControlComment, refusalMessage, type ControlCommand, type RepoPermission } from '../../../../src/control/commands.js';
 import type { QueueCancelResult } from '../jobs/queue.js';
 import type { QueueEntry } from '../jobs/queue-store.js';
 import type { RetryRequest, RetryResult } from '../jobs/retry.js';
@@ -33,13 +33,14 @@ export const CLOUD_UNSUPPORTED: readonly ControlCommand[] = ['review', 'steer', 
 
 export interface MentionGitHub {
   permission(installationId: number, repositoryId: number, repository: string, login: string): Promise<RepoPermission | null>;
-  pullRequest(installationId: number, repositoryId: number, repository: string, number: number): Promise<{ state: 'open' | 'closed'; merged: boolean; headRef: string; headSha: string }>;
+  /** `headRepoId`: the head branch's repository (a fork's differs; null when it was deleted). */
+  pullRequest(installationId: number, repositoryId: number, repository: string, number: number): Promise<{ state: 'open' | 'closed'; merged: boolean; headRef: string; headSha: string; headRepoId?: number | null }>;
   issueOpen(installationId: number, repositoryId: number, repository: string, number: number): Promise<boolean>;
   reply(installationId: number, repositoryId: number, repository: string, number: number, body: string): Promise<void>;
 }
 
 export interface MentionDeps {
-  store: Pick<Store, 'getTenant' | 'getConfigVersion' | 'getWorkflowPause' | 'pauseWorkflowSubjects' | 'claimControlCommand' | 'finishControlCommand' | 'listActiveJobs' | 'getJob' | 'resumeWorkflowPause'>;
+  store: Pick<Store, 'getTenant' | 'getConfigVersion' | 'getWorkflowPause' | 'pauseWorkflowSubjects' | 'setPauseControl' | 'claimControlCommand' | 'finishControlCommand' | 'listActiveJobs' | 'getJob' | 'resumeWorkflowPause'>;
   github: MentionGitHub;
   /** The App's slug: `@<slug>` is the handle. */
   slug: () => Promise<string | undefined>;
@@ -47,6 +48,8 @@ export interface MentionDeps {
   queue?: { waitingFor(installationId: number, repositoryId: number, subject: { issue?: number; pullRequest?: number }): Promise<QueueEntry | null>; cancel(installationId: number, jobId: string, by: string): Promise<QueueCancelResult> };
   retry?: (request: RetryRequest) => Promise<RetryResult>;
   issueOfPullRequest?: (installationId: number, repositoryId: number, pullRequest: number) => Promise<number | undefined>;
+  /** Whether Updraft manages this issue (it has a workflow, or a pause): read from the table, no GitHub call. */
+  managedIssue: (installationId: number, repositoryId: number, issue: number) => Promise<boolean>;
   consoleOrigin?: string;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
@@ -111,13 +114,29 @@ export function createMentionHandler(d: MentionDeps) {
     // Not a configured repository (by name and id): left alone, unanswered.
     if (!rules || rules.id !== repositoryId) return { disposition: 'filtered', reason: 'unknown_repo' };
 
-    // Whose workflow: a pull request on an Updraft branch (mapped to its issue when known), or an issue.
-    let issue: number | undefined = onPullRequest ? undefined : number;
+    // Someone the configuration does not let direct work here: nothing is written, GitHub is not
+    // asked, and no reply is posted (anyone can comment; no one can make the App answer them).
+    const actors = [...new Set([...(rules.actors ?? []), ...rules.triggers.flatMap((t) => t.actors ?? [])])];
+    if (!isControlActor(actors, login)) {
+      log({ control: 'actor_not_allowed', installationId: e.installationId, repositoryId, commentId });
+      return { disposition: 'filtered', reason: 'actor_not_allowed' };
+    }
+
+    // Whose workflow, from the table alone: an issue Updraft manages, or a pull request a recorded
+    // job of it opened (mapped to its issue). Anything else is left alone before any GitHub call.
+    let issue: number | undefined;
+    if (onPullRequest) {
+      issue = await d.issueOfPullRequest?.(e.installationId, repositoryId, number);
+      if (issue === undefined) return { disposition: 'filtered', reason: 'not_managed' };
+    } else {
+      if (!(await d.managedIssue(e.installationId, repositoryId, number))) return { disposition: 'filtered', reason: 'not_managed' };
+      issue = number;
+    }
     let pr: Awaited<ReturnType<MentionGitHub['pullRequest']>> | undefined;
     if (onPullRequest) {
       pr = await d.github.pullRequest(e.installationId, repositoryId, repository, number);
-      if (!pr.headRef.startsWith(UPDRAFT_BRANCH_PREFIX)) return { disposition: 'filtered', reason: 'not_updraft_pr' };
-      issue = await d.issueOfPullRequest?.(e.installationId, repositoryId, number);
+      // An Updraft branch of this repository: never a fork's branch that happens to share the name.
+      if (!pr.headRef.startsWith(UPDRAFT_BRANCH_PREFIX) || pr.headRepoId !== repositoryId) return { disposition: 'filtered', reason: 'not_updraft_pr' };
     }
     const subjects = [...new Set([issue, onPullRequest ? number : undefined].filter((n): n is number => n !== undefined))];
 
@@ -162,7 +181,6 @@ export function createMentionHandler(d: MentionDeps) {
           log({ control: 'permission_unavailable', commentId, name: (error as Error)?.name });
         }
       }
-      const actors = [...new Set([...(rules.actors ?? []), ...rules.triggers.flatMap((t) => t.actors ?? [])])];
       const decision = controlPolicy({ command, actor, body, ownLogins: [slug], allowedActors: actors, permission, elevated });
       if (!decision.allowed) return finish(decision.respond === 'ignore' ? 'ignored' : 'refused', refusalMessage(decision.reason, command), decision.respond === 'refuse');
       if (parsed.kind !== 'command' || command === 'help') {
@@ -225,20 +243,40 @@ export function createMentionHandler(d: MentionDeps) {
           return finish('applied', `Job ${target.jobId} is ${said}. Its commits and pull request are kept, and ${ref} stays paused until a maintainer resumes it.${link}`);
         }
         case 'cancel': {
-          const queued = await cancelQueued();
-          const stopped: string[] = [];
-          for (const job of d.stopJob ? await activeJobs() : []) {
-            const result = await d.stopJob!(e.installationId, job.jobId, by, (parsed.text || 'Canceled from GitHub').slice(0, 500));
-            if (result) stopped.push(`${job.jobId} (${result.state})`);
-          }
-          // With no stop to pause it (nothing was running), the cancel's own pause holds it.
-          let paused = await held();
-          if (!paused) {
+          // 1. Hold the workflow first, so nothing is admitted while the rest is ended: a new
+          // cancel pause, or the pause in place taken over (a `pause` becomes a cancel, so only a
+          // maintainer can lift it).
+          const reason = (parsed.text || 'Canceled from GitHub').slice(0, 500);
+          let pause = await held();
+          if (!pause) {
             await d.store.pauseWorkflowSubjects(e.installationId, repositoryId, controlPause('cancel'), subjects);
-            paused = await held();
+            pause = await held();
+          } else if (pause.control?.kind === 'pause') {
+            if (!(await d.store.setPauseControl(e.installationId, repositoryId, pause, [...new Set([...subjects, ...(pause.subjects ?? [])])], { ...pause.control, kind: 'cancel' }))) {
+              return finish('refused', `${ref} changed while it was being canceled; nothing was canceled. Look at it and comment again.${link}`);
+            }
           }
-          return finish(queued.length || stopped.length || paused ? 'applied' : 'noop',
-            `Canceled work on ${ref}:${queued.length ? ` queued ${queued.join(', ')} canceled;` : ''}${stopped.length ? ` stopping ${stopped.join(', ')};` : ''} commits and pull requests are kept. Nothing starts until a maintainer resumes it.${link}`);
+          if (!pause) return finish('refused', `${ref} could not be held; nothing was canceled. Comment again.${link}`);
+          // 2. Queued work of every subject (one waiting entry per issue or pull request).
+          const queued = await cancelQueued();
+          // 3. Active jobs. Each stop pauses its subjects as that job's stop; the cancel and every
+          // job it stopped are recorded on the pause in place, so resume runs all of them again.
+          const stopped: string[] = [];
+          const said: string[] = [];
+          for (const job of d.stopJob ? await activeJobs() : []) {
+            const result = await d.stopJob!(e.installationId, job.jobId, by, reason);
+            if (result) { stopped.push(job.jobId); said.push(`${job.jobId} (${result.state})`); }
+          }
+          if (stopped.length) {
+            const now = await held();
+            if (now) {
+              const prior = now.control?.stopped ?? (now.control ? [] : [now.jobId]);
+              await d.store.setPauseControl(e.installationId, repositoryId, now, now.subjects ?? subjects,
+                { kind: 'cancel', source: now.control?.source ?? String(commentId), stopped: [...prior.filter((j) => !stopped.includes(j)), ...stopped] });
+            }
+          }
+          return finish('applied',
+            `Canceled work on ${ref}:${queued.length ? ` queued ${queued.join(', ')} canceled;` : ''}${said.length ? ` stopping ${said.join(', ')};` : ''} commits and pull requests are kept. Nothing starts until a maintainer resumes it.${link}`);
         }
         case 'resume': {
           if (state !== 'open') return finish('refused', `${ref} is ${state}, so there is nothing to resume. Reopen it and apply the trigger label to start new work.${link}`);
@@ -246,11 +284,18 @@ export function createMentionHandler(d: MentionDeps) {
           const outcome = await resumeWorkflowPause(d.store, { installationId: e.installationId, repositoryId, subject: subjects.find((s) => (current.subjects ?? []).includes(s)) ?? subjects[0]!, expected: current, by, at: now() });
           if (outcome === 'stop_pending') return finish('refused', `The stopped job ${current.jobId} is still stopping. Resume once it is confirmed stopped.${link}`);
           if (outcome !== 'resumed') return finish('refused', `${ref} was paused again in the meantime; nothing was resumed.${link}`);
-          // A stopped job: run it again from its own event, through the console's retry (once per job).
-          if (!current.control && d.retry) {
-            const retried = await d.retry({ updraftRetry: { installationId: e.installationId, jobId: current.jobId, by } });
-            if (retried.ok) return finish('applied', `Resumed ${ref}: job ${retried.jobId} runs the stopped job ${current.jobId} again from its own event, against the current head; publication never opens a second pull request.${link}`);
-            return finish('applied', `Resumed ${ref}: automation continues with the next event. The stopped job ${current.jobId} was not run again: ${retried.message}${link}`);
+          // Stopped jobs (a stop's, or every job a cancel stopped): each runs again from its own
+          // event, through the console's retry (once per job, every current check).
+          const toRetry = current.control ? (current.control.stopped ?? []) : [current.jobId];
+          if (toRetry.length && d.retry) {
+            const again: string[] = [];
+            const not: string[] = [];
+            for (const jobId of toRetry) {
+              const retried = await d.retry({ updraftRetry: { installationId: e.installationId, jobId, by } });
+              if (retried.ok) again.push(`job ${retried.jobId} runs the stopped job ${jobId} again`);
+              else not.push(`${jobId}: ${retried.message}`);
+            }
+            return finish('applied', `Resumed ${ref}:${again.length ? ` ${again.join('; ')}, from its own event against the current head; publication never opens a second pull request.` : ' automation continues with the next event.'}${not.length ? ` Not run again: ${not.join('; ')}.` : ''}${link}`);
           }
           return finish('applied', `Resumed ${ref}: automation continues with the next event (a push, a review or the trigger label).${link}`);
         }

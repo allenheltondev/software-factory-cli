@@ -21,10 +21,12 @@ describe('GitHub mention commands (Cloud)', () => {
   let clock: number;
   let replies: Array<{ number: number; body: string }>;
   let permissions: Record<string, RepoPermission | null>;
-  let pr: { state: 'open' | 'closed'; merged: boolean; headRef: string; headSha: string };
+  let pr: { state: 'open' | 'closed'; merged: boolean; headRef: string; headSha: string; headRepoId: number | null };
+  let githubCalls: string[];
+  let managed: Set<number>;
   let issueOpen: boolean;
   let retry: ReturnType<typeof vi.fn>;
-  let queueCancel: ReturnType<typeof vi.fn>;
+  let queueCancel: Mock<(installationId: number, jobId: string, by: string) => Promise<{ ok: boolean; state: string }>>;
   let terminate: Mock<(id: string) => Promise<void>>;
   let vmState: string | null;
   let handle: ReturnType<typeof createMentionHandler>;
@@ -40,10 +42,12 @@ describe('GitHub mention commands (Cloud)', () => {
     await store.activateConfig(INSTALLATION, version as number);
     replies = [];
     permissions = { pat: 'write', olive: 'admin', mallory: 'admin' };
-    pr = { state: 'open', merged: false, headRef: 'updraft/issue-12-job_x', headSha: 'a'.repeat(40) };
+    pr = { state: 'open', merged: false, headRef: 'updraft/issue-12-job_x', headSha: 'a'.repeat(40), headRepoId: REPO.id };
+    githubCalls = [];
+    managed = new Set([ISSUE]);
     issueOpen = true;
     retry = vi.fn(async () => ({ ok: true, jobId: 'job_retried000001' }));
-    queueCancel = vi.fn(async () => ({ ok: true, state: 'canceled' }));
+    queueCancel = vi.fn(async (_i: number, _j: string, _b: string) => ({ ok: true, state: 'canceled' }));
     terminate = vi.fn(async (_id: string) => undefined);
     vmState = 'RUNNING';
     commentSeq = 0;
@@ -53,18 +57,20 @@ describe('GitHub mention commands (Cloud)', () => {
       slug: async () => 'updraft-app',
       github: {
         permission: async (_i, _r, _n, login) => {
+          githubCalls.push(`permission ${login}`);
           const p = permissions[login];
           if (p === undefined) throw new Error('unavailable');
           return p;
         },
-        pullRequest: async () => pr,
-        issueOpen: async () => issueOpen,
-        reply: async (_i, _r, _n, number, body) => { replies.push({ number, body }); },
+        pullRequest: async () => { githubCalls.push('pullRequest'); return pr; },
+        issueOpen: async () => { githubCalls.push('issueOpen'); return issueOpen; },
+        reply: async (_i, _r, _n, number, body) => { githubCalls.push('reply'); replies.push({ number, body }); },
       },
       stopJob: (i, jobId, by, reason) => stopper.request(i, jobId, by, reason),
       queue: { waitingFor: async (_i, _r, s) => (s.issue === ISSUE ? ({ jobId: 'job_queued00000001' } as never) : null), cancel: queueCancel as never },
       retry: retry as never,
       issueOfPullRequest: async (_i, _r, n) => (n === PR ? ISSUE : undefined),
+      managedIssue: async (_i, _r, n) => managed.has(n),
       consoleOrigin: 'https://updraft.example',
       now: () => clock,
       log: () => {},
@@ -110,16 +116,73 @@ describe('GitHub mention commands (Cloud)', () => {
     expect(replies).toEqual([]);
   });
 
-  it('refuses an unauthorized actor politely, once, with no state and no private detail', async () => {
-    const event = comment('mallory', '@updraft-app pause');
-    expect(await handle(event)).toMatchObject({ disposition: 'handled', reason: 'control_refused' });
-    expect(replies).toHaveLength(1);
-    expect(replies[0]!.body).toContain('not allowed to direct Updraft');
-    expect(replies[0]!.body).not.toMatch(/job_|#12|workflow/i);
+  it('ignores an actor who is not allowed: no GitHub call, no write, no reply', async () => {
+    // On an issue Updraft does not manage, and on one it does.
+    managed = new Set();
+    const unmanaged = comment('mallory', '@updraft-app pause', { id: 501 });
+    unmanaged.payload.issue = { number: 99 };
+    expect(await handle(unmanaged)).toMatchObject({ disposition: 'filtered', reason: 'actor_not_allowed' });
+    managed = new Set([ISSUE]);
+    const event = comment('mallory', '@updraft-app cancel', { id: 502 });
+    expect(await handle(event)).toMatchObject({ disposition: 'filtered', reason: 'actor_not_allowed' });
+    expect(await handle(comment('mallory', '@updraft-app stop', { onPr: true, id: 503 }))).toMatchObject({ reason: 'actor_not_allowed' });
+    expect(githubCalls).toEqual([]);
+    expect(replies).toEqual([]);
+    for (const id of [501, 502, 503]) expect(await store.getControlCommand(INSTALLATION, REPO.id, id)).toBeNull();
     expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toBeNull();
-    // Redelivered: nothing more.
-    expect(await handle(event)).toMatchObject({ disposition: 'deduped' });
-    expect(replies).toHaveLength(1);
+  });
+
+  it('leaves an unmanaged issue or pull request alone before any GitHub call, even for an allowed actor', async () => {
+    const other = comment('pat', '@updraft-app pause', { id: 504 });
+    other.payload.issue = { number: 99 };
+    expect(await handle(other)).toMatchObject({ disposition: 'filtered', reason: 'not_managed' });
+    const otherPr = comment('pat', '@updraft-app pause', { id: 505, onPr: true });
+    otherPr.payload.issue = { number: 77, pull_request: { url: 'x' } };
+    expect(await handle(otherPr)).toMatchObject({ disposition: 'filtered', reason: 'not_managed' });
+    expect(githubCalls).toEqual([]);
+    expect(await store.getControlCommand(INSTALLATION, REPO.id, 504)).toBeNull();
+  });
+
+  it('ignores a fork’s pull request whose branch merely looks like Updraft’s', async () => {
+    pr = { ...pr, headRepoId: 12345 };
+    expect(await handle(comment('olive', '@updraft-app pause', { onPr: true }))).toMatchObject({ disposition: 'filtered', reason: 'not_updraft_pr' });
+    pr = { ...pr, headRepoId: null };
+    expect(await handle(comment('olive', '@updraft-app pause', { onPr: true }))).toMatchObject({ reason: 'not_updraft_pr' });
+    expect(replies).toEqual([]);
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toBeNull();
+  });
+
+  it('a write-only actor cannot undo a maintainer’s cancel that took over their pause', async () => {
+    expect(await handle(comment('pat', '@updraft-app pause'))).toMatchObject({ reason: 'control_applied' });
+    expect(await handle(comment('olive', '@updraft-app cancel'))).toMatchObject({ reason: 'control_applied' });
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toMatchObject({ control: { kind: 'cancel' } });
+    expect(await handle(comment('pat', '@updraft-app resume'))).toMatchObject({ reason: 'control_refused' });
+    expect(replies.at(-1)!.body).toContain('needs maintain or admin');
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).not.toBeNull();
+    expect(await handle(comment('olive', '@updraft-app resume'))).toMatchObject({ reason: 'control_applied' });
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toBeNull();
+  });
+
+  it('cancel holds first, then ends queued and every active job; resume runs each stopped job again', async () => {
+    await runningJob('job_running000001');
+    await runningJob('job_running000002', { pullRequest: PR, issue: undefined, workflowIssue: ISSUE });
+    const order: string[] = [];
+    queueCancel.mockImplementation(() => store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE).then((p) => {
+      order.push(`queue:${p ? 'held' : 'open'}`);
+      return { ok: true, state: 'canceled' };
+    }));
+    expect(await handle(comment('olive', '@updraft-app cancel', { onPr: true }))).toMatchObject({ reason: 'control_applied' });
+    expect(order).toEqual(['queue:held']);
+    expect(terminate).toHaveBeenCalledTimes(2);
+    const pause = (await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE))!;
+    expect(pause.control).toMatchObject({ kind: 'cancel', stopped: ['job_running000001', 'job_running000002'] });
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, PR)).toMatchObject({ control: { kind: 'cancel' } });
+    vmState = 'TERMINATED';
+    await stopper.request(INSTALLATION, 'job_running000001', 'x', 'confirm');
+    await stopper.request(INSTALLATION, 'job_running000002', 'x', 'confirm');
+    expect(await handle(comment('pat', '@updraft-app resume'))).toMatchObject({ reason: 'control_refused' });
+    expect(await handle(comment('olive', '@updraft-app resume'))).toMatchObject({ reason: 'control_applied' });
+    expect(retry.mock.calls.map((c) => (c[0] as { updraftRetry: { jobId: string } }).updraftRetry.jobId)).toEqual(['job_running000001', 'job_running000002']);
   });
 
   it('pauses without cutting off a job already running, and names it', async () => {

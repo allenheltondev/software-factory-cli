@@ -173,8 +173,10 @@ function pauseItem(i: Record<string, unknown>): WorkflowPause {
   if (n(i.issue) !== undefined) out.issue = n(i.issue)!;
   if (n(i.pullRequest) !== undefined) out.pullRequest = n(i.pullRequest)!;
   if (typeof i.jobCreatedAt === 'string') out.jobCreatedAt = i.jobCreatedAt;
-  const c = i.control as { kind?: unknown; source?: unknown } | undefined;
-  if (c && (c.kind === 'pause' || c.kind === 'cancel') && typeof c.source === 'string') out.control = { kind: c.kind, source: c.source };
+  const c = i.control as { kind?: unknown; source?: unknown; stopped?: unknown } | undefined;
+  if (c && (c.kind === 'pause' || c.kind === 'cancel') && typeof c.source === 'string') {
+    out.control = { kind: c.kind, source: c.source, ...(Array.isArray(c.stopped) ? { stopped: c.stopped.filter((j): j is string => typeof j === 'string') } : {}) };
+  }
   return out;
 }
 
@@ -1616,6 +1618,18 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         return 'paused';
       } catch (err) {
         if (err instanceof TransactionCanceledException && err.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return 'held';
+        throw err;
+      }
+    },
+    async setPauseControl(id, repo, pause, subjects, control) {
+      try {
+        await client.send(new TransactWriteCommand({ TransactItems: [...new Set(subjects)].map((n) => ({ Update: { TableName: T,
+          Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${n}` }, UpdateExpression: 'SET #control = :control',
+          ConditionExpression: 'jobId = :job AND #at = :pat', ExpressionAttributeNames: { '#control': 'control', '#at': 'at' },
+          ExpressionAttributeValues: { ':control': control, ':job': pause.jobId, ':pat': pause.at } } })) }));
+        return true;
+      } catch (err) {
+        if (err instanceof TransactionCanceledException && err.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return false;
         throw err;
       }
     },

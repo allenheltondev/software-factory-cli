@@ -464,7 +464,7 @@ export interface WorkflowPause {
    * new starts, but a job already started before it keeps being served to its end (its step
    * finishes). `cancel`: like a stop's pause, and resuming it needs maintain.
    */
-  control?: { kind: 'pause' | 'cancel'; source: string };
+  control?: { kind: 'pause' | 'cancel'; source: string; stopped?: string[] };
 }
 
 /** What a stop's pause records of its job, so it can be shown and resumed without the job's records. */
@@ -758,6 +758,12 @@ export interface Store {
    * before (a redelivery, a replay). Kept 90 days.
    */
   claimControlCommand(record: ControlCommandRecord): Promise<boolean>;
+  /**
+   * Sets `control` on exactly this pause (job and time) on every one of these subjects, in one
+   * transaction: a GitHub `cancel` taking over a `pause` (resuming it then needs maintain), or the
+   * jobs a cancel stopped. False, and nothing changed, when any subject is held by another pause.
+   */
+  setPauseControl(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at'>, subjects: number[], control: NonNullable<WorkflowPause['control']>): Promise<boolean>;
   /** What came of a claimed command: its audit record's outcome. */
   finishControlCommand(record: Pick<ControlCommandRecord, 'installationId' | 'repositoryId' | 'commentId'>, outcome: ControlCommandRecord['outcome'], message: string): Promise<void>;
   getControlCommand(installationId: number, repositoryId: number, commentId: number): Promise<ControlCommandRecord | null>;
@@ -1156,6 +1162,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       if (all.some((n) => pauses.has(`${id}/${repo}/${n}`))) return 'held';
       for (const n of all) pauses.set(`${id}/${repo}/${n}`, { ...pause, subjects: all });
       return 'paused';
+    },
+    async setPauseControl(id, repo, pause, subjects, control) {
+      const keys = [...new Set(subjects)].map((n) => `${id}/${repo}/${n}`);
+      if (keys.some((k) => pauses.get(k)?.jobId !== pause.jobId || pauses.get(k)?.at !== pause.at)) return false;
+      for (const k of keys) pauses.set(k, { ...pauses.get(k)!, control: { ...control } });
+      return true;
     },
     async claimControlCommand(record) {
       const key = `${record.installationId}/${record.repositoryId}/${record.commentId}`;

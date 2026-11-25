@@ -320,6 +320,9 @@ const mentionHandler = createMentionHandler({
   ...(dispatcher ? { queue: { waitingFor: (id: number, repositoryId: number, subject: { issue?: number; pullRequest?: number }) => queueStore.waitingFor(id, repositoryId, subject), cancel: (id: number, jobId: string, by: string) => dispatcher.cancel(id, jobId, by) } } : {}),
   ...(retryJob ? { retry: retryJob } : {}),
   issueOfPullRequest: (installationId, repositoryId, pullRequest) => workflows.issueOfPullRequest(installationId, repositoryId, pullRequest),
+  // A workflow record (kept 90 days after its last change) or a pause (kept until resumed).
+  managedIssue: async (installationId, repositoryId, issue) =>
+    (await workflowStore.getWorkflow(installationId, `${repositoryId}-i${issue}`)) !== null || (await store.getWorkflowPause(installationId, repositoryId, issue)) !== null,
   ...(consoleOrigin ? { consoleOrigin } : {}),
 });
 

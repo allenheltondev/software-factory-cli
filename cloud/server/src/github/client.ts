@@ -56,6 +56,8 @@ export interface PullRequestHead {
   merged: boolean;
   headSha: string;
   headRef: string;
+  /** The head branch's repository id (a fork's differs); null when unknown or deleted. */
+  headRepoId?: number | null;
 }
 
 export interface LabeledIssue {
@@ -255,7 +257,9 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       const [owner = '', repo = ''] = repository.split('/');
       const out = await json<Json>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pullRequest}`, token), 'GET /repos/pulls');
       const head = (out.head ?? {}) as Json;
-      return { state: out.state === 'open' ? 'open' : 'closed', merged: out.merged === true, headSha: String(head.sha ?? ''), headRef: String(head.ref ?? '') };
+      const headRepo = head.repo as Json | null | undefined;
+      return { state: out.state === 'open' ? 'open' : 'closed', merged: out.merged === true, headSha: String(head.sha ?? ''), headRef: String(head.ref ?? ''),
+        headRepoId: typeof headRepo?.id === 'number' ? headRepo.id : null };
     },
 
     async commitChecks(token, repository, sha) {

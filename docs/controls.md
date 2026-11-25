@@ -53,14 +53,20 @@ time (`GET /repos/{owner}/{repo}/collaborators/{login}/permission`); if it canno
 refused. A refusal is one short reply that says nothing about the workflow's state. Destructive commands are
 only ever recognized from their own word.
 
+Someone who is **not** an allowed actor gets no reply at all, and costs nothing: the allowlist is checked first,
+before any GitHub request, and in Cloud before anything is written (only a log line). Anyone can comment on an
+issue; no one outside the allowlist can make the App post. Cloud also checks, from its own table, that the issue
+has a workflow (or a pause) or that the pull request was opened by a recorded job, before any GitHub request,
+and a pull request's head must be in the same repository (never a fork's look-alike `updraft/` branch).
+
 ## What each command does
 
 | Command | Effect |
 | --- | --- |
-| `pause` | Nothing new of the workflow starts: queued work is held, and later events are held too. A job already running finishes its current step (it may still publish it); the reply names it. |
+| `pause` | Nothing new of the workflow starts: queued work is held, and later events are held too. A job already running **continues to completion and may still publish**; the reply names it. Use `stop` to end it. |
 | `resume` | Lifts the pause it finds, exactly that one: a newer stop always wins. Then continues from where it stopped (below). On a closed issue or a merged or closed pull request, nothing is resumed: reopen and label it to start new work. |
 | `stop` | Emergency stop of the one active job of this issue and its pull requests, through the same stop primitive as the console's **Stop job** (docs: `cloud/server/src/jobs/STOPPING.md`). Pauses the workflow. With no active job, nothing happens; with several, it names them and stops none: name one. The reply says *stopping* until termination is confirmed. It never turns on the platform kill switch. |
-| `cancel` | Stops active work and ends queued work of the workflow, and pauses it. Commits, branches and pull requests are kept. |
+| `cancel` | Holds the workflow first (a new pause, or the `pause` in place taken over, so only a maintainer can lift it), then ends its queued work and stops every active job. Resume runs each stopped job again. Commits, branches and pull requests are kept. |
 | `review` | Reviews the pull request's current head again, without a dummy commit. Earlier reviews and threads stay. |
 | `steer` | Queues a coding run on the pull request with the text as a change request by the person who wrote it, under `maxRevisions` and the usual checks; the next review checks it too (it becomes an `S<n>` acceptance requirement, see [Acceptance criteria](acceptance.md)). A run already in progress does not see it. On an issue with no pull request yet, it is refused: comment on the pull request once it opens. |
 | `escalate` | Not available yet: routing policy (tiers, escalation, tier override labels) decides. |
