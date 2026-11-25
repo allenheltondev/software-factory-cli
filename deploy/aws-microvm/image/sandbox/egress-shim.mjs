@@ -100,8 +100,20 @@ export function relay(client, socketPath, record) {
   // never cut off by the dead upstream's close.
   let answered = false;
   let target;
+  let seenRequest = false;
+  let pendingRecord; // a refusal recorded before the client's request was read
   let afterTunnel = false; // the next upstream bytes are the first after a 200
-  client.once('data', (chunk) => { target = /^CONNECT (\S+) /.exec(chunk.toString('latin1', 0, 300))?.[1]; });
+  const flushPending = () => {
+    if (pendingRecord) record({ ...pendingRecord, target });
+    pendingRecord = undefined;
+  };
+  client.once('data', (chunk) => {
+    seenRequest = true;
+    target = /^CONNECT (\S+) /.exec(chunk.toString('latin1', 0, 300))?.[1];
+    flushPending();
+  });
+  // A proxy at its hard limit closes at once, possibly before the request was read here.
+  client.once('close', flushPending);
   client.on('error', () => upstream.destroy());
   let connected = false;
   upstream.once('connect', () => { connected = true; });
@@ -110,7 +122,9 @@ export function relay(client, socketPath, record) {
     headDone = true;
     answered = true;
     client.unpipe(upstream);
-    record({ reason, target });
+    client.resume(); // unpipe stops the flow; keep reading so the request (and its target) arrives
+    if (seenRequest) record({ reason, target });
+    else pendingRecord = { reason };
     const [code, text] = reason === 'proxy-busy' ? [503, 'Service Unavailable'] : [502, 'Bad Gateway'];
     const body = `Updraft egress ${reason}\n`;
     client.end(`HTTP/1.1 ${code} ${text}\r\nX-Updraft-Egress: reason=${reason}\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
@@ -159,9 +173,19 @@ export async function startRelay(socketPath, host = '127.0.0.1') {
     if (known) known.count += 1;
     else if (refusals.size < MAX_DIAGNOSTICS) refusals.set(key, { ...r, count: 1 });
   };
-  const server = net.createServer((client) => relay(client, socketPath, record));
+  const open = new Set();
+  const server = net.createServer((client) => {
+    open.add(client);
+    client.once('close', () => open.delete(client));
+    relay(client, socketPath, record);
+  });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, host, resolve); });
-  return { port: server.address().port, server, diagnostics: () => [...refusals.values()].map(diagnosticLine) };
+  /** Wait (at most `ms`) for relayed connections to finish, so their refusals are recorded. */
+  const drain = async (ms = 500) => {
+    const until = Date.now() + ms;
+    while (open.size > 0 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+  };
+  return { port: server.address().port, server, drain, diagnostics: () => [...refusals.values()].map(diagnosticLine) };
 }
 
 async function main(argv) {
@@ -189,6 +213,7 @@ async function main(argv) {
     child.once('exit', (exitCode, signal) => resolve(exitCode ?? 128 + (os.constants.signals[signal] ?? 0)));
   });
   if (relayState) {
+    await relayState.drain();
     for (const line of relayState.diagnostics()) process.stderr.write(`${line}\n`);
     relayState.server.close();
   }
