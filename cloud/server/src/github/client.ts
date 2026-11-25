@@ -47,6 +47,22 @@ export class GitHubError extends Error {
   }
 }
 
+export interface PullRequestHead {
+  state: 'open' | 'closed';
+  merged: boolean;
+  headSha: string;
+  headRef: string;
+}
+
+export interface CommitCheckCounts {
+  /** Check runs and statuses seen. */
+  total: number;
+  pending: number;
+  failed: number;
+  passed: number;
+  complete: boolean;
+}
+
 export interface GitHubApi {
   /** Exchange an authorization code for a user-to-server token (POST /login/oauth/access_token). */
   exchangeCode(input: {
@@ -77,6 +93,14 @@ export interface GitHubApi {
   getBotUser(token: string, slug: string): Promise<GitHubUser>;
   listInstallationRepositories(installationToken: string): Promise<GitHubRepository[]>;
   issueState?(installationToken: string, repository: string, issue: number): Promise<{ open: boolean; labels: string[]; pullRequest?: true }>;
+  /** A pull request's state and head (GET /repos/{owner}/{repo}/pulls/{n}). For the workflow reconciler. */
+  pullRequestHead?(installationToken: string, repository: string, pullRequest: number): Promise<PullRequestHead>;
+  /**
+   * The checks of one commit, check runs and commit statuses together (newest per name or
+   * context), as counts. `complete` is false when a listing could not be read to its end: then
+   * nothing is known to be finished. For the workflow reconciler.
+   */
+  commitChecks?(installationToken: string, repository: string, sha: string): Promise<CommitCheckCounts>;
   /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
   createIssueComment(installationToken: string, repository: string, issue: number, body: string): Promise<void>;
 }
@@ -184,6 +208,47 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       const labels = Array.isArray(out.labels) ? out.labels.flatMap((label: unknown) =>
         label && typeof label === 'object' && 'name' in label && typeof label.name === 'string' ? [label.name] : []) : [];
       return { open: out.state === 'open', labels, ...(out.pull_request ? { pullRequest: true as const } : {}) };
+    },
+
+    async pullRequestHead(token, repository, pullRequest) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const out = await json<Json>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pullRequest}`, token), 'GET /repos/pulls');
+      const head = (out.head ?? {}) as Json;
+      return { state: out.state === 'open' ? 'open' : 'closed', merged: out.merged === true, headSha: String(head.sha ?? ''), headRef: String(head.ref ?? '') };
+    },
+
+    async commitChecks(token, repository, sha) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(sha)}`;
+      const counts = { total: 0, pending: 0, failed: 0, passed: 0, complete: true };
+      // Check runs: the newest per name (GitHub's default filter=latest).
+      let seenRuns = 0;
+      let totalRuns = 0;
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const out = await json<{ total_count?: number; check_runs?: Json[] }>(await call(`${base}/check-runs?per_page=100&page=${page}`, token), 'GET /repos/commits/check-runs');
+        totalRuns = Number(out.total_count ?? 0);
+        const runs = out.check_runs ?? [];
+        for (const r of runs) {
+          seenRuns++;
+          counts.total++;
+          if (r.status !== 'completed') counts.pending++;
+          else if (['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(r.conclusion))) counts.failed++;
+          else counts.passed++;
+        }
+        if (runs.length < 100) break;
+      }
+      if (seenRuns < totalRuns) counts.complete = false;
+      // Commit statuses: the combined view lists the newest per context.
+      const status = await json<{ statuses?: Json[]; total_count?: number }>(await call(`${base}/status?per_page=100`, token), 'GET /repos/commits/status');
+      const statuses = status.statuses ?? [];
+      for (const st of statuses) {
+        counts.total++;
+        if (st.state === 'pending') counts.pending++;
+        else if (st.state === 'success') counts.passed++;
+        else counts.failed++;
+      }
+      if (typeof status.total_count === 'number' && status.total_count > statuses.length) counts.complete = false;
+      return counts;
     },
 
     async createIssueComment(token, repository, issue, body) {

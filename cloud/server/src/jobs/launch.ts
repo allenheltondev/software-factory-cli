@@ -134,6 +134,8 @@ export interface LaunchDeps {
   bundleKeys?: BundleKeys;
   /** Posts the over-quota comment on the issue (once a day per issue). Its failure is only logged. */
   notifyThrottled?: (input: ThrottleNotice) => Promise<void>;
+  /** Records each launched job on its issue's workflow (workflows/recorder.ts). Best effort. */
+  workflows?: import('../workflows/recorder.js').WorkflowRecorder;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
   /** Retry pause for recording the microVM on the job. */
@@ -495,6 +497,7 @@ export function createLauncher(deps: LaunchDeps) {
       // never got this far.
       await deps.store.markLaunching(jobId);
       launching = true;
+      await deps.workflows?.started(job);
       if (native) return { status: 202, disposition: 'launched', jobId };
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) }));
       microvmId = out.microvmId;

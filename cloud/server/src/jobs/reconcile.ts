@@ -33,11 +33,14 @@ export function createReconciler({
   store,
   microvmState,
   native,
+  workflows,
   now = Date.now,
   log = (entry) => console.log(JSON.stringify(entry)),
 }: {
   store: Store;
   native?: { reconcile(job: import('../store/store.js').Job): Promise<boolean> };
+  /** Records a job whose microVM is gone without its finish on its workflow. Best effort. */
+  workflows?: import('../workflows/recorder.js').WorkflowRecorder;
   /** lambda:GetMicrovm: the state, or null when Lambda has no such microVM. */
   microvmState: (microvmId: string) => Promise<string | null>;
   now?: () => number;
@@ -87,7 +90,10 @@ export function createReconciler({
         if (gone) {
           // A microVM that ended without the job's finish (stopped, crashed, out of time): the job
           // is over for the console too. finishJob keeps a finish that won the race.
-          if (job.status !== 'finished') await store.finishJob(jobId, MICROVM_GONE_OUTCOME, { at: now() });
+          if (job.status !== 'finished') {
+            const recorded = await store.finishJob(jobId, MICROVM_GONE_OUTCOME, { at: now() });
+            if (recorded === MICROVM_GONE_OUTCOME || recorded === null) await workflows?.finished(job, MICROVM_GONE_OUTCOME);
+          }
           await store.releaseJob(job, unusedTime(job, now()));
           released.push(jobId);
           continue;

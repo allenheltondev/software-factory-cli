@@ -118,8 +118,12 @@ describe('quota reconciliation', () => {
     await admitted(store, 'job_gone00001', { microvmId: 'mvm-gone' });
     const finished = await admitted(store, 'job_finish001', { microvmId: 'mvm-done' });
     await store.finishJob(finished.jobId, 'succeeded', { at: Date.now() });
-    await createReconciler({ store, microvmState: async () => 'TERMINATED', log: () => {} })();
+    const finishes: { jobId: string; outcome: string }[] = [];
+    const workflows = { started: async () => {}, finished: async (job: { jobId: string }, outcome: string) => void finishes.push({ jobId: job.jobId, outcome }) };
+    await createReconciler({ store, microvmState: async () => 'TERMINATED', log: () => {}, workflows })();
     expect((await store.getJobSummary(55, 'job_gone00001'))).toMatchObject({ status: 'finished', outcome: MICROVM_GONE_OUTCOME, finishedAt: expect.any(String) });
     expect((await store.getJobSummary(55, 'job_finish001'))?.outcome).toBe('succeeded');
+    // Its workflow learns the job is lost; the one that finished on its own was recorded at its finish.
+    expect(finishes).toEqual([{ jobId: 'job_gone00001', outcome: MICROVM_GONE_OUTCOME }]);
   });
 });

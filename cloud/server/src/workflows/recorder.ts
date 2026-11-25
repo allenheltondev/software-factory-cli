@@ -1,0 +1,81 @@
+/**
+ * Records what happens to a job on its workflow (workflow.ts): where the launcher, the broker and
+ * the quota reconciler call in. Best effort for them: a failure here is logged and never fails a
+ * launch or a finish (the job's own record is what decides), and the next event of the workflow
+ * repairs its state, since each change is computed from the record as it then is.
+ */
+import type { Job, JobFinishDetail } from '../store/store.js';
+import type { WorkflowStore } from './store.js';
+import { newWorkflow, onJobFinished, onJobStarted, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
+
+type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'>;
+
+const ATTEMPTS = 4;
+
+/**
+ * Read, change and save a workflow, again if another writer saved it meanwhile. `change` gets
+ * the record as stored (or null) and returns the new one and its event, or null to do nothing.
+ */
+export async function updateWorkflow(
+  store: WorkflowStore,
+  installationId: number,
+  workflowId: string,
+  change: (w: Workflow | null) => { workflow: Workflow; event?: WorkflowEvent } | null,
+): Promise<Workflow | null> {
+  for (let i = 0; i < ATTEMPTS; i++) {
+    const previous = await store.getWorkflow(installationId, workflowId);
+    const out = change(previous);
+    if (!out) return previous;
+    const next = { ...out.workflow, version: (previous?.version ?? 0) + 1 };
+    // The event first: written once by id, so a save that loses the race and is redone writes it again harmlessly.
+    if (out.event) await store.addWorkflowEvent(installationId, workflowId, { ...out.event, seq: next.version });
+    if (await store.saveWorkflow(next, previous)) return next;
+  }
+  throw new Error(`workflow ${workflowId}: too many concurrent changes`);
+}
+
+/** The workflow a job belongs to: its issue's, or the one its pull request was mapped to, or the pull request's own. */
+export async function workflowOfJob(store: WorkflowStore, job: JobRef): Promise<string | null> {
+  if (job.issue !== undefined && job.pullRequest === undefined) return workflowIdFor(job.repositoryId, { issue: job.issue });
+  if (job.pullRequest !== undefined) {
+    const mapped = await store.workflowOfPullRequest(job.installationId, job.repositoryId, job.pullRequest);
+    if (mapped) return mapped;
+    return workflowIdFor(job.repositoryId, job.issue !== undefined ? { issue: job.issue } : { pullRequest: job.pullRequest });
+  }
+  return null;
+}
+
+export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => number; log?: (entry: Record<string, unknown>) => void }) {
+  const now = o.now ?? Date.now;
+  const log = o.log ?? ((entry) => console.log(JSON.stringify(entry)));
+  const safely = async (what: string, job: JobRef, fn: () => Promise<void>) => {
+    try {
+      await fn();
+    } catch (err) {
+      log({ jobId: job.jobId, warning: `could not record the workflow ${what}: ${(err as Error)?.name ?? 'error'}` });
+    }
+  };
+  return {
+    /** A job was launched (jobs/launch.ts). */
+    started: (job: JobRef) =>
+      safely('start', job, async () => {
+        const id = await workflowOfJob(o.store, job);
+        if (!id) return;
+        const at = now();
+        await o.store.linkJob(job.installationId, job.jobId, id);
+        await updateWorkflow(o.store, job.installationId, id, (w) => onJobStarted(w ?? newWorkflow(job, id, at), job, at));
+      }),
+    /** A job finished: its runner's finish (broker), or the reconciler found its microVM gone. */
+    finished: (job: JobRef, outcome: string, detail?: JobFinishDetail) =>
+      safely('finish', job, async () => {
+        const id = await workflowOfJob(o.store, job);
+        if (!id) return;
+        const at = now();
+        // The pull request the job opened belongs to its issue's workflow from now on.
+        if (detail?.prNumber !== undefined && job.issue !== undefined) await o.store.linkPullRequest(job.installationId, job.repositoryId, detail.prNumber, id);
+        await updateWorkflow(o.store, job.installationId, id, (w) => onJobFinished(w ?? newWorkflow(job, id, at), job, outcome, detail, at));
+      }),
+  };
+}
+
+export type WorkflowRecorder = ReturnType<typeof createWorkflowRecorder>;

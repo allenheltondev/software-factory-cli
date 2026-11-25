@@ -1,3 +1,6 @@
+import { createDynamoWorkflowStore } from './workflows/store.js';
+import { createWorkflowRecorder } from './workflows/recorder.js';
+import { createWorkflowReconciler, type ReconcileReport } from './workflows/reconcile.js';
 import { waitingId } from './native/sessions.js';
 import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -28,6 +31,8 @@ import { createBenchmarkDispatch } from './benchmarks/dispatch.js';
 
 const env = process.env;
 const store = createDynamoStore(env.TABLE_NAME ?? '');
+const workflowStore = createDynamoWorkflowStore(env.TABLE_NAME ?? '');
+const workflows = createWorkflowRecorder({ store: workflowStore });
 
 // GitHub waits 10 seconds for a webhook: one retry at most.
 const clientOptions = { maxAttempts: 2 };
@@ -79,6 +84,7 @@ function launcher(): Launcher | undefined {
   const partition = env.PARTITION ?? 'aws';
   return createLauncher({
     store,
+    workflows,
     ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
     native: nativeWorker.launch,
     resolveNative: nativeWorker.resolveNative,
@@ -270,7 +276,29 @@ async function resumeClaude(installationId: number) {
   }
 }
 
-export async function handler(event: APIGatewayProxyEvent | RetryRequest | { action: 'resumeClaude'; installationId: number }): Promise<APIGatewayProxyResult | RetryResult | void> {
+// Workflow reconciliation (workflows/reconcile.ts), on its own schedule: here, since a missed
+// check event is recovered by launching the job it would have started.
+const reconcileWorkflows = createWorkflowReconciler({
+  store: workflowStore,
+  github,
+  loadSettings,
+  ...(launch ? { launch } : {}),
+  appBot: async () => {
+    const settings = await loadSettings();
+    return settings?.slug ? `${settings.slug}[bot]` : undefined;
+  },
+  killSwitch,
+});
+
+export async function handler(
+  event: APIGatewayProxyEvent | RetryRequest | { action: 'resumeClaude'; installationId: number } | { action: 'reconcileWorkflows' },
+): Promise<APIGatewayProxyResult | RetryResult | ReconcileReport | void> {
+  if ('action' in event && event.action === 'reconcileWorkflows') {
+    const report = await reconcileWorkflows();
+    // The next run (five minutes on) retries what failed; fail this one so alarms see it.
+    if (report.failed > 0) throw new Error(`workflow reconciliation failed for ${report.failed} workflow(s)`);
+    return report;
+  }
   if ('action' in event) {
     if (event.action === 'resumeClaude' && Number.isSafeInteger(event.installationId) && event.installationId > 0) await resumeClaude(event.installationId);
     return;

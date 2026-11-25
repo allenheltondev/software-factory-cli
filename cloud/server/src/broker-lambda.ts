@@ -1,3 +1,5 @@
+import { createDynamoWorkflowStore } from './workflows/store.js';
+import { createWorkflowRecorder } from './workflows/recorder.js';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException, TerminateMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
@@ -34,6 +36,7 @@ const native = nativeWorker.control;
 const webhook = new LambdaClient({});
 const handle = createBroker({
   store,
+  workflows: createWorkflowRecorder({ store: createDynamoWorkflowStore(process.env.TABLE_NAME ?? '') }),
   native,
   loadSettings,
   github,
