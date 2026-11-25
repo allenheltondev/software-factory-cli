@@ -33,6 +33,14 @@ export interface ReadinessContext {
 
 export const PENDING_MICROVM = 'mvm-pending';
 
+/**
+ * The worker protocol this route's VM registered, or undefined when the worker row belongs to a
+ * different VM (a placeholder left by a retirement, or the previous session's worker): its version
+ * says nothing about this VM, which is still starting, not protocol-incompatible.
+ */
+export const routeWorkerVersion = (route: Pick<NativeRoute, 'microvmId'>, worker: Pick<Worker, 'microvmId' | 'workerVersion'> | null | undefined) =>
+  worker && worker.microvmId === route.microvmId ? worker.workerVersion : undefined;
+
 const suspended = (s?: string | null) => s === 'SUSPENDED' || s === 'SUSPENDING';
 const ended = (s?: string | null) => s === null || s === 'TERMINATED' || s === 'TERMINATING';
 
@@ -50,7 +58,7 @@ export function classifyReadiness(route: NativeRoute, worker: Worker | null, now
   const startingUntil = session?.phase === 'bound' ? session.startingUntil : ctx.startingUntil;
   if (ctx.imagePolicy) {
     if (ctx.imagePolicy.imageVersion !== route.imageVersion) return 'image-unapproved';
-    const decision = imageDecision(ctx.imagePolicy, worker?.workerVersion);
+    const decision = imageDecision(ctx.imagePolicy, routeWorkerVersion(route, worker));
     if (decision !== 'approved') return decision;
   } else if (latestImageVersion !== undefined && route.imageVersion !== latestImageVersion) return 'image-unapproved';
   if (!worker || worker.microvmId !== route.microvmId || worker.imageVersion !== route.imageVersion) {

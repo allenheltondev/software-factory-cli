@@ -243,6 +243,22 @@ describe('Claude subscription mode in the installation app', () => {
       expect(stop).toHaveBeenCalledExactlyOnceWith('mvm-native');
     });
 
+    it('reports no required update while a new VM starts behind another VM\'s placeholder row', async () => {
+      const policy = { imageVersion: '10.0', revision: 1, state: 'approved' as const, protocol: 'tenant-browser-1', reason: 'Latest verified image' };
+      const api = createNativeSettingsService({ github, mode, workers, now: () => now, managed: {
+        route: async (id) => ({ ...route, installationId: id, workerId: `managed-${id}`, microvmId: 'mvm-new', imageVersion: '10.0', generation: 'g2' }),
+        start: vi.fn(), stop, vmState: async () => 'RUNNING', imageVersion: '10.0', imagePolicy: async () => policy,
+        sessions: { get: vi.fn() }, grant: () => undefined,
+      } });
+      Object.assign(worker!, { microvmId: 'mvm-retired', imageVersion: '9.0', workerVersion: 'unregistered', auth: 'unavailable', heartbeatAt: 0 });
+      const view = await api.view(caller, 55);
+      expect(view).not.toHaveProperty('upgrade');
+      expect(view).not.toHaveProperty('updateAvailable');
+      // On this VM's own row the same version is a real incompatibility.
+      Object.assign(worker!, { microvmId: 'mvm-new', imageVersion: '10.0', heartbeatAt: now });
+      expect(await api.view(caller, 55)).toMatchObject({ upgrade: { optional: false, reason: 'Worker protocol is not supported by this deployment' } });
+    });
+
     it('refuses while the worker has not registered this VM yet', async () => {
       worker!.microvmId = 'mvm-other';
       owner();
