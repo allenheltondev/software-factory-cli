@@ -232,6 +232,8 @@ function stepLabel(st: NonNullable<WorkflowEvent['steps']>[number]): string {
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** A job record's id: only these have a job page (an id made up for a command or a recovery does not). */
+const JOB_ID = /^job_[A-Za-z0-9_-]{8,64}$/;
 /** How long ago an instant was (from `now`, or the clock). */
 const ageMs = (at: string, now?: number) => (now ?? Date.now()) - Date.parse(at);
 
@@ -263,7 +265,7 @@ export function WorkflowTimeline({ events, base, repository, jobRetentionDays, n
                       <StatusBadge tone={eventTone(e)}>{eventTitle(e)}</StatusBadge>
                       {e.id === latest && <StatusBadge tone="primary">Latest</StatusBadge>}
                       {e.stage && <span className="text-sm">{stageLabel(e.stage)}</span>}
-                      {e.jobId &&
+                      {e.jobId && JOB_ID.test(e.jobId) &&
                         (expired(e) ? (
                           <span className="text-sm text-muted-foreground" title={`Job records are kept ${jobRetentionDays} days`}>
                             Job record expired

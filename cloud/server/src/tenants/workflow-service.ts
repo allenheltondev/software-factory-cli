@@ -156,7 +156,7 @@ export function createWorkflowService({ store, jobs, pauses, github, now = Date.
         if (!p) throw notFound();
         const { repositoryId: _r, ...pause } = p;
         const gone = pausedWorkflow(installationId, p);
-        return { workflow: view({ ...gone, paused: true }), events: [], totals: totalsOf([], now()), history: { ...historyOf(gone, { shown: 0, omitted: 0, complete: false }, now()), expiredEarlier: true }, pause: { ...pause, canResume: role === 'owner' } };
+        return { workflow: view({ ...gone, paused: true }), events: [], totals: totalsOf([], now()), history: { ...historyOf(gone, { shown: 0, omitted: 0, complete: true }, now()), expiredEarlier: true }, pause: { ...pause, canResume: role === 'owner' } };
       }
       const [page, pause] = await Promise.all([store.listWorkflowHistory(installationId, workflowId, EVENT_LIMIT), pauseOn(installationId, w.repositoryId, [w.issue, w.pullRequest], role)]);
       // Totals are of the events shown: with older ones left out, the history says so.

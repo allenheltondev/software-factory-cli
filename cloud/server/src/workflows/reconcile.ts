@@ -32,7 +32,7 @@ import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import type { Store } from '../store/store.js';
 import { workflowPause } from '../jobs/stop.js';
 import { updateWorkflow } from './recorder.js';
-import { pausedWorkflow, resumedWorkflow } from './timeline.js';
+import { pauseControlOf, pausedWorkflow, resumedWorkflow } from './timeline.js';
 import { createRecovery, type RecoveryDeps } from './recovery.js';
 import type { WorkflowStore } from './store.js';
 import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
@@ -81,6 +81,11 @@ export interface ReconcileReport {
 }
 
 const short = (sha: string) => sha.slice(0, 12);
+/** A PAUSE record's command descriptor (PR #168), when it has a well-formed one. */
+const withControl = (raw: unknown) => {
+  const control = pauseControlOf(raw);
+  return control ? { control } : {};
+};
 const iso = (ms: number) => new Date(ms).toISOString();
 
 export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
@@ -126,7 +131,7 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     if (pause) {
       const repeated = w.controlPause?.jobId === pause.jobId && w.controlPause.at === pause.at;
       await change(w, (cur) => ({
-        workflow: pausedWorkflow(cur, pause, at),
+        workflow: pausedWorkflow(cur, { jobId: pause.jobId, at: pause.at, by: pause.by, ...withControl((pause as { control?: unknown }).control) }, at),
         ...(!repeated ? { event: { ...blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, 'An authorized stop paused automation on this workflow.'), reason: 'workflow_paused' } } : {}),
       }));
       if (!repeated) report.blocked++;

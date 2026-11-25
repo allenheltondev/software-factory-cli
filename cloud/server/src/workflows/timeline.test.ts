@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createWorkflowRecorder, updateWorkflow } from './recorder.js';
 import { createMemoryWorkflowStore } from './store.js';
-import { endedWait, historyOf, keepPaused, orderEvents, pausedWorkflow, resumedWorkflow, waitKindOf } from './timeline.js';
+import { endedWait, historyOf, keepPaused, orderEvents, pauseControlOf, pausedWorkflow, resumedWorkflow, waitKindOf } from './timeline.js';
 import { newWorkflow, type Workflow, type WorkflowEvent } from './workflow.js';
 
 const T0 = Date.parse('2026-11-25T12:00:00.000Z');
@@ -207,6 +207,62 @@ describe('stop and resume on the timeline', () => {
     const finished: Workflow = { ...w0, status: 'finished', stage: 'done' };
     expect(keepPaused(w0, finished, T0)).toBe(finished);
     expect(keepPaused(lost, finished, T0)).toMatchObject({ reason: 'workflow_paused', controlPause: { previous: { status: 'finished' } } });
+  });
+});
+
+describe('a wait a pause interrupts', () => {
+  it('is reported once up to the pause, and again only from the resume: paused time is never waiting', async () => {
+    const s = setup();
+    await s.recorder.started(job());
+    await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } });
+    const waitStart = s.tick(0);
+    s.tick(60_000);
+    await s.recorder.stopRequested(job({ jobId: 'job_stopped001' }), { requestedAt: s.tick(0), by: 'pat' });
+    const stopAt = s.tick(0);
+    expect((await s.events()).at(-1)).toMatchObject({ kind: 'control', waited: { for: 'ci', since: new Date(waitStart).toISOString(), seconds: 60 } });
+    expect((await s.wf())!.waitingSince).toBeUndefined();
+
+    s.tick(60 * 60_000);
+    await s.recorder.resumed({ installationId: 55, workflowId: '99-i7' }, { jobId: 'job_stopped001', at: stopAt }, 'pat');
+    const resumedAt = s.tick(0);
+    expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'waiting-for-ci', waitingSince: new Date(resumedAt).toISOString() });
+
+    s.tick(60_000);
+    await s.recorder.started(job({ jobId: 'job_pr000001', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: 'd-2' }));
+    const started = (await s.events()).at(-1)!;
+    expect(started).toMatchObject({ kind: 'job_started', waited: { for: 'ci', since: new Date(resumedAt).toISOString(), seconds: 60 } });
+    // Never the whole span, pause included.
+    expect((await s.events()).some((e) => e.waited?.for === 'ci' && e.waited.seconds > 120)).toBe(false);
+  });
+
+  it('keeps a workflow paused when a resume lifts one pause and another still holds it', async () => {
+    const store = createMemoryWorkflowStore();
+    let clock = T0;
+    const held = { jobId: 'job_review001', at: T0 + 10, by: 'sam' };
+    const pauses = { getWorkflowPause: async (_i: number, _r: number, n: number) => (n === 12 ? held : null) };
+    const recorder = createWorkflowRecorder({ store, pauses, now: () => clock, log: () => {} });
+    await recorder.started(job());
+    await recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } });
+    await recorder.stopRequested(job(), { requestedAt: T0, by: 'pat' });
+    clock += 60_000;
+    await recorder.resumed({ installationId: 55, workflowId: '99-i7' }, { jobId: 'job_issue0001', at: T0 }, 'pat');
+    const w = (await store.getWorkflow(55, '99-i7'))!;
+    expect(w).toMatchObject({ status: 'blocked', reason: 'workflow_paused', message: expect.stringContaining('sam'), controlPause: { jobId: 'job_review001', at: T0 + 10, by: 'sam', previous: { status: 'waiting', reason: 'ci_pending' } } });
+    expect((await store.listWorkflowEvents(55, '99-i7', 20)).at(-1)).toMatchObject({ kind: 'control', control: { action: 'resumed' }, message: expect.stringMatching(/stays paused/) });
+  });
+
+  it('words a command-made pause or cancel as what it was, and ignores a malformed descriptor', () => {
+    const w0 = newWorkflow(job(), '99-i7', T0);
+    const paused = pausedWorkflow(w0, { jobId: 'control-1', at: 1, by: 'pat', control: { kind: 'pause', source: 'github_comment' } }, T0);
+    expect(paused.message).toBe('Automation was paused by pat (github comment). Existing commits and the pull request are preserved.');
+    expect(paused.nextAction).not.toMatch(/retry job/);
+    expect(paused.controlPause).toMatchObject({ control: { kind: 'pause', source: 'github_comment' } });
+    expect(pausedWorkflow(w0, { jobId: 'control-1', at: 1, by: 'pat', control: { kind: 'cancel', source: 'github_comment', by: 'sam' } }, T0).message).toMatch(/^Automation was canceled by sam/);
+    // The finish of a job keeps the command's words.
+    expect(keepPaused(paused, { ...w0, status: 'finished', stage: 'done' }, T0).message).toMatch(/paused by pat \(github comment\)/);
+    expect(pauseControlOf({ kind: 'pause', source: 'GitHub Comment!' })).toBeUndefined();
+    expect(pauseControlOf({ kind: 'stop', source: 'x' })).toBeUndefined();
+    expect(pauseControlOf({ kind: 'cancel', source: 'console', by: 'sam' })).toEqual({ kind: 'cancel', source: 'console', by: 'sam' });
   });
 });
 

@@ -58,7 +58,7 @@ const managedWorker = managedClaude();
 const tableName = process.env.TABLE_NAME ?? '';
 const store = tableName ? createDynamoStore(tableName) : undefined;
 /** Records stops and resumes on their workflows (#139): one recorder for the stopper and the status service. */
-const workflowRecorder = tableName ? createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName) }) : undefined;
+const workflowRecorder = tableName && store ? createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName), pauses: store }) : undefined;
 const github = store ? createGitHubFlows({ store, github: createGitHubApi(), loadSettings: createSettingsLoader() }) : undefined;
 
 // Tenant config bundles (tenants/config-service.ts). The function's role reaches only

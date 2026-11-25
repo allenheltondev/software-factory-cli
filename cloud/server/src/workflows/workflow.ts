@@ -59,6 +59,8 @@ export interface Workflow {
   /** Presentation overlay; the authoritative admission fence is the durable PAUSE record. */
   controlPause?: {
     jobId: string; at: number; by: string;
+    /** What made the pause, when not a console stop (a command, say): for its wording only. */
+    control?: PauseControl;
     /** What the workflow said before the pause, restored on resume. */
     previous: Pick<Workflow, 'status' | 'reason' | 'message' | 'nextAction' | 'nextCheckAt'>;
   };
@@ -69,6 +71,14 @@ export interface Workflow {
    * its attempts are spent, so a duplicate or stale look can never start a second job for it.
    */
   recovery?: WorkflowRecovery;
+}
+
+/** What made a pause, as its PAUSE record says (a command's pause or cancel, from where). Wording only: the record is the fence. */
+export interface PauseControl {
+  kind: 'pause' | 'cancel';
+  /** Where it came from (a GitHub comment, the console, ...), as a short code. */
+  source: string;
+  by?: string;
 }
 
 export type RecoveryKind = 'missed_check_event' | 'lost_job';

@@ -13,7 +13,7 @@
  *               console, the reconciler or a later steering command records them
  *   retention   how long each record is kept, so the console can say what is gone and why
  */
-import { CI_RECHECK_MS, type Workflow, type WorkflowEvent, type WorkflowWait } from './workflow.js';
+import { CI_RECHECK_MS, type PauseControl, type Workflow, type WorkflowEvent, type WorkflowWait } from './workflow.js';
 
 /** Workflow records are kept this long after their last change; each event this long after it was recorded. */
 export const WORKFLOW_RETENTION_DAYS = 90;
@@ -90,6 +90,37 @@ export interface PauseRef {
   jobId: string;
   at: number;
   by: string;
+  /** A pause made other than by a console stop (a command): what it was, for its wording. */
+  control?: PauseControl;
+}
+
+const CODE = /^[a-z][a-z0-9_-]{0,39}$/;
+
+/** A PAUSE record's `control` descriptor, if it is a well-formed one (anything else is ignored). */
+export function pauseControlOf(raw: unknown): PauseControl | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const c = raw as Record<string, unknown>;
+  if ((c.kind !== 'pause' && c.kind !== 'cancel') || typeof c.source !== 'string' || !CODE.test(c.source)) return undefined;
+  return { kind: c.kind, source: c.source, ...(typeof c.by === 'string' && c.by ? { by: c.by.slice(0, 100) } : {}) };
+}
+
+/** The words of a pause: a console stop's, or a command's (pause or cancel, and from where). */
+function pauseWords(pause: PauseRef): { message: string; nextAction: string } {
+  const c = pause.control;
+  if (!c) {
+    return {
+      message: `Automation was paused by ${pause.by}. The stopped job and existing pull request are preserved.`,
+      nextAction: `Resume automation from this workflow's page (nothing is run again), or retry job ${pause.jobId} from its page while it is still kept.`,
+    };
+  }
+  const who = c.by ?? pause.by;
+  const from = c.source.replace(/[_-]/g, ' ');
+  return {
+    message: c.kind === 'cancel'
+      ? `Automation was canceled by ${who} (${from}). Existing commits and the pull request are preserved.`
+      : `Automation was paused by ${who} (${from}). Existing commits and the pull request are preserved.`,
+    nextAction: "Resume automation from this workflow's page (nothing is run again).",
+  };
 }
 
 /**
@@ -98,15 +129,17 @@ export interface PauseRef {
  * again by the same stop keeps the state from before the first time.
  */
 export function pausedWorkflow(cur: Workflow, pause: PauseRef, at: number): Workflow {
+  // The pause ends any wait (the event it comes with says how long that wait was): a resume starts
+  // a new one, so paused time is never counted as waiting.
+  const { waitingSince: _w, ...rest } = cur;
   return {
-    ...cur,
+    ...rest,
     status: 'blocked',
     reason: 'workflow_paused',
-    message: `Automation was paused by ${pause.by}. The stopped job and existing pull request are preserved.`,
-    nextAction: `Resume automation from this workflow's page (nothing is run again), or retry job ${pause.jobId} from its page while it is still kept.`,
+    ...pauseWords(pause),
     nextCheckAt: iso(at + CI_RECHECK_MS),
     updatedAt: iso(at),
-    controlPause: { jobId: pause.jobId, at: pause.at, by: pause.by, previous: cur.controlPause?.previous ?? pauseStateOf(cur) },
+    controlPause: { jobId: pause.jobId, at: pause.at, by: pause.by, ...(pause.control ? { control: pause.control } : {}), previous: cur.controlPause?.previous ?? pauseStateOf(cur) },
   };
 }
 
@@ -128,7 +161,9 @@ export function resumedWorkflow(cur: Workflow, at: number): Workflow {
   } else if (previous.reason === 'job_canceled') {
     previous = { status: 'blocked', reason: 'job_canceled', message: 'The job was stopped; automation has been resumed since. Its pull request and commits are preserved.', nextAction: 'The next GitHub event (a review, a push, a finished check) continues the workflow; or retry the stopped job from its page.' };
   }
-  return { ...without(cur, 'controlPause', 'reason', 'message', 'nextAction', 'nextCheckAt'), ...previous, updatedAt: iso(at) };
+  const restored: Workflow = { ...without(cur, 'controlPause', 'reason', 'message', 'nextAction', 'nextCheckAt', 'waitingSince'), ...previous, updatedAt: iso(at) };
+  // Waiting again from now: the wait before the pause was already reported when the pause ended it.
+  return restored.status === 'waiting' ? { ...restored, waitingSince: iso(at) } : restored;
 }
 
 /**
@@ -137,7 +172,8 @@ export function resumedWorkflow(cur: Workflow, at: number): Workflow {
  */
 export function keepPaused(before: Workflow | null, next: Workflow, at: number): Workflow {
   if (!before?.controlPause || next.controlPause) return next;
-  return pausedWorkflow(next, before.controlPause, at);
+  const { previous: _p, ...pause } = before.controlPause;
+  return pausedWorkflow(next, pause, at);
 }
 
 /** What the console says about how much of a workflow's history is kept. */

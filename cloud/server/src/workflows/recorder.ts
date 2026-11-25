@@ -4,9 +4,9 @@
  * launch or a finish (the job's own record is what decides), and the next event of the workflow
  * repairs its state, since each change is computed from the record as it then is.
  */
-import type { Job, JobFinishDetail } from '../store/store.js';
+import type { Job, JobFinishDetail, Store, WorkflowPause } from '../store/store.js';
 import type { WorkflowStore } from './store.js';
-import { endedWait, keepPaused, pausedWorkflow, resumedWorkflow, waitFrom, type PauseRef } from './timeline.js';
+import { endedWait, keepPaused, pauseControlOf, pausedWorkflow, resumedWorkflow, waitFrom, type PauseRef } from './timeline.js';
 import { newWorkflow, onJobFinished, onJobQueued, onJobStarted, onJobWaiting, onQueueCovered, onQueueEnded, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
 
 type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'> & Partial<Pick<Job, 'expiresAt' | 'native'>>;
@@ -63,6 +63,11 @@ export async function workflowOfJob(store: WorkflowStore, job: JobRef): Promise<
   return null;
 }
 
+const withControl = (raw: unknown) => {
+  const control = pauseControlOf(raw);
+  return control ? { control } : {};
+};
+
 /** A change's event, with more said about it (a reason code, a wait the change ended). */
 const withEvent = (out: { workflow: Workflow; event: WorkflowEvent } | null, more: Partial<WorkflowEvent>) => (out ? { ...out, event: { ...out.event, ...more } } : null);
 
@@ -72,9 +77,25 @@ const capacityWait = (queue: { enqueuedAt: number } | undefined, at: number): Pa
   return waited ? { waited } : {};
 };
 
-export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => number; log?: (entry: Record<string, unknown>) => void }) {
+export function createWorkflowRecorder(o: {
+  store: WorkflowStore;
+  /** The durable pauses (jobs/stop.ts): a resume keeps a workflow paused while another pause still holds one of its subjects. */
+  pauses?: Pick<Store, 'getWorkflowPause'>;
+  now?: () => number;
+  log?: (entry: Record<string, unknown>) => void;
+}) {
   const now = o.now ?? Date.now;
   const log = o.log ?? ((entry) => console.log(JSON.stringify(entry)));
+  /** A pause other than `resumed` holding one of the workflow's subjects now (its issue, its pull request). */
+  const otherPause = async (w: Workflow, resumed: { jobId: string; at: number }): Promise<WorkflowPause | null> => {
+    if (!o.pauses) return null;
+    for (const subject of new Set([w.issue, w.pullRequest])) {
+      if (subject === undefined) continue;
+      const p = await o.pauses.getWorkflowPause(w.installationId, w.repositoryId, subject).catch(() => null);
+      if (p && !(p.jobId === resumed.jobId && p.at === resumed.at)) return p;
+    }
+    return null;
+  };
   const safely = async (what: string, job: JobRef, fn: () => Promise<void>) => {
     try {
       await fn();
@@ -199,16 +220,26 @@ export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => nu
         const id = where.workflowId ?? (where.job ? ((await o.store.workflowOfJob(where.installationId, where.job.jobId)) ?? (await workflowOfJob(o.store, where.job))) : null);
         if (!id) return;
         const at = now();
+        // Another stop's pause that still holds one of the workflow's subjects: it stays paused, by that one.
+        const current = await o.store.getWorkflow(where.installationId, id);
+        const other = current ? await otherPause(current, pause) : null;
         await updateWorkflow(o.store, where.installationId, id, (w) => {
           if (!w) return null;
           const ours = w.controlPause?.jobId === pause.jobId && w.controlPause.at === pause.at;
           const waited = waitFrom('pause', pause.at, at);
+          const next = !ours
+            ? { ...w, updatedAt: new Date(at).toISOString() }
+            : other
+              ? pausedWorkflow(w, { jobId: other.jobId, at: other.at, by: other.by, ...withControl((other as { control?: unknown }).control) }, at)
+              : resumedWorkflow(w, at);
           return {
-            workflow: ours ? resumedWorkflow(w, at) : { ...w, updatedAt: new Date(at).toISOString() },
+            workflow: next,
             event: {
               id: `control:resume:${pause.jobId}:${pause.at}`, at: new Date(at).toISOString(), kind: 'control', generation: w.generation, jobId: pause.jobId,
               control: { action: 'resumed', by }, ...(waited ? { waited } : {}),
-              message: 'Automation resumed. Future GitHub events continue the workflow; nothing is run again.',
+              message: other
+                ? `This pause was resumed, but automation stays paused: ${other.by}'s stop of job ${other.jobId} still holds it.`
+                : 'Automation resumed. Future GitHub events continue the workflow; nothing is run again.',
             },
           };
         });

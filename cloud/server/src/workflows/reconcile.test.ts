@@ -88,6 +88,13 @@ describe('workflow reconciliation', () => {
     expect(events.at(-1)).toMatchObject({ kind: 'control', waited: { for: 'ci', seconds: CI_FIRST_CHECK_MS / 1000 } });
   });
 
+  it('words a pause a command made from its PAUSE record\'s descriptor', async () => {
+    const s = setup(); await s.waitForCi(); s.tick(CI_FIRST_CHECK_MS);
+    s.controls.getWorkflowPause.mockResolvedValue({ jobId: 'control-abc', at: T0, by: 'pat', control: { kind: 'pause', source: 'github_comment' } } as never);
+    await s.reconcile();
+    expect(await s.wf()).toMatchObject({ reason: 'workflow_paused', message: 'Automation was paused by pat (github comment). Existing commits and the pull request are preserved.', controlPause: { control: { kind: 'pause' } } });
+  });
+
   it('on resume, gives a workflow that was already blocked its own state back, without diagnosing it again', async () => {
     const s = setup();
     await s.recorder.started(job());

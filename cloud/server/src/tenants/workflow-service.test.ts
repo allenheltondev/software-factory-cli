@@ -125,6 +125,7 @@ describe('the workflow views', () => {
     expect((await service.get(caller, 55, legacy.workflowId)).history).toMatchObject({ complete: false });
     const gone = await service.get(caller, 55, '99-i9');
     expect(gone.workflow).toMatchObject({ paused: true, reason: 'workflow_paused' });
-    expect(gone.history).toMatchObject({ shown: 0, complete: false, expiredEarlier: true });
+    // Nothing more to read: complete, so the console says only that the earlier history is gone.
+    expect(gone.history).toMatchObject({ shown: 0, complete: true, expiredEarlier: true });
   });
 });
