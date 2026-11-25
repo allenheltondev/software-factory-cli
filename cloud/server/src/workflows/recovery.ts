@@ -51,7 +51,7 @@ import { workflowPause } from '../jobs/stop.js';
 import type { Store } from '../store/store.js';
 import { saveChange } from './recorder.js';
 import type { WorkflowStore } from './store.js';
-import type { RecoveryKind, Workflow, WorkflowEvent, WorkflowRecovery } from './workflow.js';
+import { CI_RECHECK_MS, type RecoveryKind, type Workflow, type WorkflowEvent, type WorkflowRecovery } from './workflow.js';
 
 /** Tries of one action, and distinct actions per run. */
 export const MAX_RECOVERY_ATTEMPTS = 6;
@@ -76,6 +76,15 @@ export const recoveryDeliveryId = (installationId: number, workflowId: string, k
 export const recoveryJobId = (installationId: number, workflowId: string, key: string) => `job_${hash([installationId, workflowId, key, 'job']).toString('base64url').slice(0, 16)}`;
 export const missedCheckKey = (w: Pick<Workflow, 'generation'>, headSha: string) => `ci:${w.generation}:${headSha}`;
 export const lostJobKey = (jobId: string) => `lost:${jobId}`;
+/**
+ * The ids of an action's n-th launch: the first is the key's own; a launch whose job record ended
+ * `launch_failed` (its reservation reclaimed before any microVM was asked for) gives the next try
+ * ids of its own, since a job record is written once.
+ */
+export const recoveryIds = (installationId: number, workflowId: string, key: string, n: number) => {
+  const k = n === 0 ? key : `${key}#${n}`;
+  return { jobId: recoveryJobId(installationId, workflowId, k), deliveryId: recoveryDeliveryId(installationId, workflowId, k) };
+};
 
 /**
  * The `check_suite.completed` event the missed one would have been, for one pull request and head.
@@ -128,13 +137,29 @@ export function createRecovery(deps: {
   store: WorkflowStore;
   controls: Pick<Store, 'getWorkflowPause'>;
   jobs: Pick<Store, 'getJob' | 'getJobSummary'>;
-  github: Pick<GitHubApi, 'pullRequestHead' | 'issueState' | 'matchingBranches'>;
+  github: Pick<GitHubApi, 'pullRequestHead' | 'issueState' | 'matchingBranches' | 'pullRequestsByHeadPrefix'>;
   /** An installation token for the workflow's repository with these permissions. */
   token: (w: Workflow, permissions: Record<string, 'read'>) => Promise<string>;
   recovery: RecoveryDeps;
   log: (entry: Record<string, unknown>) => void;
 }) {
   const { store } = deps;
+
+  /**
+   * Looked at again in `ms`, unchanged otherwise: every look that does not act moves the workflow's
+   * next look on, so a workflow that cannot be acted on yet never stays first in line.
+   */
+  const defer = async (w: Workflow, at: number, ms: number): Promise<RecoveryOutcome> => {
+    await saveChange(store, w.installationId, w.workflowId, (cur) =>
+      cur && cur.version === w.version && (!cur.nextCheckAt || Date.parse(cur.nextCheckAt) <= at) ? { workflow: { ...cur, nextCheckAt: iso(at + ms), updatedAt: iso(at) } } : null,
+    );
+    return { kind: 'none' };
+  };
+  /** After a claim that did not save: the record moved on (its writer set its next look), or the try was a replay (moved on here). */
+  const notClaimed = async (w: Workflow, at: number): Promise<RecoveryOutcome> => {
+    const cur = await store.getWorkflow(w.installationId, w.workflowId);
+    return cur ? defer(cur, at, RECOVERY_RECHECK_MS) : { kind: 'none' };
+  };
 
   /** A versioned change: nothing if the workflow moved on since `w` was read. */
   const save = (w: Workflow, f: (cur: Workflow) => { workflow: Workflow; event?: WorkflowEvent } | null) =>
@@ -182,7 +207,7 @@ export function createRecovery(deps: {
     const out = await save(w, (cur) => ({
       workflow: { ...cur, ...spec.state, recovery, nextCheckAt: iso(at + recoveryBackoff(attempts)), updatedAt: iso(at) },
       event: {
-        id: `recovery:${spec.key}:${attempts}`, at: iso(at), kind: 'recovery', generation: cur.generation, jobId: spec.jobId,
+        id: `recovery:${spec.key}:${recovery.used}:${attempts}`, at: iso(at), kind: 'recovery', generation: cur.generation, jobId: spec.jobId,
         ...(spec.headSha ? { headSha: spec.headSha } : {}), ...(cur.pullRequest !== undefined ? { prNumber: cur.pullRequest } : {}),
         message: `${spec.message}${attempts > 1 ? ` (try ${attempts} of ${MAX_RECOVERY_ATTEMPTS})` : ''}`,
       },
@@ -231,20 +256,38 @@ export function createRecovery(deps: {
    * Every check on the pull request's head `pr.headSha` finished and no job took their result.
    * `w` is the record the reconciler decided on.
    */
-  async function missedCheckEvent(w: Workflow, pr: PullRequestHead, checks: CommitCheckCounts, at: number): Promise<RecoveryOutcome> {
+  async function missedCheckEvent(w: Workflow, pr: PullRequestHead, checks: CommitCheckCounts, at: number, canAct: () => boolean): Promise<RecoveryOutcome> {
     if (w.pullRequest === undefined || !pr.headSha) return { kind: 'report', workflow: w };
     // A job queued behind the last one is on its way, and reads the pull request as it is.
-    if (w.pendingJobId) return { kind: 'none' };
+    if (w.pendingJobId) return defer(w, at, CI_RECHECK_MS);
     const key = missedCheckKey(w, pr.headSha);
-    const jobId = recoveryJobId(w.installationId, w.workflowId, key);
-    const deliveryId = recoveryDeliveryId(w.installationId, w.workflowId, key);
+    const ran = (id: string, outcome: string | undefined): RecoveryOutcome => ({
+      kind: 'report', workflow: w,
+      note: `Updraft already ran the missed CI step once for this head (job ${id}, ${outcome ?? 'finished'}), and it did not move the loop on, so it is not run again.`,
+    });
 
     // This head's event was synthesized before, and its job ran (or runs): never a second time.
-    const earlier = await deps.jobs.getJob(jobId);
-    if (earlier) {
-      if (earlier.status !== 'finished') return { kind: 'none' };
-      return { kind: 'report', workflow: w, note: `Updraft already ran the missed CI step once for this head (job ${jobId}, ${earlier.outcome ?? 'finished'}), and it did not move the loop on, so it is not run again.` };
+    // A launch whose job ended launch_failed never ran anything: the next try has ids of its own.
+    let ids: { jobId: string; deliveryId: string } | undefined;
+    for (let n = 0; n <= MAX_RECOVERY_ATTEMPTS && !ids; n++) {
+      const next = recoveryIds(w.installationId, w.workflowId, key, n);
+      const earlier = await deps.jobs.getJob(next.jobId);
+      if (!earlier) ids = next;
+      else if (earlier.status === 'finished' && earlier.outcome === 'launch_failed') continue;
+      else if (earlier.status !== 'finished') return defer(w, at, CI_RECHECK_MS);
+      else return ran(next.jobId, earlier.outcome);
     }
+    // A try that handed the event to another job (folded into one of the pull request's, or a
+    // queued entry it joined): that job is this head's CI step. Never a second one.
+    const handed = w.recovery?.generation === w.generation && w.recovery.key === key ? w.recovery.startedJobId : undefined;
+    if (handed && handed !== ids?.jobId) {
+      const holder = await deps.jobs.getJob(handed);
+      if (holder && holder.status !== 'finished') return defer(w, at, CI_RECHECK_MS);
+      // (A launch that never got a microVM ran nothing: it does not count as the head's CI step.)
+      if (!(holder?.outcome === 'launch_failed')) return ran(handed, holder?.outcome ?? 'handed over');
+    }
+    if (!ids) return { kind: 'report', workflow: w, note: `Automatic recovery could not get a job for this head started in ${MAX_RECOVERY_ATTEMPTS + 1} launches.` };
+    const { jobId, deliveryId } = ids;
     const room = budget(w, key);
     if (room !== 'ok') {
       return {
@@ -254,12 +297,14 @@ export function createRecovery(deps: {
           : `Automatic recovery already acted ${MAX_RECOVERIES_PER_RUN} times in this run, so it does not act again.`,
       };
     }
+    // Left for the next run, unchanged and first in line, once this run has acted enough.
+    if (!canAct()) return { kind: 'none' };
     const claimed = await claim(w, {
       kind: 'missed_check_event', key, jobId, deliveryId, headSha: pr.headSha,
       message: `The checks on ${short(pr.headSha)} finished (${checks.failed} failed, ${checks.passed} passed) but their event never reached Updraft: the CI step is started for this head.`,
       state: { reason: 'recovering', message: `The checks on ${short(pr.headSha)} finished without their event reaching Updraft; Updraft starts the CI step for this head itself.`, nextAction: 'No action is needed.' },
     }, at);
-    if (!claimed) return { kind: 'none' };
+    if (!claimed) return notClaimed(w, at);
     const { workflow: cw, recovery } = claimed;
 
     // Right before: a stop wins, and a head that moved is the newer head's to drive.
@@ -294,7 +339,7 @@ export function createRecovery(deps: {
   }
 
   /** The workflow's latest job was lost with its worker. */
-  async function lostJob(w: Workflow, at: number): Promise<RecoveryOutcome> {
+  async function lostJob(w: Workflow, at: number, canAct: () => boolean): Promise<RecoveryOutcome> {
     const jobId = w.lastJobId;
     if (!jobId) return forget(w, at);
     const [job, summary] = await Promise.all([deps.jobs.getJob(jobId), deps.jobs.getJobSummary(w.installationId, jobId)]);
@@ -322,32 +367,49 @@ export function createRecovery(deps: {
         'Open the job to see why, then retry it from its page, or apply the label again on GitHub.');
     }
 
+    // A stop anywhere in this run since the lost job was created (a pause since resumed between
+    // two looks included): nothing is run again automatically after a resume.
+    const since = Date.parse(job.createdAt);
+    for (const r of (w.jobRuns ?? []).filter((x) => x.generation === w.generation && x.jobId !== jobId)) {
+      const other = await deps.jobs.getJobSummary(w.installationId, r.jobId);
+      if (other?.stop && other.stop.requestedAt >= since) {
+        return final('job_lost', `The job's worker was lost, and automation on this workflow was stopped (job ${r.jobId}) since, so it is not retried automatically.`, 'Retry the job from its page.');
+      }
+    }
+
     // GitHub's answer now: still wanted, and nothing published that a retry could duplicate.
-    const token = await deps.token(w, { issues: 'read', contents: 'read' });
     let branches: string[];
+    let pulls: { numbers: number[]; complete: boolean };
     try {
+      const token = await deps.token(w, { issues: 'read', contents: 'read', pull_requests: 'read' });
       const state = await deps.github.issueState!(token, w.repository, w.issue);
       if (!state.open) return final('job_lost', `The job's worker was lost, and issue #${w.issue} has been closed since, so it is not retried.`, 'Reopen the issue and apply the label again to start a new run.');
       if (job.label && !state.labels.some((l) => l.toLowerCase() === job.label!.toLowerCase())) {
         return final('job_lost', `The job's worker was lost, and the \`${job.label}\` label has been removed since, so it is not retried.`, 'Apply the label again on GitHub to start a new run.');
       }
       branches = await deps.github.matchingBranches!(token, w.repository, issueBranchPrefix(w.issue), 5);
+      // A pull request the lost run opened, whose branch was deleted since (merged or closed).
+      pulls = await deps.github.pullRequestsByHeadPrefix!(token, w.repository, issueBranchPrefix(w.issue), job.createdAt);
     } catch (err) {
       if (err instanceof GitHubError && (err.status === 404 || err.status === 410)) return final('job_lost', 'The job\'s worker was lost, and the issue or repository is no longer accessible to the App.', 'Check the App\'s access to the repository, then apply the label again.');
+      // GitHub could not answer (5xx, a rate limit, a refused token): looked at again later, not every run.
+      await defer(w, at, CI_RECHECK_MS);
       throw err;
     }
-    if (branches.length > 0) {
+    if (branches.length > 0 || pulls.numbers.length > 0 || !pulls.complete) {
+      const found = [...branches.map((b) => `branch \`${b}\``), ...pulls.numbers.map((n) => `pull request #${n}`)];
       return final('publication_uncertain',
-        `The job's worker was lost after it may have pushed its work (${branches.map((b) => `\`${b}\``).join(', ')} exists on GitHub). A retry publishes on a branch of its own, so it is not retried automatically: that could open a second pull request.`,
-        'Look at the branch: open a pull request from it, or delete it and retry the job from its page.');
+        `The job's worker was lost after it may have published its work (${found.length ? `${found.join(', ')} exists on GitHub` : 'the pull requests opened since it started could not all be read'}). A retry publishes on a branch of its own, so it is not retried automatically: that could open a second pull request.`,
+        'Look at the branch or pull request: continue from it, or delete the branch and retry the job from its page.');
     }
 
+    if (!canAct()) return { kind: 'none' };
     const claimed = await claim(w, {
       kind: 'lost_job', key, jobId,
       message: `The worker of job ${jobId} was lost before it reported how it ended, and nothing of it was published: it is retried.`,
       state: { status: 'waiting', reason: 'recovering', message: `The worker of job ${jobId} was lost before it reported how it ended; nothing of it was published, so Updraft retries it once.`, nextAction: 'No action is needed.', waitingSince: iso(at) },
     }, at);
-    if (!claimed) return { kind: 'none' };
+    if (!claimed) return notClaimed(w, at);
     const { workflow: cw, recovery } = claimed;
     if (await paused(cw)) return { kind: 'none' };
     const result = await deps.recovery.retry({ updraftRetry: { installationId: cw.installationId, jobId, by: 'automatic recovery' } });

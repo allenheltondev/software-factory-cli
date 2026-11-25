@@ -41,7 +41,7 @@ export interface WorkflowReconcilerDeps {
   controls: Pick<Store, 'getWorkflowPause'>;
   /** The jobs' own records, for a workflow whose job's finish was never recorded on it. */
   jobs?: Pick<Store, 'getJob' | 'getJobSummary'>;
-  github: Pick<GitHubApi, 'createInstallationToken' | 'pullRequestHead' | 'commitChecks' | 'issueState' | 'matchingBranches'>;
+  github: Pick<GitHubApi, 'createInstallationToken' | 'pullRequestHead' | 'commitChecks' | 'issueState' | 'matchingBranches' | 'pullRequestsByHeadPrefix'>;
   /**
    * Fenced automatic recovery (recovery.ts): the launcher and the console retry it may start work
    * through. Absent: report only, as before. It also needs `jobs`.
@@ -164,8 +164,7 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     // The latest job was lost with its worker: retried where that is safe (recovery.ts), else left blocked.
     if ((w.status === 'blocked' && w.reason === 'job_lost') || (w.reason === 'recovering' && w.recovery?.kind === 'lost_job')) {
       if (recovery) {
-        if (!canAct()) return;
-        const out = await recovery.lostJob(w, at);
+        const out = await recovery.lostJob(w, at, canAct);
         if (out.kind === 'recovered') report.recovered++;
         if (out.kind === 'blocked') report.blocked++;
         return;
@@ -262,8 +261,7 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     let on = w;
     let note: string | undefined;
     if (recovery) {
-      if (!canAct()) return;
-      const out = await recovery.missedCheckEvent(w, pr, checks, at);
+      const out = await recovery.missedCheckEvent(w, pr, checks, at, canAct);
       if (out.kind === 'recovered') report.recovered++;
       if (out.kind !== 'report') return;
       on = out.workflow;

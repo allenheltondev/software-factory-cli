@@ -9,11 +9,11 @@ import { createReconciler } from '../jobs/reconcile.js';
 import { createRetryHandler } from '../jobs/retry.js';
 import { createMemoryStore, type JobFinishDetail, type Tenant } from '../store/store.js';
 import { dispatchRules } from '../tenants/dispatch.js';
-import { createWorkflowRecorder } from './recorder.js';
+import { createWorkflowRecorder, updateWorkflow } from './recorder.js';
 import { createWorkflowReconciler } from './reconcile.js';
-import { issueBranchPrefix, LOST_TOKEN_GRACE_MS, MAX_RECOVERIES_PER_RUN, MAX_RECOVERY_ATTEMPTS, missedCheckKey, recoveryBackoff, recoveryJobId } from './recovery.js';
+import { issueBranchPrefix, LOST_TOKEN_GRACE_MS, MAX_RECOVERIES_PER_RUN, MAX_RECOVERY_ATTEMPTS, missedCheckKey, recoveryBackoff, recoveryIds, recoveryJobId } from './recovery.js';
 import { createMemoryWorkflowStore } from './store.js';
-import { CI_FIRST_CHECK_MS, LOST_JOB_LOOK_MS } from './workflow.js';
+import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, LOST_JOB_LOOK_MS, type Workflow } from './workflow.js';
 
 // Relative to the real clock: the memory store judges delivery claims by it.
 const NOW = Date.now();
@@ -60,6 +60,7 @@ async function world(o: { ciFix?: boolean; concurrentJobs?: number } = {}) {
     checks: { total: 2, pending: 0, failed: 1, passed: 1, complete: true } as CommitCheckCounts,
     issue: { open: true, labels: ['updraft'] } as { open: boolean; labels: string[] },
     branches: [] as string[],
+    pulls: { numbers: [] as number[], complete: true },
   };
   const github = {
     createInstallationToken: vi.fn(async () => ({ token: 'ghs_x', expiresAt: clock + 3_600_000 })),
@@ -67,6 +68,7 @@ async function world(o: { ciFix?: boolean; concurrentJobs?: number } = {}) {
     commitChecks: vi.fn(async (): Promise<CommitCheckCounts> => ({ ...gh.checks })),
     issueState: vi.fn(async () => ({ ...gh.issue })),
     matchingBranches: vi.fn(async (_t: string, _r: string, prefix: string) => gh.branches.filter((b) => b.startsWith(prefix))),
+    pullRequestsByHeadPrefix: vi.fn(async () => ({ ...gh.pulls, numbers: [...gh.pulls.numbers] })),
   };
   const loadSettings = async () => APP as never;
   const launch = createLauncher({
@@ -106,13 +108,18 @@ async function world(o: { ciFix?: boolean; concurrentJobs?: number } = {}) {
     await recorder.finished(job, outcome, detail);
   };
   /** The issue's job opens PR #12 and leaves it waiting for CI. */
-  const waitForCi = async () => {
-    const first = await launch(label());
+  const waitForCi = async (issue = 7, pr = 12) => {
+    const req = label(`d-label-${issue}`);
+    req.payload = { ...req.payload, issue: { number: issue } };
+    req.body = JSON.stringify(req.payload);
+    const first = await launch(req);
     expect(first).toMatchObject({ disposition: 'launched' });
-    await finish(first.jobId!, 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci', verdict: 'ready-to-merge' } });
+    await finish(first.jobId!, 'succeeded', { prNumber: pr, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci', verdict: 'ready-to-merge' } });
     return first.jobId!;
   };
-  const wf = async () => (await workflowStore.getWorkflow(55, WF))!;
+  const wf = async (id = WF) => (await workflowStore.getWorkflow(55, id))!;
+  /** Puts the workflow back where it was, due now (what a lost write, or a recorder failure, leaves). */
+  const rewind = (o: Partial<Workflow>, id = WF) => updateWorkflow(workflowStore, 55, id, (cur) => ({ workflow: { ...cur!, ...o, nextCheckAt: new Date(clock).toISOString() } }));
   const timeline = () => workflowStore.listWorkflowEvents(55, WF, 100);
   /** An owner stops a running job of the workflow: its stop pauses the issue and its pull request. */
   let stops = 0;
@@ -125,7 +132,7 @@ async function world(o: { ciFix?: boolean; concurrentJobs?: number } = {}) {
   };
   return {
     store, workflowStore, queueStore, recorder, launch, dispatcher, retry, reconcile, reconcilerFor, quota, gh, github, runs, events, logs,
-    label, finish, waitForCi, wf, timeline, stop,
+    label, finish, waitForCi, wf, rewind, timeline, stop,
     tick: (ms: number) => (clock += ms),
     now,
     setImage: (v: string | null) => (imageVersion = v),
@@ -324,6 +331,69 @@ describe('fenced automatic recovery', () => {
       expect(await w.reconcile()).toMatchObject({ recovered: 1 });
     });
 
+    it('never lets a workflow it cannot act on yet starve the others (a pending queued job, a recovery job still running)', async () => {
+      await w.waitForCi(7, 12);
+      await w.waitForCi(8, 13);
+      // Issue 7's workflow has a queued job pending behind its last one: nothing to do yet.
+      await updateWorkflow(w.workflowStore, 55, WF, (cur) => ({ workflow: { ...cur!, pendingJobId: 'job_pending00000001' } }));
+      w.tick(CI_FIRST_CHECK_MS);
+      // One action per run: the no-op look at issue 7 must not use it, and must move its next look on.
+      const one = w.reconcilerFor({ maxRecoveries: 1 });
+      expect(await one()).toMatchObject({ checked: 2, recovered: 1, backlog: 0, oldestDueSeconds: 0 });
+      expect(Date.parse((await w.wf()).nextCheckAt!)).toBe(w.now() + CI_RECHECK_MS);
+      expect(await w.wf('99-i8')).toMatchObject({ status: 'active' });
+
+      // A recovery job that runs while its workflow was not told (a lost write): waited on, moved on, never relaunched.
+      const x = await world();
+      await x.waitForCi();
+      x.tick(CI_FIRST_CHECK_MS);
+      await x.reconcile();
+      await x.rewind({ status: 'waiting', stage: 'waiting-for-ci', reason: 'recovering' });
+      expect(await x.reconcile()).toMatchObject({ recovered: 0, blocked: 0, backlog: 0 });
+      expect(Date.parse((await x.wf()).nextCheckAt!)).toBe(x.now() + CI_RECHECK_MS);
+      expect(x.runs).toHaveLength(2);
+    });
+
+    it('claims a head again after the head moved away and back, rather than replaying its old try', async () => {
+      await w.waitForCi();
+      w.setImage(null); // every try answers jobs_off
+      for (const head of [HEAD, HEAD2, HEAD]) {
+        w.gh.pr = { ...w.gh.pr, headSha: head };
+        w.tick(CI_FIRST_CHECK_MS * 8);
+        expect(await w.reconcile()).toMatchObject({ checked: 1, failed: 0 });
+        expect(await w.wf()).toMatchObject({ recovery: { key: `ci:1:${head}`, attempts: 1 } });
+        expect(Date.parse((await w.wf()).nextCheckAt!)).toBeGreaterThan(w.now());
+      }
+      expect((await w.timeline()).filter((e) => e.kind === 'recovery')).toHaveLength(3);
+    });
+
+    it('never runs a second CI step when the first was folded into another job', async () => {
+      await w.waitForCi();
+      w.tick(CI_FIRST_CHECK_MS);
+      const launch = vi.fn(async () => ({ status: 200, disposition: 'coalesced', coveredBy: 'job_holder000000001' }));
+      const r = w.reconcilerFor({ recovery: { launch, retry: w.retry } });
+      expect(await r()).toMatchObject({ recovered: 1 });
+      expect(await w.wf()).toMatchObject({ recovery: { result: 'coalesced', startedJobId: 'job_holder000000001' } });
+      // The covering job's start never reached the workflow; a later look finds the head still waiting.
+      w.tick(recoveryBackoff(1));
+      expect(await r()).toMatchObject({ recovered: 0, blocked: 1 });
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(await w.wf()).toMatchObject({ reason: 'ci_event_missed', message: expect.stringMatching(/already ran the missed CI step once for this head \(job job_holder000000001/) });
+    });
+
+    it('tries again under ids of its own after a launch that never got a microVM (launch_failed)', async () => {
+      await w.waitForCi();
+      w.tick(CI_FIRST_CHECK_MS);
+      await w.reconcile();
+      // Reconciliation reclaimed the launch before RunMicrovm: its job ended launch_failed, nothing ran.
+      await w.finish(ciJobId(), 'launch_failed');
+      await w.rewind({ status: 'waiting', stage: 'waiting-for-ci', reason: 'recovering', lastJobId: (await w.wf()).jobRuns![0]!.jobId });
+      expect(await w.reconcile()).toMatchObject({ recovered: 1, blocked: 0 });
+      const second = recoveryIds(55, WF, missedCheckKey({ generation: 1 }, HEAD), 1).jobId;
+      expect(await w.store.getJob(second)).toMatchObject({ eventName: 'check_suite' });
+      expect(w.runs).toHaveLength(3);
+    });
+
     it('stays report-only without recovery configured', async () => {
       await w.waitForCi();
       w.tick(CI_FIRST_CHECK_MS);
@@ -354,7 +424,7 @@ describe('fenced automatic recovery', () => {
       w.tick(LOST_JOB_LOOK_MS);
       expect(await w.reconcile()).toMatchObject({ recovered: 1 });
       expect(w.github.matchingBranches).toHaveBeenCalledWith('ghs_x', 'acme/web', issueBranchPrefix(7), 5);
-      expect(w.github.createInstallationToken).toHaveBeenCalledWith(expect.any(String), 55, { repositoryIds: [99], permissions: { issues: 'read', contents: 'read' } });
+      expect(w.github.createInstallationToken).toHaveBeenCalledWith(expect.any(String), 55, { repositoryIds: [99], permissions: { issues: 'read', contents: 'read', pull_requests: 'read' } });
       expect(w.runs).toHaveLength(2);
       const summary = (await w.store.getJobSummary(55, lost))!;
       expect(summary.retriedAs).toBeDefined();
@@ -461,7 +531,44 @@ describe('fenced automatic recovery', () => {
       w.github.matchingBranches.mockRejectedValueOnce(new GitHubError(502, 'bad gateway'));
       expect(await w.reconcile()).toMatchObject({ failed: 1, recovered: 0 });
       expect(w.runs).toHaveLength(1);
-      expect(await w.wf()).toMatchObject({ status: 'blocked', reason: 'job_lost', nextCheckAt: expect.any(String) });
+      // Backed off, not due again at every run: the next run does not look at it.
+      expect(await w.wf()).toMatchObject({ status: 'blocked', reason: 'job_lost', nextCheckAt: new Date(w.now() + CI_RECHECK_MS).toISOString() });
+      expect(await w.reconcile()).toMatchObject({ checked: 0, failed: 0 });
+      w.tick(CI_RECHECK_MS);
+      expect(await w.reconcile()).toMatchObject({ recovered: 1 });
+    });
+
+    it('never retries a lost run with a pull request since it started, merged or closed and its branch deleted, or one it could not list', async () => {
+      await lose();
+      w.gh.pulls = { numbers: [31], complete: true };
+      w.tick(LOST_JOB_LOOK_MS);
+      expect(await w.reconcile()).toMatchObject({ recovered: 0, blocked: 1 });
+      expect(await w.wf()).toMatchObject({ reason: 'publication_uncertain', message: expect.stringContaining('pull request #31') });
+      expect(w.github.pullRequestsByHeadPrefix).toHaveBeenCalledWith('ghs_x', 'acme/web', issueBranchPrefix(7), expect.any(String));
+
+      w = await world();
+      await lose();
+      w.gh.pulls = { numbers: [], complete: false };
+      w.tick(LOST_JOB_LOOK_MS);
+      expect(await w.reconcile()).toMatchObject({ recovered: 0, blocked: 1 });
+      expect(await w.wf()).toMatchObject({ reason: 'publication_uncertain', message: expect.stringMatching(/could not all be read/) });
+      expect(w.runs).toHaveLength(1);
+    });
+
+    it('does not retry after a stop that was resumed between two looks', async () => {
+      const lost = await lose();
+      // Another job of the run is stopped (a pause), and resumed before the reconciler looks.
+      const other = { ...(await w.store.getJob(lost))!, jobId: 'job_stopped0000099', status: 'launched' as const, stop: undefined, releasedAt: undefined, outcome: undefined };
+      await w.store.putJob(other);
+      w.tick(60_000);
+      await w.store.requestJobStop(other, { requestedAt: w.now(), by: 'pat', reason: 'hold' }, [7]);
+      await w.store.resumeWorkflowPause(55, 99, { jobId: other.jobId, at: w.now() }, [7], 'pat', w.now());
+      expect(await w.store.getWorkflowPause(55, 99, 7)).toBeNull();
+      await updateWorkflow(w.workflowStore, 55, WF, (cur) => ({ workflow: { ...cur!, jobRuns: [...cur!.jobRuns!, { jobId: other.jobId, generation: 1 }] } }));
+      w.tick(LOST_JOB_LOOK_MS);
+      expect(await w.reconcile()).toMatchObject({ recovered: 0, blocked: 1 });
+      expect(w.runs).toHaveLength(1);
+      expect(await w.wf()).toMatchObject({ status: 'blocked', reason: 'job_lost', message: expect.stringMatching(/stopped \(job job_stopped0000099\) since/) });
     });
 
     it('never retries a review-loop job, and says how the loop continues', async () => {
