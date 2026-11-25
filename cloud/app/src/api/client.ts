@@ -623,6 +623,37 @@ export interface Insights {
   report: StatsReport;
 }
 
+/** Repository readiness (#137): server/src/tenants/readiness-service.ts. */
+export type ReadinessCheckState = 'verified' | 'failing' | 'unverified' | 'off';
+export type ReadinessProblem = 'invalid_config' | 'missing_credentials' | 'permissions' | 'reconnect' | 'transient' | 'paused' | 'provider';
+export type ReadinessFixTarget = 'config' | 'keys' | 'claude' | 'telemetry' | 'workflows' | 'job' | 'github';
+export interface ReadinessCheck {
+  id: string;
+  stage: 'installation' | 'config' | 'github' | 'credentials' | 'subscription' | 'review' | 'ci' | 'capacity' | 'pauses' | 'telemetry' | 'egress' | 'execution';
+  required: boolean;
+  state: ReadinessCheckState;
+  problem?: ReadinessProblem;
+  unverified?: 'read_failed' | 'not_checked' | 'needs_run';
+  summary: string;
+  fix?: { text: string; target: ReadinessFixTarget };
+}
+export type RepositoryReadinessStatus = 'ready' | 'action_needed' | 'temporarily_unavailable' | 'paused' | 'unknown' | 'not_configured';
+export interface RepositoryReadiness {
+  repository: string;
+  repositoryId?: number;
+  status: RepositoryReadinessStatus;
+  checks: ReadinessCheck[];
+  lastJob?: { jobId: string; result: JobResult; at: string; configVersion?: number };
+}
+export interface ReadinessReport {
+  checkedAt: string;
+  cached: boolean;
+  configVersion: number | null;
+  installation: ReadinessCheck[];
+  repositories: RepositoryReadiness[];
+  limitations: string[];
+}
+
 export interface Overview {
   tenant: TenantSummary;
   installation: { status: InstallationStatus; checked: boolean; missingPermissions: { name: string; needs: string; granted?: string }[] };
@@ -830,6 +861,8 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     reactivateConfig: (installationId: number, version: number, input: { confirmAutoMerge?: boolean } = {}) =>
       request<PublishResult>(`/installations/${installationId}/config/versions/${version}/reactivate`, { method: 'POST', body: JSON.stringify(input) }),
     overview: (installationId: number) => request<Overview>(`/installations/${installationId}/overview`),
+    /** Per-repository preflight; `refresh` reads again rather than serving the last check (bounded by the server). */
+    readiness: (installationId: number, refresh = false) => request<ReadinessReport>(`/installations/${installationId}/readiness${refresh ? '?refresh=1' : ''}`),
     insights: (installationId: number, query: { window?: InsightsWindow; repo?: string } = {}) => {
       const q = new URLSearchParams();
       if (query.window) q.set('window', query.window);
