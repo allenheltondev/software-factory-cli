@@ -115,6 +115,11 @@ export function queueComment(e: QueueEntry, consoleOrigin?: string, now = Date.n
   if (e.state === 'admitted') {
     return lines(`Started · queued for ${minutes((o?.at ?? now) - e.enqueuedAt)}`, [
       `Updraft started the queued work${o?.jobId && o.jobId !== e.jobId ? ` as job \`${o.jobId}\`` : ''}. The job page shows what runs and how it ends.`,
+      '',
+      // Routing runs inside the job, after this edit: nothing about its choice is known here.
+      e.pullRequest !== undefined && e.issue === undefined
+        ? 'The worker, model and effort are chosen when the job runs; the review or revision it posts names them.'
+        : 'Complexity, capability tier, worker, model and effort are chosen when the job runs; the assignment comment that follows names them.',
     ]);
   }
   const status = e.state === 'expired' ? 'Expired' : e.state === 'refused' ? 'Not started' : 'Canceled';
