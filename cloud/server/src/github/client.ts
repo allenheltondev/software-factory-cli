@@ -127,6 +127,12 @@ export interface GitHubApi {
   latestLabelEvent?(installationToken: string, repository: string, issue: number, label: string): Promise<LabelEvent | null>;
   /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
   createIssueComment(installationToken: string, repository: string, issue: number, body: string): Promise<void>;
+  /** The same, answering the new comment's id: for a comment edited later (the admission queue's acknowledgement). */
+  postIssueComment?(installationToken: string, repository: string, issue: number, body: string): Promise<number>;
+  /** Replaces a comment's body (PATCH /repos/{owner}/{repo}/issues/comments/{id}). */
+  updateIssueComment?(installationToken: string, repository: string, commentId: number, body: string): Promise<void>;
+  /** The id of the App's own comment on the issue whose body carries `marker`, or null (newest first, a bounded search). */
+  findIssueComment?(installationToken: string, repository: string, issue: number, marker: string, author?: string): Promise<number | null>;
 }
 
 const API = 'https://api.github.com';
@@ -313,6 +319,34 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue}/comments`;
       const res = await call(path, token, { method: 'POST', body: JSON.stringify({ body }), headers: { 'content-type': 'application/json' } });
       await json<Json>(res, 'POST /repos/issues/comments');
+    },
+
+    async postIssueComment(token, repository, issue, body) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue}/comments`;
+      const out = await json<Json>(await call(path, token, { method: 'POST', body: JSON.stringify({ body }), headers: { 'content-type': 'application/json' } }), 'POST /repos/issues/comments');
+      const id = Number(out.id);
+      if (!Number.isSafeInteger(id) || id <= 0) throw new GitHubError(502, 'POST /repos/issues/comments answered no comment id');
+      return id;
+    },
+
+    async updateIssueComment(token, repository, commentId, body) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/comments/${commentId}`;
+      await json<Json>(await call(path, token, { method: 'PATCH', body: JSON.stringify({ body }), headers: { 'content-type': 'application/json' } }), 'PATCH /repos/issues/comments');
+    },
+
+    async findIssueComment(token, repository, issue, marker, author) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue}/comments`;
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const out = await json<Json[]>(await call(`${base}?per_page=100&page=${page}`, token), 'GET /repos/issues/comments');
+        const comments = Array.isArray(out) ? out : [];
+        const found = comments.find((c) => typeof c.body === 'string' && c.body.includes(marker) && (author === undefined || (c.user as Json | undefined)?.login === author));
+        if (found && Number.isSafeInteger(found.id)) return Number(found.id);
+        if (comments.length < 100) break;
+      }
+      return null;
     },
 
     async listInstallationRepositories(token) {

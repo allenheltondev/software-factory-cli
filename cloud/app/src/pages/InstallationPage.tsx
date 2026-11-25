@@ -27,7 +27,7 @@ import { JobActions, JobStopStatus } from '../components/job-actions';
 import { SetupChecklist, setupComplete, setupSteps } from '../components/setup';
 import { ReadinessPanel } from '../components/readiness';
 
-type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'> & Partial<Pick<ApiClient, 'workflows' | 'stopJob' | 'resumeJob' | 'readiness'>>;
+type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'> & Partial<Pick<ApiClient, 'workflows' | 'stopJob' | 'resumeJob' | 'cancelQueuedJob' | 'readiness'>>;
 type Tab = 'jobs' | 'workflows' | 'deliveries' | 'repositories';
 type Load = { state: 'loading' } | { state: 'ok'; overview: Overview; jobs: JobView[]; deliveries: Delivery[]; workflows: WorkflowView[] } | { state: 'error'; message: string };
 
@@ -178,8 +178,9 @@ function ActivityView({
   const deliveryTotal = Object.values(overview.activity.deliveries).reduce((n, v) => n + (v ?? 0), 0);
   const steps = setupSteps(overview, base);
   const inSetup = !setupComplete(steps);
+  const queuedJobs = jobs.filter((job) => job.result === 'queued');
   const runningJobs = jobs.filter((job) => job.result === 'running');
-  const recentJobs = jobs.filter((job) => job.result !== 'running');
+  const recentJobs = jobs.filter((job) => job.result !== 'running' && job.result !== 'queued');
 
   return (
     <>
@@ -222,6 +223,18 @@ function ActivityView({
           </CardHeader>
           <CardBody>
             <JobsList jobs={runningJobs} base={base} api={api} installationId={t.installationId} onRefresh={onRefresh} />
+          </CardBody>
+        </Card>
+      )}
+
+      {queuedJobs.length > 0 && (
+        <Card data-testid="queued-jobs">
+          <CardHeader>
+            <CardTitle>Queued jobs</CardTitle>
+          </CardHeader>
+          <CardBody>
+            <p className="mb-2 text-sm text-muted-foreground">These start automatically, in this order, when execution capacity is available. Nothing is counted against quotas while they wait.</p>
+            <JobsList jobs={queuedJobs} base={base} api={api} installationId={t.installationId} onRefresh={onRefresh} />
           </CardBody>
         </Card>
       )}
@@ -402,9 +415,17 @@ function JobsList({ jobs, base, api, installationId, onRefresh }: { jobs: JobVie
             )}
             <span className="flex w-full flex-wrap items-center gap-3 text-sm text-muted-foreground sm:ml-auto sm:w-auto">
               {j.configVersion !== undefined && <span title="Configuration version">v{j.configVersion}</span>}
-              {j.result !== 'running' && <span title="Duration">{formatDuration(j.durationSeconds)}</span>}
+              {j.result === 'queued' && j.queue ? (
+                <>
+                  {j.queue.position !== undefined && <span title="Its place in this installation's queue (the order it starts in)" data-testid={`job-position-${j.jobId}`}>#{j.queue.position} in line</span>}
+                  <span title={j.queue.waitMessage}>Waiting {formatDuration(j.queue.waitedSeconds)}</span>
+                </>
+              ) : (
+                j.result !== 'running' && <span title="Duration">{formatDuration(j.durationSeconds)}</span>
+              )}
               <span title={exact(j.createdAt)}>{relativeTime(j.createdAt)}</span>
             </span>
+            {j.result === 'queued' && j.queue && <p className="basis-full text-sm text-muted-foreground">{j.queue.waitMessage} It starts automatically; no action is needed.</p>}
           </li>
         );
       })}

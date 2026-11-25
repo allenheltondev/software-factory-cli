@@ -96,7 +96,15 @@ export interface ConsoleReview {
   prompt: string;
   /** Let the agent that wrote the code review it when the pool has no other agent. */
   allowSameAgent: boolean;
+  /**
+   * How the issue's acceptance criteria are checked (the CLI's review.acceptance, docs/acceptance.md):
+   * enforce (the CLI's default when unset), report (shown, never holding a head back) or off.
+   */
+  acceptance?: ConsoleAcceptance;
 }
+
+export const ACCEPTANCE_POLICIES = ['enforce', 'report', 'off'] as const;
+export type ConsoleAcceptance = (typeof ACCEPTANCE_POLICIES)[number];
 
 export interface ConsoleRevise {
   enabled: boolean;
@@ -441,7 +449,7 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
 
       const rv = isObject(w.review) ? w.review : {};
       if (!isObject(w.review)) c.err(`${path}.review`, 'must be a mapping');
-      only(c, `${path}.review`, rv, ['enabled', 'pool', 'prompt', 'allowSameAgent']);
+      only(c, `${path}.review`, rv, ['enabled', 'pool', 'prompt', 'allowSameAgent', 'acceptance']);
       const reviewOn = bool(c, `${path}.review.enabled`, rv.enabled, false);
       const review: ConsoleReview = {
         enabled: reviewOn,
@@ -449,6 +457,11 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
         prompt: reviewOn ? prompt(c, `${path}.review.prompt`, rv.prompt) : typeof rv.prompt === 'string' && rv.prompt.trim() ? rv.prompt : DEFAULT_PROMPTS.review,
         allowSameAgent: bool(c, `${path}.review.allowSameAgent`, rv.allowSameAgent, false),
       };
+      if (rv.acceptance !== undefined && rv.acceptance !== null) {
+        const a = ACCEPTANCE_POLICIES.find((x) => x === rv.acceptance);
+        if (a) review.acceptance = a;
+        else c.err(`${path}.review.acceptance`, `one of ${ACCEPTANCE_POLICIES.join(', ')}`);
+      }
 
       const rs = isObject(w.revise) ? w.revise : {};
       if (!isObject(w.revise)) c.err(`${path}.revise`, 'must be a mapping');
@@ -604,10 +617,16 @@ function checkMeaning(config: ConsoleConfig, c: Check) {
 
     // The CLI reviews and revises per repository, so the workflows that run here must agree.
     const policy = ([, w]: (typeof wfs)[number]) =>
-      JSON.stringify([w.review.enabled, w.review.enabled && w.review.allowSameAgent, w.revise.enabled, w.revise.enabled ? (w.revise.maxRevisions ?? null) : null]);
+      JSON.stringify([
+        w.review.enabled,
+        w.review.enabled && w.review.allowSameAgent,
+        w.review.enabled ? (w.review.acceptance ?? 'enforce') : null,
+        w.revise.enabled,
+        w.revise.enabled ? (w.revise.maxRevisions ?? null) : null,
+      ]);
     const differs = wfs.find((x) => policy(x) !== policy(wfs[0]!));
     if (differs) {
-      c.err(`${path}.workflows`, `${wfs[0]![0]} and ${differs[0]} handle pull requests differently: the workflows of one repository must agree on review, revision and revision rounds`);
+      c.err(`${path}.workflows`, `${wfs[0]![0]} and ${differs[0]} handle pull requests differently: the workflows of one repository must agree on review, acceptance criteria, revision and revision rounds`);
     }
     const reviewed = wfs.some(([, w]) => w.review.enabled);
     if (r.autoMerge && !reviewed) c.err(`${path}.autoMerge`, 'turn on review in its workflow first: Updraft only merges a pull request its own reviewer found ready');
@@ -919,7 +938,10 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
     for (const a of actors) if (!everyone.has(a.toLowerCase())) everyone.set(a.toLowerCase(), a);
     // The workflows of a repository agree on these (checkMeaning): the first one speaks for all.
     const first = config.workflows[r.workflows[0] ?? ''];
-    const review = first?.review.enabled ? (first.review.allowSameAgent ? { allowSameAgent: true } : true) : undefined;
+    const options = first?.review.enabled
+      ? { ...(first.review.allowSameAgent ? { allowSameAgent: true } : {}), ...(first.review.acceptance ? { acceptance: first.review.acceptance } : {}) }
+      : null;
+    const review = options ? (Object.keys(options).length ? options : true) : undefined;
     const revise = first?.revise.enabled ? { revise: true, ...(first.revise.maxRevisions !== undefined ? { maxRevisions: first.revise.maxRevisions } : {}) } : {};
     repositories[fullName] = {
       ...(r.enabled ? {} : { paused: true }),

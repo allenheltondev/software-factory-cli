@@ -5,6 +5,8 @@ import type { RetryResult } from '../jobs/retry.js';
 import { resumeJobPause, resumeWorkflowPause, stopSubjects, type ResumeOutcome, type StopResult } from '../jobs/stop.js';
 import { countBy, deliveryCounts, jobResult, notRetryableMessage, retryable, type JobResult } from '../jobs/status.js';
 import type { DeliveryRecord, JobSummary, Store, TelemetrySettings } from '../store/store.js';
+import { positions, queueView, type QueueCancelResult, type QueueView } from '../jobs/queue.js';
+import { isWaiting, type QueueEntry, type QueueStore } from '../jobs/queue-store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
 import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from './agents.js';
 import { redact } from './redact.js';
@@ -50,7 +52,13 @@ export interface MissingPermission {
 
 export type InstallationStatus = 'active' | 'suspended' | 'missing_permissions' | 'disabled' | 'uninstalled';
 
-export interface JobView extends JobSummary {
+export interface JobView extends Omit<JobSummary, 'status'> {
+  /** `queued`: it waits in the admission queue, and has no job record yet. */
+  status: JobSummary['status'] | 'queued';
+  /** Its time in the admission queue, when it waited there (before it started, or instead). */
+  queue?: QueueView;
+  /** An owner can cancel it while it waits. */
+  canCancel?: boolean;
   canStop?: boolean;
   canResume?: boolean;
   result: JobResult;
@@ -165,6 +173,10 @@ export interface StatusServiceDeps {
   /** Asks the launcher to run a job's event again (jobs/retry.ts). Absent: retrying is not offered. */
   requestRetry?: (installationId: number, jobId: string, by?: string) => Promise<RetryResult>;
   requestStop?: (installationId: number, jobId: string, by: string, reason: string) => Promise<StopResult | null>;
+  /** The admission queue's entries (jobs/queue-store.ts), read only. Absent: no queue is shown. */
+  queue?: Pick<QueueStore, 'list' | 'get'>;
+  /** Asks the webhook function to cancel a queued job (jobs/queue.ts cancel). */
+  requestQueueCancel?: (installationId: number, jobId: string, by: string) => Promise<QueueCancelResult>;
   /** The stack's ResultRetentionDays: a job's logs are expired once it ended longer ago than that. */
   resultRetentionDays?: number;
   /** HONEYCOMB_TIMELINE_URL, as parseTimelineTemplate accepted it: a link to a conversation in Agent Timeline. */
@@ -245,6 +257,36 @@ export function jobView(job: JobSummary, telemetry: TelemetrySettings | null = n
   return view;
 }
 
+/**
+ * A queued job that has no job record (it waits, or it ended without starting) as a job of the
+ * console: `queued` while it waits, never running, finished or throttled. Its link is its stable id.
+ */
+export function queuedJobView(e: QueueEntry, now: number, position?: number): JobView {
+  const waiting = isWaiting(e);
+  const view: JobView = {
+    jobId: e.jobId,
+    repository: e.repository,
+    ...(e.issue !== undefined ? { issue: e.issue } : {}),
+    ...(e.pullRequest !== undefined ? { pullRequest: e.pullRequest } : {}),
+    ...(e.label ? { label: e.label } : {}),
+    ...(e.sender ? { sender: e.sender } : {}),
+    createdAt: new Date(e.enqueuedAt).toISOString(),
+    status: waiting ? 'queued' : 'finished',
+    ...(waiting ? {} : { outcome: `queue_${e.state}`, finishedAt: new Date(e.outcome?.at ?? now).toISOString() }),
+    configVersion: e.configVersion,
+    deliveryId: e.deliveryId,
+    executionMode: e.route === 'standard' ? 'standard' : 'subscription',
+    result: waiting ? 'queued' : e.state === 'canceled' ? 'canceled' : e.state === 'admitted' ? 'other' : 'not_run',
+    retryable: false,
+    logs: [],
+    telemetryStatus: 'not_configured',
+    queue: queueView(e, now, position),
+  };
+  if (e.issue !== undefined) view.issueUrl = `https://github.com/${e.repository}/issues/${e.issue}`;
+  else if (e.pullRequest !== undefined) view.prUrl = `https://github.com/${e.repository}/pull/${e.pullRequest}`;
+  return view;
+}
+
 /** A resume that did not happen, as the error the console shows. */
 function resumed(outcome: ResumeOutcome): void {
   if (outcome === 'resumed') return;
@@ -253,13 +295,15 @@ function resumed(outcome: ResumeOutcome): void {
   throw new FlowError('pause_changed', 409, 'A newer stop controls this workflow; look at it again before resuming');
 }
 
-export function createStatusService({ store, github, agentKeys, readLog, requestRetry, requestStop, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
+export function createStatusService({ store, github, agentKeys, readLog, requestRetry, requestStop, queue, requestQueueCancel, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
   const view = (job: JobSummary, telemetry: TelemetrySettings | null, settingsUnavailable = false) => jobView(job, telemetry, { now: now(), timelineTemplate, settingsUnavailable });
   const settingsOf = (installationId: number) => store.getTelemetry(installationId).then((t) => ({ t, unavailable: false }), () => ({ t: null, unavailable: true }));
   const limitOf = (raw: unknown) => {
     const n = Number(raw);
     return Number.isSafeInteger(n) && n > 0 ? Math.min(n, LIST_LIMIT) : 50;
   };
+  // The queue is read for display only; a failure to read it never hides the jobs.
+  const queueOf = (installationId: number): Promise<QueueEntry[]> => (queue ? queue.list(installationId, LIST_LIMIT).catch(() => []) : Promise.resolve([]));
 
   return {
     async overview(caller: Caller, installationId: number): Promise<Overview> {
@@ -382,10 +426,40 @@ export function createStatusService({ store, github, agentKeys, readLog, request
 
     async jobs(caller: Caller, installationId: number, limit?: unknown): Promise<{ jobs: JobView[] }> {
       const member = await github.member(caller, installationId);
-      const [jobs, settings] = await Promise.all([store.listRecentJobs(installationId, limitOf(limit)), settingsOf(installationId)]);
+      const [jobs, settings, entries] = await Promise.all([store.listRecentJobs(installationId, limitOf(limit)), settingsOf(installationId), queueOf(installationId)]);
       const active = requestStop && member.summary.role === 'owner' ? new Set((await store.listActiveJobs()).filter((j) => j.installationId === installationId).map((j) => j.jobId)) : new Set<string>();
-      return { jobs: jobs.map((j) => ({ ...view(j, settings.t, settings.unavailable), canResume: member.summary.role === 'owner' && j.stop?.confirmedAt !== undefined && j.stop.resumedAt === undefined,
-        canStop: !!requestStop && member.summary.role === 'owner' && (j.status !== 'finished' || !!j.stop && (j.stop.confirmedAt === undefined || !!j.stop.error) || active.has(j.jobId)) })) };
+      const known = new Set(jobs.map((j) => j.jobId));
+      const order = positions(entries);
+      const byId = new Map(entries.map((e) => [e.jobId, e]));
+      // Queued work first, oldest first (the order it starts in); then the jobs as before.
+      const queued = entries.filter((e) => isWaiting(e) && !known.has(e.jobId)).sort((a, b) => a.enqueuedAt - b.enqueuedAt)
+        .map((e) => ({ ...queuedJobView(e, now(), order.get(e.jobId)), canCancel: !!requestQueueCancel && member.summary.role === 'owner' && e.state === 'queued' }));
+      return { jobs: [...queued, ...jobs.map((j) => {
+        const e = byId.get(j.jobId);
+        return { ...view(j, settings.t, settings.unavailable), ...(e ? { queue: queueView(e, now()) } : {}), canResume: member.summary.role === 'owner' && j.stop?.confirmedAt !== undefined && j.stop.resumedAt === undefined,
+          canStop: !!requestStop && member.summary.role === 'owner' && (j.status !== 'finished' || !!j.stop && (j.stop.confirmedAt === undefined || !!j.stop.error) || active.has(j.jobId)) };
+      })] };
+    },
+
+    /** The installation's admission queue: what waits (in the order it starts) and what ended without starting, kept 30 days. */
+    async queue(caller: Caller, installationId: number, limit?: unknown): Promise<{ queue: JobView[] }> {
+      const member = await github.member(caller, installationId);
+      const entries = (await queueOf(installationId)).slice(0, limitOf(limit));
+      const order = positions(entries);
+      return { queue: entries.map((e) => ({ ...queuedJobView(e, now(), order.get(e.jobId)), canCancel: !!requestQueueCancel && member.summary.role === 'owner' && e.state === 'queued' })) };
+    },
+
+    /** An owner cancels a job that waits in the queue (one that has started is stopped instead). */
+    async cancelQueued(caller: Caller, installationId: number, jobId: string): Promise<{ jobId: string; state: string }> {
+      const member = await github.member(caller, installationId);
+      if (member.summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner may cancel queued jobs');
+      if (!JOB_ID.test(jobId) || !queue) throw new FlowError('not_found', 404, 'There is no such queued job in this installation');
+      // Read here first: only this tenant's entry is ever named to the webhook function.
+      if (!(await queue.get(installationId, jobId))) throw new FlowError('not_found', 404, 'There is no such queued job in this installation');
+      if (!requestQueueCancel) throw new FlowError('cancel_unavailable', 503, 'Canceling queued jobs is unavailable in this deployment');
+      const out = await requestQueueCancel(installationId, jobId, member.githubLogin ?? caller.sub);
+      if (!out.ok) throw new FlowError(out.code, out.status, out.message);
+      return { jobId, state: out.state };
     },
 
     /**
@@ -395,6 +469,14 @@ export function createStatusService({ store, github, agentKeys, readLog, request
     async job(caller: Caller, installationId: number, jobId: string): Promise<{ job: JobView; deliveries: DeliveryRecord[]; conversation: JobView[] }> {
       const member = await github.member(caller, installationId);
       const job = JOB_ID.test(jobId) ? await store.getJobSummary(installationId, jobId) : null;
+      // The queue entry under the same id: the job before it started (its link works from the
+      // acknowledgement on), or why it never did, and how long it waited before it started.
+      const entry = JOB_ID.test(jobId) && queue ? await queue.get(installationId, jobId).catch(() => null) : null;
+      if (!job && entry) {
+        const order = isWaiting(entry) ? positions(await queueOf(installationId)) : new Map<string, number>();
+        const deliveries = await store.listDeliveriesOf(installationId, entry.deliveryId).catch(() => []);
+        return { job: { ...queuedJobView(entry, now(), order.get(entry.jobId)), canCancel: !!requestQueueCancel && member.summary.role === 'owner' && entry.state === 'queued' }, deliveries, conversation: [] };
+      }
       if (!job) throw new FlowError('not_found', 404, 'There is no such job in this installation (jobs are kept 30 days)');
       // Every kept attempt of its delivery: GitHub reuses the id on a redelivery, so an earlier
       // attempt (one that failed to launch, a day before) is part of this job's history.
@@ -406,7 +488,7 @@ export function createStatusService({ store, github, agentKeys, readLog, request
       ]);
       const conversation = recent.filter((j) => j.jobId !== job.jobId && conversationOf(j) === conversationId).map((j) => view(j, settings.t, settings.unavailable));
       const execution = requestStop && member.summary.role === 'owner' ? await store.getJob(jobId) : null;
-      return { job: { ...view(job, settings.t, settings.unavailable), canResume: member.summary.role === 'owner' && job.stop?.confirmedAt !== undefined && job.stop.resumedAt === undefined,
+      return { job: { ...view(job, settings.t, settings.unavailable), ...(entry ? { queue: queueView(entry, now()) } : {}), canResume: member.summary.role === 'owner' && job.stop?.confirmedAt !== undefined && job.stop.resumedAt === undefined,
         canStop: !!requestStop && member.summary.role === 'owner' && (job.status !== 'finished' || !!job.stop && (job.stop.confirmedAt === undefined || !!job.stop.error) || !!execution && execution.releasedAt === undefined) }, deliveries, conversation };
     },
 

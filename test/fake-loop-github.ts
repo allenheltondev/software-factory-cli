@@ -53,6 +53,8 @@ export class FakeLoopGitHub {
   /** Annotations and log of each failed check run, by check run id (the CI step). */
   diagnostics: Record<number, CheckRunDiagnostics> = {};
   issueEvents: GitHubIssueEvent[] = [];
+  /** The issue's body, as getIssue returns it. */
+  issueBody = 'Please add a widget.';
   /** Every write, in order. */
   readonly writes: string[] = [];
   /** Every call, in order. */
@@ -123,7 +125,7 @@ export class FakeLoopGitHub {
     return { events: [], nextPage: null, etag: null, notModified: false };
   }
   async getIssue(): Promise<GitHubIssue> {
-    return { number: this.issue, title: 'Add a widget', body: 'Please add a widget.', htmlUrl: `https://github.com/${this.fullName}/issues/${this.issue}`, state: 'open', labels: ['updraft:ready'], isPullRequest: false };
+    return { number: this.issue, title: 'Add a widget', body: this.issueBody, htmlUrl: `https://github.com/${this.fullName}/issues/${this.issue}`, state: 'open', labels: ['updraft:ready'], isPullRequest: false };
   }
   async listEventsForIssue(): Promise<GitHubIssueEvent[]> {
     return this.issueEvents;

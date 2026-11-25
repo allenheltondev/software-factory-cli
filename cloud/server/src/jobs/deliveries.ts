@@ -12,7 +12,11 @@ import type { LaunchResult } from './launch.js';
  *   deduped        a redelivery of a delivery that already has a job
  *   coalesced      folded into another delivery's job: a pull request event within a few
  *                  seconds of one that started a job for the same pull request (launch.ts)
- *   throttled      over a quota; the reason is the limit
+ *   queued         eligible, and kept in the admission queue (queue.ts) until capacity frees; the
+ *                  reason is why it waits (concurrent_jobs, platform_concurrency, queue_ahead) and
+ *                  jobId the job it starts as. A redelivery or relabel of queued work is `deduped`
+ *                  (already_queued)
+ *   throttled      over a budget, or the queue's bound (queue_full); the reason is the limit
  *   launch_failed  the job could not be started; errorClass is the AWS error's class
  *   launched       a job was started; jobId is it
  *
@@ -53,6 +57,12 @@ export function deliveryFromLaunch(base: DeliveryEvent, result: LaunchResult): D
       return { ...base, disposition: 'coalesced', ...(result.message ? { message: result.message } : {}) };
     case 'throttled':
       return { ...base, disposition: 'throttled', ...(result.reason ? { reason: result.reason } : {}) };
+    case 'queued':
+      return { ...base, disposition: 'queued', ...(result.reason ? { reason: result.reason } : {}), ...(result.jobId ? { jobId: result.jobId } : {}) };
+    case 'queue_joined':
+      return { ...base, disposition: 'deduped', reason: 'already_queued', ...(result.message ? { message: result.message } : {}), ...(result.jobId ? { jobId: result.jobId } : {}) };
+    case 'queue_busy':
+      return { ...base, disposition: 'launch_failed', errorClass: 'QueueBusy', ...(result.message ? { message: result.message } : {}), ...(result.jobId ? { jobId: result.jobId } : {}) };
     case 'launch_failed':
       return { ...base, disposition: 'launch_failed', errorClass: result.errorClass ?? 'Error', ...(result.jobId ? { jobId: result.jobId } : {}) };
     case 'cancelled':

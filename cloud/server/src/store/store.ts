@@ -197,7 +197,7 @@ export interface DeliveryRecord {
   pullRequest?: number;
   label?: string;
   sender?: string;
-  disposition: 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
+  disposition: 'filtered' | 'deduped' | 'coalesced' | 'queued' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
   reason?: string;
   message?: string;
   /** launch_failed: the AWS error's class (its name), never its message. */
@@ -735,6 +735,11 @@ export interface Store {
   holdSlots(job: Pick<Job, 'installationId' | 'jobId' | 'tenantSlot' | 'platformSlot'>, until: number): Promise<boolean>;
   /** The platform's unexpired slots and the jobs holding them. */
   listPlatformSlots(): Promise<{ jobId: string; expiresAt: number }[]>;
+  /**
+   * The numbers of the unexpired slots held now, of a tenant or of the platform: a read-only hint
+   * (the admission queue skips a full tenant without calling GitHub). reserveJob alone takes slots.
+   */
+  heldSlots(scope: number | 'platform'): Promise<number[]>;
   /** The reservations not yet released (reserveJob to releaseJob): what reconciliation looks at. */
   listActiveJobs(): Promise<ActiveJob[]>;
   /** An active entry whose job is gone, past its maximum duration: frees its slots and drops it. */
@@ -1133,6 +1138,11 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       active.set(jobId, { ...entry, phase: 'launching' });
       const j = jobs.get(jobId);
       if (j) jobs.set(jobId, { ...j, launchingAt: Date.now() });
+    },
+    async heldSlots(scope) {
+      const now = Date.now();
+      const prefix = scope === 'platform' ? 'platform/' : `${scope}/`;
+      return [...slots.entries()].filter(([key, s]) => key.startsWith(prefix) && s.expiresAt >= now).map(([key]) => Number(key.slice(prefix.length)));
     },
     async listPlatformSlots() {
       const now = Date.now();

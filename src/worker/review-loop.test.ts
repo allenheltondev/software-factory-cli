@@ -46,7 +46,7 @@ afterEach(() => {
   for (const f of fixtures.splice(0)) f.cleanup();
 });
 
-function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[] } = {}) {
+function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[]; coderArgs?: string[] } = {}) {
   const f = createGitFixture(FULL);
   fixtures.push(f);
   const paths: UpdraftPaths = resolvePaths({ env: { UPDRAFT_HOME: join(f.root, 'updraft home') } });
@@ -68,7 +68,7 @@ function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[] }
     version: 1,
     execution: { mode: 'live' },
     agents: {
-      claude: { command: process.execPath, args: ['--mode', 'success'], env },
+      claude: { command: process.execPath, args: over.coderArgs ?? ['--mode', 'success'], env },
       codex: { command: process.execPath, args: over.reviewerArgs ?? ['--mode', 'review'], env },
     },
     pools: { general: { agents: ['claude'] }, reviewers: { agents: ['codex'] } },
@@ -311,6 +311,43 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     const pr = getLoopPr(db, REPO_ID, PR)!;
     expect(pr).toMatchObject({ verdict: null, mergeState: null, headSha: remoteHead(f, prBranch) });
     expect(prStage(db, pr, 3)).toMatchObject({ stage: 'needs-human', detail: expect.stringMatching(/did not finish/) });
+  });
+
+  it('holds a ready verdict back until every acceptance criterion is independently verified, revising the one that is not met', async () => {
+    const s = setup({ coderArgs: ['--mode', 'success', '--acceptance'], reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge', '--acceptance'] });
+    const { db, gh, paths } = s;
+    gh.issueBody = ['Please add a widget.', '', '## Acceptance', '- [ ] The widget exists', '- [ ] The widget is documented', '- [ ] The widget has a test', '- [ ] The widget is in the changelog'].join('\n');
+    const worker = start(s);
+    await vi.waitFor(() => expect(gh.merges).toHaveLength(1), { timeout: 150_000, interval: 100 });
+    await worker.stop();
+
+    const jobs = jobsOf(db);
+    expect(jobs.map((j) => j.envelope.type)).toEqual(['issue.labeled', 'pull_request.review', 'pull_request.changes_requested', 'pull_request.review']);
+    const [code, review1, revision, review2] = jobs as [Job, Job, Job, Job];
+    const runOf = (j: Job) => latestRunOfJob(db, j.id)!;
+    const criteria = runOf(review1).summary!.review!.acceptance!.criteria;
+    expect(criteria.map((c) => c.text)).toEqual(['The widget exists', 'The widget is documented', 'The widget has a test', 'The widget is in the changelog']);
+    const last = criteria[3]!.id;
+
+    // The coding agent's report is recorded as its claim, and given to the reviewer as one.
+    expect(runOf(code).summary!.acceptanceReport!.claims).toHaveLength(4);
+    expect(reviewOf(review1)!.acceptanceClaims).toMatchObject({ runId: runOf(code).id });
+    const prompt1 = readFileSync(join(paths.runsDir, runOf(review1).id, 'prompt.md'), 'utf8');
+    expect(prompt1).toContain(`## Criterion 4 of 4: ${last}`);
+    expect(prompt1).toContain("- Coding agent's report (a claim, not evidence): implemented");
+
+    // Round 1: the reviewer wrote ready, but the fourth criterion is not met: a revision, given it.
+    expect(getPrReview(db, runOf(review1).id)).toMatchObject({ verdict: 'changes-requested', outcome: 'revision-queued' });
+    expect(revisionOf(revision)!.acceptance).toEqual([{ id: last, text: 'The widget is in the changelog', status: 'unmet', gate: 'code', note: 'not done yet' }]);
+    expect(readFileSync(join(paths.runsDir, runOf(revision).id, 'prompt.md'), 'utf8')).toContain('The reviewer of the current head found it: unmet');
+
+    // Round 2: all four verified on the new head, which is what was merged.
+    expect(getPrReview(db, runOf(review2).id)).toMatchObject({ verdict: 'ready-to-merge', outcome: 'ready' });
+    const posted = gh.reviews.filter((r) => r.user === 'updraft-bot');
+    expect(posted[0]!.body).toContain(`- **Not met** · \`${last}\``);
+    expect(posted[1]!.body).toContain('4 of 4 mandatory criteria verified');
+    expect(posted[1]!.body).toContain(`\`${last}\` not met → verified`);
+    expect(gh.merges).toEqual([{ sha: runOf(review2).summary!.review!.headSha, method: 'squash' }]);
   });
 
   it('keeps the verdict when the findings count is broken: no count is recorded, and run.log says why', async () => {

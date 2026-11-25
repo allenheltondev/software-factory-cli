@@ -7,6 +7,7 @@ export const BENCHMARK_RETRY_MESSAGE = 'To rerun this benchmark, submit a fresh 
  * How a job ended, as the console shows it (#71). From the outcome the runner reported to the
  * broker and what it said with it (JobFinishDetail).
  *
+ *   queued           waiting in the admission queue for capacity: no job has started (queue.ts)
  *   running          not finished yet
  *   success          it ran and published (or had nothing to publish)
  *   nothing_to_do    run-event found nothing to do for the event
@@ -25,6 +26,8 @@ export const BENCHMARK_RETRY_MESSAGE = 'To rerun this benchmark, submit a fresh 
  *   other            anything else (a newer outcome)
  */
 export type JobResult =
+  /** Waiting in the admission queue for capacity (jobs/queue.ts): not started, nothing reserved. */
+  | 'queued'
   | 'running'
   | 'success'
   | 'nothing_to_do'

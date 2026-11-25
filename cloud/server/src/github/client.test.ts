@@ -40,6 +40,24 @@ describe('the GitHub client', () => {
     await expect(api.createIssueComment('ghs_x', 'acme/web', 12, 'x')).rejects.toBeInstanceOf(GitHubError);
   });
 
+  it('posts a comment it can edit later, finds it again by its marker, and edits it in place', async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const api = createGitHubApi(async (url, init) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      if (String(url).includes('/comments?')) {
+        return new Response(JSON.stringify([{ id: 5, body: 'someone else <!-- updraft-queue: job_a -->', user: { login: 'mallory' } }, { id: 6, body: 'x <!-- updraft-queue: job_a -->', user: { login: 'updraft[bot]' } }]), { status: 200 });
+      }
+      return new Response(JSON.stringify({ id: 77 }), { status: 201 });
+    });
+    expect(await api.postIssueComment!('ghs_x', 'acme/web', 12, 'queued')).toBe(77);
+    // Only the App's own comment counts: anyone can paste a marker.
+    expect(await api.findIssueComment!('ghs_x', 'acme/web', 12, '<!-- updraft-queue: job_a -->', 'updraft[bot]')).toBe(6);
+    expect(await api.findIssueComment!('ghs_x', 'acme/web', 12, '<!-- updraft-queue: job_b -->', 'updraft[bot]')).toBeNull();
+    await api.updateIssueComment!('ghs_x', 'acme/web', 77, 'started');
+    expect(calls.at(-1)!.url).toBe('https://api.github.com/repos/acme/web/issues/comments/77');
+    expect(calls.at(-1)!.init.method).toBe('PATCH');
+  });
+
   it('reads a pull request\'s state and head', async () => {
     const api = createGitHubApi(async () => new Response(JSON.stringify({ state: 'closed', merged: true, head: { sha: 'abc', ref: 'updraft/x' } }), { status: 200 }));
     expect(await api.pullRequestHead!('ghs_x', 'acme/web', 12)).toEqual({ state: 'closed', merged: true, headSha: 'abc', headRef: 'updraft/x' });

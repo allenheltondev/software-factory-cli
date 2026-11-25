@@ -31,6 +31,7 @@ const STAGE: Record<string, string> = {
   done: 'Done',
   failed: 'Failed',
   'awaiting-sign-in': 'Waiting for sign-in',
+  queued: 'Queued for capacity',
   'publish-failed': 'Publication failed',
 };
 

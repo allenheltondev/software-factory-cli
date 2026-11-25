@@ -33,6 +33,8 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     retryJob: vi.fn(),
     stopJob: vi.fn(),
     resumeJob: vi.fn(),
+    cancelQueuedJob: vi.fn(),
+    queue: vi.fn().mockResolvedValue({ queue: [] }),
     resumeWorkflow: vi.fn(),
     packageRegistries: vi.fn().mockResolvedValue({ hosts: [], defaults: ['registry.npmjs.org'], max: 20, canEdit: false, version: 0 }),
     setPackageRegistries: vi.fn(),

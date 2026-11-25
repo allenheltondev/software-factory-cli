@@ -59,9 +59,12 @@ export function createWebhookHandler({
   launch,
   routines,
   benchmarkInstallationId,
+  queueEvents,
   now = () => Date.now(),
   log = (m: string) => console.log(m),
 }: {
+  /** The admission queue's dispatcher (jobs/queue.ts): label removals and closes cancel queued work. */
+  queueEvents?: Pick<import('../jobs/queue.js').QueueDispatcher, 'subjectChanged'>;
   store: Store;
   github: Pick<GitHubApi, 'getInstallation'>;
   loadSettings: LoadSettings;
@@ -153,6 +156,20 @@ export function createWebhookHandler({
       }
       await record(deliveryFromLaunch(base, result));
       return done(result.disposition, result.status);
+    }
+    // A queued job's issue lost its trigger label or was closed: its queued work ends now, rather
+    // than when capacity frees (admission checks both again in any case: jobs/queue.ts).
+    if (event === 'issues' && (action === 'unlabeled' || action === 'closed') && validInstallation && queueEvents) {
+      const repositoryId = payload.repository?.id;
+      const issue = payload.issue?.number;
+      const label = payload.label?.name;
+      if (Number.isSafeInteger(repositoryId) && Number.isSafeInteger(issue) && (action === 'closed' || typeof label === 'string')) {
+        const canceled = await queueEvents.subjectChanged(installationId, repositoryId as number, { issue: issue as number }, action === 'closed' ? { kind: 'closed' } : { kind: 'unlabeled', label: label as string });
+        if (canceled) {
+          await record({ ...base, disposition: 'filtered', reason: 'queue_canceled', message: action === 'closed' ? 'The issue was closed: its queued job was canceled' : 'The trigger label was removed: its queued job was canceled' });
+          return done('queue_canceled');
+        }
+      }
     }
     if (!LIFECYCLE_EVENTS.has(event)) {
       // Work Updraft Cloud does not take (yet): listed for the tenant it was meant for.

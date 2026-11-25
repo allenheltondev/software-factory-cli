@@ -214,7 +214,8 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     ...(job.platformSlot !== undefined ? [platformSlotKey(job.platformSlot)] : []),
   ];
   /** A free slot below `count` (none, or expired), or null. Strongly consistent. */
-  async function freeSlot(pk: string, count: number, spread: boolean): Promise<number | null> {
+  /** The sort keys of a partition's unexpired slots. */
+  async function heldSlotKeys(pk: string): Promise<Set<string>> {
     const now = Math.floor(Date.now() / 1000);
     const held = new Set<string>();
     let ExclusiveStartKey: Record<string, unknown> | undefined;
@@ -231,6 +232,10 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       for (const item of page.Items ?? []) if (typeof item.ttl === 'number' && item.ttl >= now) held.add(String(item.sk));
       ExclusiveStartKey = page.LastEvaluatedKey;
     } while (ExclusiveStartKey);
+    return held;
+  }
+  async function freeSlot(pk: string, count: number, spread: boolean): Promise<number | null> {
+    const held = await heldSlotKeys(pk);
     // The platform's slots are shared by every tenant: start anywhere, so launches rarely race.
     const start = spread && count > 0 ? Math.floor(Math.random() * count) : 0;
     for (let i = 0; i < count; i++) {
@@ -1669,6 +1674,11 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     async forgetActiveJob(entry) {
       for (const key of jobSlotKeys(entry)) await deleteIfHeld(key, entry.jobId);
       await client.send(new DeleteCommand({ TableName: T, Key: activeKey(entry.jobId) }));
+    },
+
+    async heldSlots(scope) {
+      const held = await heldSlotKeys(scope === 'platform' ? PLATFORM : `TENANT#${scope}`);
+      return [...held].map((sk) => Number(sk.slice('SLOT#'.length))).filter(Number.isSafeInteger);
     },
 
     async listPlatformSlots() {

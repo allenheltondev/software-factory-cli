@@ -308,6 +308,13 @@ export const repositorySchema = z.strictObject({
         pool: name.optional(),
         /** Let the agent that wrote the code also review it when the review pool has no other enabled agent. Default false. */
         allowSameAgent: z.boolean().default(false),
+        /**
+         * The issue's acceptance criteria (docs/acceptance.md). enforce (the default): the reviewer
+         * assesses each one, and a head with a mandatory criterion not verified is never ready.
+         * report: assessed and shown, never holding a head back (a waiver, set by whoever writes
+         * the config). off: not given to the agents at all.
+         */
+        acceptance: z.enum(['enforce', 'report', 'off']).optional(),
       }),
     ])
     .optional(),
@@ -542,6 +549,16 @@ export function dependenciesEnabled(config: Pick<UpdraftConfig, 'execution' | 'r
 /** True when the revision loop runs for this repository: live mode, publication on, revise on. */
 export function reviseActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'revise'>): boolean {
   return config.execution.mode === 'live' && repo.revise === true && publishMode(repo) !== 'none';
+}
+
+/**
+ * repositories.<repo>.review.acceptance as a policy: null when review is off or acceptance is
+ * off, else enforce (the default) or report.
+ */
+export function acceptancePolicy(repo: Pick<RepositoryConfig, 'review'>): 'enforce' | 'report' | null {
+  if (repo.review === undefined || repo.review === false) return null;
+  const set = repo.review === true ? undefined : repo.review.acceptance;
+  return set === 'off' ? null : (set ?? 'enforce');
 }
 
 /** repositories.<repo>.review as settings: off unless set to true or to an options object. */

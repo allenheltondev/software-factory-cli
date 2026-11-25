@@ -390,7 +390,7 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
     // Diagnostics change by the second: never cached on the way.
     app.use('/v1/installations/:id/*', async (c, next) => {
       await next();
-      if (/\/(overview|deliveries|jobs|workflows)/.test(c.req.path)) c.header('Cache-Control', 'no-store');
+      if (/\/(overview|deliveries|jobs|workflows|queue)/.test(c.req.path)) c.header('Cache-Control', 'no-store');
     });
     app.get('/v1/installations/:id/overview', async (c) => {
       const id = positive(c.req.param('id'));
@@ -422,6 +422,14 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
         return id ? c.json(await workflows.ofJob(c.get('caller'), id, c.req.param('jobId'))) : c.json({ error: 'not_found' }, 404);
       });
     }
+    app.get('/v1/installations/:id/queue', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await status.queue(c.get('caller'), id, c.req.query('limit'))) : c.json({ error: 'not_found' }, 404);
+    });
+    app.post('/v1/installations/:id/jobs/:jobId/cancel', async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await status.cancelQueued(c.get('caller'), id, c.req.param('jobId'))) : c.json({ error: 'not_found' }, 404);
+    });
     app.post('/v1/installations/:id/jobs/:jobId/retry', async (c) => {
       const id = positive(c.req.param('id'));
       return id ? c.json(await status.retry(c.get('caller'), id, c.req.param('jobId')), 202) : c.json({ error: 'not_found' }, 404);

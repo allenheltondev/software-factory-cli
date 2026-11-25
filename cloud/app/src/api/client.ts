@@ -259,8 +259,10 @@ export interface NativeClaudeView {
 // A tenant's status and diagnostics (server/src/tenants/status-service.ts).
 
 export type InstallationStatus = 'active' | 'suspended' | 'missing_permissions' | 'disabled' | 'uninstalled';
-export type DeliveryDisposition = 'filtered' | 'deduped' | 'coalesced' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
+export type DeliveryDisposition = 'filtered' | 'deduped' | 'coalesced' | 'queued' | 'throttled' | 'launch_failed' | 'launched' | 'routine_triggered' | 'routine_failed' | 'routine_unknown';
 export type JobResult =
+  /** Waiting in the admission queue for capacity: nothing has started. */
+  | 'queued'
   | 'running'
   | 'success'
   | 'nothing_to_do'
@@ -370,7 +372,28 @@ export interface WorkflowEvent {
   message?: string;
 }
 
+/** A job's time in the admission queue (server/src/jobs/queue.ts). */
+export interface QueueView {
+  state: 'queued' | 'admitting' | 'admitted' | 'canceled' | 'refused' | 'expired';
+  reason: 'concurrent_jobs' | 'platform_concurrency' | 'queue_ahead' | 'retrying';
+  waitMessage: string;
+  enqueuedAt: string;
+  expiresAt: string;
+  waitedSeconds: number;
+  /** Its place in the installation's line (1 starts next): the order, never a promised time. */
+  position?: number;
+  attempts: number;
+  deliveries: number;
+  eventName: string;
+  route: 'standard' | 'subscription';
+  outcome?: { at: string; reason: string; message: string; nextAction?: string; by?: string; jobId?: string };
+}
+
 export interface JobView {
+  /** Its time in the admission queue, when it waited there. */
+  queue?: QueueView;
+  /** An owner can cancel it while it waits. */
+  canCancel?: boolean;
   canStop?: boolean;
   stop?: { requestedAt: number; by: string; reason: string; confirmedAt?: number; error?: string; reconnectRequired?: boolean; resumedAt?: number; resumedBy?: string };
   canResume?: boolean;
@@ -383,7 +406,8 @@ export interface JobView {
   label?: string;
   sender?: string;
   createdAt: string;
-  status: 'launched' | 'finished';
+  /** `queued`: waiting in the admission queue, with no job record yet. */
+  status: 'queued' | 'launched' | 'finished';
   outcome?: string;
   configVersion?: number;
   finishedAt?: string;
@@ -727,7 +751,8 @@ export interface ConsoleWorkflow {
   pool: string;
   prompt: string;
   timeoutMinutes?: number;
-  review: { enabled: boolean; pool: string; prompt: string; allowSameAgent: boolean };
+  /** acceptance: how the issue's acceptance criteria are checked; absent means the CLI's default, enforce. */
+  review: { enabled: boolean; pool: string; prompt: string; allowSameAgent: boolean; acceptance?: 'enforce' | 'report' | 'off' };
   revise: { enabled: boolean; prompt: string; maxRevisions?: number };
 }
 
@@ -902,6 +927,10 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
       request<{ jobId: string }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' }),
     stopJob: (installationId: number, jobId: string, reason = 'Stopped from the console') =>
       request<{ jobId: string; state: 'stopping' | 'canceled' | 'finished' }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/stop`, { method: 'POST', body: JSON.stringify({ reason }) }),
+    /** Cancels a job that waits in the admission queue (owners). Throws ApiError `admitting` (409) once it is starting: stop it then. */
+    cancelQueuedJob: (installationId: number, jobId: string) =>
+      request<{ jobId: string; state: string }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' }),
+    queue: (installationId: number, limit = 100) => request<{ queue: JobView[] }>(`/installations/${installationId}/queue?limit=${limit}`),
     resumeJob: (installationId: number, jobId: string) => request<{ resumed: true }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/resume`, { method: 'POST' }),
     /** The end of a log; throws ApiError `log_expired` (410) once it is past the retention. */
     jobLog: (installationId: number, jobId: string, name: string) =>
