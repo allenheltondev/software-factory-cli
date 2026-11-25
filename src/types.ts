@@ -361,6 +361,12 @@ export interface RunSummary {
   lastOutput: string[];
   /** Parts of the summary that could not be computed. */
   notes: string[];
+  /**
+   * The model the agent CLI itself reported for the run (its main conversation), when the
+   * adapter can read one from the output; absent otherwise. Never the configured model: a
+   * comment shows the two apart, and an absent value is never filled in from the config.
+   */
+  observedModel?: string;
   /** Result of the action's verify commands; absent when none ran (and in summaries from before they existed). */
   verification?: VerificationSummary;
   /** A reviewer run only: the commit it reviewed and what it concluded. Absent when no verdict could be read. */

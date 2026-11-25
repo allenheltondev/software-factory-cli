@@ -963,11 +963,20 @@ export class LiveExecutor implements Executor {
     // 6. Outcome.
     // Read before the stderr is appended: with separateStderr this is the agent's stdout alone.
     const outputTail = await tailLines(logPath, outputStart);
-    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || review || dependencies || revision?.findings?.length ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
+    const agentOutput = adapter.interpretExit || adapter.summarizeOutput || adapter.observedModel || review || dependencies || revision?.findings?.length ? await readOutput(logPath, outputStart, RAW_OUTPUT_BYTES) : '';
     const stderrText = await moveStderr();
     // What exit interpretation and summaries see: stdout, then stderr (an error is often only there).
     const rawOutput = stderrText.trim() ? (agentOutput ? `${agentOutput.replace(/\r?\n$/, '')}\n${stderrText}` : stderrText) : agentOutput;
     let lastOutput = outputTail;
+    // The model the CLI itself reported, kept apart from the configured one (docs/assignment-comments.md).
+    let observedModel: string | null = null;
+    if (adapter.observedModel && agentOutput) {
+      try {
+        observedModel = adapter.observedModel(agentOutput);
+      } catch (err) {
+        ctx.log.warn('adapter could not read the reported model', { adapter: adapterName, error: message(err) });
+      }
+    }
     if (adapter.summarizeOutput) {
       try {
         const lines = adapter.summarizeOutput(rawOutput);
@@ -1152,6 +1161,7 @@ export class LiveExecutor implements Executor {
         untrustedWorktree: Boolean(box),
       });
       summary = detail.summary;
+      if (observedModel) summary.observedModel = observedModel;
       if (verification) summary.verification = verification;
       if (reviewResult) summary.review = reviewResult;
       if (resolutions) summary.resolutions = resolutions;

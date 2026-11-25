@@ -236,3 +236,23 @@ describe('claude adapter: results', () => {
     expect(claudeAdapter.interpretExit!(exit(out))).toEqual({ outcome: 'succeeded' });
   });
 });
+
+describe('claude adapter: the model it reported', () => {
+  const observed = (output: string) => claudeAdapter.observedModel!(output);
+  const withModel = (ev: Record<string, unknown>, model: string) => ({ ...ev, message: { ...(ev.message as object), model } });
+
+  it('reads the main conversation model, never a subagent one', () => {
+    const sub = withModel(assistantText('subagent work', 'toolu_1'), 'claude-haiku-4-5');
+    expect(observed(stream(init(), sub, assistantText('done'), sub, success('done')))).toBe('claude-sonnet-4-5');
+  });
+
+  it('falls back to the init message, and reports nothing when the output names no model', () => {
+    expect(observed(stream({ ...init(), model: 'claude-opus-4-5' }, success('done')))).toBe('claude-opus-4-5');
+    expect(observed(stream(success('done')))).toBeNull();
+    expect(observed('plain text output\nmodel: opus\n')).toBeNull();
+  });
+
+  it('drops values that do not look like a model name', () => {
+    expect(observed(stream(withModel(assistantText('x'), 'opus <!-- x --> `y`')))).toBeNull();
+  });
+});

@@ -621,6 +621,8 @@ describe('LiveExecutor (Claude Code adapter, fake claude CLI)', { timeout: 120_0
     const log = readFileSync(c.run.logPath!, 'utf8');
     expect(log).toContain('"type":"result"'); // the raw stream stays in run.log
     expect(log).toContain('  | - Added the roster page.\n');
+    // The model the CLI reported is kept apart from any configured one (none is configured here).
+    expect(result.summary?.observedModel).toBe('claude-sonnet-4-5');
     expect(log).toContain('outcome: succeeded');
   });
 

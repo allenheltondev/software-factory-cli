@@ -114,6 +114,13 @@ export interface AgentAdapter {
    */
   summarizeOutput?(output: string): string[] | null;
   /**
+   * The model the agent CLI itself reported in its raw output (see {@link AgentExit.output}) for
+   * the run's main conversation, or null when it reported none. Only what the output says: never
+   * the configured model, and nothing for a CLI whose output does not name one. Absent: the
+   * adapter's output never names a model.
+   */
+  observedModel?(output: string): string | null;
+  /**
    * The agent's own final message and nothing else (no status line, no tool output), read from
    * its raw output. A reviewer run's verdict is parsed from this. Null: the output is structured
    * but holds no final message (the run did not end normally). Undefined, or no such method: the
