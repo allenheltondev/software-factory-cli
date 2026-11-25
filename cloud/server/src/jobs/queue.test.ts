@@ -345,6 +345,26 @@ describe('the admission queue', () => {
     expect(notices).toEqual([]);
   });
 
+  it('admits queued subscription work on a replacement session of the same worker (a new generation is not a new route)', async () => {
+    const native = (generation: string): NonNullable<LaunchDeps['native']> => ({
+      route: { installationId: 55, repositoryId: 9, repository: 'acme/web', labels: ['updraft'], workerId: 'worker-1', microvmId: `mvm-${generation}`, imageVersion: '7', generation,
+        controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/test-abcdef' },
+      secret: async () => 'worker-control-credential-01234567890123456789',
+      enabled: async () => true,
+    });
+    const first = createLauncher(deps({ native: native('g1') }));
+    const a = await first(request(1, 'delivery-a'));
+    expect(a.disposition).toBe('launched');
+    const b = await first(request(2, 'delivery-b'));
+    expect(b).toMatchObject({ disposition: 'queued' });
+    expect((await queue.get(55, b.jobId!))?.route).toBe('worker-1');
+    await finish(a.jobId!);
+    // The session was replaced meanwhile (a compatible image rollout, #155): same worker, new generation.
+    await dispatcherFor(createLauncher(deps({ native: native('g2') }))).dispatch();
+    expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'admitted' });
+    expect((await store.getJob(b.jobId!))?.native).toMatchObject({ workerId: 'worker-1', generation: 'g2' });
+  });
+
   it('refuses queued work whose execution route changed, never rerouting it', async () => {
     const launch = createLauncher(deps());
     const a = await launch(request(1, 'delivery-a'));
