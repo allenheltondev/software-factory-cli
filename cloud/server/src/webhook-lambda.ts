@@ -118,6 +118,7 @@ function launcher(): Launcher | undefined {
       egressConnectorArn: internetEgressConnector(partition, region),
       logGroup: env.MICROVM_LOG_GROUP ?? '',
       brokerFunctionName: env.BROKER_FUNCTION_NAME,
+      consoleOrigin: env.UPDRAFT_CONSOLE_ORIGIN || undefined,
       maximumDurationSeconds: Number(env.MAX_DURATION_SECONDS ?? 10800),
       watchdogReserveSeconds: Number(env.WATCHDOG_RESERVE_SECONDS ?? 600),
     },

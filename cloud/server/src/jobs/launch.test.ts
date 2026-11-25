@@ -12,7 +12,7 @@ import { configPrefix } from '../tenants/paths.js';
 import { dispatchRules } from '../tenants/dispatch.js';
 import { createAdminService } from '../admin/admin.js';
 import { createReconciler } from './reconcile.js';
-import { createLauncher, readinessAction, waitingComment, type NativeReadiness, PR_COALESCE_MS, PRELAUNCH_CLAIM_MS, pullRequestLease, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
+import { createLauncher, readinessAction, waitingComment, type NativeReadiness, PR_COALESCE_MS, PRELAUNCH_CLAIM_MS, pullRequestLease, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice, runHookPayload } from './launch.js';
 
 // Relative to the real clock: the memory store judges a delivery claim's expiry by it.
 const NOW = Date.now();
@@ -1114,5 +1114,16 @@ describe('the launcher', () => {
 
   it('refuses a delivery id that cannot be part of an S3 key', async () => {
     expect(await createLauncher(deps)(request({}, '../../x'))).toEqual({ status: 400, disposition: 'bad_delivery_id' });
+  });
+});
+
+describe('runHookPayload console origin', () => {
+  const job = { jobId: 'job_abc12345', token: 't', deliveryId: 'd', launchedAt: NOW };
+  it('carries only a valid https origin, for the same retries and native runs as the job itself', () => {
+    expect(runHookPayload({ ...SETTINGS, consoleOrigin: 'https://updraft.readysetcloud.io/x?y' }, job)).toMatchObject({ consoleOrigin: 'https://updraft.readysetcloud.io' });
+    expect(runHookPayload({ ...SETTINGS, consoleOrigin: 'https://staging.example.com' }, { ...job, retry: true })).toMatchObject({ consoleOrigin: 'https://staging.example.com', retry: true });
+    for (const bad of [undefined, '', 'http://x.io', 'not a url', 'https://u:p@x.io']) {
+      expect(runHookPayload({ ...SETTINGS, consoleOrigin: bad }, job)).not.toHaveProperty('consoleOrigin');
+    }
   });
 });

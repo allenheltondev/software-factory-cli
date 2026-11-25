@@ -108,6 +108,21 @@ describe('lifecycle hook routing', () => {
     expect(calls.started).toHaveLength(1);
   });
 
+  it('keeps a valid https consoleOrigin of a version 2 payload and drops anything else', () => {
+    const v2 = (extra) => ({
+      microvmId: 'mvm-1',
+      runHookPayload: JSON.stringify({
+        version: 2, deliveryId: 'd-1', eventName: 'issues', region: 'us-east-1',
+        broker: { functionName: 'broker', jobId: 'job_abc12345', jobToken: 'x'.repeat(43) },
+        maximumDurationSeconds: 3600, watchdogReserveSeconds: 60, launchedAt: '2026-01-02T03:04:05.000Z', ...extra,
+      }),
+    });
+    expect(parseRunRequest(v2({ consoleOrigin: 'https://updraft.readysetcloud.io' })).payload.consoleOrigin).toBe('https://updraft.readysetcloud.io');
+    for (const bad of ['http://x.io', 'https://x.io/path', 'https://u:p@x.io', 'junk', 5]) {
+      expect(parseRunRequest(v2({ consoleOrigin: bad })).payload).not.toHaveProperty('consoleOrigin');
+    }
+  });
+
   it('rejects an oversized /run body', async () => {
     const { calls, hook } = await startServer();
     const response = await hook('run', { microvmId: 'mvm-1', runHookPayload: 'x'.repeat(200_000) }).catch(() => undefined);

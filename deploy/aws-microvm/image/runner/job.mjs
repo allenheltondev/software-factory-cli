@@ -349,7 +349,7 @@ export async function runJob(request, deps) {
       tracer.start();
       log(`sending agent telemetry (trace ${tracer.traceId}) to ${telemetry.host}${telemetry.captureContent ? ', with content' : ''}`);
     }
-    const { stateDir, state } = await timed('restore_state', {}, async (step) => {
+    const { stateDir, state, installationId } = await timed('restore_state', {}, async (step) => {
       const prepared = await prepare(payload, deps);
       if (deps.configureJob) await deps.configureJob(prepared.stateDir);
       step.attributes = { 'updraft.state.restored': Boolean(prepared.state) };
@@ -419,7 +419,7 @@ export async function runJob(request, deps) {
       checkpointer?.start();
       try {
         run = await timed('run_event', { 'updraft.run_event.try': pending.tries + 1, 'updraft.run_event.deadline_minutes': deadlineNow }, async (step) => {
-          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: sending ? tracer?.traceId : undefined, agentTelemetryEnv }, { agentEnv, redact }, (stop) => {
+          const done = await runUpdraft(payload, stateDir, budget, deadlineNow, { ...deps, log, traceId: sending ? tracer?.traceId : undefined, agentTelemetryEnv, installationId }, { agentEnv, redact }, (stop) => {
             stopChild = stop;
             if (stopRequested) stop();
           });
@@ -643,6 +643,7 @@ function notAttempted() {
  * payload names one, the shared state database. Returns its path and what was downloaded.
  */
 async function prepare(payload, deps) {
+  let installationId;
   const { jobUser } = deps;
   await fs.mkdir(deps.stateRoot, { recursive: true });
   // mkdtemp's suffix is generated now, inside this microVM, not at image build.
@@ -674,7 +675,9 @@ async function prepare(payload, deps) {
   if (payload.version === 2) {
     // Updraft Cloud: no key in the job at all. An installation token for this job's repository,
     // which the tenant's compiled config reads (github.app.tokenFile: ./app-token.json).
-    await writeTokenFile(stateDir, await deps.githubToken(), deps);
+    const tokenDocument = await deps.githubToken();
+    await writeTokenFile(stateDir, tokenDocument, deps);
+    installationId = tokenDocument?.installationId;
   } else {
     const privateKey = await deps.getSecret(payload.secrets.githubAppPrivateKey);
     if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(privateKey ?? '')) {
@@ -694,7 +697,7 @@ async function prepare(payload, deps) {
   }
 
   if (jobUser.uid !== undefined && jobUser.gid !== undefined) await chownTree(stateDir, jobUser.uid, jobUser.gid);
-  return { stateDir, state };
+  return { stateDir, state, installationId };
 }
 
 /**
@@ -1015,6 +1018,19 @@ function jobEnvironment(payload, stateDir, agentEnv, deps) {
   // relay; no key). Last, so an agent key of the same name cannot point them elsewhere. The
   // sandbox runtime passes exactly these on to a contained agent (updraft-sandbox.mjs).
   Object.assign(env, deps.agentTelemetryEnv);
+  // Updraft Cloud: the non-secret context for the job link in the assignment comment. The Cloud
+  // job id is the broker's (the same for every try and every local run of this job), the
+  // installation comes from the broker's token file, the origin from the deployment's own
+  // launch settings. All three or none: run-event renders plain ids otherwise.
+  if (payload.version === 2) {
+    const jobId = payload.broker?.jobId;
+    const installation = deps.installationId;
+    if (typeof payload.consoleOrigin === 'string' && typeof jobId === 'string' && /^[1-9][0-9]{0,18}$/.test(String(installation ?? ''))) {
+      env.UPDRAFT_CONSOLE_ORIGIN = payload.consoleOrigin;
+      env.UPDRAFT_CLOUD_INSTALLATION_ID = String(installation);
+      env.UPDRAFT_CLOUD_JOB_ID = jobId;
+    }
+  }
   // Deliberately absent: AWS_* (the runner's credentials and region), anything naming the
   // key file, and the run request. See "Security model" in the README for what this does
   // and does not achieve.
