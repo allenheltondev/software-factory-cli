@@ -90,13 +90,18 @@ export function relay(client, socketPath, record) {
   const upstream = net.createConnection(socketPath);
   let head = Buffer.alloc(0);
   let headDone = false;
+  // Set when the shim itself answered (the proxy is unreachable): that answer must be flushed,
+  // never cut off by the dead upstream's close.
+  let answered = false;
   client.on('error', () => upstream.destroy());
   upstream.on('error', () => {
     if (!headDone) {
+      headDone = true;
+      answered = true;
+      client.unpipe(upstream);
       record({ reason: 'proxy-unavailable' });
       const body = 'Updraft egress proxy unavailable\n';
       client.end(`HTTP/1.1 502 Bad Gateway\r\nX-Updraft-Egress: reason=proxy-unavailable\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
-      headDone = true;
     } else client.destroy();
   });
   upstream.on('data', (chunk) => {
@@ -111,8 +116,13 @@ export function relay(client, socketPath, record) {
     }
     client.write(chunk);
   });
-  upstream.on('end', () => client.end());
-  upstream.on('close', () => client.destroy());
+  // A clean close (the proxy's refusal, or the registry ending the tunnel) ends the client
+  // after what was written is flushed; only a failed tunnel is cut at once.
+  upstream.on('close', (hadError) => {
+    if (answered) return;
+    if (hadError) client.destroy();
+    else client.end();
+  });
   client.on('close', () => upstream.destroy());
   client.pipe(upstream);
 }
