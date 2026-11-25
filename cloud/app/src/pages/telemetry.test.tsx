@@ -239,6 +239,23 @@ describe('the job page links to its trace', () => {
     expect(screen.queryByRole('link', { name: 'Set up agent telemetry' })).not.toBeInTheDocument();
   });
 
+  it('offers a retry when the telemetry settings could not be read', async () => {
+    showJob(job({ telemetryStatus: 'unknown' }));
+    expect(await screen.findByRole('button', { name: 'Retry' })).toBeInTheDocument();
+  });
+
+  it('says trace details are pending while an enabled job runs', async () => {
+    showJob(job({ result: 'running', telemetryStatus: 'enabled' }));
+    expect(await screen.findByTestId('job-telemetry-status')).toHaveTextContent('Telemetry enabled · trace details pending');
+    expect(screen.queryByRole('link', { name: 'Set up agent telemetry' })).not.toBeInTheDocument();
+  });
+
+  it('explains a local-only job without a setup prompt for a configured installation', async () => {
+    showJob(job({ telemetryStatus: 'enabled', telemetry: { traceId: 'ab'.repeat(16), local: true, spans: 0, exported: 0, failed: 0 } }));
+    expect(await screen.findByTestId('job-telemetry-status')).toHaveTextContent('Local telemetry');
+    expect(screen.queryByRole('link', { name: 'Set up agent telemetry' })).not.toBeInTheDocument();
+  });
+
   it('offers settings when telemetry is paused', async () => {
     showJob(job({ telemetryStatus: 'paused' }));
     expect(await screen.findByRole('link', { name: 'Manage telemetry settings' })).toBeInTheDocument();

@@ -203,7 +203,7 @@ function Loaded({ job, deliveries, conversation, api, installationId }: { job: J
 
       <AgentWork job={job} />
 
-      <Traces job={job} installationId={installationId} />
+      <Traces job={job} installationId={installationId} onRetry={() => void refresh()} />
 
       <Conversation job={job} others={conversation} installationId={installationId} />
 
@@ -346,7 +346,7 @@ function Totals({ totals }: { totals: JobTotals }) {
 }
 
 /** Where the job's trace went: its links in the destination, the conversation, and how the export went. */
-function Traces({ job, installationId }: { job: JobView; installationId: number }) {
+function Traces({ job, installationId, onRetry }: { job: JobView; installationId: number; onRetry?: () => void }) {
   const t = job.telemetry;
   const [copied, setCopied] = useState(false);
   if (!t || t.local) {
@@ -359,7 +359,7 @@ function Traces({ job, installationId }: { job: JobView; installationId: number 
     );
     let message: string | null;
     if (t?.local) message = 'Local telemetry: this job did not export its traces. What it recorded locally is shown below.';
-    else if (status === 'unknown') message = 'Unable to check telemetry settings. Reload to retry.';
+    else if (status === 'unknown') message = 'Unable to check telemetry settings.';
     else if (status === 'paused') message = 'Telemetry paused. This job has no telemetry report.';
     else if (status === 'enabled') message = finished ? 'No telemetry report available for this job.' : 'Telemetry enabled · trace details pending';
     else message = null;
@@ -372,7 +372,12 @@ function Traces({ job, installationId }: { job: JobView; installationId: number 
         </CardHeader>
         <CardBody className="flex flex-col gap-2 text-sm">
           {message && <p data-testid="job-telemetry-status">{message}</p>}
-          {showSettings && !(t?.local && status === 'enabled') && settings}
+          {status === 'unknown' && onRetry && (
+            <button type="button" className="auth-link self-start font-semibold" onClick={onRetry}>
+              Retry
+            </button>
+          )}
+          {showSettings && settings}
         </CardBody>
       </Card>
     );
