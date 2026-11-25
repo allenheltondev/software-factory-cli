@@ -5,6 +5,7 @@ import { nativeAuthCommand, type NativeAuthOptions } from './native-auth.js';
 import { cancelCommand } from './cancel.js';
 import { cleanCommand } from './clean.js';
 import { configureCommand } from './configure.js';
+import { controlCommand } from './control.js';
 import { DEFAULT_LABEL } from './config-edit.js';
 import { MissingConfigError } from '../config/io.js';
 import { createDefaultContext, legacyNotice, println, type CommandContext, type GlobalOptions } from './context.js';
@@ -40,6 +41,7 @@ export interface Handlers {
   reviews(ctx: CommandContext, opts: ReviewsOptions): Promise<number>;
   stats(ctx: CommandContext, opts: StatsOptions): Promise<number>;
   cancel(ctx: CommandContext, jobId: string): Promise<number>;
+  control(ctx: CommandContext, ref: string, command: string, text: string[]): Promise<number>;
   logs(ctx: CommandContext, id: string, opts: LogsOptions): Promise<number>;
 }
 
@@ -62,6 +64,7 @@ export const defaultHandlers: Handlers = {
   reviews: (ctx, opts) => reviewsCommand(ctx, opts),
   stats: (ctx, opts) => statsCommand(ctx, opts),
   cancel: (ctx, jobId) => cancelCommand(ctx, jobId),
+  control: (ctx, ref, command, text) => controlCommand(ctx, ref, command, text),
   logs: (ctx, id, opts) => logsCommand(ctx, id, opts),
 };
 
@@ -203,6 +206,14 @@ export function buildProgram(opts: ProgramOptions): Command {
     .description('Cancel a queued job, or ask the running worker to stop a running one (its worktree is kept)')
     .argument('<jobId>', 'job id (see "updraft status")')
     .action((jobId: string) => exec((ctx) => handlers.cancel(ctx, jobId)));
+
+  program
+    .command('control')
+    .description('Pause, resume, stop, cancel, re-review or steer an issue\'s workflow, as the mention commands do (see docs/controls.md)')
+    .argument('<ref>', 'OWNER/REPO#NUMBER: the issue, or a pull request Updraft opened for it')
+    .argument('<command>', 'pause, resume, stop, cancel, review, steer or help')
+    .argument('[text...]', 'for steer: the instructions; for stop: a job id when several are running')
+    .action((ref: string, command: string, text: string[]) => exec((ctx) => handlers.control(ctx, ref, command, text)));
 
   program
     .command('logs')

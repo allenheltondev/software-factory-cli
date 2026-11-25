@@ -61,7 +61,7 @@ describe('updraft start', () => {
     expect(seen?.paths).toBe(s.ctx.paths);
     expect(Object.keys(seen!.config.repositories)).toEqual(['o/r']);
     expect(s.deps.pollOnce).toHaveBeenCalledWith(expect.objectContaining({ api: s.api, config: seen!.config }));
-    expect(s.deps.checkJobDispatchable).toHaveBeenCalledWith({ api: s.api, config: seen!.config }, { id: 'job_1' });
+    expect(s.deps.checkJobDispatchable).toHaveBeenCalledWith({ api: s.api, config: seen!.config, db: expect.anything() }, { id: 'job_1' });
     expect(s.deps.createLogger).toHaveBeenCalledWith(expect.objectContaining({ file: expect.stringMatching(/updraft\.log$/) }));
     expect(s.closed).toEqual([s.ctx.paths.dbFile]);
     expect(s.uninstall).toHaveBeenCalledOnce();

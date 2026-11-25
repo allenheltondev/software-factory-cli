@@ -307,13 +307,24 @@ function acceptanceClaimsFor(db: Db, repoId: number, prNumber: number, sha: stri
  */
 export function enqueueReviewJob(
   db: Db,
-  o: { repo: { id: number; fullName: string }; pr: LoopPr; pool: string; allowedActors: readonly string[]; now?: () => number },
+  o: {
+    repo: { id: number; fullName: string };
+    pr: LoopPr;
+    pool: string;
+    allowedActors: readonly string[];
+    now?: () => number;
+    /**
+     * A review asked for by a person (`@<app> review`, docs/controls.md): its own dedupe key
+     * (reviewEventId plus the command), so the head is reviewed again once per command.
+     */
+    rerunOf?: string;
+  },
 ): Job | null {
   const { repo, pr } = o;
   if (pr.state !== 'open' || !pr.headSha) return null;
   const headSha = pr.headSha;
   const at = nowIso(o.now);
-  const eventId = reviewEventId(pr.prNumber, headSha);
+  const eventId = o.rerunOf ? `${reviewEventId(pr.prNumber, headSha)}:rerun:${o.rerunOf}` : reviewEventId(pr.prNumber, headSha);
   return transaction(db, () => {
     const exists = db
       .prepare(

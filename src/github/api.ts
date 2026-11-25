@@ -97,6 +97,27 @@ export interface GitHubIssueComment {
   user: string | null;
 }
 
+/** A comment in a repository's issue and pull request conversations, as the repository-wide listing gives it (docs/controls.md). */
+export interface RepoIssueComment {
+  id: number;
+  htmlUrl: string;
+  body: string;
+  user: string | null;
+  /** GitHub's account type (`User`, `Bot`, `Organization`); null when unknown. */
+  userType: string | null;
+  /** The issue or pull request it is on. */
+  issueNumber: number;
+  /** Its html_url is a pull request's conversation. */
+  onPullRequest: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RepoIssueCommentsPage {
+  comments: RepoIssueComment[];
+  nextPage: number | null;
+}
+
 /** One pull request in the by-update listing: enough to tell whether it changed and whether it is still open. */
 export interface PullRequestUpdate {
   number: number;
@@ -364,6 +385,16 @@ export interface GitHubApi {
   createIssueComment(repo: RepoRef, issueNumber: number, body: string): Promise<GitHubIssueComment>;
   /** Replace the body of an issue or pull request comment the worker posted. */
   updateIssueComment(repo: RepoRef, commentId: number, body: string): Promise<GitHubIssueComment>;
+  /**
+   * The repository's issue and pull request comments updated at or after `since`, oldest update
+   * first (`GET /repos/{o}/{r}/issues/comments`). For human steering (docs/controls.md).
+   */
+  listRepoIssueComments?(repo: RepoRef, opts: { since: string; page: number; perPage?: number }): Promise<RepoIssueCommentsPage>;
+  /**
+   * `login`'s permission on the repository now (`GET .../collaborators/{login}/permission`):
+   * admin, maintain, write, triage, read or none; null when GitHub's answer was not one of them.
+   */
+  getRepoPermission?(repo: RepoRef, login: string): Promise<import('../control/commands.js').RepoPermission | null>;
   /** One pull request with its head, base, draft flag and mergeability (REST). Throws GitHubError(404) when it does not exist. */
   getPullRequest(repo: RepoRef, pullNumber: number): Promise<PullRequestDetails>;
   /** Every submitted review of one pull request, oldest first (REST, paginated internally). */

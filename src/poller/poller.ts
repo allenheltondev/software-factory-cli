@@ -44,6 +44,10 @@ import { ENVELOPE_SCHEMA_VERSION, labelEventIdOf, reviewOf, revisionOf, type Eve
 import type { Logger } from '../util/log.js';
 import { checkReviewDispatchable, queuedReviewProblem } from './review-jobs.js';
 import { checkRevisionDispatchable, pollRepoReviews, queuedRevisionProblem } from './reviews.js';
+import { controlsEnabled, pollRepoControls } from './controls.js';
+import { holdPausedJob, pauseProblem } from '../control/local.js';
+import { holdUnderPause } from '../db/control.js';
+import type { WorkerIdentity } from '../github/credentials.js';
 
 /** Events per page. Keep constant: the stored page-1 ETag depends on the query string. */
 export const EVENTS_PER_PAGE = 100;
@@ -90,6 +94,8 @@ export interface RepoPollResult {
   revisionsQueued?: number;
   /** Reviewer jobs queued (repositories.<repo>.review); absent when nothing was queued. */
   reviewsQueued?: number;
+  /** Mention commands handled (docs/controls.md); absent when there were none. */
+  controlsHandled?: number;
   error?: string;
   /** True when the repo was skipped because it is backing off after errors. */
   skipped?: boolean;
@@ -164,6 +170,8 @@ export async function pollOnce(deps: PollerDeps): Promise<PollSummary> {
   const getIssue = cachedIssueLookup(deps.api);
   const results: RepoPollResult[] = [];
   let revisionJobsCanceled = 0;
+  // Human steering (docs/controls.md): who the worker is decides which mentions are for it.
+  let identity: WorkerIdentity | null = null;
 
   for (const [fullName, cfg] of Object.entries(deps.config.repositories)) {
     const repo: RepoRef = { id: cfg.id, fullName };
@@ -187,8 +195,18 @@ export async function pollOnce(deps: PollerDeps): Promise<PollSummary> {
       // failure here backs the repository off, and each of the two keeps its own checkpoint.
       const reviews = await pollRepoReviews(deps, repo, cfg, log);
       revisionJobsCanceled += reviews?.jobsCanceled ?? 0;
+      // Commands by mention: after the events, so a pause given now holds what they just queued
+      // (the re-check below), and under the same error handling.
+      let controls = 0;
+      if (controlsEnabled(deps.config)) {
+        identity ??= await deps.api.getWorkerIdentity();
+        controls = await pollRepoControls(deps, repo, cfg, identity, log);
+      }
       results.push(
-        reviews ? { ...polled, revisionsQueued: reviews.revisionsQueued, ...(reviews.reviewsQueued ? { reviewsQueued: reviews.reviewsQueued } : {}) } : polled,
+        {
+          ...(reviews ? { ...polled, revisionsQueued: reviews.revisionsQueued, ...(reviews.reviewsQueued ? { reviewsQueued: reviews.reviewsQueued } : {}) } : polled),
+          ...(controls ? { controlsHandled: controls } : {}),
+        },
       );
       backoff.delete(repo.id);
     } catch (err) {
@@ -724,6 +742,15 @@ async function recheckQueuedJobs(
   for (const job of queued) {
     const b = backoff.get(job.repoId);
     if (b && b.until > now()) continue; // don't hammer a repo that is failing
+    // A paused workflow (docs/controls.md) starts nothing: its queued work is held for resume.
+    const paused = pauseProblem(deps.db, job);
+    if (paused) {
+      if (holdPausedJob(deps.db, job, paused, deps.now)) {
+        canceled++;
+        deps.log.info('queued job held: its workflow is paused', { job: job.id, repo: job.repoFullName, issue: job.issueNumber });
+      }
+      continue;
+    }
     let check: DispatchCheck;
     try {
       if (revisionOf(job)) {
@@ -764,7 +791,13 @@ async function recheckQueuedJobs(
  * GitHubError for transient API failures (rate limit, network, 5xx), in which case
  * the caller should leave the job queued and try later.
  */
-export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'config'>, job: Job): Promise<DispatchCheck> {
+export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'config'> & { db?: Db }, job: Job): Promise<DispatchCheck> {
+  // A paused workflow (docs/controls.md): the job is not started, and resume puts it back.
+  const paused = deps.db ? pauseProblem(deps.db, job) : null;
+  if (paused) {
+    holdUnderPause(deps.db!, job.repoId, job.issueNumber, job.id);
+    return { ok: false, reason: paused };
+  }
   const check = (j: Job) =>
     evaluateJob(
       deps.config,

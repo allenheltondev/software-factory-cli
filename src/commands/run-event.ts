@@ -1129,7 +1129,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
           checkDispatchable: async (job) => {
             // Another machine may have revised for this review already, from a state this run never saw: GitHub knows.
             const elsewhere = await revisionAnsweredElsewhere(api, job);
-            return elsewhere ? { ok: false, reason: elsewhere } : checkJobDispatchable({ api, config }, job);
+            return elsewhere ? { ok: false, reason: elsewhere } : checkJobDispatchable({ api, config, db: openDb }, job);
           },
           signal: controller.signal,
           executor: createExecutor(config, {
