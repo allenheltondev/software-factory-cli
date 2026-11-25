@@ -458,6 +458,13 @@ export interface WorkflowPause {
   pullRequest?: number;
   /** The stopped job's creation time: where its summary is, to mark it resumed while it exists. */
   jobCreatedAt?: string;
+  /**
+   * A pause given by a GitHub command (#135, control/mentions.ts) rather than a job's stop: `jobId`
+   * is then the command's own id (`control-<comment>`), never a job. `dispatch` (`pause`): nothing
+   * new starts, but a job already started before it keeps being served to its end (its step
+   * finishes). `cancel`: like a stop's pause, and resuming it needs maintain.
+   */
+  control?: { kind: 'pause' | 'cancel'; source: string };
 }
 
 /** What a stop's pause records of its job, so it can be shown and resumed without the job's records. */
@@ -470,6 +477,23 @@ export const pausedOf = (job: Pick<Job, 'repository' | 'issue' | 'pullRequest' |
     jobCreatedAt: job.createdAt,
   };
 };
+
+/** A GitHub command (#135) as received and handled: its audit record, and what dedupes it. */
+export interface ControlCommandRecord {
+  installationId: number;
+  repositoryId: number;
+  repository: string;
+  commentId: number;
+  deliveryId: string;
+  actor: string;
+  command: string;
+  /** The issue and pull request the command was given on (the workflow's subjects). */
+  issue?: number;
+  pullRequest?: number;
+  receivedAt: string;
+  outcome?: 'applied' | 'noop' | 'refused' | 'ignored' | 'ambiguous' | 'unsupported';
+  message?: string;
+}
 
 /** A pause as listed: where it is held. */
 export type HeldPause = WorkflowPause & { repositoryId: number; subject: number };
@@ -724,6 +748,19 @@ export interface Store {
    * record: a pause outlives them.
    */
   resumeWorkflowPause(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at' | 'jobCreatedAt'>, subjects: number[], by: string, at: number): Promise<boolean>;
+  /**
+   * A pause with no stopped job behind it (a GitHub `pause` or `cancel`, #135): written on every
+   * subject in one transaction, only where none is held. 'held': one already was; nothing written.
+   */
+  pauseWorkflowSubjects(installationId: number, repositoryId: number, pause: WorkflowPause, subjects: number[]): Promise<'paused' | 'held'>;
+  /**
+   * Claims a GitHub command (#135) by its comment, with its audit record: false when it was claimed
+   * before (a redelivery, a replay). Kept 90 days.
+   */
+  claimControlCommand(record: ControlCommandRecord): Promise<boolean>;
+  /** What came of a claimed command: its audit record's outcome. */
+  finishControlCommand(record: Pick<ControlCommandRecord, 'installationId' | 'repositoryId' | 'commentId'>, outcome: ControlCommandRecord['outcome'], message: string): Promise<void>;
+  getControlCommand(installationId: number, repositoryId: number, commentId: number): Promise<ControlCommandRecord | null>;
   /** The resume audit of a pause, if it was resumed. */
   getPauseResume(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at'>): Promise<{ resumedAt: number; resumedBy: string; subjects: number[] } | null>;
   /**
@@ -827,6 +864,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
   const deliveries2: { id: number; d: DeliveryRecord }[] = [];
   const jobs = new Map<string, Job>();
   const pauses = new Map<string, WorkflowPause>();
+  /** `<installationId>/<repositoryId>/<commentId>` -> a GitHub command's audit record (#135). */
+  const controls = new Map<string, ControlCommandRecord>();
   /** `<installationId>/<repositoryId>/<jobId>/<at>` -> who resumed that pause, kept for good. */
   const resumes = new Map<string, { resumedAt: number; resumedBy: string; subjects: number[] }>();
   const paused = (job: Job) => workflowSubjects(job).some((n) => {
@@ -1111,6 +1150,26 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async getPauseResume(id, repo, pause) {
       return resumes.get(`${id}/${repo}/${pause.jobId}/${pause.at}`) ?? null;
+    },
+    async pauseWorkflowSubjects(id, repo, pause, subjects) {
+      const all = [...new Set(subjects)];
+      if (all.some((n) => pauses.has(`${id}/${repo}/${n}`))) return 'held';
+      for (const n of all) pauses.set(`${id}/${repo}/${n}`, { ...pause, subjects: all });
+      return 'paused';
+    },
+    async claimControlCommand(record) {
+      const key = `${record.installationId}/${record.repositoryId}/${record.commentId}`;
+      if (controls.has(key)) return false;
+      controls.set(key, { ...record });
+      return true;
+    },
+    async finishControlCommand(record, outcome, message) {
+      const key = `${record.installationId}/${record.repositoryId}/${record.commentId}`;
+      const current = controls.get(key);
+      if (current) controls.set(key, { ...current, outcome, message });
+    },
+    async getControlCommand(id, repo, commentId) {
+      return controls.get(`${id}/${repo}/${commentId}`) ?? null;
     },
     async holdSlots(job, until) {
       const now = Date.now();

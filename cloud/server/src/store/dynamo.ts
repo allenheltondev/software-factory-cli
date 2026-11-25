@@ -29,6 +29,7 @@ import type {
   JobSummary,
   JobStop,
   WorkflowPause,
+  ControlCommandRecord,
   HeldPause,
   Member,
   OAuthState,
@@ -41,6 +42,8 @@ import type {
 import { finishFields, isFailure, NativeEnqueueRejectedError, pausedOf } from './store.js';
 
 const DAY_SECONDS = 24 * 3600;
+/** How long a GitHub command's audit record (and its dedupe) is kept (#135). */
+const CONTROL_RETENTION_S = 90 * DAY_SECONDS;
 const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
 
 /** The DynamoDB Store over UpdraftTable (layout in store.ts). */
@@ -170,6 +173,8 @@ function pauseItem(i: Record<string, unknown>): WorkflowPause {
   if (n(i.issue) !== undefined) out.issue = n(i.issue)!;
   if (n(i.pullRequest) !== undefined) out.pullRequest = n(i.pullRequest)!;
   if (typeof i.jobCreatedAt === 'string') out.jobCreatedAt = i.jobCreatedAt;
+  const c = i.control as { kind?: unknown; source?: unknown } | undefined;
+  if (c && (c.kind === 'pause' || c.kind === 'cancel') && typeof c.source === 'string') out.control = { kind: c.kind, source: c.source };
   return out;
 }
 
@@ -1600,6 +1605,41 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
         console.log(JSON.stringify({ installationId: id, jobId: pause.jobId, warning: 'workflow resumed; marking the job record resumed failed (the pause audit is authoritative)', name: (err as Error)?.name }));
       }
       return true;
+    },
+    async pauseWorkflowSubjects(id, repo, pause, subjects) {
+      const all = [...new Set(subjects)];
+      try {
+        // No TTL, like a stop's pause: it lasts until someone resumes it.
+        await client.send(new TransactWriteCommand({ TransactItems: all.map((n) => ({ Put: { TableName: T,
+          Item: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${n}`, ...pause, subjects: all },
+          ConditionExpression: 'attribute_not_exists(pk)' } })) }));
+        return 'paused';
+      } catch (err) {
+        if (err instanceof TransactionCanceledException && err.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return 'held';
+        throw err;
+      }
+    },
+    async claimControlCommand(record) {
+      try {
+        await client.send(new PutCommand({ TableName: T,
+          Item: { pk: `TENANT#${record.installationId}`, sk: `CONTROL#${record.repositoryId}#${record.commentId}`, ...record, ttl: Math.floor(Date.now() / 1000) + CONTROL_RETENTION_S },
+          ConditionExpression: 'attribute_not_exists(pk)' }));
+        return true;
+      } catch (err) {
+        if (err instanceof ConditionalCheckFailedException) return false;
+        throw err;
+      }
+    },
+    async finishControlCommand(record, outcome, message) {
+      await client.send(new UpdateCommand({ TableName: T, Key: { pk: `TENANT#${record.installationId}`, sk: `CONTROL#${record.repositoryId}#${record.commentId}` },
+        UpdateExpression: 'SET outcome = :o, #message = :m', ConditionExpression: 'attribute_exists(pk)',
+        ExpressionAttributeNames: { '#message': 'message' }, ExpressionAttributeValues: { ':o': outcome, ':m': message } }));
+    },
+    async getControlCommand(id, repo, commentId) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: `CONTROL#${repo}#${commentId}` }, ConsistentRead: true }));
+      if (!out.Item || !liveItem(out.Item)) return null;
+      const { pk: _pk, sk: _sk, ttl: _ttl, ...record } = out.Item;
+      return record as ControlCommandRecord;
     },
     async getPauseResume(id, repo, pause) {
       const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSELOG#${repo}#${pause.jobId}#${pause.at}` }, ConsistentRead: true }));

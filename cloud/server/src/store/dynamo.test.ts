@@ -863,6 +863,24 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect((await store.getJobSummary(55, completed.jobId))?.stop?.executionMicrovmId).toBe('mvm-retiring');
   });
 
+  it('holds a GitHub command\'s pause on every subject or none, and claims each command once (#135)', async () => {
+    const table = fakeTable(); const store = createDynamoStore('T', table.client);
+    const pause = { jobId: 'control-77', at: 1000, by: 'github:pat', confirmedAt: 1000, repository: 'acme/web', issue: 12, control: { kind: 'pause' as const, source: '77' } };
+    expect(await store.pauseWorkflowSubjects(55, 9, pause, [12, 40])).toBe('paused');
+    expect(await store.getWorkflowPause(55, 9, 40)).toEqual({ ...pause, subjects: [12, 40] });
+    expect(await store.pauseWorkflowSubjects(55, 9, { ...pause, jobId: 'control-78', at: 2000 }, [40, 41])).toBe('held');
+    expect(await store.getWorkflowPause(55, 9, 41)).toBeNull();
+    expect(await store.resumeWorkflowPause(55, 9, pause, [12, 40], 'github:olive', 3000)).toBe(true);
+    expect(await store.getWorkflowPause(55, 9, 12)).toBeNull();
+
+    const record = { installationId: 55, repositoryId: 9, repository: 'acme/web', commentId: 77, deliveryId: 'd-77', actor: 'pat', command: 'pause', issue: 12, receivedAt: '2026-11-25T00:00:00.000Z' };
+    expect(await store.claimControlCommand(record)).toBe(true);
+    expect(await store.claimControlCommand({ ...record, deliveryId: 'd-redelivered' })).toBe(false);
+    await store.finishControlCommand(record, 'applied', 'Paused #12');
+    expect(await store.getControlCommand(55, 9, 77)).toEqual({ ...record, outcome: 'applied', message: 'Paused #12' });
+    expect(await store.getControlCommand(66, 9, 77)).toBeNull();
+  });
+
   it('keeps a pause, and what resuming it needs, past the job\'s own records, and resumes exactly that pause', async () => {
     const table = fakeTable(); const store = createDynamoStore('T', table.client);
     const job: Job = { jobId: 'job_stop0002', installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12,

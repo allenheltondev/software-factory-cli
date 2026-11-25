@@ -12,9 +12,11 @@ export interface StopResult {
 
 export const stopSubjects = workflowSubjects;
 
-export async function workflowPause(store: Pick<Store, 'getWorkflowPause'>, job: Pick<Job, 'installationId' | 'repositoryId' | 'issue' | 'pullRequest' | 'workflowIssue' | 'resumeOf'>) {
+export async function workflowPause(store: Pick<Store, 'getWorkflowPause'>, job: Pick<Job, 'installationId' | 'repositoryId' | 'issue' | 'pullRequest' | 'workflowIssue' | 'resumeOf'> & Partial<Pick<Job, 'startedAt'>>) {
   for (const subject of stopSubjects(job)) {
     const pause = await store.getWorkflowPause(job.installationId, job.repositoryId, subject);
+    // A GitHub `pause` (#135) holds what has not started; a job that started before it runs its step to the end.
+    if (pause?.control?.kind === 'pause' && job.startedAt !== undefined && job.startedAt < pause.at) continue;
     if (pause && pause.jobId !== job.resumeOf) return pause;
   }
   return null;

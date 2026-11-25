@@ -10,6 +10,7 @@ import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/clie
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { createWebhookHandler } from './flows/webhook.js';
+import { createMentionHandler } from './control/mentions.js';
 import { createRoutineDispatcher } from './routines/dispatch.js';
 import { createDynamoRoutineRuleStore } from './routines/rules.js';
 import { createGitHubApi, GitHubError } from './github/client.js';
@@ -259,6 +260,8 @@ const handleWebhook = createWebhookHandler({
   github,
   loadSettings,
   launch,
+  // Declared below, with the retry it resumes through; called only once a delivery arrives.
+  mentions: (event) => mentionHandler(event),
   ...(dispatcher ? { queueEvents: dispatcher } : {}),
   ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
   routines: createRoutineDispatcher({
@@ -287,6 +290,38 @@ const retryJob = launch
       },
     })
   : undefined;
+
+// Commands by mention (control/mentions.ts, #135). Every call uses a token for that one
+// repository, with only the permission the call needs.
+const scopedToken = async (installationId: number, repositoryId: number, permissions: Record<string, string>) => {
+  const settings = await loadSettings();
+  if (!settings) throw new Error('the App settings are unavailable');
+  return (await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId, { repositoryIds: [repositoryId], permissions })).token;
+};
+const mentionHandler = createMentionHandler({
+  store,
+  slug: async () => (await loadSettings())?.slug || undefined,
+  github: {
+    async permission(installationId, repositoryId, repository, login) {
+      return github.repositoryPermission!(await scopedToken(installationId, repositoryId, { metadata: 'read' }), repository, login);
+    },
+    async pullRequest(installationId, repositoryId, repository, number) {
+      return github.pullRequestHead!(await scopedToken(installationId, repositoryId, { pull_requests: 'read' }), repository, number);
+    },
+    async issueOpen(installationId, repositoryId, repository, number) {
+      return (await github.issueState!(await scopedToken(installationId, repositoryId, { issues: 'read' }), repository, number)).open;
+    },
+    async reply(installationId, repositoryId, repository, number, body) {
+      // A pull request's conversation takes pull request access as well (quotas.ts throttleCommentPermissions).
+      await github.createIssueComment(await scopedToken(installationId, repositoryId, throttleCommentPermissions(true)), repository, number, body);
+    },
+  },
+  stopJob: (installationId, jobId, by, reason) => stopJob.request(installationId, jobId, by, reason),
+  ...(dispatcher ? { queue: { waitingFor: (id: number, repositoryId: number, subject: { issue?: number; pullRequest?: number }) => queueStore.waitingFor(id, repositoryId, subject), cancel: (id: number, jobId: string, by: string) => dispatcher.cancel(id, jobId, by) } } : {}),
+  ...(retryJob ? { retry: retryJob } : {}),
+  issueOfPullRequest: (installationId, repositoryId, pullRequest) => workflows.issueOfPullRequest(installationId, repositoryId, pullRequest),
+  ...(consoleOrigin ? { consoleOrigin } : {}),
+});
 
 async function resumeClaude(installationId: number) {
   const sessions = nativeWorker.managed?.sessions;
