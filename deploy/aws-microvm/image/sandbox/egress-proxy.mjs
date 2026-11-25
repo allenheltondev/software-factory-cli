@@ -142,7 +142,8 @@ export const SHARED_SUFFIXES = Object.freeze([
   'herokuapp.com', 'vercel.app', 'netlify.app', 'pages.dev', 'workers.dev', 'fly.dev', 'onrender.com', 'railway.app',
   'jfrog.io', 'cloudsmith.io', 'packagecloud.io', 'gemfury.com', 'fury.io',
   'ngrok.io', 'ngrok-free.app', 'ngrok.app', 'trycloudflare.com', 'r2.dev', 'digitaloceanspaces.com', 'backblazeb2.com',
-  'co.uk', 'co.jp', 'com.au', 'com.br', 'co.in', 'com.cn',
+  'azurefd.net', 'cloudflare.net', 'fastly.net', 'akamaized.net', 'edgekey.net',
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'co.jp', 'com.au', 'net.au', 'org.au', 'com.br', 'co.in', 'com.cn', 'com.mx', 'co.nz', 'co.za', 'com.sg',
 ]);
 
 /**

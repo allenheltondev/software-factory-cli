@@ -49,6 +49,9 @@ export async function startCloudWorker(config, microvmId, service, options = {})
   let child;
   let ended;
   let childDone = false;
+  // Set when a job's registry hosts could not be removed after its runner exited: the next
+  // iteration stops this worker rather than poll for work with the previous job's rules.
+  let egressResetFailed = false;
   // A status probe that cannot tell (a slow or failed `claude auth status`) is probed once more
   // before it is reported: one unreadable probe should not park the next issue (#144). Only a
   // fresh answer is ever sent; an earlier "connected" is never reused in its place.
@@ -84,6 +87,7 @@ export async function startCloudWorker(config, microvmId, service, options = {})
         }
       }
       while (!stopped) {
+        if (egressResetFailed) throw new Error('egress policy reset failed');
         if (child) {
           const status = await call(message('heartbeat'));
           // A cancel for a runner that already exited has nothing left to stop: settle it, and let
@@ -120,7 +124,12 @@ export async function startCloudWorker(config, microvmId, service, options = {})
             childDone = false;
             ended = new Promise((resolve) => {
               const finish = () => {
-                if (!childDone) service.resetJobEgress?.();
+                if (!childDone) {
+                  try { service.resetJobEgress?.(); } catch {
+                    egressResetFailed = true;
+                    console.error('Removing the finished job\'s registry hosts failed; the worker stops before polling again.');
+                  }
+                }
                 childDone = true;
                 resolve();
               };

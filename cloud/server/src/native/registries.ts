@@ -32,11 +32,11 @@ export const DEFAULT_REGISTRY_HOSTS = [
   'api.nuget.org',
 ] as const;
 
-/** INTERNAL_TLDS in egress-proxy.mjs. */
-const INTERNAL_TLDS = new Set(['local', 'localhost', 'internal', 'lan', 'home', 'corp', 'intranet', 'localdomain', 'arpa', 'test', 'invalid', 'example', 'onion']);
+/** INTERNAL_TLDS in egress-proxy.mjs (a test holds them equal). */
+export const INTERNAL_TLDS = Object.freeze(['local', 'localhost', 'internal', 'lan', 'home', 'corp', 'intranet', 'localdomain', 'arpa', 'test', 'invalid', 'example', 'onion']) as readonly string[];
 
-/** SHARED_SUFFIXES in egress-proxy.mjs: a wildcard over one would admit other customers' names. */
-const SHARED_SUFFIXES = [
+/** SHARED_SUFFIXES in egress-proxy.mjs (a test holds them equal): a wildcard over one would admit other customers' names. */
+export const SHARED_SUFFIXES: readonly string[] = Object.freeze([
   'amazonaws.com', 'cloudfront.net', 'awsapps.com', 'on.aws',
   'azurewebsites.net', 'azureedge.net', 'core.windows.net', 'azurecr.io', 'trafficmanager.net', 'cloudapp.net',
   'googleapis.com', 'appspot.com', 'run.app', 'web.app', 'firebaseapp.com', 'cloudfunctions.net', 'pkg.dev', 'storage.googleapis.com',
@@ -44,13 +44,14 @@ const SHARED_SUFFIXES = [
   'herokuapp.com', 'vercel.app', 'netlify.app', 'pages.dev', 'workers.dev', 'fly.dev', 'onrender.com', 'railway.app',
   'jfrog.io', 'cloudsmith.io', 'packagecloud.io', 'gemfury.com', 'fury.io',
   'ngrok.io', 'ngrok-free.app', 'ngrok.app', 'trycloudflare.com', 'r2.dev', 'digitaloceanspaces.com', 'backblazeb2.com',
-  'co.uk', 'co.jp', 'com.au', 'com.br', 'co.in', 'com.cn',
-];
+  'azurefd.net', 'cloudflare.net', 'fastly.net', 'akamaized.net', 'edgekey.net',
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'co.jp', 'com.au', 'net.au', 'org.au', 'com.br', 'co.in', 'com.cn', 'com.mx', 'co.nz', 'co.za', 'com.sg',
+]);
 
 const LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
 
 /** normalizeHost in egress-proxy.mjs: a lower-case DNS name with at least two labels, or undefined. */
-function normalizeHost(text: string): string | undefined {
+export function normalizeHost(text: string): string | undefined {
   let host = text.trim().toLowerCase();
   if (host.endsWith('.')) host = host.slice(0, -1);
   if (host.length === 0 || host.length > 253 || isIP(host) !== 0) return undefined;
@@ -73,7 +74,7 @@ export function parseRegistryHost(raw: unknown): { host: string } | { problem: s
       ? `"${shown}" is not a host name pattern: use *.example.com for the names below example.com`
       : `"${shown}" is not a host name: enter a name such as npm.pkg.example.com, without https://, a path, a port or an IP address` };
   }
-  if (INTERNAL_TLDS.has(host.split('.').at(-1)!) || host.endsWith('.home.arpa')) return { problem: `"${shown}" is an internal name, which a job can never reach` };
+  if (INTERNAL_TLDS.includes(host.split('.').at(-1)!) || host.endsWith('.home.arpa')) return { problem: `"${shown}" is an internal name, which a job can never reach` };
   if (wildcard && SHARED_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) {
     return { problem: `"${shown}" covers a shared domain where anyone can get a name; list the exact host instead` };
   }

@@ -152,8 +152,12 @@ can change the list; members see it read-only.
   `{"nativeWorker":"egress","reason":"invalid-stored-policy"}` and the console shows the list
   as not applied), an entry the worker refuses (`invalid-host`), more than 20 (`too-many-hosts`),
   an unexpected shape (`malformed`), another job's list (`other-job`). If Cloud cannot read the
-  list, it assigns nothing; the job stays queued for the next poll. If the supervisor cannot
-  apply a list, the dispatcher stops before the job runs.
+  list, the poll fails before the assignment is written: no job is handed out and the job stays
+  queued, but the broker answers the worker with an error, and the worker's dispatcher stops on
+  it as on any uncertain broker answer. That worker takes no more jobs; it needs operator
+  recovery (for a managed worker, a restart and a new sign-in), and the queued job waits for the
+  next worker. If the supervisor cannot apply a list, or cannot remove one after the job's runner
+  exits, the dispatcher stops too: before the job runs, or before it polls for the next one.
 - **Same checks as every other host.** An installation's host gets the same treatment as a
   default registry: HTTPS `CONNECT` to an allowed port, every resolved address public (a name
   that resolves to a private, loopback or metadata address is refused, also when only one of

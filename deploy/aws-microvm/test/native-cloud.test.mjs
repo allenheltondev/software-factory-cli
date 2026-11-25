@@ -100,6 +100,28 @@ describe('root subscription worker Cloud loop', () => {
       'reset',
     ]);
   });
+  it("stops, without polling again, when a finished job's registry hosts cannot be removed", async () => {
+    const child = fakeChild();
+    const ops = [];
+    const call = async (p) => {
+      ops.push(p.op);
+      if (p.op === 'poll') return { ok: true, request: { payload: { broker: { jobId: 'job_a' } } }, egress: { jobId: 'job_a', hosts: ['npm.pkg.github.com'] } };
+      return { ok: true, busy: false };
+    };
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const launch = vi.fn(() => child);
+    const service = { authStatus: async () => 'connected', applyJobEgress: vi.fn(), resetJobEgress: vi.fn(() => { throw new Error('proxy gone'); }) };
+    const worker = await startCloudWorker(config, 'mvm-native', service, { call, launch, interval: 5 });
+    await until(() => launch.mock.calls.length === 1);
+    child.emit('close');
+    await worker.done;
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(ops.filter((op) => op === 'poll')).toHaveLength(1);
+    expect(ops).not.toContain('settled');
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('registry hosts failed'));
+    error.mockRestore();
+    await worker.close();
+  });
   it('starts no runner when the registry policy cannot be applied', async () => {
     const launch = vi.fn(() => fakeChild());
     const service = { authStatus: async () => 'connected', applyJobEgress: () => { throw new Error('proxy gone'); }, resetJobEgress: vi.fn() };

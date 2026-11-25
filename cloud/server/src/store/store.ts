@@ -1328,6 +1328,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       for (const [k, c] of configs) if (c.installationId === id) configs.delete(k);
       for (const k of [...keys.keys()]) if (k.startsWith(`${id}/`)) keys.delete(k);
       telemetry.delete(id);
+      registries.delete(id);
       for (let i = refusals.length - 1; i >= 0; i--) if (refusals[i]!.id === id) refusals.splice(i, 1);
       for (let i = deliveries2.length - 1; i >= 0; i--) if (deliveries2[i]!.id === id) deliveries2.splice(i, 1);
       for (const m of [slots, days, months]) for (const k of [...m.keys()]) if (k.startsWith(`${id}/`)) m.delete(k);

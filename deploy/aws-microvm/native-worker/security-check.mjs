@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
+import dns from 'node:dns';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -21,6 +22,7 @@ let service;
 let probe;
 let networkTrap;
 let shimDir;
+let stubRegistry;
 const workerUid = 21000;
 const claudeUid = 21001;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -323,7 +325,24 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   fs.writeFileSync(configFile, JSON.stringify({ ...egressConfig, egress: { ...egressConfig.egress, shim: `${fixture}/claude` } }), { mode: 0o644 });
   assert.throws(() => loadConfig(configFile), /under \/usr/);
   results.push('egress config refuses address allowlist entries and a shim outside /usr');
-  service = await startService(egressConfig, socketPath, () => {});
+  // Deterministic names for the per-installation checks (#157): a public-looking address that
+  // the stub connect sends to a local listener, and names that resolve inward. Every other name
+  // goes to real DNS, as before.
+  const STUB_PUBLIC = '93.184.216.34';
+  const stubNames = {
+    'npm.pkg.github.com': [{ address: STUB_PUBLIC, family: 4 }],
+    'loopback.tenant-registry.dev': [{ address: '127.0.0.1', family: 4 }],
+    'mixed.tenant-registry.dev': [{ address: STUB_PUBLIC, family: 4 }, { address: '::1', family: 6 }],
+    'metadata.tenant-registry.dev': [{ address: '169.254.169.254', family: 4 }],
+  };
+  stubRegistry = net.createServer((socket) => { socket.on('error', () => {}); socket.resume(); });
+  await new Promise((resolve) => stubRegistry.listen(0, '127.0.0.1', resolve));
+  const stubPort = stubRegistry.address().port;
+  const egressDeps = {
+    resolve: (host) => stubNames[host] ?? dns.promises.lookup(host, { all: true, verbatim: true }),
+    connect: (target) => (target.address === STUB_PUBLIC ? net.connect(stubPort, '127.0.0.1') : net.connect({ host: target.address, port: target.port, family: target.family })),
+  };
+  service = await startService(egressConfig, socketPath, () => {}, egressDeps);
   const connectVia = (target) => `node -e 'const u=new URL(process.env.HTTPS_PROXY);const s=require("net").connect(Number(u.port),u.hostname,()=>s.write("CONNECT ${target} HTTP/1.1\\r\\n\\r\\n"));let d="";s.on("data",x=>{d+=x;if(d.includes("\\r\\n\\r\\n")){console.log("STATUS "+d.split(" ")[1]);process.exit(0)}});s.on("error",e=>{console.log("ERR "+e.code);process.exit(0)})'`;
   const egressReply = await native([
     // Still no route around the proxy: the host loopback trap, the metadata service, the supervisor socket.
@@ -380,12 +399,16 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   });
   assert(forged.includes('STATUS 403') && forged.includes('(not-allowed)'), forged);
   assert(!service.applyJobEgress({ jobId: 'job-sec-a', hosts: [tenantHost] }, 'job-sec-a').problem);
+  // Allowed by the job's policy: the tunnel opens (the stub registry accepts it).
   const tenantAllowed = await verifyVia(`${tenantHost}:443`);
-  assert(/STATUS (200|502|504)/.test(tenantAllowed.output), tenantAllowed.output);
-  // A name that resolves to loopback stays refused even when the installation allows it.
-  service.applyJobEgress({ jobId: 'job-sec-a', hosts: ['localtest.me'] }, 'job-sec-a');
-  const inward = await verifyVia('localtest.me:443');
-  assert(/STATUS (403|502|504)/.test(inward.output) && (!inward.output.includes('STATUS 403') || inward.output.includes('(non-public-address')), inward.output);
+  assert(tenantAllowed.output.includes('STATUS 200') && !tenantAllowed.output.includes('updraft-egress:'), tenantAllowed.output);
+  // Names that resolve inward, wholly or in part, stay refused even when the installation allows them.
+  const inwardHosts = ['loopback.tenant-registry.dev', 'mixed.tenant-registry.dev', 'metadata.tenant-registry.dev'];
+  assert(!service.applyJobEgress({ jobId: 'job-sec-a', hosts: inwardHosts }, 'job-sec-a').problem);
+  for (const host of inwardHosts) {
+    const inward = await verifyVia(`${host}:443`);
+    assert(inward.output.includes('STATUS 403') && inward.output.includes(`refused CONNECT ${host}:443 (non-public-address)`), inward.output);
+  }
   // Another job's policy, or one with an address in it, leaves the image's hosts only.
   assert.equal(service.applyJobEgress({ jobId: 'job-sec-a', hosts: [tenantHost] }, 'job-sec-b').problem, 'other-job');
   assert((await verifyVia(`${tenantHost}:443`)).output.includes('(not-allowed)'));
@@ -400,6 +423,7 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   await probe?.close();
   await service?.close();
   if (networkTrap) await new Promise((resolve) => networkTrap.close(resolve));
+  if (stubRegistry) await new Promise((resolve) => stubRegistry.close(resolve));
   // Only the exact mkdtemp fixture is removed; no user directories are involved.
   fs.rmSync(fixture, { recursive: true, force: true });
   if (shimDir) fs.rmSync(shimDir, { recursive: true, force: true });

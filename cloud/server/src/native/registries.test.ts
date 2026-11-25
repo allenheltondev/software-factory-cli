@@ -3,14 +3,14 @@ import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows } from '../flows/github.js';
 import { createMemoryStore, type MemberRole, type Tenant } from '../store/store.js';
 import {
-  DEFAULT_REGISTRY_HOSTS, MAX_REGISTRY_HOSTS, createRegistryPolicyService, effectiveRegistryHosts, parseRegistryHost, parseRegistryHosts,
+  DEFAULT_REGISTRY_HOSTS, INTERNAL_TLDS, MAX_REGISTRY_HOSTS, SHARED_SUFFIXES, createRegistryPolicyService, normalizeHost, effectiveRegistryHosts, parseRegistryHost, parseRegistryHosts,
 } from './registries.js';
 
 const VALID = ['npm.pkg.github.com', 'acme.jfrog.io', 'acme-123456789012.d.codeartifact.us-east-1.amazonaws.com', '*.artifacts.acme.dev', 'NEXUS.Acme.com.'];
 const INVALID = [
   '10.0.0.1', '169.254.169.254', '[fd00:ec2::254]', '::1', '0177.0.0.1', 'https://npm.pkg.github.com', 'npm.pkg.github.com/path', 'npm.pkg.github.com:443',
   '*', '*.com', '**.acme.dev', 'a.*.acme.dev', 'localhost', 'registry', 'registry.localhost', 'nexus.corp', 'mirror.internal', 'npm.svc.cluster.local',
-  'router.home.arpa', '1.0.0.127.in-addr.arpa', 'bad_host.acme.dev', '-x.acme.dev', '*.amazonaws.com', '*.s3.amazonaws.com', '*.jfrog.io', '*.github.io', '*.co.uk', '',
+  'router.home.arpa', '1.0.0.127.in-addr.arpa', 'bad_host.acme.dev', '-x.acme.dev', '*.amazonaws.com', '*.s3.amazonaws.com', '*.jfrog.io', '*.github.io', '*.co.uk', '*.org.uk', '*.ac.uk', '*.com.mx', '*.azurefd.net', '',
 ];
 
 describe('package registry hosts (#157)', () => {
@@ -47,7 +47,10 @@ describe('package registry hosts (#157)', () => {
     const file = new URL('../../../../deploy/aws-microvm/image/sandbox/egress-proxy.mjs', import.meta.url).href;
     const proxy = (await import(/* @vite-ignore */ file)) as {
       parseTenantHost(text: unknown): { problem?: string; host?: string; wildcard?: boolean };
+      normalizeHost(text: unknown): string | undefined;
       DEFAULT_REGISTRY_HOSTS: readonly string[];
+      INTERNAL_TLDS: readonly string[];
+      SHARED_SUFFIXES: readonly string[];
       MAX_TENANT_HOSTS: number;
     };
     for (const entry of [...VALID, ...INVALID, '*.example.com', 'example.com', 'registry.acme.dev']) {
@@ -57,6 +60,19 @@ describe('package registry hosts (#157)', () => {
       if ('host' in cloud) expect(cloud.host).toBe(`${worker.wildcard ? '*.' : ''}${worker.host}`);
     }
     expect([...DEFAULT_REGISTRY_HOSTS]).toEqual([...proxy.DEFAULT_REGISTRY_HOSTS]);
+    expect([...INTERNAL_TLDS]).toEqual([...proxy.INTERNAL_TLDS]);
+    expect([...SHARED_SUFFIXES]).toEqual([...proxy.SHARED_SUFFIXES]);
+    for (const text of ['Registry.Example.COM.', 'a.b', 'a', '', ' x.example.dev ', 'x..example.dev', '-x.example.dev', 'x-.example.dev', 'x_y.example.dev',
+      '10.0.0.1', '::1', '1.2.3.4.5', 'x.example.123', 'x.example.1a', `${'a'.repeat(63)}.example.dev`, `${'a'.repeat(64)}.example.dev`,
+      `${'a.'.repeat(126)}dev`, `${'a.'.repeat(127)}dev`, 'xn--bcher-kva.example', 'ex ample.com', 'example.com/x']) {
+      expect({ text, host: normalizeHost(text) }).toEqual({ text, host: proxy.normalizeHost(text) });
+    }
+    // Every shared suffix is refused as a wildcard on both sides, and allowed as the base of an exact host.
+    for (const suffix of SHARED_SUFFIXES) {
+      expect(parseRegistryHost(`*.${suffix}`)).toHaveProperty('problem');
+      expect(proxy.parseTenantHost(`*.${suffix}`).problem).toBeDefined();
+      expect(parseRegistryHost(`*.tenant.${suffix}`)).toHaveProperty('problem');
+    }
     expect(MAX_REGISTRY_HOSTS).toBe(proxy.MAX_TENANT_HOSTS);
   });
 });
@@ -122,6 +138,11 @@ describe('package registry settings in the console', () => {
     const view = await service().view(caller, 55);
     expect(view.hosts).toEqual(['npm.pkg.github.com', '169.254.169.254']);
     expect(view.problem).toMatch(/default registries only/);
+  });
+  it("is removed with the installation's data", async () => {
+    await service().update(caller, 55, { hosts: ['npm.pkg.github.com'], version: 0 });
+    await store.purgeTenantPartition(55);
+    expect(await store.getRegistryPolicy(55)).toBeNull();
   });
   it('refuses to save for an uninstalled installation', async () => {
     await store.markUninstalled(55, Date.now() + 86_400_000);

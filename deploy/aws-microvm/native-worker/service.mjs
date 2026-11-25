@@ -60,7 +60,12 @@ export function assertEphemeralHome(c) {
   if (homeMount !== parent) throw new Error('unexpected mount inside the disposable Claude home');
 }
 
-export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe = assertEfsMount) {
+/**
+ * `egressDeps` replaces the proxy's name resolution and upstream connect ({ resolve, connect },
+ * as createEgressProxy takes them). Only security-check.mjs passes it, so its refusals are
+ * deterministic without DNS; hooks.mjs and the CLI entry point never do.
+ */
+export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe = assertEfsMount, egressDeps = {}) {
   if (process.platform !== 'linux' || process.getuid() !== 0) throw new Error('native worker supervisor requires Linux root');
   process.umask(0o077);
   storageProbe(c);
@@ -101,6 +106,8 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     fs.chmodSync(dir, 0o710); // the umask above would leave it 0700, closed to the job identity
     egressProxy = createEgressProxy({ rules: policy.rules, limits: policy.limits }, {
       // Decisions only: target, reason and byte counts, never request or payload bytes.
+      ...(egressDeps.resolve ? { resolve: egressDeps.resolve } : {}),
+      ...(egressDeps.connect ? { connect: egressDeps.connect } : {}),
       log: logEgress,
     });
     const socketFile = `${dir}/${EGRESS_SOCKET}`;
