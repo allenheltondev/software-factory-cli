@@ -20,7 +20,7 @@ import { join, resolve } from 'node:path';
 import { loadConfig } from '../config/io.js';
 import { ciSettings, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
-import { routeSourceOf } from '../db/metrics.js';
+import { routeReasonCode, routeSourceOf } from '../db/metrics.js';
 import { getFailureComment } from '../db/failure-comments.js';
 import { putHold, releaseHolds } from '../db/holds.js';
 import { cancelQueuedJob, commitPollBatch } from '../db/ingest.js';
@@ -121,7 +121,12 @@ export interface RunEventJobSummary {
   runId: string | null;
   agent: string | null;
   kind?: 'implement' | 'review' | 'revision' | 'other';
-  routing?: { source: 'pool' | 'tier' | 'fixed'; pool?: string; tier?: string; risk?: string; confidence?: number; hops?: number };
+  /**
+   * How the run was routed, from the run's own `run.selected` row and the job's routing decision:
+   * `tier` is the tier that ran, `requestedTier` the one the router chose (they differ after an
+   * escalation), `reason` a fixed code (metrics.ts routeReasonCode).
+   */
+  routing?: { source: 'pool' | 'tier' | 'fixed'; pool?: string; tier?: string; requestedTier?: string; reason?: string; risk?: string; confidence?: number; hops?: number };
   /** The run's outcome (succeeded, failed, start_failed, interrupted); null when no agent run ended. */
   runOutcome: string | null;
   /** The worker's own reason when the job did not succeed (or its publication failed). */
@@ -397,8 +402,8 @@ function summarizeJob(db: Db, config: UpdraftConfig, jobId: string): RunEventJob
   const review = reviewOf(job);
   const kind = revision ? 'revision' : review ? 'review' : 'implement';
   const route = job.envelope.routing;
-  const selection = run ? db.prepare("SELECT tier, hops, route_source FROM metric_events WHERE kind = 'run.selected' AND subject_id = ?").get(run.id) as
-    { tier: string | null; hops: number | null; route_source: string | null } | undefined : undefined;
+  const selection = run ? db.prepare("SELECT tier, requested_tier, reason, hops, route_source FROM metric_events WHERE kind = 'run.selected' AND subject_id = ?").get(run.id) as
+    { tier: string | null; requested_tier: string | null; reason: string | null; hops: number | null; route_source: string | null } | undefined : undefined;
   const provenance = selection?.route_source ?? routeSourceOf(route ?? null);
   const source = provenance === 'override' || provenance === 'legacy-label' ? 'fixed'
     : provenance === 'local-rule' || provenance === 'cli-triage' || provenance === 'fallback' ? 'tier'
@@ -407,6 +412,8 @@ function summarizeJob(db: Db, config: UpdraftConfig, jobId: string): RunEventJob
     source,
     pool: run?.pool ?? job.pool,
     tier: selection?.tier ?? route?.tier,
+    requestedTier: selection?.requested_tier ?? route?.tier,
+    reason: selection?.reason ?? routeReasonCode(route ?? null) ?? undefined,
     risk: route?.risk,
     confidence: route?.confidence,
     hops: selection?.hops ?? undefined,

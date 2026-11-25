@@ -68,12 +68,29 @@ describe('assignment comment', () => {
     const { api, commenter } = setup();
     await commenter.announce(job(), run('run_1', 'codex'));
     expect(api.comments).toHaveLength(1);
-    expect(api.comments[0]!.body).toBe(renderAssignmentComment({ details: { worker: 'codex', model: 'Unknown', modelKind: null, complexity: 'Not classified' }, jobId: 'job_1', runId: 'run_1', pool: 'general' }));
+    expect(api.comments[0]!.body).toBe(renderAssignmentComment({
+        details: {
+          worker: 'codex',
+          model: 'Unknown',
+          modelKind: null,
+          complexity: 'Not classified (tier routing off)',
+          tier: 'Not applicable (tier routing off)',
+          adapter: null,
+          effort: 'Unknown',
+          reason: null,
+          observedModel: null,
+          attempt: null,
+        },
+        jobId: 'job_1',
+        runId: 'run_1',
+        pool: 'general',
+      }));
     expect(api.comments[0]!.body).toContain('Updraft assigned a worker to this issue.');
     expect(api.comments[0]!.body).toContain('| Field | Value |\n| --- | --- |');
     expect(api.comments[0]!.body).toContain('| Worker | `codex` |');
     expect(api.comments[0]!.body).toContain('| Model | `Unknown` |');
-    expect(api.comments[0]!.body).toContain('| Complexity | `Not classified` |');
+    expect(api.comments[0]!.body).toContain('| Complexity | `Not classified (tier routing off)` |');
+    expect(api.comments[0]!.body).toContain('| Status | Assigned |');
     expect(api.comments[0]!.body).not.toContain('](');
     expect(api.comments[0]!.body).toContain('`job_1`');
     expect(api.comments[0]!.body).toContain('`run_1`');

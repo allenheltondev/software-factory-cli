@@ -48,6 +48,7 @@ import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type Revi
 import { findRepoConfig } from '../worker/executor.js';
 import { evaluateCiAll, postCiNotices } from './ci.js';
 import { code } from './failure-comment.js';
+import { runDetails, selectionLine } from './run-details.js';
 import { evaluateAutoMerges, postMergeNotices } from './merge.js';
 import { safeMarkdown } from './markdown.js';
 import {
@@ -101,6 +102,8 @@ export function renderReview(o: {
   findings: string;
   /** What the worker does with this verdict under the current config, in its own words. */
   next: string;
+  /** What ran the review (run-details.ts selectionLine): fixed words and inline code only. */
+  selection?: string;
 }): string {
   const marker = reviewMarker(o.runId);
   const body = [
@@ -109,6 +112,7 @@ export function renderReview(o: {
     `Automated review of commit ${code(short(o.headSha))} by agent ${inline(o.agent)} (run ${code(o.runId)}). It is posted as a comment because the ` +
       'account that opened a pull request cannot approve or request changes on it; the verdict itself is recorded by the worker.',
     '',
+    ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
     '**Findings**',
     '',
     safeMarkdown(o.findings.trim() || '(the reviewer wrote no findings)', MAX_FINDINGS),
@@ -193,6 +197,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
   const check = eligibility(deps, runId);
   if (!check.ok) return { status: 'not-eligible', reason: check.reason };
   const { run, job, request, result, repoFullName, repo } = check.e;
+  const selection = selectionLine(runDetails(deps.db, job, run));
   const prNumber = request.pullRequest.number;
   const headSha = result.headSha;
   const repoRef = { id: job.repoId, fullName: repoFullName };
@@ -326,6 +331,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
               next,
               marker,
               maxBody: MAX_BODY,
+              selection,
             });
           if (plan.inline.length) {
             try {
@@ -341,7 +347,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
           posted ??= await create({ body: render(plan), commitId: headSha });
           await runLog([`findings: ${plan.inline.length} inline, ${plan.summary.length} in the summary, ${plan.repeats.length} in earlier threads, ${structured.checks.length} check(s) of earlier findings`]);
         } else {
-          posted = await create({ body: renderReview({ runId, agent: run.agent, verdict, headSha, findings: result.findings, next }), commitId: headSha });
+          posted = await create({ body: renderReview({ runId, agent: run.agent, verdict, headSha, findings: result.findings, next, selection }), commitId: headSha });
         }
       }
       hold({ reviewId: posted.id, reviewUrl: posted.htmlUrl });

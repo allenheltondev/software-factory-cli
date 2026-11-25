@@ -45,6 +45,7 @@ import { isWorkerLogin } from '../github/credentials.js';
 import { revisionOf, type Job, type RepoRef, type Revision, type RevisionRequest, type Run, type RunSummary } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
+import { runDetails, selectionLine } from './run-details.js';
 import { safeMarkdown } from './markdown.js';
 import { answerFindings } from './threads.js';
 import { workerLogin } from '../github/identity.js';
@@ -185,7 +186,7 @@ function withMarker(lines: string[], marker: string): string {
 }
 
 /** The reply after a push: the new commits, the verification result and the agent's final message, all inert. */
-export function renderRevisionReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary; commitCount: number; perFinding?: string[] }): string {
+export function renderRevisionReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary; commitCount: number; perFinding?: string[]; selection?: string }): string {
   return withMarker(
     [
       ...(o.perFinding?.length
@@ -200,6 +201,7 @@ export function renderRevisionReply(o: { runId: string; agent: string; review: R
         : [`Updraft pushed ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`, '']),
       `From run ${code(o.runId)} (agent ${inline(o.agent)}). Review it before merging; merging is up to a person.`,
       '',
+      ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
       ...renderRunResult(o.summary, o.commitCount),
     ],
     revisionMarker(o.runId),
@@ -230,13 +232,14 @@ export function renderSupersededNote(o: { runId: string; review: RevisionRequest
 }
 
 /** The reply when the run succeeded without committing anything. */
-export function renderNoChangeReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary }): string {
+export function renderNoChangeReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary; selection?: string }): string {
   return withMarker(
     [
       `Updraft ran a revision for the changes requested by ${code(o.review.author)} in ${o.review.url}, but the agent made no commits, so nothing was pushed.`,
       '',
       `From run ${code(o.runId)} (agent ${inline(o.agent)}).`,
       '',
+      ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
       "**The agent's final message**",
       '',
       safeMarkdown(o.summary.lastOutput.join('\n').trim() || '(no output)', MAX_FINAL_MESSAGE),
@@ -345,6 +348,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
   const check = eligibility(deps, runId);
   if (!check.ok) return { status: 'not-eligible', reason: check.reason };
   const { run, job, request, repoFullName, repo, checkoutPath } = check.e;
+  const selectionOf = (r: typeof run) => selectionLine(runDetails(deps.db, job, r));
   const prNumber = request.pullRequest.number;
   const prBranch = request.pullRequest.branch;
   const baseSha = run.summary.baseSha;
@@ -506,7 +510,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       // 3a. Nothing to push; the reviewer is still owed an answer (one, from whichever run gets there first).
       const first = await answeredElsewhere(null);
       if (first) throw new Superseded(first);
-      await comment(() => renderNoChangeReply({ runId, agent: run.agent, review: request.review, summary: run.summary }), { headSha: baseSha });
+      await comment(() => renderNoChangeReply({ runId, agent: run.agent, review: request.review, summary: run.summary, selection: selectionOf(run) }), { headSha: baseSha });
       const reason = `the agent made no commits on top of ${short(baseSha)}; nothing was pushed`;
       const done = finish({ state: 'skipped', error: reason });
       await runLog([`skipped: ${reason}`]);
@@ -603,7 +607,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     }
 
     // 4. The reply: recorded, found by marker, or new.
-    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding }), { headSha: localSha });
+    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run) }), { headSha: localSha });
 
     const done = finish({ state: 'published' });
     log.info('revision pushed', { pr: prNumber, from: baseSha, to: localSha });

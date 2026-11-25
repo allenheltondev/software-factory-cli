@@ -371,6 +371,7 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     expect(reply).toContain('not a verification');
     const pr = api.comments[0]!.body;
     expect(pr).toContain('**Coding agent** · pushed 1 commit(s)');
+    expect(pr).toMatch(/<sub>Profile `[\w.-]+` · (adapter `\w+` · )?model `[\w .-]+` · effort `[\w .-]+`<\/sub>/);
     expect(pr).toContain('- Blocker · Generation not checked: fixed ([in its thread](https://github.com/octo/widgets/pull/100#discussion_r71))');
     expect(pr).toContain(`- Suggestion · Rename x: Not changed: I disagree, in`);
     expect(pr).toContain('x is the domain term.');

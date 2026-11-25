@@ -169,12 +169,15 @@ export function renderStructuredReview(o: {
   next: string;
   marker: string;
   maxBody: number;
+  /** What ran the review (run-details.ts selectionLine): fixed words and inline code only. */
+  selection?: string;
 }): string {
   const lines: string[] = [
     `**${ROLE.review} · Round ${o.round} · reviewed ${code(short(o.headSha))}**`,
     '',
     headline(o.verdict, o.structured.findings),
     '',
+    ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
     ...(o.override ? [`${ROLE.updraft}: the reviewer wrote ready to merge, but ${inline(o.override)}, so this counts as changes requested.`, ''] : []),
   ];
   if (o.prose.trim()) lines.push(safeMarkdown(o.prose.trim(), 20_000), '');

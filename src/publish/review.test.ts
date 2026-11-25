@@ -576,6 +576,8 @@ describe('findings as threads', () => {
     expect(s.gh.writes).toEqual([`review #${PR} COMMENT at ${H1} with 1 inline`]);
     const body = s.gh.reviews[0]!.body;
     expect(body).toContain(`**Review agent · Round 1 · reviewed \`${H1.slice(0, 12)}\`**`);
+    // What ran the review. This run was recorded without a claim, so no selection: nothing is claimed.
+    expect(body).toContain('<sub>Profile `codex` · model `Unknown` · effort `Unknown`</sub>');
     expect(body).toContain("I found 2 blockers and 1 suggestion. I'm requesting a revision before this is ready.");
     expect(body).toContain('- **Blocker F1** · Generation not checked · `src/a.ts` line 3: in its thread on the diff');
     expect(body).toContain("- **Blocker F2** · Docs are stale · `docs/pool.md` line 10 (the file is not part of this pull request's change)");

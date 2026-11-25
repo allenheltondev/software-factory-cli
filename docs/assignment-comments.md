@@ -1,22 +1,66 @@
 # Assignment comments
 
 In live mode, when the worker claims an implementation run and the final dispatch check passes, it
-comments once on the source issue, just before the agent starts:
+comments once on the source issue, just before the agent starts. By then the router has decided
+the job's route (at enqueue, [tier-routing.md](tier-routing.md)) and the claim has recorded which
+profile the run was given, so the comment states what was actually chosen:
 
 > Updraft assigned a worker to this issue.
 >
 > | Field | Value |
 > | --- | --- |
-> | Worker | `codex` |
-> | Model (configured) | `claude-sonnet` |
+> | Status | Assigned |
+> | Attempt | escalation 1 |
 > | Complexity | `standard` |
+> | Capability tier | `complex` |
+> | Worker | `claude-complex` |
+> | Adapter | `claude` |
+> | Model (configured) | `claude-opus` |
+> | Reasoning effort | `high` |
+> | Pool | `complex` |
+> | Routing reason | local classifier; escalated from standard |
 > | Job ID | [job_...](https://updraft.readysetcloud.io/installations/123/jobs/job_...) |
 > | Run ID | `run_...` |
-> | Pool | `general` |
 
-Model shows `CLI default` or `Unknown` when no model is configured or recorded, and complexity
-`Not classified` when the job was not routed; a model is never claimed as observed at assignment.
+Every value comes from persisted records, never from the current config or a model call: the
+job's routing decision, stored at enqueue, and the run's own selection record (`run.selected`,
+written in the claim's transaction: profile, adapter, configured model and effort, the tier that
+runs and the one the router chose, the route's reason code, escalation hops and retries). Each
+run has its own record, so a later attempt never changes what an earlier attempt's comment says.
+
+- **Complexity** is the issue's classification (`routine`, `standard`, `complex`) by the local
+  classifier or [triage](triage.md). Without one it says why: `Not classified (tier routing off)`
+  when the workflow has no `tiers`, `Not classified (tier set by label)` for a tier override label,
+  `Not classified (pool set by label rule)` for a `pool.rules` match. It is never guessed.
+- **Capability tier** is the tier whose pool runs this attempt, including a high-risk floor and an
+  escalation; `Not applicable (tier routing off)` without tiers, `Unknown` when nothing was
+  recorded. It is never inferred from a model or profile name.
+- **Model (configured)** and **Reasoning effort** are what the profile asks its CLI for
+  (`agents.<name>.model`/`effort`, or the same flags in `args`). `CLI default` means the profile
+  sets none, so the CLI chooses; `Unknown` means the run has no selection record. A model is
+  never claimed as observed at assignment.
+- **Routing reason** is built from fixed codes only (`tier override label`, `local classifier`,
+  `local classifier, low confidence`, `triage`, `triage (earlier answer reused)`, `triage
+  unavailable, local policy used`, `pool rule label`, `workflow pool`, plus `high-risk floor` and
+  `escalated from <tier>`); no issue text or triage explanation. Omitted when none is known.
+- **Attempt** appears for a retry (`retry N`) or an escalation (`escalation N`).
+
 Values are escaped for a Markdown table.
+
+### The model the CLI reported
+
+After the run, the worker reads the model the agent CLI itself reported, when its output names
+one (Claude Code: the main conversation's `assistant` messages, else its `init` message; other
+adapters report none). It is kept on the run as `observedModel`, beside the configured model,
+never in its place: the publication and failure comments list `Model (observed)` on its own line,
+and nothing is listed when the CLI reported nothing.
+
+### Review, revision and CI repair runs
+
+They post no assignment comment. The message each one posts on the pull request (the review, and
+a revision's or CI repair's reply) carries one line naming what ran it, from the same records:
+
+> <sub>Profile `codex-review` · adapter `codex` · model (configured) `gpt-5` · model (observed) `gpt-5` · effort `high`</sub>
 
 ## Job link
 
@@ -44,7 +88,8 @@ paths and logs are never included.
 ## When it is posted
 
 - Live mode only; log-only and prepare-only mode post nothing.
-- Implementation runs only; reviewer and revision runs post nothing.
+- Implementation runs only; reviewer and revision runs name their selection in their own pull
+  request message instead (above).
 - Only after the dispatch check passes. A claim canceled or released by that check (issue closed,
   label removed, worker stopping) posts nothing.
 - Every attempt is announced separately: `updraft retry`, or a start failure that moves the job to
@@ -80,10 +125,14 @@ refused. Updraft acknowledges it once, as the App:
 The link is the job's real, stable id (or the plain id when no console origin is configured).
 The comment names no worker and promises no start time. It carries a hidden marker,
 `<!-- updraft-queue: JOB_ID -->`, so a retried post finds it instead of posting again. It is
-edited in place, never repeated: to `Started · queued for N minutes` when the job starts (the
-assignment comment above then follows, for an implementation run, with the worker actually
-selected), or to why it never started and what to do (`Canceled`, `Not started`, `Expired`).
-A relabel or redelivery of queued work changes nothing. Queue policy, bounds and expiry are in
+edited in place, never repeated: to why it never started and what to do (`Canceled`, `Not
+started`, `Expired`), or to `Started · queued for N minutes` when the job starts. Routing
+runs inside the job, after that edit, so `Started` names no worker, model or tier and says the
+assignment comment follows; that comment (for an implementation run) then carries the routing
+decision and the worker actually selected. The acknowledgement is not rewritten into the
+assignment table: it and the runner's assignment comment are written by different processes, and
+keeping them separate means a late queue edit can never overwrite the selected metadata. A
+relabel or redelivery of queued work changes nothing. Queue policy, bounds and expiry are in
 [cloud/README.md](../cloud/README.md#admission-queue).
 
 ## Permission
