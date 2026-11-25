@@ -307,7 +307,7 @@ export function createAdmissionQueue(deps: {
       log({ installationId: queued.installationId, jobId: queued.jobId, delivery: queued.deliveryId, queued: queued.reason, repository: queued.repository });
       await deps.workflows?.queued(
         { jobId: queued.jobId, installationId: queued.installationId, repository: queued.repository, repositoryId: queued.repositoryId, eventName: queued.eventName, deliveryId: queued.deliveryId, ...(queued.issue !== undefined ? { issue: queued.issue } : {}), ...(queued.pullRequest !== undefined ? { pullRequest: queued.pullRequest } : {}) },
-        { reason: 'capacity_wait', message: `Queued: ${waitMessage(queued.reason)} It starts automatically when capacity is available.` },
+        { reason: 'capacity_wait', code: queued.reason, message: `Queued: ${waitMessage(queued.reason)} It starts automatically when capacity is available.` },
       );
       // Acknowledged on GitHub once it is kept. Best effort: the dispatcher posts it later if this fails.
       if (deps.notify) await syncComment(deps.store, deps.notify, queued, deps.consoleOrigin, at, log).catch(() => {});
@@ -464,7 +464,7 @@ export interface DispatcherDeps {
   readEvent: (key: string) => Promise<string | null>;
   revalidate: Revalidate;
   notify?: QueueNotifier;
-  workflows?: Pick<WorkflowRecorder, 'queueEnded' | 'queueCovered'>;
+  workflows?: Pick<WorkflowRecorder, 'queueEnded' | 'queueCovered'> & Partial<Pick<WorkflowRecorder, 'queueAdmitted'>>;
   killSwitch?: KillSwitch;
   consoleOrigin?: string;
   budgetMs?: number;
@@ -505,7 +505,9 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
     if (!(await deps.queue.settle(next, e))) return null;
     const settled = { ...next, version: e.version + 1 };
     log({ installationId: e.installationId, jobId: e.jobId, queue: state, reason: outcome.reason, waitedSeconds: Math.round((at - e.enqueuedAt) / 1000) });
-    if (state !== 'admitted') await deps.workflows?.queueEnded(subjectRef(e), { reason: `queue_${state}`, message: `The queued job did not start: ${outcome.message}`, ...(outcome.nextAction ? { nextAction: outcome.nextAction } : {}) });
+    if (state !== 'admitted') await deps.workflows?.queueEnded(subjectRef(e), { reason: `queue_${state}`, message: `The queued job did not start: ${outcome.message}`, ...(outcome.nextAction ? { nextAction: outcome.nextAction } : {}) }, { enqueuedAt: e.enqueuedAt });
+    // Admitted under its own id: the timeline says how long it waited, by this entry's clock.
+    else if (outcome.reason === 'admitted' && (outcome.jobId ?? e.jobId) === e.jobId) await deps.workflows?.queueAdmitted?.(subjectRef(e), { enqueuedAt: e.enqueuedAt, reason: e.reason });
     if (deps.notify) await syncComment(deps.queue, deps.notify, settled, deps.consoleOrigin, at, log);
     return settled;
   }
@@ -652,7 +654,7 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
         // A job of the pull request is starting and reads it as it is then: this event is in it.
         // The workflow follows that job, not this entry's (which never runs).
         const settled = await end(e, 'admitted', { reason: 'coalesced', message: r.message ?? 'Covered by a job of the same pull request.', ...(r.coveredBy ? { jobId: r.coveredBy } : {}) });
-        if (settled) await deps.workflows?.queueCovered(subjectRef(e), r.coveredBy);
+        if (settled) await deps.workflows?.queueCovered(subjectRef(e), r.coveredBy, { enqueuedAt: e.enqueuedAt });
         return 'admitted';
       }
       case 'cancelled':

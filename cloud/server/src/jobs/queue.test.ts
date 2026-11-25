@@ -196,8 +196,12 @@ describe('the admission queue', () => {
     await finish((await store.listRecentJobs(55, 5))[0]!.jobId);
     await dispatcherFor(launch).dispatch();
     expect(await workflowStore.getWorkflow(55, '9-i2')).toMatchObject({ status: 'active', stage: 'implementing', lastJobId: b.jobId, generation: 1 });
-    const kinds = (await workflowStore.listWorkflowEvents(55, '9-i2', 10)).map((e) => e.kind);
-    expect(kinds).toEqual(['waiting', 'job_started']);
+    const events = await workflowStore.listWorkflowEvents(55, '9-i2', 10);
+    expect(events.map((e) => e.kind)).toEqual(['waiting', 'job_started', 'admitted']);
+    // Why it waited (a code), and for how long by the queue entry's own clock.
+    expect(events[0]).toMatchObject({ jobId: b.jobId, stage: 'queued', reason: 'concurrent_jobs' });
+    expect(events[2]).toMatchObject({ jobId: b.jobId, reason: 'concurrent_jobs', waited: { for: 'capacity' } });
+    expect(events[2]!.waited!.seconds).toBeGreaterThanOrEqual(0);
   });
 
   it('folds redeliveries and relabels of queued work into it: no second entry, no second comment', async () => {

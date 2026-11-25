@@ -42,7 +42,7 @@ const job = (over: Partial<Job> = {}): Job => ({
   ...over,
 });
 
-async function setup(opts: { installation?: GitHubInstallation | null | Error; logs?: Record<string, string>; retentionDays?: number; requestRetry?: StatusServiceDeps['requestRetry']; requestStop?: StatusServiceDeps['requestStop']; role?: 'owner' | 'editor' } = {}) {
+async function setup(opts: { installation?: GitHubInstallation | null | Error; logs?: Record<string, string>; retentionDays?: number; requestRetry?: StatusServiceDeps['requestRetry']; requestStop?: StatusServiceDeps['requestStop']; workflows?: StatusServiceDeps['workflows']; role?: 'owner' | 'editor' } = {}) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant(), { installationId: 55, sub: 'u1', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
   const gh = 'installation' in opts ? opts.installation : { id: 55, account: { id: 900, login: 'acme', type: 'Organization' }, suspendedAt: null, permissions: ALL };
@@ -81,6 +81,7 @@ async function setup(opts: { installation?: GitHubInstallation | null | Error; l
     readLog,
     ...(opts.requestRetry ? { requestRetry: opts.requestRetry } : {}),
     ...(opts.requestStop ? { requestStop: opts.requestStop } : {}),
+    ...(opts.workflows ? { workflows: opts.workflows } : {}),
     log: () => {},
   });
   const app = createApp({ resolveCaller: () => caller, status: service, logError: () => {} });
@@ -222,6 +223,35 @@ describe('status and diagnostics (#71)', () => {
       expect((await workflowsOf(s, wf).get({ sub: 'u1' } as Caller, 55, '9-i12')).pause).toBeUndefined();
       // A subject without the pause it names is refused.
       expect(await s.post('55/workflows/9-i12/resume', { subject: 30 })).toMatchObject({ status: 400 });
+    });
+
+    it('records a resume on the workflow\'s timeline and gives the workflow its state back at once', async () => {
+      const wf = createMemoryWorkflowStore();
+      const recorder = createWorkflowRecorder({ store: wf, log: () => {} });
+      const s = await setup({ workflows: recorder });
+      const j = job();
+      await recorder.started(j);
+      await recorder.stopRequested(j, { requestedAt: 1_000, by: 'Pat' });
+      await s.store.putJob(j);
+      await s.store.requestJobStop(j, { requestedAt: 1_000, by: 'Pat', reason: 'stop' }, [12]);
+      await s.store.finishJob(j.jobId, 'canceled'); await s.store.recordJobStop(j, { confirmedAt: 2_000 });
+      await recorder.finished(j, 'canceled');
+      expect(await wf.getWorkflow(55, '9-i12')).toMatchObject({ reason: 'workflow_paused' });
+      // Resumed from the workflow, naming no pause: the one held is the one recorded.
+      expect(await s.post('55/workflows/9-i12/resume')).toMatchObject({ status: 200 });
+      expect(await wf.getWorkflow(55, '9-i12')).toMatchObject({ status: 'blocked', reason: 'job_canceled' });
+      const control = (await wf.listWorkflowEvents(55, '9-i12', 20)).filter((e) => e.kind === 'control');
+      expect(control.map((e) => [e.control?.action, e.control?.by])).toEqual([['stop_requested', 'Pat'], ['resumed', 'Pat']]);
+
+      // Resumed from the job's own page: the job's workflow records it too.
+      const k = job({ jobId: 'job_status0007', deliveryId: 'd-7', issue: 13 });
+      await recorder.started(k);
+      await s.store.putJob(k);
+      await s.store.requestJobStop(k, { requestedAt: 3_000, by: 'Pat', reason: 'stop' }, [13]);
+      await recorder.stopRequested(k, { requestedAt: 3_000, by: 'Pat' });
+      await s.store.finishJob(k.jobId, 'canceled'); await s.store.recordJobStop(k, { confirmedAt: 4_000 });
+      expect(await s.post(`55/jobs/${k.jobId}/resume`)).toMatchObject({ status: 200 });
+      expect((await wf.listWorkflowEvents(55, '9-i13', 20)).filter((e) => e.kind === 'control').map((e) => e.control?.action)).toEqual(['stop_requested', 'resumed']);
     });
 
     it('is for owners, takes only the pause it names, and says when nothing is paused', async () => {

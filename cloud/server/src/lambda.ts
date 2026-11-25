@@ -57,6 +57,8 @@ const verifier = userPoolId && clientId ? CognitoJwtVerifier.create({ userPoolId
 const managedWorker = managedClaude();
 const tableName = process.env.TABLE_NAME ?? '';
 const store = tableName ? createDynamoStore(tableName) : undefined;
+/** Records stops and resumes on their workflows (#139): one recorder for the stopper and the status service. */
+const workflowRecorder = tableName ? createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName) }) : undefined;
 const github = store ? createGitHubFlows({ store, github: createGitHubApi(), loadSettings: createSettingsLoader() }) : undefined;
 
 // Tenant config bundles (tenants/config-service.ts). The function's role reaches only
@@ -175,7 +177,8 @@ const app = createApp({
         workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), jobs: store, pauses: store, github }),
         status: createStatusService({
           store,
-          requestStop: awsJobStopper(store, native!.control, createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName) })).request,
+          requestStop: awsJobStopper(store, native!.control, workflowRecorder).request,
+          ...(workflowRecorder ? { workflows: workflowRecorder } : {}),
           github,
           agentKeys: agentKeyService,
           resultRetentionDays: Math.max(1, Number(process.env.RESULT_RETENTION_DAYS ?? 30) || 30),

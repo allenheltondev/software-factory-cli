@@ -78,4 +78,53 @@ describe('the workflow views', () => {
     const none = createWorkflowService({ store, pauses: { getWorkflowPause: async () => null, listWorkflowPauses: async () => [] }, github: { member: async () => ({ summary: { role: 'owner' } }) as never } });
     expect(await none.get(caller, 55, '99-i7')).not.toHaveProperty('pause');
   });
+
+  it('says how much history is kept, and when the earliest events are past their retention', async () => {
+    const store = createMemoryWorkflowStore();
+    const created = Date.parse('2026-08-01T00:00:00.000Z');
+    let clock = created;
+    const recorder = createWorkflowRecorder({ store, now: () => clock, log: () => {} });
+    await recorder.started(job);
+    clock += 60_000;
+    await recorder.finished(job, 'failed');
+    const at = (now: number) => createWorkflowService({ store, github: { member: async () => ({}) as never }, now: () => now });
+    expect((await at(clock).get(caller, 55, '99-i7')).history).toEqual({ shown: 2, omitted: 0, complete: true, workflowRetentionDays: 90, eventRetentionDays: 90, jobRetentionDays: 30, expiredEarlier: false });
+    expect((await at(created + 100 * 86_400_000).get(caller, 55, '99-i7')).history).toMatchObject({ expiredEarlier: true });
+  });
+
+  it('marks paused workflows, filters by them, and finds a paused workflow past the list\'s limit by its own record', async () => {
+    const store = createMemoryWorkflowStore();
+    const recorder = createWorkflowRecorder({ store, log: () => {} });
+    await recorder.started(job);
+    await recorder.finished(job, 'canceled');
+    const other = { ...job, jobId: 'job_other001', issue: 8 };
+    await recorder.started(other);
+    const held = [{ jobId: 'job_issue0001', at: 1_000, by: 'pat', repositoryId: 99, subject: 7 }];
+    const pauses = { getWorkflowPause: async (_i: number, _r: number, n: number) => (n === 7 ? held[0]! : null), listWorkflowPauses: async () => held };
+    const service = createWorkflowService({ store, pauses, github: { member: async () => ({ summary: { role: 'owner' } }) as never } });
+    const { workflows } = await service.list(caller, 55);
+    expect(workflows.find((w) => w.issue === 7)).toMatchObject({ paused: true });
+    expect(workflows.find((w) => w.issue === 8)).not.toHaveProperty('paused');
+    expect((await service.list(caller, 55, undefined, { status: 'paused' })).workflows.map((w) => w.issue)).toEqual([7]);
+    expect((await service.get(caller, 55, '99-i7')).workflow).toMatchObject({ paused: true });
+
+    // Older than the newest the list reads: still found, with its own record (not rebuilt from the pause).
+    const limited = { ...store, listWorkflows: async () => (await store.listWorkflows(55, 10)).filter((w) => w.issue !== 7) };
+    const past = createWorkflowService({ store: limited, pauses, github: { member: async () => ({ summary: { role: 'owner' } }) as never } });
+    const found = (await past.list(caller, 55)).workflows.find((w) => w.issue === 7)!;
+    expect(found).toMatchObject({ workflowId: '99-i7', paused: true, reason: 'job_canceled', createdAt: expect.any(String) });
+    expect(found.gaps).toBeUndefined();
+  });
+
+  it('says what a workflow rebuilt from job records, or from its pause alone, cannot show', async () => {
+    const store = createMemoryWorkflowStore();
+    const jobs = { listRecentJobs: async () => [{ jobId: 'job_old00001', repository: 'acme/web', issue: 5, createdAt: '2026-11-01T00:00:00.000Z', status: 'launched', deliveryId: 'd-0' }] as never };
+    const held = [{ jobId: 'job_gone0001', at: Date.parse('2026-01-01T00:00:00.000Z'), by: 'pat', repositoryId: 99, subject: 9, issue: 9, repository: 'acme/web' }];
+    const service = createWorkflowService({ store, jobs, pauses: { getWorkflowPause: async () => null, listWorkflowPauses: async () => held }, github: { member: async () => ({ summary: { role: 'owner' } }) as never } });
+    const legacy = (await service.list(caller, 55)).workflows.find((w) => w.reconstructed)!;
+    expect((await service.get(caller, 55, legacy.workflowId)).history).toMatchObject({ complete: false });
+    const gone = await service.get(caller, 55, '99-i9');
+    expect(gone.workflow).toMatchObject({ paused: true, reason: 'workflow_paused' });
+    expect(gone.history).toMatchObject({ shown: 0, complete: false, expiredEarlier: true });
+  });
 });

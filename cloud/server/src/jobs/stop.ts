@@ -187,6 +187,8 @@ export function createJobStopper(d: {
     const stopped = await d.store.requestJobStop(job, { requestedAt: now(), by, reason }, stopSubjects(job, summary?.detail?.prNumber));
     if (!stopped) return null;
     log({ jobStop: 'requested', jobId, installationId, by: stopped.stop?.by, at: stopped.stop?.requestedAt });
+    // The workflow shows the pause and who asked now, before termination (best effort).
+    if (stopped.stop) await d.workflows?.stopRequested(stopped, { requestedAt: stopped.stop.requestedAt, by: stopped.stop.by, ...(stopped.stop.reason ? { reason: stopped.stop.reason } : {}) });
     return advance(stopped);
   }
   return { request, advance };

@@ -7,6 +7,7 @@ import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows } from '../flows/github.js';
 import type { HeldPause, Store, WorkflowPause } from '../store/store.js';
 import type { WorkflowStore } from '../workflows/store.js';
+import { historyOf, type WorkflowHistory } from '../workflows/timeline.js';
 import { LEGACY_WORKFLOW_ID, reconstructWorkflows, totalsOf, type WorkflowTotals } from '../workflows/view.js';
 import { WORKFLOW_ID, type Workflow, type WorkflowEvent, type WorkflowStatus } from '../workflows/workflow.js';
 
@@ -14,9 +15,10 @@ const LIST_LIMIT = 200;
 const EVENT_LIMIT = 500;
 const JOB_ID = /^job_[A-Za-z0-9_-]{8,64}$/;
 
-export type WorkflowView = Omit<Workflow, 'version' | 'installationId'> & { reconstructed?: true; gaps?: string[] };
+/** `paused`: a stop's pause holds it now (the durable PAUSE record, which never expires), whatever its record says. */
+export type WorkflowView = Omit<Workflow, 'version' | 'installationId'> & { reconstructed?: true; gaps?: string[]; paused?: true };
 
-const view = (w: Workflow & { reconstructed?: true; gaps?: string[] }): WorkflowView => {
+const view = (w: Workflow & { reconstructed?: true; gaps?: string[]; paused?: true }): WorkflowView => {
   const { version: _v, installationId: _i, ...rest } = w;
   return rest;
 };
@@ -76,20 +78,30 @@ export function createWorkflowService({ store, jobs, pauses, github, now = Date.
     }
     return null;
   };
-  /** Paused workflows whose record is gone: one per pause, unless a kept workflow covers one of its subjects. */
-  const pausedOnly = async (installationId: number, recorded: Workflow[]): Promise<(Workflow & { gaps: string[] })[]> => {
-    if (!pauses) return [];
-    const has = new Set(recorded.flatMap((w) => [w.issue, w.pullRequest].filter((n) => n !== undefined).map((n) => `${w.repositoryId}#${n}`)));
+  /** The pauses held now (best effort: none when they cannot be read). */
+  const heldPauses = async (installationId: number): Promise<HeldPause[]> => (pauses ? pauses.listWorkflowPauses(installationId, PAUSE_LIMIT).catch(() => []) : []);
+  const subjectKeys = (w: Pick<Workflow, 'repositoryId' | 'issue' | 'pullRequest' | 'pastPullRequests'>) =>
+    [w.issue, w.pullRequest, ...(w.pastPullRequests ?? []).map((p) => p.number)].filter((n) => n !== undefined).map((n) => `${w.repositoryId}#${n}`);
+  /**
+   * Paused workflows not among the recorded ones listed: one per pause. Its own record when it is
+   * still kept (an older workflow past the list's limit); else built from the pause alone, so paused
+   * work can always be found, and resumed, however old.
+   */
+  const pausedOnly = async (installationId: number, recorded: Workflow[], held: HeldPause[]): Promise<(Workflow & { gaps?: string[]; paused: true })[]> => {
+    const has = new Set(recorded.flatMap(subjectKeys));
     const seen = new Set<string>();
-    const out: (Workflow & { gaps: string[] })[] = [];
-    for (const p of await pauses.listWorkflowPauses(installationId, PAUSE_LIMIT).catch(() => [])) {
+    const out: (Workflow & { gaps?: string[]; paused: true })[] = [];
+    for (const p of held) {
       const id = `${p.repositoryId}#${p.jobId}#${p.at}`;
       if (seen.has(id) || has.has(`${p.repositoryId}#${p.subject}`)) continue;
       seen.add(id);
-      out.push(pausedWorkflow(installationId, p));
+      const built = pausedWorkflow(installationId, p);
+      if (out.some((o) => o.workflowId === built.workflowId)) continue;
+      const kept = await store.getWorkflow(installationId, built.workflowId).catch(() => null);
+      out.push({ ...(kept ?? built), paused: true });
     }
     // A pause held on several subjects, or several pauses of one issue, is one workflow.
-    return out.filter((w, i) => out.findIndex((o) => o.workflowId === w.workflowId) === i);
+    return out;
   };
   /** Workflows rebuilt from job records that no recorded workflow covers. */
   const rebuilt = async (installationId: number, recorded: Workflow[]) => {
@@ -102,29 +114,36 @@ export function createWorkflowService({ store, jobs, pauses, github, now = Date.
     return reconstructWorkflows(installationId, summaries, (repo, o) => has.has(`${repo.toLowerCase()}#${o.issue !== undefined ? `i${o.issue}` : `p${o.pullRequest}`}`));
   };
   return {
-    /** Most recently changed first; `status` and `repository` (OWNER/REPO) narrow the list. */
+    /** Most recently changed first; `status` (or `paused`) and `repository` (OWNER/REPO) narrow the list. */
     async list(caller: Caller, installationId: number, limit?: unknown, filter: { status?: unknown; repository?: unknown } = {}): Promise<{ workflows: WorkflowView[] }> {
       await github.member(caller, installationId);
       const n = Number(limit);
       const max = Number.isSafeInteger(n) && n > 0 ? Math.min(n, LIST_LIMIT) : 50;
       const recorded = await store.listWorkflows(installationId, LIST_LIMIT);
-      const all: WorkflowView[] = [...recorded.map(view), ...(await rebuilt(installationId, recorded)).map((r) => view(r.workflow)), ...(await pausedOnly(installationId, recorded)).map(view)];
+      const held = await heldPauses(installationId);
+      const pausedKeys = new Set(held.map((p) => `${p.repositoryId}#${p.subject}`));
+      const all: WorkflowView[] = [
+        ...recorded.map((w) => view(subjectKeys(w).some((k) => pausedKeys.has(k)) ? { ...w, paused: true } : w)),
+        ...(await rebuilt(installationId, recorded)).map((r) => view(r.workflow)),
+        ...(await pausedOnly(installationId, recorded, held)).map(view),
+      ];
+      const paused = filter.status === 'paused';
       const status = STATUSES.find((s) => s === filter.status);
       const repository = typeof filter.repository === 'string' && filter.repository ? filter.repository.toLowerCase() : null;
       return {
         workflows: all
-          .filter((w) => (!status || w.status === status) && (!repository || w.repository.toLowerCase() === repository))
+          .filter((w) => (!status || w.status === status) && (!paused || w.paused) && (!repository || w.repository.toLowerCase() === repository))
           .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
           .slice(0, max),
       };
     },
-    async get(caller: Caller, installationId: number, workflowId: string): Promise<{ workflow: WorkflowView; events: WorkflowEvent[]; totals: WorkflowTotals; pause?: WorkflowPauseView }> {
+    async get(caller: Caller, installationId: number, workflowId: string): Promise<{ workflow: WorkflowView; events: WorkflowEvent[]; totals: WorkflowTotals; history: WorkflowHistory; pause?: WorkflowPauseView }> {
       const member = await github.member(caller, installationId);
       const notFound = () => new FlowError('not_found', 404, 'There is no such workflow in this installation (workflows are kept 90 days after their last change)');
       if (LEGACY_WORKFLOW_ID.test(workflowId)) {
         const found = (await rebuilt(installationId, await store.listWorkflows(installationId, LIST_LIMIT))).find((r) => r.workflow.workflowId === workflowId);
         if (!found) throw notFound();
-        return { workflow: view(found.workflow), events: found.events, totals: totalsOf(found.events, now()) };
+        return { workflow: view(found.workflow), events: found.events, totals: totalsOf(found.events, now()), history: historyOf(found.workflow, { shown: found.events.length, omitted: 0, complete: false }, now()) };
       }
       if (!WORKFLOW_ID.test(workflowId)) throw notFound();
       const role = member?.summary?.role ?? 'member';
@@ -136,10 +155,15 @@ export function createWorkflowService({ store, jobs, pauses, github, now = Date.
         const p = held.find((h) => pausedWorkflow(installationId, h).workflowId === workflowId);
         if (!p) throw notFound();
         const { repositoryId: _r, ...pause } = p;
-        return { workflow: view(pausedWorkflow(installationId, p)), events: [], totals: totalsOf([], now()), pause: { ...pause, canResume: role === 'owner' } };
+        const gone = pausedWorkflow(installationId, p);
+        return { workflow: view({ ...gone, paused: true }), events: [], totals: totalsOf([], now()), history: { ...historyOf(gone, { shown: 0, omitted: 0, complete: false }, now()), expiredEarlier: true }, pause: { ...pause, canResume: role === 'owner' } };
       }
-      const [events, pause] = await Promise.all([store.listWorkflowEvents(installationId, workflowId, EVENT_LIMIT), pauseOn(installationId, w.repositoryId, [w.issue, w.pullRequest], role)]);
-      return { workflow: view(w), events, totals: totalsOf(events, now()), ...(pause ? { pause } : {}) };
+      const [page, pause] = await Promise.all([store.listWorkflowHistory(installationId, workflowId, EVENT_LIMIT), pauseOn(installationId, w.repositoryId, [w.issue, w.pullRequest], role)]);
+      // Totals are of the events shown: with older ones left out, the history says so.
+      return {
+        workflow: view(pause ? { ...w, paused: true } : w), events: page.events, totals: totalsOf(page.events, now()),
+        history: historyOf(w, { shown: page.events.length, omitted: page.omitted, complete: page.complete }, now()), ...(pause ? { pause } : {}),
+      };
     },
     /** The workflow a job belongs to, if it was recorded. */
     async ofJob(caller: Caller, installationId: number, jobId: string): Promise<{ workflowId: string | null }> {

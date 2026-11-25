@@ -173,6 +173,8 @@ export interface StatusServiceDeps {
   /** Asks the launcher to run a job's event again (jobs/retry.ts). Absent: retrying is not offered. */
   requestRetry?: (installationId: number, jobId: string, by?: string) => Promise<RetryResult>;
   requestStop?: (installationId: number, jobId: string, by: string, reason: string) => Promise<StopResult | null>;
+  /** Records a resume on the workflow's timeline, and gives it back its state at once (workflows/recorder.ts). Best effort. */
+  workflows?: Pick<import('../workflows/recorder.js').WorkflowRecorder, 'resumed'>;
   /** The admission queue's entries (jobs/queue-store.ts), read only. Absent: no queue is shown. */
   queue?: Pick<QueueStore, 'list' | 'get'>;
   /** Asks the webhook function to cancel a queued job (jobs/queue.ts cancel). */
@@ -295,7 +297,7 @@ function resumed(outcome: ResumeOutcome): void {
   throw new FlowError('pause_changed', 409, 'A newer stop controls this workflow; look at it again before resuming');
 }
 
-export function createStatusService({ store, github, agentKeys, readLog, requestRetry, requestStop, queue, requestQueueCancel, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
+export function createStatusService({ store, github, agentKeys, readLog, requestRetry, requestStop, workflows, queue, requestQueueCancel, resultRetentionDays = 30, timelineTemplate = null, now = Date.now, log = (e) => console.log(JSON.stringify(e)) }: StatusServiceDeps) {
   const view = (job: JobSummary, telemetry: TelemetrySettings | null, settingsUnavailable = false) => jobView(job, telemetry, { now: now(), timelineTemplate, settingsUnavailable });
   const settingsOf = (installationId: number) => store.getTelemetry(installationId).then((t) => ({ t, unavailable: false }), () => ({ t: null, unavailable: true }));
   const limitOf = (raw: unknown) => {
@@ -530,7 +532,9 @@ export function createStatusService({ store, github, agentKeys, readLog, request
       if (!job || job.installationId !== installationId || !job.stop) throw new FlowError('not_found', 404, 'There is no stopped job in this installation; a paused workflow can be resumed from its page');
       if (job.stop.confirmedAt === undefined) throw new FlowError('stop_pending', 409, 'Wait until execution has stopped before resuming automation');
       // The pause this job's stop made, on any of its subjects, as a whole; a newer stop is never lifted.
-      resumed(await resumeJobPause(store, { ...job, stop: job.stop }, stopSubjects(job, summary?.detail?.prNumber), member.githubLogin ?? caller.sub, now()));
+      const by = member.githubLogin ?? caller.sub;
+      resumed(await resumeJobPause(store, { ...job, stop: job.stop }, stopSubjects(job, summary?.detail?.prNumber), by, now()));
+      await workflows?.resumed({ installationId, job }, { jobId: job.jobId, at: job.stop.requestedAt }, by);
       return { resumed: true };
     },
 
@@ -547,7 +551,11 @@ export function createStatusService({ store, github, agentKeys, readLog, request
       // The subject the pause was shown on (the workflow's pull request, say), or the workflow's own.
       // Only exactly the pause named is lifted, wherever it is read: a newer one answers 409.
       const subject = expected?.subject ?? Number(m[2]);
-      resumed(await resumeWorkflowPause(store, { installationId, repositoryId: Number(m[1]), subject, ...(expected ? { expected: { jobId: expected.jobId, at: expected.at } } : {}), by: member.githubLogin ?? caller.sub, at: now() }));
+      const by = member.githubLogin ?? caller.sub;
+      // The pause resumed: the one named, or the one held now (what resumeWorkflowPause lifts).
+      const held = expected ?? (await store.getWorkflowPause(installationId, Number(m[1]), subject).catch(() => null));
+      resumed(await resumeWorkflowPause(store, { installationId, repositoryId: Number(m[1]), subject, ...(expected ? { expected: { jobId: expected.jobId, at: expected.at } } : {}), by, at: now() }));
+      if (held) await workflows?.resumed({ installationId, workflowId }, { jobId: held.jobId, at: held.at }, by);
       return { resumed: true };
     },
 
