@@ -21,10 +21,11 @@ export interface WorkflowStore {
   /**
    * Saves `next` if the stored record is still at `previous`'s version (or absent, for none), and
    * with it, in the same transaction, `event`: both or neither, so the timeline never shows a
-   * change that was not made. An event already recorded (a replay) is not written again. False
-   * when the record moved on.
+   * change that was not made. `conflict`: the record moved on (read again and redo). `replay`:
+   * the event is already recorded, so this change was made before: nothing is written, neither
+   * the event nor the record, so a replayed start or finish can never change state again.
    */
-  saveWorkflow(next: Workflow, previous: Workflow | null, event?: WorkflowEvent): Promise<boolean>;
+  saveWorkflow(next: Workflow, previous: Workflow | null, event?: WorkflowEvent): Promise<'saved' | 'conflict' | 'replay'>;
   /** Records an event once: a second call with the same id changes nothing. */
   addWorkflowEvent(installationId: number, workflowId: string, event: WorkflowEvent): Promise<void>;
   /** A workflow's events, oldest first (at most `limit`, the newest). */
@@ -60,15 +61,12 @@ export function createMemoryWorkflowStore(): WorkflowStore & { dump(): { workflo
     },
     async saveWorkflow(next, previous, event) {
       const key = k(next.installationId, next.workflowId);
+      if (event && (events.get(key) ?? []).some((e) => e.id === event.id)) return 'replay';
       const stored = workflows.get(key);
-      if ((stored?.version ?? 0) !== (previous?.version ?? 0)) return false;
+      if ((stored?.version ?? 0) !== (previous?.version ?? 0)) return 'conflict';
       workflows.set(key, structuredClone(next));
-      if (event) {
-        const list = events.get(key) ?? [];
-        if (!list.some((e) => e.id === event.id)) list.push(structuredClone(event));
-        events.set(key, list);
-      }
-      return true;
+      if (event) events.set(key, [...(events.get(key) ?? []), structuredClone(event)]);
+      return 'saved';
     },
     async addWorkflowEvent(id, wf, event) {
       const list = events.get(k(id, wf)) ?? [];
@@ -153,18 +151,17 @@ export function createDynamoWorkflowStore(tableName: string, client = DynamoDBDo
       if (next.nextCheckAt && next.nextCheckAt !== previous?.nextCheckAt) {
         items.push({ Put: { TableName: T, Item: { ...dueKey(next, next.nextCheckAt), installationId: next.installationId, workflowId: next.workflowId, ttl: ttl() } } });
       }
-      // The event, once: a replay of a change already made finds it and leaves it as it is.
-      if (event) {
-        const key = evKey(next.installationId, next.workflowId, event.id);
-        const exists = await client.send(new GetCommand({ TableName: T, Key: key, ConsistentRead: true }));
-        if (!exists.Item) items.push({ Put: { TableName: T, Item: { ...key, ...event, ttl: ttl() }, ConditionExpression: 'attribute_not_exists(pk)' } });
-      }
+      // The event, once: a replay of a change already made writes nothing at all.
+      if (event) items.push({ Put: { TableName: T, Item: { ...evKey(next.installationId, next.workflowId, event.id), ...event, ttl: ttl() }, ConditionExpression: 'attribute_not_exists(pk)' } });
       try {
         await client.send(new TransactWriteCommand({ TransactItems: items }));
-        return true;
+        return 'saved';
       } catch (err) {
-        // The record moved on, or the event was written meanwhile: read again and redo.
-        if (err instanceof TransactionCanceledException && err.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return false;
+        if (!(err instanceof TransactionCanceledException)) throw err;
+        const reasons = err.CancellationReasons ?? [];
+        if (event && reasons[items.length - 1]?.Code === 'ConditionalCheckFailed') return 'replay';
+        // The record moved on: read again and redo.
+        if (reasons.some((r) => r.Code === 'ConditionalCheckFailed')) return 'conflict';
         throw err;
       }
     },

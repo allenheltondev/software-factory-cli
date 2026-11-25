@@ -34,14 +34,17 @@ export async function saveChange(
   installationId: number,
   workflowId: string,
   change: (w: Workflow | null) => { workflow: Workflow; event?: WorkflowEvent } | null,
-): Promise<{ workflow: Workflow | null; saved: boolean }> {
+): Promise<{ workflow: Workflow | null; saved: boolean; replay?: true }> {
   for (let i = 0; i < ATTEMPTS; i++) {
     const previous = await store.getWorkflow(installationId, workflowId);
     const out = change(previous);
     if (!out) return { workflow: previous, saved: false };
     const next = { ...out.workflow, version: (previous?.version ?? 0) + 1 };
-    // The change and its event together: a save that loses the race leaves no event behind.
-    if (await store.saveWorkflow(next, previous, out.event ? { ...out.event, seq: next.version } : undefined)) return { workflow: next, saved: true };
+    // The change and its event together: a save that loses the race leaves no event behind, and
+    // a replay (its event is recorded already) changes nothing.
+    const result = await store.saveWorkflow(next, previous, out.event ? { ...out.event, seq: next.version } : undefined);
+    if (result === 'saved') return { workflow: next, saved: true };
+    if (result === 'replay') return { workflow: previous, saved: false, replay: true };
   }
   throw new Error(`workflow ${workflowId}: too many concurrent changes`);
 }

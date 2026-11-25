@@ -8,28 +8,25 @@
  *   waiting for CI, checks still running      looked at again later, nothing held; blocked once
  *                                             they have run for CI_WAIT_LIMIT_MS
  *   waiting for CI, every check finished      the check event was missed (or never sent: CI that
- *     (or the head has none)                  only reports commit statuses): the same job a
- *                                             `check_suite.completed` delivery would start is
- *                                             launched, at most MAX_CI_RECOVERIES times per head,
- *                                             under a delivery id derived from the head, so a
- *                                             redelivery or a second run starts nothing twice
+ *     (or the head has none)                  only reports commit statuses): blocked, saying how
+ *                                             to restart it. Nothing is launched from here: a
+ *                                             launch could not be fenced against a real check
+ *                                             event, a push, a close or a stop meanwhile
  *   waiting for the next loop event           blocked after STALL_LIMIT_MS: no job has run
  *
  * It decides from GitHub's own answers (the pull request's state and head, the head's check runs
  * and statuses), never from elapsed time alone, and changes a workflow only through its versioned
- * save, so a job starting meanwhile wins. A ready-to-merge pull request waits for a person and is
- * never looked at. The kill switch stops the whole run.
+ * save, so a job starting meanwhile wins. It never starts a job. A pull request waiting for a
+ * person is looked at only for a merge or close. The kill switch stops the whole run.
  */
-import { createHash } from 'node:crypto';
 import type { GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
-import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import type { Store } from '../store/store.js';
-import { saveChange, updateWorkflow } from './recorder.js';
+import { updateWorkflow } from './recorder.js';
 import type { WorkflowStore } from './store.js';
-import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, MAX_CI_RECOVERIES, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
+import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
 
 export interface WorkflowReconcilerDeps {
   store: WorkflowStore;
@@ -37,9 +34,6 @@ export interface WorkflowReconcilerDeps {
   jobs?: Pick<Store, 'getJob' | 'getJobSummary'>;
   github: Pick<GitHubApi, 'createInstallationToken' | 'pullRequestHead' | 'commitChecks'>;
   loadSettings: LoadSettings;
-  /** The launcher (jobs/launch.ts); absent: jobs are off, and a missed check event is only reported. */
-  launch?: (req: LaunchRequest) => Promise<LaunchResult>;
-  appBot?: () => Promise<string | undefined>;
   killSwitch?: KillSwitch;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
@@ -49,7 +43,6 @@ export interface WorkflowReconcilerDeps {
 
 export interface ReconcileReport {
   checked: number;
-  recovered: number;
   /** Workflows whose job had finished without the finish reaching them: brought up to date from the job's record. */
   repaired: number;
   blocked: number;
@@ -61,13 +54,7 @@ export interface ReconcileReport {
 }
 
 const short = (sha: string) => sha.slice(0, 12);
-const TRANSIENT = new Set(['throttled', 'launch_failed', 'kill_switch', 'jobs_off', 'coalesce_unconfirmed', 'cancelled']);
 const iso = (ms: number) => new Date(ms).toISOString();
-
-/** The delivery id of a CI recovery: one per workflow head and attempt, so it is claimed once. */
-export function recoveryDeliveryId(w: Pick<Workflow, 'installationId' | 'repositoryId' | 'pullRequest'>, headSha: string, attempt: number): string {
-  return `reconcile-${createHash('sha256').update(`${w.installationId}:${w.repositoryId}:${w.pullRequest}:${headSha}:${attempt}`).digest('hex').slice(0, 32)}`;
-}
 
 export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
   const now = deps.now ?? Date.now;
@@ -86,9 +73,11 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
   };
 
   async function one(first: Workflow, at: number, report: ReconcileReport): Promise<void> {
-    let w = first;
+    const w = first;
     report.checked++;
-    const blockedEvent = (id: string, message: string): WorkflowEvent => ({ id, at: iso(at), kind: 'blocked', generation: w.generation, message });
+    // The reconciler's own events are named for the record they were decided on: each decision is
+    // made once (its save is version-checked), and a later one is a new event, never a replay.
+    const blockedEvent = (id: string, message: string): WorkflowEvent => ({ id: `${id}@${w.version}`, at: iso(at), kind: 'blocked', generation: w.generation, message });
     const block = (reason: string, message: string, nextAction: string, id: string) =>
       change(w, (cur) => ({ workflow: { ...without(cur, 'nextCheckAt'), status: 'blocked', reason, message, nextAction, updatedAt: iso(at) }, event: blockedEvent(id, message) })).then(() => {
         report.blocked++;
@@ -143,7 +132,7 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
       const message = pr.merged ? `Pull request #${w.pullRequest} was merged.` : `Pull request #${w.pullRequest} was closed.`;
       await change(w, (cur) => ({
         workflow: { ...without(cur, 'nextCheckAt', 'reason', 'nextAction', 'waitingSince'), status: 'finished', stage: pr.merged ? 'merged' : 'closed', message, updatedAt: iso(at) },
-        event: { id: `pr-${pr.merged ? 'merged' : 'closed'}:${w.pullRequest}`, at: iso(at), kind: 'finished', generation: w.generation, prNumber: w.pullRequest, message },
+        event: { id: `pr-${pr.merged ? 'merged' : 'closed'}:${w.pullRequest}@${w.version}`, at: iso(at), kind: 'finished', generation: w.generation, prNumber: w.pullRequest, message },
       }));
       report.finished++;
       return;
@@ -177,77 +166,20 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
         `ci-stuck:${pr.headSha}`,
       );
     }
-    // Every check finished, yet no job took the result: the check event was missed.
-    const attempts = w.recoveredSha === pr.headSha ? (w.recoveries ?? 0) : 0;
-    if (attempts >= MAX_CI_RECOVERIES) {
-      return block(
-        'ci_event_missed',
-        `The checks on ${short(pr.headSha)} finished, but no job picked their result up, after ${attempts} recover${attempts === 1 ? 'y' : 'ies'}.`,
-        'Retry the last job from its page, or push to the pull request.',
-        `ci-missed:${pr.headSha}`,
-      );
-    }
-    if (!deps.launch) {
-      return block('ci_event_missed', `The checks on ${short(pr.headSha)} finished, but no job picked their result up.`, 'Retry the last job from its page.', `ci-missed:${pr.headSha}`);
-    }
-    const payload = {
-      action: 'completed',
-      repository: { id: w.repositoryId, full_name: w.repository },
-      sender: { login: (await deps.appBot?.()) ?? 'updraft' },
-      check_suite: {
-        head_branch: pr.headRef,
-        head_sha: pr.headSha,
-        status: 'completed',
-        pull_requests: [{ number: w.pullRequest, head: { ref: pr.headRef, sha: pr.headSha } }],
-      },
-      installation: { id: w.installationId },
-    };
-    const deliveryId = recoveryDeliveryId(w, pr.headSha, attempts + 1);
-    // The recovery is reserved on the workflow first, against the version it was decided on: if
-    // anything changed meanwhile (a job started or finished, another run got here), nothing is
-    // launched. The reservation counts the attempt, so a crash after it cannot launch a third.
-    const message = `The checks on ${short(pr.headSha)} finished (${checks.failed} failed, ${checks.passed} passed${checks.total === 0 ? ', none reported' : ''}) without a check event reaching Updraft: queued the step that event would have started.`;
-    const reservation = await saveChange(deps.store, w.installationId, w.workflowId, (cur) => cur && cur.version === w.version ? ({
-      workflow: { ...cur, recoveries: attempts + 1, recoveredSha: pr.headSha, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at) },
-      event: { id: `ci-recovered:${pr.headSha}:${attempts + 1}`, at: iso(at), kind: 'ci_recovered', generation: w.generation, prNumber: w.pullRequest, headSha: pr.headSha, message },
-    }) : null);
-    const reserved = reservation.workflow;
-    // Only the run whose save made the reservation launches.
-    if (!reservation.saved || !reserved) {
-      log({ workflow: w.workflowId, installationId: w.installationId, skipped: 'the workflow changed while it was looked at; nothing launched' });
-      return;
-    }
-    const appBot = await deps.appBot?.();
-    const result = await deps.launch({
-      installationId: w.installationId,
-      deliveryId,
-      eventName: 'check_suite',
-      ...(appBot ? { appBot } : {}),
-      body: JSON.stringify(payload),
-      payload: payload as unknown as LaunchRequest['payload'],
-    });
-    if (result.disposition === 'launched' || result.disposition === 'duplicate' || result.disposition === 'coalesced') {
-      report.recovered++;
-      log({ workflow: w.workflowId, installationId: w.installationId, recovered: deliveryId, disposition: result.disposition, ...(result.jobId ? { jobId: result.jobId } : {}) });
-      return;
-    }
-    // Every outcome below acts on the reserved workflow, not the one first read.
-    w = reserved;
-    // Not now (a quota, a failed launch, jobs paused): the attempt is given back, and the head looked at again later.
-    if (TRANSIENT.has(result.disposition)) {
-      await change(w, (cur) => ({ workflow: { ...cur, recoveries: attempts, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at) } }));
-      return;
-    }
+    // Every check finished, yet no job took the result: the check event was missed (or never
+    // sent: CI that only reports commit statuses). Reported, not re-dispatched: a job launched
+    // from here could not be fenced against a real check event, a push, a close or a stop that
+    // lands between this look and its launch, so a person starts the next step.
     return block(
-      'ci_not_dispatched',
-      `The checks on ${short(pr.headSha)} finished, but Updraft could not start the next step: ${result.message ?? result.reason ?? result.disposition}.`,
-      'Check the repository\'s configuration (CI repair needs review), then retry the last job from its page.',
-      `ci-refused:${pr.headSha}:${result.reason ?? result.disposition}`,
+      'ci_event_missed',
+      `The checks on ${short(pr.headSha)} finished (${checks.failed} failed, ${checks.passed} passed${checks.total === 0 ? ', none reported' : ''}), but no job picked their result up: the check event never reached Updraft.`,
+      'Re-run a check on GitHub (its result restarts the review loop), or retry the last job from its page.',
+      `ci-missed:${pr.headSha}`,
     );
   }
 
   return async function reconcileWorkflows(): Promise<ReconcileReport> {
-    const report: ReconcileReport = { checked: 0, recovered: 0, repaired: 0, blocked: 0, finished: 0, failed: 0, backlog: 0, oldestDueSeconds: 0 };
+    const report: ReconcileReport = { checked: 0, repaired: 0, blocked: 0, finished: 0, failed: 0, backlog: 0, oldestDueSeconds: 0 };
     if (await killSwitch.engaged()) return report;
     const at = now();
     for (const due of await deps.store.listDueWorkflows(at, limit)) {

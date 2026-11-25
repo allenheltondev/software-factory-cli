@@ -1,12 +1,11 @@
 import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { CommitCheckCounts, PullRequestHead } from '../github/client.js';
-import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
 import type { Job, JobSummary } from '../store/store.js';
 import { createWorkflowRecorder } from './recorder.js';
-import { createWorkflowReconciler, recoveryDeliveryId } from './reconcile.js';
+import { createWorkflowReconciler } from './reconcile.js';
 import { createMemoryWorkflowStore } from './store.js';
-import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, MAX_CI_RECOVERIES, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
+import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
 
 const T0 = Date.parse('2026-11-25T12:00:00.000Z');
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
@@ -18,7 +17,7 @@ const job = (over: Record<string, unknown> = {}) =>
     ReturnType<typeof createWorkflowRecorder>['started']
   >[0];
 
-function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; launch?: LaunchResult; engaged?: boolean; jobs?: Record<string, { job?: Partial<Job>; summary?: Partial<JobSummary> }> } = {}) {
+function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; engaged?: boolean; jobs?: Record<string, { job?: Partial<Job>; summary?: Partial<JobSummary> }> } = {}) {
   const store = createMemoryWorkflowStore();
   let clock = T0;
   const now = () => clock;
@@ -28,11 +27,6 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; l
     pullRequestHead: vi.fn(async (): Promise<PullRequestHead> => ({ state: 'open', merged: false, headSha: HEAD, headRef: 'updraft/issue-7-job', ...o.pr })),
     commitChecks: vi.fn(async (): Promise<CommitCheckCounts> => o.checks ?? { total: 2, pending: 0, failed: 1, passed: 1, complete: true }),
   };
-  const launched: LaunchRequest[] = [];
-  const launch = vi.fn(async (req: LaunchRequest): Promise<LaunchResult> => {
-    launched.push(req);
-    return o.launch ?? { status: 202, disposition: 'launched', jobId: 'job_recovered01' };
-  });
   const reconcile = createWorkflowReconciler({
     store,
     jobs: {
@@ -41,8 +35,6 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; l
     },
     github,
     loadSettings: async () => SETTINGS as never,
-    launch,
-    appBot: async () => 'updraft[bot]',
     killSwitch: { engaged: async () => o.engaged === true },
     now,
     log: () => {},
@@ -54,7 +46,7 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; l
     await recorder.started(job());
     await recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci', verdict: 'ready-to-merge' } });
   };
-  return { store, recorder, reconcile, github, launch, launched, tick, wf, waitForCi };
+  return { store, recorder, reconcile, github, tick, wf, waitForCi };
 }
 
 describe('workflow reconciliation', () => {
@@ -70,58 +62,39 @@ describe('workflow reconciliation', () => {
     expect(r).toMatchObject({ failed: 1, backlog: 0 });
   });
 
-  it('recovers a missed check event once per head: the job a check_suite delivery would start', async () => {
+  it('reports a missed check event, and starts no job: a person restarts the loop', async () => {
     const s = setup();
     await s.waitForCi();
     s.tick(CI_FIRST_CHECK_MS);
-    expect(await s.reconcile()).toMatchObject({ checked: 1, recovered: 1 });
-    expect(s.launched).toHaveLength(1);
-    const req = s.launched[0]!;
-    expect(req).toMatchObject({ installationId: 55, eventName: 'check_suite', appBot: 'updraft[bot]', deliveryId: recoveryDeliveryId({ installationId: 55, repositoryId: 99, pullRequest: 12 }, HEAD, 1) });
-    expect(JSON.parse(req.body)).toMatchObject({ action: 'completed', repository: { id: 99, full_name: 'acme/web' }, installation: { id: 55 }, check_suite: { head_sha: HEAD, pull_requests: [{ number: 12 }] } });
+    expect(await s.reconcile()).toMatchObject({ checked: 1, blocked: 1 });
     expect(s.github.createInstallationToken).toHaveBeenCalledWith(expect.any(String), 55, { repositoryIds: [99], permissions: { pull_requests: 'read', checks: 'read', statuses: 'read' } });
-    expect(await s.wf()).toMatchObject({ recoveries: 1, recoveredSha: HEAD, status: 'waiting' });
+    expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'ci_event_missed', message: expect.stringMatching(/1 failed, 1 passed/), nextAction: expect.stringMatching(/Re-run a check/) });
+    expect((await s.wf())!.nextCheckAt).toBeUndefined();
     const events = await s.store.listWorkflowEvents(55, '99-i7', 50);
-    expect(events.at(-1)).toMatchObject({ kind: 'ci_recovered', headSha: HEAD, message: expect.stringMatching(/without a check event/) });
+    expect(events.at(-1)).toMatchObject({ kind: 'blocked', message: expect.stringMatching(/never reached Updraft/) });
 
-    // The recovered job starts: the workflow is active, nothing is due.
-    await s.recorder.started(job({ jobId: 'job_recovered01', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: req.deliveryId }));
-    expect((await s.wf())!.nextCheckAt).toBeUndefined();
-  });
-
-  it('stops recovering a head after MAX_CI_RECOVERIES, and says a person must act', async () => {
-    const s = setup({ launch: { status: 200, disposition: 'duplicate' } });
-    await s.waitForCi();
-    for (let i = 0; i < MAX_CI_RECOVERIES; i++) {
-      s.tick(CI_RECHECK_MS);
-      await s.reconcile();
-    }
-    expect(s.launched.map((r) => r.deliveryId)).toEqual([1, 2].map((n) => recoveryDeliveryId({ installationId: 55, repositoryId: 99, pullRequest: 12 }, HEAD, n)));
-    s.tick(CI_RECHECK_MS);
-    expect(await s.reconcile()).toMatchObject({ blocked: 1 });
-    expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'ci_event_missed', nextAction: expect.stringMatching(/Retry/) });
-    expect((await s.wf())!.nextCheckAt).toBeUndefined();
-    expect(s.launched).toHaveLength(MAX_CI_RECOVERIES);
+    // The re-run check's event starts the next job: the workflow works again.
+    await s.recorder.started(job({ jobId: 'job_pr000001', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: 'd-2' }));
+    expect(await s.wf()).toMatchObject({ status: 'active' });
   });
 
   it('treats CI that reports only commit statuses, or none at all, like any finished checks', async () => {
     const s = setup({ checks: { total: 0, pending: 0, failed: 0, passed: 0, complete: true } });
     await s.waitForCi();
     s.tick(CI_FIRST_CHECK_MS);
-    expect(await s.reconcile()).toMatchObject({ recovered: 1 });
-    expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).at(-1)!.message).toContain('none reported');
+    expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+    expect((await s.wf())!.message).toContain('none reported');
   });
 
   it('waits while checks run, holding nothing, and blocks once they have run too long', async () => {
     const s = setup({ checks: { total: 3, pending: 1, failed: 0, passed: 2, complete: true } });
     await s.waitForCi();
     s.tick(CI_FIRST_CHECK_MS);
-    expect(await s.reconcile()).toMatchObject({ checked: 1, recovered: 0, blocked: 0 });
+    expect(await s.reconcile()).toMatchObject({ checked: 1, blocked: 0 });
     expect(await s.wf()).toMatchObject({ status: 'waiting', nextCheckAt: new Date(T0 + CI_FIRST_CHECK_MS + CI_RECHECK_MS).toISOString() });
     s.tick(CI_WAIT_LIMIT_MS);
     expect(await s.reconcile()).toMatchObject({ blocked: 1 });
     expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'ci_stuck', message: expect.stringMatching(/1 still running/) });
-    expect(s.launched).toEqual([]);
   });
 
   it('never reads an incomplete listing of checks as finished', async () => {
@@ -129,7 +102,7 @@ describe('workflow reconciliation', () => {
     await s.waitForCi();
     s.tick(CI_FIRST_CHECK_MS);
     await s.reconcile();
-    expect(s.launched).toEqual([]);
+    expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'waiting-for-ci' });
   });
 
   it('finishes a workflow whose pull request was merged or closed meanwhile', async () => {
@@ -138,7 +111,6 @@ describe('workflow reconciliation', () => {
     s.tick(CI_FIRST_CHECK_MS);
     expect(await s.reconcile()).toMatchObject({ finished: 1 });
     expect(await s.wf()).toMatchObject({ status: 'finished', stage: 'merged' });
-    expect(s.launched).toEqual([]);
   });
 
   it('blocks a loop that waits for an event no one sent, after STALL_LIMIT_MS', async () => {
@@ -153,20 +125,6 @@ describe('workflow reconciliation', () => {
     expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'stalled', nextAction: expect.stringMatching(/retry/) });
   });
 
-  it('says why when the launcher refuses the step, and leaves a quota refusal for later', async () => {
-    const refused = setup({ launch: { status: 200, disposition: 'not_dispatched', reason: 'loop_off', message: 'ciFix is off for this repository' } });
-    await refused.waitForCi();
-    refused.tick(CI_FIRST_CHECK_MS);
-    await refused.reconcile();
-    expect(await refused.wf()).toMatchObject({ status: 'blocked', reason: 'ci_not_dispatched', message: expect.stringMatching(/ciFix is off/) });
-
-    const throttled = setup({ launch: { status: 200, disposition: 'throttled' } });
-    await throttled.waitForCi();
-    throttled.tick(CI_FIRST_CHECK_MS);
-    await throttled.reconcile();
-    expect(await throttled.wf()).toMatchObject({ status: 'waiting', nextCheckAt: expect.any(String) });
-  });
-
   it('changes nothing when a job started while it looked, does nothing with the kill switch on, and isolates a failing workflow', async () => {
     const s = setup();
     await s.waitForCi();
@@ -178,7 +136,7 @@ describe('workflow reconciliation', () => {
     });
     await s.reconcile();
     expect(await s.wf()).toMatchObject({ status: 'active', lastJobId: 'job_pr000001' });
-    expect((await s.wf())!.recoveries ?? 0).toBe(0);
+    expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).some((e) => e.kind === 'blocked')).toBe(false);
 
     const off = setup({ engaged: true });
     await off.waitForCi();
@@ -242,7 +200,7 @@ describe('workflow reconciliation', () => {
   });
 
   describe('never acts on a workflow that moved on', () => {
-    it('launches nothing when a job starts or finishes while it reads GitHub', async () => {
+    it('blocks nothing when a job starts or finishes while it reads GitHub', async () => {
       for (const meanwhile of ['started', 'finished'] as const) {
         const s = setup();
         await s.waitForCi();
@@ -255,27 +213,33 @@ describe('workflow reconciliation', () => {
           return { total: 1, pending: 0, failed: 1, passed: 0, complete: true };
         });
         await s.reconcile();
-        expect(s.launched).toEqual([]);
-        expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).some((e) => e.kind === 'ci_recovered')).toBe(false);
+        expect((await s.wf())!.status).not.toBe('blocked');
+        expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).some((e) => e.kind === 'blocked')).toBe(false);
       }
     });
 
-    it('launches once when two reconcilers look at the same workflow at once', async () => {
+    it('records one block when two reconcilers look at the same workflow at once', async () => {
       const s = setup();
       await s.waitForCi();
       s.tick(CI_FIRST_CHECK_MS);
-      const other = createWorkflowReconciler({ store: s.store, github: s.github, loadSettings: async () => SETTINGS as never, launch: s.launch, appBot: async () => 'updraft[bot]', now: () => T0 + CI_FIRST_CHECK_MS, log: () => {} });
+      const other = createWorkflowReconciler({ store: s.store, github: s.github, loadSettings: async () => SETTINGS as never, now: () => T0 + CI_FIRST_CHECK_MS, log: () => {} });
       await Promise.all([s.reconcile(), other()]);
-      expect(s.launched).toHaveLength(1);
-      expect(await s.wf()).toMatchObject({ recoveries: 1 });
+      expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).filter((e) => e.kind === 'blocked')).toHaveLength(1);
     });
 
-    it('gives the attempt back when the launch is refused for now', async () => {
-      const s = setup({ launch: { status: 200, disposition: 'throttled' } });
+    it('records a later block of the same head as a new event, never as a replay', async () => {
+      const s = setup();
       await s.waitForCi();
       s.tick(CI_FIRST_CHECK_MS);
       await s.reconcile();
-      expect(await s.wf()).toMatchObject({ recoveries: 0, status: 'waiting' });
+      // A retry runs and leaves the same head waiting for CI again; its event is missed again.
+      await s.recorder.started(job({ jobId: 'job_retry001', deliveryId: 'retry-1' }));
+      await s.recorder.finished(job({ jobId: 'job_retry001', deliveryId: 'retry-1' }), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } });
+      s.tick(CI_FIRST_CHECK_MS);
+      expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+      expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'ci_event_missed' });
+      expect((await s.wf())!.nextCheckAt).toBeUndefined();
+      expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).filter((e) => e.kind === 'blocked')).toHaveLength(2);
     });
   });
 
@@ -287,11 +251,28 @@ describe('workflow reconciliation', () => {
     s.tick(PR_POLL_MS);
     await s.reconcile();
     expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'ready-to-merge' });
-    expect(s.launched).toEqual([]);
     // Merged by a person, with no webhook: found at the next look.
     s.github.pullRequestHead.mockResolvedValue({ state: 'closed', merged: true, headSha: HEAD, headRef: 'updraft/x' });
     s.tick(PR_POLL_MS);
     await s.reconcile();
     expect(await s.wf()).toMatchObject({ status: 'finished', stage: 'merged' });
+  });
+
+  it('never finishes a new run because of the last run\'s merged pull request', async () => {
+    const s = setup();
+    // Run 1: PR #12 is merged.
+    await s.recorder.started(job());
+    await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'merged', merged: true } });
+    // Run 2: the issue is labeled again, and its job opens PR #20, which waits for CI.
+    await s.recorder.started(job({ jobId: 'job_again001', deliveryId: 'd-9' }));
+    expect(await s.wf()).toMatchObject({ generation: 2, pastPullRequests: [{ number: 12, generation: 1 }] });
+    expect((await s.wf())!.pullRequest).toBeUndefined();
+    await s.recorder.finished(job({ jobId: 'job_again001', deliveryId: 'd-9' }), 'succeeded', { prNumber: 20, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } });
+    expect(await s.wf()).toMatchObject({ pullRequest: 20, status: 'waiting', stage: 'waiting-for-ci' });
+    s.tick(CI_FIRST_CHECK_MS);
+    s.github.commitChecks.mockResolvedValueOnce({ total: 1, pending: 1, failed: 0, passed: 0, complete: true });
+    await s.reconcile();
+    expect(s.github.pullRequestHead).toHaveBeenLastCalledWith('ghs_x', 'acme/web', 20);
+    expect(await s.wf()).toMatchObject({ status: 'waiting', generation: 2 });
   });
 });

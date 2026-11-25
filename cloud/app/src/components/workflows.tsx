@@ -157,8 +157,6 @@ function eventTitle(e: WorkflowEvent): string {
       return `${e.retry ? 'Retry started' : 'Job started'}${e.eventName ? `: ${EVENT_NAME[e.eventName] ?? e.eventName}` : ''}`;
     case 'job_finished':
       return `Job finished${e.outcome ? `: ${e.outcome.replace(/_/g, ' ')}` : ''}`;
-    case 'ci_recovered':
-      return 'Missed check event recovered';
     case 'ci_checked':
       return 'Checks looked at';
     case 'blocked':
@@ -171,13 +169,16 @@ function eventTitle(e: WorkflowEvent): string {
       return 'Label event missed';
     case 'finish_recovered':
       return `Job finished (recovered)${e.outcome ? `: ${e.outcome.replace(/_/g, ' ')}` : ''}`;
+    default:
+      // A kind this console does not know (recorded by a newer or older server): shown as it is.
+      return String((e as { kind: string }).kind).replace(/_/g, ' ');
   }
 }
 
 const eventTone = (e: WorkflowEvent): Tone =>
   e.kind === 'blocked' || e.kind === 'label_missed'
     ? 'error'
-    : e.kind === 'ci_recovered' || e.kind === 'waiting'
+    : e.kind === 'waiting'
       ? 'warning'
       : e.kind === 'finished'
         ? 'success'

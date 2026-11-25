@@ -5,7 +5,7 @@ describe('reconciliation metrics', () => {
   it('writes one Embedded Metric Format line with every count of the run', () => {
     const line = JSON.parse(
       reconcileMetricsLine(
-        { checked: 3, recovered: 1, repaired: 1, blocked: 1, finished: 0, failed: 1, backlog: 4, oldestDueSeconds: 600 },
+        { checked: 3, repaired: 1, blocked: 1, finished: 0, failed: 1, backlog: 4, oldestDueSeconds: 600 },
         { tenants: 2, flagged: 1, failed: 1 },
         1_700_000_000_000,
       ),

@@ -22,8 +22,8 @@ const workflow = (over: Partial<WorkflowView> = {}): WorkflowView => ({
   status: 'blocked',
   stage: 'waiting-for-ci',
   reason: 'ci_event_missed',
-  message: 'The checks on aaaaaaaaaaaa finished, but no job picked their result up, after 2 recoveries.',
-  nextAction: 'Retry the last job from its page, or push to the pull request.',
+  message: 'The checks on aaaaaaaaaaaa finished (1 failed, 1 passed), but no job picked their result up: the check event never reached Updraft.',
+  nextAction: 'Re-run a check on GitHub (its result restarts the review loop), or retry the last job from its page.',
   lastJobId: 'job_abcdefgh02',
   createdAt: NOW,
   updatedAt: NOW,
@@ -47,7 +47,7 @@ const events: WorkflowEvent[] = [
     ],
     loop: { rounds: 0, maxRevisions: 3, reviews: 1, verdict: 'ready-to-merge' },
   },
-  { id: 'ci-recovered:aaa:1', at: NOW, kind: 'ci_recovered', generation: 1, jobId: 'job_abcdefgh02', message: 'queued the step that event would have started.' },
+  { id: 'ci-missed:aaa@3', at: NOW, kind: 'blocked', generation: 1, message: 'The check event never reached Updraft.' },
   { id: 'job_abcdefgh09:started', at: NOW, kind: 'job_started', generation: 2, jobId: 'job_abcdefgh09', eventName: 'issues', retry: false },
 ];
 
@@ -65,14 +65,14 @@ describe('workflows in the console', () => {
     expect(api.workflow).toHaveBeenCalledWith(55, '99-i7');
     expect(screen.getByTestId('workflow-status')).toHaveTextContent('Blocked');
     expect(screen.getByTestId('workflow-state')).toHaveTextContent('no job picked their result up');
-    expect(screen.getByTestId('workflow-next')).toHaveTextContent('Retry the last job from its page');
+    expect(screen.getByTestId('workflow-next')).toHaveTextContent('Re-run a check on GitHub');
     expect(screen.getByRole('link', { name: 'Latest job' })).toHaveAttribute('href', '/installations/55/jobs/job_abcdefgh02');
     const finished = screen.getByTestId('event-job_abcdefgh01:finished');
     expect(finished).toHaveTextContent('Job finished: succeeded');
     expect(finished).toHaveTextContent('Coding agent (claude): succeeded');
     expect(finished).toHaveTextContent('Review agent (codex): succeeded');
     expect(finished).toHaveTextContent('1 review(s), 0 of 3 revision round(s), last verdict ready to merge');
-    expect(screen.getByTestId('event-ci-recovered:aaa:1')).toHaveTextContent('Missed check event recovered');
+    expect(screen.getByTestId('event-ci-missed:aaa@3')).toHaveTextContent('Blocked');
     expect(screen.getByRole('region', { name: 'Run 2' })).toBeInTheDocument();
   });
 
