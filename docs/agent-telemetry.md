@@ -140,10 +140,10 @@ One job (one microVM, one webhook event) is one trace:
 
 ```
 invoke_workflow updraft                 the job; agent "updraft"
-├─ invoke_agent <profile>               one agent run: implement, review or revision
+├─ invoke_agent <role> / <profile>      one agent run: implement, review, revision or ci_repair
 │  ├─ chat <model>                      one model response, with its token usage
 │  ├─ execute_tool <tool>               one tool call: Bash, Edit, shell, an MCP tool, ...
-│  │  └─ invoke_agent <profile>/<type>  a Claude Code subagent (the Task tool), with its own spans
+│  │  └─ invoke_agent <role> / <profile> / <type>  a Claude Code subagent (the Task tool), with its own spans
 │  └─ ...
 └─ invoke_workflow verify               the workflow's verify commands; agent "updraft"
    └─ execute_tool verify               one command, failed when it exits non-zero
@@ -152,7 +152,7 @@ invoke_workflow updraft                 the job; agent "updraft"
 | Span | `gen_ai.operation.name` | Kind | Notable attributes |
 | --- | --- | --- | --- |
 | `invoke_workflow updraft` | `invoke_workflow` | internal | `updraft.job.outcome`, `updraft.pull_request(.url)`, `updraft.loop.stage`, `updraft.loop.rounds`, `updraft.loop.reviews`, `updraft.loop.merged` |
-| `invoke_agent <profile>` | `invoke_agent` | internal | `gen_ai.agent.name` (the profile), `gen_ai.agent.id` (the Claude session or Codex thread), `gen_ai.provider.name`, `gen_ai.request.model` (configured), `updraft.job.kind`, `updraft.run.outcome`, totals of tokens and tool calls |
+| `invoke_agent <role> / <profile>` | `invoke_agent` | internal | `gen_ai.agent.name` (`<role> / <profile>`), `updraft.agent.profile` (the configured profile), `updraft.agent.role` (`coding` or `reviewing`), `updraft.agent.role.detail`, `gen_ai.agent.id` (the Claude session or Codex thread), `gen_ai.provider.name`, `gen_ai.request.model` (configured), `updraft.job.kind`, `updraft.run.outcome`, totals of tokens and tool calls |
 | `chat <model>` | `chat` | client | `gen_ai.response.model` (what the API reported), `gen_ai.response.id`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens`, `gen_ai.response.finish_reasons` |
 | `execute_tool <tool>` | `execute_tool` | internal | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type` (`function`, or `extension` for MCP tools), `updraft.tool.exit_code` |
 | `execute_tool verify` | `execute_tool` | internal | `updraft.verify.command`, `updraft.verify.index`, `updraft.tool.exit_code` |
@@ -162,6 +162,33 @@ Every span carries `gen_ai.conversation.id`, which is `<owner>/<repo>#<issue>`, 
 traces into a conversation by the first and spans into lanes by the second, so one issue's implement run, each review, and each revision, over however
 many webhook events and microVMs, read as one conversation, with the coding agent, the reviewing
 agent and Updraft itself each in its own lane.
+
+### Agent lane names
+
+An agent's `gen_ai.agent.name` is `<role> / <profile>`, so implementation, review and revision are
+separate lanes even when they use the same profile (`implement / claude-standard`,
+`review / claude-standard`, `revision / claude-standard`). The role comes from the run's kind in
+its run header (not from the profile, model or prompt), and is one of `implement`, `review`,
+`revision` or `ci_repair` (a revision whose trigger is `ci_failure`). A header with no kind is
+`implement`; a run is only `review` when its header says it reviews code. The same name is on the
+run's `invoke_agent`, `chat` and `execute_tool` spans; a Claude subagent is
+`<role> / <profile> / <subagent_type>`. Every agent span also has:
+
+- `updraft.agent.profile`: the configured profile, stable across roles.
+- `updraft.agent.role`: `coding` (implement, revision, ci_repair) or `reviewing`.
+- `updraft.agent.role.detail`: `implement`, `review`, `revision` or `ci_repair`.
+- `updraft.job.kind`: unchanged (`implement`, `review`, `revision`). A CI repair is a `revision` here;
+  only the lane name and `updraft.agent.role.detail` say `ci_repair`.
+
+Updraft's own spans keep `gen_ai.agent.name` = `updraft` and carry no role. The conversation id and
+trace ids are unchanged. **Migration:** queries that grouped or filtered on `gen_ai.agent.name` equal
+to a raw profile should use `updraft.agent.profile` (spans from before this change have no such
+attribute, so use a Honeycomb calculated field such as `COALESCE($updraft.agent.profile, $gen_ai.agent.name)`), and group by
+`updraft.agent.role` for coding versus reviewing. Historical spans have no role; use
+`updraft.job.kind` for them.
+
+The conversation breakdown in the console (`gen_ai.conversation.id` by `gen_ai.agent.name`) therefore
+shows role-qualified lanes.
 
 Details that follow the conventions:
 
@@ -174,7 +201,7 @@ Details that follow the conventions:
   previous tool results back (or started), and ends when the response's last block arrived. A
   Codex turn has no per-call breakdown, so it is one `chat` span with the turn's usage.
 - **The calling agent emits `invoke_agent`.** A Claude Code subagent is an `execute_tool Task`
-  span with an `invoke_agent <profile>/<subagent_type>` span under it; the subagent's own model and
+  span with an `invoke_agent <role> / <profile> / <subagent_type>` span under it; the subagent's own model and
   tool calls carry its own agent name, as the conventions suggest for multi-agent workflows.
 - **Failures are span errors.** A tool result marked `is_error`, a Codex command that exited
   non-zero or an MCP call that failed, an agent run that did not succeed, a verify command that
@@ -209,7 +236,7 @@ Updraft's own steps are spans on the `updraft` lane:
 invoke_workflow updraft
 ├─ runner isolation / restore_state / verify_isolation / coalesce_wait / run_event / state_wait
 ├─ updraft prepare          prompt and worktree, until the agent starts (failed if it never did; the error text only with content on)
-├─ invoke_agent <profile>
+├─ invoke_agent <role> / <profile>
 ├─ invoke_workflow verify
 ├─ updraft publish          push and pull request, one span per attempt, an event per line (its text only for Updraft's own lines; a reason or an error from GitHub only with content on)
 ├─ updraft post_review      the review posted and what it led to (updraft.review.outcome)
@@ -340,8 +367,8 @@ on span width; the raw span name is what is exported.
 
 What a destination, a query, a board or an alert can rely on, whichever tool reads it:
 
-- **Span names and kinds**: `invoke_workflow updraft`, `invoke_agent <profile>`,
-  `invoke_agent <profile>/<subagent type>`, `chat <model>`, `execute_tool <tool>`,
+- **Span names and kinds**: `invoke_workflow updraft`, `invoke_agent <role> / <profile>`,
+  `invoke_agent <role> / <profile> / <subagent type>` (`<role>` is `implement`, `review`, `revision` or `ci_repair`), `chat <model>`, `execute_tool <tool>`,
   `execute_tool verify`, `invoke_workflow verify`, `updraft <step>` and `runner <step>`, in the tree
   under [The spans](#the-spans), one trace per job.
 - **The GenAI attributes** in the tables above, with the conventions' meaning:

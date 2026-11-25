@@ -524,7 +524,7 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(posts[0].url).toBe('https://api.honeycomb.io/v1/traces');
     expect(posts[0].headers['x-honeycomb-team']).toBe('hcaik_01honeycombsecretvalue');
     const spans = posts.flatMap((p) => p.body.resourceSpans[0].scopeSpans[0].spans);
-    expect(spans.map((s) => s.name).filter((n) => !n.startsWith('runner ') && !n.startsWith('updraft ')).sort()).toEqual(['chat claude-x', 'execute_tool Bash', 'invoke_agent claude', 'invoke_workflow updraft']);
+    expect(spans.map((s) => s.name).filter((n) => !n.startsWith('runner ') && !n.startsWith('updraft ')).sort()).toEqual(['chat claude-x', 'execute_tool Bash', 'invoke_agent implement / claude', 'invoke_workflow updraft']);
     // The runner's own steps, under the job's span, which starts with the job (before the tracer did).
     const root = spans.find((s) => s.name === 'invoke_workflow updraft');
     const runnerSteps = spans.filter((s) => s.name.startsWith('runner '));
@@ -543,7 +543,7 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(harness.finishDetails[0].telemetry).toMatchObject({ traceId: expect.stringMatching(/^[0-9a-f]{32}$/), spans: spans.length, exported: spans.length, failed: 0 });
     // And the spans worth a link: here, the agent's, a span that was sent.
     const agentMark = harness.finishDetails[0].telemetry.marks.find((m) => m.kind === 'agent');
-    expect(agentMark.spanId).toBe(spans.find((s) => s.name === 'invoke_agent claude').spanId);
+    expect(agentMark.spanId).toBe(spans.find((s) => s.name === 'invoke_agent implement / claude').spanId);
     // The job process never had the telemetry key; it has the trace id, to record with its runs.
     const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
     expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');
@@ -585,7 +585,7 @@ describe.runIf(onLinuxLikeHost)('runJob, version 2: agent telemetry', () => {
     expect(record.env.OTEL_EXPORTER_OTLP_HEADERS).toBeUndefined();
     expect(JSON.stringify(record)).not.toContain('hcaik_01honeycombsecretvalue');
     const spans = posts.flatMap((p) => p.resourceSpans[0].scopeSpans[0].spans);
-    const agent = spans.find((s) => s.name === 'invoke_agent claude');
+    const agent = spans.find((s) => s.name === 'invoke_agent implement / claude');
     expect(agent.events.map((e) => e.name)).toEqual(['claude_code.api_error', 'claude_code.api_request']);
     const attrs = Object.fromEntries(agent.attributes.map((a) => [a.key, a.value]));
     expect(attrs['updraft.agent.api_requests']).toEqual({ intValue: '1' });

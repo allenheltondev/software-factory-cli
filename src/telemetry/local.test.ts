@@ -77,7 +77,7 @@ describe('a trace per run', () => {
       ].filter((line) => line !== undefined).join('\n'));
       await trace.end(hasReport ? 'succeeded' : 'failed');
       const body = posts.join('\n');
-      expect(body).toContain('invoke_agent devstral');
+      expect(body).toContain('invoke_agent implement / devstral');
       expect(body).not.toContain('never-export-this');
       if (hasReport) {
         expect(body).toContain('"key":"gen_ai.usage.input_tokens","value":{"intValue":"15"}');
@@ -90,6 +90,34 @@ describe('a trace per run', () => {
       }
     } finally {
       fs.rmSync(runsDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['review', ['trigger: pull_request.review of head abc', 'pull request: #100 https://example.invalid/pull/100', 'code written by agent: claude-opus; this run reviews it'], 'review / claude-opus', 'reviewing'],
+    ['revision', ['trigger: pull_request.changes_requested (updraft_review) by updraft at x', 'pull request: #100 https://example.invalid/pull/100', 'review: https://example.invalid/r (2 inline comment(s))'], 'revision / claude-opus', 'coding'],
+    ['ci repair', ['trigger: pull_request.changes_requested (ci_failure) by updraft at x', 'pull request: #100 https://example.invalid/pull/100', 'review: https://example.invalid/r (0 inline comment(s))'], 'ci_repair / claude-opus', 'coding'],
+    ['legacy, no kind', [], 'implement / claude-opus', 'coding'],
+  ])('exports a role-qualified lane for %s, with and without capture content', async (_label, extra, lane, role) => {
+    for (const capture of [false, true]) {
+      const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'updraft-local-telemetry-'));
+      try {
+        const posts: string[] = [];
+        const fetchFn = (async (_url: string, init: RequestInit) => (posts.push(String(init.body)), { ok: true, status: 200, text: async () => '' })) as unknown as typeof fetch;
+        const config = localTelemetryFromEnv({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318', ...(capture ? { OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: 'true' } : {}) })!;
+        const trace = createLocalTelemetry({ ...config, captureContent: capture }, { runsDir, fetch: fetchFn, pollMs: 20 }).begin('run_a')!;
+        fs.mkdirSync(path.join(runsDir, 'run_a'));
+        const head = header('run_a', 7).replace('agent: claude-opus', [...extra, 'agent: claude-opus'].join('\n'));
+        fs.writeFileSync(path.join(runsDir, 'run_a', 'run.log'), `${head}${claude.stream(claude.assistantText('done'))}---- end of agent output ----\noutcome: succeeded\n`);
+        await trace.end('succeeded');
+        const body = posts.join('\n');
+        expect(body).toContain(`invoke_agent ${lane}`);
+        expect(body).toContain(`"key":"gen_ai.agent.name","value":{"stringValue":"${lane}"}`);
+        expect(body).toContain('"key":"updraft.agent.profile","value":{"stringValue":"claude-opus"}');
+        expect(body).toContain(`"key":"updraft.agent.role","value":{"stringValue":"${role}"}`);
+      } finally {
+        fs.rmSync(runsDir, { recursive: true, force: true });
+      }
     }
   });
 
