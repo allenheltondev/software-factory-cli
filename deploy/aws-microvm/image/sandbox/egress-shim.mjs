@@ -23,6 +23,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const EGRESS_HEADER = 'x-updraft-egress';
+/** The proxy's answer to a tunnel whose first bytes it refused (egress-proxy.mjs TLS_ACCESS_DENIED). */
+const TLS_ACCESS_DENIED = Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x31]);
 const MAX_HEAD = 16384;
 const MAX_DIAGNOSTICS = 20;
 
@@ -76,6 +78,9 @@ export function diagnosticLine({ reason, target, detail, count }) {
     'port-not-allowed': 'the port is not allowed',
     'non-public-address': `the name resolves to a non-public address${detail ? ` (${detail})` : ''}`,
     'dns-failure': `name resolution failed${detail ? ` (${detail})` : ''}`,
+    'dns-timeout': 'name resolution took too long',
+    'request-timeout': 'the request was not sent in time',
+    'tls-refused': 'the proxy closed the tunnel at the TLS handshake: it must be TLS whose server name (SNI) is the host the CONNECT named',
     'connect-failed': `the registry refused or dropped the connection${detail ? ` (${detail})` : ''}`,
     'connect-timeout': 'the registry did not answer in time',
     'too-many-connections': 'too many registry connections were open at once',
@@ -93,6 +98,9 @@ export function relay(client, socketPath, record) {
   // Set when the shim itself answered (the proxy is unreachable): that answer must be flushed,
   // never cut off by the dead upstream's close.
   let answered = false;
+  let target;
+  let afterTunnel = false; // the next upstream bytes are the first after a 200
+  client.once('data', (chunk) => { target = /^CONNECT (\S+) /.exec(chunk.toString('latin1', 0, 300))?.[1]; });
   client.on('error', () => upstream.destroy());
   upstream.on('error', () => {
     if (!headDone) {
@@ -111,8 +119,15 @@ export function relay(client, socketPath, record) {
       if (!parsed && head.length < MAX_HEAD) return;
       headDone = true;
       if (parsed && parsed.status !== 200) record({ reason: parsed.egress?.reason ?? 'bad-request', target: parsed.egress?.target, detail: parsed.egress?.detail });
+      const end = head.indexOf('\r\n\r\n');
+      if (parsed?.status === 200 && end !== -1 && end + 4 === head.length) afterTunnel = true;
+      else if (parsed?.status === 200 && end !== -1 && head.subarray(end + 4).equals(TLS_ACCESS_DENIED)) record({ reason: 'tls-refused', target });
       client.write(head);
       return;
+    }
+    if (afterTunnel) {
+      afterTunnel = false;
+      if (chunk.equals(TLS_ACCESS_DENIED)) record({ reason: 'tls-refused', target });
     }
     client.write(chunk);
   });

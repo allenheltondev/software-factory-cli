@@ -26,7 +26,7 @@ Updraft (UID 1000) -> docker-shaped runtime -> root supervisor
                            UID 1000, narrow worktree/git mounts
                            fresh HOME and PID/mount/user/network namespaces
                            no native auth home, host processes/sockets or network
-                           (package registries only, through the egress proxy)
+                           (TLS to allowlisted registry hosts only, via the egress proxy)
 ```
 
 Claude starts outside the repository with `--restricted`, empty `--setting-sources`, disabled

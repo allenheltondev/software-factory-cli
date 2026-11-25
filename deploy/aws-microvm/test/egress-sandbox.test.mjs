@@ -64,15 +64,31 @@ afterAll(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-/** What runs inside: the proxy route, a direct route to the host's loopback, and DNS. */
+/**
+ * What runs inside: the proxy route (with a real ClientHello from Node's TLS client, made
+ * inside the sandbox, and one for another name), a direct route to the host's loopback, and DNS.
+ */
 const PROBE = `
-const net = require('net'), dns = require('dns');
+const net = require('net'), dns = require('dns'), tls = require('tls');
 const url = new URL(process.env.HTTPS_PROXY);
-const viaProxy = (target) => new Promise((resolve) => {
+const hello = (servername) => new Promise((resolve) => {
+  const capture = net.createServer((s) => s.once('data', (d) => { resolve(d); s.destroy(); capture.close(); }));
+  capture.listen(0, '127.0.0.1', () => tls.connect({ host: '127.0.0.1', port: capture.address().port, servername, rejectUnauthorized: false }).on('error', () => {}));
+});
+const viaProxy = (target, first) => new Promise((resolve) => {
   const s = net.connect(Number(url.port), url.hostname, () => s.write('CONNECT ' + target + ' HTTP/1.1\\r\\n\\r\\n'));
-  let data = '';
-  s.on('data', (d) => { data += d; if (data.startsWith('HTTP/1.1 200') && !data.includes('echo:')) s.write('hi'); if (data.includes('echo:hi')) s.end(); });
-  s.on('close', () => resolve(data.split('\\r\\n')[0] + (data.includes('echo:hi') ? ' tunneled' : '')));
+  let data = Buffer.alloc(0), sent = false;
+  s.on('data', (d) => {
+    data = Buffer.concat([data, d]);
+    const text = data.toString('latin1');
+    if (!sent && text.startsWith('HTTP/1.1 200') && text.includes('\\r\\n\\r\\n') && first) { sent = true; s.write(first); }
+    if (text.includes('echo:')) s.end();
+  });
+  s.on('close', () => {
+    const text = data.toString('latin1');
+    const after = data.subarray(text.indexOf('\\r\\n\\r\\n') + 4);
+    resolve(text.split('\\r\\n')[0] + (text.includes('echo:') ? ' tunneled' : after.length === 7 && after[0] === 0x15 ? ' alert' : ''));
+  });
   s.on('error', (e) => resolve('error ' + e.code));
 });
 const direct = (port) => new Promise((resolve) => {
@@ -81,7 +97,8 @@ const direct = (port) => new Promise((resolve) => {
 });
 (async () => {
   const out = {
-    allowed: await viaProxy('registry.npmjs.org:443'),
+    allowed: await viaProxy('registry.npmjs.org:443', await hello('registry.npmjs.org')),
+    wrongName: await viaProxy('registry.npmjs.org:443', await hello('evil.example')),
     denied: await viaProxy('example.com:443'),
     directHostLoopback: await direct(Number(process.argv[1])),
     dns: await new Promise((r) => dns.lookup('registry.npmjs.org', (e) => r(e ? e.code : 'resolved'))),
@@ -105,13 +122,15 @@ describe.skipIf(!availability.usable)(`registry egress in the sandbox${availabil
     const out = JSON.parse(result.stdout.trim().split('\n').pop());
     expect(out).toEqual({
       allowed: 'HTTP/1.1 200 Connection Established tunneled',
+      wrongName: 'HTTP/1.1 200 Connection Established alert',
       denied: 'HTTP/1.1 403 Forbidden',
       directHostLoopback: 'ECONNREFUSED',
       dns: expect.stringMatching(/^E/),
       interfaces: 0,
     });
     expect(result.stderr).toContain('updraft-egress: refused CONNECT example.com:443 (not-allowed)');
-    expect(connects).toEqual([{ address: '104.16.0.35', port: 443, family: 4 }]);
+    expect(result.stderr).toContain('updraft-egress: refused CONNECT registry.npmjs.org:443 (tls-refused)');
+    expect(connects).toEqual([{ address: '104.16.0.35', port: 443, family: 4 }, { address: '104.16.0.35', port: 443, family: 4 }]);
   });
 
   it('leaves the network off without egress', async () => {
