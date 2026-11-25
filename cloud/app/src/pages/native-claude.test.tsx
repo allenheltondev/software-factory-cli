@@ -353,3 +353,18 @@ describe('guided Claude connection', () => {
     },
   );
 });
+
+describe('package registries on the Claude page (#157)', () => {
+  it("loads this installation's list for a configured worker", async () => {
+    const packageRegistries = vi.fn().mockResolvedValue({ hosts: ['npm.pkg.github.com'], defaults: ['registry.npmjs.org'], max: 20, canEdit: true, version: 1 });
+    show(fakeApi({ nativeClaude: async () => ready, packageRegistries }));
+    expect(await screen.findByRole('textbox', { name: /Extra registry hosts/ })).toHaveValue('npm.pkg.github.com');
+    expect(packageRegistries).toHaveBeenCalledWith(55);
+  });
+  it('is not shown where the worker is not configured', async () => {
+    const packageRegistries = vi.fn();
+    show(fakeApi({ nativeClaude: async () => ({ configured: false, enabled: false, worker: null }), packageRegistries }));
+    expect(await screen.findByText(/Claude subscription is unavailable in this deployment/)).toBeInTheDocument();
+    expect(packageRegistries).not.toHaveBeenCalled();
+  });
+});

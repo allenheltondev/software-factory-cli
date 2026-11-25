@@ -1,4 +1,5 @@
 import { ClaudeNavigation } from '../components/ClaudeNavigation';
+import { PackageRegistries, type PackageRegistriesApi } from '../components/PackageRegistries';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router';
 import {
@@ -39,6 +40,9 @@ export function NativeClaudePage({ api }: { api?: Api }) {
 
 function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
   const { id } = useParams();
+  // Shown when the client can load the list (the real one always can).
+  const candidate = api as Partial<PackageRegistriesApi>;
+  const registriesApi = candidate.packageRegistries && candidate.setPackageRegistries ? (candidate as PackageRegistriesApi) : undefined;
   const location = useLocation();
   const navigate = useNavigate();
   const connectRequested = (location.state as { connectClaude?: unknown } | null)?.connectClaude === true;
@@ -608,6 +612,9 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                     </div>
                   </CardBody>
                 </Card>
+              )}
+              {view.configured && registriesApi && (
+                <PackageRegistries api={registriesApi} installationId={installationId} />
               )}
               {!view.configured && (
                 <Alert variant="info">
