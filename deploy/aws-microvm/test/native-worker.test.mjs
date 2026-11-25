@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, claudeArgs, claudeEnv, checkInventory, validateRun, resolveRunEnvironment } from '../native-worker/policy.mjs';
+import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, EGRESS_TARGET, claudeArgs, claudeEnv, checkInventory, validateRun, resolveRunEnvironment, withEgress, networkNote } from '../native-worker/policy.mjs';
+import { parseRunArgs } from '../image/sandbox/updraft-sandbox.mjs';
 import { frames, readPrompt } from '../native-worker/protocol.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
 import { endpointPorts, tokenArgs, verifyHookPort } from '../native-worker/endpoint-token.mjs';
@@ -100,6 +101,30 @@ describe('native Claude worker policy', () => {
     expect(args).toContain(TOOL);
     expect(args).not.toContain('bypassPermissions');
     expect(args.slice(-4)).toEqual(['--model', 'sonnet', '--effort', 'high']);
+  });
+
+  it('tells Claude whether registries are reachable, and never to report unrun checks as passing', () => {
+    const prompt = (args) => args[args.indexOf('--append-system-prompt') + 1];
+    expect(prompt(claudeArgs(['-p', '--output-format', 'stream-json'], '{}'))).toContain('Network access is disabled.');
+    const limited = prompt(claudeArgs(['-p', '--output-format', 'stream-json'], '{}', { egress: true }));
+    expect(limited).toContain('limited to package registries');
+    expect(limited).toContain('never describe unrun checks as passing');
+    expect(limited).not.toContain('Network access is disabled');
+    expect(networkNote(false)).toBe('Network access is disabled.');
+  });
+
+  it('adds registry egress to a sandboxed command without opening the network', () => {
+    const runArgs = ['--rm', '--name', 'n', '--user', '1000:1000', '--network', 'none', '--tmpfs', '/updraft-home:mode=1777',
+      '-e', 'HOME=/updraft-home', '--mount', 'type=bind,source=/w/job,target=/w/job', '--workdir', '/w/job', IMAGE, 'npm', 'test'];
+    const run = parseRunArgs(runArgs);
+    const egress = { dir: '/run/updraft-native/sessions-x/egress', shim: '/usr/local/lib/updraft-egress/egress-shim.mjs', node: '/usr/local/bin/node' };
+    const wrapped = withEgress(runArgs, run, ['/bin/sh', '-c', 'npm ci'], egress);
+    const parsed = parseRunArgs(wrapped);
+    expect(parsed.network).toBe('none');
+    expect(parsed.mounts).toContainEqual({ source: egress.dir, target: EGRESS_TARGET, readOnly: true });
+    expect(parsed.command).toEqual([egress.node, egress.shim, `${EGRESS_TARGET}/proxy.sock`, '--', '/bin/sh', '-c', 'npm ci']);
+    expect(withEgress(runArgs, run, run.command, undefined)).toEqual(runArgs);
+    expect(() => withEgress(runArgs.map((a) => (a === IMAGE ? 'other' : a)), run, run.command, egress)).toThrow();
   });
 
   it.each([

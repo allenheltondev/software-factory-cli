@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
@@ -20,6 +20,7 @@ const results = [];
 let service;
 let probe;
 let networkTrap;
+let shimDir;
 const workerUid = 21000;
 const claudeUid = 21001;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -29,6 +30,12 @@ try {
   fs.cpSync(source, `${fixture}/native-worker`, { recursive: true });
   fs.mkdirSync(`${fixture}/image/sandbox`, { recursive: true });
   fs.copyFileSync(path.resolve(source, '../image/sandbox/updraft-sandbox.mjs'), `${fixture}/image/sandbox/updraft-sandbox.mjs`);
+  fs.copyFileSync(path.resolve(source, '../image/sandbox/egress-proxy.mjs'), `${fixture}/image/sandbox/egress-proxy.mjs`);
+  // The shim must sit under /usr, the only system tree the sandbox mounts, as install.sh puts it.
+  shimDir = fs.mkdtempSync('/usr/local/lib/updraft-egress-check-');
+  fs.copyFileSync(path.resolve(source, '../image/sandbox/egress-shim.mjs'), `${shimDir}/egress-shim.mjs`);
+  fs.chmodSync(shimDir, 0o755);
+  fs.chmodSync(`${shimDir}/egress-shim.mjs`, 0o644);
   fs.copyFileSync(path.resolve(source, '../../../dist/agents/native-claude-auth.js'), `${fixture}/auth.mjs`);
   // Copies may retain checkout ownership as well as group-writable modes. Model a real
   // root installation explicitly, before creating the separately owned data directories.
@@ -303,6 +310,54 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   assert.equal((await native(['test -f answer.js'])).code, 0);
   assert.equal(fs.readFileSync(`${credentialHome}/.claude/.credentials.json`, 'utf8'), marker);
   results.push('supervisor replacement reuses the same synthetic CLI home');
+  // Registry egress (#147): same boundary, plus a root proxy that only tunnels to registries.
+  await service.close(); service = undefined;
+  const egressConfig = { ...config, toolTimeoutSeconds: 600, egress: { defaultRegistries: true, shim: `${shimDir}/egress-shim.mjs` } };
+  fs.writeFileSync(configFile, JSON.stringify(egressConfig), { mode: 0o644 });
+  assert.deepEqual(loadConfig(configFile), egressConfig);
+  fs.writeFileSync(configFile, JSON.stringify({ ...egressConfig, egress: { ...egressConfig.egress, allowHosts: ['169.254.169.254'] } }), { mode: 0o644 });
+  assert.throws(() => loadConfig(configFile));
+  fs.writeFileSync(configFile, JSON.stringify({ ...egressConfig, egress: { ...egressConfig.egress, shim: `${fixture}/claude` } }), { mode: 0o644 });
+  assert.throws(() => loadConfig(configFile), /under \/usr/);
+  results.push('egress config refuses address allowlist entries and a shim outside /usr');
+  service = await startService(egressConfig, socketPath, () => {});
+  const connectVia = (target) => `node -e 'const u=new URL(process.env.HTTPS_PROXY);const s=require("net").connect(Number(u.port),u.hostname,()=>s.write("CONNECT ${target} HTTP/1.1\\r\\n\\r\\n"));let d="";s.on("data",x=>{d+=x;if(d.includes("\\r\\n\\r\\n")){console.log("STATUS "+d.split(" ")[1]);process.exit(0)}});s.on("error",e=>{console.log("ERR "+e.code);process.exit(0)})'`;
+  const egressReply = await native([
+    // Still no route around the proxy: the host loopback trap, the metadata service, the supervisor socket.
+    ...[
+      `node -e 'const net=require("net");const s=net.connect(${port},"127.0.0.1");s.on("error",()=>process.exit(1));s.on("data",x=>process.stdout.write(x));s.setTimeout(1000,()=>process.exit(1))'`,
+      `node -e 'const net=require("net");const s=net.connect(80,"169.254.169.254");s.on("error",()=>process.exit(1));s.on("connect",()=>process.exit(0));s.setTimeout(1000,()=>process.exit(1))'`,
+      `node -e 'require("net").connect(${JSON.stringify(socketPath)}).on("error",()=>process.exit(1))'`,
+    ],
+    connectVia('169.254.169.254:80'),
+    connectVia('github.com:443'),
+    connectVia('localhost:443'),
+    connectVia('registry.npmjs.org:443'),
+    'echo "proxy=$HTTPS_PROXY npm=$npm_config_https_proxy"',
+  ]);
+  assert.equal(egressReply.code, 0, egressReply.output);
+  assert(!egressReply.output.includes(marker), egressReply.output);
+  // The synthetic CLI reports each tool call's text as "<output>\nexit=<code>", in order.
+  const resultEvent = egressReply.output.split('\n').filter((line) => line.includes('"type":"result"')).map((line) => JSON.parse(line)).pop();
+  const calls = [...resultEvent.result.matchAll(/([\s\S]*?)\nexit=(\d+)[^\n]*(?:\n|$)/g)].map((m) => ({ text: m[1], code: Number(m[2]) }));
+  assert.equal(calls.length, 8, resultEvent.result);
+  for (const call of calls.slice(0, 3)) assert.notEqual(call.code, 0, resultEvent.result);
+  assert(calls[3].text.includes('STATUS 403') && calls[3].text.includes('(ip-literal)'), calls[3].text);
+  assert(calls[4].text.includes('STATUS 403') && calls[4].text.includes('updraft-egress: refused CONNECT github.com:443 (not-allowed)'), calls[4].text);
+  assert(/STATUS 40[03]/.test(calls[5].text), calls[5].text);
+  // An allowed registry is never refused by policy: 200 with a network, 502/504 without one.
+  assert(/STATUS (200|502|504)/.test(calls[6].text), calls[6].text);
+  assert(/proxy=http:\/\/127\.0\.0\.1:\d+ npm=http:\/\/127\.0\.0\.1:\d+/.test(calls[7].text), calls[7].text);
+  results.push('with egress: loopback, metadata and supervisor socket stay blocked; the proxy refuses addresses, localhost and unlisted hosts, explains each refusal, and never refuses an allowed registry');
+  const claudeConnect = spawnSync('/usr/bin/setpriv', ['--reuid', String(claudeUid), '--regid', String(claudeUid), '--clear-groups', process.execPath, '-e',
+    'const fs=require("fs");const p=process.argv[1];let f;try{f=fs.readdirSync(p).find(n=>n.startsWith("sessions-"))}catch(e){console.log(e.code);process.exit(0)}require("net").connect(p+"/"+f+"/egress/proxy.sock").on("connect",()=>console.log("connected")).on("error",e=>console.log(e.code))',
+    path.dirname(socketPath)], { encoding: 'utf8' });
+  assert(!claudeConnect.stdout.includes('connected'), claudeConnect.stdout);
+  results.push('the Claude identity cannot open the egress proxy socket');
+  const egressVerify = await request(argv(['/bin/sh', '-c', 'echo "verify proxy=${HTTPS_PROXY:-none}"']));
+  assert.equal(egressVerify.code, 0, egressVerify.output);
+  assert(/verify proxy=http:\/\/127\.0\.0\.1:\d+/.test(egressVerify.output), egressVerify.output);
+  results.push('verification commands get the same registry egress as tool calls');
   console.log(JSON.stringify({ passed: results, limitations: ['Synthetic Claude CLI, not a model call', 'Local durable directory, not a deployed EFS mount', 'No AWS replacement or subscription end-to-end proof'] }, null, 2));
 } finally {
   await probe?.close();
@@ -310,4 +365,5 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   if (networkTrap) await new Promise((resolve) => networkTrap.close(resolve));
   // Only the exact mkdtemp fixture is removed; no user directories are involved.
   fs.rmSync(fixture, { recursive: true, force: true });
+  if (shimDir) fs.rmSync(shimDir, { recursive: true, force: true });
 }

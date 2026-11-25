@@ -2,12 +2,38 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseRunArgs } from '../image/sandbox/updraft-sandbox.mjs';
+import { parseEgressConfig } from '../image/sandbox/egress-proxy.mjs';
 
 export const IMAGE = 'native-claude-worker';
 export const TOOL = 'mcp__updraft__exec';
 export const MAX_FRAME = 2 * 1024 * 1024;
 export const DEFAULT_SOCKET = '/run/updraft-native/worker.sock';
 export const GIT_IDENTITY = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+/** Where the egress proxy's socket directory appears inside the sandbox (#147). */
+export const EGRESS_TARGET = '/updraft-egress';
+export const EGRESS_SOCKET = 'proxy.sock';
+export const DEFAULT_TOOL_TIMEOUT_SECONDS = 120;
+
+/**
+ * The run arguments for one sandboxed command with registry egress: the proxy's socket
+ * directory bound in, and the command started behind the in-sandbox shim. The network stays
+ * `none`; the only way out is the proxy, which allows registry hosts only. Pure.
+ * `egress` is { dir, shim, node }; without it the arguments are returned unchanged.
+ */
+export function withEgress(runArgs, run, command, egress) {
+  const imageIndex = runArgs.length - run.command.length - 1;
+  if (runArgs[imageIndex] !== IMAGE) throw new Error('unexpected runtime arguments');
+  const options = runArgs.slice(0, imageIndex);
+  if (!egress) return [...options, IMAGE, ...command];
+  return [...options, '--mount', `type=bind,source=${egress.dir},target=${EGRESS_TARGET},readonly`, IMAGE,
+    egress.node, egress.shim, `${EGRESS_TARGET}/${EGRESS_SOCKET}`, '--', ...command];
+}
+
+/** The system prompt sentence about the network, for the agent and the exec tool description. */
+export function networkNote(egress) {
+  if (!egress) return 'Network access is disabled.';
+  return 'Network access is limited to package registries through a proxy that every command already uses (npm, pnpm, Yarn, pip, uv, cargo, go and gem read it): install the locked dependencies with the repository\'s own package manager and lockfile (for example npm ci in each package directory) before running its tests, lint, typecheck and build. Every other host is refused; a refusal is printed as an "updraft-egress:" line. If installation or a check cannot run, report the exact command and error and say the check was not run; never describe unrun checks as passing.';
+}
 
 function checkEnvironment(entry) {
   if (entry.name === 'HOME' && entry.value === '/updraft-home') return;
@@ -61,7 +87,7 @@ export function validateRun(argv, config) {
 
 // Do not forward arbitrary flags, permission rules, configuration, resume paths or plugins.
 // Updraft's default bypassPermissions is consumed, then replaced with a narrow MCP allow rule.
-export function claudeArgs(input, mcpConfig) {
+export function claudeArgs(input, mcpConfig, { egress = false } = {}) {
   const safe = [];
   let print = false;
   let format;
@@ -91,7 +117,7 @@ export function claudeArgs(input, mcpConfig) {
     '--setting-sources', '', '--disable-slash-commands', '--strict-mcp-config', '--mcp-config', mcpConfig,
     '--settings', JSON.stringify({ disableAllHooks: true }), '--permission-mode', 'default',
     '--allowedTools', TOOL, '--append-system-prompt',
-    'Use only mcp__updraft__exec for repository work, including reading, editing, git and tests. The tool starts each command in the job worktree. Network access is disabled. Commit changes when the task requires it.', ...safe];
+    `Use only mcp__updraft__exec for repository work, including reading, editing, git and tests. The tool starts each command in the job worktree. ${networkNote(egress)} Commit changes when the task requires it.`, ...safe];
 }
 
 export function checkInventory(event) {
@@ -121,7 +147,16 @@ export function loadConfig(file) {
   trustedFile(file);
   const c = JSON.parse(fs.readFileSync(file, 'utf8'));
   const keys = ['workerUid', 'workerGid', 'claudeUid', 'claudeGid', 'credentialHome', 'workRoot', 'claude', 'sandboxConfig', 'authModule'];
-  if (Object.keys(c).some((k) => !keys.includes(k)) || keys.some((k) => c[k] === undefined)) throw new Error('invalid worker configuration');
+  const optional = ['egress', 'toolTimeoutSeconds'];
+  if (Object.keys(c).some((k) => !keys.includes(k) && !optional.includes(k)) || keys.some((k) => c[k] === undefined)) throw new Error('invalid worker configuration');
+  if (c.toolTimeoutSeconds !== undefined && (!Number.isInteger(c.toolTimeoutSeconds) || c.toolTimeoutSeconds < 10 || c.toolTimeoutSeconds > 1800)) {
+    throw new Error('toolTimeoutSeconds must be 10 to 1800');
+  }
+  // Validated here so a bad allowlist stops the supervisor before it listens.
+  if (c.egress !== undefined) {
+    parseEgressConfig(c.egress);
+    trustedFile(c.egress.shim);
+  }
   for (const key of ['workerUid', 'workerGid', 'claudeUid', 'claudeGid']) {
     if (!Number.isInteger(c[key]) || c[key] < 1000) throw new Error('worker identities must be unprivileged');
   }

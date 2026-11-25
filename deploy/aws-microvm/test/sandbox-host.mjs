@@ -22,11 +22,11 @@ const quote = (text) => `'${String(text).replaceAll("'", `'\\''`)}'`;
  * Write a runtime into `dir` and return how to call it. `readOnlyBinds` and `env` go into its
  * config file, next to what this Node.js needs.
  */
-export function installRuntime(dir, { readOnlyBinds = [], env = {} } = {}) {
+export function installRuntime(dir, { readOnlyBinds = [], env = {}, image } = {}) {
   fs.mkdirSync(dir, { recursive: true });
   const configFile = path.join(dir, 'sandbox.json');
   const runtimeDir = path.join(dir, 'state');
-  fs.writeFileSync(configFile, JSON.stringify({ readOnlyBinds: [...nodeBinds(), ...readOnlyBinds], env }), { mode: 0o644 });
+  fs.writeFileSync(configFile, JSON.stringify({ ...(image ? { image } : {}), readOnlyBinds: [...nodeBinds(), ...readOnlyBinds], env }), { mode: 0o644 });
   const file = path.join(dir, 'updraft-sandbox');
   fs.writeFileSync(
     file,
