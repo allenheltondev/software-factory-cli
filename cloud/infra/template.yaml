@@ -582,6 +582,8 @@ Resources:
           NATIVE_MANAGED_ROLE_ARN: !If [ManagedClaude, !GetAtt ManagedClaudeExecutionRole.Arn, ""]
           NATIVE_MANAGED_LOG_GROUP: !If [ManagedClaude, !Ref MicrovmLogGroup, ""]
           BROKER_FUNCTION_NAME: !Ref BrokerFunction
+          # Trusted console origin for the job links in GitHub assignment comments; empty when none is configured (plain IDs).
+          UPDRAFT_CONSOLE_ORIGIN: !If [ManagedClaudeOriginOverride, !Ref ManagedClaudeConsoleOrigin, !If [DeployCustomDomain, !Sub 'https://${AppDomainName}', '']]
           NATIVE_WORKER_LOGIN_IMAGE_ARN: !If [NativeWorkerBrowserLogin, !Ref NativeWorkerImageArn, ""]
           # Tenant config bundles: the console publishes them (tenants/config-service.ts).
           TENANT_BUCKET: !Ref TenantBucket
@@ -737,6 +739,8 @@ Resources:
             - !If [ManagedClaudeOriginOverride, !Ref ManagedClaudeConsoleOrigin, !Sub 'https://${AppDomainName}']
             - ''
           BROKER_FUNCTION_NAME: !Ref BrokerFunction
+          # Trusted console origin for the job links in GitHub assignment comments; empty when none is configured (plain IDs).
+          UPDRAFT_CONSOLE_ORIGIN: !If [ManagedClaudeOriginOverride, !Ref ManagedClaudeConsoleOrigin, !If [DeployCustomDomain, !Sub 'https://${AppDomainName}', '']]
           MICROVM_LOG_GROUP: !Ref MicrovmLogGroup
           # Agent timeouts are capped at 120 minutes and verify at 30 (tenants/config.ts).
           MAX_DURATION_SECONDS: '10800'
@@ -860,6 +864,8 @@ Resources:
           NATIVE_MANAGED_ROLE_ARN: !If [ManagedClaude, !GetAtt ManagedClaudeExecutionRole.Arn, ""]
           NATIVE_MANAGED_LOG_GROUP: !If [ManagedClaude, !Ref MicrovmLogGroup, ""]
           BROKER_FUNCTION_NAME: !Ref BrokerFunction
+          # Trusted console origin for the job links in GitHub assignment comments; empty when none is configured (plain IDs).
+          UPDRAFT_CONSOLE_ORIGIN: !If [ManagedClaudeOriginOverride, !Ref ManagedClaudeConsoleOrigin, !If [DeployCustomDomain, !Sub 'https://${AppDomainName}', '']]
           NODE_OPTIONS: --enable-source-maps
       Policies:
         - !If
