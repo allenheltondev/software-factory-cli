@@ -4,7 +4,12 @@ import type { Store } from '../store/store.js';
 import { createNativeControl } from './control.js';
 import { managedClaude } from './managed.js';
 import { nativeRoute, type NativeRoute } from './route.js';
+import type { NativeReadiness } from '../jobs/launch.js';
 import { createNativeModeStore, createNativeStore } from './store.js';
+import { classifyReadiness, needsVmState, sessionPhase } from './readiness.js';
+import { STARTUP_MS } from './admission.js';
+
+export { classifyReadiness, HEARTBEAT_FRESH_MS, WORKER_LOST_MS } from './readiness.js';
 
 /** Resolves the legacy pinned route or the current managed session for an installation. */
 export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
@@ -23,27 +28,43 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
     if (!value || value.length < 32 || value.length > 256) throw new Error('invalid worker control credential');
     return value;
   };
+  async function microvmState(id: string): Promise<string | null> {
+    try { return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: id }))).state ?? 'UNKNOWN'; }
+    catch (e) { if (e instanceof ResourceNotFoundException) return null; throw e; }
+  }
   const makeControl = (route?: NativeRoute) => createNativeControl({ store, workers, route, secret: () => secret(route), disabled: disabled ?? (() => managed?.disabled() ?? Promise.resolve(false)),
     enabled: async () => !!route && mode.enabled(route.installationId, route.workerId),
     settings: { region: e.AWS_REGION ?? '', bucket: e.TENANT_BUCKET ?? '', imageArn: '', executionRoleArn: '', ingressConnectorArn: '', egressConnectorArn: '', logGroup: '',
       brokerFunctionName: e.BROKER_FUNCTION_NAME ?? e.AWS_LAMBDA_FUNCTION_NAME ?? '', consoleOrigin: e.UPDRAFT_CONSOLE_ORIGIN || undefined, maximumDurationSeconds: Number(e.MAX_DURATION_SECONDS ?? 10800), watchdogReserveSeconds: Number(e.WATCHDOG_RESERVE_SECONDS ?? 600) },
     async terminateMicrovm(id) { await microvms.send(new TerminateMicrovmCommand({ microvmIdentifier: id })); },
-    async microvmState(id) {
-      try { return (await microvms.send(new GetMicrovmCommand({ microvmIdentifier: id }))).state ?? 'UNKNOWN'; }
-      catch (e) { if (e instanceof ResourceNotFoundException) return null; throw e; }
-    },
+    microvmState,
   });
   // A managed worker still on an image older than the deployed one gets no new job: the job
-  // waits for sign-in instead, and the console asks the owner to restart the worker.
-  const forLaunch = (route: NativeRoute, latestImageVersion?: string) => ({
-    route, secret: () => secret(route), mode: () => mode.snapshot(route.installationId, route.workerId),
-    async ready() {
-      if (latestImageVersion !== undefined && route.imageVersion !== latestImageVersion) return false;
-      const worker = await workers.get(route.installationId, route.workerId);
-      return !!worker && worker.microvmId === route.microvmId && worker.imageVersion === route.imageVersion &&
-        !worker.fenced && worker.auth === 'connected' && Date.now() - worker.heartbeatAt <= 60_000;
-    },
-  });
+  // waits instead, and the console asks the owner to restart the worker. Each reason not to
+  // dispatch is named, so a healthy session between polls is never reported as signed out (#144).
+  const forLaunch = (route: NativeRoute, latestImageVersion?: string) => {
+    const readiness = () => readinessOf(route, latestImageVersion);
+    return {
+      route, secret: () => secret(route), mode: () => mode.snapshot(route.installationId, route.workerId),
+      async ready() { return (await readiness()) === 'ready'; },
+      readiness,
+    };
+  };
+  async function readinessOf(route: NativeRoute, latestImageVersion?: string): Promise<NativeReadiness> {
+    const worker = await workers.get(route.installationId, route.workerId);
+    // A managed route is judged against the session record itself: route() leaves out the
+    // generation of a session that has not bound a VM yet, which is starting, not lost.
+    const session = managed && route.workerId.startsWith('managed-')
+      ? sessionPhase(await managed.sessions.session(route.installationId), route, STARTUP_MS) : undefined;
+    const first = classifyReadiness(route, worker, Date.now(), latestImageVersion, { session });
+    if (!needsVmState(first, route, session)) return first;
+    // Only on these paths does dispatch ask AWS: it tells a suspended or ended environment from a
+    // worker that is starting, briefly silent, or lost. An unreadable state leaves the first
+    // answer: the job waits or asks for a reconnect, and is never sent to a silent worker.
+    const vmState = await microvmState(route.microvmId).catch(() => undefined);
+    return vmState === undefined ? first : classifyReadiness(route, worker, Date.now(), latestImageVersion, { session, vmState });
+  }
+
   const control = makeControl(pinned);
   return {
     control: { ...control, async handle(event: unknown) {

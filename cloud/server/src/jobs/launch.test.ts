@@ -12,7 +12,7 @@ import { configPrefix } from '../tenants/paths.js';
 import { dispatchRules } from '../tenants/dispatch.js';
 import { createAdminService } from '../admin/admin.js';
 import { createReconciler } from './reconcile.js';
-import { createLauncher, PR_COALESCE_MS, PRELAUNCH_CLAIM_MS, pullRequestLease, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice, runHookPayload } from './launch.js';
+import { createLauncher, readinessAction, waitingComment, type NativeReadiness, PR_COALESCE_MS, PRELAUNCH_CLAIM_MS, pullRequestLease, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice, runHookPayload } from './launch.js';
 
 // Relative to the real clock: the memory store judges a delivery claim's expiry by it.
 const NOW = Date.now();
@@ -145,6 +145,79 @@ describe('the launcher', () => {
     expect(await store.getJob(id)).toMatchObject({ native: { workerId: 'managed-55', generation: 'session-a' } });
     expect(reserve).toHaveBeenCalledOnce();
     expect(runs).toEqual([]);
+  });
+
+  it.each([
+    ['heartbeat-stale', 'native_waiting_for_worker'],
+    ['auth-unavailable', 'native_waiting_for_worker'],
+    ['worker-starting', 'native_waiting_for_worker'],
+    ['worker-lost', 'native_waiting_for_reconnect'],
+    ['startup-failed', 'native_waiting_for_reconnect'],
+    ['environment-retiring', 'native_waiting_for_reconnect'],
+    ['not-connected', 'native_waiting_for_sign_in'],
+    ['environment-suspended', 'native_waiting_for_reconnect'],
+    ['environment-ended', 'native_waiting_for_reconnect'],
+    ['fenced', 'native_waiting_for_reconnect'],
+    ['auth-required', 'native_waiting_for_sign_in'],
+    ['expired', 'native_waiting_for_sign_in'],
+  ] as const)('names why a managed issue waits (%s) and asks for sign-in only when auth is gone (#144)', async (readiness, reason) => {
+    const version = await store.createConfigVersion(55, { sha256: 'why', files: [], publishedBy: 's', publishedAt: '', dispatch: dispatchRules({
+      dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
+    }, { keysFor: () => ['ANTHROPIC_API_KEY'] }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    const logs: Record<string, unknown>[] = [];
+    deps.log = (entry) => logs.push(entry);
+    deps.resolveNative = async () => ({
+      route: { installationId: 55, workerId: 'managed-55', microvmId: 'mvm-native', imageVersion: '7', generation: 'session-a',
+        controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/root' },
+      secret: async () => 'scoped-worker-secret-01234567890',
+      mode: async () => ({ enabled: true, revision: 1, triggers: [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }] }),
+      readiness: async () => readiness,
+    });
+    deps.waitForClaude = vi.fn(async () => 'job_waiting');
+    expect(await createLauncher(deps)(request())).toMatchObject({ status: 202, reason, jobId: 'job_waiting' });
+    expect(deps.waitForClaude).toHaveBeenCalledWith(expect.anything(), 'acme/web', 9, 12, readiness);
+    expect(logs).toContainEqual(expect.objectContaining({ nativeDispatch: 'wait', readiness, generation: 'session-a', microvmId: 'mvm-native' }));
+    expect(runs).toEqual([]);
+  });
+
+  it('resumes a job parked on a transient auth probe once the worker reports connected, with no sign-in', async () => {
+    const version = await store.createConfigVersion(55, { sha256: 'transient', files: [], publishedBy: 's', publishedAt: '', dispatch: dispatchRules({
+      dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
+    }, { keysFor: () => ['ANTHROPIC_API_KEY'] }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    const id = waitingId(55, 'delivery-1');
+    let readiness: NativeReadiness = 'auth-unavailable';
+    let parked = false;
+    deps.resolveNative = async () => ({
+      route: { installationId: 55, workerId: 'managed-55', microvmId: 'mvm-native', imageVersion: '7', generation: 'session-a',
+        controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/root' },
+      secret: async () => 'scoped-worker-secret-01234567890',
+      mode: async () => ({ enabled: true, revision: 1, triggers: [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }] }),
+      readiness: async () => readiness,
+    });
+    deps.waitForClaude = vi.fn(async () => { parked = true; return id; });
+    deps.parkedClaude = async () => parked ? id : undefined;
+    const launch = createLauncher(deps);
+    expect(await launch(request())).toMatchObject({ reason: 'native_waiting_for_worker', jobId: id });
+    // Still unready: a resume attempt does not start it, and does not ask for sign-in.
+    expect(await launch({ ...request(), resumeClaude: true, jobId: id })).toMatchObject({ reason: 'native_worker_unavailable' });
+    readiness = 'ready';
+    expect(await launch({ ...request(), resumeClaude: true, jobId: id })).toMatchObject({ disposition: 'launched', jobId: id });
+    expect(await store.getJob(id)).toMatchObject({ native: { workerId: 'managed-55', generation: 'session-a' } });
+    expect(deps.waitForClaude).toHaveBeenCalledOnce();
+    expect(runs).toEqual([]);
+  });
+
+  it('asks for sign-in in the issue comment only when the login is gone', () => {
+    expect(waitingComment('https://console/x', 'expired')).toMatch(/waiting for Claude subscription sign-in/);
+    expect(waitingComment('https://console/x')).toMatch(/sign-in/);
+    expect(waitingComment('https://console/x', 'auth-unavailable')).toMatch(/no sign-in is needed/);
+    expect(waitingComment('https://console/x', 'heartbeat-stale')).not.toMatch(/sign in|sign-in\./);
+    expect(waitingComment('https://console/x', 'environment-suspended')).toMatch(/reconnect Claude/);
+    expect(readinessAction('ready')).toBe('none');
   });
 
   it('starts a job: the event under its tenant, a pinned job record, a version 2 run hook, and its microVM recorded', async () => {
