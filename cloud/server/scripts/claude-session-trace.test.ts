@@ -16,7 +16,7 @@ const base = (patch: Partial<TraceInput> = {}): TraceInput => ({
 describe('claude-session-trace snapshot', () => {
   it('reports reuse for a healthy session with shortened identifiers and the effective deadlines', () => {
     const s = snapshot(base());
-    expect(s.dispatch).toEqual({ readiness: 'ready', ownerAction: 'none' });
+    expect(s.dispatch).toEqual({ readiness: 'ready', session: 'bound', ownerAction: 'none' });
     expect(s.session).toMatchObject({ generation: '6f1c2d3e…', lifetimeEndsAt: '2026-11-25T22:00:00.000Z', idleEndsAt: '2026-11-25T22:58:00.000Z', idleMinutes: 480 });
     expect(s.worker).toMatchObject({ session: 'b0b0b0b0…', heartbeatAgeSeconds: 5, auth: 'connected' });
     expect(s.jobs[0]).toMatchObject({ generation: '6f1c2d3e…' });
@@ -24,11 +24,14 @@ describe('claude-session-trace snapshot', () => {
   });
   it('names a suspended environment behind a stale heartbeat as needing a reconnect', () => {
     const s = snapshot(base({ worker: { ...base().worker!, heartbeatAt: now - 10 * 60_000 }, vm: { state: 'SUSPENDED' } }));
-    expect(s.dispatch).toEqual({ readiness: 'environment-suspended', ownerAction: 'reconnect' });
+    expect(s.dispatch).toEqual({ readiness: 'environment-suspended', session: 'bound', ownerAction: 'reconnect' });
     expect(s.vm).toMatchObject({ idlePolicy: 'none reported' });
   });
   it('reports a retiring or missing session as needing a connection', () => {
-    expect(snapshot(base({ session: { ...base().session!, retiring: true, retirementReason: 'idle' } })).dispatch).toEqual({ readiness: 'no-session', ownerAction: 'connect' });
+    expect(snapshot(base({ session: { ...base().session!, retiring: true, retirementReason: 'idle' } })).dispatch).toEqual({ readiness: 'environment-retiring', session: 'retiring', ownerAction: 'reconnect' });
+    expect(snapshot(base({ session: undefined, lease: undefined, vm: undefined })).dispatch).toEqual({ readiness: 'not-connected', session: 'none', ownerAction: 'sign-in' });
+    const pending = { generation: 'g-pending-0000000000', imageVersion: '10', requestedAt: now - 60_000, startupDeadline: now + 60_000 };
+    expect(snapshot(base({ session: pending, worker: null, vm: undefined })).dispatch).toEqual({ readiness: 'worker-starting', session: 'pending', ownerAction: 'wait' });
     expect(snapshot(base({ session: undefined, lease: undefined, vm: undefined })).session).toBeUndefined();
     expect(short('abc')).toBe('abc');
   });

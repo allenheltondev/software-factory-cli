@@ -117,8 +117,9 @@ export interface NativeLaunch {
 }
 
 /** Why a subscription worker is not taking a job now; see readinessAction for what it asks of the owner. */
-export type NativeReadiness = 'ready' | 'image-outdated' | 'worker-starting' | 'worker-lost' | 'fenced' | 'heartbeat-stale'
-  | 'environment-suspended' | 'environment-ended' | 'auth-required' | 'expired' | 'auth-unavailable';
+export type NativeReadiness = 'ready' | 'not-connected' | 'image-outdated' | 'worker-starting' | 'startup-failed' | 'worker-lost'
+  | 'fenced' | 'heartbeat-stale' | 'environment-retiring' | 'environment-suspended' | 'environment-ended'
+  | 'auth-required' | 'expired' | 'auth-unavailable';
 /**
  * sign-in: the CLI login is gone or expired. reconnect: this environment can never serve again
  * (suspended with no resume, ended, fenced, its worker lost, or on a retired image). wait: a
@@ -127,8 +128,9 @@ export type NativeReadiness = 'ready' | 'image-outdated' | 'worker-starting' | '
  */
 export function readinessAction(reason: NativeReadiness): 'none' | 'sign-in' | 'reconnect' | 'wait' {
   if (reason === 'ready') return 'none';
-  if (reason === 'auth-required' || reason === 'expired') return 'sign-in';
-  if (['environment-suspended', 'environment-ended', 'fenced', 'worker-lost', 'image-outdated'].includes(reason)) return 'reconnect';
+  // No session yet: connecting is signing in (the first connection or after a retirement).
+  if (reason === 'not-connected' || reason === 'auth-required' || reason === 'expired') return 'sign-in';
+  if (['environment-retiring', 'environment-suspended', 'environment-ended', 'fenced', 'worker-lost', 'startup-failed', 'image-outdated'].includes(reason)) return 'reconnect';
   return 'wait';
 }
 export const needsSignIn = (reason: NativeReadiness) => readinessAction(reason) === 'sign-in';

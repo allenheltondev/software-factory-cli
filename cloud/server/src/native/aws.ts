@@ -6,7 +6,7 @@ import { managedClaude } from './managed.js';
 import { nativeRoute, type NativeRoute } from './route.js';
 import type { NativeReadiness } from '../jobs/launch.js';
 import { createNativeModeStore, createNativeStore } from './store.js';
-import { classifyReadiness, needsVmState } from './readiness.js';
+import { classifyReadiness, needsVmState, sessionPhase } from './readiness.js';
 import { STARTUP_MS } from './admission.js';
 
 export { classifyReadiness, HEARTBEAT_FRESH_MS, WORKER_LOST_MS } from './readiness.js';
@@ -52,16 +52,17 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
   };
   async function readinessOf(route: NativeRoute, latestImageVersion?: string): Promise<NativeReadiness> {
     const worker = await workers.get(route.installationId, route.workerId);
-    const session = route.generation && managed ? await managed.sessions.session(route.installationId) : undefined;
-    const startingUntil = session && session.generation === route.generation && !session.readyAt
-      ? session.startupDeadline ?? session.requestedAt + STARTUP_MS : undefined;
-    const first = classifyReadiness(route, worker, Date.now(), latestImageVersion, { startingUntil });
-    if (!needsVmState(first)) return first;
+    // A managed route is judged against the session record itself: route() leaves out the
+    // generation of a session that has not bound a VM yet, which is starting, not lost.
+    const session = managed && route.workerId.startsWith('managed-')
+      ? sessionPhase(await managed.sessions.session(route.installationId), route, STARTUP_MS) : undefined;
+    const first = classifyReadiness(route, worker, Date.now(), latestImageVersion, { session });
+    if (!needsVmState(first, route, session)) return first;
     // Only on these paths does dispatch ask AWS: it tells a suspended or ended environment from a
     // worker that is starting, briefly silent, or lost. An unreadable state leaves the first
     // answer: the job waits or asks for a reconnect, and is never sent to a silent worker.
     const vmState = await microvmState(route.microvmId).catch(() => undefined);
-    return vmState === undefined ? first : classifyReadiness(route, worker, Date.now(), latestImageVersion, { startingUntil, vmState });
+    return vmState === undefined ? first : classifyReadiness(route, worker, Date.now(), latestImageVersion, { session, vmState });
   }
 
   const control = makeControl(pinned);

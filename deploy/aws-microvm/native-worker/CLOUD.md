@@ -89,14 +89,23 @@ When a labeled issue cannot start at once, the webhook names why and what it nee
 
 | Readiness | Owner action | Meaning |
 | --- | --- | --- |
-| `auth-required`, `expired` | sign in | the CLI login is gone |
-| `environment-suspended`, `environment-ended`, `fenced`, `worker-lost`, `image-outdated` | reconnect | this environment can never run a job again |
+| `not-connected`, `auth-required`, `expired` | sign in | there is no session, or the CLI login is gone |
+| `environment-retiring`, `environment-suspended`, `environment-ended`, `fenced`, `worker-lost`, `startup-failed`, `image-outdated` | reconnect | this environment can never run a job again |
 | `worker-starting`, `heartbeat-stale`, `auth-unavailable` | none: wait | a bounded gap; the job starts on the worker's next connected poll |
 
-`worker-starting` lasts only until the session's startup deadline. `heartbeat-stale` lasts only
+Readiness is judged from the session record first. A session can be absent, reserved with no VM
+bound yet, retiring, or bound. AWS is only asked about a bound VM, never about the
+`mvm-pending` placeholder. `worker-starting` lasts only until the session's startup deadline,
+whether or not the VM is bound yet. After that it is `startup-failed`. `heartbeat-stale` lasts only
 three minutes on a running VM. After that the in-VM dispatcher is `worker-lost`: its loop never
 restarts. Cleanup then retires the environment with that reason, unless it still holds active,
-settling or queued work. Parked jobs are kept and resume once Claude is reconnected.
+settling or queued work. Parked jobs are kept and resume once Claude is reconnected. Cleanup
+decides again on the exact worker snapshot its sealing transaction checks. A worker that
+heartbeat or took work since cleanup read it is kept (`claudeSession: keep` in the log), and
+so is one whose version moves before the transaction commits.
+
+Known limitation: a lost dispatcher that still holds queued, never-assigned work is neither
+retired nor reconnectable until that job expires (#141, #136).
 
 The dispatcher stops for good on any refused control call. So Cloud answers each call from the
 state that won any concurrent write: the runner's terminate, the dispatcher's `settled`, a

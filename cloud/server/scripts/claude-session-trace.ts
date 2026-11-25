@@ -16,7 +16,7 @@ import { DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException } from '@aws-sdk/client-lambda-microvms';
 import { GetCommand, QueryCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { IDLE_MS, SESSION_SECONDS, STARTUP_MS, type SessionLease } from '../src/native/admission.js';
-import { classifyReadiness } from '../src/native/readiness.js';
+import { classifyReadiness, PENDING_MICROVM, sessionPhase } from '../src/native/readiness.js';
 import { readinessAction } from '../src/jobs/launch.js';
 import type { ManagedSession, WaitingClaudeJob } from '../src/native/sessions.js';
 import { managedWorkerId } from '../src/native/sessions.js';
@@ -44,17 +44,19 @@ export interface TraceInput {
 export function snapshot(t: TraceInput) {
   const s = t.session;
   const w = t.worker;
-  const route = s?.microvmId && !s.retiring
-    ? { installationId: t.installationId, workerId: managedWorkerId(t.installationId), microvmId: s.microvmId, imageVersion: s.imageVersion, controlSecretArn: '' }
-    : undefined;
-  const startingUntil = s && !s.readyAt ? s.startupDeadline ?? s.requestedAt + STARTUP_MS : undefined;
-  const readiness = route ? classifyReadiness(route, w, t.now, t.latestImageVersion, { startingUntil, ...(t.vm ? { vmState: t.vm.state } : {}) }) : 'no-session';
+  const route = {
+    installationId: t.installationId, workerId: managedWorkerId(t.installationId), controlSecretArn: '',
+    microvmId: s?.microvmId && !s.retiring ? s.microvmId : PENDING_MICROVM, imageVersion: s?.imageVersion ?? t.latestImageVersion ?? '',
+    ...(s?.microvmId && !s.retiring ? { generation: s.generation } : {}),
+  };
+  const session = sessionPhase(s, route, STARTUP_MS);
+  const readiness = classifyReadiness(route, w, t.now, t.latestImageVersion, { session, ...(t.vm ? { vmState: t.vm.state } : {}) });
   const idleMs = t.lease?.idleMs ?? IDLE_MS;
   const idleAt = t.lease ? Math.max(t.lease.idleAt, (w?.lastWorkAt ?? 0) + idleMs) : undefined;
   return {
     at: iso(t.now),
     installationId: t.installationId,
-    dispatch: { readiness, ownerAction: readiness === 'no-session' ? 'connect' : readinessAction(readiness) },
+    dispatch: { readiness, session: session.phase, ownerAction: readinessAction(readiness) },
     session: s && {
       generation: short(s.generation), imageVersion: s.imageVersion, microvmId: s.microvmId,
       requestedAt: iso(s.requestedAt), readyAt: iso(s.readyAt), retiring: !!s.retiring, retirementReason: s.retirementReason,

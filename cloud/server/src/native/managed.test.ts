@@ -164,6 +164,61 @@ describe('managed connection reservation', () => {
     expect(logs.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual(expect.objectContaining({ reason: 'worker-lost', vmState: 'RUNNING' }));
     logs.mockRestore();
   });
+  it('keeps a worker that heartbeats after cleanup read it as lost, and it stays routable (#144)', async () => {
+    let recovered = false;
+    mocks.vm.mockImplementation(async (command) => {
+      if (command instanceof RunMicrovmCommand) return { microvmId: 'mvm-fixture' };
+      if (command.constructor.name === 'TerminateMicrovmCommand') return {};
+      // Cleanup has read the stale worker; its heartbeat lands while cleanup asks AWS.
+      if (recovered) row = { ...row!, heartbeatAt: clock, version: row!.version + 1 };
+      return { state: 'RUNNING' };
+    });
+    await managed().start(55);
+    row = connectedWorker();
+    await managed().lifecycle(55);
+    clock += 10 * 60_000;
+    recovered = true;
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    expect(logs.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual(expect.objectContaining({ claudeSession: 'keep', reason: 'worker-lost', why: 'recovered' }));
+    logs.mockRestore();
+    expect(mocks.retire).not.toHaveBeenCalled();
+    expect(mocks.vm.mock.calls.some(([command]) => command.constructor.name === 'TerminateMicrovmCommand')).toBe(false);
+    expect(current?.retiring).toBeUndefined();
+    expect(await managed().route(55)).toMatchObject({ microvmId: 'mvm-fixture', generation: current!.generation });
+    expect(await admission.list()).toHaveLength(1);
+  });
+  it('keeps a worker whose heartbeat lands between the eligibility read and the sealing write', async () => {
+    await managed().start(55);
+    row = connectedWorker();
+    await managed().lifecycle(55);
+    clock += 10 * 60_000;
+    mocks.retire.mockResolvedValueOnce(false); // the worker's version moved: the transaction fails
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    expect(mocks.vm.mock.calls.some(([command]) => command.constructor.name === 'TerminateMicrovmCommand')).toBe(false);
+    expect(current?.retiring).toBeUndefined();
+    vi.mocked(console.log).mockRestore();
+  });
+  it('keeps an idle session whose worker took work after cleanup read it', async () => {
+    const configured = () => managed({ NATIVE_MANAGED_IDLE_MINUTES: '120' });
+    let worked = false;
+    mocks.vm.mockImplementation(async (command) => {
+      if (command instanceof RunMicrovmCommand) return { microvmId: 'mvm-fixture' };
+      if (worked) row = { ...row!, lastWorkAt: clock, heartbeatAt: clock, version: row!.version + 1 };
+      return { state: 'RUNNING' };
+    });
+    await configured().start(55);
+    row = connectedWorker();
+    await configured().lifecycle(55);
+    clock += 2 * 3_600_000 + 1;
+    row = { ...row, heartbeatAt: clock };
+    worked = true;
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await configured().reconcile()).toEqual({ released: 0, failed: 0 });
+    vi.mocked(console.log).mockRestore();
+    expect(mocks.retire).not.toHaveBeenCalled();
+  });
   it('never retires a lost dispatcher that still holds queued work', async () => {
     await managed().start(55);
     row = connectedWorker();
