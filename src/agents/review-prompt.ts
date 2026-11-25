@@ -156,6 +156,13 @@ export function renderReviewPrompt(reviewPrompt: string, issue: IssueContext, re
             'say so in its check, and add a finding with `sameAs` set to its key when it still blocks.',
           '',
           ...checks,
+          ...(review.openFindingsOmitted
+            ? [
+                `${review.openFindingsOmitted} more earlier finding(s) are not listed: more than one review can check. ` +
+                  'Unless every earlier blocker is verified, the pull request is not ready, so do not write ready-to-merge while any is unchecked.',
+                '',
+              ]
+            : []),
         ]
       : []),
     ...(requests.length

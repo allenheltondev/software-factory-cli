@@ -224,6 +224,8 @@ export interface ReviewRunRequest {
    * coding agent's report on each (a claim): what this reviewer checks. Absent before findings existed.
    */
   openFindings?: OpenFindingSnapshot[];
+  /** Earlier findings not verified yet that are not in openFindings (more than one review can check). */
+  openFindingsOmitted?: number;
 }
 
 /** An earlier finding to re-check (docs/review-loop.md, "Findings as threads"). Its text and report are untrusted. */

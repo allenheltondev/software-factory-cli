@@ -22,9 +22,11 @@
 import type { FindingCheck, FindingLocation, StructuredFinding, StructuredReview } from '../agents/findings.js';
 import { findingKey } from '../agents/findings.js';
 import type { Db } from '../db/database.js';
+import { transaction } from '../db/database.js';
 import {
   applyRepeat,
   findingsOfRun,
+  getFinding,
   markThreadResolved,
   promoteThread,
   recordCheck,
@@ -36,7 +38,7 @@ import {
 } from '../db/review-findings.js';
 import { GitHubError, type GitHubApi, type PullRequestReviewComment, type ReviewCommentInput } from '../github/api.js';
 import { sameLogin } from '../github/identity.js';
-import type { OpenFindingSnapshot, RepoRef, ReviewVerdict, RevisionFinding } from '../types.js';
+import type { RepoRef, ReviewVerdict, RevisionFinding } from '../types.js';
 import { anchorFinding, type CommentableLines } from './anchors.js';
 import { code } from './failure-comment.js';
 import { safeMarkdown } from './markdown.js';
@@ -226,33 +228,65 @@ export function inlineComments(o: { runId: string; round: number; headSha: strin
 // ---------------------------------------------------------------------------
 
 /**
+ * What a review says about each earlier thread, by the thread's root: verified only when every
+ * check of it (through any of its keys) says verified and no finding of the review repeats it;
+ * anything else is unresolved. A key that is no finding of the pull request is left out. One
+ * review never says two things about one thread.
+ */
+export function effectiveChecks(
+  structured: StructuredReview | null,
+  runId: string,
+  rootOf: (key: string) => ReviewFinding | null,
+): Map<string, { root: ReviewFinding; status: 'verified' | 'unresolved'; notes: string[]; repeat: string | null }> {
+  const out = new Map<string, { root: ReviewFinding; status: 'verified' | 'unresolved'; notes: string[]; repeat: string | null }>();
+  const entry = (root: ReviewFinding) => {
+    let e = out.get(root.key);
+    if (!e) out.set(root.key, (e = { root, status: 'verified', notes: [], repeat: null }));
+    return e;
+  };
+  for (const c of structured?.checks ?? []) {
+    const root = rootOf(c.finding);
+    if (!root) continue;
+    const e = entry(root);
+    if (c.status !== 'verified') e.status = 'unresolved';
+    if (c.note) e.notes.push(c.note);
+  }
+  for (const f of structured?.findings ?? []) {
+    if (!f.sameAs) continue;
+    // A finding naming another of this same review is not about an earlier thread.
+    if (f.sameAs.startsWith(`${runId}#`)) continue;
+    const root = rootOf(f.sameAs);
+    if (!root) continue;
+    const e = entry(root);
+    e.status = 'unresolved';
+    e.repeat ??= findingKey(runId, f.id);
+  }
+  return out;
+}
+
+/**
  * Why a ready-to-merge verdict contradicts the review it ends, or null when it does not: the
- * review lists a blocker, re-checks an earlier blocker as unresolved, or leaves an earlier blocker
- * it was given (`open`) unchecked and unrepeated. Such a verdict is never acted on as ready; the
- * caller takes it as changes requested. A legacy review (no block) with no earlier findings is
- * not checked: there is nothing structured to agree with.
+ * review lists a blocker, or an earlier blocker thread of the pull request (every one recorded,
+ * not only those the reviewer was shown) is not verified by it. Such a verdict is never acted on
+ * as ready; the caller takes it as changes requested. A legacy review on a pull request without
+ * earlier blockers is not checked: there is nothing structured to agree with.
  */
 export function verdictContradiction(
   verdict: ReviewVerdict,
   structured: StructuredReview | null,
-  open: readonly OpenFindingSnapshot[],
-  rootOf: (key: string) => ReviewFinding | null,
+  o: { runId: string; blockers: readonly ReviewFinding[]; rootOf: (key: string) => ReviewFinding | null },
 ): string | null {
   if (verdict !== 'ready-to-merge') return null;
   const blockers = (structured?.findings ?? []).filter((f) => f.severity === 'blocker');
   if (blockers.length) return `it lists ${blockers.length} blocker(s) (${blockers.map((b) => b.id).join(', ')})`;
-  const openBlockers = open.filter((f) => f.severity === 'blocker');
-  if (!openBlockers.length) return null;
-  if (!structured) return `it re-checked none of the ${openBlockers.length} earlier blocker(s)`;
-  const rootKey = (key: string) => rootOf(key)?.key ?? key;
-  const checked = new Map(structured.checks.map((c) => [rootKey(c.finding), c.status]));
-  const repeated = new Set(structured.findings.flatMap((f) => (f.sameAs ? [rootKey(f.sameAs)] : [])));
-  for (const f of openBlockers) {
-    const key = rootKey(f.key);
-    if (checked.get(key) === 'unresolved' || repeated.has(key)) return `it found the earlier blocker ${f.key} still unresolved`;
-    if (checked.get(key) !== 'verified') return `it did not re-check the earlier blocker ${f.key}`;
-  }
-  return null;
+  if (!o.blockers.length) return null;
+  if (!structured) return `it re-checked none of the ${o.blockers.length} earlier blocker(s)`;
+  const said = effectiveChecks(structured, o.runId, o.rootOf);
+  const open = o.blockers.filter((b) => said.get(b.key)?.status !== 'verified');
+  if (!open.length) return null;
+  const unresolved = open.filter((b) => said.get(b.key)?.status === 'unresolved');
+  if (unresolved.length) return `it found the earlier blocker ${unresolved[0]!.key} still unresolved`;
+  return open.length === 1 ? `it did not re-check the earlier blocker ${open[0]!.key}` : `it did not re-check ${open.length} earlier blockers (${open[0]!.key}, ...)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +389,7 @@ export async function recordPostedThreads(
   return { comments, log };
 }
 
-/** GitHub reads the threads of a pull request this many at a time (client.ts); the root comment is looked up among them. */
+/** The worker's own thread whose first comment is `rootCommentId`, among the pull request's threads (read once per step). */
 async function findThread(
   deps: ThreadDeps,
   repo: RepoRef,
@@ -369,38 +403,72 @@ async function findThread(
   return cache.threads.find((t) => t.rootCommentId === rootCommentId && sameLogin(t.rootAuthor, login)) ?? null;
 }
 
+export interface ThreadAnswers {
+  repeats: { root: ReviewFinding; finding: ReviewFinding }[];
+  checks: { root: ReviewFinding; status: 'verified' | 'unresolved'; note: string }[];
+  log: string[];
+}
+
 /**
- * Step 2, only for a review of the pull request's current head (the caller checks): what it says
- * about earlier findings becomes their state. A repeat makes its thread unresolved again with what
- * the reviewer found now (its severity and text), and is followed up in that thread; a repeat
- * posted inline because its earlier finding had no thread becomes that thread's root. Each check
- * is recorded on the thread it names and answered there, and a verified thread the worker started
- * is resolved, recorded only once GitHub confirms it. `at` is when the review was recorded: a
- * newer review's state is never overwritten by an older one's. Never repeats a write a retry
- * already made.
+ * Step 2, for a review of the pull request's current head only (the caller checks GitHub right
+ * before): what the review says about earlier threads becomes their state, in one transaction, so
+ * nothing is left half done. A repeat posted inline of a finding that had no thread becomes that
+ * thread's root; each earlier thread the review checks or repeats gets the review's one effective
+ * status (effectiveChecks), a repeat also its current severity and text. `at` is when the review
+ * was recorded: a newer review's state is never overwritten by an older one's. Returns what to
+ * answer in the threads (answerInThreads). Idempotent: a retry finds everything done.
  */
-export async function applyCurrentReview(
+export function applyFindingState(
   deps: ThreadDeps,
-  o: { repo: RepoRef; prNumber: number; runId: string; headSha: string; round: number; at: string; structured: StructuredReview; login: string; comments: Comments | null },
+  o: { repoId: number; prNumber: number; runId: string; headSha: string; at: string; structured: StructuredReview },
+): ThreadAnswers {
+  deps.guard();
+  return transaction(deps.db, () => {
+    const { repoId, prNumber, runId } = o;
+    const log: string[] = [];
+    const rootOf = (key: string) => threadOf(deps.db, repoId, prNumber, key);
+    // Promotions first, so every key below resolves to the thread as it is now.
+    for (const f of o.structured.findings) {
+      if (!f.sameAs) continue;
+      const own = getFinding(deps.db, repoId, prNumber, findingKey(runId, f.id));
+      const root = rootOf(findingKey(runId, f.id));
+      if (own && root && root.key !== own.key && !root.commentId && own.commentId) promoteThread(deps.db, repoId, prNumber, own.key, deps.now);
+    }
+    for (const c of o.structured.checks) if (!rootOf(c.finding)) log.push(`threads: the check of ${c.finding} names no finding of this pull request; ignored`);
+    const answers: ThreadAnswers = { repeats: [], checks: [], log };
+    for (const [key, e] of effectiveChecks(o.structured, runId, rootOf)) {
+      const note = e.notes.join(' ');
+      const repeat = e.repeat ? getFinding(deps.db, repoId, prNumber, e.repeat) : null;
+      const applied = repeat
+        ? applyRepeat(deps.db, repoId, prNumber, key, repeat, o.at, deps.now)
+        : recordCheck(deps.db, repoId, prNumber, key, { status: e.status, sha: o.headSha, note, at: o.at, now: deps.now });
+      if (!applied) {
+        log.push(`threads: a newer review already recorded the state of ${key}; this review's is not applied`);
+        continue;
+      }
+      const root = getFinding(deps.db, repoId, prNumber, key)!;
+      if (repeat && repeat.key !== root.key) answers.repeats.push({ root, finding: repeat });
+      if (e.notes.length || !repeat) answers.checks.push({ root, status: e.status, note });
+    }
+    return answers;
+  });
+}
+
+/**
+ * Step 3: the state step 2 recorded, answered in each thread the worker started. A thread is
+ * resolved only when step 2 verified it, it is still verified for this head, and `stillCurrent`
+ * (GitHub, read right before) says the pull request has not moved on; the resolution is recorded
+ * only once GitHub confirms it. Never repeats a write a retry already made.
+ */
+export async function answerInThreads(
+  deps: ThreadDeps,
+  o: { repo: RepoRef; prNumber: number; runId: string; headSha: string; round: number; login: string; comments: Comments | null; answers: ThreadAnswers; stillCurrent: () => Promise<boolean> },
 ): Promise<{ log: string[] }> {
-  const log: string[] = [];
+  const log = [...o.answers.log];
   const { repo, prNumber, runId } = o;
   const comments = o.comments ?? [];
-
-  // Repeats.
-  for (const f of findingsOfRun(deps.db, runId)) {
-    if (f.threadKey === f.key) continue;
-    let root = threadOf(deps.db, repo.id, prNumber, f.key);
-    if (!root) continue;
-    if (!root.commentId && f.commentId) {
-      // The earlier finding was only in a summary; this one is on the diff. Its comment is the thread now.
-      deps.guard();
-      promoteThread(deps.db, repo.id, prNumber, f.key, deps.now);
-      root = getRoot(deps, repo.id, prNumber, f.key)!;
-    }
-    deps.guard();
-    applyRepeat(deps.db, repo.id, prNumber, root.key, f, o.at, deps.now);
-    if (!root.commentId || root.key === f.key) continue;
+  for (const { root, finding } of o.answers.repeats) {
+    if (!root.commentId) continue;
     try {
       await replyOnce(
         deps,
@@ -408,27 +476,16 @@ export async function applyCurrentReview(
         prNumber,
         root.commentId,
         threadReplyMarker('repeat', runId, root.key),
-        [`**${ROLE.review} · Round ${o.round} · ${code(short(o.headSha))}:** this is still not fixed.`, '', ...findingText(f)].join('\n'),
+        [`**${ROLE.review} · Round ${o.round} · ${code(short(o.headSha))}:** this is still not fixed.`, '', ...findingText(finding)].join('\n'),
         comments,
       );
     } catch (err) {
       settle(deps, err, log, `could not reply in the thread of ${root.key}; the review summary has the finding`);
     }
   }
-
-  // Checks of earlier findings: only findings of this pull request, and only their own threads.
   const cache: Parameters<typeof findThread>[5] = {};
-  for (const c of o.structured.checks) {
-    const root = threadOf(deps.db, repo.id, prNumber, c.finding);
-    if (!root) {
-      log.push(`threads: the check of ${c.finding} names no finding of this pull request; ignored`);
-      continue;
-    }
-    deps.guard();
-    if (!recordCheck(deps.db, repo.id, prNumber, root.key, { status: c.status, sha: o.headSha, note: c.note, at: o.at, now: deps.now })) {
-      log.push(`threads: a newer review already checked ${root.key}; this check is not applied`);
-      continue;
-    }
+  for (const c of o.answers.checks) {
+    const { root } = c;
     if (!root.commentId) continue;
     const words = c.status === 'verified' ? `I verified this on ${code(short(o.headSha))}.` : `This is still open on ${code(short(o.headSha))}.`;
     try {
@@ -445,7 +502,7 @@ export async function applyCurrentReview(
       settle(deps, err, log, `could not answer the check of ${root.key} in its thread; the review summary has it`);
       continue;
     }
-    if (c.status !== 'verified' || root.threadResolvedAt || !deps.api.listReviewThreads || !deps.api.resolveReviewThread) continue;
+    if (c.status !== 'verified' || !deps.api.listReviewThreads || !deps.api.resolveReviewThread) continue;
     try {
       const thread = await findThread(deps, repo, prNumber, root.commentId, o.login, cache);
       if (!thread) {
@@ -453,6 +510,16 @@ export async function applyCurrentReview(
         continue;
       }
       if (!thread.isResolved) {
+        // Right before: still this head's verification, and still this head on GitHub.
+        const now = getFinding(deps.db, repo.id, prNumber, root.key);
+        if (now?.status !== 'verified' || now.statusSha !== o.headSha) {
+          log.push(`threads: ${root.key} is no longer verified for ${short(o.headSha)}; not resolved`);
+          continue;
+        }
+        if (!(await o.stillCurrent())) {
+          log.push(`threads: the pull request moved on from ${short(o.headSha)}; ${root.key} is verified, not resolved`);
+          continue;
+        }
         deps.guard();
         await deps.api.resolveReviewThread(repo, thread.id);
       }
@@ -464,8 +531,6 @@ export async function applyCurrentReview(
   }
   return { log };
 }
-
-const getRoot = (deps: ThreadDeps, repoId: number, prNumber: number, key: string) => threadOf(deps.db, repoId, prNumber, key);
 
 // ---------------------------------------------------------------------------
 // The coding agent's replies, after its revision's push is confirmed

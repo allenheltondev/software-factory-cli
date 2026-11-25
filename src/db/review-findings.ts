@@ -120,15 +120,37 @@ export function threadOf(db: Db, repoId: number, prNumber: number, key: string):
   return f.threadKey === f.key ? f : getFinding(db, repoId, prNumber, f.threadKey);
 }
 
+/** How many earlier findings one reviewer is given to re-check: as many as one review can check. */
+export const MAX_OPEN_FINDINGS = 50;
+
 /**
- * The threads of a pull request that a later reviewer has not verified, oldest first: what the
- * next reviewer re-checks. At most `limit`.
+ * The threads of a pull request that a later reviewer has not verified: what the next reviewer
+ * re-checks. Blockers first, then oldest first, at most `limit`, so a long list of suggestions
+ * never pushes a blocker out of the reviewer's sight.
  */
-export function openThreads(db: Db, repoId: number, prNumber: number, limit = 30): ReviewFinding[] {
+export function openThreads(db: Db, repoId: number, prNumber: number, limit = MAX_OPEN_FINDINGS): ReviewFinding[] {
   return (
     db
-      .prepare("SELECT * FROM review_findings WHERE repo_id = ? AND pr_number = ? AND thread_key = finding_key AND status != 'verified' ORDER BY created_at, rowid LIMIT ?")
+      .prepare(
+        `SELECT * FROM review_findings WHERE repo_id = ? AND pr_number = ? AND thread_key = finding_key AND status != 'verified'
+          ORDER BY CASE severity WHEN 'blocker' THEN 0 ELSE 1 END, created_at, rowid LIMIT ?`,
+      )
       .all(repoId, prNumber, limit) as unknown as Row[]
+  ).map(toFinding);
+}
+
+/** How many threads of a pull request no reviewer has verified. */
+export function countOpenThreads(db: Db, repoId: number, prNumber: number): number {
+  const r = db.prepare("SELECT COUNT(*) AS n FROM review_findings WHERE repo_id = ? AND pr_number = ? AND thread_key = finding_key AND status != 'verified'").get(repoId, prNumber) as { n: number } | undefined;
+  return r?.n ?? 0;
+}
+
+/** Every blocker thread of a pull request that no reviewer has verified, however many: what a ready verdict must have verified. */
+export function unverifiedBlockers(db: Db, repoId: number, prNumber: number): ReviewFinding[] {
+  return (
+    db
+      .prepare("SELECT * FROM review_findings WHERE repo_id = ? AND pr_number = ? AND thread_key = finding_key AND status != 'verified' AND severity = 'blocker' ORDER BY created_at, rowid")
+      .all(repoId, prNumber) as unknown as Row[]
   ).map(toFinding);
 }
 

@@ -36,10 +36,10 @@ import {
   type ReviewOutcome,
 } from '../db/pr-reviews.js';
 import { getJob, getRun } from '../db/queue.js';
-import { findingsOfRun, recordFindings, reviewRound, threadOf } from '../db/review-findings.js';
+import { findingsOfRun, recordFindings, reviewRound, threadOf, unverifiedBlockers } from '../db/review-findings.js';
 import { readStructuredFindings, type StructuredReview } from '../agents/findings.js';
 import { diffIndex } from './anchors.js';
-import { applyCurrentReview, inlineComments, planThreads, recordPostedThreads, renderStructuredReview, verdictContradiction, withoutInline, type ThreadPlan } from './threads.js';
+import { answerInThreads, applyFindingState, inlineComments, planThreads, recordPostedThreads, renderStructuredReview, verdictContradiction, withoutInline, type ThreadAnswers, type ThreadPlan } from './threads.js';
 import { countRevisions, enqueueRevision, getReviewRequest, revisionJob } from '../db/revisions.js';
 import { GitHubError, type PullRequestReviewSummary } from '../github/api.js';
 import { sameLogin, workerLogin } from '../github/identity.js';
@@ -203,7 +203,11 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
   // ready. It is recorded and acted on as changes requested, and the review says why.
   const reading = readStructuredFindings(result.findings);
   const structured: StructuredReview | null = reading.structured && (reading.structured.findings.length || reading.structured.checks.length) ? reading.structured : null;
-  const override = verdictContradiction(result.verdict, structured, request.openFindings ?? [], (key) => threadOf(deps.db, job.repoId, prNumber, key));
+  const override = verdictContradiction(result.verdict, structured, {
+    runId,
+    blockers: unverifiedBlockers(deps.db, job.repoId, prNumber),
+    rootOf: (key) => threadOf(deps.db, job.repoId, prNumber, key),
+  });
   const verdict: ReviewVerdict = override ? 'changes-requested' : result.verdict;
 
   const begun = beginPrReview(deps.db, {
@@ -380,6 +384,22 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
       reviewUrl: rev.reviewUrl ?? request.pullRequest.url,
       recordedAt: rev.createdAt,
     });
+    // 2a. A structured review of the current head: what it says about earlier findings becomes
+    // their state first, so the transition below (a revision, ready) follows coherent state. Looked
+    // at on GitHub right before: a review whose head has moved on is history, and changes nothing.
+    const stillCurrent = async () => {
+      hold();
+      const live = await deps.api.getPullRequest(repoRef, prNumber);
+      return live.state === 'open' && live.headSha === headSha;
+    };
+    let answers: ThreadAnswers | null = null;
+    if (structured && rev.reviewId && open && current) {
+      if (await stillCurrent()) {
+        answers = applyFindingState(threadDeps, { repoId: job.repoId, prNumber, runId, headSha, at: rev.createdAt, structured });
+      } else {
+        await runLog(['threads: the pull request moved on from the reviewed commit; this review\'s checks and repeats change nothing']);
+      }
+    }
     if (!open) {
       outcome = 'closed';
     } else if (!current) {
@@ -442,18 +462,11 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
         await runLog([`marked pull request #${prNumber} ready for review`]);
       }
     }
-    // 3. Structured findings of a review of the current head: repeats, checks and resolutions
-    // become the earlier findings' state, and are answered in their threads. Looked at on GitHub
-    // first: a review whose head has moved on is history, and changes nothing about them.
-    if (structured && rev.reviewId && outcome !== 'stale' && outcome !== 'closed') {
-      hold();
-      const live = await deps.api.getPullRequest(repoRef, prNumber);
-      if (live.state === 'open' && live.headSha === headSha) {
-        const applied = await applyCurrentReview(threadDeps, { repo: repoRef, prNumber, runId, headSha, round, at: rev.createdAt, structured, login, comments: ownComments });
-        if (applied.log.length) await runLog(applied.log);
-      } else {
-        await runLog([`threads: the pull request is ${live.state !== 'open' ? 'closed' : `at ${short(live.headSha)} now`}; this review's checks and repeats change nothing`]);
-      }
+    // 3. The state step 2a recorded, answered in the threads; a thread is resolved only while
+    // GitHub still shows the reviewed head (checked right before each resolution).
+    if (answers && outcome !== 'stale' && outcome !== 'closed') {
+      const answered = await answerInThreads(threadDeps, { repo: repoRef, prNumber, runId, headSha, round, login, comments: ownComments, answers, stillCurrent });
+      if (answered.log.length) await runLog(answered.log);
     }
 
     hold({ outcome, outcomeDetail: detail, ...(revisionJobId ? { revisionJobId } : {}) });
