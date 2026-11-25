@@ -6,6 +6,7 @@
  */
 import type { Job, JobFinishDetail } from '../store/store.js';
 import type { WorkflowStore } from './store.js';
+import { endedWait, keepPaused, pausedWorkflow, resumedWorkflow, waitFrom, type PauseRef } from './timeline.js';
 import { newWorkflow, onJobFinished, onJobQueued, onJobStarted, onJobWaiting, onQueueCovered, onQueueEnded, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
 
 type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'> & Partial<Pick<Job, 'expiresAt' | 'native'>>;
@@ -40,9 +41,11 @@ export async function saveChange(
     const out = change(previous);
     if (!out) return { workflow: previous, saved: false };
     const next = { ...out.workflow, version: (previous?.version ?? 0) + 1 };
+    // A change that ends a wait says how long it waited, from the workflow's own record (timeline.ts).
+    const waited = out.event && !out.event.waited ? endedWait(previous, next, Date.parse(out.event.at)) : undefined;
     // The change and its event together: a save that loses the race leaves no event behind, and
     // a replay (its event is recorded already) changes nothing.
-    const result = await store.saveWorkflow(next, previous, out.event ? { ...out.event, seq: next.version } : undefined);
+    const result = await store.saveWorkflow(next, previous, out.event ? { ...out.event, ...(waited ? { waited } : {}), seq: next.version } : undefined);
     if (result === 'saved') return { workflow: next, saved: true };
     if (result === 'replay') return { workflow: previous, saved: false, replay: true };
   }
@@ -59,6 +62,15 @@ export async function workflowOfJob(store: WorkflowStore, job: JobRef): Promise<
   }
   return null;
 }
+
+/** A change's event, with more said about it (a reason code, a wait the change ended). */
+const withEvent = (out: { workflow: Workflow; event: WorkflowEvent } | null, more: Partial<WorkflowEvent>) => (out ? { ...out, event: { ...out.event, ...more } } : null);
+
+/** A wait for capacity, measured from the queue entry's own enqueue time. */
+const capacityWait = (queue: { enqueuedAt: number } | undefined, at: number): Partial<WorkflowEvent> => {
+  const waited = queue ? waitFrom('capacity', queue.enqueuedAt, at) : undefined;
+  return waited ? { waited } : {};
+};
 
 export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => number; log?: (entry: Record<string, unknown>) => void }) {
   const now = o.now ?? Date.now;
@@ -97,29 +109,48 @@ export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => nu
         await updateWorkflow(o.store, job.installationId, id, (w) => onJobWaiting(w ?? newWorkflow(job, id, at), job, why, at));
       }),
     /** A delivery waits in the admission queue for capacity (jobs/queue.ts), under its job's stable id. */
-    queued: (job: JobRef, why: { reason: string; message: string }) =>
+    queued: (job: JobRef, why: { reason: string; message: string; code?: string }) =>
       safely('queue', job, async () => {
         const id = await workflowOfJob(o.store, job);
         if (!id) return;
         const at = now();
         await o.store.linkJob(job.installationId, job.jobId, id);
-        await updateWorkflow(o.store, job.installationId, id, (w) => onJobQueued(w ?? newWorkflow(job, id, at), job, why, at));
+        await updateWorkflow(o.store, job.installationId, id, (w) => withEvent(onJobQueued(w ?? newWorkflow(job, id, at), job, why, at), { reason: why.code ?? why.reason }));
+      }),
+    /**
+     * A queued job was admitted and started (its start is recorded by the launcher): how long it
+     * waited, measured by the queue's own entry. History only: the start decided the state.
+     */
+    queueAdmitted: (job: JobRef, queue: { enqueuedAt: number; reason?: string }) =>
+      safely('queue admission', job, async () => {
+        const id = await workflowOfJob(o.store, job);
+        if (!id) return;
+        const at = now();
+        await updateWorkflow(o.store, job.installationId, id, (w) => {
+          if (!w) return null;
+          const generation = w.jobRuns?.find((r) => r.jobId === job.jobId)?.generation ?? w.generation;
+          const waited = waitFrom('capacity', queue.enqueuedAt, at);
+          return {
+            workflow: { ...w, updatedAt: new Date(at).toISOString() },
+            event: { id: `${job.jobId}:admitted`, at: new Date(at).toISOString(), kind: 'admitted', generation, jobId: job.jobId, eventName: job.eventName, ...(queue.reason ? { reason: queue.reason } : {}), ...(waited ? { waited } : {}), message: 'Admitted from the queue: capacity became available and the job started.' },
+          };
+        });
       }),
     /** A queued job will never start, and why. Only a workflow still waiting on it changes. */
-    queueEnded: (job: JobRef, why: { reason: string; message: string; nextAction?: string }) =>
+    queueEnded: (job: JobRef, why: { reason: string; message: string; nextAction?: string }, queue?: { enqueuedAt: number }) =>
       safely('queue end', job, async () => {
         const id = await workflowOfJob(o.store, job);
         if (!id) return;
         const at = now();
-        await updateWorkflow(o.store, job.installationId, id, (w) => (w ? onQueueEnded(w, job, why, at) : null));
+        await updateWorkflow(o.store, job.installationId, id, (w) => (w ? withEvent(onQueueEnded(w, job, why, at), { reason: why.reason, ...capacityWait(queue, at) }) : null));
       }),
     /** A queued job was folded into `holderJobId`, another job of its pull request: the workflow follows that one. */
-    queueCovered: (job: JobRef, holderJobId: string | undefined) =>
+    queueCovered: (job: JobRef, holderJobId: string | undefined, queue?: { enqueuedAt: number }) =>
       safely('queue cover', job, async () => {
         const id = await workflowOfJob(o.store, job);
         if (!id) return;
         const at = now();
-        await updateWorkflow(o.store, job.installationId, id, (w) => (w ? onQueueCovered(w, job, holderJobId, at) : null));
+        await updateWorkflow(o.store, job.installationId, id, (w) => (w ? withEvent(onQueueCovered(w, job, holderJobId, at), { reason: 'coalesced', ...capacityWait(queue, at) }) : null));
       }),
     /** A job finished: its runner's finish (broker), or the reconciler found its microVM gone. */
     finished: (job: JobRef, outcome: string, detail?: JobFinishDetail) =>
@@ -129,7 +160,58 @@ export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => nu
         const at = now();
         // The pull request the job opened belongs to its issue's workflow from now on.
         if (detail?.prNumber !== undefined && job.issue !== undefined) await o.store.linkPullRequest(job.installationId, job.repositoryId, detail.prNumber, id);
-        await updateWorkflow(o.store, job.installationId, id, (w) => onJobFinished(w ?? newWorkflow(job, id, at), job, outcome, detail, at));
+        await updateWorkflow(o.store, job.installationId, id, (w) => {
+          const out = onJobFinished(w ?? newWorkflow(job, id, at), job, outcome, detail, at);
+          // A stop's pause outlasts the stopped job's finish: the workflow stays paused (timeline.ts).
+          return { ...out, workflow: keepPaused(w, out.workflow, at) };
+        });
+      }),
+    /**
+     * An owner asked to stop a job (jobs/stop.ts): its stop paused the workflow's subjects, so the
+     * workflow says so now, rather than at the reconciler's next look, and the timeline shows who.
+     */
+    stopRequested: (job: JobRef, stop: { requestedAt: number; by: string; reason?: string }) =>
+      safely('stop', job, async () => {
+        const id = (await o.store.workflowOfJob(job.installationId, job.jobId)) ?? (await workflowOfJob(o.store, job));
+        if (!id) return;
+        const at = now();
+        const pause: PauseRef = { jobId: job.jobId, at: stop.requestedAt, by: stop.by };
+        await updateWorkflow(o.store, job.installationId, id, (w) => {
+          if (!w) return null;
+          const generation = w.jobRuns?.find((r) => r.jobId === job.jobId)?.generation ?? w.generation;
+          return {
+            workflow: pausedWorkflow(w, pause, at),
+            event: {
+              id: `control:stop:${job.jobId}:${stop.requestedAt}`, at: new Date(at).toISOString(), kind: 'control', generation, jobId: job.jobId,
+              control: { action: 'stop_requested', by: stop.by, ...(stop.reason ? { reason: stop.reason.slice(0, 200) } : {}) },
+              message: 'Stop requested. Automation on this workflow is paused until an owner resumes it; the job\'s commits and pull request are kept.',
+            },
+          };
+        });
+      }),
+    /**
+     * An owner resumed a pause (from the workflow or from the stopped job): the workflow says
+     * what it said before, now, and the timeline shows who resumed it and how long it was paused.
+     * `workflowId` when the resume named it; otherwise the stopped job's.
+     */
+    resumed: (where: { installationId: number; workflowId?: string; job?: JobRef }, pause: { jobId: string; at: number }, by: string) =>
+      safely('resume', where.job ?? { jobId: pause.jobId, installationId: where.installationId } as JobRef, async () => {
+        const id = where.workflowId ?? (where.job ? ((await o.store.workflowOfJob(where.installationId, where.job.jobId)) ?? (await workflowOfJob(o.store, where.job))) : null);
+        if (!id) return;
+        const at = now();
+        await updateWorkflow(o.store, where.installationId, id, (w) => {
+          if (!w) return null;
+          const ours = w.controlPause?.jobId === pause.jobId && w.controlPause.at === pause.at;
+          const waited = waitFrom('pause', pause.at, at);
+          return {
+            workflow: ours ? resumedWorkflow(w, at) : { ...w, updatedAt: new Date(at).toISOString() },
+            event: {
+              id: `control:resume:${pause.jobId}:${pause.at}`, at: new Date(at).toISOString(), kind: 'control', generation: w.generation, jobId: pause.jobId,
+              control: { action: 'resumed', by }, ...(waited ? { waited } : {}),
+              message: 'Automation resumed. Future GitHub events continue the workflow; nothing is run again.',
+            },
+          };
+        });
       }),
   };
 }

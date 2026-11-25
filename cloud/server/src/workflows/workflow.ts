@@ -15,7 +15,7 @@
  */
 import type { Job, JobFinishDetail } from '../store/store.js';
 import { isFailure } from '../store/store.js';
-import type { JobLoop, LoopStage } from '../jobs/lifecycle.js';
+import type { JobLoop, JobRouting, LoopStage } from '../jobs/lifecycle.js';
 
 export type WorkflowStatus = 'active' | 'waiting' | 'blocked' | 'finished';
 
@@ -95,7 +95,30 @@ export interface WorkflowRecovery {
   startedJobId?: string;
 }
 
-export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered' | 'recovery';
+export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered' | 'recovery'
+  /** A queued job was admitted (jobs/queue.ts): it started after waiting for capacity. */
+  | 'admitted'
+  /** A person's control of the workflow: a stop that paused it, a resume (timeline.ts). */
+  | 'control';
+
+/** A wait that ended at an event: what it waited for, since when, and for how long (server clocks). */
+export interface WorkflowWait {
+  for: 'capacity' | 'sign_in' | 'ci' | 'person' | 'merge' | 'review_event' | 'pause';
+  since: string;
+  seconds: number;
+}
+
+/** A person's control action, as the timeline shows it. */
+export interface WorkflowControl {
+  action: 'stop_requested' | 'resumed';
+  /** Who: the GitHub login (or the console caller) Updraft authorized. */
+  by: string;
+  /** Their own short reason, as they gave it to the console. */
+  reason?: string;
+}
+
+/** The route a job ran on, as the runner reported it (jobs/lifecycle.ts routingOf): fixed codes only. */
+export type WorkflowRouting = Pick<JobRouting, 'source' | 'pool' | 'tier' | 'requestedTier' | 'reason'>;
 
 /** One entry of a workflow's timeline. `id` is immutable and unique: recording an event twice changes nothing. */
 export interface WorkflowEvent {
@@ -114,8 +137,18 @@ export interface WorkflowEvent {
   stage?: WorkflowStage;
   prNumber?: number;
   prUrl?: string;
-  /** The steps the job reported: role (implement, review, revision), agent profile and outcome. */
-  steps?: { kind: string; agent?: string; outcome?: string; usage?: StepUsage }[];
+  /** The steps the job reported: role (implement, review, revision), agent profile, the adapter, model and effort it ran with, and outcome. */
+  steps?: { kind: string; agent?: string; adapter?: string; model?: string; effort?: string; outcome?: string; usage?: StepUsage }[];
+  /** The route the job ran on (tier, the tier first chosen, why), once the runner reported it. */
+  routing?: WorkflowRouting;
+  /** A code for why (a queue wait's reason, a queue end's, a block's). */
+  reason?: string;
+  /** The wait this event ended. */
+  waited?: WorkflowWait;
+  /** A person's stop or resume. */
+  control?: WorkflowControl;
+  /** When it happened, where that is earlier than when it was recorded (`at`): a finish found later from the job's own record. */
+  occurredAt?: string;
   /** The job ran on a Claude subscription worker: its cost is an estimate, not what was billed. */
   subscription?: boolean;
   loop?: Pick<JobLoop, 'rounds' | 'maxRevisions' | 'reviews' | 'verdict'>;
@@ -318,7 +351,8 @@ export function onJobFinished(
     outcome,
     ...(prNumber !== undefined ? { prNumber } : {}),
     ...(detail?.prUrl ? { prUrl: detail.prUrl } : {}),
-    ...(detail?.steps?.length ? { steps: detail.steps.map((s) => ({ kind: s.kind, ...(s.agent ? { agent: s.agent } : {}), ...(s.outcome ? { outcome: s.outcome } : {}), ...(usageOf(s.usage) ? { usage: usageOf(s.usage)! } : {}) })) } : {}),
+    ...(detail?.steps?.length ? { steps: detail.steps.map(stepOf) } : {}),
+    ...(routingSummary(detail?.routing) ? { routing: routingSummary(detail?.routing)! } : {}),
     ...(loop ? { loop: { rounds: loop.rounds, reviews: loop.reviews, ...(loop.maxRevisions !== undefined ? { maxRevisions: loop.maxRevisions } : {}), ...(loop.verdict ? { verdict: loop.verdict } : {}) } } : {}),
   };
   if (superseded) {
@@ -378,6 +412,31 @@ function settle(w: Workflow, outcome: string, stage: LoopStage | undefined, at: 
       // awaiting-review, reviewing, changes-requested, revising, fixing-ci: the next job comes from a GitHub event.
       return waiting(stage, 'awaiting_event', 'Waiting for the next step of the review loop to start.', STALL_CHECK_MS);
   }
+}
+
+/** A step as the timeline keeps it: what ran and how it ended, never what it wrote. */
+function stepOf(s: NonNullable<JobFinishDetail['steps']>[number]): NonNullable<WorkflowEvent['steps']>[number] {
+  const usage = usageOf(s.usage);
+  return {
+    kind: s.kind,
+    ...(s.agent ? { agent: s.agent } : {}),
+    ...(s.adapter ? { adapter: s.adapter } : {}),
+    ...(s.model ? { model: s.model } : {}),
+    ...(s.effort ? { effort: s.effort } : {}),
+    ...(s.outcome ? { outcome: s.outcome } : {}),
+    ...(usage ? { usage } : {}),
+  };
+}
+
+function routingSummary(r: JobRouting | undefined): WorkflowRouting | null {
+  if (!r) return null;
+  return {
+    source: r.source,
+    ...(r.pool ? { pool: r.pool } : {}),
+    ...(r.tier ? { tier: r.tier } : {}),
+    ...(r.requestedTier ? { requestedTier: r.requestedTier } : {}),
+    ...(r.reason ? { reason: r.reason } : {}),
+  };
 }
 
 function usageOf(u: { inputTokens?: number; outputTokens?: number; costUsd?: number; durationMs?: number } | undefined): StepUsage | null {

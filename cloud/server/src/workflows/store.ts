@@ -14,6 +14,7 @@
  */
 import { ConditionalCheckFailedException, DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { orderEvents } from './timeline.js';
 import type { Workflow, WorkflowEvent } from './workflow.js';
 
 export interface WorkflowStore {
@@ -30,6 +31,12 @@ export interface WorkflowStore {
   addWorkflowEvent(installationId: number, workflowId: string, event: WorkflowEvent): Promise<void>;
   /** A workflow's events, oldest first (at most `limit`, the newest). */
   listWorkflowEvents(installationId: number, workflowId: string, limit: number): Promise<WorkflowEvent[]>;
+  /**
+   * The same, saying what was left out: `omitted` older events beyond `limit`, and `complete`
+   * false when the read stopped before the end (more events than one read takes), so the newest
+   * shown may not be the newest kept.
+   */
+  listWorkflowHistory(installationId: number, workflowId: string, limit: number): Promise<{ events: WorkflowEvent[]; omitted: number; complete: boolean }>;
   /** A tenant's workflows, most recently changed first. */
   listWorkflows(installationId: number, limit: number): Promise<Workflow[]>;
   linkPullRequest(installationId: number, repositoryId: number, pullRequest: number, workflowId: string): Promise<void>;
@@ -44,7 +51,13 @@ export interface WorkflowStore {
 }
 
 const TTL_DAYS = 90;
-const byTime = (a: WorkflowEvent, b: WorkflowEvent) => a.at.localeCompare(b.at) || (a.seq ?? 0) - (b.seq ?? 0) || a.id.localeCompare(b.id);
+/** Events one history read takes at most. */
+export const MAX_EVENTS_READ = 2_000;
+const pageOf = (all: WorkflowEvent[], limit: number, complete: boolean) => {
+  const ordered = orderEvents(all);
+  const events = ordered.slice(-limit);
+  return { events, omitted: ordered.length - events.length, complete };
+};
 const ttl = (now = Date.now()) => Math.floor(now / 1000) + TTL_DAYS * 24 * 3600;
 
 export function createMemoryWorkflowStore(): WorkflowStore & { dump(): { workflows: Workflow[]; events: Map<string, WorkflowEvent[]> } } {
@@ -75,10 +88,10 @@ export function createMemoryWorkflowStore(): WorkflowStore & { dump(): { workflo
       events.set(k(id, wf), list);
     },
     async listWorkflowEvents(id, wf, limit) {
-      return (events.get(k(id, wf)) ?? [])
-        .map((e) => structuredClone(e))
-        .sort(byTime)
-        .slice(-limit);
+      return pageOf((events.get(k(id, wf)) ?? []).map((e) => structuredClone(e)), limit, true).events;
+    },
+    async listWorkflowHistory(id, wf, limit) {
+      return pageOf((events.get(k(id, wf)) ?? []).map((e) => structuredClone(e)), limit, true);
     },
     async listWorkflows(id, limit) {
       return [...workflows.values()]
@@ -129,6 +142,24 @@ export function createDynamoWorkflowStore(tableName: string, client = DynamoDBDo
     const { pk: _p, sk: _s, ttl: _t, ...rest } = i;
     return rest as X;
   };
+  // One read of the events, at most MAX_EVENTS_READ of them (in key order, not time order: past that, the page is not complete).
+  const history: WorkflowStore['listWorkflowHistory'] = async (id, wf, limit) => {
+    const out: WorkflowEvent[] = [];
+    let start: Record<string, unknown> | undefined;
+    do {
+      const page = await client.send(
+        new QueryCommand({
+          TableName: T,
+          KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': `WFEV#${wf}#` },
+          ExclusiveStartKey: start,
+        }),
+      );
+      for (const i of page.Items ?? []) if (live(i)) out.push(strip<WorkflowEvent>(i));
+      start = page.LastEvaluatedKey;
+    } while (start && out.length < MAX_EVENTS_READ);
+    return pageOf(out, limit, !start);
+  };
   return {
     async getWorkflow(id, wf) {
       const out = await client.send(new GetCommand({ TableName: T, Key: wfKey(id, wf), ConsistentRead: true }));
@@ -175,22 +206,9 @@ export function createDynamoWorkflowStore(tableName: string, client = DynamoDBDo
       }
     },
     async listWorkflowEvents(id, wf, limit) {
-      const out: WorkflowEvent[] = [];
-      let start: Record<string, unknown> | undefined;
-      do {
-        const page = await client.send(
-          new QueryCommand({
-            TableName: T,
-            KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
-            ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': `WFEV#${wf}#` },
-            ExclusiveStartKey: start,
-          }),
-        );
-        for (const i of page.Items ?? []) if (live(i)) out.push(strip<WorkflowEvent>(i));
-        start = page.LastEvaluatedKey;
-      } while (start && out.length < 2_000);
-      return out.sort(byTime).slice(-limit);
+      return (await history(id, wf, limit)).events;
     },
+    listWorkflowHistory: history,
     async listWorkflows(id, limit) {
       const out: Workflow[] = [];
       let start: Record<string, unknown> | undefined;

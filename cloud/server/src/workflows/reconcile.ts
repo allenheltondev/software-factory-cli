@@ -32,6 +32,7 @@ import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import type { Store } from '../store/store.js';
 import { workflowPause } from '../jobs/stop.js';
 import { updateWorkflow } from './recorder.js';
+import { pausedWorkflow, resumedWorkflow } from './timeline.js';
 import { createRecovery, type RecoveryDeps } from './recovery.js';
 import type { WorkflowStore } from './store.js';
 import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
@@ -101,15 +102,6 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
   const change = (w: Workflow, f: (cur: Workflow) => { workflow: Workflow; event?: WorkflowEvent } | null) =>
     updateWorkflow(deps.store, w.installationId, w.workflowId, (cur) => (cur && cur.version === w.version ? f(cur) : null));
 
-  /** The workflow's own state, without what is absent (a record never holds an undefined value). */
-  const stateOf = (cur: Workflow): NonNullable<Workflow['controlPause']>['previous'] => ({
-    status: cur.status,
-    ...(cur.reason !== undefined ? { reason: cur.reason } : {}),
-    ...(cur.message !== undefined ? { message: cur.message } : {}),
-    ...(cur.nextAction !== undefined ? { nextAction: cur.nextAction } : {}),
-    ...(cur.nextCheckAt !== undefined ? { nextCheckAt: cur.nextCheckAt } : {}),
-  });
-
   const without = (w: Workflow, ...keys: (keyof Workflow)[]): Workflow => {
     const out = { ...w };
     for (const k of keys) delete out[k];
@@ -123,7 +115,7 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     // made once (its save is version-checked), and a later one is a new event, never a replay.
     const blockedEvent = (id: string, message: string): WorkflowEvent => ({ id: `${id}@${w.version}`, at: iso(at), kind: 'blocked', generation: w.generation, message });
     const block = (reason: string, message: string, nextAction: string, id: string, on: Workflow = w) =>
-      change(on, (cur) => ({ workflow: { ...without(cur, 'nextCheckAt'), status: 'blocked', reason, message, nextAction, updatedAt: iso(at) }, event: { ...blockedEvent(id, message), id: `${id}@${on.version}` } })).then(() => {
+      change(on, (cur) => ({ workflow: { ...without(cur, 'nextCheckAt'), status: 'blocked', reason, message, nextAction, updatedAt: iso(at) }, event: { ...blockedEvent(id, message), id: `${id}@${on.version}`, reason } })).then(() => {
         report.blocked++;
       });
     const later = (ms: number) => change(w, (cur) => ({ workflow: { ...cur, nextCheckAt: iso(at + ms), updatedAt: iso(at) } }));
@@ -134,26 +126,16 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     if (pause) {
       const repeated = w.controlPause?.jobId === pause.jobId && w.controlPause.at === pause.at;
       await change(w, (cur) => ({
-        workflow: {
-          ...cur, status: 'blocked', reason: 'workflow_paused', message: `Automation was paused by ${pause.by}. The stopped job and existing pull request are preserved.`,
-          nextAction: `Resume automation from this workflow's page (nothing is run again), or retry job ${pause.jobId} from its page while it is still kept.`, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at),
-          controlPause: { jobId: pause.jobId, at: pause.at, by: pause.by, previous: cur.controlPause?.previous ?? stateOf(cur) },
-        },
-        ...(!repeated ? { event: blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, 'An authorized stop paused automation on this workflow.') } : {}),
+        workflow: pausedWorkflow(cur, pause, at),
+        ...(!repeated ? { event: { ...blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, 'An authorized stop paused automation on this workflow.'), reason: 'workflow_paused' } } : {}),
       }));
       if (!repeated) report.blocked++;
       return;
     }
     if (w.controlPause) {
-      let previous = w.controlPause.previous;
-      // A lost job's retry is never carried on after a resume ("nothing is run again"): it stays
-      // blocked, and a person retries it from its page if they want it.
-      if (previous.reason === 'job_lost' || (previous.reason === 'recovering' && w.recovery?.kind === 'lost_job')) {
-        previous = { status: 'blocked', reason: 'job_lost', message: 'The job stopped without reporting how it ended; automation was paused and resumed since, so it is not retried automatically.', nextAction: 'Retry the job from its page.' };
-      }
-      const restored = await change(w, (cur) => ({
-        workflow: { ...without(cur, 'controlPause', 'reason', 'message', 'nextAction', 'nextCheckAt'), ...previous, updatedAt: iso(at) },
-      }));
+      // Resumed where this workflow was not told (an older console, a job's own retry): back to
+      // what it said before. A lost job's retry is never carried on after a resume (timeline.ts).
+      const restored = await change(w, (cur) => ({ workflow: resumedWorkflow(cur, at) }));
       if (!restored || restored.version === w.version) return;
       w = restored;
       // Back to what it was. Only a workflow that was due a look then is looked at now; a
@@ -183,7 +165,8 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
         const ref = { jobId, eventName: job?.eventName ?? 'unknown' };
         await change(w, (cur) => {
           const next = onJobFinished(cur, ref, outcome, summary?.detail, at);
-          return { workflow: next.workflow, event: { ...next.event, kind: 'finish_recovered', message: 'The job had finished without its result reaching this workflow; recorded from the job\'s own record.' } };
+          const occurredAt = summary?.finishedAt && Date.parse(summary.finishedAt) < at ? summary.finishedAt : undefined;
+          return { workflow: next.workflow, event: { ...next.event, kind: 'finish_recovered', ...(occurredAt ? { occurredAt } : {}), message: 'The job had finished without its result reaching this workflow; recorded from the job\'s own record.' } };
         });
         report.repaired++;
         return;

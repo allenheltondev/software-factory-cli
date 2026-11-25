@@ -77,6 +77,17 @@ describe('workflow reconciliation', () => {
     expect(stored.controlPause!.previous).toEqual({ status: 'waiting', reason: 'ci_pending', message: expect.any(String), nextCheckAt: new Date(T0 + CI_FIRST_CHECK_MS).toISOString() });
   });
 
+  it('does not report again a pause the stop already recorded, and ends the CI wait it interrupted with how long it was', async () => {
+    const s = setup(); await s.waitForCi(); s.tick(CI_FIRST_CHECK_MS);
+    await s.recorder.stopRequested(job({ jobId: 'job_stopped0001' }), { requestedAt: T0, by: 'pat' });
+    s.controls.getWorkflowPause.mockResolvedValue({ jobId: 'job_stopped0001', at: T0, by: 'pat' });
+    s.tick(CI_RECHECK_MS);
+    expect(await s.reconcile()).toMatchObject({ checked: 1, blocked: 0 });
+    const events = await s.store.listWorkflowEvents(55, '99-i7', 50);
+    expect(events.filter((e) => e.kind === 'blocked')).toHaveLength(0);
+    expect(events.at(-1)).toMatchObject({ kind: 'control', waited: { for: 'ci', seconds: CI_FIRST_CHECK_MS / 1000 } });
+  });
+
   it('on resume, gives a workflow that was already blocked its own state back, without diagnosing it again', async () => {
     const s = setup();
     await s.recorder.started(job());

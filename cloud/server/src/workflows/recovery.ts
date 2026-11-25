@@ -233,7 +233,7 @@ export function createRecovery(deps: {
       const { nextCheckAt: _n, ...rest } = cur;
       return {
         workflow: { ...rest, status: 'blocked', reason: why.reason, message: why.message, nextAction: why.nextAction, updatedAt: iso(at) },
-        event: { id: `${why.id}@${cur.version}`, at: iso(at), kind: 'blocked', generation: cur.generation, message: why.message },
+        event: { id: `${why.id}@${cur.version}`, at: iso(at), kind: 'blocked', generation: cur.generation, reason: why.reason, message: why.message },
       };
     });
     return out.saved ? { kind: 'blocked' } : { kind: 'none' };
