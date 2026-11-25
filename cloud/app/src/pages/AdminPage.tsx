@@ -65,7 +65,7 @@ export function AdminPage({ api = defaultApi }: { api?: Pick<ApiClient, 'adminTe
 
       {load.state === 'ok' && (
         <>
-          <div className="grid gap-4 sm:grid-cols-3">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             <StatTile label="Tenants" value={load.overview.tenants.length} />
             <StatTile
               label="Jobs holding capacity"
@@ -86,7 +86,7 @@ export function AdminPage({ api = defaultApi }: { api?: Pick<ApiClient, 'adminTe
                 <EmptyState title="No tenants yet" description="A tenant appears here once someone connects an installation of the App." />
               ) : (
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left text-sm" data-testid="admin-tenants">
+                  <table className="w-full min-w-[40rem] text-left text-sm" data-testid="admin-tenants">
                     <thead className="text-muted-foreground">
                       <tr>
                         <th className="py-2 pr-4 font-medium">Account</th>

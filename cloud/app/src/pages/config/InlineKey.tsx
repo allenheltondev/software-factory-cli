@@ -42,8 +42,8 @@ export function InlineKey({ adapter, installationId, api, onSaved }: { adapter: 
 
   return (
     <form className="flex flex-col gap-2" onSubmit={(e) => void save(e)} data-testid={`inline-key-${adapter}`}>
-      <div className="flex flex-wrap items-end gap-2">
-        <div className="min-w-0 flex-1">
+      <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-end">
+        <div className="min-w-0 sm:flex-1">
           <PasswordInput
             label={guide.credential}
             autoComplete="off"

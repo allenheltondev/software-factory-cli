@@ -28,8 +28,7 @@ export function navItems(pathname: string, search: string, tenant?: TenantSummar
       { id: 'insights', label: 'Insights', href: `${base}/insights`, active: pathname === `${base}/insights`, section: tenant.accountLogin },
       { id: 'config', label: 'Configuration', href: `${base}/config`, active: pathname === `${base}/config` || pathname.startsWith(`${base}/config/`), section: 'Installation settings' },
       { id: 'keys', label: 'Agent keys', href: `${base}/keys`, active: pathname === `${base}/keys`, section: 'Installation settings' },
-      { id: 'claude', label: 'Claude subscription', href: `${base}/claude`, active: pathname === `${base}/claude`, section: 'Installation settings' },
-      { id: 'routines', label: 'Claude scheduled tasks', href: `${base}/routines`, active: pathname === `${base}/routines`, section: 'Installation settings' },
+      { id: 'claude', label: 'Claude', href: `${base}/claude`, active: pathname === `${base}/claude` || pathname === `${base}/routines`, section: 'Installation settings' },
       { id: 'telemetry', label: 'Telemetry', href: `${base}/telemetry`, active: pathname === `${base}/telemetry`, section: 'Installation settings' },
     );
   }
@@ -128,7 +127,7 @@ function ConsoleLayout({ api, auth, account, managingGitHub }: {
           void signOut().then(() => navigate('/login', { replace: true }));
         }}
       />
-      <main className="min-w-0 flex-1">
+      <main className="console-content min-w-0 flex-1">
         <Container className="py-6" style={{ maxWidth: '90rem' }}>
           <Outlet key={id} context={{ installations, preferredId: account ? lastInstallation(account) : null }} />
         </Container>

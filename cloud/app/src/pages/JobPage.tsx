@@ -556,7 +556,7 @@ function Logs({ job, api, installationId, names, name, onSelect }: {
               <span data-testid="log-size">
                 {log.log.truncated ? `The last ${formatBytes(new Blob([text]).size)} of ${formatBytes(log.log.size)}` : formatBytes(log.log.size)}
               </span>
-              <span className="ml-auto flex flex-wrap gap-2">
+              <span className="flex w-full flex-wrap gap-2 sm:ml-auto sm:w-auto">
                 <Button variant="ghost" onClick={() => setWrap((w) => !w)} aria-pressed={wrap}>
                   {wrap ? 'No wrap' : 'Wrap lines'}
                 </Button>

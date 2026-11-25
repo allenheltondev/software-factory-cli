@@ -441,7 +441,7 @@ function WorkflowsSection({ config, onChange, view, errors, generation }: Editor
             add();
           }}
         >
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
             <Input label="New workflow name" placeholder="docs" value={newName} error={nameError} onChange={(e) => setNewName(e.target.value)} />
           </div>
           <Button variant="secondary" type="submit">
@@ -516,7 +516,7 @@ function AgentsSection({ config, onChange, view, errors, installationId, keyApi,
                     )}
                     <span className="text-sm text-muted-foreground">{pools.length ? `In ${pools.join(', ')}` : 'In no pool'}</span>
                   </div>
-                  <div className="flex items-center gap-3">
+                  <div className="flex flex-wrap items-center gap-3">
                     <Check checked={a.enabled} onChange={(enabled) => patchAgent(name, { enabled })}>
                       On
                     </Check>
@@ -546,7 +546,7 @@ function AgentsSection({ config, onChange, view, errors, installationId, keyApi,
             );
           })}
           <div className="flex flex-wrap items-end gap-2">
-            <div className="min-w-0 flex-1">
+            <div className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
               <Select label="Add an agent" value={adding} onChange={(e) => setAdding(e.target.value as AgentAdapter)} hint="For example a second Claude on another model; it joins every pool">
                 {offered.map((o) => (
                   <option key={o} value={o}>
@@ -611,7 +611,7 @@ function AgentsSection({ config, onChange, view, errors, installationId, keyApi,
               addPool();
             }}
           >
-            <div className="min-w-0 flex-1">
+            <div className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
               <Input label="New pool name" placeholder="fast" value={poolName} error={poolError} onChange={(e) => setPoolName(e.target.value)} />
             </div>
             <Button variant="secondary" type="submit">

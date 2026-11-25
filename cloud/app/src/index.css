@@ -1,3 +1,62 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Keep console cards and form grids within their available width. */
+.console-content :is(.card, .stat-tile, .page-hero) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 639px) {
+  .console-content :is(.card-header, .card-body, .page-hero, .stat-tile) {
+    padding: 1rem;
+  }
+
+  .console-content .card-header {
+    align-items: flex-start;
+  }
+
+  .console-content .segmented-control {
+    display: flex;
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .console-content .segmented-control-option {
+    min-height: 2.75rem;
+    flex: 1 1 auto;
+    white-space: normal;
+  }
+
+  .console-content :is(input, select, textarea) {
+    font-size: 1rem;
+  }
+
+  .console-content .btn {
+    min-height: 2.75rem;
+    white-space: normal;
+  }
+
+  .console-content .page-hero-title {
+    font-size: 1.75rem;
+  }
+}
+
+.console-content :is(.grid > *, .card-body, .card-header, fieldset, pre) {
+  min-width: 0;
+}
+
+.console-content :is(input, select, textarea) {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.console-content :is(.card-body, .card-header, .alert, header) {
+  overflow-wrap: anywhere;
+}
+
+/* Tables keep readable columns and scroll inside their cards. */
+.console-content table {
+  overflow-wrap: normal;
+}

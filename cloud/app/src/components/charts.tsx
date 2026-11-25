@@ -176,12 +176,12 @@ export function Bars({ rows, max, fill = 'bg-primary-500 dark:bg-primary-400', l
   return (
     <ul className="flex flex-col gap-2" aria-label={label}>
       {rows.map((r) => (
-        <li key={r.key} className="grid grid-cols-[minmax(6rem,10rem)_1fr_auto] items-center gap-3 text-sm" title={r.hint}>
-          <span className="truncate">{r.label}</span>
-          <span className="h-2.5 overflow-hidden rounded-full bg-muted" aria-hidden="true">
+        <li key={r.key} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 text-sm sm:grid-cols-[minmax(6rem,10rem)_minmax(0,1fr)_auto]" title={r.hint}>
+          <span className="min-w-0 break-words sm:truncate">{r.label}</span>
+          <span className="col-span-2 row-start-2 h-2.5 overflow-hidden rounded-full bg-muted sm:col-span-1 sm:row-start-auto" aria-hidden="true">
             <span className={`block h-full rounded-full ${fill}`} style={{ width: `${Math.max(r.value > 0 ? 2 : 0, (r.value / top) * 100)}%` }} />
           </span>
-          <span className="min-w-10 text-right font-medium tabular-nums">{r.display ?? r.value}</span>
+          <span className="col-start-2 row-start-1 min-w-10 text-right font-medium tabular-nums sm:col-start-auto sm:row-start-auto">{r.display ?? r.value}</span>
         </li>
       ))}
     </ul>

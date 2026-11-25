@@ -38,7 +38,7 @@ export function InstallationsPage({ home = false }: { home?: boolean }) {
                 return (
                   <li key={tenant.installationId} className="flex flex-wrap items-center justify-between gap-2 py-3">
                     <Link className="auth-link font-medium" to={`/installations/${tenant.installationId}`}>{tenant.accountLogin}</Link>
-                    <span className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <span className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
                       {tenant.accountType === 'Organization' ? 'Organization' : 'Personal account'}
                       <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
                     </span>

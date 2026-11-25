@@ -1,3 +1,4 @@
+import { ClaudeNavigation } from '../components/ClaudeNavigation';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router';
 import {
@@ -305,6 +306,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
   const options = new Map([...(view?.triggers ?? []).map((t) => [triggerKey(t), t] as const), ...available]);
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+      {phase === 'idle' && <ClaudeNavigation />}
       {phase === 'idle' && (
         <Link className="auth-link" to={`/installations/${id}/keys`}>
           ← Agent keys

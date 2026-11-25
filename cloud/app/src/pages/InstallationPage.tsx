@@ -82,11 +82,11 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
   }, [running, refresh, refreshMs]);
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="dashboard flex min-w-0 flex-col gap-4 sm:gap-6">
       {load.state === 'loading' && (
         <div className="flex flex-col gap-4" data-testid="installation-loading">
           <Skeleton className="h-32" />
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid min-w-0 grid-cols-1 gap-3 min-[380px]:grid-cols-2 xl:grid-cols-4">
             {[0, 1, 2, 3].map((i) => (
               <Skeleton key={i} className="h-24" />
             ))}
@@ -228,7 +228,7 @@ function ActivityView({
         </CardBody>
       </Card>
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" data-testid="stats">
+      <div className="grid min-w-0 grid-cols-1 gap-3 min-[380px]:grid-cols-2 xl:grid-cols-4" data-testid="stats">
         <StatTile
           label="Configuration"
           value={overview.config.activeVersion === null ? 'None' : `v${overview.config.activeVersion}`}
@@ -342,9 +342,9 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
       {jobs.map((j) => {
         const r = JOB_RESULT[j.result];
         return (
-          <li key={j.jobId} className="flex flex-wrap items-center gap-x-4 gap-y-1 py-3" data-testid={`job-${j.jobId}`}>
+          <li key={j.jobId} className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 py-4" data-testid={`job-${j.jobId}`}>
             <StatusBadge tone={r.tone}>{r.label}</StatusBadge>
-            <Link className="auth-link font-medium" to={`${base}/jobs/${j.jobId}`}>
+            <Link className="auth-link min-w-0 basis-full break-words font-medium sm:basis-auto" to={`${base}/jobs/${j.jobId}`}>
               {j.repository}
               {j.issue !== undefined ? `#${j.issue}` : j.pullRequest !== undefined ? `#${j.pullRequest}` : ''}
             </Link>
@@ -377,7 +377,7 @@ function JobsList({ jobs, base }: { jobs: JobView[]; base: string }) {
                 Conversation ↗
               </a>
             )}
-            <span className="ml-auto flex flex-wrap items-center gap-3 text-sm">
+            <span className="flex w-full flex-wrap items-center gap-3 text-sm text-muted-foreground sm:ml-auto sm:w-auto">
               {j.configVersion !== undefined && <span title="Configuration version">v{j.configVersion}</span>}
               {j.result !== 'running' && <span title="Duration">{formatDuration(j.durationSeconds)}</span>}
               <span title={exact(j.createdAt)}>{relativeTime(j.createdAt)}</span>
@@ -489,7 +489,7 @@ function RepositoriesList({ repositories, base }: { repositories: Overview['repo
             ) : (
               <span>{r.fullName}</span>
             )}
-            <span className="flex items-center gap-2">
+            <span className="flex flex-wrap items-center gap-2">
               {r.private && <StatusBadge tone="neutral">Private</StatusBadge>}
               {!r.reachable ? (
                 <StatusBadge tone="error">Not reachable</StatusBadge>

@@ -50,7 +50,7 @@ function ConnectList({ api, installations }: { api: Pick<ApiClient, 'connect'>; 
           const row = rows[i.installationId] ?? { state: 'idle' };
           return (
             <li key={i.installationId} className="flex flex-col gap-1 py-2">
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
                 <span>
                   {i.accountLogin} <span className="text-sm text-muted-foreground">· {i.accountType === 'Organization' ? 'Organization' : 'Personal account'}</span>
                 </span>

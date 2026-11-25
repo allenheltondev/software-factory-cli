@@ -525,7 +525,7 @@ function SettingsCard({ view, api, installationId, onSaved }: { view: TelemetryV
             if (!nameProblem && serviceName !== view.serviceName) void change('name', { serviceName });
           }}
         >
-          <div className="min-w-56 flex-1">
+          <div className="min-w-0 basis-full sm:min-w-56 sm:flex-1 sm:basis-auto">
             <Input
               label="Service name"
               value={serviceName}

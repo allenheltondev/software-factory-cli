@@ -155,11 +155,11 @@ export function GitHubSettingsPage({ api = defaultApi, go = leave }: { api?: Git
                 {load.github.tenants.map((t) => {
                   const s = tenantStatusLabel(t);
                   return (
-                    <li key={t.installationId} className="flex items-center justify-between gap-3 py-3">
+                    <li key={t.installationId} className="flex flex-col items-start justify-between gap-2 py-3 sm:flex-row sm:items-center">
                       <Link className="auth-link" to={`/installations/${t.installationId}`}>
                         {t.accountLogin}
                       </Link>
-                      <span className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <span className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
                         {t.accountType === 'Organization' ? 'Organization' : 'Personal account'} · {t.role}
                         <StatusBadge tone={s.tone}>{s.label}</StatusBadge>
                       </span>
