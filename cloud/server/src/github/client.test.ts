@@ -25,6 +25,16 @@ describe('the GitHub client', () => {
     expect(await silent.getInstallation('jwt', 7)).not.toHaveProperty('events');
   });
 
+  it('says when the installation reaches more repositories than it lists', async () => {
+    const full = Array.from({ length: 100 }, (_, i) => ({ id: i, full_name: `acme/r${i}`, private: false, html_url: '' }));
+    const many = createGitHubApi(async () => new Response(JSON.stringify({ repositories: full }), { status: 200 }));
+    const listed = await many.listInstallationRepositories('ghs_x');
+    expect(listed).toHaveLength(1000);
+    expect(listed.truncated).toBe(true);
+    const few = createGitHubApi(async () => new Response(JSON.stringify({ repositories: full.slice(0, 3) }), { status: 200 }));
+    expect((await few.listInstallationRepositories('ghs_x')).truncated).toBeUndefined();
+  });
+
   it('fails on a refused comment', async () => {
     const api = createGitHubApi(async () => new Response('{}', { status: 403 }));
     await expect(api.createIssueComment('ghs_x', 'acme/web', 12, 'x')).rejects.toBeInstanceOf(GitHubError);

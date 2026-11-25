@@ -1,7 +1,7 @@
 import type { Caller } from '../caller.js';
 import type { GitHubFlows } from '../flows/github.js';
 import type { GitHubInstallation, GitHubRepository } from '../github/client.js';
-import type { KillSwitch } from '../jobs/kill-switch.js';
+import type { KillSwitch, KillSwitchState } from '../jobs/kill-switch.js';
 import { readinessAction, type NativeReadiness } from '../jobs/launch.js';
 import { dayOf, monthOf, tenantQuotas } from '../jobs/quotas.js';
 import { jobResult, type JobResult } from '../jobs/status.js';
@@ -139,6 +139,8 @@ export const LIMITATIONS = [
   'Every check is made again with current state when a job is dispatched, and before each privileged step: readiness grants nothing.',
 ];
 
+/** The repositories GitHub listed; `truncated`: it has more than were read. */
+type Listed = GitHubRepository[] & { truncated?: true };
 type Read<T> = { ok: true; value: T } | { ok: false };
 
 /** A read that never throws and never takes longer than `ms`: a failure leaves its check unverified. */
@@ -199,13 +201,13 @@ interface InstallationFacts {
   gh: Read<GitHubInstallation | null>;
   version: Read<ConfigVersion | null> | null;
   /** null: not read (the installation is not active, so GitHub would list nothing). */
-  reachable: Read<GitHubRepository[]> | null;
+  reachable: Read<Listed> | null;
   keys: Read<AgentKeyView[]>;
   usage: Read<Usage> | null;
   jobs: Read<JobSummary[]>;
   pauses: Read<HeldPause[]>;
   telemetry: Read<TelemetrySettings | null>;
-  killSwitch: Read<boolean> | null;
+  killSwitch: Read<KillSwitchState> | null;
   imageVersion: Read<string | null> | null;
   native: Read<NativeBinding | undefined> | null;
   nativeReadiness: Read<NativeReadiness> | null;
@@ -213,7 +215,11 @@ interface InstallationFacts {
 }
 
 /** The installation's checks, which every repository depends on. Pure: the facts are read first. */
-export function installationChecks(f: InstallationFacts, needsJobImage: boolean): ReadinessCheck[] {
+/**
+ * `jobImage`: whether jobs here need the published job image. `uncertain`: subscription routing
+ * could not be read, so whether any job does is not known; a missing image is then unverified.
+ */
+export function installationChecks(f: InstallationFacts, jobImage: 'required' | 'uncertain' | 'none' = 'required'): ReadinessCheck[] {
   const out: ReadinessCheck[] = [];
   const { tenant } = f;
   // The tenant record first: it is what the launcher reads.
@@ -248,13 +254,15 @@ export function installationChecks(f: InstallationFacts, needsJobImage: boolean)
 
   if (f.killSwitch === null) out.push(unverifiedCheck('kill-switch', 'capacity', 'Whether the platform has paused all jobs is not checked in this deployment.', 'not_checked'));
   else if (!f.killSwitch.ok) out.push(unverifiedCheck('kill-switch', 'capacity', 'Whether the platform has paused all jobs could not be read just now (dispatch treats an unreadable switch as paused).'));
-  else out.push(f.killSwitch.value
+  else if (f.killSwitch.value === 'unreadable') out.push(unverifiedCheck('kill-switch', 'capacity', 'The platform kill switch could not be read just now. Until it can, dispatch treats it as on and starts nothing; this is not an operator pause.'));
+  else out.push(f.killSwitch.value === 'on'
     ? check({ id: 'kill-switch', stage: 'capacity', required: true, state: 'failing', problem: 'paused', summary: "The platform's operator has paused all jobs. Nothing starts until they are resumed." })
     : check({ id: 'kill-switch', stage: 'capacity', required: true, state: 'verified', summary: 'The platform is accepting jobs.' }));
 
-  if (needsJobImage) {
+  if (jobImage !== 'none') {
     if (f.imageVersion === null) out.push(unverifiedCheck('job-image', 'capacity', 'Whether a job image is published is not checked in this deployment.', 'not_checked'));
     else if (!f.imageVersion.ok) out.push(unverifiedCheck('job-image', 'capacity', 'Whether a job image is published could not be read just now.'));
+    else if (!f.imageVersion.value && jobImage === 'uncertain') out.push(unverifiedCheck('job-image', 'capacity', 'No job image is published; whether these workflows need one (rather than the Claude subscription) could not be read just now.'));
     else out.push(f.imageVersion.value
       ? check({ id: 'job-image', stage: 'capacity', required: true, state: 'verified', summary: `Jobs run on image ${f.imageVersion.value}.` })
       : check({ id: 'job-image', stage: 'capacity', required: true, state: 'failing', problem: 'provider', summary: 'No job image is published in this deployment yet, so jobs are off.' }));
@@ -308,7 +316,7 @@ interface RepositoryFacts {
   rule: Rule;
   loop: boolean;
   live?: GitHubRepository | undefined;
-  reachable: Read<GitHubRepository[]> | null;
+  reachable: Read<Listed> | null;
   gh: Read<GitHubInstallation | null>;
   keys: Read<AgentKeyView[]>;
   pauses: Read<HeldPause[]>;
@@ -323,6 +331,7 @@ export function repositoryChecks(f: RepositoryFacts): ReadinessCheck[] {
 
   if (f.reachable === null) out.push(unverifiedCheck('repository-access', 'github', 'Repository access is not read while the installation is not active.', 'not_checked'));
   else if (!f.reachable.ok) out.push(unverifiedCheck('repository-access', 'github', 'The repositories the App reaches could not be read just now.'));
+  else if (!f.live && f.reachable.value.truncated) out.push(unverifiedCheck('repository-access', 'github', 'The App reaches more repositories than could be listed, so whether it reaches this one is unverified.'));
   else if (!f.live) out.push({ id: 'repository-access', stage: 'github', required: true, state: 'failing', problem: 'permissions', summary: 'The App no longer reaches this repository, so its jobs cannot run.', fix: { text: 'Choose repositories on GitHub', target: 'github' } });
   else if (f.live.id !== rule.id) out.push({ id: 'repository-access', stage: 'config', required: true, state: 'failing', problem: 'invalid_config', summary: 'GitHub now has a different repository under this name (recreated or replaced): publish the configuration again.', fix: { text: 'Publish the configuration again', target: 'config' } });
   else out.push({ id: 'repository-access', stage: 'github', required: true, state: 'verified', summary: 'The App reaches this repository.' });
@@ -359,9 +368,15 @@ export function repositoryChecks(f: RepositoryFacts): ReadinessCheck[] {
     const offered = new Set<string>(Object.values(AGENT_KEY_ENV));
     const retired = [...needed].filter((k) => !offered.has(k));
     const byName = new Map(f.keys.value.map((k) => [k.name, k]));
-    const missing = [...needed].filter((k) => offered.has(k) && !byName.get(k)?.configured);
+    // Subscription routing could not be read: a trigger that may run on the subscription needs no
+    // Anthropic key, so that key not being set is unknown here, not missing.
+    const routingUnread = f.native !== null && !f.native.ok;
+    const unset = [...needed].filter((k) => offered.has(k) && !byName.get(k)?.configured);
+    const missing = unset.filter((k) => !(routingUnread && k === 'ANTHROPIC_API_KEY'));
+    const uncertain = unset.filter((k) => !missing.includes(k));
     if (retired.length) out.push({ id: 'agent-retired', stage: 'credentials', required: true, state: 'failing', problem: 'invalid_config', summary: `A workflow here runs an agent this deployment no longer runs (it needs ${retired.join(', ')}): choose another agent.`, fix: { text: 'Change the workflow', target: 'config' } });
     if (missing.length) out.push({ id: 'agent-keys', stage: 'credentials', required: true, state: 'failing', problem: 'missing_credentials', summary: `${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} needed by this repository's workflows (coding or review) and not set.`, fix: { text: missing.length > 1 ? 'Add the keys' : 'Add the key', target: 'keys' } });
+    else if (uncertain.length) out.push(unverifiedCheck('agent-keys', 'credentials', 'ANTHROPIC_API_KEY is not set. Whether these workflows need it, or run on the Claude subscription instead, could not be read just now.'));
     else if (!retired.length && !unknownKeys) {
       // A key is checked with its provider when it is saved. A later job's failure is recorded on
       // it, but that job may have failed for any reason: it is said, never taken as a bad key.
@@ -444,6 +459,8 @@ export function createReadinessService(d: ReadinessServiceDeps) {
   const log = d.log ?? ((e) => console.log(JSON.stringify(e)));
   /** Per installation: the last report, and the tenant state it was made under. */
   const cache = new Map<number, { key: string; at: number; report: Omit<ReadinessReport, 'cached'> }>();
+  /** Assessments under way: concurrent misses for one installation share one (single flight). */
+  const inflight = new Map<number, { key: string; promise: Promise<Omit<ReadinessReport, 'cached'>> }>();
 
   async function assess(caller: Caller, installationId: number, tenant: Tenant): Promise<Omit<ReadinessReport, 'cached'>> {
     const at = now();
@@ -451,13 +468,13 @@ export function createReadinessService(d: ReadinessServiceDeps) {
     const [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native] = await Promise.all([
       read(() => d.github.installation(caller, installationId)),
       tenant.activeConfigVersion === undefined ? Promise.resolve(null) : read(() => d.store.getConfigVersion(installationId, tenant.activeConfigVersion!, { consistent: true })),
-      tenant.status === 'active' ? read(() => d.github.repositories(caller, installationId).then((r) => r.repositories)) : Promise.resolve(null),
+      tenant.status === 'active' ? read(() => d.github.repositories(caller, installationId).then((r): Listed => Object.assign([...r.repositories], r.truncated ? { truncated: true as const } : {}))) : Promise.resolve(null),
       read(() => d.agentKeys.list(caller, installationId).then((v) => v.keys)),
       d.quotas ? read(() => d.store.getUsage(installationId, dayOf(at), monthOf(at))) : Promise.resolve(null),
       read(() => d.store.listRecentJobs(installationId, RECENT_JOBS)),
       read(() => d.store.listWorkflowPauses(installationId, PAUSES)),
       read(() => d.store.getTelemetry(installationId)),
-      d.killSwitch ? read(() => d.killSwitch!.engaged()) : Promise.resolve(null),
+      d.killSwitch ? read(async (): Promise<KillSwitchState> => d.killSwitch!.state ? d.killSwitch!.state() : (await d.killSwitch!.engaged()) ? 'on' : 'off') : Promise.resolve(null),
       d.imageVersion ? read(() => d.imageVersion!()) : Promise.resolve(null),
       d.native ? read(() => d.native!(installationId)) : Promise.resolve(null),
     ]);
@@ -469,7 +486,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
     const nativeReadiness = binding && anyRouted ? await read(() => binding.readiness()) : null;
     const allRouted = names.length > 0 && names.every(([name, rule]) => rule.triggers.every((t) => routedToSubscription(binding, name, rule, t)));
     const facts: InstallationFacts = { tenant, gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, nativeReadiness, ...(d.quotas ? { quotas: d.quotas } : {}) };
-    const installation = installationChecks(facts, !allRouted);
+    const installation = installationChecks(facts, native && !native.ok ? 'uncertain' : allRouted ? 'none' : 'required');
     const listed = reachable?.ok ? reachable.value : [];
     const live = new Map(listed.map((r) => [r.fullName.toLowerCase(), r]));
     const repositories: RepositoryReadiness[] = names.map(([name, rule]) => {
@@ -495,6 +512,10 @@ export function createReadinessService(d: ReadinessServiceDeps) {
      * cached or not). Served from the last check for a minute, and always re-read when the
      * published configuration or the tenant's status changed since; `refresh` reads again unless
      * the last check is only seconds old.
+     *
+     * Agent keys, the Claude session and workflow pauses change outside this service (and in other
+     * containers), so they are not part of the cache key: the console asks with `refresh` whenever
+     * the page is opened, which the 10 s floor bounds, and a non-refresh read is at most a minute old.
      */
     async readiness(caller: Caller, installationId: number, opts: { refresh?: boolean } = {}): Promise<ReadinessReport> {
       const { tenant } = await d.github.member(caller, installationId);
@@ -502,11 +523,18 @@ export function createReadinessService(d: ReadinessServiceDeps) {
       const hit = cache.get(installationId);
       const age = hit ? now() - hit.at : Infinity;
       if (hit && hit.key === key && (opts.refresh ? age < minRefresh : age < ttl)) return { ...hit.report, cached: true };
-      const report = await assess(caller, installationId, tenant);
-      cache.delete(installationId);
-      cache.set(installationId, { key, at: now(), report });
-      while (cache.size > CACHE_ENTRIES) cache.delete(cache.keys().next().value!);
-      return { ...report, cached: false };
+      const running = inflight.get(installationId);
+      if (running && running.key === key) return { ...await running.promise, cached: false };
+      const promise = assess(caller, installationId, tenant).then((report) => {
+        cache.delete(installationId);
+        cache.set(installationId, { key, at: now(), report });
+        while (cache.size > CACHE_ENTRIES) cache.delete(cache.keys().next().value!);
+        return report;
+      }).finally(() => {
+        if (inflight.get(installationId)?.promise === promise) inflight.delete(installationId);
+      });
+      inflight.set(installationId, { key, promise });
+      return { ...await promise, cached: false };
     },
   };
 }

@@ -5,6 +5,7 @@ import { FlowError } from '../flows/github.js';
 import type { GitHubInstallation, GitHubRepository } from '../github/client.js';
 import type { NativeReadiness } from '../jobs/launch.js';
 import { DEFAULT_QUOTAS } from '../jobs/quotas.js';
+import { createKillSwitch } from '../jobs/kill-switch.js';
 import type { ConfigVersion, DispatchRules, HeldPause, JobSummary, TelemetrySettings, Tenant, Usage } from '../store/store.js';
 import type { AgentKeyView } from './agent-key-service.js';
 import {
@@ -34,6 +35,7 @@ interface World {
   telemetry: TelemetrySettings | null | Error;
   killSwitch: boolean | Error;
   imageVersion: string | null | Error;
+  truncated?: boolean;
   native?: Partial<NativeBinding> & { readiness?: () => Promise<NativeReadiness> } | Error;
 }
 
@@ -97,7 +99,7 @@ function setup(w: World, extra: Partial<ReadinessServiceDeps> = {}) {
     github: {
       member,
       installation: track('installation', async (c: Caller, id: number) => { await member(c, id); return value(w.installation); }),
-      repositories: track('repositories', async (c: Caller, id: number) => { await member(c, id); return { tenant: {} as never, repositories: await value(w.repositories) }; }),
+      repositories: track('repositories', async (c: Caller, id: number) => { await member(c, id); return { tenant: {} as never, repositories: await value(w.repositories), ...(w.truncated ? { truncated: true as const } : {}) }; }),
     },
     agentKeys: { list: track('keys', async () => ({ keys: await value(w.keys), refusals: [] })) },
     killSwitch: { engaged: track('killSwitch', async () => value(w.killSwitch)) },
@@ -190,6 +192,45 @@ describe('repository readiness (#137)', () => {
     const old = await setup(world({ rules: { loop: true, repositories: { 'acme/web': rule({ keys: undefined }) } } })).service.readiness(caller, 55);
     expect(get(old, 'agent-keys')).toMatchObject({ state: 'unverified', unverified: 'not_checked' });
     expect(repo(old).status).toBe('unknown');
+  });
+
+  it('never asks for an Anthropic key, or a job image, just because subscription routing could not be read', async () => {
+    const r = await setup(world({ keys: [], native: new Error('DynamoDB throttled'), imageVersion: null })).service.readiness(caller, 55);
+    expect(get(r, 'subscription')).toMatchObject({ state: 'unverified', unverified: 'read_failed' });
+    expect(get(r, 'agent-keys')).toMatchObject({ state: 'unverified', unverified: 'read_failed', summary: expect.stringContaining('ANTHROPIC_API_KEY') });
+    expect(get(r, 'job-image')).toMatchObject({ state: 'unverified', unverified: 'read_failed' });
+    expect([...r.installation, ...repo(r).checks].filter((c) => c.required && c.state === 'failing')).toEqual([]);
+    expect(repo(r).status).toBe('unknown');
+    // With an image published it is still verified; any other missing key is still missing.
+    const image = await setup(world({ keys: [], native: new Error('x') })).service.readiness(caller, 55);
+    expect(get(image, 'job-image')).toMatchObject({ state: 'verified' });
+    const codex = await setup(world({ keys: [], native: new Error('x'), rules: { loop: true, repositories: { 'acme/web': rule({ keys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] }) } } })).service.readiness(caller, 55);
+    expect(get(codex, 'agent-keys')).toMatchObject({ state: 'failing', summary: expect.stringMatching(/^CODEX_API_KEY is needed/) });
+  });
+
+  it('tells an unreadable kill switch from an operator pause', async () => {
+    const unreadable = createKillSwitch({ read: async () => { throw new Error('AccessDenied'); }, log: () => {} });
+    expect(await unreadable.engaged()).toBe(true); // dispatch still fails closed
+    const r = await setup(world(), { killSwitch: unreadable }).service.readiness(caller, 55);
+    expect(get(r, 'kill-switch')).toMatchObject({ state: 'unverified', unverified: 'read_failed' });
+    expect(get(r, 'kill-switch')!.summary).not.toMatch(/operator has paused/);
+    expect(repo(r).status).toBe('unknown');
+    const on = await setup(world(), { killSwitch: createKillSwitch({ read: async () => 'on' }) }).service.readiness(caller, 55);
+    expect(get(on, 'kill-switch')).toMatchObject({ state: 'failing', problem: 'paused' });
+  });
+
+  it('does not call a repository unreachable when GitHub listed only part of them', async () => {
+    const r = await setup(world({ repositories: [], truncated: true })).service.readiness(caller, 55);
+    expect(get(r, 'repository-access')).toMatchObject({ state: 'unverified', unverified: 'read_failed' });
+    expect(repo(r).status).toBe('unknown');
+  });
+
+  it('runs one assessment for concurrent misses of one installation', async () => {
+    const { service, calls } = setup(world());
+    const [a, b, c] = await Promise.all([service.readiness(caller, 55), service.readiness(caller, 55), service.readiness(caller, 55, { refresh: true })]);
+    expect(calls.filter((n) => n === 'installation')).toHaveLength(1);
+    expect(a.checkedAt).toBe(b.checkedAt);
+    expect(c.checkedAt).toBe(a.checkedAt);
   });
 
   it('leaves a read that takes too long unverified instead of holding the page', async () => {

@@ -107,7 +107,8 @@ export interface GitHubApi {
   ): Promise<{ token: string; expiresAt: number; permissions?: Record<string, string> }>;
   /** The App's bot user (`<slug>[bot]`), read with any token. */
   getBotUser(token: string, slug: string): Promise<GitHubUser>;
-  listInstallationRepositories(installationToken: string): Promise<GitHubRepository[]>;
+  /** `truncated`: GitHub had more than the pages read, so a repository missing here may still be reachable. */
+  listInstallationRepositories(installationToken: string): Promise<GitHubRepository[] & { truncated?: true }>;
   issueState?(installationToken: string, repository: string, issue: number): Promise<{ open: boolean; labels: string[]; pullRequest?: true }>;
   /** A pull request's state and head (GET /repos/{owner}/{repo}/pulls/{n}). For the workflow reconciler. */
   pullRequestHead?(installationToken: string, repository: string, pullRequest: number): Promise<PullRequestHead>;
@@ -315,7 +316,7 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
     },
 
     async listInstallationRepositories(token) {
-      const repos: GitHubRepository[] = [];
+      const repos: GitHubRepository[] & { truncated?: true } = [];
       for (let page = 1; page <= MAX_PAGES; page++) {
         const out = await json<{ repositories?: Json[] }>(
           await call(`/installation/repositories?per_page=100&page=${page}`, token),
@@ -331,6 +332,7 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
           })),
         );
         if (batch.length < 100) break;
+        if (page === MAX_PAGES) repos.truncated = true;
       }
       return repos;
     },
