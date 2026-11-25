@@ -107,7 +107,17 @@ goes a `PAUSELOG#<repo>#<job>#<at>` audit record (resumed when and by whom, also
 TTL). A pause not yet marked confirmed is resumed only when its job record is gone, since a
 stopped job past its record's lifetime cannot still be running; while that record exists
 and is unconfirmed, the answer is `stop_pending`. The job's records, where they still exist,
-are marked resumed as well. A pause is never expired on its own. It permits
+are marked resumed as well, the summary even once META is gone (the pause holds the job's
+creation time); that projection is best effort, and the `PAUSELOG` record is authoritative.
+A pause is never expired on its own.
+
+**Found after everything else is gone.** The pause also records its repository, issue and pull
+request. The Workflows list includes every pause no kept workflow covers (the workflow record
+lasts 90 days after its last change), as a blocked `workflow_paused` workflow built from the
+pause alone, and its page shows the pause and the resume action. The view reports the subject
+it found the pause on (the issue, or a pull request of the workflow), and the resume names that
+subject with the pause's job and time (`{ jobId, at, subject }`), so what is shown is what is
+lifted. It permits
 future GitHub events and leaves this attempt stopped. It does not replay work,
 reevaluate the same PR head immediately, reopen a closed PR, or implement #135's
 checkpoint-aware resume. Existing **Retry job**, where supported, explicitly launches

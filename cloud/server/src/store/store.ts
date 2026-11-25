@@ -439,7 +439,27 @@ export interface WorkflowPause {
   subjects?: number[];
   /** When the stopped job's execution was confirmed ended. */
   confirmedAt?: number;
+  /** What the stop was of (OWNER/REPO, its issue and pull request), so the pause can be shown after every other record of it is gone. */
+  repository?: string;
+  issue?: number;
+  pullRequest?: number;
+  /** The stopped job's creation time: where its summary is, to mark it resumed while it exists. */
+  jobCreatedAt?: string;
 }
+
+/** What a stop's pause records of its job, so it can be shown and resumed without the job's records. */
+export const pausedOf = (job: Pick<Job, 'repository' | 'issue' | 'pullRequest' | 'workflowIssue' | 'createdAt'>): Pick<WorkflowPause, 'repository' | 'issue' | 'pullRequest' | 'jobCreatedAt'> => {
+  const issue = job.workflowIssue ?? job.issue;
+  return {
+    repository: job.repository,
+    ...(issue !== undefined ? { issue } : {}),
+    ...(job.pullRequest !== undefined ? { pullRequest: job.pullRequest } : {}),
+    jobCreatedAt: job.createdAt,
+  };
+};
+
+/** A pause as listed: where it is held. */
+export type HeldPause = WorkflowPause & { repositoryId: number; subject: number };
 
 export interface Member {
   installationId: number;
@@ -677,6 +697,8 @@ export interface Store {
   requestJobStop(job: Job, stop: JobStop, subjects: number[]): Promise<Job | null>;
   recordJobStop(job: Job, progress: Pick<JobStop, 'confirmedAt' | 'error' | 'reconnectRequired' | 'executionMicrovmId'>): Promise<void>;
   getWorkflowPause(installationId: number, repositoryId: number, subject: number): Promise<WorkflowPause | null>;
+  /** The tenant's pauses (one per subject held), at most `limit`: how a pause is found once its job and workflow records are gone. */
+  listWorkflowPauses(installationId: number, limit: number): Promise<HeldPause[]>;
   /** Records on each pause of the job that its execution has ended. Only a pause by this job changes. */
   confirmWorkflowPause(job: Pick<Job, 'jobId' | 'installationId' | 'repositoryId'>, subjects: number[], confirmedAt: number): Promise<void>;
   /**
@@ -685,7 +707,7 @@ export interface Store {
    * stopped job's records, where they still exist, are marked resumed afterwards. Needs no job
    * record: a pause outlives them.
    */
-  resumeWorkflowPause(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at'>, subjects: number[], by: string, at: number): Promise<boolean>;
+  resumeWorkflowPause(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at' | 'jobCreatedAt'>, subjects: number[], by: string, at: number): Promise<boolean>;
   /** The resume audit of a pause, if it was resumed. */
   getPauseResume(installationId: number, repositoryId: number, pause: Pick<WorkflowPause, 'jobId' | 'at'>): Promise<{ resumedAt: number; resumedBy: string; subjects: number[] } | null>;
   /**
@@ -1022,7 +1044,7 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       const summary = summaries.get(job.jobId);
       if (summary) summaries.set(job.jobId, { ...summary, stop: { ...stop } });
       const all = [...new Set(subjects)];
-      for (const subject of all) pauses.set(`${job.installationId}/${job.repositoryId}/${subject}`, { jobId: job.jobId, at: stop.requestedAt, by: stop.by, reason: stop.reason, subjects: all });
+      for (const subject of all) pauses.set(`${job.installationId}/${job.repositoryId}/${subject}`, { jobId: job.jobId, at: stop.requestedAt, by: stop.by, reason: stop.reason, subjects: all, ...pausedOf(job) });
       return { ...next };
     },
     async recordJobStop(job, progress) {
@@ -1035,6 +1057,12 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     },
     async getWorkflowPause(id, repo, subject) {
       return pauses.get(`${id}/${repo}/${subject}`) ?? null;
+    },
+    async listWorkflowPauses(id, limit) {
+      return [...pauses.entries()]
+        .filter(([k]) => k.startsWith(`${id}/`))
+        .map(([k, p]) => ({ ...p, repositoryId: Number(k.split('/')[1]), subject: Number(k.split('/')[2]) }))
+        .slice(0, limit);
     },
     async confirmWorkflowPause(job, subjects, confirmedAt) {
       for (const n of new Set(subjects)) {
@@ -1050,13 +1078,13 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
       for (const key of keys) pauses.delete(key);
       const audit = `${id}/${repo}/${pause.jobId}/${pause.at}`;
       if (!resumes.has(audit)) resumes.set(audit, { resumedAt: at, resumedBy: by, subjects: [...new Set(subjects)] });
-      const current = jobs.get(pause.jobId);
-      if (current?.stop && current.installationId === id) {
-        const stop = { ...current.stop, resumedAt: current.stop.resumedAt ?? at, resumedBy: current.stop.resumedBy ?? by };
-        jobs.set(pause.jobId, { ...current, stop });
-        const summary = summaries.get(pause.jobId);
-        if (summary) summaries.set(pause.jobId, { ...summary, stop });
-      }
+      const mark = <T extends { stop?: Job['stop']; installationId: number }>(r: T | undefined): T | undefined =>
+        r?.stop && r.installationId === id ? { ...r, stop: { ...r.stop, resumedAt: r.stop.resumedAt ?? at, resumedBy: r.stop.resumedBy ?? by } } : undefined;
+      // Each of the job's records that is still kept, on its own: either may have expired.
+      const job = mark(jobs.get(pause.jobId));
+      if (job) jobs.set(pause.jobId, job);
+      const summary = mark(summaries.get(pause.jobId));
+      if (summary) summaries.set(pause.jobId, summary);
       return true;
     },
     async getPauseResume(id, repo, pause) {

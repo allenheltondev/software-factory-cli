@@ -9,6 +9,9 @@ import { jobResult } from '../jobs/status.js';
 import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
 import { expireResults } from './results-retention.js';
 import { createS3LogReader } from './s3-logs.js';
+import { createWorkflowRecorder } from '../workflows/recorder.js';
+import { createMemoryWorkflowStore } from '../workflows/store.js';
+import { createWorkflowService } from './workflow-service.js';
 import { ACTIVITY_SAMPLE, createStatusService, LOG_TAIL_BYTES, missingPermissions, type LogReader, type StatusServiceDeps } from './status-service.js';
 
 const caller = { sub: 'u1' } as Caller;
@@ -180,6 +183,45 @@ describe('status and diagnostics (#71)', () => {
       // The newer stop took #12 only; resuming the old pause through #30 fails as a whole too.
       expect(await s.post('55/workflows/9-i30/resume', { jobId: j.jobId, at: 1_000 })).toMatchObject({ status: 409, body: { error: 'pause_changed' } });
       expect(await s.store.getWorkflowPause(55, 9, 30)).toMatchObject({ jobId: j.jobId });
+    });
+
+    const workflowsOf = (s: Awaited<ReturnType<typeof setup>>, wf = createMemoryWorkflowStore()) =>
+      createWorkflowService({ store: wf, pauses: s.store, github: { member: async () => ({ summary: { role: 'owner' } }) as never } });
+
+    it('finds, opens and resumes a pause whose job and workflow records have all expired', async () => {
+      const s = await setup(); const j = await stopped(s); expire(s.store, 'both', j.jobId);
+      // No workflow record either (kept 90 days after its last change): only the pause is left.
+      const views = workflowsOf(s);
+      const { workflows } = await views.list({ sub: 'u1' } as Caller, 55);
+      expect(workflows).toEqual([expect.objectContaining({ workflowId: '9-i12', repository: 'acme/web', issue: 12, status: 'blocked', reason: 'workflow_paused', lastJobId: j.jobId })]);
+      const one = await views.get({ sub: 'u1' } as Caller, 55, '9-i12');
+      expect(one.workflow.gaps).toEqual([expect.stringMatching(/Only its pause is kept/)]);
+      expect(one.pause).toMatchObject({ jobId: j.jobId, at: 1_000, subject: 12, canResume: true });
+      // Resumed exactly as the console does it.
+      expect(await s.post('55/workflows/9-i12/resume', { jobId: one.pause!.jobId, at: one.pause!.at, subject: one.pause!.subject })).toMatchObject({ status: 200 });
+      expect((await views.list({ sub: 'u1' } as Caller, 55)).workflows).toEqual([]);
+      await expect(views.get({ sub: 'u1' } as Caller, 55, '9-i12')).rejects.toMatchObject({ status: 404 });
+      expect(await s.store.getWorkflowPause(55, 9, 30)).toBeNull();
+    });
+
+    it('resumes a pause the view found on the workflow\'s pull request, not only on its issue', async () => {
+      const s = await setup();
+      const wf = createMemoryWorkflowStore(); const recorder = createWorkflowRecorder({ store: wf, log: () => {} });
+      const opener = { jobId: 'job_status0002', installationId: 55, repository: 'acme/web', repositoryId: 9, issue: 12, eventName: 'issues', deliveryId: 'd-2' };
+      await recorder.started(opener); await recorder.finished(opener, 'succeeded', { prNumber: 30, loop: { rounds: 0, reviews: 1, stage: 'changes-requested' } });
+      // A review job on PR #30 was stopped: its pause holds #30 only.
+      const review = job({ jobId: 'job_status0003', deliveryId: 'd-3', issue: undefined, pullRequest: 30, eventName: 'pull_request_review' }); await s.store.putJob(review);
+      await s.store.requestJobStop(review, { requestedAt: 3_000, by: 'Pat', reason: 'stop' }, [30]);
+      await s.store.finishJob(review.jobId, 'canceled'); await s.store.recordJobStop(review, { confirmedAt: 4_000 });
+      const one = await workflowsOf(s, wf).get({ sub: 'u1' } as Caller, 55, '9-i12');
+      expect(one.pause).toMatchObject({ jobId: review.jobId, subject: 30 });
+      // The issue itself holds no pause: naming only the workflow would not find this one.
+      expect(await s.post('55/workflows/9-i12/resume')).toMatchObject({ status: 404 });
+      expect(await s.post('55/workflows/9-i12/resume', { jobId: one.pause!.jobId, at: one.pause!.at, subject: one.pause!.subject })).toMatchObject({ status: 200 });
+      expect(await s.store.getWorkflowPause(55, 9, 30)).toBeNull();
+      expect((await workflowsOf(s, wf).get({ sub: 'u1' } as Caller, 55, '9-i12')).pause).toBeUndefined();
+      // A subject without the pause it names is refused.
+      expect(await s.post('55/workflows/9-i12/resume', { subject: 30 })).toMatchObject({ status: 400 });
     });
 
     it('is for owners, takes only the pause it names, and says when nothing is paused', async () => {

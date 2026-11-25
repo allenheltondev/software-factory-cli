@@ -71,11 +71,11 @@ describe('the workflow views', () => {
     await recorder.started(job);
     await recorder.finished(job, 'canceled', { prNumber: 12 });
     const pause = { jobId: 'job_issue0001', at: 1_000, by: 'pat', subjects: [7, 12], confirmedAt: 2_000 };
-    const pauses = { getWorkflowPause: async (_i: number, _r: number, n: number) => (n === 12 ? pause : null) };
+    const pauses = { getWorkflowPause: async (_i: number, _r: number, n: number) => (n === 12 ? pause : null), listWorkflowPauses: async () => [] };
     const as = (role: string) => createWorkflowService({ store, pauses, github: { member: async () => ({ summary: { role } }) as never } });
-    expect((await as('owner').get(caller, 55, '99-i7')).pause).toEqual({ ...pause, canResume: true });
-    expect((await as('editor').get(caller, 55, '99-i7')).pause).toEqual({ ...pause, canResume: false });
-    const none = createWorkflowService({ store, pauses: { getWorkflowPause: async () => null }, github: { member: async () => ({ summary: { role: 'owner' } }) as never } });
+    expect((await as('owner').get(caller, 55, '99-i7')).pause).toEqual({ ...pause, subject: 12, canResume: true });
+    expect((await as('editor').get(caller, 55, '99-i7')).pause).toEqual({ ...pause, subject: 12, canResume: false });
+    const none = createWorkflowService({ store, pauses: { getWorkflowPause: async () => null, listWorkflowPauses: async () => [] }, github: { member: async () => ({ summary: { role: 'owner' } }) as never } });
     expect(await none.get(caller, 55, '99-i7')).not.toHaveProperty('pause');
   });
 });

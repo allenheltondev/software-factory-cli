@@ -430,10 +430,12 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
       const id = positive(c.req.param('id'));
       const input: unknown = await c.req.json().catch(() => ({}));
       // Optional: the pause the owner saw (its job and time), so a newer stop is never lifted.
-      const ok = input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input).every((k) => k === 'jobId' || k === 'at');
-      const { jobId, at } = (ok ? input : {}) as { jobId?: unknown; at?: unknown };
-      if (!ok || (jobId === undefined) !== (at === undefined) || (jobId !== undefined && (typeof jobId !== 'string' || !Number.isSafeInteger(at)))) return c.json({ error: 'bad_request' }, 400);
-      return id ? c.json(await status.resumeWorkflow(c.get('caller'), id, c.req.param('workflowId'), jobId !== undefined ? { jobId: jobId as string, at: at as number } : undefined)) : c.json({ error: 'not_found' }, 404);
+      // `subject`: the issue or pull request number the pause was shown on (with the pause it names).
+      const ok = input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input).every((k) => k === 'jobId' || k === 'at' || k === 'subject');
+      const { jobId, at, subject } = (ok ? input : {}) as { jobId?: unknown; at?: unknown; subject?: unknown };
+      if (!ok || (jobId === undefined) !== (at === undefined) || (jobId !== undefined && (typeof jobId !== 'string' || !Number.isSafeInteger(at)))
+        || (subject !== undefined && (jobId === undefined || !Number.isSafeInteger(subject) || (subject as number) <= 0))) return c.json({ error: 'bad_request' }, 400);
+      return id ? c.json(await status.resumeWorkflow(c.get('caller'), id, c.req.param('workflowId'), jobId !== undefined ? { jobId: jobId as string, at: at as number, ...(subject !== undefined ? { subject: subject as number } : {}) } : undefined)) : c.json({ error: 'not_found' }, 404);
     });
     app.get('/v1/installations/:id/jobs/:jobId/logs/:name', async (c) => {
       const id = positive(c.req.param('id'));

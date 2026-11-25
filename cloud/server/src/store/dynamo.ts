@@ -29,6 +29,7 @@ import type {
   JobSummary,
   JobStop,
   WorkflowPause,
+  HeldPause,
   Member,
   OAuthState,
   Quotas,
@@ -37,7 +38,7 @@ import type {
   Tenant,
   TenantLimits,
 } from './store.js';
-import { finishFields, isFailure, NativeEnqueueRejectedError } from './store.js';
+import { finishFields, isFailure, NativeEnqueueRejectedError, pausedOf } from './store.js';
 
 const DAY_SECONDS = 24 * 3600;
 const LIMIT_NAMES = ['concurrentJobs', 'jobsPerDay', 'microvmMinutesPerMonth'] as const;
@@ -156,6 +157,20 @@ function toJobSummary(i: Record<string, unknown>): JobSummary {
     ...(typeof i.microvmId === 'string' ? { microvmId: i.microvmId } : {}),
     ...(Object.keys(detail).length ? { detail } : {}),
   };
+}
+
+/** A PAUSE record as read: only what it holds, typed. */
+function pauseItem(i: Record<string, unknown>): WorkflowPause {
+  const n = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) ? v : undefined);
+  const out: WorkflowPause = { jobId: String(i.jobId), at: Number(i.at), by: String(i.by) };
+  if (typeof i.reason === 'string') out.reason = i.reason;
+  if (Array.isArray(i.subjects)) out.subjects = i.subjects.map(Number).filter(Number.isSafeInteger);
+  if (n(i.confirmedAt) !== undefined) out.confirmedAt = n(i.confirmedAt)!;
+  if (typeof i.repository === 'string') out.repository = i.repository;
+  if (n(i.issue) !== undefined) out.issue = n(i.issue)!;
+  if (n(i.pullRequest) !== undefined) out.pullRequest = n(i.pullRequest)!;
+  if (typeof i.jobCreatedAt === 'string') out.jobCreatedAt = i.jobCreatedAt;
+  return out;
 }
 
 export function createDynamoStore(tableName: string, client = DynamoDBDocumentClient.from(new DynamoDBClient({}))): Store {
@@ -1477,7 +1492,7 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
             ConditionExpression: 'attribute_exists(pk)', ExpressionAttributeNames: { '#stop': 'stop' }, ExpressionAttributeValues: { ':stop': stop } } },
           // No TTL: a pause lasts until an owner resumes it, and holds what resuming needs.
           ...[...new Set(subjects)].map((subject) => ({ Put: { TableName: T,
-            Item: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${subject}`, jobId: job.jobId, at: stop.requestedAt, by: stop.by, reason: stop.reason, subjects: [...new Set(subjects)] } } })),
+            Item: { pk: `TENANT#${job.installationId}`, sk: `PAUSE#${job.repositoryId}#${subject}`, jobId: job.jobId, at: stop.requestedAt, by: stop.by, reason: stop.reason, subjects: [...new Set(subjects)], ...pausedOf(job) } } })),
         ] }));
       } catch (err) {
         if (!(err instanceof TransactionCanceledException) || !cancelledAt(err, 0)) throw err;
@@ -1501,14 +1516,21 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
     },
     async getWorkflowPause(id, repo, subject) {
       const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: `PAUSE#${repo}#${subject}` }, ConsistentRead: true }));
-      if (!out.Item) return null;
-      const i = out.Item;
-      return {
-        jobId: String(i.jobId), at: Number(i.at), by: String(i.by),
-        ...(typeof i.reason === 'string' ? { reason: i.reason } : {}),
-        ...(Array.isArray(i.subjects) ? { subjects: i.subjects.map(Number).filter(Number.isSafeInteger) } : {}),
-        ...(typeof i.confirmedAt === 'number' ? { confirmedAt: i.confirmedAt } : {}),
-      } satisfies WorkflowPause;
+      return out.Item ? pauseItem(out.Item) : null;
+    },
+    async listWorkflowPauses(id, limit) {
+      const out: HeldPause[] = [];
+      let start: Record<string, unknown> | undefined;
+      do {
+        const page = await client.send(new QueryCommand({ TableName: T, KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+          ExpressionAttributeValues: { ':pk': `TENANT#${id}`, ':prefix': 'PAUSE#' }, ...(start ? { ExclusiveStartKey: start } : {}) }));
+        for (const i of page.Items ?? []) {
+          const [, repo, subject] = String(i.sk).split('#');
+          if (Number.isSafeInteger(Number(repo)) && Number.isSafeInteger(Number(subject))) out.push({ ...pauseItem(i), repositoryId: Number(repo), subject: Number(subject) });
+        }
+        start = page.LastEvaluatedKey;
+      } while (start && out.length < limit);
+      return out.slice(0, limit);
     },
     async confirmWorkflowPause(job, subjects, confirmedAt) {
       for (const n of new Set(subjects)) {
@@ -1550,17 +1572,27 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
           throw again;
         }
       }
-      // The job's own records, where they still exist, say so too. Gone (expired) is fine.
-      const job = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${pause.jobId}`, sk: 'META' }, ConsistentRead: true }));
-      const keys = [...(job.Item && job.Item.installationId === id ? [{ pk: `JOB#${pause.jobId}`, sk: 'META' }, jobSummaryKey(job.Item as Job)] : [])];
-      for (const Key of keys) {
-        try {
-          await client.send(new UpdateCommand({ TableName: T, Key,
-            UpdateExpression: 'SET #stop.#at = if_not_exists(#stop.#at, :at), #stop.#by = if_not_exists(#stop.#by, :by)', ConditionExpression: 'attribute_exists(#stop)',
-            ExpressionAttributeNames: { '#stop': 'stop', '#at': 'resumedAt', '#by': 'resumedBy' }, ExpressionAttributeValues: { ':at': at, ':by': by } }));
-        } catch (err) {
-          if (!(err instanceof ConditionalCheckFailedException)) throw err;
+      // The job's own records, where they still exist, say so too: a projection of the durable
+      // audit, best effort, since the resume has happened. Its summary is found through the pause
+      // (it holds the job's creation time) even once META is gone; either may have expired.
+      try {
+        const job = await client.send(new GetCommand({ TableName: T, Key: { pk: `JOB#${pause.jobId}`, sk: 'META' }, ConsistentRead: true }));
+        const createdAt = job.Item?.installationId === id ? String(job.Item.createdAt) : pause.jobCreatedAt;
+        const keys = [
+          ...(job.Item?.installationId === id ? [{ pk: `JOB#${pause.jobId}`, sk: 'META' }] : []),
+          ...(createdAt ? [jobSummaryKey({ installationId: id, createdAt, jobId: pause.jobId })] : []),
+        ];
+        for (const Key of keys) {
+          try {
+            await client.send(new UpdateCommand({ TableName: T, Key,
+              UpdateExpression: 'SET #stop.#at = if_not_exists(#stop.#at, :at), #stop.#by = if_not_exists(#stop.#by, :by)', ConditionExpression: 'attribute_exists(#stop)',
+              ExpressionAttributeNames: { '#stop': 'stop', '#at': 'resumedAt', '#by': 'resumedBy' }, ExpressionAttributeValues: { ':at': at, ':by': by } }));
+          } catch (err) {
+            if (!(err instanceof ConditionalCheckFailedException)) throw err;
+          }
         }
+      } catch (err) {
+        console.log(JSON.stringify({ installationId: id, jobId: pause.jobId, warning: 'workflow resumed; marking the job record resumed failed (the pause audit is authoritative)', name: (err as Error)?.name }));
       }
       return true;
     },

@@ -313,6 +313,8 @@ export interface WorkflowPause {
   reason?: string;
   subjects?: number[];
   confirmedAt?: number;
+  /** The issue or pull request number the pause was found on: what resuming it names. */
+  subject: number;
   canResume: boolean;
 }
 
@@ -840,8 +842,8 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     workflow: (installationId: number, workflowId: string) =>
       request<{ workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals; pause?: WorkflowPause }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}`),
     /** Lift exactly this pause (the one shown), even after the stopped job's records expired; a newer stop answers 409. */
-    resumeWorkflow: (installationId: number, workflowId: string, pause: Pick<WorkflowPause, 'jobId' | 'at'>) =>
-      request<{ resumed: true }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}/resume`, { method: 'POST', body: JSON.stringify({ jobId: pause.jobId, at: pause.at }) }),
+    resumeWorkflow: (installationId: number, workflowId: string, pause: Pick<WorkflowPause, 'jobId' | 'at' | 'subject'>) =>
+      request<{ resumed: true }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}/resume`, { method: 'POST', body: JSON.stringify({ jobId: pause.jobId, at: pause.at, subject: pause.subject }) }),
     /** The workflow a job belongs to; null when none was recorded (a job from before workflows). */
     jobWorkflow: (installationId: number, jobId: string) => request<{ workflowId: string | null }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}/workflow`),
     /** Runs a job that did not finish its work again, as a new job (its id). Throws ApiError: `not_retryable`, `already_retried`, `throttled`, `event_gone`, ... (409, 410, 429). */

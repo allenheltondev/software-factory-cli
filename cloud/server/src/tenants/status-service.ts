@@ -457,12 +457,15 @@ export function createStatusService({ store, github, agentKeys, readLog, request
      * only way once the stopped job's records have expired. `expected` is the pause the owner saw,
      * so a newer stop is never lifted by mistake.
      */
-    async resumeWorkflow(caller: Caller, installationId: number, workflowId: string, expected?: { jobId: string; at: number }): Promise<{ resumed: true }> {
+    async resumeWorkflow(caller: Caller, installationId: number, workflowId: string, expected?: { jobId: string; at: number; subject?: number }): Promise<{ resumed: true }> {
       const member = await github.member(caller, installationId);
       if (member.summary.role !== 'owner') throw new FlowError('not_authorized', 403, 'Only an installation owner may resume stopped automation');
       const m = /^([0-9]{1,20})-[ip]([0-9]{1,10})$/.exec(workflowId);
       if (!m) throw new FlowError('not_found', 404, 'There is no such workflow in this installation');
-      resumed(await resumeWorkflowPause(store, { installationId, repositoryId: Number(m[1]), subject: Number(m[2]), ...(expected ? { expected } : {}), by: member.githubLogin ?? caller.sub, at: now() }));
+      // The subject the pause was shown on (the workflow's pull request, say), or the workflow's own.
+      // Only exactly the pause named is lifted, wherever it is read: a newer one answers 409.
+      const subject = expected?.subject ?? Number(m[2]);
+      resumed(await resumeWorkflowPause(store, { installationId, repositoryId: Number(m[1]), subject, ...(expected ? { expected: { jobId: expected.jobId, at: expected.at } } : {}), by: member.githubLogin ?? caller.sub, at: now() }));
       return { resumed: true };
     },
 

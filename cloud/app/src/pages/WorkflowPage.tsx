@@ -92,7 +92,7 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
               )}
             </div>
           </PageHero>
-          {load.workflow.reconstructed && (
+          {(load.workflow.reconstructed || (load.workflow.gaps?.length ?? 0) > 0) && (
             <Alert variant="info" data-testid="workflow-rebuilt">
               {(load.workflow.gaps ?? ['Rebuilt from job records.']).join(' ')}
             </Alert>

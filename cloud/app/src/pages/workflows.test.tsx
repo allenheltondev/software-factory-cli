@@ -78,7 +78,7 @@ describe('workflows in the console', () => {
 
   it('shows a pause that outlives its job, and an owner resumes exactly that pause from here', async () => {
     const user = userEvent.setup();
-    const pause = { jobId: 'job_abcdefgh02', at: Date.now() - 9 * 86_400_000, by: 'pat', reason: 'off course', canResume: true };
+    const pause = { jobId: 'job_abcdefgh02', at: Date.now() - 9 * 86_400_000, by: 'pat', reason: 'off course', subject: 12, canResume: true };
     const resumeWorkflow = vi.fn().mockResolvedValue({ resumed: true });
     const api = fakeApi({ workflow: vi.fn().mockResolvedValueOnce({ workflow: workflow(), events, pause }).mockResolvedValue({ workflow: workflow(), events }), resumeWorkflow });
     render(
@@ -98,7 +98,7 @@ describe('workflows in the console', () => {
   });
 
   it('shows a pause without the resume action to someone who may not resume it, and says why a resume failed', async () => {
-    const pause = { jobId: 'job_abcdefgh02', at: Date.now(), by: 'pat', canResume: false };
+    const pause = { jobId: 'job_abcdefgh02', at: Date.now(), by: 'pat', subject: 7, canResume: false };
     const view = fakeApi({ workflow: vi.fn().mockResolvedValue({ workflow: workflow(), events, pause }), resumeWorkflow: vi.fn() });
     const { unmount } = render(
       <MemoryRouter initialEntries={['/installations/55/workflows/99-i7']}>

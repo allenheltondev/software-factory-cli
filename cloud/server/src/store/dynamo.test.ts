@@ -813,13 +813,24 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     await store.requestJobStop(job, stop, [12, 13]);
     // No TTL on the pause; it names every subject it holds.
     expect(table.items.get('TENANT#55|PAUSE#9#12')?.ttl).toBeUndefined();
-    expect(await store.getWorkflowPause(55, 9, 13)).toEqual({ jobId: job.jobId, at: stop.requestedAt, by: 'pat', reason: 'off course', subjects: [12, 13] });
+    expect(await store.getWorkflowPause(55, 9, 13)).toEqual({ jobId: job.jobId, at: stop.requestedAt, by: 'pat', reason: 'off course', subjects: [12, 13], repository: 'acme/web', issue: 12, jobCreatedAt: job.createdAt });
+    // Listed per subject, without PAUSELOG records.
+    expect((await store.listWorkflowPauses(55, 10)).map((p) => [p.repositoryId, p.subject, p.jobId])).toEqual([[9, 12, job.jobId], [9, 13, job.jobId]]);
     await store.confirmWorkflowPause(job, [12, 13], stop.requestedAt + 5);
     await store.confirmWorkflowPause({ ...job, jobId: 'job_other0001' }, [12], stop.requestedAt + 9);
     expect((await store.getWorkflowPause(55, 9, 12))?.confirmedAt).toBe(stop.requestedAt + 5);
 
+    // META expires first: its summary is still marked resumed, found through the pause.
+    const summaryKey = [...table.items.keys()].find((k) => k.endsWith(`#${job.jobId}`))!;
+    table.items.delete(`JOB#${job.jobId}|META`);
+    const other = { ...job, jobId: 'job_stop0003', deliveryId: 'd-stop3', issue: 40 };
+    await store.putJob(other); await store.requestJobStop(other, { ...stop, requestedAt: stop.requestedAt + 1 }, [40]);
+    table.items.delete(`JOB#${other.jobId}|META`);
+    expect(await store.resumeWorkflowPause(55, 9, (await store.getWorkflowPause(55, 9, 40))!, [40], 'sam', stop.requestedAt + 15)).toBe(true);
+    expect((table.items.get([...table.items.keys()].find((k) => k.endsWith(`#${other.jobId}`))!)?.stop as { resumedBy?: string })?.resumedBy).toBe('sam');
+    expect(table.items.has(`JOB#${other.jobId}|META`)).toBe(false);
     // Both of the job's records expire.
-    for (const k of [...table.items.keys()]) if (k.startsWith(`JOB#${job.jobId}|`) || k.endsWith(`#${job.jobId}`)) table.items.delete(k);
+    table.items.delete(summaryKey);
     expect(await store.getJob(job.jobId)).toBeNull();
     expect(await store.getJobSummary(55, job.jobId)).toBeNull();
 
