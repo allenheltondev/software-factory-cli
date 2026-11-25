@@ -44,6 +44,8 @@ export const CEILINGS = {
   /** One verify command. */
   verifyTimeoutMinutes: 30,
   autoMergeWaitMinutes: 120,
+  /** The CI step's wait for pending checks on one head. */
+  ciWaitMinutes: 120,
   maxRevisions: 5,
 } as const;
 
@@ -205,6 +207,9 @@ export function compileTenantConfig(submission: TenantSubmission, platform: Plat
       if (publish !== 'draft-pr' && publish !== 'pr') err(`${path}.publish`, 'must be draft-pr or pr on Updraft Cloud');
       if (typeof repo.autoMergeWaitMinutes === 'number' && repo.autoMergeWaitMinutes > CEILINGS.autoMergeWaitMinutes) {
         err(`${path}.autoMergeWaitMinutes`, `at most ${CEILINGS.autoMergeWaitMinutes} minutes on Updraft Cloud`);
+      }
+      if (isObject(repo.ciFix) && typeof repo.ciFix.waitMinutes === 'number' && repo.ciFix.waitMinutes > CEILINGS.ciWaitMinutes) {
+        err(`${path}.ciFix.waitMinutes`, `at most ${CEILINGS.ciWaitMinutes} minutes on Updraft Cloud`);
       }
       if (typeof repo.maxRevisions === 'number' && repo.maxRevisions > CEILINGS.maxRevisions) err(`${path}.maxRevisions`, `at most ${CEILINGS.maxRevisions} on Updraft Cloud`);
       if (Array.isArray(repo.workflows)) {

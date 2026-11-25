@@ -4,7 +4,7 @@ import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepos
 import { KiroNotEnabled } from '../../components/kiro';
 import { AGENT_GUIDES } from '../../lib/agentGuides';
 import { installationSettingsUrl } from '../../lib/diagnostics';
-import { AutoMerge } from './Editor';
+import { AutoMerge, CiRepair } from './Editor';
 import { Check, FieldError, ParsedText, PromptField } from './fields';
 import { InlineKey, type KeyApi } from './InlineKey';
 import { AGENT_LABEL, DEFAULT_OFFERED, issuesAt, KEY_FOR, newRepository, numberOrUndefined, parseLogins } from './model';
@@ -191,7 +191,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
               <section key={`${name}-${generation}`} className="flex flex-col gap-3 py-3" data-testid={`repo-${name}`} aria-label={name}>
                 <div className={repo ? 'grid gap-3 sm:grid-cols-[14rem_1fr_auto] sm:items-end' : 'flex'}>
                   <label className="flex items-center gap-2 font-medium sm:pb-2">
-                    <input type="checkbox" className="h-4 w-4 shrink-0" aria-label={`Work in ${name}`} checked={!!repo} onChange={(e) => setRepo(name, e.target.checked ? newRepository([wfName]) : null)} />
+                    <input type="checkbox" className="h-4 w-4 shrink-0" aria-label={`Work in ${name}`} checked={!!repo} onChange={(e) => setRepo(name, e.target.checked ? newRepository([wfName], w.review.enabled) : null)} />
                     {name}
                     {repo && !repo.enabled && <span className="text-sm font-normal text-muted-foreground">paused</span>}
                     {!reachable.has(name.toLowerCase()) && <span className="text-sm font-normal text-error">the App can no longer reach it</span>}
@@ -254,6 +254,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                         onChange={(allowedActors) => patchRepo(name, { allowedActors })}
                       />
                     )}
+                    <CiRepair name={name} repo={repo} reviewed={w.review.enabled} revised={w.revise.enabled} maxRevisions={w.revise.maxRevisions} errors={errors} ceiling={ceilings.ciWaitMinutes ?? ceilings.autoMergeWaitMinutes} patch={(p) => patchRepo(name, p)} />
                     <AutoMerge name={name} repo={repo} reviewed={w.review.enabled} errors={errors} ceiling={ceilings.autoMergeWaitMinutes} patch={(p) => patchRepo(name, p)} onAsk={() => onAskAutoMerge(name)} />
                   </div>
                 )}

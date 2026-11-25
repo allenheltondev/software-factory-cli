@@ -8,7 +8,8 @@ import { loadTokenFile } from '../../../../src/github/token-file-auth.js';
 import type { AppSettings } from '../github/settings.js';
 import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
 import { createReconciler } from '../jobs/reconcile.js';
-import { createBroker, hashToken, JOB_PERMISSIONS, jobPaths, jobSessionPolicy, SESSION_SECONDS } from './broker.js';
+import { createBroker, hashToken, JOB_PERMISSIONS, jobPaths, jobSessionPolicy, OPTIONAL_JOB_PERMISSIONS, SESSION_SECONDS } from './broker.js';
+import { GitHubError } from '../github/client.js';
 import { telemetryView } from '../tenants/telemetry-service.js';
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -335,6 +336,29 @@ describe('the job broker', () => {
     // The bot user is looked up once.
     await handle({ action: 'github-token', jobId: job.jobId, token });
     expect(github.getBotUser).toHaveBeenCalledOnce();
+  });
+
+  it('gives a CI fix Actions read for its logs, where the installation grants it, and no other job', async () => {
+    expect(OPTIONAL_JOB_PERMISSIONS).toEqual({ actions: 'read' });
+    job = { ...job, jobId: 'job_ci123456', eventName: 'check_suite' };
+    await store.putJob(job);
+    await handle({ action: 'start', jobId: job.jobId, token });
+    await handle({ action: 'github-token', jobId: job.jobId, token });
+    expect(github.createInstallationToken).toHaveBeenLastCalledWith(expect.any(String), 55, { repositoryIds: [99], permissions: { ...JOB_PERMISSIONS, actions: 'read' } });
+
+    // An installation that has not accepted Actions read: GitHub refuses the request (422), and
+    // the job gets the ordinary permissions; the fix reads annotations and summaries.
+    github.createInstallationToken.mockReset()
+      .mockRejectedValueOnce(new GitHubError(422, 'POST /app/installations/access_tokens failed (422)'))
+      .mockResolvedValueOnce({ token: 'ghs_plain', expiresAt: NOW + 3_600_000, permissions: JOB_PERMISSIONS });
+    const r = await handle({ action: 'github-token', jobId: job.jobId, token });
+    expect(r.ok && 'tokenFile' in r && r.tokenFile.token).toBe('ghs_plain');
+    expect(github.createInstallationToken).toHaveBeenLastCalledWith(expect.any(String), 55, { repositoryIds: [99], permissions: JOB_PERMISSIONS });
+
+    // Any other failure is not retried with less.
+    github.createInstallationToken.mockReset().mockRejectedValueOnce(new GitHubError(500, 'boom'));
+    await expect(handle({ action: 'github-token', jobId: job.jobId, token })).rejects.toThrow('boom');
+    expect(github.createInstallationToken).toHaveBeenCalledOnce();
   });
 
   it('reads the tenant strongly consistently, so a suspend that has committed stops the next request', async () => {

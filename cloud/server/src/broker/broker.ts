@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { NATIVE_SLOT_HOLD_UNTIL } from '../native/route.js';
-import type { GitHubApi } from '../github/client.js';
+import { GitHubError, type GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
@@ -59,6 +59,15 @@ export const JOB_PERMISSIONS: Record<string, string> = {
   checks: 'read',
   statuses: 'read',
 };
+
+/**
+ * Read-only extras a CI fix's token (a job a check suite started) asks for when the
+ * installation grants them: Actions read lets it read the failed job's log (docs/ci-fix.md).
+ * Other jobs never get it. An installation that has not accepted it
+ * yet still gets a token, with JOB_PERMISSIONS alone (GitHub refuses a request for more than
+ * the installation grants), and the fix works from annotations and summaries.
+ */
+export const OPTIONAL_JOB_PERMISSIONS: Record<string, string> = { actions: 'read' };
 
 /** Role chaining (the broker's own role assumes the data role) caps a session at an hour. */
 export const SESSION_SECONDS = 3600;
@@ -392,10 +401,16 @@ export function createBroker(deps: BrokerDeps) {
     // github-token: a token for this job's repository only, as the CLI reads it (token-file-auth.ts).
     const settings = await deps.loadSettings();
     if (!settings) return { ok: false, error: 'unavailable' };
-    const minted = await deps.github.createInstallationToken(appJwt(settings.appId, settings.privateKey, now()), job.installationId, {
-      repositoryIds: [job.repositoryId],
-      permissions: JOB_PERMISSIONS,
-    });
+    const jwt = appJwt(settings.appId, settings.privateKey, now());
+    const mint = (permissions: Record<string, string>) => deps.github.createInstallationToken(jwt, job.installationId, { repositoryIds: [job.repositoryId], permissions });
+    const minted =
+      job.eventName === 'check_suite'
+        ? await mint({ ...JOB_PERMISSIONS, ...OPTIONAL_JOB_PERMISSIONS }).catch((e: unknown) => {
+            // 422: the installation does not grant an optional permission. Anything else is real.
+            if (e instanceof GitHubError && e.status === 422) return mint(JOB_PERMISSIONS);
+            throw e;
+          })
+        : await mint(JOB_PERMISSIONS);
     let bot = bots.get(settings.slug);
     if (!bot) {
       bot = await deps.github.getBotUser(minted.token, settings.slug);

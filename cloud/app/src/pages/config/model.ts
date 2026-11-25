@@ -27,8 +27,13 @@ export function freeName(base: string, taken: Record<string, unknown>): string {
   for (let i = 2; ; i++) if (!Object.hasOwn(taken, `${stem}-${i}`)) return `${stem}-${i}`;
 }
 
-export function newRepository(workflows: string[]): ConsoleRepository {
-  return { enabled: true, workflows, publish: 'draft-pr', commentOnFailure: true, verify: [] };
+/**
+ * A repository just added. When its workflows review, CI repair starts on (the guided software
+ * factory: a failing check on a reviewed pull request is fixed, not left). A repository already
+ * configured keeps what it has: an explicit off stays off.
+ */
+export function newRepository(workflows: string[], reviewed = false): ConsoleRepository {
+  return { enabled: true, workflows, publish: 'draft-pr', commentOnFailure: true, verify: [], ...(reviewed ? { ci: {} } : {}) };
 }
 
 /** A new workflow: the first pool builds, a second one (when there is one) reviews, with the packaged prompts. */
@@ -81,6 +86,9 @@ export function workflowConflict(config: ConsoleConfig, repo: ConsoleRepository)
   if (first && other) return `${first[0]} and ${other[0]} review or revise pull requests differently; one repository's workflows must agree.`;
   return null;
 }
+
+/** Whether a repository's workflows revise pull requests (they agree on it). */
+export const revises = (config: ConsoleConfig, repo: ConsoleRepository) => repo.workflows.some((n) => config.workflows[n]?.revise.enabled);
 
 export const reviews = (config: ConsoleConfig, repo: ConsoleRepository) => repo.workflows.some((n) => config.workflows[n]?.review.enabled);
 

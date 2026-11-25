@@ -142,7 +142,10 @@ recording it finds the same revision again by its dedupe key.
 - **The self-hosted microVM stack** starts a microVM for `check_suite.completed` when
   `AcceptedEvents` includes `check_suite`.
 - **Updraft Cloud** starts a job for `check_suite.completed` on an Updraft pull request of a
-  repository with `ciFix` on (published config), whoever pushed the commit.
+  repository with `ciFix` on (published config), whoever pushed the commit. In the console it
+  is **Fix failing CI on pull requests the reviewer finds ready**, in a repository's settings
+  (simple and full editor). A repository added to a reviewing workflow starts with it on; one
+  configured before keeps its setting, so it stays off until it is ticked and published.
 
 A GitHub App needs **Checks: Read-only** and **Commit statuses: Read-only**, and **Actions:
 Read-only** for job logs (without it the revision gets the annotations only, and the
@@ -155,7 +158,8 @@ App. A fine-grained token needs the same three permissions.
 - A commit status event is matched to a pull request by its commit, which needs the state
   database; the Cloud and microVM launchers take `check_suite` only, so external CI that
   reports statuses alone is picked up there by the next event on the pull request.
-- Updraft Cloud job tokens are not yet issued with Actions: read, so hosted CI fixes get
-  annotations and summaries, without job logs.
+- An Updraft Cloud CI fix's token asks for Actions: read only where the installation grants
+  it; an installation that has not accepted that permission gets annotations and summaries,
+  without job logs. Other Cloud jobs never get Actions: read.
 - A head whose checks pass after its fix was queued (a flaky test re-run by a person) still
   runs that revision; one that finds nothing to change pushes nothing and says so.

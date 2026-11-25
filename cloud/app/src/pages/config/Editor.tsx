@@ -21,6 +21,7 @@ import {
   parseLogins,
   poolsOf,
   reviews,
+  revises,
   sectionOf,
   workflowConflict,
   type Section,
@@ -134,7 +135,7 @@ function RepositoriesSection({ config, onChange, view, errors, onAskAutoMerge, g
               <section key={`${name}-${generation}`} className="flex flex-col gap-4 rounded-lg border border-border p-4" data-testid={`repo-${name}`} aria-label={name}>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <label className="flex items-center gap-2 font-semibold">
-                    <input type="checkbox" aria-label={`Work in ${name}`} checked={on} onChange={(e) => setRepo(name, e.target.checked ? newRepository(workflowNames.slice(0, 1)) : null)} />
+                    <input type="checkbox" aria-label={`Work in ${name}`} checked={on} onChange={(e) => setRepo(name, e.target.checked ? newRepository(workflowNames.slice(0, 1), workflowNames.slice(0, 1).some((w) => config.workflows[w]?.review.enabled)) : null)} />
                     {name}
                     {repo && <StatusBadge tone={repo.enabled ? 'success' : 'warning'}>{repo.enabled ? 'On' : 'Paused'}</StatusBadge>}
                     {!reachable.has(name.toLowerCase()) && <StatusBadge tone="error">No access</StatusBadge>}
@@ -155,7 +156,7 @@ function RepositoriesSection({ config, onChange, view, errors, onAskAutoMerge, g
                           <Check
                             key={w}
                             checked={repo.workflows.includes(w)}
-                            onChange={(v) => patch(name, { workflows: v ? [...repo.workflows, w] : repo.workflows.filter((x) => x !== w), ...(v || reviews(config, { ...repo, workflows: repo.workflows.filter((x) => x !== w) }) ? {} : { autoMerge: undefined }) })}
+                            onChange={(v) => patch(name, { workflows: v ? [...repo.workflows, w] : repo.workflows.filter((x) => x !== w), ...(v || reviews(config, { ...repo, workflows: repo.workflows.filter((x) => x !== w) }) ? {} : { autoMerge: undefined, ci: undefined }) })}
                           >
                             <code>{config.workflows[w]!.label || '(no label)'}</code> runs <strong>{w}</strong>
                           </Check>
@@ -215,6 +216,7 @@ function RepositoriesSection({ config, onChange, view, errors, onAskAutoMerge, g
                             onChange={(allowedActors) => patch(name, { allowedActors })}
                           />
                         )}
+                        <CiRepair name={name} repo={repo} reviewed={reviews(config, repo)} revised={revises(config, repo)} maxRevisions={firstRevise(config, repo)} errors={errors} ceiling={ceilings.ciWaitMinutes ?? ceilings.autoMergeWaitMinutes} patch={(p) => patch(name, p)} />
                         <AutoMerge name={name} repo={repo} reviewed={reviews(config, repo)} errors={errors} ceiling={ceilings.autoMergeWaitMinutes} patch={(p) => patch(name, p)} onAsk={() => onAskAutoMerge(name)} />
                       </div>
                     </details>
@@ -226,6 +228,59 @@ function RepositoriesSection({ config, onChange, view, errors, onAskAutoMerge, g
         </CardBody>
       </Card>
     </>
+  );
+}
+
+/** The revision rounds a repository's workflows allow (they agree on it), or undefined for the default. */
+export const firstRevise = (config: ConsoleConfig, repo: ConsoleRepository) => config.workflows[repo.workflows[0] ?? '']?.revise.maxRevisions;
+
+const checkList = (t: string) => t.split(',').map((s) => s.trim()).filter(Boolean);
+
+/** CI as part of the review loop (repositories.R.ciFix): off, or on with optional check filters and a wait. */
+export function CiRepair({ name, repo, reviewed, revised, maxRevisions, errors, ceiling, patch }: { name: string; repo: ConsoleRepository; reviewed: boolean; revised: boolean; maxRevisions?: number; errors: ConfigIssue[]; ceiling: number; patch: (p: Partial<ConsoleRepository>) => void }) {
+  const path = `repositories.${name}.ci`;
+  const set = (next: NonNullable<ConsoleRepository['ci']>) => {
+    const out = { ...next };
+    if (out.waitMinutes === undefined) delete out.waitMinutes;
+    if (!out.checks?.length) delete out.checks;
+    if (!out.ignore?.length) delete out.ignore;
+    patch({ ci: out });
+  };
+  return (
+    <div className="flex flex-col gap-2" data-testid={`ci-${name}`}>
+      <Check testId={`ci-toggle-${name}`} checked={repo.ci !== undefined} disabled={!reviewed} onChange={(v) => patch({ ci: v ? {} : undefined })}>
+        Fix failing CI on pull requests the reviewer finds ready
+      </Check>
+      {!reviewed ? (
+        <p className="text-sm text-muted-foreground">Needs a workflow here that reviews: checks are looked at once the reviewer finds a pull request ready.</p>
+      ) : repo.ci === undefined ? (
+        <p className="text-sm text-muted-foreground">Off: a pull request the reviewer finds ready counts as done, whatever its checks say. Turn this on so a failing check is repaired by a revision.</p>
+      ) : revised ? (
+        <p className="text-sm text-muted-foreground">
+          A failing check on the pull request&apos;s current head queues one revision with the failed checks&apos; diagnostics, then a new review and new checks. Each fix counts against the {maxRevisions ?? 3} revision rounds per pull request; when they run out, or a check needs a person (cancelled, a manual approval, a check that never reports), Updraft says so on the pull request and stops.
+        </p>
+      ) : (
+        <p className="text-sm text-muted-foreground">This repository&apos;s workflows do not revise, so a failing check is reported on the pull request and left for a person. Turn on revisions to have it fixed.</p>
+      )}
+      <FieldError message={issuesAt(errors, path)} />
+      {repo.ci && (
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Input
+            label="Wait for checks (minutes)"
+            type="number"
+            min={1}
+            max={ceiling}
+            placeholder="60"
+            hint={`Per head, up to ${ceiling}`}
+            value={repo.ci.waitMinutes?.toString() ?? ''}
+            error={issuesAt(errors, `${path}.waitMinutes`)}
+            onChange={(e) => set({ ...repo.ci!, waitMinutes: numberOrUndefined(e.target.value) })}
+          />
+          <ParsedText label="Checks that decide" hint="Comma separated. Empty: every check" value={repo.ci.checks ?? []} parse={checkList} format={(v) => v.join(', ')} onChange={(checks) => set({ ...repo.ci!, checks })} />
+          <ParsedText label="Checks to ignore" hint="Comma separated, e.g. a preview deployment" value={repo.ci.ignore ?? []} parse={checkList} format={(v) => v.join(', ')} onChange={(ignore) => set({ ...repo.ci!, ignore })} />
+        </div>
+      )}
+    </div>
   );
 }
 

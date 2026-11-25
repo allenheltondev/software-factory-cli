@@ -615,6 +615,8 @@ export interface ConsoleRepository {
   verifyTimeoutMinutes?: number;
   /** Absent: off. */
   autoMerge?: { method: MergeMethod; waitMinutes?: number; requiredChecks?: string[] };
+  /** Absent: off. CI is part of the review loop: a failing check on a head the reviewer found ready queues a fix. */
+  ci?: { checks?: string[]; ignore?: string[]; waitMinutes?: number };
 }
 
 export interface ConsoleConfig {
@@ -647,7 +649,7 @@ export interface ConfigView {
   notices?: string[];
   defaults: { prompts: { implement: string; review: string; revise: string } };
   limits: {
-    ceilings: { timeoutMinutes: number; verifyTimeoutMinutes: number; autoMergeWaitMinutes: number; maxRevisions: number };
+    ceilings: { timeoutMinutes: number; verifyTimeoutMinutes: number; autoMergeWaitMinutes: number; maxRevisions: number; /** Absent from an older API. */ ciWaitMinutes?: number };
     console: Record<string, number>;
   };
 }
