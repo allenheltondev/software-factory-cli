@@ -6,7 +6,7 @@ import type { Job, JobSummary } from '../store/store.js';
 import { createWorkflowRecorder } from './recorder.js';
 import { createWorkflowReconciler, recoveryDeliveryId } from './reconcile.js';
 import { createMemoryWorkflowStore } from './store.js';
-import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, MAX_CI_RECOVERIES, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
+import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, MAX_CI_RECOVERIES, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
 
 const T0 = Date.parse('2026-11-25T12:00:00.000Z');
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
@@ -82,7 +82,7 @@ describe('workflow reconciliation', () => {
     expect(s.github.createInstallationToken).toHaveBeenCalledWith(expect.any(String), 55, { repositoryIds: [99], permissions: { pull_requests: 'read', checks: 'read', statuses: 'read' } });
     expect(await s.wf()).toMatchObject({ recoveries: 1, recoveredSha: HEAD, status: 'waiting' });
     const events = await s.store.listWorkflowEvents(55, '99-i7', 50);
-    expect(events.at(-1)).toMatchObject({ kind: 'ci_recovered', headSha: HEAD, jobId: 'job_recovered01', message: expect.stringMatching(/without a check event/) });
+    expect(events.at(-1)).toMatchObject({ kind: 'ci_recovered', headSha: HEAD, message: expect.stringMatching(/without a check event/) });
 
     // The recovered job starts: the workflow is active, nothing is due.
     await s.recorder.started(job({ jobId: 'job_recovered01', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: req.deliveryId }));
@@ -239,5 +239,59 @@ describe('workflow reconciliation', () => {
       await s.recorder.finished(job(), 'succeeded', { updraftOutcome: 'publish-failed' });
       expect(await s.wf()).toMatchObject({ status: 'blocked', stage: 'publish-failed', reason: 'publish_failed', nextAction: expect.stringMatching(/apply the label again/) });
     });
+  });
+
+  describe('never acts on a workflow that moved on', () => {
+    it('launches nothing when a job starts or finishes while it reads GitHub', async () => {
+      for (const meanwhile of ['started', 'finished'] as const) {
+        const s = setup();
+        await s.waitForCi();
+        s.tick(CI_FIRST_CHECK_MS);
+        s.github.commitChecks.mockImplementationOnce(async () => {
+          const next = job({ jobId: 'job_pr000001', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: 'd-2' });
+          await s.store.linkPullRequest(55, 99, 12, '99-i7');
+          await s.recorder.started(next);
+          if (meanwhile === 'finished') await s.recorder.finished(next, 'succeeded', { prNumber: 12, loop: { rounds: 1, reviews: 2, stage: 'waiting-for-ci' } });
+          return { total: 1, pending: 0, failed: 1, passed: 0, complete: true };
+        });
+        await s.reconcile();
+        expect(s.launched).toEqual([]);
+        expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).some((e) => e.kind === 'ci_recovered')).toBe(false);
+      }
+    });
+
+    it('launches once when two reconcilers look at the same workflow at once', async () => {
+      const s = setup();
+      await s.waitForCi();
+      s.tick(CI_FIRST_CHECK_MS);
+      const other = createWorkflowReconciler({ store: s.store, github: s.github, loadSettings: async () => SETTINGS as never, launch: s.launch, appBot: async () => 'updraft[bot]', now: () => T0 + CI_FIRST_CHECK_MS, log: () => {} });
+      await Promise.all([s.reconcile(), other()]);
+      expect(s.launched).toHaveLength(1);
+      expect(await s.wf()).toMatchObject({ recoveries: 1 });
+    });
+
+    it('gives the attempt back when the launch is refused for now', async () => {
+      const s = setup({ launch: { status: 200, disposition: 'throttled' } });
+      await s.waitForCi();
+      s.tick(CI_FIRST_CHECK_MS);
+      await s.reconcile();
+      expect(await s.wf()).toMatchObject({ recoveries: 0, status: 'waiting' });
+    });
+  });
+
+  it('looks for a merge or close of a pull request waiting for a person, and never blocks it for taking time', async () => {
+    const s = setup();
+    await s.recorder.started(job());
+    await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'ready-to-merge' } });
+    expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'ready-to-merge', nextCheckAt: new Date(T0 + PR_POLL_MS).toISOString() });
+    s.tick(PR_POLL_MS);
+    await s.reconcile();
+    expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'ready-to-merge' });
+    expect(s.launched).toEqual([]);
+    // Merged by a person, with no webhook: found at the next look.
+    s.github.pullRequestHead.mockResolvedValue({ state: 'closed', merged: true, headSha: HEAD, headRef: 'updraft/x' });
+    s.tick(PR_POLL_MS);
+    await s.reconcile();
+    expect(await s.wf()).toMatchObject({ status: 'finished', stage: 'merged' });
   });
 });

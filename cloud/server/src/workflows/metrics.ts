@@ -21,8 +21,7 @@ export function reconcileMetricsLine(report: ReconcileReport, labels: LabelScanR
     Backlog: { value: report.backlog, unit: 'Count' },
     OldestDueSeconds: { value: report.oldestDueSeconds, unit: 'Seconds' },
     LabelTenants: { value: labels.tenants, unit: 'Count' },
-    LabelRecovered: { value: labels.recovered, unit: 'Count' },
-    LabelRefused: { value: labels.refused, unit: 'Count' },
+    LabelMissed: { value: labels.flagged, unit: 'Count' },
   };
   return JSON.stringify({
     _aws: {

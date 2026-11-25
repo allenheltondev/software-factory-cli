@@ -7,7 +7,6 @@
  *   TENANT#<installId>   WFPR#<repositoryId>#<pr>       which workflow a pull request belongs to (TTL 90 days)
  *   TENANT#<installId>   WFJOB#<jobId>                  which workflow a job belongs to (TTL 90 days)
  *   TENANT#<installId>   WFSCAN                         when the missed-label scan last looked at the tenant
- *   TENANT#<installId>   WFLABEL#<repositoryId>#<eventId>  a label event the scan acted on, once (TTL 30 days)
  *   PLATFORM#WORKFLOW-DUE  <nextCheckAt>#<installId>#<workflowId>   a workflow the reconciler looks at then
  *
  * A save is conditional on the version it read, so two finishes (or a finish and the reconciler)
@@ -19,8 +18,13 @@ import type { Workflow, WorkflowEvent } from './workflow.js';
 
 export interface WorkflowStore {
   getWorkflow(installationId: number, workflowId: string): Promise<Workflow | null>;
-  /** Saves `next` if the stored record is still at `next.version - 1` (or absent, for version 1). False when it moved on. */
-  saveWorkflow(next: Workflow, previous: Workflow | null): Promise<boolean>;
+  /**
+   * Saves `next` if the stored record is still at `previous`'s version (or absent, for none), and
+   * with it, in the same transaction, `event`: both or neither, so the timeline never shows a
+   * change that was not made. An event already recorded (a replay) is not written again. False
+   * when the record moved on.
+   */
+  saveWorkflow(next: Workflow, previous: Workflow | null, event?: WorkflowEvent): Promise<boolean>;
   /** Records an event once: a second call with the same id changes nothing. */
   addWorkflowEvent(installationId: number, workflowId: string, event: WorkflowEvent): Promise<void>;
   /** A workflow's events, oldest first (at most `limit`, the newest). */
@@ -31,11 +35,9 @@ export interface WorkflowStore {
   workflowOfPullRequest(installationId: number, repositoryId: number, pullRequest: number): Promise<string | null>;
   linkJob(installationId: number, jobId: string, workflowId: string): Promise<void>;
   workflowOfJob(installationId: number, jobId: string): Promise<string | null>;
-  /** When the missed-label scan last finished a look at the tenant (ISO), or null. */
-  getScanMark(installationId: number): Promise<string | null>;
-  setScanMark(installationId: number, at: string): Promise<void>;
-  /** Claims a label event for the scan: true the first time only, so one label application is acted on once. */
-  claimLabelEvent(installationId: number, repositoryId: number, eventId: number): Promise<boolean>;
+  /** When the missed-label scan last looked at the tenant, and when such a look last succeeded (ISO), or null. */
+  getScanMark(installationId: number): Promise<{ at: string; succeededAt?: string } | null>;
+  setScanMark(installationId: number, mark: { at: string; succeededAt?: string }): Promise<void>;
   /** Workflows due a look at or before `now` (epoch ms), oldest due first. */
   listDueWorkflows(now: number, limit: number): Promise<{ installationId: number; workflowId: string }[]>;
 }
@@ -49,19 +51,23 @@ export function createMemoryWorkflowStore(): WorkflowStore & { dump(): { workflo
   const events = new Map<string, WorkflowEvent[]>();
   const prs = new Map<string, string>();
   const jobs = new Map<string, string>();
-  const scans = new Map<number, string>();
-  const labels = new Set<string>();
+  const scans = new Map<number, { at: string; succeededAt?: string }>();
   const k = (id: number, wf: string) => `${id}/${wf}`;
   return {
     async getWorkflow(id, wf) {
       const w = workflows.get(k(id, wf));
       return w ? structuredClone(w) : null;
     },
-    async saveWorkflow(next, previous) {
+    async saveWorkflow(next, previous, event) {
       const key = k(next.installationId, next.workflowId);
       const stored = workflows.get(key);
       if ((stored?.version ?? 0) !== (previous?.version ?? 0)) return false;
       workflows.set(key, structuredClone(next));
+      if (event) {
+        const list = events.get(key) ?? [];
+        if (!list.some((e) => e.id === event.id)) list.push(structuredClone(event));
+        events.set(key, list);
+      }
       return true;
     },
     async addWorkflowEvent(id, wf, event) {
@@ -96,16 +102,11 @@ export function createMemoryWorkflowStore(): WorkflowStore & { dump(): { workflo
       return jobs.get(`${id}/${job}`) ?? null;
     },
     async getScanMark(id) {
-      return scans.get(id) ?? null;
+      const m = scans.get(id);
+      return m ? { ...m } : null;
     },
-    async setScanMark(id, at) {
-      scans.set(id, at);
-    },
-    async claimLabelEvent(id, repo, ev) {
-      const k = `${id}/${repo}/${ev}`;
-      if (labels.has(k)) return false;
-      labels.add(k);
-      return true;
+    async setScanMark(id, mark) {
+      scans.set(id, { ...mark });
     },
     async listDueWorkflows(now, limit) {
       return [...workflows.values()]
@@ -135,7 +136,7 @@ export function createDynamoWorkflowStore(tableName: string, client = DynamoDBDo
       const out = await client.send(new GetCommand({ TableName: T, Key: wfKey(id, wf), ConsistentRead: true }));
       return out.Item && live(out.Item) ? strip<Workflow>(out.Item) : null;
     },
-    async saveWorkflow(next, previous) {
+    async saveWorkflow(next, previous, event) {
       const items: NonNullable<ConstructorParameters<typeof TransactWriteCommand>[0]['TransactItems']> = [
         {
           Put: {
@@ -152,11 +153,18 @@ export function createDynamoWorkflowStore(tableName: string, client = DynamoDBDo
       if (next.nextCheckAt && next.nextCheckAt !== previous?.nextCheckAt) {
         items.push({ Put: { TableName: T, Item: { ...dueKey(next, next.nextCheckAt), installationId: next.installationId, workflowId: next.workflowId, ttl: ttl() } } });
       }
+      // The event, once: a replay of a change already made finds it and leaves it as it is.
+      if (event) {
+        const key = evKey(next.installationId, next.workflowId, event.id);
+        const exists = await client.send(new GetCommand({ TableName: T, Key: key, ConsistentRead: true }));
+        if (!exists.Item) items.push({ Put: { TableName: T, Item: { ...key, ...event, ttl: ttl() }, ConditionExpression: 'attribute_not_exists(pk)' } });
+      }
       try {
         await client.send(new TransactWriteCommand({ TransactItems: items }));
         return true;
       } catch (err) {
-        if (err instanceof TransactionCanceledException && err.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed') return false;
+        // The record moved on, or the event was written meanwhile: read again and redo.
+        if (err instanceof TransactionCanceledException && err.CancellationReasons?.some((r) => r.Code === 'ConditionalCheckFailed')) return false;
         throw err;
       }
     },
@@ -227,25 +235,11 @@ export function createDynamoWorkflowStore(tableName: string, client = DynamoDBDo
     },
     async getScanMark(id) {
       const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: 'WFSCAN' } }));
-      return out.Item && typeof out.Item.at === 'string' ? out.Item.at : null;
+      if (!out.Item || typeof out.Item.at !== 'string') return null;
+      return { at: out.Item.at, ...(typeof out.Item.succeededAt === 'string' ? { succeededAt: out.Item.succeededAt } : {}) };
     },
-    async setScanMark(id, at) {
-      await client.send(new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: 'WFSCAN', at, ttl: ttl() } }));
-    },
-    async claimLabelEvent(id, repo, ev) {
-      try {
-        await client.send(
-          new PutCommand({
-            TableName: T,
-            Item: { pk: `TENANT#${id}`, sk: `WFLABEL#${repo}#${ev}`, ttl: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 },
-            ConditionExpression: 'attribute_not_exists(pk)',
-          }),
-        );
-        return true;
-      } catch (err) {
-        if (err instanceof ConditionalCheckFailedException) return false;
-        throw err;
-      }
+    async setScanMark(id, mark) {
+      await client.send(new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: 'WFSCAN', ...mark, ttl: ttl() } }));
     },
     async listDueWorkflows(now, limit) {
       const page = await client.send(

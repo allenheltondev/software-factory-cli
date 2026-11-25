@@ -167,17 +167,17 @@ function eventTitle(e: WorkflowEvent): string {
       return 'Finished';
     case 'waiting':
       return 'Waiting';
-    case 'label_recovered':
-      return 'Missed label event recovered';
+    case 'label_missed':
+      return 'Label event missed';
     case 'finish_recovered':
       return `Job finished (recovered)${e.outcome ? `: ${e.outcome.replace(/_/g, ' ')}` : ''}`;
   }
 }
 
 const eventTone = (e: WorkflowEvent): Tone =>
-  e.kind === 'blocked'
+  e.kind === 'blocked' || e.kind === 'label_missed'
     ? 'error'
-    : e.kind === 'ci_recovered' || e.kind === 'label_recovered' || e.kind === 'waiting'
+    : e.kind === 'ci_recovered' || e.kind === 'waiting'
       ? 'warning'
       : e.kind === 'finished'
         ? 'success'

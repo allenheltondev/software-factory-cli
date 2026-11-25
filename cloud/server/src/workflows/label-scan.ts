@@ -3,28 +3,27 @@
  * Updraft (an outage, a delivery GitHub gave up on) has no job and no workflow, so nothing else
  * would ever look at it. Once an hour per tenant (a few tenants per reconciliation run), this
  * looks on GitHub for open issues of the tenant's configured repositories that carry one of their
- * trigger labels and were updated since the last look, and that have no workflow. For each, the
- * newest application of the label is the event that was missed: it is dispatched as the
- * delivery GitHub would have sent, through the launcher, which checks everything a delivery is
- * checked for (the active config, who applied the label, keys, quotas, the kill switch).
+ * trigger labels, were updated since the last successful look, and have no workflow.
  *
- * Bounded and once only:
- *   - only labels applied more than QUIET_MS ago (a delivery in flight is not raced) and less
- *     than MAX_AGE_MS ago (an old label is a person's decision to leave it, not a missed event);
- *   - each label event is claimed before it is acted on, and its delivery id is derived from it,
- *     so a second scan, a redelivery that arrives late, or two reconcilers start one job at most;
- *   - at most ISSUES_PER_TENANT issues are looked at per tenant and look.
- * A launch the launcher refuses (an actor who may not start work, a label no longer configured)
- * is left as it is: the claim keeps it from being tried again.
+ * It never starts a job. A replay cannot be made safe: GitHub's delivery names no label event, so
+ * a late real delivery and a replay could not share a claim, and an issue's job from before
+ * workflows were recorded (or one whose recording failed) has no workflow either. So it only
+ * reports: when neither a delivery nor a job for the issue reached Updraft since the label was
+ * applied (its delivery records and job records, both kept 30 days), the issue gets a blocked
+ * workflow saying the label's event was missed, and that applying the label again starts it. A
+ * delivery that arrives after all starts the job as any would, and the workflow with it.
+ *
+ * Bounded: only labels applied more than QUIET_MS ago (a delivery in flight is not raced) and less
+ * than MAX_AGE_MS ago, at most ISSUES_PER_TENANT issues per tenant and look. A look that fails is
+ * tried again at the next interval, from where the last successful look left off.
  */
-import { createHash } from 'node:crypto';
 import type { GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
-import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
 import type { Store } from '../store/store.js';
+import { updateWorkflow } from './recorder.js';
 import type { WorkflowStore } from './store.js';
-import { workflowIdFor } from './workflow.js';
+import { newWorkflow, workflowIdFor } from './workflow.js';
 
 export const SCAN_INTERVAL_MS = 60 * 60 * 1000;
 export const QUIET_MS = 15 * 60 * 1000;
@@ -34,23 +33,23 @@ export const FIRST_LOOK_MS = 24 * 60 * 60 * 1000;
 const TENANTS_PER_RUN = 5;
 const ISSUES_PER_TENANT = 20;
 
+/** How far a job's or a delivery's time may be before the label event's and still count as its delivery (clock skew). */
+export const EVIDENCE_SKEW_MS = 10 * 60 * 1000;
+/** Job and delivery records read per tenant look. */
+const EVIDENCE_LIMIT = 500;
+
 export interface LabelScanReport {
   tenants: number;
-  recovered: number;
-  refused: number;
+  /** Issues whose label event was missed: given a blocked workflow. */
+  flagged: number;
   failed: number;
 }
 
-export function labelDeliveryId(installationId: number, repositoryId: number, issue: number, eventId: number): string {
-  return `label-${createHash('sha256').update(`${installationId}:${repositoryId}:${issue}:${eventId}`).digest('hex').slice(0, 32)}`;
-}
-
 export function createLabelScanner(deps: {
-  tenants: Pick<Store, 'listTenants' | 'getConfigVersion'>;
+  tenants: Pick<Store, 'listTenants' | 'getConfigVersion' | 'listRecentJobs' | 'listDeliveries'>;
   store: WorkflowStore;
   github: Pick<GitHubApi, 'createInstallationToken' | 'labeledIssues' | 'latestLabelEvent'>;
   loadSettings: LoadSettings;
-  launch: (req: LaunchRequest) => Promise<LaunchResult>;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
 }) {
@@ -62,6 +61,16 @@ export function createLabelScanner(deps: {
     const repos = Object.entries(config?.dispatch?.repositories ?? {}).filter(([, r]) => !r.paused && r.triggers.length);
     const settings = await deps.loadSettings();
     if (!settings) throw new Error('the App settings are unavailable');
+    // What reached Updraft for each issue: its deliveries (filtered ones too) and its jobs.
+    const [jobs, deliveries] = await Promise.all([deps.tenants.listRecentJobs(installationId, EVIDENCE_LIMIT), deps.tenants.listDeliveries(installationId, EVIDENCE_LIMIT)]);
+    const seen = new Map<string, number>();
+    const note = (repo: string | undefined, issue: number | undefined, at: string) => {
+      if (!repo || issue === undefined) return;
+      const key = `${repo.toLowerCase()}#${issue}`;
+      seen.set(key, Math.max(seen.get(key) ?? 0, Date.parse(at)));
+    };
+    for (const j of jobs) note(j.repository, j.issue, j.createdAt);
+    for (const d of deliveries) note(d.repository, d.issue, d.at);
     let budget = ISSUES_PER_TENANT;
     for (const [repository, rules] of repos) {
       if (budget <= 0) break;
@@ -76,62 +85,62 @@ export function createLabelScanner(deps: {
           if (await deps.store.getWorkflow(installationId, workflowId)) continue;
           const ev = await deps.github.latestLabelEvent!(token, repository, issue.number, label);
           if (!ev) continue;
-          const age = at - Date.parse(ev.createdAt);
+          const labeledAt = Date.parse(ev.createdAt);
+          const age = at - labeledAt;
           if (!(age >= QUIET_MS && age <= MAX_AGE_MS)) continue;
-          if (!(await deps.store.claimLabelEvent(installationId, rules.id, ev.id))) continue;
-          const payload = {
-            action: 'labeled',
-            issue: { number: issue.number, title: issue.title, html_url: issue.htmlUrl, state: 'open', labels: issue.labels.map((name) => ({ name })) },
-            label: { name: ev.label },
-            repository: { id: rules.id, full_name: repository },
-            sender: { login: ev.actor ?? '' },
-            installation: { id: installationId },
-          };
-          const result = await deps.launch({
-            installationId,
-            deliveryId: labelDeliveryId(installationId, rules.id, issue.number, ev.id),
-            eventName: 'issues',
-            body: JSON.stringify(payload),
-            payload: payload as unknown as LaunchRequest['payload'],
-          });
-          if (result.disposition === 'launched' || result.disposition === 'coalesced') {
-            report.recovered++;
-            const message = `The label ${ev.label} was applied${ev.actor ? ` by @${ev.actor}` : ''} without its event reaching Updraft: started the job that event would have.`;
-            await deps.store.addWorkflowEvent(installationId, workflowId, { id: `label-recovered:${ev.id}`, at: new Date(at).toISOString(), kind: 'label_recovered', generation: 1, ...(result.jobId ? { jobId: result.jobId } : {}), message });
-          } else {
-            report.refused++;
-          }
-          log({ installationId, repository, issue: issue.number, labelEvent: ev.id, labelScan: result.disposition, ...(result.reason ? { reason: result.reason } : {}) });
+          // A delivery or a job for the issue since the label was applied: its event reached Updraft.
+          if ((seen.get(`${repository.toLowerCase()}#${issue.number}`) ?? 0) >= labeledAt - EVIDENCE_SKEW_MS) continue;
+          const message = `The label ${ev.label} was applied${ev.actor ? ` by @${ev.actor}` : ''} on ${ev.createdAt}, but its event never reached Updraft, so no job started.`;
+          const flagged = await updateWorkflow(deps.store, installationId, workflowId, (w) =>
+            w
+              ? null
+              : {
+                  workflow: {
+                    ...newWorkflow({ installationId, repository, repositoryId: rules.id, issue: issue.number }, workflowId, at),
+                    status: 'blocked',
+                    stage: 'implementing',
+                    reason: 'label_event_missed',
+                    message,
+                    nextAction: `Remove the label ${ev.label} and apply it again on GitHub to start the job.`,
+                  },
+                  event: { id: `label-missed:${ev.id}`, at: new Date(at).toISOString(), kind: 'label_missed', generation: 1, message },
+                },
+          );
+          if (flagged?.reason === 'label_event_missed' && flagged.version === 1) report.flagged++;
+          log({ installationId, repository, issue: issue.number, labelEvent: ev.id, labelScan: 'missed' });
         }
       }
     }
   }
 
   return async function scanLabels(): Promise<LabelScanReport> {
-    const report: LabelScanReport = { tenants: 0, recovered: 0, refused: 0, failed: 0 };
+    const report: LabelScanReport = { tenants: 0, flagged: 0, failed: 0 };
     if (!deps.github.labeledIssues || !deps.github.latestLabelEvent) return report;
     const at = now();
-    const due: { installationId: number; version: number; since: string; mark: number }[] = [];
+    const due: { installationId: number; version: number; since: string; tried: number }[] = [];
     for (const t of await deps.tenants.listTenants()) {
       if (t.status !== 'active' || t.activeConfigVersion === undefined) continue;
       const mark = await deps.store.getScanMark(t.installationId);
-      const last = mark ? Date.parse(mark) : 0;
-      if (at - last < SCAN_INTERVAL_MS) continue;
-      // The look overlaps the last one by an interval, so an issue updated around it is not missed.
-      due.push({ installationId: t.installationId, version: t.activeConfigVersion, since: new Date(mark ? last - SCAN_INTERVAL_MS : at - FIRST_LOOK_MS).toISOString(), mark: last });
+      const tried = mark ? Date.parse(mark.at) : 0;
+      if (at - tried < SCAN_INTERVAL_MS) continue;
+      // From the last look that succeeded, overlapping it by an interval, so nothing updated around it is missed.
+      const from = mark?.succeededAt ? Date.parse(mark.succeededAt) - SCAN_INTERVAL_MS : at - FIRST_LOOK_MS;
+      due.push({ installationId: t.installationId, version: t.activeConfigVersion, since: new Date(Math.max(from, at - MAX_AGE_MS)).toISOString(), tried });
     }
     // The longest unlooked-at first.
-    due.sort((a, b) => a.mark - b.mark);
+    due.sort((a, b) => a.tried - b.tried);
     for (const t of due.slice(0, TENANTS_PER_RUN)) {
       report.tenants++;
+      const iso = new Date(at).toISOString();
       try {
         await scanTenant(t.installationId, t.version, at, t.since, report);
-        await deps.store.setScanMark(t.installationId, new Date(at).toISOString());
+        await deps.store.setScanMark(t.installationId, { at: iso, succeededAt: iso });
       } catch (err) {
         report.failed++;
         log({ installationId: t.installationId, error: 'label scan failed', name: (err as Error)?.name, message: (err as Error)?.message });
-        // Tried again at the next interval, not every run: one failing tenant cannot crowd out the others.
-        await deps.store.setScanMark(t.installationId, new Date(at).toISOString()).catch(() => {});
+        // Tried again at the next interval, not every run, and from where the last successful look left off.
+        const previous = await deps.store.getScanMark(t.installationId).catch(() => null);
+        await deps.store.setScanMark(t.installationId, { at: iso, ...(previous?.succeededAt ? { succeededAt: previous.succeededAt } : {}) }).catch(() => {});
       }
     }
     return report;

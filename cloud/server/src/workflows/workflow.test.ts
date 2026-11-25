@@ -125,4 +125,42 @@ describe('workflows', () => {
     await expect(recorder.started(job())).resolves.toBeUndefined();
     expect(logs).toHaveLength(1);
   });
+
+  it('keeps a late finish of an older job as history in every stage, filed under its own run', async () => {
+    const s = setup();
+    await s.recorder.started(job());
+    await s.store.linkPullRequest(55, 99, 12, '99-i7');
+    // B starts and finishes into a CI wait.
+    const b = job({ jobId: 'job_pr000001', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: 'd-2' });
+    await s.recorder.started(b);
+    await s.recorder.finished(b, 'succeeded', { prNumber: 12, loop: { rounds: 1, reviews: 2, stage: 'waiting-for-ci' } });
+    // A's finish arrives late (or is replayed): nothing changes.
+    await s.recorder.finished(job(), 'failed');
+    expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'waiting-for-ci', lastJobId: 'job_pr000001' });
+    expect((await s.events()).find((e) => e.id === 'job_issue0001:finished')).toMatchObject({ generation: 1, message: expect.stringMatching(/history/) });
+
+    // A new run starts; a late finish of the first run's job is filed under run 1, not the new one.
+    await s.recorder.finished(b, 'succeeded', { prNumber: 12, loop: { rounds: 1, reviews: 2, stage: 'merged' } });
+    await s.recorder.started(job({ jobId: 'job_again001', deliveryId: 'd-9' }));
+    expect(await s.wf()).toMatchObject({ generation: 2 });
+    const late = job({ jobId: 'job_pr000009', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: 'd-8' });
+    await s.recorder.finished(late, 'failed');
+    expect(await s.wf()).toMatchObject({ status: 'active', generation: 2, lastJobId: 'job_again001' });
+  });
+
+  it('never leaves an event of a change it did not make', async () => {
+    const s = setup();
+    await s.recorder.started(job());
+    let first = true;
+    await updateWorkflow(s.store, 55, '99-i7', (w) => {
+      if (first) {
+        first = false;
+        void s.store.saveWorkflow({ ...w!, generation: 2, version: w!.version + 1 }, w);
+        return { workflow: { ...w!, status: 'blocked' }, event: { id: 'phantom', at: new Date().toISOString(), kind: 'blocked', generation: 1 } };
+      }
+      // On the second read the change no longer applies.
+      return null;
+    });
+    expect((await s.events()).some((e) => e.id === 'phantom')).toBe(false);
+  });
 });

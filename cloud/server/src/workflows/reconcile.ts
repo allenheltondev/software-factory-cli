@@ -27,9 +27,9 @@ import type { LoadSettings } from '../github/settings.js';
 import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import type { Store } from '../store/store.js';
-import { updateWorkflow } from './recorder.js';
+import { saveChange, updateWorkflow } from './recorder.js';
 import type { WorkflowStore } from './store.js';
-import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, MAX_CI_RECOVERIES, onJobFinished, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
+import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, MAX_CI_RECOVERIES, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
 
 export interface WorkflowReconcilerDeps {
   store: WorkflowStore;
@@ -85,7 +85,8 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     return out;
   };
 
-  async function one(w: Workflow, at: number, report: ReconcileReport): Promise<void> {
+  async function one(first: Workflow, at: number, report: ReconcileReport): Promise<void> {
+    let w = first;
     report.checked++;
     const blockedEvent = (id: string, message: string): WorkflowEvent => ({ id, at: iso(at), kind: 'blocked', generation: w.generation, message });
     const block = (reason: string, message: string, nextAction: string, id: string) =>
@@ -149,6 +150,10 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     }
     const waited = at - Date.parse(w.waitingSince ?? w.updatedAt);
 
+    // Waiting for a person (to merge, or to act on what stopped the loop): only a merge or close
+    // ends it, looked for now and then, never blocked for taking time.
+    if (w.stage === 'ready-to-merge' || w.stage === 'needs-human') return void (await later(PR_POLL_MS));
+
     if (w.stage !== 'waiting-for-ci') {
       if (waited < STALL_LIMIT_MS) return void (await later(STALL_LIMIT_MS - waited));
       const hours = Math.round(STALL_LIMIT_MS / 3_600_000);
@@ -198,6 +203,20 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
       installation: { id: w.installationId },
     };
     const deliveryId = recoveryDeliveryId(w, pr.headSha, attempts + 1);
+    // The recovery is reserved on the workflow first, against the version it was decided on: if
+    // anything changed meanwhile (a job started or finished, another run got here), nothing is
+    // launched. The reservation counts the attempt, so a crash after it cannot launch a third.
+    const message = `The checks on ${short(pr.headSha)} finished (${checks.failed} failed, ${checks.passed} passed${checks.total === 0 ? ', none reported' : ''}) without a check event reaching Updraft: queued the step that event would have started.`;
+    const reservation = await saveChange(deps.store, w.installationId, w.workflowId, (cur) => cur && cur.version === w.version ? ({
+      workflow: { ...cur, recoveries: attempts + 1, recoveredSha: pr.headSha, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at) },
+      event: { id: `ci-recovered:${pr.headSha}:${attempts + 1}`, at: iso(at), kind: 'ci_recovered', generation: w.generation, prNumber: w.pullRequest, headSha: pr.headSha, message },
+    }) : null);
+    const reserved = reservation.workflow;
+    // Only the run whose save made the reservation launches.
+    if (!reservation.saved || !reserved) {
+      log({ workflow: w.workflowId, installationId: w.installationId, skipped: 'the workflow changed while it was looked at; nothing launched' });
+      return;
+    }
     const appBot = await deps.appBot?.();
     const result = await deps.launch({
       installationId: w.installationId,
@@ -208,17 +227,17 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
       payload: payload as unknown as LaunchRequest['payload'],
     });
     if (result.disposition === 'launched' || result.disposition === 'duplicate' || result.disposition === 'coalesced') {
-      const message = `The checks on ${short(pr.headSha)} finished (${checks.failed} failed, ${checks.passed} passed${checks.total === 0 ? ', none reported' : ''}) without a check event reaching Updraft: queued the step that event would have started.`;
-      await change(w, (cur) => ({
-        workflow: { ...cur, recoveries: attempts + 1, recoveredSha: pr.headSha, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at) },
-        event: { id: `ci-recovered:${pr.headSha}:${attempts + 1}`, at: iso(at), kind: 'ci_recovered', generation: w.generation, prNumber: w.pullRequest, headSha: pr.headSha, ...(result.jobId ? { jobId: result.jobId } : {}), message },
-      }));
       report.recovered++;
-      log({ workflow: w.workflowId, installationId: w.installationId, recovered: deliveryId, disposition: result.disposition });
+      log({ workflow: w.workflowId, installationId: w.installationId, recovered: deliveryId, disposition: result.disposition, ...(result.jobId ? { jobId: result.jobId } : {}) });
       return;
     }
-    // Not now (a quota, a failed launch, jobs paused): looked at again later.
-    if (TRANSIENT.has(result.disposition)) return void (await later(CI_RECHECK_MS));
+    // Every outcome below acts on the reserved workflow, not the one first read.
+    w = reserved;
+    // Not now (a quota, a failed launch, jobs paused): the attempt is given back, and the head looked at again later.
+    if (TRANSIENT.has(result.disposition)) {
+      await change(w, (cur) => ({ workflow: { ...cur, recoveries: attempts, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at) } }));
+      return;
+    }
     return block(
       'ci_not_dispatched',
       `The checks on ${short(pr.headSha)} finished, but Updraft could not start the next step: ${result.message ?? result.reason ?? result.disposition}.`,

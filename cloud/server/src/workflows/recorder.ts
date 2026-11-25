@@ -22,14 +22,26 @@ export async function updateWorkflow(
   workflowId: string,
   change: (w: Workflow | null) => { workflow: Workflow; event?: WorkflowEvent } | null,
 ): Promise<Workflow | null> {
+  return (await saveChange(store, installationId, workflowId, change)).workflow;
+}
+
+/**
+ * The same, saying whether this call made the change (`saved`), or left the record as it found
+ * it because `change` declined (another writer's change may be what it returns then).
+ */
+export async function saveChange(
+  store: WorkflowStore,
+  installationId: number,
+  workflowId: string,
+  change: (w: Workflow | null) => { workflow: Workflow; event?: WorkflowEvent } | null,
+): Promise<{ workflow: Workflow | null; saved: boolean }> {
   for (let i = 0; i < ATTEMPTS; i++) {
     const previous = await store.getWorkflow(installationId, workflowId);
     const out = change(previous);
-    if (!out) return previous;
+    if (!out) return { workflow: previous, saved: false };
     const next = { ...out.workflow, version: (previous?.version ?? 0) + 1 };
-    // The event first: written once by id, so a save that loses the race and is redone writes it again harmlessly.
-    if (out.event) await store.addWorkflowEvent(installationId, workflowId, { ...out.event, seq: next.version });
-    if (await store.saveWorkflow(next, previous)) return next;
+    // The change and its event together: a save that loses the race leaves no event behind.
+    if (await store.saveWorkflow(next, previous, out.event ? { ...out.event, seq: next.version } : undefined)) return { workflow: next, saved: true };
   }
   throw new Error(`workflow ${workflowId}: too many concurrent changes`);
 }

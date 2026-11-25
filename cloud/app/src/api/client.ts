@@ -322,7 +322,7 @@ export interface WorkflowTotals {
 export interface WorkflowEvent {
   id: string;
   at: string;
-  kind: 'job_started' | 'job_finished' | 'ci_recovered' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_recovered' | 'finish_recovered';
+  kind: 'job_started' | 'job_finished' | 'ci_recovered' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered';
   generation: number;
   jobId?: string;
   eventName?: string;

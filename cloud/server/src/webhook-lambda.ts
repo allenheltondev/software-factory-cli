@@ -294,15 +294,15 @@ const reconcileWorkflows = createWorkflowReconciler({
   killSwitch,
 });
 
-const scanLabels = launch ? createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings, launch }) : undefined;
+const scanLabels = createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings });
 
 export async function handler(
   event: APIGatewayProxyEvent | RetryRequest | { action: 'resumeClaude'; installationId: number } | { action: 'reconcileWorkflows' },
 ): Promise<APIGatewayProxyResult | RetryResult | (ReconcileReport & { labels: LabelScanReport }) | void> {
   if ('action' in event && event.action === 'reconcileWorkflows') {
     const report = await reconcileWorkflows();
-    // Labeled issues whose delivery never came (workflows/label-scan.ts): only where jobs can start.
-    const labels = scanLabels && !(await killSwitch.engaged()) ? await scanLabels() : { tenants: 0, recovered: 0, refused: 0, failed: 0 };
+    // Labeled issues whose delivery never came (workflows/label-scan.ts): reported, never started.
+    const labels = !(await killSwitch.engaged()) ? await scanLabels() : { tenants: 0, flagged: 0, failed: 0 };
     const combined = { ...report, labels };
     // Metrics first, whatever follows: a failing run is what the alarms look for.
     console.log(reconcileMetricsLine(report, labels, Date.now()));
