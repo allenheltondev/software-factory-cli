@@ -14,8 +14,8 @@ confirmed retirement; it does not start a job. `POST .../workflows/:workflow/res
 (`<repositoryId>-i<issue>` or `-p<n>`, optional body `{ jobId, at }`: the pause the
 owner saw) does the same from the pause itself, and is the only resume once the stopped
 job's records have expired.
-The shared `createJobStopper` service is the integration point for future authorized
-GitHub commands in #135. A plain GitHub mention currently invokes nothing.
+The shared `createJobStopper` service is also what an authorized `@<app> stop` comment uses
+(#135, [docs/controls.md](../../../../docs/controls.md)). A plain mention invokes nothing.
 
 ## Durable boundary
 

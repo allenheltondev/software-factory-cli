@@ -12,7 +12,7 @@ test('the manifest points GitHub at this deployment', () => {
   assert.equal(m.default_permissions.members, 'read');
   assert.equal(m.default_permissions.contents, 'write');
   assert.ok(!('administration' in m.default_permissions));
-  assert.deepEqual(m.default_events, ['issues', 'pull_request', 'pull_request_review']);
+  assert.deepEqual(m.default_events, ['issues', 'pull_request', 'pull_request_review', 'issue_comment', 'pull_request_review_comment']);
 });
 
 test('the start page posts the manifest to the user or org settings page, escaped', () => {
