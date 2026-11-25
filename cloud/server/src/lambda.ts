@@ -16,6 +16,8 @@ import { createGitHubFlows } from './flows/github.js';
 import { createGitHubApi } from './github/client.js';
 import { createSettingsLoader } from './github/settings.js';
 import type { RetryRequest, RetryResult } from './jobs/retry.js';
+import type { QueueCancelRequest, QueueCancelResult } from './jobs/queue.js';
+import { createDynamoQueueStore } from './jobs/queue-store.js';
 import { awsJobStopper } from './jobs/stop-aws.js';
 import { nativeAws } from './native/aws.js';
 import { quotasFromEnv } from './jobs/quotas.js';
@@ -88,6 +90,15 @@ const requestRetry = async (installationId: number, jobId: string, by?: string):
   if (out.FunctionError || !out.Payload) return { ok: false, status: 502, code: 'retry_failed', message: 'The job could not be started; try again' };
   return JSON.parse(Buffer.from(out.Payload).toString('utf8')) as RetryResult;
 };
+// Canceling a queued job (jobs/queue.ts): the webhook function owns the queue's transitions and
+// its GitHub comment; this one has checked the caller owns the installation and the entry is its.
+const requestQueueCancel = async (installationId: number, jobId: string, by: string): Promise<QueueCancelResult> => {
+  const out = await lambda!.send(
+    new InvokeCommand({ FunctionName: retryFunction, InvocationType: 'RequestResponse', Payload: Buffer.from(JSON.stringify({ updraftQueue: { action: 'cancel', installationId, jobId, by } } satisfies QueueCancelRequest)) }),
+  );
+  if (out.FunctionError || !out.Payload) throw new Error('the queued job could not be canceled');
+  return JSON.parse(Buffer.from(out.Payload).toString('utf8')) as QueueCancelResult;
+};
 
 const agentKeyService =
   store && github
@@ -150,7 +161,8 @@ const app = createApp({
           resultRetentionDays: Math.max(1, Number(process.env.RESULT_RETENTION_DAYS ?? 30) || 30),
           timelineTemplate,
           ...(bucket ? { readLog } : {}),
-          ...(retryFunction ? { requestRetry } : {}),
+          ...(retryFunction ? { requestRetry, requestQueueCancel } : {}),
+          queue: createDynamoQueueStore(tableName),
         }),
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
         // Insights: the tenant's shared state database, read only (tenants/*/state/state.db).

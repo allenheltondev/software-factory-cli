@@ -32,6 +32,8 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     retryJob: vi.fn(),
     stopJob: vi.fn(),
     resumeJob: vi.fn(),
+    cancelQueuedJob: vi.fn(),
+    queue: vi.fn().mockResolvedValue({ queue: [] }),
     resumeWorkflow: vi.fn(),
     agentKeys: vi.fn(),
     routines: vi.fn(),
