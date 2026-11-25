@@ -49,6 +49,15 @@ export async function startCloudWorker(config, microvmId, service, options = {})
   let child;
   let ended;
   let childDone = false;
+  // A status probe that cannot tell (a slow or failed `claude auth status`) is probed once more
+  // before it is reported: one unreadable probe should not park the next issue (#144). Only a
+  // fresh answer is ever sent; an earlier "connected" is never reused in its place.
+  const probeAuth = async () => {
+    const first = await service.authStatus();
+    if (first !== 'unavailable' || stopped) return first;
+    await pause(options.authRetryDelay ?? 1_000, undefined, { signal: controller.signal }).catch(() => {});
+    return stopped ? first : service.authStatus();
+  };
   let auth = await service.authStatus();
   const message = (op) => ({ op, session, microvmId, auth, imageVersion: config.imageVersion, workerVersion: config.workerVersion });
   const stopChild = async () => {
@@ -77,20 +86,18 @@ export async function startCloudWorker(config, microvmId, service, options = {})
       while (!stopped) {
         if (child) {
           const status = await call(message('heartbeat'));
-          if (status.cancel) {
-            if (!await stopChild()) throw new Error('worker cancellation required a forced kill');
-            const settled = await call(message('settled'));
-            if (settled.busy) throw new Error('canceled runner did not settle its lease');
-            child = undefined;
-          }
-          else if (childDone) {
+          // A cancel for a runner that already exited has nothing left to stop: settle it, and let
+          // Cloud's answer decide (a lease it cannot settle still stops this worker). Ending the
+          // loop here would strand a healthy shared session until its VM is fenced (#144).
+          if (status.cancel && !childDone && !await stopChild()) throw new Error('worker cancellation required a forced kill');
+          if (childDone) {
             await ended;
             const settled = await call(message('settled'));
             if (settled.busy) throw new Error('runner exited without settling its lease');
             child = undefined;
           }
         } else {
-          auth = await service.authStatus();
+          auth = await probeAuth();
           const response = await call(message('poll'));
           if (stopped) break;
           if (response.request) {

@@ -13,7 +13,7 @@ import { createSettingsLoader } from './github/settings.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
-import { createLauncher, internetEgressConnector, noIngressConnector, type Launcher, type LaunchRequest } from './jobs/launch.js';
+import { createLauncher, internetEgressConnector, noIngressConnector, waitingComment, type Launcher, type LaunchRequest } from './jobs/launch.js';
 import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
@@ -75,6 +75,7 @@ async function imageVersion(): Promise<string | null> {
 const nativeWorker = nativeAws(store);
 const stopJob = awsJobStopper(store, nativeWorker.control);
 
+
 function launcher(): Launcher | undefined {
   if (!env.JOB_IMAGE_ARN || !env.BROKER_FUNCTION_NAME) return undefined;
   const region = env.AWS_REGION ?? '';
@@ -90,7 +91,7 @@ function launcher(): Launcher | undefined {
         const id = waitingId(request.installationId, request.deliveryId);
         return (await nativeWorker.managed!.sessions.get(request.installationId, id))?.id;
       },
-      async waitForClaude(request, repository, repositoryId, issue) {
+      async waitForClaude(request, repository, repositoryId, issue, reason) {
         const { installationId, deliveryId, eventName, appBot } = request;
         const id = waitingId(installationId, deliveryId);
         const eventKey = `tenants/${installationId}/events/claude-wait/${id}.json`;
@@ -104,7 +105,7 @@ function launcher(): Launcher | undefined {
                 { repositoryIds: [repositoryId], permissions: { issues: 'write' } });
               const url = new URL(`/installations/${installationId}/claude?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN);
               await github.createIssueComment(token, repository, issue,
-                `This Updraft job is waiting for Claude subscription sign-in. [Open the waiting job in Updraft](${url.href}). An installation owner can sign in once and the job will resume automatically.`);
+                waitingComment(url.href, reason));
             }
           } catch (error) { console.error(JSON.stringify({ claudeWaiting: 'issue comment failed', name: (error as Error)?.name })); }
         }

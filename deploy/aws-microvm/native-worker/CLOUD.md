@@ -34,7 +34,7 @@ authorizes the action. Waiting requests expire in 24 hours and hold no worker sl
 runtime quota. A new worker receives a different control credential and has to sign in again.
 
 A deploy that changes `ManagedClaudeImageVersion` leaves a running worker on its old image.
-Cloud sends it no new jobs: they wait for sign-in instead. The console's Claude page shows a
+Cloud sends it no new jobs: they wait (`image-outdated`), and the issue comment asks for a reconnect. The console's Claude page shows a
 **restart required** banner with the steps; members see it too, but only an owner can act.
 **Restart worker** refuses a worker with an active, settling or queued job. Otherwise one
 transaction fences the worker row (that exact VM, unchanged since the checks) and advances the
@@ -73,6 +73,64 @@ only normal worker readiness. Confirm the deployed gateway strips AWS WebSocket 
 and that a port-8081 grant denies the lifecycle port. Do this and the authenticated
 isolation check in a controlled pilot before enabling the production switch. The console
 does not provision or rotate the MicroVM binding.
+
+## Consecutive jobs reuse one connected session (#144)
+
+After one sign-in, every eligible job runs in the same environment until it is idle for the
+configured idle limit (`NATIVE_MANAGED_IDLE_MINUTES`, default eight hours) or reaches its
+eight-hour lifetime. The managed VM is launched with an explicit idle policy
+(`maxIdleDurationSeconds` = its lifetime, `suspendedDurationSeconds: 0`,
+`autoResumeEnabled: false`). AWS measures idleness by **inbound** endpoint traffic, and this
+worker only polls outward, so with the service default it could be suspended minutes after
+sign-in. Cleanup retires a VM that is found suspended anyway, with the reason `suspended`.
+
+When a labeled issue cannot start at once, the webhook names why and what it needs, in the
+`nativeDispatch` log line and in the issue comment:
+
+| Readiness | Owner action | Meaning |
+| --- | --- | --- |
+| `not-connected`, `auth-required`, `expired` | sign in | there is no session, or the CLI login is gone |
+| `environment-retiring`, `environment-suspended`, `environment-ended`, `fenced`, `worker-lost`, `startup-failed`, `image-outdated` | reconnect | this environment can never run a job again |
+| `worker-starting`, `heartbeat-stale`, `auth-unavailable` | none: wait | a bounded gap; the job starts on the worker's next connected poll |
+
+Readiness is judged from the session record first. A session can be absent, reserved with no VM
+bound yet, retiring, or bound. AWS is only asked about a bound VM, never about the
+`mvm-pending` placeholder. `worker-starting` lasts only until the session's startup deadline,
+whether or not the VM is bound yet. After that it is `startup-failed`. `heartbeat-stale` lasts only
+three minutes on a running VM. After that the in-VM dispatcher is `worker-lost`: its loop never
+restarts. Cleanup then retires the environment with that reason, unless it still holds active,
+settling or queued work. Parked jobs are kept and resume once Claude is reconnected. Cleanup
+decides again on the exact worker snapshot its sealing transaction checks. A worker that
+heartbeat or took work since cleanup read it is kept (`claudeSession: keep` in the log), and
+so is one whose version moves before the transaction commits.
+
+Known limitation: a lost dispatcher that still holds queued, never-assigned work is neither
+retired nor reconnectable until that job expires (#141, #136).
+
+The dispatcher stops for good on any refused control call. So Cloud answers each call from the
+state that won any concurrent write: the runner's terminate, the dispatcher's `settled`, a
+heartbeat or a reconciliation. It does not refuse a call that merely lost a race. A `settled`
+request for a runner that reported its finish settles that assignment itself. A runner that
+exited without a finish is still refused and fenced.
+
+`claude-session-trace` prints the same decision from the stored state, read-only and without
+secrets. Run it for the hosted acceptance runs and keep the output with the record:
+
+```sh
+npm run claude-session-trace --workspace=server -- --installation <id> --watch 30 > trace.jsonl
+```
+
+1. Connect Claude once. Label issue A and let it finish.
+2. Label a different issue B one to five minutes later. Every line must keep the same
+   `session.generation`, `session.microvmId` and `worker.session`. B's job must name that
+   generation and VM. There must be no new waiting request, sign-in comment or BYOK launch.
+3. Repeat with a gap of more than five minutes, so a cleanup run falls between the jobs.
+4. Repeat with an implementation, review, revision or CI repair sequence, and label a separate
+   issue while it runs. The new issue must queue (`queued`) and start on the same VM after
+   settlement.
+5. Check the failure paths: sign out, reconnect explicitly, deploy a new image and stop the
+   VM. Each must show its precise readiness (`auth-required`, `image-outdated`,
+   `environment-ended`). Waiting requests must be kept, and nothing may fall back to an API key.
 
 ## Provision the older EFS-backed proof
 

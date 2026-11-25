@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "tenant-admin": "tsx scripts/tenant-admin.ts",
-    "build-job-image": "tsx scripts/build-job-image.ts"
+    "build-job-image": "tsx scripts/build-job-image.ts",
+    "claude-session-trace": "tsx scripts/claude-session-trace.ts"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch-logs": "^3.1175.0",

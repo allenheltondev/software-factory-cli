@@ -96,6 +96,33 @@ describe('root subscription worker Cloud loop', () => {
     expect(settled).toBe(true); expect(child.kill).toHaveBeenCalledWith('SIGTERM');
     await worker.close();
   });
+  it('settles and keeps polling when a cancel arrives after the runner already exited (#144)', async () => {
+    const child = fakeChild();
+    const ops = [];
+    let polls = 0;
+    const call = async (p) => {
+      ops.push(p.op);
+      if (p.op === 'poll') return ++polls === 1 ? { ok: true, request: { payload: {} } } : { ok: true, busy: false };
+      if (p.op === 'heartbeat') return { ok: true, cancel: true };
+      return { ok: true, busy: false };
+    };
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, { call, launch: () => { globalThis.queueMicrotask(() => child.emit('close')); return child; }, interval: 5 });
+    await until(() => polls >= 3);
+    await worker.close();
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(ops.slice(0, 4)).toEqual(['register', 'poll', 'heartbeat', 'settled']);
+  });
+  it('probes auth once more before reporting it unavailable, and never reuses an earlier answer', async () => {
+    const answers = ['connected', 'unavailable', 'connected', 'unavailable', 'unavailable'];
+    const polled = [];
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => answers.shift() ?? 'unavailable' }, {
+      interval: 5, authRetryDelay: 1,
+      call: async (p) => { if (p.op === 'poll') polled.push(p.auth); return { ok: true, busy: false }; },
+    });
+    await until(() => polled.length >= 2);
+    await worker.close();
+    expect(polled.slice(0, 2)).toEqual(['connected', 'unavailable']);
+  });
   it('does not renew a lease after a spawn error or exit without confirmed settlement', async () => {
     const child = fakeChild();
     let heartbeats = 0;
