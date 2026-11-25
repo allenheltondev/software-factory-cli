@@ -749,26 +749,25 @@ describe.runIf(onLinuxLikeHost)('runJob with shared state', () => {
     expect(names(calls).at(-1)).toBe('terminate');
   });
 
-  it('lets a checkpoint that fails or hangs cost the job nothing', async () => {
-    for (const control of [{ merge: 'hang' }, { merge: 'fail' }]) {
-      const s3 = memoryS3(encodeStateDb(['old']));
-      const { deps } = jobSetup('slow-state', {
-        s3,
-        rows: null,
-        control,
-        secrets: { [ENV_ARN]: JSON.stringify({ FAKE_UPDRAFT_MODE: 'slow-state', FAKE_UPDRAFT_SLOW_ROWS: JSON.stringify(['a', 'b']), FAKE_UPDRAFT_SLOW_MS: '400' }) },
-        deps: { checkpointIntervalMs: 100, checkpointPollMs: 30, stateSyncBudgetMs: 1500 },
-      });
-      const started = Date.now();
-      const result = await runJob(request(), deps);
-      // The job itself is as it would have been; the hanging checkpoint was stopped when the job ended.
-      expect(result).toMatchObject({ jobOutcome: 'succeeded', exitCode: 0, summary: { outcome: 'succeeded' } });
-      expect(result.state.checkpoints.saved).toBe(0);
-      expect(Date.now() - started).toBeLessThan(8000);
-      expect(s3.versions).toHaveLength(1);
-      fs.rmSync(stateRecord, { force: true });
-    }
-  });
+  // Each subprocess-based case has its own budget; the 8s assertion below still bounds job latency.
+  it.each([{ merge: 'hang' }, { merge: 'fail' }])('keeps the job successful when a checkpoint is set to $merge', async (control) => {
+    const s3 = memoryS3(encodeStateDb(['old']));
+    const { deps } = jobSetup('slow-state', {
+      s3,
+      rows: null,
+      control,
+      secrets: { [ENV_ARN]: JSON.stringify({ FAKE_UPDRAFT_MODE: 'slow-state', FAKE_UPDRAFT_SLOW_ROWS: JSON.stringify(['a', 'b']), FAKE_UPDRAFT_SLOW_MS: '400' }) },
+      deps: { checkpointIntervalMs: 100, checkpointPollMs: 30, stateSyncBudgetMs: 1500 },
+    });
+    const started = Date.now();
+    const result = await runJob(request(), deps);
+    // The job itself is as it would have been; the hanging checkpoint was stopped when the job ended.
+    expect(result).toMatchObject({ jobOutcome: 'succeeded', exitCode: 0, summary: { outcome: 'succeeded' } });
+    expect(result.state.checkpoints.saved).toBe(0);
+    expect(Date.now() - started).toBeLessThan(8000);
+    expect(s3.versions).toHaveLength(1);
+    fs.rmSync(stateRecord, { force: true });
+  }, 10_000);
 
   it('takes no checkpoints when the setting is 0', async () => {
     const s3 = memoryS3(encodeStateDb(['old']));
