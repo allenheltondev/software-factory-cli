@@ -1,5 +1,4 @@
 /* global fetch */
-import { parseRunRequest } from '../image/runner/hooks.mjs';
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HOOK_BASE_PATH, createHookHandler, parseRunRequest } from '../image/runner/hooks.mjs';

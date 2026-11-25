@@ -102,10 +102,10 @@ export function renderAssignmentComment(o: {
   rows.push([`Model${kind ? ` (${kind})` : ''}`, codeCell(o.details.model)]);
   rows.push(['Complexity', codeCell(o.details.complexity)]);
   if (url && cloudId === o.jobId) {
-    rows.push(['Job ID', `[${cell(o.jobId).replace(/[\[\]]/g, '\\$&')}](${url})`]);
+    rows.push(['Job ID', `[${cell(o.jobId).replace(/[[\]]/g, '\\$&')}](${url})`]);
   } else {
     rows.push(['Job ID', codeCell(o.jobId)]);
-    if (url) rows.push(['Updraft job', `[${cell(cloudId).replace(/[\[\]]/g, '\\$&')}](${url})`]);
+    if (url) rows.push(['Updraft job', `[${cell(cloudId).replace(/[[\]]/g, '\\$&')}](${url})`]);
   }
   rows.push(['Run ID', codeCell(o.runId)], ['Pool', codeCell(o.pool)]);
   return [

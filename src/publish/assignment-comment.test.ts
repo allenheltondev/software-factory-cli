@@ -113,7 +113,7 @@ describe('assignment comment', () => {
     await commenter.announce(job(), run('run_1', 'codex'));
     await commenter.announce(job(), run('run_2', 'claude'));
     expect(api.comments).toHaveLength(2);
-    expect(api.comments[1]!.body).toContain('- **Worker** `claude`');
+    expect(api.comments[1]!.body).toContain('| Worker | `claude` |');
     expect(api.comments[1]!.body).toContain('`run_2`');
   });
 
