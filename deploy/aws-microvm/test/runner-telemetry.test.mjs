@@ -284,6 +284,84 @@ describe('agent telemetry: role-qualified agent lanes', () => {
   });
 });
 
+describe('agent telemetry: role attribution edge cases', () => {
+  const body = `${claude.stream(claude.assistantText('done'))}---- end of agent output ----\noutcome: succeeded\n`;
+  const task = {
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id: 'msg_task', model: 'claude-sonnet-4-5', content: [{ type: 'tool_use', id: 'toolu_task', name: 'Task', input: { subagent_type: 'Explore', description: 'look around', prompt: 'look' } }], stop_reason: 'tool_use', usage: { input_tokens: 10, output_tokens: 5 } },
+  };
+
+  it('keeps the role on spans and names with capture content on, and never puts prompt text in a name', async () => {
+    const t = setup({ captureContent: true });
+    await t.step('run_1', `${header({ kind: 'review' })}\n${body}`, 1000);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const spans = t.exporter.spans;
+    const agent = one(spans, 'invoke_agent review / claude-opus');
+    expect(agent.attributes).toMatchObject({ 'gen_ai.agent.name': 'review / claude-opus', 'updraft.agent.profile': 'claude-opus', 'updraft.agent.role': 'reviewing', 'updraft.job.kind': 'review' });
+    const chats = spans.filter((s) => s.name.startsWith('chat'));
+    expect(chats).toHaveLength(1);
+    expect(chats[0].attributes['gen_ai.agent.name']).toBe('review / claude-opus');
+    expect(chats[0].attributes['gen_ai.input.messages'] ?? chats[0].attributes['gen_ai.output.messages']).toBeDefined();
+    // One agent span per run: nothing is duplicated.
+    expect(spans.filter((s) => s.name.startsWith('invoke_agent'))).toHaveLength(1);
+    for (const s of spans) if (s.name.startsWith('invoke_agent')) expect(s.name).not.toContain('done');
+  });
+
+  it('does not guess a reviewer from a legacy header with no kind, and never labels it reviewing', async () => {
+    const t = setup();
+    const legacy = ['updraft run run_1', 'job: job_ev9001 (attempt 1)', 'repository: octo/widgets (id 42)', 'issue: #7 Title', 'agent: claude-opus (adapter claude)', '', '---- agent output (stdout and stderr) ----'].join('\n');
+    await t.step('run_1', `${legacy}\n${body}`, 1000);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const agent = t.exporter.spans.find((s) => s.name.startsWith('invoke_agent'));
+    expect(agent.attributes['updraft.agent.role']).toBe('coding');
+    expect(agent.attributes['updraft.agent.role']).not.toBe('reviewing');
+    expect(agent.name).not.toMatch(/review/);
+  });
+
+  it('gives a Claude subagent the role of its parent run, for review and revision', async () => {
+    const t = setup();
+    for (const [run, kind] of [['run_1', 'review'], ['run_2', 'revision']]) {
+      await t.step(run, `${header({ runId: run, kind })}\n`, 0);
+      await t.step(run, claude.stream(task), 1000);
+      await t.step(run, claude.stream(claude.assistantText('found it', 'toolu_task')), 1000);
+      await t.step(run, claude.stream(claude.toolResult('toolu_task', 'ok')), 500);
+      await t.step(run, '---- end of agent output ----\noutcome: succeeded\n', 10);
+    }
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const spans = t.exporter.spans;
+    for (const [kind, role] of [['review', 'reviewing'], ['revision', 'coding']]) {
+      const sub = one(spans, `invoke_agent ${kind} / claude-opus / Explore`);
+      expect(sub.attributes).toMatchObject({ 'gen_ai.agent.name': `${kind} / claude-opus / Explore`, 'updraft.agent.profile': 'claude-opus', 'updraft.agent.role': role, 'updraft.job.kind': kind });
+      const subChat = spans.find((s) => s.name.startsWith('chat') && s.parentSpanId === sub.spanId);
+      expect(subChat.attributes['gen_ai.agent.name']).toBe(`${kind} / claude-opus / Explore`);
+    }
+  });
+
+  it('keeps updraft.job.kind as revision for a CI repair, whose lane is ci_repair', async () => {
+    const t = setup();
+    await t.step('run_1', `${header({ kind: 'revision' }).replace('(updraft_review)', '(ci_failure)')}\n${body}`, 1000);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const agent = one(t.exporter.spans, 'invoke_agent ci_repair / claude-opus');
+    expect(agent.attributes).toMatchObject({ 'updraft.job.kind': 'revision', 'updraft.agent.role': 'coding', 'updraft.agent.role.detail': 'ci_repair' });
+  });
+
+  it('attributes a mixed Claude and Codex loop to the right lane, each with its own profile', async () => {
+    const t = setup();
+    await t.step('run_1', `${header({ agent: 'codex', adapter: 'codex', model: 'gpt-5-codex' })}\n`, 0);
+    await t.step('run_1', codex.stream(codex.threadStarted(), codex.turnStarted()), 100);
+    await t.step('run_1', codex.stream(codex.agentMessage('item_1', 'implemented'), codex.turnCompleted()), 1000);
+    await t.step('run_1', '---- end of agent output ----\noutcome: succeeded\n', 10);
+    await t.step('run_2', `${header({ runId: 'run_2', kind: 'review' })}\n${body}`, 1000);
+    await t.tracer.stop({ outcome: 'succeeded' });
+    const spans = t.exporter.spans;
+    expect(one(spans, 'invoke_agent implement / codex').attributes).toMatchObject({ 'updraft.agent.role': 'coding', 'gen_ai.provider.name': 'openai', 'updraft.agent.profile': 'codex' });
+    expect(one(spans, 'invoke_agent review / claude-opus').attributes).toMatchObject({ 'updraft.agent.role': 'reviewing', 'updraft.agent.profile': 'claude-opus' });
+    const codexChat = one(spans, 'chat gpt-5-codex');
+    expect(codexChat.attributes['gen_ai.agent.name']).toBe('implement / codex');
+  });
+});
+
 describe('agent telemetry: Codex and the review loop', () => {
   it('reads codex exec --json, and puts the review and the revision in the same conversation', async () => {
     const t = setup();
