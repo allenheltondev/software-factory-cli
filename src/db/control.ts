@@ -126,6 +126,11 @@ export interface ControlCommandRecord {
   message: string;
   /** The reply comment, once posted. */
   replyId?: number;
+  /**
+   * Order of recording in this repository (1, 2, ...), assigned by recordControlCommand: commands
+   * received in the same millisecond still list in the order they were handled.
+   */
+  seq?: number;
 }
 
 const commandKey = (repoId: number, source: string) => `${CONTROL_COMMAND_PREFIX}${repoId}#${source}`;
@@ -136,8 +141,12 @@ export function getControlCommand(db: Db, repoId: number, source: string): Contr
 
 /** Record a command. False, and nothing written, when it was recorded already (a duplicate). */
 export function recordControlCommand(db: Db, record: ControlCommandRecord): boolean {
-  const res = db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING').run(commandKey(record.repoId, record.source), JSON.stringify(record));
-  return Number(res.changes) > 0;
+  return transaction(db, () => {
+    if (getControlCommand(db, record.repoId, record.source)) return false;
+    const seq = Math.max(0, ...listControlCommands(db, record.repoId).map((r) => r.seq ?? 0)) + 1;
+    const res = db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING').run(commandKey(record.repoId, record.source), JSON.stringify({ ...record, seq }));
+    return Number(res.changes) > 0;
+  });
 }
 
 export function setControlReply(db: Db, repoId: number, source: string, replyId: number): void {
@@ -145,7 +154,10 @@ export function setControlReply(db: Db, repoId: number, source: string, replyId:
   if (current) writeJson(db, commandKey(repoId, source), { ...current, replyId });
 }
 
-/** Commands of one workflow, oldest first: its control history. */
+/**
+ * Commands of one workflow, oldest first: its control history. By time received, then by the
+ * order recorded (`seq`), then by source: deterministic even for commands of the same millisecond.
+ */
 export function listControlCommands(db: Db, repoId: number, issue?: number): ControlCommandRecord[] {
   const prefix = `${CONTROL_COMMAND_PREFIX}${repoId}#`;
   const rows = db.prepare('SELECT value FROM meta WHERE substr(key, 1, ?) = ?').all(prefix.length, prefix) as Array<{ value: string }>;
@@ -158,7 +170,7 @@ export function listControlCommands(db: Db, repoId: number, issue?: number): Con
       }
     })
     .filter((r) => issue === undefined || r.issue === issue)
-    .sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || a.source.localeCompare(b.source));
+    .sort((a, b) => a.receivedAt.localeCompare(b.receivedAt) || (a.seq ?? 0) - (b.seq ?? 0) || a.source.localeCompare(b.source));
 }
 
 /**
