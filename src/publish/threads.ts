@@ -237,11 +237,11 @@ export function effectiveChecks(
   structured: StructuredReview | null,
   runId: string,
   rootOf: (key: string) => ReviewFinding | null,
-): Map<string, { root: ReviewFinding; status: 'verified' | 'unresolved'; notes: string[]; repeat: string | null }> {
-  const out = new Map<string, { root: ReviewFinding; status: 'verified' | 'unresolved'; notes: string[]; repeat: string | null }>();
+): Map<string, EffectiveCheck> {
+  const out = new Map<string, EffectiveCheck>();
   const entry = (root: ReviewFinding) => {
     let e = out.get(root.key);
-    if (!e) out.set(root.key, (e = { root, status: 'verified', notes: [], repeat: null }));
+    if (!e) out.set(root.key, (e = { root, status: 'verified', notes: [], repeats: [] }));
     return e;
   };
   for (const c of structured?.checks ?? []) {
@@ -259,9 +259,19 @@ export function effectiveChecks(
     if (!root) continue;
     const e = entry(root);
     e.status = 'unresolved';
-    e.repeat ??= findingKey(runId, f.id);
+    e.repeats.push({ key: findingKey(runId, f.id), severity: f.severity });
   }
+  // The strongest repeat first: a blocker is never outweighed by a suggestion about the same thread.
+  for (const e of out.values()) e.repeats.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'blocker' ? -1 : 1));
   return out;
+}
+
+export interface EffectiveCheck {
+  root: ReviewFinding;
+  status: 'verified' | 'unresolved';
+  notes: string[];
+  /** This review's findings that repeat the thread, the strongest first. */
+  repeats: { key: string; severity: StructuredFinding['severity'] }[];
 }
 
 /**
@@ -279,9 +289,12 @@ export function verdictContradiction(
   if (verdict !== 'ready-to-merge') return null;
   const blockers = (structured?.findings ?? []).filter((f) => f.severity === 'blocker');
   if (blockers.length) return `it lists ${blockers.length} blocker(s) (${blockers.map((b) => b.id).join(', ')})`;
+  const said = effectiveChecks(structured, o.runId, o.rootOf);
+  // Any blocker thread it leaves unresolved, whatever its recorded state: one verified before and found broken again is open.
+  const reopened = [...said.values()].find((e) => e.status === 'unresolved' && (e.root.severity === 'blocker' || e.repeats.some((r) => r.severity === 'blocker')));
+  if (reopened) return `it found the earlier blocker ${reopened.root.key} still unresolved`;
   if (!o.blockers.length) return null;
   if (!structured) return `it re-checked none of the ${o.blockers.length} earlier blocker(s)`;
-  const said = effectiveChecks(structured, o.runId, o.rootOf);
   const open = o.blockers.filter((b) => said.get(b.key)?.status !== 'verified');
   if (!open.length) return null;
   const unresolved = open.filter((b) => said.get(b.key)?.status === 'unresolved');
@@ -438,7 +451,9 @@ export function applyFindingState(
     const answers: ThreadAnswers = { repeats: [], checks: [], log };
     for (const [key, e] of effectiveChecks(o.structured, runId, rootOf)) {
       const note = e.notes.join(' ');
-      const repeat = e.repeat ? getFinding(deps.db, repoId, prNumber, e.repeat) : null;
+      const rows = e.repeats.map((r) => getFinding(deps.db, repoId, prNumber, r.key)).filter((r): r is ReviewFinding => r !== null);
+      // The strongest repeat speaks for the thread; the others' evidence is kept with it.
+      const repeat = rows[0] ? { ...rows[0], problem: [rows[0].problem, ...rows.slice(1).map((r) => `Also: ${r.problem}`)].join('\n\n') } : null;
       const applied = repeat
         ? applyRepeat(deps.db, repoId, prNumber, key, repeat, o.at, deps.now)
         : recordCheck(deps.db, repoId, prNumber, key, { status: e.status, sha: o.headSha, note, at: o.at, now: deps.now });

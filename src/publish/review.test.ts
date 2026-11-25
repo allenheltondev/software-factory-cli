@@ -1018,6 +1018,69 @@ describe('findings as threads', () => {
     expect(getFinding(s.db, REPO_ID, PR, f2)!.threadKey).toBe(`${run}#F1`);
   });
 
+  it('never takes ready when a check reopens a blocker verified before', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    const verifyAll = { findings: [], checks: [{ finding: `${first.runId}#F1`, status: 'verified' }, { finding: `${first.runId}#F2`, status: 'verified' }] };
+    expect(await postReview(s.deps, nextRound(s, H2, 'ready-to-merge', structuredFindings(verifyAll)))).toMatchObject({ review: { verdict: 'ready-to-merge' } });
+    expect(getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!.status).toBe('verified');
+    // On H3 it regressed: a check alone says so, with a ready verdict.
+    const run = nextRound(s, H3, 'ready-to-merge', structuredFindings({ findings: [], checks: [{ finding: `${first.runId}#F1`, status: 'unresolved', note: 'regressed' }] }));
+    expect(await postReview(s.deps, run)).toMatchObject({ review: { verdict: 'changes-requested' } });
+    expect(s.pr()).toMatchObject({ verdict: 'changes-requested', verdictSha: H3 });
+    expect(getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!.status).toBe('unresolved');
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+  });
+
+  it('records a ready verdict only together with the findings it verified: interrupted, it is not ready; retried, it merges', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    const run = nextRound(s, H2, 'ready-to-merge', structuredFindings({ findings: [], checks: [{ finding: `${first.runId}#F1`, status: 'verified' }, { finding: `${first.runId}#F2`, status: 'verified' }] }));
+    s.db.exec("CREATE TRIGGER boom BEFORE UPDATE OF status ON review_findings BEGIN SELECT RAISE(ABORT, 'interrupted'); END");
+    expect(await postReview(s.deps, run)).toMatchObject({ status: 'failed' });
+    expect(s.pr()).toMatchObject({ verdict: 'changes-requested', verdictSha: H1 });
+    expect(getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!.status).toBe('open');
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+    s.db.exec('DROP TRIGGER boom');
+    s.tick(10 * 60_000);
+    expect(await postReview(s.deps, run)).toMatchObject({ status: 'published', review: { verdict: 'ready-to-merge', outcome: 'ready' } });
+    expect(s.pr()).toMatchObject({ verdict: 'ready-to-merge', verdictSha: H2 });
+    await s.mergeStep();
+    expect(s.gh.merges).toHaveLength(1);
+  });
+
+  it('keeps the strongest of several repeats of one thread, with all their evidence', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    const f3 = `${first.runId}#F3`;
+    await postReview(
+      s.deps,
+      nextRound(
+        s,
+        H2,
+        'changes-requested',
+        structuredFindings({
+          findings: [
+            { id: 'S', severity: 'suggestion', title: 'Test would help', problem: 'Still no test.', sameAs: f3 },
+            { id: 'B', severity: 'blocker', title: 'Race is back', problem: 'Without the test the race came back.', sameAs: f3 },
+          ],
+          checks: [{ finding: `${first.runId}#F1`, status: 'verified' }, { finding: `${first.runId}#F2`, status: 'verified' }],
+        }),
+      ),
+    );
+    const root = getFinding(s.db, REPO_ID, PR, f3)!;
+    expect(root).toMatchObject({ severity: 'blocker', title: 'Race is back', status: 'unresolved' });
+    expect(root.problem).toContain('Without the test the race came back.');
+    expect(root.problem).toContain('Also: Still no test.');
+    // The next ready review that does not verify it is not ready.
+    const run = nextRound(s, H3, 'ready-to-merge', structuredFindings({ findings: [], checks: [] }));
+    expect(await postReview(s.deps, run)).toMatchObject({ review: { verdict: 'changes-requested' } });
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([]);
+  });
+
   it('follows up in the existing thread when a finding with a thread recurs', async () => {
     const s = withDiff();
     const first = await post(s, 'changes-requested', structuredFindings(THREE));

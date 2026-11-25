@@ -17,7 +17,7 @@
 // Same lease and attempt fence around every write as publication and the revision push.
 import { appendFile } from 'node:fs/promises';
 import { DEFAULT_MAX_REVISIONS, autoMergeMethod, ciSettings, reviewActive, reviseActive, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
-import { recordError } from '../db/database.js';
+import { recordError, transaction } from '../db/database.js';
 import {
   beginPrReview,
   finishPrReview,
@@ -371,35 +371,43 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     }
 
     // 2. The verdict, from the worker's own record. Only a verdict for the current head acts.
-    const { current, open } = recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict, headSha, now });
-    let outcome: ReviewOutcome;
-    let detail: string | null = null;
-    let revisionJobId: string | undefined;
-    const decision = verdictTrigger({
-      runId,
-      verdict,
-      findings: result.findings,
-      headSha,
-      reviewer: login,
-      reviewUrl: rev.reviewUrl ?? request.pullRequest.url,
-      recordedAt: rev.createdAt,
-    });
-    // 2a. A structured review of the current head: what it says about earlier findings becomes
-    // their state first, so the transition below (a revision, ready) follows coherent state. Looked
-    // at on GitHub right before: a review whose head has moved on is history, and changes nothing.
+    // A structured review of the current head (as GitHub shows it right before) first makes what
+    // it says about earlier findings their state, and records its verdict in the same
+    // transaction, checked once more against every blocker as it now stands: a ready verdict is
+    // never on record while a blocker is open.
     const stillCurrent = async () => {
       hold();
       const live = await deps.api.getPullRequest(repoRef, prNumber);
       return live.state === 'open' && live.headSha === headSha;
     };
     let answers: ThreadAnswers | null = null;
-    if (structured && rev.reviewId && open && current) {
-      if (await stillCurrent()) {
+    let routed: ReviewVerdict = verdict;
+    let recorded: { current: boolean; open: boolean };
+    if (structured && rev.reviewId && watched.headSha === headSha && (await stillCurrent())) {
+      hold();
+      recorded = transaction(deps.db, () => {
         answers = applyFindingState(threadDeps, { repoId: job.repoId, prNumber, runId, headSha, at: rev.createdAt, structured });
-      } else {
-        await runLog(['threads: the pull request moved on from the reviewed commit; this review\'s checks and repeats change nothing']);
-      }
+        if (routed === 'ready-to-merge' && unverifiedBlockers(deps.db, job.repoId, prNumber).length) routed = 'changes-requested';
+        return recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict: routed, headSha, now });
+      });
+      if (routed !== verdict) await runLog(['verdict: a blocker is still open after this review\'s checks; taken as changes-requested']);
+    } else {
+      if (structured && rev.reviewId) await runLog(['threads: the pull request moved on from the reviewed commit; this review\'s checks and repeats change nothing']);
+      recorded = recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict, headSha, now });
     }
+    const { current, open } = recorded;
+    let outcome: ReviewOutcome;
+    let detail: string | null = null;
+    let revisionJobId: string | undefined;
+    const decision = verdictTrigger({
+      runId,
+      verdict: routed,
+      findings: result.findings,
+      headSha,
+      reviewer: login,
+      reviewUrl: rev.reviewUrl ?? request.pullRequest.url,
+      recordedAt: rev.createdAt,
+    });
     if (!open) {
       outcome = 'closed';
     } else if (!current) {

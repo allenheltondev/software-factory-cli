@@ -784,19 +784,28 @@ export function migrate(db: Db, target = SCHEMA_VERSION): void {
   }
 }
 
+/** Open transactions per database, so a nested transaction() is a savepoint of the outer one. */
+const depth = new WeakMap<Db, number>();
+
 /**
- * Run fn inside BEGIN IMMEDIATE so writers serialize. Not re-entrant: do not
- * nest calls. Rolls back and rethrows on error.
+ * Run fn inside BEGIN IMMEDIATE so writers serialize. Rolls back and rethrows on error. Nested
+ * inside another transaction() on the same database, it is a savepoint: its changes commit or
+ * roll back with the outer transaction, and an error rolls back only what it did.
  */
 export function transaction<T>(db: Db, fn: () => T): T {
-  db.exec('BEGIN IMMEDIATE');
+  const level = depth.get(db) ?? 0;
+  const name = `updraft_sp_${level}`;
+  db.exec(level === 0 ? 'BEGIN IMMEDIATE' : `SAVEPOINT ${name}`);
+  depth.set(db, level + 1);
   try {
     const result = fn();
-    db.exec('COMMIT');
+    depth.set(db, level);
+    db.exec(level === 0 ? 'COMMIT' : `RELEASE ${name}`);
     return result;
   } catch (err) {
+    depth.set(db, level);
     try {
-      db.exec('ROLLBACK');
+      db.exec(level === 0 ? 'ROLLBACK' : `ROLLBACK TO ${name}; RELEASE ${name}`);
     } catch {
       // ignore rollback failure; surface the original error
     }
