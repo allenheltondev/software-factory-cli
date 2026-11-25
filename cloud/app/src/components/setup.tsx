@@ -172,7 +172,7 @@ export function SetupChecklist({ steps }: { steps: SetupStep[] }) {
                   </span>
                   {!s.done && isNext && s.detail && <span className="text-sm">{s.detail}</span>}
                 </div>
-                {!s.done && s.action && <span className="text-sm">{s.action}</span>}
+                {!s.done && s.action && <span className="ml-9 w-full text-sm sm:ml-0 sm:w-auto">{s.action}</span>}
               </li>
             );
           })}

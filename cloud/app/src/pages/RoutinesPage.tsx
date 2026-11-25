@@ -1,3 +1,4 @@
+import { ClaudeNavigation } from '../components/ClaudeNavigation';
 import { useEffect, useState, type FormEvent } from 'react';
 import { Link, useParams } from 'react-router';
 import { Alert, Button, Card, CardBody, CardHeader, CardTitle, Input, Skeleton } from '@readysetcloud/ui';
@@ -65,6 +66,7 @@ export function RoutinesPage({ api = defaultApi }: { api?: Api }) {
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+      <ClaudeNavigation />
       <Link to={`/installations/${id}`} className="auth-link">← Installation</Link>
       <h1 className="text-2xl font-semibold">Claude Code scheduled tasks</h1>
       <p>

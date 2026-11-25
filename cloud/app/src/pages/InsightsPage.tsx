@@ -103,7 +103,7 @@ export function InsightsPage({ api = defaultApi, refreshMs = INSIGHTS_REFRESH_MS
       {load.state === 'loading' && (
         <div className="flex flex-col gap-4" data-testid="insights-loading">
           <Skeleton className="h-32" />
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-3 min-[380px]:grid-cols-2 xl:grid-cols-4">
             {[0, 1, 2, 3].map((i) => (
               <Skeleton key={i} className="h-28" />
             ))}
@@ -238,7 +238,7 @@ function Headline({ s, report }: { s: StatsSection; report: Insights['report'] }
   const caught = s.review.findings.total;
   const changes = s.review.changesRequestedRounds.reviewer;
   return (
-    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" data-testid="insights-headline">
+    <div className="grid gap-3 min-[380px]:grid-cols-2 xl:grid-cols-4" data-testid="insights-headline">
       <StatTile
         label="Issues worked"
         value={issues}
@@ -368,7 +368,7 @@ function Rounds({ s }: { s: StatsSection }) {
       </CardHeader>
       <CardBody className="flex flex-col gap-4">
         {b.prs === 0 ? <p className="text-sm text-muted-foreground">No pull requests were opened in this window.</p> : <Bars label="Pull requests by revision rounds" rows={rows} />}
-        <dl className="grid grid-cols-3 gap-3 text-sm">
+        <dl className="grid grid-cols-1 gap-3 text-sm min-[380px]:grid-cols-3">
           <Metric label="Average" value={avg(b.revisionsPerPr.average)} />
           <Metric label="Most" value={b.revisionsPerPr.max ?? '—'} />
           <Metric label="Merged by Updraft" value={s.outcomes.prsMerged} />

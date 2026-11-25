@@ -120,7 +120,7 @@ export function AdminTenantPage({ api = defaultApi }: { api?: AdminTenantApi }) 
         <>
           <header className="flex flex-wrap items-center justify-between gap-3" data-testid="admin-tenant">
             <div className="flex flex-col gap-1">
-              <h1 className="flex items-center gap-2 text-2xl font-semibold">
+              <h1 className="flex flex-wrap items-center gap-2 text-2xl font-semibold">
                 {load.tenant.accountLogin}
                 <StatusBadge tone={tenantStatusLabel(load.tenant).tone}>{tenantStatusLabel(load.tenant).label}</StatusBadge>
               </h1>
@@ -147,7 +147,7 @@ export function AdminTenantPage({ api = defaultApi }: { api?: AdminTenantApi }) 
               ))}
           </header>
 
-          <div className="grid gap-4 sm:grid-cols-4">
+          <div className="grid gap-3 min-[380px]:grid-cols-2 xl:grid-cols-4">
             <StatTile label="Jobs today" value={`${load.tenant.usage.jobsToday} / ${load.tenant.quotas.jobsPerDay}`} />
             <StatTile
               label="MicroVM minutes this month"
@@ -235,7 +235,7 @@ export function AdminTenantPage({ api = defaultApi }: { api?: AdminTenantApi }) 
                 <EmptyState title="No jobs yet" description="Jobs appear here once a labeled issue starts one." />
               ) : (
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left text-sm" data-testid="recent-jobs">
+                  <table className="w-full min-w-[36rem] text-left text-sm" data-testid="recent-jobs">
                     <thead className="text-muted-foreground">
                       <tr>
                         <th className="py-2 pr-4 font-medium">Started</th>

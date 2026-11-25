@@ -213,7 +213,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
 
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
-          <h1 className="flex items-center gap-2 text-2xl font-semibold">
+          <h1 className="flex flex-wrap items-center gap-2 text-2xl font-semibold">
             {activeVersion === null ? 'Set up Updraft' : 'Configuration'}
             {view.tenant.status !== 'active' && <StatusBadge tone={status.tone}>{status.label}</StatusBadge>}
           </h1>
@@ -302,7 +302,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
             </pre>
           )}
 
-          <div className="sticky bottom-0 z-10 -mx-4 flex flex-col gap-3 border-t border-border bg-background/95 px-4 py-3 backdrop-blur" data-testid="publish-bar">
+          <div className="sticky bottom-0 z-10 -mx-4 flex flex-col gap-3 border-t border-border bg-background/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur" data-testid="publish-bar">
             {notice && (
               <Alert variant="success" data-testid="config-published">
                 {notice}
