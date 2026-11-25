@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { Alert, Button, Card, CardBody, CardHeader, CardTitle, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, Skeleton } from '@readysetcloud/ui';
-import { api as defaultApi, type ApiClient, type WorkflowEvent, type WorkflowPause, type WorkflowTotals, type WorkflowView } from '../api/client';
-import { WORKFLOW_STATUS, WorkflowTimeline, WorkflowTotalsView, stageLabel, workflowTitle } from '../components/workflows';
+import { api as defaultApi, type ApiClient, type WorkflowEvent, type WorkflowHistory, type WorkflowPause, type WorkflowTotals, type WorkflowView } from '../api/client';
+import { WORKFLOW_STATUS, WorkflowHistoryNote, WorkflowTimeline, WorkflowTotalsView, stageLabel, workflowTitle } from '../components/workflows';
 import { relativeTime } from '../lib/time';
 
 type WorkflowApi = Pick<ApiClient, 'workflow'> & Partial<Pick<ApiClient, 'resumeWorkflow'>>;
-type Load = { state: 'loading' } | { state: 'ok'; workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals; pause?: WorkflowPause } | { state: 'error'; message: string };
+type Load = { state: 'loading' } | { state: 'ok'; workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals; history?: WorkflowHistory; pause?: WorkflowPause } | { state: 'error'; message: string };
 
 const WORKFLOW_ID = /^(?:[0-9]{1,20}|legacy-[0-9a-f]{12})-[ip][0-9]{1,10}$/;
 export const WORKFLOW_REFRESH_MS = 15_000;
@@ -41,7 +41,9 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
     };
   }, [refresh, valid]);
 
-  const active = load.state === 'ok' && load.workflow.status === 'active';
+  // Refreshed while something can change without the viewer: a job runs, or the workflow waits
+  // (for capacity, CI, a sign-in). One read of this workflow each time, never of its jobs.
+  const active = load.state === 'ok' && (load.workflow.status === 'active' || load.workflow.status === 'waiting');
   useEffect(() => {
     if (!active) return;
     const timer = setInterval(() => void refresh(), refreshMs);
@@ -71,6 +73,7 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
                 {WORKFLOW_STATUS[load.workflow.status].label}
               </PageHeroChip>
               <PageHeroChip>{stageLabel(load.workflow.stage)}</PageHeroChip>
+              {load.workflow.paused && <PageHeroChip tone="warning">Paused</PageHeroChip>}
               {load.workflow.generation > 1 && <PageHeroChip>Run {load.workflow.generation}</PageHeroChip>}
               {load.workflow.waitingSince && load.workflow.status === 'waiting' && <PageHeroChip>Waiting since {relativeTime(load.workflow.waitingSince)}</PageHeroChip>}
             </PageHeroChips>
@@ -90,6 +93,11 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
                   Latest job
                 </Link>
               )}
+              {(load.workflow.pastPullRequests ?? []).map((p) => (
+                <a key={p.number} className="auth-link" href={`https://github.com/${load.workflow.repository}/pull/${p.number}`} target="_blank" rel="noreferrer">
+                  Run {p.generation}: pull request #{p.number} ↗
+                </a>
+              ))}
             </div>
           </PageHero>
           {(load.workflow.reconstructed || (load.workflow.gaps?.length ?? 0) > 0) && (
@@ -118,7 +126,10 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
               <CardTitle>Timeline</CardTitle>
             </CardHeader>
             <CardBody>
-              <WorkflowTimeline events={load.events} base={base} />
+              <div className="flex flex-col gap-4">
+                <WorkflowTimeline events={load.events} base={base} repository={load.workflow.repository} {...(load.history ? { jobRetentionDays: load.history.jobRetentionDays } : {})} />
+                {load.history && <WorkflowHistoryNote history={load.history} {...(load.workflow.reconstructed ? { reconstructed: true } : {})} />}
+              </div>
             </CardBody>
           </Card>
         </>

@@ -323,6 +323,29 @@ export interface WorkflowView {
   /** Rebuilt from job records (jobs from before workflows were recorded): read only, with what it cannot know. */
   reconstructed?: true;
   gaps?: string[];
+  /** A stop's pause holds it now (its durable record never expires), whatever its status says. */
+  paused?: true;
+}
+
+/** How much of a workflow's history is kept (server/src/workflows/timeline.ts). */
+export interface WorkflowHistory {
+  shown: number;
+  /** Older events this page leaves out. */
+  omitted: number;
+  /** false: the server could not read every event kept (or rebuilt this history), so some may be missing. */
+  complete: boolean;
+  workflowRetentionDays: number;
+  eventRetentionDays: number;
+  jobRetentionDays: number;
+  /** The workflow began longer ago than events are kept: its earliest have expired. */
+  expiredEarlier: boolean;
+}
+
+/** A wait that ended at an event, measured by the server. */
+export interface WorkflowWait {
+  for: 'capacity' | 'sign_in' | 'ci' | 'person' | 'merge' | 'review_event' | 'pause' | string;
+  since: string;
+  seconds: number;
 }
 
 /** A stop's pause of a workflow: it lasts until an owner resumes it. */
@@ -356,7 +379,9 @@ export interface WorkflowTotals {
 export interface WorkflowEvent {
   id: string;
   at: string;
-  kind: 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered' | 'recovery';
+  kind: 'job_started' | 'job_finished' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_missed' | 'finish_recovered' | 'recovery' | 'admitted' | 'control';
+  /** The workflow version it was saved with: the order things happened in. */
+  seq?: number;
   generation: number;
   jobId?: string;
   eventName?: string;
@@ -365,7 +390,14 @@ export interface WorkflowEvent {
   stage?: string;
   prNumber?: number;
   prUrl?: string;
-  steps?: { kind: string; agent?: string; outcome?: string; usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number; durationMs?: number } }[];
+  steps?: { kind: string; agent?: string; adapter?: string; model?: string; effort?: string; outcome?: string; usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number; durationMs?: number } }[];
+  /** The route the job ran on, once reported: the tier, the tier first chosen, and why (fixed codes). */
+  routing?: { source: string; pool?: string; tier?: string; requestedTier?: string; reason?: string };
+  reason?: string;
+  waited?: WorkflowWait;
+  control?: { action: 'stop_requested' | 'resumed' | string; by: string; reason?: string };
+  /** When it happened, if earlier than when it was recorded (`at`). */
+  occurredAt?: string;
   subscription?: boolean;
   loop?: { rounds: number; maxRevisions?: number; reviews: number; verdict?: 'ready-to-merge' | 'changes-requested' };
   headSha?: string;
@@ -916,7 +948,7 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     job: (installationId: number, jobId: string) => request<{ job: JobView; deliveries: Delivery[]; conversation?: JobView[] }>(`/installations/${installationId}/jobs/${encodeURIComponent(jobId)}`),
     workflows: (installationId: number, limit = 100) => request<{ workflows: WorkflowView[] }>(`/installations/${installationId}/workflows?limit=${limit}`),
     workflow: (installationId: number, workflowId: string) =>
-      request<{ workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals; pause?: WorkflowPause }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}`),
+      request<{ workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals; history?: WorkflowHistory; pause?: WorkflowPause }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}`),
     /** Lift exactly this pause (the one shown), even after the stopped job's records expired; a newer stop answers 409. */
     resumeWorkflow: (installationId: number, workflowId: string, pause: Pick<WorkflowPause, 'jobId' | 'at' | 'subject'>) =>
       request<{ resumed: true }>(`/installations/${installationId}/workflows/${encodeURIComponent(workflowId)}/resume`, { method: 'POST', body: JSON.stringify({ jobId: pause.jobId, at: pause.at, subject: pause.subject }) }),

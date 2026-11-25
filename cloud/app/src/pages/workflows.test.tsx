@@ -226,4 +226,93 @@ describe('workflows in the console', () => {
     await userEvent.selectOptions(screen.getByLabelText('Repository'), 'acme/api');
     expect(screen.getAllByTestId(/^workflow-/).map((e) => e.dataset.testid)).toEqual(['workflow-98-i3']);
   });
+  it('shows waits with how long they lasted, stop and resume with who, the route and models, and marks where the workflow is now', async () => {
+    const old = new Date(Date.now() - 45 * 86_400_000).toISOString();
+    const timeline: WorkflowEvent[] = [
+      { id: 'job_old000001:started', at: old, seq: 1, kind: 'job_started', generation: 1, jobId: 'job_old000001', eventName: 'issues' },
+      { id: 'job_abcdefgh01:queued', at: NOW, seq: 2, kind: 'waiting', generation: 1, jobId: 'job_abcdefgh01', stage: 'queued', reason: 'concurrent_jobs', message: 'Queued: another job is running.' },
+      { id: 'job_abcdefgh01:started', at: NOW, seq: 3, kind: 'job_started', generation: 1, jobId: 'job_abcdefgh01', eventName: 'check_suite' },
+      { id: 'job_abcdefgh01:admitted', at: NOW, seq: 4, kind: 'admitted', generation: 1, jobId: 'job_abcdefgh01', reason: 'concurrent_jobs', waited: { for: 'capacity', since: NOW, seconds: 720 } },
+      {
+        id: 'job_abcdefgh01:finished', at: NOW, seq: 5, kind: 'job_finished', generation: 1, jobId: 'job_abcdefgh01', outcome: 'succeeded', prNumber: 12,
+        routing: { source: 'tier', tier: 'complex', requestedTier: 'standard', reason: 'low-confidence' },
+        steps: [{ kind: 'revision', agent: 'coder', adapter: 'claude', model: 'claude-opus-4', effort: 'high', outcome: 'succeeded' }],
+      },
+      { id: 'recovery:ci:1:abc:1:1', at: NOW, seq: 6, kind: 'recovery', generation: 1, jobId: 'job_abcdefgh01', headSha: 'abcdef1234567890', message: 'Started the CI step.' },
+      { id: 'control:stop:job_abcdefgh01:1', at: NOW, seq: 7, kind: 'control', generation: 1, jobId: 'job_abcdefgh01', control: { action: 'stop_requested', by: 'pat', reason: 'wrong file' } },
+      { id: 'control:resume:job_abcdefgh01:1', at: NOW, seq: 8, kind: 'control', generation: 1, jobId: 'job_abcdefgh01', control: { action: 'resumed', by: 'sam' }, waited: { for: 'pause', since: NOW, seconds: 3600 } },
+      { id: 'job_late00001:finished', at: NOW, occurredAt: old, seq: 9, kind: 'finish_recovered', generation: 1, jobId: 'job_late00001', outcome: 'failed', waited: { for: 'ci', since: NOW, seconds: 90 } },
+    ];
+    const history = { shown: 9, omitted: 3, complete: true, workflowRetentionDays: 90, eventRetentionDays: 90, jobRetentionDays: 30, expiredEarlier: true };
+    const api = fakeApi({ workflow: vi.fn().mockResolvedValue({ workflow: workflow({ status: 'waiting', paused: true, pastPullRequests: [{ number: 4, generation: 1 }] }), events: timeline, history }) });
+    render(
+      <MemoryRouter initialEntries={['/installations/55/workflows/99-i7']}>
+        <Routes>
+          <Route path="/installations/:id/workflows/:workflowId" element={<WorkflowPage api={api} refreshMs={60_000} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByTestId('workflow')).toHaveTextContent('Paused');
+    expect(screen.getByRole('link', { name: 'Run 1: pull request #4 ↗' })).toHaveAttribute('href', 'https://github.com/acme/web/pull/4');
+    const queued = screen.getByTestId('event-job_abcdefgh01:queued');
+    expect(queued).toHaveTextContent('Queued for capacity');
+    expect(queued).toHaveTextContent('Reason code: concurrent_jobs');
+    expect(screen.getByTestId('event-job_abcdefgh01:admitted')).toHaveTextContent(/Started from the queue.*After waiting 12 min for capacity/);
+    const finished = screen.getByTestId('event-job_abcdefgh01:finished');
+    expect(finished).toHaveTextContent('Tier complex (first chosen: standard) · routing reason: low confidence');
+    expect(finished).toHaveTextContent('Coding agent (coder · claude · claude-opus-4 · effort high): succeeded');
+    // A pull request link from its number, when the event has no URL.
+    expect(within(finished).getByRole('link', { name: 'Pull request #12 ↗' })).toHaveAttribute('href', 'https://github.com/acme/web/pull/12');
+    expect(within(screen.getByTestId('event-recovery:ci:1:abc:1:1')).getByRole('link', { name: 'Commit abcdef1 ↗' })).toHaveAttribute('href', 'https://github.com/acme/web/commit/abcdef1234567890');
+    expect(screen.getByTestId('event-control:stop:job_abcdefgh01:1')).toHaveTextContent(/Stop requested.*By pat: wrong file/);
+    const resumed = screen.getByTestId('event-control:resume:job_abcdefgh01:1');
+    expect(resumed).toHaveTextContent('Automation resumed');
+    expect(resumed).toHaveTextContent('By sam');
+    expect(resumed).toHaveTextContent('Paused for 1 h');
+    // The newest event is where the workflow is now; it happened before it was recorded.
+    const late = screen.getByTestId('event-job_late00001:finished');
+    expect(late).toHaveAttribute('aria-current', 'step');
+    expect(late).toHaveTextContent('Latest');
+    expect(late).toHaveTextContent('recorded later');
+    expect(late).toHaveTextContent("After waiting 1 min 30 s for the pull request's checks");
+    expect(screen.getAllByText('Latest')).toHaveLength(1);
+    // A job whose record is past its retention is not a dead link.
+    expect(within(screen.getByTestId('event-job_old000001:started')).queryByRole('link', { name: 'Job' })).toBeNull();
+    expect(screen.getByTestId('event-job_old000001:started')).toHaveTextContent('Job record expired');
+    expect(within(late).queryByRole('link', { name: 'Job' })).toBeNull();
+    expect(within(resumed).getByRole('link', { name: 'Job' })).toHaveAttribute('href', '/installations/55/jobs/job_abcdefgh01');
+    const kept = screen.getByTestId('workflow-history');
+    expect(kept).toHaveTextContent('Showing the latest 9 events; 3 older events are not shown.');
+    expect(kept).toHaveTextContent('began more than 90 days ago');
+    expect(kept).toHaveTextContent("job records 30 days, and a stop's pause until it is resumed");
+  });
+
+  it('says when a history read was cut short, and keeps polling a workflow that waits', async () => {
+    const history = { shown: 1, omitted: 0, complete: false, workflowRetentionDays: 90, eventRetentionDays: 90, jobRetentionDays: 30, expiredEarlier: false };
+    const read = vi.fn().mockResolvedValue({ workflow: workflow({ status: 'waiting', stage: 'queued' }), events: events.slice(0, 1), history });
+    render(
+      <MemoryRouter initialEntries={['/installations/55/workflows/99-i7']}>
+        <Routes>
+          <Route path="/installations/:id/workflows/:workflowId" element={<WorkflowPage api={fakeApi({ workflow: read })} refreshMs={20} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByTestId('workflow-history')).toHaveTextContent('some may not be shown');
+    await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(1));
+  });
+
+  it('finds paused workflows with a filter of their own, whatever their status says', async () => {
+    const { WorkflowsList } = await import('../components/workflows');
+    render(
+      <MemoryRouter>
+        <WorkflowsList
+          base="/installations/55"
+          workflows={[workflow({ paused: true, reason: 'job_canceled' }), workflow({ workflowId: '99-i8', issue: 8, status: 'finished', stage: 'merged' }), workflow({ workflowId: '99-i9', issue: 9, status: 'finished', stage: 'done', paused: true })]}
+        />
+      </MemoryRouter>,
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Paused (2)' }));
+    expect(screen.getAllByTestId(/^workflow-/).map((e) => e.dataset.testid)).toEqual(['workflow-99-i7', 'workflow-99-i9']);
+    expect(within(screen.getByTestId('workflow-99-i9')).getByText('Paused')).toBeInTheDocument();
+  });
 });
