@@ -160,6 +160,8 @@ export interface BrokerDeps {
   policy: PolicyContext;
   /** Absent: never engaged. */
   killSwitch?: KillSwitch;
+  /** Records each finish on the job's workflow (workflows/recorder.ts). Best effort. */
+  workflows?: import('../workflows/recorder.js').WorkflowRecorder;
   now?: () => number;
 }
 
@@ -302,6 +304,8 @@ export function createBroker(deps: BrokerDeps) {
       // Redelivering the webhook is how a failed job is retried: anything but a clean success
       // gives up the delivery's claim, so the launcher starts a job for the redelivery.
       if (recorded !== 'succeeded') await deps.store.releaseDelivery(job.installationId, job.deliveryId, job.jobId);
+      // The workflow learns the finish whose outcome stuck; a repeated finish with another outcome changes nothing there.
+      if (recorded === given) await deps.workflows?.finished(job, recorded, finished);
       // How the job's telemetry export went, for the settings page. Best effort, like the key's use.
       const sent = finished?.telemetry;
       // A job read only for the console (no destination) exported nothing to report.

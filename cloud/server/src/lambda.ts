@@ -1,3 +1,5 @@
+import { createWorkflowService } from './tenants/workflow-service.js';
+import { createDynamoWorkflowStore } from './workflows/store.js';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
@@ -136,6 +138,7 @@ const app = createApp({
           route: nativeRoute(process.env.NATIVE_WORKER_ROUTE),
           loginGrant: browserLoginGrant(process.env.NATIVE_WORKER_LOGIN_IMAGE_ARN ?? '', nativeRoute(process.env.NATIVE_WORKER_ROUTE)),
           mode: createNativeModeStore(tableName), workers: createNativeStore(tableName) }),
+        workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), jobs: store, github }),
         status: createStatusService({
           store,
           github,

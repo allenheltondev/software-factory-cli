@@ -165,6 +165,8 @@ export interface LaunchDeps {
   bundleKeys?: BundleKeys;
   /** Posts the over-quota comment on the issue (once a day per issue). Its failure is only logged. */
   notifyThrottled?: (input: ThrottleNotice) => Promise<void>;
+  /** Records each launched job on its issue's workflow (workflows/recorder.ts). Best effort. */
+  workflows?: import('../workflows/recorder.js').WorkflowRecorder;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
   /** Retry pause for recording the microVM on the job. */
@@ -365,9 +367,28 @@ export function createLauncher(deps: LaunchDeps) {
       return skip('kill_switch');
     }
 
+    /** The issue's workflow waits for the sign-in (workflows/recorder.ts); it is blocked if no one signs in. */
+    const waitingForSignIn = (jobId: string, action: 'sign-in' | 'reconnect' = 'sign-in') =>
+      deps.workflows?.waiting(
+        { installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, eventName, deliveryId: req.deliveryId, jobId, ...(decision.issue !== undefined ? { issue: decision.issue } : {}), ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}) },
+        action === 'sign-in'
+          ? {
+              reason: 'sign_in_required',
+              message: 'The job waits for a Claude subscription sign-in before it can start.',
+              nextAction: 'Open the Claude page of this installation and sign in; the job then starts on its own.',
+            }
+          : {
+              reason: 'reconnect_required',
+              message: 'The job waits for the Claude subscription to be reconnected before it can start.',
+              nextAction: 'Open the Claude page of this installation and reconnect; the job then starts on its own.',
+            },
+      );
     if (binding?.route.workerId.startsWith('managed-') && !req.resumeClaude && !req.retry) {
       const jobId = await deps.parkedClaude?.(req);
-      if (jobId) return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Open the Claude sign-in request for this delivery', jobId };
+      if (jobId) {
+        await waitingForSignIn(jobId);
+        return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Open the Claude sign-in request for this delivery', jobId };
+      }
     }
     const readiness: NativeReadiness | undefined = native?.readiness ? await native.readiness()
       // A worker that reports no reason keeps the old meaning of not ready: sign-in.
@@ -381,6 +402,8 @@ export function createLauncher(deps: LaunchDeps) {
       if (native.route.workerId.startsWith('managed-') && decision.issue !== undefined && !req.resumeClaude && !req.retry && deps.waitForClaude) {
         const jobId = await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness);
         const action = readinessAction(readiness);
+        // A wait only a person can end (a sign-in, a reconnect) is the workflow's too.
+        if (action === 'sign-in' || action === 'reconnect') await waitingForSignIn(jobId, action);
         return action === 'sign-in'
           ? { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Waiting for Claude subscription sign-in', jobId }
           : action === 'reconnect'
@@ -539,6 +562,7 @@ export function createLauncher(deps: LaunchDeps) {
       // never got this far.
       await deps.store.markLaunching(jobId);
       launching = true;
+      await deps.workflows?.started(job);
       if (native) return { status: 202, disposition: 'launched', jobId };
       const out = await deps.runMicrovm(runMicrovmInput(s, imageVersion, { jobId, token, deliveryId: req.deliveryId, launchedAt, eventName, ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) }));
       microvmId = out.microvmId;

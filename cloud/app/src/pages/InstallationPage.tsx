@@ -18,20 +18,21 @@ import {
   StatTile,
   StatusBadge,
 } from '@readysetcloud/ui';
-import { api as defaultApi, type ApiClient, type Delivery, type DeliveryDisposition, type JobView, type Overview } from '../api/client';
+import { api as defaultApi, type ApiClient, type Delivery, type DeliveryDisposition, type JobView, type Overview, type WorkflowView } from '../api/client';
+import { WorkflowsList } from '../components/workflows';
 import { DISPOSITION, INSTALLATION, JOB_RESULT, deliveryReason, formatDuration, installationSettingsUrl } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
 import { LoopBadges } from '../components/lifecycle';
 import { SetupChecklist, setupComplete, setupSteps } from '../components/setup';
 
-type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'>;
-type Tab = 'jobs' | 'deliveries' | 'repositories';
-type Load = { state: 'loading' } | { state: 'ok'; overview: Overview; jobs: JobView[]; deliveries: Delivery[] } | { state: 'error'; message: string };
+type InstallationApi = Pick<ApiClient, 'overview' | 'jobs' | 'deliveries'> & Partial<Pick<ApiClient, 'workflows'>>;
+type Tab = 'jobs' | 'workflows' | 'deliveries' | 'repositories';
+type Load = { state: 'loading' } | { state: 'ok'; overview: Overview; jobs: JobView[]; deliveries: Delivery[]; workflows: WorkflowView[] } | { state: 'error'; message: string };
 
 /** While a job runs, the page looks again this often. */
 export const REFRESH_MS = 15_000;
 const exact = (iso: string) => new Date(iso).toLocaleString();
-const TABS: Tab[] = ['jobs', 'deliveries', 'repositories'];
+const TABS: Tab[] = ['jobs', 'workflows', 'deliveries', 'repositories'];
 
 /**
  * One installation of the App (#71): is it working, and if not, why. A hero with its status,
@@ -53,9 +54,15 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [overview, jobs, deliveries] = await Promise.all([api.overview(installationId), api.jobs(installationId), api.deliveries(installationId)]);
+      const [overview, jobs, deliveries, workflows] = await Promise.all([
+        api.overview(installationId),
+        api.jobs(installationId),
+        api.deliveries(installationId),
+        // Workflows are an addition: an API without them (or a failure to read them) leaves the rest of the page as it is.
+        api.workflows ? api.workflows(installationId).catch(() => ({ workflows: [] as WorkflowView[] })) : Promise.resolve({ workflows: [] as WorkflowView[] }),
+      ]);
       if (live.current) {
-        setLoad({ state: 'ok', overview, jobs: jobs.jobs, deliveries: deliveries.deliveries });
+        setLoad({ state: 'ok', overview, jobs: jobs.jobs, deliveries: deliveries.deliveries, workflows: workflows.workflows });
         setCheckedAt(Date.now());
       }
     } catch (err) {
@@ -106,6 +113,7 @@ export function InstallationPage({ api = defaultApi, refreshMs = REFRESH_MS }: {
             overview={load.overview}
             jobs={load.jobs}
             deliveries={load.deliveries}
+            workflows={load.workflows}
             tab={tab}
             onTab={(t) => setParams(t === 'jobs' ? {} : { tab: t }, { replace: true })}
             onRefresh={() => void refresh()}
@@ -146,7 +154,7 @@ function RepositoryView({ overview, onRefresh, refreshing }: { overview: Overvie
 }
 
 function ActivityView({
-  overview, jobs, deliveries, tab, onTab, onRefresh, refreshing, checkedAt,
+  overview, jobs, deliveries, workflows, tab, onTab, onRefresh, refreshing, checkedAt,
 }: Omit<Extract<Load, { state: 'ok' }>, 'state'> & {
   tab: Exclude<Tab, 'repositories'>;
   onTab: (tab: Exclude<Tab, 'repositories'>) => void;
@@ -216,6 +224,7 @@ function ActivityView({
             onChange={onTab}
             options={[
               { value: 'jobs', label: `Jobs (${recentJobs.length})` },
+              { value: 'workflows', label: `Workflows (${workflows.length})` },
               { value: 'deliveries', label: `Deliveries (${deliveries.length})` },
             ]}
           />
@@ -224,6 +233,7 @@ function ActivityView({
           {tab === 'jobs' && (recentJobs.length === 0 && runningJobs.length > 0
             ? <EmptyState title="No finished jobs yet" description="Running jobs appear above until they finish." />
             : <JobsList jobs={recentJobs} base={base} />)}
+          {tab === 'workflows' && <WorkflowsList workflows={workflows} base={base} />}
           {tab === 'deliveries' && <DeliveriesList deliveries={deliveries} base={base} />}
         </CardBody>
       </Card>
