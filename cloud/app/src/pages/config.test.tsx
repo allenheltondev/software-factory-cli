@@ -165,7 +165,8 @@ describe('the simple page', () => {
     expect(api.publishConfig).toHaveBeenCalledWith(55, { config: expect.any(Object), baseVersion: null });
     const sent = sentConfig(api);
     expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['claude', 'codex'] } });
-    expect(sent.repositories['acme/web']).toEqual({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm ci && npm test'] });
+    // A new reviewed repository repairs failing CI: the guided software factory.
+    expect(sent.repositories['acme/web']).toEqual({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm ci && npm test'], ci: {} });
     const first = await screen.findByTestId('first-publish');
     expect(first).toHaveTextContent('add the label updraft to an issue in acme/web');
     expect(within(first).getByRole('link', { name: /acme\/web/ })).toHaveAttribute('href', 'https://github.com/acme/web/issues');
@@ -315,6 +316,63 @@ describe('the simple page', () => {
     expect(api.publishConfig).toHaveBeenCalledWith(55, expect.objectContaining({ confirmAutoMerge: true }));
   });
 
+  it('keeps an existing repository with CI repair off, says so, and turns it on with check filters', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
+    configPage(api);
+    const web = await screen.findByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
+    const ci = within(web).getByTestId('ci-acme/web');
+    expect(within(ci).getByRole('checkbox', { name: /Fix failing CI/ })).not.toBeChecked();
+    expect(ci).toHaveTextContent(/Off: a pull request the reviewer finds ready counts as done/);
+    await userEvent.click(within(ci).getByRole('checkbox', { name: /Fix failing CI/ }));
+    expect(ci).toHaveTextContent(/counts against the 3 revision rounds/);
+    await userEvent.type(within(ci).getByLabelText('Checks to ignore'), 'preview-deploy');
+    await userEvent.type(within(ci).getByLabelText('Wait for checks (minutes)'), '30');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).repositories['acme/web']?.ci).toEqual({ ignore: ['preview-deploy'], waitMinutes: 30 });
+  });
+
+  it('drops CI repair with the last review agent, keeping the repository\'s other settings, and publishes', async () => {
+    const config = withRepo();
+    config.repositories['acme/web'] = { ...config.repositories['acme/web']!, publish: 'pr', verify: ['npm test'], ci: { ignore: ['preview'] } };
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig: publishedOk(2) });
+    configPage(api);
+    await userEvent.click(within(await screen.findByTestId('review-claude')).getByRole('checkbox'));
+    await userEvent.click(within(screen.getByTestId('review-codex')).getByRole('checkbox'));
+    const web = screen.getByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
+    expect(within(web).getByRole('checkbox', { name: /Fix failing CI/ })).not.toBeChecked();
+    expect(within(web).getByRole('checkbox', { name: /Fix failing CI/ })).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const sent = sentConfig(api);
+    expect(sent.workflows.implement!.review.enabled).toBe(false);
+    expect(sent.repositories['acme/web']).toEqual({ enabled: true, workflows: ['implement'], publish: 'pr', commentOnFailure: true, verify: ['npm test'] });
+  });
+
+  it('says which checks decide when auto-merge names required checks, and what off means with auto-merge on', async () => {
+    const config = withRepo();
+    config.repositories['acme/web']!.autoMerge = { method: 'squash', requiredChecks: ['test'] };
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config })) }));
+    const web = await screen.findByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
+    const ci = within(web).getByTestId('ci-acme/web');
+    expect(ci).toHaveTextContent(/auto-merge still waits for its checks before it merges, but a failing check is not repaired/);
+    await userEvent.click(within(ci).getByRole('checkbox', { name: /Fix failing CI/ }));
+    expect(ci).toHaveTextContent("Empty: auto-merge's required checks (test)");
+  });
+
+  it('turns CI repair off again, and an explicit off is published as off', async () => {
+    const config = withRepo();
+    config.repositories['acme/web']!.ci = {};
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig: publishedOk(2) });
+    configPage(api);
+    const web = await screen.findByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
+    await userEvent.click(within(web).getByRole('checkbox', { name: /Fix failing CI/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).repositories['acme/web']?.ci).toBeUndefined();
+  });
+
   it('keeps prompts and limits under Advanced, and resets an edited prompt', async () => {
     const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);
@@ -358,7 +416,7 @@ describe('the full editor', () => {
     await userEvent.type(within(api_).getByLabelText('Verify commands'), 'npm test');
     await userEvent.click(publish);
     expect(api.publishConfig).toHaveBeenCalledWith(55, { config: expect.any(Object), baseVersion: 1 });
-    expect(sentConfig(api).repositories['acme/api']).toEqual({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm test'] });
+    expect(sentConfig(api).repositories['acme/api']).toEqual({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm test'], ci: {} });
     expect(await screen.findByTestId('config-published')).toHaveTextContent('Published version 2');
     expect(screen.getByTestId('draft-state')).toHaveTextContent('Version 2 is active');
   });
@@ -475,6 +533,35 @@ describe('the full editor', () => {
     expect(api.publishConfig).toHaveBeenCalledWith(55, expect.objectContaining({ confirmAutoMerge: true }));
   });
 
+  it('drops CI repair when the workflow stops reviewing, and publishes the rest unchanged', async () => {
+    const config = withRepo();
+    config.repositories['acme/web'] = { ...config.repositories['acme/web']!, verify: ['npm test'], baseBranch: 'dev', ci: { waitMinutes: 30 } };
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig: publishedOk(2) });
+    configPage(api);
+    await openFull();
+    await userEvent.click(await screen.findByRole('button', { name: 'Workflows' }));
+    await userEvent.click(within(screen.getByTestId('workflow-implement')).getByTestId('review-implement'));
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const sent = sentConfig(api);
+    expect(sent.workflows.implement!.review.enabled).toBe(false);
+    expect(sent.repositories['acme/web']).toEqual({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm test'], baseBranch: 'dev' });
+  });
+
+  it('lets CI repair be turned off where nothing reviews any more', async () => {
+    const config = withRepo();
+    config.workflows.implement!.review.enabled = false;
+    config.repositories['acme/web']!.ci = {};
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig: publishedOk(2) });
+    configPage(api);
+    await openFull();
+    const toggle = within(await screen.findByTestId('repo-acme/web')).getByRole('checkbox', { name: /Fix failing CI/ });
+    expect(toggle).toBeEnabled();
+    await userEvent.click(toggle);
+    expect(toggle).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).repositories['acme/web']?.ci).toBeUndefined();
+  });
+
   it('offers no auto-merge where no workflow reviews', async () => {
     const config = withRepo();
     config.workflows.implement!.review.enabled = false;
@@ -482,6 +569,7 @@ describe('the full editor', () => {
     await openFull();
     const web = await screen.findByTestId('repo-acme/web');
     expect(within(web).getByRole('checkbox', { name: /Auto-merge/ })).toBeDisabled();
+    expect(within(web).getByRole('checkbox', { name: /Fix failing CI/ })).toBeDisabled();
   });
 
   it('asks again when the server wants the auto-merge confirmation, and resends with it', async () => {

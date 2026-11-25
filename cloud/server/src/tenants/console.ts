@@ -127,6 +127,20 @@ export interface ConsoleAutoMerge {
   requiredChecks?: string[];
 }
 
+/**
+ * The CI step of the review loop (docs/ci-fix.md), compiled to repositories.R.ciFix: a pull
+ * request the reviewer found ready is not done while its checks are pending or failing, and a
+ * failure the code can cause queues a revision (when the workflows revise). Needs review.
+ */
+export interface ConsoleCi {
+  /** Only these checks decide; absent: autoMerge.requiredChecks when set, else every check except `ignore`. */
+  checks?: string[];
+  /** Checks that never count, such as a preview deployment that is not about the code. */
+  ignore?: string[];
+  /** How long to wait for pending checks on one head, minutes (CLI default 60). */
+  waitMinutes?: number;
+}
+
 export interface ConsoleRepository {
   /** false: paused. It stays configured, and no labeled issue starts a job. */
   enabled: boolean;
@@ -143,6 +157,8 @@ export interface ConsoleRepository {
   verifyTimeoutMinutes?: number;
   /** Absent: off. Turning it on takes an explicit confirmation (config-service.ts). */
   autoMerge?: ConsoleAutoMerge;
+  /** Absent: off. Checks are part of the review loop, and failures are repaired (see ConsoleCi). */
+  ci?: ConsoleCi;
 }
 
 /** What an upgrade from version 1 keeps resolvable for work in flight (see the top of this file). */
@@ -465,7 +481,7 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
         c.err(path, 'must be a mapping');
         continue;
       }
-      only(c, path, r, ['enabled', 'workflows', 'allowedActors', 'baseBranch', 'publish', 'commentOnFailure', 'verify', 'verifyTimeoutMinutes', 'autoMerge']);
+      only(c, path, r, ['enabled', 'workflows', 'allowedActors', 'baseBranch', 'publish', 'commentOnFailure', 'verify', 'verifyTimeoutMinutes', 'autoMerge', 'ci']);
 
       const runs = names(c, `${path}.workflows`, r.workflows, isObject(raw.workflows) ? raw.workflows : undefined, 'workflow', CONSOLE_LIMITS.workflowsPerRepository);
       if (Array.isArray(r.workflows) && r.workflows.length === 0) c.err(`${path}.workflows`, 'choose at least one workflow: its label is how an issue starts work here');
@@ -518,6 +534,33 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
         }
       }
 
+      let ci: ConsoleCi | undefined;
+      if (r.ci !== undefined && r.ci !== null) {
+        const cp = `${path}.ci`;
+        if (!isObject(r.ci)) c.err(cp, 'must be a mapping, or absent for off');
+        else {
+          only(c, cp, r.ci, ['checks', 'ignore', 'waitMinutes']);
+          const waitMinutes = minutes(c, `${cp}.waitMinutes`, r.ci.waitMinutes, CEILINGS.ciWaitMinutes);
+          const checkNames = (key: 'checks' | 'ignore'): string[] | undefined => {
+            const v = r.ci && isObject(r.ci) ? r.ci[key] : undefined;
+            if (v === undefined || v === null) return undefined;
+            if (!Array.isArray(v)) {
+              c.err(`${cp}.${key}`, 'must be a list of check names');
+              return undefined;
+            }
+            if (v.length > CONSOLE_LIMITS.requiredChecks) c.err(`${cp}.${key}`, `at most ${CONSOLE_LIMITS.requiredChecks} checks`);
+            return v.map((n, i) => text(c, `${cp}.${key}.${i}`, n, { required: true, max: 255 })).filter((n): n is string => n !== undefined);
+          };
+          const checks = checkNames('checks');
+          const ignore = checkNames('ignore');
+          ci = {
+            ...(checks?.length ? { checks } : {}),
+            ...(ignore?.length ? { ignore } : {}),
+            ...(waitMinutes !== undefined ? { waitMinutes } : {}),
+          };
+        }
+      }
+
       repositories[fullName] = {
         enabled: bool(c, `${path}.enabled`, r.enabled, true),
         workflows: runs,
@@ -528,6 +571,7 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
         verify,
         ...(verify.length && verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes } : {}),
         ...(autoMerge ? { autoMerge } : {}),
+        ...(ci ? { ci } : {}),
       };
     }
     if (list.length === 0) c.err('repositories', 'add at least one repository');
@@ -567,6 +611,7 @@ function checkMeaning(config: ConsoleConfig, c: Check) {
     }
     const reviewed = wfs.some(([, w]) => w.review.enabled);
     if (r.autoMerge && !reviewed) c.err(`${path}.autoMerge`, 'turn on review in its workflow first: Updraft only merges a pull request its own reviewer found ready');
+    if (r.ci && !reviewed) c.err(`${path}.ci`, 'turn on review in its workflow first: checks are looked at for a pull request the reviewer found ready');
 
     if (r.enabled) {
       for (const [, w] of wfs) {
@@ -890,6 +935,7 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
             ...(r.autoMerge.requiredChecks?.length ? { autoMergeRequiredChecks: [...r.autoMerge.requiredChecks] } : {}),
           }
         : {}),
+      ...(r.ci ? { ciFix: r.ci.checks || r.ci.ignore || r.ci.waitMinutes !== undefined ? { ...r.ci } : true } : {}),
       workflows: r.workflows.map((n) => {
         const w = config.workflows[n]!;
         return {
@@ -960,6 +1006,7 @@ export function toConsolePath(path: string, config: ConsoleConfig): string {
     if (r.startsWith('review') || r.startsWith('revise') || r.startsWith('maxRevisions')) return join(base, 'workflows');
     if (r.startsWith('autoMergeWaitMinutes')) return join(base, 'autoMerge', 'waitMinutes');
     if (r.startsWith('autoMergeRequiredChecks')) return join(base, 'autoMerge', r.replace(/^autoMergeRequiredChecks/, 'requiredChecks'));
+    if (r.startsWith('ciFix')) return join(base, r.replace(/^ciFix/, 'ci'));
     if (r === 'paused') return join(base, 'enabled');
     return join(base, r);
   }

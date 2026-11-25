@@ -142,6 +142,36 @@ describe('compiling', () => {
     expect(yaml.repositories['acme/web']).toMatchObject({ review: { allowSameAgent: true }, revise: true, maxRevisions: 2, autoMerge: 'squash', autoMergeWaitMinutes: 30, autoMergeRequiredChecks: ['ci'] });
     expect(r.files['prompts/implement.revise.md']).toBe('# Fix');
   });
+
+  it('leaves CI repair off where it is not set: an existing repository keeps its policy', () => {
+    const r = compile(ok(settings()));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(yamlOf(r.files).repositories['acme/web']?.ciFix).toBeUndefined();
+    expect(r.dispatch.repositories['acme/web']?.ci).toBeUndefined();
+  });
+
+  it('compiles CI repair to ciFix, and the published dispatch rule takes check suites', () => {
+    const on = compile(ok(settings({ 'acme/web': repo({ ci: {} }) })));
+    expect(on.ok).toBe(true);
+    if (!on.ok) return;
+    expect(yamlOf(on.files).repositories['acme/web']).toMatchObject({ review: true, revise: true, ciFix: true });
+    expect(on.dispatch.repositories['acme/web']).toMatchObject({ review: true, revise: true, ci: true });
+
+    const filtered = compile(ok(settings({ 'acme/web': repo({ ci: { checks: ['test', 'lint'], ignore: ['preview'], waitMinutes: 45 } }) })));
+    expect(filtered.ok).toBe(true);
+    if (!filtered.ok) return;
+    expect(yamlOf(filtered.files).repositories['acme/web']?.ciFix).toEqual({ checks: ['test', 'lint'], ignore: ['preview'], waitMinutes: 45 });
+    expect(filtered.dispatch.repositories['acme/web']?.ci).toBe(true);
+  });
+
+  it('keeps CI settings through a save and a reload', () => {
+    const ci = { checks: ['test'], ignore: ['preview'], waitMinutes: 30 };
+    const first = ok(settings({ 'acme/web': repo({ ci }) }));
+    expect(first.repositories['acme/web']?.ci).toEqual(ci);
+    expect(ok(JSON.parse(JSON.stringify(first))).repositories['acme/web']?.ci).toEqual(ci);
+    expect(ok(settings({ 'acme/web': repo({ ci: {} }) })).repositories['acme/web']?.ci).toEqual({});
+  });
 });
 
 describe('parseConsoleConfig', () => {
@@ -205,6 +235,16 @@ describe('parseConsoleConfig', () => {
     expect(errorsOf(settings({ 'acme/web': repo({ autoMerge: { method: 'squash' } }) }, reviewOff))).toEqual([
       expect.objectContaining({ path: 'repositories.acme/web.autoMerge', message: expect.stringMatching(/review/) }),
     ]);
+  });
+
+  it('allows CI repair only where a workflow reviews, within the ceiling', () => {
+    expect(errorsOf(settings({ 'acme/web': repo({ ci: {} }) }, reviewOff))).toEqual([
+      expect.objectContaining({ path: 'repositories.acme/web.ci', message: expect.stringMatching(/review/) }),
+    ]);
+    expect(errorsOf(settings({ 'acme/web': repo({ ci: { waitMinutes: 500 } }) }))).toEqual([expect.objectContaining({ path: 'repositories.acme/web.ci.waitMinutes' })]);
+    expect(errorsOf(settings({ 'acme/web': repo({ ci: { checks: 'test' } }) }))).toEqual([expect.objectContaining({ path: 'repositories.acme/web.ci.checks' })]);
+    expect(errorsOf(settings({ 'acme/web': repo({ ci: { other: 1 } }) }))).toEqual([expect.objectContaining({ path: 'repositories.acme/web.ci.other' })]);
+    expect(errorsOf(settings({ 'acme/web': repo({ ci: true }) }))).toEqual([expect.objectContaining({ path: 'repositories.acme/web.ci' })]);
   });
 
   it('refuses verify commands that are not one line', () => {
@@ -422,6 +462,7 @@ describe('toConsolePath', () => {
     ['repositories.acme/api.workflows.0.allowedActors', 'repositories.acme/api.allowedActors'],
     ['repositories.acme/web.site.review', 'repositories.acme/web.site.workflows'],
     ['repositories.acme/web.site.autoMergeWaitMinutes', 'repositories.acme/web.site.autoMerge.waitMinutes'],
+    ['repositories.acme/web.site.ciFix.waitMinutes', 'repositories.acme/web.site.ci.waitMinutes'],
     ['repositories.acme/web.site', 'repositories.acme/web.site'],
     ['dispatch.allowedActors', 'allowedActors'],
     ['something.else', 'something.else'],

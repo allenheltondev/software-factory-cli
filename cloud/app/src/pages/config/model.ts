@@ -27,8 +27,13 @@ export function freeName(base: string, taken: Record<string, unknown>): string {
   for (let i = 2; ; i++) if (!Object.hasOwn(taken, `${stem}-${i}`)) return `${stem}-${i}`;
 }
 
-export function newRepository(workflows: string[]): ConsoleRepository {
-  return { enabled: true, workflows, publish: 'draft-pr', commentOnFailure: true, verify: [] };
+/**
+ * A repository just added. When its workflows review, CI repair starts on (the guided software
+ * factory: a failing check on a reviewed pull request is fixed, not left). A repository already
+ * configured keeps what it has: an explicit off stays off.
+ */
+export function newRepository(workflows: string[], reviewed = false): ConsoleRepository {
+  return { enabled: true, workflows, publish: 'draft-pr', commentOnFailure: true, verify: [], ...(reviewed ? { ci: {} } : {}) };
 }
 
 /** A new workflow: the first pool builds, a second one (when there is one) reviews, with the packaged prompts. */
@@ -82,9 +87,28 @@ export function workflowConflict(config: ConsoleConfig, repo: ConsoleRepository)
   return null;
 }
 
+/** Whether a repository's workflows revise pull requests (they agree on it). */
+export const revises = (config: ConsoleConfig, repo: ConsoleRepository) => repo.workflows.some((n) => config.workflows[n]?.revise.enabled);
+
 export const reviews = (config: ConsoleConfig, repo: ConsoleRepository) => repo.workflows.some((n) => config.workflows[n]?.review.enabled);
 
 /** Which editor section a field path belongs to. */
 export type Section = 'repositories' | 'workflows' | 'agents';
 export const sectionOf = (path: string): Section =>
   path.startsWith('agents') || path.startsWith('pools') ? 'agents' : path.startsWith('workflows') ? 'workflows' : 'repositories';
+
+/**
+ * The settings with CI repair dropped from repositories none of whose workflows review any more:
+ * it needs review, so turning review off takes it along instead of leaving a draft the server
+ * refuses. Every other setting of the repository stays.
+ */
+export function withoutUnreviewedCi(config: ConsoleConfig): ConsoleConfig {
+  let repositories: ConsoleConfig['repositories'] | undefined;
+  for (const [name, repo] of Object.entries(config.repositories)) {
+    if (repo.ci === undefined || reviews(config, repo)) continue;
+    repositories ??= { ...config.repositories };
+    const { ci: _dropped, ...rest } = repo;
+    repositories[name] = rest;
+  }
+  return repositories ? { ...config, repositories } : config;
+}
