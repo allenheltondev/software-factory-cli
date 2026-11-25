@@ -7,7 +7,7 @@ import { installationSettingsUrl } from '../../lib/diagnostics';
 import { AutoMerge, CiRepair } from './Editor';
 import { Check, FieldError, ParsedText, PromptField } from './fields';
 import { InlineKey, type KeyApi } from './InlineKey';
-import { AGENT_LABEL, DEFAULT_OFFERED, issuesAt, KEY_FOR, newRepository, numberOrUndefined, parseLogins } from './model';
+import { AGENT_LABEL, DEFAULT_OFFERED, issuesAt, KEY_FOR, newRepository, numberOrUndefined, parseLogins, withoutUnreviewedCi } from './model';
 
 export const CODING = 'builders';
 export const REVIEW = 'reviewers';
@@ -95,7 +95,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
     if (nextReview.length) pools[REVIEW] = { agents: order(nextReview) };
     // With one review agent, it reviews whatever it wrote itself: there is no one else.
     const reviewSettings = { ...w.review, enabled: nextReview.length > 0, pool: REVIEW, allowSameAgent: nextReview.length < 2 };
-    onChange({ ...config, agents, pools, workflows: { [wfName]: { ...w, review: reviewSettings } } });
+    onChange(withoutUnreviewedCi({ ...config, agents, pools, workflows: { [wfName]: { ...w, review: reviewSettings } } }));
   }
 
   const setRepo = (name: string, next: ConsoleRepository | null) => {

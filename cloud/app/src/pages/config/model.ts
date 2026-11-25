@@ -96,3 +96,19 @@ export const reviews = (config: ConsoleConfig, repo: ConsoleRepository) => repo.
 export type Section = 'repositories' | 'workflows' | 'agents';
 export const sectionOf = (path: string): Section =>
   path.startsWith('agents') || path.startsWith('pools') ? 'agents' : path.startsWith('workflows') ? 'workflows' : 'repositories';
+
+/**
+ * The settings with CI repair dropped from repositories none of whose workflows review any more:
+ * it needs review, so turning review off takes it along instead of leaving a draft the server
+ * refuses. Every other setting of the repository stays.
+ */
+export function withoutUnreviewedCi(config: ConsoleConfig): ConsoleConfig {
+  let repositories: ConsoleConfig['repositories'] | undefined;
+  for (const [name, repo] of Object.entries(config.repositories)) {
+    if (repo.ci === undefined || reviews(config, repo)) continue;
+    repositories ??= { ...config.repositories };
+    const { ci: _dropped, ...rest } = repo;
+    repositories[name] = rest;
+  }
+  return repositories ? { ...config, repositories } : config;
+}

@@ -22,6 +22,7 @@ import {
   poolsOf,
   reviews,
   revises,
+  withoutUnreviewedCi,
   sectionOf,
   workflowConflict,
   type Section,
@@ -239,6 +240,8 @@ const checkList = (t: string) => t.split(',').map((s) => s.trim()).filter(Boolea
 /** CI as part of the review loop (repositories.R.ciFix): off, or on with optional check filters and a wait. */
 export function CiRepair({ name, repo, reviewed, revised, maxRevisions, errors, ceiling, patch }: { name: string; repo: ConsoleRepository; reviewed: boolean; revised: boolean; maxRevisions?: number; errors: ConfigIssue[]; ceiling: number; patch: (p: Partial<ConsoleRepository>) => void }) {
   const path = `repositories.${name}.ci`;
+  // The CLI's default for `checks` (ciSettings): auto-merge's required checks when set, else every check.
+  const inherited = repo.autoMerge?.requiredChecks ?? [];
   const set = (next: NonNullable<ConsoleRepository['ci']>) => {
     const out = { ...next };
     if (out.waitMinutes === undefined) delete out.waitMinutes;
@@ -248,13 +251,18 @@ export function CiRepair({ name, repo, reviewed, revised, maxRevisions, errors, 
   };
   return (
     <div className="flex flex-col gap-2" data-testid={`ci-${name}`}>
-      <Check testId={`ci-toggle-${name}`} checked={repo.ci !== undefined} disabled={!reviewed} onChange={(v) => patch({ ci: v ? {} : undefined })}>
+      {/* Turning it off is always allowed, so a setting that can no longer apply never traps the draft. */}
+      <Check testId={`ci-toggle-${name}`} checked={repo.ci !== undefined} disabled={!reviewed && repo.ci === undefined} onChange={(v) => patch({ ci: v ? {} : undefined })}>
         Fix failing CI on pull requests the reviewer finds ready
       </Check>
       {!reviewed ? (
         <p className="text-sm text-muted-foreground">Needs a workflow here that reviews: checks are looked at once the reviewer finds a pull request ready.</p>
       ) : repo.ci === undefined ? (
-        <p className="text-sm text-muted-foreground">Off: a pull request the reviewer finds ready counts as done, whatever its checks say. Turn this on so a failing check is repaired by a revision.</p>
+        <p className="text-sm text-muted-foreground">
+          {repo.autoMerge
+            ? 'Off: auto-merge still waits for its checks before it merges, but a failing check is not repaired; the pull request waits for a person. Turn this on so a failing check is repaired by a revision.'
+            : 'Off: a pull request the reviewer finds ready counts as done, whatever its checks say. Turn this on so a failing check is repaired by a revision.'}
+        </p>
       ) : revised ? (
         <p className="text-sm text-muted-foreground">
           A failing check on the pull request&apos;s current head queues one revision with the failed checks&apos; diagnostics, then a new review and new checks. Each fix counts against the {maxRevisions ?? 3} revision rounds per pull request; when they run out, or a check needs a person (cancelled, a manual approval, a check that never reports), Updraft says so on the pull request and stops.
@@ -276,7 +284,7 @@ export function CiRepair({ name, repo, reviewed, revised, maxRevisions, errors, 
             error={issuesAt(errors, `${path}.waitMinutes`)}
             onChange={(e) => set({ ...repo.ci!, waitMinutes: numberOrUndefined(e.target.value) })}
           />
-          <ParsedText label="Checks that decide" hint="Comma separated. Empty: every check" value={repo.ci.checks ?? []} parse={checkList} format={(v) => v.join(', ')} onChange={(checks) => set({ ...repo.ci!, checks })} />
+          <ParsedText label="Checks that decide" hint={inherited.length ? `Comma separated. Empty: auto-merge's required checks (${inherited.join(', ')})` : 'Comma separated. Empty: every check'} value={repo.ci.checks ?? []} parse={checkList} format={(v) => v.join(', ')} onChange={(checks) => set({ ...repo.ci!, checks })} />
           <ParsedText label="Checks to ignore" hint="Comma separated, e.g. a preview deployment" value={repo.ci.ignore ?? []} parse={checkList} format={(v) => v.join(', ')} onChange={(ignore) => set({ ...repo.ci!, ignore })} />
         </div>
       )}
@@ -344,7 +352,7 @@ function WorkflowsSection({ config, onChange, view, errors, generation }: Editor
   const patch = (name: string, p: Partial<ConsoleWorkflow>) => {
     const next: ConsoleWorkflow = { ...config.workflows[name]!, ...p };
     for (const k of Object.keys(p) as (keyof ConsoleWorkflow)[]) if (p[k] === undefined) delete next[k];
-    onChange({ ...config, workflows: { ...config.workflows, [name]: next } });
+    onChange(withoutUnreviewedCi({ ...config, workflows: { ...config.workflows, [name]: next } }));
   };
 
   function add() {
