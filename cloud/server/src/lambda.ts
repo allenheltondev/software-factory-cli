@@ -138,7 +138,7 @@ const app = createApp({
           route: nativeRoute(process.env.NATIVE_WORKER_ROUTE),
           loginGrant: browserLoginGrant(process.env.NATIVE_WORKER_LOGIN_IMAGE_ARN ?? '', nativeRoute(process.env.NATIVE_WORKER_ROUTE)),
           mode: createNativeModeStore(tableName), workers: createNativeStore(tableName) }),
-        workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), github }),
+        workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), jobs: store, github }),
         status: createStatusService({
           store,
           github,

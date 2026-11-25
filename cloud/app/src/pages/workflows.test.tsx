@@ -1,4 +1,5 @@
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { JobView, Overview, WorkflowEvent, WorkflowView } from '../api/client';
@@ -140,5 +141,41 @@ describe('workflows in the console', () => {
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByTestId('job-workflow')).toHaveAttribute('href', '/installations/55/workflows/99-i7'));
+  });
+
+  it('shows what a workflow added up to, saying what is estimated or missing, and that a rebuilt one is history', async () => {
+    const totals = { jobs: 3, retries: 1, reviews: 2, revisions: 1, inputTokens: 12_500, outputTokens: 2_000, costUsd: 1.234, stepsWithoutCost: 1, subscription: true, activeSeconds: 900, wallSeconds: 3600, running: false };
+    const api = fakeApi({ workflow: vi.fn().mockResolvedValue({ workflow: workflow({ workflowId: 'legacy-0123456789ab-i5', reconstructed: true, gaps: ['Rebuilt from job records, which are kept 30 days.'] }), events, totals }) });
+    render(
+      <MemoryRouter initialEntries={['/installations/55/workflows/legacy-0123456789ab-i5']}>
+        <Routes>
+          <Route path="/installations/:id/workflows/:workflowId" element={<WorkflowPage api={api} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const shown = await screen.findByTestId('workflow-totals');
+    expect(shown).toHaveTextContent('3 (1 retry)');
+    expect(shown).toHaveTextContent('12.5k in, 2.0k out');
+    expect(shown).toHaveTextContent('Cost (estimate)$1.23');
+    expect(within(shown).getByTitle(/not what was billed. 1 step\(s\) reported no cost/)).toBeInTheDocument();
+    expect(screen.getByTestId('workflow-rebuilt')).toHaveTextContent('Rebuilt from job records');
+  });
+
+  it('narrows the list by status and repository', async () => {
+    const { WorkflowsList } = await import('../components/workflows');
+    render(
+      <MemoryRouter>
+        <WorkflowsList
+          base="/installations/55"
+          workflows={[workflow(), workflow({ workflowId: '98-i3', repository: 'acme/api', repositoryId: 98, issue: 3, status: 'finished', stage: 'merged' }), workflow({ workflowId: '99-i8', issue: 8, status: 'active', stage: 'implementing' })]}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getAllByTestId(/^workflow-/)).toHaveLength(3);
+    await userEvent.click(screen.getByRole('button', { name: 'Blocked (1)' }));
+    expect(screen.getAllByTestId(/^workflow-/).map((e) => e.dataset.testid)).toEqual(['workflow-99-i7']);
+    await userEvent.click(screen.getByRole('button', { name: 'All (3)' }));
+    await userEvent.selectOptions(screen.getByLabelText('Repository'), 'acme/api');
+    expect(screen.getAllByTestId(/^workflow-/).map((e) => e.dataset.testid)).toEqual(['workflow-98-i3']);
   });
 });

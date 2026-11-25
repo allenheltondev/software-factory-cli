@@ -26,12 +26,15 @@ import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
 import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
+import type { Store } from '../store/store.js';
 import { updateWorkflow } from './recorder.js';
 import type { WorkflowStore } from './store.js';
-import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, MAX_CI_RECOVERIES, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
+import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, MAX_CI_RECOVERIES, onJobFinished, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
 
 export interface WorkflowReconcilerDeps {
   store: WorkflowStore;
+  /** The jobs' own records, for a workflow whose job's finish was never recorded on it. */
+  jobs?: Pick<Store, 'getJob' | 'getJobSummary'>;
   github: Pick<GitHubApi, 'createInstallationToken' | 'pullRequestHead' | 'commitChecks'>;
   loadSettings: LoadSettings;
   /** The launcher (jobs/launch.ts); absent: jobs are off, and a missed check event is only reported. */
@@ -47,9 +50,14 @@ export interface WorkflowReconcilerDeps {
 export interface ReconcileReport {
   checked: number;
   recovered: number;
+  /** Workflows whose job had finished without the finish reaching them: brought up to date from the job's record. */
+  repaired: number;
   blocked: number;
   finished: number;
   failed: number;
+  /** Workflows still due a look once the run ended (at most 1000 counted), and how long the oldest has been due. */
+  backlog: number;
+  oldestDueSeconds: number;
 }
 
 const short = (sha: string) => sha.slice(0, 12);
@@ -85,6 +93,39 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
         report.blocked++;
       });
     const later = (ms: number) => change(w, (cur) => ({ workflow: { ...cur, nextCheckAt: iso(at + ms), updatedAt: iso(at) } }));
+
+    // A job was running, and by now it cannot be: its finish never reached the workflow (a lost
+    // response, a write that failed). The job's own record says how it ended.
+    if (w.status === 'active') {
+      const jobId = w.lastJobId;
+      if (!jobId || !deps.jobs) return void (await change(w, (cur) => ({ workflow: { ...without(cur, 'nextCheckAt'), updatedAt: iso(at) } })));
+      const [job, summary] = await Promise.all([deps.jobs.getJob(jobId), deps.jobs.getJobSummary(w.installationId, jobId)]);
+      const outcome = job?.status === 'finished' ? job.outcome : summary?.status === 'finished' ? summary.outcome : undefined;
+      if (outcome) {
+        const ref = { jobId, eventName: job?.eventName ?? 'unknown' };
+        await change(w, (cur) => {
+          const next = onJobFinished(cur, ref, outcome, summary?.detail, at);
+          return { workflow: next.workflow, event: { ...next.event, kind: 'finish_recovered', message: 'The job had finished without its result reaching this workflow; recorded from the job\'s own record.' } };
+        });
+        report.repaired++;
+        return;
+      }
+      // Still running past its maximum duration: the quota reconciliation ends it (microvm_gone), which records it here.
+      if (job) return void (await later(CI_RECHECK_MS));
+      return block('job_lost', 'The last job is gone without a recorded end (its record has expired).', 'Retry the job from its page, or apply the label again on GitHub.', `job-gone:${jobId}`);
+    }
+
+    // A job that waits for a Claude sign-in: blocked once no one has signed in for a day.
+    if (w.stage === 'awaiting-sign-in') {
+      const waitedFor = at - Date.parse(w.waitingSince ?? w.updatedAt);
+      if (waitedFor < SIGN_IN_LIMIT_MS) return void (await later(SIGN_IN_LIMIT_MS - waitedFor));
+      return block(
+        'sign_in_expired',
+        `The job waited ${Math.round(SIGN_IN_LIMIT_MS / 3_600_000)} hours for a Claude subscription sign-in that did not happen.`,
+        'Sign in on the Claude page of this installation, then apply the label again on GitHub.',
+        `sign-in-expired:${w.lastJobId ?? w.waitingSince}`,
+      );
+    }
 
     if (w.pullRequest === undefined || !deps.github.pullRequestHead) {
       await change(w, (cur) => ({ workflow: { ...without(cur, 'nextCheckAt'), updatedAt: iso(at) } }));
@@ -187,7 +228,7 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
   }
 
   return async function reconcileWorkflows(): Promise<ReconcileReport> {
-    const report: ReconcileReport = { checked: 0, recovered: 0, blocked: 0, finished: 0, failed: 0 };
+    const report: ReconcileReport = { checked: 0, recovered: 0, repaired: 0, blocked: 0, finished: 0, failed: 0, backlog: 0, oldestDueSeconds: 0 };
     if (await killSwitch.engaged()) return report;
     const at = now();
     for (const due of await deps.store.listDueWorkflows(at, limit)) {
@@ -202,6 +243,13 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
         // Not looked at again at once: the next try is later, so one broken workflow cannot hold up the rest.
         await updateWorkflow(deps.store, w.installationId, w.workflowId, (cur) => (cur && cur.version === w.version ? { workflow: { ...cur, nextCheckAt: iso(at + CI_RECHECK_MS) } } : null)).catch(() => {});
       }
+    }
+    // What is left: a backlog that grows, or a look that stays due, means the reconciler is behind or stuck.
+    const left = await deps.store.listDueWorkflows(now(), 1000);
+    report.backlog = left.length;
+    if (left[0]) {
+      const oldest = await deps.store.getWorkflow(left[0].installationId, left[0].workflowId);
+      if (oldest?.nextCheckAt) report.oldestDueSeconds = Math.max(0, Math.round((now() - Date.parse(oldest.nextCheckAt)) / 1000));
     }
     return report;
   };

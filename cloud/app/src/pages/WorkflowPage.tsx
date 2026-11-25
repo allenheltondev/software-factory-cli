@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { Alert, Card, CardBody, CardHeader, CardTitle, PageHero, PageHeroChip, PageHeroChips, PageHeroSubtitle, PageHeroTitle, Skeleton } from '@readysetcloud/ui';
-import { api as defaultApi, type ApiClient, type WorkflowEvent, type WorkflowView } from '../api/client';
-import { WORKFLOW_STATUS, WorkflowTimeline, stageLabel, workflowTitle } from '../components/workflows';
+import { api as defaultApi, type ApiClient, type WorkflowEvent, type WorkflowTotals, type WorkflowView } from '../api/client';
+import { WORKFLOW_STATUS, WorkflowTimeline, WorkflowTotalsView, stageLabel, workflowTitle } from '../components/workflows';
 import { relativeTime } from '../lib/time';
 
 type WorkflowApi = Pick<ApiClient, 'workflow'>;
-type Load = { state: 'loading' } | { state: 'ok'; workflow: WorkflowView; events: WorkflowEvent[] } | { state: 'error'; message: string };
+type Load = { state: 'loading' } | { state: 'ok'; workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals } | { state: 'error'; message: string };
 
-const WORKFLOW_ID = /^[0-9]{1,20}-[ip][0-9]{1,10}$/;
+const WORKFLOW_ID = /^(?:[0-9]{1,20}|legacy-[0-9a-f]{12})-[ip][0-9]{1,10}$/;
 export const WORKFLOW_REFRESH_MS = 15_000;
 
 /**
@@ -92,6 +92,21 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
               )}
             </div>
           </PageHero>
+          {load.workflow.reconstructed && (
+            <Alert variant="info" data-testid="workflow-rebuilt">
+              {(load.workflow.gaps ?? ['Rebuilt from job records.']).join(' ')}
+            </Alert>
+          )}
+          {load.totals && (
+            <Card>
+              <CardHeader>
+                <CardTitle>Totals</CardTitle>
+              </CardHeader>
+              <CardBody>
+                <WorkflowTotalsView totals={load.totals} />
+              </CardBody>
+            </Card>
+          )}
           {load.workflow.nextAction && (load.workflow.status === 'blocked' || load.workflow.status === 'waiting') && (
             <Alert variant={load.workflow.status === 'blocked' ? 'error' : 'info'} data-testid="workflow-next">
               <strong>Next:</strong> {load.workflow.nextAction}

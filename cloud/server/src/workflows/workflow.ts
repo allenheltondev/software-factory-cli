@@ -20,7 +20,7 @@ import type { JobLoop, LoopStage } from '../jobs/lifecycle.js';
 export type WorkflowStatus = 'active' | 'waiting' | 'blocked' | 'finished';
 
 /** Where a workflow is: the review loop's stage, or the step before it has one. */
-export type WorkflowStage = 'implementing' | 'reviewing-loop' | LoopStage | 'done' | 'failed';
+export type WorkflowStage = 'implementing' | 'reviewing-loop' | 'awaiting-sign-in' | 'publish-failed' | LoopStage | 'done' | 'failed';
 
 export interface Workflow {
   workflowId: string;
@@ -54,7 +54,7 @@ export interface Workflow {
   version: number;
 }
 
-export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_recovered' | 'ci_checked' | 'blocked' | 'finished';
+export type WorkflowEventKind = 'job_started' | 'job_finished' | 'ci_recovered' | 'ci_checked' | 'blocked' | 'finished' | 'waiting' | 'label_recovered' | 'finish_recovered';
 
 /** One entry of a workflow's timeline. `id` is immutable and unique: recording an event twice changes nothing. */
 export interface WorkflowEvent {
@@ -74,12 +74,27 @@ export interface WorkflowEvent {
   prNumber?: number;
   prUrl?: string;
   /** The steps the job reported: role (implement, review, revision), agent profile and outcome. */
-  steps?: { kind: string; agent?: string; outcome?: string }[];
+  steps?: { kind: string; agent?: string; outcome?: string; usage?: StepUsage }[];
+  /** The job ran on a Claude subscription worker: its cost is an estimate, not what was billed. */
+  subscription?: boolean;
   loop?: Pick<JobLoop, 'rounds' | 'maxRevisions' | 'reviews' | 'verdict'>;
   headSha?: string;
   /** In Updraft's own words. */
   message?: string;
 }
+
+/** What one step reported it used: tokens, the agent's own cost estimate, its duration. */
+export interface StepUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  durationMs?: number;
+}
+
+/** A job that waits for a Claude sign-in is blocked once it has waited this long. */
+export const SIGN_IN_LIMIT_MS = 24 * 60 * 60 * 1000;
+/** After a job's maximum duration, how long its finish has to be recorded before the reconciler looks at the job itself. */
+export const FINISH_GRACE_MS = 15 * 60 * 1000;
 
 /** How long a CI wait goes before the reconciler first looks at GitHub itself. */
 export const CI_FIRST_CHECK_MS = 15 * 60 * 1000;
@@ -138,7 +153,7 @@ const clearWait = (w: Workflow): Workflow => {
 };
 
 /** A job of the workflow was launched. */
-export function onJobStarted(w: Workflow, job: Pick<Job, 'jobId' | 'eventName' | 'deliveryId' | 'pullRequest'>, at: number): { workflow: Workflow; event: WorkflowEvent } {
+export function onJobStarted(w: Workflow, job: Pick<Job, 'jobId' | 'eventName' | 'deliveryId' | 'pullRequest'> & Partial<Pick<Job, 'expiresAt' | 'native'>>, at: number): { workflow: Workflow; event: WorkflowEvent } {
   const retry = isRetryDelivery(job);
   // Labeled again once it had ended: a new generation, not a retry.
   const again = ISSUE_EVENTS.has(job.eventName) && !retry && (w.status === 'finished' || w.status === 'blocked') && w.lastJobId !== undefined;
@@ -152,11 +167,23 @@ export function onJobStarted(w: Workflow, job: Pick<Job, 'jobId' | 'eventName' |
     ...(job.pullRequest !== undefined && w.pullRequest === undefined ? { pullRequest: job.pullRequest } : {}),
     // A new head is coming: what the reconciler did for the last one no longer counts.
     ...(job.eventName !== 'check_suite' ? { recoveries: 0 } : {}),
+    // Looked at once the job could no longer be running: a finish that was never recorded is found then.
+    ...(job.expiresAt !== undefined ? { nextCheckAt: iso(job.expiresAt + FINISH_GRACE_MS) } : {}),
     updatedAt: iso(at),
   };
   return {
     workflow,
-    event: { id: `${job.jobId}:started`, at: iso(at), kind: 'job_started', generation, jobId: job.jobId, eventName: job.eventName, ...(retry ? { retry: true } : {}), stage: workflow.stage },
+    event: {
+      id: `${job.jobId}:started`,
+      at: iso(at),
+      kind: 'job_started',
+      generation,
+      jobId: job.jobId,
+      eventName: job.eventName,
+      ...(retry ? { retry: true } : {}),
+      ...(job.native ? { subscription: true } : {}),
+      stage: workflow.stage,
+    },
   };
 }
 
@@ -192,12 +219,14 @@ export function onJobFinished(
     outcome,
     ...(prNumber !== undefined ? { prNumber } : {}),
     ...(detail?.prUrl ? { prUrl: detail.prUrl } : {}),
-    ...(detail?.steps?.length ? { steps: detail.steps.map((s) => ({ kind: s.kind, ...(s.agent ? { agent: s.agent } : {}), ...(s.outcome ? { outcome: s.outcome } : {}) })) } : {}),
+    ...(detail?.steps?.length ? { steps: detail.steps.map((s) => ({ kind: s.kind, ...(s.agent ? { agent: s.agent } : {}), ...(s.outcome ? { outcome: s.outcome } : {}), ...(usageOf(s.usage) ? { usage: usageOf(s.usage)! } : {}) })) } : {}),
     ...(loop ? { loop: { rounds: loop.rounds, reviews: loop.reviews, ...(loop.maxRevisions !== undefined ? { maxRevisions: loop.maxRevisions } : {}), ...(loop.verdict ? { verdict: loop.verdict } : {}) } } : {}),
   };
   if (superseded) return { workflow: base, event: { ...event, message: 'A later job of this workflow had already started.' } };
 
-  const next = settle(clearWait(base), outcome, loop?.stage, at);
+  const next = detail?.updraftOutcome === 'publish-failed' && outcome === 'succeeded'
+    ? { ...clearWait(base), status: 'blocked' as const, stage: 'publish-failed' as const, reason: 'publish_failed', message: 'The agent finished, but its work could not be published to GitHub.', nextAction: 'Open the job to see why, fix it, then apply the label again on GitHub: the run\'s work is kept, and publication is tried again.' }
+    : settle(clearWait(base), outcome, loop?.stage, at);
   return { workflow: next, event: { ...event, stage: next.stage } };
 }
 
@@ -241,4 +270,44 @@ function settle(w: Workflow, outcome: string, stage: LoopStage | undefined, at: 
       // awaiting-review, reviewing, changes-requested, revising, fixing-ci: the next job comes from a GitHub event.
       return waiting(stage, 'awaiting_event', 'Waiting for the next step of the review loop to start.', STALL_CHECK_MS);
   }
+}
+
+function usageOf(u: { inputTokens?: number; outputTokens?: number; costUsd?: number; durationMs?: number } | undefined): StepUsage | null {
+  if (!u) return null;
+  const out: StepUsage = {};
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
+  const set = (k: keyof StepUsage, v: unknown) => {
+    const n = num(v);
+    if (n !== undefined) out[k] = n;
+  };
+  set('inputTokens', u.inputTokens);
+  set('outputTokens', u.outputTokens);
+  set('costUsd', u.costUsd);
+  set('durationMs', u.durationMs);
+  return Object.keys(out).length ? out : null;
+}
+
+/** A job is waiting for something only a person can give (a Claude sign-in): the workflow waits, and blocks after SIGN_IN_LIMIT_MS. */
+export function onJobWaiting(
+  w: Workflow,
+  job: { jobId?: string; eventName: string },
+  why: { reason: string; message: string; nextAction: string },
+  at: number,
+): { workflow: Workflow; event: WorkflowEvent } {
+  const workflow: Workflow = {
+    ...clearWait(w),
+    status: 'waiting',
+    stage: 'awaiting-sign-in',
+    reason: why.reason,
+    message: why.message,
+    nextAction: why.nextAction,
+    waitingSince: iso(at),
+    nextCheckAt: iso(at + SIGN_IN_LIMIT_MS),
+    ...(job.jobId ? { lastJobId: job.jobId } : {}),
+    updatedAt: iso(at),
+  };
+  return {
+    workflow,
+    event: { id: `${job.jobId ?? 'pending'}:waiting:${why.reason}`, at: iso(at), kind: 'waiting', generation: w.generation, ...(job.jobId ? { jobId: job.jobId } : {}), eventName: job.eventName, stage: 'awaiting-sign-in', message: why.message },
+  };
 }

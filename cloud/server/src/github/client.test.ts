@@ -45,4 +45,26 @@ describe('the GitHub client', () => {
     );
     expect((await partial.commitChecks!('ghs_x', 'acme/web', 'abc')).complete).toBe(false);
   });
+
+  it('lists open labeled issues without pull requests, and finds the newest application of a label', async () => {
+    const urls: string[] = [];
+    const api = createGitHubApi(async (url) => {
+      urls.push(String(url));
+      if (String(url).includes('/events')) {
+        return new Response(JSON.stringify([
+          { id: 1, event: 'labeled', label: { name: 'Updraft' }, actor: { login: 'old' }, created_at: '2026-11-20T00:00:00Z' },
+          { id: 2, event: 'unlabeled', label: { name: 'updraft' }, actor: { login: 'x' }, created_at: '2026-11-21T00:00:00Z' },
+          { id: 3, event: 'labeled', label: { name: 'updraft' }, actor: { login: 'pat' }, created_at: '2026-11-22T00:00:00Z' },
+          { id: 4, event: 'labeled', label: { name: 'other' }, actor: { login: 'y' }, created_at: '2026-11-23T00:00:00Z' },
+        ]), { status: 200 });
+      }
+      return new Response(JSON.stringify([
+        { number: 7, title: 'a', html_url: 'u7', labels: [{ name: 'updraft' }] },
+        { number: 8, title: 'pr', html_url: 'u8', labels: [], pull_request: {} },
+      ]), { status: 200 });
+    });
+    expect(await api.labeledIssues!('ghs_x', 'acme/web', 'updraft', '2026-11-24T00:00:00Z', 20)).toEqual([{ number: 7, title: 'a', htmlUrl: 'u7', labels: ['updraft'] }]);
+    expect(urls[0]).toContain('/repos/acme/web/issues?state=open&labels=updraft&since=2026-11-24T00%3A00%3A00Z');
+    expect(await api.latestLabelEvent!('ghs_x', 'acme/web', 7, 'UPDRAFT')).toEqual({ id: 3, actor: 'pat', createdAt: '2026-11-22T00:00:00Z', label: 'updraft' });
+  });
 });

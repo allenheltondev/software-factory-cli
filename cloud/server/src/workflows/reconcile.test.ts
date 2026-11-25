@@ -2,10 +2,11 @@ import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { CommitCheckCounts, PullRequestHead } from '../github/client.js';
 import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
+import type { Job, JobSummary } from '../store/store.js';
 import { createWorkflowRecorder } from './recorder.js';
 import { createWorkflowReconciler, recoveryDeliveryId } from './reconcile.js';
 import { createMemoryWorkflowStore } from './store.js';
-import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, MAX_CI_RECOVERIES, STALL_LIMIT_MS } from './workflow.js';
+import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, MAX_CI_RECOVERIES, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
 
 const T0 = Date.parse('2026-11-25T12:00:00.000Z');
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
@@ -17,7 +18,7 @@ const job = (over: Record<string, unknown> = {}) =>
     ReturnType<typeof createWorkflowRecorder>['started']
   >[0];
 
-function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; launch?: LaunchResult; engaged?: boolean } = {}) {
+function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; launch?: LaunchResult; engaged?: boolean; jobs?: Record<string, { job?: Partial<Job>; summary?: Partial<JobSummary> }> } = {}) {
   const store = createMemoryWorkflowStore();
   let clock = T0;
   const now = () => clock;
@@ -34,6 +35,10 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; l
   });
   const reconcile = createWorkflowReconciler({
     store,
+    jobs: {
+      getJob: async (id: string) => (o.jobs?.[id]?.job as Job | undefined) ?? null,
+      getJobSummary: async (_i: number, id: string) => (o.jobs?.[id]?.summary as JobSummary | undefined) ?? null,
+    },
     github,
     loadSettings: async () => SETTINGS as never,
     launch,
@@ -53,11 +58,16 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; l
 }
 
 describe('workflow reconciliation', () => {
-  it('does nothing before a CI wait is due', async () => {
+  it('does nothing before a CI wait is due, and reports what is left due and for how long', async () => {
     const s = setup();
     await s.waitForCi();
-    expect(await s.reconcile()).toMatchObject({ checked: 0 });
+    expect(await s.reconcile()).toMatchObject({ checked: 0, backlog: 0, oldestDueSeconds: 0 });
     expect(s.github.pullRequestHead).not.toHaveBeenCalled();
+    // Due, but the run fails on it: it is left due, and the report says how long.
+    s.tick(CI_FIRST_CHECK_MS + 120_000);
+    s.github.pullRequestHead.mockRejectedValueOnce(new Error('down'));
+    const r = await s.reconcile();
+    expect(r).toMatchObject({ failed: 1, backlog: 0 });
   });
 
   it('recovers a missed check event once per head: the job a check_suite delivery would start', async () => {
@@ -181,5 +191,53 @@ describe('workflow reconciliation', () => {
     broken.github.pullRequestHead.mockRejectedValueOnce(new Error('GitHub is down'));
     expect(await broken.reconcile()).toMatchObject({ failed: 1 });
     expect(await broken.wf()).toMatchObject({ nextCheckAt: new Date(T0 + CI_FIRST_CHECK_MS + CI_RECHECK_MS).toISOString() });
+  });
+
+  describe('stalls', () => {
+    it('brings a workflow up to date from its job\'s own record when the finish never reached it', async () => {
+      const s = setup({ jobs: { job_issue0001: { job: { status: 'finished', outcome: 'succeeded', eventName: 'issues' }, summary: { status: 'finished', outcome: 'succeeded', detail: { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } } } } } });
+      await s.recorder.started(job({ expiresAt: T0 + 3_600_000 }));
+      expect(await s.wf()).toMatchObject({ status: 'active', nextCheckAt: new Date(T0 + 3_600_000 + FINISH_GRACE_MS).toISOString() });
+      s.tick(3_600_000 + FINISH_GRACE_MS);
+      expect(await s.reconcile()).toMatchObject({ repaired: 1 });
+      expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'waiting-for-ci', pullRequest: 12 });
+      expect((await s.store.listWorkflowEvents(55, '99-i7', 10)).at(-1)).toMatchObject({ kind: 'finish_recovered', jobId: 'job_issue0001' });
+    });
+
+    it('waits for a job that is still running, and blocks one whose record is gone', async () => {
+      const running = setup({ jobs: { job_issue0001: { job: { status: 'launched' } } } });
+      await running.recorder.started(job({ expiresAt: T0 }));
+      running.tick(FINISH_GRACE_MS);
+      await running.reconcile();
+      expect(await running.wf()).toMatchObject({ status: 'active', nextCheckAt: expect.any(String) });
+
+      const gone = setup();
+      await gone.recorder.started(job({ expiresAt: T0 }));
+      gone.tick(FINISH_GRACE_MS);
+      expect(await gone.reconcile()).toMatchObject({ blocked: 1 });
+      expect(await gone.wf()).toMatchObject({ status: 'blocked', reason: 'job_lost' });
+    });
+
+    it('waits a day for a Claude sign-in, then blocks with what to do', async () => {
+      const s = setup();
+      await s.recorder.waiting({ installationId: 55, repository: 'acme/web', repositoryId: 99, issue: 7, eventName: 'issues', deliveryId: 'd-1', jobId: 'job_waiting01' }, { reason: 'sign_in_required', message: 'waits', nextAction: 'sign in' });
+      expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'awaiting-sign-in', reason: 'sign_in_required', lastJobId: 'job_waiting01' });
+      s.tick(SIGN_IN_LIMIT_MS / 2);
+      await s.reconcile();
+      expect(await s.wf()).toMatchObject({ status: 'waiting' });
+      s.tick(SIGN_IN_LIMIT_MS);
+      expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+      expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'sign_in_expired', nextAction: expect.stringMatching(/Sign in/) });
+      // The sign-in comes after all: the job starts, and the workflow works again.
+      await s.recorder.started(job({ jobId: 'job_waiting01' }));
+      expect(await s.wf()).toMatchObject({ status: 'active' });
+    });
+
+    it('blocks a run whose publication failed, with how to get it published', async () => {
+      const s = setup();
+      await s.recorder.started(job());
+      await s.recorder.finished(job(), 'succeeded', { updraftOutcome: 'publish-failed' });
+      expect(await s.wf()).toMatchObject({ status: 'blocked', stage: 'publish-failed', reason: 'publish_failed', nextAction: expect.stringMatching(/apply the label again/) });
+    });
   });
 });

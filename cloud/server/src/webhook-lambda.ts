@@ -1,6 +1,8 @@
 import { createDynamoWorkflowStore } from './workflows/store.js';
 import { createWorkflowRecorder } from './workflows/recorder.js';
 import { createWorkflowReconciler, type ReconcileReport } from './workflows/reconcile.js';
+import { createLabelScanner, type LabelScanReport } from './workflows/label-scan.js';
+import { reconcileMetricsLine } from './workflows/metrics.js';
 import { waitingId } from './native/sessions.js';
 import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -280,6 +282,7 @@ async function resumeClaude(installationId: number) {
 // check event is recovered by launching the job it would have started.
 const reconcileWorkflows = createWorkflowReconciler({
   store: workflowStore,
+  jobs: store,
   github,
   loadSettings,
   ...(launch ? { launch } : {}),
@@ -290,14 +293,21 @@ const reconcileWorkflows = createWorkflowReconciler({
   killSwitch,
 });
 
+const scanLabels = launch ? createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings, launch }) : undefined;
+
 export async function handler(
   event: APIGatewayProxyEvent | RetryRequest | { action: 'resumeClaude'; installationId: number } | { action: 'reconcileWorkflows' },
-): Promise<APIGatewayProxyResult | RetryResult | ReconcileReport | void> {
+): Promise<APIGatewayProxyResult | RetryResult | (ReconcileReport & { labels: LabelScanReport }) | void> {
   if ('action' in event && event.action === 'reconcileWorkflows') {
     const report = await reconcileWorkflows();
+    // Labeled issues whose delivery never came (workflows/label-scan.ts): only where jobs can start.
+    const labels = scanLabels && !(await killSwitch.engaged()) ? await scanLabels() : { tenants: 0, recovered: 0, refused: 0, failed: 0 };
+    const combined = { ...report, labels };
+    // Metrics first, whatever follows: a failing run is what the alarms look for.
+    console.log(reconcileMetricsLine(report, labels, Date.now()));
     // The next run (five minutes on) retries what failed; fail this one so alarms see it.
-    if (report.failed > 0) throw new Error(`workflow reconciliation failed for ${report.failed} workflow(s)`);
-    return report;
+    if (report.failed > 0 || labels.failed > 0) throw new Error(`workflow reconciliation failed for ${report.failed} workflow(s) and ${labels.failed} tenant label scan(s)`);
+    return combined;
   }
   if ('action' in event) {
     if (event.action === 'resumeClaude' && Number.isSafeInteger(event.installationId) && event.installationId > 0) await resumeClaude(event.installationId);

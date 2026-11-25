@@ -1,6 +1,8 @@
+import { useState } from 'react';
 import { Link } from 'react-router';
-import { EmptyState, StatusBadge } from '@readysetcloud/ui';
-import type { WorkflowEvent, WorkflowStatus, WorkflowView } from '../api/client';
+import { EmptyState, SegmentedControl, StatusBadge } from '@readysetcloud/ui';
+import type { WorkflowEvent, WorkflowStatus, WorkflowTotals, WorkflowView } from '../api/client';
+import { formatDuration } from '../lib/diagnostics';
 import { relativeTime } from '../lib/time';
 
 type Tone = 'success' | 'warning' | 'error' | 'neutral' | 'primary';
@@ -28,6 +30,8 @@ const STAGE: Record<string, string> = {
   closed: 'Closed',
   done: 'Done',
   failed: 'Failed',
+  'awaiting-sign-in': 'Waiting for sign-in',
+  'publish-failed': 'Publication failed',
 };
 
 export const stageLabel = (stage: string | undefined) => (stage ? (STAGE[stage] ?? stage) : '');
@@ -46,31 +50,104 @@ export function workflowTitle(w: Pick<WorkflowView, 'repository' | 'issue' | 'pu
   return `${w.repository}${w.issue !== undefined ? `#${w.issue}` : w.pullRequest !== undefined ? ` PR #${w.pullRequest}` : ''}`;
 }
 
-/** A tenant's workflows, most recently changed first. */
+type StatusFilter = 'all' | WorkflowStatus;
+
+/** A tenant's workflows, most recently changed first, narrowed by status and repository. */
 export function WorkflowsList({ workflows, base }: { workflows: WorkflowView[]; base: string }) {
+  const [status, setStatus] = useState<StatusFilter>('all');
+  const [repository, setRepository] = useState('');
   if (!workflows.length) {
     return <EmptyState title="No workflows yet" description="Each labeled issue becomes a workflow: its jobs, reviews and CI fixes as one timeline." />;
   }
+  const repositories = [...new Set(workflows.map((w) => w.repository))].sort();
+  const count = (s: WorkflowStatus) => workflows.filter((w) => w.status === s).length;
+  const shown = workflows.filter((w) => (status === 'all' || w.status === status) && (!repository || w.repository === repository));
   return (
-    <ul className="flex flex-col divide-y divide-border" aria-label="Workflows">
-      {workflows.map((w) => {
-        const s = WORKFLOW_STATUS[w.status];
-        return (
-          <li key={w.workflowId} className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 py-4" data-testid={`workflow-${w.workflowId}`}>
-            <StatusBadge tone={s.tone}>{s.label}</StatusBadge>
-            <Link className="auth-link min-w-0 basis-full break-words font-medium sm:basis-auto" to={`${base}/workflows/${w.workflowId}`}>
-              {workflowTitle(w)}
-            </Link>
-            <StatusBadge tone="neutral">{stageLabel(w.stage)}</StatusBadge>
-            {w.generation > 1 && <span className="text-sm text-muted-foreground">Run {w.generation}</span>}
-            {w.status === 'blocked' && w.message && <span className="basis-full text-sm text-muted-foreground">{w.message}</span>}
-            <span className="flex w-full flex-wrap items-center gap-3 text-sm text-muted-foreground sm:ml-auto sm:w-auto">
-              <span title={new Date(w.updatedAt).toLocaleString()}>{relativeTime(w.updatedAt)}</span>
-            </span>
-          </li>
-        );
-      })}
-    </ul>
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <SegmentedControl<StatusFilter>
+          aria-label="Show workflows"
+          value={status}
+          onChange={setStatus}
+          options={[
+            { value: 'all', label: `All (${workflows.length})` },
+            { value: 'blocked', label: `Blocked (${count('blocked')})` },
+            { value: 'waiting', label: `Waiting (${count('waiting')})` },
+            { value: 'active', label: `Working (${count('active')})` },
+            { value: 'finished', label: `Finished (${count('finished')})` },
+          ]}
+        />
+        {repositories.length > 1 && (
+          <label className="flex items-center gap-2 text-sm">
+            Repository
+            <select className="input" value={repository} onChange={(e) => setRepository(e.target.value)} aria-label="Repository">
+              <option value="">All</option>
+              {repositories.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+      </div>
+      {!shown.length ? (
+        <EmptyState title="No workflows match" description="Choose another status or repository." />
+      ) : (
+        <ul className="flex flex-col divide-y divide-border" aria-label="Workflows">
+          {shown.map((w) => {
+            const s = WORKFLOW_STATUS[w.status];
+            return (
+              <li key={w.workflowId} className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 py-4" data-testid={`workflow-${w.workflowId}`}>
+                <StatusBadge tone={s.tone}>{s.label}</StatusBadge>
+                <Link className="auth-link min-w-0 basis-full break-words font-medium sm:basis-auto" to={`${base}/workflows/${w.workflowId}`}>
+                  {workflowTitle(w)}
+                </Link>
+                <StatusBadge tone="neutral">{stageLabel(w.stage)}</StatusBadge>
+                {w.generation > 1 && <span className="text-sm text-muted-foreground">Run {w.generation}</span>}
+                {w.reconstructed && <span className="text-sm text-muted-foreground" title="Rebuilt from job records">Rebuilt</span>}
+                {w.status === 'blocked' && w.message && <span className="basis-full text-sm text-muted-foreground">{w.message}</span>}
+                <span className="flex w-full flex-wrap items-center gap-3 text-sm text-muted-foreground sm:ml-auto sm:w-auto">
+                  <span title={new Date(w.updatedAt).toLocaleString()}>{relativeTime(w.updatedAt)}</span>
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+const tokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+
+/** What the workflow's jobs added up to, from what they reported; what is estimated or missing says so. */
+export function WorkflowTotalsView({ totals }: { totals: WorkflowTotals }) {
+  const items: [string, string, string?][] = [
+    ['Jobs', `${totals.jobs}${totals.retries ? ` (${totals.retries} retr${totals.retries === 1 ? 'y' : 'ies'})` : ''}`],
+    ['Reviews', String(totals.reviews)],
+    ['Revisions', String(totals.revisions)],
+    ['Tokens', totals.inputTokens || totals.outputTokens ? `${tokens(totals.inputTokens)} in, ${tokens(totals.outputTokens)} out` : '—'],
+    [
+      totals.subscription ? 'Cost (estimate)' : 'Cost (reported)',
+      totals.costUsd ? `$${totals.costUsd.toFixed(2)}` : '—',
+      [
+        totals.subscription ? 'Some jobs ran on a Claude subscription: their cost is the agent\'s estimate, not what was billed.' : 'The agents\' own estimates.',
+        totals.stepsWithoutCost ? `${totals.stepsWithoutCost} step(s) reported no cost and are not included.` : '',
+      ].filter(Boolean).join(' '),
+    ],
+    ['Active', formatDuration(totals.activeSeconds), 'Time jobs were running, summed.'],
+    ['Wall time', `${formatDuration(totals.wallSeconds)}${totals.running ? ' so far' : ''}`, 'From the first job\'s start to the latest event.'],
+  ];
+  return (
+    <dl className="grid grid-cols-[repeat(auto-fit,minmax(8rem,1fr))] gap-3" data-testid="workflow-totals">
+      {items.map(([label, value, title]) => (
+        <div key={label} className="flex flex-col" title={title}>
+          <dt className="text-sm text-muted-foreground">{label}</dt>
+          <dd className="font-medium">{value}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
@@ -88,11 +165,27 @@ function eventTitle(e: WorkflowEvent): string {
       return 'Blocked';
     case 'finished':
       return 'Finished';
+    case 'waiting':
+      return 'Waiting';
+    case 'label_recovered':
+      return 'Missed label event recovered';
+    case 'finish_recovered':
+      return `Job finished (recovered)${e.outcome ? `: ${e.outcome.replace(/_/g, ' ')}` : ''}`;
   }
 }
 
 const eventTone = (e: WorkflowEvent): Tone =>
-  e.kind === 'blocked' ? 'error' : e.kind === 'ci_recovered' ? 'warning' : e.kind === 'finished' ? 'success' : e.kind === 'job_finished' ? (e.outcome === 'succeeded' ? 'success' : 'warning') : 'neutral';
+  e.kind === 'blocked'
+    ? 'error'
+    : e.kind === 'ci_recovered' || e.kind === 'label_recovered' || e.kind === 'waiting'
+      ? 'warning'
+      : e.kind === 'finished'
+        ? 'success'
+        : e.kind === 'job_finished' || e.kind === 'finish_recovered'
+          ? e.outcome === 'succeeded'
+            ? 'success'
+            : 'warning'
+          : 'neutral';
 
 /**
  * A workflow's timeline, oldest first, by run (a new label after it ended is a new run; a retry

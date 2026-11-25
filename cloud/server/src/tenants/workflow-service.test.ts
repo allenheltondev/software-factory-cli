@@ -35,4 +35,33 @@ describe('the workflow views', () => {
     await expect(service.list(caller, 66)).rejects.toMatchObject({ status: 403 });
     expect(members.every((m) => m === 55)).toBe(true);
   });
+
+  it('filters the list, adds totals, and shows workflows rebuilt from older job records', async () => {
+    const store = createMemoryWorkflowStore();
+    const recorder = createWorkflowRecorder({ store, log: () => {} });
+    await recorder.started(job);
+    await recorder.started({ ...job, jobId: 'job_other001', repository: 'acme/api', repositoryId: 98, issue: 3 });
+    const jobs = {
+      listRecentJobs: async () => [
+        { jobId: 'job_old00001', repository: 'acme/web', issue: 5, createdAt: '2026-11-01T00:00:00.000Z', finishedAt: '2026-11-01T00:10:00.000Z', status: 'finished', outcome: 'succeeded', deliveryId: 'd-0' },
+        // The recorded workflow's own job: not rebuilt.
+        { jobId: 'job_issue0001', repository: 'acme/web', issue: 7, createdAt: '2026-11-25T00:00:00.000Z', status: 'launched', deliveryId: 'd-1' },
+      ] as never,
+    };
+    const service = createWorkflowService({ store, jobs, github: { member: async () => ({}) as never } });
+    const all = (await service.list(caller, 55)).workflows;
+    expect(all.map((w) => [w.repository, w.issue, w.reconstructed ?? false])).toEqual(expect.arrayContaining([
+      ['acme/web', 7, false],
+      ['acme/api', 3, false],
+      ['acme/web', 5, true],
+    ]));
+    expect(all).toHaveLength(3);
+    expect((await service.list(caller, 55, undefined, { repository: 'ACME/api' })).workflows.map((w) => w.issue)).toEqual([3]);
+    expect((await service.list(caller, 55, undefined, { status: 'finished' })).workflows.map((w) => w.issue)).toEqual([5]);
+    const legacy = all.find((w) => w.reconstructed)!;
+    const one = await service.get(caller, 55, legacy.workflowId);
+    expect(one.workflow).toMatchObject({ reconstructed: true, status: 'finished' });
+    expect(one.totals).toMatchObject({ jobs: 1, activeSeconds: 600 });
+    expect((await service.get(caller, 55, '99-i7')).totals).toMatchObject({ jobs: 1, running: true });
+  });
 });

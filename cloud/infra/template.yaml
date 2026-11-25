@@ -281,6 +281,50 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  # Workflow reconciliation (server/src/workflows/reconcile.ts, metrics.ts; runbook in
+  # cloud/README.md, "Workflow reconciliation runbook"). Its metrics are Embedded Metric Format
+  # lines of WebhookFunction's ReconcileWorkflows schedule, namespace Updraft/Workflows.
+  WorkflowReconcileNotRunningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Workflow reconciliation has not completed a run in 15 minutes; missed check events and stalled workflows are not being recovered (cloud/README.md runbook).
+      Namespace: Updraft/Workflows
+      MetricName: Runs
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+
+  WorkflowReconcileFailingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Workflow reconciliation has failed on some workflow or tenant for 15 minutes in a row (cloud/README.md runbook).
+      Namespace: Updraft/Workflows
+      MetricName: Failed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  WorkflowReconcileBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A workflow has been due a look for more than 30 minutes; reconciliation is behind or stuck (cloud/README.md runbook).
+      Namespace: Updraft/Workflows
+      MetricName: OldestDueSeconds
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1800
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
   JobEventsDestinationFailuresAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:

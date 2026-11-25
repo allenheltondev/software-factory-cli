@@ -6,6 +6,8 @@
  *   TENANT#<installId>   WFEV#<workflowId>#<eventId>    one timeline event, written once (TTL 90 days)
  *   TENANT#<installId>   WFPR#<repositoryId>#<pr>       which workflow a pull request belongs to (TTL 90 days)
  *   TENANT#<installId>   WFJOB#<jobId>                  which workflow a job belongs to (TTL 90 days)
+ *   TENANT#<installId>   WFSCAN                         when the missed-label scan last looked at the tenant
+ *   TENANT#<installId>   WFLABEL#<repositoryId>#<eventId>  a label event the scan acted on, once (TTL 30 days)
  *   PLATFORM#WORKFLOW-DUE  <nextCheckAt>#<installId>#<workflowId>   a workflow the reconciler looks at then
  *
  * A save is conditional on the version it read, so two finishes (or a finish and the reconciler)
@@ -29,6 +31,11 @@ export interface WorkflowStore {
   workflowOfPullRequest(installationId: number, repositoryId: number, pullRequest: number): Promise<string | null>;
   linkJob(installationId: number, jobId: string, workflowId: string): Promise<void>;
   workflowOfJob(installationId: number, jobId: string): Promise<string | null>;
+  /** When the missed-label scan last finished a look at the tenant (ISO), or null. */
+  getScanMark(installationId: number): Promise<string | null>;
+  setScanMark(installationId: number, at: string): Promise<void>;
+  /** Claims a label event for the scan: true the first time only, so one label application is acted on once. */
+  claimLabelEvent(installationId: number, repositoryId: number, eventId: number): Promise<boolean>;
   /** Workflows due a look at or before `now` (epoch ms), oldest due first. */
   listDueWorkflows(now: number, limit: number): Promise<{ installationId: number; workflowId: string }[]>;
 }
@@ -42,6 +49,8 @@ export function createMemoryWorkflowStore(): WorkflowStore & { dump(): { workflo
   const events = new Map<string, WorkflowEvent[]>();
   const prs = new Map<string, string>();
   const jobs = new Map<string, string>();
+  const scans = new Map<number, string>();
+  const labels = new Set<string>();
   const k = (id: number, wf: string) => `${id}/${wf}`;
   return {
     async getWorkflow(id, wf) {
@@ -85,6 +94,18 @@ export function createMemoryWorkflowStore(): WorkflowStore & { dump(): { workflo
     },
     async workflowOfJob(id, job) {
       return jobs.get(`${id}/${job}`) ?? null;
+    },
+    async getScanMark(id) {
+      return scans.get(id) ?? null;
+    },
+    async setScanMark(id, at) {
+      scans.set(id, at);
+    },
+    async claimLabelEvent(id, repo, ev) {
+      const k = `${id}/${repo}/${ev}`;
+      if (labels.has(k)) return false;
+      labels.add(k);
+      return true;
     },
     async listDueWorkflows(now, limit) {
       return [...workflows.values()]
@@ -203,6 +224,28 @@ export function createDynamoWorkflowStore(tableName: string, client = DynamoDBDo
     async workflowOfJob(id, job) {
       const out = await client.send(new GetCommand({ TableName: T, Key: jobKey(id, job) }));
       return out.Item && live(out.Item) && typeof out.Item.workflowId === 'string' ? out.Item.workflowId : null;
+    },
+    async getScanMark(id) {
+      const out = await client.send(new GetCommand({ TableName: T, Key: { pk: `TENANT#${id}`, sk: 'WFSCAN' } }));
+      return out.Item && typeof out.Item.at === 'string' ? out.Item.at : null;
+    },
+    async setScanMark(id, at) {
+      await client.send(new PutCommand({ TableName: T, Item: { pk: `TENANT#${id}`, sk: 'WFSCAN', at, ttl: ttl() } }));
+    },
+    async claimLabelEvent(id, repo, ev) {
+      try {
+        await client.send(
+          new PutCommand({
+            TableName: T,
+            Item: { pk: `TENANT#${id}`, sk: `WFLABEL#${repo}#${ev}`, ttl: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 },
+            ConditionExpression: 'attribute_not_exists(pk)',
+          }),
+        );
+        return true;
+      } catch (err) {
+        if (err instanceof ConditionalCheckFailedException) return false;
+        throw err;
+      }
     },
     async listDueWorkflows(now, limit) {
       const page = await client.send(

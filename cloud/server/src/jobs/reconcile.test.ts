@@ -119,7 +119,7 @@ describe('quota reconciliation', () => {
     const finished = await admitted(store, 'job_finish001', { microvmId: 'mvm-done' });
     await store.finishJob(finished.jobId, 'succeeded', { at: Date.now() });
     const finishes: { jobId: string; outcome: string }[] = [];
-    const workflows = { started: async () => {}, finished: async (job: { jobId: string }, outcome: string) => void finishes.push({ jobId: job.jobId, outcome }) };
+    const workflows = { started: async () => {}, waiting: async () => {}, finished: async (job: { jobId: string }, outcome: string) => void finishes.push({ jobId: job.jobId, outcome }) };
     await createReconciler({ store, microvmState: async () => 'TERMINATED', log: () => {}, workflows })();
     expect((await store.getJobSummary(55, 'job_gone00001'))).toMatchObject({ status: 'finished', outcome: MICROVM_GONE_OUTCOME, finishedAt: expect.any(String) });
     expect((await store.getJobSummary(55, 'job_finish001'))?.outcome).toBe('succeeded');

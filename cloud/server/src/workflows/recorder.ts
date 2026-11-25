@@ -6,9 +6,9 @@
  */
 import type { Job, JobFinishDetail } from '../store/store.js';
 import type { WorkflowStore } from './store.js';
-import { newWorkflow, onJobFinished, onJobStarted, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
+import { newWorkflow, onJobFinished, onJobStarted, onJobWaiting, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
 
-type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'>;
+type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'> & Partial<Pick<Job, 'expiresAt' | 'native'>>;
 
 const ATTEMPTS = 4;
 
@@ -64,6 +64,18 @@ export function createWorkflowRecorder(o: { store: WorkflowStore; now?: () => nu
         const at = now();
         await o.store.linkJob(job.installationId, job.jobId, id);
         await updateWorkflow(o.store, job.installationId, id, (w) => onJobStarted(w ?? newWorkflow(job, id, at), job, at));
+      }),
+    /**
+     * A delivery that starts no job yet because it waits for a person (a Claude sign-in): the
+     * workflow waits, with why and what to do, and is blocked if no one acts (SIGN_IN_LIMIT_MS).
+     */
+    waiting: (job: Omit<JobRef, 'jobId'> & { jobId?: string }, why: { reason: string; message: string; nextAction: string }) =>
+      safely('wait', { ...job, jobId: job.jobId ?? 'pending' }, async () => {
+        const id = await workflowOfJob(o.store, { ...job, jobId: job.jobId ?? 'pending' });
+        if (!id) return;
+        const at = now();
+        if (job.jobId) await o.store.linkJob(job.installationId, job.jobId, id);
+        await updateWorkflow(o.store, job.installationId, id, (w) => onJobWaiting(w ?? newWorkflow(job, id, at), job, why, at));
       }),
     /** A job finished: its runner's finish (broker), or the reconciler found its microVM gone. */
     finished: (job: JobRef, outcome: string, detail?: JobFinishDetail) =>

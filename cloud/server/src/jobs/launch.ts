@@ -336,13 +336,27 @@ export function createLauncher(deps: LaunchDeps) {
       return skip('kill_switch');
     }
 
+    /** The issue's workflow waits for the sign-in (workflows/recorder.ts); it is blocked if no one signs in. */
+    const waitingForSignIn = (jobId: string) =>
+      deps.workflows?.waiting(
+        { installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, eventName, deliveryId: req.deliveryId, jobId, ...(decision.issue !== undefined ? { issue: decision.issue } : {}), ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}) },
+        {
+          reason: 'sign_in_required',
+          message: 'The job waits for a Claude subscription sign-in before it can start.',
+          nextAction: 'Open the Claude page of this installation and sign in; the job then starts on its own.',
+        },
+      );
     if (binding?.route.workerId.startsWith('managed-') && !req.resumeClaude && !req.retry) {
       const jobId = await deps.parkedClaude?.(req);
-      if (jobId) return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Open the Claude sign-in request for this delivery', jobId };
+      if (jobId) {
+        await waitingForSignIn(jobId);
+        return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Open the Claude sign-in request for this delivery', jobId };
+      }
     }
     if (native?.ready && !await native.ready()) {
       if (native.route.workerId.startsWith('managed-') && decision.issue !== undefined && !req.resumeClaude && !req.retry && deps.waitForClaude) {
         const jobId = await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue);
+        await waitingForSignIn(jobId);
         return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Waiting for Claude subscription sign-in', jobId };
       }
       return skip('not_dispatched', { reason: 'native_worker_unavailable', message: 'The Claude subscription worker is offline or needs sign-in. Reconnect it before retrying this delivery.' });

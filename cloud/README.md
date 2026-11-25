@@ -47,12 +47,20 @@ So far it covers these phases:
     - **Identity and runs:** each workflow is keyed by the repository id and the issue (`<repositoryId>-i<issue>`). A pull request belongs to its issue's workflow once a job reports opening it; one Updraft never saw opened gets its own (`<repositoryId>-p<n>`). Labeling the issue again after the workflow finished or was blocked starts a new run of it; a retry does not.
     - **Recording:** the launcher records each job's start, and the broker records the finish that stuck. When reconciliation finds a job's microVM gone without a finish, it records that too, and the workflow is blocked with what to do next. Each change is a versioned save, so concurrent writers never overwrite each other.
     - **Status:** from the review loop's stage (`detail.loop.stage`) and the outcome, a workflow is working, waiting (for CI, a person's merge, or the loop's next event) or blocked (`job_failed`, `job_lost`, `needs_human`, `stalled`, `ci_stuck`, `ci_event_missed`, `ci_not_dispatched`). A blocked or waiting workflow carries a reason in words and a next step.
-    - **Timeline:** every job start and finish (with the steps' roles: the coding agent for implement and revision, the review agent for review), recovery and block. Each event has an immutable id, so recording one twice changes nothing. Kept 90 days after the workflow's last change; jobs recorded before workflows existed have none.
+    - **Timeline:** every job start and finish (with the steps' roles: the coding agent for implement and revision, the review agent for review), recovery, wait and block. Each event has an immutable id, so recording one twice changes nothing. Kept 90 days after the workflow's last change.
+    - **Totals:** computed on read from the timeline, counting each job once. They cover jobs and retries, reviews and revisions, tokens, the agents' reported cost, active time and wall time. A cost that includes a Claude subscription job is labelled an estimate, and steps that reported no cost are counted and left out.
+    - **List filters:** the list takes `status` and `repository` filters, and the console offers both.
+    - **Rebuilt workflows:** jobs whose issue has no recorded workflow are rebuilt on read from job records, kept 30 days. This covers jobs from before workflows existed, and jobs whose recording failed. A rebuilt workflow has an id `legacy-<digest of the repository>-i<issue>`, is marked as rebuilt, and lists what it cannot show. It is never stored or reconciled.
+    - **Sign-in waits:** a job waiting for a Claude subscription sign-in makes its workflow wait (`sign_in_required`, with where to sign in).
+    - **Failed publication:** a run whose publication failed is blocked (`publish_failed`), with how to publish it again.
   - **Workflow reconciliation** (#136): a schedule on `WebhookFunction`, every five minutes, `{"action":"reconcileWorkflows"}` (`server/src/workflows/reconcile.ts`). It runs there because it may launch a job. It looks at up to 25 workflows that are due a look (`PLATFORM#WORKFLOW-DUE`), with an installation token limited to the repository and to reading pull requests, checks and statuses. It decides from GitHub's answers, never from elapsed time alone, and changes a workflow only if no job started meanwhile.
     - **Merged or closed:** a pull request merged or closed meanwhile finishes the workflow.
     - **Checks still running:** a wait for CI is looked at again every 15 minutes, holding nothing, and is blocked (`ci_stuck`) after 24 hours.
     - **Missed check event:** checks that all finished on the current head (check runs and commit statuses, or none at all) with no job picking up the result mean the check event was missed, or never sent. Status-only CI never sends one. Reconciliation launches the job a `check_suite.completed` delivery would have started, under a delivery id derived from the head and the attempt, so it is claimed once. It does this at most twice per head, then blocks (`ci_event_missed`). A launch refused for a reason that lasts (`ciFix` off, say) blocks with that reason. A quota or a failed launch is tried again later.
     - **Stalled loop:** a review loop waiting for an event no one sent is blocked (`stalled`) after six hours.
+    - **Lost finish:** a workflow whose job should have ended by now (its maximum duration plus 15 minutes) without the finish reaching it is updated from the job's own record (`finish_recovered`). A job still running is left to quota reconciliation, which ends it as `microvm_gone`. A job whose record has expired blocks the workflow (`job_lost`).
+    - **Sign-in expiry:** a wait for a Claude sign-in is blocked after 24 hours (`sign_in_expired`).
+    - **Missed first label:** a labeled issue whose `issues.labeled` delivery never arrived has no workflow, so nothing above looks at it. Once an hour per tenant (five tenants per run), `server/src/workflows/label-scan.ts` lists the tenant's configured repositories' open issues that carry a trigger label and were updated since its last look. That look overlaps the previous one by an hour; the first goes back 24 hours. It takes at most 20 issues per tenant and look. For an issue with no workflow whose label was applied between 15 minutes and seven days ago, it claims that label event (`WFLABEL#…`, once), then launches it as the delivery GitHub would have sent, under a delivery id derived from the event. The launcher checks it like any delivery: the active config, who applied the label, keys, quotas and the kill switch. A refused launch is not tried again.
     - **Ready to merge:** a pull request ready for a person to merge is never looked at.
     - **Kill switch:** the kill switch stops the whole run.
   - **Retention:** results (result documents and logs) follow the stack's `ResultRetentionDays` (default 30): the daily cleanup deletes each tenant's older objects under `tenants/<id>/results/`.
@@ -405,6 +413,26 @@ Each of these that fails answers 200 with why (`no_tenant`, `tenant_inactive`, `
 **Failures:** if storing or launching fails, the webhook answers 500 so the delivery can be redelivered. It releases the claim and the quota reservation so the redelivery isn't refused, and retires the job record so its token is never served. A job that ends without a clean success also releases the claim when it reports `finish`, so redelivering the webhook is how a failed job is retried. A success without a summary counts as unconfirmed.
 
 `updraft run-event` in the microVM still makes the final decision, against GitHub and the same config. The launcher only makes sure no job starts that the config wouldn't allow.
+
+### Workflow reconciliation runbook
+
+Every run of `WebhookFunction`'s `ReconcileWorkflows` schedule logs one Embedded Metric Format line (`"workflowReconcile":true`). CloudWatch turns it into metrics in the `Updraft/Workflows` namespace:
+
+- **Run outcome:** `Runs`, `Checked`, `Recovered`, `Repaired`, `Blocked`, `Finished` and `Failed`.
+- **Backlog:** `Backlog`, and `OldestDueSeconds`, how long the oldest workflow due a look has waited.
+- **Label scan:** `LabelTenants`, `LabelRecovered` and `LabelRefused`.
+
+The metrics feed three alarms:
+
+| Alarm | What it means | What to do |
+| --- | --- | --- |
+| `WorkflowReconcileNotRunningAlarm` | No run completed in 15 minutes. | Check the schedule is enabled and `WebhookFunction` is not throttled or failing at start (its `Errors` metric and log group). A run that throws before it logs metrics counts as not running. |
+| `WorkflowReconcileFailingAlarm` | Some workflow or tenant failed in three runs in a row. | Find the `workflow reconciliation failed` / `label scan failed` log lines: they name the installation and workflow. GitHub errors (a revoked installation, rate limits) clear on their own. A failing workflow is looked at again 15 minutes later, and a failing tenant's scan an hour later, so one cannot hold up the rest. |
+| `WorkflowReconcileBacklogAlarm` | A workflow has been due a look for more than 30 minutes. | Each run looks at 25 workflows. A growing `Backlog` means more are due than that: raise `limit` in `webhook-lambda.ts`, or the schedule's rate. A steady `OldestDueSeconds` with a small backlog points at one workflow that fails every time (see the failing alarm). |
+
+**Blocked workflows:** these are not alarms; they are for the tenant. The workflow's page says why and what to do: retry the job, sign in, re-run a stuck check, apply the label again, or act on the pull request.
+
+To look at one workflow, read `TENANT#<installationId>` / `WORKFLOW#<workflowId>` and its `WFEV#<workflowId>#…` events. A workflow due a look has `nextCheckAt`, and an entry under `PLATFORM#WORKFLOW-DUE`. To stop the reconciler from acting at all, engage the kill switch: it also stops launches.
 
 ### Pull request events
 

@@ -399,7 +399,7 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
     if (workflows) {
       app.get('/v1/installations/:id/workflows', async (c) => {
         const id = positive(c.req.param('id'));
-        return id ? c.json(await workflows.list(c.get('caller'), id, c.req.query('limit'))) : c.json({ error: 'not_found' }, 404);
+        return id ? c.json(await workflows.list(c.get('caller'), id, c.req.query('limit'), { status: c.req.query('status'), repository: c.req.query('repository') })) : c.json({ error: 'not_found' }, 404);
       });
       app.get('/v1/installations/:id/workflows/:workflowId', async (c) => {
         const id = positive(c.req.param('id'));

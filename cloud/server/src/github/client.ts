@@ -54,6 +54,20 @@ export interface PullRequestHead {
   headRef: string;
 }
 
+export interface LabeledIssue {
+  number: number;
+  title: string;
+  htmlUrl: string;
+  labels: string[];
+}
+
+export interface LabelEvent {
+  id: number;
+  actor: string | null;
+  createdAt: string;
+  label: string;
+}
+
 export interface CommitCheckCounts {
   /** Check runs and statuses seen. */
   total: number;
@@ -101,6 +115,13 @@ export interface GitHubApi {
    * nothing is known to be finished. For the workflow reconciler.
    */
   commitChecks?(installationToken: string, repository: string, sha: string): Promise<CommitCheckCounts>;
+  /**
+   * Open issues (not pull requests) carrying `label`, updated since `since` (ISO), newest first, at
+   * most `limit`. For the missed-label scan (workflows/label-scan.ts).
+   */
+  labeledIssues?(installationToken: string, repository: string, label: string, since: string, limit: number): Promise<LabeledIssue[]>;
+  /** The newest time `label` was applied to an issue: the event's id, who applied it and when; null when it never was. */
+  latestLabelEvent?(installationToken: string, repository: string, issue: number, label: string): Promise<LabelEvent | null>;
   /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
   createIssueComment(installationToken: string, repository: string, issue: number, body: string): Promise<void>;
 }
@@ -249,6 +270,38 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       }
       if (typeof status.total_count === 'number' && status.total_count > statuses.length) counts.complete = false;
       return counts;
+    },
+
+    async labeledIssues(token, repository, label, since, limit) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const q = new URLSearchParams({ state: 'open', labels: label, since, sort: 'updated', direction: 'desc', per_page: String(Math.min(100, limit)) });
+      const out = await json<Json[]>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?${q}`, token), 'GET /repos/issues');
+      return (Array.isArray(out) ? out : [])
+        .filter((i) => !i.pull_request && typeof i.number === 'number')
+        .slice(0, limit)
+        .map((i) => ({
+          number: Number(i.number),
+          title: String(i.title ?? ''),
+          htmlUrl: String(i.html_url ?? ''),
+          labels: Array.isArray(i.labels) ? (i.labels as Json[]).flatMap((l) => (typeof l?.name === 'string' ? [l.name] : [])) : [],
+        }));
+    },
+
+    async latestLabelEvent(token, repository, issue, label) {
+      const [owner = '', repo = ''] = repository.split('/');
+      let newest: LabelEvent | null = null;
+      for (let page = 1; page <= MAX_PAGES; page++) {
+        const out = await json<Json[]>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issue}/events?per_page=100&page=${page}`, token), 'GET /repos/issues/events');
+        const events = Array.isArray(out) ? out : [];
+        for (const e of events) {
+          const name = (e.label as Json | undefined)?.name;
+          if (e.event !== 'labeled' || typeof name !== 'string' || name.toLowerCase() !== label.toLowerCase() || typeof e.id !== 'number') continue;
+          const at = String(e.created_at ?? '');
+          if (!newest || at >= newest.createdAt) newest = { id: e.id, actor: typeof (e.actor as Json | undefined)?.login === 'string' ? String((e.actor as Json).login) : null, createdAt: at, label: name };
+        }
+        if (events.length < 100) break;
+      }
+      return newest;
     },
 
     async createIssueComment(token, repository, issue, body) {
