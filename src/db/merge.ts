@@ -187,6 +187,11 @@ export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
     parent: { column: 'run_id', table: 'runs' },
     rule: 'a wait that has ended (resumed, closed, canceled or expired) is never replaced by one still waiting; otherwise the later updated_at wins (this run on a tie)',
   },
+  review_findings: {
+    kind: 'keyed',
+    conflict: later('updated_at'),
+    rule: 'the later updated_at wins (this run on a tie): a finding only gains a thread, a report and a check over time',
+  },
   revision_prs: {
     kind: 'keyed',
     conflict: pullRequestConflict,

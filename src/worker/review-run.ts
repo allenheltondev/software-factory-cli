@@ -11,6 +11,7 @@
 //   whatever it is, the verdict stands as parsed.
 import { appendFile } from 'node:fs/promises';
 import type { AgentAdapter } from '../agents/adapters/registry.js';
+import { capFindings } from '../agents/findings.js';
 import { parseVerdict, readFindingsCount } from '../agents/verdict.js';
 import { fetchBranch, remoteDefaultBranch, runGit, type GitOptions } from '../git/git.js';
 import { discardWorktree, withCheckoutLock } from '../git/worktree.js';
@@ -80,7 +81,8 @@ export function readReviewVerdict(adapter: AgentAdapter, rawOutput: string): Rev
   const parsed = parseVerdict(final ?? rawOutput);
   if (!parsed.ok) return parsed;
   const counted = readFindingsCount(parsed.findings);
-  const findings = counted.findings.length > MAX_FINDINGS ? `${counted.findings.slice(0, MAX_FINDINGS - 1)}…` : counted.findings;
+  // A long review is cut in its prose, so its findings block (findings.ts) stays readable.
+  const findings = capFindings(counted.findings, MAX_FINDINGS);
   return { ok: true, verdict: parsed.verdict, findings, findingsCount: counted.count, findingsCountProblem: counted.problem };
 }
 

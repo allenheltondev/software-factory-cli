@@ -25,7 +25,10 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
+
+/** The schema version that added review_findings (docs/review-loop.md, "Findings as threads"). */
+export const FINDINGS_SCHEMA_VERSION = 19;
 
 /** The schema version that added dependency_waits (docs/dependencies.md). */
 export const DEPENDENCIES_SCHEMA_VERSION = 17;
@@ -620,6 +623,48 @@ const MIGRATIONS: Record<number, Migration> = {
     const have = new Set((db.prepare('PRAGMA table_info(revision_prs)').all() as { name: string }[]).map((c) => c.name));
     for (const [name, decl] of CI_COLUMNS) if (!have.has(name)) db.exec(`ALTER TABLE revision_prs ADD COLUMN ${name} ${decl}`);
   },
+  // The structured findings of Updraft's reviewer runs (src/agents/findings.ts), one row per
+  // finding, and the review thread each one is discussed in. The posted text is never read back
+  // to decide anything: the thread a finding has is the comment the worker itself posted with
+  // the review (its own login, its review id, its marker), and its status is what the worker
+  // recorded from the coding agent's report and the next reviewer's check.
+  // thread_key: the finding whose thread this one is discussed in (itself, or the earlier
+  // finding it repeats). status: open, verified (a later reviewer checked it is fixed) or
+  // unresolved (a later reviewer found it is not). resolution*: the coding agent's report of
+  // the revision that answered it, recorded after its push was confirmed: a claim, not a check.
+  19: `
+    CREATE TABLE IF NOT EXISTS review_findings (
+      repo_id            INTEGER NOT NULL,
+      pr_number          INTEGER NOT NULL,
+      finding_key        TEXT    NOT NULL,   -- <run_id>#<finding id>
+      run_id             TEXT    NOT NULL,   -- the reviewer run
+      finding_id         TEXT    NOT NULL,
+      head_sha           TEXT    NOT NULL,   -- the commit it was found on
+      severity           TEXT    NOT NULL CHECK (severity IN ('blocker','suggestion')),
+      title              TEXT    NOT NULL,
+      problem            TEXT    NOT NULL,
+      suggestion         TEXT,
+      path               TEXT,
+      line               INTEGER,
+      thread_key         TEXT    NOT NULL,
+      review_id          INTEGER,            -- GitHub's id of the review it was posted with
+      comment_id         INTEGER,            -- the thread's first comment, when it is inline
+      comment_url        TEXT,
+      status             TEXT    NOT NULL DEFAULT 'open' CHECK (status IN ('open','verified','unresolved')),
+      status_sha         TEXT,               -- the head the status is about
+      status_note        TEXT,
+      status_at          TEXT,               -- when the review behind the status was recorded: an older one never overwrites it
+      resolution         TEXT    CHECK (resolution IN ('fixed','disagreed','deferred','unable','unreported')),
+      resolution_note    TEXT,
+      resolution_sha     TEXT,
+      resolution_run_id  TEXT,
+      thread_resolved_at TEXT,
+      created_at         TEXT    NOT NULL,
+      updated_at         TEXT    NOT NULL,
+      PRIMARY KEY (repo_id, pr_number, finding_key)
+    );
+    CREATE INDEX IF NOT EXISTS review_findings_by_run ON review_findings (run_id);
+  `,
 };
 
 /** Migration 18's columns of revision_prs. */
@@ -739,19 +784,28 @@ export function migrate(db: Db, target = SCHEMA_VERSION): void {
   }
 }
 
+/** Open transactions per database, so a nested transaction() is a savepoint of the outer one. */
+const depth = new WeakMap<Db, number>();
+
 /**
- * Run fn inside BEGIN IMMEDIATE so writers serialize. Not re-entrant: do not
- * nest calls. Rolls back and rethrows on error.
+ * Run fn inside BEGIN IMMEDIATE so writers serialize. Rolls back and rethrows on error. Nested
+ * inside another transaction() on the same database, it is a savepoint: its changes commit or
+ * roll back with the outer transaction, and an error rolls back only what it did.
  */
 export function transaction<T>(db: Db, fn: () => T): T {
-  db.exec('BEGIN IMMEDIATE');
+  const level = depth.get(db) ?? 0;
+  const name = `updraft_sp_${level}`;
+  db.exec(level === 0 ? 'BEGIN IMMEDIATE' : `SAVEPOINT ${name}`);
+  depth.set(db, level + 1);
   try {
     const result = fn();
-    db.exec('COMMIT');
+    depth.set(db, level);
+    db.exec(level === 0 ? 'COMMIT' : `RELEASE ${name}`);
     return result;
   } catch (err) {
+    depth.set(db, level);
     try {
-      db.exec('ROLLBACK');
+      db.exec(level === 0 ? 'ROLLBACK' : `ROLLBACK TO ${name}; RELEASE ${name}`);
     } catch {
       // ignore rollback failure; surface the original error
     }

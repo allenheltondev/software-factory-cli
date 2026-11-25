@@ -17,7 +17,7 @@
 // Same lease and attempt fence around every write as publication and the revision push.
 import { appendFile } from 'node:fs/promises';
 import { DEFAULT_MAX_REVISIONS, autoMergeMethod, ciSettings, reviewActive, reviseActive, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
-import { recordError } from '../db/database.js';
+import { recordError, transaction } from '../db/database.js';
 import {
   beginPrReview,
   finishPrReview,
@@ -36,11 +36,15 @@ import {
   type ReviewOutcome,
 } from '../db/pr-reviews.js';
 import { getJob, getRun } from '../db/queue.js';
+import { recordFindings, reviewRound, threadOf, unverifiedBlockers } from '../db/review-findings.js';
+import { readStructuredFindings, type StructuredReview } from '../agents/findings.js';
+import { diffIndex } from './anchors.js';
+import { answerInThreads, applyFindingState, inlineComments, revisionFindingsOf, planThreads, recordPostedThreads, renderStructuredReview, verdictContradiction, withoutInline, type ThreadAnswers, type ThreadPlan } from './threads.js';
 import { countRevisions, enqueueRevision, getReviewRequest, revisionJob } from '../db/revisions.js';
 import { GitHubError, type PullRequestReviewSummary } from '../github/api.js';
 import { sameLogin, workerLogin } from '../github/identity.js';
 import { verdictTrigger } from '../poller/review-trigger.js';
-import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type ReviewVerdict, type RevisionRequest, type Run } from '../types.js';
+import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type ReviewVerdict, type RevisionFinding, type RevisionRequest, type Run } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { evaluateCiAll, postCiNotices } from './ci.js';
 import { code } from './failure-comment.js';
@@ -194,6 +198,18 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
   const repoRef = { id: job.repoId, fullName: repoFullName };
   const log = deps.log.child({ runId, repo: repoFullName, pr: prNumber });
 
+  // Structured findings (findings.ts), and the verdict they must agree with: a ready-to-merge that
+  // lists a blocker, or leaves an earlier blocker unresolved or unchecked, is never acted on as
+  // ready. It is recorded and acted on as changes requested, and the review says why.
+  const reading = readStructuredFindings(result.findings);
+  const structured: StructuredReview | null = reading.structured && (reading.structured.findings.length || reading.structured.checks.length) ? reading.structured : null;
+  const override = verdictContradiction(result.verdict, structured, {
+    runId,
+    blockers: unverifiedBlockers(deps.db, job.repoId, prNumber),
+    rootOf: (key) => threadOf(deps.db, job.repoId, prNumber, key),
+  });
+  const verdict: ReviewVerdict = override ? 'changes-requested' : result.verdict;
+
   const begun = beginPrReview(deps.db, {
     runId,
     jobId: job.id,
@@ -203,7 +219,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     prNumber,
     headSha,
     agent: run.agent,
-    verdict: result.verdict,
+    verdict,
     findings: result.findings,
     findingsCount: result.findingsCount ?? null,
     leaseSeconds: PUBLISH_LEASE_SECONDS,
@@ -241,12 +257,12 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     return getPrReview(deps.db, runId)!;
   };
 
-  await runLog([`attempt ${rev.attempts} at ${new Date(now()).toISOString()}: verdict ${result.verdict} for ${short(headSha)} of pull request #${prNumber}`]);
+  await runLog([`attempt ${rev.attempts} at ${new Date(now()).toISOString()}: verdict ${verdict} for ${short(headSha)} of pull request #${prNumber}`]);
   try {
     const watched = getLoopPr(deps.db, job.repoId, prNumber);
     if (!watched) throw new PublishRefusal(`pull request #${prNumber} is not one this worker published; refusing to review it`);
     if (watched.state !== 'open') {
-      recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict: result.verdict, headSha, now });
+      recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict, headSha, now });
       const reason = `pull request #${prNumber} was closed or merged before the review could be posted`;
       hold({ outcome: 'closed', outcomeDetail: reason });
       const done = finish({ state: 'skipped', error: reason });
@@ -255,6 +271,10 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     }
 
     // 1. The comment review: recorded, found by its marker among the worker's own reviews, or new.
+    // With structured findings, those whose line the reviewed diff has are inline comments of it.
+    if (override) await runLog([`verdict: the reviewer wrote ready-to-merge, but ${override}; taken as changes-requested`]);
+    if (reading.problem) await runLog([`findings: ${reading.problem}; the review is posted as written`]);
+    const round = structured ? reviewRound(deps.db, runId) : 0;
     const login = await workerLogin(deps.api);
     if (!rev.reviewId) {
       hold();
@@ -262,38 +282,118 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
       const found = (await deps.api.listPullRequestReviews(repoRef, prNumber)).find((r) => r.body.includes(marker) && sameLogin(r.user, login));
       let posted: PullRequestReviewSummary | undefined = found;
       if (!posted) {
-        const body = renderReview({
-          runId,
-          agent: run.agent,
-          verdict: result.verdict,
-          headSha,
-          findings: result.findings,
-          next: nextStep(deps.config, repo, result.verdict, countRevisions(deps.db, job.repoId, prNumber)),
-        });
-        hold(); // the lookup may have outlived the lease
-        try {
-          posted = await deps.api.createPullRequestReview(repoRef, prNumber, { body, commitId: headSha });
-        } catch (err) {
-          // The commit is no longer part of the pull request (its branch was rewritten). The body
-          // names the commit, so the review is still worth having, unpinned.
-          if (!(err instanceof GitHubError) || err.status !== 422) throw err;
-          hold();
-          posted = await deps.api.createPullRequestReview(repoRef, prNumber, { body });
-          await runLog([`GitHub refused to attach the review to ${short(headSha)} (${err.message}); posted it without a commit`]);
+        const next = nextStep(deps.config, repo, verdict, countRevisions(deps.db, job.repoId, prNumber));
+        const create = async (input: Parameters<typeof deps.api.createPullRequestReview>[2]): Promise<PullRequestReviewSummary> => {
+          hold(); // the lookup may have outlived the lease
+          try {
+            return await deps.api.createPullRequestReview(repoRef, prNumber, input);
+          } catch (err) {
+            // The commit is no longer part of the pull request (its branch was rewritten). The body
+            // names the commit, so the review is still worth having, unpinned.
+            if (!(err instanceof GitHubError) || err.status !== 422 || !input.commitId || input.comments?.length) throw err;
+            hold();
+            const unpinned = await deps.api.createPullRequestReview(repoRef, prNumber, { body: input.body });
+            await runLog([`GitHub refused to attach the review to ${short(headSha)} (${err.message}); posted it without a commit`]);
+            return unpinned;
+          }
+        };
+        if (structured) {
+          let diff: ReturnType<typeof diffIndex> | null = null;
+          let noDiff: string | undefined;
+          if (!deps.api.listPullRequestFiles) noDiff = 'this GitHub client cannot post inline comments';
+          else {
+            hold();
+            const pr = await deps.api.getPullRequest(repoRef, prNumber);
+            if (pr.headSha !== headSha) noDiff = `the pull request is at ${short(pr.headSha)} now, not the reviewed ${short(headSha)}`;
+            else {
+              hold();
+              diff = diffIndex(await deps.api.listPullRequestFiles(repoRef, prNumber));
+            }
+          }
+          let plan = planThreads(structured, { diff, noDiff, rootOf: (key) => threadOf(deps.db, job.repoId, prNumber, key) });
+          const render = (p: ThreadPlan) =>
+            renderStructuredReview({
+              runId,
+              agent: run.agent,
+              round,
+              verdict,
+              headSha,
+              prose: reading.prose,
+              structured,
+              plan: p,
+              threads: (key) => threadOf(deps.db, job.repoId, prNumber, key),
+              override,
+              next,
+              marker,
+              maxBody: MAX_BODY,
+            });
+          if (plan.inline.length) {
+            try {
+              posted = await create({ body: render(plan), commitId: headSha, comments: inlineComments({ runId, round, headSha, plan }) });
+            } catch (err) {
+              // GitHub refuses the whole review when it cannot place one comment. Every finding is
+              // kept: they all go in the summary instead.
+              if (!(err instanceof GitHubError) || err.status !== 422) throw err;
+              plan = withoutInline(plan, 'GitHub did not accept it as an inline comment');
+              await runLog([`GitHub refused the inline comments (${err.message}); posting every finding in the review summary`]);
+            }
+          }
+          posted ??= await create({ body: render(plan), commitId: headSha });
+          await runLog([`findings: ${plan.inline.length} inline, ${plan.summary.length} in the summary, ${plan.repeats.length} in earlier threads, ${structured.checks.length} check(s) of earlier findings`]);
+        } else {
+          posted = await create({ body: renderReview({ runId, agent: run.agent, verdict, headSha, findings: result.findings, next }), commitId: headSha });
         }
       }
       hold({ reviewId: posted.id, reviewUrl: posted.htmlUrl });
       await runLog([found ? `review already on pull request #${prNumber}: ${posted.htmlUrl}` : `posted a comment review on pull request #${prNumber}: ${posted.htmlUrl}`]);
     }
 
+    // 1b. Structured findings: recorded with the inline comments the review posted, whatever head
+    // it is for. What they change about earlier findings waits for step 3.
+    const threadDeps = { db: deps.db, api: deps.api, now, guard: () => hold(), repoFullName, runId };
+    let revisionFindings: RevisionFinding[] = [];
+    let ownComments: Awaited<ReturnType<typeof recordPostedThreads>>['comments'] = null;
+    if (structured && rev.reviewId) {
+      hold();
+      recordFindings(deps.db, { repoId: job.repoId, prNumber, runId, headSha, reviewId: rev.reviewId, findings: structured.findings, now });
+      const recorded = await recordPostedThreads(threadDeps, { repo: repoRef, prNumber, runId, reviewId: rev.reviewId, login });
+      ownComments = recorded.comments;
+      if (recorded.log.length) await runLog(recorded.log);
+    }
+
     // 2. The verdict, from the worker's own record. Only a verdict for the current head acts.
-    const { current, open } = recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict: result.verdict, headSha, now });
+    // A structured review of the current head (as GitHub shows it right before) first makes what
+    // it says about earlier findings their state, and records its verdict in the same
+    // transaction, checked once more against every blocker as it now stands: a ready verdict is
+    // never on record while a blocker is open.
+    const stillCurrent = async () => {
+      hold();
+      const live = await deps.api.getPullRequest(repoRef, prNumber);
+      return live.state === 'open' && live.headSha === headSha;
+    };
+    let answers: ThreadAnswers | null = null;
+    let routed: ReviewVerdict = verdict;
+    let recorded: { current: boolean; open: boolean };
+    if (structured && rev.reviewId && watched.headSha === headSha && (await stillCurrent())) {
+      hold();
+      recorded = transaction(deps.db, () => {
+        answers = applyFindingState(threadDeps, { repoId: job.repoId, prNumber, runId, headSha, at: rev.createdAt, structured });
+        if (routed === 'ready-to-merge' && unverifiedBlockers(deps.db, job.repoId, prNumber).length) routed = 'changes-requested';
+        revisionFindings = revisionFindingsOf(deps.db, { repoId: job.repoId, prNumber, runId, structured });
+        return recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict: routed, headSha, now });
+      });
+      if (routed !== verdict) await runLog(['verdict: a blocker is still open after this review\'s checks; taken as changes-requested']);
+    } else {
+      if (structured && rev.reviewId) await runLog(['threads: the pull request moved on from the reviewed commit; this review\'s checks and repeats change nothing']);
+      recorded = recordVerdict(deps.db, { repoId: job.repoId, prNumber, runId, verdict, headSha, now });
+    }
+    const { current, open } = recorded;
     let outcome: ReviewOutcome;
     let detail: string | null = null;
     let revisionJobId: string | undefined;
     const decision = verdictTrigger({
       runId,
-      verdict: result.verdict,
+      verdict: routed,
       findings: result.findings,
       headSha,
       reviewer: login,
@@ -316,6 +416,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
           originalEventId: watched.originalEventId,
           review: decision.review,
           reviewedSha: decision.reviewedSha,
+          ...(revisionFindings.length ? { findings: revisionFindings } : {}),
         };
         const max = repo.maxRevisions ?? DEFAULT_MAX_REVISIONS;
         const record = {
@@ -361,10 +462,17 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
         await runLog([`marked pull request #${prNumber} ready for review`]);
       }
     }
+    // 3. The state step 2a recorded, answered in the threads; a thread is resolved only while
+    // GitHub still shows the reviewed head (checked right before each resolution).
+    if (answers && outcome !== 'stale' && outcome !== 'closed') {
+      const answered = await answerInThreads(threadDeps, { repo: repoRef, prNumber, runId, headSha, round, login, comments: ownComments, answers, stillCurrent });
+      if (answered.log.length) await runLog(answered.log);
+    }
+
     hold({ outcome, outcomeDetail: detail, ...(revisionJobId ? { revisionJobId } : {}) });
     const done = finish({ state: 'published' });
-    await runLog([`verdict ${result.verdict}: ${outcome}${detail ? ` (${detail})` : ''}`]);
-    log.info('review posted', { verdict: result.verdict, outcome, review: done.reviewUrl });
+    await runLog([`verdict ${verdict}: ${outcome}${detail ? ` (${detail})` : ''}`]);
+    log.info('review posted', { verdict, outcome, review: done.reviewUrl });
     return { status: 'published', review: done, already: false };
   } catch (err) {
     if (err instanceof PrReviewSupersededError) {

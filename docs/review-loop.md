@@ -237,6 +237,84 @@ second one (only among the worker's own reviews). Posting uses the same lease, r
 The verdict is acted on once its review is on the PR, so nothing happens on a PR that people
 cannot see explained there.
 
+## Findings as threads
+
+A reviewer may list its findings in a structured block as well as in prose. The default
+prompt asks for one. When it does, each finding becomes something people can follow on the pull
+request, and the coding agent and the next reviewer answer it where it was raised.
+
+Three roles speak on the pull request, all as the worker's one GitHub account (Updraft never
+pretends to be another user). Each says which role it is: the **Review agent**, the **Coding
+agent**, and **Updraft** itself. This holds even when the same agent or profile plays both
+review and coding.
+
+### The contract
+
+Before its findings count and verdict lines, the reviewer writes one fenced block tagged
+`updraft-findings`:
+
+````text
+```updraft-findings
+{"findings": [{"id": "F1", "severity": "blocker", "title": "Retired worker is not fenced",
+               "path": "src/pool.ts", "line": 42, "startLine": 40, "side": "RIGHT",
+               "problem": "What is wrong and how it fails.", "suggestion": "What would fix it.",
+               "sameAs": "run_abc#F2"}],
+ "checks": [{"finding": "run_abc#F1", "status": "verified", "note": "What was checked."}]}
+```
+````
+
+- **Required fields:** a finding needs a `title` or a `problem`. Everything else is optional.
+- **Severity:** `severity` is `blocker` or `suggestion`. Anything else counts as a blocker, so a typo can't make a finding optional.
+- **Keys:** a finding's key is `<run id>#<id>`, and that key names it for the rest of the pull request. An `id` that is missing or used twice is replaced by `F<n>`.
+- **Location:** `path` is relative to the repository. `line` (and `startLine` for a range) is on `side`: RIGHT, the head's numbering (the default), or LEFT, a removed line. A path or line that can't be used is dropped with the reason. The finding itself is always kept.
+- **Repeats:** `sameAs` names an earlier finding of this pull request that is still not fixed. The new finding joins that finding's thread.
+- **Checks:** `checks` re-check earlier findings against the commit under review. `verified` or `unresolved`; anything else counts as unresolved.
+- **Limits:** a block holds at most 50 findings and 50 checks. Each text field is capped, and control characters are removed.
+- **Verdict:** the verdict line decides, as before, but a structured review's verdict must agree with its findings. A `ready-to-merge` is never acted on as ready when the review lists a blocker, or when any earlier blocker thread of the pull request is not verified by it. That means every recorded blocker, not only the ones the reviewer was shown, and also a blocker verified in an earlier round that this review finds broken again. Its state and the verdict are recorded in one transaction, checked once more against every blocker as it then stands, so a ready verdict is never on record while a blocker is open. It is recorded and acted on as changes requested, and the review says why. A legacy review on a pull request with no earlier blockers is not checked.
+- **One answer per thread:** a review says one thing about each earlier thread, whichever of its keys it names. A thread counts as verified only when every check of it says `verified` and no finding of the review repeats it. Anything else is unresolved. When several findings repeat one thread, the strongest (a blocker over a suggestion) speaks for it, and the others' text is kept with it. A repeat never lowers a thread's severity: a blocker that is repeated is still a blocker, whatever the repeat calls it.
+- **What the reviewer is shown:** at most 50 earlier findings, blockers first. When there are more, the prompt says so: a pull request with more unverified blockers than one review can check needs further rounds, or a person.
+- **Fallback:** a review with no block, two blocks or a block that isn't valid JSON is posted as a legacy review: its whole text, as before. Run.log says why.
+
+### On the pull request
+
+- **One review:** each reviewer run posts one COMMENT review, pinned to the reviewed commit. The body is short. It opens with `Review agent · Round N · reviewed <sha>`, then the verdict in plain words, the reviewer's prose, one line per finding, the re-checks of earlier findings, and what happens next.
+- **Inline threads:** a finding whose line is in the pull request's diff, as GitHub shows it for the reviewed head, is posted with the review as an inline comment on that line. Its full text is in the thread and not repeated in the summary. Updraft never invents a line: a range must be within one hunk, and the file must have a diff.
+- **The rest:** findings on lines outside the diff, files the change didn't touch, findings with no file, findings beyond 25 inline comments, and every finding when the pull request has moved past the reviewed commit go in the summary in full, with the reason.
+- **Refused inline comments:** GitHub refuses the whole review when it can't place one comment. Updraft then posts the review again with every finding in the summary. Nothing is dropped.
+- **Current head only:** repeats and checks change earlier findings only for a review of the pull request's current head, looked at on GitHub just before. They change them in one transaction, before the verdict queues a revision or marks the pull request ready. A review whose head has moved on is posted as history and changes nothing. A check or repeat from an older review never overwrites the state a newer review recorded. A thread is resolved only if it is still verified for that head and GitHub, read right before, still shows that head.
+- **Repeats:** a repeat of a finding that has a thread gets a reply in that thread ("this is still not fixed", with the current text), not a new thread. The summary carries the repeat's full text too. A repeat of a finding that was only in a summary, posted inline now, becomes that finding's thread. Either way, the thread takes on the repeat's current severity and text, so a suggestion that now blocks is a blocker for the next round.
+- **Checks:** each check of an earlier finding is answered in that finding's thread. A thread is resolved only when the check `verified` it and the thread is one the worker started: its first comment was posted by the worker's own login, with the review recorded for that run. A person's thread is never resolved. A thread of the worker's that a later review finds unresolved again (a check or a repeat) is reopened on GitHub if it was resolved, while the pull request is still at that head; a person's thread is never reopened. The resolution is recorded only once GitHub confirms it, and the reply never says "resolved" on its own. A check that names no finding of this pull request is ignored, and the summary says so.
+
+### The revision
+
+The revision of a structured review gets each finding by key, as its thread stands after the review: a repeat by the thread it repeats, with the strongest severity and all its text, and each earlier thread a check found unresolved. For each it gets its severity, file, line, title,
+problem and suggestion, fenced as untrusted input like any review. The revision is asked to end
+its final message with a report on each one, in a block tagged `updraft-resolutions`:
+
+````text
+```updraft-resolutions
+[{"finding": "run_abc#F1", "status": "fixed", "note": "Retire compares generations.", "tests": "npm test: 214 passed"}]
+```
+````
+
+`status` is `fixed`, `disagreed`, `deferred` or `unable`. Only keys the revision was given are
+read. A finding the agent doesn't report on is answered as having no report.
+
+- **After the push:** only once the push is confirmed does the worker reply in each finding's thread as the **Coding agent**. The reply names the commit and its link, the agent's note and its tests, and says that it is the coding agent's account, not a verification.
+- **No push:** a revision that pushed nothing (no commits, a branch that moved) says nothing in the threads.
+- **The reply comment:** the revision's PR comment lists every finding with its status. A finding whose thread couldn't be replied to, or that has no thread, gets its whole answer there.
+- **The record:** the report is recorded as the coding agent's claim.
+- **The next review:** the next reviewer is given every finding no reviewer has verified yet, with that claim marked as a claim. It checks each one on the new head, by key.
+
+### What decides
+
+- **The worker's records:** what the worker recorded decides, never the posted text. That record is the finding, its thread (the comment the worker itself posted), the coding agent's report and the reviewer's check, kept in `review_findings` in the state database and merged across Cloud jobs (see [shared state](shared-state.md)).
+- **Markers:** every reply carries a marker for its kind, run and thread, so a retry or a lost response never posts it twice. A marker copied into someone else's comment is ignored.
+- **The fence:** every thread write and every change of a finding's state is made under the step's lease and attempt fence, checked right before it, with the same stop and deadline. An attempt that lost its lease, or is stopping, writes nothing more.
+- **Failures:** a thread write GitHub refuses for good (a permission, a thread that is gone) is said in run.log; the summary has the finding, and the step goes on. A failure worth retrying (a rate limit, a 5xx, the network) fails the attempt, which is retried like any. The review is not posted twice, and no reply is either.
+- **Many threads:** the threads of a pull request are read page by page. One with more than 2000 threads is reported as not fully read, and its findings are verified, not resolved.
+- **Without thread support:** a GitHub client without thread support posts the summary only.
+
 ## Where the reviewer runs
 
 Through the same path as every live run: the agent's container if it has one, the action's
@@ -353,7 +431,12 @@ while a watched PR is open, plus one GraphQL request per watched PR that changed
 - starting a reviewer job: one GraphQL request for the PR, plus the issue lookups of any job;
 - per reviewer run: one request for the worker's own login (once per worker process), one
   listing of the PR's reviews, one request to post the review; for a ready verdict one request
-  for the PR, and one more to mark a draft ready;
+  for the PR, and one more to mark a draft ready. With structured findings, also one request
+  for the PR and one listing of its files before posting, one listing of its review comments
+  after, one reply per repeated or re-checked finding with a thread, and, when a check verified
+  a thread, one GraphQL listing of the threads and one GraphQL request per thread resolved;
+- per revision of structured findings, after its push: one listing of the PR's review comments
+  and one reply per finding with a thread;
 - `autoMerge`, per poll and per PR that is ready and whose merge has not settled: up to four
   requests (the PR, its reviews, commit statuses, check runs), fewer when an earlier one already
   decides; then one merge request. A PR that is merged or blocked costs nothing more. A blocked

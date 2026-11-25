@@ -14,7 +14,11 @@ import {
   type IssueEventsPage,
   type MergePullRequestInput,
   type PullRequestDetails,
+  type PullRequestFile,
+  type PullRequestReviewComment,
   type PullRequestReviewSummary,
+  type ReviewCommentInput,
+  type ReviewThread,
   type PullRequestReviews,
   type PullRequestUpdatesPage,
 } from '../src/github/api.js';
@@ -28,7 +32,11 @@ type Failable =
   | 'getCommitChecks'
   | 'getCheckRunDiagnostics'
   | 'mergePullRequest'
-  | 'createIssueComment';
+  | 'createIssueComment'
+  | 'replyToReviewComment'
+  | 'resolveReviewThread'
+  | 'unresolveReviewThread'
+  | 'listReviewThreads';
 
 export class FakeLoopGitHub {
   login = 'updraft-bot';
@@ -59,6 +67,14 @@ export class FakeLoopGitHub {
   /** The body the pull request was opened with (it carries the run's marker), and who opened it. */
   pullBody = '';
   pullAuthor: string | null = null;
+  /** The pull request's diff, as listPullRequestFiles reports it. */
+  files: PullRequestFile[] = [];
+  /** Inline review comments and replies, oldest first. */
+  reviewComments: Array<PullRequestReviewComment & { line?: number; side?: string; startLine?: number }> = [];
+  /** Threads (by their first comment's id) that are resolved. */
+  readonly resolved = new Set<number>();
+  /** Refuse a review with inline comments (422), as GitHub does for a line outside the diff. */
+  refuseInline = false;
   private version = 0;
   private nextId = 1;
 
@@ -175,15 +191,64 @@ export class FakeLoopGitHub {
     this.maybeFail('listPullRequestReviews');
     return [...this.reviews];
   }
-  async createPullRequestReview(_repo: RepoRef, pull: number, input: { body: string; commitId?: string }): Promise<PullRequestReviewSummary> {
+  async createPullRequestReview(_repo: RepoRef, pull: number, input: { body: string; commitId?: string; comments?: ReviewCommentInput[] }): Promise<PullRequestReviewSummary> {
     this.maybeFail('createPullRequestReview');
     if (this.refuseCommitId && input.commitId) throw new GitHubError('POST /pulls/reviews failed: 422 Unprocessable Entity: commit_id is not part of the pull request', 422);
-    this.writes.push(`review #${pull} COMMENT at ${input.commitId ?? '(no commit)'}`);
+    if (this.refuseInline && input.comments?.length) throw new GitHubError('POST /pulls/reviews failed: 422 Unprocessable Entity: Line could not be resolved', 422);
+    this.writes.push(`review #${pull} COMMENT at ${input.commitId ?? '(no commit)'}${input.comments?.length ? ` with ${input.comments.length} inline` : ''}`);
     const id = this.nextId++;
     const r: PullRequestReviewSummary = { id, state: 'COMMENTED', user: this.login, body: input.body, htmlUrl: `https://github.com/${this.fullName}/pull/${pull}#pullrequestreview-${id}`, submittedAt: this.updatedAt, commitId: input.commitId ?? null };
     this.reviews.push(r);
+    for (const c of input.comments ?? []) {
+      const cid = this.nextId++;
+      this.reviewComments.push({ id: cid, reviewId: id, inReplyToId: null, user: this.login, body: c.body, path: c.path, htmlUrl: `https://github.com/${this.fullName}/pull/${pull}#discussion_r${cid}`, line: c.line, side: c.side, ...(c.startLine !== undefined ? { startLine: c.startLine } : {}) });
+    }
     this.touch();
     return r;
+  }
+  async listPullRequestFiles(): Promise<PullRequestFile[]> {
+    this.calls.push('listPullRequestFiles');
+    return [...this.files];
+  }
+  async listPullRequestReviewComments(): Promise<PullRequestReviewComment[]> {
+    this.calls.push('listPullRequestReviewComments');
+    return this.reviewComments.map(({ line: _l, side: _s, startLine: _st, ...c }) => ({ ...c }));
+  }
+  /** A person (or anyone) replies in a thread. */
+  reply(commentId: number, user: string, body: string): PullRequestReviewComment {
+    const root = this.reviewComments.find((c) => c.id === commentId);
+    if (!root) throw new GitHubError('comment not found', 404);
+    const id = this.nextId++;
+    const c = { id, reviewId: null, inReplyToId: root.inReplyToId ?? root.id, user, body, path: root.path, htmlUrl: `https://github.com/${this.fullName}/pull/${this.pull?.number}#discussion_r${id}` };
+    this.reviewComments.push(c);
+    this.touch();
+    return c;
+  }
+  async replyToReviewComment(_repo: RepoRef, pull: number, commentId: number, body: string): Promise<PullRequestReviewComment> {
+    this.maybeFail('replyToReviewComment');
+    this.writes.push(`reply #${pull} to ${commentId}`);
+    return this.reply(commentId, this.login, body);
+  }
+  async listReviewThreads(): Promise<ReviewThread[]> {
+    this.calls.push('listReviewThreads');
+    this.maybeFail('listReviewThreads');
+    return this.reviewComments.filter((c) => c.inReplyToId === null).map((c) => ({ id: `T_${c.id}`, isResolved: this.resolved.has(c.id), rootCommentId: c.id, rootAuthor: c.user }));
+  }
+  async resolveReviewThread(_repo: RepoRef, threadId: string): Promise<void> {
+    this.maybeFail('resolveReviewThread');
+    this.writes.push(`resolve ${threadId}`);
+    this.resolved.add(Number(threadId.replace(/^T_/, '')));
+    this.touch();
+  }
+  async unresolveReviewThread(_repo: RepoRef, threadId: string): Promise<void> {
+    this.maybeFail('unresolveReviewThread');
+    this.writes.push(`reopen ${threadId}`);
+    this.resolved.delete(Number(threadId.replace(/^T_/, '')));
+    this.touch();
+  }
+  /** The thread replies under a first comment, oldest first. */
+  thread(rootId: number): PullRequestReviewComment[] {
+    return this.reviewComments.filter((c) => c.inReplyToId === rootId);
   }
   async markPullRequestReady(_repo: RepoRef, nodeId: string): Promise<void> {
     this.maybeFail('markPullRequestReady');

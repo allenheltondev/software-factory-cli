@@ -202,6 +202,47 @@ export interface PullRequestReviewSummary {
   commitId: string | null;
 }
 
+/** One file of a pull request's diff against its base, as REST lists it. */
+export interface PullRequestFile {
+  path: string;
+  /** added, removed, modified, renamed, copied, changed, unchanged. */
+  status: string;
+  /** The unified diff hunks; null when GitHub leaves it out (binary, or too large). */
+  patch: string | null;
+}
+
+/** An inline comment submitted with a review: on `line` (and from `startLine`) of the diff, on `side`. */
+export interface ReviewCommentInput {
+  path: string;
+  line: number;
+  side: 'LEFT' | 'RIGHT';
+  startLine?: number;
+  startSide?: 'LEFT' | 'RIGHT';
+  body: string;
+}
+
+/** An inline review comment as REST lists it. */
+export interface PullRequestReviewComment {
+  id: number;
+  /** The review it was submitted with; null when GitHub does not say. */
+  reviewId: number | null;
+  /** The comment it replies to (the thread's first comment); null for a thread's first comment. */
+  inReplyToId: number | null;
+  user: string | null;
+  body: string;
+  path: string;
+  htmlUrl: string;
+}
+
+/** A review thread (GraphQL): its node id, whether it is resolved, and its first comment. */
+export interface ReviewThread {
+  id: string;
+  isResolved: boolean;
+  /** REST id of its first comment; null when GitHub does not say. */
+  rootCommentId: number | null;
+  rootAuthor: string | null;
+}
+
 /**
  * The checks GitHub reports for one commit: commit statuses and check runs together, newest per
  * context or name. A commit with none has `total` 0 and both lists empty.
@@ -331,7 +372,21 @@ export interface GitHubApi {
    * Write: submit a COMMENT review on a pull request. Never an approval or a change request: the
    * account that opened a pull request may not submit those on it. `commitId` pins it to a commit.
    */
-  createPullRequestReview(repo: RepoRef, pullNumber: number, input: { body: string; commitId?: string }): Promise<PullRequestReviewSummary>;
+  createPullRequestReview(repo: RepoRef, pullNumber: number, input: { body: string; commitId?: string; comments?: ReviewCommentInput[] }): Promise<PullRequestReviewSummary>;
+  // Review threads (docs/review-loop.md, "Findings as threads"). Optional: without them the
+  // review is posted as one comment with every finding in its body, and nothing is replied to.
+  /** The files of a pull request's diff, with their patches (paginated internally; GitHub lists at most 3000). */
+  listPullRequestFiles?(repo: RepoRef, pullNumber: number): Promise<PullRequestFile[]>;
+  /** Every inline review comment of a pull request, oldest first (paginated internally). */
+  listPullRequestReviewComments?(repo: RepoRef, pullNumber: number): Promise<PullRequestReviewComment[]>;
+  /** Write: reply in the thread of an inline review comment. */
+  replyToReviewComment?(repo: RepoRef, pullNumber: number, commentId: number, body: string): Promise<PullRequestReviewComment>;
+  /** The review threads of a pull request (GraphQL, at most the first 100), with the same repository-id check as getPullRequestReviews. */
+  listReviewThreads?(repo: RepoRef, pullNumber: number): Promise<ReviewThread[]>;
+  /** Write: resolve a review thread (GraphQL). Only ever called for a thread the worker started. */
+  resolveReviewThread?(repo: RepoRef, threadId: string): Promise<void>;
+  /** Write: reopen a resolved review thread (GraphQL). Only ever called for a thread the worker started. */
+  unresolveReviewThread?(repo: RepoRef, threadId: string): Promise<void>;
   /** Write: turn a draft pull request into one that is ready for review (GraphQL; REST cannot). */
   markPullRequestReady(repo: RepoRef, nodeId: string): Promise<void>;
   /** Commit statuses and check runs of one commit (two REST requests, plus one per further 100 check runs). */
