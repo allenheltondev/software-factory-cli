@@ -25,7 +25,7 @@ import { postFailureComment } from './failure-comment.js';
 import { evaluateAutoMerges, mergeBlockedMarker, outstandingChangeRequests, postMergeNotices } from './merge.js';
 import { publishRun, type PublishDeps } from './publish.js';
 import { createReviewLoopPublisher, postReview, reviewMarker } from './review.js';
-import { findingsOfRun, getFinding, recordResolution } from '../db/review-findings.js';
+import { findingsOfRun, getFinding, recordCheck, recordResolution } from '../db/review-findings.js';
 import { renderReviewPrompt } from '../agents/review-prompt.js';
 import { findingMarker } from './threads.js';
 import { postLimitNotices } from './revision.js';
@@ -1081,6 +1081,26 @@ describe('findings as threads', () => {
     // Its state is unresolved all the same, and the reply says so.
     expect(getFinding(s.db, REPO_ID, PR, f1.key)!.status).toBe('unresolved');
     expect(s.gh.thread(f1.commentId!).at(-1)!.body).toContain('This is still open');
+  });
+
+  it('does not reopen a thread a newer check verified while the threads were listed', async () => {
+    const s = withDiff();
+    const first = await post(s, 'changes-requested', structuredFindings(THREE));
+    const f1 = getFinding(s.db, REPO_ID, PR, `${first.runId}#F1`)!;
+    await postReview(s.deps, nextRound(s, H2, 'ready-to-merge', structuredFindings({ findings: [], checks: [{ finding: f1.key, status: 'verified' }, { finding: `${first.runId}#F2`, status: 'verified' }] })));
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(true);
+    const run = nextRound(s, H3, 'changes-requested', structuredFindings({ findings: [], checks: [{ finding: f1.key, status: 'unresolved', note: 'broken' }] }));
+    const list = s.gh.listReviewThreads.bind(s.gh);
+    s.gh.listReviewThreads = async () => {
+      const r = await list();
+      // A newer check on the same head verifies the root meanwhile.
+      recordCheck(s.db, REPO_ID, PR, f1.key, { status: 'verified', sha: H3, note: 'fixed', at: new Date(s.tick() + 60_000).toISOString() });
+      return r;
+    };
+    await postReview(s.deps, run);
+    expect(s.gh.writes.filter((w) => w.startsWith('reopen'))).toEqual([]);
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(true);
+    expect(getFinding(s.db, REPO_ID, PR, f1.key)).toMatchObject({ status: 'verified', statusSha: H3 });
   });
 
   it('records a ready verdict only together with the findings it verified: interrupted, it is not ready; retried, it merges', async () => {

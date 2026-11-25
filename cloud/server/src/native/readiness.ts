@@ -1,5 +1,6 @@
 import type { NativeReadiness } from '../jobs/launch.js';
 import type { NativeRoute } from './route.js';
+import { imageDecision, type ImagePolicy } from './image-policy.js';
 import type { Worker } from './store.js';
 
 /** A worker that heartbeat within this long is live (its interval is 10 s, a call at most 15 s). */
@@ -23,6 +24,7 @@ export type SessionPhase =
 export interface ReadinessContext {
   /** The VM's AWS state, null when AWS no longer has it; undefined when not read. */
   vmState?: string | null;
+  imagePolicy?: ImagePolicy;
   /** Until when a VM without a registered worker is still starting (never once it was ready). */
   startingUntil?: number;
   /** Managed routes only: the session record read for this decision. */
@@ -46,7 +48,11 @@ export function classifyReadiness(route: NativeRoute, worker: Worker | null, now
   if (session?.phase === 'pending') return now < session.startingUntil ? 'worker-starting' : 'startup-failed';
   if (route.microvmId === PENDING_MICROVM) return 'not-connected';
   const startingUntil = session?.phase === 'bound' ? session.startingUntil : ctx.startingUntil;
-  if (latestImageVersion !== undefined && route.imageVersion !== latestImageVersion) return 'image-outdated';
+  if (ctx.imagePolicy) {
+    if (ctx.imagePolicy.imageVersion !== route.imageVersion) return 'image-unapproved';
+    const decision = imageDecision(ctx.imagePolicy, worker?.workerVersion);
+    if (decision !== 'approved') return decision;
+  } else if (latestImageVersion !== undefined && route.imageVersion !== latestImageVersion) return 'image-unapproved';
   if (!worker || worker.microvmId !== route.microvmId || worker.imageVersion !== route.imageVersion) {
     // No worker has registered for this VM: it is starting, its startup failed, or (once the
     // session was ready) its worker is gone.

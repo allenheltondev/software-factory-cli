@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createLauncher, type LaunchSettings } from '../jobs/launch.js';
 import { createMemoryStore, type Job } from '../store/store.js';
 import { dispatchRules } from '../tenants/dispatch.js';
-import { createBroker, jobSessionPolicy } from '../broker/broker.js';
+import { createBroker, jobSessionPolicy, hashToken } from '../broker/broker.js';
 import { createReconciler } from '../jobs/reconcile.js';
 import { createNativeControl, WORKER_LEASE_MS } from './control.js';
 import { nativeJobToken, nativeRoute, type NativeRoute } from './route.js';
@@ -491,4 +491,59 @@ describe('native worker Cloud dispatch', () => {
     expect(JSON.stringify(policy)).toContain('agent-keys/CODEX_API_KEY-*');
     expect(JSON.stringify(policy)).not.toMatch(/ANTHROPIC|native-workers|agent-keys\/\*/);
   });
+  it('lets an active approved job drain but refuses another assignment after retirement policy changes', async () => {
+    const job = await assigned();
+    row!.workerVersion = 'tenant-browser-1';
+    const gated = createNativeControl({ store, workers, route, secret: async () => secret, settings, terminateMicrovm,
+      microvmState: async () => state, disabled: async () => false, now: () => clock,
+      imagePolicy: async () => ({ imageVersion: route.imageVersion, revision: 2, state: 'draining', protocol: 'tenant-browser-1', reason: 'Security upgrade required' }) });
+    expect(await gated.canServe(job)).toBe(true);
+    expect(await gated.canServe({ ...job, imageVersion: 'different' })).toBe(false);
+    await store.finishJob(job.jobId, 'succeeded');
+    expect(await gated.complete((await store.getJob(job.jobId))!)).toBe(true);
+    const waiting = await launch(request('delivery-after-drain'));
+    expect(await gated.handle(input('poll', { workerVersion: 'tenant-browser-1' }))).toEqual({ ok: true, busy: false });
+    expect((await store.getJob(waiting.jobId!))?.microvmId).toBeUndefined();
+    expect(terminateMicrovm).not.toHaveBeenCalled();
+  });
+  it('denies credentials on emergency revoke, physically fences execution, and preserves queued work', async () => {
+    const job = await assigned();
+    row!.workerVersion = 'tenant-browser-1';
+    const waiting = await launch(request('delivery-after-revoke'));
+    terminateMicrovm.mockImplementation(async () => { state = 'TERMINATED'; });
+    const gated = createNativeControl({ store, workers, route, secret: async () => secret, settings, terminateMicrovm,
+      microvmState: async () => state, disabled: async () => false, now: () => clock,
+      imagePolicy: async () => ({ imageVersion: route.imageVersion, revision: 3, state: 'revoked', protocol: 'tenant-browser-1', reason: 'Critical security fix' }) });
+    expect(await gated.canServe(job)).toBe(false);
+    expect(await gated.reconcile(job)).toBe(true);
+    expect(terminateMicrovm).toHaveBeenCalledWith(route.microvmId);
+    expect(row?.fenced).toBe(true);
+    expect(row?.active).toBeUndefined();
+    expect((await store.getJob(job.jobId))?.releasedAt).toBeDefined();
+    expect((await store.getJob(waiting.jobId!))?.status).toBe('launched');
+    expect((await store.getJob(waiting.jobId!))?.microvmId).toBeUndefined();
+  });
+
+  it('recovers a never-started queued job after replacement with a fresh per-job token and unchanged deadline', async () => {
+    const job = await queued();
+    await store.putJob({ ...job, native: { ...job.native!, generation: 'old-generation' } });
+    const replacement = { ...route, generation: 'new-generation', imageVersion: '8', microvmId: 'mvm-new' };
+    workers.rebindQueued = vi.fn(async (old, target, tokenHash) => {
+      await store.putJob({ ...old, imageVersion: target.imageVersion, native: { ...old.native!, generation: target.generation }, tokenHash });
+      return true;
+    });
+    const nextSecret = 'new-control-credential-01234567890123456789';
+    const next = createNativeControl({ store, workers, route: replacement, secret: async () => nextSecret, settings, terminateMicrovm,
+      microvmState: async () => state, disabled: async () => false, now: () => clock });
+    const message = (op: string) => ({ ...input(op), token: nextSecret, session: 'new-session-0123456', microvmId: replacement.microvmId, imageVersion: replacement.imageVersion });
+    expect(await next.handle(message('register'))).toMatchObject({ ok: true });
+    expect(await next.handle(message('poll'))).toMatchObject({ request: { microvmId: 'mvm-new', payload: { broker: { jobId: job.jobId } } } });
+    const rebound = (await store.getJob(job.jobId))!;
+    expect(rebound.expiresAt).toBe(job.expiresAt);
+    expect(rebound.tokenHash).toBe(hashToken(nativeJobToken(nextSecret, job.jobId)));
+    expect(rebound.tokenHash).not.toBe(job.tokenHash);
+    expect(rebound.native?.generation).toBe('new-generation');
+    expect(rebound.imageVersion).toBe('8');
+  });
+
 });

@@ -1,3 +1,4 @@
+import { imageDecision, type ImagePolicy } from './image-policy.js';
 import type { Caller } from '../caller.js';
 import { FlowError, type GitHubFlows } from '../flows/github.js';
 import type { Store, Tenant } from '../store/store.js';
@@ -12,8 +13,9 @@ export function createNativeSettingsService(d: {
   managed?: {
     route(id: number): Promise<NativeRoute>;
     start(id: number): Promise<void>;
-    /** The deployed worker image version; a session on another one must be restarted. */
+    /** Latest image for new sessions; older approved images may remain connected. */
     imageVersion?: string;
+    imagePolicy?(version: string): Promise<ImagePolicy>;
     stop?(microvmId: string): Promise<void>;
     vmState?(id: number, generation?: string): Promise<string | null>;
     lifecycle?(id: number, generation?: string): Promise<{ preparing: boolean; startupFailed: boolean; retiring: boolean; retired?: boolean; retirementReason?: string; expiresAt?: string; idleExpiresAt?: string; idleSeconds?: number }>;
@@ -40,15 +42,18 @@ export function createNativeSettingsService(d: {
   }
 
   /**
-   * A managed session VM built from an older image than the deployed one: `required` while it
-   * runs, `stopping` once asked to stop, `stopped` when a new worker can be started.
+   * A different approved image is an optional update. Only explicit policy blocks dispatch.
    */
-  async function upgradeOf(r: NativeRoute) {
+  async function upgradeOf(r: NativeRoute, workerVersion?: string) {
     const latest = d.managed?.imageVersion;
-    if (r === d.route || !latest || r.microvmId === 'mvm-pending' || r.imageVersion === latest || !d.managed?.vmState) return undefined;
+    if (r === d.route || !latest || r.microvmId === 'mvm-pending' || !d.managed?.vmState) return undefined;
+    const policy = await d.managed.imagePolicy?.(r.imageVersion);
+    const decision = policy ? imageDecision(policy, workerVersion) : 'approved';
+    if (r.imageVersion === latest && decision === 'approved') return undefined;
     const state = await d.managed.vmState(r.installationId, r.generation);
     const status = state === null || state === 'TERMINATED' ? 'stopped' as const : state === 'TERMINATING' ? 'stopping' as const : 'required' as const;
-    return { from: r.imageVersion, to: latest, state: status };
+    return { from: r.imageVersion, to: latest, state: status, optional: decision === 'approved',
+      reason: decision === 'protocol-incompatible' ? 'Worker protocol is not supported by this deployment' : policy?.reason ?? 'A newer worker image is available' };
   }
 
   async function view(caller: Caller, installationId: number) {
@@ -62,10 +67,11 @@ export function createNativeSettingsService(d: {
     ]);
     const stale = !worker || worker.microvmId !== r.microvmId || worker.imageVersion !== r.imageVersion || worker.fenced === true || now() - worker.heartbeatAt > 60_000;
     const managed = r !== d.route ? d.managed : undefined;
-    const [upgrade, pending, session, queued] = await Promise.all([
-      upgradeOf(r), managed?.sessions.pending?.(installationId), managed?.sessions.session?.(installationId),
+    const [imageUpdate, pending, session, queued] = await Promise.all([
+      upgradeOf(r, worker?.workerVersion), managed?.sessions.pending?.(installationId), managed?.sessions.session?.(installationId),
       worker ? d.workers.queued(r.installationId, r.workerId) : Promise.resolve([]),
     ]);
+    const upgrade = imageUpdate?.optional ? undefined : imageUpdate;
     const lifecycle = await managed?.lifecycle?.(installationId, r.generation);
     const recovering = lifecycle?.startupFailed || lifecycle?.retiring || !upgrade && managed && worker?.microvmId === r.microvmId && (worker.fenced || worker.auth === 'expired' || stale);
     const awaitingWorker = !upgrade && !recovering && managed && session && (!worker || worker.microvmId !== r.microvmId || worker.auth === 'unavailable');
@@ -74,6 +80,7 @@ export function createNativeSettingsService(d: {
     const recovery = recovering ? { state: lifecycle?.startupFailed && !lifecycle.retiring ? 'required' as const : lifecycle?.retiring && vm !== null && vm !== 'TERMINATED' ? 'stopping' as const : replacementState(vm) } : undefined;
     return {
       preparing,
+      ...(imageUpdate?.optional ? { updateAvailable: imageUpdate } : {}),
       startupFailed: lifecycle?.startupFailed ?? false,
       retired: lifecycle?.retired ?? false,
       ...(lifecycle?.retirementReason ? { retirementReason: lifecycle.retirementReason } : {}),
@@ -81,7 +88,7 @@ export function createNativeSettingsService(d: {
       ...(lifecycle?.idleExpiresAt && !lifecycle.retired ? { idleExpiresAt: lifecycle.idleExpiresAt } : {}),
       ...(recovery ? { recovery } : {}),
       ...(lifecycle?.expiresAt && !lifecycle.retired ? { sessionExpiresAt: lifecycle.expiresAt } : !lifecycle?.retired && session?.microvmId === r.microvmId ? { sessionExpiresAt: new Date(session.requestedAt + 8 * 60 * 60_000).toISOString() } : {}),
-      ...(upgrade ? { upgrade } : {}),
+      ...(upgrade ? { upgrade, upgradeBlocked: Boolean(worker?.active || worker?.settling) } : {}),
       ...(pending?.[0] ? { pendingRequest: pending[0].id } : {}),
       // Restarting and signing in are owner actions; members see the state, not the buttons.
       owner: membership?.summary?.role === 'owner' && membership?.tenant?.status === 'active',
@@ -114,6 +121,8 @@ export function createNativeSettingsService(d: {
         throw new FlowError('invalid_settings', 409, 'Browser sign-in is unavailable for this installation');
       }
       const worker = await d.workers.get(installationId, r.workerId);
+      const image = await d.managed?.imagePolicy?.(r.imageVersion);
+      if (image && imageDecision(image, worker?.workerVersion) !== 'approved') throw new FlowError('invalid_settings', 409, `Claude image requires an update: ${image.reason}`);
       if (!worker || worker.microvmId !== r.microvmId || worker.imageVersion !== r.imageVersion || worker.fenced ||
           worker.active || worker.settling || now() - worker.heartbeatAt > 60_000 || !['auth-required', 'expired'].includes(worker.auth)) {
         throw new FlowError('invalid_settings', 409, 'Wait for the worker to be online and ready for sign-in');
@@ -158,9 +167,9 @@ export function createNativeSettingsService(d: {
           (r.microvmId !== 'mvm-pending' && r.microvmId !== session.microvmId))) {
         throw new FlowError('invalid_settings', 409, 'The Claude environment changed. Check its current status before reconnecting.');
       }
-      const upgrade = await upgradeOf(r);
-      const lifecycle = await d.managed.lifecycle?.(installationId, session?.generation);
       const previous = await d.workers.get(r.installationId, r.workerId);
+      const upgrade = await upgradeOf(r, previous?.workerVersion);
+      const lifecycle = await d.managed.lifecycle?.(installationId, session?.generation);
       if (!upgrade && !lifecycle?.startupFailed && !lifecycle?.retiring && (!previous || previous.microvmId !== r.microvmId || (!previous.fenced && previous.auth !== 'expired' && now() - previous.heartbeatAt <= 60_000))) {
         throw new FlowError('invalid_settings', 409, 'The Claude worker is already up to date and healthy');
       }

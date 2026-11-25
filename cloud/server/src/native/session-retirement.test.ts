@@ -19,13 +19,15 @@ function fixture(worker?: Worker, registrationRace = false, enqueueRace = false)
     if (!(command instanceof TransactWriteCommand)) throw Error('Unexpected command');
     if (registrationRace) items.set('NATIVE#55#managed-55|WORKER', { version: 1, microvmId: 'mvm-startup' });
     for (const operation of command.input.TransactItems ?? []) {
-      const action = operation.Put ?? operation.Update;
+      const action = operation.Put ?? operation.Update ?? operation.ConditionCheck;
       if (!action) throw Error('Unexpected transaction operation');
       const key = 'Item' in action ? action.Item : action.Key;
       const item = items.get(`${key?.pk}|${key?.sk}`);
       const values = action.ExpressionAttributeValues ?? {};
       const expr = action.ConditionExpression;
-      const allowed =
+      const allowed = expr === '#v = :v' ? item?.version === values[':v']
+        : expr === 'revision = :revision AND #state = :revoked' ? item?.revision === values[':revision'] && item?.state === values[':revoked']
+        :
         expr === 'attribute_not_exists(pk)'
           ? !item
           : expr === 'generation = :g AND attribute_not_exists(retiring)'
@@ -81,4 +83,22 @@ describe('generation-bound startup retirement', () => {
     expect(items.get('TENANT#55|CLAUDE_SESSION')).not.toHaveProperty('retiring');
     expect(items.get('NATIVE#55#managed-55|WORKER')?.fenced).not.toBe(true);
   });
+  it.each([false, true])('atomically fences revoked sessions with active work (reapproval race: %s)', async (reapproved) => {
+    const worker: Worker = { installationId: 55, workerId: 'managed-55', microvmId: session.microvmId!, imageVersion: session.imageVersion,
+      session: 'worker-session-test', version: 1, workerVersion: 'tenant-browser-1', auth: 'connected', heartbeatAt: 1, active: { jobId: 'active-job', until: 60000 } };
+    const { sessions, items } = fixture(worker);
+    items.set('NATIVE_IMAGE#10|POLICY', { revision: reapproved ? 3 : 2, state: reapproved ? 'approved' : 'revoked' });
+    const result = await sessions.retire(55, session, { enabled: true, revision: 1, routingVersion: 1 }, worker, 'image-revoked', {
+      imageVersion: '10', revision: 2, state: 'revoked', protocol: 'tenant-browser-1', reason: 'Emergency security fix',
+    });
+    expect(result).toBe(!reapproved);
+    if (reapproved) {
+      expect(items.get('TENANT#55|CLAUDE_SESSION')).not.toHaveProperty('retiring');
+      expect(items.get('NATIVE#55#managed-55|WORKER')).not.toHaveProperty('fenced');
+    } else {
+      expect(items.get('TENANT#55|CLAUDE_SESSION')).toMatchObject({ retiring: true, retirementReason: 'image-revoked' });
+      expect(items.get('NATIVE#55#managed-55|WORKER')).toMatchObject({ fenced: true, active: worker.active });
+    }
+  });
+
 });

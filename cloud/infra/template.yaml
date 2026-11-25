@@ -371,6 +371,12 @@ Resources:
               - lambda:TerminateMicrovm
             Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
           - Effect: Allow
+            Action: [dynamodb:GetItem, dynamodb:PutItem]
+            Resource: !GetAtt UpdraftTable.Arn
+            Condition:
+              ForAllValues:StringLike:
+                dynamodb:LeadingKeys: ['NATIVE_IMAGE#*']
+          - Effect: Allow
             Action: iam:PassRole
             Resource: !GetAtt ManagedClaudeExecutionRole.Arn
             Condition:
@@ -1024,6 +1030,13 @@ Resources:
                       - 'JOB#*'
                       - 'TENANT#*'
                       - 'NATIVE#*'
+              # Compatibility approval is read-only to the broker, including transaction fences.
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:ConditionCheckItem]
+                Resource: !GetAtt UpdraftTable.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: ['NATIVE_IMAGE#*']
               # A delivery's claim and a job's quota slots (the tenant's and the platform's): a
               # started job holds them for its lifetime (start, conditional PutItems in one
               # transaction with its microVM time), and finish frees them (conditional DeleteItems).

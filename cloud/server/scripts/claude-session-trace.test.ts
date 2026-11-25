@@ -22,6 +22,20 @@ describe('claude-session-trace snapshot', () => {
     expect(s.jobs[0]).toMatchObject({ generation: '6f1c2d3e…' });
     expect(JSON.stringify(s)).not.toMatch(/1234567890ab|444455556666/);
   });
+  it('records settlement and source links without exposing job credentials or key values', () => {
+    const job = { ...base().jobs[0]!, repository: 'owner/repo', issue: 131, pullRequest: 145,
+      eventName: 'pull_request', startedAt: now - 120_000, releasedAt: now - 60_000,
+      reservedSeconds: 10800, agentKeys: ['ANTHROPIC_API_KEY'], tokenHash: 'private-token-hash' };
+    const s = snapshot(base({ jobs: [job] }));
+    expect(s.jobs[0]).toMatchObject({ issueUrl: 'https://github.com/owner/repo/issues/131',
+      pullRequestUrl: 'https://github.com/owner/repo/pull/145', eventName: 'pull_request',
+      startedAt: '2026-11-25T14:58:00.000Z', releasedAt: '2026-11-25T14:59:00.000Z',
+      reservedSeconds: 10800, apiKeyRequested: true });
+    expect(JSON.stringify(s)).not.toMatch(/private-token-hash|ANTHROPIC_API_KEY/);
+    expect(snapshot(base({ jobs: [{ ...job, repository: 'https://untrusted.example' }] })).jobs[0]).not.toHaveProperty('issueUrl');
+    expect(snapshot(base()).jobs[0]!.apiKeyRequested).toBeUndefined();
+    expect(snapshot(base({ jobs: [{ ...job, agentKeys: [] }] })).jobs[0]!.apiKeyRequested).toBe(false);
+  });
   it('names a suspended environment behind a stale heartbeat as needing a reconnect', () => {
     const s = snapshot(base({ worker: { ...base().worker!, heartbeatAt: now - 10 * 60_000 }, vm: { state: 'SUSPENDED' } }));
     expect(s.dispatch).toEqual({ readiness: 'environment-suspended', session: 'bound', ownerAction: 'reconnect' });
