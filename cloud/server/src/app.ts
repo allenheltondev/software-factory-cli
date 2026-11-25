@@ -14,6 +14,7 @@ import type { StatsService } from './tenants/stats-service.js';
 import type { TelemetryService } from './tenants/telemetry-service.js';
 import type { ConfigService, PublishOutcome } from './tenants/config-service.js';
 import type { NativeSettingsService } from './native/settings.js';
+import type { ReadinessService } from './tenants/readiness-service.js';
 
 /**
  * The API, mounted at /api because CloudFront forwards `/api/*` paths to API Gateway unchanged.
@@ -47,6 +48,10 @@ import type { NativeSettingsService } from './native/settings.js';
  *   GET    /api/v1/installations/:id/jobs/:jobId                one job, with its deliveries
  *   POST   /api/v1/installations/:id/jobs/:jobId/retry          run a job that did not finish its work again: 202 { jobId } of the new job
  *   GET    /api/v1/installations/:id/jobs/:jobId/logs/:name     the end of updraft.log or run.log
+ *
+ * A tenant's repository readiness (tenants/readiness-service.ts), members only, read only:
+ *   GET    /api/v1/installations/:id/readiness?refresh=1        per repository: verified, failing (with the fix) or
+ *                                                               unverified prerequisites, as of a time; cached a minute
  *
  * A tenant's agent telemetry (tenants/telemetry-service.ts), members only. The key is write-only:
  *   GET    /api/v1/installations/:id/telemetry           settings, whether a key is set, where it sends, the last export
@@ -87,6 +92,7 @@ export interface AppOptions {
   workflows?: import('./tenants/workflow-service.js').WorkflowService;
   stats?: StatsService;
   telemetry?: TelemetryService;
+  readiness?: ReadinessService;
   /** Logs unexpected errors. The response never carries their details. */
   logError?: (err: unknown) => void;
 }
@@ -100,7 +106,7 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** Who did it, for the admin's actions: their email, else their sub. */
 const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
 
-export function createApp({ resolveCaller, github, admin, config, agentKeys, routines, nativeClaude, status, workflows, stats, telemetry, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
+export function createApp({ resolveCaller, github, admin, config, agentKeys, routines, nativeClaude, status, workflows, stats, telemetry, readiness, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -464,6 +470,16 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
     app.delete('/v1/installations/:id/telemetry/key', async (c) => {
       const id = idOf(c);
       return id ? c.json(await telemetry.removeKey(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+  }
+
+  if (readiness) {
+    app.get('/v1/installations/:id/readiness', async (c) => {
+      const n = Number(c.req.param('id'));
+      if (!Number.isSafeInteger(n) || n <= 0) return c.json({ error: 'not_found' }, 404);
+      // The service keeps its own bounded cache; nothing on the way may keep a stale copy.
+      c.header('Cache-Control', 'no-store');
+      return c.json(await readiness.readiness(c.get('caller'), n, { refresh: c.req.query('refresh') === '1' }));
     });
   }
 

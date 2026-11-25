@@ -3,6 +3,7 @@ import { createDynamoWorkflowStore } from './workflows/store.js';
 import { createWorkflowRecorder } from './workflows/recorder.js';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { handle } from 'hono/aws-lambda';
@@ -22,7 +23,9 @@ import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { managedClaude } from './native/managed.js';
 import { browserLoginGrant } from './native/browser-login.js';
-import { nativeRoute } from './native/route.js';
+import { legacyNativeTriggers, nativeRoute } from './native/route.js';
+import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
+import { createReadinessService } from './tenants/readiness-service.js';
 import { createNativeModeStore, createNativeStore } from './native/store.js';
 import { createNativeSettingsService } from './native/settings.js';
 import { createAgentKeyService } from './tenants/agent-key-service.js';
@@ -89,6 +92,22 @@ const requestRetry = async (installationId: number, jobId: string, by?: string):
   return JSON.parse(Buffer.from(out.Payload).toString('utf8')) as RetryResult;
 };
 
+// Repository readiness (tenants/readiness-service.ts) reads what the launcher reads, and nothing
+// more: the kill switch, the published job image, the subscription worker's heartbeat. Never a
+// write, a worker start or a model call.
+const ssm = new SSMClient({});
+const parameter = async (name: string): Promise<string | null> => {
+  try {
+    return (await ssm.send(new GetParameterCommand({ Name: name }))).Parameter?.Value ?? null;
+  } catch (err) {
+    if (err instanceof ParameterNotFound) return null;
+    throw err;
+  }
+};
+const killSwitch = createKillSwitch({ read: () => parameter(process.env.KILL_SWITCH_PARAMETER || KILL_SWITCH_PARAMETER) });
+const jobImageParameter = process.env.JOB_IMAGE_VERSION_PARAMETER ?? '';
+const native = store ? nativeAws(store) : undefined;
+
 const agentKeyService =
   store && github
     ? createAgentKeyService({
@@ -144,7 +163,7 @@ const app = createApp({
         workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), jobs: store, pauses: store, github }),
         status: createStatusService({
           store,
-          requestStop: awsJobStopper(store, nativeAws(store).control, createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName) })).request,
+          requestStop: awsJobStopper(store, native!.control, createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName) })).request,
           github,
           agentKeys: agentKeyService,
           resultRetentionDays: Math.max(1, Number(process.env.RESULT_RETENTION_DAYS ?? 30) || 30),
@@ -153,6 +172,21 @@ const app = createApp({
           ...(retryFunction ? { requestRetry } : {}),
         }),
         ...(bucket ? { config: createConfigService({ store, github, objects }) } : {}),
+        readiness: createReadinessService({
+          store,
+          github,
+          agentKeys: agentKeyService,
+          quotas: quotasFromEnv(process.env),
+          killSwitch,
+          ...(jobImageParameter ? { imageVersion: async () => (await parameter(jobImageParameter))?.trim() || null } : {}),
+          native: async (id) => {
+            // The binding dispatch would use: the pinned route for its installation, else the managed session.
+            const binding = native?.launch?.route.installationId === id ? native.launch : await native?.resolveNative?.(id);
+            if (!binding) return undefined;
+            const mode = await binding.mode();
+            return { enabled: mode.enabled, explicitTriggers: mode.triggers !== undefined, triggers: mode.triggers ?? legacyNativeTriggers(binding.route), readiness: binding.readiness };
+          },
+        }),
         // Insights: the tenant's shared state database, read only (tenants/*/state/state.db).
         telemetry: createTelemetryService({ store, github, secrets: createSecretsManagerPort(), check: checkHoneycombKey() }),
         stats: createStatsService({ github, store, ...(bucket ? { readState: createS3StateReader(s3, bucket) } : {}), cacheDir: '/tmp/updraft-state' }),
