@@ -205,6 +205,25 @@ function blocks(lines: string[]): { start: number; end: number; text: string }[]
 }
 
 /**
+ * The JSON object of a review's one findings block, for readers of fields other than findings and
+ * checks (acceptance.ts). `present` is false when there is no block; `data` is null, with why,
+ * when there is one that cannot be read. A bare list reads as `{findings: [...]}`.
+ */
+export function readFindingsBlock(text: string): { present: boolean; data: Record<string, unknown> | null; problem: string | null } {
+  const found = blocks(text.replace(/\r\n?/g, '\n').split('\n'));
+  if (found.length === 0) return { present: false, data: null, problem: null };
+  if (found.length > 1) return { present: true, data: null, problem: `the review has ${found.length} ${FINDINGS_BLOCK} blocks; exactly one is read` };
+  let data: unknown;
+  try {
+    data = JSON.parse(found[0]!.text);
+  } catch {
+    return { present: true, data: null, problem: `the ${FINDINGS_BLOCK} block is not valid JSON` };
+  }
+  const obj = Array.isArray(data) ? { findings: data } : data;
+  return isObject(obj) ? { present: true, data: obj, problem: null } : { present: true, data: null, problem: `the ${FINDINGS_BLOCK} block is not an object` };
+}
+
+/**
  * Read the structured findings from a review's findings text (what parseVerdict left before the
  * verdict line). No block: a legacy review, structured null and no problem. One block that reads:
  * its findings and checks, and the prose without it. Anything else (two blocks, text that is not

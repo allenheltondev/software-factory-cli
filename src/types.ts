@@ -189,6 +189,17 @@ export interface RevisionRequest {
   reviewedSha?: string;
   /** updraft_review with structured findings: each one to report on. Absent for a legacy review, a person's review and a CI fix. */
   findings?: RevisionFinding[];
+  /** updraft_review: mandatory acceptance criteria the review did not find met on reviewedSha (docs/acceptance.md). */
+  acceptance?: RevisionCriterion[];
+}
+
+/** A mandatory acceptance criterion a revision must address. The text is the issue's (untrusted); the note the reviewer's. */
+export interface RevisionCriterion {
+  id: string;
+  text: string;
+  status: 'unmet' | 'unverified' | 'needs-clarification';
+  gate: 'code' | 'live';
+  note: string | null;
 }
 
 /** What Updraft's reviewer concluded about one head commit. Anything else is not a verdict. */
@@ -226,6 +237,11 @@ export interface ReviewRunRequest {
   openFindings?: OpenFindingSnapshot[];
   /** Earlier findings not verified yet that are not in openFindings (more than one review can check). */
   openFindingsOmitted?: number;
+  /**
+   * The acceptance report of the Updraft run that pushed headSha, if it wrote one: the coding
+   * agent's claims, for the reviewer to check (docs/acceptance.md). Absent otherwise.
+   */
+  acceptanceClaims?: { runId: string } & AcceptanceReport;
 }
 
 /** An earlier finding to re-check (docs/review-loop.md, "Findings as threads"). Its text and report are untrusted. */
@@ -373,6 +389,65 @@ export interface RunSummary {
   review?: ReviewResult;
   /** A revision of structured findings only: the agent's own report per finding key (a claim, never a check). */
   resolutions?: { finding: string; status: 'fixed' | 'disagreed' | 'deferred' | 'unable'; note: string | null; tests: string | null }[];
+  /**
+   * A code run (implementation or revision) that was given acceptance criteria: the agent's own
+   * report per criterion (docs/acceptance.md). A claim for the reviewer to check, never evidence.
+   */
+  acceptanceReport?: AcceptanceReport;
+}
+
+/** How acceptance criteria are used by the review loop (repositories.<repo>.review.acceptance). */
+export type AcceptancePolicy = 'enforce' | 'report';
+
+/**
+ * Where a pull request's acceptance criteria came from. checklist: the issue's task-list items.
+ * requirements: list items under a heading such as "Acceptance" or "Requirements", in an issue
+ * without a task list. none: the issue has neither (the reviewer infers concrete requirements).
+ * unavailable: the issue body was withheld or could not be read.
+ */
+export type AcceptanceSourceKind = 'checklist' | 'requirements' | 'none' | 'unavailable';
+
+/** One acceptance criterion as extracted from the issue (src/agents/acceptance.ts). Its text is untrusted. */
+export interface AcceptanceCriterion {
+  /** `AC-<8 hex>`, from the criterion's normalized text: the same text keeps its id across edits of the rest of the issue. */
+  id: string;
+  text: string;
+  /** The heading it was listed under, if any. */
+  section: string | null;
+  origin: 'checklist' | 'requirement';
+  /** False for an item marked optional or listed under an optional heading: it never blocks. */
+  mandatory: boolean;
+  /** live: it names a real deployment, staging, screenshots or other evidence no agent review can produce. */
+  gate: 'code' | 'live';
+  /** The issue shows it as ticked. Recorded, never taken as evidence. */
+  checkedInSource: boolean;
+}
+
+/** The acceptance criteria a run was given, and the issue revision they came from. */
+export interface AcceptanceSnapshot {
+  /** sha256 (first 16 hex) of the issue title and body the criteria were read from. */
+  fingerprint: string;
+  source: AcceptanceSourceKind;
+  criteria: AcceptanceCriterion[];
+  /** Criteria beyond the limit, not listed. */
+  omitted: number;
+  policy: AcceptancePolicy;
+}
+
+export type AcceptanceClaimStatus = 'implemented' | 'partial' | 'not-done' | 'needs-live-validation';
+
+/** A coding agent's report on one criterion. Untrusted, and never proof. */
+export interface AcceptanceClaim {
+  criterion: string;
+  status: AcceptanceClaimStatus;
+  evidence: string | null;
+  tests: string | null;
+}
+
+export interface AcceptanceReport {
+  /** The fingerprint of the criteria the agent was given: claims about another revision of the issue are not shown. */
+  fingerprint: string;
+  claims: AcceptanceClaim[];
 }
 
 /** The parsed result of a reviewer run. `findings` is the reviewer's text before the verdict line: untrusted. */
@@ -386,6 +461,11 @@ export interface ReviewResult {
    * Telemetry only: it never affects the verdict. Absent in summaries from before it existed.
    */
   findingsCount?: number | null;
+  /**
+   * The acceptance criteria the reviewer was given (docs/acceptance.md). Its assessments are read
+   * from the findings block. Absent for runs from before it existed, and when acceptance is off.
+   */
+  acceptance?: AcceptanceSnapshot;
 }
 
 /**

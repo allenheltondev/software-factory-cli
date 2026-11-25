@@ -179,6 +179,7 @@ export function renderReview(r: PrReview): string {
         'revision-queued': `revision job ${r.revisionJobId ?? '(pruned)'} queued`,
         'over-limit': 'not acted on: the pull request reached maxRevisions',
         'no-revise': 'not acted on: revise is off',
+        'needs-verification': `held back: ${oneLine(r.outcomeDetail ?? 'acceptance criteria are unverified', 140)}`,
         stale: 'not acted on: the pull request had moved on from that commit',
         closed: 'not acted on: the pull request was closed',
       };

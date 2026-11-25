@@ -80,7 +80,14 @@ export function workflowConflict(config: ConsoleConfig, repo: ConsoleRepository)
     if (prior) return `${prior} and ${n} both start on the label "${w.label}".`;
     labels.set(w.label.toLowerCase(), n);
   }
-  const policy = (w: ConsoleWorkflow) => JSON.stringify([w.review.enabled, w.review.enabled && w.review.allowSameAgent, w.revise.enabled, w.revise.enabled ? (w.revise.maxRevisions ?? null) : null]);
+  const policy = (w: ConsoleWorkflow) =>
+    JSON.stringify([
+      w.review.enabled,
+      w.review.enabled && w.review.allowSameAgent,
+      w.review.enabled ? (w.review.acceptance ?? 'enforce') : null,
+      w.revise.enabled,
+      w.revise.enabled ? (w.revise.maxRevisions ?? null) : null,
+    ]);
   const first = wfs[0];
   const other = first && wfs.find(([, w]) => policy(w) !== policy(first[1]));
   if (first && other) return `${first[0]} and ${other[0]} review or revise pull requests differently; one repository's workflows must agree.`;

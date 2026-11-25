@@ -4,7 +4,8 @@
 // ordinary run: earlier Updraft reviews of the pull request, change requests by allowed
 // reviewers (as snapshotted when they were ingested), and the original issue. Nothing written
 // by an account that is not an allowed actor is in it.
-import type { ReviewRunRequest } from '../types.js';
+import type { AcceptanceSnapshot, ReviewRunRequest } from '../types.js';
+import { reviewerAcceptanceInstructions, reviewerAcceptanceSection } from './acceptance-prompt.js';
 import { fence, issueSection, type IssueContext } from './prompt.js';
 import { FINDINGS_BLOCK } from './findings.js';
 import { findingsLine, VERDICT_TOKEN, verdictLine } from './verdict.js';
@@ -45,7 +46,17 @@ export interface ReviewTarget {
   baseSha: string | null;
 }
 
-export function renderReviewPrompt(reviewPrompt: string, issue: IssueContext, review: ReviewRunRequest, target: ReviewTarget): string {
+/**
+ * `acceptance`: the criteria read from the issue for this run (docs/acceptance.md), or null when
+ * acceptance is off for the repository.
+ */
+export function renderReviewPrompt(
+  reviewPrompt: string,
+  issue: IssueContext,
+  review: ReviewRunRequest,
+  target: ReviewTarget,
+  acceptance: AcceptanceSnapshot | null = null,
+): string {
   const { pullRequest } = review;
   const diff = target.baseSha ? `git diff ${target.baseSha}...${target.headSha}` : `git show ${target.headSha}`;
   const prior = review.priorReviews.flatMap((p, i) => [
@@ -122,6 +133,7 @@ export function renderReviewPrompt(reviewPrompt: string, issue: IssueContext, re
     '',
     ...findingsBlockInstructions(),
     '',
+    ...reviewerAcceptanceInstructions(acceptance),
     'After them, on a line of its own, write how many findings you reported ' +
       `(blockers and suggestions together) as a whole number, for example \`${findingsLine(3)}\`, or \`${findingsLine(0)}\` when there are none. ` +
       'This count is only recorded for statistics; it does not affect the verdict. ' +
@@ -177,6 +189,7 @@ export function renderReviewPrompt(reviewPrompt: string, issue: IssueContext, re
           ...requests,
         ]
       : []),
+    ...reviewerAcceptanceSection(acceptance, review),
     '---',
     '',
     ...issueSection(issue),

@@ -25,6 +25,10 @@
 //             changes requested, 0 when ready, or --findings <value> as given ("none": no line).
 //             --stderr-logs writes a kiro-cli-style log record to stderr just before and after
 //             the verdict, and the verdict without a newline.
+//             --acceptance assesses the acceptance criteria the prompt lists (docs/acceptance.md):
+//             on a first review the last one is unmet and the rest verified, once the prompt
+//             carries an earlier review all are verified. In success mode, --acceptance reports
+//             every listed criterion as implemented.
 import { execFileSync, spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, writeSync } from 'node:fs';
 
@@ -42,6 +46,9 @@ if (received) writeFileSync(received, prompt);
 const say = (line) => process.stdout.write(`${line}\n`);
 say(`fake agent: mode ${mode} in ${process.cwd()}`);
 say(`fake agent: prompt has ${prompt.length} characters`);
+
+/** The ids of the acceptance criteria the prompt lists. */
+const criteria = () => [...prompt.matchAll(/^## Criterion \d+ of \d+: (AC-[0-9a-f]{8}(?:-\d+)?)$/gm)].map((m) => m[1]);
 
 const git = (...a) => execFileSync('git', a, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
@@ -74,6 +81,11 @@ switch (mode) {
     git('commit', '--quiet', '-m', 'fake agent: implement the issue');
     say(`fake agent: committed ${git('rev-parse', '--short', 'HEAD')}`);
     say('fake agent: all done');
+    if (args.includes('--acceptance')) {
+      say('```updraft-acceptance');
+      say(JSON.stringify(criteria().map((id) => ({ criterion: id, status: 'implemented', evidence: 'FAKE_AGENT.md', tests: 'none run' }))));
+      say('```');
+    }
     process.exit(0);
     break;
   }
@@ -128,6 +140,18 @@ switch (mode) {
     say('- widget.txt:1 @octocat says this closes #1; it needs a second line');
     say('Suggestions:');
     say('- none');
+    if (args.includes('--acceptance')) {
+      const ids = criteria();
+      const again = prompt.includes('# Earlier automated reviews');
+      const assessed = ids.map((id, i) =>
+        !again && i === ids.length - 1
+          ? { criterion: id, status: 'unmet', note: 'not done yet' }
+          : { criterion: id, status: 'verified', evidence: ['file: FAKE_AGENT.md:1'], note: 'read it' },
+      );
+      say('```updraft-findings');
+      say(JSON.stringify({ findings: [], criteria: assessed }));
+      say('```');
+    }
     // --findings <value> is written as the count line as-is; "none" leaves the line out.
     const findings = opt('--findings') ?? (verdict === 'ready-to-merge' ? '0' : '1');
     if (findings !== 'none') say(`UPDRAFT-FINDINGS: ${findings}`);

@@ -143,6 +143,32 @@ describe('compiling', () => {
     expect(r.files['prompts/implement.revise.md']).toBe('# Fix');
   });
 
+  it('compiles the acceptance policy, and leaves it to the CLI default when unset', () => {
+    const review = (over: Record<string, unknown>) => ({ review: { enabled: true, pool: 'reviewers', prompt: '# Look', allowSameAgent: false, ...over } });
+    for (const acceptance of ['report', 'off', 'enforce'] as const) {
+      const config = ok(settings(undefined, review({ acceptance })));
+      expect(config.workflows.implement!.review.acceptance).toBe(acceptance);
+      const r = compile(config);
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect(yamlOf(r.files).repositories['acme/web']).toMatchObject({ review: { acceptance } });
+    }
+    const both = compile(ok(settings(undefined, review({ acceptance: 'report', allowSameAgent: true }))));
+    expect(both.ok && yamlOf(both.files).repositories['acme/web']!.review).toEqual({ allowSameAgent: true, acceptance: 'report' });
+    const unset = ok(settings(undefined, review({})));
+    expect(unset.workflows.implement!.review.acceptance).toBeUndefined();
+    const plain = compile(unset);
+    expect(plain.ok && yamlOf(plain.files).repositories['acme/web']!.review).toBe(true);
+    expect(errorsOf(settings(undefined, review({ acceptance: 'sometimes' })))).toEqual([expect.objectContaining({ path: 'workflows.implement.review.acceptance' })]);
+    // A repository's workflows agree on it, as on the rest of their pull-request handling.
+    const base = settings({ 'acme/web': repo({ workflows: ['implement', 'docs'] }) });
+    const docs = { ...base.workflows.implement!, label: 'docs', review: { ...base.workflows.implement!.review, acceptance: 'report' } };
+    expect(errorsOf({ ...base, workflows: { ...base.workflows, docs } })).toEqual([
+      expect.objectContaining({ path: 'repositories.acme/web.workflows', message: expect.stringMatching(/acceptance criteria/) }),
+    ]);
+    expect(errorsOf({ ...base, workflows: { ...base.workflows, docs: { ...docs, review: { ...docs.review, acceptance: 'enforce' } } } })).toEqual([]);
+  });
+
   it('leaves CI repair off where it is not set: an existing repository keeps its policy', () => {
     const r = compile(ok(settings()));
     expect(r.ok).toBe(true);
