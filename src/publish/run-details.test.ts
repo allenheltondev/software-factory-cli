@@ -21,7 +21,7 @@ describe('run details', () => {
     const d = runDetails(db, job('standard'), run('run_1'));
     expect(d).toMatchObject({ worker: 'codex-standard', model: 'gpt-5', modelKind: 'configured', complexity: 'standard' });
     const body = renderAssignmentComment({ details: d, jobId: 'job_1', runId: 'run_1', pool: 'Workhorses' });
-    expect(body).toContain('- **Worker** `codex-standard`\n- **Model (configured)** `gpt-5`\n- **Complexity** `standard`');
+    expect(body).toContain('| Worker | `codex-standard` |\n| Model (configured) | `gpt-5` |\n| Complexity | `standard` |');
   });
 
   it('uses observed later, and each run reports its own model with the same job id', () => {
