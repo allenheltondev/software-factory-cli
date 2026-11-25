@@ -364,6 +364,14 @@ export function managedClaude(
           } else failed++;
           continue;
         }
+        // A committed seal is irreversible. Finish physical retirement before consulting
+        // current policy or busy/queue state: reapproval cannot make this generation usable.
+        if (session.retiring) {
+          const reason = session.retirementReason ?? 'reconnect';
+          console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation, microvmId: session.microvmId, reason, retry: true }));
+          if (await retire(lease.installationId, lease.generation, reason)) released++;
+          continue;
+        }
         // Emergency containment cannot depend on the revoked image polling, registering, or
         // owning an active job. Never-started queue entries survive generation retirement.
         const image = await imagePolicy(session.imageVersion);

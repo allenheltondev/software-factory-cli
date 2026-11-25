@@ -597,6 +597,35 @@ describe('managed connection reservation', () => {
     expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
     expect(await admission.list()).toHaveLength(0);
   });
+  it.each(['reapproved', 'unreadable'] as const)('finishes a sealed emergency retirement with queued work when policy is %s', async (policyState) => {
+    await managed().start(55);
+    const generation = current!.generation;
+    mocks.queued.mockResolvedValue(['never-started-job']);
+    mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 2, state: 'revoked', protocol: 'tenant-browser-1', reason: 'Emergency revoke' }));
+    mocks.vm.mockResolvedValue({ state: 'UNKNOWN' });
+    const stops = () => mocks.vm.mock.calls.filter(([command]) => command.constructor.name === 'TerminateMicrovmCommand');
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    expect(current).toMatchObject({ generation, retiring: true, retirementReason: 'image-revoked' });
+    expect(stops()).toHaveLength(1);
+    expect(await admission.get(generation)).toMatchObject({ retiring: true });
+
+    mocks.imagePolicy.mockClear();
+    if (policyState === 'reapproved') {
+      mocks.imagePolicy.mockImplementation(async (imageVersion: string) => ({ imageVersion, revision: 3, state: 'approved', protocol: 'tenant-browser-1', reason: 'Reapproved' }));
+    } else mocks.imagePolicy.mockRejectedValue(new Error('Policy unavailable'));
+    expect(await managed().reconcile()).toEqual({ released: 0, failed: 0 });
+    expect(stops()).toHaveLength(2);
+    expect(await admission.get(generation)).toBeDefined();
+    expect(mocks.imagePolicy).not.toHaveBeenCalled();
+
+    mocks.vm.mockResolvedValue({ state: 'TERMINATED' });
+    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(await admission.list()).toHaveLength(0);
+    expect(current).toMatchObject({ generation, retiring: true, retirementReason: 'image-revoked' });
+    expect(await mocks.queued()).toEqual(['never-started-job']);
+    expect(mocks.retire).toHaveBeenCalledTimes(1); // The committed fence is reused, never undone.
+    expect(mocks.vm.mock.calls.filter(([command]) => command instanceof RunMicrovmCommand)).toHaveLength(1);
+  });
   it.each(['draining', 'revoked'] as const)('replaces a pending %s A reservation with approved B before admitting a launch', async (state) => {
     current = { generation: 'pending-A', imageVersion: '9', requestedAt: clock, admissionRequired: true };
     await admission.reserve(55, current.generation, clock);

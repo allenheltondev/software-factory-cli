@@ -56,7 +56,9 @@ npx tsx scripts/claude-image-policy.ts --image 18.0 --state revoked --reason "Cr
   before busy/queue checks, including silent and unregistered workers. Its atomic
   fence checks the revocation revision, so a concurrent reapproval cannot be
   mistaken for the old emergency decision; capacity is released only
-  after termination is confirmed. Already delivered credentials cannot be
+  after termination is confirmed. Once committed, the retirement seal is
+  irreversible: cleanup retries termination before policy and busy/queue checks,
+  even after reapproval or during a policy-read outage. Already delivered credentials cannot be
   recalled, so emergency containment requires that physical stop. This is not a
   claim of instantaneous VM termination at the policy write. Queued jobs are not
   discarded or silently routed to API keys.
