@@ -87,7 +87,7 @@ async function world(o: { ciFix?: boolean; concurrentJobs?: number } = {}) {
   const logs: Record<string, unknown>[] = [];
   const reconcilerFor = (over: Partial<Parameters<typeof createWorkflowReconciler>[0]> = {}) => createWorkflowReconciler({
     store: workflowStore, controls: store, jobs: store, github, loadSettings, now, log: (e) => void logs.push(e),
-    recovery: { launch, retry, appBot: async () => 'updraft[bot]' },
+    recovery: { launch, retry, appBot: async () => 'updraft[bot]', queue: queueStore },
     ...over,
   });
   const reconcile = reconcilerFor();
@@ -385,13 +385,54 @@ describe('fenced automatic recovery', () => {
       await w.waitForCi();
       w.tick(CI_FIRST_CHECK_MS);
       await w.reconcile();
-      // Reconciliation reclaimed the launch before RunMicrovm: its job ended launch_failed, nothing ran.
+      // Reconciliation reclaimed the launch before RunMicrovm: its job ended launch_failed, nothing ran
+      // (no start, no microVM, never marked launching).
       await w.finish(ciJobId(), 'launch_failed');
+      const { microvmId: _m, launchingAt: _l, startedAt: _s, ...reclaimed } = (await w.store.getJob(ciJobId()))!;
+      await w.store.putJob(reclaimed);
+      await w.store.finishJob(ciJobId(), 'launch_failed', { at: w.now() });
       await w.rewind({ status: 'waiting', stage: 'waiting-for-ci', reason: 'recovering', lastJobId: (await w.wf()).jobRuns![0]!.jobId });
       expect(await w.reconcile()).toMatchObject({ recovered: 1, blocked: 0 });
       const second = recoveryIds(55, WF, missedCheckKey({ generation: 1 }, HEAD), 1).jobId;
       expect(await w.store.getJob(second)).toMatchObject({ eventName: 'check_suite' });
       expect(w.runs).toHaveLength(3);
+    });
+
+    it('never launches again after a launch_failed that may have reached RunMicrovm', async () => {
+      await w.waitForCi();
+      w.tick(CI_FIRST_CHECK_MS);
+      await w.reconcile();
+      // RunMicrovm's answer was lost: the launcher recorded launch_failed, but the job had started.
+      await w.finish(ciJobId(), 'launch_failed');
+      const job = (await w.store.getJob(ciJobId()))!;
+      await w.store.putJob({ ...job, startedAt: w.now() });
+      await w.rewind({ status: 'waiting', stage: 'waiting-for-ci', reason: 'recovering', lastJobId: (await w.wf()).jobRuns![0]!.jobId });
+      expect(await w.reconcile()).toMatchObject({ recovered: 0, blocked: 1 });
+      expect(w.runs).toHaveLength(2);
+      expect(await w.store.getJob(recoveryIds(55, WF, missedCheckKey({ generation: 1 }, HEAD), 1).jobId)).toBeNull();
+      expect(await w.wf()).toMatchObject({ reason: 'ci_event_missed', message: expect.stringMatching(/already ran the missed CI step once/) });
+    });
+
+    it('waits on a try handed to a queued event while it waits, and says so truthfully once it ended unstarted', async () => {
+      await w.waitForCi();
+      w.tick(CI_FIRST_CHECK_MS);
+      const holder = 'job_queued00000001';
+      const launch = vi.fn(async () => ({ status: 200, disposition: 'queue_joined', jobId: holder }));
+      const r = w.reconcilerFor({ recovery: { launch, retry: w.retry, queue: w.queueStore } });
+      const entry = { jobId: holder, installationId: 55, repository: 'acme/web', repositoryId: 99, pullRequest: 12, deliveryId: 'd-q', eventName: 'check_suite', eventKey: 'k', route: 'standard', configVersion: 1, reason: 'concurrent_jobs', state: 'queued', enqueuedAt: w.now(), expiresAt: w.now() + 3_600_000, attempts: 0, nextAttemptAt: w.now(), deliveries: 1, version: 0 } as const;
+      await w.queueStore.enqueue({ ...entry }, 25);
+      expect(await r()).toMatchObject({ recovered: 1 });
+      // Its record is waiting (a recorder write was lost, say): the workflow is due again.
+      w.tick(recoveryBackoff(1));
+      expect(await r()).toMatchObject({ recovered: 0, blocked: 0 });
+      expect(Date.parse((await w.wf()).nextCheckAt!)).toBe(w.now() + CI_RECHECK_MS);
+      // The entry ends without starting: blocked, saying exactly that.
+      const cur = (await w.queueStore.get(55, holder))!;
+      expect(await w.queueStore.settle({ ...cur, state: 'canceled', outcome: { at: w.now(), reason: 'stale_head', message: 'moved on' } }, cur)).toBeTruthy();
+      w.tick(CI_RECHECK_MS);
+      expect(await r()).toMatchObject({ recovered: 0, blocked: 1 });
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(await w.wf()).toMatchObject({ reason: 'ci_event_missed', message: expect.stringMatching(/handed the missed CI step for this head to another queued event \(job job_queued00000001\), which did not start \(stale_head\)/) });
     });
 
     it('stays report-only without recovery configured', async () => {

@@ -48,7 +48,8 @@ import { GitHubError } from '../github/client.js';
 import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
 import type { RetryRequest, RetryResult } from '../jobs/retry.js';
 import { workflowPause } from '../jobs/stop.js';
-import type { Store } from '../store/store.js';
+import type { Job, Store } from '../store/store.js';
+import { isWaiting, type QueueStore } from '../jobs/queue-store.js';
 import { saveChange } from './recorder.js';
 import type { WorkflowStore } from './store.js';
 import { CI_RECHECK_MS, type RecoveryKind, type Workflow, type WorkflowEvent, type WorkflowRecovery } from './workflow.js';
@@ -77,9 +78,12 @@ export const recoveryJobId = (installationId: number, workflowId: string, key: s
 export const missedCheckKey = (w: Pick<Workflow, 'generation'>, headSha: string) => `ci:${w.generation}:${headSha}`;
 export const lostJobKey = (jobId: string) => `lost:${jobId}`;
 /**
- * The ids of an action's n-th launch: the first is the key's own; a launch whose job record ended
- * `launch_failed` (its reservation reclaimed before any microVM was asked for) gives the next try
- * ids of its own, since a job record is written once.
+ * The ids of an action's n-th launch: the first is the key's own. Only a launch that provably ran
+ * nothing gives the next try ids of its own (a job record is written once): its record ended
+ * `launch_failed` with no start, no microVM and no mark that RunMicrovm was asked for (its
+ * reservation reclaimed before the launch got that far). The launcher also records launch_failed
+ * when RunMicrovm itself fails, which may have accepted a request whose answer was lost: that one
+ * may be running, and counts as the head's CI step.
  */
 export const recoveryIds = (installationId: number, workflowId: string, key: string, n: number) => {
   const k = n === 0 ? key : `${key}#${n}`;
@@ -109,6 +113,8 @@ export interface RecoveryDeps {
   retry: (req: RetryRequest) => Promise<RetryResult>;
   /** The platform App's own login (`<slug>[bot]`). */
   appBot?: () => Promise<string | undefined>;
+  /** The admission queue's entries: a try handed to a queued event is waited on while that entry waits. */
+  queue?: Pick<QueueStore, 'get'>;
 }
 
 /** What a recovery look came to, for the reconciler's report. */
@@ -128,6 +134,10 @@ const STARTED = new Set(['launched', 'queued', 'queue_joined', 'coalesced']);
 const TRANSIENT = new Set(['duplicate', 'kill_switch', 'jobs_off', 'launch_failed', 'coalesce_unconfirmed', 'queue_busy', 'capacity_wait']);
 /** Retry refusals worth another try later. */
 const TRANSIENT_RETRY = new Set(['retry_pending', 'throttled', 'jobs_off', 'launch_failed', 'event_unavailable', 'retry_failed']);
+
+/** A job record that proves its launch never reached a microVM. */
+export const ranNothing = (job: Pick<Job, 'status' | 'outcome' | 'startedAt' | 'microvmId' | 'launchingAt'>) =>
+  job.status === 'finished' && job.outcome === 'launch_failed' && job.startedAt === undefined && job.microvmId === undefined && job.launchingAt === undefined;
 
 const iso = (ms: number) => new Date(ms).toISOString();
 const short = (sha: string) => sha.slice(0, 12);
@@ -267,13 +277,13 @@ export function createRecovery(deps: {
     });
 
     // This head's event was synthesized before, and its job ran (or runs): never a second time.
-    // A launch whose job ended launch_failed never ran anything: the next try has ids of its own.
+    // A launch that provably ran nothing (ranNothing) gives the next try ids of its own.
     let ids: { jobId: string; deliveryId: string } | undefined;
     for (let n = 0; n <= MAX_RECOVERY_ATTEMPTS && !ids; n++) {
       const next = recoveryIds(w.installationId, w.workflowId, key, n);
       const earlier = await deps.jobs.getJob(next.jobId);
       if (!earlier) ids = next;
-      else if (earlier.status === 'finished' && earlier.outcome === 'launch_failed') continue;
+      else if (ranNothing(earlier)) continue;
       else if (earlier.status !== 'finished') return defer(w, at, CI_RECHECK_MS);
       else return ran(next.jobId, earlier.outcome);
     }
@@ -283,8 +293,17 @@ export function createRecovery(deps: {
     if (handed && handed !== ids?.jobId) {
       const holder = await deps.jobs.getJob(handed);
       if (holder && holder.status !== 'finished') return defer(w, at, CI_RECHECK_MS);
-      // (A launch that never got a microVM ran nothing: it does not count as the head's CI step.)
-      if (!(holder?.outcome === 'launch_failed')) return ran(handed, holder?.outcome ?? 'handed over');
+      if (!holder) {
+        // Handed to a queued event that has no job yet: waited on while its entry waits.
+        const entry = await deps.recovery.queue?.get(w.installationId, handed);
+        if (entry && isWaiting(entry)) return defer(w, at, CI_RECHECK_MS);
+        if (entry || deps.recovery.queue) {
+          return { kind: 'report', workflow: w, note: `Updraft handed the missed CI step for this head to another queued event (job ${handed}), which did not start${entry?.outcome ? ` (${entry.outcome.reason})` : ''}, so it is not run again.` };
+        }
+        return ran(handed, 'handed over');
+      }
+      // (A launch that provably never got a microVM ran nothing: it does not count as the head's CI step.)
+      if (!ranNothing(holder)) return ran(handed, holder.outcome);
     }
     if (!ids) return { kind: 'report', workflow: w, note: `Automatic recovery could not get a job for this head started in ${MAX_RECOVERY_ATTEMPTS + 1} launches.` };
     const { jobId, deliveryId } = ids;

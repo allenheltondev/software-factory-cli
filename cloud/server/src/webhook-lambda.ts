@@ -345,7 +345,7 @@ const appBot = async () => {
 };
 const reconcileWorkflows = createWorkflowReconciler({
   store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch,
-  ...(launch && retryJob ? { recovery: { launch, retry: retryJob, appBot } } : {}),
+  ...(launch && retryJob ? { recovery: { launch, retry: retryJob, appBot, queue: queueStore } } : {}),
 });
 
 const scanLabels = createLabelScanner({ tenants: store, store: workflowStore, github, loadSettings });
