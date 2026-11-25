@@ -50,8 +50,12 @@ export const MAX_ADMIT_ATTEMPTS = 8;
 const BACKOFF_BASE_MS = 30 * 1000;
 const BACKOFF_MAX_MS = 15 * 60 * 1000;
 export const backoff = (attempts: number) => Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1));
-/** How long one dispatch run starts admissions (within the webhook function's 20 s). */
-export const DISPATCH_BUDGET_MS = 10 * 1000;
+/**
+ * How long one dispatch run starts admissions. An admission can take a pull request's coalescing
+ * wait (up to 8 s) and a launch on top, all within the webhook function's 20 s; one cut short by
+ * the timeout is safe (its lease runs out, and its job record, if any, wins), only slower.
+ */
+export const DISPATCH_BUDGET_MS = 6 * 1000;
 /** How long the enqueue has to post its acknowledgement before the dispatcher posts a missing one. */
 export const ACK_GRACE_MS = 60 * 1000;
 /** Waiting entries one dispatch run reads. */
@@ -99,6 +103,12 @@ export function queueComment(e: QueueEntry, consoleOrigin?: string, now = Date.n
     ]);
   }
   const o = e.outcome;
+  if (e.state === 'admitted' && o?.reason.startsWith('native_waiting')) {
+    // Handed to the subscription's own wait: nothing has started yet, and this says so.
+    return lines('Waiting for the Claude subscription', [
+      `Capacity is available, and the job now waits for the connected Claude subscription (${o.reason === 'native_waiting_for_sign_in' ? 'a sign-in' : o.reason === 'native_waiting_for_reconnect' ? 'a reconnect' : 'its environment to be ready'}) before it starts. The job page says what is needed.`,
+    ]);
+  }
   if (e.state === 'admitted') {
     return lines(`Started · queued for ${minutes((o?.at ?? now) - e.enqueuedAt)}`, [
       `Updraft started the queued work${o?.jobId && o.jobId !== e.jobId ? ` as job \`${o.jobId}\`` : ''}. The job page shows what runs and how it ends.`,

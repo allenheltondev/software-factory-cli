@@ -474,6 +474,10 @@ describe('the admission queue', () => {
     const e = { jobId: 'job_aaaaaaaaaaaaaaaa', installationId: 55, enqueuedAt: NOW, expiresAt: NOW + QUEUE_EXPIRY_MS, state: 'queued', reason: 'concurrent_jobs', issue: 2 } as QueueEntry;
     expect(queueComment(e)).toContain('`job_aaaaaaaaaaaaaaaa`');
     expect(queueComment(e)).not.toMatch(/throttl|running/i);
+    // Handed to a subscription sign-in wait: never claimed as started.
+    const handed = queueComment({ ...e, state: 'admitted', outcome: { at: NOW, reason: 'native_waiting_for_sign_in', message: 'Waiting' } });
+    expect(handed).toContain('**Status:** Waiting for the Claude subscription');
+    expect(handed).not.toContain('Started');
   });
 
   describe('pull request events', () => {
