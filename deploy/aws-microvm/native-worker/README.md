@@ -26,6 +26,7 @@ Updraft (UID 1000) -> docker-shaped runtime -> root supervisor
                            UID 1000, narrow worktree/git mounts
                            fresh HOME and PID/mount/user/network namespaces
                            no native auth home, host processes/sockets or network
+                           (TLS to allowlisted registry hosts only, via the egress proxy)
 ```
 
 Claude starts outside the repository with `--restricted`, empty `--setting-sources`, disabled
@@ -52,10 +53,13 @@ no-new-privileges and parent-death signals; disconnect/stop/shutdown cancels the
 The trust boundary includes root, the kernel, root-owned installation/configuration and the
 official CLI. Cloud dispatch remains disabled by default; [CLOUD.md](CLOUD.md) describes the
 operator-only #104 test route. The boundary does not protect source code from model requests
-authorized by the job. Networking for repository code is disabled: bake dependencies
-and tools into the image. Triage, background jobs, arbitrary agent flags, alternate adapters,
+authorized by the job. Repository code has no network except package registries, reached
+through a root proxy over a bound Unix socket while the sandbox keeps `--network none`
+([docs/package-egress.md](../../../docs/package-egress.md)). Without the config's `egress`
+section, it has no network at all. Bake other tools into the image. Triage, background jobs, arbitrary agent flags, alternate adapters,
 suspend/resume and sharing this storage between tenants are outside this proof.
-Prompts are limited to 512 KiB, each tool command to 120 seconds/256 KiB output, and each
+Prompts are limited to 512 KiB, each tool command to `toolTimeoutSeconds` (default 120, 600 in
+the example config)/256 KiB output, and each
 verification command to 2 MiB output. A blocked transport also closes rather than buffering
 unlimited output; larger production workloads need a separately reviewed resource policy.
 

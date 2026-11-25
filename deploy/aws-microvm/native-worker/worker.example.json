@@ -7,5 +7,11 @@
   "workRoot": "/var/lib/updraft-jobs",
   "claude": "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
   "sandboxConfig": "/etc/updraft-native-sandbox.json",
-  "authModule": "/usr/local/lib/node_modules/@allenheltondev/updraft/dist/agents/native-claude-auth.js"
+  "authModule": "/usr/local/lib/node_modules/@allenheltondev/updraft/dist/agents/native-claude-auth.js",
+  "toolTimeoutSeconds": 600,
+  "egress": {
+    "defaultRegistries": true,
+    "allowHosts": [],
+    "shim": "/usr/local/lib/updraft-egress/egress-shim.mjs"
+  }
 }

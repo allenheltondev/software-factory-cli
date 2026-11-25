@@ -18,6 +18,12 @@ cp "$here"/*.mjs /opt/updraft/native-worker/
 npm install --prefix /opt/updraft/native-worker --no-save --package-lock=false --ignore-scripts ws@8.23.0
 cp "$here/mount-home.sh" /opt/updraft/native-worker/
 cp "$here/../image/sandbox/updraft-sandbox.mjs" /opt/updraft/image/sandbox/
+cp "$here/../image/sandbox/egress-proxy.mjs" /opt/updraft/image/sandbox/
+# The shim runs inside the sandbox, which mounts only /usr and the job's own paths (#147).
+mkdir -p /usr/local/lib/updraft-egress
+cp "$here/../image/sandbox/egress-shim.mjs" /usr/local/lib/updraft-egress/
+chown -R root:root /usr/local/lib/updraft-egress
+chmod 0755 /usr/local/lib/updraft-egress; chmod 0644 /usr/local/lib/updraft-egress/egress-shim.mjs
 cp "$here/worker.example.json" /etc/updraft-native-worker.json
 node -e 'const fs=require("fs");const p="/etc/updraft-native-worker.json";const c=JSON.parse(fs.readFileSync(p));c.claude=fs.realpathSync(process.argv[1]);fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n");' "$(command -v claude)"
 printf '{"image":"native-claude-worker"}\n' > /etc/updraft-native-sandbox.json

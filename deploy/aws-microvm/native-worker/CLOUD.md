@@ -136,8 +136,8 @@ npm run claude-session-trace --workspace=server -- --installation <id> --watch 3
 
 1. Follow [README.md](README.md) to build the separate native image, create the tenant's EFS
    access point, grant its dedicated execution role EFS access, configure VPC/internet egress,
-   and run the signed-out official CLI and credential isolation checks. Bake all test dependencies
-   into the image: repository/tool/verify networking remains disabled. Keep suspend/resume off.
+   and run the signed-out official CLI and credential isolation checks. Repository, tool and verify
+   commands reach package registries only ([docs/package-egress.md](../../../docs/package-egress.md)). Keep suspend/resume off.
    The dedicated role must **not** be the Cloud BYOK execution role.
 2. Publish this Cloud version with `NativeWorkerRoute` left empty. Record the Cloud stack's
    `BrokerFunctionName` output. The image tarball must include this branch's runner and CLI.
