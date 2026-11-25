@@ -7,7 +7,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_REGISTRY_HOSTS, EGRESS_HEADER, TLS_ACCESS_DENIED, buildAllowlist, classifyAddress, createEgressProxy, hostAllowed, ipv6Groups,
   parseClientHello, parseConnect, parseEgressConfig, parseHostRule, refusal, vetTarget,
@@ -297,6 +297,15 @@ async function hold(socket, bytes) {
 
 const settle = (ms = 50) => new Promise((r) => setTimeout(r, ms));
 
+/** The proxy's live sockets (Node's own count) and what it holds, as numbers. */
+async function held() {
+  const connections = await new Promise((r) => proxy.server.getConnections((_, n) => r(n)));
+  return { connections, ...proxy.live(), clients: proxy.stats.clients, open: proxy.stats.open };
+}
+
+/** Wait until the proxy holds nothing: no live socket, lookup waiter or slot. */
+const drained = () => vi.waitFor(async () => expect(await held()).toMatchObject({ connections: 0, sockets: 0, waiters: 0, clients: 0, open: 0 }), { timeout: 3000, interval: 20 });
+
 describe.skipIf(!unix)('egress proxy over its socket', () => {
   let npmHello;
   let evilHello;
@@ -320,8 +329,8 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
     expect(result.rest.subarray(0, 5).toString()).toBe('echo:');
     expect(connects).toEqual([{ address: PUBLIC, port: 443, family: 4 }]);
     expect(logs[0]).toEqual({ event: 'egress', decision: 'allow', target: 'registry.npmjs.org:443', address: PUBLIC });
-    await settle();
-    expect(proxy.stats).toMatchObject({ allowed: 1, clients: 0, open: 0 });
+    await drained();
+    expect(proxy.stats.allowed).toBe(1);
   });
 
   it.each([
@@ -368,7 +377,8 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
       await settle();
       expect(received).toEqual([]);
       expect(logs).toContainEqual(expect.objectContaining({ decision: 'deny', reason }));
-      expect(proxy.stats).toMatchObject({ allowed: 0, clients: 0, open: 0 });
+      await drained();
+      expect(proxy.stats.allowed).toBe(0);
     });
 
     it('waits for a ClientHello that arrives in pieces', async () => {
@@ -392,25 +402,48 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
       const result = await tunnel(socket, 'registry.npmjs.org:443', { close: 'server' });
       expect(result.rest.equals(TLS_ACCESS_DENIED)).toBe(true);
       expect(logs).toContainEqual(expect.objectContaining({ reason: 'tls-required', detail: 'no?client?hello' }));
-      expect(proxy.stats).toMatchObject({ clients: 0, open: 0 });
+      await drained();
     });
   });
 
   describe('bounds every stage, and recovers', () => {
-    it('caps accepted clients at admission, counting partial request heads', async () => {
+    it('holds no more live sockets than maxClients, whatever a burst does, and recovers', async () => {
       const { socket } = await startProxy({ limits: { maxClients: 3 } });
-      const held = [];
-      for (let i = 0; i < 3; i += 1) held.push(await hold(socket, 'CONNECT registry.np'));
-      await settle();
-      expect(proxy.stats.clients).toBe(3);
-      const refused = await tunnel(socket, 'registry.npmjs.org:443');
-      expect(refused.head).toMatch(/^HTTP\/1.1 503 /);
-      expect(refused.head).toContain('reason=too-many-connections');
-      for (const s of held) s.destroy();
-      await settle();
-      expect(proxy.stats.clients).toBe(0);
+      const kept = [];
+      for (let i = 0; i < 3; i += 1) kept.push(await hold(socket, 'CONNECT registry.np'));
+      await vi.waitFor(async () => expect((await held()).connections).toBe(3));
+      // A burst far over the limit: each extra connection is destroyed on arrival, unanswered.
+      const burst = await Promise.all(Array.from({ length: 50 }, () => new Promise((resolve) => {
+        const s = net.connect(socket);
+        let data = '';
+        s.on('data', (d) => (data += d));
+        s.on('error', () => {});
+        s.on('close', () => resolve(data));
+      })));
+      expect(burst.every((data) => data === '')).toBe(true);
+      expect(await held()).toMatchObject({ connections: 3, sockets: 3, clients: 3 });
+      expect(proxy.stats.dropped).toBe(50);
+      // One rate-limited log line for the burst, not fifty.
+      expect(logs.filter((r) => r.decision === 'drop')).toHaveLength(1);
+      for (const s of kept) s.destroy();
+      await drained();
       const next = await tunnel(socket, 'registry.npmjs.org:443', { first: npmHello });
       expect(next.head).toBe('HTTP/1.1 200 Connection Established');
+    });
+
+    it('counts a refused client until its socket has closed, refusal flush included', async () => {
+      const { socket } = await startProxy({ limits: { maxClients: 1 } });
+      // The client reads the 403 and keeps its end open: the proxy's 1 s cleanup closes it.
+      const s = await hold(socket, 'CONNECT github.com:443 HTTP/1.1\r\n\r\n');
+      s.allowHalfOpen = true;
+      await new Promise((r) => s.once('data', r));
+      expect(await held()).toMatchObject({ connections: 1, clients: 1 });
+      // While it is still open, it holds the only slot: a new connection is dropped.
+      const dropped = await new Promise((resolve) => { const n = net.connect(socket); n.on('error', () => {}); n.on('close', () => resolve(true)); });
+      expect(dropped).toBe(true);
+      expect(proxy.stats.dropped).toBe(1);
+      await drained();
+      s.destroy();
     });
 
     it('refuses an oversized head, complete or not', async () => {
@@ -426,7 +459,7 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
       const result = await tunnel(socket, '', { raw: 'CONNECT registry.npmjs.org:443 HTTP/1.1\r\n' });
       expect(result.head).toMatch(/^HTTP\/1.1 408 /);
       expect(result.head).toContain('reason=request-timeout');
-      expect(proxy.stats.clients).toBe(0);
+      await drained();
     });
 
     it('gives DNS a deadline, ignores the late answer and bounds unsettled lookups', async () => {
@@ -447,7 +480,7 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
       expect(connects).toEqual([]);
       const next = await tunnel(socket, 'registry.npmjs.org:443', { first: npmHello });
       expect(next.head).toBe('HTTP/1.1 200 Connection Established');
-      expect(proxy.stats.clients).toBe(0);
+      await drained();
     });
 
     it('shares one lookup between concurrent requests for a name, as package managers open them', async () => {
@@ -457,8 +490,36 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
       expect(lookups).toHaveLength(1);
       expect(proxy.stats.lookups).toBe(1);
       lookups[0].resolve([{ address: PUBLIC, family: 4 }]);
+      await drained();
+      expect(proxy.stats.lookups).toBe(0);
+    });
+
+    it('holds one entry for a never-settling lookup across repeated waves, detaching every waiter', async () => {
+      const { socket, lookups } = await startProxy({ limits: { maxClients: 10, dnsTimeoutMs: 50 } });
+      for (let wave = 0; wave < 5; wave += 1) {
+        const results = await Promise.all(Array.from({ length: 10 }, () => tunnel(socket, 'hang.example.dev:443')));
+        for (const r of results) expect(r.head).toContain('reason=dns-timeout');
+        await vi.waitFor(async () => expect(await held()).toMatchObject({ connections: 0, waiters: 0, lookups: 1 }), { timeout: 3000, interval: 20 });
+      }
+      // Fifty requests, one resolver call, still unsettled, and nothing attached to it.
+      expect(lookups).toHaveLength(1);
+      lookups[0].resolve([{ address: PUBLIC, family: 4 }]);
       await settle();
-      expect(proxy.stats).toMatchObject({ lookups: 0, clients: 0 });
+      expect(await held()).toMatchObject({ lookups: 0, waiters: 0 });
+    });
+
+    it('detaches the waiter of a peer that leaves during DNS before the lookup settles', async () => {
+      const { socket, lookups } = await startProxy();
+      const a = await hold(socket, 'CONNECT hang.example.dev:443 HTTP/1.1\r\n\r\n');
+      const b = await hold(socket, 'CONNECT hang.example.dev:443 HTTP/1.1\r\n\r\n');
+      await vi.waitFor(async () => expect(await held()).toMatchObject({ waiters: 2, lookups: 1 }));
+      a.destroy();
+      await vi.waitFor(async () => expect(await held()).toMatchObject({ waiters: 1, connections: 1 }));
+      b.destroy();
+      await vi.waitFor(async () => expect(await held()).toMatchObject({ waiters: 0, connections: 0, lookups: 1 }));
+      lookups[0].resolve([{ address: PUBLIC, family: 4 }]);
+      await settle();
+      expect(await held()).toMatchObject({ lookups: 0 });
     });
 
     it('releases everything when the peer leaves during DNS', async () => {
@@ -467,8 +528,7 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
       await settle();
       expect(proxy.stats).toMatchObject({ clients: 1, lookups: 1 });
       s.destroy();
-      await settle();
-      expect(proxy.stats.clients).toBe(0);
+      await drained();
       lookups[0].resolve([{ address: PUBLIC, family: 4 }]);
       await settle();
       expect(connects).toEqual([]);
@@ -481,12 +541,11 @@ describe.skipIf(!unix)('egress proxy over its socket', () => {
       await settle(20);
       expect(proxy.stats).toMatchObject({ clients: 1, open: 1 });
       s.destroy();
-      await settle();
-      expect(proxy.stats).toMatchObject({ clients: 0, open: 0 });
+      await drained();
       const timedOut = await tunnel(socket, 'registry.npmjs.org:443');
       expect(timedOut.head).toMatch(/^HTTP\/1.1 504 /);
       expect(timedOut.head).toContain('reason=connect-timeout');
-      expect(proxy.stats).toMatchObject({ clients: 0, open: 0 });
+      await drained();
     });
 
     it('bounds concurrent tunnels', async () => {
@@ -573,6 +632,16 @@ describe.skipIf(!unix)('egress shim', () => {
     const result = await runShim(socket, 'process.exit(7)');
     expect(result.code).toBe(7);
     expect(result.stderr).toBe('');
+  });
+
+  it('says so when the proxy is full', async () => {
+    const { socket } = await startProxy({ limits: { maxClients: 1 } });
+    const kept = await hold(socket, 'CONNECT registry.np');
+    await vi.waitFor(async () => expect((await held()).connections).toBe(1));
+    const result = await runShim(socket, CLIENT, ['registry.npmjs.org:443']);
+    expect(result.stdout).toContain('HTTP/1.1 503 Service Unavailable');
+    expect(result.stderr).toContain('updraft-egress: refused CONNECT registry.npmjs.org:443 (proxy-busy)');
+    kept.destroy();
   });
 
   it('says so when the proxy is not there', async () => {

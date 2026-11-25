@@ -46,8 +46,9 @@ export const DEFAULT_REGISTRY_HOSTS = Object.freeze([
 ]);
 
 /**
- * Every stage of a connection is bounded. `maxClients` counts every accepted socket, whatever
- * its stage (request head, DNS, connect, TLS hello, tunnel), and is checked at admission;
+ * Every stage of a connection is bounded. `maxClients` is a hard limit on live client sockets,
+ * whatever their stage (request head, DNS, connect, TLS hello, tunnel, refusal being flushed):
+ * Node destroys a connection beyond it on arrival;
  * `maxConnections` counts those past DNS (connecting, hello, tunnel); `maxPendingLookups`
  * counts resolver calls that have not settled, including ones whose deadline already passed,
  * so hung lookups cannot accumulate.
@@ -435,44 +436,57 @@ export function createEgressProxy(options, deps = {}) {
   const resolveName = deps.resolve ?? defaultResolve;
   const connect = deps.connect ?? defaultConnect;
   const log = deps.log ?? (() => {});
-  const stats = { allowed: 0, denied: 0, clients: 0, open: 0, lookups: 0 };
+  const stats = { allowed: 0, denied: 0, dropped: 0, clients: 0, open: 0, lookups: 0 };
   const sockets = new Set();
 
   /**
-   * The resolver with a deadline per request. Concurrent requests for one name share a single
-   * resolver call (a package manager opens many tunnels to one registry at once), and each
-   * distinct name counts against maxPendingLookups until its call settles, deadline or not.
+   * Name lookups. Concurrent requests for one name share a single resolver call (a package
+   * manager opens many tunnels to one registry at once). Each call has exactly one completion
+   * handler, which settles the waiters attached at that moment. A request waits as a waiter
+   * that is detached on its own deadline and when its connection ends, so a resolver that never
+   * settles holds one entry here, not one per request. Each distinct name counts against
+   * maxPendingLookups until its call settles, deadline or not.
    */
-  const inflight = new Map();
-  const lookupAllowed = (host) => inflight.has(host) || inflight.size < limits.maxPendingLookups;
-  const boundedResolve = (host) => {
-    let call = inflight.get(host);
-    if (!call) {
-      call = Promise.resolve().then(() => resolveName(host));
-      inflight.set(host, call);
-      stats.lookups = inflight.size;
-      call.then(() => {}, () => {}).finally(() => { inflight.delete(host); stats.lookups = inflight.size; });
+  const lookups = new Map(); // host -> { waiters: Set<waiter> }
+  const lookupAllowed = (host) => lookups.has(host) || lookups.size < limits.maxPendingLookups;
+  const lookup = (host) => {
+    let entry = lookups.get(host);
+    if (!entry) {
+      entry = { waiters: new Set() };
+      const current = entry;
+      lookups.set(host, current);
+      stats.lookups = lookups.size;
+      const settle = (ok, value) => {
+        if (lookups.get(host) === current) lookups.delete(host);
+        stats.lookups = lookups.size;
+        for (const waiter of [...current.waiters]) waiter.done(ok, value);
+      };
+      Promise.resolve().then(() => resolveName(host)).then((value) => settle(true, value), (error) => settle(false, error));
     }
-    let timer;
-    const deadline = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(Object.assign(new Error('dns timeout'), { code: 'EGRESS_DNS_TIMEOUT' })), limits.dnsTimeoutMs);
+    const waiters = entry.waiters;
+    const waiter = {};
+    const promise = new Promise((resolveWaiter, rejectWaiter) => {
+      waiter.done = (ok, value) => {
+        clearTimeout(waiter.timer);
+        waiters.delete(waiter);
+        if (ok) resolveWaiter(value);
+        else rejectWaiter(value);
+      };
     });
-    return Promise.race([call, deadline]).finally(() => clearTimeout(timer));
+    waiter.timer = setTimeout(() => waiter.done(false, Object.assign(new Error('dns timeout'), { code: 'EGRESS_DNS_TIMEOUT' })), limits.dnsTimeoutMs);
+    waiters.add(waiter);
+    // Detached, the waiter's promise never settles and nothing references it any more.
+    const cancel = () => { clearTimeout(waiter.timer); waiters.delete(waiter); };
+    return { promise, cancel };
   };
 
   const server = net.createServer((client) => {
+    // Admitted: counted (stats.clients, and by Node for maxConnections) until the socket has
+    // physically closed, refusal and flush included.
     sockets.add(client);
-    client.on('error', () => {});
-    if (stats.clients >= limits.maxClients) {
-      // Refused at admission: one short answer, then the socket goes regardless.
-      stats.denied += 1;
-      log({ event: 'egress', decision: 'deny', reason: 'too-many-connections', target: '' });
-      client.end(refusal('too-many-connections'));
-      const kill = setTimeout(() => client.destroy(), 1000);
-      client.once('close', () => { clearTimeout(kill); sockets.delete(client); });
-      return;
-    }
     stats.clients += 1;
+    client.on('error', () => {});
+    client.once('close', () => { sockets.delete(client); stats.clients -= 1; });
 
     let stage = 'head';
     let done = false;
@@ -481,6 +495,7 @@ export function createEgressProxy(options, deps = {}) {
     let tunnelSlot = false;
     let request;
     let vetted;
+    let cancelLookup;
     let buffered = Buffer.alloc(0);
     const arm = (ms, onTimeout) => {
       clearTimeout(timer);
@@ -493,8 +508,8 @@ export function createEgressProxy(options, deps = {}) {
       done = true;
       clearTimeout(timer);
       client.removeListener('data', onData);
+      cancelLookup?.();
       if (tunnelSlot) stats.open -= 1;
-      stats.clients -= 1;
       if (upstream) {
         upstream.removeAllListeners('connect');
         upstream.on('error', () => {});
@@ -510,7 +525,6 @@ export function createEgressProxy(options, deps = {}) {
       } else client.destroy();
     };
     client.once('close', () => {
-      sockets.delete(client);
       if (!done) {
         if (stage !== 'tunnel') log({ event: 'egress', decision: 'aborted', stage, target: sanitize(request?.target ?? '') });
         finish();
@@ -535,11 +549,17 @@ export function createEgressProxy(options, deps = {}) {
       if (!lookupAllowed(request.host)) { finish('too-many-connections', 'lookups'); return; }
       stage = 'dns';
       clearTimeout(timer); // the resolver has its own deadline
-      void vetTarget(request, rules, boundedResolve).then(onVetted, () => finish('dns-failure'));
+      const resolveForThis = (host) => {
+        const pending = lookup(host);
+        cancelLookup = pending.cancel;
+        return pending.promise;
+      };
+      void vetTarget(request, rules, resolveForThis).then(onVetted, () => finish('dns-failure'));
     };
 
     const onVetted = (target) => {
       if (done) return; // the peer left, or the connection ended, while the name resolved
+      cancelLookup = undefined;
       if (target.reason) { finish(target.reason, target.detail); return; }
       if (stats.open >= limits.maxConnections) { finish('too-many-connections'); return; }
       stats.open += 1;
@@ -604,9 +624,29 @@ export function createEgressProxy(options, deps = {}) {
     client.on('data', onData);
   });
 
+  // The hard limit: beyond maxClients live sockets (admitted ones count until they close),
+  // Node destroys a new connection at once, before any handler, timer or write. No answer is
+  // sent; the shim reports a connection closed without one as "proxy-busy".
+  server.maxConnections = limits.maxClients;
+  let lastDropLog = 0;
+  server.on('drop', () => {
+    stats.dropped += 1;
+    const now = Date.now();
+    if (now - lastDropLog >= 1000) {
+      lastDropLog = now;
+      log({ event: 'egress', decision: 'drop', reason: 'too-many-connections', dropped: stats.dropped });
+    }
+  });
+
   return {
     server,
     stats,
+    /** What is actually held: live sockets (clients and upstreams), lookups and attached waiters. */
+    live() {
+      let waiters = 0;
+      for (const entry of lookups.values()) waiters += entry.waiters.size;
+      return { sockets: sockets.size, lookups: lookups.size, waiters };
+    },
     /** Stop accepting and drop every open connection. */
     async close() {
       for (const s of sockets) s.destroy();

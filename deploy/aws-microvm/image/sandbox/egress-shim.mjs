@@ -86,6 +86,7 @@ export function diagnosticLine({ reason, target, detail, count }) {
     'too-many-connections': 'too many registry connections were open at once',
     'https-only': 'only HTTPS through CONNECT is allowed',
     'proxy-unavailable': 'the worker egress proxy is not reachable; registry access is off for this command',
+    'proxy-busy': 'the worker egress proxy is at its connection limit and closed the connection unanswered; lower the tool\'s parallelism or retry',
   }[reason] ?? 'the request was not understood';
   return `updraft-egress: refused ${what} (${reason}): ${why}${count > 1 ? ` [${count} times]` : ''}`;
 }
@@ -102,15 +103,21 @@ export function relay(client, socketPath, record) {
   let afterTunnel = false; // the next upstream bytes are the first after a 200
   client.once('data', (chunk) => { target = /^CONNECT (\S+) /.exec(chunk.toString('latin1', 0, 300))?.[1]; });
   client.on('error', () => upstream.destroy());
+  let connected = false;
+  upstream.once('connect', () => { connected = true; });
+  /** Answer the client ourselves when the proxy gave no answer: unreachable, or full (it closes at once). */
+  const answerFor = (reason) => {
+    headDone = true;
+    answered = true;
+    client.unpipe(upstream);
+    record({ reason, target });
+    const [code, text] = reason === 'proxy-busy' ? [503, 'Service Unavailable'] : [502, 'Bad Gateway'];
+    const body = `Updraft egress ${reason}\n`;
+    client.end(`HTTP/1.1 ${code} ${text}\r\nX-Updraft-Egress: reason=${reason}\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
+  };
   upstream.on('error', () => {
-    if (!headDone) {
-      headDone = true;
-      answered = true;
-      client.unpipe(upstream);
-      record({ reason: 'proxy-unavailable' });
-      const body = 'Updraft egress proxy unavailable\n';
-      client.end(`HTTP/1.1 502 Bad Gateway\r\nX-Updraft-Egress: reason=proxy-unavailable\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
-    } else client.destroy();
+    if (!headDone) answerFor(connected ? 'proxy-busy' : 'proxy-unavailable');
+    else client.destroy();
   });
   upstream.on('data', (chunk) => {
     if (!headDone) {
@@ -135,7 +142,8 @@ export function relay(client, socketPath, record) {
   // after what was written is flushed; only a failed tunnel is cut at once.
   upstream.on('close', (hadError) => {
     if (answered) return;
-    if (hadError) client.destroy();
+    if (!headDone) answerFor(connected ? 'proxy-busy' : 'proxy-unavailable');
+    else if (hadError) client.destroy();
     else client.end();
   });
   client.on('close', () => upstream.destroy());

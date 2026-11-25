@@ -43,11 +43,15 @@ sandbox (--network none, job identity)          supervisor (root, outside)
   loopback. It decides nothing. A tool that ignores these variables has no network, as before.
 - The socket's directory is `root:<job group>` mode `0710`, and the socket is `0660`. The
   Claude CLI's own identity cannot open it.
-- **Bounds at every stage.** Up to 64 accepted connections in total, counted at admission
-  whatever their stage: an incomplete request head, DNS, connect, TLS hello or tunnel. Beyond
-  that, a connection is answered `503 too-many-connections` and closed. Up to 32 are past DNS
-  (connecting or tunneled). Concurrent requests for one name share a single lookup, as package
-  managers open many tunnels to one registry at once. Up to 8 distinct names may be resolving
+- **Bounds at every stage.** A hard limit of 64 live client sockets, whatever their stage: an
+  incomplete request head, DNS, connect, TLS hello, tunnel, or a refusal still being flushed.
+  A socket counts until it has physically closed. Beyond the limit, Node destroys a new
+  connection on arrival, before any handler, timer or write. Drops are counted, and logged at
+  most once a second. The shim reports such a connection as `proxy-busy`. Up to 32 are past DNS
+  (connecting or tunneled). Concurrent requests for one name share a single resolver call, as
+  package managers open many tunnels to one registry at once. That call has one completion
+  handler. Each request waits as a waiter that is detached on its own deadline and when its
+  connection ends, so a resolver that never settles holds one entry, not one per request. Up to 8 distinct names may be resolving
   at a time, and a lookup whose deadline passed still counts until the resolver returns, so
   hung lookups cannot pile up. Deadlines:
   10 s for the request head, 5 s for DNS, 10 s to connect, 10 s for the ClientHello, 120 s
@@ -129,7 +133,8 @@ updraft-egress: refused CONNECT github.com:443 (not-allowed): the host is not an
 | `request-timeout` | request | The client opened a connection and did not send a complete `CONNECT` within 10 s |
 | `tls-refused` | TLS | The tunnel did not start with a ClientHello for the `CONNECT` host: not TLS, no or another server name, or Encrypted Client Hello. The supervisor log names which (`tls-required`, `tls-no-sni`, `tls-authority-mismatch`, `tls-opaque-handshake`, `tls-malformed`). Clients see a TLS `access denied` alert |
 | `connect-failed (<code>)`, `connect-timeout` | network | The registry refused or did not answer: an outage, or the worker has no internet egress |
-| `too-many-connections` | limit | Lower the tool's parallelism, or raise `maxConnections` |
+| `too-many-connections` | limit | Too many tunnels, or too many distinct names resolving at once. Lower the tool's parallelism, or raise `maxConnections` |
+| `proxy-busy` | limit | The proxy was at its hard limit of live connections and closed this one unanswered. Lower the tool's parallelism, or retry |
 | `proxy-unavailable` | worker | The shim cannot reach the proxy socket. The supervisor's egress did not start: check its log and config |
 
 Registry authentication errors (401 or 403 from the registry itself, after the tunnel is up)
@@ -146,7 +151,9 @@ What the proxy enforces, and nothing more:
 
 - A command can open a TLS connection to an allowlisted host name on an allowed port. The
   connection goes to an address that name resolved to, every one of which is public, and the
-  TLS ClientHello must name that host in its SNI. Nothing else leaves the sandbox: no other
+  TLS ClientHello must name that host in its SNI. That check gates the **initial ClientHello
+  only**. Once it passes, every later byte of the connection (the rest of the handshake, the
+  encrypted records, the HTTP authority inside them) is relayed unexamined. Nothing else leaves the sandbox: no other
   host, no address, no plain HTTP, no non-TLS protocol, and no route at all for a tool that
   ignores the proxy variables.
 
