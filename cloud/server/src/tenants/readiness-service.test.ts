@@ -228,14 +228,25 @@ describe('repository readiness (#137)', () => {
   it('reports what waits in the admission queue, for information only', async () => {
     const entry = (over: Record<string, unknown>) => ({ jobId: 'job_q', installationId: 55, repository: 'acme/web', repositoryId: 9, deliveryId: 'd', eventName: 'issues', eventKey: 'k', route: 'standard',
       configVersion: 3, reason: 'concurrent_jobs', state: 'queued', enqueuedAt: NOW - 12 * 60_000, expiresAt: NOW + 1, attempts: 0, ...over }) as never;
-    const list = vi.fn(async (id: number) => { expect(id).toBe(55); return [entry({}), entry({ jobId: 'job_r', enqueuedAt: NOW - 60_000 }), entry({ state: 'admitted' }), entry({ repositoryId: 77 })]; });
-    const r = await setup(world(), { queue: { list } }).service.readiness(caller, 55);
-    expect(get(r, 'queue')).toMatchObject({ state: 'failing', required: false, problem: 'transient', summary: expect.stringContaining('2 jobs wait') });
+    const listed = [entry({}), entry({ jobId: 'job_r', enqueuedAt: NOW - 60_000 }), entry({ state: 'admitted' }), entry({ repositoryId: 77 })];
+    const list = vi.fn(async (id: number) => { expect(id).toBe(55); return listed; });
+    // depth == found: exact.
+    const r = await setup(world(), { queue: { list, depth: async () => 3 } }).service.readiness(caller, 55);
+    expect(get(r, 'queue')).toMatchObject({ state: 'failing', required: false, problem: 'transient', summary: expect.stringMatching(/^2 jobs wait/) });
     expect(get(r, 'queue')!.summary).toContain('12 min');
     expect(repo(r).status).toBe('ready');
-    const empty = await setup(world(), { queue: { list: async () => [] } }).service.readiness(caller, 55);
+    // depth 0: verified without listing.
+    const none = vi.fn(async () => listed);
+    const empty = await setup(world(), { queue: { list: none, depth: async () => 0 } }).service.readiness(caller, 55);
     expect(get(empty, 'queue')).toMatchObject({ state: 'verified', required: false });
-    const unread = await setup(world(), { queue: { list: async () => { throw new Error('x'); } } }).service.readiness(caller, 55);
+    expect(none).not.toHaveBeenCalled();
+    // depth > found: a lower bound where some were found, unverified where none were.
+    const partial = await setup(world(), { queue: { list, depth: async () => 9 } }).service.readiness(caller, 55);
+    expect(get(partial, 'queue')).toMatchObject({ state: 'failing', required: false, summary: expect.stringMatching(/^At least 2 jobs wait/) });
+    const other = await setup(world(), { queue: { list: async () => [entry({ repositoryId: 77 })], depth: async () => 5 } }).service.readiness(caller, 55);
+    expect(get(other, 'queue')).toMatchObject({ state: 'unverified', unverified: 'read_failed', required: false });
+    expect(repo(other).status).toBe('ready');
+    const unread = await setup(world(), { queue: { list, depth: async () => { throw new Error('x'); } } }).service.readiness(caller, 55);
     expect(get(unread, 'queue')).toMatchObject({ state: 'unverified', required: false });
     expect(repo(unread).status).toBe('ready');
     expect(get(await setup(world()).service.readiness(caller, 55), 'queue')).toBeUndefined();

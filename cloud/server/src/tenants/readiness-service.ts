@@ -114,7 +114,7 @@ export interface ReadinessServiceDeps {
   imageVersion?: () => Promise<string | null>;
   native?: (installationId: number) => Promise<NativeBinding | undefined>;
   /** The admission queue (jobs/queue-store.ts), read only: what waits, for information. */
-  queue?: Pick<QueueStore, 'list'>;
+  queue?: Pick<QueueStore, 'list' | 'depth'>;
   now?: () => number;
   /** How long a check is served again without asking (per installation, per Lambda container). */
   ttlMs?: number;
@@ -141,6 +141,12 @@ export const LIMITATIONS = [
   "Trigger labels are not looked up on GitHub here; `updraft doctor` checks them for a local configuration. Branch protection applies only when Updraft asks GitHub to merge.",
   'Every check is made again with current state when a job is dispatched, and before each privileged step: readiness grants nothing.',
 ];
+
+/**
+ * The queue as read: the tenant's waiting count (kept transactionally with every entry), and the
+ * entries a bounded listing found. The listing can miss waiting entries; `depth` says whether it did.
+ */
+interface QueueRead { depth: number; entries: QueueEntry[] }
 
 /** The repositories GitHub listed; `truncated`: it has more than were read. */
 type Listed = GitHubRepository[] & { truncated?: true };
@@ -326,7 +332,7 @@ interface RepositoryFacts {
   native: Read<NativeBinding | undefined> | null;
   nativeReadiness: Read<NativeReadiness> | null;
   /** null: this deployment has no admission queue to read. */
-  queue?: Read<QueueEntry[]> | null;
+  queue?: Read<QueueRead> | null;
   now?: number;
 }
 
@@ -438,12 +444,18 @@ export function repositoryChecks(f: RepositoryFacts): ReadinessCheck[] {
   if (f.queue === null || f.queue === undefined) { /* no queue in this deployment */ }
   else if (!f.queue.ok) out.push(unverifiedCheck('queue', 'capacity', 'The admission queue could not be read just now.', 'read_failed', false));
   else {
-    const waiting = f.queue.value.filter((e) => isWaiting(e) && e.repositoryId === rule.id);
+    const { depth, entries } = f.queue.value;
+    const found = entries.filter(isWaiting);
+    // The listing found fewer waiting entries than the tenant's count: what it says of this
+    // repository is a lower bound, and "none" is not known.
+    const partial = found.length < depth;
+    const waiting = found.filter((e) => e.repositoryId === rule.id);
     const oldest = Math.min(...waiting.map((e) => e.enqueuedAt));
     const minutes = waiting.length ? Math.max(0, Math.round(((f.now ?? Date.now()) - oldest) / 60_000)) : 0;
-    out.push(waiting.length
-      ? { id: 'queue', stage: 'capacity', required: false, state: 'failing', problem: 'transient', summary: `${waiting.length === 1 ? 'One job waits' : `${waiting.length} jobs wait`} in the admission queue (the oldest for ${minutes} min); ${waiting.length === 1 ? 'it starts' : 'they start'} as capacity frees.`, fix: { text: 'Open the jobs', target: 'workflows' } }
-      : { id: 'queue', stage: 'capacity', required: false, state: 'verified', summary: 'No job of this repository waits in the admission queue.' });
+    const count = `${partial ? 'At least ' : ''}${waiting.length === 1 ? `${partial ? 'one' : 'One'} job waits` : `${waiting.length} jobs wait`}`;
+    if (waiting.length) out.push({ id: 'queue', stage: 'capacity', required: false, state: 'failing', problem: 'transient', summary: `${count} in the admission queue (the oldest found for ${minutes} min); ${waiting.length === 1 && !partial ? 'it starts' : 'they start'} as capacity frees.`, fix: { text: 'Open the jobs', target: 'workflows' } });
+    else if (partial) out.push(unverifiedCheck('queue', 'capacity', `${depth} ${depth === 1 ? 'job waits' : 'jobs wait'} in this installation's admission queue, and not all of them could be listed: whether any is this repository's is unverified.`, 'read_failed', false));
+    else out.push({ id: 'queue', stage: 'capacity', required: false, state: 'verified', summary: 'No job of this repository waits in the admission queue.' });
   }
 
   out.push(unverifiedCheck('egress', 'egress', 'Package registry access is exercised only when a job installs dependencies.', 'needs_run'));
@@ -495,7 +507,11 @@ export function createReadinessService(d: ReadinessServiceDeps) {
       d.killSwitch ? read(async (): Promise<KillSwitchState> => d.killSwitch!.state ? d.killSwitch!.state() : (await d.killSwitch!.engaged()) ? 'on' : 'off') : Promise.resolve(null),
       d.imageVersion ? read(() => d.imageVersion!()) : Promise.resolve(null),
       d.native ? read(() => d.native!(installationId)) : Promise.resolve(null),
-      d.queue ? read(() => d.queue!.list(installationId, RECENT_JOBS)) : Promise.resolve(null),
+      d.queue ? read(async (): Promise<QueueRead> => {
+        // The waiting count first: nothing waits, nothing to list.
+        const depth = await d.queue!.depth(installationId);
+        return { depth, entries: depth > 0 ? await d.queue!.list(installationId, RECENT_JOBS) : [] };
+      }) : Promise.resolve(null),
     ]);
     const rules = version?.ok ? version.value?.dispatch : undefined;
     const binding = native?.ok ? native.value : undefined;
