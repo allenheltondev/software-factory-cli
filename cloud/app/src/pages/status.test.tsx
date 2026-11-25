@@ -358,6 +358,9 @@ describe('JobPage (#71)', () => {
         const facts = await screen.findByTestId('job-facts');
         expect(facts).toHaveTextContent('Elapsed (live)');
         expect(facts).toHaveTextContent('Running… 1:05');
+        // findBy resolves when the DOM commits, but React flushes the interval's passive effect a moment later;
+        // advancing the clock before then ticks nothing (the flake). Flush effects so the interval is registered first.
+        await act(async () => {});
         await act(async () => {
           vi.advanceTimersByTime(3000);
         });
