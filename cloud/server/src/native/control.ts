@@ -287,10 +287,10 @@ export function createNativeControl(d: NativeControlDeps) {
       // read hands nothing out. Snapshotted for this job: a later change applies from the next one.
       // Bound to this job and to the route's installation, never another's. A stored value that no
       // longer validates gives no hosts (the image's only) and says so; the worker checks again.
-      const policy = await d.store.getRegistryPolicy(r.installationId);
-      const registries = effectiveRegistryHosts(policy);
+      const registryPolicy = await d.store.getRegistryPolicy(r.installationId);
+      const registries = effectiveRegistryHosts(registryPolicy);
       if (registries.problem) log({ nativeWorker: 'egress', installationId: r.installationId, jobId: id, reason: registries.problem });
-      const egress = { jobId: id, hosts: registries.hosts, version: policy?.version ?? 0, ...(registries.problem ? { problem: registries.problem } : {}) };
+      const egress = { jobId: id, hosts: registries.hosts, version: registryPolicy?.version ?? 0, ...(registries.problem ? { problem: registries.problem } : {}) };
       // Lost to another poll: read again, and the winner's assignment refuses this poll.
       if (!await d.workers.assign(job, w, now(), Math.min(job.expiresAt, now() + WORKER_LEASE_MS), policy)) return RETRY;
       // Assignment is durable before it is handed out. A lost response fences this VM on expiry;
