@@ -42,7 +42,7 @@ export function createReconciler({
   stop?: { advance(job: import('../store/store.js').Job): Promise<import('./stop.js').StopResult> };
   native?: { reconcile(job: import('../store/store.js').Job): Promise<boolean> };
   /** Records a job whose microVM is gone without its finish on its workflow. Best effort. */
-  workflows?: import('../workflows/recorder.js').WorkflowRecorder;
+  workflows?: Pick<import('../workflows/recorder.js').WorkflowRecorder, 'finished'>;
   /** lambda:GetMicrovm: the state, or null when Lambda has no such microVM. */
   microvmState: (microvmId: string) => Promise<string | null>;
   now?: () => number;

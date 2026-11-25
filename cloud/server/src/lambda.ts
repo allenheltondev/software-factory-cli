@@ -1,5 +1,6 @@
 import { createWorkflowService } from './tenants/workflow-service.js';
 import { createDynamoWorkflowStore } from './workflows/store.js';
+import { createWorkflowRecorder } from './workflows/recorder.js';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
@@ -143,7 +144,7 @@ const app = createApp({
         workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), jobs: store, github }),
         status: createStatusService({
           store,
-          requestStop: awsJobStopper(store, nativeAws(store).control).request,
+          requestStop: awsJobStopper(store, nativeAws(store).control, createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName) })).request,
           github,
           agentKeys: agentKeyService,
           resultRetentionDays: Math.max(1, Number(process.env.RESULT_RETENTION_DAYS ?? 30) || 30),

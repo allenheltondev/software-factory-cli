@@ -178,6 +178,8 @@ export interface LaunchDeps {
 }
 
 export interface LaunchRequest {
+  /** Server-owned workflow provenance, used by durable recovery after job retention expires. */
+  workflowIssue?: number;
   benchmark?: { identity: BenchmarkIdentity; configVersion: number; configYaml: string; agentKey: string; agent: string; workflow: string };
   installationId: number;
   deliveryId: string;
@@ -284,7 +286,7 @@ export function createLauncher(deps: LaunchDeps) {
     const mode = await binding?.mode?.();
     const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
     let workerId = req.retryRuntime?.workerId;
-    let workflowIssue: number | undefined;
+    let workflowIssue = req.workflowIssue;
     if (isIssue) {
       const d = decideDispatch(config?.dispatch, {
         repositoryFullName: req.payload.repository?.full_name,
@@ -336,7 +338,7 @@ export function createLauncher(deps: LaunchDeps) {
           return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this pull request runtime' });
         }
         workerId = originJob?.native?.workerId ?? workerId;
-        workflowIssue = originJob?.workflowIssue ?? originJob?.issue;
+        workflowIssue = await deps.workflows?.issueOfPullRequest(req.installationId, d.repositoryId, d.pullRequest) ?? originJob?.workflowIssue ?? originJob?.issue ?? workflowIssue;
         if (origin?.label) {
           label = origin.label;
           // Only under the version active now, which this job runs: a republish may have changed
@@ -568,10 +570,6 @@ export function createLauncher(deps: LaunchDeps) {
       await deps.putEvent(paths.eventKey, req.body);
       await deps.store.putJob(job);
       recorded = true;
-      const latestPause = await deps.store.getWorkflowPause(req.installationId, decision.repositoryId, number);
-      if (latestPause && job.resumeOf !== latestPause.jobId) {
-        await deps.store.requestJobStop(job, { requestedAt: now(), by: latestPause.by, reason: 'Workflow was stopped during dispatch' }, [number]);
-      }
       // From here a microVM may exist: the reservation is no longer reclaimable as a launch that
       // never got this far.
       await deps.store.markLaunching(jobId);
@@ -584,6 +582,11 @@ export function createLauncher(deps: LaunchDeps) {
       if (recorded && err instanceof WorkflowPausedError) {
         const stopped = await deps.store.requestJobStop(job, { requestedAt: now(), by: 'workflow control', reason: 'Workflow paused before launch admission' }, []);
         if (stopped && deps.stopJob) await deps.stopJob(stopped);
+        else if (await deps.store.cancelReservation(reservation, 'reserved') === 'cancelled') {
+          await deps.store.finishJob(jobId, 'canceled');
+          await deps.store.recordJobStop(job, { confirmedAt: now() });
+          await deps.store.releaseJob(job);
+        }
         return { status: 202, disposition: 'cancelled', jobId };
       }
       if (native && !recorded && err instanceof NativeEnqueueRejectedError) {

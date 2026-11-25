@@ -26,10 +26,11 @@ const store = createDynamoStore(process.env.TABLE_NAME ?? '');
 const microvms = new LambdaMicrovmsClient({});
 
 const nativeWorker = nativeAws(store);
+const workflows = createWorkflowRecorder({ store: createDynamoWorkflowStore(process.env.TABLE_NAME ?? '') });
 const reconcile = createReconciler({
   store,
-  stop: awsJobStopper(store, nativeWorker.control),
-  workflows: createWorkflowRecorder({ store: createDynamoWorkflowStore(process.env.TABLE_NAME ?? '') }),
+  stop: awsJobStopper(store, nativeWorker.control, workflows),
+  workflows,
   native: nativeWorker.control,
   async microvmState(microvmId) {
     try {

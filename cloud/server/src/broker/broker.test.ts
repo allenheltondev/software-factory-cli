@@ -113,6 +113,18 @@ describe('the job broker', () => {
     for (const action of ['start', 'credentials', 'github-token']) expect(await handle({ action, jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
     expect(assumeRole).not.toHaveBeenCalled(); expect(github.createInstallationToken).not.toHaveBeenCalled();
   });
+  it('refuses atomic start if a source-issue pause lands after the broker servable read', async () => {
+    job = { ...job, issue: 12 }; await store.putJob(job);
+    const owner = { ...job, jobId: 'job_owner0001' }; await store.putJob(owner);
+    const start = store.startJob;
+    vi.spyOn(store, 'startJob').mockImplementationOnce(async (...args) => {
+      await store.requestJobStop(owner, { requestedAt: clock, by: 'pat', reason: 'pause source' }, [12]);
+      return start(...args);
+    });
+    expect(await handle({ action: 'start', jobId: job.jobId, token })).toEqual({ ok: false, error: 'refused' });
+    expect((await store.getJob(job.jobId))?.startedAt).toBeUndefined();
+    expect(assumeRole).not.toHaveBeenCalled(); expect(github.createInstallationToken).not.toHaveBeenCalled();
+  });
 
   it("marks the tenant's first job when a job starts, once", async () => {
     expect((await store.getTenant(55))?.firstJobAt).toBeUndefined();

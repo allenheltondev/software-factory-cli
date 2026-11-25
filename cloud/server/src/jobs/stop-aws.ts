@@ -2,9 +2,9 @@ import { GetMicrovmCommand, LambdaMicrovmsClient, ResourceNotFoundException, Ter
 import type { Store } from '../store/store.js';
 import { createJobStopper } from './stop.js';
 
-export function awsJobStopper(store: Store, native: Parameters<typeof createJobStopper>[0]['native']) {
+export function awsJobStopper(store: Store, native: Parameters<typeof createJobStopper>[0]['native'], workflows?: Parameters<typeof createJobStopper>[0]['workflows']) {
   const client = new LambdaMicrovmsClient({ maxAttempts: 2 });
-  return createJobStopper({ store, native,
+  return createJobStopper({ store, native, workflows,
     async terminateMicrovm(id) { await client.send(new TerminateMicrovmCommand({ microvmIdentifier: id })); },
     async microvmState(id) {
       try { return (await client.send(new GetMicrovmCommand({ microvmIdentifier: id }))).state ?? 'UNKNOWN'; }

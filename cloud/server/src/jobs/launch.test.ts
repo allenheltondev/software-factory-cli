@@ -114,6 +114,20 @@ describe('the launcher', () => {
     expect(await store.listActiveJobs()).toHaveLength(1);
     expect(await createLauncher(deps)(request())).toMatchObject({ reason: 'workflow_paused' });
   });
+  it('does not provision a sibling VM when the source issue is stopped after routing checks', async () => {
+    const owner = await createLauncher(deps)(request({}, 'parent-delivery'));
+    const parent = (await store.getJob(owner.jobId!))!;
+    const mark = store.markLaunching;
+    vi.spyOn(store, 'markLaunching').mockImplementationOnce(async (id) => {
+      await store.requestJobStop(parent, { requestedAt: NOW, by: 'pat', reason: 'stop workflow' }, [12]);
+      return mark(id);
+    });
+    const result = await createLauncher(deps)(request({}, 'racing-delivery'));
+    expect(result).toMatchObject({ disposition: 'cancelled' });
+    expect(runs).toHaveLength(1); // only the parent, never the racing sibling
+    expect((await store.getJob(result.jobId!))?.outcome).toBe('canceled');
+    expect(await store.getWorkflowPause(55, 9, 12)).toMatchObject({ jobId: parent.jobId });
+  });
 
   it('routes a console-selected Claude trigger without a stack repository and refuses offline fallback', async () => {
     const version = await store.createConfigVersion(55, { sha256: 'y', files: [], publishedBy: 's', publishedAt: '',

@@ -10,13 +10,14 @@ export interface StopResult {
 
 export const stopSubjects = workflowSubjects;
 
-export async function workflowIsPaused(store: Store, job: Pick<Job, 'installationId' | 'repositoryId' | 'issue' | 'pullRequest' | 'workflowIssue' | 'resumeOf'>): Promise<boolean> {
+export async function workflowPause(store: Pick<Store, 'getWorkflowPause'>, job: Pick<Job, 'installationId' | 'repositoryId' | 'issue' | 'pullRequest' | 'workflowIssue' | 'resumeOf'>) {
   for (const subject of stopSubjects(job)) {
     const pause = await store.getWorkflowPause(job.installationId, job.repositoryId, subject);
-    if (pause && pause.jobId !== job.resumeOf) return true;
+    if (pause && pause.jobId !== job.resumeOf) return pause;
   }
-  return false;
+  return null;
 }
+export async function workflowIsPaused(store: Pick<Store, 'getWorkflowPause'>, job: Parameters<typeof workflowPause>[1]): Promise<boolean> { return !!await workflowPause(store, job); }
 
 /** Shared cancellation primitive. Callers authenticate the operator; execution
  * identifiers always come from the store, never from a request body. */
@@ -25,6 +26,7 @@ export function createJobStopper(d: {
   terminateMicrovm(id: string): Promise<void>;
   microvmState(id: string): Promise<string | null>;
   native?: { stop(job: Job): Promise<boolean> };
+  workflows?: import('../workflows/recorder.js').WorkflowRecorder;
   now?: () => number;
   log?: (event: Record<string, unknown>) => void;
 }) {
@@ -59,7 +61,8 @@ export function createJobStopper(d: {
         else ended = (job.launchingAt === undefined && !entry) || now() > job.expiresAt;
       }
       if (ended) {
-        await d.store.finishJob(job.jobId, 'canceled', { at: now() });
+        const outcome = await d.store.finishJob(job.jobId, 'canceled', { at: now() });
+        await d.workflows?.finished(job, outcome ?? 'canceled');
         await d.store.recordJobStop(job, { confirmedAt: now(), error: '' });
         await d.store.releaseJob(job, unusedTime(job, now()));
         log({ jobStop: 'confirmed', jobId: job.jobId, installationId: job.installationId, latencyMs: now() - job.stop.requestedAt });

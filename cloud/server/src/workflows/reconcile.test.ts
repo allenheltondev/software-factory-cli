@@ -20,6 +20,7 @@ const job = (over: Record<string, unknown> = {}) =>
 
 function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; launch?: LaunchResult; engaged?: boolean; jobs?: Record<string, { job?: Partial<Job>; summary?: Partial<JobSummary> }> } = {}) {
   const store = createMemoryWorkflowStore();
+  const controls = { getWorkflowPause: vi.fn(async (_i: number, _r: number, _s: number): Promise<import('../store/store.js').WorkflowPause | null> => null) };
   let clock = T0;
   const now = () => clock;
   const recorder = createWorkflowRecorder({ store, now, log: () => {} });
@@ -35,6 +36,7 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; l
   });
   const reconcile = createWorkflowReconciler({
     store,
+    controls,
     jobs: {
       getJob: async (id: string) => (o.jobs?.[id]?.job as Job | undefined) ?? null,
       getJobSummary: async (_i: number, id: string) => (o.jobs?.[id]?.summary as JobSummary | undefined) ?? null,
@@ -54,10 +56,39 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; l
     await recorder.started(job());
     await recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci', verdict: 'ready-to-merge' } });
   };
-  return { store, recorder, reconcile, github, launch, launched, tick, wf, waitForCi };
+  return { store, controls, recorder, reconcile, github, launch, launched, tick, wf, waitForCi };
 }
 
 describe('workflow reconciliation', () => {
+  it('shows durable source-issue pauses without consuming CI recovery attempts, then resumes after explicit unpause', async () => {
+    const s = setup(); await s.waitForCi(); s.tick(CI_FIRST_CHECK_MS);
+    s.controls.getWorkflowPause.mockImplementation(async (_i, _r, subject) => subject === 7 ? { jobId: 'job_stopped0001', at: T0, by: 'pat' } : null);
+    expect(await s.reconcile()).toMatchObject({ recovered: 0, blocked: 1 });
+    expect(s.launch).not.toHaveBeenCalled(); expect(s.github.commitChecks).not.toHaveBeenCalled();
+    expect(await s.wf()).toMatchObject({ reason: 'workflow_paused', status: 'blocked', controlPause: { jobId: 'job_stopped0001' } });
+    s.controls.getWorkflowPause.mockResolvedValue(null); s.tick(CI_RECHECK_MS);
+    expect(await s.reconcile()).toMatchObject({ recovered: 1 });
+    expect(s.launched[0]).toMatchObject({ workflowIssue: 7 });
+    expect(await s.wf()).not.toHaveProperty('controlPause');
+  });
+  it('gives back CI recovery when an issue stop lands after reservation or at the final launcher gate', async () => {
+    for (const when of ['reservation', 'launcher']) {
+      const s = setup({ launch: { status: 200, disposition: 'not_dispatched', reason: 'workflow_paused' } });
+      await s.waitForCi(); s.tick(CI_FIRST_CHECK_MS);
+      if (when === 'reservation') {
+        const save = s.store.saveWorkflow;
+        vi.spyOn(s.store, 'saveWorkflow').mockImplementationOnce(async (...args) => {
+          const saved = await save(...args);
+          s.controls.getWorkflowPause.mockResolvedValue({ jobId: 'job_stopRace01', at: T0, by: 'pat' });
+          return saved;
+        });
+      }
+      expect(await s.reconcile()).toMatchObject({ recovered: 0 });
+      expect((await s.wf())?.recoveries ?? 0).toBe(0);
+      if (when === 'reservation') expect(s.launch).not.toHaveBeenCalled();
+      else expect(s.launch).toHaveBeenCalledOnce();
+    }
+  });
   it('does nothing before a CI wait is due, and reports what is left due and for how long', async () => {
     const s = setup();
     await s.waitForCi();
@@ -264,7 +295,7 @@ describe('workflow reconciliation', () => {
       const s = setup();
       await s.waitForCi();
       s.tick(CI_FIRST_CHECK_MS);
-      const other = createWorkflowReconciler({ store: s.store, github: s.github, loadSettings: async () => SETTINGS as never, launch: s.launch, appBot: async () => 'updraft[bot]', now: () => T0 + CI_FIRST_CHECK_MS, log: () => {} });
+      const other = createWorkflowReconciler({ store: s.store, controls: s.controls, github: s.github, loadSettings: async () => SETTINGS as never, launch: s.launch, appBot: async () => 'updraft[bot]', now: () => T0 + CI_FIRST_CHECK_MS, log: () => {} });
       await Promise.all([s.reconcile(), other()]);
       expect(s.launched).toHaveLength(1);
       expect(await s.wf()).toMatchObject({ recoveries: 1 });

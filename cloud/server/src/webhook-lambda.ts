@@ -80,7 +80,7 @@ async function imageVersion(): Promise<string | null> {
 }
 
 const nativeWorker = nativeAws(store);
-const stopJob = awsJobStopper(store, nativeWorker.control);
+const stopJob = awsJobStopper(store, nativeWorker.control, workflows);
 
 
 function launcher(): Launcher | undefined {
@@ -286,6 +286,7 @@ async function resumeClaude(installationId: number) {
 // check event is recovered by launching the job it would have started.
 const reconcileWorkflows = createWorkflowReconciler({
   store: workflowStore,
+  controls: store,
   jobs: store,
   github,
   loadSettings,

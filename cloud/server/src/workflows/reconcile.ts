@@ -27,12 +27,14 @@ import type { LoadSettings } from '../github/settings.js';
 import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
 import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import type { Store } from '../store/store.js';
+import { workflowPause } from '../jobs/stop.js';
 import { saveChange, updateWorkflow } from './recorder.js';
 import type { WorkflowStore } from './store.js';
 import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, MAX_CI_RECOVERIES, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
 
 export interface WorkflowReconcilerDeps {
   store: WorkflowStore;
+  controls: Pick<Store, 'getWorkflowPause'>;
   /** The jobs' own records, for a workflow whose job's finish was never recorded on it. */
   jobs?: Pick<Store, 'getJob' | 'getJobSummary'>;
   github: Pick<GitHubApi, 'createInstallationToken' | 'pullRequestHead' | 'commitChecks'>;
@@ -94,6 +96,23 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
         report.blocked++;
       });
     const later = (ms: number) => change(w, (cur) => ({ workflow: { ...cur, nextCheckAt: iso(at + ms), updatedAt: iso(at) } }));
+
+    const pause = await workflowPause(deps.controls, w);
+    if (pause) {
+      const repeated = w.controlPause?.jobId === pause.jobId;
+      await change(w, (cur) => ({ workflow: {
+        ...cur, status: 'blocked', reason: 'workflow_paused', message: `Automation was paused by ${pause.by}. The stopped job and existing pull request are preserved.`,
+        nextAction: `Resume automation or retry from job ${pause.jobId}.`, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at),
+        controlPause: { ...pause, previous: cur.controlPause?.previous ?? { status: cur.status, reason: cur.reason, message: cur.message, nextAction: cur.nextAction } },
+      }, ...(!repeated ? { event: blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, 'An authorized stop paused automatic recovery.') } : {}) }));
+      report.blocked++;
+      return;
+    }
+    if (w.controlPause) {
+      const restored = await change(w, (cur) => ({ workflow: { ...without(cur, 'controlPause', 'reason', 'message', 'nextAction'), ...cur.controlPause!.previous, updatedAt: iso(at) } }));
+      if (!restored) return;
+      w = restored;
+    }
 
     // A job was running, and by now it cannot be: its finish never reached the workflow (a lost
     // response, a write that failed). The job's own record says how it ended.
@@ -218,8 +237,16 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
       return;
     }
     const appBot = await deps.appBot?.();
+    // A pause may have landed while GitHub or the reservation write was in flight.
+    // Do not consume recovery attempts for intentional stops; the launch/start/assignment
+    // transactions are still the authority if a stop races this final read.
+    if (await workflowPause(deps.controls, w)) {
+      await change(reserved, (cur) => ({ workflow: { ...cur, recoveries: attempts, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at) } }));
+      return;
+    }
     const result = await deps.launch({
       installationId: w.installationId,
+      ...(w.issue !== undefined ? { workflowIssue: w.issue } : {}),
       deliveryId,
       eventName: 'check_suite',
       ...(appBot ? { appBot } : {}),
@@ -233,6 +260,10 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     }
     // Every outcome below acts on the reserved workflow, not the one first read.
     w = reserved;
+    if (result.reason === 'workflow_paused') {
+      await change(w, (cur) => ({ workflow: { ...cur, recoveries: attempts, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at) } }));
+      return;
+    }
     // Not now (a quota, a failed launch, jobs paused): the attempt is given back, and the head looked at again later.
     if (TRANSIENT.has(result.disposition)) {
       await change(w, (cur) => ({ workflow: { ...cur, recoveries: attempts, nextCheckAt: iso(at + CI_RECHECK_MS), updatedAt: iso(at) } }));

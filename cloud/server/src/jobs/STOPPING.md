@@ -20,15 +20,28 @@ A transaction writes the first operator, reason and timestamp to the job and its
 summary, sets the attempt's `stopRequestedAt`, and pauses dispatch for its source
 issue/PR and any recorded PR alias. Repeated requests retain the first audit record.
 The broker refuses new starts, credentials and GitHub publication tokens. The
-launcher checks workflow pauses; `markLaunching` and `startJob` check the attempt
-fence. A human stop never changes the platform kill switch.
+launcher checks workflow pauses; `markLaunching`, `startJob` and native assignment
+condition their own transactions on every applicable issue/PR pause key, as well as
+the attempt fence. Native assignment also checks the exact idle worker version and
+queue entry, attaching the VM and deleting the queue entry in that transaction. A
+queued cancellation that wins prevents assignment; an assignment that wins retains
+its capacity until trusted cleanup or physical termination is confirmed. A human
+stop never changes the platform kill switch.
+
+Admission transactions define the sibling boundary. A sibling whose launch admission
+committed before the pause may have an in-flight VM request; registration detects the
+pause and retires that sibling without replacing the original owner's pause. It
+cannot subsequently pass broker start. A sibling already executing before the pause
+is not the target of this per-job stop; future starts and credential grants are
+refused, and no unrelated shared session is killed. In-flight external calls are
+subject to the credential/write limits below.
 
 Already-issued GitHub tokens and STS credentials remain valid until expiry.
 Termination ends their use by the target execution; broker refusal alone does not
 revoke them. A GitHub write already in flight may complete. Stops do not undo
 external writes, delete commits or PRs, or force-push human changes. The fuller
-trusted-publisher boundary in #134 and stable workflow reconciliation in #135/#139
-remain companion work.
+trusted-publisher boundary in #134 and checkpoint-aware resume in #135 remain
+companion work. This PR is stacked on #154's stable workflow records and recovery.
 
 Standard jobs terminate only the VM recorded by the server. A late VM registration
 immediately advances a pending stop. A reservation canceled before `markLaunching`
@@ -42,8 +55,9 @@ The root runner signals and reaps the process group. The signed-in session is re
 only after trusted server settlement; a forced root-runner kill never permits reuse.
 After the 60-second grace period or lease expiration, reconciliation fences the exact
 active worker assignment and requests termination. A queued or old completed job
-cannot terminate a worker doing other work. Forced termination is recorded as needing
-Claude reconnection. An uncertain/missing assignment retains capacity and reports an
+cannot terminate a worker doing other work. Reconnect guidance is recorded only after
+the fenced VM is confirmed terminated; a failed fence CAS or cooperative settlement
+does not report reconnect. An uncertain/missing assignment retains capacity and reports an
 error instead of guessing which VM to kill.
 
 The console polls status and keeps **Stopping…** visible even if the runner has
@@ -58,7 +72,13 @@ milliseconds for log-based alarms and stop-latency metrics.
 ## Recovery
 
 Intentionally stopped work stays paused across redelivery, relabeling, PR events and
-CI events. Owner-authorized **Resume automation** removes only pauses owned by this
+CI events, including #154's missed-event recovery. The workflow reconciler displays
+`workflow_paused` and defers without reading CI or spending recovery attempts; it
+also checks again after reserving a recovery and gives the attempt back if a stop
+wins the final launcher gate. Durable issue/PR provenance is carried through recovery
+even after the originating job expires. A canceled workflow remains explicitly
+blocked as `job_canceled`, rather than being mistaken for a missed finish or an
+ordinary CI wait. Owner-authorized **Resume automation** removes only pauses owned by this
 stopped job, atomically with a resume audit; it cannot clear a newer stop. It permits
 future GitHub events and leaves this attempt stopped. It does not replay work,
 reevaluate the same PR head immediately, reopen a closed PR, or implement #135's

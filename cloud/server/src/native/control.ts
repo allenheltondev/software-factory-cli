@@ -85,20 +85,25 @@ export function createNativeControl(d: NativeControlDeps) {
   }
   async function finishSettlement(w: Worker, job: Job): Promise<boolean> {
     if (job.status !== 'finished' || w.settling?.jobId !== job.jobId) return false;
+    if (w.fenced) return fence(w);
     // Retain the durable marker through partial failures. Completion retries and
     // reconciliation can repeat releaseJob safely, then make the worker available.
-    if (job.stop) await d.store.recordJobStop(job, { confirmedAt: now(), error: '', reconnectRequired: false });
+    if (job.stop) await d.store.recordJobStop(job, { confirmedAt: now(), error: '' });
     await d.store.releaseJob(job, unusedTime(job, now()));
+    const reused = async () => {
+      if (job.stop) await d.store.recordJobStop(job, { reconnectRequired: false });
+      return true;
+    };
     for (let attempt = 0; attempt < COMPLETE_ATTEMPTS; attempt++) {
       const next = { ...w, version: w.version + 1, lastWorkAt: now() };
       delete next.settling;
-      if (await d.workers.put(next, w.version)) return true;
+      if (await d.workers.put(next, w.version)) return reused();
       // The runner's terminate, the dispatcher's settled and reconciliation all finish the same
       // settlement. Losing that race is not a failure: if this exact session and VM no longer
       // hold the job in any form, the release above is confirmed and the worker is free (#144).
       const fresh = await d.workers.get(w.installationId, w.workerId);
       const same = !!fresh && fresh.session === w.session && fresh.microvmId === w.microvmId && !fresh.fenced;
-      if (same && fresh.settling?.jobId !== job.jobId && fresh.active?.jobId !== job.jobId) return true;
+      if (same && fresh.settling?.jobId !== job.jobId && fresh.active?.jobId !== job.jobId) return reused();
       // Fenced, replaced, or reassigned: uncertain, so fail closed.
       if (!same || fresh.settling?.jobId !== job.jobId) return false;
       w = fresh; // still settling this job; another write moved the version on
