@@ -200,6 +200,32 @@ function lastAssistantText(events: Record<string, unknown>[]): string | null {
   return null;
 }
 
+/** What a model name has to look like to be reported: no spaces, paths or markup. */
+const MODEL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:@+/[\]-]{0,127}$/;
+
+/**
+ * The model Claude Code reported for the main conversation: the newest main-conversation
+ * `assistant` message's API `message.model` (subagents carry a parent_tool_use_id and may run
+ * another model), else the `system` `init` message's `model`. Null when neither is in the output.
+ */
+export function reportedModel(output: string): string | null {
+  const lines = output.split(/\r?\n/);
+  let init: string | null = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes('"model"')) continue;
+    const ev = parseLine(line);
+    if (!ev) continue;
+    if (ev.type === 'assistant' && !ev.parent_tool_use_id) {
+      const model = (ev.message as { model?: unknown } | undefined)?.model;
+      if (typeof model === 'string' && MODEL_NAME.test(model)) return model;
+    } else if (ev.type === 'system' && ev.subtype === 'init' && init === null && typeof ev.model === 'string' && MODEL_NAME.test(ev.model)) {
+      init = ev.model;
+    }
+  }
+  return init;
+}
+
 export const claudeAdapter: AgentAdapter = {
   name: 'claude',
 
@@ -267,6 +293,10 @@ export const claudeAdapter: AgentAdapter = {
     if (result) return result.subtype === 'success' && !result.is_error && typeof result.result === 'string' ? result.result : null;
     // No JSON at all: plain text output was chosen in agents.<name>.args.
     return scan(output).events.length ? null : undefined;
+  },
+
+  observedModel(output: string): string | null {
+    return reportedModel(output);
   },
 
   summarizeOutput(output: string): string[] | null {

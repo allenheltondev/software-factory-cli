@@ -2,8 +2,11 @@
 // check passes, it comments once on the source issue as the active GitHub identity, so the issue
 // shows which agent was assigned and which local job and run to look up.
 //
-// The comment carries only what the worker itself knows: agent name, job id, run id and pool. No
-// prompt, path or log. It says "assigned", so it stays true if the run later fails.
+// The comment carries only what the worker itself persisted when it claimed the run
+// (run-details.ts): the routing decision (complexity, capability tier, reason), the profile, its
+// adapter, configured model and effort, the pool, and the job and run ids. No prompt, path or log.
+// It is posted after routing and selection, so it never claims a choice that was not made, and it
+// says "assigned", so it stays true if the run later fails.
 //
 // Delivery is independent of the run: the caller does not wait for it, it never throws, and a
 // failure is only logged and recorded as an error. Idempotent by run id: a hidden marker carries
@@ -16,7 +19,7 @@ import { GitHubError, type GitHubApi } from '../github/api.js';
 import { GitHubAppError } from '../github/app-auth.js';
 import type { Job, Run } from '../types.js';
 import type { Logger } from '../util/log.js';
-import { runDetails, type RunDetails } from './run-details.js';
+import { runDetails, UNKNOWN, type RunDetails } from './run-details.js';
 
 /** Writes tried per assignment (the first plus retries of transient failures). */
 export const ASSIGNMENT_MAX_ATTEMPTS = 4;
@@ -97,17 +100,23 @@ export function renderAssignmentComment(o: {
 }): string {
   const url = consoleJobUrl(o.console);
   const cloudId = o.console?.cloudJobId ?? '';
-  const rows: Array<[string, string]> = [['Worker', codeCell(o.details.worker)]];
-  const kind = o.details.modelKind ? 'configured' : null;
-  rows.push([`Model${kind ? ` (${kind})` : ''}`, codeCell(o.details.model)]);
-  rows.push(['Complexity', codeCell(o.details.complexity)]);
+  const d = o.details;
+  // The order of the issue's example (#140): what was decided about the issue, then what runs it.
+  const rows: Array<[string, string]> = [['Status', 'Assigned']];
+  if (d.attempt) rows.push(['Attempt', cell(d.attempt)]);
+  rows.push(['Complexity', codeCell(d.complexity)], ['Capability tier', codeCell(d.tier ?? UNKNOWN)], ['Worker', codeCell(d.worker)]);
+  if (d.adapter) rows.push(['Adapter', codeCell(d.adapter)]);
+  // Nothing has been observed at assignment: a known model is the configured one.
+  rows.push([`Model${d.modelKind ? ' (configured)' : ''}`, codeCell(d.model)]);
+  rows.push(['Reasoning effort', codeCell(d.effort ?? UNKNOWN)], ['Pool', codeCell(o.pool)]);
+  if (d.reason) rows.push(['Routing reason', cell(d.reason)]);
   if (url && cloudId === o.jobId) {
     rows.push(['Job ID', `[${cell(o.jobId).replace(/[[\]]/g, '\\$&')}](${url})`]);
   } else {
     rows.push(['Job ID', codeCell(o.jobId)]);
     if (url) rows.push(['Updraft job', `[${cell(cloudId).replace(/[[\]]/g, '\\$&')}](${url})`]);
   }
-  rows.push(['Run ID', codeCell(o.runId)], ['Pool', codeCell(o.pool)]);
+  rows.push(['Run ID', codeCell(o.runId)]);
   return [
     'Updraft assigned a worker to this issue.',
     '',

@@ -59,12 +59,20 @@ export const MAX_STEPS = 24;
 export interface JobRouting {
   source: 'pool' | 'tier' | 'fixed';
   pool?: string;
+  /** The capability tier that ran (after any escalation). */
   tier?: string;
+  /** The tier the router chose at enqueue; differs from `tier` after an escalation. */
+  requestedTier?: string;
+  /** Why the route is what it is, as the CLI's fixed code (override-label, confident, triage-answered, ...); never free text. */
+  reason?: string;
   risk?: string;
   confidence?: number;
   hops?: number;
 }
 const CODE = /^[a-z][a-z_-]{0,39}$/;
+const TIERS: readonly string[] = ['routine', 'standard', 'complex', 'high-risk'];
+/** The CLI's route reason codes (src/db/metrics.ts routeReasonCode). */
+const ROUTE_REASONS: readonly string[] = ['default', 'legacy-label', 'override-label', 'confident', 'low-confidence', 'triage-answered', 'triage-cached', 'triage-unavailable'];
 const AGENT = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const count = (v: unknown, max: number) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= max ? v : undefined);
 
@@ -74,7 +82,9 @@ export function routingOf(raw: unknown): JobRouting | undefined {
   if (r.source !== 'pool' && r.source !== 'tier' && r.source !== 'fixed') return undefined;
   const out: JobRouting = { source: r.source };
   if (typeof r.pool === 'string' && AGENT.test(r.pool)) out.pool = r.pool;
-  if (typeof r.tier === 'string' && ['routine', 'standard', 'complex', 'high-risk'].includes(r.tier)) out.tier = r.tier;
+  if (typeof r.tier === 'string' && TIERS.includes(r.tier)) out.tier = r.tier;
+  if (typeof r.requestedTier === 'string' && TIERS.includes(r.requestedTier)) out.requestedTier = r.requestedTier;
+  if (typeof r.reason === 'string' && ROUTE_REASONS.includes(r.reason)) out.reason = r.reason;
   if (typeof r.risk === 'string' && ['low', 'medium', 'high'].includes(r.risk)) out.risk = r.risk;
   if (typeof r.confidence === 'number' && r.confidence >= 0 && r.confidence <= 1) out.confidence = r.confidence;
   const hops = count(r.hops, 100);

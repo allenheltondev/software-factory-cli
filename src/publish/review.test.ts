@@ -577,6 +577,8 @@ describe('findings as threads', () => {
     expect(s.gh.writes).toEqual([`review #${PR} COMMENT at ${H1} with 1 inline`]);
     const body = s.gh.reviews[0]!.body;
     expect(body).toContain(`**Review agent · Round 1 · reviewed \`${H1.slice(0, 12)}\`**`);
+    // What ran the review. This run was recorded without a claim, so no selection: nothing is claimed.
+    expect(body).toContain('<sub>Profile `codex` · model `Unknown` · effort `Unknown`</sub>');
     expect(body).toContain("I found 2 blockers and 1 suggestion. I'm requesting a revision before this is ready.");
     expect(body).toContain('- **Blocker F1** · Generation not checked · `src/a.ts` line 3: in its thread on the diff');
     expect(body).toContain("- **Blocker F2** · Docs are stale · `docs/pool.md` line 10 (the file is not part of this pull request's change)");
@@ -1576,6 +1578,11 @@ describe('acceptance criteria', () => {
     expect(body).toContain(`- **Verified** · \`${c}\` · Tests cover the race (ticked in the issue, not evidence)`);
     expect(body).toContain(`[\`src/a.ts:3\`](https://github.com/${FULL}/blob/${H1}/src/a.ts#L3)`);
     expect(body).not.toContain('"criteria"');
+    // Both behaviors in one review (#140 with #163): who ran it, then the override, the findings,
+    // the checklist and what happens next, in that order.
+    const order = ['<sub>Profile `codex`', 'Updraft: the reviewer wrote ready to merge', '**Findings**', '**Acceptance criteria**'].map((t) => body.indexOf(t));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((x, y) => x - y));
     const revision = revisionOf(getJob(s.db, getPrReview(s.db, first.runId)!.revisionJobId!)!)!;
     expect(revision.acceptance).toEqual([{ id: d, text: 'Docs describe the generation check', status: 'unmet', gate: 'code', note: 'docs/pool.md is unchanged' }]);
     await s.mergeStep();
@@ -1639,6 +1646,11 @@ describe('acceptance criteria', () => {
     const body = s.gh.reviews[0]!.body;
     expect(body).toContain('**Review agent · Round 1');
     expect(body).toContain(`- **Not met** · \`${a}\``);
+    // The selection line sits under the headline, before the findings and the checklist.
+    const at = (t: string) => body.indexOf(t);
+    expect(at('<sub>Profile `codex`')).toBeGreaterThan(at('**Review agent · Round 1'));
+    expect(at('<sub>Profile `codex`')).toBeLessThan(at('**Findings**'));
+    expect(at('**Findings**')).toBeLessThan(at(`- **Not met** · \`${a}\``));
     const revision = revisionOf(getJob(s.db, getPrReview(s.db, runId)!.revisionJobId!)!)!;
     expect(revision.findings).toHaveLength(3);
     expect(revision.acceptance!.map((x) => [x.id, x.status])).toEqual(snap.criteria.map((x) => [x.id, x.id === a ? 'unmet' : 'unverified']));

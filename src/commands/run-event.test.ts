@@ -104,7 +104,7 @@ function world(): World {
 }
 
 /** One microVM: its own state directory, config and event file. */
-function vm(w: World, name: string, o: { mode?: string; agentMode?: string; payload?: unknown; repo?: Record<string, unknown>; configure?: boolean } = {}) {
+function vm(w: World, name: string, o: { mode?: string; agentMode?: string; payload?: unknown; repo?: Record<string, unknown>; agent?: Record<string, unknown>; configure?: boolean } = {}) {
   const home = join(w.f.root, name);
   mkdirSync(join(home, 'prompts'), { recursive: true });
   writeFileSync(join(home, 'prompts', 'implement.md'), 'Implement the issue below.\n');
@@ -125,6 +125,7 @@ function vm(w: World, name: string, o: { mode?: string; agentMode?: string; payl
           GIT_COMMITTER_NAME: 'Fake Agent',
           GIT_COMMITTER_EMAIL: 'agent@example.com',
         },
+        ...o.agent,
       },
     },
     pools: { general: { agents: ['claude'] } },
@@ -328,6 +329,56 @@ describe('updraft run-event, end to end', { timeout: 120_000 }, () => {
     expect(remoteHead(w.f, BRANCH)).toBe(raced);
     // Only the assignment comment: nothing was pushed or opened.
     expect(w.gh.writes).toEqual([`comment #${ISSUE}`]);
+  });
+
+  // #140: the hosted path (one event, one run-event) routes the issue, claims the run, and only then
+  // posts the assignment: it carries the persisted decision, and the summary the runner hands
+  // Cloud carries the same route.
+  it('a tier-routed event posts the routing decision and the selection actually made', async () => {
+    const w = world();
+    w.gh.issueState = { labels: [LABEL, 'architecture'] };
+    const one = vm(w, 'vm tiers', {
+      agent: { model: 'opus', effort: 'high' },
+      repo: {
+        workflows: [
+          {
+            id: 'wf',
+            trigger: { event: 'issue.labeled', label: LABEL },
+            action: 'implement-issue',
+            pool: 'general',
+            tiers: { pools: { routine: 'general', standard: 'general', complex: 'general' } },
+          },
+        ],
+      },
+    });
+    const r = await one.run();
+    expect(r.summary).toMatchObject({ outcome: 'succeeded', routing: { source: 'tier', pool: 'general', tier: 'complex', requestedTier: 'complex', reason: 'confident', hops: 0 } });
+    const assignment = w.gh.comments.find((c) => c.body.includes('<!-- updraft-run-assigned: '))!.body;
+    expect(assignment).toContain(
+      [
+        '| Status | Assigned |',
+        '| Complexity | `complex` |',
+        '| Capability tier | `complex` |',
+        '| Worker | `claude` |',
+        '| Adapter | `claude` |',
+        '| Model (configured) | `opus` |',
+        '| Reasoning effort | `high` |',
+        '| Pool | `general` |',
+        '| Routing reason | local classifier |',
+      ].join('\n'),
+    );
+    expect(assignment).not.toContain('observed');
+    expect(w.gh.comments.filter((c) => c.body.includes('<!-- updraft-run-assigned: '))).toHaveLength(1);
+  });
+
+  it('without tiers it says routing is off instead of claiming a classification', async () => {
+    const w = world();
+    const r = await vm(w, 'vm untiered').run();
+    expect(r.summary).toMatchObject({ outcome: 'succeeded', routing: { source: 'pool', pool: 'general' } });
+    expect(r.summary.routing).not.toHaveProperty('tier');
+    const assignment = w.gh.comments.find((c) => c.body.includes('<!-- updraft-run-assigned: '))!.body;
+    expect(assignment).toContain('| Complexity | `Not classified (tier routing off)` |\n| Capability tier | `Not applicable (tier routing off)` |');
+    expect(assignment).toContain('| Model | `CLI default` |\n| Reasoning effort | `CLI default` |');
   });
 });
 

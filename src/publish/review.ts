@@ -50,6 +50,7 @@ import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type Revi
 import { findRepoConfig } from '../worker/executor.js';
 import { evaluateCiAll, postCiNotices } from './ci.js';
 import { code } from './failure-comment.js';
+import { runDetails, selectionLine } from './run-details.js';
 import { evaluateAutoMerges, postMergeNotices } from './merge.js';
 import { safeMarkdown } from './markdown.js';
 import {
@@ -107,6 +108,8 @@ export function renderReview(o: {
   override?: string | null;
   /** The acceptance checklist (acceptance.ts), if the review had criteria to assess. */
   acceptance?: string | null;
+  /** What ran the review (run-details.ts selectionLine): fixed words and inline code only. */
+  selection?: string;
 }): string {
   const marker = reviewMarker(o.runId);
   const body = [
@@ -115,6 +118,7 @@ export function renderReview(o: {
     `Automated review of commit ${code(short(o.headSha))} by agent ${inline(o.agent)} (run ${code(o.runId)}). It is posted as a comment because the ` +
       'account that opened a pull request cannot approve or request changes on it; the verdict itself is recorded by the worker.',
     '',
+    ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
     ...(o.override ? [`Updraft: the reviewer wrote ready to merge, but ${inline(o.override)}, so this counts as changes requested.`, ''] : []),
     '**Findings**',
     '',
@@ -207,6 +211,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
   const check = eligibility(deps, runId);
   if (!check.ok) return { status: 'not-eligible', reason: check.reason };
   const { run, job, request, result, repoFullName, repo } = check.e;
+  const selection = selectionLine(runDetails(deps.db, job, run));
   const prNumber = request.pullRequest.number;
   const headSha = result.headSha;
   const repoRef = { id: job.repoId, fullName: repoFullName };
@@ -366,6 +371,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
               next: checklist ? `${checklist}\n\n${next}` : next,
               marker,
               maxBody: MAX_BODY,
+              selection,
             });
           if (plan.inline.length) {
             try {
@@ -384,7 +390,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
           // A block that was read (it held only criteria) is not shown as raw JSON: the checklist says it.
           const findings = reading.structured ? reading.prose : result.findings;
           posted = await create({
-            body: renderReview({ runId, agent: run.agent, verdict, headSha, findings, next, override: acceptanceOverride, acceptance: checklist }),
+            body: renderReview({ runId, agent: run.agent, verdict, headSha, findings, next, override: acceptanceOverride, acceptance: checklist, selection }),
             commitId: headSha,
           });
         }

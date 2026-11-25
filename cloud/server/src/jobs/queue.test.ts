@@ -500,6 +500,16 @@ describe('the admission queue', () => {
     expect(handed).not.toContain('Started');
   });
 
+  it('says at Started that routing has not chosen anything yet, and names no worker or model (#140)', () => {
+    const e = { jobId: 'job_aaaaaaaaaaaaaaaa', installationId: 55, enqueuedAt: NOW, expiresAt: NOW + QUEUE_EXPIRY_MS, state: 'admitted', reason: 'concurrent_jobs', issue: 2, outcome: { at: NOW + 60_000, reason: 'admitted', message: 'Started.' } } as QueueEntry;
+    const started = queueComment(e);
+    expect(started).toContain('**Status:** Started · queued for 1 minute');
+    expect(started).toContain('Complexity, capability tier, worker, model and effort are chosen when the job runs; the assignment comment that follows names them.');
+    expect(started).not.toMatch(/\| (Worker|Model)|Assigned/);
+    const pr = queueComment({ ...e, issue: undefined, pullRequest: 4 });
+    expect(pr).toContain('the review or revision it posts names them.');
+  });
+
   describe('waiting is not failing (review of #164)', () => {
     it('never spends admission attempts on capacity waits: a long wait, then one transient error, is retried, not refused', async () => {
       const launch = createLauncher(deps());
