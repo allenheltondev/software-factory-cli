@@ -6,11 +6,13 @@ import net from 'node:net';
 import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { IMAGE, DEFAULT_SOCKET, MAX_FRAME, loadConfig, claudeEnv, validateRun, claudeArgs, checkInventory, trustedFile } from './policy.mjs';
+import { IMAGE, DEFAULT_SOCKET, MAX_FRAME, DEFAULT_TOOL_TIMEOUT_SECONDS, EGRESS_SOCKET, loadConfig, claudeEnv, validateRun, claudeArgs, checkInventory, trustedFile, withEgress, networkNote } from './policy.mjs';
+import { createEgressProxy, parseEgressConfig } from '../image/sandbox/egress-proxy.mjs';
 import { frames, send } from './protocol.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const sandbox = path.resolve(here, '../image/sandbox/updraft-sandbox.mjs');
+const egressProxyModule = path.resolve(here, '../image/sandbox/egress-proxy.mjs');
 
 export function identityCommand(uid, gid, file, args) {
   return ['/usr/bin/setpriv', ['--reuid', String(uid), '--regid', String(gid), '--clear-groups', '--no-new-privs', '--pdeathsig', 'SIGKILL', '--', file, ...args]];
@@ -62,7 +64,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   if (process.platform !== 'linux' || process.getuid() !== 0) throw new Error('native worker supervisor requires Linux root');
   process.umask(0o077);
   storageProbe(c);
-  for (const file of [process.execPath, '/usr/bin/setpriv', sandbox, ...['service.mjs', 'mcp.mjs', 'policy.mjs', 'protocol.mjs'].map((n) => path.join(here, n))]) trustedFile(file);
+  for (const file of [process.execPath, '/usr/bin/setpriv', sandbox, ...(c.egress ? [egressProxyModule, c.egress.shim] : []), ...['service.mjs', 'mcp.mjs', 'policy.mjs', 'protocol.mjs'].map((n) => path.join(here, n))]) trustedFile(file);
   const { nativeClaudeAuthFromStatus } = await import(pathToFileURL(c.authModule).href);
   const environment = claudeEnv(c);
   const root = path.dirname(socketPath);
@@ -82,6 +84,37 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   const sandboxEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8',
     UPDRAFT_SANDBOX_CONFIG: c.sandboxConfig, UPDRAFT_SANDBOX_RUNTIME_DIR: sandboxState };
   const track = (child) => { children.add(child); child.once('close', () => children.delete(child)); return child; };
+  // Registry egress (#147): a root proxy on a Unix socket in a directory only the job
+  // identity's group can traverse. Sandboxed commands keep --network none and reach it
+  // through the in-sandbox shim. Claude itself (another identity) cannot open the socket.
+  const toolTimeoutMs = (c.toolTimeoutSeconds ?? DEFAULT_TOOL_TIMEOUT_SECONDS) * 1000;
+  let egress;
+  let egressProxy;
+  if (c.egress) {
+    const policy = parseEgressConfig(c.egress);
+    const dir = `${scratch}/egress`;
+    fs.mkdirSync(dir, { mode: 0o710 });
+    fs.chownSync(dir, 0, c.workerGid);
+    fs.chmodSync(dir, 0o710); // the umask above would leave it 0700, closed to the job identity
+    egressProxy = createEgressProxy({ rules: policy.rules, limits: policy.limits }, {
+      // Decisions only: target, reason and byte counts, never request or payload bytes.
+      log: (record) => process.stdout.write(`${JSON.stringify(record)}\n`),
+    });
+    const socketFile = `${dir}/${EGRESS_SOCKET}`;
+    try {
+      // Linux truncates a longer Unix socket path silently; the shim would then find nothing.
+      if (Buffer.byteLength(socketFile) > 100) throw new Error('egress socket path is too long for a Unix socket');
+      await new Promise((resolve, reject) => { egressProxy.server.once('error', reject); egressProxy.server.listen(socketFile, resolve); });
+      fs.chownSync(socketFile, 0, c.workerGid);
+      fs.chmodSync(socketFile, 0o660);
+    } catch (error) {
+      await egressProxy.close().catch(() => {});
+      fs.rmSync(scratch, { recursive: true, force: true });
+      throw error;
+    }
+    egress = { dir, shim: policy.shim, node: process.execPath };
+  }
+  const closeEgress = async () => { if (egressProxy) await egressProxy.close(); };
   const sandboxChild = (args) => track(startAs(c.workerUid, c.workerGid, process.execPath, [sandbox, ...args], { env: sandboxEnv, stdio: ['pipe', 'pipe', 'pipe'] }));
   // The credential home lock excludes a second supervisor in either storage mode.
   // This file contains no credentials. Never use an expiring directory lock that can
@@ -92,9 +125,9 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     lease.once('error', reject);
     lease.once('exit', () => reject(new Error('credential home already leased or lock unavailable')));
     lease.stdout.once('data', (data) => data.toString() === 'ready' ? resolve() : reject(new Error('credential lease failed')));
-  }).catch((error) => { lease.stdin.destroy(); fs.rmSync(scratch, { recursive: true, force: true }); throw error; });
+  }).catch(async (error) => { lease.stdin.destroy(); await closeEgress(); fs.rmSync(scratch, { recursive: true, force: true }); throw error; });
   let closing = false;
-  lease.once('exit', () => { if (!closing) { for (const client of clients) client.destroy(); for (const child of children) kill(child); server.close(); } });
+  lease.once('exit', () => { if (!closing) { for (const client of clients) client.destroy(); for (const child of children) kill(child); server.close(); void closeEgress(); } });
   const releaseLease = async () => {
     closing = true;
     if (lease.exitCode !== null) return;
@@ -115,8 +148,8 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
 
   async function executeTool(runArgs, run, command, sessionChildren) {
     if (typeof command !== 'string' || command.length > 65536 || command.includes('\0')) throw new Error('invalid tool command');
-    const args = [...runArgs.slice(0, -run.command.length), '/bin/sh', '-c', command];
-    // Every tool gets the SAME mounts, uid, empty network and temporary HOME as verification.
+    const args = withEgress(runArgs, run, ['/bin/sh', '-c', command], egress);
+    // Every tool gets the SAME mounts, uid, empty network (registry proxy only) and temporary HOME as verification.
     const child = sandboxChild(['run', ...args]);
     sessionChildren.add(child);
     child.stdin.end();
@@ -136,7 +169,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       });
       child.once('error', () => { limited = true; });
       child.once('close', finish);
-      timer = setTimeout(() => { limited = true; kill(child); }, 120000);
+      timer = setTimeout(() => { limited = true; kill(child); }, toolTimeoutMs);
     });
   }
 
@@ -163,7 +196,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
         if (request.method === 'initialize') {
           reply({ protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'updraft', version: '0.1.0' } });
         } else if (request.method === 'ping') reply({});
-        else if (request.method === 'tools/list') reply({ tools: [{ name: 'exec', description: 'Run a shell command in the isolated job worktree. Read/edit files, run git, build and test here. Network is unavailable.',
+        else if (request.method === 'tools/list') reply({ tools: [{ name: 'exec', description: `Run a shell command in the isolated job worktree. Read/edit files, run git, install dependencies, build and test here. Each command may run ${Math.round(toolTimeoutMs / 1000)} seconds. ${networkNote(Boolean(egress))}`,
           inputSchema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'], additionalProperties: false } }] });
         else if (request.method === 'tools/call' && request.params?.name === 'exec' && !busy && initialized) {
           busy = true;
@@ -179,7 +212,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       await auth(dir, sessionChildren);
       if (client.destroyed || failed) return 125;
       const config = JSON.stringify({ mcpServers: { updraft: { command: process.execPath, args: [path.join(here, 'mcp.mjs'), toolSocket] } } });
-      const args = claudeArgs(run.command.slice(1), config);
+      const args = claudeArgs(run.command.slice(1), config, { egress: Boolean(egress) });
       await new Promise((resolve, reject) => { tools.once('error', reject); tools.listen(toolSocket, resolve); });
       // Cancellation can arrive while the socket starts, before a child exists to kill.
       if (client.destroyed || failed) return 125;
@@ -246,8 +279,9 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
             output(version.stdout); return 0;
           }
           if (run.command[0] === 'claude') return await claudeSession(runArgs, run, prompt, client, cancel);
-          // Updraft verification invocations are allowed arbitrary commands, always sandboxed.
-          const child = sandboxChild(args);
+          // Updraft verification invocations are allowed arbitrary commands, always sandboxed,
+          // with the same registry egress as the agent's own tool calls.
+          const child = sandboxChild(['run', ...withEgress(runArgs, run, run.command, egress)]);
           cancel.stop = () => kill(child);
           child.stdin.end(prompt);
           let bytes = 0;
@@ -287,6 +321,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     fs.chmodSync(socketPath, 0o660);
   } catch (error) {
     for (const child of children) kill(child);
+    await closeEgress();
     await releaseLease();
     fs.rmSync(scratch, { recursive: true, force: true });
     throw error;
@@ -305,6 +340,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       for (const child of children) kill(child);
       await Promise.all(ended);
       await new Promise((resolve) => server.close(resolve));
+      await closeEgress();
       await releaseLease();
       fs.rmSync(scratch, { recursive: true, force: true });
     },
