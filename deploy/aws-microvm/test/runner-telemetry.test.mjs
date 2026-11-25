@@ -565,7 +565,7 @@ describe('agent telemetry: structural detail, without content', () => {
     );
     await t.tracer.stop({ outcome: 'succeeded' });
     const spans = t.exporter.spans;
-    expect(one(spans, 'invoke_agent implement / claude-opus').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3 });
+    expect(one(spans, 'invoke_agent review / claude-opus').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3 });
     expect(one(spans, 'updraft post_review').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.outcome': 'revision-queued' });
     expect(one(spans, 'invoke_workflow updraft').attributes).toMatchObject({ 'updraft.review.verdict': 'changes-requested', 'updraft.review.findings': 3, 'updraft.review.outcome': 'revision-queued' });
   });
@@ -689,7 +689,7 @@ describe('agent telemetry: how the agent worked', () => {
     await t.step('run_9', `${header({ runId: 'run_9', kind: 'revision' }).replace('pool: deep', 'follows: run run_5 (review, trace ' + review + ')\npool: deep')}\n`, 0);
     await t.step('run_9', '---- end of agent output ----\noutcome: succeeded\n', 1000);
     await t.tracer.stop({ outcome: 'succeeded' });
-    const agent = one(t.exporter.spans, 'invoke_agent implement / claude-opus');
+    const agent = one(t.exporter.spans, 'invoke_agent revision / claude-opus');
     expect(agent.spanId).toBe(agentSpanIdFor('run_9'));
     expect(agent.links).toEqual([{ traceId: review, spanId: agentSpanIdFor('run_5'), attributes: { 'updraft.link.relation': 'review', 'updraft.run.id': 'run_5' } }]);
     expect(toOtlpSpan(agent).links).toEqual([{ traceId: review, spanId: agentSpanIdFor('run_5'), attributes: [{ key: 'updraft.link.relation', value: { stringValue: 'review' } }, { key: 'updraft.run.id', value: { stringValue: 'run_5' } }] }]);

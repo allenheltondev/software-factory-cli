@@ -170,7 +170,7 @@ describe("Claude Code's own events on the agent span", () => {
     expect(trace.agentEvent(ev('claude_code.api_retries_exhausted', { status_code: 529, attempt: 10 }))).toBe(true);
     trace.line('---- end of agent output ----', 3000);
     trace.close(3000);
-    const agent = spans.find((s) => s.name === 'invoke_agent claude');
+    const agent = spans.find((s) => s.name === 'invoke_agent implement / claude');
     expect(agent.events).toHaveLength(8);
     expect(agent.attributes).toMatchObject({
       'updraft.agent.api_requests': 2,
@@ -204,7 +204,7 @@ describe("Claude Code's own events on the agent span", () => {
     trace.agentEvent(ev('claude_code.api_error', { status_code: 400, error: 'bad request for sk-secret' }));
     trace.agentEvent(ev('claude_code.api_retries_exhausted', { status_code: 529, attempt: 10, error: 'overloaded' }));
     trace.close(3000);
-    const agent = spans.find((s) => s.name === 'invoke_agent claude');
+    const agent = spans.find((s) => s.name === 'invoke_agent implement / claude');
     expect(agent.events.map((e) => e.attributes.error)).toEqual(['bad request for [redacted]', 'overloaded']);
   });
 
@@ -212,7 +212,7 @@ describe("Claude Code's own events on the agent span", () => {
     const { trace, spans } = runTrace();
     for (let i = 0; i < MAX_EVENTS_PER_SPAN + 10; i++) trace.agentEvent(ev('claude_code.api_request', { duration_ms: 1 }));
     trace.close(5000);
-    const agent = spans.find((s) => s.name === 'invoke_agent claude');
+    const agent = spans.find((s) => s.name === 'invoke_agent implement / claude');
     expect(agent.events).toHaveLength(MAX_EVENTS_PER_SPAN);
     expect(agent.attributes['updraft.agent.api_requests']).toBe(MAX_EVENTS_PER_SPAN + 10);
     expect(agent.attributes['updraft.agent.events_dropped']).toBe(10);
