@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'n
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
-import { CloneError, ensureClone, githubCloneUrl, MANAGED_CLONE_KEY, workerNetworkGit } from './clone.js';
+import { CloneError, ensureClone, GC_INTERVAL_MS, githubCloneUrl, housekeepManagedClone, LAST_GC_KEY, MANAGED_CLONE_KEY, workerNetworkGit } from './clone.js';
 import { runGit, type GitOptions } from './git.js';
 import { prepareJobWorktree } from './worktree.js';
 
@@ -38,7 +38,7 @@ describe('ensureClone', { timeout: 60_000 }, () => {
       seen.push({ args, opts });
       return runGit(args, opts);
     };
-    expect(await ensureClone({ checkoutPath, cloneUrl: githubCloneUrl(FULL), runGit: recording })).toEqual({ created: true, managed: true });
+    expect(await ensureClone({ checkoutPath, cloneUrl: githubCloneUrl(FULL), runGit: recording, now: () => 1_000 })).toEqual({ created: true, managed: true });
 
     expect(seen.map((s) => s.args.join(' '))).toEqual([
       'init --quiet',
@@ -46,6 +46,7 @@ describe('ensureClone', { timeout: 60_000 }, () => {
       `config --local ${MANAGED_CLONE_KEY} true`,
       'config --local gc.auto 0',
       'config --local maintenance.auto false',
+      `config --local ${LAST_GC_KEY} 1000`,
     ]);
     // No automatic gc, whose ref packing a contained agent's commit would trigger in a read-only git directory.
     expect(f.git(checkoutPath, 'config', '--get', 'gc.auto')).toBe('0');
@@ -85,6 +86,38 @@ describe('ensureClone', { timeout: 60_000 }, () => {
     // Outside any repository: the fixture root is not one either.
     await expect(ensureClone({ checkoutPath, cloneUrl: f.remoteDir })).rejects.toBeInstanceOf(CloneError);
     expect(readdirSync(checkoutPath)).toEqual(['notes.txt']);
+  });
+});
+
+describe('housekeepManagedClone', { timeout: 60_000 }, () => {
+  it('runs git gc --auto itself in a clone it made, at most once per interval, with git\'s threshold and no hooks', async () => {
+    const f = fixture();
+    const checkoutPath = join(f.root, 'managed');
+    await ensureClone({ checkoutPath, cloneUrl: githubCloneUrl(FULL), now: () => 0 });
+    const seen: string[] = [];
+    const recording = (args: readonly string[], opts: GitOptions) => {
+      seen.push(args.join(' '));
+      return runGit(args, opts);
+    };
+    const hooksPath = join(f.root, 'no hooks');
+    // Made just now: not due.
+    expect(await housekeepManagedClone({ checkoutPath, hooksPath, runGit: recording, now: () => GC_INTERVAL_MS - 1 })).toEqual({ ran: false, why: 'collected recently' });
+    expect(seen.some((a) => a.includes(' gc '))).toBe(false);
+    // A day later: due, and recorded.
+    expect(await housekeepManagedClone({ checkoutPath, hooksPath, runGit: recording, now: () => GC_INTERVAL_MS })).toEqual({ ran: true, why: 'git gc --auto' });
+    expect(seen).toContain(`-c gc.auto=6700 -c gc.autoDetach=false -c maintenance.auto=false -c core.hooksPath=${hooksPath} gc --auto --quiet`);
+    expect(f.git(checkoutPath, 'config', '--get', LAST_GC_KEY)).toBe(String(GC_INTERVAL_MS));
+    // Agents still get no automatic gc.
+    expect(f.git(checkoutPath, 'config', '--get', 'gc.auto')).toBe('0');
+    // updraft clean asks with no interval: it runs whenever asked.
+    expect((await housekeepManagedClone({ checkoutPath, hooksPath, intervalMs: 0, now: () => GC_INTERVAL_MS + 1 })).ran).toBe(true);
+  });
+
+  it("leaves a person's clone to its own gc", async () => {
+    const f = fixture();
+    const before = readFileSync(join(f.clone, '.git', 'config'), 'utf8');
+    expect(await housekeepManagedClone({ checkoutPath: f.clone, hooksPath: join(f.root, 'no hooks'), intervalMs: 0 })).toEqual({ ran: false, why: 'not a clone the worker made' });
+    expect(readFileSync(join(f.clone, '.git', 'config'), 'utf8')).toBe(before);
   });
 });
 

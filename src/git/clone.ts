@@ -22,6 +22,7 @@
 import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { isHttpsGitHub, publishGitEnv, redactSecret } from '../publish/publish.js';
 import { isGitRepo, runGit as defaultRunGit, type GitOptions, type GitOutput } from './git.js';
+import { withCheckoutLock } from './worktree.js';
 
 /** Marks a clone `ensureClone` created; a clone carrying it is always fetched with the worker's credentials. */
 export const MANAGED_CLONE_KEY = 'updraft.managedClone';
@@ -54,6 +55,7 @@ export interface EnsureCloneRequest {
   git?: string;
   /** Injected in tests to record what reaches git. */
   runGit?: RunGit;
+  now?: () => number;
 }
 
 export interface EnsuredClone {
@@ -94,9 +96,51 @@ export async function ensureClone(req: EnsureCloneRequest): Promise<EnsuredClone
   // No automatic housekeeping. A contained agent commits through a git directory whose top
   // level is read-only (src/worker/container.ts, gitMounts), and the gc that `git commit` may
   // start packs refs there: it fails, with a "packed-refs.lock: Read-only file system" warning
-  // in the agent's output. This clone lives as long as its machine, so nothing needs collecting.
+  // in the agent's output. The worker collects garbage itself instead, outside any agent run
+  // (housekeepManagedClone).
   for (const [key, value] of MANAGED_CLONE_CONFIG) await run(['config', '--local', key, value], opts);
+  await run(['config', '--local', LAST_GC_KEY, String(req.now?.() ?? Date.now())], opts);
   return { created: true, managed: true };
+}
+
+/** When the worker last ran `git gc --auto` in a clone it made (ms since the epoch). */
+export const LAST_GC_KEY = 'updraft.lastGc';
+/** How often housekeepManagedClone collects garbage in one clone. */
+export const GC_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The automatic gc that ensureClone turns off for agents, run by the worker itself: `git gc
+ * --auto` on the host, with git's default threshold, no hooks (gc --auto runs pre-auto-gc), and
+ * serialized with every other operation on the clone, so never while an agent of it runs. At most
+ * once per `intervalMs` (0: whenever asked, as `updraft clean` does). Only for a clone ensureClone
+ * made; a clone a person made keeps its own gc. Never throws: returns what it did.
+ */
+export function housekeepManagedClone(o: {
+  checkoutPath: string;
+  git?: string;
+  runGit?: RunGit;
+  now?: () => number;
+  intervalMs?: number;
+  /** A path that does not exist: core.hooksPath for gc. */
+  hooksPath: string;
+}): Promise<{ ran: boolean; why: string }> {
+  const run = o.runGit ?? defaultRunGit;
+  const opts: GitOptions = { cwd: o.checkoutPath, git: o.git };
+  const now = o.now?.() ?? Date.now();
+  return withCheckoutLock(o.checkoutPath, async () => {
+    try {
+      const marked = await run(['config', '--local', '--get', MANAGED_CLONE_KEY], opts).catch(() => null);
+      if (marked?.stdout.trim() !== 'true') return { ran: false, why: 'not a clone the worker made' };
+      const last = Number((await run(['config', '--local', '--get', LAST_GC_KEY], opts).catch(() => null))?.stdout.trim() ?? NaN);
+      const interval = o.intervalMs ?? GC_INTERVAL_MS;
+      if (interval > 0 && Number.isFinite(last) && now - last < interval) return { ran: false, why: 'collected recently' };
+      await run(['-c', 'gc.auto=6700', '-c', 'gc.autoDetach=false', '-c', 'maintenance.auto=false', '-c', `core.hooksPath=${o.hooksPath}`, 'gc', '--auto', '--quiet'], opts);
+      await run(['config', '--local', LAST_GC_KEY, String(now)], opts);
+      return { ran: true, why: 'git gc --auto' };
+    } catch (err) {
+      return { ran: false, why: `git gc --auto failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
 }
 
 /** What a network git command of the worker runs with, and how to keep its credential out of messages. */

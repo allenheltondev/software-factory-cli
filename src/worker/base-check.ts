@@ -26,9 +26,15 @@ export const BASE_DIR_ENV = 'UPDRAFT_BASE_DIR';
 /** The variable that names the agent's writable scratch directory. */
 export const SCRATCH_DIR_ENV = 'UPDRAFT_SCRATCH_DIR';
 
-/** Where a run's base checkout lives. Pure. */
+/**
+ * Where a run's base checkout lives. Pure. Always one new path component below
+ * `<dataDir>/base-checks`: a run id that is empty, `.`, `..` or starts with anything but a letter
+ * or digit gets a prefix, so the directory removed at the end of the run can never be
+ * `base-checks` itself, the data directory or anything above it.
+ */
 export function baseCheckRoot(dataDir: string, runId: string): string {
-  return join(dataDir, 'base-checks', runId.replace(/[^A-Za-z0-9_.-]/g, '-'));
+  const name = runId.replace(/[^A-Za-z0-9_.-]/g, '-');
+  return join(dataDir, 'base-checks', /^[A-Za-z0-9]/.test(name) ? name : `run-${name}`);
 }
 
 export interface BaseCheckout {

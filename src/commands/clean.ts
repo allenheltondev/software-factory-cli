@@ -8,6 +8,7 @@ import type { UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
 import { countOldErrors, listPrunableJobs, pruneErrors, pruneJob, type PrunableJob } from '../db/prune.js';
 import { setRunProcess } from '../db/queue.js';
+import { housekeepManagedClone } from '../git/clone.js';
 import { gitCommonDir, pruneWorktrees, removeWorktree, runGit } from '../git/git.js';
 import { isInside, withCheckoutLock, worktreesRoot } from '../git/worktree.js';
 import type { RunOutcome } from '../types.js';
@@ -310,6 +311,18 @@ export async function cleanCommand(ctx: CommandContext, opts: CleanOptions = {})
 
     // After the worktree pass, so a pruned job's removable worktrees are already gone.
     if (pruneAgeMs !== null) failed += await pruneOldState(env, pruneAgeMs, Boolean(opts.dryRun));
+
+    // Clones the worker made have git's automatic gc off for agents (src/git/clone.ts): collect here.
+    if (!opts.dryRun && config) {
+      for (const repo of Object.values(config.repositories)) {
+        if (!repo.checkoutPath) continue;
+        const checkoutPath = resolve(paths.configDir, repo.checkoutPath);
+        if (!existsSync(checkoutPath)) continue;
+        const gc = await housekeepManagedClone({ checkoutPath, intervalMs: 0, hooksPath: join(paths.dataDir, 'no-hooks'), ...(opts.git ? { git: opts.git } : {}) });
+        if (gc.ran) println(ctx.out, `Collected garbage in ${checkoutPath} (git gc --auto)`);
+        else if (gc.why.includes('failed')) println(ctx.err, `Could not collect garbage in ${checkoutPath}: ${gc.why}`);
+      }
+    }
   } finally {
     db.close();
   }
