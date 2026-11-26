@@ -766,7 +766,7 @@ export interface Store {
    * delete is conditioned on job and time) can no longer lift it. False, and nothing changed, when
    * any subject is not as expected.
    */
-  takeOverPause(installationId: number, repositoryId: number, expected: Pick<WorkflowPause, 'jobId' | 'at'>, next: WorkflowPause, held: number[], added: number[]): Promise<boolean>;
+  takeOverPause(installationId: number, repositoryId: number, expected: Pick<WorkflowPause, 'jobId' | 'at' | 'confirmedAt'>, next: WorkflowPause, held: number[], added: number[]): Promise<boolean>;
   /** What came of a claimed command: its audit record's outcome. */
   finishControlCommand(record: Pick<ControlCommandRecord, 'installationId' | 'repositoryId' | 'commentId'>, outcome: ControlCommandRecord['outcome'], message: string): Promise<void>;
   getControlCommand(installationId: number, repositoryId: number, commentId: number): Promise<ControlCommandRecord | null>;
@@ -1169,7 +1169,8 @@ export function createMemoryStore(): Store & { ttlOf(installationId: number): { 
     async takeOverPause(id, repo, expected, next, held, added) {
       const heldKeys = [...new Set(held)].map((n) => `${id}/${repo}/${n}`);
       const addedKeys = [...new Set(added)].filter((n) => !held.includes(n)).map((n) => `${id}/${repo}/${n}`);
-      if (heldKeys.some((k) => pauses.get(k)?.jobId !== expected.jobId || pauses.get(k)?.at !== expected.at)) return false;
+      // Also as confirmed as it was read: a confirmation written since is never overwritten.
+      if (heldKeys.some((k) => pauses.get(k)?.jobId !== expected.jobId || pauses.get(k)?.at !== expected.at || pauses.get(k)?.confirmedAt !== expected.confirmedAt)) return false;
       if (addedKeys.some((k) => pauses.has(k))) return false;
       for (const k of [...heldKeys, ...addedKeys]) pauses.set(k, { ...next });
       return true;

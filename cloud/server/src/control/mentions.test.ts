@@ -185,6 +185,34 @@ describe('GitHub mention commands (Cloud)', () => {
     expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toMatchObject({ control: { kind: 'cancel' } });
   });
 
+  it('a GitHub pause landing between the cancel’s read and its write still becomes the cancel', async () => {
+    const original = store.pauseWorkflowSubjects.bind(store);
+    let injected = false;
+    store.pauseWorkflowSubjects = async (id, repo, pause, subjects) => {
+      if (!injected && pause.control?.kind === 'cancel') {
+        injected = true;
+        // pat's pause commits first.
+        await original(id, repo, { jobId: 'control-999', at: clock - 1, by: 'github:pat', confirmedAt: clock - 1, control: { kind: 'pause', source: '999' } }, [ISSUE]);
+      }
+      return original(id, repo, pause, subjects);
+    };
+    expect(await handle(comment('olive', '@updraft-app cancel'))).toMatchObject({ reason: 'control_applied' });
+    expect(injected).toBe(true);
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toMatchObject({ jobId: 'control-999', control: { kind: 'cancel' } });
+    expect(await handle(comment('pat', '@updraft-app resume'))).toMatchObject({ reason: 'control_refused' });
+    expect(replies.at(-1)!.body).toContain('needs maintain or admin');
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).not.toBeNull();
+  });
+
+  it('a takeover never overwrites a confirmation written since it read the pause', async () => {
+    await handle(comment('pat', '@updraft-app pause'));
+    const read = (await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE))!;
+    await store.confirmWorkflowPause({ jobId: read.jobId, installationId: INSTALLATION, repositoryId: REPO.id }, [ISSUE], read.at); // already confirmed: unchanged
+    const stale = { ...read, confirmedAt: undefined };
+    expect(await store.takeOverPause(INSTALLATION, REPO.id, stale, { ...read, at: read.at + 1, control: { kind: 'cancel', source: 'x' } }, [ISSUE], [])).toBe(false);
+    expect(await store.getWorkflowPause(INSTALLATION, REPO.id, ISSUE)).toMatchObject({ at: read.at, confirmedAt: read.confirmedAt });
+  });
+
   it('a cancel on the pull request takes over a pause given on the issue, and holds both', async () => {
     expect(await handle(comment('pat', '@updraft-app pause'))).toMatchObject({ reason: 'control_applied' });
     expect(await store.getWorkflowPause(INSTALLATION, REPO.id, PR)).toBeNull();

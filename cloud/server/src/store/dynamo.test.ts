@@ -43,6 +43,8 @@ function fakeTable() {
     if (expr === 'attribute_exists(#stop)') return item?.stop !== undefined;
     if (expr === 'attribute_not_exists(pk) OR (jobId = :job AND #at = :pat)') return !item || (item.jobId === values[':job'] && item.at === values[':pat']);
     if (expr === 'jobId = :job AND #at = :pat') return !!item && item.jobId === values[':job'] && item.at === values[':pat'];
+    if (expr === 'jobId = :job AND #at = :pat AND attribute_not_exists(confirmedAt)') return !!item && item.jobId === values[':job'] && item.at === values[':pat'] && item.confirmedAt === undefined;
+    if (expr === 'jobId = :job AND #at = :pat AND confirmedAt = :confirmed') return !!item && item.jobId === values[':job'] && item.at === values[':pat'] && item.confirmedAt === values[':confirmed'];
     if (expr === 'attribute_exists(#stop.confirmedAt)') return (item?.stop as Item | undefined)?.confirmedAt !== undefined;
     if (expr === 'attribute_not_exists(pk) OR jobId = :job') return !item || item.jobId === values[':job'];
     if (expr === '#enabled = :enabled AND routingVersion = :routingVersion') {
@@ -876,6 +878,8 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     expect(await store.takeOverPause(55, 9, { jobId: 'control-other', at: 1000 }, next, [12, 40], [41])).toBe(false);
     expect((await store.getWorkflowPause(55, 9, 12))?.control?.kind).toBe('pause');
     expect(await store.getWorkflowPause(55, 9, 41)).toBeNull();
+    // A confirmation it did not read fails it rather than being overwritten.
+    expect(await store.takeOverPause(55, 9, { ...pause, confirmedAt: undefined }, next, [12, 40], [41])).toBe(false);
     expect(await store.takeOverPause(55, 9, pause, next, [12, 40], [41])).toBe(true);
     expect(await store.getWorkflowPause(55, 9, 41)).toMatchObject({ at: 1500, control: { kind: 'cancel', source: '77', stopped: ['job_a'] } });
     // A resume decided against the earlier pause no longer lifts it.

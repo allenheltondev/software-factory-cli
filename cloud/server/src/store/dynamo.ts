@@ -1628,8 +1628,12 @@ export function createDynamoStore(tableName: string, client = DynamoDBDocumentCl
       try {
         // No TTL, like every pause.
         await client.send(new TransactWriteCommand({ TransactItems: [
-          ...heldSet.map((n) => ({ Put: { TableName: T, Item: item(n), ConditionExpression: 'jobId = :job AND #at = :pat',
-            ExpressionAttributeNames: { '#at': 'at' }, ExpressionAttributeValues: { ':job': expected.jobId, ':pat': expected.at } } })),
+          // As confirmed as it was read: a confirmation written since (confirmWorkflowPause) fails
+          // the takeover, which is then retried from a fresh read, rather than being overwritten.
+          ...heldSet.map((n) => ({ Put: { TableName: T, Item: item(n),
+            ConditionExpression: expected.confirmedAt === undefined ? 'jobId = :job AND #at = :pat AND attribute_not_exists(confirmedAt)' : 'jobId = :job AND #at = :pat AND confirmedAt = :confirmed',
+            ExpressionAttributeNames: { '#at': 'at' },
+            ExpressionAttributeValues: { ':job': expected.jobId, ':pat': expected.at, ...(expected.confirmedAt === undefined ? {} : { ':confirmed': expected.confirmedAt }) } } })),
           ...addedSet.map((n) => ({ Put: { TableName: T, Item: item(n), ConditionExpression: 'attribute_not_exists(pk)' } })),
         ] }));
         return true;

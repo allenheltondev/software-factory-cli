@@ -268,16 +268,21 @@ export function createMentionHandler(d: MentionDeps) {
           // maintainer can lift it), extended to every subject of this command.
           const reason = (parsed.text || 'Canceled from GitHub').slice(0, 500);
           let pause = await held();
+          // Nothing held: hold it as this cancel. Another pause may land first (the write then
+          // finds it held): whatever is in place now is what is taken over below.
           if (!pause) {
             await d.store.pauseWorkflowSubjects(e.installationId, repositoryId, controlPause('cancel'), subjects);
             pause = await held();
-            if (pause && subjects.some((n) => !(pause!.subjects ?? []).includes(n)) && !(await takeOver(pause, (p) => p.control ?? { kind: 'cancel', source: String(commentId) }))) pause = null;
-          } else if (pause.control?.kind === 'pause' || subjects.some((n) => !(pause!.subjects ?? []).includes(n))) {
-            if (!(await takeOver(pause, (p) => (p.control ? { ...p.control, kind: 'cancel' } : undefined)))) {
+          }
+          if (!pause) return finish('refused', `${ref} could not be held; nothing was canceled. Comment again.${link}`);
+          // A GitHub `pause` in place (found first, or landed in between) becomes a cancel, and the
+          // pause covers every subject of this command. A stop's pause already needs maintain.
+          const upgrade = (p: WorkflowPause): WorkflowPause['control'] => (p.control ? { ...p.control, kind: 'cancel' } : undefined);
+          if (pause.control?.kind === 'pause' || subjects.some((n) => !(pause!.subjects ?? []).includes(n))) {
+            if (!(await takeOver(pause, upgrade))) {
               return finish('refused', `${ref} changed while it was being canceled; nothing was canceled. Look at it and comment again.${link}`);
             }
           }
-          if (!pause) return finish('refused', `${ref} could not be held; nothing was canceled. Comment again.${link}`);
           // 2. Queued work of every subject (one waiting entry per issue or pull request).
           const queued = await cancelQueued();
           // 3. Active jobs. Each stop pauses its subjects as that job's stop; the cancel and every
