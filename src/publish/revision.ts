@@ -53,6 +53,9 @@ import { workerLogin } from '../github/identity.js';
 import {
   cap,
   classifyFailure,
+  mergePolicy,
+  mergeSentence,
+  type MergePolicy,
   classifyGit,
   fenced,
   inline,
@@ -213,6 +216,8 @@ export function renderRevisionReply(o: {
   trigger?: RevisionRequest['trigger'];
   /** The commit the push left the pull request at, and its page. */
   pushed?: { sha: string; url: string | null };
+  /** What merge.ts will do with the pull request (publish.ts mergePolicy); absent: up to a person. */
+  merge?: MergePolicy;
 }): string {
   const at = o.pushed ? (o.pushed.url ? `[${code(short(o.pushed.sha))}](${o.pushed.url})` : code(short(o.pushed.sha))) : null;
   return withMarker(
@@ -234,7 +239,7 @@ export function renderRevisionReply(o: {
               '',
             ]
           : [`Updraft pushed ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`, '']),
-      `From run ${code(o.runId)} (agent ${inline(o.agent)}). Review it before merging; merging is up to a person.`,
+      `From run ${code(o.runId)} (agent ${inline(o.agent)}). ${o.merge?.auto ? `Updraft merges it (${code(o.merge.method)}) once review and checks pass.` : `Review it before merging; ${mergeSentence(o.merge ?? { auto: false, reason: null }).replace(/^M/, 'm')}`}`,
       '',
       ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
       ...renderRunResult(o.summary, o.commitCount),
@@ -645,7 +650,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     }
 
     // 4. The reply: recorded, found by marker, or new.
-    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run), trigger: request.trigger, pushed: { sha: localSha, url: commitUrl(request.pullRequest.url, localSha) } }), { headSha: localSha });
+    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run), trigger: request.trigger, pushed: { sha: localSha, url: commitUrl(request.pullRequest.url, localSha) }, merge: mergePolicy(deps.config, repo, { mode: 'pr', verifies: Boolean(ownEntry(deps.config.actions, job.action)?.verify?.length), summary: { verification: run.summary.verification, headSha: localSha } }) }), { headSha: localSha });
 
     const done = finish({ state: 'published' });
     log.info('revision pushed', { pr: prNumber, from: baseSha, to: localSha });

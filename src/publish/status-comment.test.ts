@@ -9,6 +9,7 @@ import { capWholeBlocks, stripMachineBlocks } from './markdown.js';
 import { renderQuietCiNotice } from './ci.js';
 import { renderQuietMergeBlockedNotice } from './merge.js';
 import { mergePolicy, mergeSentence, renderPrBody } from './publish.js';
+import { renderRevisionReply } from './revision.js';
 import { findStatusComment, writeStatusComment, type StatusWrite } from './status-comment.js';
 import { mayReplace, parseStatusMarker, renderStatusComment, STATUS_STAGE, statusDetails, statusLink, statusMarker } from './status-marker.js';
 
@@ -403,5 +404,15 @@ describe('the CI step (quiet)', () => {
     const merge = renderQuietCiNotice({ pr: pr({ ciState: 'passed' }), sha, merge: null })!;
     expect(merge).toContain('after CI fix 1');
     expect(merge).toContain('Please merge it');
+  });
+});
+
+describe('the revision reply', () => {
+  it('states the merge Updraft will attempt, like the PR body', () => {
+    const base = { runId: 'run_v', agent: 'claude', review: { id: 1, author: 'bob', url: 'https://github.com/o/r/pull/1#r', body: '', state: 'CHANGES_REQUESTED', submittedAt: null, comments: [] } as never, summary: summary(['Fixed.']), commitCount: 1 };
+    expect(renderRevisionReply({ ...base, merge: { auto: true, method: 'squash' } })).toContain('Updraft merges it (`squash`) once review and checks pass.');
+    expect(renderRevisionReply({ ...base, merge: { auto: true, method: 'squash' } })).not.toContain('up to a person');
+    expect(renderRevisionReply(base)).toContain('Review it before merging; merging is up to a person.');
+    expect(renderRevisionReply({ ...base, merge: { auto: false, reason: "the worker's verify commands did not pass on this commit" } })).toContain("merging is up to a person: the worker's verify commands did not pass on this commit.");
   });
 });

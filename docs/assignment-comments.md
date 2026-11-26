@@ -87,16 +87,25 @@ to do and, when hosted, the console link:
 - a Claude sign-in or reconnect wait (Updraft Cloud);
 - queued work that was refused (a budget, a missing key, the routing changed) or expired, and the
   over-quota comment (`queue_full`, jobs per day, job minutes);
+- a delivery refused because an agent key is not set: which key, a link to the installation's
+  Agent keys page, and how to try again. Once per issue or pull request, configuration version
+  and set of keys (`<!-- updraft-refused: missing_key v3 ANTHROPIC_API_KEY -->`);
+- a workflow the reconciler or automatic recovery blocked for a person (`publication_uncertain`,
+  `recovery_exhausted`, a lost job that needs a manual retry, `ci_event_missed`, `ci_stuck`,
+  `stalled`, `sign_in_expired`, a refused recovery): its message and next action, with the
+  workflow's console link, on the pull request when the workflow has one, else on the issue.
+  Once per workflow run and reason (`<!-- updraft-blocked: 99-i7 g2 publication_uncertain -->`).
+  Posting it never changes what recovery decided;
 - the CI step stopping for a person (the budget is used up, the failure isn't code, CI repair is
   off) or a fixed head that passed when merging is up to a person ([ci-fix.md](ci-fix.md));
 - a merge auto-merge left to a person;
-- the revision limit, and a revision that could not be pushed ([revisions.md](revisions.md));
+- the revision limit, and a revision that could not be pushed ([revisions.md](revisions.md)); the
+  revision's own reply states the same merge policy as the PR body;
 - the review itself (including a verdict held back as `needs-verification`), its inline findings,
   thread replies and replies to mention commands ([controls.md](controls.md)), which are the
   product, not status.
 
-`publication_uncertain` and other blocked workflow states are shown in the console (the workflow
-page says what to do); they post nothing on GitHub.
+A pause an owner made is shown in the console only: the person who paused it knows.
 
 ### The pull request body
 
