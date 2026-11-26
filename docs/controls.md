@@ -98,6 +98,33 @@ resumed).
 a pull request Updraft opened. Whoever can run it owns the state database, so it asks GitHub for no permission;
 it is recorded like a comment command.
 
+### Command history
+
+`updraft controls OWNER/REPO[#N] [--json] [--limit N] [--outcome OUTCOME]` lists the commands recorded in the
+state database: every `@<handle>` command and every `updraft control` run, who gave it, what Updraft decided
+and why. It is read-only and local: the database is opened read-only, GitHub is never called and no credentials
+are needed.
+
+```text
+$ updraft controls octo/widgets#7
+RECEIVED                  ISSUE  PR   ACTOR              COMMAND  OUTCOME  MESSAGE
+2026-01-05T14:02:11.408Z  #7     -    allen              pause    applied  Paused #7: nothing new starts. Job job_3kQ9xT2 is running; it continues to comp…
+2026-01-05T14:20:37.002Z  #7     #12  mona               stop     refused  stop needs maintain or admin access.
+2026-01-05T15:41:09.913Z  #7     -    allen (local CLI)  resume   applied  Resumed #7: requeued 1 job.
+```
+
+- `OWNER/REPO` lists every issue and pull request of the repository; `OWNER/REPO#N` only issue `N`. When `N`
+  is a pull request Updraft opened (one the review loop knows), it lists the commands of that pull request's
+  issue, the way `updraft control` resolves it.
+- Oldest first: by time received, then the order recorded, then the comment id (or `cli-…` source).
+- `--limit N` keeps the newest `N` (default 50), still oldest first. `--outcome` keeps one outcome: `applied`,
+  `noop`, `refused`, `ignored`, `ambiguous` or `unsupported`.
+- The table shows each message on one line of about 80 characters. Actor, command and message are printed as
+  plain text: escape sequences and control characters a comment carried are removed.
+- `--json` prints the records, unshortened, as one JSON array (the fields of the stored record: `source`,
+  `repoId`, `issue`, `pullRequest`, `actor`, `command`, `receivedAt`, `headSha`, `outcome`, `message`,
+  `replyId`, `seq`), and `[]` when there are none.
+
 ## Updraft Cloud
 
 The webhook handles `issue_comment` and `pull_request_review_comment` deliveries (`created`) after verifying
@@ -122,5 +149,6 @@ readiness page reports whether issue comments reach Updraft.
 - Cloud: `review`, `steer`, `escalate`; resuming a `pause` given while nothing was stopped waits for the next
   event (a push, a review, the label) instead of re-reading the pull request at once.
 - Escalation by comment on either path.
-- Console: the command history of a workflow (the audit records exist; no page shows them yet).
+- Console: the command history of a workflow (the audit records exist; no page shows them yet). Locally,
+  `updraft controls` shows it.
 - Hosted validation on a real staging issue and pull request (standard and subscription routes).

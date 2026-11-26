@@ -119,6 +119,10 @@ export function resumeWorkflow(
   });
 }
 
+/** What came of a command: every value of ControlCommandRecord['outcome']. */
+export const CONTROL_OUTCOMES = ['applied', 'noop', 'refused', 'ignored', 'ambiguous', 'unsupported'] as const;
+export type ControlOutcome = (typeof CONTROL_OUTCOMES)[number];
+
 /** One command, as received and as handled: the audit trail. */
 export interface ControlCommandRecord {
   /** The comment id (or `cli-…`): one record per command, which is what dedupes redeliveries. */
@@ -131,7 +135,7 @@ export interface ControlCommandRecord {
   receivedAt: string;
   /** The pull request head the command was judged against, when there was one. */
   headSha: string | null;
-  outcome: 'applied' | 'noop' | 'refused' | 'ignored' | 'ambiguous' | 'unsupported';
+  outcome: ControlOutcome;
   message: string;
   /** The reply comment, once posted. */
   replyId?: number;

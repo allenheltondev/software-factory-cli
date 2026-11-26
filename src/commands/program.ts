@@ -6,6 +6,7 @@ import { cancelCommand } from './cancel.js';
 import { cleanCommand } from './clean.js';
 import { configureCommand } from './configure.js';
 import { controlCommand } from './control.js';
+import { controlsCommand, type ControlsOptions } from './controls.js';
 import { DEFAULT_LABEL } from './config-edit.js';
 import { MissingConfigError } from '../config/io.js';
 import { createDefaultContext, legacyNotice, println, type CommandContext, type GlobalOptions } from './context.js';
@@ -42,6 +43,7 @@ export interface Handlers {
   stats(ctx: CommandContext, opts: StatsOptions): Promise<number>;
   cancel(ctx: CommandContext, jobId: string): Promise<number>;
   control(ctx: CommandContext, ref: string, command: string, text: string[]): Promise<number>;
+  controls(ctx: CommandContext, ref: string, opts: ControlsOptions): Promise<number>;
   logs(ctx: CommandContext, id: string, opts: LogsOptions): Promise<number>;
 }
 
@@ -65,6 +67,7 @@ export const defaultHandlers: Handlers = {
   stats: (ctx, opts) => statsCommand(ctx, opts),
   cancel: (ctx, jobId) => cancelCommand(ctx, jobId),
   control: (ctx, ref, command, text) => controlCommand(ctx, ref, command, text),
+  controls: (ctx, ref, opts) => controlsCommand(ctx, ref, opts),
   logs: (ctx, id, opts) => logsCommand(ctx, id, opts),
 };
 
@@ -214,6 +217,15 @@ export function buildProgram(opts: ProgramOptions): Command {
     .argument('<command>', 'pause, resume, stop, cancel, review, steer or help')
     .argument('[text...]', 'for steer: the instructions; for stop: a job id when several are running')
     .action((ref: string, command: string, text: string[]) => exec((ctx) => handlers.control(ctx, ref, command, text)));
+
+  program
+    .command('controls')
+    .description('List the recorded mention and control commands of a repository or issue, oldest first (read-only, offline; see docs/controls.md)')
+    .argument('<ref>', 'OWNER/REPO, or OWNER/REPO#NUMBER: an issue, or a pull request Updraft opened for it')
+    .addOption(new Option('--json', 'print the records as one JSON array on stdout'))
+    .option('--limit <n>', 'keep the newest N records', '50')
+    .option('--outcome <outcome>', 'only commands with this outcome: applied, noop, refused, ignored, ambiguous or unsupported')
+    .action((ref: string, o: ControlsOptions) => exec((ctx) => handlers.controls(ctx, ref, o)));
 
   program
     .command('logs')
