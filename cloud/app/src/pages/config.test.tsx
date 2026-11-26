@@ -337,6 +337,19 @@ describe('the simple page', () => {
     expect(sentConfig(api).repositories['acme/web']?.ci).toEqual({ ignore: ['preview-deploy'], waitMinutes: 30 });
   });
 
+  it('shows and publishes the GitHub notifications setting: quiet by default, verbose when chosen', async () => {
+    const config = withRepo();
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig: publishedOk(2) });
+    configPage(api);
+    const web = await screen.findByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
+    const verbose = within(web).getByRole('checkbox', { name: /separate comment for each step/ });
+    expect(verbose).not.toBeChecked();
+    await userEvent.click(verbose);
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).repositories['acme/web']?.notifications).toBe('verbose');
+  });
+
   it('drops CI repair with the last review agent, keeping the repository\'s other settings, and publishes', async () => {
     const config = withRepo();
     config.repositories['acme/web'] = { ...config.repositories['acme/web']!, publish: 'pr', verify: ['npm test'], ci: { ignore: ['preview'] } };

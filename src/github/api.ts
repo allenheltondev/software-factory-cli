@@ -379,6 +379,12 @@ export interface GitHubApi {
   getPullRequestReviews(repo: RepoRef, pullNumber: number): Promise<PullRequestReviews>;
   /** Write: open a pull request. Used only by the publication step, never by an agent. */
   createPullRequest(repo: RepoRef, input: CreatePullRequestInput): Promise<GitHubPullRequest>;
+  /** Write: replace the body of a pull request the worker opened (its merge sentence follows the newest verified head). */
+  updatePullRequestBody?(repo: RepoRef, pullNumber: number, body: string): Promise<void>;
+  /** The full names of the refs starting with `prefix` (`refs/...`), for cleaning up the worker's hidden claim refs. */
+  listMatchingRefs?(repo: RepoRef, prefix: string): Promise<string[]>;
+  /** Write: delete one ref (`refs/...`) the worker created. */
+  deleteRef?(repo: RepoRef, ref: string): Promise<void>;
   /** Every comment on one issue, oldest first (paginated internally). */
   listIssueComments(repo: RepoRef, issueNumber: number): Promise<GitHubIssueComment[]>;
   /** Write: comment on an issue. Used only by the publication step. */

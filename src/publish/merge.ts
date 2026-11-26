@@ -38,9 +38,12 @@ import { sameLogin, workerLogin } from '../github/identity.js';
 import type { RepoRef } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
-import { cap, fenced, type PublishDeps } from './publish.js';
+import { cap, fenced, inline, type PublishDeps } from './publish.js';
+import { consoleWorkflowUrl } from './console-link.js';
+import { noteStatus, quietFor } from './status-comment.js';
+import { STATUS_STAGE } from './status-marker.js';
 
-type MergeDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'scope'>;
+type MergeDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'scope' | 'console'>;
 
 /** Merge requests sent for one head before an unknown result (network error, 5xx) is given up on. */
 export const MAX_MERGE_ATTEMPTS = 3;
@@ -75,6 +78,22 @@ export function renderMergeBlockedNotice(o: { sha: string; method: MergeMethod; 
     mergeBlockedMarker(o.sha),
   ].join('\n');
 }
+
+/**
+ * Quiet notifications: the same notice as one or two plain sentences, with what to do and, when
+ * hosted, the console link.
+ */
+export function renderQuietMergeBlockedNotice(o: { sha: string; prNumber: number; reason: string; link?: string | null }): string {
+  return [
+    `Updraft did not merge PR #${o.prNumber} at ${code(short(o.sha))}: ${inline(cap(o.reason, 500))}. ` +
+      `Please merge it yourself once it is ready; a new commit on the branch gets a new review.${o.link ? ` [View this work in Updraft](${o.link})` : ''}`,
+    '',
+    mergeBlockedMarker(o.sha),
+  ].join('\n');
+}
+
+/** "after CI fix N" for a status line, when the CI step fixed the pull request. */
+const afterFixes = (n: number) => (n > 0 ? ` after CI fix ${n}` : '');
 
 /**
  * Allowed actors whose newest decisive review is "Request changes". A later approval or a
@@ -233,6 +252,12 @@ export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: Rep
       // Stop watching it now rather than at the next poll, so nothing more is queued for it.
       closeRevisionPr(db, pr.repoId, pr.prNumber, `pull request #${pr.prNumber} was merged by Updraft`, now);
       log.info('merged', { method, mergeCommit: res.sha });
+      if (quietFor(deps.config, { repoId: pr.repoId, repoFullName: repo.fullName })) {
+        await noteStatus(
+          { api, log },
+          { repo, issue: pr.issueNumber, target: { pr: pr.prNumber }, stage: STATUS_STAGE.final, title: 'Merged', text: `PR #${pr.prNumber} was merged${afterFixes(pr.ciFixes)}.` },
+        );
+      }
     } catch (err) {
       if (isTransient(err)) {
         log.warn('the merge request got no answer; checking again after the next poll', { error: message(err) });
@@ -288,13 +313,23 @@ export async function postMergeNotices(deps: MergeDeps, signal?: AbortSignal): P
       const login = await workerLogin(deps.api);
       const marker = mergeBlockedMarker(sha);
       const existing = (await deps.api.listIssueComments(repoRef, pr.prNumber)).find((c) => c.body.includes(marker) && sameLogin(c.user, login));
+      const quiet = quietFor(deps.config, { repoId: pr.repoId, repoFullName: found.fullName });
+      const reason = pr.mergeReason ?? 'no reason was recorded';
       const posted =
         existing ??
         (await deps.api.createIssueComment(
           repoRef,
           pr.prNumber,
-          renderMergeBlockedNotice({ sha, method, reason: pr.mergeReason ?? 'no reason was recorded', repoFullName: found.fullName }),
+          quiet
+            ? renderQuietMergeBlockedNotice({ sha, prNumber: pr.prNumber, reason, link: consoleWorkflowUrl(deps.console, pr.repoId, pr.issueNumber) })
+            : renderMergeBlockedNotice({ sha, method, reason, repoFullName: found.fullName }),
         ));
+      if (quiet) {
+        await noteStatus(
+          { api: deps.api, log: deps.log },
+          { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, stage: STATUS_STAGE.person, sha, latest: pr.headSha === sha, at: (deps.now ?? Date.now)(), title: 'Waiting for a person', text: `PR #${pr.prNumber} is ready for a person to merge; Updraft did not merge it (see the PR).` },
+        );
+      }
       recordMergeNotice(deps.db, pr.repoId, pr.prNumber, sha, { commentId: posted.id, commentUrl: posted.htmlUrl }, deps.now);
       deps.log.info('commented that the pull request was not merged', { repo: found.fullName, pr: pr.prNumber, comment: posted.htmlUrl });
     } catch (err) {

@@ -7,6 +7,7 @@ import type { WorkflowRecorder } from '../workflows/recorder.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
 import type { LaunchRequest, LaunchResult } from './launch.js';
 import { isWaiting, type QueueEntry, type QueueState, type QueueStore, type QueueWaitReason } from './queue-store.js';
+import { mayReplace, parseStatusMarker, renderStatusComment, STATUS_STAGE, statusLinkLine } from '../../../../src/publish/status-marker.js';
 
 /**
  * The Cloud admission queue (#141). A tenant runs a bounded number of jobs at once (one by default)
@@ -129,6 +130,54 @@ export function queueComment(e: QueueEntry, consoleOrigin?: string, now = Date.n
   ]);
 }
 
+/**
+ * Quiet notifications (#173): the acknowledgement is the first stage of the issue's one live
+ * status comment (src/publish/status-marker.ts), which the run takes over at assignment and edits
+ * from then on. It carries the queue's own marker too, so a retried post finds it. Null: this
+ * state writes nothing on the status comment (an admission: the run's assignment follows; any
+ * pull request event: the review loop's stages are the run's to write).
+ */
+export function quietQueueComment(e: QueueEntry, consoleOrigin?: string): { body: string; stage: number } | null {
+  if (e.issue === undefined) return null;
+  const link = jobLink(consoleOrigin, e);
+  const o = e.outcome;
+  let status: { title: string; text: string; stage: number };
+  if (isWaiting(e)) {
+    status = { title: 'Queued', text: `Updraft queued this issue. ${waitMessage(e.reason)} It starts automatically when capacity is free; no action is needed.`, stage: STATUS_STAGE.queued };
+  } else if (e.state === 'admitted' && o?.reason.startsWith('native_waiting')) {
+    status = { title: 'Waiting for Claude', text: 'Capacity is free; the job now waits for the connected Claude subscription before it starts.', stage: STATUS_STAGE.waiting };
+  } else if (e.state === 'admitted' && o?.launchFailed) {
+    // No runner took it over: its launch failed. Said as an end, until a retry's run takes the comment over.
+    status = { title: 'Not started', text: 'Updraft could not start a worker for this work; the job page says why and can retry it.', stage: STATUS_STAGE.ended };
+  } else if (e.state === 'admitted') {
+    return null;
+  } else {
+    const title = e.state === 'expired' ? 'Expired' : e.state === 'refused' ? 'Not started' : 'Canceled';
+    status = { title, text: `Updraft did not start this work: ${o?.message ?? 'it is no longer eligible.'}`, stage: STATUS_STAGE.ended };
+  }
+  const body = renderStatusComment({ title: status.title, text: status.text, link: link ? statusLinkLine(link, 'work') : null, mark: { key: e.jobId, stage: status.stage } });
+  return { body: `${body}\n${queueCommentMarker(e.jobId)}`, stage: status.stage };
+}
+
+/** The marker of the separate comment that asks a person to act on queued work that did not start. */
+export const queueActMarker = (jobId: string) => `<!-- updraft-queue-act: ${jobId} -->`;
+
+/**
+ * Quiet notifications: queued work that was refused or expired needs a person. One or two plain
+ * sentences, what to do, the console link. Null for any other state.
+ */
+export function queueActComment(e: QueueEntry, consoleOrigin?: string): string | null {
+  const link = jobLink(consoleOrigin, e);
+  if (e.state === 'admitted' && e.outcome?.launchFailed) {
+    return [`Updraft could not start a worker for the queued work on ${e.issue === undefined ? 'this pull request' : 'this issue'}. Please retry the job from its page${link ? ` ([open it in Updraft](${link}))` : ' in Updraft'}.`, '', queueActMarker(e.jobId)].join('\n');
+  }
+  if (e.state !== 'refused' && e.state !== 'expired') return null;
+  const what = e.issue === undefined ? 'the latest event on this pull request' : 'this issue';
+  const why = (e.outcome?.message ?? 'it is no longer eligible.').replace(/\s+$/, '');
+  const next = e.outcome?.nextAction ?? (e.state === 'expired' ? (e.issue === undefined ? 'Push a commit or submit the review again to try again.' : 'Remove the label and add it again to try again.') : '');
+  return [`Updraft could not start the queued work for ${what}: ${why}${next ? ` ${next}` : ''}${link ? ` [Open it in Updraft](${link})` : ''}`, '', queueActMarker(e.jobId)].join('\n');
+}
+
 /** A queued job as the console shows it: never as running, finished or throttled. */
 export interface QueueView {
   state: QueueState;
@@ -176,6 +225,11 @@ export interface QueueNotifier {
   /** Creates the comment and returns its id, or finds one already carrying `marker` (a post whose answer was lost). */
   post(e: QueueEntry, body: string, marker: string): Promise<number | undefined>;
   update(e: QueueEntry, commentId: number, body: string): Promise<void>;
+  /**
+   * The comment's body now, or null when it is gone. Quiet notifications read it before an edit:
+   * the run may have taken the comment over, and a queue edit never writes over the run's stages.
+   */
+  read?(e: QueueEntry, commentId: number): Promise<string | null>;
   /** The App's own comment carrying `marker`, if one was posted (its id never recorded). */
   find?(e: QueueEntry, marker: string): Promise<number | undefined>;
 }
@@ -192,6 +246,8 @@ export interface EnqueueInput {
   route: string;
   configVersion: number;
   reason: QueueWaitReason;
+  /** repositories.R.notifications at enqueue (#173). Absent: verbose, as before. */
+  notifications?: 'quiet' | 'verbose';
   /** Called once the entry's write has committed (whatever its result), before any side effect. */
   persisted?: () => Promise<void>;
 }
@@ -260,6 +316,7 @@ export function createAdmissionQueue(deps: {
         ...(headSha ? { headSha } : {}),
         route: input.route,
         configVersion: input.configVersion,
+        ...(input.notifications ? { notifications: input.notifications } : {}),
         reason: input.reason,
         state: 'queued',
         enqueuedAt: at,
@@ -324,23 +381,36 @@ export function createAdmissionQueue(deps: {
  */
 export async function syncComment(store: QueueStore, notify: QueueNotifier, e: QueueEntry, consoleOrigin: string | undefined, now: number, log: (entry: Record<string, unknown>) => void, again = true): Promise<QueueEntry> {
   if (e.commentState === e.state) return e;
-  const body = queueComment(e, consoleOrigin, now);
+  const quiet = e.notifications === 'quiet';
+  const status = quiet ? quietQueueComment(e, consoleOrigin) : { body: queueComment(e, consoleOrigin, now), stage: 0 };
   const marker = queueCommentMarker(e.jobId);
   try {
     // The comment's id as kept now (another writer may have recorded it after `e` was read), or
     // the comment itself on GitHub (its id was never recorded): an existing comment is edited,
     // whatever the state, rather than left saying something that is no longer true.
     let commentId = e.commentId ?? (await store.get(e.installationId, e.jobId))?.commentId;
-    if (commentId === undefined && notify.find) commentId = await notify.find(e, marker);
-    if (commentId !== undefined) await notify.update(e, commentId, body);
-    else if (isWaiting(e) || e.state === 'refused' || e.state === 'expired') commentId = await notify.post(e, body, marker);
+    if (status) {
+      if (commentId === undefined && notify.find) commentId = await notify.find(e, marker);
+      if (commentId !== undefined) {
+        // Quiet: the run takes the comment over at assignment. A queue edit that comes late (a
+        // retried sync, a lost wakeup) reads it first, and never writes over the run's stages.
+        const current = quiet && notify.read ? await notify.read(e, commentId) : undefined;
+        const mark = current ? parseStatusMarker(current) : null;
+        if (current !== null && (!mark || mayReplace(mark, status.stage))) await notify.update(e, commentId, status.body);
+      } else if (quiet ? isWaiting(e) : isWaiting(e) || e.state === 'refused' || e.state === 'expired') {
+        commentId = await notify.post(e, status.body, marker);
+      }
+    }
+    // Quiet: work that a person has to start again gets one comment of its own that says so.
+    const act = quiet && !e.actPosted ? queueActComment(e, consoleOrigin) : null;
+    const actPosted = act ? (await notify.post(e, act, queueActMarker(e.jobId)), true) : false;
     // Recorded on the entry as it is now: a version conflict re-reads and merges, so the id is
     // never lost. The state shown is recorded only while the entry is still in it.
     let cur: QueueEntry | null = e;
     for (let attempt = 0; attempt < 4 && cur; attempt++) {
       if (attempt > 0) cur = await store.get(e.installationId, e.jobId);
       if (!cur) break;
-      const next: QueueEntry = { ...cur, ...(commentId !== undefined ? { commentId } : {}), ...(cur.state === e.state ? { commentState: e.state } : {}) };
+      const next: QueueEntry = { ...cur, ...(commentId !== undefined ? { commentId } : {}), ...(actPosted ? { actPosted: true as const } : {}), ...(cur.state === e.state ? { commentState: e.state } : {}) };
       if (!(await store.update(next, cur))) continue;
       const stored = { ...next, version: cur.version + 1 };
       // The entry moved on while this comment was written (admitted, say, while the enqueue's
@@ -498,7 +568,7 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
     ...(e.issue !== undefined ? { issue: e.issue } : {}), ...(e.pullRequest !== undefined ? { pullRequest: e.pullRequest } : {}),
   });
 
-  async function end(e: QueueEntry, state: 'admitted' | 'canceled' | 'refused' | 'expired', outcome: { reason: string; message: string; nextAction?: string; by?: string; jobId?: string }): Promise<QueueEntry | null> {
+  async function end(e: QueueEntry, state: 'admitted' | 'canceled' | 'refused' | 'expired', outcome: { reason: string; message: string; nextAction?: string; by?: string; jobId?: string; launchFailed?: true }): Promise<QueueEntry | null> {
     const at = now();
     const { admittingUntil: _a, ...rest } = e;
     const next: QueueEntry = { ...rest, state, outcome: { at, ...outcome } };
@@ -696,7 +766,7 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
           // A launch that got as far as the job's record: never relaunched from here (its VM may
           // exist). The job's own record and recovery own it now: reconciliation, or a console
           // retry of a job whose launch failed.
-          await end(e, 'admitted', { reason: 'admitted', message: 'A job was recorded for it; its page shows how its launch ended.', jobId: r.jobId });
+          await end(e, 'admitted', { reason: 'admitted', message: 'A job was recorded for it; its page shows how its launch ended.', jobId: r.jobId, launchFailed: true });
           return 'admitted';
         }
         return failed(e, r.errorClass ?? r.disposition);

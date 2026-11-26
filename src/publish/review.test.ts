@@ -77,6 +77,7 @@ function setup(o: Options = {}) {
         id: REPO_ID,
         checkoutPath: './clone',
         publish: 'draft-pr',
+        notifications: 'verbose',
         revise: true,
         review: true,
         autoMerge: 'squash',

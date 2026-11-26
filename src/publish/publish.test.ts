@@ -194,6 +194,7 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, over:
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
+        notifications: 'verbose',
         workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
         ...repoOver,
       },
@@ -341,10 +342,11 @@ describe('publishRun', { timeout: 60_000 }, () => {
     const pr = api.pulls[0]!;
     expect(pr).toMatchObject({ draft: true, headRef: s.branch, baseRef: 'main', title: 'Issue 7' });
     expect(pr.body).toMatch(/^Closes #7\n/);
-    expect(pr.body).toContain(`run \`${s.runId}\``);
+    expect(pr.body).toContain(`Run \`${s.runId}\``);
     expect(pr.body).toMatch(/\*\*Changes:\*\* \d+ files? changed/);
     expect(pr.body).toContain('Implemented the widget.');
-    expect(pr.body.trimEnd().endsWith(publicationMarker(s.runId))).toBe(true);
+    expect(pr.body).toContain(publicationMarker(s.runId));
+    expect(pr.body.trimEnd().endsWith(`<!-- updraft-agent: ${s.runId} claude -->`)).toBe(true);
     expect(api.comments).toHaveLength(1);
     expect(api.comments[0]!.body).toContain(pr.htmlUrl);
     expect(api.comments[0]!.body).toContain(publicationMarker(s.runId));

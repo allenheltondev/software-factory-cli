@@ -21,7 +21,8 @@ import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
 import { createLauncher, internetEgressConnector, noIngressConnector, waitingComment, type Launcher, type LaunchRequest } from './jobs/launch.js';
-import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
+import { createGitHubNotices } from './jobs/notices.js';
+import { quotasFromEnv, throttleCommentPermissions, throttledComment, installationPage } from './jobs/quotas.js';
 import { createAdmissionQueue, createGitHubRevalidator, createQueueDispatcher, dispatchMetricsLine, isQueueCancelRequest, type DispatchReport, type QueueCancelRequest, type QueueCancelResult, type QueueNotifier } from './jobs/queue.js';
 import { createDynamoQueueStore, type QueueEntry } from './jobs/queue-store.js';
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
@@ -132,19 +133,28 @@ const queueNotifier: QueueNotifier = {
   async post(entry, body, marker) {
     const { token, bot } = await queueToken(entry);
     const subject = (entry.issue ?? entry.pullRequest)!;
-    // A post whose answer was lost: found again, never posted twice.
+    // A post whose answer was lost: found again, never posted twice. Only among the App's own
+    // comments, so without its login nothing is posted at all (the sync logs and tries again).
+    if (!bot) throw new Error('the App slug is unknown');
     const existing = await github.findIssueComment!(token, entry.repository, subject, marker, bot);
     return existing ?? (await github.postIssueComment!(token, entry.repository, subject, body));
   },
   async find(entry, marker) {
     const { token, bot } = await queueToken(entry);
+    if (!bot) throw new Error('the App slug is unknown');
     return (await github.findIssueComment!(token, entry.repository, (entry.issue ?? entry.pullRequest)!, marker, bot)) ?? undefined;
   },
   async update(entry, commentId, body) {
     const { token } = await queueToken(entry);
     await github.updateIssueComment!(token, entry.repository, commentId, body);
   },
+  async read(entry, commentId) {
+    const { token } = await queueToken(entry);
+    return github.issueCommentBody!(token, entry.repository, commentId);
+  },
 };
+// Please-act comments (#173): a delivery refused for a missing key, a workflow blocked for a person.
+const notices = createGitHubNotices({ github, loadSettings, ...(consoleOrigin ? { consoleOrigin } : {}) });
 const admissionQueue = createAdmissionQueue({ store: queueStore, putEvent, notify: queueNotifier, workflows, ...(consoleOrigin ? { consoleOrigin } : {}) });
 
 
@@ -222,6 +232,7 @@ function launcher(): Launcher | undefined {
     quotas: quotasFromEnv(env),
     killSwitch,
     // The App's own token for that one repository, allowed only to write issues (and a pull request's conversation).
+    notifyRefused: (n) => notices.refused(n),
     notifyThrottled: async ({ installationId, repository, repositoryId, issue, pullRequest, limit, quotas }) => {
       const settings = await loadSettings();
       if (!settings) return;
@@ -229,7 +240,7 @@ function launcher(): Launcher | undefined {
         repositoryIds: [repositoryId],
         permissions: throttleCommentPermissions(pullRequest),
       });
-      await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas, pullRequest));
+      await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas, pullRequest, installationPage(process.env.UPDRAFT_CONSOLE_ORIGIN, installationId)));
     },
   });
 }
@@ -407,7 +418,7 @@ const appBot = async () => {
   return settings?.slug ? `${settings.slug}[bot]` : undefined;
 };
 const reconcileWorkflows = createWorkflowReconciler({
-  store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch,
+  store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch, notifyBlocked: notices.blocked,
   ...(launch && retryJob ? { recovery: { launch, retry: retryJob, appBot, queue: queueStore } } : {}),
 });
 

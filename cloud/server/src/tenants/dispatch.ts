@@ -12,7 +12,7 @@ import type { DispatchRules } from '../store/store.js';
  */
 
 type Workflow = { trigger?: { label?: unknown }; allowedActors?: unknown };
-type Repository = { id?: unknown; workflows?: unknown; review?: unknown; revise?: unknown; ciFix?: unknown };
+type Repository = { id?: unknown; workflows?: unknown; review?: unknown; revise?: unknown; ciFix?: unknown; notifications?: unknown };
 
 /** What a repository's dispatch rules need beyond the compiled config: whether it is paused. */
 export interface DispatchOptions {
@@ -62,6 +62,8 @@ export function dispatchRules(compiled: { repositories?: Record<string, unknown>
       ...(review ? { review: true as const } : {}),
       ...(revise ? { revise: true as const } : {}),
       ...(ci ? { ci: true as const } : {}),
+      // What the queue says on GitHub (#173): quiet, the default, is stored as nothing.
+      ...(repo.notifications === 'verbose' ? { verbose: true as const } : {}),
       triggers: stored,
     };
   }

@@ -580,7 +580,7 @@ and puts back what the revision and review loops read:
 | Row | From |
 | --- | --- |
 | The job | The event itself: the job id is derived from it, so it is the row the original run had. Status `succeeded` |
-| The run | Its id from the marker in the pull request's body; its agent from the "Opened by updraft from run ... (agent ...)" line; its attempt from the branch name. No summary, no log, no commits: nobody observed them |
+| The run | Its id from the marker in the pull request's body; its agent from the `<!-- updraft-agent: RUN_ID AGENT -->` marker beside it (or, for a pull request opened before #173, the "Opened by updraft from run ... (agent ...)" line); its attempt from the branch name. No summary, no log, no commits: nobody observed them |
 | The publication | State `published`, with the pull request's number, URL, head branch and base branch from the API. `head_sha` and the issue comment are not recorded; the next read of the pull request supplies the head |
 | The watch (`revision_prs`) | Derived from the publication and the job, as always |
 

@@ -119,7 +119,7 @@ describe('where agent prose is published', () => {
     expect(body).not.toContain('@octocat');
     expect(body).not.toMatch(/<!--[^>]*run_forged/);
     expect(body.match(/<!-- updraft-run: /g)).toHaveLength(1);
-    expect(body.endsWith(publicationMarker('run_x'))).toBe(true);
+    expect(body.endsWith(`${publicationMarker('run_x')}\n<!-- updraft-agent: run_x claude -->`)).toBe(true);
     expect(body).toContain('> ````\n\n');
   });
 

@@ -466,7 +466,7 @@ The enqueue and the end of an entry are each one transaction over all four, so t
 
 **States.** `queued`, `admitting`, then one end: `admitted` (a job started under the entry's id, or the subscription's sign-in wait took it over), `canceled` (label removed, issue or pull request closed, stale head, paused, canceled by an owner), `refused` (a budget, keys, config or route: with what to change), `expired`.
 
-**On GitHub.** One acknowledgement per queued job, the App's own comment, posted with a token for that one repository (issues, and a pull request's conversation), with a hidden marker (`<!-- updraft-queue: <jobId> -->`) that is searched for before any new post:
+**On GitHub.** With a repository's `notifications: quiet` (the default) the acknowledgement is the first stage of the issue's one live status comment, which the run takes over at assignment (the queue makes no `Started` edit, and reads the comment before any later edit so it never writes over the run); a queued pull request event posts nothing, and refused or expired work also gets one separate comment saying what to do ([assignment-comments.md](../docs/assignment-comments.md#queued-work-updraft-cloud)). With `verbose`, and for entries queued before the setting existed: one acknowledgement per queued job, the App's own comment, posted with a token for that one repository (issues, and a pull request's conversation), with a hidden marker (`<!-- updraft-queue: <jobId> -->`) that is searched for before any new post:
 
 > Updraft queued this issue. Your account's current execution slot is occupied. Work will start automatically when capacity is available. No action is needed.
 >

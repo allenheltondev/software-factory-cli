@@ -589,7 +589,7 @@ function mapEvent(r: RawIssueEvent): GitHubIssueEvent {
 
 interface RequestOptions {
   /** GET unless set. Writes are used only by the publication, revision and review steps. */
-  method?: 'GET' | 'POST' | 'PUT' | 'PATCH';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   /** JSON request body (POST). */
   body?: unknown;
   query?: Record<string, string | number>;
@@ -685,6 +685,8 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     log?.debug('github request', { method, url: display, status: res.status });
 
     if (res.status === 304) return { status: 304, data: null, headers: res.headers };
+    // No content (a DELETE): nothing to read.
+    if (res.status === 204) return { status: 204, data: null, headers: res.headers };
     if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
       // Only reachable with redirect: 'manual' (getIssue): the subject moved.
       throw new GitHubError(`${method} ${display}: moved (${res.status || 301})`, res.status || 301);
@@ -948,6 +950,19 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         body: { title: input.title, head: input.head, base: input.base, body: input.body, draft: input.draft },
       });
       return mapPull(res.data!);
+    },
+
+    async updatePullRequestBody(repo, pullNumber, body) {
+      await request<RawPullRequest>(`${repoPath(repo)}/pulls/${pullNumber}`, { method: 'PATCH', body: { body } });
+    },
+
+    async listMatchingRefs(repo, prefix) {
+      const res = await request<Array<{ ref?: unknown }>>(`${repoPath(repo)}/git/matching-refs/${prefix.replace(/^refs\//, '').split('/').map(encodeURIComponent).join('/')}`);
+      return (res.data ?? []).map((r) => r.ref).filter((r): r is string => typeof r === 'string' && r.startsWith(prefix));
+    },
+
+    async deleteRef(repo, ref) {
+      await request<unknown>(`${repoPath(repo)}/git/refs/${ref.replace(/^refs\//, '').split('/').map(encodeURIComponent).join('/')}`, { method: 'DELETE' });
     },
 
     async listIssueComments(repo, issueNumber) {

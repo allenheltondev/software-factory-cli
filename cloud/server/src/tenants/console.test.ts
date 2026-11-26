@@ -143,6 +143,25 @@ describe('compiling', () => {
     expect(r.files['prompts/implement.revise.md']).toBe('# Fix');
   });
 
+  it('round-trips notifications: quiet by default, verbose when set, into config.yaml and the dispatch rules', () => {
+    const unset = ok(settings());
+    expect(unset.repositories['acme/web']!.notifications).toBeUndefined();
+    const quiet = compile(unset);
+    expect(quiet.ok && yamlOf(quiet.files).repositories['acme/web']!.notifications).toBeUndefined();
+    expect(quiet.ok && quiet.dispatch.repositories['acme/web']?.verbose).toBeUndefined();
+    for (const mode of ['quiet', 'verbose'] as const) {
+      const config = ok(settings({ 'acme/web': repo({ notifications: mode }) }));
+      // What the console saved reads back the same.
+      expect(ok(JSON.parse(JSON.stringify(config))).repositories['acme/web']!.notifications).toBe(mode);
+      const r = compile(config);
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect(yamlOf(r.files).repositories['acme/web']!.notifications).toBe(mode);
+      expect(r.dispatch.repositories['acme/web']?.verbose).toBe(mode === 'verbose' ? true : undefined);
+    }
+    expect(errorsOf(settings({ 'acme/web': repo({ notifications: 'loud' }) }))).toEqual([expect.objectContaining({ path: 'repositories.acme/web.notifications' })]);
+  });
+
   it('compiles the acceptance policy, and leaves it to the CLI default when unset', () => {
     const review = (over: Record<string, unknown>) => ({ review: { enabled: true, pool: 'reviewers', prompt: '# Look', allowSameAgent: false, ...over } });
     for (const acceptance of ['report', 'off', 'enforce'] as const) {

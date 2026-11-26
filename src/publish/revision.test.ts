@@ -118,6 +118,7 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, mode 
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
+        notifications: 'verbose',
         revise: true,
         commentOnFailure: true,
         workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
@@ -641,6 +642,96 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     await reviseRun(deps(badNone, api4), badNone.runId);
     expect(api4.comments[0]!.body).toMatch(new RegExp(`a revision for the checks that failed on \`${failedSha.slice(0, 12)}\`, but`));
     expect(api4.comments[0]!.body).not.toContain('javascript:');
+  });
+
+  it('quiet notifications: a CI fix pushes, and posts no reply and no claim on the PR; a change request is still answered', async () => {
+    const p = await published();
+    const failedSha = 'a'.repeat(40);
+    const base = request(p);
+    const req: RevisionRequest = { ...base, trigger: 'ci_failure', reviewedSha: failedSha, review: { ...base.review, url: `https://github.com/${FULL}/runs/7`, author: 'updraft-bot[bot]', headSha: failedSha } };
+    const s = await revised(p, { req });
+    const api = new FakeCommentsApi();
+    const quiet = makeConfig(s.f, { notifications: 'quiet' });
+    expect((await reviseRun(deps(s, api, { config: quiet, claimReviews: true }), s.runId)).status).toBe('published');
+    expect(api.comments).toEqual([]);
+
+    const q = await published();
+    const r = await revised(q);
+    const api2 = new FakeCommentsApi();
+    expect((await reviseRun(deps(r, api2, { config: makeConfig(r.f, { notifications: 'quiet' }) }), r.runId)).status).toBe('published');
+    expect(api2.comments).toHaveLength(1);
+  });
+
+  it('quiet notifications: two runners fixing the same failed head land exactly one revision, and neither says anything on the PR', async () => {
+    const p = await published();
+    const failedSha = remoteSha(p)!;
+    const ciReq = (base: RevisionRequest): RevisionRequest => ({ ...base, trigger: 'ci_failure', reviewedSha: failedSha, review: { ...base.review, id: `ci-failure:${PR}:${failedSha}`, url: `https://github.com/${FULL}/runs/7`, author: 'updraft-bot[bot]', headSha: failedSha } });
+    // Two machines' runs for the one CI-fix review, both prepared from the failed head.
+    const a = await revised(p, { req: ciReq(request(p)) });
+    const other = ciReq(request(p));
+    const b = await revised(p, { req: { ...other, review: { ...other.review, id: 'ci-failure-second-machine' } } });
+    const env = JSON.parse((p.db.prepare('SELECT envelope FROM jobs WHERE id = ?').get(b.jobId) as { envelope: string }).envelope) as { revision: RevisionRequest };
+    env.revision.review.id = `ci-failure:${PR}:${failedSha}`;
+    p.db.prepare('UPDATE jobs SET envelope = ? WHERE id = ?').run(JSON.stringify(env), b.jobId);
+    expect(b.baseSha).toBe(a.baseSha);
+
+    const quiet = makeConfig(p.f, { notifications: 'quiet' });
+    const apiA = new FakeCommentsApi();
+    const apiB = new FakeCommentsApi();
+    // B gets as far as its first push; A then runs to the end; then B goes on: the race at its worst.
+    let resultA: Awaited<ReturnType<typeof reviseRun>> | undefined;
+    let raced = false;
+    const racing: RunGit = async (args, opts) => {
+      if (args[0] === 'push' && !raced) {
+        raced = true;
+        resultA = await reviseRun(deps(a, apiA, { config: quiet, claimReviews: true }), a.runId);
+      }
+      return runGit(args, opts);
+    };
+    const resultB = await reviseRun(deps(b, apiB, { config: quiet, claimReviews: true, runGit: racing }), b.runId);
+    expect(resultA).toMatchObject({ status: 'published' });
+    expect(resultB).toMatchObject({ status: 'skipped' });
+    expect(getRevision(p.db, b.runId)!.error).toMatch(/^superseded: /);
+    // Exactly one revision on the branch: A's.
+    expect(remoteSha(p)).toBe(a.localSha);
+    expect(p.f.git(p.f.clone, 'log', '--format=%H', `${failedSha}..${a.localSha}`).split('\n')).toHaveLength(1);
+    // Nothing on the pull request, from either.
+    expect(apiA.comments).toEqual([]);
+    expect(apiB.comments).toEqual([]);
+    // The claims are refs, not branches.
+    expect(p.f.git(p.f.root, 'ls-remote', '--heads', p.f.remoteDir)).not.toContain('revision-claims');
+    // The winner's claim stays (it is what a later loser reads); the loser took its own back.
+    const claims = p.f.git(p.f.root, 'ls-remote', p.f.remoteDir, 'refs/updraft/*');
+    expect(claims).toContain(`${a.localSha}\trefs/updraft/revision-claims/ci-failure-${PR}-${failedSha}/${a.runId}`);
+    expect(claims).not.toContain(b.runId);
+
+    // A third machine, prepared from the failed head after A landed: it gives way before pushing anything.
+    const c = await revised(p, { req: { ...other, review: { ...other.review, id: 'ci-failure-third-machine' } } });
+    const envC = JSON.parse((p.db.prepare('SELECT envelope FROM jobs WHERE id = ?').get(c.jobId) as { envelope: string }).envelope) as { revision: RevisionRequest };
+    envC.revision.review.id = `ci-failure:${PR}:${failedSha}`;
+    p.db.prepare('UPDATE jobs SET envelope = ? WHERE id = ?').run(JSON.stringify(envC), c.jobId);
+    expect(await reviseRun(deps(c, new FakeCommentsApi(), { config: quiet, claimReviews: true }), c.runId)).toMatchObject({ status: 'skipped' });
+    expect(remoteSha(p)).toBe(a.localSha);
+  });
+
+  it('quiet notifications: a remote that refuses the claim ref costs only the claim, never the CI fix', async () => {
+    const p = await published();
+    const failedSha = remoteSha(p)!;
+    const base = request(p);
+    const s = await revised(p, { req: { ...base, trigger: 'ci_failure', reviewedSha: failedSha, review: { ...base.review, url: `https://github.com/${FULL}/runs/7`, author: 'updraft-bot[bot]', headSha: failedSha } } });
+    // As a ruleset or a pre-receive hook refuses refs outside branches and tags.
+    const refusing: RunGit = async (args, opts) => {
+      if (args[0] === 'push' && args.some((a) => a.includes(':refs/updraft/'))) {
+        throw new GitError('git push failed', [...args], 1, ' ! [remote rejected] refs/updraft/revision-claims/x (pre-receive hook declined)');
+      }
+      return runGit(args, opts);
+    };
+    const api = new FakeCommentsApi();
+    const r = await reviseRun(deps(s, api, { config: makeConfig(s.f, { notifications: 'quiet' }), claimReviews: true, runGit: refusing }), s.runId);
+    expect(r).toMatchObject({ status: 'published' });
+    expect(remoteSha(p)).toBe(s.localSha);
+    expect(api.comments).toEqual([]);
+    expect(readFileSync(s.logPath, 'utf8')).toContain('the remote refused the claim ref');
   });
 
   it('pushes nothing to a PR that was closed while the revision ran', async () => {

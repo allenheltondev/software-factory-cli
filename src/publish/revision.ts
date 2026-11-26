@@ -17,6 +17,7 @@
 //   one comment on the PR says so.
 // Destination validation, the throwaway repository, hooks-off and the token handling are
 // publication's (openPushTarget), as are the lease and attempt fence around every write.
+import { quietFor } from './status-comment.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -53,6 +54,10 @@ import { workerLogin } from '../github/identity.js';
 import {
   cap,
   classifyFailure,
+  mergePolicy,
+  mergeSentence,
+  withMergeSentence,
+  type MergePolicy,
   classifyGit,
   fenced,
   inline,
@@ -151,6 +156,34 @@ export async function findRevisionClaims(api: Pick<GitHubApi, 'listIssueComments
     .map(({ c, m }) => ({ reviewId, baseSha: m[2]!, headSha: m[3]!, runId: RUN_MARKER.exec(c.body)?.[1] ?? null, commentId: c.id, url: c.htmlUrl }));
 }
 
+/**
+ * Quiet notifications: a CI fix's claim is a ref on the remote, never a comment on the pull request.
+ * `refs/updraft/revision-claims/<review>/<run>` points at the commit the run pushes. GitHub shows
+ * no branch or tag for it, and a fetch of branches never brings it.
+ */
+export function revisionClaimRef(reviewId: string, runId?: string): string {
+  const key = reviewId.replace(/[^A-Za-z0-9._-]/g, '-').replace(/\.{2,}/g, '-').replace(/^[.-]+|[.]+$/g, '').slice(0, 120) || 'review';
+  return `refs/updraft/revision-claims/${key}/${runId ? runId.replace(/[^A-Za-z0-9_-]/g, '-') : ''}`;
+}
+
+/** The ref claims of the runs that revised for `reviewId`, as the remote has them now. */
+export async function findRefClaims(
+  run1: (args: readonly string[], opts: GitOptions) => Promise<{ stdout: string }>,
+  pushUrl: string,
+  net: GitOptions,
+  reviewId: string,
+  repoFullName: string,
+  prNumber: number,
+): Promise<RevisionClaim[]> {
+  const prefix = revisionClaimRef(reviewId);
+  const listed = (await run1(['ls-remote', pushUrl, `${prefix}*`], net)).stdout;
+  return listed
+    .split(/\r?\n/)
+    .map((l) => l.trim().split(/\s+/))
+    .filter((parts): parts is [string, string] => parts.length >= 2 && /^[0-9a-f]{40,64}$/.test(parts[0]!) && parts[1]!.startsWith(prefix))
+    .map(([sha, ref]) => ({ reviewId, baseSha: '', headSha: sha, runId: ref.slice(prefix.length) || null, commentId: 0, url: `https://github.com/${repoFullName}/pull/${prNumber}` }));
+}
+
 /** Hidden marker on the one comment that says a PR reached maxRevisions. */
 export const REVISION_LIMIT_MARKER = '<!-- updraft-revision-limit -->';
 
@@ -213,6 +246,8 @@ export function renderRevisionReply(o: {
   trigger?: RevisionRequest['trigger'];
   /** The commit the push left the pull request at, and its page. */
   pushed?: { sha: string; url: string | null };
+  /** What merge.ts will do with the pull request (publish.ts mergePolicy); absent: up to a person. */
+  merge?: MergePolicy;
 }): string {
   const at = o.pushed ? (o.pushed.url ? `[${code(short(o.pushed.sha))}](${o.pushed.url})` : code(short(o.pushed.sha))) : null;
   return withMarker(
@@ -234,13 +269,25 @@ export function renderRevisionReply(o: {
               '',
             ]
           : [`Updraft pushed ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`, '']),
-      `From run ${code(o.runId)} (agent ${inline(o.agent)}). Review it before merging; merging is up to a person.`,
+      `From run ${code(o.runId)} (agent ${inline(o.agent)}). ${o.merge?.auto ? `Updraft merges it (${code(o.merge.method)}) once review and required checks pass.` : `Review it before merging; ${mergeSentence(o.merge ?? { auto: false, reason: null }).replace(/^M/, 'm')}`}`,
       '',
       ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
       ...renderRunResult(o.summary, o.commitCount),
     ],
     revisionMarker(o.runId),
   );
+}
+
+/** Restate the PR body's merge sentence after a push. Best effort: the body is not what decides a merge. */
+async function restateMerge(deps: PublishDeps, repo: RepoRef, prNumber: number, merge: MergePolicy, log: PublishDeps['log']): Promise<void> {
+  if (!deps.api.updatePullRequestBody) return;
+  try {
+    const body = (await deps.api.getPullRequest(repo, prNumber)).body;
+    const next = body ? withMergeSentence(body, merge) : null;
+    if (next) await deps.api.updatePullRequestBody(repo, prNumber, next);
+  } catch (err) {
+    log.warn('could not restate the merge sentence of the pull request body', { error: message(err) });
+  }
 }
 
 /** With claimReviews: what a revision posts just before its push, and then replaces with the reply (or with why it pushed nothing). */
@@ -441,7 +488,15 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     if (!finishRevision(deps.db, runId, fence.attempt, { ...r, now })) throw new RevisionSupersededError(runId, fence.attempt);
     return getRevision(deps.db, runId)!;
   };
-  const claiming = deps.claimReviews === true;
+  // Quiet notifications: a CI fix is said on the issue's status comment, not on the pull request,
+  // so it posts no claim and no reply (only a refusal to push, which a person has to look at).
+  const silent = request.trigger === 'ci_failure' && quietFor(deps.config, job);
+  const claiming = deps.claimReviews === true && !silent;
+  // ...and claims its push where no one sees it instead: a ref of its own on the remote
+  // (revisionClaimRef), read the same way as a comment claim. One revision per review, still.
+  const refClaiming = deps.claimReviews === true && silent;
+  /** Deletes this run's claim ref, once it pushed one and then stepped aside. Best effort. */
+  let dropClaim: (() => Promise<void>) | null = null;
   /**
    * The PR comment of this run: recorded, found by its marker, or new.
    *
@@ -533,9 +588,12 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
      * history this run started from. A claim whose push never came is nobody's.
      */
     const answeredElsewhere = async (remoteSha: string | null): Promise<RevisionClaim | null> => {
-      if (!claiming) return null;
+      if (!claiming && !refClaiming) return null;
       hold();
-      for (const c of await findRevisionClaims(deps.api, repoRef, prNumber, request.review.id)) {
+      const claims = claiming
+        ? await findRevisionClaims(deps.api, repoRef, prNumber, request.review.id)
+        : await findRefClaims(run1, pushUrl, net, request.review.id, repoFullName, prNumber);
+      for (const c of claims) {
         if (c.runId === runId) continue;
         if (c.headSha === remoteSha || c.headSha === baseSha) return c;
         // Exit 1: not an ancestor; 128: a commit this clone never fetched, so not in the run's history either.
@@ -595,6 +653,23 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     } else {
       // Said on the pull request before it is done, so that no run can build on this push without being able to see whose it is.
       if (claiming) await comment(() => renderRevisionClaim({ runId, review: request.review, commitCount }), { headSha: localSha });
+      if (refClaiming) {
+        // The run's own claim ref, before the push: a run that loses the branch's lease finds it.
+        // A remote that refuses refs outside branches and tags (a ruleset, a pre-receive hook)
+        // costs only the claim: the push goes on, and a lost race reads as the branch moving.
+        hold();
+        const own = revisionClaimRef(request.review.id, runId);
+        try {
+          await run1(['push', '--no-verify', '--recurse-submodules=no', '--porcelain', pushUrl, `+${localSha}:${own}`], net);
+          dropClaim = async () => {
+            await run1(['push', '--no-verify', '--porcelain', pushUrl, `:${own}`], net).catch(() => {});
+          };
+        } catch (err) {
+          if (!(err instanceof GitError)) throw err;
+          log.warn('the remote refused the revision\'s claim ref; pushing without it', { ref: own, error: redactSecret(err.stderr.trim().split(/\r?\n/).slice(-1)[0] ?? err.message, token) });
+          await runLog([`the remote refused the claim ref ${own}; pushing without it`]);
+        }
+      }
       await runLog([`pushing ${short(baseSha)}..${short(localSha)} (${commitCount} commit(s)) to ${prBranch} on ${remote} (${redactRemoteUrl(pushUrl)})`]);
       hold();
       try {
@@ -644,8 +719,11 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       if (answered.log.length) await runLog(answered.log);
     }
 
-    // 4. The reply: recorded, found by marker, or new.
-    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run), trigger: request.trigger, pushed: { sha: localSha, url: commitUrl(request.pullRequest.url, localSha) } }), { headSha: localSha });
+    // 4. The PR body's merge sentence, for the new head and its own verification.
+    const merge = mergePolicy(deps.config, repo, { mode: 'pr', verifies: Boolean(ownEntry(deps.config.actions, job.action)?.verify?.length), summary: { verification: run.summary.verification, headSha: localSha } });
+    await restateMerge(deps, repoRef, prNumber, merge, log);
+    // 5. The reply: recorded, found by marker, or new.
+    if (!silent) await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run), trigger: request.trigger, pushed: { sha: localSha, url: commitUrl(request.pullRequest.url, localSha) }, merge }), { headSha: localSha });
 
     const done = finish({ state: 'published' });
     log.info('revision pushed', { pr: prNumber, from: baseSha, to: localSha });
@@ -656,6 +734,8 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       // Not a failure and not news for the pull request: the review has its revision. What this
       // run announced, if it got that far, is taken back; a failure to do so is retried like any.
       const { claim } = err;
+      // Its own claim is nobody's answer now.
+      await dropClaim?.();
       const reason = `${SUPERSEDED_PREFIX}another run answered this review first (${claim.url}${claim.runId ? `, run ${claim.runId}` : ''}, ${short(claim.baseSha)}..${short(claim.headSha)}); nothing was pushed`;
       try {
         if (rev.commentId) await comment(() => renderSupersededNote({ runId, review: request.review, otherUrl: claim.url }));
@@ -668,6 +748,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       }
     }
     if (err instanceof NotPushed) {
+      await dropClaim?.();
       // Say so on the PR. If that fails for now, the whole attempt is retried: the branch check
       // above refuses again, and the comment gets another try.
       const refusal = err;

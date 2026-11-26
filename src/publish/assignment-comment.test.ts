@@ -6,7 +6,7 @@ import { ENVELOPE_SCHEMA_VERSION, type EventEnvelope, type Job, type Run } from 
 import { silentLogger } from '../util/log.js';
 import { consoleContextFromEnv, consoleJobUrl, assignmentCommentMarker, createAssignmentCommenter, renderAssignmentComment } from './assignment-comment.js';
 
-const config = (mode: 'live' | 'log-only' | 'prepare-only' = 'live'): UpdraftConfig =>
+const config = (mode: 'live' | 'log-only' | 'prepare-only' = 'live', notifications: 'quiet' | 'verbose' = 'verbose'): UpdraftConfig =>
   configSchema.parse({
     version: 1,
     agents: { codex: {}, claude: {} },
@@ -14,6 +14,13 @@ const config = (mode: 'live' | 'log-only' | 'prepare-only' = 'live'): UpdraftCon
     actions: { 'implement-issue': { prompt: './p.md' } },
     dispatch: { allowedActors: ['allen'] },
     execution: { mode },
+    repositories: {
+      'owner/repo': {
+        id: 1,
+        notifications,
+        workflows: [{ trigger: { event: 'issue.labeled', label: 'ready' }, action: 'implement-issue', pool: 'general' }],
+      },
+    },
   });
 
 const envelope = (type = 'issue.labeled'): EventEnvelope =>

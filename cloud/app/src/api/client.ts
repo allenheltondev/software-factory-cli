@@ -803,6 +803,8 @@ export interface ConsoleRepository {
   autoMerge?: { method: MergeMethod; waitMinutes?: number; requiredChecks?: string[] };
   /** Absent: off. CI is part of the review loop: a failing check on a head the reviewer found ready queues a fix. */
   ci?: { checks?: string[]; ignore?: string[]; waitMinutes?: number };
+  /** Absent or quiet: one live status comment per run, and a comment only when a person has to act. verbose: separate status comments. */
+  notifications?: 'quiet' | 'verbose';
 }
 
 export interface ConsoleConfig {

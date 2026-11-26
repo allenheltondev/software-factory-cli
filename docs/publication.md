@@ -32,9 +32,16 @@ account (`GH_TOKEN` or `GITHUB_TOKEN` if set, otherwise `gh auth token`):
    the same commit, the push is skipped; at a different commit, before or during the push,
    publication fails and the remote branch is left alone.
 2. **Open a PR** from the job branch into the base branch (draft for `draft-pr`), titled with
-   the issue title. The body says `Closes #<n>`, lists the commits and the diffstat, quotes the
-   agent's final message (capped, as sanitized Markdown, see below), and carries the run id and a hidden `<!-- updraft-run: <runId> -->` marker.
-3. **Comment on the issue** with a link to the PR and a short summary, with the same marker.
+   the issue title. The body says `Closes #<n>`, states the merge Updraft will attempt (`Updraft
+   merges this once review and checks pass` only when `autoMerge` is on and its verify gate passed
+   on the commit, otherwise `Merging is up to a person`), links the run's console timeline when
+   hosted (else names the run and agent), lists the commits and the diffstat, quotes the agent's
+   final message (as sanitized Markdown, see below, without its `updraft-acceptance` and
+   `updraft-findings` blocks, and cut only at a line outside any fenced block), and carries the
+   hidden `<!-- updraft-run: <runId> -->` and `<!-- updraft-agent: <runId> <agent> -->` markers.
+3. **On the issue**: with `notifications: quiet` (the default), the issue's live status comment
+   moves to `PR opened` ([assignment-comments.md](assignment-comments.md)); with `verbose`, a
+   comment with a link to the PR and a short summary, with the same marker.
 
 The agent's prose (its final message here, the findings of a review, the replies to a review)
 is rendered as GitHub Markdown, so headings, lists, emphasis, links, inline code and code

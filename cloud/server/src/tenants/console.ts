@@ -167,6 +167,12 @@ export interface ConsoleRepository {
   autoMerge?: ConsoleAutoMerge;
   /** Absent: off. Checks are part of the review loop, and failures are repaired (see ConsoleCi). */
   ci?: ConsoleCi;
+  /**
+   * What Updraft says on GitHub (repositories.R.notifications, #173). Absent or quiet: one live
+   * status comment per run, and a comment only when a person has to act. verbose: the separate
+   * status comments of earlier versions.
+   */
+  notifications?: 'quiet' | 'verbose';
 }
 
 /** What an upgrade from version 1 keeps resolvable for work in flight (see the top of this file). */
@@ -494,7 +500,8 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
         c.err(path, 'must be a mapping');
         continue;
       }
-      only(c, path, r, ['enabled', 'workflows', 'allowedActors', 'baseBranch', 'publish', 'commentOnFailure', 'verify', 'verifyTimeoutMinutes', 'autoMerge', 'ci']);
+      only(c, path, r, ['enabled', 'workflows', 'allowedActors', 'baseBranch', 'publish', 'commentOnFailure', 'verify', 'verifyTimeoutMinutes', 'autoMerge', 'ci', 'notifications']);
+      if (r.notifications !== undefined && r.notifications !== 'quiet' && r.notifications !== 'verbose') c.err(`${path}.notifications`, 'must be quiet or verbose');
 
       const runs = names(c, `${path}.workflows`, r.workflows, isObject(raw.workflows) ? raw.workflows : undefined, 'workflow', CONSOLE_LIMITS.workflowsPerRepository);
       if (Array.isArray(r.workflows) && r.workflows.length === 0) c.err(`${path}.workflows`, 'choose at least one workflow: its label is how an issue starts work here');
@@ -585,6 +592,7 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
         ...(verify.length && verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes } : {}),
         ...(autoMerge ? { autoMerge } : {}),
         ...(ci ? { ci } : {}),
+        ...(r.notifications === 'quiet' || r.notifications === 'verbose' ? { notifications: r.notifications } : {}),
       };
     }
     if (list.length === 0) c.err('repositories', 'add at least one repository');
@@ -958,6 +966,7 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
           }
         : {}),
       ...(r.ci ? { ciFix: r.ci.checks || r.ci.ignore || r.ci.waitMinutes !== undefined ? { ...r.ci } : true } : {}),
+      ...(r.notifications ? { notifications: r.notifications } : {}),
       workflows: r.workflows.map((n) => {
         const w = config.workflows[n]!;
         return {

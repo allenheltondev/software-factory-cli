@@ -9,7 +9,7 @@ import { createGitHubApi } from './github/client.js';
 import { appJwt } from './github/jwt.js';
 import { createSettingsLoader } from './github/settings.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
-import { throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
+import { throttleCommentPermissions, throttledComment, installationPage } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
 
@@ -72,7 +72,7 @@ const handle = createBroker({
       repositoryIds: [repositoryId],
       permissions: throttleCommentPermissions(pullRequest),
     });
-    await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas, pullRequest));
+    await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas, pullRequest, installationPage(process.env.UPDRAFT_CONSOLE_ORIGIN, installationId)));
   },
 });
 

@@ -5,7 +5,8 @@ import { createWorkflowRecorder } from '../workflows/recorder.js';
 import { createMemoryWorkflowStore } from '../workflows/store.js';
 import { deliveryFromLaunch } from './deliveries.js';
 import { createLauncher, pullRequestLease, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice } from './launch.js';
-import { ADMIT_LEASE_MS, createAdmissionQueue, createGitHubRevalidator, createQueueDispatcher, dispatchMetricsLine, isQueueCancelRequest, MAX_ADMIT_ATTEMPTS, QUEUE_EXPIRY_MS, queueComment, queueCommentMarker, type QueueNotifier, type Revalidate } from './queue.js';
+import { ADMIT_LEASE_MS, createAdmissionQueue, createGitHubRevalidator, createQueueDispatcher, dispatchMetricsLine, isQueueCancelRequest, MAX_ADMIT_ATTEMPTS, QUEUE_EXPIRY_MS, queueComment, queueCommentMarker, syncComment, type QueueNotifier, type Revalidate } from './queue.js';
+import { parseStatusMarker, renderStatusComment, STATUS_STAGE } from '../../../../src/publish/status-marker.js';
 import { createMemoryQueueStore, type QueueEntry } from './queue-store.js';
 import { jobResult } from './status.js';
 import { GitHubError } from '../github/client.js';
@@ -25,9 +26,10 @@ const SETTINGS: LaunchDeps['settings'] = {
 };
 const ONE_AT_A_TIME = { concurrentJobs: 1, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 };
 const tenant = (installationId: number): Tenant => ({ installationId, accountId: installationId, accountLogin: `acct${installationId}`, accountType: 'Organization', status: 'active', createdAt: '2026-11-19T00:00:00.000Z', createdBy: 's' });
-const rules = (repo: string, id: number, loop = false) => dispatchRules({
+// The comments of #164 are verbose notifications; quiet ones (#173) are tested on their own below.
+const rules = (repo: string, id: number, loop = false, notifications: 'quiet' | 'verbose' | undefined = 'verbose') => dispatchRules({
   dispatch: { allowedActors: ['pat'] },
-  repositories: { [repo]: { id, ...(loop ? { review: true, revise: true, ciFix: true } : {}), workflows: [{ trigger: { label: 'updraft' } }] } },
+  repositories: { [repo]: { id, ...(loop ? { review: true, revise: true, ciFix: true } : {}), ...(notifications ? { notifications } : {}), workflows: [{ trigger: { label: 'updraft' } }] } },
 }, { keysFor: () => [] });
 
 type Comment = { jobId: string; id: number; body: string; edits: number };
@@ -57,11 +59,14 @@ describe('the admission queue', () => {
       c.body = body;
       c.edits++;
     },
+    async read(_e, id) {
+      return comments.find((x) => x.id === id)?.body ?? null;
+    },
   };
 
-  const setup = async (installationId: number, repo = 'acme/web', repoId = 9, loop = false) => {
+  const setup = async (installationId: number, repo = 'acme/web', repoId = 9, loop = false, notifications: 'quiet' | 'verbose' | undefined = 'verbose') => {
     await store.putTenantWithMember(tenant(installationId), { installationId, sub: 's', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
-    const v = await store.createConfigVersion(installationId, { sha256: 'x', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: rules(repo, repoId, loop) });
+    const v = await store.createConfigVersion(installationId, { sha256: 'x', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: rules(repo, repoId, loop, notifications) });
     await store.markConfigReady(installationId, v as number);
     await store.activateConfig(installationId, v as number);
   };
@@ -711,6 +716,137 @@ describe('the admission queue', () => {
       await dispatcher.dispatch();
       expect(await dispatcher.cancel(55, c.jobId!, 'pat')).toMatchObject({ ok: false }); // already ended at admission
       expect(comments.map((x) => x.body.match(/\*\*Status:\*\* ([^\n]*)/)?.[1])).toEqual([expect.stringContaining('Started'), 'Canceled · label_removed']);
+    });
+  });
+
+  describe('quiet notifications (#173): the acknowledgement is the first stage of the one status comment', () => {
+    beforeEach(async () => {
+      const v = await store.createConfigVersion(55, { sha256: 'q', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: rules('acme/web', 9, true, 'quiet') });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+    });
+    const runnerStage = (key: string) => renderStatusComment({ title: 'Assigned', text: 'Updraft assigned a worker.', details: '| | |\n| --- | --- |\n| Worker | `claude` |', mark: { key, stage: STATUS_STAGE.assigned } });
+
+    it('Queued names no agent and no ETA; the admission leaves it to the run, and a late queue edit never overwrites the run', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ notifications: 'quiet' });
+      expect(comments).toHaveLength(1);
+      const ack = comments[0]!.body;
+      expect(parseStatusMarker(ack)).toEqual({ key: b.jobId, stage: STATUS_STAGE.queued });
+      expect(ack).toContain('**Updraft · Queued**');
+      expect(ack).toContain(`[View this work in Updraft](https://updraft.example.com/installations/55/jobs/${b.jobId})`);
+      expect(ack).not.toMatch(/minutes|hours|claude|codex|assigned/i);
+
+      // Admitted: no "Started" edit; the run's assignment is the next stage.
+      await finish(a.jobId!);
+      await dispatcherFor(launch).dispatch();
+      expect((await store.getJob(b.jobId!))?.status).toBe('launched');
+      expect(comments[0]!.edits).toBe(0);
+
+      // The run takes the comment over; then a late sync of the queue's (an older state, say)
+      // reads it first and leaves it alone.
+      comments[0]!.body = runnerStage(b.jobId!);
+      const entry = (await queue.get(55, b.jobId!))!;
+      const { commentState: _s, ...stale } = { ...entry, state: 'queued' as const };
+      await syncComment(queue, notify, stale as typeof entry, 'https://updraft.example.com', clock, () => {});
+      expect(comments[0]!.body).toBe(runnerStage(b.jobId!));
+      expect(comments).toHaveLength(1);
+    });
+
+    it('a redelivery or a retried post finds the comment by its marker: never a second one', async () => {
+      const launch = createLauncher(deps());
+      await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      await launch(request(2, 'delivery-b'));
+      const entry = (await queue.get(55, b.jobId!))!;
+      // The id was never recorded (the post's answer was lost): the sync finds it again.
+      const { commentId: _c, commentState: _s, ...lost } = entry;
+      await syncComment(queue, notify, lost as typeof entry, 'https://updraft.example.com', clock, () => {});
+      expect(comments).toHaveLength(1);
+    });
+
+    it('expired or refused: the status comment says so, and one separate comment asks a person to act', async () => {
+      const launch = createLauncher(deps());
+      await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      clock += QUEUE_EXPIRY_MS + 1;
+      await dispatcherFor(launch).dispatch();
+      await dispatcherFor(launch).dispatch();
+      expect(comments).toHaveLength(2);
+      expect(parseStatusMarker(comments[0]!.body)).toEqual({ key: b.jobId, stage: STATUS_STAGE.ended });
+      expect(comments[0]!.body).toContain('**Updraft · Expired**');
+      const act = comments[1]!.body;
+      expect(act).toMatch(/^Updraft could not start the queued work for this issue: /);
+      expect(act).toContain(`[Open it in Updraft](https://updraft.example.com/installations/55/jobs/${b.jobId})`);
+      expect(act.split('\n')[0]!.split(/(?<=\.) /).length).toBeLessThanOrEqual(3);
+      expect((await queue.get(55, b.jobId!))?.actPosted).toBe(true);
+
+    });
+
+    it('a budget refusal at admission: the status comment says so, and one separate comment says what to do', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      await finish(a.jobId!);
+      await store.setTenantLimits(55, { jobsPerDay: 1 });
+      await dispatcherFor(launch).dispatch();
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'refused', outcome: { reason: 'jobs_per_day' } });
+      expect(comments).toHaveLength(2);
+      expect(comments[0]!.body).toContain('**Updraft · Not started**');
+      expect(comments[1]!.body).toMatch(/^Updraft could not start the queued work for this issue: /);
+      expect(notices).toEqual([]);
+    });
+
+    it('an admission whose launch failed, with no run to take the comment over, ends it and asks for a retry once', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      await finish(a.jobId!);
+      const failing = (async () => ({ status: 502, disposition: 'launch_failed', jobId: b.jobId })) as unknown as ReturnType<typeof createLauncher>;
+      // No job record before the launch; the failed launch got as far as recording one.
+      let launched = false;
+      const jobs = { getJob: async () => (launched ? ({ jobId: b.jobId } as never) : null), getDeliveryClaim: async () => null };
+      const recorded = failing;
+      const failingOnce = (async (req: never) => ((launched = true), recorded(req))) as unknown as ReturnType<typeof createLauncher>;
+      await dispatcherFor(failingOnce, { jobs }).dispatch();
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'admitted', outcome: { launchFailed: true } });
+      expect(comments).toHaveLength(2);
+      expect(parseStatusMarker(comments[0]!.body)).toEqual({ key: b.jobId, stage: STATUS_STAGE.ended });
+      expect(comments[0]!.body).toContain('**Updraft · Not started**');
+      expect(comments[1]!.body).toMatch(/^Updraft could not start a worker for the queued work on this issue\. Please retry the job from its page/);
+      // A retry's run takes the comment over from there: the queue's end is below every runner stage.
+      await dispatcherFor(failing, { jobs }).dispatch();
+      expect(comments).toHaveLength(2);
+    });
+
+    it('a canceled entry is edited quietly, with no separate comment', async () => {
+      const launch = createLauncher(deps());
+      await launch(request(1, 'delivery-a'));
+      await launch(request(2, 'delivery-b'));
+      await dispatcherFor(launch).subjectChanged(55, 9, { issue: 2 }, { kind: 'unlabeled', label: 'updraft' });
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain('**Updraft · Canceled**');
+    });
+
+    it('queued pull request events post nothing on the pull request', async () => {
+      const launch = createLauncher(deps());
+      await launch(request(1, 'delivery-a'));
+      const payload = { action: 'submitted', pull_request: { number: 40, head: { ref: 'updraft/issue-12-abc', sha: 'aaaaaaa1' } }, review: { state: 'changes_requested' }, sender: { login: 'pat' }, repository: { id: 9, full_name: 'acme/web' } };
+      expect(await launch({ installationId: 55, deliveryId: 'pr-1', eventName: 'pull_request_review', appBot: 'updraft[bot]', body: JSON.stringify(payload), payload })).toMatchObject({ disposition: 'queued' });
+      expect(comments).toEqual([]);
+    });
+
+    it('verbose restores the separate acknowledgement', async () => {
+      const v = await store.createConfigVersion(55, { sha256: 'v', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: rules('acme/web', 9, true, 'verbose') });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      const launch = createLauncher(deps());
+      await launch(request(1, 'delivery-a'));
+      await launch(request(2, 'delivery-b'));
+      expect(comments[0]!.body).toContain('**Status:** Queued · Waiting for capacity');
+      expect(parseStatusMarker(comments[0]!.body)).toBeNull();
     });
   });
 

@@ -39,7 +39,7 @@ import {
 import { listUnpublishedSinceEnabled } from '../db/publish-settings.js';
 import { dependencyRef, getDependencyWait } from '../db/dependency-waits.js';
 import { recordError, type Db } from '../db/database.js';
-import { publishMode, type UpdraftConfig } from '../config/schema.js';
+import { autoMergeMethod, publishMode, type MergeMethod, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import {
   assertValidBranchName,
   GitError,
@@ -62,7 +62,11 @@ import { reviewOf, revisionOf, type Job, type Publication, type Run, type RunSum
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { verificationLines, verificationNotes } from '../worker/verify.js';
-import { safeMarkdown } from './markdown.js';
+import { capWholeBlocks, safeMarkdown, stripMachineBlocks } from './markdown.js';
+import { renderStatusTable, statusKeys, statusLinkFor } from './assignment-comment.js';
+import { consoleWorkflowUrl, type ConsoleContext } from './console-link.js';
+import { quietFor, writeStatusComment } from './status-comment.js';
+import { STATUS_STAGE } from './status-marker.js';
 import { code } from './failure-comment.js';
 import { detailLines, runDetails, type RunDetails } from './run-details.js';
 
@@ -128,6 +132,8 @@ export interface PublishDeps {
    * "One revision per review"). Absent: the worker's own database is the only one, and says.
    */
   claimReviews?: boolean;
+  /** Hosted console context (runner-provided), for links in what is posted; absent for standalone workers. */
+  console?: ConsoleContext | null;
 }
 
 /** Which runs and pull requests a publisher may act on by itself (PublishDeps.scope). */
@@ -355,7 +361,10 @@ export function inline(text: string): string {
 export function renderRunResult(s: RunSummary, commitCount: number): string[] {
   const commits = s.commits.length ? s.commits.join('\n') : '(none listed)';
   const more = commitCount > s.commits.length ? `\n… ${commitCount - s.commits.length} more` : '';
-  const finalMessage = safeMarkdown(s.lastOutput.join('\n').trim() || '(no output)', MAX_FINAL_MESSAGE);
+  // The agents' machine-readable blocks are for the worker, and a block is kept whole or not at
+  // all: a cap never leaves half a fence behind.
+  const { text, cut } = capWholeBlocks(stripMachineBlocks(s.lastOutput.join('\n').trim()), MAX_FINAL_MESSAGE);
+  const finalMessage = safeMarkdown(text || '(no output)', MAX_FINAL_MESSAGE + 1) + (cut ? `\n\n_The rest of the agent's message is in the run log._` : '');
   return [
     `**Commits** (${commitCount})`,
     '',
@@ -378,6 +387,35 @@ export function renderRunResult(s: RunSummary, commitCount: number): string[] {
   ];
 }
 
+/**
+ * The merge Updraft will attempt for a pull request it opens, as its body states it: what
+ * merge.ts will do with this pull request, given the repository's autoMerge and the gates that
+ * can already be read when it is opened. Never more than Updraft will try.
+ */
+export type MergePolicy = { auto: true; method: MergeMethod } | { auto: false; reason: string | null };
+
+export function mergePolicy(
+  config: UpdraftConfig,
+  repo: RepositoryConfig,
+  o: { mode: 'draft-pr' | 'pr'; verifies: boolean; summary: Pick<RunSummary, 'verification' | 'headSha'> },
+): MergePolicy {
+  const method = autoMergeMethod(config, repo);
+  if (!method) return { auto: false, reason: null };
+  // A draft is no gate here: a ready-to-merge verdict marks it ready (review.ts), or, with the CI
+  // step, its passing checks do (ci.ts). Gate 1 (merge.ts): the action's verify commands must have passed on exactly this commit.
+  const v = o.summary.verification;
+  if (o.verifies && !(v?.passed === true && v.exact === true && (!o.summary.headSha || v.sha === o.summary.headSha))) {
+    return { auto: false, reason: "the worker's verify commands did not pass on this commit" };
+  }
+  return { auto: true, method };
+}
+
+export function mergeSentence(p: MergePolicy): string {
+  // Branch protection and the required checks still decide: Updraft only ever asks GitHub to merge.
+  if (p.auto) return `Updraft merges this (${code(p.method)}) once review and required checks pass.`;
+  return p.reason ? `Merging is up to a person: ${p.reason}.` : 'Merging is up to a person.';
+}
+
 export function renderPrBody(o: {
   runId: string;
   issueNumber: number;
@@ -385,19 +423,54 @@ export function renderPrBody(o: {
   summary: RunSummary;
   commitCount: number;
   mode: 'draft-pr' | 'pr';
+  /** What merge.ts will do with it; absent: up to a person. */
+  merge?: MergePolicy;
+  /** The run's console timeline, when hosted. */
+  link?: string | null;
 }): string {
+  const markable = /^[A-Za-z0-9_.-]{1,64}$/.test(o.agent);
+  // An agent name the hidden marker cannot carry keeps the line a lost-state restore reads instead.
+  const where = o.link
+    ? `[View this work in Updraft](${o.link})${markable ? '' : ` Opened by updraft from run ${code(o.runId)} (agent ${inline(o.agent)}).`}`
+    : markable ? `Run ${code(o.runId)}, agent ${code(inline(o.agent))}.` : `Opened by updraft from run ${code(o.runId)} (agent ${inline(o.agent)}).`;
   const body = [
     `Closes #${o.issueNumber}`,
     '',
-    `Opened by updraft from run \`${o.runId}\` (agent ${inline(o.agent)})${o.mode === 'draft-pr' ? ' as a draft' : ''}. ` +
-      'Review it before merging; merging is up to a person.',
+    `${mergeSection(o.merge ?? { auto: false, reason: null }, o.mode)} ${where}`,
     '',
     ...renderRunResult(o.summary, o.commitCount),
-    '',
-    `Run id: \`${o.runId}\``,
   ].join('\n');
-  const marker = publicationMarker(o.runId);
+  // The agent beside the run's marker: what a run that lost its state reads back (run-event-restore.ts).
+  const agent = markable ? `\n${prAgentMarker(o.runId, o.agent)}` : '';
+  const marker = `${publicationMarker(o.runId)}${agent}`;
   return `${cap(body, MAX_BODY - marker.length - 2)}\n\n${marker}`;
+}
+
+const MERGE_OPEN = '<!-- updraft-merge -->';
+const MERGE_CLOSE = '<!-- /updraft-merge -->';
+
+/** The PR body's merge sentence, between markers so a later verified head can restate it. */
+function mergeSection(p: MergePolicy, mode: 'draft-pr' | 'pr'): string {
+  return `${MERGE_OPEN}${mergeSentence(p)}${mode === 'draft-pr' ? ' Opened as a draft.' : ''}${MERGE_CLOSE}`;
+}
+
+/**
+ * `body` with its merge sentence restated for `p` (a revision or CI fix pushed a new head, which
+ * its own verification is about). Null when the body has no merge section (opened before #173),
+ * or nothing changes.
+ */
+export function withMergeSentence(body: string, p: MergePolicy): string | null {
+  const start = body.indexOf(MERGE_OPEN);
+  const end = body.indexOf(MERGE_CLOSE, start);
+  if (start < 0 || end < 0) return null;
+  const draft = body.slice(start, end).includes(' Opened as a draft.') ? ' Opened as a draft.' : '';
+  const next = `${body.slice(0, start)}${MERGE_OPEN}${mergeSentence(p)}${draft}${body.slice(end)}`;
+  return next === body ? null : next;
+}
+
+/** Hidden marker naming the agent of the run that opened a pull request. */
+export function prAgentMarker(runId: string, agent: string): string {
+  return `<!-- updraft-agent: ${runId} ${agent} -->`;
 }
 
 export function renderIssueComment(o: { runId: string; pr: GitHubPullRequest; commitCount: number; summary: RunSummary; details?: RunDetails }): string {
@@ -731,15 +804,45 @@ export async function publishRun(
           head: branch,
           base: baseBranch,
           draft: mode === 'draft-pr',
-          body: renderPrBody({ runId, issueNumber: job.issueNumber, agent: run.agent, summary: run.summary, commitCount, mode }),
+          body: renderPrBody({
+            runId,
+            issueNumber: job.issueNumber,
+            agent: run.agent,
+            summary: run.summary,
+            commitCount,
+            mode,
+            merge: mergePolicy(deps.config, repo, { mode, verifies: Boolean(ownEntry(deps.config.actions, job.action)?.verify?.length), summary: run.summary }),
+            link: consoleWorkflowUrl(deps.console, job.repoId, job.issueNumber),
+          }),
         });
         await runLog([`opened ${pr.draft ? 'draft ' : ''}PR #${pr.number}: ${pr.htmlUrl}`]);
       }
       progress({ prNumber: pr.number, prUrl: pr.htmlUrl });
     }
 
-    // 4. The issue comment: recorded, found by marker, or new.
-    if (!pub.commentId) {
+    // 4. The issue comment: recorded, found by marker, or new. Quiet notifications: the issue's
+    // live status comment moves to "PR opened" instead (posted, if nothing posted it before).
+    if (!pub.commentId && quietFor(deps.config, job)) {
+      hold();
+      const r = await writeStatusComment(
+        { api: deps.api, log },
+        {
+          repo: repoRef,
+          issue: job.issueNumber,
+          target: { keys: statusKeys(job, deps.console), create: true },
+          stage: STATUS_STAGE.published,
+          title: 'PR opened',
+          text: `${pr.draft ? 'Draft PR' : 'PR'} #${pr.number} opened: ${pr.htmlUrl}`,
+          details: renderStatusTable({ details: runDetails(deps.db, job, run), jobId: job.id, console: deps.console }),
+          link: statusLinkFor(deps.console, job.repoId, job.issueNumber),
+          pr: pr.number,
+        },
+      );
+      if (r.status !== 'none') {
+        progress({ commentId: r.comment.id, commentUrl: r.comment.htmlUrl });
+        await runLog([`status comment ${r.status} on issue #${job.issueNumber}: ${r.comment.htmlUrl}`]);
+      }
+    } else if (!pub.commentId) {
       hold();
       const marker = publicationMarker(runId);
       const found = (await deps.api.listIssueComments(repoRef, job.issueNumber)).find((c) => c.body.includes(marker));

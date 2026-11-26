@@ -102,7 +102,8 @@ export const dayOf = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 export const monthOf = (ms: number) => new Date(ms).toISOString().slice(0, 7);
 
 /** The comment on an issue whose label started nothing because of a quota, or on a pull request whose event did not. */
-export function throttledComment(limit: QuotaLimit | 'queue_full', quotas: Quotas, pullRequest = false): string {
+/** `link`: the installation's console page, when the deployment has one. */
+export function throttledComment(limit: QuotaLimit | 'queue_full', quotas: Quotas, pullRequest = false, link?: string): string {
   const why: Record<QuotaLimit | 'queue_full', string> = {
     queue_full: `this account already has the most Updraft work queued that it may (${QUEUE_MAX_PER_TENANT} waiting)`,
     concurrent_jobs:
@@ -120,20 +121,30 @@ export function throttledComment(limit: QuotaLimit | 'queue_full', quotas: Quota
     microvm_minutes: 'next month',
     platform_concurrency: 'in a few minutes',
   };
+  // A please-act comment (#173): what happened and what to do, in two sentences, with the console.
+  const open = link ? ` [Open Updraft](${link})` : '';
   if (pullRequest) {
     return [
-      `Updraft did not act on this pull request's latest review or push: ${why[limit]}.`,
-      '',
-      `To try again ${when[limit]}, submit the review again or push a commit.`,
+      `Updraft did not act on this pull request's latest review or push: ${why[limit]}. To try again ${when[limit]}, submit the review again or push a commit.${open}`,
       '',
       '<sub>Updraft posts this once a day per pull request.</sub>',
     ].join('\n');
   }
   return [
-    `Updraft did not start a job for this label: ${why[limit]}.`,
-    '',
-    `To try again ${when[limit]}, remove the label and add it again.`,
+    `Updraft did not start a job for this label: ${why[limit]}. To try again ${when[limit]}, remove the label and add it again.${open}`,
     '',
     '<sub>Updraft posts this once a day per issue.</sub>',
   ].join('\n');
+}
+
+/** The installation's console page for a comment's link, or undefined without an https console origin. */
+export function installationPage(consoleOrigin: string | undefined, installationId: number): string | undefined {
+  if (!consoleOrigin) return undefined;
+  try {
+    const u = new URL(consoleOrigin);
+    if (u.protocol !== 'https:' || u.username || u.password) return undefined;
+    return new URL(`/installations/${installationId}`, u.origin).href;
+  } catch {
+    return undefined;
+  }
 }
