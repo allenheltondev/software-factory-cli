@@ -33,14 +33,15 @@ just before the run, with the same rule as for every run. If the issue's text is
 text an allowed actor stands behind, the body is withheld.
 
 - **A task list:** every `- [ ]` and `- [x]` item is a criterion, in order, nested ones too. A ticked box is recorded as ticked, and never taken as evidence.
+- **Nested content:** an item's criterion text includes what is nested under it: indented sub-bullets, numbered sub-items and continuation lines, up to the next item at the same or a lower indent. A nested checkbox (`  - [ ] ...`) is a criterion of its own, with its parent's first line shown as context. Only an item's own first line can mark it optional.
 - **No task list:** the list items under a heading such as *Acceptance*, *Acceptance criteria*, *Requirements*, *Definition of done* or *Must* are criteria. A bold line (`**Requirements**`) or a short label ending in a colon (`Requirements:`) counts as a heading.
 - **Neither:** the issue has no criteria. The reviewer is asked to name the concrete requirements the text states, as `I1`, `I2`, ..., and to say `needs-clarification` where the issue does not say clearly what is wanted.
 - **Body withheld or unreadable:** nothing can be checked. The checklist has one row for the issue's requirements, unverified, and a person has to confirm them.
 
 Only the text is read, never rewritten. Items in code blocks and HTML comments are not
-criteria. Items under an *Out of scope* or *Non-goals* heading are left out. An item marked
+criteria, and are left out of the text of an item they are nested under. Items under an *Out of scope* or *Non-goals* heading are left out. An item marked
 `(optional)`, or listed under an *Optional*, *Nice to have*, *Stretch* or *Follow-ups* heading,
-is optional: it is shown, and never holds a head back. At most 30 criteria are taken. The rest
+is optional: it is shown, and never holds a head back. At most 30 criteria are taken, top-level and nested checkboxes together. The rest
 are counted, the prompt says so, and they appear on the checklist as one mandatory row, `MORE`.
 That row is always unverified, since no review was given them, so a head is never ready on 30
 of more. Split such an issue, or have a person confirm them.
@@ -52,7 +53,7 @@ that reason, and never to do so for anything the change could do.
 
 ### Ids and issue revisions
 
-- **Criterion id:** each criterion's id is `AC-` and 8 hex characters of a hash of its own text. Case, spacing and Markdown emphasis are ignored. Editing the rest of the issue keeps the id. Editing the criterion itself gives it a new id, so an earlier assessment of the old text does not carry over to the new one. A repeated text gets `-2`, `-3`, and so on.
+- **Criterion id:** each criterion's id is `AC-` and 8 hex characters of a hash of its own text, sub-points included. Case, spacing and Markdown emphasis are ignored. Editing the rest of the issue keeps the id. Editing the criterion itself gives it a new id, so an earlier assessment of the old text does not carry over to the new one. A repeated text gets `-2`, `-3`, and so on.
 - **Issue revision:** the issue revision is a hash of the title and body the criteria were read from, shown on every checklist. The reviewer is told when the coding agent reported on a different revision. The checklist says when the issue changed since the previous review.
 
 ## The coding agent
@@ -208,6 +209,7 @@ Updraft: this head is not ready while 1 mandatory acceptance criterion is not me
 ```
 
 - **Links:** file references link to the reviewed commit, and commit references to the commit.
+- **Sub-points:** a criterion with sub-points shows its first line, then the sub-points as a compact inline list: `Unit tests cover: (1) ordering; (2) filtering`. A nested checkbox shows its parent's first line as `(under: ...)`.
 - **Inert text:** criterion text, notes and references are flattened to one line and made inert: no mentions, HTML, comments, links of their own or closing keywords.
 - **Changes since the previous review:** a line compares each criterion with the previous review of the pull request. It names a criterion that is new because the issue changed, one the issue no longer has, and any status change.
 - **Elsewhere:** `updraft status` shows a held-back head as `needs a human: <head> is held back by its acceptance criteria: ...`, and the verdict as `held back: ...`.
