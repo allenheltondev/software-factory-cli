@@ -1,6 +1,6 @@
 import { useId, useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
-import { Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Input, Select, StatusBadge } from '@readysetcloud/ui';
+import { Button, Card, CardBody, CardDescription, CardHeader, EmptyState, Input, Select, StatusBadge } from '@readysetcloud/ui';
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepository, ConsoleWorkflow } from '../../api/client';
 import { AGENT_GUIDES } from '../../lib/agentGuides';
 import { installationSettingsUrl } from '../../lib/diagnostics';
@@ -259,7 +259,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
     <div className="flex flex-col gap-6" data-testid="simple-config">
       <Card data-testid="connected-agents">
         <CardHeader>
-          <CardTitle>{step(1, 'Connect agents')}</CardTitle>
+          <StepTitle>{step(1, 'Connect agents')}</StepTitle>
           <CardDescription>Connect the coding agents you already pay for. Connecting one does not start using it: you choose who works in the next step.</CardDescription>
         </CardHeader>
         <CardBody className="grid gap-3 sm:grid-cols-2">
@@ -318,7 +318,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
 
       <Card data-testid="default-team">
         <CardHeader>
-          <CardTitle>{step(2, 'Choose your agent team')}</CardTitle>
+          <StepTitle>{step(2, 'Choose your agent team')}</StepTitle>
           <CardDescription>Every label and repository uses this team unless you give it its own. Updraft picks the model and effort.</CardDescription>
         </CardHeader>
         <CardBody className="grid gap-6 sm:grid-cols-2">
@@ -373,7 +373,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
 
       <Card data-testid="labels">
         <CardHeader>
-          <CardTitle>{step(3, 'Choose where work starts')}</CardTitle>
+          <StepTitle>{step(3, 'Choose where work starts')}</StepTitle>
           <CardDescription>When one of these people adds a label to an issue, a coding agent picks it up and opens a pull request.</CardDescription>
         </CardHeader>
         <CardBody className="flex flex-col gap-4">
@@ -725,7 +725,7 @@ export function EffectiveConfig({ config, children }: { config: ConsoleConfig; c
   return (
     <Card data-testid="effective-config">
       <CardHeader>
-        <CardTitle>What will run</CardTitle>
+        <StepTitle>What will run</StepTitle>
         <CardDescription>The effective configuration of this draft: who codes and who reviews, for each repository and label.</CardDescription>
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
@@ -766,6 +766,14 @@ export function EffectiveConfig({ config, children }: { config: ConsoleConfig; c
       </CardBody>
     </Card>
   );
+}
+
+/**
+ * A section title one level below the page's heading (the kit's CardTitle is always an h3), so
+ * the steps are the page's second-level headings and a screen reader's outline follows them.
+ */
+function StepTitle({ children }: { children: ReactNode }) {
+  return <h2 className="card-title">{children}</h2>;
 }
 
 /** An info icon with a tooltip, shown on hover and on focus (so a tap shows it too); clicking it may act. */

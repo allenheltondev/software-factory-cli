@@ -1,15 +1,18 @@
 import { render, screen, waitFor, within } from '@testing-library/react';
 import { AuthProvider, configureAuth } from '@readysetcloud/ui/auth';
 import userEvent from '@testing-library/user-event';
+import axe from 'axe-core';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError, ConfigInvalidError, type ConfigView, type ConsoleConfig, type VersionSummary } from '../api/client';
+import { ApiError, ConfigInvalidError, type AgentKeyView, type ConfigView, type ConsoleConfig, type VersionSummary } from '../api/client';
 import { AppLayout } from '../layout/AppLayout';
 import { fakeApi } from '../test/fakeApi';
 import { ConfigHistoryPage, diffFiles } from './ConfigHistoryPage';
 import { ConfigPage, issuesAt, parseLogins } from './ConfigPage';
 import { InstallationPage } from './InstallationPage';
 import { keysNeeded, workflowConflict } from './config/model';
+// The settings the server's round-trip and compile tests use (server/src/tenants/config-service.test.ts).
+import fixture from '../../../server/src/tenants/fixtures/console-samples.json';
 
 const PROMPTS = { implement: '# Implement the issue', review: '# Review the PR', revise: '# Revise the PR' };
 
@@ -935,3 +938,363 @@ describe('ConfigHistoryPage', () => {
     expect(api.configVersions).toHaveBeenCalledTimes(2);
   });
 });
+
+/*
+ * #193, against the server: the settings below are fixtures/console-samples.json, which the server's
+ * tests compile, publish, load and publish again (config-service.test.ts). What the page sends is
+ * asserted equal to them, so a no-op load, preview or save compiles to the same bundle.
+ */
+const SAMPLES = fixture.samples as unknown as Record<string, ConsoleConfig>;
+const TWO_PROVIDERS = fixture.twoProviders as unknown as { start: ConsoleConfig; published: ConsoleConfig };
+const keyView = (keys: AgentKeyView[]) => ({ keys, refusals: [] });
+const key = (name: string, over: Partial<AgentKeyView> = {}): AgentKeyView => ({ name, configured: true, required: false, ...over });
+const okPreview = () => vi.fn().mockResolvedValue({ ok: true, yaml: 'version: 1\n', warnings: [], autoMergeTurnedOn: [] });
+const previewed = (api: ReturnType<typeof fakeApi>, call = 0) => (api.previewConfig as ReturnType<typeof vi.fn>).mock.calls[call]![1] as ConsoleConfig;
+/** Connects a provider from its card, as a person does: Connect, the key, Save key. */
+async function connect(adapter: string, name: string, value: string) {
+  const card = screen.getByTestId(`provider-${adapter}`);
+  await userEvent.click(within(card).getByRole('button', { name: `Connect ${name}` }));
+  await userEvent.type(within(card).getByLabelText(/API key/), value);
+  await userEvent.click(within(card).getByRole('button', { name: 'Save key' }));
+}
+
+describe('the page and the compiled config agree (#193)', () => {
+  it.each(Object.keys(SAMPLES))('%s: a no-op load and preview sends the settings byte for byte as loaded; saving an unrelated edit sends everything else unchanged', async (name) => {
+    const sample = SAMPLES[name]!;
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config: clone(sample) })), previewConfig: okPreview(), publishConfig: publishedOk(2) });
+    configPage(api);
+    await userEvent.click(await screen.findByRole('button', { name: 'View config' }));
+    expect(JSON.stringify(previewed(api))).toBe(JSON.stringify(sample));
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    expect(screen.queryByTestId('pending-changes')).toBeNull();
+    // Only the advanced sample needs the full editor; its custom settings are named, not converted.
+    expect(screen.queryByTestId('simple-config') !== null).toBe(name !== 'advanced');
+    expect(screen.queryByTestId('config-custom') !== null).toBe(name === 'advanced');
+
+    // One more person who can start work, in whichever view is open: nothing else in the settings moves.
+    const actors = screen.getByLabelText(name === 'advanced' ? 'Allowed actors' : 'Who can add a label');
+    await userEvent.type(actors, ' lee');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(JSON.stringify(sentConfig(api))).toBe(JSON.stringify({ ...sample, allowedActors: [...sample.allowedActors, 'lee'] }));
+    await userEvent.click(screen.getByRole('button', { name: 'Hide config' }));
+    await userEvent.click(screen.getByRole('button', { name: 'View config' }));
+    expect(JSON.stringify(previewed(api, 1))).toBe(JSON.stringify(sentConfig(api)));
+  });
+
+  it('shows explicit models and efforts as Manual, never as Automatic, and keeps them through a save', async () => {
+    const sample = SAMPLES.labels!;
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config: clone(sample) })), publishConfig: publishedOk(2) });
+    configPage(api);
+    await userEvent.click(await screen.findByText(/models and effort/));
+    expect(screen.getByTestId('model-claude')).toHaveTextContent('Manual: claude-opus-5-5 (high)');
+    expect(screen.getByTestId('model-codex')).toHaveTextContent('Manual (medium)');
+    expect(within(screen.getByTestId('model-claude')).getByLabelText('Model')).toHaveValue('claude-opus-5-5');
+    await userEvent.type(screen.getByLabelText('Who can add a label'), ' lee');
+    expect(screen.queryByText('Model or effort settings changed.')).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).agents).toEqual(sample.agents);
+  });
+
+  it('a manual model or effort the server refuses is shown at its field under Advanced, and nothing is published until it is fixed', async () => {
+    // The server's own messages for these values (config-service.test.ts, "manual models and efforts").
+    const refused = new ConfigInvalidError(
+      [
+        { path: 'agents.claude.model', message: 'a model name: letters, digits, ".", "_", ":", "/" or "-"' },
+        { path: 'agents.claude.effort', message: 'an effort level, such as low, medium or high' },
+      ],
+      [],
+    );
+    const publishConfig = vi.fn().mockRejectedValueOnce(refused).mockResolvedValueOnce({ ok: true, version: 2, yaml: 'version: 1\n', warnings: [] });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig });
+    configPage(api);
+    await userEvent.click(await screen.findByText(/models and effort/));
+    const claude = screen.getByTestId('model-claude');
+    await userEvent.click(within(claude).getByRole('checkbox', { name: 'Choose the model myself' }));
+    await userEvent.type(within(claude).getByLabelText('Model'), 'claude opus');
+    await userEvent.type(within(claude).getByLabelText('Reasoning effort'), 'very high');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+
+    expect(await screen.findByTestId('config-errors')).toHaveTextContent('Nothing was published');
+    expect(screen.queryByTestId('config-published')).toBeNull();
+    expect(screen.getByTestId('active-version')).toHaveTextContent('version 1 is active');
+    expect(screen.getByTestId('advanced')).toHaveAttribute('open');
+    const model = within(claude).getByLabelText('Model');
+    expect(model).toBeInvalid();
+    expect(model).toHaveAccessibleDescription(expect.stringContaining('a model name: letters, digits'));
+    expect(within(claude).getByLabelText('Reasoning effort')).toHaveAccessibleDescription(expect.stringContaining('an effort level, such as low, medium or high'));
+
+    await userEvent.clear(model);
+    await userEvent.type(model, 'claude-opus-5-5');
+    await userEvent.clear(within(claude).getByLabelText('Reasoning effort'));
+    await userEvent.type(within(claude).getByLabelText('Reasoning effort'), 'high');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(await screen.findByTestId('config-published')).toHaveTextContent('Published version 2');
+    expect(sentConfig(api, 1).agents.claude).toEqual({ adapter: 'claude', model: 'claude-opus-5-5', effort: 'high', enabled: true });
+  });
+
+  it('two providers: connect Claude Code and Codex, choose both to code and Kiro to review, and publish what the server compiles', async () => {
+    const setAgentKey = vi
+      .fn()
+      .mockResolvedValueOnce(keyView([key('ANTHROPIC_API_KEY'), key('CODEX_API_KEY', { configured: false }), key('KIRO_API_KEY')]))
+      .mockResolvedValueOnce(keyView([key('ANTHROPIC_API_KEY'), key('CODEX_API_KEY'), key('KIRO_API_KEY')]));
+    const api = fakeApi({
+      config: vi.fn().mockResolvedValue(view({ config: clone(TWO_PROVIDERS.start), agents: ['claude', 'codex', 'kiro'], agentKeys: { KIRO_API_KEY: true } })),
+      setAgentKey,
+      previewConfig: okPreview(),
+      publishConfig: publishedOk(1),
+    });
+    configPage(api);
+    expect(await screen.findByTestId('provider-kiro')).toHaveTextContent('Saved, checked on first use');
+    await connect('claude', 'Claude Code', 'sk-ant-abc');
+    await waitFor(() => expect(within(screen.getByTestId('provider-claude')).getByText('Connected')).toBeInTheDocument());
+    await connect('codex', 'Codex', 'sk-proj-abc');
+    await waitFor(() => expect(within(screen.getByTestId('provider-codex')).getByText('Connected')).toBeInTheDocument());
+
+    // Connected, and nothing chosen yet: the draft is still exactly what the server started from.
+    await userEvent.click(screen.getByRole('button', { name: 'View config' }));
+    expect(JSON.stringify(previewed(api))).toBe(JSON.stringify(TWO_PROVIDERS.start));
+
+    await userEvent.click(within(screen.getByTestId('coding-claude')).getByRole('checkbox', { name: 'Claude Code' }));
+    await userEvent.click(within(screen.getByTestId('coding-codex')).getByRole('checkbox', { name: 'Codex' }));
+    await userEvent.click(within(screen.getByTestId('coding-kiro')).getByRole('checkbox', { name: 'Kiro' }));
+    expect(within(screen.getByTestId('review-kiro')).getByRole('checkbox', { name: 'Kiro' })).toBeChecked();
+    expect(screen.getByTestId('review-summary')).toHaveTextContent(/Independent review/);
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Work in acme/web' }));
+    const row = screen.getByTestId('effective-acme/web-updraft');
+    expect(row).toHaveTextContent('Claude Code, Codex');
+    expect(row).toHaveTextContent('Kiro');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    // The server compiles exactly these settings to builders [claude, codex], reviewers [kiro].
+    expect(JSON.stringify(sentConfig(api))).toBe(JSON.stringify(TWO_PROVIDERS.published));
+  });
+
+  it('connecting a provider on its own changes nothing that would be compiled or published', async () => {
+    const sample = SAMPLES.simple!;
+    const setAgentKey = vi.fn().mockResolvedValue(keyView([key('ANTHROPIC_API_KEY'), key('CODEX_API_KEY'), key('KIRO_API_KEY')]));
+    const api = fakeApi({
+      config: vi.fn().mockResolvedValue(published({ config: clone(sample), agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } })),
+      setAgentKey,
+      previewConfig: okPreview(),
+    });
+    configPage(api);
+    await screen.findByTestId('provider-kiro');
+    await connect('kiro', 'Kiro', 'ksk_abcdefghijklmnopqrstuvwxyz0123456789');
+    await waitFor(() => expect(screen.getByTestId('provider-kiro')).toHaveTextContent('Saved, checked on first use'));
+    expect(setAgentKey).toHaveBeenCalledWith(55, 'KIRO_API_KEY', 'ksk_abcdefghijklmnopqrstuvwxyz0123456789');
+    expect(screen.getByTestId('provider-kiro')).toHaveTextContent('Not in any team yet.');
+    for (const role of ['coding', 'review']) expect(within(screen.getByTestId(`${role}-kiro`)).getByRole('checkbox', { name: 'Kiro' })).not.toBeChecked();
+    expect(screen.queryByTestId('pending-changes')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'View config' }));
+    expect(JSON.stringify(previewed(api))).toBe(JSON.stringify(sample));
+  });
+
+  it('a stale connection, then reconnect: saving the key again shows it connected, and the draft is untouched', async () => {
+    const agentKeys = vi
+      .fn()
+      .mockResolvedValueOnce(keyView([key('ANTHROPIC_API_KEY', { required: true, lastUsed: { at: '2026-11-20T00:00:00Z', ok: false } }), key('CODEX_API_KEY', { required: true })]))
+      // As the server answers once the key is saved again: set, and not used since (config-service.test.ts).
+      .mockResolvedValue(keyView([key('ANTHROPIC_API_KEY', { required: true }), key('CODEX_API_KEY', { required: true })]));
+    const setAgentKey = vi.fn().mockResolvedValue(keyView([key('ANTHROPIC_API_KEY', { required: true }), key('CODEX_API_KEY', { required: true })]));
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), agentKeys, setAgentKey, previewConfig: okPreview() });
+    configPage(api);
+    const card = await screen.findByTestId('provider-claude');
+    await waitFor(() => expect(within(card).getByText('Last use failed')).toBeInTheDocument());
+    expect(screen.getByTestId('coding-claude')).toHaveTextContent('its last run could not use the key: reconnect it');
+
+    await userEvent.click(within(card).getByRole('button', { name: 'Reconnect Claude Code' }));
+    await userEvent.type(within(card).getByLabelText(/Claude Console API key/), 'sk-ant-new');
+    await userEvent.click(within(card).getByRole('button', { name: 'Save key' }));
+    expect(setAgentKey).toHaveBeenCalledWith(55, 'ANTHROPIC_API_KEY', 'sk-ant-new');
+    await waitFor(() => expect(within(card).getByText('Connected')).toBeInTheDocument());
+    expect(within(card).queryByText('Last use failed')).toBeNull();
+    expect(screen.getByTestId('coding-claude')).not.toHaveTextContent('could not use the key');
+    expect(within(screen.getByTestId('coding-claude')).getByRole('checkbox', { name: 'Claude Code' })).toBeChecked();
+    expect(within(screen.getByTestId('review-claude')).getByRole('checkbox', { name: 'Claude Code' })).toBeChecked();
+    expect(screen.queryByTestId('pending-changes')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'View config' }));
+    expect(previewed(api)).toEqual(withRepo());
+  });
+
+  it('a member who is not an owner gets the same page as the server allows: connect, choose and publish', async () => {
+    const api = fakeApi({
+      config: vi.fn().mockResolvedValue(published({ tenant: { ...view().tenant, role: 'editor' }, agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } })),
+      publishConfig: publishedOk(2),
+    });
+    configPage(api);
+    await screen.findByTestId('simple-config');
+    expect(screen.queryByTestId('config-readonly')).toBeNull();
+    expect(within(screen.getByTestId('provider-kiro')).getByRole('button', { name: 'Connect Kiro' })).toBeEnabled();
+    await userEvent.click(within(screen.getByTestId('review-claude')).getByRole('checkbox', { name: 'Claude Code' }));
+    await userEvent.click(screen.getByTestId('allow-self-review'));
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).pools.reviewers).toEqual({ agents: ['codex'] });
+  });
+});
+
+/** The controls a person can reach: links, buttons, form fields and disclosure toggles. */
+const CONTROLS = 'a[href], button, input:not([type="hidden"]), select, textarea, summary, [tabindex]:not([tabindex="-1"])';
+const ROLES = ['button', 'checkbox', 'textbox', 'combobox', 'spinbutton', 'link', 'radio', 'switch'] as const;
+const STEPS = ['connected-agents', 'default-team', 'labels'] as const;
+
+/** A window this wide, as the browser reports it to media queries and to script. */
+function viewport(width: number) {
+  Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: width });
+  window.matchMedia = ((query: string) => {
+    const min = /min-width:\s*(\d+)px/.exec(query);
+    const max = /max-width:\s*(\d+)px/.exec(query);
+    const matches = (!min || width >= Number(min[1])) && (!max || width <= Number(max[1]));
+    return { matches, media: query, onchange: null, addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false };
+  }) as typeof window.matchMedia;
+  window.dispatchEvent(new Event('resize'));
+}
+
+/** Why an element is not shown, if it is not: hidden itself, inside something hidden, or a closed disclosure's content. */
+function hiddenBy(el: Element): string | null {
+  for (let at: Element | null = el; at; at = at.parentElement) {
+    if (at.hasAttribute('hidden')) return 'hidden';
+    if (at.getAttribute('aria-hidden') === 'true') return 'aria-hidden';
+    if (/(^|\s)([a-z-]+:)?(hidden|invisible|sr-only)(\s|$)/.test(at.getAttribute('class') ?? '')) return `class ${at.getAttribute('class')}`;
+    const style = window.getComputedStyle(at);
+    if (style.display === 'none' || style.visibility === 'hidden') return 'style';
+    if (at.parentElement?.tagName === 'DETAILS' && !(at.parentElement as HTMLDetailsElement).open && at.tagName !== 'SUMMARY') return 'closed details';
+  }
+  return null;
+}
+
+/** A first run with Claude Code and Codex connected, and Kiro not yet. */
+const firstRun = () => view({ config: clone(TWO_PROVIDERS.start), agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } });
+
+describe('accessibility and layout of the configuration page (#193)', () => {
+  it('passes the automated accessibility checks, as a first run, as a returning user with everything open, and while connecting', async () => {
+    // jsdom computes no colours, so contrast is the one check left to the owner's screenshots.
+    // The page alone, as the app shell's <main> holds it (AppLayout); the shell's landmarks are its own.
+    const check = async (state: string) => {
+      const result = await axe.run(screen.getByTestId('config-page'), { rules: { 'color-contrast': { enabled: false } } });
+      expect(result.violations.map((v) => `${state}: ${v.id}: ${v.help} (${v.nodes.map((n) => n.html.slice(0, 80)).join(' | ')})`)).toEqual([]);
+    };
+    const first = configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
+    await screen.findByTestId('simple-config');
+    await check('first run');
+    await userEvent.click(within(screen.getByTestId('provider-kiro')).getByRole('button', { name: 'Connect Kiro' }));
+    await check('connecting Kiro');
+    first.unmount();
+
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config: clone(SAMPLES.labels!) })) }));
+    await screen.findByTestId('simple-config');
+    await userEvent.click(screen.getByText(/models and effort/));
+    await userEvent.click(within(screen.getByTestId('repo-acme/web')).getByRole('button', { name: 'Settings for acme/web' }));
+    await check('returning, Advanced and settings open');
+  });
+
+  it('every control has an accessible name and the role of what it is', async () => {
+    const { container } = configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config: clone(SAMPLES.labels!) })) }));
+    await screen.findByTestId('simple-config');
+    await userEvent.click(screen.getByText(/models and effort/));
+    await userEvent.click(within(screen.getByTestId('repo-acme/web')).getByRole('button', { name: 'Settings for acme/web' }));
+    const exposed = new Set<Element>();
+    for (const role of ROLES) {
+      for (const el of screen.queryAllByRole(role)) {
+        exposed.add(el);
+        expect(el, `${role}: ${el.outerHTML.slice(0, 160)}`).toHaveAccessibleName();
+      }
+    }
+    // Every native control is exposed with one of those roles (a summary is a disclosure toggle, named by its text).
+    const controls = [...container.querySelectorAll(CONTROLS)];
+    expect(controls.length).toBeGreaterThan(40);
+    for (const el of controls) {
+      // A closed dialog (the auto-merge confirmations) is not on the page until it opens.
+      if (el.closest('dialog:not([open])')) continue;
+      if (el.tagName === 'SUMMARY') expect(el.textContent?.trim()).toBeTruthy();
+      else expect(exposed.has(el), el.outerHTML.slice(0, 160)).toBe(true);
+    }
+    for (const el of container.querySelectorAll('input[type="checkbox"]')) expect(screen.getAllByRole('checkbox')).toContain(el);
+    for (const el of container.querySelectorAll('select')) expect(screen.getAllByRole('combobox')).toContain(el);
+    // Each step is a heading under the page's own, in order.
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual(['Connect agents', 'Choose your agent team', 'Choose where work starts', 'What will run']);
+  });
+
+  it('says each provider\'s status in words, not by colour alone', async () => {
+    const config = withRepo();
+    config.agents.vibe = { adapter: 'vibe', enabled: false };
+    const agentKeys = vi.fn().mockResolvedValue(
+      keyView([key('ANTHROPIC_API_KEY', { lastUsed: { at: '2026-11-20T00:00:00Z', ok: true } }), key('CODEX_API_KEY', { lastUsed: { at: '2026-11-20T00:00:00Z', ok: false } }), key('KIRO_API_KEY', { configured: false })]),
+    );
+    const first = configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config, agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } })), agentKeys }));
+    const expected: Record<string, { status: string; action: string | null }> = {
+      claude: { status: 'Connected', action: 'Replace Claude Code key' },
+      codex: { status: 'Last use failed', action: 'Reconnect Codex' },
+      kiro: { status: 'Not connected', action: 'Connect Kiro' },
+      vibe: { status: 'Not available here', action: null },
+    };
+    await waitFor(() => expect(within(screen.getByTestId('provider-codex')).getByText('Last use failed')).toBeInTheDocument());
+    for (const [a, { status, action }] of Object.entries(expected)) {
+      const card = screen.getByTestId(`provider-${a}`);
+      const badge = within(card).getByText(status);
+      expect(hiddenBy(badge), a).toBeNull();
+      if (action) expect(within(card).getByRole('button', { name: action })).toBeInTheDocument();
+      else expect(within(card).queryByRole('button')).toBeNull();
+    }
+    // Each state has its own words.
+    expect(new Set(Object.values(expected).map((e) => e.status)).size).toBe(4);
+    first.unmount();
+
+    // A Kiro key cannot be checked before a job uses it: that is said too.
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: true } })) }));
+    expect(within(await screen.findByTestId('provider-kiro')).getByText('Saved, checked on first use')).toBeInTheDocument();
+  });
+
+  it('focus moves through the steps in order: connect, team, where work starts, then publishing', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
+    await screen.findByTestId('simple-config');
+    const regions = ['header', ...STEPS, 'effective-config', 'advanced', 'publish-bar'];
+    const regionOf = (el: Element) => {
+      const i = regions.findIndex((r) => r !== 'header' && el.closest(`[data-testid="${r}"]`));
+      return i < 0 ? 0 : i;
+    };
+    const order: number[] = [];
+    const seen: Element[] = [];
+    document.body.focus();
+    for (let i = 0; i < 400; i++) {
+      await userEvent.tab();
+      const el = document.activeElement;
+      if (!el || el === document.body || seen.includes(el)) break;
+      seen.push(el);
+      order.push(regionOf(el));
+    }
+    // Never back to an earlier step, and every step is reached.
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    for (const step of [1, 2, 3, 6]) expect(order, regions[step]).toContain(step);
+    // Within the first step, the providers in the order they are shown.
+    const cards = seen.map((el) => el.closest('[data-testid^="provider-"]')?.getAttribute('data-testid')).filter((x): x is string => !!x);
+    expect([...new Set(cards)]).toEqual(['provider-claude', 'provider-codex', 'provider-kiro']);
+  });
+
+  it.each([375, 1280])('at %ipx wide the three steps stack in order, and no control is hidden', async (width) => {
+    viewport(width);
+    try {
+      const { container } = configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
+      const page = await screen.findByTestId('simple-config');
+      const steps = STEPS.map((s) => screen.getByTestId(s));
+      // One column at every width: the steps are siblings in a vertical flex container, in order.
+      for (const step of steps) expect(step.parentElement).toBe(page);
+      expect(page.className.split(/\s+/)).toEqual(expect.arrayContaining(['flex', 'flex-col']));
+      expect(page.className).not.toMatch(/(^|\s)[a-z-]+:(flex-row|grid|grid-cols-\d+|hidden)(\s|$)/);
+      for (let i = 1; i < steps.length; i++) expect(steps[i - 1]!.compareDocumentPosition(steps[i]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(steps.map((s) => within(s).getAllByRole('heading')[0]!.textContent)).toEqual(['1 · Connect agents', '2 · Choose your agent team', '3 · Choose where work starts']);
+
+      // Every control of the steps and of the publish bar is shown; only Advanced waits behind its toggle.
+      const shown = [...steps, screen.getByTestId('publish-bar')].flatMap((s) => [...s.querySelectorAll(CONTROLS)]);
+      expect(shown.length).toBeGreaterThan(15);
+      for (const el of shown) expect(hiddenBy(el), el.outerHTML.slice(0, 160)).toBeNull();
+      expect(hiddenBy(within(screen.getByTestId('advanced')).getByText('Advanced'))).toBeNull();
+      // The same controls at both widths: nothing is dropped on a phone.
+      expect(container.querySelectorAll(CONTROLS).length).toBe(LAYOUT_CONTROLS.count ??= container.querySelectorAll(CONTROLS).length);
+    } finally {
+      viewport(1024);
+    }
+  });
+});
+/** The number of controls the first width rendered, for the second to compare with. */
+const LAYOUT_CONTROLS: { count?: number } = {};
