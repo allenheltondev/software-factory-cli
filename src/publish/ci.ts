@@ -522,6 +522,16 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
 
     // A failure the code can cause.
     const failedNames = names(verdict.failures.map((d) => d.name));
+    // Right after Updraft's re-run, GitHub may still list the attempt it re-ran as the latest:
+    // a failure that completed before the re-run was asked for is that attempt, not the re-run's
+    // verdict. Wait for the new attempt, for a while.
+    if (pr.ciRerunSha === sha && pr.ciRerunAt) {
+      const rerunAt = Date.parse(pr.ciRerunAt);
+      const stale = verdict.failures.filter((d) => d.completedAt !== undefined && Date.parse(d.completedAt) < rerunAt);
+      if (stale.length && now() - rerunAt < CI_REGISTER_GRACE_MS) {
+        return wait(`waiting for the re-run of ${names(stale.map((d) => d.name))} on ${short(sha)} to start: GitHub still lists the attempt that failed before it`);
+      }
+    }
     // One revision at a time per pull request: one that is on its way (a person's change request)
     // comes first, and its push gets a review and checks of its own.
     // This head's own fix (queued by an earlier try of this step) is not another revision.
@@ -547,8 +557,12 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
       if (decision.rerun) {
         const reason = `check(s) ${failedNames} failed on ${short(sha)}, and Updraft re-ran the failed jobs once (it looks unrelated to the change: ${decision.why})`;
         if (recordCiRerun(db, pr.repoId, pr.prNumber, sha, { reason, checks: decision.checks, files: decision.files }, now)) {
+          const accepted: number[] = [];
           try {
-            for (const id of decision.runs) await api.rerunFailedJobs!(repo, id);
+            for (const id of decision.runs) {
+              await api.rerunFailedJobs!(repo, id);
+              accepted.push(id);
+            }
             log.info('re-ran the failed jobs once', { checks: failedNames, runs: decision.runs, why: decision.why });
             if (quiet) {
               await noteStatus(
@@ -569,8 +583,14 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
             return { status: 'waiting', reason };
           } catch (err) {
             // Recorded first, so it is never asked for twice: a re-run that could not be asked
-            // for goes the way any failure does.
-            log.warn('could not re-run the failed jobs; handling the failure as usual', { error: message(err) });
+            // for goes the way any failure does, unless part of it is under way: then wait for
+            // that part, and judge the checks again once it is done.
+            if (accepted.length) {
+              const failedRuns = decision.runs.filter((id) => !accepted.includes(id));
+              log.warn('re-ran the failed jobs of only some workflow runs; waiting for those', { error: message(err), rerun: accepted, failed: failedRuns });
+              return wait(`${reason}; GitHub re-ran workflow run(s) ${accepted.join(', ')} but refused ${failedRuns.join(', ')}`);
+            }
+            log.warn('could not re-run the failed jobs; handling the failure as usual', { error: message(err), runs: decision.runs });
           }
         }
       } else {

@@ -807,6 +807,68 @@ describe('one re-run for a failure that cannot be the change\'s (docs/ci-fix.md,
     expect(s.pr()).toMatchObject({ ciRerunSha: H1 });
   });
 
+  it('reads the attempt it re-ran, still listed right after the re-run, as pending, not as the re-run failing', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    const failedAt = new Date(s.now() - 60_000).toISOString();
+    const stale = () => checksOf([leg('ubuntu-latest / node 22', 'success', 1), { ...leg('windows-latest / node 22', 'failure', 2), completedAt: failedAt }, leg('windows-latest / node 24', 'success', 3)]);
+    s.gh.checks = stale();
+    s.gh.diagnostics[2] = FLAKY;
+    await s.review('ready-to-merge');
+    await s.ci();
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+
+    // A webhook right after: GitHub has not created the new attempt yet.
+    s.tick(5_000);
+    expect(await s.ci(true)).toMatchObject([{ status: 'waiting', reason: expect.stringMatching(/waiting for the re-run of windows-latest \/ node 22/) }]);
+    expect(s.queued()).toEqual([]);
+
+    // The new attempt passes: merged as if it had passed the first time.
+    s.gh.checks = matrix('success', 4);
+    expect(await s.ci(true)).toMatchObject([{ status: 'passed' }]);
+    await evaluateAutoMerges(s.deps);
+    expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+  });
+
+  it('stops waiting for a re-run that never shows up, and handles the failure as usual', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    const failedAt = new Date(s.now() - 60_000).toISOString();
+    s.gh.checks = checksOf([leg('ubuntu-latest / node 22', 'success', 1), { ...leg('windows-latest / node 22', 'failure', 2), completedAt: failedAt }, leg('windows-latest / node 24', 'success', 3)]);
+    s.gh.diagnostics[2] = FLAKY;
+    await s.review('ready-to-merge');
+    await s.ci();
+    s.tick(CI_REGISTER_GRACE_MS + 1_000);
+    expect(await s.ci(true)).toMatchObject([{ status: 'fixing' }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+  });
+
+  it('waits for the part of a re-run GitHub accepted when it refuses the rest', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    const OTHER_RUN = 901;
+    s.gh.checks = checksOf([leg('test', 'failure', 2), leg('e2e', 'failure', 5, OTHER_RUN), leg('lint', 'success', 3)]);
+    s.gh.diagnostics[2] = FLAKY;
+    s.gh.diagnostics[5] = FLAKY;
+    const original = s.gh.rerunFailedJobs.bind(s.gh);
+    s.gh.rerunFailedJobs = async (repo, id) => {
+      if (id === OTHER_RUN) throw new GitHubError(`POST /actions/runs/${id}/rerun-failed-jobs failed: 403`, 403);
+      return original(repo, id);
+    };
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'waiting', reason: expect.stringMatching(/re-ran workflow run\(s\) 900 but refused 901/) }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+    expect(s.queued()).toEqual([]);
+    expect(s.pr()).toMatchObject({ ciRerunSha: H1, ciState: 'waiting' });
+
+    // The re-run's attempt fails again, with the refused run's failure still there: the CI fix, as usual.
+    s.gh.checks = checksOf([leg('test', 'failure', 6), leg('e2e', 'failure', 5, OTHER_RUN), leg('lint', 'success', 3)]);
+    s.gh.diagnostics[6] = FLAKY;
+    expect(await s.ci(true)).toMatchObject([{ status: 'fixing' }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+  });
+
   for (const notifications of ['quiet', 'verbose'] as const) {
     it(`stops, after the re-run failed too, naming the check and why, never "ready to merge"; a re-run that passes later merges it (${notifications})`, async () => {
       const s = setup({ autoMerge: 'squash', notifications, revise: false });

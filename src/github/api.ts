@@ -308,6 +308,8 @@ export interface CheckDetail {
   app?: string | null;
   /** A GitHub Actions check run: the workflow run its job belongs to (read from its URL), which a re-run of its failed jobs names. */
   workflowRunId?: number;
+  /** A completed check run: when it completed (ISO 8601), as GitHub reports it. */
+  completedAt?: string;
   /** A check run's output title and summary, or a status's description; capped. */
   summary?: string;
 }

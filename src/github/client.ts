@@ -1222,6 +1222,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
             name?: string;
             status?: string;
             conclusion?: string | null;
+            completed_at?: string | null;
             html_url?: string | null;
             details_url?: string | null;
             app?: { slug?: string | null } | null;
@@ -1252,6 +1253,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
             ...(typeof c.id === 'number' ? { checkRunId: c.id } : {}),
             app: c.app?.slug ?? null,
             ...workflowRunOf(c.html_url, c.details_url),
+            ...(c.status === 'completed' && typeof c.completed_at === 'string' ? { completedAt: c.completed_at } : {}),
             ...(summary ? { summary: summary.slice(0, DETAIL_SUMMARY_MAX) } : {}),
           });
         }

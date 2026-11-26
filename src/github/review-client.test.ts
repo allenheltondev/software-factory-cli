@@ -222,14 +222,14 @@ describe('createGitHubApi: the review loop', () => {
       return json({
         total_count: 2,
         check_runs: [
-          { id: 71, name: 'windows-latest / node 22', status: 'completed', conclusion: 'failure', html_url: 'https://github.com/o/r/actions/runs/555/job/71', app: { slug: 'github-actions' } },
+          { id: 71, name: 'windows-latest / node 22', status: 'completed', conclusion: 'failure', completed_at: '2026-11-18T12:00:00Z', html_url: 'https://github.com/o/r/actions/runs/555/job/71', app: { slug: 'github-actions' } },
           { id: 72, name: 'other', status: 'completed', conclusion: 'failure', html_url: 'https://ci.example/actions/runs/1', details_url: 'https://github.com/o/r/runs/72' },
         ],
       });
     });
     const api = await createGitHubApi({ token: 't', fetch: fn });
     const checks = await api.getCommitChecks(repo, SHA);
-    expect(checks.details?.[0]).toMatchObject({ checkRunId: 71, workflowRunId: 555 });
+    expect(checks.details?.[0]).toMatchObject({ checkRunId: 71, workflowRunId: 555, completedAt: '2026-11-18T12:00:00Z' });
     expect(checks.details?.[1]).not.toHaveProperty('workflowRunId');
     // 201 with no body is a re-run accepted.
     await api.rerunFailedJobs!(repo, 555);
