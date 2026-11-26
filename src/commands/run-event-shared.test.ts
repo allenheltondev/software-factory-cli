@@ -439,6 +439,8 @@ describe('updraft run-event: the suggestion step on Updraft Cloud (#197)', { tim
     w.gh.files = [{ path: 'FAKE_AGENT.md', status: 'added', patch: '@@ -0,0 +1,3 @@\n+# Done\n+\n+Implement the issue below.' }];
     const real = () => remoteHead(w.f, BRANCH);
     w.gh.headSha = laggingHead(real, lagReads);
+    // The branch ref moves with the push itself.
+    w.gh.branchSha = real;
     w.gh.checks = pending;
     return { w, real };
   };
@@ -460,6 +462,10 @@ describe('updraft run-event: the suggestion step on Updraft Cloud (#197)', { tim
     expect(r.summary).toMatchObject({ drain: 'idle', loop: { rounds: 1, reviews: 2, headSha: head2, verdictSha: head2, verdict: 'ready-to-merge', stage: 'waiting-for-ci', merged: false } });
     expect(w.gh.writes).toContain(`review #${PR} COMMENT at ${head2}`);
     expect(statusOf(w)).not.toContain('Addressing suggestions');
+    // Waiting for GitHub to catch up is routine: logged, never recorded as an error.
+    expect(r.err).toContain('job not started yet; it stays queued until the next poll');
+    expect(r.err).not.toContain('pre-start check failed');
+    expect(withDb(one.state, (db) => db.prepare("SELECT message FROM errors WHERE scope = 'worker'").all())).toEqual([]);
     expect(one.upload()).toMatchObject({ changed: true });
 
     // CI passes on the pushed head; the check suite's delivery (the App's) reaches another machine.
@@ -472,6 +478,50 @@ describe('updraft run-event: the suggestion step on Updraft Cloud (#197)', { tim
     expect(w.gh.merges).toEqual([{ sha: head2, method: 'squash' }]);
     expect(statusOf(w)).toContain('**Updraft · Merged**');
     expect(w.gh.comments.filter((c) => c.issue === ISSUE)).toHaveLength(1);
+  });
+
+  it('without ciFix too: a check suite of the pushed head carries the loop on when its review never started', async () => {
+    const repo = { ...LOOP, notifications: 'quiet' };
+    // The pull request does not show the push during the whole first run, and no ciFix.
+    const { w, real } = suggestionWorld(1_000_000);
+    w.gh.checks = green;
+    const one = vm(w, 'vm one', { repo, reviewerArgs });
+    expect((await one.run({ deliveryId: 'd-1' })).summary.drain).toBe('stalled');
+    one.upload();
+    const head2 = real();
+    w.gh.headSha = real;
+    const two = vm(w, 'vm two', { repo, reviewerArgs, payload: suiteOf(w, head2) });
+    two.download();
+    const r = await two.run({ eventName: 'check_suite', deliveryId: 'd-2' });
+    expect(r.err).not.toContain('ERROR');
+    expect(r.summary).toMatchObject({ loop: { verdictSha: head2, stage: 'merged', merged: true } });
+    expect(w.gh.merges).toEqual([{ sha: head2, method: 'squash' }]);
+    expect(statusOf(w)).toContain('**Updraft · Merged**');
+
+    // Once the head was reviewed and merged, a check suite without ciFix does nothing again.
+    two.upload();
+    const three = vm(w, 'vm three', { repo, reviewerArgs, payload: suiteOf(w, head2) });
+    three.download();
+    expect((await three.run({ eventName: 'check_suite', deliveryId: 'd-3' })).summary).toMatchObject({ outcome: 'nothing-to-do' });
+  });
+
+  it('a person who pushes the branch back over the suggestion revision\'s push right after it is believed at once: the branch ref is not lag', async () => {
+    const { w, real } = suggestionWorld(3);
+    const one = vm(w, 'vm one', { repo: SUGGEST, reviewerArgs });
+    expect((await one.run({ deliveryId: 'd-1' })).summary).toMatchObject({ loop: { stage: 'waiting-for-ci' } });
+    one.upload();
+    const head2 = real();
+    const head1 = w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'rev-parse', `${head2}~1`);
+    // Within minutes of the push: the branch is force-pushed back to the commit it revised.
+    w.f.git(w.f.root, '--git-dir', w.f.remoteDir, 'update-ref', `refs/heads/${BRANCH}`, head1);
+    w.gh.headSha = real;
+    w.gh.touch();
+    const two = vm(w, 'vm push', { repo: SUGGEST, reviewerArgs, payload: pullRequestEvent('synchronize') });
+    two.download();
+    const r = await two.run({ eventName: 'pull_request', deliveryId: 'd-2' });
+    expect(r.err).not.toContain('ERROR');
+    expect(r.summary.loop).toMatchObject({ headSha: head1 });
+    expect(w.gh.calls).toContain(`getBranchSha ${BRANCH}`);
   });
 
   it('a pull request left as PR #195 was (the review of the pushed head canceled as "moved", the status on "Addressing suggestions") is reviewed and merged by the next delivery for it', async () => {

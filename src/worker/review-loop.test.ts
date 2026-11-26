@@ -446,6 +446,7 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     gh.files = [{ path: 'FAKE_AGENT.md', status: 'added', patch: '@@ -0,0 +1,3 @@\n+# Done\n+\n+Implement the issue below.' }];
     // Right after each push, GitHub's pull request still names the commit it replaced.
     gh.headSha = laggingHead(() => remoteHead(f, prBranch));
+    gh.branchSha = () => remoteHead(f, prBranch);
     const worker = start(s, {}, true);
     const status = () => gh.comments.find((c) => c.issue === ISSUE)?.body ?? '';
     try {

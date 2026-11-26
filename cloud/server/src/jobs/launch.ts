@@ -438,20 +438,23 @@ export function createLauncher(deps: LaunchDeps) {
       decision = { repository: d.repository, repositoryId: d.repositoryId, keys: benchmark ? [benchmark.agentKey] : d.keys, label: d.label, issue: req.payload.issue!.number as number };
     } else {
       const subject = pullRequestOfPayload(eventName, req.payload);
-      const d = decidePullRequestDispatch(
-        config?.dispatch,
-        {
-          eventName,
-          action: req.payload.action,
-          repositoryFullName: req.payload.repository?.full_name,
-          repositoryId: req.payload.repository?.id,
-          sender: req.payload.sender?.login,
-          number: subject.number,
-          headRef: subject.headRef,
-          reviewState: req.payload.review?.state,
-        },
-        req.appBot ? { appBot: req.appBot } : {},
-      );
+      const event = {
+        eventName,
+        action: req.payload.action,
+        repositoryFullName: req.payload.repository?.full_name,
+        repositoryId: req.payload.repository?.id,
+        sender: req.payload.sender?.login,
+        number: subject.number,
+        headRef: subject.headRef,
+        reviewState: req.payload.review?.state,
+      };
+      let d = decidePullRequestDispatch(config?.dispatch, event, req.appBot ? { appBot: req.appBot } : {});
+      // A check suite with ciFix off: still a job when the pull request's loop waits on its head
+      // (#197). One read of its workflow, only then.
+      if (!d.start && d.code === 'loop_off' && eventName === 'check_suite' && deps.workflows && typeof event.repositoryId === 'number' && typeof event.number === 'number' &&
+        await Promise.resolve().then(() => deps.workflows!.loopWaitsOnHead(req.installationId, event.repositoryId as number, event.number as number)).catch(() => false)) {
+        d = decidePullRequestDispatch(config?.dispatch, event, { ...(req.appBot ? { appBot: req.appBot } : {}), loopWaitsOnHead: true });
+      }
       if (!d.start) {
         if (d.code === 'event_not_accepted') return skip('ignored');
         log({ delivery: req.deliveryId, installationId: req.installationId, ignored: d.reason });

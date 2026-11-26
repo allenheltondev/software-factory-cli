@@ -268,6 +268,16 @@ describe('createGitHubApi: publication writes', () => {
     ...extra,
   });
 
+  it('reads a branch from its git ref (#197), and a missing branch as null', async () => {
+    const { fn, calls } = fakeFetch((url) =>
+      url.pathname.endsWith('/gone') ? json({ message: 'Not Found' }, { status: 404 }) : json({ ref: 'refs/heads/updraft/issue-7-job_x', object: { sha: 'a'.repeat(40), type: 'commit' } }),
+    );
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    expect(await api.getBranchSha!({ id: 42, fullName: 'o/r' }, 'updraft/issue-7-job_x')).toBe('a'.repeat(40));
+    expect(calls[0]).toMatchObject({ url: 'https://api.github.com/repositories/42/git/ref/heads/updraft/issue-7-job_x' });
+    expect(await api.getBranchSha!({ id: 42, fullName: 'o/r' }, 'gone')).toBeNull();
+  });
+
   it('opens a PR with POST on the stable-ID route and maps the response', async () => {
     const { fn, calls } = fakeFetch(() => json(rawPull(5), { status: 201 }));
     const api = await createGitHubApi({ token: 't', fetch: fn });

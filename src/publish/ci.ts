@@ -18,6 +18,7 @@
 // Every decision is about one head: the PR is read on GitHub first, and a head that moved on is
 // left to its own review. The revision is dropped before it starts if the head moved since
 // (verdictStale). CI output is untrusted input: it is redacted, capped and fenced in the prompt.
+import { observeLiveHead } from '../poller/head-lag.js';
 import { createHash } from 'node:crypto';
 import { autoMergeMethod, ciSettings, DEFAULT_MAX_REVISIONS, suggestionsActive, workflowId, type CiSettings, type MergeMethod, type RepositoryConfig } from '../config/schema.js';
 import {
@@ -26,7 +27,6 @@ import {
   listCiCandidates,
   listPendingCiNotices,
   markReadyRecorded,
-  observeHead,
   recordCiNotice,
   recordCiRerun,
   resumeBlockedCi,
@@ -469,7 +469,7 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
     const live = await api.getPullRequest(repo, pr.prNumber);
     if (live.state !== 'open' || live.merged) return { status: 'none' };
     if (live.headSha !== sha) {
-      observeHead(db, pr.repoId, pr.prNumber, live.headSha, readAt);
+      await observeLiveHead({ db, api }, repo, pr, live.headSha, readAt);
       log.info('not judging the checks: the pull request moved on from the reviewed commit', { head: live.headSha });
       return { status: 'none' };
     }

@@ -387,6 +387,12 @@ export interface GitHubApi {
   createPullRequest(repo: RepoRef, input: CreatePullRequestInput): Promise<GitHubPullRequest>;
   /** Write: replace the body of a pull request the worker opened (its merge sentence follows the newest verified head). */
   updatePullRequestBody?(repo: RepoRef, pullNumber: number, body: string): Promise<void>;
+  /**
+   * The commit a branch points at now, from the git ref (`GET git/ref/heads/<branch>`), or null
+   * when there is no such branch. Unlike a pull request's `head.sha`, which GitHub updates some
+   * time after a push lands, the ref moves with the push itself (#197).
+   */
+  getBranchSha?(repo: RepoRef, branch: string): Promise<string | null>;
   /** The full names of the refs starting with `prefix` (`refs/...`), for cleaning up the worker's hidden claim refs. */
   listMatchingRefs?(repo: RepoRef, prefix: string): Promise<string[]>;
   /** Write: delete one ref (`refs/...`) the worker created. */

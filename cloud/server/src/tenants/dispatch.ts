@@ -181,7 +181,11 @@ export function decidePullRequestDispatch(
     headRef: unknown;
     reviewState?: unknown;
   },
-  options: { appBot?: string } = {},
+  /**
+   * `loopWaitsOnHead`: the pull request's review loop waits on a review of its head (the
+   * workflow recorder says so, #197). A check suite then starts a job with ciFix off as well.
+   */
+  options: { appBot?: string; loopWaitsOnHead?: boolean } = {},
 ): PullRequestDecision {
   const actions = PULL_REQUEST_ACTIONS[event.eventName];
   if (!actions || typeof event.action !== 'string' || !actions.includes(event.action)) {
@@ -198,7 +202,7 @@ export function decidePullRequestDispatch(
   const review = event.eventName === 'pull_request_review';
   const push = event.eventName === 'pull_request' && event.action === 'synchronize';
   const checks = event.eventName === 'check_suite';
-  if (checks && !repo.ci) return { start: false, reason: 'ciFix is off for this repository', code: 'loop_off' };
+  if (checks && !repo.ci && !(repo.review && options.loopWaitsOnHead)) return { start: false, reason: 'ciFix is off for this repository', code: 'loop_off' };
   if (review && !repo.revise) return { start: false, reason: 'revisions are off for this repository', code: 'loop_off' };
   if (push && !repo.review) return { start: false, reason: 'review is off for this repository', code: 'loop_off' };
   if (!repo.review && !repo.revise) return { start: false, reason: 'review and revisions are off for this repository', code: 'loop_off' };

@@ -13,12 +13,13 @@
 //      once whatever is replayed.
 //   5. The checkpoint (ETag, newest updated_at) is stored only after every PR was processed; an
 //      API error leaves it where it was and the scan is repeated.
+import { observeLiveHead } from './head-lag.js';
 import { revisionClaimRef } from '../publish/revision.js';
 import { noteStatus, quietFor } from '../publish/status-comment.js';
 import { STATUS_STAGE } from '../publish/status-marker.js';
 import { allowedActorsFor, DEFAULT_MAX_REVISIONS, reviewActive, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
-import { getLoopPr, observeHead, scheduleReviews } from '../db/pr-reviews.js';
+import { getLoopPr, scheduleReviews } from '../db/pr-reviews.js';
 import {
   closeRevisionPr,
   enqueueRevision,
@@ -241,7 +242,7 @@ export async function pollRepoReviews(
       await close(w, `pull request #${w.prNumber} was ${pr.merged ? 'merged' : 'closed'}`, pr.merged ? 'merged' : 'closed');
       continue;
     }
-    if (reviewing && pr.headRef === w.branch && observeHead(db, repo.id, w.prNumber, pr.headSha, readAt)) {
+    if (reviewing && pr.headRef === w.branch && (await observeLiveHead({ db, api }, repo, w, pr.headSha, readAt))) {
       log.info('pull request head changed', { pr: w.prNumber, head: pr.headSha });
     }
     if (revising) {

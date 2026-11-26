@@ -6,6 +6,7 @@ import { reviewActive, workflowId, type UpdraftConfig } from '../config/schema.j
 import type { Db } from '../db/database.js';
 import { getLoopPr, HEAD_LAG_GRACE_MS, ownPushReplacing } from '../db/pr-reviews.js';
 import { GitHubError, type GitHubApi, type PullRequestReviews } from '../github/api.js';
+import { branchSha } from './head-lag.js';
 import { reviewOf, type IssueSnapshot, type Job, type ReviewRunRequest } from '../types.js';
 
 const short = (sha: string) => sha.slice(0, 12);
@@ -50,21 +51,34 @@ export function queuedReviewProblem(config: UpdraftConfig, db: Db, job: Job): st
 
 /**
  * GitHub's pull request still names the commit the worker's own push of `review.headSha`
- * replaced, and that push is recent: GitHub has not caught up with it yet (#197). Not a move:
- * canceling would leave the head the worker pushed without a review for good (its dedupe key is
- * spent, and the worker's own push starts no event). The reason to wait, or null.
+ * replaced (#197). That is GitHub catching up, not a move, when the branch's git ref is at the
+ * pushed commit (or, for a client that cannot read the ref, when the push is less than
+ * HEAD_LAG_GRACE_MS old; a push dated after `now`, a clock that ran ahead, is not). Canceling
+ * then would leave the head the worker pushed without a review: its dedupe key would be spent,
+ * and the worker's own push starts no event. The reason to wait, or null: a real move.
  */
-export function laggingHead(db: Db | undefined, job: Job, review: ReviewRunRequest, githubHead: string, now: () => number = Date.now): string | null {
-  if (!db) return null;
-  const pushedAt = ownPushReplacing(db, job.repoId, review.pullRequest.number, review.headSha, githubHead);
-  if (!pushedAt || now() - Date.parse(pushedAt) >= HEAD_LAG_GRACE_MS) return null;
-  return `GitHub still shows ${short(githubHead)} as the head of pull request #${review.pullRequest.number}, the commit the worker's push of ${short(review.headSha)} (at ${pushedAt}) replaced; looked at again shortly`;
+export async function laggingHead(
+  deps: { api: Pick<GitHubApi, 'getBranchSha'>; db?: Db; now?: () => number },
+  job: Job,
+  review: ReviewRunRequest,
+  githubHead: string,
+): Promise<string | null> {
+  if (!deps.db) return null;
+  const pushedAt = ownPushReplacing(deps.db, job.repoId, review.pullRequest.number, review.headSha, githubHead);
+  if (!pushedAt) return null;
+  const why = `GitHub's pull request #${review.pullRequest.number} still shows ${short(githubHead)}, the commit the worker's push of ${short(review.headSha)} (at ${pushedAt}) replaced`;
+  const branch = await branchSha(deps.api, { id: job.repoId, fullName: job.repoFullName }, review.pullRequest.branch);
+  if (branch === review.headSha) return `${why}, and its branch is at ${short(review.headSha)}: GitHub has not caught up yet`;
+  if (branch !== undefined) return null;
+  const age = (deps.now ?? Date.now)() - Date.parse(pushedAt);
+  return age >= 0 && age < HEAD_LAG_GRACE_MS ? `${why}, less than ${HEAD_LAG_GRACE_MS / 60_000} minutes ago` : null;
 }
 
 /**
  * Final check before the worker starts a reviewer job: the config still asks for it, and the PR
- * is still open with the commit under review as its head. One request. With `db`, a read that
- * has not caught up with the worker's own push of that commit keeps the job queued (it rejects).
+ * is still open with the commit under review as its head. One request, two when GitHub's pull
+ * request may only lag behind the worker's own push of that commit (laggingHead): then the job
+ * is not canceled but left queued for the next pass (`retry`).
  *
  * `vouchIssue` is the issue job's own check, as for a revision: when the issue's text is no
  * longer text an allowed actor stands behind, the review still runs (the commit is what it
@@ -77,7 +91,7 @@ export async function checkReviewDispatchable(
   deps: { api: GitHubApi; config: UpdraftConfig; db?: Db; now?: () => number },
   job: Job,
   vouchIssue: (original: Job) => Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }>,
-): Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }> {
+): Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string; retry?: true }> {
   const review = reviewOf(job);
   if (!review) return { ok: false, reason: 'the job has no review request' };
   const problem = configProblem(deps.config, job);
@@ -97,8 +111,8 @@ export async function checkReviewDispatchable(
     return { ok: false, reason: `the head of pull request #${n} is ${pr.headRef}, not the published branch ${review.pullRequest.branch}` };
   }
   if (pr.headSha !== review.headSha) {
-    const lag = laggingHead(deps.db, job, review, pr.headSha, deps.now);
-    if (lag) throw new Error(lag);
+    const lag = await laggingHead(deps, job, review, pr.headSha);
+    if (lag) return { ok: false, reason: lag, retry: true };
     return { ok: false, reason: moved(review, pr.headSha) };
   }
 

@@ -45,6 +45,8 @@ export class FakeLoopGitHub {
   pull: { number: number; state: 'open' | 'closed'; merged: boolean; draft: boolean; headRef: string; baseRef: string; mergeable: boolean | null; mergeableState: string } | null = null;
   /** The pull request's head commit right now (tests point this at the real remote, or at a variable). */
   headSha: () => string = () => '0'.repeat(40);
+  /** The branch's git ref, which moves with a push itself (getBranchSha); null: the pull request's head (headSha). */
+  branchSha: (() => string | null) | null = null;
   /** Reviews as REST lists them: the worker's comment reviews and people's reviews. */
   reviews: PullRequestReviewSummary[] = [];
   /** People's reviews as the review poller reads them (GraphQL). */
@@ -294,6 +296,10 @@ export class FakeLoopGitHub {
     this.writes.push(`ready ${nodeId}`);
     this.need().draft = false;
     this.touch();
+  }
+  async getBranchSha(_repo: RepoRef, branch: string): Promise<string | null> {
+    this.calls.push(`getBranchSha ${branch}`);
+    return this.branchSha ? this.branchSha() : this.headSha();
   }
   async getCommitChecks(_repo: RepoRef, sha: string): Promise<CommitChecks> {
     this.calls.push(`getCommitChecks ${sha}`);

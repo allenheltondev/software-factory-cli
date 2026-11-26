@@ -96,12 +96,28 @@ runs at the same time as a revision of that PR. A reviewer job whose commit is n
 PR's head is canceled before it starts; the new head has its own job.
 
 GitHub updates a pull request's head a little after a push lands, so a read right after one of
-Updraft's own pushes can still name the commit that push replaced. For five minutes after the
-push, such a read is not taken for a move: the head on record stays the pushed commit, and its
-reviewer job stays queued and is looked at again shortly instead of being canceled. Should a
-reviewer job of the current head be canceled as "moved" all the same, the head gets a new
-reviewer job (at most three times), so a head Updraft pushed is never left without a review
-([#197](https://github.com/allenheltondev/software-factory-cli/issues/197)).
+Updraft's own pushes can still name the commit that push replaced
+([#197](https://github.com/allenheltondev/software-factory-cli/issues/197)). Such a read is
+checked against the branch's git ref (`GET git/ref/heads/<branch>`), which moves with the push
+itself:
+
+- the ref is at Updraft's push: GitHub has not caught up. The head on record stays the pushed
+  commit, and its reviewer job stays queued and is looked at again shortly (logged, not recorded
+  as an error) instead of being canceled;
+- the ref is anywhere else (a person pushed the branch back, say): the move is believed at once.
+
+A client that cannot read the ref believes such a read only five minutes after the push (a push
+dated after the current time, a clock that ran ahead, is not waited for). Should a reviewer job
+of the current head be canceled as "moved" all the same, the head gets a new reviewer job (at
+most three times), so a head Updraft pushed is not left without a review.
+
+Updraft's own push starts no event (Updraft Cloud does not start a job for a `synchronize` the
+App sent: the run that pushed handles what follows). When that run could not review the head, a
+check suite of the pull request carries the loop on: with ciFix on, as for any check suite; with
+ciFix off, a check suite is looked at while the pull request's loop waits on its head (no review
+of the head was posted, or its suggestion revision holds it). On Updraft Cloud that is read from
+the pull request's workflow record (stage awaiting review, reviewing or revising, not finished);
+any other check suite with ciFix off still starts nothing.
 
 Turning `review` on for a repository that already has open PRs opened by Updraft reviews
 their current heads.
@@ -433,13 +449,19 @@ is never touched.
   and the head goes on to its checks and merge. That is at most one revision attempt later than
   without suggestions. A head whose suggestions cannot be settled because GitHub keeps failing is
   let through after five attempts. A suggestion revision that pushed a head the pull request
-  does not show is waited for ten minutes at most; then GitHub is asked: the PR moves on to the
-  pushed head (which gets its own review), or, if the push is not there, the suggestions are
-  settled on the ready head, which goes on to its checks and merge.
+  does not show is waited for ten minutes at most (not at all for a push dated in the future);
+  then the branch's git ref decides, not the pull request (which may still lag): at the pushed
+  head, or any other commit, the PR moves on to it and that head gets its own review; at the ready
+  head, the push is not there, and the suggestions are settled on the ready head, which goes on to
+  its checks and merge. A suggestion the revision reported fixed in that push is not settled as
+  fixed then: the fix is not on the head that is merged, so it is deferred to the follow-up issue
+  with that reason, and its thread is told so.
 - **Change a verdict.** Suggestions are not blockers; the acceptance gate ([acceptance.md](acceptance.md))
   and the CI gate ([ci-fix.md](ci-fix.md)) are unchanged. Auto-merge waits for the suggestion
   revision's own head to be reviewed and pass its checks; it never merges the head the revision
-  was for while that revision is on its way.
+  was for while that revision is on its way. Only once the revision's push is known not to be on
+  the branch (the timeout above) is the head it was for released to its checks and merge, without
+  the fixes, which go to the follow-up issue.
 - **Run twice.** The revision's dedupe key is the pull request (`suggestions:<pr>`): a redelivered
   review, a retry or a stale head never queues a second one. A revision queued for a head that a
   person's push replaced is canceled before it starts, as for any verdict; the new head is

@@ -598,7 +598,8 @@ export async function buildJobs(
 }
 
 /** `issue` is the issue as fetched by the check, for the executor (live runs render it into the prompt). */
-export type DispatchCheck = { ok: true; issue?: IssueSnapshot } | { ok: false; reason: string };
+/** `retry`: not now, and not a reason to cancel either; the job stays queued for the next pass (a reviewer job whose pushed head GitHub does not show yet, #197). */
+export type DispatchCheck = { ok: true; issue?: IssueSnapshot } | { ok: false; reason: string; retry?: true };
 
 /** Shared dispatchability check. Throws for transient API errors (never a cancel reason). */
 type IssueEventsLookup = (repo: RepoRef, issueNumber: number) => Promise<GitHubIssueEvent[]>;

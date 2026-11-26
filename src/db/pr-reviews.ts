@@ -283,27 +283,46 @@ export function ownPushReplacing(db: Db, repoId: number, prNumber: number, headS
   return row?.pushed_at ?? null;
 }
 
+/** The lag guard of observeHead, in SQL: the head on record is the worker's own push that replaced `?` (the observed commit), made in (`?`, `?`]. */
+const LAGGING_READ = `EXISTS (
+  SELECT 1 FROM revisions v
+   WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
+     AND v.head_sha = revision_prs.head_sha AND v.base_sha = ? AND v.pushed_at IS NOT NULL AND v.pushed_at > ? AND v.pushed_at <= ?
+)`;
+
+function lagWindow(observedAt: string): string {
+  const from = Date.parse(observedAt) - HEAD_LAG_GRACE_MS;
+  return Number.isFinite(from) ? new Date(from).toISOString() : observedAt;
+}
+
+/**
+ * A read of the PR made at `observedAt` names `sha`, and the head on record is the worker's own
+ * push that replaced `sha`, made within HEAD_LAG_GRACE_MS before the read (never after it: a
+ * clock that ran ahead does not stretch the window). Such a read may only be GitHub catching up
+ * (#197). Returns the head on record then, else null.
+ */
+export function lagSuspect(db: Db, repoId: number, prNumber: number, sha: string, observedAt: string): string | null {
+  const row = db
+    .prepare(`SELECT head_sha FROM revision_prs WHERE repo_id = ? AND pr_number = ? AND head_sha IS NOT NULL AND head_sha != ? AND ${LAGGING_READ}`)
+    .get(repoId, prNumber, sha, sha, lagWindow(observedAt), observedAt) as { head_sha: string } | undefined;
+  return row?.head_sha ?? null;
+}
+
 /**
  * The PR was read from GitHub and its head is `sha`. `observedAt` is when the read was started:
  * an observation older than what the row holds (a read that raced the worker's own push) is
- * ignored, and so is one that names the commit the worker's own push of the head replaced, within
- * HEAD_LAG_GRACE_MS of that push: GitHub had not caught up yet (#197). Returns true when the head
- * changed.
+ * ignored, and so is one that may only be GitHub catching up with the worker's own push of the
+ * head (lagSuspect, #197), unless `o.believe`: the caller confirmed the move from the branch's
+ * git ref (src/poller/head-lag.ts). Returns true when the head changed.
  */
-export function observeHead(db: Db, repoId: number, prNumber: number, sha: string, observedAt: string): boolean {
-  const lagUntil = Date.parse(observedAt) - HEAD_LAG_GRACE_MS;
-  const cutoff = Number.isFinite(lagUntil) ? new Date(lagUntil).toISOString() : observedAt;
+export function observeHead(db: Db, repoId: number, prNumber: number, sha: string, observedAt: string, o: { believe?: boolean } = {}): boolean {
   const res = db
     .prepare(
       `UPDATE revision_prs SET head_sha = ?, head_at = ?, updated_at = ?
        WHERE repo_id = ? AND pr_number = ? AND (head_sha IS NULL OR head_sha != ?) AND (head_at IS NULL OR head_at < ?)
-         AND NOT EXISTS (
-           SELECT 1 FROM revisions v
-            WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
-              AND v.head_sha = revision_prs.head_sha AND v.base_sha = ? AND v.pushed_at IS NOT NULL AND v.pushed_at > ?
-         )`,
+         AND (? = 1 OR NOT ${LAGGING_READ})`,
     )
-    .run(sha, observedAt, observedAt, repoId, prNumber, sha, observedAt, sha, cutoff);
+    .run(sha, observedAt, observedAt, repoId, prNumber, sha, observedAt, o.believe ? 1 : 0, sha, lagWindow(observedAt), observedAt);
   return Number(res.changes) > 0;
 }
 

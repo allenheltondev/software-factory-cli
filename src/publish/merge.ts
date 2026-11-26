@@ -21,6 +21,7 @@
 // be read, or did not pass in time): its gates are evaluated again, every MERGE_RECHECK_MS or when
 // asked to (a check event), and when they all hold now, after a re-run on that same head, the
 // merge goes ahead as it would have the first time. Its comment is not posted again.
+import { observeLiveHead } from '../poller/head-lag.js';
 import { allowedActorsFor, autoMergeMethod, ciSettings, DEFAULT_AUTO_MERGE_WAIT_MINUTES, suggestionsActive, workflowId, type MergeMethod, type RepositoryConfig } from '../config/schema.js';
 import {
   codeRunForHead,
@@ -28,7 +29,6 @@ import {
   listMergeCandidates,
   listPendingMergeNotices,
   listResumableMerges,
-  observeHead,
   recordMergeNotice,
   reopenBlockedMerge,
   RESUMABLE_MERGE_CODES,
@@ -189,7 +189,7 @@ async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: 
   if (live.headSha !== sha) {
     // Stale: the verdict is for a commit that is no longer the head. Not a refusal worth a
     // comment; the new head gets its own review.
-    observeHead(db, pr.repoId, pr.prNumber, live.headSha, readAt);
+    await observeLiveHead({ db, api }, repo, pr, live.headSha, readAt);
     deps.log.info('not merging: the pull request moved on from the reviewed commit', { repo: repo.fullName, pr: pr.prNumber, reviewed: sha, head: live.headSha });
     return { action: 'none' };
   }
