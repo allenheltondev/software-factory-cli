@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { isHttpsGitHub, publishGitEnv, redactSecret } from '../publish/publish.js';
 import { isGitRepo, runGit as defaultRunGit, type GitOptions, type GitOutput } from './git.js';
 import { withCheckoutLock } from './worktree.js';
+import type { AgentConfig } from '../config/schema.js';
 
 /** Marks a clone `ensureClone` created; a clone carrying it is always fetched with the worker's credentials. */
 export const MANAGED_CLONE_KEY = 'updraft.managedClone';
@@ -56,6 +57,45 @@ export interface EnsureCloneRequest {
   /** Injected in tests to record what reaches git. */
   runGit?: RunGit;
   now?: () => number;
+  /**
+   * The ref store of a new clone: `reftable` only when every agent that may work in it runs the
+   * host's git (cloneRefFormat). Default `files`.
+   */
+  refFormat?: CloneRefFormat;
+}
+
+export type CloneRefFormat = 'reftable' | 'files';
+
+/** Git 2.45 is the first that reads (and makes) reftable repositories. */
+export const REFTABLE_MIN_GIT = [2, 45] as const;
+
+/**
+ * Images of the runtimes that run the host's own git: updraft-sandbox (bubblewrap) and the native
+ * worker bind the host's /usr, so a contained agent's git is the worker's git. Any other image
+ * brings its own git, which may be too old to read a reftable repository.
+ */
+const HOST_GIT_RUNTIMES = new Set(['updraft-sandbox', 'updraft-native-worker']);
+const HOST_GIT_IMAGES = new Set(['microvm', 'native-claude-worker']);
+
+/** Does this agent run the host's git against the clone? Without a container, or in a runtime that binds the host's /usr. */
+export function runsHostGit(agent: Pick<AgentConfig, 'container'>): boolean {
+  const c = agent.container;
+  if (!c) return true;
+  const runtime = c.runtime.split(/[\\/]/).pop() ?? '';
+  return HOST_GIT_RUNTIMES.has(runtime) && HOST_GIT_IMAGES.has(c.image);
+}
+
+/**
+ * The ref store for a clone the worker makes: reftable (see ensureClone) only when every enabled
+ * agent runs the host's git, which then reads what it made. An agent in an image of its own may
+ * have git older than 2.45, which refuses a reftable repository outright ("unknown repository
+ * extension: refstorage"); with it in the config, the clone keeps the files store, and a
+ * contained commit on git 2.45+ prints its packed-refs.lock warning as before. Every enabled
+ * agent counts, not only those a workflow names today: pools, routing and escalation can pick
+ * any of them.
+ */
+export function cloneRefFormat(agents: Record<string, Pick<AgentConfig, 'container' | 'enabled'>>): CloneRefFormat {
+  return Object.values(agents).every((a) => a.enabled === false || runsHostGit(a)) ? 'reftable' : 'files';
 }
 
 export interface EnsuredClone {
@@ -99,11 +139,18 @@ export async function ensureClone(req: EnsureCloneRequest): Promise<EnsuredClone
   // `git branch -d` failed. Reftable keeps every ref, its lock and its tables in `reftable/`,
   // one of the directories a commit may already write, so nothing needs the top level. An older
   // git refuses the option before creating anything, and gets the files store as before.
-  try {
-    await run(['init', '--quiet', '--ref-format=reftable'], opts);
-  } catch {
-    await run(['init', '--quiet'], opts);
+  // Only when every agent's git is the host's (cloneRefFormat): an older git in an agent's own
+  // image cannot open a reftable repository at all.
+  let initialized = false;
+  if (req.refFormat === 'reftable') {
+    try {
+      await run(['init', '--quiet', '--ref-format=reftable'], opts);
+      initialized = true;
+    } catch {
+      // git older than 2.45
+    }
   }
+  if (!initialized) await run(['init', '--quiet'], opts);
   await run(['remote', 'add', 'origin', req.cloneUrl], opts);
   await run(['config', '--local', MANAGED_CLONE_KEY, 'true'], opts);
   // No automatic housekeeping. A contained agent commits through a git directory whose top

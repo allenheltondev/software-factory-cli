@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'n
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
-import { CloneError, ensureClone, GC_INTERVAL_MS, githubCloneUrl, housekeepManagedClone, LAST_GC_KEY, MANAGED_CLONE_KEY, workerNetworkGit } from './clone.js';
+import { CloneError, cloneRefFormat, ensureClone, GC_INTERVAL_MS, runsHostGit, githubCloneUrl, housekeepManagedClone, LAST_GC_KEY, MANAGED_CLONE_KEY, workerNetworkGit } from './clone.js';
 import { runGit, type GitOptions } from './git.js';
 import { prepareJobWorktree } from './worktree.js';
 
@@ -41,11 +41,9 @@ describe('ensureClone', { timeout: 60_000 }, () => {
     };
     expect(await ensureClone({ checkoutPath, cloneUrl: githubCloneUrl(FULL), runGit: recording, now: () => 1_000 })).toEqual({ created: true, managed: true });
 
-    // Reftable where this git has it; an older git refuses the option and gets the files store.
-    const reftable = spawnSync('git', ['rev-parse', '--show-ref-format'], { cwd: checkoutPath, encoding: 'utf8' }).stdout.trim() === 'reftable';
+    // The files store unless asked for reftable (cloneRefFormat).
     expect(seen.map((s) => s.args.join(' '))).toEqual([
-      'init --quiet --ref-format=reftable',
-      ...(reftable ? [] : ['init --quiet']),
+      'init --quiet',
       `remote add origin https://github.com/${FULL}.git`,
       `config --local ${MANAGED_CLONE_KEY} true`,
       'config --local gc.auto 0',
@@ -90,6 +88,43 @@ describe('ensureClone', { timeout: 60_000 }, () => {
     // Outside any repository: the fixture root is not one either.
     await expect(ensureClone({ checkoutPath, cloneUrl: f.remoteDir })).rejects.toBeInstanceOf(CloneError);
     expect(readdirSync(checkoutPath)).toEqual(['notes.txt']);
+  });
+});
+
+describe('the ref store of a clone the worker makes', { timeout: 60_000 }, () => {
+  const docker = { runtime: 'docker', image: 'node:22-bookworm', env: [], args: [] };
+  const sandbox = { runtime: '/opt/updraft/bin/updraft-sandbox', image: 'microvm', env: [], args: [] };
+  const native = { runtime: '/opt/updraft/bin/updraft-native-worker', image: 'native-claude-worker', env: [], args: [] };
+
+  it('is reftable only when every enabled agent runs the host\'s git', () => {
+    expect(runsHostGit({})).toBe(true);
+    expect(runsHostGit({ container: sandbox } as never)).toBe(true);
+    expect(runsHostGit({ container: native } as never)).toBe(true);
+    // Its own image brings its own git, maybe older than 2.45.
+    expect(runsHostGit({ container: docker } as never)).toBe(false);
+    expect(runsHostGit({ container: { ...sandbox, image: 'my/image:1' } } as never)).toBe(false);
+    expect(runsHostGit({ container: { ...docker, image: 'microvm' } } as never)).toBe(false);
+
+    expect(cloneRefFormat({})).toBe('reftable');
+    expect(cloneRefFormat({ claude: {}, kiro: { container: sandbox } } as never)).toBe('reftable');
+    expect(cloneRefFormat({ claude: { container: native } } as never)).toBe('reftable');
+    expect(cloneRefFormat({ claude: { container: sandbox }, codex: { container: docker } } as never)).toBe('files');
+    // A disabled agent never works in the clone.
+    expect(cloneRefFormat({ claude: { container: sandbox }, codex: { container: docker, enabled: false } } as never)).toBe('reftable');
+  });
+
+  it('makes a reftable clone where git can and asked to, and a files one otherwise', async () => {
+    const f = fixture();
+    const format = (p: string) => spawnSync('git', ['config', '--get', 'extensions.refstorage'], { cwd: p, encoding: 'utf8' }).stdout.trim() || 'files';
+    const files = join(f.root, 'files');
+    await ensureClone({ checkoutPath: files, cloneUrl: githubCloneUrl(FULL), refFormat: 'files' });
+    expect(format(files)).toBe('files');
+    const asked = join(f.root, 'reftable');
+    await ensureClone({ checkoutPath: asked, cloneUrl: githubCloneUrl(FULL), refFormat: 'reftable' });
+    // Git older than 2.45 refuses the option before creating anything and gets the files store.
+    const hasReftable = spawnSync('git', ['init', '--quiet', '--ref-format=reftable', join(f.root, 'probe')]).status === 0;
+    expect(format(asked)).toBe(hasReftable ? 'reftable' : 'files');
+    expect(f.git(asked, 'remote', 'get-url', 'origin')).toBe(`https://github.com/${FULL}.git`);
   });
 });
 

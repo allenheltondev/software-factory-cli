@@ -23,7 +23,7 @@ import { silentLogger } from '../../../src/util/log.ts';
 import { LiveExecutor } from '../../../src/worker/live.ts';
 import { baseCheckRoot } from '../../../src/worker/base-check.ts';
 import { buildContainerRunArgs, worktreeMounts } from '../../../src/worker/container.ts';
-import { ensureClone } from '../../../src/git/clone.ts';
+import { cloneRefFormat, ensureClone } from '../../../src/git/clone.ts';
 import { SANDBOX_IMAGE } from '../image/runner/isolation.mjs';
 import { installRuntime, requireUnlessAllowedToSkip, sandboxAvailability } from './sandbox-host.mjs';
 
@@ -265,12 +265,15 @@ describe.runIf(sandbox.usable)('git in the sandbox, in a clone the worker made',
    */
   async function inSandbox(f, script, config = []) {
     const clone = path.join(f.root, 'worker clone');
-    await ensureClone({ checkoutPath: clone, cloneUrl: f.remoteDir });
+    const runtime = installRuntime(path.join(f.root, 'runtime'));
+    // As run-event picks it: this runtime runs the host's git, so the clone may use reftable.
+    const refFormat = cloneRefFormat({ claude: { container: { runtime: runtime.path, image: SANDBOX_IMAGE } } });
+    expect(refFormat).toBe('reftable');
+    await ensureClone({ checkoutPath: clone, cloneUrl: f.remoteDir, refFormat });
     for (const [key, value] of config) f.git(clone, 'config', '--local', key, value);
     f.git(clone, 'fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main');
     const worktree = path.join(f.root, 'job');
     f.git(clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-1-job_t1', worktree, 'origin/main');
-    const runtime = installRuntime(path.join(f.root, 'runtime'));
     // Git's own trace of what it ran, for the failure message: which command touched what.
     const traceDir = path.join(f.root, 'trace');
     fs.mkdirSync(traceDir);

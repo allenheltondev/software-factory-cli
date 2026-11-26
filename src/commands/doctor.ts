@@ -390,12 +390,20 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
   if (config) {
     const sev = agentProblemSeverity(config.execution.mode);
     const enabled = Object.entries(config.agents).filter(([, a]) => a.enabled);
+    // Clones with the reftable ref store, which an agent's own git must be 2.45+ to read.
+    const reftableClones: string[] = [];
+    for (const repo of Object.values(config.repositories)) {
+      if (!repo.checkoutPath) continue;
+      const checkout = resolve(paths.configDir, repo.checkoutPath);
+      const store = await probes.run('git', ['-C', checkout, 'config', '--get', 'extensions.refstorage']).catch(() => null);
+      if (store?.code === 0 && store.stdout.trim().toLowerCase() === 'reftable') reftableClones.push(checkout);
+    }
     const results = await Promise.all(
       enabled.map(async ([agentName, agent]) => {
         const adapter = agentAdapter(agentName, agent);
         const env = agentLookupEnv(probes.env, agent);
         if (agent.container) {
-          return containerAgentChecks(agentName, adapter, agent, paths.configDir, { platform: probes.platform, env, which: probes.which, run: probes.run }, sev);
+          return containerAgentChecks(agentName, adapter, agent, paths.configDir, { platform: probes.platform, env, which: probes.which, run: probes.run }, sev, reftableClones);
         }
         const report = await probes.discoverAgent(adapter, { env, ...(agent.command ? { command: agent.command } : {}), baseDir: paths.configDir });
         const checks = agentChecks(report, sev, { name: agentName, args: agent.args });

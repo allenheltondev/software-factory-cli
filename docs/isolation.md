@@ -156,17 +156,32 @@ pseudorefs (`AUTO_MERGE`, `CHERRY_PICK_HEAD` and the like) through the ref store
 `error: Unable to create '.../packed-refs.lock': Read-only file system` (the commit itself
 succeeds). No configuration turns that deletion off.
 
-So a clone the worker creates itself (`updraft run-event`) uses the reftable ref store where Git
-has it (2.45 and later): every ref, its lock and its tables live in `reftable/`, which is mounted
-like `refs/`, and commits and ref deletions (`git update-ref -d`) work without the top level.
-`git branch -d` and `git stash` still also rewrite the clone's `config`, which stays read-only,
-and warn `could not lock config file`; use the base checkout instead of stashing. An
-older Git gets the files store, and its `git commit` deletes no ref. The same clone also has
-`gc.auto=0` and `maintenance.auto=false`, because the automatic gc that `git commit` starts once
-there are enough loose objects writes `gc.pid.lock` there too; the worker runs `git gc --auto`
-itself instead, on the host and outside any agent run (before an event's run at most once a
-day, and on `updraft clean`). A clone you made is left as you configured it: with the files
-store and Git 2.45 or later, a contained agent's commits print that error and still succeed.
+So a clone the worker creates itself (`updraft run-event`) uses the reftable ref store, when Git
+has it (2.45 and later) and every enabled agent runs the host's Git: no container, or the
+`updraft-sandbox` or native-worker runtime, which bind the host's `/usr`. Every ref, its lock and
+its tables then live in `reftable/`, which is mounted like `refs/`, and commits and ref deletions
+(`git update-ref -d`) work without the top level. `git branch -d` and `git stash` still also
+rewrite the clone's `config`, which stays read-only, and warn `could not lock config file`; use
+the base checkout instead of stashing. With any agent in an image of its own (Docker, Podman),
+the clone keeps the files store: the image brings its own Git, and a Git older than 2.45 (Ubuntu
+24.04, Debian bookworm, Amazon Linux 2023) refuses a reftable repository outright ("unknown
+repository extension: refstorage"). A contained agent's Git must therefore be 2.45 or later to
+work in a reftable clone; `updraft doctor` warns when an image's Git is older and a configured
+clone uses reftable. With the files store, an agent's commits on Git 2.45+ print that
+`packed-refs.lock` error and still succeed. An older host Git gets the files store, and its
+`git commit` deletes no ref.
+
+The reftable tables are written by the agent and read by host Git: the worker's `git fetch`,
+`git worktree`, `git gc` and reftable's own compaction parse `tables.list` and the tables the
+agent left, as they parse loose refs and `logs/` with the files store. A malformed table can make
+those commands fail; it cannot make host Git run anything, so the exposure is a failed run, not
+code execution.
+
+The same clone also has `gc.auto=0` and `maintenance.auto=false`, because the automatic gc that
+`git commit` starts once there are enough loose objects writes `gc.pid.lock` there too; the
+worker runs `git gc --auto` itself instead, on the host and outside any agent run (before an
+event's run at most once a day, and on `updraft clean`). A clone you made is left as you
+configured it.
 
 After the agent exits, the worker summarizes the run with `git diff` on the host, in a
 worktree whose contents the agent wrote. For a containerized run it tells Git not to look
