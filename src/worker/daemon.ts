@@ -103,8 +103,11 @@ export interface DaemonDeps {
   log: Logger;
   /** One poll cycle (wired to poller.pollOnce by `updraft start`). */
   poll: () => Promise<unknown>;
-  /** Final pre-start check (wired to poller.checkJobDispatchable). `issue` is passed to the executor. */
-  checkDispatchable: (job: Job) => Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }>;
+  /**
+   * Final pre-start check (wired to poller.checkJobDispatchable). `issue` is passed to the
+   * executor. `retry`: the job is neither started nor canceled, and stays queued for the next pass.
+   */
+  checkDispatchable: (job: Job) => Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string; retry?: true }>;
   /** Abort to stop gracefully (SIGINT/SIGTERM). */
   signal: AbortSignal;
   /**
@@ -435,6 +438,13 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       if (signal.aborted || lockLost) {
         releaseClaim(db, run.id, lockLost ? 'worker lost its lock' : 'worker stopping', now);
         return;
+      }
+      if (!check.ok && check.retry) {
+        // Not a failure: no error is recorded (a reviewer job whose pushed head GitHub does not show yet, #197).
+        deferred.add(job.id);
+        log.info('job not started yet; it stays queued until the next poll', { jobId: job.id, reason: check.reason });
+        releaseClaim(db, run.id, `not started yet: ${check.reason}`, now);
+        continue;
       }
       if (!check.ok) {
         cancelClaim(db, run.id, check.reason, now);

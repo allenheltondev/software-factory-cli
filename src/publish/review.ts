@@ -15,6 +15,7 @@
 // A verdict for a commit that is no longer the head is recorded as stale and changes nothing.
 //
 // Same lease and attempt fence around every write as publication and the revision push.
+import { observeLiveHead } from '../poller/head-lag.js';
 import { appendFile } from 'node:fs/promises';
 import { DEFAULT_MAX_REVISIONS, autoMergeMethod, ciSettings, reviewActive, reviseActive, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import { recordError, transaction } from '../db/database.js';
@@ -26,7 +27,6 @@ import {
   holdPrReview,
   listDuePrReviews,
   markReadyRecorded,
-  observeHead,
   PrReviewSupersededError,
   recordVerdict,
   REVIEW_MAX_AUTO_ATTEMPTS,
@@ -513,7 +513,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
       if (pr.state !== 'open') {
         outcome = 'closed';
       } else if (pr.headSha !== headSha) {
-        observeHead(deps.db, job.repoId, prNumber, pr.headSha, readAt);
+        await observeLiveHead(deps, repoRef, { prNumber, branch: request.pullRequest.branch }, pr.headSha, readAt);
         outcome = 'stale';
         detail = `the pull request is at ${short(pr.headSha)} now; this verdict was for ${short(headSha)}`;
       } else if (pr.draft && !ciSettings(deps.config, repo)) {

@@ -598,7 +598,8 @@ export async function buildJobs(
 }
 
 /** `issue` is the issue as fetched by the check, for the executor (live runs render it into the prompt). */
-export type DispatchCheck = { ok: true; issue?: IssueSnapshot } | { ok: false; reason: string };
+/** `retry`: not now, and not a reason to cancel either; the job stays queued for the next pass (a reviewer job whose pushed head GitHub does not show yet, #197). */
+export type DispatchCheck = { ok: true; issue?: IssueSnapshot } | { ok: false; reason: string; retry?: true };
 
 /** Shared dispatchability check. Throws for transient API errors (never a cancel reason). */
 type IssueEventsLookup = (repo: RepoRef, issueNumber: number) => Promise<GitHubIssueEvent[]>;
@@ -791,7 +792,7 @@ async function recheckQueuedJobs(
  * GitHubError for transient API failures (rate limit, network, 5xx), in which case
  * the caller should leave the job queued and try later.
  */
-export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'config'> & { db?: Db }, job: Job): Promise<DispatchCheck> {
+export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'config' | 'now'> & { db?: Db }, job: Job): Promise<DispatchCheck> {
   // A paused workflow (docs/controls.md): the job is not started, and resume puts it back.
   const paused = deps.db ? pauseProblem(deps.db, job) : null;
   if (paused) {

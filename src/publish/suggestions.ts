@@ -19,6 +19,7 @@
 // never become blockers and change no verdict, so the acceptance and CI gates are untouched.
 // Nothing here posts a status comment: thread replies and the follow-up issue are the only
 // GitHub writes, and the issue's live status comment says where the loop is.
+import { branchSha, observeLiveHead } from '../poller/head-lag.js';
 import { autoMergeMethod, DEFAULT_MAX_REVISIONS, reviseActive, suggestionMode, suggestionsActive, workflowId, type RepositoryConfig } from '../config/schema.js';
 import { transaction } from '../db/database.js';
 import {
@@ -52,6 +53,13 @@ export type SuggestionDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' |
 
 /** Failed attempts to settle one head before it is let through anyway: a suggestion never holds a merge back for good. */
 export const MAX_SUGGEST_ATTEMPTS = 5;
+/**
+ * How long the suggestion step waits for the head a suggestion revision pushed to replace the one
+ * it revised (#197). Past this, GitHub decides: a pull request at the pushed head moves on to it
+ * (that head gets its own review), and one still at the revised head has its suggestions settled
+ * there and goes on to its checks and its merge. Never held for good.
+ */
+export const SUGGEST_PUSH_WAIT_MS = 10 * 60_000;
 /** Suggestions one revision is given; the rest are deferred to the follow-up issue. */
 const MAX_REVISION_SUGGESTIONS = 25;
 /** Suggestions settled on one head at most (each is a few requests); the next head settles what is left. */
@@ -221,8 +229,12 @@ function unpushedReports(deps: SuggestionDeps, jobId: string | null): Map<string
  * found unfixed since. declined: the coding agent left it, saying why. deferred: everything else
  * (deferred, unable, no report, not given to any revision, or found unfixed after the claim).
  */
-export function classify(f: ReviewFinding, unpushed: Map<string, { status: string; note: string | null }>): Settlement {
+export function classify(f: ReviewFinding, unpushed: Map<string, { status: string; note: string | null }>, unlanded: string | null = null): Settlement {
   if (f.status === 'verified') return { finding: f, as: 'fixed', note: null };
+  // Reported fixed in a push the pull request does not have (#197): not fixed on the head that goes on.
+  if (unlanded && f.resolution === 'fixed' && f.resolutionSha === unlanded) {
+    return { finding: f, as: 'deferred', note: `reported fixed in ${short(unlanded)}, a commit that never reached the pull request` };
+  }
   if (f.resolution === 'fixed' && !(f.status === 'unresolved' && f.statusSha === f.resolutionSha)) return { finding: f, as: 'fixed', note: f.resolutionNote };
   if (f.resolution === 'disagreed') return { finding: f, as: 'declined', note: f.resolutionNote };
   const report = unpushed.get(f.key);
@@ -293,16 +305,35 @@ export async function evaluateSuggestions(deps: SuggestionDeps, repo: RepoRef, c
     const max = cfg.maxRevisions ?? DEFAULT_MAX_REVISIONS;
     let reason: string;
     let released = false;
+    /** The head the suggestion revision pushed, when the pull request is not at it. */
+    let unlanded: string | null = null;
     if (pr.suggestState === 'fixing') {
       const job = pr.suggestJobId ? getJob(db, pr.suggestJobId) : null;
       if (job && (job.status === 'queued' || job.status === 'running')) return { status: 'waiting', reason: `the suggestion revision (job ${job.id}) is ${job.status}` };
       // The queue's own rule: a push the worker will still retry by itself is pending; one it gave up on is not.
-      const push = (pr.suggestJobId ? revisionPushOfJob(db, pr.suggestJobId, now) : null) ?? { unsettled: false, pushedSha: null };
+      const push = (pr.suggestJobId ? revisionPushOfJob(db, pr.suggestJobId, now) : null) ?? { unsettled: false, pushedSha: null, pushedAt: null };
       if (push.unsettled) return { status: 'waiting', reason: 'the suggestion revision is being pushed' };
-      // Pushed: the pull request moves to that head, which gets its own review.
-      if (push.pushedSha && push.pushedSha !== sha) return { status: 'waiting', reason: `the suggestion revision pushed ${short(push.pushedSha)}` };
+      // Pushed: the pull request moves to that head, which gets its own review. While the head on
+      // record is still the revised one (GitHub had not caught up with the push), for a while only
+      // (#197); a push dated after now (a clock that ran ahead) is not waited for. Then the
+      // branch's git ref decides, which moves with the push itself where the pull request's
+      // head can lag: at another commit, the pull request moves on to it; at this head, the push
+      // is not there, and the suggestions are settled here, none of them as fixed by it.
+      if (push.pushedSha && push.pushedSha !== sha) {
+        unlanded = push.pushedSha;
+        const age = now() - (push.pushedAt ? Date.parse(push.pushedAt) : Number.NaN);
+        if (Number.isNaN(age) || (age >= 0 && age < SUGGEST_PUSH_WAIT_MS)) return { status: 'waiting', reason: `the suggestion revision pushed ${short(unlanded)}` };
+        const at = await branchSha(deps.api, repo, pr.branch);
+        if (at && at !== sha) {
+          observeHead(db, pr.repoId, pr.prNumber, at, new Date(now()).toISOString(), { believe: true });
+          log.info("the suggestion revision's push is on the branch; the pull request moves on to it", { pushed: unlanded, branch: at });
+          return { status: 'none' };
+        }
+      }
       released = true;
-      reason = `the revision for the suggestions (job ${pr.suggestJobId ?? '?'}) ended without changing ${short(sha)}`;
+      reason = unlanded
+        ? `the revision for the suggestions (job ${pr.suggestJobId ?? '?'}) pushed ${short(unlanded)}, which is not on the pull request: its branch is still at ${short(sha)}`
+        : `the revision for the suggestions (job ${pr.suggestJobId ?? '?'}) ended without changing ${short(sha)}`;
     } else {
       // No request for a head with nothing to answer: most heads.
       const login = openSuggestions(db, pr.repoId, pr.prNumber).length ? await workerLogin(deps.api) : '';
@@ -321,7 +352,7 @@ export async function evaluateSuggestions(deps: SuggestionDeps, repo: RepoRef, c
       }
       reason = noRevisionWords(decision.why, max);
     }
-    const done = await settleHead(deps, repo, cfg, pr, sha, reason, log);
+    const done = await settleHead(deps, repo, cfg, pr, sha, reason, log, unlanded);
     if (done.status === 'settled' && released && quietFor(deps.config, { repoId: pr.repoId, repoFullName: repo.fullName })) {
       // Back to where the review left the head: ready, with its checks or its merge to come.
       const status = verdictStatus(deps.config, cfg, 'ready', pr.prNumber, sha);
@@ -419,7 +450,17 @@ async function fileFollowUp(
  * their threads get. Throws on a failure worth retrying (the next cycle settles what is left:
  * every reply is found again by its marker, and the issue by its marker).
  */
-async function settleHead(deps: SuggestionDeps, repo: RepoRef, cfg: RepositoryConfig, pr: LoopPr, sha: string, reason: string, log: SuggestionDeps['log']): Promise<SuggestionStepResult> {
+async function settleHead(
+  deps: SuggestionDeps,
+  repo: RepoRef,
+  cfg: RepositoryConfig,
+  pr: LoopPr,
+  sha: string,
+  reason: string,
+  log: SuggestionDeps['log'],
+  /** A commit the suggestion revision pushed that the pull request does not have: a fix it reports there is not one. */
+  unlanded: string | null = null,
+): Promise<SuggestionStepResult> {
   const { db, api } = deps;
   const now = deps.now ?? Date.now;
   const readAt = new Date(now()).toISOString();
@@ -427,7 +468,7 @@ async function settleHead(deps: SuggestionDeps, repo: RepoRef, cfg: RepositoryCo
   if (live.state !== 'open' || live.merged) return { status: 'none' };
   if (live.headSha !== sha) {
     // Moved on (a person's push, or another machine's suggestion revision): the new head has its own review.
-    observeHead(db, pr.repoId, pr.prNumber, live.headSha, readAt);
+    await observeLiveHead({ db, api }, repo, pr, live.headSha, readAt);
     return { status: 'none' };
   }
   const login = await workerLogin(api);
@@ -435,7 +476,7 @@ async function settleHead(deps: SuggestionDeps, repo: RepoRef, cfg: RepositoryCo
   const threadDeps: ThreadDeps = { db, api, now, guard: () => {}, repoFullName: repo.fullName, runId: `suggestions-${pr.prNumber}` };
   const unpushed = unpushedReports(deps, pr.suggestJobId);
   // Every open suggestion, however many: past what one revision is given, they are deferred.
-  const settlements = openSuggestions(db, pr.repoId, pr.prNumber, MAX_SETTLED).map((f) => classify(f, unpushed));
+  const settlements = openSuggestions(db, pr.repoId, pr.prNumber, MAX_SETTLED).map((f) => classify(f, unpushed, unlanded));
   const deferred = settlements.filter((s) => s.as === 'deferred');
 
   // The follow-up issue (fileFollowUp): the one the deferred suggestions go into.

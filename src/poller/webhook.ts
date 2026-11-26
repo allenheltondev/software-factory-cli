@@ -14,7 +14,8 @@
 // there the existing pre-start checks run unchanged.
 import { createHash } from 'node:crypto';
 import { autoMergeMethod, ciSettings, reviewActive, reviseActive, suggestionsActive, type UpdraftConfig } from '../config/schema.js';
-import { listResumableMerges } from '../db/pr-reviews.js';
+import { getLoopPr, listResumableMerges } from '../db/pr-reviews.js';
+import type { Db } from '../db/database.js';
 import { getRevisionPr, listOpenRevisionPrsByHead } from '../db/revisions.js';
 import type { NewJob } from '../db/ingest.js';
 import type { GitHubApi, GitHubIssueEvent } from '../github/api.js';
@@ -237,7 +238,8 @@ async function pullRequestChanged(deps: WebhookDeps, _payload: Payload, event: W
  * (for a check), or the watched pull request whose head is the payload's commit (for a status,
  * which names no pull request); the CI step reads the checks from the API itself. Without ciFix,
  * only a pull request whose merge was blocked on the checks of its head is looked at: a pass there
- * (a re-run) carries the merge on (src/publish/merge.ts).
+ * (a re-run) carries the merge on (src/publish/merge.ts); and one whose review loop waits on its
+ * head (loopWaits), for which a check suite may be the only delivery that comes (#197).
  */
 async function checksChanged(deps: WebhookDeps, payload: Payload, event: WebhookEventInfo): Promise<WebhookDecision> {
   const nothing = (reason: NothingToDoReason, message: string): WebhookDecision => ({ dispatch: false, reason, message, event });
@@ -247,7 +249,8 @@ async function checksChanged(deps: WebhookDeps, payload: Payload, event: Webhook
     return nothing('repository-not-configured', `no configured repository has id ${event.repositoryId}${event.repository ? ` (${event.repository})` : ''}`);
   }
   const ci = ciSettings(deps.config, found.cfg) !== null;
-  if (!ci && !autoMergeMethod(deps.config, found.cfg)) {
+  const reviewing = reviewActive(deps.config, found.cfg);
+  if (!ci && !autoMergeMethod(deps.config, found.cfg) && !reviewing) {
     return nothing('review-loop-off', `ciFix is not on for ${found.fullName} (it needs review, publish and execution.mode: live), so nothing acts on its checks`);
   }
   const subject = obj(payload.check_suite) ?? obj(payload.check_run);
@@ -265,16 +268,32 @@ async function checksChanged(deps: WebhookDeps, payload: Payload, event: Webhook
   if (pullRequest === null) return nothing('pull-request', `the ${event.name} event is not about a pull request this worker watches`);
   if (!ci) {
     const n = pullRequest;
-    const blocked = listResumableMerges(deps.db, found.cfg.id, { requireSuggestions: suggestionsActive(deps.config, found.cfg) }).some((pr) => pr.prNumber === n);
+    const blocked =
+      (autoMergeMethod(deps.config, found.cfg) && listResumableMerges(deps.db, found.cfg.id, { requireSuggestions: suggestionsActive(deps.config, found.cfg) }).some((pr) => pr.prNumber === n)) ||
+      (reviewing && loopWaits(deps.db, found.cfg.id, n));
     if (!blocked) {
       return nothing(
         'review-loop-off',
-        `ciFix is not on for ${found.fullName}, and the merge of pull request #${n} is not blocked on its checks, so nothing acts on this ${event.name} event`,
+        `ciFix is not on for ${found.fullName}, the merge of pull request #${n} is not blocked on its checks, and its review loop does not wait on its head, so nothing acts on this ${event.name} event`,
       );
     }
   }
   event.pullRequest = pullRequest;
   return { dispatch: 'poll-reviews', repo: { id: found.cfg.id, fullName: found.fullName }, pullRequest, event };
+}
+
+/**
+ * The review loop of a watched pull request waits on its head, from local state: no review of the
+ * head was posted (its reviewer job is queued, was lost, or is to be queued again:
+ * requeueLostReview), or the head was found ready and is held by its suggestion revision (one
+ * whose push the pull request does not show yet). The App's own push starts
+ * no event, so without ciFix a check suite of that head may be the only delivery for it (#197).
+ */
+export function loopWaits(db: Db, repoId: number, prNumber: number): boolean {
+  const pr = getLoopPr(db, repoId, prNumber);
+  if (!pr || pr.state !== 'open' || !pr.headSha) return false;
+  if (pr.verdictSha === pr.headSha && pr.suggestSha === pr.headSha && pr.suggestState === 'fixing') return true;
+  return !db.prepare("SELECT 1 AS x FROM pr_reviews WHERE repo_id = ? AND pr_number = ? AND head_sha = ? AND state = 'published' LIMIT 1").get(repoId, prNumber, pr.headSha);
 }
 
 async function issueLabeled(deps: WebhookDeps, payload: Payload, event: WebhookEventInfo): Promise<WebhookDecision> {

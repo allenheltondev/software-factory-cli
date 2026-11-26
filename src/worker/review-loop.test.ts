@@ -9,7 +9,7 @@ import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeAdapter } from '../../test/fake-adapter.js';
 import type { NativeAuthRunner } from '../agents/native-claude-auth.js';
-import { FakeLoopGitHub } from '../../test/fake-loop-github.js';
+import { FakeLoopGitHub, laggingHead } from '../../test/fake-loop-github.js';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { registerAdapter } from '../agents/adapters/registry.js';
@@ -132,7 +132,7 @@ function start(s: ReturnType<typeof setup>, executorOptions: { nativeClaudeAuth?
     signal: controller.signal,
     executor: createExecutor(config, executorOptions),
     poll: () => pollOnce({ db, api, config, log: silentLogger }),
-    checkDispatchable: (job) => checkJobDispatchable({ api, config }, job),
+    checkDispatchable: (job) => checkJobDispatchable({ api, config, db }, job),
     publisher: createReviewLoopPublisher(deps, createRevisionPublisher(deps, createPublisher(deps))),
     ...(withStatus ? { assignmentCommenter: createAssignmentCommenter({ db, config, api, log: silentLogger, sleep: async () => {} }) } : {}),
     hostname: hostname(),
@@ -439,6 +439,37 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
       }
     },
   );
+
+  it('suggestions, GitHub slow to show a push (#197): the head the suggestion revision pushed is reviewed, goes through CI and is merged; the status ends at "Merged"', async () => {
+    const s = setup({ repo: { notifications: 'quiet', ciFix: true }, reviewerArgs: ['--mode', 'review', '--suggest'], coderArgs: ['--mode', 'success', '--resolve'] });
+    const { db, gh, f, prBranch } = s;
+    gh.files = [{ path: 'FAKE_AGENT.md', status: 'added', patch: '@@ -0,0 +1,3 @@\n+# Done\n+\n+Implement the issue below.' }];
+    // Right after each push, GitHub's pull request still names the commit it replaced.
+    gh.headSha = laggingHead(() => remoteHead(f, prBranch));
+    gh.branchSha = () => remoteHead(f, prBranch);
+    const worker = start(s, {}, true);
+    const status = () => gh.comments.find((c) => c.issue === ISSUE)?.body ?? '';
+    try {
+      await vi.waitFor(() => expect(gh.merges).toHaveLength(1), { timeout: 150_000, interval: 100 });
+      await vi.waitFor(() => expect(status()).toContain('**Updraft · Merged**'), { timeout: 10_000, interval: 50 });
+    } finally {
+      await worker.stop();
+    }
+    const jobs = jobsOf(db);
+    expect(jobs.map((j) => [j.envelope.type, j.status])).toEqual([
+      ['issue.labeled', 'succeeded'],
+      ['pull_request.review', 'succeeded'],
+      ['pull_request.changes_requested', 'succeeded'],
+      ['pull_request.review', 'succeeded'],
+    ]);
+    const [, review1, revision, review2] = jobs as [Job, Job, Job, Job];
+    const head2 = remoteHead(f, prBranch);
+    expect(revisionOf(revision)).toMatchObject({ trigger: 'suggestions', reviewedSha: reviewOf(review1)!.headSha });
+    expect(reviewOf(review2)!.headSha).toBe(head2);
+    expect(gh.merges).toEqual([{ sha: head2, method: 'squash' }]);
+    expect(status()).not.toContain('Addressing suggestions');
+    expect(prStage(db, getLoopPr(db, REPO_ID, PR)!, 3, { ci: true, suggestions: true }).stage).toBe('merged');
+  });
 
   it('quiet notifications, autoMerge off: the status rests on "Ready for a person to merge", and a person\'s merge is its last word', async () => {
     const s = setup({ repo: { notifications: 'quiet', autoMerge: undefined }, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] });

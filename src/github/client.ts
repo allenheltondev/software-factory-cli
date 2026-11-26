@@ -969,6 +969,17 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       await request<RawPullRequest>(`${repoPath(repo)}/pulls/${pullNumber}`, { method: 'PATCH', body: { body } });
     },
 
+    async getBranchSha(repo, branch) {
+      try {
+        const res = await request<{ object?: { sha?: unknown } }>(`${repoPath(repo)}/git/ref/heads/${branch.split('/').map(encodeURIComponent).join('/')}`);
+        const sha = res.data?.object?.sha;
+        return typeof sha === 'string' ? sha : null;
+      } catch (err) {
+        if (err instanceof GitHubError && err.status === 404) return null;
+        throw err;
+      }
+    },
+
     async listMatchingRefs(repo, prefix) {
       const res = await request<Array<{ ref?: unknown }>>(`${repoPath(repo)}/git/matching-refs/${prefix.replace(/^refs\//, '').split('/').map(encodeURIComponent).join('/')}`);
       return (res.data ?? []).map((r) => r.ref).filter((r): r is string => typeof r === 'string' && r.startsWith(prefix));

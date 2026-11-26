@@ -116,6 +116,17 @@ export function createWorkflowRecorder(o: {
       const id = await o.store.workflowOfPullRequest(installationId, repositoryId, pullRequest);
       return id ? (await o.store.getWorkflow(installationId, id))?.issue : undefined;
     },
+    /**
+     * The pull request's review loop waits on its head (#197): its workflow is not finished, and
+     * the last job left it awaiting a review, reviewing, or revising (a suggestion revision whose
+     * push the pull request does not show yet). Then a check suite of the pull request is worth a
+     * job even with ciFix off: the App's own push starts none, and it may be the only delivery.
+     */
+    async loopWaitsOnHead(installationId: number, repositoryId: number, pullRequest: number): Promise<boolean> {
+      const id = await o.store.workflowOfPullRequest(installationId, repositoryId, pullRequest);
+      const w = id ? await o.store.getWorkflow(installationId, id) : null;
+      return !!w && w.status !== 'finished' && (LOOP_WAITS_ON_HEAD as readonly string[]).includes(w.stage);
+    },
     /** A job was launched (jobs/launch.ts). */
     started: (job: JobRef) =>
       safely('start', job, async () => {
@@ -299,3 +310,6 @@ export function createWorkflowRecorder(o: {
 }
 
 export type WorkflowRecorder = ReturnType<typeof createWorkflowRecorder>;
+
+/** Loop stages in which the pull request waits on a review of its head (loopWaitsOnHead). */
+export const LOOP_WAITS_ON_HEAD = ['awaiting-review', 'reviewing', 'revising'] as const;

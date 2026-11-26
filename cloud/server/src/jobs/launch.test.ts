@@ -1,4 +1,4 @@
-import { createWorkflowRecorder } from '../workflows/recorder.js';
+import { createWorkflowRecorder, LOOP_WAITS_ON_HEAD } from '../workflows/recorder.js';
 import { createMemoryWorkflowStore } from '../workflows/store.js';
 import { waitingId } from '../native/sessions.js';
 import { parse, stringify } from 'yaml';
@@ -11,7 +11,7 @@ import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type DispatchRules, type Tenant } from '../store/store.js';
 import { createBundleKeys, workflowKeys } from '../tenants/key-needs.js';
 import { configPrefix } from '../tenants/paths.js';
-import { dispatchRules } from '../tenants/dispatch.js';
+import { decidePullRequestDispatch, dispatchRules } from '../tenants/dispatch.js';
 import { createAdminService } from '../admin/admin.js';
 import { createReconciler } from './reconcile.js';
 import { createLauncher, readinessAction, waitingComment, type NativeReadiness, PR_COALESCE_MS, PRELAUNCH_CLAIM_MS, pullRequestLease, type LaunchDeps, type LaunchRequest, type RunMicrovmInput, type ThrottleNotice, runHookPayload } from './launch.js';
@@ -1193,6 +1193,65 @@ describe('the launcher', () => {
       expect(await launch(prEvent({ pull_request: { number: 40, head: { ref: 'main' } } }))).toMatchObject({ disposition: 'not_dispatched', reason: 'not_updraft_pr' });
       expect(await launch(prEvent({ action: 'opened' }, 'x', 'pull_request'))).toMatchObject({ disposition: 'ignored' });
       expect(runs).toEqual([]);
+    });
+
+    // #197: the App's own suggestion revision pushed a new head. Its `synchronize` (sent by the
+    // App) starts nothing: the run that pushed reviews that head. The check suite of that head,
+    // also sent by the App, does start a job, whose run-event reviews the head if nothing did
+    // (a review canceled as "moved" is queued again: the CLI's requeueLostReview), then merges it.
+    it("after the App's own push: its synchronize starts nothing, and the check suite of the pushed head (the App's too) starts the job that carries the loop on", async () => {
+      const v = await store.createConfigVersion(55, { sha256: 'ci', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: dispatchRules(
+        { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, review: true, revise: true, ciFix: true, workflows: [{ trigger: { label: 'updraft' } }] } } },
+        { keysFor: () => ['ANTHROPIC_API_KEY'] },
+      ) });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      const launch = createLauncher(deps);
+      const pushed = 'e'.repeat(40);
+      expect(await launch(prEvent({ action: 'synchronize', sender: { login: 'updraft[bot]' }, pull_request: { number: 40, head: { ref: 'updraft/issue-12-abc', sha: pushed } } }, 'pr-sync', 'pull_request')))
+        .toMatchObject({ disposition: 'not_dispatched', reason: 'own_event' });
+      expect(runs).toEqual([]);
+      const suite = prEvent({ action: 'completed', pull_request: undefined, review: undefined, sender: { login: 'updraft[bot]' },
+        check_suite: { head_branch: 'updraft/issue-12-abc', head_sha: pushed, pull_requests: [{ number: 40, head: { ref: 'updraft/issue-12-abc' } }] } }, 'pr-suite', 'check_suite');
+      const started = await launch(suite);
+      expect(started).toMatchObject({ disposition: 'launched' });
+      expect(runs).toHaveLength(1);
+      expect(await store.getJob(started.jobId!)).toMatchObject({ eventName: 'check_suite', pullRequest: 40 });
+      expect(JSON.parse(events['tenants/55/events/pr-suite/event.json']!)).toMatchObject({ check_suite: { head_sha: pushed }, sender: { login: 'updraft[bot]' } });
+    });
+
+    it('with ciFix off, a check suite starts a job only while the pull request\'s loop waits on its head (#197), from its workflow record', async () => {
+      // The rules of this block: review and revise on, ciFix off.
+      const suite = (deliveryId: string) => prEvent({ action: 'completed', pull_request: undefined, review: undefined, sender: { login: 'updraft[bot]' },
+        check_suite: { head_branch: 'updraft/issue-12-abc', head_sha: 'e'.repeat(40), pull_requests: [{ number: 40, head: { ref: 'updraft/issue-12-abc' } }] } }, deliveryId, 'check_suite');
+      const asked: Array<[number, number, number]> = [];
+      let stage = 'merging';
+      let status = 'waiting';
+      const records = { workflowOfPullRequest: async () => '9-i12', getWorkflow: async () => ({ status, stage }) } as unknown as Parameters<typeof createWorkflowRecorder>[0]['store'];
+      const recorder = createWorkflowRecorder({ store: records, log: () => {} });
+      deps.workflows = { ...recorder, loopWaitsOnHead: async (...a: [number, number, number]) => (asked.push(a), recorder.loopWaitsOnHead(...a)) };
+      const launch = createLauncher(deps);
+      expect(await launch(suite('s-1'))).toMatchObject({ disposition: 'not_dispatched', reason: 'loop_off' });
+      expect(asked).toEqual([[55, 9, 40]]);
+      for (const s of LOOP_WAITS_ON_HEAD) {
+        stage = s;
+        expect(await recorder.loopWaitsOnHead(55, 9, 40)).toBe(true);
+      }
+      // A finished workflow waits on nothing.
+      status = 'finished';
+      expect(await launch(suite('s-2'))).toMatchObject({ disposition: 'not_dispatched', reason: 'loop_off' });
+      status = 'waiting';
+      stage = 'revising';
+      expect(await launch(suite('s-3'))).toMatchObject({ disposition: 'launched' });
+      expect(runs).toHaveLength(1);
+      // A failed read of the record is "no": as before.
+      deps.workflows = { ...recorder, loopWaitsOnHead: async () => { throw new Error('throttled'); } };
+      expect(await createLauncher(deps)(suite('s-4'))).toMatchObject({ disposition: 'not_dispatched', reason: 'loop_off' });
+      // Without the record's say-so, the rule is unchanged.
+      expect(decidePullRequestDispatch(loopRules, { eventName: 'check_suite', action: 'completed', repositoryFullName: 'acme/web', repositoryId: 9, sender: 'updraft[bot]', number: 40, headRef: 'updraft/issue-12-abc' }, { appBot: 'updraft[bot]' }))
+        .toMatchObject({ start: false, code: 'loop_off' });
+      expect(decidePullRequestDispatch(loopRules, { eventName: 'check_suite', action: 'completed', repositoryFullName: 'acme/web', repositoryId: 9, sender: 'updraft[bot]', number: 40, headRef: 'updraft/issue-12-abc' }, { appBot: 'updraft[bot]', loopWaitsOnHead: true }))
+        .toMatchObject({ start: true, pullRequest: 40 });
     });
 
     describe("the keys of the workflow that started the pull request", () => {
