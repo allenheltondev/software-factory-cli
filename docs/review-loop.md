@@ -496,8 +496,13 @@ it if anything was pushed after the review, and applies branch protection itself
 
 If a gate fails, the wait runs out, or GitHub refuses the merge (branch protection, a
 conflict, a moved head), that is final for that commit: the reason is recorded, one comment on
-the PR says so, and the PR stays at "ready to merge" for a person. Updraft never forces a
-merge, never bypasses protection, never retries a refused merge and never deletes a branch.
+the PR says so, and the PR stays at "ready to merge" for a person. The exception is a block on
+the commit's checks (a check failed, could not be read, or did not pass in time): it is not
+"ready to merge" (the comment and the status say **Blocked by a failing check** and name it), and
+when the checks pass on that same commit after a re-run, every gate is evaluated again and the
+merge goes ahead, with no second comment ([ci-fix.md](ci-fix.md#picking-the-merge-up-again)).
+Updraft never forces a merge, never bypasses protection, never retries a refused merge and never
+deletes a branch.
 The only repetition is for a merge request that got no answer at all (a network error): the
 next cycle asks GitHub what became of it, and after three such requests it gives up. A new
 head starts a new review and a new decision.

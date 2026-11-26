@@ -370,16 +370,50 @@ describe('updraft run-event: the whole review loop in one run', { timeout: 180_0
     expect(asked).toBeGreaterThanOrEqual(3);
     expect(r.summary).toMatchObject({ outcome: 'succeeded', drain: 'idle', loop: { rounds: 0, reviews: 1, stage: 'merged', merged: true } });
 
-    // With a failing check the merge is blocked for good: the run ends, and says so.
+    // With a failing check the merge is blocked on that head: the run ends, and says so. It is not
+    // "ready to merge" while a check fails; a pass on the same head (a re-run) picks the merge up.
     const w2 = world();
     w2.gh.checks = { total: 1, failing: ['ci / build'], pending: [], succeeded: [], complete: true };
     const blocked = await vm(w2, 'vm one', { repo: LOOP, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] }).run();
     expect(blocked.code).toBe(0);
-    expect(blocked.summary).toMatchObject({ outcome: 'succeeded', drain: 'idle', loop: { stage: 'ready-to-merge', ready: true, merged: false } });
+    expect(blocked.summary).toMatchObject({ outcome: 'succeeded', drain: 'idle', loop: { stage: 'needs-human', ready: true, merged: false } });
     expect(blocked.summary.loop?.notMergedReason).toContain('1 check(s)');
     expect(w2.gh.merges).toEqual([]);
     // The one comment that says so was posted before the run ended.
     expect(w2.gh.writes.filter((x) => x === `comment #${PR}`)).toHaveLength(1);
+  });
+
+  it('picks up a merge blocked by a failing check when a check suite on the same head reports green, with no new commit', async () => {
+    const w = world();
+    const reviewerArgs = ['--mode', 'review', '--verdict', 'ready-to-merge'];
+    w.gh.checks = { total: 2, failing: ['windows-latest / node 22'], pending: [], succeeded: ['windows-latest / node 24'], complete: true };
+    const one = vm(w, 'vm one', { repo: LOOP, reviewerArgs });
+    const r = await one.run({ deliveryId: 'd-1' });
+    expect(r.code).toBe(0);
+    expect(r.summary).toMatchObject({ loop: { stage: 'needs-human', merged: false } });
+    expect(one.upload()).toMatchObject({ changed: true });
+    const head = remoteHead(w.f, BRANCH);
+    expect(w.gh.comments.filter((c) => c.body.includes(`<!-- updraft-merge-blocked: ${head} -->`))).toHaveLength(1);
+
+    // Someone re-ran the failed job and it passed: the check suite's delivery reaches another machine.
+    w.gh.checks = { total: 2, failing: [], pending: [], succeeded: ['windows-latest / node 22', 'windows-latest / node 24'], complete: true };
+    const suite = {
+      action: 'completed',
+      repository: { id: REPO_ID, full_name: FULL },
+      sender: { login: 'someone' },
+      check_suite: { head_branch: BRANCH, head_sha: head, pull_requests: [{ number: PR, head: { ref: BRANCH } }] },
+    };
+    const two = vm(w, 'vm two', { repo: LOOP, reviewerArgs, payload: suite });
+    two.download();
+    const resumed = await two.run({ eventName: 'check_suite', deliveryId: 'd-2' });
+    expect(resumed.err).not.toContain('ERROR');
+    expect(resumed.code).toBe(0);
+    expect(resumed.summary).toMatchObject({ loop: { stage: 'merged', merged: true } });
+    expect(resumed.summary.message).toContain('its checks pass now on the head whose merge was blocked on them');
+    expect(remoteHead(w.f, BRANCH)).toBe(head);
+    expect(w.gh.merges).toEqual([{ sha: head, method: 'squash' }]);
+    // The blocked note for that commit was not posted again.
+    expect(w.gh.comments.filter((c) => c.body.includes(`<!-- updraft-merge-blocked: ${head} -->`))).toHaveLength(1);
   });
 });
 

@@ -470,3 +470,23 @@ describe('migration v21', () => {
     expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 21 });
   });
 });
+
+describe('migration v22', () => {
+  it('adds the one re-run per head and the merge block code, reading the code of an earlier block from its reason', () => {
+    const db = openDatabase(':memory:', { migrateTo: 21 });
+    const cols = () => (db.prepare('PRAGMA table_info(revision_prs)').all() as { name: string }[]).map((c) => c.name);
+    expect(cols()).not.toContain('ci_rerun_sha');
+    db.prepare(
+      `INSERT INTO revision_prs (repo_id, pr_number, pr_url, source_run_id, original_event_id, workflow_id, issue_number, issue_title, issue_url, label, labels, action, pool, branch,
+                                state, created_at, updated_at, merge_state, merge_sha, merge_reason)
+       VALUES (1, 5, 'u', 'run_1', 'e', 'w', 2, 't', 'u', 'l', '[]', 'a', 'p', 'b', 'open', 't', 't', 'blocked', 'abc', '1 check(s) of abc did not pass: test')`,
+    ).run();
+    migrate(db, 22);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 22 });
+    expect(cols()).toEqual(expect.arrayContaining(['ci_rerun_sha', 'ci_rerun_at', 'ci_rerun_checks', 'ci_rerun_files', 'merge_code', 'merge_checked_at']));
+    expect(db.prepare('SELECT merge_code FROM revision_prs').get()).toEqual({ merge_code: 'checks-failed' });
+    db.exec('PRAGMA user_version = 21');
+    migrate(db, 22);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 22 });
+  });
+});
